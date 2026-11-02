@@ -55,7 +55,8 @@ jobs:
       # since a corpus that grows slows its target, and a run past them is taken for a hang.
       matrix:
         include:
-          - { target: OCI layer, runs: 3M }
+          # Slows as its corpus grows (more files per layer): 3M took 27 minutes with a kept one.
+          - { target: OCI layer, runs: 1M }
           - { target: OCI references and challenges, runs: 8M }
           - { target: OCI manifests, runs: 8M }
           - { target: expressions, runs: 1M }
