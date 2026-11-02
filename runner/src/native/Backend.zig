@@ -1808,13 +1808,22 @@ fn below(b: *Backend) ?Store.Key {
         b.store = null;
         return null;
     };
+    // A root runner's job has a resolver of its own, in its own directory (`jobBinds`): keyed as
+    // the host's, which it is made from, so jobs replay one another's layers.
+    const binds = b.arena.dupe(sandbox.Spec.Bind, b.binds) catch {
+        b.store = null;
+        return null;
+    };
+    for (binds) |*bd| if (std.mem.eql(u8, bd.at, "/etc/resolv.conf")) {
+        bd.host = "/etc/resolv.conf";
+    };
     return belowKey(.{
         .format = Store.store_format,
         .scope = b.scope,
         .repository = b.repository,
         .fingerprint = &fp,
         .userns = @tagName(b.how.userns),
-        .binds = b.binds,
+        .binds = binds,
         .seeds = b.seed_layers.items,
     }, null);
 }
@@ -3646,7 +3655,7 @@ test "root runner: a native job resolves through a nameserver only another inter
     cfg.test_resolv_conf = resolv;
     const script =
         \\cat /etc/resolv.conf
-        \\getent hosts probe || echo "probe unresolved"
+        \\getent hosts probe || echo "probe un""resolved"
         \\python3 - <<'EOF'
         \\import socket
         \\def reach(host, port):
@@ -3672,6 +3681,7 @@ test "root runner: a native job resolves through a nameserver only another inter
         "other port unreachable",
         "host side unreachable",
     });
+    // Not in the script as written, which the log shows too.
     for ([_][]const u8{ "127.0.0.53", "fd7a:", "probe unresolved" }) |no|
         try std.testing.expect(std.mem.indexOf(u8, first.text, no) == null);
 
