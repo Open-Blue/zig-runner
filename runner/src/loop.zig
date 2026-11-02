@@ -166,6 +166,7 @@ pub fn pool(c: Runner, n: u32) !Exit {
         // The last slot is the pre-warm's (`Warmer`).
         const entries = try c.arena.alloc(admission.Admission.Slot, n + 1);
         m.* = .init(c.io, c.cfg.admission_limits, entries);
+        m.native = c.cfg.backend == .native;
         const cgroup = c.cfg.engine_cgroup;
         m.engine.source = if (std.mem.eql(u8, cgroup, "none"))
             .off

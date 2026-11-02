@@ -707,7 +707,19 @@ fn jobCgroup(b: *Backend, cfg: Config, parent: cgroup.Parent, name: []const u8) 
                 Limit.memory(b.limits.memory_max),
                 Limit.count(b.limits.pids_max),
             }));
-            if (b.gate) |g| g.native(j.dir);
+            // memory.high from what the gate reserves for the job; under memory.max, which stays
+            // the hard cap.
+            const high_mb = if (b.gate) |g| g.native(j.dir) orelse return else return;
+            const high = j.setHigh(arena, b.io, @as(u64, high_mb) << 20) catch |e| {
+                try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: the " ++
+                    "job's memory.high could not be set ({s}).", .{@errorName(e)}));
+                return;
+            };
+            try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: memory.high " ++
+                "{f}, from what the memory gate reserves for the job: past it the kernel " ++
+                "reclaims and slows the job instead of letting it take its neighbours' memory.", .{
+                Limit.memory(high),
+            }));
             return;
         } else |e| try std.fmt.allocPrint(arena, "it could not be made under {s}: {s}", .{
             dir,
@@ -718,7 +730,7 @@ fn jobCgroup(b: *Backend, cfg: Config, parent: cgroup.Parent, name: []const u8) 
     try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: the job has no " ++
         "cgroup of its own ({s}), so no memory or process limit of its own, and the memory " ++
         "gate does not measure it.", .{why}));
-    if (b.gate) |g| g.native(null);
+    if (b.gate) |g| _ = g.native(null);
 }
 
 /// A limit for the log: bytes as GB, or a count; `max` for none.
@@ -4862,4 +4874,57 @@ test "root runner: native gate accuracy, each job's own cgroup against the engin
         try std.testing.expect(own <= mb + 60);
     }
     try std.testing.expect(seen[2] >= 2 * mb - 20);
+}
+
+test "root runner: a native job's cgroup gets memory.high from what the gate reserves for it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    try testCgroup(arena, &cfg);
+    switch (cgroup.parent(arena, io, cfg.cgroup.parent)) {
+        .dir => {},
+        .none => |why| return skip(true, why),
+    }
+    var slots: [1]admission.Admission.Slot = undefined;
+    var pool: admission.Admission = .init(io, .{}, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    pool.native = true;
+    var gate: admission.Gate = .{ .pool = &pool };
+    var gated = cfg;
+    gated.gate = &gate;
+    const key = admission.jobKey("o/r", "ci.yml", "memory.high");
+    const job = testJob(&.{testStep("echo small job")});
+
+    // Not learned yet: `native_per_job_mb` (256 MB), twice that and 512 MB of headroom, as the
+    // kernel holds it (read back from the job's cgroup), beside its memory.max.
+    gate.leave(true);
+    gate.assigned(key);
+    const first = try runNativeJob(arena, gated, job, .root);
+    if (!first.res.succeeded) std.debug.print("{s}\n", .{first.text});
+    try std.testing.expect(first.res.succeeded);
+    try std.testing.expectEqual(@as(?u32, 1024), slots[0].high_mb);
+    try expectLines(first.text, &.{
+        "with memory.max ",
+        "Native steps: memory.high 1.0 GB, from what the memory gate reserves for the job",
+    });
+    const learned = gate.ended() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(learned.native and learned.alone);
+    // The job's own few MB (its shell and helper), or the 64 MB floor.
+    try std.testing.expect(learned.estimate_mb < 128);
+
+    // Learned: its next memory.high is from what it took, 640 MB at the floor.
+    gate.leave(true);
+    gate.assigned(key);
+    const second = try runNativeJob(arena, gated, job, .root);
+    try std.testing.expect(second.res.succeeded);
+    const high = admission.nativeHighMb(learned.estimate_mb);
+    try std.testing.expectEqual(@as(?u32, high), slots[0].high_mb);
+    try expectLines(second.text, &.{
+        try std.fmt.allocPrint(arena, "Native steps: memory.high {d} MB, from ", .{high}),
+    });
+    _ = gate.ended();
 }
