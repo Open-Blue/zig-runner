@@ -154,6 +154,18 @@
       "extractVersionTemplate": "^v(?<version>.*)$"
     },
     {
+      "description": "checksec, pinned by version in checksec.sh. A new version also needs its checksums from the release's checksec_checksums.sha512, updated by hand, which CI enforces by failing until they are (Release builds runs checksec.sh on a change to it).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/scripts/checksec\\.sh$/"
+      ],
+      "matchStrings": [
+        "\\nversion=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "slimm609/checksec",
+      "datasourceTemplate": "github-releases"
+    },
+    {
       "description": "The images release.yml pins by digest: Trivy, BuildKit and BuildKit's SBOM scanner.",
       "customType": "regex",
       "managerFilePatterns": [
