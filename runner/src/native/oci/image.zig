@@ -220,7 +220,7 @@ pub const Config = struct {
     };
 };
 
-fn parseManifest(arena: Allocator, m: registry.Client.Manifest, why: *[]const u8) !Manifest {
+pub fn parseManifest(arena: Allocator, m: registry.Client.Manifest, why: *[]const u8) !Manifest {
     const doc = std.json.parseFromSliceLeaky(Manifest, arena, m.bytes, .{ .ignore_unknown_fields = true }) catch {
         why.* = "the registry's manifest is not one";
         return error.BadManifest;

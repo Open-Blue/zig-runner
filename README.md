@@ -105,6 +105,16 @@ It is not a required check yet. Before a release, run the same suite by hand aga
 (`.github/scripts/*-diff.sh`): the expression evaluator, YAML reader, `hashFiles()`, problem
 matcher regular expressions, HPACK decoder and RS256 signing against the implementations they
 follow, on fresh random cases.
+CodeQL and Semgrep read no Zig, so the runner's own code has analysis of its own. `analysis` runs
+nightly: "Fuzz" runs each of `runner/src/fuzz.zig`'s targets (an image layer's tar, PAX and paths
+applied beside a directory it must not reach; image references, registry challenges and manifests;
+expressions, YAML, regular expressions, HPACK, `hashFiles()` patterns, minisign signatures,
+workflow commands and problem matchers) with Zig's coverage-guided fuzzer
+(`.github/scripts/zig-fuzz.sh`, LLVM-built, for a bounded number of runs), keeping each target's
+corpus in the Actions cache and failing, named after the target, on a crash, a failed check, a leak
+or a hang, with the input as an artifact; `zig build test` runs the same targets over their seed
+corpus every time. Locally: `zig build test -Dllvm --fuzz` (add `-Dtest-filter='fuzz: YAML'` for
+one target).
 `proofs` checks the [Lean proofs](proofs/README.md) (the step cache, the regex matcher's loops, and
 the `hashFiles()` walk) and compares the walk's model with `runner/src/glob.zig` on random cases,
 when either changes and weekly ("Proofs"). The workflows are written to be hard to turn against the
@@ -155,7 +165,8 @@ repository:
   (`.github/scripts/shellcheck.sh`), `busybox-pin.sh` the runner's busybox pin, and CodeQL the
   workflows, the Go tools and the Python generators; every job has a time limit. The Database
   tests job runs every test under
-  ThreadSanitizer (`zig build test -Dsanitize-thread` locally). Vulnerabilities are reported privately ([docs/SECURITY.md](docs/SECURITY.md)).
+  ThreadSanitizer (`zig build test -Dsanitize-thread` locally), and `analysis` fuzzes its parsers
+  nightly (above). Vulnerabilities are reported privately ([docs/SECURITY.md](docs/SECURITY.md)).
 - **One secret, one step.** The deploy key that may push to `main` is the `prod` environment's,
   which deploys only from `main` and waits for approval; it is loaded only in the step that pushes,
   and pushes only to GitHub's pinned host key.
