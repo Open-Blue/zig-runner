@@ -161,7 +161,7 @@ fn stepOutput(sh: *JobLog, step: u32, text: []const u8) void {
                 "##[add-mask] command.");
         } else {
             if (st.echo) sh.appendLocked(step, "::add-mask::***");
-            sh.addMask(value);
+            if (!sh.addMask(value)) sh.outOfMemoryLocked(st, step);
         },
         .group => |title| sh.appendScratch(step, "##[group]{s}", .{title}),
         .endgroup => sh.appendLocked(step, "##[endgroup]"),
@@ -197,8 +197,8 @@ fn stepOutput(sh: *JobLog, step: u32, text: []const u8) void {
                 st.failed = true;
                 return;
             }
-            const kept = sh.arena.dupe(u8, token) catch return;
-            if (kept.len > 6) sh.addMask(kept);
+            const kept = sh.arena.dupe(u8, token) catch return sh.outOfMemoryLocked(st, step);
+            if (kept.len > 6 and !sh.addMask(kept)) sh.outOfMemoryLocked(st, step);
             st.stop_token = kept;
             sh.appendLocked(step, text);
         },
@@ -206,8 +206,8 @@ fn stepOutput(sh: *JobLog, step: u32, text: []const u8) void {
             st.stop_token = null;
             sh.appendLocked(step, text);
         },
-        .set_output => |kv| if (sh.keepVar(kv)) |v| st.outputs.append(sh.arena, v) catch {},
-        .save_state => |kv| if (sh.keepVar(kv)) |v| st.state.append(sh.arena, v) catch {},
+        .set_output => |kv| sh.keepVarIn(st, step, &st.outputs, kv),
+        .save_state => |kv| sh.keepVarIn(st, step, &st.state, kv),
         .set_env => |se| {
             if (!st.unsecure_commands) return sh.unsecureDisabledLocked(step, line, "set-env");
             const name = se.name orelse "";
@@ -226,8 +226,7 @@ fn stepOutput(sh: *JobLog, step: u32, text: []const u8) void {
                     return;
                 return sh.errorLineLocked(step, msg);
             }
-            const kv = sh.keepVar(.{ .name = name, .value = se.value }) orelse return;
-            st.env.append(sh.arena, kv) catch {};
+            sh.keepVarIn(st, step, &st.env, .{ .name = name, .value = se.value });
         },
         .add_path => |dir| {
             if (!st.unsecure_commands) return sh.unsecureDisabledLocked(step, line, "add-path");
@@ -237,8 +236,8 @@ fn stepOutput(sh: *JobLog, step: u32, text: []const u8) void {
                 line,
                 "Value cannot be null. (Parameter 'path')",
             );
-            const kept = sh.arena.dupe(u8, dir) catch return;
-            st.paths.append(sh.arena, kept) catch {};
+            const kept = sh.arena.dupe(u8, dir) catch return sh.outOfMemoryLocked(st, step);
+            st.paths.append(sh.arena, kept) catch sh.outOfMemoryLocked(st, step);
         },
         // `EchoCommandExtension`: `on` or `off`, in any case, around whitespace.
         .echo => |value| {
@@ -373,12 +372,21 @@ fn appendScratch(sh: *JobLog, step: u32, comptime fmt: []const u8, args: anytype
     sh.appendLocked(step, text);
 }
 
-/// An output or state value parsed from a line, copied into the job's arena.
-fn keepVar(sh: *JobLog, kv: job_mod.EnvVar) ?job_mod.EnvVar {
-    return .{
-        .name = sh.arena.dupe(u8, kv.name) catch return null,
-        .value = sh.arena.dupe(u8, kv.value) catch return null,
+/// An output, state or env value parsed from a line, copied into the job's arena and kept in
+/// `list`.
+fn keepVarIn(sh: *JobLog, st: *StepCommands, step: u32, list: *std.ArrayList(job_mod.EnvVar), kv: job_mod.EnvVar) void {
+    const kept: job_mod.EnvVar = .{
+        .name = sh.arena.dupe(u8, kv.name) catch return sh.outOfMemoryLocked(st, step),
+        .value = sh.arena.dupe(u8, kv.value) catch return sh.outOfMemoryLocked(st, step),
     };
+    list.append(sh.arena, kept) catch sh.outOfMemoryLocked(st, step);
+}
+
+/// A command the runner had no memory to carry out fails its step: one left out silently let the
+/// step pass without the output, env or path it set, or with a value it asked to mask printed.
+fn outOfMemoryLocked(sh: *JobLog, st: *StepCommands, step: u32) void {
+    st.failed = true;
+    sh.errorLineLocked(step, "The runner ran out of memory carrying out a workflow command.");
 }
 
 /// The matcher files steps have asked for, emptied. Called off the log path.
@@ -525,19 +533,24 @@ pub fn appendFmt(sh: *JobLog, step: u32, comptime fmt: []const u8, args: anytype
 /// The set keeps them longest first, so a secret that begins with another is masked whole. It
 /// starts from the log's secrets (the job's), copied once; before it, each mask copied and
 /// sorted the whole list again, which made 20000 masks cost 5.8 GB.
-fn addMask(sh: *JobLog, value: []const u8) void {
+///
+/// False when memory ran out before every form was in: the caller fails the step
+/// (`outOfMemoryLocked`) rather than let it go on printing what it asked to hide.
+fn addMask(sh: *JobLog, value: []const u8) bool {
     const set = sh.masks orelse set: {
-        const set = sh.arena.create(redact.Set) catch return;
+        const set = sh.arena.create(redact.Set) catch return false;
         set.* = .{};
-        for (sh.log.currentSecrets()) |s| set.add(sh.arena, s) catch return;
+        for (sh.log.currentSecrets()) |s| set.add(sh.arena, s) catch return false;
         sh.masks = set;
         break :set set;
     };
+    // The forms that made it in apply, even when one did not.
+    defer sh.log.setSecretSet(set);
     // In every form, as the job's own secrets are (redact.forms). The forms are worked out in
     // the scratch arena: the set copies the ones it has not seen.
-    const forms = redact.forms(sh.scratchAllocator(), value) catch return;
-    for (forms) |f| set.add(sh.arena, f) catch {};
-    sh.log.setSecretSet(set);
+    const forms = redact.forms(sh.scratchAllocator(), value) catch return false;
+    for (forms) |f| set.add(sh.arena, f) catch return false;
+    return true;
 }
 
 fn dupeOpt(a: Allocator, s: ?[]const u8) Allocator.Error!?[]const u8 {

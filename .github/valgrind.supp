@@ -1,0 +1,17 @@
+# Valgrind suppressions for the runner's tests (.github/scripts/zig-valgrind.sh). Only reports known
+# to be benign belong here, each with a comment saying why; a report that is a bug is fixed instead.
+# zig-valgrind.sh prints a suppression for every report (--gen-suppressions=all) to copy from.
+
+# Zig's std.Io.Threaded wakes a futex whose word lived in the waiting thread's frame (a Future it
+# awaited), after that thread saw the result and returned, so the address is below its stack
+# pointer. FUTEX_WAKE never reads or writes the word: the kernel only hashes the address to find
+# waiters, of which there are none left. Memcheck checks the syscall's pointer argument as if it
+# were read. Seen from Io.Threaded.Future.start (a test starting a job's concurrent tasks).
+{
+   zig-std-io-threaded-futex-wake-after-the-waiter-returned
+   Memcheck:Param
+   futex(futex)
+   fun:os.linux.x86_64.syscall3
+   fun:os.linux.futex_3arg
+   fun:Io.Threaded.Thread.futexWake
+}

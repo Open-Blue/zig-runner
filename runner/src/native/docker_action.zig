@@ -284,8 +284,6 @@ fn openContext(arena: Allocator, io: std.Io, bd: Build) !struct { path: []const 
     return .{ .path = try std.fmt.allocPrint(arena, "/proc/self/fd/{d}", .{dir.handle}), .dir = dir };
 }
 
-const Planned = union(enum) { plan: dockerfile.Plan, base: images.Image, failed: []const u8 };
-
 /// The Dockerfile of `bd` read and planned on its base image from the native store; `digests`:
 /// the COPY sources' content keyed (a build), else a fixed one (only whether it can be built).
 fn planBuild(b: *Backend, bd: Build, ctx: []const u8, digests: bool) !struct { dockerfile.Plan, images.Image } {

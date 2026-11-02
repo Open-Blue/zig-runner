@@ -1,0 +1,133 @@
+name: analysis
+
+# Zig-specific analysis of the runner's own code, nightly (README, "Pipeline"). CodeQL and Semgrep
+# read no Zig, so these search where the tests and ci's ThreadSanitizer pass do not look:
+#
+#   Fuzz (TARGET)  runner/src/fuzz.zig's targets, each with Zig's coverage-guided fuzzer for a
+#                  bounded number of runs (.github/scripts/zig-fuzz.sh): the parsers that read what
+#                  registries, workflows, jobs and servers hand the runner. The corpus each finds
+#                  is kept from night to night in the Actions cache; a crash, a failed check, a
+#                  leak or a hang fails the job, named after its target, with the input as an
+#                  artifact (fuzz-TARGET).
+#   Valgrind       every test under Valgrind's memcheck (.github/scripts/zig-valgrind.sh): reads
+#                  of memory never written, and accesses outside what was allocated.
+#
+# Each search costs more than a pull request should wait for, so they run here and not in ci; a
+# failure is a case for an issue (or a fix), not a broken main.
+
+on:
+  schedule:
+    - cron: "41 3 * * *" # nightly, 03:41 UTC
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Runs per fuzz target (each target's own when empty; `100K`, `2M`)
+        required: false
+  # A pull request that changes this workflow or its scripts runs it, so a change to them is seen
+  # working before it merges (workflow_dispatch reaches a workflow only once the default branch
+  # has it). Not a required check, so the path filter leaves nothing waiting.
+  pull_request:
+    paths:
+      - .github/workflows/analysis.yml
+      - .github/scripts/zig-fuzz.sh
+      - .github/scripts/zig-valgrind.sh
+      - .github/valgrind.supp
+
+permissions: {}
+
+# A pull request's new push replaces the run of its old one.
+concurrency:
+  group: analysis-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    permissions:
+      contents: read # to check out the code
+    strategy:
+      fail-fast: false
+      # Runs for about ten minutes each, from the laptop's speeds (from some 1,500 runs a second for
+      # expressions and the OCI layer, which writes every layer to a directory, to 20,000 for
+      # references); zig-fuzz.sh gives each 30, and a run past them is a hang.
+      matrix:
+        include:
+          - { target: OCI layer, runs: 600K }
+          - { target: OCI references and challenges, runs: 5M }
+          - { target: OCI manifests, runs: 5M }
+          - { target: expressions, runs: 600K }
+          - { target: YAML, runs: 600K }
+          - { target: regular expressions, runs: 600K }
+          - { target: HPACK, runs: 1M }
+          - { target: hashFiles patterns, runs: 1M }
+          - { target: minisign, runs: 1M }
+          - { target: workflow commands, runs: 1M }
+          - { target: problem matchers, runs: 1M }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      # The cache key's name for the target: "OCI layer" is fuzz-OCI-layer-.
+      - name: The corpus's key
+        id: key
+        env:
+          TARGET: ${{ matrix.target }}
+        run: echo "prefix=fuzz-${TARGET// /-}-" >>"$GITHUB_OUTPUT"
+
+      # The newest corpus of this target (keys are per run: a cache entry cannot be overwritten).
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: runner/.zig-cache/f
+          key: ${{ steps.key.outputs.prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.key.outputs.prefix }}
+
+      - name: Fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          RUNS: ${{ inputs.runs || matrix.runs }}
+        run: .github/scripts/zig-fuzz.sh "$TARGET" "$RUNS" 30 "$RUNNER_TEMP/fuzz"
+
+      # Kept whatever happened: what the fuzzer found up to a crash is worth starting from.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ !cancelled() }}
+        with:
+          path: runner/.zig-cache/f
+          key: ${{ steps.key.outputs.prefix }}${{ github.run_id }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: ${{ steps.key.outputs.prefix }}input
+          path: ${{ runner.temp }}/fuzz
+          if-no-files-found: ignore
+
+  # Under Valgrind the tests took about 50 minutes on the laptop (busy with other work too).
+  valgrind:
+    name: Valgrind
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      # Ubuntu's own package, checked by apt against the archive's signed index.
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends valgrind
+          valgrind --version
+
+      - name: Tests under memcheck
+        run: .github/scripts/zig-valgrind.sh

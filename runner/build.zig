@@ -37,7 +37,13 @@ pub fn build(b: *std.Build) void {
     run_cmd.addPassthruArgs();
     b.step("run", "Run the runner").dependOn(&run_cmd.step);
 
-    const tests = b.addTest(.{ .root_module = exe.root_module });
+    // `zig build test -Dtest-filter='fuzz: YAML' --fuzz=100K`: one fuzz target at a time, as the
+    // fuzz workflow runs them (.github/scripts/zig-fuzz.sh).
+    const test_filters = b.option([]const []const u8, "test-filter", "Only the tests whose names contain this") orelse &.{};
+    // `-Dllvm`: the tests compiled by LLVM rather than Zig's own x86_64 backend, which instruments
+    // no code for the fuzzer (`--fuzz` then fails on an empty coverage file).
+    const use_llvm = b.option(bool, "llvm", "Compile the tests with LLVM (needed by --fuzz on x86_64)") orelse null;
+    const tests = b.addTest(.{ .root_module = exe.root_module, .filters = test_filters, .use_llvm = use_llvm });
     const test_step = b.step("test", "Run tests");
     const run_tests = b.addRunArtifact(tests);
     // Which tests run depends on the environment (PG*, ZIG_TEST_PG_URL, ZIG_TEST_REQUIRE_DB), which

@@ -180,6 +180,11 @@ pub const Store = struct {
     dropped: u64 = 0,
     stop: std.atomic.Value(bool) = .init(false),
     writer_stopped: std.atomic.Value(bool) = .init(false),
+    /// Set by `close` once it stops waiting, before it cancels the writer: what is still queued
+    /// is dropped. The cancel alone ends only the statement it lands in (`error.Canceled`, once),
+    /// and the writer went on dialling and writing the rest of a long queue while `close` waited
+    /// for it, a statement timeout per row.
+    abandon: std.atomic.Value(bool) = .init(false),
     /// What `close` gives the writer to write what is left before cutting it short.
     close_wait_ms: u32 = 5000,
 
@@ -206,6 +211,7 @@ pub const Store = struct {
             var waited: u32 = 0;
             while (!s.writer_stopped.load(.acquire) and waited < s.close_wait_ms) : (waited += 50)
                 s.io.sleep(.fromMilliseconds(50), .awake) catch break;
+            s.abandon.store(true, .release);
             f.cancel(s.io);
             s.writer = null;
         }
@@ -222,7 +228,7 @@ pub const Store = struct {
 
     fn writerMain(s: *Store) void {
         defer s.writer_stopped.store(true, .release);
-        while (true) {
+        while (!s.abandon.load(.acquire)) {
             const sql = s.next() orelse {
                 if (s.stop.load(.acquire)) return;
                 s.io.sleep(.fromMilliseconds(20), .awake) catch return;
@@ -231,7 +237,10 @@ pub const Store = struct {
             defer s.gpa.free(sql);
             s.mu.lockUncancelable(s.io);
             defer s.mu.unlock(s.io);
-            s.execLocked(sql) catch {};
+            s.execLocked(sql) catch |e| switch (e) {
+                error.Canceled => return, // `close` gave up waiting (`abandon`)
+                else => {}, // counted in `failed` and remembered, for `Reporter`
+            };
         }
     }
 
