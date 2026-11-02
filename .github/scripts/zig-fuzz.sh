@@ -17,6 +17,9 @@
 #           .zig-cache/f/crash); a hang (MINUTES ran out): the inputs in flight (.zig-cache/f/in*)
 #           are copied to OUT; or the build failed
 #
+# The first run of the workflow found a crash in hashFiles() that this script then called nothing
+# found: Zig's own exit status says nothing about the test's, below.
+#
 # Each failure is a `::error` naming the target. A crash's input reproduces as a corpus entry of
 # its test (`@embedFile` it into the test's `.corpus`), which `zig build test` then runs every time.
 set -euo pipefail
@@ -39,7 +42,9 @@ timeout --kill-after=30 "$((minutes * 60))" \
 	status=$?
 echo "::$stop::"
 
-if ((status == 0)); then
+# `zig build --fuzz=N` exits 0 even when the test failed (Zig 0.17 prints the failure, saves the
+# input, and goes on to its report), so the crash file and the build runner's `error:` lines decide.
+if ((status == 0)) && [[ ! -e .zig-cache/f/crash ]] && ! grep -q '^error: ' "$out/log"; then
 	echo "fuzz: $target: $runs runs, nothing found"
 	exit 0
 fi

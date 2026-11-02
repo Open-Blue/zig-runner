@@ -241,12 +241,16 @@ fn expressions(_: void, smith: *Smith) !void {
 }
 
 test "fuzz: hashFiles patterns" {
-    try std.testing.fuzz({}, hashFilesPatterns, .{ .corpus = comptime seeds(&.{
-        &.{"**/*.txt\n!a/skip.txt"},
-        &.{"--follow-symbolic-links\n~/x/**"},
-        &.{"[ab]?/**/[!x]*\n# comment\n/w/../w/./b.txt"},
-        &.{"a/**/b/**\n!**/b"},
-    }) });
+    try std.testing.fuzz({}, hashFilesPatterns, .{
+        .corpus = comptime seeds(&.{
+            &.{"**/*.txt\n!a/skip.txt"},
+            &.{"--follow-symbolic-links\n~/x/**"},
+            &.{"[ab]?/**/[!x]*\n# comment\n/w/../w/./b.txt"},
+            &.{"a/**/b/**\n!**/b"},
+            // Asserted, until the fuzzer found it: `\.` is accepted, its implicit `/w/\./**` is not.
+            &.{"\\."},
+        }),
+    });
 }
 
 const fuzz_tree = struct {
