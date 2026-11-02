@@ -221,7 +221,8 @@ fn flock(f: std.Io.File, how: i32) bool {
 
 /// Held while a step with this key runs, so two jobs sharing the store (a pool's runners, or two
 /// jobs of one) never run one key at once: the second waits, then finds the first's layer.
-/// Polled, so `stop` (a cancel or a timeout while it waits) ends the wait with `error.Stopped`.
+/// Polled, so `stop` (a cancel or a timeout while it waits) ends the wait with `error.Stopped`;
+/// the waiting task's own cancel ends it with `error.Canceled`.
 /// A lock file `collect` removed while it was being taken is not trusted: the lock is taken only
 /// on the file the path names.
 pub fn lockKey(
@@ -241,7 +242,7 @@ pub fn lockKey(
         }
         f.close(io);
         if (stop.load(.acquire)) return error.Stopped;
-        io.sleep(.fromMilliseconds(50), .awake) catch {};
+        try io.sleep(.fromMilliseconds(50), .awake);
     }
 }
 
@@ -1526,6 +1527,28 @@ test "native store: a key's lock: a second taker waits, and a stop ends its wait
     first.close(io);
     const second = try s.lockKey(arena, io, k, &never);
     second.close(io);
+}
+
+test "native store: a key's lock: the waiting task's cancel ends its wait" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const s: Store = .{ .root = root };
+    try prepare(arena, io, root, .{ .check_parents = false });
+    var kh: KeyHasher = .plain("test");
+    const k = kh.final();
+    var never: std.atomic.Value(bool) = .init(false);
+    const first = try s.lockKey(arena, io, k, &never);
+    defer first.close(io);
+    // Its own arena: the waiter allocates while this thread does not.
+    var wa: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer wa.deinit();
+    var waiter = try io.concurrent(lockKey, .{ s, wa.allocator(), io, k, &never });
+    try std.testing.expectError(error.Canceled, waiter.cancel(io));
 }
 
 test "native store: a key's preimage is P8's: tag, parent, script, then the stable env counted" {
