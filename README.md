@@ -412,7 +412,11 @@ the machine thrashed for hours (#126). Two things keep that from happening again
   the host, reaching the engine over a unix socket), it holds on the engine's own memory cap and
   swap too, since the engine can fill its cap while the machine still has memory (#142), and
   learns from it what each job (by repository, workflow and name) takes, so that a light job
-  reserves less than a heavy one once it has run (#144). The limits and why they are what they
+  reserves less than a heavy one once it has run (#144). A native job (`RUNNER_BACKEND=native`)
+  is measured in a cgroup of its own and learned apart from Dagger's, reserves 256 MB until it
+  has run (`RUNNER_NATIVE_MEM_PER_JOB_MB`), and gets a `memory.high` from its estimate, so one that
+  outgrows it is slowed in its own cgroup rather than taking its neighbours' memory
+  (docs/native-backend.md, P4). The limits and why they are what they
   are are in `deploy/runner.env.example` (`RUNNER_MIN_MEM_AVAILABLE_MB` and the rest;
   `RUNNER_ADMISSION=false` turns it off). The gate sees only its own process's runners: run one
   pool per machine.

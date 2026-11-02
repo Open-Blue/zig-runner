@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The memory gate no longer holds native jobs back for memory they never use: a native job is learned from its own cgroup under its name, apart from the same job on Dagger, and one not learned yet reserves RUNNER_NATIVE_MEM_PER_JOB_MB (256 MB) instead of the engine''s 1.5 GB, which held e2e jobs of a few MB on razorbill''s native runners for up to 150 s. Each native job''s cgroup gets a memory.high from that estimate (twice it, plus 512 MB), so a job that outgrows it is slowed there rather than taking its neighbours'' memory; memory.max stays the hard cap. A job a native pool sends to Dagger is learned on the engine, and a Dagger job is no longer taken as running beside a native one.'
+time: 2026-11-02T12:00:00.000000-05:00

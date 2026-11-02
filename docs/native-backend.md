@@ -212,6 +212,8 @@ RUNNER_NATIVE_CGROUP=                             # default: /sys/fs/cgroup/zig-
                                                   # none rootless; `self`, `none`, or a path
 RUNNER_NATIVE_MEMORY_MAX_MB=                      # default 3/4 of MemTotal; 0 for no limit
 RUNNER_NATIVE_PIDS_MAX=8192                       # default; 0 for no limit
+RUNNER_NATIVE_MEM_PER_JOB_MB=256                  # default; the memory gate's reservation for a
+                                                  # native job not learned yet (P4); 0 for none
 ```
 
 **The rootfs.** Since P3 the runner pulls and provisions the image itself (see P3), and this
@@ -649,12 +651,38 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   `self`, where the job runs as in P1 and "Set up job" says why.
 - The memory gate (`admission.zig`) is told of a native job's cgroup (`Gate.native`) and measures
   the job there, from nothing, with the engine's own definition of a working set
-  (`workingSetMb`: `memory.current` less `inactive_file` and `slab_reclaimable`), so what it
-  learns of a job means the same on either backend. A native job is never measured beside another
+  (`workingSetMb`: `memory.current` less `inactive_file` and `slab_reclaimable`), so the same
+  bytes count on either backend (though an engine reading also holds what the engine grew by for
+  the job, which is why the two are learned apart, below). A native job is never measured beside another
   (its cgroup is its own), its last sample is taken just before its cgroup goes
   (`Gate.nativeDone`), and its reservation is left out of the engine's cap
   (`Reservation.native_mb`). A native job without a cgroup is not measured, as a job without an
   engine signal is not.
+- **What a native job reserves** (after razorbill, 2026-11-02): its estimates are learned per job
+  name in a table of their own (`Admission.learned_native`), apart from the same name's on the
+  engine, whose reading is the job plus what the engine grew by for it. A job a native pool sends
+  to Dagger, unsupported or after a native set-up (`Gate.backToEngine`), is measured on the engine
+  from then and learned there. A native job not learned yet reserves `RUNNER_NATIVE_MEM_PER_JOB_MB`
+  (256 MB), and a native pool's runner polling reserves the most of that and any native job's
+  estimate, where both used `RUNNER_MEM_PER_JOB_MB`'s 1.5 GB, sized for `zig build test` on the
+  engine: razorbill's six native bench runners held e2e jobs of a few MB for 87-150 s ("3 job(s)
+  needing 4.5 GB would leave under 1536 MB" with 5533 MB available). A native job is always
+  learned as alone, and a job on the engine is no longer taken as beside a native one: the overlap
+  mark a native job sets as it starts is taken back once it is known to be native
+  (`Admission.shareEngine`).
+- **`memory.high` per native job** (`Job.setHigh`, `admission.nativeHighMb`): twice the job's
+  estimate (learned, or the native default) plus 512 MB, so 1 GB for a job not learned yet; "Set
+  up job" says it, as the kernel holds it. Past it the kernel reclaims the job's page cache, then
+  slows its allocations; it never kills, so a job that outgrows its estimate is throttled in its
+  own cgroup instead of taking memory its neighbours were admitted against, or meeting the OOM
+  killer. `memory.max` stays the hard cap above it (three quarters of `MemTotal` by default; a
+  `memory.high` above it is simply never reached), and the host's `MemAvailable` floor
+  (`RUNNER_MIN_MEM_AVAILABLE_MB`), pressure and swap growth still hold every runner. The headroom
+  is for what `memory.high` counts and the estimate does not: page cache and reclaimable slab. A
+  job that outgrew its estimate and went over `memory.high` (memory.events `high`) is learned at
+  no less than that limit, since what it was seen to take is what the throttle let it, so its
+  next limit doubles until a run fits. Without the gate (`RUNNER_ADMISSION=false`) or with
+  `RUNNER_NATIVE_MEM_PER_JOB_MB=0`, no `memory.high` is set.
 - On P2's step store: the digest below a base (`Backend.belowKey`) holds the seeds' layers and
   which binds are cache volumes, after the model's fields and only when the job has either, so a
   stored layer is never replayed over a different seed and a job with neither keys as before (the
@@ -675,9 +703,7 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   fork its epilogue (its log says the job reached its process limit). Fixing that needs a PID 1
   that reaps and kills a step's leftovers before the epilogue. The tool cache's checked trees (`set_up.verifyToolTrees`) and the seed
   registry's discovery from them are off natively: steps check the trees they use themselves, as on
-  Dagger without the check. A Dagger job that overlapped only native jobs is still learned as "beside
-  others", an upper bound (small; the gate's overlap marks are set before a job is known to be
-  native). Rootless runners without delegation have no limits (P5 must refuse untrusted jobs
+  Dagger without the check. Rootless runners without delegation have no limits (P5 must refuse untrusted jobs
   there).
 
 ### P5: isolation for untrusted jobs
@@ -1446,7 +1472,7 @@ What Dagger did implicitly, now explicit in `native/`:
   chowns what it makes).
 - **The engine's one cgroup was the gate's only view.** It charged every job running for all of
   them; per-job cgroups give each job its own working set, and the gate reads a native job's with
-  the same definition, so learned estimates mean the same across backends.
+  the same definition. The same definition is not the same quantity, though (below).
 
 Surprises:
 
@@ -1477,6 +1503,32 @@ MB own, 609 and 304 MB engine-wide. A runaway job capped at 256 MB was OOM-kille
 own cgroup while its neighbour held 200 MB untouched, and a fork bomb capped at 64 processes was
 refused 125 forks there and the job went on. A cap near the size of the step's own shell and helper
 is a trap: at 64 MB the root pass's kernel killed the shell with the hog.
+
+After the first Pi run (razorbill, six native bench runners, 2026-11-02):
+
+- **The engine's default was the wrong default for native jobs.** The gate learned native jobs
+  from their own cgroups, but reserved `RUNNER_MEM_PER_JOB_MB` (1.5 GB on razorbill) for any name
+  it had not learned, and for every runner polling. That number exists because a `zig build test`
+  on the engine grows the engine's one cgroup by 1.6 GB, and nothing stops a job there from taking
+  more. On a native pool it held e2e jobs of a few MB for 87-150 s each: three runners asking
+  "needed" 4.5 GB of the 5.5 GB available. What makes a low native default safe is the thing the
+  engine lacks: a cgroup per job, where a `memory.high` from the job's estimate slows a job that
+  outgrows it instead of letting it take memory its neighbours were admitted against. So the
+  default and the throttle came together (`RUNNER_NATIVE_MEM_PER_JOB_MB`, 256 MB; `memory.high`
+  twice the estimate plus 512 MB).
+- **One quantity per table.** An engine reading of a job is the job and the engine's growth for
+  it; a native reading is the job. Kept in one table under one name, a job that went to Dagger
+  once (a set-up that fell back) would have mixed them, so each backend learns its own.
+- **A throttle that is learned from teaches itself.** A job held at `memory.high` is seen to take
+  about `memory.high`, and an estimate from that sets the same limit again. A run that outgrew its
+  estimate and went over its limit (memory.events `high`) is learned at no less than the limit,
+  which doubles it for the next run. Going over on page cache alone (a checkout) does not count:
+  the working set the gate learns leaves the cache out, so it stays within the estimate.
+- **`memory.peak` is not what to learn.** It is the cgroup's high-water mark, page cache included,
+  and a cgroup keeps its cache until something presses on it: a job that writes a checkout and a
+  build's output would be learned at its cache, up to the very `memory.high` set from the last
+  estimate. The working set sampled each second (`workingSetMb`) and read a last time as the
+  cgroup goes stays the measure; `memory.peak` is still read (`cgroup.Usage`), and not learned.
 
 ### P8: remapping the proofs
 

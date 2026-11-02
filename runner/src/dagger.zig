@@ -830,12 +830,14 @@ pub fn run(
             opts.backend_note = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{
                 w,
             });
+            // The gate took it for a native job (a native pool's): it is an engine job.
+            if (cfg.gate) |g| g.backToEngine();
         } else if (try runNative(arena, io, opts, cfg, job, log, &opts.backend_note)) |r| {
             return r;
         } else if (cfg.gate) |g| {
             // Native set the job up (its cgroup told the gate) and then sent it here (P7's
             // preload), or its set-up failed (`setUpFallback`): the gate measures it on the
-            // engine again, learning nothing from it.
+            // engine from here, and learns it under the engine.
             g.backToEngine();
         }
     }

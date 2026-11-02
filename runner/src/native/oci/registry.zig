@@ -253,10 +253,10 @@ pub const Client = struct {
                 return error.TooManyRedirects;
             }
             const next = c.onceAt(uri, accept, body, challenge) catch |e| switch (e) {
-                error.HttpConnectionClosing => if (stale < http.staleRetries(c.http)) {
+                error.HttpConnectionClosing, error.ResetBeforeHead => if (stale < http.staleRetries(c.http)) {
                     stale += 1;
                     continue;
-                } else return e,
+                } else return if (e == error.ResetBeforeHead) error.ReadFailed else e,
                 else => return e,
             };
             uri = next orelse return c.content_type;
@@ -287,7 +287,13 @@ pub const Client = struct {
             conn.closing = true;
         };
         try req.sendBodiless();
-        var res = try req.receiveHead(&.{});
+        // A kept connection the server closed can also answer with a reset, not an end of
+        // stream: the request reached a socket already gone (seen on arm64 CI, in the stale
+        // test). No head came back, so nothing was read: `once` tries it again too.
+        var res = req.receiveHead(&.{}) catch |e| return switch (e) {
+            error.ReadFailed => error.ResetBeforeHead,
+            else => e,
+        };
         const status = res.head.status;
         c.content_type = "";
         var it = res.head.iterateHeaders();

@@ -1,8 +1,10 @@
 //! A cgroup v2 per native job (docs/native-backend.md, P4): `memory.max` and `pids.max` hold a
 //! runaway job inside its own limits, so a memory hog is OOM-killed in its own cgroup and a fork
-//! bomb stops at its own process limit, without touching its neighbours; `memory.current`,
-//! `memory.stat` and `memory.peak` give the memory gate (`admission.zig`) the job's own working
-//! set, where the Dagger engine's one cgroup charges every job running for all of them.
+//! bomb stops at its own process limit, without touching its neighbours; `memory.current` and
+//! `memory.stat` give the memory gate (`admission.zig`) the job's own working set, where the
+//! Dagger engine's one cgroup charges every job running for all of them; and `memory.high`, from
+//! what the gate reserves for the job (`Job.setHigh`), slows a job that outgrows that before it
+//! takes its neighbours' memory, below `memory.max`, which kills.
 //!
 //! Each step's helper joins the job's cgroup before it does anything else (`sandbox.zig`), so
 //! every process of the step is born in it; the runner never is. Between steps the cgroup is
@@ -296,6 +298,17 @@ pub const Job = struct {
         const pids = if (limits.pids_max) |p| try std.fmt.allocPrint(arena, "{d}", .{p}) else "max";
         if (write(arena, dir, "pids.max", pids) != .SUCCESS) return error.PidsLimitFailed;
         return j;
+    }
+
+    /// `memory.high`, from the memory gate's estimate for the job (`admission.nativeHighMb`):
+    /// past it the kernel reclaims the job's memory, its page cache first, and then slows its
+    /// allocations, so a job that outgrows what it reserved is held back in its own cgroup instead
+    /// of taking memory its neighbours were let in against. Nothing is killed there; that is
+    /// `memory.max`'s, the hard cap, above it. Returns what the kernel holds afterwards.
+    pub fn setHigh(j: Job, arena: Allocator, io: std.Io, bytes: u64) !u64 {
+        const text = try std.fmt.allocPrint(arena, "{d}", .{bytes});
+        if (write(arena, j.dir, "memory.high", text) != .SUCCESS) return error.MemoryHighFailed;
+        return admission.readCgroupBytes(io, j.dir, "memory.high") orelse error.MemoryHighFailed;
     }
 
     /// What the job has used so far.

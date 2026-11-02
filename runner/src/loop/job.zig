@@ -246,12 +246,14 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     if (c.gate) |gate| gate.assigned(admission.jobKey(g.repository, g.workflow_ref, job_name));
     defer if (c.gate) |gate| if (gate.ended()) |learned| sayUnallocated(
         c,
-        "job '{s}' raised the engine's memory by {f} at most ({s}); reserving {f} for it while " ++
-            "it starts",
+        "job '{s}' {s} {f} at most ({s}); reserving {f} for it while it starts",
         .{
             job_name,
+            if (learned.native) "took" else "raised the engine's memory by",
             admission.gb(learned.seen_mb),
-            if (learned.alone) "alone" else "beside other jobs",
+            if (learned.native)
+                "natively, in its own cgroup"
+            else if (learned.alone) "alone" else "beside other jobs",
             admission.gb(learned.estimate_mb),
         },
     );
