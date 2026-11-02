@@ -648,8 +648,12 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
     // Until the lock is the Backend's, a failure removes the directory and closes the lock here;
     // from then on `deinit` does both, once.
     errdefer removeTree(arena, io, new);
-    for ([_][]const u8{ "W", "M", sandbox.secrets_dir }) |d|
+    for ([_][]const u8{ "W", "M", sandbox.secrets_dir, mount_points ++ "/etc" }) |d|
         try cwd.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ new, d }));
+    for (mount_point_files) |f| try cwd.writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "{s}/{s}{s}", .{ new, mount_points, f }),
+        .data = "",
+    });
     const lock = try lockFile(arena, io, try std.fmt.allocPrint(arena, "{s}/lock", .{new}), true);
     const how = launch(arena, io, cfg) catch |e| {
         lock.close(io);
@@ -764,6 +768,13 @@ fn jobBinds(b: *Backend, cfg: Config) ![]const sandbox.Spec.Bind {
     });
     return std.mem.concat(b.arena, sandbox.Spec.Bind, &.{ cfg.binds, b.etc_binds });
 }
+
+/// The job's mount points' layer, in its directory (`sandbox.Spec.mount_points`): empty files
+/// where the job's resolver and hosts file are bound (`jobBinds`), below every image, so an
+/// image without them (Alpine's) gets them too, in a step, a Docker action, its build or a
+/// service, and no layer of the job's holds them.
+pub const mount_points = "P";
+const mount_point_files = [_][]const u8{ "/etc/resolv.conf", "/etc/hosts" };
 
 /// The host's resolver files a root runner's jobs get theirs from.
 fn resolvPaths(cfg: *const Config) []const []const u8 {
@@ -1737,6 +1748,7 @@ fn execIn(
         .id_base = base_id,
         .id_count = ids_per_slot,
         .netns = b.netns,
+        .mount_points = mount_points,
         .cgroup = if (b.job_cgroup) |j| j.dir else null,
         .image_layers = @intCast(b.seed_layers.items.len + 1),
         .canonical = canonical,
@@ -3558,90 +3570,11 @@ test "root runner: a native job resolves through a nameserver only another inter
     const env = try std.testing.environ.createMap(arena);
     const required = std.mem.eql(u8, env.get("ZIG_RUNNER_REQUIRE_NATIVE") orelse "", "1");
 
-    // A resolver as Tailscale's MagicDNS is to razorbill: on no uplink, but on an interface of its
-    // own (here a veth to a network namespace of the test's, TEST-NET-2), with two addresses, and
-    // a TCP port that is not DNS. The host routes there, but the jobs' rules forward nothing
-    // there but DNS to the nameservers the job's resolver names.
-    const ns = "zrtest-dns";
-    const ip = struct {
-        fn run(ar: Allocator, args: []const []const u8) !void {
-            const argv = try std.mem.concat(ar, []const u8, &.{ &.{"ip"}, args });
-            const r = try std.process.run(ar, std.testing.io, .{ .argv = argv });
-            if (r.term != .exited or r.term.exited != 0) {
-                std.debug.print("ip {s}: {s}\n", .{ try std.mem.join(ar, " ", args), r.stderr });
-                return error.IpFailed;
-            }
-        }
+    var dns = TestResolver.start(arena) catch |e| switch (e) {
+        error.NoIp => return skip(required, "this machine has no `ip` (iproute2) for the resolver's network"),
+        else => return e,
     };
-    _ = std.process.run(arena, io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch
-        return skip(required, "this machine has no `ip` (iproute2) for the resolver's network");
-    defer _ = std.process.run(arena, io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch {};
-    try ip.run(arena, &.{ "netns", "add", ns });
-    try ip.run(arena, &.{ "link", "add", "zrtdns0", "type", "veth", "peer", "name", "eth0", "netns", ns });
-    try ip.run(arena, &.{ "addr", "add", "198.51.100.1/24", "dev", "zrtdns0" });
-    try ip.run(arena, &.{ "link", "set", "zrtdns0", "up" });
-    try ip.run(arena, &.{ "-n", ns, "addr", "add", "198.51.100.53/24", "dev", "eth0" });
-    try ip.run(arena, &.{ "-n", ns, "addr", "add", "198.51.100.54/24", "dev", "eth0" });
-    try ip.run(arena, &.{ "-n", ns, "link", "set", "eth0", "up" });
-    try ip.run(arena, &.{ "-n", ns, "link", "set", "lo", "up" });
-    // Every name under zr.test is 192.0.2.77, over UDP and TCP; any other is NXDOMAIN. A UDP
-    // socket for each address, so each answer comes from the address it was asked at.
-    const responder =
-        \\import socket, struct, sys, threading
-        \\def answer(q):
-        \\    i, labels = 12, []
-        \\    while q[i]:
-        \\        labels.append(q[i + 1:i + 1 + q[i]].decode()); i += 1 + q[i]
-        \\    qtype = struct.unpack(">H", q[i + 1:i + 3])[0]
-        \\    name = ".".join(labels).lower()
-        \\    rcode, an, ans = 3, 0, b""
-        \\    if name == "zr.test" or name.endswith(".zr.test"):
-        \\        rcode = 0
-        \\        if qtype == 1:
-        \\            an, ans = 1, b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4) + bytes([192, 0, 2, 77])
-        \\    return q[:2] + struct.pack(">HHHHH", 0x8180 | rcode, 1, an, 0, 0) + q[12:i + 5] + ans
-        \\def udp(s):
-        \\    while True:
-        \\        q, peer = s.recvfrom(512)
-        \\        try: s.sendto(answer(q), peer)
-        \\        except Exception: pass
-        \\def tcp_one(c):
-        \\    with c:
-        \\        try:
-        \\            n = struct.unpack(">H", c.recv(2))[0]; q = b""
-        \\            while len(q) < n: q += c.recv(n - len(q))
-        \\            r = answer(q); c.sendall(struct.pack(">H", len(r)) + r)
-        \\        except Exception: pass
-        \\def tcp(s, dns):
-        \\    while True:
-        \\        c, _ = s.accept()
-        \\        if dns: threading.Thread(target=tcp_one, args=(c,), daemon=True).start()
-        \\        else: c.close()
-        \\def udp_on(addr):
-        \\    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind((addr, 53)); return u
-        \\def listener(port):
-        \\    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        \\    s.bind(("0.0.0.0", port)); s.listen(16); return s
-        \\for addr in ("198.51.100.53", "198.51.100.54"):
-        \\    threading.Thread(target=udp, args=(udp_on(addr),), daemon=True).start()
-        \\threading.Thread(target=tcp, args=(listener(53), True), daemon=True).start()
-        \\threading.Thread(target=tcp, args=(listener(8080), False), daemon=True).start()
-        \\print("ready", flush=True)
-        \\sys.stdin.read()
-    ;
-    var child = try std.process.spawn(io, .{
-        .argv = &.{ "ip", "netns", "exec", ns, "python3", "-c", responder },
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .inherit,
-    });
-    defer {
-        child.kill(io);
-    }
-    var ready_buf: [64]u8 = undefined;
-    var ready = child.stdout.?.readerStreaming(io, &ready_buf);
-    const line = (try ready.interface.takeDelimiter('\n')) orelse return error.ResponderDidNotStart;
-    try std.testing.expectEqualStrings("ready", line);
+    defer dns.stop(arena);
 
     // A host service on the resolver's network, at the host's own address there.
     const host_side = try listen(47126, 0);
@@ -3702,6 +3635,264 @@ test "root runner: a native job resolves through a nameserver only another inter
         "dns54 reached",
         "other port unreachable",
     });
+}
+
+/// The tests' rootfs (`testConfig`) without /etc/resolv.conf and /etc/hosts, as Alpine's is, and
+/// a Docker action's image `zr-test/noetc:1` without them either: the tests' images directory.
+fn withoutEtcFiles(arena: Allocator, tmp: *std.testing.TmpDir) ![]const u8 {
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    for ([_][]const u8{ "rootfs/etc/resolv.conf", "rootfs/etc/hosts" }) |f| try tmp.dir.deleteFile(io, f);
+    const image_dir = try std.fmt.allocPrint(arena, "images/{s}", .{try images.key(arena, "zr-test/noetc:1")});
+    for ([_][]const u8{ "etc/ssl", "usr", "tmp", "dev", "proc", "sys", "root" }) |p|
+        try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/rootfs/{s}", .{ image_dir, p }));
+    for ([_][2][]const u8{ .{ "usr/bin", "bin" }, .{ "usr/lib", "lib" }, .{ "usr/lib64", "lib64" } }) |l|
+        try tmp.dir.symLink(io, l[0], try std.fmt.allocPrint(arena, "{s}/rootfs/{s}", .{ image_dir, l[1] }), .{});
+    for ([_][2][]const u8{
+        .{ "rootfs/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n" },
+        .{ "rootfs/etc/ld.so.cache", "" },
+        .{ "config.json", "{\"config\":{\"Env\":[\"PATH=/usr/bin:/bin\"]}}" },
+    }) |f| try tmp.dir.writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ image_dir, f[0] }),
+        .data = f[1],
+    });
+    return std.fmt.allocPrint(arena, "{s}/images", .{root});
+}
+
+test "an image without /etc/resolv.conf or /etc/hosts gets the job's, in a step and a Docker action, and no layer keeps them" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    cfg.images = try withoutEtcFiles(arena, &tmp);
+    const host = std.Io.Dir.cwd().readFileAlloc(std.testing.io, "/etc/hosts", arena, .limited(1 << 20)) catch "";
+    if (std.mem.indexOf(u8, host, "localhost") == null) return error.SkipZigTest;
+    // The step's own layer holds no mount point: it writes beside them, and the store's replay
+    // of it would show one (`Store`); here the layer is looked at directly.
+    const step = testStep("grep -c localhost /etc/hosts >/dev/null && echo step-hosts; " ++
+        "test -e /etc/resolv.conf && echo step-resolv; echo x > /etc/written");
+    var docker_step = testStep("");
+    docker_step.action = .{ .docker = .{ .image = "zr-test/noetc:1", .inputs = &.{
+        .{ .name = "entrypoint", .value = .{ .lit = "sh" } },
+        .{ .name = "args", .value = .{ .lit = "-c \"grep -q localhost /etc/hosts && echo action-hosts; " ++
+            "test -e /etc/resolv.conf && echo action-resolv\"" } },
+    } } };
+    var b = try init(arena, std.testing.io, std.testing.allocator, cfg);
+    defer b.deinit();
+    var out: Captured = .{ .arena = arena };
+    const ended = try b.exec(step.action.script.script.lit, &.{"PATH=/usr/bin:/bin"}, &.{}, 0, 0, out.output());
+    try std.testing.expectEqual(@as(i32, 0), ended.code);
+    try expectLines(out.tailLines(20), &.{ "step-hosts", "step-resolv" });
+    const upper = b.layers.items[b.layers.items.len - 1].path;
+    var layer = try std.Io.Dir.cwd().openDir(std.testing.io, upper, .{});
+    defer layer.close(std.testing.io);
+    try layer.access(std.testing.io, "etc/written", .{});
+    for ([_][]const u8{ "etc/resolv.conf", "etc/hosts" }) |f|
+        try std.testing.expectError(error.FileNotFound, layer.access(std.testing.io, f, .{}));
+    const r = try runNativeJob(arena, cfg, testJob(&.{docker_step}), .root);
+    try expectLines(r.text, &.{ "action-hosts", "action-resolv" });
+}
+
+/// A resolver for the root tests, as Tailscale's MagicDNS is to razorbill: on no uplink, but on
+/// an interface of its own (a veth to a network namespace of the test's, TEST-NET-2, the host at
+/// 198.51.100.1), at 198.51.100.53 and .54, with a TCP port that is not DNS (8080). The host routes
+/// there, but the jobs' rules forward nothing there but DNS to the nameservers the job's resolver
+/// names. Over UDP and TCP, `git.zr.test` is 127.0.0.1 (a job's own loopback, where a fetch that
+/// resolved finds nothing listening), every other name under zr.test 192.0.2.77, and any other
+/// name NXDOMAIN. A UDP socket for each address, so each answer comes from the address it was
+/// asked at. `error.NoIp` without iproute2's `ip`.
+const TestResolver = struct {
+    child: std.process.Child,
+
+    const ns = "zrtest-dns";
+
+    fn start(arena: Allocator) !TestResolver {
+        const io = std.testing.io;
+        _ = std.process.run(arena, io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch
+            return error.NoIp;
+        errdefer _ = std.process.run(arena, io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch {};
+        try ip(arena, &.{ "netns", "add", ns });
+        try ip(arena, &.{ "link", "add", "zrtdns0", "type", "veth", "peer", "name", "eth0", "netns", ns });
+        try ip(arena, &.{ "addr", "add", "198.51.100.1/24", "dev", "zrtdns0" });
+        try ip(arena, &.{ "link", "set", "zrtdns0", "up" });
+        try ip(arena, &.{ "-n", ns, "addr", "add", "198.51.100.53/24", "dev", "eth0" });
+        try ip(arena, &.{ "-n", ns, "addr", "add", "198.51.100.54/24", "dev", "eth0" });
+        try ip(arena, &.{ "-n", ns, "link", "set", "eth0", "up" });
+        try ip(arena, &.{ "-n", ns, "link", "set", "lo", "up" });
+        const responder =
+            \\import socket, struct, sys, threading
+            \\def answer(q):
+            \\    i, labels = 12, []
+            \\    while q[i]:
+            \\        labels.append(q[i + 1:i + 1 + q[i]].decode()); i += 1 + q[i]
+            \\    qtype = struct.unpack(">H", q[i + 1:i + 3])[0]
+            \\    name = ".".join(labels).lower()
+            \\    rcode, an, ans = 3, 0, b""
+            \\    if name == "zr.test" or name.endswith(".zr.test"):
+            \\        rcode = 0
+            \\        addr = [127, 0, 0, 1] if name == "git.zr.test" else [192, 0, 2, 77]
+            \\        if qtype == 1:
+            \\            an, ans = 1, b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4) + bytes(addr)
+            \\    return q[:2] + struct.pack(">HHHHH", 0x8180 | rcode, 1, an, 0, 0) + q[12:i + 5] + ans
+            \\def udp(s):
+            \\    while True:
+            \\        q, peer = s.recvfrom(512)
+            \\        try: s.sendto(answer(q), peer)
+            \\        except Exception: pass
+            \\def tcp_one(c):
+            \\    with c:
+            \\        try:
+            \\            n = struct.unpack(">H", c.recv(2))[0]; q = b""
+            \\            while len(q) < n: q += c.recv(n - len(q))
+            \\            r = answer(q); c.sendall(struct.pack(">H", len(r)) + r)
+            \\        except Exception: pass
+            \\def tcp(s, dns):
+            \\    while True:
+            \\        c, _ = s.accept()
+            \\        if dns: threading.Thread(target=tcp_one, args=(c,), daemon=True).start()
+            \\        else: c.close()
+            \\def udp_on(addr):
+            \\    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind((addr, 53)); return u
+            \\def listener(port):
+            \\    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            \\    s.bind(("0.0.0.0", port)); s.listen(16); return s
+            \\for addr in ("198.51.100.53", "198.51.100.54"):
+            \\    threading.Thread(target=udp, args=(udp_on(addr),), daemon=True).start()
+            \\threading.Thread(target=tcp, args=(listener(53), True), daemon=True).start()
+            \\threading.Thread(target=tcp, args=(listener(8080), False), daemon=True).start()
+            \\print("ready", flush=True)
+            \\sys.stdin.read()
+        ;
+        var child = try std.process.spawn(io, .{
+            .argv = &.{ "ip", "netns", "exec", ns, "python3", "-c", responder },
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .inherit,
+        });
+        errdefer child.kill(io);
+        var ready_buf: [64]u8 = undefined;
+        var ready = child.stdout.?.readerStreaming(io, &ready_buf);
+        const line = (try ready.interface.takeDelimiter('\n')) orelse return error.ResponderDidNotStart;
+        try std.testing.expectEqualStrings("ready", line);
+        return .{ .child = child };
+    }
+
+    fn stop(r: *TestResolver, arena: Allocator) void {
+        r.child.kill(std.testing.io);
+        _ = std.process.run(arena, std.testing.io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch {};
+    }
+
+    fn ip(arena: Allocator, args: []const []const u8) !void {
+        const argv = try std.mem.concat(arena, []const u8, &.{ &.{"ip"}, args });
+        const r = try std.process.run(arena, std.testing.io, .{ .argv = argv });
+        if (r.term != .exited or r.term.exited != 0) {
+            std.debug.print("ip {s}: {s}\n", .{ try std.mem.join(arena, " ", args), r.stderr });
+            return error.IpFailed;
+        }
+    }
+};
+
+test "root runner: a native checkout and an action's fetch resolve through the job's resolver, as root and as the runner user, with a Zig seed below" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const env = try std.testing.environ.createMap(arena);
+    const required = std.mem.eql(u8, env.get("ZIG_RUNNER_REQUIRE_NATIVE") orelse "", "1");
+    if (std.process.run(arena, io, .{ .argv = &.{ "git", "--version" } })) |_| {} else |_| return skip(required, "git is not installed");
+    var dns = TestResolver.start(arena) catch |e| switch (e) {
+        error.NoIp => return skip(required, "this machine has no `ip` (iproute2) for the resolver's network"),
+        else => return e,
+    };
+    defer dns.stop(arena);
+    const resolv = try std.fmt.allocPrint(arena, "{s}/host-resolv.conf", .{
+        try tmp.dir.realPathFileAlloc(io, ".", arena),
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = resolv, .data = "nameserver 198.51.100.53\n" ++
+        "search zr.test\noptions timeout:1 attempts:2\n" });
+    cfg.test_resolv_conf = resolv;
+    // As razorbill's toolcache job (runner-bench 41391500747) ran: a Zig seed below the job's
+    // layers, the package caches bound, the steps as the runner user.
+    cfg.test_seed_script = "mkdir -p /zig-seed/o/s && echo seeded > /zig-seed/o/s/f";
+    try sudoRootfs(arena, try tmp.dir.realPathFileAlloc(io, ".", arena));
+    const caches: volumes.Options = .{
+        .package_caches = true,
+        .trusted = true,
+        .zig_seeds = &.{.{ .version = "0.0.1", .sha256 = "00" }},
+    };
+
+    // The job's image has no /etc/resolv.conf or /etc/hosts, as Alpine's has not, nor does the
+    // Docker action's: the job's are bound all the same (`mount_points`).
+    cfg.images = try withoutEtcFiles(arena, &tmp);
+
+    const Run = struct {
+        fn job(arena_: Allocator, cfg_: Config, j: job_mod.Job, caches_: volumes.Options, user: config.StepUser) ![]const u8 {
+            var environ: std.process.Environ.Map = .init(arena_);
+            var w: std.Io.Writer.Allocating = .init(arena_);
+            var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+            _ = try dagger.run(arena_, std.testing.io, &environ, .{
+                .native = cfg_,
+                .step_user = user,
+                .gpa = std.testing.allocator,
+                .package_caches = caches_.package_caches,
+                .trusted = caches_.trusted,
+                .zig_seeds = caches_.zig_seeds,
+            }, j, &log);
+            return w.written();
+        }
+
+        fn expectResolved(text: []const u8, what: []const u8) !void {
+            for ([_][]const u8{ "Could not resolve host", "unresolved", "bad address" }) |no|
+                if (std.mem.indexOf(u8, text, no) != null) {
+                    std.debug.print("{s}: {s} in:\n{s}\n", .{ what, no, text });
+                    return error.TestUnexpectedResult;
+                };
+        }
+    };
+    // The repository's server is `git.zr.test`, which only the test's resolver knows: a fetch
+    // that resolved it fails to connect to the job's own loopback; one that did not says so.
+    for ([_]config.StepUser{ .root, .runner }) |user| {
+        const look = testStep("echo uid=$(id -u); ls -ln /etc/resolv.conf; cat /etc/resolv.conf # zig\n" ++
+            "getent hosts git.zr.test || echo \"git.zr.test un\"\"resolved\"");
+        var co = testStep("");
+        co.name = "checkout";
+        co.action = .{ .checkout = &.{.{ .name = "repository", .value = .{ .lit = "o/other" } }} };
+        var job = testJob(&.{ look, co });
+        job.github.server_url = "http://git.zr.test:9";
+        const text = try Run.job(arena, cfg, job, caches, user);
+        try expectLines(text, &.{
+            "Zig global cache seeded from Zig 0.0.1",
+            if (user == .root) "uid=0" else "uid=1001",
+            "nameserver 198.51.100.53",
+            "127.0.0.1",
+            "could not fetch o/other",
+            "git.zr.test port 9",
+        });
+        try Run.expectResolved(text, @tagName(user));
+    }
+    // An action's fetch, before the job ("Set up job" fails on an action it cannot fetch).
+    var act = testStep("");
+    act.action = .{ .uses = .{ .owner = "o", .name = "act", .ref = "v1" } };
+    var act_job = testJob(&.{act});
+    act_job.github.server_url = "http://git.zr.test:9";
+    const act_text = try Run.job(arena, cfg, act_job, caches, .root);
+    try expectLines(act_text, &.{ "Unable to resolve action `o/act@v1`", "git.zr.test port 9" });
+    try Run.expectResolved(act_text, "the action's fetch");
+    // A Docker action in an image without a resolver of its own.
+    var docker_step = testStep("");
+    docker_step.action = .{ .docker = .{ .image = "zr-test/noetc:1", .inputs = &.{
+        .{ .name = "entrypoint", .value = .{ .lit = "sh" } },
+        .{ .name = "args", .value = .{ .lit = "-c \"cat /etc/resolv.conf; getent hosts probe || echo docker un\"\"resolved\"\"" } },
+    } } };
+    const docker_text = try Run.job(arena, cfg, testJob(&.{docker_step}), .{}, .root);
+    try expectLines(docker_text, &.{ "nameserver 198.51.100.53", "192.0.2.77", "probe.zr.test" });
+    try Run.expectResolved(docker_text, "the Docker action");
 }
 
 /// A TCP listener of the test's on the host, on `port` at `addr` (host order; 0 for every
@@ -3862,6 +4053,11 @@ const oci_layer = @import("oci/layer.zig");
 /// tests' rootfs (`testConfig`, whose binds bring the host's /usr), its own passwd and a marker,
 /// then a layer that removes a file of the first.
 fn testImageLayers(arena: Allocator) ![]const []const u8 {
+    return testImageLayersWith(arena, true);
+}
+
+/// `testImageLayers`, with or without /etc/hosts and /etc/resolv.conf (Alpine's has neither).
+fn testImageLayersWith(arena: Allocator, etc_files: bool) ![]const []const u8 {
     var t: oci_layer.TestTar = .{ .a = arena };
     for ([_][]const u8{ "usr/", "etc/", "etc/ssl/", "tmp/", "dev/", "proc/", "sys/", "root/", "home/", "home/app/" }) |d|
         try t.add(.{ .path = d, .kind = .directory, .mode = if (std.mem.eql(u8, d, "tmp/")) 0o1777 else 0o755 });
@@ -3869,7 +4065,9 @@ fn testImageLayers(arena: Allocator) ![]const []const u8 {
         try t.add(.{ .path = l[0], .kind = .symlink, .link = l[1] });
     try t.add(.{ .path = "etc/passwd", .body = "root:x:0:0:root:/root:/bin/sh\napp:x:1002:1003::/home/app:/bin/sh\n" });
     try t.add(.{ .path = "etc/group", .body = "root:x:0:\napp:x:1003:\nstaff:x:50:\n" });
-    for ([_][]const u8{ "etc/hosts", "etc/resolv.conf", "etc/ld.so.cache" }) |f| try t.add(.{ .path = f });
+    for ([_][]const u8{ "etc/hosts", "etc/resolv.conf", "etc/ld.so.cache" }) |f| {
+        if (etc_files or std.mem.eql(u8, f, "etc/ld.so.cache")) try t.add(.{ .path = f });
+    }
     try t.add(.{ .path = "etc/marker", .body = "from the image\n" });
     try t.add(.{ .path = "etc/gone", .body = "x" });
     var t2: oci_layer.TestTar = .{ .a = arena };

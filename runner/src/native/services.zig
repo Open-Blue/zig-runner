@@ -259,6 +259,7 @@ fn startOne(
         .id_base = b.idBase(),
         .id_count = Backend.ids_per_slot,
         .netns = b.netns,
+        .mount_points = Backend.mount_points,
         // P4: the service's helper and everything it starts are in the job's cgroup, held to
         // the job's limits and measured with it.
         .cgroup = if (b.job_cgroup) |j| j.dir else null,
@@ -778,7 +779,7 @@ test "native services: postgres and redis from real images (ZIG_RUNNER_SERVICE_I
     job.services = &.{
         .{
             .name = "postgres",
-            .image = .{ .lit = "postgres:17-alpine" },
+            .image = .{ .lit = "postgres:18-alpine" },
             .env = &.{.{ .name = "POSTGRES_PASSWORD", .value = .{ .lit = "postgres" } }},
             .ports = &.{.{ .lit = "5432:5432" }},
             // Over TCP: the entrypoint's first, set-up server listens on its socket alone.
@@ -809,7 +810,7 @@ test "native services: postgres and redis from real images (ZIG_RUNNER_SERVICE_I
         "Ready to accept connections",
     });
     for (r.res.extra) |e| if (e.kind == .initialize) std.debug.print("native services: " ++
-        "Initialize containers took {d} ms (postgres:17-alpine, redis:7-alpine)\n", .{
+        "Initialize containers took {d} ms (postgres:18-alpine, redis:7-alpine)\n", .{
         e.completed_ms - e.started_ms,
     });
 }
