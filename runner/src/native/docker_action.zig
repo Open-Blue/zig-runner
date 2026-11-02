@@ -508,21 +508,16 @@ fn markerLine(arena: Allocator, kind: []const u8, n: u32, mark: []const u8) ![]c
 }
 
 /// The step's file commands as one text, as `scripts.writeCombinedFileCommands` writes `all_<fc>`:
-/// each after a `::zig-file-command::<kind>` line and followed by a newline, read from the step's
+/// each after a `::zig-file-command::<kind> <bytes>` line and followed by a newline, read from the step's
 /// layer (one the action removed is empty, as the script's `>>` makes it), then the `ran` marker,
 /// empty with the step cache off. Each is read inside the layer, through no symlink.
 fn combined(arena: Allocator, layer: []const u8, fc: u32) ![]const u8 {
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    for (scripts.fc_kinds) |k| {
-        const text = switch (try sandbox.readIn(arena, layer, try scripts.fcPath(arena, k, fc), Backend.max_read)) {
-            .text => |t| t,
-            .missing, .whiteout => "",
-        };
-        try w.print(scripts.fc_marker ++ "{s}\n{s}\n", .{ k, text });
-    }
-    try w.writeAll(scripts.fc_marker ++ "ran\n\n");
-    return aw.written();
+    var parts: [scripts.fc_kinds.len][2][]const u8 = undefined;
+    for (scripts.fc_kinds, &parts) |k, *p| p.* = .{ k, switch (try sandbox.readIn(arena, layer, try scripts.fcPath(arena, k, fc), Backend.max_read)) {
+        .text => |t| t,
+        .missing, .whiteout => "",
+    } };
+    return scripts.combine(arena, &parts, "");
 }
 
 // --- tests ---
