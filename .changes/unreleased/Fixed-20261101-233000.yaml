@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'What ZLint''s first run found: the database writer went on writing its whole queue after `close` gave up waiting for it (the cancel was swallowed), so a slow database held the runner''s exit for a statement timeout per queued row; a runner held at the memory gate, or backing off after a failed registration, ignored the pool''s cancel when another runner could not start, so the runner did not exit; and a workflow command the runner had no memory to carry out (`set-output`, `save-state`, `set-env`, `add-path`, `add-mask`, `stop-commands`) was dropped silently, where it now fails the step. Unused declarations removed.'
+time: 2026-11-01T23:30:00.000000-04:00

@@ -142,10 +142,12 @@ pub fn pull(
 }
 
 fn fail(arena: Allocator, why: *[]const u8, c: *const registry.Client, e: anyerror, what: []const u8) anyerror {
+    // Returns the error rather than an error union: out of memory, that is the error returned.
     if (why.len == 0) why.* = if (c.why.len > 0)
         c.why
     else
-        try std.fmt.allocPrint(arena, "{f}: could not fetch {s}: {s}", .{ c.ref, what, @errorName(e) });
+        std.fmt.allocPrint(arena, "{f}: could not fetch {s}: {s}", .{ c.ref, what, @errorName(e) }) catch |oom|
+            return oom;
     return e;
 }
 

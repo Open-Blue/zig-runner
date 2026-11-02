@@ -22,7 +22,6 @@ const expr = @import("../expr.zig");
 const Exec = @import("../dagger/Exec.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
 const JobLog = @import("../dagger/JobLog.zig");
-const Port = @import("../dagger/services.zig").Port;
 const Backend = @import("Backend.zig");
 const sandbox = @import("sandbox.zig");
 const health = @import("health.zig");
