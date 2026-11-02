@@ -541,4 +541,33 @@ test "add-matcher and remove-matcher" {
 
     // And not while commands are stopped.
     try std.testing.expect(try parseWorkflow(ar, "::add-matcher::x.json", "tok") == .none);
+    // A one-byte path is a path.
+    try std.testing.expectEqualStrings("m", (try parseWorkflow(ar, "::add-matcher::m", null)).add_matcher);
+}
+
+test "escapes: %3A and %2C only in property values, and an escape cut short is kept as written" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const w = (try parseWorkflow(ar, "::warning title=x%3Ay%2Cz%25::a%3Ab%2Cc%25d%0Ae", null)).annotation;
+    try std.testing.expectEqualStrings("x:y,z%", w.title.?);
+    try std.testing.expectEqualStrings("a%3Ab%2Cc%d\ne", w.message);
+    // At the end of the data, a `%` with fewer than two bytes after it is no escape.
+    for ([_][]const u8{ "end%", "end%2", "end%0" }) |m| {
+        const line = try std.fmt.allocPrint(ar, "::warning::{s}", .{m});
+        try std.testing.expectEqualStrings(m, (try parseWorkflow(ar, line, null)).annotation.message);
+    }
+    // A command starts the line (after whitespace), or there is none.
+    try std.testing.expect(try parseWorkflow(ar, "x ::warning::m", null) == .none);
+    try std.testing.expect(try parseWorkflow(ar, "x:warning::m", null) == .none);
+    try std.testing.expectEqualStrings("m", (try parseWorkflow(ar, "  ::warning::m", null)).annotation.message);
+}
+
+test "GITHUB_PATH: one directory a line, trimmed, a one-byte one too" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const got = try parsePaths(a.allocator(), " /\n\n/opt/bin \r\n");
+    try std.testing.expectEqual(@as(usize, 2), got.len);
+    try std.testing.expectEqualStrings("/", got[0]);
+    try std.testing.expectEqualStrings("/opt/bin", got[1]);
 }
