@@ -31,11 +31,11 @@ plain=("${modules[@]}")
 # for the sandbox's failure. TSan's runtime needs glibc's dynamic loader: the native target links
 # it, a PIE still, where the release's static PIE (musl, #283) crashes at startup.
 tests=("${plain[@]}")
-exe=("${plain[@]}")
+runner=("${plain[@]}")
 if [[ ${ZIG_TEST_SANITIZE_THREAD:-} == 1 ]]; then
 	zig_modules "$scratch" "$scratch/version" -fsanitize-thread
 	tests=("${modules[@]}")
-	exe=("${modules[@]}")
+	runner=("${modules[@]}")
 fi
 
 # ZIG_TEST_WAIT_FOR_DB=1: between compiling the tests and running them, wait for the database
@@ -53,7 +53,7 @@ fi
 export ZIG_RUNNER_TEST_EXE="$scratch/runner"
 (
 	rc=0
-	zig build-exe "${exe[@]}" --name runner -femit-bin="$scratch/runner" || rc=$?
+	zig build-exe "${runner[@]}" --name runner -femit-bin="$scratch/runner" || rc=$?
 	echo "$rc" >"$scratch/runner.rc"
 ) &
 exe=$!
