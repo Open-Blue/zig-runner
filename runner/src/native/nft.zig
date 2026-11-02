@@ -31,8 +31,6 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const net = @import("net.zig");
 
-const Allocator = std.mem.Allocator;
-
 /// The runner's table, in the `ip` family.
 pub const table = "zig_runner";
 

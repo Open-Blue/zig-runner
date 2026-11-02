@@ -543,16 +543,18 @@ pub const Pattern = struct {
         };
     }
 
-    /// `pattern/**`, for implicit descendants.
-    fn descendants(p: Pattern, arena: Allocator) Allocator.Error!Pattern {
+    /// `pattern/**`, for implicit descendants; null, with `why`, when @actions/glob refuses it.
+    /// It can, though the pattern was accepted: `\.` is `.` only as the first segment, which a
+    /// relative pattern's is not once it is under the workspace (`/w/\./**`), so GitHub's
+    /// hashFiles() fails on it ("Relative pathing"), as this does. It once asserted instead, and a
+    /// job's `hashFiles('\.')` took the runner down (found by the fuzzer).
+    fn descendants(p: Pattern, arena: Allocator, why: *[]const u8) Allocator.Error!?Pattern {
         var segs: std.ArrayList([]const u8) = .empty;
         try segs.appendSlice(arena, p.segments);
         try segs.append(arena, "**");
         const text = try joinSegments(arena, segs.items);
-        var why: []const u8 = "";
         const line = if (p.negate) try std.mem.concat(arena, u8, &.{ "!", text }) else text;
-        // Built from a pattern that was accepted, so it is accepted too.
-        return (try init(arena, line, "/", "/", true, &why)).?;
+        return init(arena, line, "/", "/", true, why);
     }
 
     /// What this pattern matches `item` as (`Pattern.match`).
@@ -634,13 +636,14 @@ pub fn parse(arena: Allocator, args: []const []const u8, cwd: []const u8, home: 
     return .{ .ok = .{ .patterns = patterns.items, .follow = follow } };
 }
 
-/// The patterns with implicit descendants added (`globGenerator`).
-fn withDescendants(arena: Allocator, patterns: []const Pattern) Allocator.Error![]const Pattern {
+/// The patterns with implicit descendants added (`globGenerator`); null, with `why`, when one is
+/// refused (`Pattern.descendants`).
+fn withDescendants(arena: Allocator, patterns: []const Pattern, why: *[]const u8) Allocator.Error!?[]const Pattern {
     var out: std.ArrayList(Pattern) = .empty;
     for (patterns) |p| {
         try out.append(arena, p);
         if (p.trailing_separator or !std.mem.eql(u8, p.segments[p.segments.len - 1], "**"))
-            try out.append(arena, try p.descendants(arena));
+            try out.append(arena, (try p.descendants(arena, why)) orelse return null);
     }
     return out.items;
 }
@@ -734,7 +737,7 @@ pub fn walk(
     why: *[]const u8,
 ) Allocator.Error!Walked {
     if (follow and fs.vtable.realpath == null) return .{ .failed = "--follow-symbolic-links is not supported here yet" };
-    const patterns = try withDescendants(arena, patterns_in);
+    const patterns = (try withDescendants(arena, patterns_in, why)) orelse return .{ .failed = why.* };
     var nodes: std.ArrayList(Node) = .empty;
     var roots: std.ArrayList(u32) = .empty;
     var frontier: std.ArrayList(u32) = .empty;
@@ -925,9 +928,26 @@ test "matching: stars, classes, escapes, globstars, and partial matches" {
     try std.testing.expect(try deep.partialMatch(ar, "/"));
     try std.testing.expect(!try deep.partialMatch(ar, "/w/other"));
     // The implicit `pattern/**` matches only below.
-    const imp = try (try testPattern(ar, "src")).descendants(ar);
+    var imp_why: []const u8 = "";
+    const imp = (try (try testPattern(ar, "src")).descendants(ar, &imp_why)).?;
     try std.testing.expectEqual(none, try imp.match(ar, "/w/src"));
     try std.testing.expectEqual(all, try imp.match(ar, "/w/src/a.go"));
+}
+
+test "a pattern whose implicit descendants @actions/glob refuses fails the walk, not the runner" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    var mem: MemFs = .{ .kinds = &.{.{ "/w", .directory, .directory }}, .lists = &.{} };
+    // `\.` is accepted as the first segment, and refused once under the workspace: GitHub's
+    // hashFiles() throws when it adds `/w/\./**` (fixupPattern), and this asserted until the
+    // fuzzer found it.
+    for ([_][]const u8{ "\\.", "!\\." }) |line| {
+        const parsed = (try parse(ar, &.{line}, "/w", "/home/u")).ok;
+        var why: []const u8 = "";
+        const got = try walk(ar, mem.fs(), parsed.patterns, false, "/w", &why);
+        try std.testing.expect(std.mem.startsWith(u8, got.failed, "Invalid pattern '/w/\\./**'. Relative pathing"));
+    }
 }
 
 test "search paths leave out those below another" {

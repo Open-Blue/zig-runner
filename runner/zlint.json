@@ -1,0 +1,21 @@
+{
+  "rules": {
+    "homeless-try": "error",
+    "no-unresolved": "error",
+    "unused-decls": "error",
+    "suppressed-errors": "off",
+    "must-return-ref": "error",
+    "returned-stack-reference": "error",
+    "useless-error-return": "error",
+    "duplicate-case": "off",
+    "unsafe-undefined": "off",
+    "no-print": "off",
+    "avoid-as": "off",
+    "case-convention": "off",
+    "empty-file": "off",
+    "line-length": "off",
+    "no-catch-return": "off",
+    "no-return-try": "off",
+    "allocator-first-param": "off"
+  }
+}

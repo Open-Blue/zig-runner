@@ -16,6 +16,8 @@
 //! The filter runs on the step's every system call, so it is built as ranges: the allowed numbers,
 //! sorted, make a few dozen runs, and a call is two comparisons per run until its own.
 
+// zlint-disable returned-stack-reference -- `allowedNumbers` and `program` run at compile time only
+// (`out[0..n].*` needs a comptime n): what they return is a constant, not the stack.
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;

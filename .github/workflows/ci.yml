@@ -134,6 +134,31 @@ jobs:
             sleep $((attempt * 15))
           done
 
+  # ZLint over the runner's Zig (.github/scripts/zlint.sh, its rules in runner/zlint.json): CodeQL
+  # and Semgrep read no Zig, so this is the only static analysis of the runner's own code besides
+  # the compiler. A few seconds, with no Zig to install. Skipped, still reporting, on a change that
+  # cannot affect it (ci-scope.sh tests).
+  lint:
+    name: Lint (ZLint)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether this change can affect the lint
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh tests
+
+      - name: ZLint
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/zlint.sh
+
   # The comparison tools' Go (runner/tools/*diff), with go vet and staticcheck (go-lint.sh): they
   # are test oracles, so a bug in one hides one in the runner. Skipped, still reporting, on a change
   # that cannot affect them (ci-scope.sh go); compare.yml runs it weekly whatever changed.
