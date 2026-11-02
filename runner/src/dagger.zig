@@ -921,7 +921,10 @@ fn runNative(
     defer sh.flush();
     // After the last step, as for a Dagger session: each replayed step's log ends with the note.
     defer noteReusedSteps(&sh, native_reused_note);
-    var b = Backend.init(arena, io, opts.gpa, cfg) catch |e| {
+    // What failed and on which path, as "Set up job" says it (`Backend.initWhy`).
+    var why: []const u8 = "";
+    var b = Backend.initWhy(arena, io, opts.gpa, cfg, &why) catch |e| {
+        const what = if (why.len > 0) why else @errorName(e);
         // A job the runner does not vouch for whose cgroup could not be made with its limits
         // after all (P4, P5's `job_limits`): not native, and not failed either.
         if (e == error.NoJobLimits) {
@@ -934,15 +937,13 @@ fn runNative(
         // which needs none of them.
         if (setUpFallback(opts, e)) {
             dagger_note.* = try std.fmt.allocPrint(arena, "This job runs on Dagger: the native " ++
-                "set-up failed (could not make the job's sandbox: {s}).", .{@errorName(e)});
+                "set-up failed (could not make the job's sandbox: {s}).", .{what});
             return null;
         }
         return try fail(
             &sh,
             results,
-            try std.fmt.allocPrint(arena, "could not make the job's native store: {s}", .{
-                @errorName(e),
-            }),
+            try std.fmt.allocPrint(arena, "could not make the job's native store: {s}", .{what}),
         );
     };
     defer b.deinit();
