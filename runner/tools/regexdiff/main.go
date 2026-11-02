@@ -80,9 +80,28 @@ func main() {
 			cases = append(cases, testCase{ID: len(cases), Pattern: p, Inputs: poolLines})
 		}
 	}
+	for _, c := range edgeCases {
+		cases = append(cases, testCase{ID: len(cases), Pattern: c.Pattern, Inputs: c.Inputs})
+	}
 	raw, err := json.MarshalIndent(cases, "", " ")
 	must(err)
 	must(os.WriteFile(*out, raw, 0o644))
+}
+
+// Fixed cases: backreferences that do not fit before or after where they are tried, forwards and
+// in a lookbehind, folded or not, over characters of more than one byte (regex.zig once stepped
+// back past the start of the input).
+var edgeCases = []testCase{
+	{Pattern: `(?=(aa))a(?<=\1)`, Inputs: []string{"aaa", "aa", "a", "baab"}},
+	{Pattern: `(?i)(?=(aa))a(?<=\1)`, Inputs: []string{"aaa", "AaA", "aa"}},
+	{Pattern: `(?=(éé))é(?<=\1)`, Inputs: []string{"ééé", "éé", "中éé"}},
+	{Pattern: `(?<=(aa))\1`, Inputs: []string{"aaa", "aaaa", "aa"}},
+	{Pattern: `(?i)(?<=(éé))\1`, Inputs: []string{"ééé", "ééÉÉ", "éé"}},
+	{Pattern: `(?=.*(.))(?<=\1)`, Inputs: []string{"éé", "中a中", "é"}},
+	{Pattern: `(?i)(?=.*(.))(?<=\1)`, Inputs: []string{"éÉ", "中a中", "é"}},
+	{Pattern: `(?<=\$.)|x`, Inputs: []string{"$é", "$中x", "é$"}},
+	{Pattern: `(?=.(.))\1(?<=.)`, Inputs: []string{"À�", "�À�", "aa"}},
+	{Pattern: `^(.).(?<=\1)`, Inputs: []string{"�À", "��", "éé"}},
 }
 
 type gen struct {
