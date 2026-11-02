@@ -32,7 +32,8 @@ CONSTANTS
     MaxCorrupts,    \* entries a hand changes behind the store's back
     BuildHoldsKeyLock, \* layers.zig takes the key's lock around its publish (the fix)
     SyncBeforePublish, \* Store.publish calls syncfs before the rename (Store.zig:462)
-    EvictRechecks      \* evict checks its lock is on the file the path names (the fix)
+    EvictRechecks,     \* evict checks its lock is on the file the path names (the fix)
+    BuildLooksUpFirst  \* layers.zig looks its key up under the key's lock before it publishes
 
 ASSUME StepKeys \cap BuildKeys = {} /\ Steps \in Nat \ {0}
 
@@ -73,7 +74,7 @@ Idle == [pc |-> "start", step |-> 1, key |-> CHOOSE k \in Keys : TRUE, mode |-> 
          after |-> "op_file", kfd |-> NoFd, klk |-> FALSE, owns |-> FALSE, keyed |-> FALSE,
          od |-> NoDir, moved |-> FALSE, held |-> {}, evk |-> CHOOSE k \in Keys : TRUE,
          evd |-> NoDir, evRet |-> "open", rtd |-> NoDir, rtOrig |-> "none", rtRet |-> "start",
-         todo |-> {}, ktodo |-> {}]
+         todo |-> {}, ktodo |-> {}, lost |-> FALSE]
 
 Dead == [Idle EXCEPT !.pc = "crashed"]
 
@@ -147,11 +148,14 @@ Evict(r, k, ret) == [r EXCEPT !.pc = "ev_open", !.evk = k, !.evRet = ret]
 
 (* open found nothing to replay.  Backend.zig:1963-1969 (`orelse return   *)
 (* .{ .key = k, .lock = lock }`): the step runs keyed.  A build runs      *)
-(* (dockerfile.zig:578-582); after its publish lost, nothing is there to  *)
-(* take and the build fails (layers.zig:75, `orelse return e`).           *)
-Missed(r) == CASE r.mode = "step"  -> [r EXCEPT !.pc = "run", !.keyed = TRUE]
-               [] r.mode = "build" -> [r EXCEPT !.pc = "run"]
-               [] r.mode = "retry" -> [r EXCEPT !.pc = "step_end"]
+(* (dockerfile.zig:578-582).  Its lookup under the key's lock missing     *)
+(* (`lookup`, BuildLooksUpFirst): it publishes.  Publishing first, a      *)
+(* refused rename looks again (`retry`); finding nothing, the build fails *)
+(* (`orelse return e`) though a layer was there a moment before: `lost`.  *)
+Missed(r) == CASE r.mode = "step"   -> [r EXCEPT !.pc = "run", !.keyed = TRUE]
+               [] r.mode = "build"  -> [r EXCEPT !.pc = "run"]
+               [] r.mode = "lookup" -> [r EXCEPT !.pc = "pb_mkdir"]
+               [] r.mode = "retry"  -> [r EXCEPT !.pc = "step_end", !.lost = TRUE]
 
 (* open's error.Invalid: the entry is broken and another job holds it.    *)
 (* Backend.zig:1963-1969: the key's lock let go, the step runs uncached.  *)
@@ -258,11 +262,15 @@ OpRead(p) ==
 (* the key's lock is held (the claim is released by the step's `defer`,   *)
 (* Backend.zig:1248).  A build publishes through layers.Store.publish     *)
 (* (dockerfile.zig:595), which takes the key's lock first when            *)
-(* BuildHoldsKeyLock (layers.zig:70-71, the fix) and did not before.      *)
+(* BuildHoldsKeyLock (layers.zig:70-71, the fix) and did not before, and  *)
+(* under it looks the key up before it publishes when BuildLooksUpFirst   *)
+(* (layers.zig:72-80, `lookup`), or publishes first (`retry`) as #299 did. *)
 Run(p) ==
     /\ S(p).pc = "run"
     /\ \E ok \in BOOLEAN :
-         Put(p, IF ok /\ S(p).mode = "build" /\ BuildHoldsKeyLock
+         Put(p, IF ok /\ S(p).mode = "build" /\ BuildHoldsKeyLock /\ BuildLooksUpFirst
+                THEN [S(p) EXCEPT !.pc = "lk_create", !.after = "op_file", !.mode = "lookup"]
+                ELSE IF ok /\ S(p).mode = "build" /\ BuildHoldsKeyLock
                 THEN [S(p) EXCEPT !.pc = "lk_create", !.after = "pb_mkdir"]
                 ELSE IF ok /\ (S(p).mode = "build" \/ S(p).keyed)
                 THEN [S(p) EXCEPT !.pc = "pb_mkdir"]
@@ -340,8 +348,10 @@ PbRename(p) ==
 PbFail(p) ==
     LET d == Me(p)
         next == IF S(p).mode = "build" THEN "op_file" ELSE "step_end"
+        \* After a lookup under the lock missed, a refused publish fails the build (`try`).
         r == [S(p) EXCEPT !.moved = FALSE,
-                          !.mode = IF S(p).mode = "build" THEN "retry" ELSE @]
+                          !.mode = IF S(p).mode = "build" THEN "retry" ELSE @,
+                          !.lost = (S(p).mode = "lookup")]
         back == ~S(p).moved \/ "fs" \in dirs[d].parts
     IN
     /\ S(p).pc = "pb_fail"
@@ -619,6 +629,12 @@ NoLostUpper == ~lostUpper
 
 (* One entry per key (renameat2's NOREPLACE).                             *)
 OnePub == \A k \in Keys : Cardinality(Pub(k)) <= 1
+
+(* A build that built its layer gets one: its own published, or the one  *)
+(* another builder stored.  Publishing first, a refused rename then a    *)
+(* collect evicting the other builder's layer before the lookup failed   *)
+(* the build for nothing (found by store_stress.zig, after #299).         *)
+NoBuildLost == \A p \in Procs : ~S(p).lost
 
 -----------------------------------------------------------------------------
 (* Liveness, under weak fairness of each process.                         *)
