@@ -21,8 +21,8 @@ a sha256, which the model does not compute: the vectors' parents are given as 32
 Each line is tab-separated, every byte string in lowercase hex, numbers in decimal:
 
     key    name equal|differ  A B   with A, B: tag parent script env uid gid workdir files preimage
-    below  name equal|differ  A B   with A, B: format scope repository fingerprint userns idBase
-                                         binds [seeds=…] preimage
+    below  name equal|differ  A B   with A, B: format scope repository fingerprint userns binds
+                                         [seeds=…] preimage
     layer  name root|any  entries preimage    (a tree, and `Native.walkPreimage` of it)
 
 An environment is `name=value` pairs joined by `,` in the container's order, volatile names
@@ -69,7 +69,7 @@ def atomText : Nat → String
   | 27 => "/run/systemd/resolve/resolv.conf"
   | 28 => "/etc/resolv.conf"
   | 29 => "mkdir -p /home/runner/work/r/r /home/runner/work/_temp"
-  | 31 => "zig-runner native store 2"
+  | 31 => "zig-runner native store 3"
   | 33 => "repo"
   | 34 => "untrusted"
   | 35 => "Open-Blue/zig-runner"
@@ -116,7 +116,7 @@ def scriptText : Script → String
 
 def path : Binding := (0, 10)
 def home : Binding := (2, 14)
-def below0 : Below := ⟨31, 33, 35, 23, 25, 1900000000, [⟨27, 28, true, true⟩], [], []⟩
+def below0 : Below := ⟨31, 33, 35, 23, 25, [⟨27, 28, true, true⟩], [], []⟩
 def asRoot : Extra := ⟨0, 0, 20, []⟩
 def eventFile (c : Nat) : Kept := ⟨22, c, 0o644⟩
 
@@ -127,7 +127,7 @@ def baseOf : Nat → BaseSpec
   | 1 => ⟨below0, 29, [path], asRoot⟩
   | 2 => ⟨below0, 29, [path, home], ⟨0, 0, 20, [eventFile 18]⟩⟩
   | 3 => ⟨below0, 29, [path, home], ⟨0, 0, 20, [eventFile 19]⟩⟩
-  | 4 => ⟨{ below0 with idBase := 1900065536 }, 29, [path, home], asRoot⟩
+  | 4 => ⟨{ below0 with userns := 26 }, 29, [path, home], asRoot⟩
   | 5 => ⟨{ below0 with scope := 34 }, 29, [path, home], asRoot⟩
   | n => ⟨below0, n, [], asRoot⟩
 
@@ -164,7 +164,7 @@ def fmt : Format where
 `Bool` field does not compile to code. -/
 def bindT (b : Bind) := (b.host, b.place, b.readOnly, b.optional)
 def belowT (w : Below) :=
-  (w.format, w.scope, w.repository, w.fingerprint, w.userns, w.idBase, w.binds.map bindT, w.seeds, w.volumes)
+  (w.format, w.scope, w.repository, w.fingerprint, w.userns, w.binds.map bindT, w.seeds, w.volumes)
 def extraT (x : Extra) := (x.uid, x.gid, x.workdir, x.files.map fun k => (k.path, k.contents, k.mode))
 def baseT (b : BaseSpec) := (belowT b.below, b.script, b.env, extraT b.extra)
 
@@ -252,7 +252,7 @@ def baseVectors : List (String × (Nat × Env) × (Nat × Env)) :=
     ("base-env", (0, [path, home]), (1, [path])),
     ("base-event-file", (2, [path, home]), (3, [path, home])),
     ("base-file-or-none", (0, [path, home]), (2, [path, home])),
-    ("base-slot", (0, [path, home]), (4, [path, home])),
+    ("base-userns", (0, [path, home]), (4, [path, home])),
     ("base-fork", (0, [path, home]), (5, [path, home])) ]
 
 /-- A job's binds with a cache volume (npm's), as P4 binds it, and the same marked a volume. -/
@@ -265,8 +265,7 @@ def belowVectors : List (String × Below × Below) :=
     ("below-fork", below0, { below0 with scope := 34 }),
     ("below-repository", below0, { below0 with repository := 36 }),
     ("below-rootfs", below0, { below0 with fingerprint := 24 }),
-    ("below-userns", below0, { below0 with userns := 26, idBase := 0 }),
-    ("below-slot", below0, { below0 with idBase := 1900065536 }),
+    ("below-userns", below0, { below0 with userns := 26 }),
     ("below-read-only", below0, { below0 with binds := [⟨27, 28, false, true⟩] }),
     ("below-no-binds", below0, { below0 with binds := [] }),
     -- P4: the Zig cache seeds' layers and which binds are cache volumes, after the rest and only
@@ -280,7 +279,7 @@ def belowVectors : List (String × Below × Below) :=
 
 def belowLine (w : Below) : String :=
   "\t".intercalate ([hex (fmt.str w.format), hex (fmt.str w.scope), hex (fmt.str w.repository),
-    hex (fmt.str w.fingerprint), hex (fmt.str w.userns), toString w.idBase,
+    hex (fmt.str w.fingerprint), hex (fmt.str w.userns),
     bindsField w.binds w.volumes] ++
     (if w.seeds.isEmpty then [] else ["seeds=" ++ list (fun s => hex (fmt.str s)) w.seeds]) ++
     [hex (belowPreimage fmt w)])
