@@ -54,7 +54,6 @@ pub const BelowInput = struct {
     repository: []const u8,
     fingerprint: []const u8,
     userns: []const u8,
-    id_base: u64,
     binds: []const Bind,
     /// P4's Zig cache seeds' layers; which binds are cache volumes is `Bind.volume`.
     seeds: []const []const u8 = &.{},
@@ -104,7 +103,6 @@ pub fn belowPreimage(gpa: Allocator, in: BelowInput) ![]u8 {
         .repository = in.repository,
         .fingerprint = in.fingerprint,
         .userns = in.userns,
-        .id_base = in.id_base,
         .binds = in.binds,
         .seeds = in.seeds,
     }, &w.writer);
@@ -210,7 +208,6 @@ fn belowSide(arena: Allocator, it: *Fields) !Side {
     const repository = try unhex(arena, it.next().?);
     const fingerprint = try unhex(arena, it.next().?);
     const userns = try unhex(arena, it.next().?);
-    const id_base = try num(it.next().?);
     var binds: std.ArrayList(Bind) = .empty;
     // With P4's volumes, a fifth part: whether the bind is a cache volume.
     for (try itemsOf(arena, it.next().?, 4, 5)) |p| try binds.append(arena, .{
@@ -228,7 +225,7 @@ fn belowSide(arena: Allocator, it: *Fields) !Side {
         last = it.next().?;
     }
     return .{ .below = .{
-        .in = .{ .format = format, .scope = scope, .repository = repository, .fingerprint = fingerprint, .userns = userns, .id_base = id_base, .binds = binds.items, .seeds = seeds.items },
+        .in = .{ .format = format, .scope = scope, .repository = repository, .fingerprint = fingerprint, .userns = userns, .binds = binds.items, .seeds = seeds.items },
         .preimage = try unhex(arena, last),
     } };
 }

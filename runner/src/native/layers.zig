@@ -82,7 +82,7 @@ test "a layer is published once, whole, under its key" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
-    try P2Store.prepare(arena, io, root);
+    try P2Store.prepare(arena, io, root, .{ .check_parents = false });
     var held: std.ArrayList(std.Io.File) = .empty;
     defer for (held.items) |f| f.close(io);
     const store: Store = .{ .dir = root, .store = .{ .root = root }, .held = &held, .scope = "repo" };
