@@ -206,7 +206,7 @@ trust, and the runner itself enforces it:
   trusts when it starts ("trusting refs refs/heads/main,refs/tags/v* and events
   push,workflow_dispatch"). The `prod` GitHub environment holds the release's deploy key, deploys
   only from `main`, and waits for the maintainer's approval.
-- **pre-prod**, where pull requests and the merge queue run, is GitHub's `ubuntu-latest`, on
+- **pre-prod**, where pull requests and the merge queue run, is GitHub's `ubuntu-26.04`, on
   purpose: a hosted runner starts cold every time, so every pull request builds and tests the
   project in the worst case, with no caches to hide a slow or broken first build. Nothing there is
   trusted or holds a secret.

@@ -42,7 +42,7 @@ jobs:
   # nothing to release asks the maintainer nothing.
   check:
     name: Anything to release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: read # to check out main and its tags
@@ -68,7 +68,7 @@ jobs:
     name: Tag
     needs: check
     if: needs.check.outputs.tag != ''
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # The wait for main's checks (WAIT_MINUTES), and the rest.
     timeout-minutes: 45
     environment: prod
