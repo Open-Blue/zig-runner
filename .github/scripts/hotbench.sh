@@ -2,9 +2,10 @@
 # The runner's hot paths (runner/tools/hotbench.zig: expressions, YAML, HPACK, the hashFiles() glob,
 # SHA-256) as a position-independent executable against the same code without, in ReleaseSafe for
 # x86_64-linux-musl as the release builds it (BENCHMARKS.md, "Position-independent executable").
-# The two builds run in turn, RUNS times each, so drift in the machine (heat, other load) falls on
-# both alike; each run times ROUNDS rounds of every benchmark. Prints, per benchmark and build, the
-# median round, its interquartile range and its fastest, then the median's change from no-PIE.
+# The two builds run in turn, RUNS times each, in alternating order, so drift in the machine (heat,
+# other load) falls on both alike; each run times ROUNDS rounds of every benchmark. Prints, per
+# benchmark and build, the median round, its interquartile range and its fastest, then the
+# median's change from no-PIE.
 #
 #   hotbench.sh [ROUNDS] [RUNS]      by default 21 rounds, 10 runs: 210 rounds per benchmark and build
 set -euo pipefail
@@ -21,8 +22,12 @@ for pie in no-PIE PIE; do
 		"${flags[@]}" -Mhpack=src/hpack.zig "${flags[@]}" -Mglob=src/glob.zig \
 		--name "hotbench-$pie" -femit-bin="$scratch/hotbench-$pie"
 done
+# The order swaps every run (no-PIE first, then PIE first): whichever ran second in every pair
+# measured up to 6% slower on a quiet laptop, an order effect, not PIE's.
 for ((run = 1; run <= runs; run++)); do
-	for pie in no-PIE PIE; do
+	order=(no-PIE PIE)
+	((run % 2)) || order=(PIE no-PIE)
+	for pie in "${order[@]}"; do
 		"$scratch/hotbench-$pie" "$rounds" ../.github/workflows/ci.yml ../.github/workflows/release.yml |
 			sed "s/^/$pie\t/" >>"$scratch/rounds.tsv"
 	done

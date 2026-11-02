@@ -157,9 +157,9 @@ repository:
   same binary): the kernel loads each at a random address, where before they sat at the fixed
   0x1000000. They have full RELRO (what is relocated at startup is read-only before the runner's
   code runs), a non-executable stack, and no segment both writable and executable (W^X). PIE costs
-  nothing measurable ([BENCHMARKS.md](BENCHMARKS.md), "Position-independent executable"). Intel CET
-  (IBT and shadow stacks) is not available: Zig 0.17 has no `-fcf-protection` for Zig code, so the
-  binaries carry no CET note. [checksec](https://github.com/slimm609/checksec) 3.2
+  0-3% on the hot paths ([BENCHMARKS.md](BENCHMARKS.md), "Position-independent executable").
+  Intel CET (IBT and shadow stacks) is not available: Zig 0.17 has no `-fcf-protection` for Zig
+  code, so the binaries carry no CET note. [checksec](https://github.com/slimm609/checksec) 3.2
   (`.github/scripts/checksec.sh`, pinned by version and checksum) fails the release, and on pull
   requests "Release builds", "Release builds and tests (arm64)" and "Binaries (check)", on any
   binary without PIE, full RELRO, NX or W^X:

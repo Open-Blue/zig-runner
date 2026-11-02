@@ -193,33 +193,43 @@ the runner, is the difference (the runner's own work is 0.11 s of CPU a job, see
 
 *2026-11-01, zig-runner at main (after v0.23.0).* The release's binaries became static
 position-independent executables (README, "Hardened binaries"), which the rule allowed only if it
-cost no more than about 3%. Measured on the laptop (Ryzen 5 PRO 4650U, on AC and the balanced power
-profile, sampled every 2 s throughout; not a quiet machine: load average 5-6 from other work), both
-builds ReleaseSafe for x86_64-linux-musl as the release builds them, run alternately so drift falls
-on both.
+cost no more than about 3%. Measured on the laptop (Ryzen 5 PRO 4650U), on AC and the balanced
+power profile, both checked every 2 s throughout (never changed by hand), with the load average
+recorded; both builds ReleaseSafe for x86_64-linux-musl as the release builds them, run in turn.
 
 **The runner's hot paths** (`.github/scripts/hotbench.sh 21 10`, `runner/tools/hotbench.zig`): 210
-timed rounds per benchmark and build, from 10 runs of each binary in turn. Milliseconds a round;
-"change" is the PIE median against no-PIE's.
+timed rounds per benchmark and build, from 10 runs of each binary, the order swapped every run.
+Load average 1.8-2.8. Milliseconds a round; "change" is the PIE median against no-PIE's.
 
 | Benchmark (one round) | no-PIE median (IQR) | PIE median (IQR) | Change |
 | --- | --- | --- | --- |
-| Expressions: 10 workflow expressions and an interpolation, 4,000 times | 90.6 (84.8-99.9) | 91.3 (85.2-97.7) | +0.9% |
-| YAML: ci.yml and release.yml parsed, 200 times | 51.8 (48.2-55.4) | 49.7 (46.1-53.2) | -4.1% |
-| HPACK: RFC 7541's request and response examples, a decoder each, 16,000 times | 116.4 (107.8-123.3) | 113.9 (106.8-122.0) | -2.2% |
-| hashFiles() glob: 4 patterns over a 5,500-entry in-memory workspace, 6 times | 93.0 (88.7-97.6) | 94.6 (88.1-101.8) | +1.7% |
-| SHA-256 of 32 MiB | 144.9 (135.4-154.6) | 146.8 (133.1-159.8) | +1.4% |
+| Expressions: 10 workflow expressions and an interpolation, 4,000 times | 72.5 (70.4-74.4) | 74.6 (71.8-76.0) | +2.9% |
+| YAML: ci.yml and release.yml parsed, 200 times | 43.4 (41.5-44.7) | 41.6 (40.7-42.5) | -4.2% |
+| HPACK: RFC 7541's request and response examples, a decoder each, 16,000 times | 92.4 (89.7-95.6) | 93.0 (91.6-95.3) | +0.6% |
+| hashFiles() glob: 4 patterns over a 5,500-entry in-memory workspace, 6 times | 75.6 (73.7-77.2) | 77.3 (76.2-78.1) | +2.1% |
+| SHA-256 of 32 MiB | 118.2 (115.7-120.5) | 118.5 (116.4-119.8) | +0.3% |
 
 **The test suite** (`zig-test.sh`, compiles cached, so this is the tests running; the native
-backend's root tests not included), five runs of each, alternately: no-PIE median 45.6 s
-(44.9-47.5 s), PIE 44.4 s (44.2-45.3 s), 2.6% faster.
+backend's root tests not included), five runs of each, alternately, load average 1.8-5.1: no-PIE
+median 42.2 s (40.4-43.6 s), PIE 40.9 s (40.8-42.5 s), 2.9% faster.
 
-- **PIE costs nothing measurable.** No median moved by more than 1.7% the slow way, each well
-  inside its own interquartile range (5-10% wide on this machine), and two of the five moved the
-  other way. On x86_64 Zig's code already addresses its data relative to the instruction pointer; a
-  static PIE adds only its own relocation, once, at startup.
-- **The first run is not in the table:** the battery was at 18% and the laptop had moved itself to
-  the low-power profile (not by hand). Its medians agreed (+2.4% to -5.6%), with wider spread.
+- **PIE costs about 0-3% on the hot paths, and nothing on the tests.** The expressions and the
+  glob are the most affected, at the limit; YAML is consistently faster (the code's layout, not
+  PIE's work); SHA-256 and HPACK do not move.
+- **The glob is the one at risk of the rule.** Across the runs below it measured +2.1%, +5.4% and
+  +6.1%, and with address randomization turned off (`setarch -R`) still +4.2%: a cost of PIE's
+  code, not of where it loads. A walk over 5,500 entries costs about 0.3 ms more; hashFiles() runs
+  only where a workflow calls it.
+- **The order matters on a quiet machine.** A run with no-PIE always first (load average 0.6-1.6)
+  had PIE at +6.7% (expressions), +6.1% (glob), +3.5% (HPACK), +2.2% (SHA-256, whose fastest round
+  was the same both ways) and -3.0% (YAML): whichever ran second was slower. The script now swaps
+  the order every run. A run rotating no-PIE, PIE and PIE without randomization (12 runs, load
+  average 1.1-2.7) gave +1.5%, +5.4%, +1.1%, -0.1% and -5.0%.
+- **The first published numbers, now replaced,** came from a busy machine (load average 5-6, the
+  same 21 by 10 with no-PIE always first): +0.9%, -4.1%, -2.2%, +1.7% and +1.4%, with
+  interquartile ranges 10-15% wide against 3-5% here, and the tests 45.6 s against 44.4 s. A run
+  before that, with the battery at 18% and the laptop moved to the low-power profile on its own,
+  is left out.
 - The binaries grew by 0.6% (x86_64, 3,533,136 to 3,554,000 bytes) and 1.6% (aarch64), for the
   relocations.
 
