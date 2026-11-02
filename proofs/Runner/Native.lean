@@ -13,8 +13,9 @@ engine discharged becomes the runner's obligation, and each one is stated and pr
   (`Store.KeyHasher`, `Backend.keyFor`): a tag, the parent's key, the script text, the stable
   environment, then the uid, gid, working directory and kept files, each length-prefixed. A base has
   the digest below it (`Backend.below`: store format, trust scope, repository, rootfs, id mapping,
-  slot, binds, and the Zig cache seeds and which binds are cache volumes when there are any) in its
-  parent's place. `fork_keys_apart`: a fork's pull request and the repository's
+  binds, and the Zig cache seeds and which binds are cache volumes when there are any) in its
+  parent's place. Not the slot: a stored layer has the canonical ids, which every slot's job sees as
+  its own, so jobs in different slots share keys and layers. `fork_keys_apart`: a fork's pull request and the repository's
   own jobs never share a key. The
   extras are no new input: a base's are part of what the model's base is (`BaseSpec`), and a step's
   are its base's (`Format.stepExtra`), so determined by its key's parent. `encKey_injective` says no
@@ -93,7 +94,8 @@ structure Bind where
 (`Store.store_format`, bumped when what a layer or its record means changes), the trust scope
 (`set_up.packageCacheScope`: `repo`, or `untrusted` for a fork's pull request or a job the runner
 does not vouch for), the repository, the rootfs's fingerprint (`Store.rootfsFingerprint`), how ids
-are mapped (the userns mode's name), the slot's first id on a root runner (0 otherwise), and the
+are mapped (the userns mode's name: a root runner's layers have the canonical ids, which every
+slot's job sees as its own, a rootless one's are its user's, so the two never share a key), and the
 binds; then, from P4, the Zig cache seeds' layers between the rootfs and the job's (by path) and,
 per bind, whether it is a cache volume (`Bind.volume`), empty when none is. A job with neither has
 the bytes it had before P4 (`belowTail`). -/
@@ -103,7 +105,6 @@ structure Below where
   repository : Nat
   fingerprint : Nat
   userns : Nat
-  idBase : Nat
   binds : List Bind
   seeds : List Nat := []
   volumes : List Bool := []
@@ -195,13 +196,13 @@ def belowTail (seeds : List Nat) (volumes : List Bool) : Bytes :=
       (f.word volumes.length ++ encList (encBool f) volumes))
 
 /-- **The digest below a base** (`Backend.below`), untagged (`KeyHasher.plain`): the label, the
-store's format, the scope, the repository, the rootfs's fingerprint, the userns mode, the slot's
-first id, the binds, counted, and the tail (`belowTail`). -/
+store's format, the scope, the repository, the rootfs's fingerprint, the userns mode, the binds,
+counted, and the tail (`belowTail`). -/
 def belowPreimage (w : Below) : Bytes :=
   lp f f.label ++ (lp f (f.str w.format) ++ (lp f (f.str w.scope) ++ (lp f (f.str w.repository) ++
     (lp f (f.str w.fingerprint) ++ (lp f (f.str w.userns) ++
-    (f.word w.idBase ++ (f.word w.binds.length ++ (encList (encBind f) w.binds ++
-      belowTail f w.seeds w.volumes))))))))
+    (f.word w.binds.length ++ (encList (encBind f) w.binds ++
+      belowTail f w.seeds w.volumes)))))))
 
 /-- **What the store hashes for a key** (`KeyHasher.init(tag)`, `core`, then `keyFor`'s tail): the
 tag, the parent's key, the script's text, the stable environment, then the `Extra`. -/
@@ -358,11 +359,11 @@ theorem belowTail_inj (h : f.Sound) {sd sd' : List Nat} {v v' : List Bool}
     exact ⟨hsd, hv⟩
 
 /-- **The digest below a base is unambiguous**: equal preimages, the same store format, scope,
-repository, rootfs, mapping, slot, binds, seeds and volume flags. -/
+repository, rootfs, mapping, binds, seeds and volume flags. -/
 theorem belowPreimage_inj (h : f.Sound) {w w' : Below} (e : belowPreimage f w = belowPreimage f w') :
     w = w' := by
-  obtain ⟨fm, sc, rp, fp, u, i, bs, sd, v⟩ := w
-  obtain ⟨fm', sc', rp', fp', u', i', bs', sd', v'⟩ := w'
+  obtain ⟨fm, sc, rp, fp, u, bs, sd, v⟩ := w
+  obtain ⟨fm', sc', rp', fp', u', bs', sd', v'⟩ := w'
   simp only [belowPreimage] at e
   obtain ⟨_, e⟩ := lp_split h e
   obtain ⟨hfm, e⟩ := lp_split h e
@@ -370,11 +371,10 @@ theorem belowPreimage_inj (h : f.Sound) {w w' : Below} (e : belowPreimage f w = 
   obtain ⟨hrp, e⟩ := lp_split h e
   obtain ⟨hfp, e⟩ := lp_split h e
   obtain ⟨hu, e⟩ := lp_split h e
-  obtain ⟨hi, e⟩ := h.word_split e
   obtain ⟨hl, e⟩ := h.word_split e
   obtain ⟨hbs, e⟩ := list_split (bind_split h) hl e
   obtain ⟨hsd, hv⟩ := belowTail_inj h e
-  rw [h.str_inj hfm, h.str_inj hsc, h.str_inj hrp, h.str_inj hfp, h.str_inj hu, hi, hbs, hsd, hv]
+  rw [h.str_inj hfm, h.str_inj hsc, h.str_inj hrp, h.str_inj hfp, h.str_inj hu, hbs, hsd, hv]
 
 theorem tag_ne (h : f.Sound) {n m : Nat} {r s : Bytes} (ne : n ≠ m) : f.word n ++ r ≠ f.word m ++ s :=
   fun e => ne (h.word_split e).1
@@ -431,6 +431,16 @@ have different keys, however alike everything else is: the scope is below every 
 key above it. -/
 theorem scope_apart (h : f.Sound) {s s' : State}
     (ne : (f.base (root s)).below.scope ≠ (f.base (root s')).below.scope) :
+    encState f s ≠ encState f s' :=
+  fun e => ne (by rw [encState_injective h e])
+
+/-- **Root and rootless runners never share a container.** A root runner's stored layers have the
+canonical ids (0 to 65535, seen through each job's own range of host ids, whichever slot it has), a
+rootless runner's are owned by its one user: the userns mode is below every base, so two containers
+whose bases differ in it have different keys. The slot is in no key, so jobs in different slots of
+one root runner share every layer (docs/native-backend.md, "A layer has the canonical ids"). -/
+theorem userns_apart (h : f.Sound) {s s' : State}
+    (ne : (f.base (root s)).below.userns ≠ (f.base (root s')).below.userns) :
     encState f s ≠ encState f s' :=
   fun e => ne (by rw [encState_injective h e])
 
@@ -507,7 +517,7 @@ def f : Format where
     | .body b _ => [b]
     | .stamped t _ => [t]
   label := []
-  base _ := ⟨⟨0, 0, 0, 0, 0, 0, [], [], []⟩, 0, [], ⟨0, 0, 0, []⟩⟩
+  base _ := ⟨⟨0, 0, 0, 0, 0, [], [], []⟩, 0, [], ⟨0, 0, 0, []⟩⟩
   stepExtra _ := ⟨0, 0, 0, []⟩
 
 theorem apart :
