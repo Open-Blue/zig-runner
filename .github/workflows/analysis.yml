@@ -49,22 +49,23 @@ jobs:
       contents: read # to check out the code
     strategy:
       fail-fast: false
-      # Runs for about ten minutes each, from the laptop's speeds (from some 1,500 runs a second for
-      # expressions and the OCI layer, which writes every layer to a directory, to 20,000 for
-      # references); zig-fuzz.sh gives each 30, and a run past them is a hang.
+      # About five minutes of fuzzing each on GitHub's runner, from the first run's speeds (2,000
+      # runs a second for regular expressions, HPACK and minisign, 25,000 for references and
+      # manifests; the build before them takes about two minutes). zig-fuzz.sh gives each 30,
+      # since a corpus that grows slows its target, and a run past them is taken for a hang.
       matrix:
         include:
-          - { target: OCI layer, runs: 600K }
-          - { target: OCI references and challenges, runs: 5M }
-          - { target: OCI manifests, runs: 5M }
-          - { target: expressions, runs: 600K }
-          - { target: YAML, runs: 600K }
-          - { target: regular expressions, runs: 600K }
+          - { target: OCI layer, runs: 3M }
+          - { target: OCI references and challenges, runs: 8M }
+          - { target: OCI manifests, runs: 8M }
+          - { target: expressions, runs: 1M }
+          - { target: YAML, runs: 5M }
+          - { target: regular expressions, runs: 1M }
           - { target: HPACK, runs: 1M }
           - { target: hashFiles patterns, runs: 1M }
           - { target: minisign, runs: 1M }
-          - { target: workflow commands, runs: 1M }
-          - { target: problem matchers, runs: 1M }
+          - { target: workflow commands, runs: 3M }
+          - { target: problem matchers, runs: 3M }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -107,11 +108,11 @@ jobs:
           path: ${{ runner.temp }}/fuzz
           if-no-files-found: ignore
 
-  # Under Valgrind the tests took about 50 minutes on the laptop (busy with other work too).
+  # About ten minutes on GitHub's runner.
   valgrind:
     name: Valgrind
     runs-on: ubuntu-26.04
-    timeout-minutes: 120
+    timeout-minutes: 45
     permissions:
       contents: read # to check out the code
     steps:

@@ -65,9 +65,9 @@ case $status in
 0) echo "Valgrind: no reports, every test passed" ;;
 1)
 	echo "Valgrind: no reports"
-	failed=$(grep -oE '^[0-9]+/[0-9]+ [^ ].*\.\.\.' "$scratch/log" | sed -n 's/\.\.\.$//p' |
-		while IFS= read -r t; do grep -qF "$t...OK" "$scratch/log" || grep -qF "$t...SKIP" "$scratch/log" || echo "$t"; done |
-		paste -sd ';' -) || true
+	# The test each `FAIL (...)` belongs to: the last `N/M name...` line before it (a test's own
+	# output can come between the two).
+	failed=$(awk '/^[0-9]+\/[0-9]+ /{t=$0; sub(/\.\.\..*/, "", t)} /FAIL \(/{print t}' "$scratch/log" | paste -sd ';' -)
 	echo "::warning title=Valgrind::memcheck reported nothing, but tests failed under it (timing, most likely: see the script): ${failed:-see the log}"
 	status=0
 	;;
