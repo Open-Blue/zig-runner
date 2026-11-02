@@ -112,7 +112,11 @@ and govulncheck for information).
 CodeQL and Semgrep read no Zig, so the runner's own code has analysis of its own. "Lint (ZLint)"
 (`ci`, `.github/scripts/zlint.sh`) runs [ZLint](https://github.com/DonIsaac/zlint) on every pull
 request, pinned and checked against its release's checksum, with the rules that find bugs
-(`runner/zlint.json`; the script says why each other rule is off). `analysis` runs nightly: "Fuzz"
+(`runner/zlint.json`; the script says why each other rule is off). `analysis` runs nightly: "ZLint
+(suppressed-errors)" runs the rule for `catch {}` and `catch unreachable`, which ZLint cannot yet
+disable line by line, against the sites read and meant (`.github/scripts/zlint-suppressed.baseline`,
+each by its file and a fingerprint of its line, so moved lines stay known), failing on a new one,
+listed (`.github/scripts/zlint.sh suppressed-errors`; `--update` rewrites the baseline); "Fuzz"
 runs each of `runner/src/fuzz.zig`'s targets (an image layer's tar, PAX and paths applied beside a
 directory it must not reach; image references, registry challenges and manifests; expressions,
 YAML, regular expressions, HPACK, `hashFiles()` patterns, minisign signatures, workflow commands
@@ -147,10 +151,11 @@ repository:
   (`runner/src/dagger.zig`, checked by `.github/scripts/ubuntu-pin.sh`); the packages provisioning
   installs into it come from the Ubuntu archive on the day the engine builds them, and the pre-warm
   logs their fingerprint. tls.zig and GitHub's expression
-  test cases are pinned by commit. Zig, changie and checksec are checked against pinned checksums
-  before they run, tls.zig against its `.hash` as well; a Renovate pull request for a new Zig, tls.zig or
-  changie fails until its checksums are updated (changie's by the Workflows job, which downloads
-  it on every pull request, though only the release runs it).
+  test cases are pinned by commit. Zig, changie, checksec, ZLint, hadolint and shfmt are checked
+  against pinned checksums before they run, tls.zig against its `.hash` as well; a Renovate pull
+  request for a new Zig, tls.zig, changie, hadolint or shfmt fails until its checksums are updated
+  (changie's by the Workflows job, which downloads it on every pull request, though only the
+  release runs it).
 - **Verifiable releases.** Every binary and image has a signed provenance attestation saying which
   workflow built it from which commit. Check a binary as razorbill does, built by `release.yml` from
   its tag on GitHub's own runners:
@@ -188,7 +193,9 @@ repository:
   database fetched once, with retries, from Google's mirror first; accepted findings are in
   `.trivyignore.yaml`, each with why. GitHub's secret scanning blocks pushes carrying credentials.
 - **Checked.** actionlint and zizmor check the workflows, shellcheck every shell script
-  (`.github/scripts/shellcheck.sh`), `busybox-pin.sh` the runner's busybox pin, and CodeQL the
+  (`.github/scripts/shellcheck.sh`) and shfmt its format (`.github/scripts/shfmt.sh`, shfmt's
+  defaults: tabs; `-w` formats), hadolint the Dockerfile (`.github/scripts/hadolint.sh`; a finding
+  kept is ignored on its instruction, with why), `busybox-pin.sh` the runner's busybox pin, and CodeQL the
   workflows, the Go tools and the Python generators, which `go vet` and staticcheck lint too
   (`.github/scripts/go-lint.sh`); every job has a time limit. The Database
   tests job runs every test under
