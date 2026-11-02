@@ -22,7 +22,8 @@
 //!
 //! ZIG_TEST_STORE_STRESS_SECONDS (30), ZIG_TEST_STORE_STRESS_PROCS (6) and
 //! ZIG_TEST_STORE_STRESS_SEED (random, printed) set the run; the nightly analysis workflow runs it
-//! for longer. A seed fixes each worker's jobs, builds and pauses; the processes' interleaving
+//! for longer; 0 seconds skips it, for a machine already loaded (a laptop's pre-push hook).
+//! A seed fixes each worker's jobs, builds and pauses; the processes' interleaving
 //! and the steps' own nonces and sleeps are the machine's.
 
 const std = @import("std");
@@ -68,6 +69,10 @@ test "native store under load: processes share one store under a small cap" {
     const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
     var env = try std.testing.environ.createMap(arena);
     const seconds = try envInt(&env, "ZIG_TEST_STORE_STRESS_SECONDS", 30);
+    if (seconds == 0) {
+        std.debug.print("native store under load: skipped (ZIG_TEST_STORE_STRESS_SECONDS=0)\n", .{});
+        return error.SkipZigTest;
+    }
     const procs = try envInt(&env, "ZIG_TEST_STORE_STRESS_PROCS", 6);
     const seed = try envInt(&env, "ZIG_TEST_STORE_STRESS_SEED", seed: {
         var raw: [4]u8 = undefined;
@@ -98,7 +103,8 @@ test "native store under load: processes share one store under a small cap" {
     const run_test = 5;
     const exit = 0;
     var msgs: [20]u8 = undefined;
-    for ([_]u32{ run_test, 4, @intCast(index), exit, 0 }, 0..) |v, i|
+    const index32 = std.math.cast(u32, index) orelse return error.TooManyTests;
+    for ([_]u32{ run_test, 4, index32, exit, 0 }, 0..) |v, i|
         std.mem.writeInt(u32, msgs[4 * i ..][0..4], v, .little);
     try tmp.dir.writeFile(io, .{ .sub_path = "worker.in", .data = &msgs });
     const self = try std.Io.Dir.cwd().realPathFileAlloc(io, "/proc/self/exe", arena);
@@ -106,7 +112,7 @@ test "native store under load: processes share one store under a small cap" {
     const children = try arena.alloc(std.process.Child, procs);
     for (children, 0..) |*child, i| {
         var wenv = try env.clone(arena);
-        const wseed = seed +% @as(u32, @intCast(i)) *% 0x9e3779b9;
+        const wseed = @as(u64, seed) +% @as(u64, i) *% 0x9e3779b97f4a7c15;
         try wenv.put(worker_env, try print(arena, "{s}|{d}|{d}|{d}|{d}", .{ root, i, wseed, deadline, cap }));
         const in = try tmp.dir.openFile(io, "worker.in", .{});
         defer in.close(io);
