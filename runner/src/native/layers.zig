@@ -69,14 +69,18 @@ pub const Store = struct {
         const k = try s.key(hex);
         const key_lock = try s.store.lockKey(arena, io, k, s.stop);
         defer key_lock.close(io);
-        // Kind `fetch`: a tree with an empty record, never replayed as a step's (P2 has no
-        // `build` kind yet).
-        const layer = s.store.publish(arena, io, k, .fetch, built, .{ .log = "", .fc = "" }) catch |e| {
-            const first = (try s.store.open(arena, io, k)) orelse return e;
+        // Looked up first, under the lock: a layer another builder stored is used, and one that
+        // is not there cannot appear before this publish. Publishing first and looking up on a
+        // refused rename failed the build when a collect evicted the other builder's layer in
+        // between (the store's stress test, `store_stress.zig`).
+        if (try s.store.open(arena, io, k)) |first| {
             P2Store.removeTree(arena, io, built);
             try s.held.append(arena, first.layer.lock);
             return first.layer.fs;
-        };
+        }
+        // Kind `fetch`: a tree with an empty record, never replayed as a step's (P2 has no
+        // `build` kind yet).
+        const layer = try s.store.publish(arena, io, k, .fetch, built, .{ .log = "", .fc = "" });
         try s.held.append(arena, layer.lock);
         return layer.fs;
     }

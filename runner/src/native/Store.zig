@@ -399,7 +399,11 @@ pub fn checkEntry(s: Store, arena: Allocator, io: std.Io, name: []const u8) !?u6
     if (!flock(f, lock_sh) or !sameFile(arena, f, lock_path)) return null;
     _ = try readEntry(arena, io, dir);
     const m = try metaOf(arena, io, dir);
-    if (try treeBytes(arena, io, try join(arena, dir, "fs")) != m.bytes) return error.TreeBytes;
+    const bytes = try treeBytes(arena, io, try join(arena, dir, "fs"));
+    if (bytes != m.bytes) {
+        std.debug.print("native store: {s}'s tree takes {d} bytes, its meta says {d}\n", .{ name, bytes, m.bytes });
+        return error.TreeBytes;
+    }
     return m.bytes;
 }
 
