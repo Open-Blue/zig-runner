@@ -408,7 +408,8 @@ fn isDir(arena: Allocator, p: []const u8) bool {
 /// holds it for the job. Built under a temporary name, written to disk (`syncfs`) before it is
 /// visible, held before it is visible (so an eviction cannot take it at once), and published by
 /// one rename that never replaces. On failure the upper is back where it was, or, if it cannot be
-/// put back, left in the temporary entry and logged, never deleted.
+/// put back, left in the temporary entry and logged, never deleted. The caller holds the key's
+/// lock (`lockKey`) throughout: `collect` removes a temporary entry whose key's lock is free.
 pub fn publish(
     s: Store,
     arena: Allocator,
