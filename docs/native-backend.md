@@ -906,6 +906,24 @@ What it does not do yet, and who pays:
   on GitHub (`docker run`). Nothing the runner does can hide a program's own arguments; secrets
   belong in `env:`.
 
+**The Dockerfile builder** (`runner/src/native/dockerfile.zig`, a stacked pull request, not yet
+reachable: it waits for the action loader above). `parse` reads a Dockerfile as Docker's parser
+does (comments, parser directives, `\` continuations, either case, JSON and shell forms); `plan`
+evaluates `FROM`, `RUN`, `COPY`, `ADD`, `ENV`, `WORKDIR`, `ENTRYPOINT`, `CMD`, `ARG`, `USER` and
+`LABEL` into the image's config and one key per instruction, chained from the base's:
+`sha256(parent key, instruction as evaluated, what it reads)`, where a `RUN` reads the env and
+build arguments it sees and a `COPY` the content of its sources (`contextDigest`: a sorted walk
+of paths, kinds, modes, link targets and contents, through no symlink). A config-only
+instruction gets a key and no layer, so the `RUN` after it is keyed on it. `build` takes each
+layer from the store by its key, or makes it (`COPY`/`ADD` by the runner, as Docker places
+sources; `RUN` through a `Runner`, the sandbox) and publishes it (`layers.zig`, the stand-in for
+P2's store: "the layer under K, or store this directory under K", by rename). It refuses, with
+the line and why: multi-stage builds, `COPY --from`, wildcards, `ADD` of a URL or an archive,
+`SHELL`, `ONBUILD`, heredocs, sources outside the context, and `--chown` by name. Left for the
+loader's pull request: a `Runner` over the sandbox (`Spec.Container` with the built layers as
+its lowers instead of one rootfs), the build context taken from the fetched action, and the
+image config's `USER` honoured.
+
 **For P3 and P2, what to swap when they land:**
 
 - P3's image store replaces `images.lookup(arena, io, dir, ref)`: return `Image{ rootfs, entrypoint,
@@ -916,8 +934,9 @@ What it does not do yet, and who pays:
   takes it with the step and mounts the container's overlay in the step's own namespace (the
   job's overlay and its layer as for any step). Its layer store: the action's step always runs
   (it has the job token) and is never keyed or replayed, as on Dagger; its layer is the job's
-  next one as any step's. The Dockerfile builder will store each instruction's layer under its
-  key there (`key = sha256(parent key, instruction, build args)`).
+  next one as any step's. The Dockerfile builder stores each instruction's layer under its key
+  there: `layers.Store.get`, `begin` and `publish` become the store's lookup, a directory to
+  build in under the key's flock, and the atomic publish.
 
 **Measured** (laptop "cowbird", balanced profile, 2026-11-01, load about 3, rootless under
 `unshare`, the runner built `ReleaseSafe`, `--exec-job`, plain `ubuntu:24.04` as the rootfs and
