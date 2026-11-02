@@ -51,7 +51,7 @@ fn seedAlloc(a: std.mem.Allocator, parts: []const []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     for (parts) |p| {
         var len: [4]u8 = undefined;
-        std.mem.writeInt(u32, &len, @intCast(p.len), .little);
+        std.mem.writeInt(u32, &len, std.math.cast(u32, p.len) orelse return error.SeedTooLong, .little);
         try out.appendSlice(a, &len);
         try out.appendSlice(a, p);
     }
@@ -372,7 +372,7 @@ test "fuzz: OCI layer" {
     const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena);
     const rc = linux.open(try arena.dupeSentinel(u8, path, 0), .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
     try std.testing.expect(linux.errno(rc) == .SUCCESS);
-    const box: LayerBox = .{ .base = @intCast(rc), .path = path };
+    const box: LayerBox = .{ .base = try fd(rc), .path = path };
     defer _ = linux.close(box.base);
 
     const host = try std.fmt.allocPrint(arena, "{s}/outside/host", .{path});
@@ -446,7 +446,7 @@ fn ociLayer(box: *const LayerBox, smith: *Smith) !void {
     try std.testing.expect(linux.errno(linux.mkdirat(box.base, "root", 0o755)) == .SUCCESS);
     const rc = linux.openat(box.base, "root", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
     try std.testing.expect(linux.errno(rc) == .SUCCESS);
-    const root: linux.fd_t = @intCast(rc);
+    const root = try fd(rc);
     defer _ = linux.close(root);
     var r: std.Io.Reader = .fixed(blob);
     var totals: layer.Totals = .{};
@@ -463,11 +463,28 @@ fn ociLayer(box: *const LayerBox, smith: *Smith) !void {
     try std.testing.expect(st.mode & linux.S.IFMT == linux.S.IFREG and st.nlink == 1 and st.size == 4);
 }
 
+/// The descriptor an `open` returned, checked as no cast would be.
+fn fd(rc: usize) !linux.fd_t {
+    return std.math.cast(linux.fd_t, rc) orelse error.TestUnexpectedResult;
+}
+
+/// `v` in octal, zero-padded to fill `field` (a tar header's number), its high digits dropped
+/// when it does not fit.
+fn octal(field: []u8, v: u64) void {
+    var rest = v;
+    var i = field.len;
+    while (i > 0) {
+        i -= 1;
+        field[i] = '0' + @as(u8, @truncate(rest & 7));
+        rest >>= 3;
+    }
+}
+
 /// The names in `dir` (under `base`), which must be exactly `want`.
 fn expectOnly(base: linux.fd_t, dir: [:0]const u8, want: []const []const u8) !void {
     const rc = linux.openat(base, dir, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
     try std.testing.expect(linux.errno(rc) == .SUCCESS);
-    var d: std.Io.Dir = .{ .handle = @intCast(rc) };
+    var d: std.Io.Dir = .{ .handle = try fd(rc) };
     defer d.close(std.testing.io);
     var seen: usize = 0;
     var it = d.iterate();
@@ -527,15 +544,15 @@ fn tarFrom(arena: std.mem.Allocator, smith: *Smith) ![]const u8 {
         h[156] = flags[smith.index(flags.len)];
         var body_buf: [2048]u8 = undefined;
         const body = take(smith, &body_buf);
-        _ = std.fmt.bufPrint(h[100..107], "{o:0>7}", .{smith.value(u32) & 0o7777777}) catch unreachable;
-        _ = std.fmt.bufPrint(h[108..115], "{o:0>7}", .{smith.value(u16)}) catch unreachable;
-        _ = std.fmt.bufPrint(h[116..123], "{o:0>7}", .{smith.value(u16)}) catch unreachable;
+        octal(h[100..107], smith.value(u32));
+        octal(h[108..115], smith.value(u16));
+        octal(h[116..123], smith.value(u16));
         if (smith.value(bool)) {
             smith.bytes(h[124..136]); // base-256, or not a number at all
         } else {
-            _ = std.fmt.bufPrint(h[124..135], "{o:0>11}", .{body.len}) catch unreachable;
+            octal(h[124..135], body.len);
         }
-        _ = std.fmt.bufPrint(h[136..147], "{o:0>11}", .{smith.value(u32)}) catch unreachable;
+        octal(h[136..147], smith.value(u32));
         _ = smith.slice(h[157..257]);
         if (smith.value(bool)) {
             @memcpy(h[257..263], "ustar\x00");
@@ -546,7 +563,8 @@ fn tarFrom(arena: std.mem.Allocator, smith: *Smith) ![]const u8 {
         var sum: u32 = 0;
         for (h) |c| sum += c;
         if (smith.boolWeighted(31, 1)) sum +%= smith.value(u8);
-        _ = std.fmt.bufPrint(h[148..155], "{o:0>6}\x00", .{sum & 0o777777}) catch unreachable;
+        octal(h[148..154], sum);
+        h[154] = 0;
         try out.appendSlice(arena, &h);
         try out.appendSlice(arena, body);
         try out.appendNTimes(arena, 0, (512 - body.len % 512) % 512);

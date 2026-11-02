@@ -32,6 +32,15 @@ out=${4:-${RUNNER_TEMP:-/tmp}/fuzz}
 mkdir -p "$out"
 rm -f .zig-cache/f/crash .zig-cache/f/in*
 
+# The packages first, tried three times: a failed lookup of github.com once failed a fuzz job
+# that had nothing to do with its target ("NameServerFailure").
+for attempt in 1 2 3; do
+	zig build --fetch && break
+	((attempt < 3)) || exit 1
+	echo "::warning::fetching the packages failed (attempt $attempt of 3): trying again"
+	sleep $((attempt * 15))
+done
+
 # The tests' output is only text to the job (zig-test.sh): an input can hold `::` lines.
 stop="fuzz-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 echo "::stop-commands::$stop"
