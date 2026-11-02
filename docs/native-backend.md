@@ -401,7 +401,12 @@ What it covers, as built:
 - **Locks**: one flock per key while its exec runs (polled, so a cancel or a timeout ends the
   wait), so two jobs sharing the store do not run one key at once: the second replays the
   first's, on a root runner too, whatever their slots. A job holds a shared flock on each store
-  layer it uses until it ends.
+  layer it uses until it ends. Every publish, a Dockerfile build layer's too (`layers.zig`), runs
+  under its key's lock, which is how `collect` tells a live runner's `.tmp-` entry from a dead
+  one's. The protocol (these locks, the renames, `collect`, crashes at any point) is model-checked
+  with TLC: proofs/tla/StoreLocking.tla, proofs/README.md "The store's locking, in TLA+". It
+  found the build layers' unlocked publish and an eviction that renamed away an entry published
+  after the one it locked, both fixed.
 - **GC** (`Store.collect`, after each job): past `RUNNER_NATIVE_STORE_MAX_MB` (default 10240),
   the layers no job holds go, least recently used first (the lock file's mtime is the last use),
   each renamed away under its lock taken exclusively, then deleted. Half-built and half-evicted
@@ -1396,7 +1401,8 @@ What BuildKit's cache did implicitly, now explicit in `native/Store.zig`:
   directory the delete was walking, and a whole-looking entry with part of its tree gone was
   published for the next job to mount (the record's checks do not read the tree). The one-job and
   two-job tests could not see it; a stress test (`store_stress.zig`: several processes, one
-  store, a cap small enough that every job's end evicts) found it in seconds. `publish` now
+  store, a cap small enough that every job's end evicts) found it in seconds, as the TLA+ model
+  did on its own the same day (proofs/tla/StoreLocking.tla). `publish` now
   refuses without the lock. Lessons: a precondition another function relies on belongs in a check,
   not a doc comment; and a store shared between processes needs a test with processes, many, for
   long enough, checking every invariant at once. Its first ten-minute nightly run found the
