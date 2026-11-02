@@ -657,7 +657,11 @@ const Parser = struct {
             const close = std.mem.indexOfScalarPos(u8, p.src, p.i, ')') orelse return error.BadPattern;
             const text = p.src[p.i..close];
             var sub: Parser = .{ .arena = p.arena, .src = text, .unnamed = p.unnamed };
-            const as_look = sub.parseAlternation(f, depth + 1) catch null;
+            // Out of memory is not "not a lookahead": read as one, it refused a good pattern.
+            const as_look = sub.parseAlternation(f, depth + 1) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            };
             if (text.len > 0 and std.ascii.isDigit(text[0])) {
                 const n = std.fmt.parseInt(u32, text, 10) catch return error.BadPattern;
                 cond.ref = .{ .number = n };
@@ -1217,7 +1221,12 @@ pub const Regex = struct {
         var first: Parser = .{ .arena = arena, .src = pattern };
         _ = try first.parseAlternation(.{}, 0);
         if (first.i != pattern.len) return error.BadPattern; // too many )'s
-        _ = first.resolve() catch {};
+        // Its other errors are the second pass's to report; out of memory would leave the groups
+        // half numbered, and a later `\N` read as the wrong one of backreference and octal.
+        _ = first.resolve() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {},
+        };
         var p: Parser = .{ .arena = arena, .src = pattern, .known = first.caps.items };
         const alts = try p.parseAlternation(.{}, 0);
         if (p.i != pattern.len) return error.BadPattern;

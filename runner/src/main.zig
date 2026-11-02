@@ -69,6 +69,7 @@ comptime {
     _ = @import("timefmt.zig");
     _ = @import("expr.zig");
     _ = @import("glob.zig");
+    _ = @import("alloc_failures.zig");
     _ = @import("context.zig");
     _ = @import("commands.zig");
     _ = @import("regex.zig");

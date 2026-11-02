@@ -745,7 +745,7 @@ fn openSession(c: Runner, jit: jitconfig.Jit) ?Session {
     const body = broker.sessionBody(c.arena, settings, "zig-runner") catch return null;
     const created = broker.call(c.arena, c.io, .POST, url, token, body) catch return null;
     if (created.status.class() != .success) return null;
-    const sid = jsonString(c.arena, created.body, "sessionId") orelse return null;
+    const sid = (jsonString(c.arena, created.body, "sessionId") catch return null) orelse return null;
     return .{ .base = base, .sid = sid, .token = token, .token_at = token_at };
 }
 
@@ -956,7 +956,7 @@ pub fn cycle(c: Runner) !Cycle {
         const created = broker.call(c.arena, c.io, .POST, session_url, token, session_body) catch |e|
             return fail(c, "create session", e);
         if (created.status.class() != .success) return failBody(c, "create session", created);
-        sid = jsonString(c.arena, created.body, "sessionId") orelse
+        sid = (try jsonString(c.arena, created.body, "sessionId")) orelse
             return fail(c, "create session", error.BadResponse);
         session = .{ .base = base, .sid = sid };
     }
@@ -1006,12 +1006,12 @@ fn listen(
         if (m.status == .accepted or (m.status.class() == .success and m.body.len == 0)) continue;
         if (m.status.class() != .success) return failBody(c, "poll", m);
 
-        const mtype = jsonString(c.arena, m.body, "messageType") orelse "";
+        const mtype = (try jsonString(c.arena, m.body, "messageType")) orelse "";
         if (!std.mem.eql(u8, mtype, "RunnerJobRequest")) {
             try say(c, "ignoring message of type '{s}'", .{mtype});
             continue;
         }
-        const inner = jsonString(c.arena, m.body, "body") orelse
+        const inner = (try jsonString(c.arena, m.body, "body")) orelse
             return fail(c, "job request", error.BadResponse);
         // Its memory is reserved in the other runners' checks while it ramps up.
         if (c.gate) |g| g.leave(true);
@@ -1077,8 +1077,13 @@ pub fn mintToken(c: Runner, creds: auth.Credentials, status: *std.http.Status) !
     return auth.fetchAccessToken(c.arena, c.io, creds, jwt, status);
 }
 
-pub fn jsonString(arena: Allocator, body: []const u8, key: []const u8) ?[]const u8 {
-    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return null;
+/// The string at `key` in the JSON object `body`, or null when it is not one. Running out of memory
+/// is an error, not a missing key: read as one, a job request was ignored as a message of type ''.
+pub fn jsonString(arena: Allocator, body: []const u8, key: []const u8) Allocator.Error!?[]const u8 {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     if (v != .object) return null;
     const s = v.object.get(key) orelse return null;
     return if (s == .string) s.string else null;
