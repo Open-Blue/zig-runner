@@ -3584,7 +3584,8 @@ test "root runner: a native job resolves through a nameserver only another inter
     try ip.run(arena, &.{ "-n", ns, "addr", "add", "198.51.100.54/24", "dev", "eth0" });
     try ip.run(arena, &.{ "-n", ns, "link", "set", "eth0", "up" });
     try ip.run(arena, &.{ "-n", ns, "link", "set", "lo", "up" });
-    // Every name under zr.test is 192.0.2.77, over UDP and TCP; any other is NXDOMAIN.
+    // Every name under zr.test is 192.0.2.77, over UDP and TCP; any other is NXDOMAIN. A UDP
+    // socket for each address, so each answer comes from the address it was asked at.
     const responder =
         \\import socket, struct, sys, threading
         \\def answer(q):
@@ -3616,11 +3617,13 @@ test "root runner: a native job resolves through a nameserver only another inter
         \\        c, _ = s.accept()
         \\        if dns: threading.Thread(target=tcp_one, args=(c,), daemon=True).start()
         \\        else: c.close()
-        \\u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("0.0.0.0", 53))
+        \\def udp_on(addr):
+        \\    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind((addr, 53)); return u
         \\def listener(port):
         \\    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         \\    s.bind(("0.0.0.0", port)); s.listen(16); return s
-        \\threading.Thread(target=udp, args=(u,), daemon=True).start()
+        \\for addr in ("198.51.100.53", "198.51.100.54"):
+        \\    threading.Thread(target=udp, args=(udp_on(addr),), daemon=True).start()
         \\threading.Thread(target=tcp, args=(listener(53), True), daemon=True).start()
         \\threading.Thread(target=tcp, args=(listener(8080), False), daemon=True).start()
         \\print("ready", flush=True)
