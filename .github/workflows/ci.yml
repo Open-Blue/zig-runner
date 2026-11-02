@@ -119,6 +119,32 @@ jobs:
             sleep $((attempt * 15))
           done
 
+  # The comparison tools' Go (runner/tools/*diff), with go vet and staticcheck (go-lint.sh): they
+  # are test oracles, so a bug in one hides one in the runner. Skipped, still reporting, on a change
+  # that cannot affect them (ci-scope.sh go); compare.yml runs it weekly whatever changed.
+  go:
+    name: Go tools
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether this change can affect the Go tools
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh go
+
+      # Go is on GitHub's runner; it fetches the pinned staticcheck and the toolchain the go.mods
+      # name, checked against Go's checksum database.
+      - name: go vet and staticcheck
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/go-lint.sh
+
   # The database tests, which skip themselves without a database: here against TimescaleDB, as
   # deployments use, and required to run (ZIG_TEST_REQUIRE_DB), so this job cannot pass by skipping
   # them. On GitHub's runner. Every test runs here, so here they run under ThreadSanitizer, which
