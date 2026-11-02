@@ -3,24 +3,53 @@ const std = @import("std");
 
 pub const mask = "***";
 
-/// Writes `text` to `w` with every occurrence of any secret replaced by `***`.
+/// Writes `text` to `w` with every secret in it masked as GitHub's runner masks one
+/// (`SecretMasker.MaskSecrets`): every occurrence of every secret is found, overlapping ones
+/// included, the spans they cover are merged where they overlap or touch, and each merged span is
+/// written as one `***`. Masking only the longest secret at each place and going on after it gave
+/// `***cdef` for `abcdef` with the secrets `ab` and `bcdef`: most of the second secret, shown.
 pub fn write(
     w: *std.Io.Writer,
     text: []const u8,
     secrets: []const []const u8,
 ) std.Io.Writer.Error!void {
-    var i: usize = 0;
-    outer: while (i < text.len) {
-        for (secrets) |s| {
-            if (s.len > 0 and std.mem.startsWith(u8, text[i..], s)) {
-                try w.writeAll(mask);
-                i += s.len;
-                continue :outer;
-            }
+    return maskSpans(w, text, List{ .secrets = secrets });
+}
+
+/// The longest of `secrets` a text starts with, by trying each.
+const List = struct {
+    secrets: []const []const u8,
+
+    fn longestAt(l: List, text: []const u8) usize {
+        var best: usize = 0;
+        for (l.secrets) |s| {
+            if (s.len > best and std.mem.startsWith(u8, text, s)) best = s.len;
         }
-        try w.writeByte(text[i]);
-        i += 1;
+        return best;
     }
+};
+
+/// `write`'s masking, with `secrets.longestAt(rest)` the length of the longest secret `rest`
+/// starts with (0 for none): the longest one at a place covers every shorter one there.
+fn maskSpans(w: *std.Io.Writer, text: []const u8, secrets: anytype) std.Io.Writer.Error!void {
+    var plain: usize = 0; // the start of the text not written yet
+    var i: usize = 0;
+    while (i < text.len) {
+        const n = secrets.longestAt(text[i..]);
+        if (n == 0) {
+            i += 1;
+            continue;
+        }
+        // The span grows by every secret that starts inside it or where it ends.
+        var end = i + n;
+        var j = i + 1;
+        while (j <= end and j < text.len) : (j += 1) end = @max(end, j + secrets.longestAt(text[j..]));
+        try w.writeAll(text[plain..i]);
+        try w.writeAll(mask);
+        i = end;
+        plain = end;
+    }
+    try w.writeAll(text[plain..]);
 }
 
 /// `write` with `index` when there is one (the same result, faster), and `secrets` otherwise.
@@ -44,8 +73,8 @@ pub fn writeWith(
 /// many steps as the longest secret prefix found there, whatever the number of secrets. (Indexing
 /// the list by first byte instead still cost 13 ms a line when every mask began alike.)
 ///
-/// `write` gives what `redact.write` gives with `all`: the first match in a longest-first list is
-/// the longest secret starting at the position, which is the deepest end the walk passes.
+/// `write` gives what `redact.write` gives with `all`: the longest secret starting at a position
+/// is the deepest end the walk passes.
 pub const Set = struct {
     /// Every secret, longest first: the list the sinks report as their secrets.
     all: std.ArrayList([]const u8) = .empty,
@@ -88,6 +117,7 @@ pub const Set = struct {
 
     /// The length of the longest secret `text` starts with, or 0.
     fn longestAt(set: *const Set, text: []const u8) usize {
+        if (text.len == 0) return 0;
         var node = set.root[text[0]];
         var best: usize = 0;
         var j: usize = 1;
@@ -111,20 +141,7 @@ pub const Set = struct {
 
     /// As `redact.write` with `all`.
     pub fn write(set: *const Set, w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
-        var plain: usize = 0; // the start of the text not written yet
-        var i: usize = 0;
-        while (i < text.len) {
-            const n = set.longestAt(text[i..]);
-            if (n == 0) {
-                i += 1;
-                continue;
-            }
-            try w.writeAll(text[plain..i]);
-            try w.writeAll(mask);
-            i += n;
-            plain = i;
-        }
-        try w.writeAll(text[plain..]);
+        return maskSpans(w, text, set);
     }
 };
 
@@ -264,4 +281,74 @@ test "a set masks as write does with its list, longest first, whatever order mas
     var got: std.Io.Writer.Allocating = .init(ar);
     try set.write(&got.writer, "abcde bc abx");
     try std.testing.expectEqualStrings("***e ***c ***x", got.written());
+}
+
+/// `text` masked as GitHub's `SecretMasker.MaskSecrets` does it, step by step: every position of
+/// every secret (`ValueSecret.GetPositions`, which looks again one character after each match),
+/// sorted by start, merged where one starts at or before the end of the last, each merged range
+/// replaced by `***`. The model `write` is held to (the tests and fuzz.zig), not used to log.
+pub fn modelGitHub(arena: std.mem.Allocator, text: []const u8, secrets: []const []const u8) std.mem.Allocator.Error![]const u8 {
+    const Pos = struct { start: usize, end: usize };
+    var found: std.ArrayList(Pos) = .empty;
+    for (secrets) |s| {
+        if (s.len == 0) continue;
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, text, from, s)) |at| : (from = at + 1)
+            try found.append(arena, .{ .start = at, .end = at + s.len });
+    }
+    // `OrderBy` sorts by start; the merge does not depend on the order of ties.
+    std.mem.sort(Pos, found.items, {}, struct {
+        fn less(_: void, a: Pos, b: Pos) bool {
+            return a.start < b.start;
+        }
+    }.less);
+    var out: std.ArrayList(u8) = .empty;
+    var written: usize = 0;
+    var k: usize = 0;
+    while (k < found.items.len) {
+        const start = found.items[k].start;
+        var end = found.items[k].end;
+        k += 1;
+        while (k < found.items.len and found.items[k].start <= end) : (k += 1)
+            end = @max(end, found.items[k].end);
+        try out.appendSlice(arena, text[written..start]);
+        try out.appendSlice(arena, mask);
+        written = end;
+    }
+    try out.appendSlice(arena, text[written..]);
+    return out.items;
+}
+
+test "overlapping and touching secrets are masked as one span, as GitHub's runner masks them" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // `ab` is found first; `bcdef` starts inside it and is masked with it, not shown as `cdef`.
+    try std.testing.expectEqualStrings("x***y", try alloc(ar, "xabcdefy", &.{ "ab", "bcdef" }));
+    // Two that touch are one span, as are a secret's own overlapping occurrences.
+    try std.testing.expectEqualStrings("***", try alloc(ar, "abab", &.{"ab"}));
+    try std.testing.expectEqualStrings("-***-", try alloc(ar, "-aaaa-", &.{"aaa"}));
+    try std.testing.expectEqualStrings("***c***", try alloc(ar, "abcab", &.{"ab"}));
+    // Against GitHub's algorithm, over text and secrets from a small alphabet, so they overlap,
+    // nest and repeat; the list and the set alike.
+    var prng: std.Random.DefaultPrng = .init(7);
+    const r = prng.random();
+    for (0..2000) |_| {
+        var secrets: [4][]const u8 = undefined;
+        var set: Set = .{};
+        for (&secrets) |*s| {
+            const buf = try ar.alloc(u8, r.uintAtMost(usize, 5));
+            for (buf) |*c| c.* = "abc"[r.uintLessThan(usize, 3)];
+            s.* = buf;
+            try set.add(ar, buf);
+        }
+        var text: [40]u8 = undefined;
+        const len = r.uintAtMost(usize, text.len);
+        for (text[0..len]) |*c| c.* = "abcd"[r.uintLessThan(usize, 4)];
+        const want = try modelGitHub(ar, text[0..len], &secrets);
+        try std.testing.expectEqualStrings(want, try alloc(ar, text[0..len], &secrets));
+        var got: std.Io.Writer.Allocating = .init(ar);
+        try set.write(&got.writer, text[0..len]);
+        try std.testing.expectEqualStrings(want, got.written());
+    }
 }
