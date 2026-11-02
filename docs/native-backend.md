@@ -107,10 +107,10 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:` or `options:`, `services:`,
   `uses:` actions, `docker://` steps, Dagger in steps (`RUNNER_DAGGER_NESTING`), `hashFiles()`
   anywhere in the job (it reads the container through Dagger), a checkout with submodules, and a
-  machine whose probe fails (no user namespaces, `iptables` missing, no default route, the jobs'
-  ids taken on the host, the jobs' subnet overlapping a route of the host's). A failed probe is
-  tried again after five minutes, not kept for the process's life. (Until P3 also: no rootfs
-  configured, `container:` and a custom image.)
+  machine whose probe fails (no user namespaces, nftables refusing the jobs' rules, no default
+  route, the jobs' ids taken on the host, the jobs' subnet overlapping a route of the host's). A
+  failed probe is tried again after five minutes, not kept for the process's life. (Until P3
+  also: no rootfs configured, `container:` and a custom image.)
 - Off on native, as caches: output keys. Results do not depend on them. (The step cache was off
   in P1; P2's layer store gives it. The package caches, uv's environment in its cache, and Zig's
   local cache and seed came with P4.) The tool cache is never off: a step may install into it, and
@@ -161,11 +161,8 @@ On a root runner, each step runs:
 - with **Docker's default capabilities** (the bounding set cut to them, ambient cleared),
   **no_new_privs** for root steps and rootless ones (not for the runner user on a root runner,
   whose sudo works as on GitHub and reaches only the job's own root, within the same capabilities
-  and filter), and a **seccomp filter** that refuses Docker's default profile's dangerous
-  calls (module loading, kexec, keyrings, bpf, perf, mount and the new mount API, namespaces,
-  clone with namespace flags, the clock, swap, reboot, `open_by_handle_at`, and io_uring, as
-  Docker has since moby 25), and allows `personality` only with Docker's values (Linux, 32-bit
-  Linux, a 2.6 uname, and the query).
+  and filter), and a **seccomp filter**: P1's refused Docker's default profile's dangerous calls
+  (a deny list); since P5 it is Docker's allow list itself ("P5" below).
 - with a script that holds a secret written to a **tmpfs of the step's own** and bound at its
   path over an empty file, so the secret never reaches the store's disk (the empty file goes
   when the step ends).
@@ -179,9 +176,7 @@ What it does not provide yet:
 
 - **Resource limits on a rootless runner without delegation.** P4's cgroup needs root or a
   delegated cgroup (`RUNNER_NATIVE_CGROUP=self`); without one a job runs as P1 did, and "Set up
-  job" says so.
-- **The seccomp filter is Docker's deny list, not its allow list.** Calls Docker refuses by
-  omission are allowed here.
+  job" says so. A job the runner does not vouch for never runs without one (P5).
 - **Rootless runners.** Only one id is mapped and steps share the host's network: off unless
   `RUNNER_NATIVE_ROOTLESS=1`, for tests and the laptop. A rootless job network needs a userspace
   stack (a Zig port of the parts of pasta or slirp4netns it needs), and full ids need
@@ -232,7 +227,8 @@ in-place change, the stamp not touched) is found when the runner restarts, by th
 **What the runner needs.** As root (the supported mode): `CAP_SYS_ADMIN` (namespaces, mounts,
 idmapped mounts, `pivot_root`), `CAP_NET_ADMIN` (the bridge, veths, addresses, routes, NAT),
 `CAP_SETUID`/`CAP_SETGID` (writing the job's id maps), Linux 5.19 or later (idmapped overlay
-layers), `iptables` on the host (the rules, below), a default route, a free
+layers), nftables in the kernel (`nf_tables`, `nft_ct`, `nft_masq`, `nft_chain_nat`; no `nft` or
+`iptables` binary since P5), a default route, a free
 `RUNNER_NATIVE_SUBNET`, and a writable `/run/zig-runner`. The runner makes `zr0` and its rules
 itself on its first native job, and removes each job's namespace when the job ends, or at the
 next start after a crash (`sweep`, by the jobs' locks).
@@ -254,13 +250,18 @@ What it changes on the host, which is shared by every runner on it:
   runners' jobs need it, and turning it off under them would cut their network. The runner logs
   a warning when it turns it on, and another when the FORWARD policy is ACCEPT, since the host
   would then route for any neighbour; set that policy to DROP (Docker does).
-- **iptables rules**, each added once at the head of its chain: `nat POSTROUTING` masquerades
-  the subnet; `filter INPUT` drops what comes from `zr0` and is not a reply; `filter FORWARD`, and
-  `DOCKER-USER` on a Docker host, drop `zr0` to `zr0`, accept `zr0` out through each uplink (the
-  interfaces of the default routes; a job adds the rules for a new one, a laptop moving from
-  cable to Wi-Fi), and accept replies back to `zr0`. Nothing else from `zr0` is accepted, so
-  Docker's containers and other bridges stay closed to jobs and ufw's forward policy decides the
-  rest. The rules stay when the runner stops.
+- **nftables rules** (since P5, over netlink; P1 made the same with `iptables`): a table of the
+  runner's own, `ip zig_runner`, replaced atomically whenever the rules are made. It masquerades
+  the subnet; drops what comes from `zr0` to the host and is not a reply; forwards from `zr0` only
+  out through an uplink (the interfaces of the default routes; a job remakes the rules for a new
+  one, a laptop moving from cable to Wi-Fi), so never `zr0` to `zr0`, to Docker's containers or to
+  the host's other networks; and forwards to `zr0` replies only. Since every base chain on a hook
+  must accept a packet, the host's iptables-nft `filter FORWARD` chain, and `DOCKER-USER` on a
+  Docker host (both drop by policy under Docker and ufw), get `-i zr0 -j ACCEPT` and `-o zr0 -j
+  ACCEPT` at their heads, in iptables-nft's own encoding, so `iptables -S` shows them and Docker
+  keeps working the table; the runner's table does the deciding. The rules stay when the runner
+  stops. A host whose own nftables tables (firewalld's) drop forwarded traffic must let `zr0`'s
+  through; iptables-legacy rules are not seen (the runner warns when it finds legacy tables).
 
 - Under `deploy/compose.yaml` (not changed by P1): the runner image is `FROM scratch` and runs as
   root. It needs `privileged: true` (as the engine service has), or `cap_add: [SYS_ADMIN,
@@ -270,9 +271,9 @@ What it changes on the host, which is shared by every runner on it:
   directory on overlayfs), and the rootfs another volume. The slots' locks must be the host's:
   bind `/run/zig-runner:/run/zig-runner` from the host into every runner container (the
   container's own /run would give each its own slot 0 on the shared bridge). The image has no
-  `iptables`, so P1's NAT needs the host's rules made outside it, or P5's netlink rules. For the
-  jobs' cgroups, `cgroup: private` (the default on cgroup v2) with `RUNNER_NATIVE_CGROUP=self`:
-  the container's root is then its own cgroup, and the runner moves itself into a leaf of it.
+  `iptables`, and needs none since P5: the rules are made over netlink. For the jobs' cgroups,
+  `cgroup: private` (the default on cgroup v2) with `RUNNER_NATIVE_CGROUP=self`: the container's
+  root is then its own cgroup, and the runner moves itself into a leaf of it.
 - Under `deploy/zig-runner.service` on razorbill (not changed by P1): the unit runs as root with
   `ProtectSystem=strict`, which makes the store's default and `/run` read-only. It needs
   `StateDirectory=zig-runner` (or `ReadWritePaths=/var/lib/zig-runner`) for the store, and
@@ -672,6 +673,30 @@ remains before native steps may run jobs the runner does not vouch for:
   runner vouches for (`trust.vouches`); others fall back.
 - Exit: the hostile-job tests (fork bomb, memory hog, mount escape attempts, network to the host's
   services, a kernel-interface sweep) are contained.
+
+**Status: in progress.** Landed in the first pull request:
+
+- **Seccomp as Docker's allow list** (`runner/src/native/seccomp.zig`): moby/profiles'
+  `seccomp/default.json` at 6fe7deb1b9fb (2026-09-17), as Docker applies it to a container with
+  its default capabilities (of the capability-gated rules only `chroot`; `ptrace` and
+  `process_vm_*` as on Linux 4.8 and later). A call the profile does not name gets EPERM; one
+  numbered past every call it names gets ENOSYS, as runc gives it, so a C library falls back. Its
+  argument conditions stay: `clone` without namespace flags, `clone3` ENOSYS, `personality` with
+  Docker's five values, `socket` with Docker's address families. The calls are named, and numbered
+  from std's x86_64 and aarch64 tables; a test runs both filters in a small BPF interpreter, and
+  another fails when a call std knows is neither named by the profile nor known to be refused (a
+  name spelt otherwise would drop out quietly).
+- **The rules over nftables netlink** (`runner/src/native/nft.zig`), no binary: "What it changes on
+  the host" under P1 has them. `zig-runner native-nft <subnet> [uplink...]` makes them in the
+  caller's network namespace.
+- **The gate for untrusted jobs** (`Backend.untrustedRefusal`): a job the runner does not vouch for
+  runs natively only when `Config.job_limits` is set, on a root runner. Phase 4 sets it once each
+  job's cgroup has `memory.max` and `pids.max`; until then such jobs keep falling back.
+
+Still to do in P5: the hostile-job tests (the fork bomb and the memory hog need P4's cgroups), and
+the rootless part (a userspace network stack for the job's network, subordinate ids through
+`newuidmap`), each its own pull request. Until the rootless part, a rootless runner never runs an
+untrusted job natively.
 
 ### P6: services
 
@@ -1196,3 +1221,30 @@ specification:
   both streams (`dup2(1, 2)` before `execve` in `sandbox.zig`), so a store that records that pipe
   replays the run without merging. The script keeps the line because both backends run the same
   script, and its text is in the key.
+
+### P5: Docker's allow list, the rules over netlink
+
+- **A filter of names is only as good as its table.** Docker's profile names calls; the filter
+  needs numbers, per architecture. A name std spells otherwise (`_sysctl`, `newfstatat`) would be
+  left out without a sound, so the test walks every call of both architectures' tables and
+  requires each to be named by the profile or known refused. Unknown calls get ENOSYS, not EPERM,
+  as runc found: a C library falls back on ENOSYS only.
+- **Long filters need short jumps.** Classic BPF's conditional jumps reach 255 instructions; an
+  allow list of about 370 calls compared one by one would need longer ones. Runs of consecutive
+  numbers, each block ending in its own returns, keep every jump short, and a call costs two
+  comparisons per run below its own rather than one per allowed call.
+- **An accept in our table cannot overturn a drop in theirs.** nftables runs every base chain on a
+  hook and a packet must pass them all. So the deciding moves into the runner's own table, where a
+  drop holds whatever else the host has, and the host's iptables-nft chains only get the two
+  plainest accepts (`-i zr0`, `-o zr0`). The reply-only rule needs no conntrack match in their
+  table, since ours enforces it.
+- **Write into iptables' table only as iptables would.** A rule iptables-nft cannot translate makes
+  it call the whole table incompatible and refuse to change it, which would break Docker. The rules
+  there are iptables' own encoding (meta, cmp with the name's terminating zero, a counter, an
+  immediate), checked against `iptables-nft -S` and `nft --debug=netlink` in an unprivileged
+  `unshare -rn` namespace, which needs no root: nftables works in a network namespace a user
+  namespace owns.
+- **Kernel modules.** `nft_masq`, `nft_ct` and `nft_chain_nat` may not be loaded on a host whose
+  firewall is iptables-nft (Docker's MASQUERADE uses the xtables target). The root runner's first
+  batch loads them; a test that makes the rules in an unprivileged namespace first may find them
+  missing.

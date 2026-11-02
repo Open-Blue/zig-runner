@@ -4,12 +4,14 @@
 //! port space, and no step reaches the host's 127.0.0.1. Dagger gives each exec the same through
 //! BuildKit's CNI network.
 //!
-//! Links, addresses and routes are made over rtnetlink here, with no `ip`. The NAT that takes the
-//! jobs' traffic out is made with `iptables` (`natRules`): debt, recorded in the plan.
+//! Links, addresses and routes are made over rtnetlink here, with no `ip`; the NAT that takes the
+//! jobs' traffic out, and the rules that keep them from the host and each other, over nftables
+//! netlink (`natRules`, `nft.zig`), with no `iptables`.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
+const nft = @import("nft.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -442,21 +444,16 @@ const Message = struct {
 /// What the runner needs from the host for its jobs' traffic to leave, and nothing more:
 ///
 /// - IPv4 forwarding on. It is host-wide and stays on (other runners' jobs need it too); the
-///   runner says so in its log when it turns it on, and warns when the FORWARD policy would then
-///   route for anyone (ACCEPT).
-/// - The jobs' addresses masqueraded on their way out.
-/// - In `FORWARD`, and on a Docker host in `DOCKER-USER` (the chain Docker leaves for others'
-///   rules; its FORWARD policy drops the rest): the jobs' traffic accepted out through the host's
-///   uplinks (the interfaces of its default routes) and the replies back, and traffic from one job
-///   to another through the host dropped. Nothing else from `zr0` is accepted, so the host's
-///   policy (Docker's, ufw's) decides it: Docker's containers, other bridges and the host's other
-///   networks are not opened.
-/// - In `INPUT`, everything from `zr0` that is not a reply dropped: a job reaches no service on
-///   the host, at the bridge's address or any other of the host's.
+///   runner says so in its log when it turns it on, and warns when the host's FORWARD policy would
+///   then route for anyone (ACCEPT, or no filter at all).
+/// - The jobs' rules, over nftables netlink (`nft.zig`): their addresses masqueraded on the way
+///   out; from `zr0` nothing into the host but replies, and nothing forwarded but out through the
+///   host's uplinks (the interfaces of its default routes), so never to another job, to Docker's
+///   containers or to the host's other networks; to `zr0` replies only. The host's iptables-nft
+///   `FORWARD` and `DOCKER-USER` chains (Docker's and ufw's, whose policies drop) accept the
+///   bridge's traffic and leave the deciding to the runner's table.
 ///
-/// Made with `iptables`, which every Docker host has and which puts them in the same tables as
-/// Docker's (debt: phase 5 makes them over netlink). Each rule is added once. On failure, what
-/// went wrong.
+/// On failure, what went wrong.
 pub fn natRules(
     arena: Allocator,
     io: std.Io,
@@ -475,38 +472,18 @@ pub fn natRules(
         std.log.warn("native: turned on IPv4 forwarding (net.ipv4.ip_forward=1, host-wide) for " ++
             "the jobs' NAT; it stays on (docs/native-backend.md)", .{});
     }
-    if (try iptablesOutput(arena, io, &.{ "-t", "filter", "-S", "FORWARD" })) |rules|
-        if (std.mem.indexOf(u8, rules, "-P FORWARD ACCEPT") != null)
-            std.log.warn("native: the FORWARD policy is ACCEPT, so with IPv4 forwarding on this " ++
-                "host routes for its neighbours; set it to DROP (the jobs' traffic has rules of " ++
-                "its own)", .{});
-
-    const sub = try std.fmt.allocPrint(arena, "{f}", .{subnet});
-    const established = [_][]const u8{ "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED" };
-    const masq = [_][]const u8{ "-s", sub, "!", "-o", bridge, "-j", "MASQUERADE" };
-    if (try ensureRule(arena, io, "nat", "POSTROUTING", &masq)) |why| return why;
-    const not_reply = [_][]const u8{
-        "-i", bridge, "-m", "conntrack", "!", "--ctstate", "RELATED,ESTABLISHED", "-j", "DROP",
-    };
-    if (try ensureRule(arena, io, "filter", "INPUT", &not_reply)) |why| return why;
-
-    // Each goes in at the chain's head, so the last is first: jobs to jobs dropped, then the
-    // uplinks, then the replies.
-    var forward: std.ArrayList([]const []const u8) = .empty;
-    try forward.append(arena, &(.{ "-o", bridge } ++ established ++ .{ "-j", "ACCEPT" }));
-    for (ups) |up| {
-        const out = [_][]const u8{ "-i", bridge, "-o", up, "-j", "ACCEPT" };
-        try forward.append(arena, try arena.dupe([]const u8, &out));
-    }
-    try forward.append(arena, &.{ "-i", bridge, "-o", bridge, "-j", "DROP" });
-    var chains: std.ArrayList([]const u8) = .empty;
-    try chains.append(arena, "FORWARD");
-    // Docker's own chain, when this is a Docker host.
-    if (try iptables(arena, io, &.{ "-t", "filter", "-n", "-L", "DOCKER-USER" }) == null)
-        try chains.append(arena, "DOCKER-USER");
-    for (chains.items) |chain| for (forward.items) |rule|
-        if (try ensureRule(arena, io, "filter", chain, rule)) |why| return why;
-    return null;
+    if (nft.forwardPolicy() != .drop)
+        std.log.warn("native: the host's FORWARD policy is ACCEPT (or it has no filter), so " ++
+            "with IPv4 forwarding on it routes for its neighbours; set it to DROP (the jobs' " ++
+            "traffic has rules of its own)", .{});
+    // Rules made with iptables-legacy are not nftables': a legacy FORWARD policy of DROP would
+    // drop the jobs' traffic past the runner's accepts.
+    const legacy = readProc(arena, io, "/proc/net/ip_tables_names") orelse "";
+    if (std.mem.indexOf(u8, legacy, "filter") != null)
+        std.log.warn("native: this host has iptables-legacy tables (/proc/net/ip_tables_names), " ++
+            "which the jobs' nftables rules do not reach; a legacy FORWARD policy of DROP " ++
+            "would cut the jobs' traffic", .{});
+    return nft.apply(subnet, ups);
 }
 
 /// The host's uplinks: the interfaces of its IPv4 default routes (`/proc/net/route`), the bridge
@@ -600,42 +577,6 @@ fn fromRouteHex(v: u32) u32 {
     var b: [4]u8 = undefined;
     std.mem.writeInt(u32, &b, v, builtin.cpu.arch.endian());
     return std.mem.readInt(u32, &b, .big);
-}
-
-/// Adds `rule` at the head of `chain` unless it is there (`iptables -C`).
-fn ensureRule(
-    arena: Allocator,
-    io: std.Io,
-    table: []const u8,
-    chain: []const u8,
-    rule: []const []const u8,
-) !?[]const u8 {
-    const check = try std.mem.concat(arena, []const u8, &.{ &.{ "-t", table, "-C", chain }, rule });
-    if (try iptables(arena, io, check) == null) return null;
-    const head: []const []const u8 = &.{ "-t", table, "-I", chain };
-    const insert = try std.mem.concat(arena, []const u8, &.{ head, rule });
-    return iptables(arena, io, insert);
-}
-
-/// Runs `iptables` with `args` (waiting for its lock, as Docker may hold it); null when it
-/// succeeded, else why not.
-fn iptables(arena: Allocator, io: std.Io, args: []const []const u8) !?[]const u8 {
-    const argv = try std.mem.concat(arena, []const u8, &.{ &.{ "iptables", "-w" }, args });
-    const r = std.process.run(arena, io, .{ .argv = argv }) catch |e|
-        return try std.fmt.allocPrint(arena, "cannot run iptables: {s}", .{@errorName(e)});
-    if (r.term == .exited and r.term.exited == 0) return null;
-    return try std.fmt.allocPrint(arena, "iptables {s} failed: {s}", .{
-        try std.mem.join(arena, " ", args),
-        std.mem.trim(u8, r.stderr, " \n"),
-    });
-}
-
-/// What `iptables` with `args` printed, or null when it failed.
-fn iptablesOutput(arena: Allocator, io: std.Io, args: []const []const u8) !?[]const u8 {
-    const argv = try std.mem.concat(arena, []const u8, &.{ &.{ "iptables", "-w" }, args });
-    const r = std.process.run(arena, io, .{ .argv = argv }) catch return null;
-    if (r.term == .exited and r.term.exited == 0) return r.stdout;
-    return null;
 }
 
 /// The resolver a job's steps get: its own namespace cannot reach a resolver on the host's

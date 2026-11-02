@@ -16,15 +16,15 @@
 //! step relies on, each now explicit here: HOME from the image's /etc/passwd when the env has
 //! none, the host's /etc/resolv.conf and /etc/hosts, a /dev of a few nodes, /proc for the step's
 //! PID namespace with runc's masked and read-only paths, the working directory made when it is
-//! missing, umask 022, Docker's default capability set and seccomp profile (its deny list), and
-//! killing every process of the step when its first one ends.
+//! missing, umask 022, Docker's default capability set and seccomp profile (its allow list,
+//! `seccomp.zig`), and killing every process of the step when its first one ends.
 //!
 //! Every path inside the overlay is resolved inside it (`openIn`): the layers are the steps' to
 //! write, and a symlink a step left must not send the helper to the host's files.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const linux = std.os.linux;
+const seccomp = @import("seccomp.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -944,129 +944,9 @@ fn dropCapabilities() void {
 /// Docker's default capability set, as a step's root sees it in /proc/self/status (`CapEff`).
 pub const docker_caps: u64 = 0xa80425fb;
 
-/// Docker's default seccomp profile, as a deny list: what it refuses a container without
-/// CAP_SYS_ADMIN and friends fails with EPERM (module loading, kexec, keyrings, bpf, perf, mounts,
-/// namespaces, the clock, swap, reboot, io_uring as moby 25 refuses it), `clone` making namespaces
-/// too, `personality` but for the values Docker allows (Linux, 32-bit Linux, a 2.6 uname, and the
-/// query), and `clone3` is ENOSYS so the C library falls back to `clone`. Anything else is
-/// allowed, as Docker's allow list is in effect for what a default container can do.
+/// Docker's default seccomp profile, its allow list (`seccomp.zig`).
 fn installSeccomp() void {
-    const prog = comptime seccompProgram();
-    const fprog: extern struct { len: u16, filter: [*]const SockFilter } = .{
-        .len = @intCast(prog.len),
-        .filter = prog.ptr,
-    };
-    check("install the seccomp filter", linux.prctl(
-        @backingInt(linux.PR.SET_SECCOMP),
-        linux.SECCOMP.MODE.FILTER,
-        @intFromPtr(&fprog),
-        0,
-        0,
-    ));
-}
-
-/// `personality`'s arguments Docker's profile allows: PER_LINUX, PER_LINUX32, UNAME26,
-/// UNAME26 | PER_LINUX32, and 0xffffffff, which asks for the current one.
-pub const allowed_personalities = [_]u32{ 0x0, 0x8, 0x20000, 0x20008, 0xffffffff };
-
-/// The filter, as instructions whose jumps name a block (`Target`) and are resolved once the
-/// blocks' places are known. BPF jumps only forward, so the blocks follow the main sequence.
-fn seccompProgram() []const SockFilter {
-    const Target = enum { next, allow, deny, clone, personality };
-    const Ins = struct { code: u16, k: u32, jt: Target = .next, jf: Target = .next };
-    const denied = deniedSyscalls();
-    var ins: [denied.len + 32]Ins = undefined;
-    var n: usize = 0;
-    var at: std.enums.EnumArray(Target, usize) = .initFill(0);
-    const emit = struct {
-        fn f(list: []Ins, len: *usize, i: Ins) void {
-            list[len.*] = i;
-            len.* += 1;
-        }
-    }.f;
-    // The architecture: a foreign one's numbers mean other calls.
-    emit(&ins, &n, .{ .code = bpf_ld_w_abs, .k = 4 });
-    emit(&ins, &n, .{ .code = bpf_jeq, .k = native_arch, .jf = .deny });
-    emit(&ins, &n, .{ .code = bpf_ld_w_abs, .k = 0 });
-    // x32's calls, numbered from 0x40000000 on x86_64.
-    if (builtin.cpu.arch == .x86_64)
-        emit(&ins, &n, .{ .code = bpf_jset, .k = 0x40000000, .jt = .deny });
-    for (denied) |nr| emit(&ins, &n, .{ .code = bpf_jeq, .k = nr, .jt = .deny });
-    emit(&ins, &n, .{ .code = bpf_jeq, .k = @backingInt(linux.SYS.clone), .jt = .clone });
-    const personality = @backingInt(linux.SYS.personality);
-    emit(&ins, &n, .{ .code = bpf_jeq, .k = personality, .jt = .personality });
-    emit(&ins, &n, .{ .code = bpf_jeq, .k = @backingInt(linux.SYS.clone3), .jf = .allow });
-    emit(&ins, &n, .{ .code = bpf_ret, .k = seccomp_errno | @as(u32, @backingInt(linux.E.NOSYS)) });
-    // clone's flags, its first argument's low word on a little-endian machine.
-    at.set(.clone, n);
-    emit(&ins, &n, .{ .code = bpf_ld_w_abs, .k = 16 });
-    emit(&ins, &n, .{ .code = bpf_jset, .k = 0x7E020000, .jt = .deny, .jf = .allow });
-    // personality's one argument, an `unsigned int` to the kernel.
-    at.set(.personality, n);
-    emit(&ins, &n, .{ .code = bpf_ld_w_abs, .k = 16 });
-    for (allowed_personalities) |p| emit(&ins, &n, .{ .code = bpf_jeq, .k = p, .jt = .allow });
-    at.set(.deny, n);
-    emit(&ins, &n, .{ .code = bpf_ret, .k = seccomp_errno | @as(u32, @backingInt(linux.E.PERM)) });
-    // Last, so every jump to it goes forward.
-    at.set(.allow, n);
-    emit(&ins, &n, .{ .code = bpf_ret, .k = seccomp_allow });
-
-    var out: [n]SockFilter = undefined;
-    for (ins[0..n], &out, 0..) |i, *o, pc| {
-        const jump = struct {
-            fn f(t: Target, from: usize, places: std.enums.EnumArray(Target, usize)) u8 {
-                if (t == .next) return 0;
-                const to = places.get(t);
-                if (to <= from) @compileError("a seccomp jump goes backwards");
-                return @intCast(to - from - 1);
-            }
-        }.f;
-        o.* = .{ .code = i.code, .jt = jump(i.jt, pc, at), .jf = jump(i.jf, pc, at), .k = i.k };
-    }
-    const final = out;
-    return &final;
-}
-
-const SockFilter = extern struct { code: u16, jt: u8, jf: u8, k: u32 };
-const bpf_ld_w_abs = 0x20;
-const bpf_jeq = 0x15;
-const bpf_jset = 0x45;
-const bpf_ret = 0x06;
-const seccomp_allow = 0x7fff0000;
-const seccomp_errno = 0x00050000;
-/// `AUDIT_ARCH_X86_64` and `AUDIT_ARCH_AARCH64` (std's `AUDIT.ARCH` does not compile in 0.17).
-const native_arch: u32 = switch (builtin.cpu.arch) {
-    .x86_64 => 0xC000003E,
-    .aarch64 => 0xC00000B7,
-    else => @compileError("the native backend's seccomp filter knows x86_64 and aarch64"),
-};
-
-fn deniedSyscalls() []const u32 {
-    const names = [_][]const u8{
-        "acct",           "add_key",           "bpf",             "clock_adjtime",
-        "clock_settime",  "create_module",     "delete_module",   "fanotify_init",
-        "finit_module",   "fsconfig",          "fsmount",         "fsopen",
-        "fspick",         "get_kernel_syms",   "get_mempolicy",   "init_module",
-        "io_uring_enter", "io_uring_register", "io_uring_setup",  "ioperm",
-        "iopl",           "kcmp",              "kexec_file_load", "kexec_load",
-        "keyctl",         "lookup_dcookie",    "mbind",           "mount",
-        "mount_setattr",  "move_mount",        "move_pages",      "name_to_handle_at",
-        "nfsservctl",     "open_by_handle_at", "open_tree",       "perf_event_open",
-        "pivot_root",     "quotactl",          "quotactl_fd",     "reboot",
-        "request_key",    "set_mempolicy",     "setns",           "settimeofday",
-        "stime",          "swapoff",           "swapon",          "syslog",
-        "sysfs",          "_sysctl",           "umount",          "umount2",
-        "unshare",        "uselib",            "userfaultfd",     "ustat",
-        "vm86",           "vm86old",
-    };
-    var out: [names.len]u32 = undefined;
-    var n: usize = 0;
-    for (names) |name| if (@hasField(linux.SYS, name)) {
-        out[n] = @backingInt(@field(linux.SYS, name));
-        n += 1;
-    };
-    const final = out[0..n].*;
-    return &final;
+    check("install the seccomp filter", seccomp.install());
 }
 
 /// A /dev of the nodes a step needs, bound from the host's, as runc builds one: not the host's

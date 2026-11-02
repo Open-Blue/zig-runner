@@ -131,8 +131,14 @@ pub const Config = struct {
     store: []const u8 = "",
     /// This binary, which runs each step's sandbox (`sandbox.command`).
     self_exe: []const u8 = "",
-    /// The runner vouches for the job (`trust.vouches`): native steps run only in such jobs.
+    /// The runner vouches for the job (`trust.vouches`). Jobs it does not vouch for run natively
+    /// only once `job_limits` holds, on a root runner (`untrustedRefusal`).
     vouched: bool = false,
+    /// Each job runs in a cgroup of its own with `memory.max` and `pids.max` (phase 4): set by
+    /// `configFor` when there is a parent to make it under and neither limit is configured away.
+    /// False, a job the runner does not vouch for runs on Dagger, where a fork bomb or a memory
+    /// hog stays in the engine's limits.
+    job_limits: bool = false,
     /// Rootless native steps (`RUNNER_NATIVE_ROOTLESS`): only root is mapped inside, so apt's
     /// `_apt`, `chown` to other users and `tar` with owners fail, and steps share the host's
     /// network. Off: a rootless runner sends every job to Dagger.
@@ -210,6 +216,11 @@ pub fn configFor(
     vouched: bool,
 ) !?Config {
     if (cfg.backend != .native) return null;
+    const cg: cgroup.Config = .{
+        .parent = cfg.native_cgroup,
+        .memory_max_mb = cfg.native_memory_max_mb,
+        .pids_max = cfg.native_pids_max,
+    };
     return .{
         .rootfs = cfg.native_rootfs,
         .store = try cfg.nativeStore(arena, environ),
@@ -219,12 +230,19 @@ pub fn configFor(
         .subid_base = cfg.native_subid_base,
         .subnet = try net.Subnet.parse(cfg.native_subnet),
         .store_max_bytes = cfg.native_store_max_mb * 1024 * 1024,
-        .cgroup = .{
-            .parent = cfg.native_cgroup,
-            .memory_max_mb = cfg.native_memory_max_mb,
-            .pids_max = cfg.native_pids_max,
-        },
+        .cgroup = cg,
+        .job_limits = jobLimits(arena, io, cg),
     };
+}
+
+/// Whether each job gets a cgroup of its own with `memory.max` and `pids.max` (P5's
+/// `Config.job_limits`): a parent to make it under, and neither limit configured away. `init`
+/// fails a job the runner does not vouch for when its cgroup could not be made after all
+/// (`jobCgroup`), so this never lets one run unlimited.
+fn jobLimits(arena: Allocator, io: std.Io, cg: cgroup.Config) bool {
+    const l = cgroup.Limits.of(io, cg);
+    if (l.memory_max == null or l.pids_max == null) return false;
+    return cgroup.parent(arena, io, cg.parent) == .dir;
 }
 
 /// How sandboxes are started on this machine (`launch`).
@@ -254,8 +272,7 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         return "the native rootfs (RUNNER_NATIVE_ROOTFS) cannot be read";
     if (oci.hostPlatform() == null) return "there are no images for this machine's architecture";
     if (cfg.self_exe.len == 0 or cfg.store.len == 0) return "the native store is not set up";
-    if (!cfg.vouched) return "native steps run only in jobs this runner vouches for " ++
-        "(RUNNER_TRUSTED_REFS)";
+    if (!cfg.vouched) if (untrustedRefusal(cfg)) |why| return why;
     if (std.os.linux.geteuid() != 0 and !cfg.rootless) return "the runner is not root, and " ++
         "rootless native steps have only one id mapped (RUNNER_NATIVE_ROOTLESS=1 runs them " ++
         "anyway; subordinate ids are phase 5's)";
@@ -290,6 +307,18 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         },
         .script, .unsupported => {},
     };
+    return null;
+}
+
+/// Why a job the runner does not vouch for cannot run natively here, or null when it can: only
+/// with every phase 5 isolation in place (Docker's seccomp allow list, the nftables rules) and
+/// phase 4's per-job resource limits (`Config.job_limits`), and only on a root runner, since a
+/// rootless one has neither the job's own network nor its own range of ids yet.
+pub fn untrustedRefusal(cfg: Config) ?[]const u8 {
+    if (!cfg.job_limits) return "native steps run only in jobs this runner vouches for " ++
+        "(RUNNER_TRUSTED_REFS) until each job has cgroup limits of its own (phase 4)";
+    if (std.os.linux.geteuid() != 0) return "native steps run jobs this runner does not vouch " ++
+        "for only on a root runner (a rootless job's own network and ids are phase 5's)";
     return null;
 }
 
@@ -336,7 +365,7 @@ fn templateText(t: job_mod.Template) []const u8 {
 /// Whether this machine can run native steps, found with one sandbox; null when it can, else
 /// why not, and every native job then runs on Dagger. A success holds for the process's life; a
 /// failure is tried again once `probe_backoff_ms` have passed, so a machine that was not ready
-/// (iptables locked, a module not loaded yet) does not keep native off until a restart. On a root
+/// (nftables busy, a module not loaded yet) does not keep native off until a restart. On a root
 /// runner, it also makes the network's NAT rules (`net.natRules`) and checks the jobs' ids and
 /// subnet against the host's.
 pub fn usable(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) ?[]const u8 {
@@ -396,6 +425,9 @@ fn probe(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !?[]const u8
     // Not a job: the gate measures none in it.
     var probing = cfg;
     probing.gate = null;
+    // What the machine can do, whoever's job asked: an untrusted job's need of limits is
+    // `init`'s to enforce for that job, not the probe's for every job.
+    probing.vouched = true;
     var b = try init(arena, io, gpa, probing);
     defer b.deinit();
     // Without the operator's rootfs, the default image as pulled: the probe then also says
@@ -428,7 +460,7 @@ fn natRulesFor(arena: Allocator, io: std.Io, subnet: net.Subnet, probing: bool) 
     defer rules_mu.unlock(io);
     if (ups.len > 0 and std.mem.eql(u8, joined, rules_for[0..rules_len])) return null;
     if (try net.natRules(arena, io, subnet, ups)) |why| return why;
-    // Too long to keep: the rules are checked again (`iptables -C`) next time.
+    // Too long to keep: the rules are made again next time.
     rules_len = if (joined.len <= rules_for.len) joined.len else 0;
     @memcpy(rules_for[0..rules_len], joined[0..rules_len]);
     return null;
@@ -593,6 +625,10 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
 fn jobCgroup(b: *Backend, cfg: Config, parent: cgroup.Parent, name: []const u8) !void {
     const arena = b.arena;
     b.limits = cgroup.Limits.of(b.io, cfg.cgroup);
+    // A job the runner does not vouch for runs natively only within limits of its own
+    // (`untrustedRefusal`, decided on `Config.job_limits`): without them it does not run.
+    const limited = b.limits.memory_max != null and b.limits.pids_max != null;
+    if (!cfg.vouched and !limited) return error.NoJobLimits;
     const why: []const u8 = switch (parent) {
         .none => |w| w,
         .dir => |dir| if (cgroup.Job.make(arena, dir, name, b.limits)) |j| {
@@ -610,6 +646,7 @@ fn jobCgroup(b: *Backend, cfg: Config, parent: cgroup.Parent, name: []const u8) 
             @errorName(e),
         }),
     };
+    if (!cfg.vouched) return error.NoJobLimits;
     try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: the job has no " ++
         "cgroup of its own ({s}), so no memory or process limit of its own, and the memory " ++
         "gate does not measure it.", .{why}));
@@ -2320,6 +2357,13 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     var remote = ok;
     remote.vouched = false;
     try expectReason("vouches", unsupported(io, run_only, root, remote));
+    try expectReason("cgroup limits", unsupported(io, run_only, root, remote));
+    // With phase 4's limits, on a root runner only.
+    remote.job_limits = true;
+    if (std.os.linux.geteuid() == 0)
+        try std.testing.expect(unsupported(io, run_only, root, remote) == null)
+    else
+        try expectReason("root runner", unsupported(io, run_only, root, remote));
     if (std.os.linux.geteuid() != 0) {
         var rootless = ok;
         rootless.rootless = false;
@@ -3218,6 +3262,7 @@ test "a job's directory and lock are let go once, when its set-up fails after th
         .rootfs = try std.fmt.allocPrint(arena, "{s}/rootfs", .{root}),
         .store = try std.fmt.allocPrint(arena, "{s}/store", .{root}),
         .self_exe = "/bin/true",
+        .vouched = true,
         .test_fail_after_lock = true,
         .check_store_parents = false,
     };
