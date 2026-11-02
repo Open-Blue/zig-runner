@@ -59,16 +59,23 @@ pub const Store = struct {
 
     /// Stores the directory `begin` gave under `key`, held for the job, and returns the layer's
     /// path. When another builder stored the key first, its layer is used and this one removed.
+    /// Under the key's lock, as a step's layer is (`P2Store.publish`): without it, another
+    /// runner's `collect` took the layer's temporary entry for one a dead runner left and
+    /// removed it while it was published.
     pub fn publish(s: Store, arena: Allocator, io: std.Io, built: []const u8, hex: []const u8) ![]const u8 {
         const k = try s.key(hex);
-        // Kind `fetch`: a tree with an empty record, never replayed as a step's (P2 has no
-        // `build` kind yet).
-        const layer = s.store.publish(arena, io, k, .fetch, built, .{ .log = "", .fc = "" }) catch |e| {
-            const first = (try s.store.open(arena, io, k)) orelse return e;
+        // Held only while a builder publishes, never across a build: the wait is short.
+        const never: std.atomic.Value(bool) = .init(false);
+        const lock = try s.store.lockKey(arena, io, k, &never);
+        defer lock.close(io);
+        if (try s.store.open(arena, io, k)) |first| {
             P2Store.removeTree(arena, io, built);
             try s.held.append(arena, first.layer.lock);
             return first.layer.fs;
-        };
+        }
+        // Kind `fetch`: a tree with an empty record, never replayed as a step's (P2 has no
+        // `build` kind yet).
+        const layer = try s.store.publish(arena, io, k, .fetch, built, .{ .log = "", .fc = "" });
         try s.held.append(arena, layer.lock);
         return layer.fs;
     }

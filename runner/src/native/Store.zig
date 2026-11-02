@@ -245,6 +245,16 @@ pub fn lockKey(
     }
 }
 
+/// Whether some process holds the key's lock (`lockKey`): this one's own holder too, as a lock
+/// taken through another open of the file conflicts with it.
+fn keyLocked(s: Store, arena: Allocator, io: std.Io, key: Key) bool {
+    const path = std.fmt.allocPrint(arena, "{s}/keys/{s}.lock", .{ s.root, &hex(key) }) catch
+        return false;
+    const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+    defer f.close(io);
+    return !flock(f, lock_ex | lock_nb);
+}
+
 /// A layer a job uses, held shared until the job ends: eviction takes the lock exclusively, so
 /// it never removes a layer under a running job.
 pub const Layer = struct {
@@ -409,6 +419,10 @@ fn isDir(arena: Allocator, p: []const u8) bool {
 /// visible, held before it is visible (so an eviction cannot take it at once), and published by
 /// one rename that never replaces. On failure the upper is back where it was, or, if it cannot be
 /// put back, left in the temporary entry and logged, never deleted.
+///
+/// The caller holds the key's lock (`lockKey`) until this returns: `collect` takes a temporary
+/// entry whose key's lock is free for one a dead runner left, and removes it. Refused
+/// (`error.KeyNotLocked`) when no one holds it, before anything moves.
 pub fn publish(
     s: Store,
     arena: Allocator,
@@ -419,6 +433,7 @@ pub fn publish(
     rec: Record,
 ) !Layer {
     if (recordFault(kind, rec)) |e| return e;
+    if (!s.keyLocked(arena, io, key)) return error.KeyNotLocked;
     const cwd = std.Io.Dir.cwd();
     var raw: [8]u8 = undefined;
     io.random(&raw);
@@ -1753,6 +1768,12 @@ test "native store: a record that cannot be replayed is refused, and a broken en
     var kh: KeyHasher = .plain("test");
     const k = kh.final();
     const ran = "::zig-file-command::ran\nj1\n";
+    // Refused without the key's lock, which `collect` would take for a dead publisher's.
+    try std.testing.expectError(error.KeyNotLocked, s.publish(arena, io, k, .base, upper, .{ .log = "", .fc = "" }));
+    try tmp.dir.access(io, "up", .{});
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, k, &never);
+    defer kl.close(io);
     // Refused, and the upper left where it was: a step's file commands without their ran marker
     // or empty, a base's with any, and file commands past the limit.
     const big = try arena.alloc(u8, max_record_bytes + 1);
@@ -1776,6 +1797,8 @@ test "native store: a record that cannot be replayed is refused, and a broken en
     // published again.
     var kh2: KeyHasher = .plain("test 2");
     const k2 = kh2.final();
+    const kl2 = try s.lockKey(arena, io, k2, &never);
+    defer kl2.close(io);
     try tmp.dir.createDirPath(io, "up2");
     const up2 = try std.fmt.allocPrint(arena, "{s}/up2", .{root});
     const l = try s.publish(arena, io, k2, .step, up2, .{ .log = "a whole log\n", .fc = ran });
