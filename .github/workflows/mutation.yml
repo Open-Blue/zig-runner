@@ -25,6 +25,11 @@ on:
       sample:
         description: Mutants to try, picked at random (all of the module's when empty)
         required: false
+  # TEMPORARY, reverted before merge: the first run of every module, for the pull request that
+  # adds this workflow (workflow_dispatch reaches it only once main has it).
+  pull_request:
+    paths:
+      - .github/workflows/mutation.yml
 
 permissions: {}
 
