@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'CI''s runs are free of annotations that were not about them: the tests'' output is only text to the job that runs them (`::stop-commands::` in `zig-test.sh` and in ci.yml''s `zig build test`), so the native backend''s runaway and fork-bomb tests no longer raise "The job reached its process limit" and "its memory limit" as CI''s own errors; and the GitHub-hosted jobs are pinned to `ubuntu-26.04`, not `ubuntu-latest`, ending the migration notice on every job and making an image upgrade, which moves what the native passes stand on, a deliberate change. The runner itself is unchanged.'
-time: 2026-11-01T21:30:00.000000-04:00

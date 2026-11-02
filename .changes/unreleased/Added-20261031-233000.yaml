@@ -1,3 +1,0 @@
-kind: Added
-body: 'docs/native-backend.md: the plan for running steps in the runner itself, with namespaces, overlayfs and chroot, in place of the Dagger engine. A `Backend` boundary between job orchestration and step execution, `RUNNER_BACKEND=dagger|native` (default dagger) with a per-job fallback to Dagger for what native cannot do yet, nine phases with exit criteria and measurements, the result that would make us stop at the hybrid, and a running log of what each phase learns.'
-time: 2026-10-31T23:30:00.000000-04:00
