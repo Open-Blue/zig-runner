@@ -18,7 +18,7 @@ from a copy of runner/src (the checkout is never touched) with only the module's
 compile is counted apart: the compiler killed it, not the tests.
 
     python3 runner/tools/mutate.py masking                 one module, its report on stdout
-    python3 runner/tools/mutate.py --all --out DIR         every module; DIR/report.md, DIR/results.json
+    python3 runner/tools/mutate.py --all --out DIR         every module: DIR/report.md, results.json
     python3 runner/tools/mutate.py minisign --list         the mutants, none run
     python3 runner/tools/mutate.py expr --sample 200       a seeded sample of the module's mutants
 
@@ -82,7 +82,8 @@ WORD = re.compile(r"\b(and|or|true|false)\b")
 INTEGER = re.compile(r"(?<![\w.])(\d+)(?![\w.])")
 GUARD_IF = re.compile(r"^\s*if \(.*\) return error\.\w+;\s*$")
 GUARD_BARE = re.compile(r"^\s*return error\.\w+;\s*$")
-NOT_A_STATEMENT = re.compile(r"^\s*(const|var|pub|fn|return|break|continue|unreachable|else|test|comptime)\b")
+NOT_A_STATEMENT = re.compile(
+    r"^\s*(const|var|pub|fn|return|break|continue|unreachable|else|test|comptime)\b")
 
 
 def blank_literals(line):
@@ -161,7 +162,8 @@ def mutants_of(path, text):
     for n, line, code in code_lines(text):
         def at(start, end, new, op):
             return {"file": path, "line": n, "op": op, "old": line.strip(),
-                    "new": (line[:start] + new + line[end:]).strip(), "start": start, "end": end, "text": new}
+                    "new": (line[:start] + new + line[end:]).strip(),
+                    "start": start, "end": end, "text": new}
 
         if "@import" not in code:
             for m in OPERATOR.finditer(code):
@@ -208,6 +210,12 @@ def tls_root():
     return root
 
 
+def output(cmd, **kw):
+    """`cmd` run to its end, what it wrote kept as text: a failed test may print any bytes."""
+    return subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                          stdin=subprocess.DEVNULL, **kw)
+
+
 class Worker:
     """A copy of runner/src to mutate, and a cache of its own."""
 
@@ -222,19 +230,18 @@ class Worker:
         self.expr_cases = expr_cases
 
     def build(self):
-        cmd = ["zig", "test", "-fPIE", "--dep", "build_version", "--dep", "tls", "-Mroot=src/main.zig",
-               "-Mbuild_version=version", f"-Mtls={self.tls}", "--cache-dir", "cache",
-               "--test-no-exec", "-femit-bin=t"]
+        cmd = ["zig", "test", "-fPIE", "--dep", "build_version", "--dep", "tls",
+               "-Mroot=src/main.zig", "-Mbuild_version=version", f"-Mtls={self.tls}",
+               "--cache-dir", "cache", "--test-no-exec", "-femit-bin=t"]
         for f in self.filters:
             cmd += ["--test-filter", f]
-        return subprocess.run(cmd, cwd=self.dir, capture_output=True, text=True, timeout=600)
+        return output(cmd, cwd=self.dir, timeout=600)
 
     def run(self):
         """'passed', 'failed' or 'timeout', and what the tests wrote."""
         env = dict(os.environ, ZIG_RUNNER_TEST_EXE="/nonexistent")
         try:
-            p = subprocess.run([os.path.join(self.dir, "t")], cwd=self.dir, capture_output=True,
-                               text=True, timeout=self.timeout, env=env, stdin=subprocess.DEVNULL)
+            p = output([os.path.join(self.dir, "t")], cwd=self.dir, timeout=self.timeout, env=env)
         except subprocess.TimeoutExpired:
             return "timeout", ""
         return ("passed" if p.returncode == 0 else "failed"), p.stderr
@@ -242,15 +249,14 @@ class Worker:
     def cases_agree(self):
         """Whether expr.zig fails exactly the GitHub cases it is known to fail
         (tools/exprcorpus-failing.txt), as expr-conformance.sh checks."""
-        b = subprocess.run(["zig", "build-exe", "--dep", "expr",
-                            f"-Mroot={RUNNER}/tools/exprcorpus.zig", "-Mexpr=src/expr.zig",
-                            "--cache-dir", "cache", "-femit-bin=exprcorpus"],
-                           cwd=self.dir, capture_output=True, text=True, timeout=600)
+        b = output(["zig", "build-exe", "--dep", "expr", f"-Mroot={RUNNER}/tools/exprcorpus.zig",
+                    "-Mexpr=src/expr.zig", "--cache-dir", "cache", "-femit-bin=exprcorpus"],
+                   cwd=self.dir, timeout=600)
         if b.returncode != 0:
             return False
         try:
-            p = subprocess.run([os.path.join(self.dir, "exprcorpus"), self.expr_cases, "--failing"],
-                               capture_output=True, text=True, timeout=self.timeout)
+            p = output([os.path.join(self.dir, "exprcorpus"), self.expr_cases, "--failing"],
+                       timeout=self.timeout)
         except subprocess.TimeoutExpired:
             return False
         with open(os.path.join(RUNNER, "tools", "exprcorpus-failing.txt")) as f:
@@ -287,6 +293,8 @@ def run_module(name, args, base):
             mutants += list(mutants_of(path, f.read()))
     if args.ops:
         mutants = [m for m in mutants if m["op"] in args.ops]
+    if args.at:
+        mutants = [m for m in mutants if f'{m["file"]}:{m["line"]}' in args.at]
     if args.sample and args.sample < len(mutants):
         mutants = sorted(random.Random(args.seed).sample(mutants, args.sample),
                          key=lambda m: (m["file"], m["line"], m["start"]))
@@ -330,13 +338,16 @@ def run_module(name, args, base):
             w = free.pop()
         try:
             m["result"] = w.trial(m)
+        except Exception as e:  # one mutant's trouble is reported, not the run's end
+            m["result"] = "error"
+            print(f"{name}: {m['file']}:{m['line']}: {e!r}", file=sys.stderr)
         finally:
             with lock:
                 free.append(w)
                 done[0] += 1
                 if m["result"] == "survived" or done[0] % 25 == 0:
-                    print(f"{name}: {done[0]}/{len(mutants)} {m['file']}:{m['line']} {m['result']}",
-                          file=sys.stderr)
+                    print(f"{name}: {done[0]}/{len(mutants)} {m['file']}:{m['line']} "
+                          f"{m['result']}", file=sys.stderr)
         return m
 
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
@@ -384,6 +395,9 @@ def main():
                    help=f'one or more of: {", ".join(MODULES)}')
     p.add_argument("--all", action="store_true", help="every module")
     p.add_argument("--ops", nargs="+", choices=["cmp", "logic", "bool", "guard", "int", "delete"])
+    p.add_argument("--at", nargs="+", metavar="FILE:LINE",
+                   help="only the mutants on these lines (src/redact.zig:174), to see a new "
+                   "test kill them")
     p.add_argument("--sample", type=int, help="this many mutants per module, picked at random")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--jobs", "-j", type=int, default=4, help="mutants built and run at once")
