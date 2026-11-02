@@ -1,0 +1,18 @@
+# gitleaks' configuration (security.yml, .github/scripts/install-gitleaks.sh): its default rules,
+# and the findings in this repository's history that are not secrets, each allowed as narrowly as
+# it can be (one rule, one file, the line's shape) with why. A new finding fails the job; if it is
+# not a secret, add it here the same way, in the pull request that brings it.
+title = "zig-runner"
+
+[extend]
+useDefault = true
+
+# A test's layer key in the native backend's layer store (a sha256-shaped name for a cache entry,
+# made up for the test; first in e41f663): generic-api-key reads any 64 hex digits assigned to a
+# `key` as one.
+[[allowlists]]
+description = "Test layer key in runner/src/native/layers.zig"
+targetRules = ["generic-api-key"]
+paths = ['''^runner/src/native/layers\.zig$''']
+regexTarget = "line"
+regexes = ['''^\s*const key = "[0-9a-f]{64}";$''']
