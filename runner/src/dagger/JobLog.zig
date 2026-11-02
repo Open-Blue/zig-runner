@@ -1489,9 +1489,10 @@ test "masks cost memory in proportion to their number, and a repeated one costs 
     const n = 2000;
     const before = a.queryCapacity();
     for (0..n) |i| sh.stepOutput(1, try std.fmt.bufPrint(&buf, "::add-mask::secret-value-{d}", .{i}));
-    // About 470 bytes each (930 KB), the trie and the arena's spare room included. Each
-    // mask copied the whole list and sorted it again: 130 MB here, 5.8 GB for 20000.
-    try std.testing.expect(a.queryCapacity() - before < n * 1024);
+    // About 2.1 KB each (4.2 MB), the trie and the arena's spare room included: each mask is
+    // kept in its forms, base64 at three offsets among them (redact.forms). Each mask copied
+    // the whole list and sorted it again: 130 MB here, 5.8 GB for 20000.
+    try std.testing.expect(a.queryCapacity() - before < n * 4096);
     const after_masks = a.queryCapacity();
     for (0..n) |_| sh.stepOutput(1, "::add-mask::secret-value-7");
     try std.testing.expect(a.queryCapacity() - after_masks < 16 * 1024);

@@ -175,39 +175,128 @@ pub fn alloc(arena: std.mem.Allocator, text: []const u8, secrets: []const []cons
 /// would otherwise mask every brace of every log; the whole value and its longer lines still are.
 pub const min_line = 4;
 
-/// What one secret must be masked as, wherever it appears: its value without the whitespace around
-/// it (a token saved with a trailing newline still matches), each line of a multi-line value (the
-/// log is redacted line by line, so a whole multi-line value never matches there), and the whole
-/// value as JSON (`toJSON(secrets)`), base64 and URL encoding write it.
+/// What one secret must be masked as, wherever it appears, as GitHub's runner masks a secret
+/// (`InitializeSecretMasker` in Worker.cs, `AddMaskCommandExtension`, the encoders HostContext.cs
+/// registers): its value without the whitespace around it (a token saved with a trailing newline
+/// still matches), each line of a multi-line value, split at `\r` or `\n` (the log is masked line
+/// by line, so a whole multi-line value never matches there), and each of those as GitHub's
+/// `ValueEncoders` write it (`encodings`).
+///
+/// One difference: a line shorter than `min_line` is not masked on its own (GitHub masks every
+/// line), or a JSON key file's `{` and `}` lines would mask every brace of every log.
 pub fn forms(arena: std.mem.Allocator, value: []const u8) std.mem.Allocator.Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
-    const whole = std.mem.trim(u8, value, " \t\r\n");
+    const whole = std.mem.trim(u8, value, &std.ascii.whitespace);
     if (whole.len == 0) return out.items;
-    try out.append(arena, whole);
-    if (std.mem.indexOfScalar(u8, whole, '\n') != null) {
-        var lines = std.mem.splitScalar(u8, whole, '\n');
+    try encodings(arena, &out, whole);
+    if (std.mem.indexOfAny(u8, whole, "\r\n") != null) {
+        var lines = std.mem.tokenizeAny(u8, whole, "\r\n");
         while (lines.next()) |l| {
-            const line = std.mem.trim(u8, l, " \t\r");
-            if (line.len >= min_line) try out.append(arena, line);
+            const line = std.mem.trim(u8, l, &std.ascii.whitespace);
+            if (line.len >= min_line) try encodings(arena, &out, line);
         }
     }
-    // As a JSON string's contents.
+    return out.items;
+}
+
+/// The shortest base64 text masked as part of a longer one (`encodings`): six bytes of a secret.
+const min_base64_part = 8;
+
+/// `value` and what GitHub's `ValueEncoders` make of it, each that differs from `value` and is not
+/// empty, appended to `out`:
+///
+///   - JSON, as `JsonConvert.ToString` writes a string's contents (`toJSON(secrets)`, a JSON
+///     log line), and as std.json does where the two differ (U+0085, U+2028, U+2029);
+///   - base64 (`Base64StringEscape`), and of the value without its first byte or two
+///     (`Base64StringEscapeShift1`, `Shift2`): inside a longer encoded text, such as
+///     `base64(user:password)`, the secret's bytes start one or two bytes into a group of three.
+///     Each with its padding and without it, and, when it is at least `min_base64_part` long,
+///     without the last characters that depend on the bytes after the secret, which GitHub's
+///     forms keep, so the secret is masked whatever follows it;
+///   - URL-encoded, every byte outside the unreserved set (`UriDataEscape`);
+///   - `"` as `\"` (`CommandLineArgumentEscape`), `'` as `''` (`ExpressionStringEscape`), XML's
+///     five entities (`XmlDataEscape`), without the double quotes around it (`TrimDoubleQuotes`),
+///     and the parts PowerShell prints around a `&` (`PowerShellPreAmpersandEscape`, `Post`).
+fn encodings(arena: std.mem.Allocator, out: *std.ArrayList([]const u8), value: []const u8) std.mem.Allocator.Error!void {
+    try out.append(arena, value);
+    const Add = struct {
+        fn add(ar: std.mem.Allocator, o: *std.ArrayList([]const u8), v: []const u8, form: []const u8) !void {
+            if (form.len > 0 and !std.mem.eql(u8, form, v)) try o.append(ar, form);
+        }
+    };
+    const add = Add.add;
+
+    // JSON.
     var json: std.Io.Writer.Allocating = .init(arena);
-    std.json.Stringify.encodeJsonStringChars(whole, .{}, &json.writer) catch return error.OutOfMemory;
-    if (!std.mem.eql(u8, json.written(), whole)) try out.append(arena, json.written());
-    // Base64, without padding, so it also matches inside a longer encoded text that starts with it.
-    const enc = std.base64.standard_no_pad.Encoder;
-    const b64 = try arena.alloc(u8, enc.calcSize(whole.len));
-    try out.append(arena, enc.encode(b64, whole));
-    // URL-encoded (every byte outside the unreserved set), when that differs.
+    std.json.Stringify.encodeJsonStringChars(value, .{}, &json.writer) catch return error.OutOfMemory;
+    try add(arena, out, value, json.written());
+    const newtonsoft = try replaceAll(arena, json.written(), &.{
+        .{ "\u{85}", "\\u0085" }, .{ "\u{2028}", "\\u2028" }, .{ "\u{2029}", "\\u2029" },
+    });
+    try add(arena, out, value, newtonsoft);
+
+    // Base64, of the value and of it shifted by one and two bytes.
+    const enc = std.base64.standard.Encoder;
+    for (0..3) |shift| {
+        if (shift > 0 and value.len <= shift) break;
+        const bytes = value[shift..];
+        const padded = try arena.alloc(u8, enc.calcSize(bytes.len));
+        _ = enc.encode(padded, bytes);
+        try add(arena, out, value, padded);
+        try add(arena, out, value, std.mem.trimEnd(u8, padded, "="));
+        // Each character holds six bits: the first `len * 8 / 6` hold only the value's.
+        const own = padded[0 .. bytes.len * 8 / 6];
+        if (own.len >= min_base64_part) try add(arena, out, value, own);
+    }
+
+    // URL-encoded.
     var url: std.ArrayList(u8) = .empty;
-    for (whole) |ch| {
+    for (value) |ch| {
         if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '.' or ch == '_' or ch == '~')
             try url.append(arena, ch)
         else
             try url.print(arena, "%{X:0>2}", .{ch});
     }
-    if (!std.mem.eql(u8, url.items, whole)) try out.append(arena, url.items);
+    try add(arena, out, value, url.items);
+
+    try add(arena, out, value, try replaceAll(arena, value, &.{.{ "\"", "\\\"" }}));
+    try add(arena, out, value, try replaceAll(arena, value, &.{.{ "'", "''" }}));
+    try add(arena, out, value, try replaceAll(arena, value, &.{
+        .{ "&", "&amp;" }, .{ "<", "&lt;" }, .{ ">", "&gt;" }, .{ "\"", "&quot;" }, .{ "'", "&apos;" },
+    }));
+    if (value.len > 8 and value[0] == '"' and value[value.len - 1] == '"')
+        try add(arena, out, value, value[1 .. value.len - 1]);
+    // PowerShell: up to and including the first `&+`, or else the last `&`; and after it (past
+    // the one character it colours after `&+`). Each only from six bytes.
+    if (std.mem.indexOf(u8, value, "&+")) |at| {
+        const pre = value[0 .. at + 2];
+        if (pre.len >= 6) try add(arena, out, value, pre);
+        if (value.len > at + 3) {
+            const post = value[at + 3 ..];
+            if (post.len >= 6) try add(arena, out, value, post);
+        }
+    } else if (std.mem.lastIndexOfScalar(u8, value, '&')) |at| {
+        const pre = value[0 .. at + 1];
+        const post = value[at + 1 ..];
+        if (pre.len >= 6) try add(arena, out, value, pre);
+        if (post.len >= 6) try add(arena, out, value, post);
+    }
+}
+
+/// `text` with each pair's first string replaced by its second, at each place, the first pair that
+/// matches there winning.
+fn replaceAll(arena: std.mem.Allocator, text: []const u8, pairs: []const [2][]const u8) std.mem.Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    next: while (i < text.len) {
+        for (pairs) |p| if (std.mem.startsWith(u8, text[i..], p[0])) {
+            try out.appendSlice(arena, p[1]);
+            i += p[0].len;
+            continue :next;
+        };
+        try out.append(arena, text[i]);
+        i += 1;
+    }
     return out.items;
 }
 
@@ -246,6 +335,43 @@ test "a secret is masked in every form it takes: trimmed, line by line, JSON, ba
     try std.testing.expectEqualStrings("auth ***", try alloc(ar, "auth YWJjZGVm", list));
     const spaced = try expand(ar, &.{"p@ss word"});
     try std.testing.expectEqualStrings("u=***", try alloc(ar, "u=p%40ss%20word", spaced));
+}
+
+test "a secret is masked in the forms GitHub's runner masks it in, base64 at any offset" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const list = try expand(ar, &.{"pa\"ss'w<o>rd&+s3cret-x"});
+    // base64(user:password): the password starts two bytes into a group of three, where the
+    // plain base64 form never matched. And followed by more bytes, which change its last
+    // character.
+    const enc = std.base64.standard.Encoder;
+    for ([_][]const u8{ "", "u", "us", "user:", "user:x" }) |before| {
+        for ([_][]const u8{ "", "!", "!!", "\n--more--" }) |after| {
+            const plain = try std.mem.concat(ar, u8, &.{ before, "pa\"ss'w<o>rd&+s3cret-x", after });
+            const b64 = try ar.alloc(u8, enc.calcSize(plain.len));
+            _ = enc.encode(b64, plain);
+            const got = try alloc(ar, b64, list);
+            try std.testing.expect(std.mem.indexOf(u8, got, mask) != null);
+            // What is left are at most the characters that also hold the bytes around it.
+            try std.testing.expect(got.len <= mask.len + 4 * (before.len + after.len + 2) / 3 + 4);
+        }
+    }
+    // Escaped for a command line, an expression and XML; PowerShell's halves around `&+`.
+    for ([_][]const u8{
+        "pa\\\"ss'w<o>rd&+s3cret-x",
+        "pa\"ss''w<o>rd&+s3cret-x",
+        "pa&quot;ss&apos;w&lt;o&gt;rd&amp;+s3cret-x",
+        "pa\"ss'w<o>rd&+",
+        "3cret-x",
+    }) |form| try std.testing.expectEqualStrings("<***>", try alloc(ar, try std.mem.concat(ar, u8, &.{ "<", form, ">" }), list));
+    // In double quotes, the value inside them.
+    const quoted = try expand(ar, &.{"\"quoted-value\""});
+    try std.testing.expectEqualStrings("=***", try alloc(ar, "=quoted-value", quoted));
+    // Lines split at a lone `\r` too, each masked in its forms.
+    const cr = try expand(ar, &.{"first-line\rsecond-line"});
+    try std.testing.expectEqualStrings("***", try alloc(ar, "second-line", cr));
+    try std.testing.expectEqualStrings("***", try alloc(ar, "c2Vjb25kLWxpbmU", cr));
 }
 
 test "redacts all occurrences" {
