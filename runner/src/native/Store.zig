@@ -1889,6 +1889,59 @@ test "native store: over its cap, collect evicts the least recently used layers 
     (try s.open(arena, io, keys[2])).?.layer.lock.close(io);
 }
 
+test "native store: a key published already stays, and the second upper is put back where it was" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    const k, const l = try testLayer(arena, io, tmp, &s, "up");
+    l.lock.close(io);
+    try tmp.dir.createDirPath(io, "again");
+    try tmp.dir.writeFile(io, .{ .sub_path = "again/g", .data = "second" });
+    const again = try std.fmt.allocPrint(arena, "{s}/again", .{try tmp.dir.realPathFileAlloc(io, ".", arena)});
+    try std.testing.expectError(error.Publish, s.publish(arena, io, k, .step, again, .{ .log = "b\n", .fc = "::zig-file-command::ran\nj2\n" }));
+    // The upper is back, whole, and nothing of the attempt is left in the store.
+    try tmp.dir.access(io, "again/g", .{});
+    var layers = try tmp.dir.openDir(io, "store/layers", .{ .iterate = true });
+    defer layers.close(io);
+    var it = layers.iterate();
+    var n: usize = 0;
+    while (try it.next(io)) |e| : (n += 1) try std.testing.expectEqualStrings(&hex(k), e.name);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    // The first layer is the one replayed.
+    const hit = (try s.open(arena, io, k)).?;
+    hit.layer.lock.close(io);
+    try std.testing.expectEqualStrings("a log\n", hit.rec.log);
+    // An upper that cannot be read fails before it moves: its temporary entry is removed.
+    var other: KeyHasher = .plain("other");
+    const missing = try std.fmt.allocPrint(arena, "{s}/missing", .{s.root});
+    try std.testing.expect(std.meta.isError(s.publish(arena, io, other.final(), .step, missing, .{ .log = "", .fc = "::zig-file-command::ran\n" })));
+    var after = try tmp.dir.openDir(io, "store/layers", .{ .iterate = true });
+    defer after.close(io);
+    var it2 = after.iterate();
+    n = 0;
+    while (try it2.next(io)) |_| n += 1;
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+
+test "native store: a key's tag is part of its preimage, output-keyed's as 2" {
+    var buf: [8]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var k: KeyHasher = .{ .h = .init(.{}), .bytes = &w };
+    k.int(@backingInt(Tag.output_keyed));
+    try std.testing.expectEqualSlices(u8, &.{ 2, 0, 0, 0, 0, 0, 0, 0 }, w.buffered());
+    var base: KeyHasher = .init(.base);
+    var step: KeyHasher = .init(.step);
+    var keyed: KeyHasher = .init(.output_keyed);
+    const kb = base.final();
+    const ks = step.final();
+    const kk = keyed.final();
+    try std.testing.expect(!std.mem.eql(u8, &kb, &ks) and !std.mem.eql(u8, &ks, &kk) and !std.mem.eql(u8, &kb, &kk));
+}
+
 test "native store: a step's log past the limit, or a base's file commands, are not published" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -1941,7 +1994,18 @@ test "native store: a layer whose file commands or tree changed is not replayed"
     try tmp.dir.writeFile(io, .{ .sub_path = fc, .data = "::zig-file-command::ran\nj2\n" });
     try std.testing.expect(try s.open(arena, io, k) == null);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, fc, .{}));
-    // Its tree gone: `collect`, which reads no record, removes it.
+    // The log, likewise.
+    const k3, const l3 = try testLayer(arena, io, tmp, &s, "up3");
+    l3.lock.close(io);
+    const log = try std.fmt.allocPrint(arena, "store/layers/{s}/log", .{&hex(k3)});
+    try tmp.dir.writeFile(io, .{ .sub_path = log, .data = "A log\n" });
+    try std.testing.expect(try s.open(arena, io, k3) == null);
+    // Its tree gone: a miss for `open`.
+    const k4, const l4 = try testLayer(arena, io, tmp, &s, "up4");
+    l4.lock.close(io);
+    removeTree(arena, io, l4.fs);
+    try std.testing.expect(try s.open(arena, io, k4) == null);
+    // And `collect`, which reads no record, removes it too.
     const k2, const l2 = try testLayer(arena, io, tmp, &s, "up2");
     l2.lock.close(io);
     removeTree(arena, io, l2.fs);
