@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The nightly OCI layer fuzz job runs 1M inputs instead of 3M: it took 27 of its 30 minutes as its kept corpus grew, and past 30 minutes zig-fuzz.sh reports a hang.'
-time: 2026-11-02T04:00:00.000000-05:00
