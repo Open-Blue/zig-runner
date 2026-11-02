@@ -775,13 +775,30 @@ fn overlayOptions(
 }
 
 fn mountOverlay(arena: Allocator, spec: Spec, lowers: []const []const u8, userxattr: bool) void {
-    check("mount the overlay", linux.mount(
-        "overlay",
-        z(arena, spec.merged),
-        "overlay",
-        0,
-        @intFromPtr(overlayOptions(arena, spec, lowers, userxattr).ptr),
-    ));
+    mountVolatile(arena, "mount the overlay", spec.merged, spec.work, overlayOptions(arena, spec, lowers, userxattr));
+}
+
+/// An overlay at `merged` with `opts`, `volatile` (Linux 5.10): never synced to its upper's
+/// filesystem, which otherwise its unmount does, whole (`sync_filesystem` of the upper's
+/// superblock), at every step's end: a step then waited for every other write to that disk, a
+/// tool cache being filled by another job, 5.7 s a step on a laptop's NVMe under one writer. What
+/// must outlive a crash is synced on its own: a layer before it is published (`Store.publish`).
+/// An upper is never mounted again after a crash (a dead runner's job directory is swept), and
+/// `volatile`'s mark in the work directory, which would refuse the next step's mount on it, is
+/// removed first. A kernel without it gets the overlay as before.
+fn mountVolatile(arena: Allocator, what: []const u8, merged: []const u8, work: []const u8, opts: []const u8) void {
+    const mark = std.fmt.allocPrintSentinel(arena, "{s}/work/incompat/volatile", .{work}, 0) catch oom();
+    // The mark: a directory holding one file, `dirty`.
+    _ = linux.unlink(z(arena, std.fmt.allocPrint(arena, "{s}/dirty", .{mark}) catch oom()));
+    _ = linux.rmdir(mark);
+    _ = linux.rmdir(z(arena, std.fs.path.dirname(mark).?));
+    const with = std.fmt.allocPrintSentinel(arena, "{s},volatile", .{opts}, 0) catch oom();
+    const rc = linux.mount("overlay", z(arena, merged), "overlay", 0, @intFromPtr(with.ptr));
+    if (linux.errno(rc) == .INVAL) {
+        check(what, linux.mount("overlay", z(arena, merged), "overlay", 0, @intFromPtr(z(arena, opts))));
+        return;
+    }
+    check(what, rc);
 }
 
 /// Joins the job's network namespace (its file, bind-mounted by `netUp`).
@@ -922,13 +939,7 @@ fn mountContainer(arena: Allocator, c: Spec.Container, lowers: []const []const u
         c.work,
         if (userxattr) ",userxattr" else "",
     }) catch oom();
-    check("mount the container's overlay", linux.mount(
-        "overlay",
-        z(arena, c.merged),
-        "overlay",
-        0,
-        @intFromPtr(z(arena, opts)),
-    ));
+    mountVolatile(arena, "mount the container's overlay", c.merged, c.work, opts);
 }
 
 /// Binds each of the container's shares from the job's overlay into the container (`root`), as
