@@ -70,9 +70,12 @@ pub fn pull(
     req: Request,
     why: *[]const u8,
 ) !Image {
-    const ref = registry.parseRef(arena, req.image) catch {
-        why.* = try std.fmt.allocPrint(arena, "{s} is not an image reference", .{req.image});
-        return error.InvalidImageReference;
+    const ref = registry.parseRef(arena, req.image) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidImageReference => {
+            why.* = try std.fmt.allocPrint(arena, "{s} is not an image reference", .{req.image});
+            return error.InvalidImageReference;
+        },
     };
     const platform = req.platform orelse hostPlatform() orelse {
         why.* = "this machine's architecture has no images";
@@ -160,10 +163,16 @@ fn imageKey(arena: Allocator, manifest: []const u8, owners: bool) ![]const u8 {
 fn fromStore(arena: Allocator, io: std.Io, store: Store, digest: []const u8, manifest: []const u8, owners: bool) !?Image {
     const dir = try std.fmt.allocPrint(arena, "{s}/oci/images/{s}", .{ store.root, try imageKey(arena, manifest, owners) });
     const cwd = std.Io.Dir.cwd();
-    const raw = cwd.readFileAlloc(io, try std.fmt.allocPrint(arena, "{s}/config.json", .{dir}), arena, .limited(max_config)) catch
-        return null;
-    const cfg = std.json.parseFromSliceLeaky(Config, arena, raw, .{ .ignore_unknown_fields = true }) catch
-        return null;
+    // Out of memory is not "not in the store": read as one, the pull reported that the store lost
+    // the image it had just unpacked.
+    const raw = cwd.readFileAlloc(io, try std.fmt.allocPrint(arena, "{s}/config.json", .{dir}), arena, .limited(max_config)) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const cfg = parseConfig(arena, raw) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BadConfig => return null,
+    };
     const inner = cfg.config orelse Config.Inner{};
     return .{
         .rootfs = try std.fmt.allocPrint(arena, "{s}/rootfs", .{dir}),
@@ -220,10 +229,21 @@ pub const Config = struct {
     };
 };
 
-fn parseManifest(arena: Allocator, m: registry.Client.Manifest, why: *[]const u8) !Manifest {
-    const doc = std.json.parseFromSliceLeaky(Manifest, arena, m.bytes, .{ .ignore_unknown_fields = true }) catch {
-        why.* = "the registry's manifest is not one";
-        return error.BadManifest;
+/// An image config, or `error.BadConfig`; out of memory is not a bad config.
+fn parseConfig(arena: Allocator, raw: []const u8) error{ OutOfMemory, BadConfig }!Config {
+    return std.json.parseFromSliceLeaky(Config, arena, raw, .{ .ignore_unknown_fields = true }) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadConfig,
+    };
+}
+
+fn parseManifest(arena: Allocator, m: registry.Client.Manifest, why: *[]const u8) error{ OutOfMemory, BadManifest }!Manifest {
+    const doc = std.json.parseFromSliceLeaky(Manifest, arena, m.bytes, .{ .ignore_unknown_fields = true }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            why.* = "the registry's manifest is not one";
+            return error.BadManifest;
+        },
     };
     if (doc.schemaVersion != 2) {
         why.* = try std.fmt.allocPrint(arena, "manifest schema {d} is not supported (only 2: " ++
@@ -288,9 +308,12 @@ const Unpack = struct {
         const c = u.client;
         const cfg_desc = u.doc.config.?;
         const raw = try c.smallBlob(cfg_desc.digest, max_config);
-        const cfg = std.json.parseFromSliceLeaky(Config, arena, raw, .{ .ignore_unknown_fields = true }) catch {
-            u.why = try std.fmt.allocPrint(arena, "{s}: its config is not an image config", .{u.image});
-            return error.BadConfig;
+        const cfg = parseConfig(arena, raw) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.BadConfig => {
+                u.why = try std.fmt.allocPrint(arena, "{s}: its config is not an image config", .{u.image});
+                return error.BadConfig;
+            },
         };
         const layers = u.doc.layers.?;
         const diff_ids = if (cfg.rootfs) |r| r.diff_ids else &.{};
@@ -369,4 +392,47 @@ test "native oci platform pick: linux on this architecture, its variant first, n
     try testing.expectEqualStrings("sha256:c", pickPlatform(list[0..3], .{ .architecture = "arm64", .variant = "v8" }).?.digest);
     try testing.expect(pickPlatform(list[0..2], .{ .architecture = "amd64" }) == null);
     try testing.expect(hostPlatform() != null);
+}
+
+test "allocation failures: OCI manifests, indexes and image configs" {
+    const af = @import("../../alloc_failures.zig");
+    const S = struct {
+        fn manifest(a: Allocator, bytes: []const u8, ok: bool) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            var why: []const u8 = "";
+            const m: registry.Client.Manifest = .{ .bytes = bytes, .media_type = "", .digest = "" };
+            const doc = parseManifest(arena.allocator(), m, &why) catch |e| switch (e) {
+                error.BadManifest => return if (ok) e else {},
+                else => return e,
+            };
+            try testing.expect(ok and (doc.manifests != null or doc.layers != null));
+        }
+        fn config(a: Allocator, raw: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            const cfg = try parseConfig(arena.allocator(), raw);
+            try testing.expectEqual(@as(usize, 2), cfg.config.?.Env.?.len);
+        }
+    };
+    const d = comptime "sha256:" ++ layer.repeat('a', 64);
+    const index = std.fmt.comptimePrint(
+        \\{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[
+        \\ {{"digest":"{s}","size":1,"platform":{{"architecture":"amd64","os":"linux"}}}},
+        \\ {{"digest":"{s}","platform":{{"architecture":"arm64","os":"linux","variant":"v8"}},"annotations":{{"x":"y"}}}}]}}
+    , .{ d, d });
+    const image = std.fmt.comptimePrint(
+        \\{{"schemaVersion":2,"config":{{"mediaType":"c","digest":"{s}"}},
+        \\ "layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{s}","size":3}}]}}
+    , .{ d, d });
+    try af.checkOne(S.manifest, .{ index, true });
+    try af.checkOne(S.manifest, .{ image, true });
+    // Refused, each with a message: schema 1, a digest that is not sha256, not JSON.
+    try af.checkOne(S.manifest, .{ "{\"schemaVersion\":1}", false });
+    try af.checkOne(S.manifest, .{ "{\"schemaVersion\":2,\"layers\":[{\"digest\":\"md5:x\"}]}", false });
+    try af.checkOne(S.manifest, .{ "not json", false });
+    try af.checkOne(S.config, .{
+        \\{"architecture":"amd64","os":"linux","config":{"Env":["PATH=/bin","A=1"],"User":"u","WorkingDir":"/w"},
+        \\ "rootfs":{"type":"layers","diff_ids":["sha256:1","sha256:2"]},"history":[{"created_by":"x"}]}
+    });
 }

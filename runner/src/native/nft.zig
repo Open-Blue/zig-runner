@@ -390,6 +390,8 @@ const Batch = struct {
         b.attrStr(nfta_chain_name, name);
         const h = b.begin(nfta_chain_hook);
         b.attrBe32(nfta_hook_hooknum, hook);
+        // A negative priority (NAT's -100) goes as its two's complement, which the kernel reads
+        // back as the signed value (i32 to u32: the same bits, under any @bitCast definition).
         b.attrBe32(nfta_hook_priority, @bitCast(priority));
         b.end(h);
         b.attrBe32(nfta_chain_policy, nf_accept);

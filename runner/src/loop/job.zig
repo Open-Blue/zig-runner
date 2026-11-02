@@ -916,7 +916,7 @@ const Renewer = struct {
                 r.say(
                     arena,
                     "job hold renewed (locked until {s})",
-                    .{jsonString(arena, resp.body, "lockedUntil") orelse "?"},
+                    .{(jsonString(arena, resp.body, "lockedUntil") catch null) orelse "?"},
                 );
             }
         }
@@ -988,12 +988,13 @@ const CancelWatch = struct {
                     cc.io.sleep(.fromSeconds(5), .awake) catch return;
                 continue;
             }
-            const mtype = jsonString(cc.arena, m.body, "messageType") orelse "";
+            // A message this cannot read for want of memory is lost either way: the poll took it.
+            const mtype = (jsonString(cc.arena, m.body, "messageType") catch continue) orelse "";
             if (!std.mem.eql(u8, mtype, "JobCancellation")) continue;
-            const inner = jsonString(cc.arena, m.body, "body") orelse continue;
-            const id = jsonString(cc.arena, inner, "jobId") orelse continue;
+            const inner = (jsonString(cc.arena, m.body, "body") catch continue) orelse continue;
+            const id = (jsonString(cc.arena, inner, "jobId") catch continue) orelse continue;
             if (!std.mem.eql(u8, id, w.job_id)) continue;
-            const grace_ms = timeSpanMs(jsonString(cc.arena, inner, "timeout") orelse "") orelse
+            const grace_ms = timeSpanMs((jsonString(cc.arena, inner, "timeout") catch null) orelse "") orelse
                 default_grace_ms;
             w.cancel.request(std.Io.Clock.real.now(cc.io).toMilliseconds() + grace_ms);
             const text = std.fmt.allocPrint(

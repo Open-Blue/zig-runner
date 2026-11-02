@@ -1006,6 +1006,7 @@ fn digestIn(
         // which no tool can set back (a tar restoring mtimes does not restore it).
         if (depth == .metadata) {
             h.int(n.st.ino);
+            // Seconds are signed (before 1970 is negative): hashed as their two's complement.
             h.int(@bitCast(n.st.ctime.sec));
             h.int(n.st.ctime.nsec);
         }

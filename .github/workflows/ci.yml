@@ -61,6 +61,12 @@ jobs:
       - name: shellcheck
         run: .github/scripts/shellcheck.sh
 
+      # The casts and assertions that skip Zig's checks (@bitCast, @ptrCast, @alignCast, @intCast,
+      # `catch unreachable`) in runner/src, against their checked-in counts: a new one raises
+      # unsafe-ratchet.baseline in the same pull request, where a reviewer sees it.
+      - name: Unsafe constructs ratchet
+        run: .github/scripts/unsafe-ratchet.sh
+
       # The runner's check of the tool cache's trees (runner/src/dagger/tool_trees.sh), on a small
       # fake tree: its lists let it skip re-reading unchanged files, never a changed, added or
       # deleted one, and a list a job writes into the tool cache is never read.

@@ -531,7 +531,10 @@ fn reachable(addr: [4]u8, port: u16) bool {
     defer _ = linux.close(fd);
     var sa: linux.sockaddr.in = .{
         .port = std.mem.nativeToBig(u16, port),
-        .addr = @bitCast(addr),
+        // The bytes as they are, in network order. Not `@bitCast`: since Zig 0.17 it puts an
+        // array's first element in the integer's lowest bits, which is the same memory only on a
+        // little-endian machine.
+        .addr = std.mem.bytesToValue(u32, &addr),
     };
     const c = linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in));
     if (linux.errno(c) == .SUCCESS) return true;
