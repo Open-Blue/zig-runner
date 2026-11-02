@@ -72,9 +72,13 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 	if grep -q '^\.github/workflows/' <<<"$changed"; then
 		say "actionlint and zizmor"
 		(cd "$tree" && go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12) || fail "actionlint found problems"
-		if command -v pipx >/dev/null; then zizmor=(pipx run zizmor==1.31.1)
-		elif command -v uvx >/dev/null; then zizmor=(uvx zizmor@1.31.1)
-		else fail "workflows changed, and zizmor needs pipx or uv to run (CI's \"Workflows\" job runs zizmor 1.31.1)"; fi
+		if command -v pipx >/dev/null; then
+			zizmor=(pipx run zizmor==1.31.1)
+		elif command -v uvx >/dev/null; then
+			zizmor=(uvx zizmor@1.31.1)
+		else
+			fail "workflows changed, and zizmor needs pipx or uv to run (CI's \"Workflows\" job runs zizmor 1.31.1)"
+		fi
 		(cd "$tree" && "${zizmor[@]}" .github/workflows) || fail "zizmor found problems"
 	fi
 	while read -r mod; do

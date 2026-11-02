@@ -26,9 +26,15 @@ zig_modules() {
 	local url rev want got
 	if [[ ! -d $scratch/tls ]]; then
 		url=$(sed -n 's|^ *\.url = "\(https://github\.com/.*/archive/[0-9a-f]\{40\}\.tar\.gz\)",$|\1|p' build.zig.zon)
-		[[ $(wc -l <<<"$url") == 1 && -n $url ]] || { echo "expected one GitHub archive URL in build.zig.zon" >&2; return 1; }
+		[[ $(wc -l <<<"$url") == 1 && -n $url ]] || {
+			echo "expected one GitHub archive URL in build.zig.zon" >&2
+			return 1
+		}
 		want=$(sed -n 's|^ *\.hash = "\([^"]*\)",$|\1|p' build.zig.zon)
-		[[ $(wc -l <<<"$want") == 1 && -n $want ]] || { echo "expected one .hash in build.zig.zon" >&2; return 1; }
+		[[ $(wc -l <<<"$want") == 1 && -n $want ]] || {
+			echo "expected one .hash in build.zig.zon" >&2
+			return 1
+		}
 		rev=${url##*/}
 		git init -q "$scratch/tls"
 		git -C "$scratch/tls" fetch -q --depth 1 "${url%/archive/*}" "${rev%.tar.gz}"
@@ -66,9 +72,15 @@ zig_package_hash() {
 	while IFS= read -r -d '' f; do
 		f=${f#./}
 		if [[ -L $dir/$f ]]; then
-			d=$({ printf '%s' "$f"; readlink "$dir/$f" | tr -d '\n'; } | sha256sum)
+			d=$({
+				printf '%s' "$f"
+				readlink "$dir/$f" | tr -d '\n'
+			} | sha256sum)
 		else
-			d=$({ printf '%s\0\0' "$f"; cat "$dir/$f"; } | sha256sum)
+			d=$({
+				printf '%s\0\0' "$f"
+				cat "$dir/$f"
+			} | sha256sum)
 			size=$((size + $(wc -c <"$dir/$f")))
 		fi
 		digests+=${d%% *}

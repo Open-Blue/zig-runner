@@ -5,6 +5,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-mapfile -t scripts < <(git ls-files -z | xargs -0 grep -lsE '^#!/usr/bin/env (bash|sh)|^#!/bin/(ba)?sh' -- 2>/dev/null; echo .githooks/common.sh)
+mapfile -t scripts < <(
+	git ls-files -z | xargs -0 grep -lsE '^#!/usr/bin/env (bash|sh)|^#!/bin/(ba)?sh' -- 2>/dev/null
+	echo .githooks/common.sh
+)
 docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d -x "${scripts[@]}"
 echo "shellcheck: ${#scripts[@]} scripts, no findings"

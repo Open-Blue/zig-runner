@@ -38,7 +38,12 @@ expect() {
 	fi
 }
 ok() {
-	if "${@:2}"; then echo "ok: $1"; else echo "FAIL: $1"; failures=$((failures + 1)); fi
+	if "${@:2}"; then
+		echo "ok: $1"
+	else
+		echo "FAIL: $1"
+		failures=$((failures + 1))
+	fi
 }
 not() { ! "$@"; }
 # The check's output, and whether it gives the tree its pinned digest.
