@@ -11,6 +11,19 @@ name: analysis
 #                  artifact (fuzz-TARGET).
 #   Valgrind       every test under Valgrind's memcheck (.github/scripts/zig-valgrind.sh): reads
 #                  of memory never written, and accesses outside what was allocated.
+#   Stress         the concurrency-sensitive tests (.github/scripts/zig-race-tests.sh: cancels,
+#                  deadlines, the memory gate, the native store's locks, the database, the
+#                  broker's long-poll, log uploads) 100 times over under CPU and memory load
+#                  (.github/scripts/zig-stress.sh), with the database; the first failing round
+#                  fails the job, its output an artifact (stress-output).
+#
+# Not here, as they cannot work on these tests (measured 2026-11-02): rr, which needs the CPU's
+# performance counters, and GitHub's runner (an Azure VM) exposes none (no `cpu` event source,
+# even with perf_event_paranoid at 1: "Unable to open performance counter"); and Valgrind's
+# Helgrind and DRD, which know only pthreads' locks and their own annotations, and Zig's std
+# builds every lock on raw futexes and atomics (Io.Threaded's own run queue is the first of
+# 109,234 Helgrind and 105,938 DRD reports from pg.zig's one deadline test). ci's
+# ThreadSanitizer pass sees those locks.
 #
 # Each search costs more than a pull request should wait for, so they run here and not in ci; a
 # failure is a case for an issue (or a fix), not a broken main.
@@ -32,6 +45,8 @@ on:
       - .github/scripts/zig-fuzz.sh
       - .github/scripts/zig-valgrind.sh
       - .github/valgrind.supp
+      - .github/scripts/zig-race-tests.sh
+      - .github/scripts/zig-stress.sh
 
 permissions: {}
 
@@ -133,3 +148,53 @@ jobs:
 
       - name: Tests under memcheck
         run: .github/scripts/zig-valgrind.sh
+
+  # The concurrency-sensitive tests under load. About 11 s a round on an idle runner.
+  stress:
+    name: Stress
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    permissions:
+      contents: read # to check out the code
+    # The database's tests run too (ci.yml's Database tests job, whose database this is), and fail
+    # without it rather than skip.
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: ci-only
+      PGDATABASE: tsdb
+      PGSSLMODE: disable
+      ZIG_TEST_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Start the database
+        run: .github/scripts/ci-database.sh start
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      # Ubuntu's own package, checked by apt against the archive's signed index, at the version
+      # pinned here, so every night loads the machine the same way.
+      - name: Install stress-ng
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends stress-ng=0.20.01-1
+          stress-ng --version
+
+      - name: Wait for the database
+        run: .github/scripts/ci-database.sh wait
+
+      - name: Tests under load
+        run: .github/scripts/zig-stress.sh 100 "$RUNNER_TEMP/stress"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: stress-output
+          path: ${{ runner.temp }}/stress
+          if-no-files-found: ignore
+

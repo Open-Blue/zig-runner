@@ -123,7 +123,11 @@ artifact; `zig build test` runs the same targets over their seed corpus every ti
 `zig build test -Dllvm --fuzz` (add `-Dtest-filter='fuzz: YAML'` for one target). "Valgrind" runs
 every test under memcheck (`.github/scripts/zig-valgrind.sh`), for reads of memory never written
 and accesses outside an allocation, which Debug's safety checks miss; known-benign reports are
-suppressed in `.github/valgrind.supp`, each with why.
+suppressed in `.github/valgrind.supp`, each with why. "Stress" runs the concurrency-sensitive
+tests (cancels, deadlines, the memory gate, the native store's locks, the database, the broker's
+long-poll, log uploads; `.github/scripts/zig-race-tests.sh` names them) 100 times over under
+stress-ng's CPU and memory load, with the database, and fails on the first round that fails, its
+output an artifact (`.github/scripts/zig-stress.sh`).
 `proofs` checks the [Lean proofs](proofs/README.md) (the step cache, the regex matcher's loops, and
 the `hashFiles()` walk) and compares the walk's model with `runner/src/glob.zig` on random cases,
 when either changes and weekly ("Proofs"). The workflows are written to be hard to turn against the
@@ -193,7 +197,8 @@ repository:
   (`.github/scripts/go-lint.sh`); every job has a time limit. The Database
   tests job runs every test under
   ThreadSanitizer (`zig build test -Dsanitize-thread` locally); ZLint checks the runner's Zig, and
-  `analysis` fuzzes its parsers and runs its tests under Valgrind nightly (above). Vulnerabilities
+  `analysis` fuzzes its parsers, runs its tests under Valgrind and its concurrency-sensitive tests
+  under load nightly (above). Vulnerabilities
   are reported privately ([docs/SECURITY.md](docs/SECURITY.md)).
 - **One secret, one step.** The deploy key that may push to `main` is the `prod` environment's,
   which deploys only from `main` and waits for approval; it is loaded only in the step that pushes,
