@@ -554,7 +554,7 @@ const Batch = struct {
         b.attrBe32(nfta_payload_dreg, nft_reg_1);
         b.attrBe32(nfta_payload_base, base);
         b.attrBe32(nfta_payload_offset, offset);
-        b.attrBe32(nfta_payload_len, @intCast(value.len));
+        b.attrBe32(nfta_payload_len, std.math.lossyCast(u32, value.len));
         b.endExpr(d);
         b.cmp(.eq, value);
     }
