@@ -36,6 +36,7 @@ const SpanDemux = @import("../dagger/JobLog.zig").SpanDemux;
 const checkout = @import("../dagger/checkout.zig");
 const scripts = @import("../dagger/scripts.zig");
 const set_up = @import("../dagger/set_up.zig");
+const phases = @import("phases.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -62,6 +63,8 @@ image_uid: u32 = 0,
 image_gid: u32 = 0,
 /// A `container:` job's PATH once its env is set (`dagger.Base.runtime_path`).
 runtime_path: ?[]const u8 = null,
+/// Where the job's time went (`phases.zig`): its set-up, each sandbox and publish, its teardown.
+timings: phases.Phases = .{},
 /// What "Set up job" says of the image and its provisioning, the job's cgroup and its caches.
 notes: std.ArrayList([]const u8) = .empty,
 /// Remote actions fetched before "Set up job" (`actions.preload`), by `Exec.loadAction`'s key.
@@ -679,17 +682,21 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
 /// FileNotFound"), for "Set up job": an error's name alone does not say which of the job's
 /// directories, locks, helpers or files it was.
 pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *[]const u8) !Backend {
+    var ph: phases.Phases = .{};
+    var t = phases.now();
     if (Store.secure(arena, io, cfg.store, .{ .check_parents = cfg.check_store_parents }) catch |e|
         return failed(why, arena, "preparing the native store", cfg.store, e)) |unsafe|
     {
         why.* = unsafe;
         return error.StoreUnsafe;
     }
+    t = ph.since(arena, .store, t);
     const cg_parent = cgroup.parent(arena, io, cfg.cgroup.parent);
     sweep(arena, io, cfg.store, switch (cg_parent) {
         .dir => |d| d,
         .none => null,
     });
+    t = ph.since(arena, .sweep, t);
     var raw: [8]u8 = undefined;
     io.random(&raw);
     const id = std.fmt.bytesToHex(raw, .lower);
@@ -722,7 +729,9 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         const paths = try std.fmt.allocPrint(arena, "{s} to {s}", .{ new, dir });
         return failed(why, arena, "renaming", paths, e);
     };
+    t = ph.since(arena, .dir, t);
     var b: Backend = .{
+        .timings = ph,
         .arena = arena,
         .io = io,
         .gpa = gpa,
@@ -751,8 +760,11 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         cfg.self_exe_replaced,
         cfg.self_exe,
     }));
+    t = phases.now();
     try b.jobCgroup(cfg, cg_parent, &id);
+    t = b.timings.since(arena, .cgroup, t);
     b.binds = try b.jobBinds(cfg, why);
+    _ = b.timings.since(arena, .resolver, t);
     if (b.how.userns == .mapped) try b.jobNetwork(cfg, why);
     return b;
 }
@@ -954,6 +966,7 @@ pub fn serviceDirs(b: *Backend, n: u32, rootfs: []const u8) !ServiceDirs {
 /// (`net.command`), since a thread of the runner must not change its namespace.
 fn jobNetwork(b: *Backend, cfg: Config, why: *[]const u8) !void {
     const arena = b.arena;
+    var t = phases.now();
     b.slot = lockSlot(arena, b.io, net.slots_dir) catch |e|
         return failed(why, arena, "taking a slot in", net.slots_dir, e);
     const n = b.slot.?.n;
@@ -962,6 +975,7 @@ fn jobNetwork(b: *Backend, cfg: Config, why: *[]const u8) !void {
     var sock = net.Socket.open() catch |e| return failed(why, arena, "opening", "a netlink socket", e);
     sock.deleteVeth(n);
     sock.close();
+    t = b.timings.since(arena, .slot, t);
     const subnet = try std.fmt.allocPrint(arena, "{f}", .{cfg.subnet});
     // The host's uplinks and its resolver may have changed since the probe made their rules.
     const rules = natRulesFor(arena, b.io, cfg.subnet, b.nameservers, false) catch |e|
@@ -971,6 +985,8 @@ fn jobNetwork(b: *Backend, cfg: Config, why: *[]const u8) !void {
         why.* = try std.fmt.allocPrint(arena, "making the jobs' NAT rules for {s}: {s}", .{ subnet, no });
         return error.JobNetworkFailed;
     }
+    t = b.timings.since(arena, .nat, t);
+    defer _ = b.timings.since(arena, .netns, t);
     const path = try std.fmt.allocPrint(arena, "{s}/netns", .{b.dir});
     const slot = try std.fmt.allocPrint(arena, "{d}", .{n});
     var child = std.process.spawn(b.io, .{
@@ -1064,13 +1080,16 @@ fn lockFile(arena: Allocator, io: std.Io, path: []const u8, wait: bool) !std.Io.
 /// The job's network taken down, its layers removed, its volumes, cgroup, slot and lock let go.
 pub fn deinit(b: *Backend) void {
     const arena = b.arena;
+    var t = phases.now();
     // First: their helpers hold the job's directory and network, and are in its cgroup.
     b.service_set.stopAll(b.io);
     b.cache_plan.release(b.io);
+    t = b.timings.since(arena, .services, t);
     if (b.job_cgroup) |j| {
         if (b.gate) |g| g.nativeDone();
         j.remove(arena, b.io);
     }
+    t = b.timings.since(arena, .cgroup_rm, t);
     if (b.slot) |s| {
         var sock = net.Socket.open() catch null;
         if (sock) |*so| {
@@ -1079,13 +1098,16 @@ pub fn deinit(b: *Backend) void {
         }
     }
     if (b.netns) |p| detachNetns(arena, p);
+    t = b.timings.since(arena, .veth_rm, t);
     removeTree(arena, b.io, b.dir);
+    t = b.timings.since(arena, .tree_rm, t);
     for (b.held.items) |f| f.close(b.io);
     if (b.slot) |s| s.lock.close(b.io);
     b.lock.close(b.io);
     // The store kept under its cap, now that this job holds none of its layers: whether or not
     // the job cached steps, as Dockerfile builds publish layers too (`layers.zig`).
     if (b.store_cfg.root.len > 0) b.store_cfg.collect(arena, b.io);
+    _ = b.timings.since(arena, .collect, t);
 }
 
 fn detachNetns(arena: Allocator, path: []const u8) void {
@@ -1134,8 +1156,10 @@ pub fn base(
 ) !void {
     const arena = b.arena;
     try b.prepareRootfs(ev, plan, err_msg);
+    var t = phases.now();
     // On the job's image (the seed's build and the roll run on `b.rootfs`).
     try b.setUpCaches(ev, plan);
+    t = b.timings.since(arena, .caches, t);
     try b.baseEnv(ev, plan);
     // Not with services (P6): what a step got from a service (its image, its env, its data) is
     // in no key, so a replay could stand for a run against another service.
@@ -1161,6 +1185,8 @@ pub fn base(
             return error.NativeToDagger;
         }
     }
+    t = b.timings.since(arena, .actions, t);
+    defer _ = b.timings.since(arena, .base, t);
 
     // The workspace and RUNNER_TEMP, made as Dagger's base makes them: in the provisioned image by
     // root, owned by the step user when it is not root; in any other image by its own user, who
@@ -1282,6 +1308,8 @@ pub fn execScript(
     mounts: []const dagger.Mount,
 ) !Exec.Out {
     const arena = b.arena;
+    const mark = b.timings.mark();
+    defer b.stepPhases(x, num, mark);
     try b.applyPendingEnv(x);
     // The step's mounts (a JavaScript action's runtime and shims, `js.zig`): bound for every
     // step after, their mount points made once.
@@ -1396,6 +1424,16 @@ pub fn execScript(
             try b.publishTop(k, .step, .{ .log = r.items, .fc = all orelse "" });
         return out;
     }
+}
+
+/// With step debug: where step `num`'s time went (`phases.zig`), from its key's claim to its
+/// layer published.
+fn stepPhases(b: *Backend, x: *Exec, num: u32, mark: phases.Phases.Mark) void {
+    if (!x.sh.step_debug) return;
+    const text = b.timings.text(b.arena, mark, .steps) catch return;
+    if (text.len == 0) return;
+    x.sh.append(num, std.fmt.allocPrint(b.arena, "##[debug]Native phases (ms): {s}", .{text}) catch
+        return);
 }
 
 /// A stored step's record as Dagger's answer for an exec served from its cache gives it
@@ -1802,7 +1840,7 @@ fn execIn(
     new_layer: bool,
 ) !sandbox.Ended {
     const arena = b.arena;
-    if (b.layers.items.len >= b.flatten_at) b.flatten() catch |e| return if (e == error.LayerNotShifted) e else .{
+    if (b.layers.items.len >= b.flatten_at) b.flattenTimed() catch |e| return if (e == error.LayerNotShifted) e else .{
         .code = 1,
         .failure = try std.fmt.allocPrint(arena, "could not flatten the job's {d} layers " ++
             "into one: {s}", .{ b.layers.items.len, @errorName(e) }),
@@ -1853,6 +1891,7 @@ fn execIn(
         .volume_id_base = volumeIdBase(b.subid_base),
         .container = container,
     }, &b.running, out);
+    b.timings.helper(arena, ended.helper, ended.spawned, ended.ended);
     if (new_layer) try b.layers.append(arena, .{ .name = upper, .path = upper_path });
     return ended;
 }
@@ -2036,6 +2075,8 @@ fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
     const k = key orelse return .{};
     const s = b.store.?;
     const arena = b.arena;
+    const t = phases.now();
+    defer _ = b.timings.since(arena, .claim, t);
     b.stop_wait.store(false, .release);
     b.waiting.store(true, .release);
     const lock = s.lockKey(arena, b.io, k, &b.stop_wait) catch |e| {
@@ -2089,7 +2130,9 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) 
     // Room first: once the layer has moved, the job must hold it and point at it.
     b.held.ensureUnusedCapacity(arena, 1) catch return;
     const top = &b.layers.items[b.layers.items.len - 1];
+    const t = phases.now();
     try b.canonicalize(top);
+    _ = b.timings.since(arena, .unshift, t);
     const name = b.layerName('l') catch return;
     const link = std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name }) catch return;
     const layer_fs = std.fmt.allocPrint(arena, "{s}/layers/{s}/fs", .{
@@ -2102,7 +2145,7 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) 
         std.log.warn("native: cannot link a layer into the store: {s}", .{@errorName(e)});
         return;
     };
-    const layer = s.publish(arena, b.io, key, kind, top.path, rec) catch |e| {
+    const layer = s.publishTimed(arena, b.io, key, kind, top.path, rec, &b.timings) catch |e| {
         std.log.warn("native: cannot publish a layer to the store: {s}", .{@errorName(e)});
         cwd.deleteFile(b.io, link) catch {};
         return;
@@ -2158,6 +2201,12 @@ pub fn keyFetched(b: *Backend, what: []const u8) !void {
 /// The job's stack merged into one layer (`Store.flatten`), before overlay's limits on layers and
 /// on its options' length are reached. The merged layer stands for the stack's top: its key is
 /// the top's, so the steps after it are keyed and published as before.
+fn flattenTimed(b: *Backend) !void {
+    const t = phases.now();
+    defer _ = b.timings.since(b.arena, .flatten, t);
+    return b.flatten();
+}
+
 fn flatten(b: *Backend) !void {
     const arena = b.arena;
     const paths = try arena.alloc([]const u8, b.layers.items.len);
@@ -2217,6 +2266,7 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
         creds = .{ .username = c.user, .password = c.pass };
     };
     var why: []const u8 = "";
+    var t = phases.now();
     const img = b.pull(plan.job_image, creds, &why) catch |e| {
         err_msg.* = try std.fmt.allocPrint(arena, "could not pull {s} natively: {s}", .{
             plan.job_image,
@@ -2235,11 +2285,13 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
         },
     ) else "Image: from the native store");
     b.rootfs = img.rootfs;
+    t = b.timings.since(arena, .image, t);
     if (plan.provision) b.rootfs = try b.provision(
         img,
         if (plan.as_runner) set_up.provision_runner_script else set_up.provision_script,
         err_msg,
     );
+    _ = b.timings.since(arena, .provision, t);
     if (!plan.as_runner and img.user.len > 0) {
         const user_ids = b.imageUser(img.user) catch |e| {
             err_msg.* = try std.fmt.allocPrint(arena, "the image's USER {s}: {s}", .{
@@ -4823,6 +4875,48 @@ test "native step cache: measured, replay per step and the store's size over 50 
         try storeLayers(arena, c.cfg.store),
         (try Store.treeBytes(arena, io, layers)) / 1024,
     });
+}
+
+test "native phases: where a cached job's time goes, cold and replayed" {
+    // A measurement, not a check: ZIG_RUNNER_NATIVE_PHASES=<runs> runs it, each run a cold job
+    // in a store of its own then the same job replayed. It prints each job's phases as the
+    // runner logs them, for .github/scripts/native-phases.sh (`zig build test ... 2>&1 |
+    // native-phases.sh`). ZIG_RUNNER_NATIVE_PHASES_DIR puts the stores there (a slow disk's
+    // mount) instead of the tests' temporary directory.
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env = try std.testing.environ.createMap(arena);
+    const runs_text = env.get("ZIG_RUNNER_NATIVE_PHASES") orelse return error.SkipZigTest;
+    const n = std.fmt.parseInt(u32, runs_text, 10) catch return error.SkipZigTest;
+    // A small file, 32 MiB in one, 3000 empty files, and nothing.
+    const steps = [_]job_mod.Step{
+        testStep("echo small > /tmp/small"),
+        testStep("head -c 33554432 /dev/urandom > /tmp/big.bin"),
+        testStep("mkdir -p /tmp/many && cd /tmp/many && seq 1 3000 | xargs touch"),
+        testStep("true"),
+    };
+    for (0..n) |i| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var c = try cachedConfig(arena, &tmp);
+        if (env.get("ZIG_RUNNER_NATIVE_PHASES_DIR")) |dir| {
+            const store = try std.fmt.allocPrint(arena, "{s}/store-{d}", .{ dir, i });
+            Store.removeTree(arena, std.testing.io, store);
+            c.cfg.store = store;
+        }
+        defer if (env.get("ZIG_RUNNER_NATIVE_PHASES_DIR") != null)
+            Store.removeTree(arena, std.testing.io, c.cfg.store);
+        for ([_][]const u8{ "cold", "replayed" }) |how| {
+            const r = try runCached(arena, c.cfg, testJob(&steps), how);
+            try expectSucceeded(r);
+            std.debug.print("job {d} '{s}': native phases (ms): {s}\n", .{
+                i,
+                how,
+                r.res.native_phases orelse "",
+            });
+        }
+    }
 }
 
 test "native step cache: a fork's pull request keys its layers apart from its repository's jobs" {

@@ -31,6 +31,10 @@
 # timings and the runner's log go), E2E_ZIG_RUNNER_REF (the zig-runner commit whose
 # install-zig.sh the tool cache job runs, main). `start` also takes GH_APP_ID and
 # GH_APP_PRIVATE_KEY_FILE, the runner's own (deploy/runner.env.example).
+#
+# After a native pass, where the native jobs' time went, per phase (native-phases.sh), from the
+# runner's log when `start` started it. On razorbill, after `e2e.sh check pi-bench`:
+# `journalctl -u zig-runner@bench.service --since '-15 min' | .github/scripts/native-phases.sh`.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -345,6 +349,11 @@ check() {
 	trap - EXIT
 	echo "timings ($backend):"
 	awk -F'\t' -v b="$backend" '$1 == b' "$out/timings.tsv" | cut -f2- | column -t -s $'\t'
+	# Where the native jobs' time went, from the runner's log when `start` started it.
+	if [[ $backend == native && -e $out/runner-native.log ]]; then
+		echo "phases (native):"
+		NATIVE_PHASES_BY_JOB=1 .github/scripts/native-phases.sh "$out/runner-native.log" || true
+	fi
 	if ((failures > 0)); then
 		# On stdout, after the table: GitHub merges the two streams out of order.
 		echo "e2e ($backend): $failures failed; job logs in $out/logs"

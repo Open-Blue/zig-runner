@@ -26,6 +26,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const seccomp = @import("seccomp.zig");
 const health = @import("health.zig");
+const phases = @import("phases.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -164,7 +165,16 @@ pub const Userns = enum { mapped, self, inherited };
 /// What a step ended with: its exit code (128 + n for signal n, as a shell reports it), and the
 /// helper's own failure, when the sandbox could not be made. `killed`: it was stopped by
 /// `Running.kill`, so its end is not the step's own.
-pub const Ended = struct { code: i32, failure: []const u8, killed: bool = false };
+pub const Ended = struct {
+    code: i32,
+    failure: []const u8,
+    killed: bool = false,
+    /// The helper's phases (`phases.Helper`, a line on its stderr, not part of `failure`), and
+    /// when it was started and waited for, on the same clock.
+    helper: phases.Helper = .{},
+    spawned: u64 = 0,
+    ended: u64 = 0,
+};
 
 /// Starts the helper and streams the step's output to `out` (`Output.chunk`) as it arrives;
 /// returns once the step and every process it started have ended. `Running` lets another task
@@ -180,6 +190,7 @@ pub fn run(
     const argv = try std.mem.concat(arena, []const u8, &.{ argv_prefix, &.{command} });
     // Nothing of the runner's environment (its tokens among it): the step's is in the spec.
     var empty: std.process.Environ.Map = .init(arena);
+    const spawned = phases.now();
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .environ_map = &empty,
@@ -196,7 +207,9 @@ pub fn run(
     running.begin(io, child.stdin.?);
     child.stdin = null;
     defer running.end(io);
-    return finish(arena, io, &child, running, out);
+    var ended = try finish(arena, io, &child, running, out);
+    ended.spawned = spawned;
+    return ended;
 }
 
 /// The helper's output to its end, then how it ended.
@@ -220,6 +233,8 @@ fn finish(
         try failure.appendSlice(arena, buf[0..n]);
     }
     const term = try child.wait(io);
+    const waited = phases.now();
+    const said = phases.Helper.take(failure.items);
     const code: i32 = switch (term) {
         .exited => |c| c,
         .signal => |s| 128 + @as(i32, @intCast(@backingInt(s))),
@@ -227,8 +242,10 @@ fn finish(
     };
     return .{
         .code = code,
-        .failure = std.mem.trimEnd(u8, failure.items, "\n"),
+        .failure = std.mem.trimEnd(u8, said.rest, "\n"),
         .killed = running.wasKilled(io),
+        .helper = said.helper,
+        .ended = waited,
     };
 }
 
@@ -432,7 +449,15 @@ fn dirIn(arena: Allocator, root: linux.fd_t, path: []const u8) ?linux.fd_t {
 /// only raw system calls once it has the spec, so nothing starts a thread before `unshare`.
 pub fn main(arena: Allocator) u8 {
     const spec = readSpec(arena) catch |e| fatal("cannot read the step's spec", @intFromError(e));
-    return runStep(arena, spec);
+    var marks: phases.Helper = .{ .start = phases.now() };
+    const code = runStep(arena, spec, &marks);
+    // Its phases, for the runner (`phases.Helper.take`): once the step has ended, so never
+    // mixed with a failure, which ends the helper before this (`fatal`).
+    marks.end = phases.now();
+    var buf: [256]u8 = undefined;
+    const line = marks.line(&buf);
+    _ = linux.write(2, line.ptr, line.len);
+    return code;
 }
 
 /// The spec's one line from stdin, read a byte at a time so nothing after it is taken: what
@@ -458,7 +483,7 @@ pub fn readJsonLine(comptime T: type, arena: Allocator) !T {
     return std.json.parseFromSliceLeaky(T, arena, data.items, .{ .allocate = .alloc_always });
 }
 
-fn runStep(arena: Allocator, spec: Spec) u8 {
+fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper) u8 {
     // First, so every process the step makes, and this helper, is held to the job's limits.
     if (spec.cgroup) |dir| joinCgroup(arena, dir);
     // Files a step creates get the modes they get under runc.
@@ -494,7 +519,9 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
                 null;
             check("unshare(mount)", linux.unshare(linux.CLONE.NEWNS));
             makePrivate();
+            marks.namespaces = phases.now();
             lowers = idmapLowers(arena, lowers, image_layers, spec.canonical, userns);
+            marks.idmap = phases.now();
             mountOverlay(arena, spec, lowers, false);
             if (spec.container) |c| {
                 const mapped = arena.alloc([]const u8, c_lowers.len) catch oom();
@@ -504,6 +531,7 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
                 }
                 mountContainer(arena, c, mapped, false);
             }
+            marks.overlay = phases.now();
             // The binds, as the host's root: in the job's namespace the helper is nobody on the
             // host and may not search the directories on the way to a host path. They go on
             // with the overlay into the step's namespace (its bind onto itself is recursive).
@@ -517,12 +545,16 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
             check("setgroups", linux.setgroups(0, no_groups));
             check("setgid", linux.setgid(0));
             check("setuid", linux.setuid(0));
+            marks.binds = phases.now();
         },
         .self, .inherited => {
             if (spec.userns == .self) enterUserns();
             makePrivate();
+            marks.namespaces = phases.now();
+            marks.idmap = marks.namespaces;
             mountOverlay(arena, spec, lowers, true);
             if (spec.container) |c| mountContainer(arena, c, c_lowers, true);
+            marks.overlay = phases.now();
         },
     }
 
@@ -546,7 +578,10 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
     check("open the overlay", root_rc);
     const root: linux.fd_t = @intCast(root_rc);
     // As the namespace's root, so what is made here is the job's root's.
-    if (spec.userns != .mapped) bindAll(arena, spec, null);
+    if (spec.userns != .mapped) {
+        bindAll(arena, spec, null);
+        marks.binds = phases.now();
+    }
     var secrets = false;
     for (spec.files) |f| secrets = secrets or !f.keep;
     if (secrets) check("mount the tmpfs for secret files", linux.mount(
@@ -571,6 +606,7 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
     const workdir = z(arena, spec.workdir);
     var alive: [2]linux.fd_t = undefined;
     check("make a pipe", linux.pipe2(&alive, .{ .CLOEXEC = true }));
+    marks.root = phases.now();
     const pid = linux.fork();
     check("fork", pid);
     if (pid == 0) {

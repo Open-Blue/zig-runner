@@ -29,6 +29,7 @@ const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const dagger = @import("../dagger.zig");
+const phases = @import("phases.zig");
 
 /// The store's directory.
 root: []const u8,
@@ -418,7 +419,23 @@ pub fn publish(
     upper: []const u8,
     rec: Record,
 ) !Layer {
+    return s.publishTimed(arena, io, key, kind, upper, rec, null);
+}
+
+/// `publish`, its phases (the upper's size, its record written, the sync, the rename) sampled
+/// into `ph` when given (`phases.zig`).
+pub fn publishTimed(
+    s: Store,
+    arena: Allocator,
+    io: std.Io,
+    key: Key,
+    kind: Kind,
+    upper: []const u8,
+    rec: Record,
+    ph: ?*phases.Phases,
+) !Layer {
     if (recordFault(kind, rec)) |e| return e;
+    var t = phases.now();
     const cwd = std.Io.Dir.cwd();
     var raw: [8]u8 = undefined;
     io.random(&raw);
@@ -447,6 +464,7 @@ pub fn publish(
         .log_sha = undefined,
         .fc_sha = undefined,
     };
+    if (ph) |p| t = p.since(arena, .size, t);
     Sha256.hash(rec.log, &m.log_sha, .{});
     Sha256.hash(rec.fc, &m.fc_sha, .{});
     try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "log"), .data = rec.log });
@@ -456,9 +474,11 @@ pub fn publish(
     if (!flock(lock.?, lock_sh)) return error.Locked;
     try cwd.rename(upper, cwd, fs_tmp, io);
     moved = true;
+    if (ph) |p| t = p.since(arena, .record, t);
     // On disk before it is visible: a crash after the rename must not leave a whole-looking
     // entry whose files are empty or short.
     if (linux.errno(linux.syncfs(lock.?.handle)) != .SUCCESS) return error.Sync;
+    if (ph) |p| t = p.since(arena, .sync, t);
     const dir = try s.layerDir(arena, key);
     // One rename that never replaces: a layer published meanwhile stays, and this one is not.
     const rc = linux.renameat2(
@@ -469,6 +489,7 @@ pub fn publish(
         .{ .NOREPLACE = true },
     );
     if (linux.errno(rc) != .SUCCESS) return error.Publish;
+    if (ph) |p| _ = p.since(arena, .rename, t);
     return .{ .fs = try join(arena, dir, "fs"), .lock = lock.? };
 }
 
