@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A change file with an unescaped apostrophe in its single-quoted body (native services, Added-20261101-120600) stopped v0.24.0 at its Tag step; it is fixed, and the Workflows job now batches every unreleased entry as a dry run, so a change file that is not valid YAML fails the pull request that adds it.'
+time: 2026-11-02T02:15:00.000000-05:00
