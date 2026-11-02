@@ -44,7 +44,7 @@ applets=$(docker run --rm "$address" sh -c 'busybox --list && mkdir /a /b && mv 
 	echo "busybox-pin: could not run $address (pull failed, or an applet the runner uses is missing)" >&2
 	exit 75
 }
-for applet in sh mkdir printf env tcpsvd nc find mv rm cp touch chown; do
+for applet in sh mkdir printf env tcpsvd nc find mv rm cp touch chown cat wc; do
 	grep -qx "$applet" <<<"$applets" || {
 		echo "busybox-pin: $address has no $applet applet, which the runner's scripts use" >&2
 		exit 1
