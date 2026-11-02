@@ -482,7 +482,7 @@ pub fn publish(
     }
     var m: Meta = .{
         .kind = kind,
-        .bytes = try treeBytes(arena, io, upper),
+        .bytes = undefined,
         .log_len = rec.log.len,
         .fc_len = rec.fc.len,
         .log_sha = undefined,
@@ -492,7 +492,6 @@ pub fn publish(
     Sha256.hash(rec.fc, &m.fc_sha, .{});
     try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "log"), .data = rec.log });
     try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "fc"), .data = rec.fc });
-    try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "meta"), .data = try m.write(arena) });
     lock = try cwd.createFile(io, try join(arena, tmp, "lock"), .{});
     if (!flock(lock.?, lock_sh)) return error.Locked;
     try cwd.rename(upper, cwd, fs_tmp, io);
@@ -500,6 +499,15 @@ pub fn publish(
     // On disk before it is visible: a crash after the rename must not leave a whole-looking
     // entry whose files are empty or short.
     if (linux.errno(linux.syncfs(lock.?.handle)) != .SUCCESS) return error.Sync;
+    // Measured once written: a file the kernel is still writing back can show fewer blocks
+    // than it takes (a block short, the stress test found, under other publishers' syncfs),
+    // and the store would count less than it holds. The meta, written after the syncfs, is
+    // synced itself before the rename.
+    m.bytes = try treeBytes(arena, io, fs_tmp);
+    const meta = try cwd.createFile(io, try join(arena, tmp, "meta"), .{});
+    defer meta.close(io);
+    try meta.writeStreamingAll(io, try m.write(arena));
+    if (linux.errno(linux.fsync(meta.handle)) != .SUCCESS) return error.Sync;
     const dir = try s.layerDir(arena, key);
     // One rename that never replaces: a layer published meanwhile stays, and this one is not.
     const rc = linux.renameat2(
