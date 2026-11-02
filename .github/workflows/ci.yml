@@ -229,7 +229,11 @@ jobs:
             # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
             sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
             ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/zig-test.sh
-            ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 ../.github/scripts/zig-test.sh
+            # Real postgres and redis images for the native services test (native/services.zig),
+            # which needs root: their entrypoints change to the images' own users.
+            ../.github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
+            ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 \
+              ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" ../.github/scripts/zig-test.sh
           else
             stop="tests-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
             echo "::stop-commands::$stop" >&2

@@ -828,7 +828,9 @@ pub fn run(
             opts.backend_note = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{
                 w,
             });
-        } else return runNative(arena, io, opts, cfg, job, log);
+        } else if (try runNative(arena, io, opts, cfg, job, log, &opts.backend_note)) |r| {
+            return r;
+        }
     }
     var env = try environ.clone(arena);
     try env.put("NO_COLOR", "1");
@@ -885,7 +887,8 @@ pub fn run(
 /// replayed step that points into the tool cache's volume runs again, `Exec.tool_cache`). They
 /// are caches, so a job's results do not depend on them. The cache volumes, Zig's local cache
 /// and seeds are the backend's own (`native/volumes.zig`): off here for the shared code, which
-/// would ask a Dagger session for them, and handed to the backend as they were.
+/// would ask a Dagger session for them, and handed to the backend as they were. Null when the
+/// job runs on Dagger after all, with `dagger_note` saying why.
 fn runNative(
     arena: Allocator,
     io: std.Io,
@@ -893,7 +896,8 @@ fn runNative(
     cfg: Backend.Config,
     job: job_mod.Job,
     log: *sink.LogSink,
-) !Result {
+    dagger_note: *?[]const u8,
+) !?Result {
     var opts = opts_in;
     opts.output_keys = false;
     opts.package_caches = false;
@@ -908,18 +912,28 @@ fn runNative(
     defer sh.flush();
     // After the last step, as for a Dagger session: each replayed step's log ends with the note.
     defer noteReusedSteps(&sh, native_reused_note);
-    var b = Backend.init(arena, io, opts.gpa, cfg) catch |e| return fail(
-        &sh,
-        results,
-        try std.fmt.allocPrint(arena, "could not make the job's native store: {s}", .{
-            @errorName(e),
-        }),
-    );
+    var b = Backend.init(arena, io, opts.gpa, cfg) catch |e| {
+        // A job the runner does not vouch for whose cgroup could not be made with its limits
+        // after all (P4, P5's `job_limits`): not native, and not failed either.
+        if (e == error.NoJobLimits) {
+            dagger_note.* = "This job runs on Dagger: native steps run a job this runner does " ++
+                "not vouch for only within a cgroup of its own with memory and process limits, " ++
+                "which could not be made for it.";
+            return null;
+        }
+        return try fail(
+            &sh,
+            results,
+            try std.fmt.allocPrint(arena, "could not make the job's native store: {s}", .{
+                @errorName(e),
+            }),
+        );
+    };
     defer b.deinit();
     b.caches = .of(opts_in);
     // Which ids the job's steps have, as "Set up job" says (`Backend.idsNote`).
     opts.backend_note = try b.idsNote(arena);
-    return runSteps(arena, io, opts, job, &sh, results, b.transport(), &b);
+    return try runSteps(arena, io, opts, job, &sh, results, b.transport(), &b);
 }
 
 /// What every task of a job shares: the log, and one slot per log step — the job's steps, then

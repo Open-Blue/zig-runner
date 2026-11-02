@@ -104,13 +104,15 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   checkout runs).
 - Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a job the runner
   does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
-  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:` or `options:`, `services:`,
-  `uses:` actions, `docker://` steps, Dagger in steps (`RUNNER_DAGGER_NESTING`), `hashFiles()`
+  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:` or `options:`, `services:`
+  on a rootless runner or with an image given by an expression (native since P6, below, their
+  images pulled by P3), `uses:` actions, `docker://` steps, Dagger in steps
+  (`RUNNER_DAGGER_NESTING`), `hashFiles()`
   anywhere in the job (it reads the container through Dagger), a checkout with submodules, and a
-  machine whose probe fails (no user namespaces, `iptables` missing, no default route, the jobs'
-  ids taken on the host, the jobs' subnet overlapping a route of the host's). A failed probe is
-  tried again after five minutes, not kept for the process's life. (Until P3 also: no rootfs
-  configured, `container:` and a custom image.)
+  machine whose probe fails (no user namespaces, nftables refusing the jobs' rules, no default
+  route, the jobs' ids taken on the host, the jobs' subnet overlapping a route of the host's). A
+  failed probe is tried again after five minutes, not kept for the process's life. (Until P3
+  also: no rootfs configured, `container:` and a custom image.)
 - Off on native, as caches: output keys. Results do not depend on them. (The step cache was off
   in P1; P2's layer store gives it. The package caches, uv's environment in its cache, and Zig's
   local cache and seed came with P4.) The tool cache is never off: a step may install into it, and
@@ -143,7 +145,9 @@ On a root runner, each step runs:
   ranges, and refused when it overlaps a route of the host's), a default route out through NAT. Two
   jobs can both listen on :5432. The job reaches nothing on the host: not its 127.0.0.1, and not a
   service on any of its addresses (the bridge's included), since `INPUT` drops whatever comes from
-  `zr0` and is not a reply. Jobs cannot reach each other: each veth is an isolated bridge port
+  `zr0` and is not a reply. Nor does anything reach the job that it did not ask for: `OUTPUT` and
+  `FORWARD` drop what goes to `zr0` and is not a reply (added in P6, when services began to listen
+  there). Jobs cannot reach each other: each veth is an isolated bridge port
   (`IFLA_BRPORT_ISOLATED`), and `FORWARD` drops traffic from `zr0` back to `zr0`. IPv6 is off on the
   job's `eth0` and on the bridge, so no link-local address slips past those IPv4 rules (`lo` keeps
   its ::1). Ports below 1024 and ping work without capabilities on the host's
@@ -161,11 +165,8 @@ On a root runner, each step runs:
 - with **Docker's default capabilities** (the bounding set cut to them, ambient cleared),
   **no_new_privs** for root steps and rootless ones (not for the runner user on a root runner,
   whose sudo works as on GitHub and reaches only the job's own root, within the same capabilities
-  and filter), and a **seccomp filter** that refuses Docker's default profile's dangerous
-  calls (module loading, kexec, keyrings, bpf, perf, mount and the new mount API, namespaces,
-  clone with namespace flags, the clock, swap, reboot, `open_by_handle_at`, and io_uring, as
-  Docker has since moby 25), and allows `personality` only with Docker's values (Linux, 32-bit
-  Linux, a 2.6 uname, and the query).
+  and filter), and a **seccomp filter**: P1's refused Docker's default profile's dangerous calls
+  (a deny list); since P5 it is Docker's allow list itself ("P5" below).
 - with a script that holds a secret written to a **tmpfs of the step's own** and bound at its
   path over an empty file, so the secret never reaches the store's disk (the empty file goes
   when the step ends).
@@ -179,9 +180,7 @@ What it does not provide yet:
 
 - **Resource limits on a rootless runner without delegation.** P4's cgroup needs root or a
   delegated cgroup (`RUNNER_NATIVE_CGROUP=self`); without one a job runs as P1 did, and "Set up
-  job" says so.
-- **The seccomp filter is Docker's deny list, not its allow list.** Calls Docker refuses by
-  omission are allowed here.
+  job" says so. A job the runner does not vouch for never runs without one (P5).
 - **Rootless runners.** Only one id is mapped and steps share the host's network: off unless
   `RUNNER_NATIVE_ROOTLESS=1`, for tests and the laptop. A rootless job network needs a userspace
   stack (a Zig port of the parts of pasta or slirp4netns it needs), and full ids need
@@ -232,7 +231,8 @@ in-place change, the stamp not touched) is found when the runner restarts, by th
 **What the runner needs.** As root (the supported mode): `CAP_SYS_ADMIN` (namespaces, mounts,
 idmapped mounts, `pivot_root`), `CAP_NET_ADMIN` (the bridge, veths, addresses, routes, NAT),
 `CAP_SETUID`/`CAP_SETGID` (writing the job's id maps), Linux 5.19 or later (idmapped overlay
-layers), `iptables` on the host (the rules, below), a default route, a free
+layers), nftables in the kernel (`nf_tables`, `nft_ct`, `nft_masq`, `nft_chain_nat`; no `nft` or
+`iptables` binary since P5), a default route, a free
 `RUNNER_NATIVE_SUBNET`, and a writable `/run/zig-runner`. The runner makes `zr0` and its rules
 itself on its first native job, and removes each job's namespace when the job ends, or at the
 next start after a crash (`sweep`, by the jobs' locks).
@@ -254,13 +254,19 @@ What it changes on the host, which is shared by every runner on it:
   runners' jobs need it, and turning it off under them would cut their network. The runner logs
   a warning when it turns it on, and another when the FORWARD policy is ACCEPT, since the host
   would then route for any neighbour; set that policy to DROP (Docker does).
-- **iptables rules**, each added once at the head of its chain: `nat POSTROUTING` masquerades
-  the subnet; `filter INPUT` drops what comes from `zr0` and is not a reply; `filter FORWARD`, and
-  `DOCKER-USER` on a Docker host, drop `zr0` to `zr0`, accept `zr0` out through each uplink (the
-  interfaces of the default routes; a job adds the rules for a new one, a laptop moving from
-  cable to Wi-Fi), and accept replies back to `zr0`. Nothing else from `zr0` is accepted, so
-  Docker's containers and other bridges stay closed to jobs and ufw's forward policy decides the
-  rest. The rules stay when the runner stops.
+- **nftables rules** (since P5, over netlink; P1 made the same with `iptables`): a table of the
+  runner's own, `ip zig_runner`, replaced atomically whenever the rules are made. It masquerades
+  the subnet; drops what comes from `zr0` to the host and is not a reply; drops what the host's own
+  processes send to `zr0` and is not a reply (`output`, P6); forwards from `zr0` only
+  out through an uplink (the interfaces of the default routes; a job remakes the rules for a new
+  one, a laptop moving from cable to Wi-Fi), so never `zr0` to `zr0`, to Docker's containers or to
+  the host's other networks; and forwards to `zr0` replies only. Since every base chain on a hook
+  must accept a packet, the host's iptables-nft `filter FORWARD` chain, and `DOCKER-USER` on a
+  Docker host (both drop by policy under Docker and ufw), get `-i zr0 -j ACCEPT` and `-o zr0 -j
+  ACCEPT` at their heads, in iptables-nft's own encoding, so `iptables -S` shows them and Docker
+  keeps working the table; the runner's table does the deciding. The rules stay when the runner
+  stops. A host whose own nftables tables (firewalld's) drop forwarded traffic must let `zr0`'s
+  through; iptables-legacy rules are not seen (the runner warns when it finds legacy tables).
 
 - Under `deploy/compose.yaml` (not changed by P1): the runner image is `FROM scratch` and runs as
   root. It needs `privileged: true` (as the engine service has), or `cap_add: [SYS_ADMIN,
@@ -270,9 +276,9 @@ What it changes on the host, which is shared by every runner on it:
   directory on overlayfs), and the rootfs another volume. The slots' locks must be the host's:
   bind `/run/zig-runner:/run/zig-runner` from the host into every runner container (the
   container's own /run would give each its own slot 0 on the shared bridge). The image has no
-  `iptables`, so P1's NAT needs the host's rules made outside it, or P5's netlink rules. For the
-  jobs' cgroups, `cgroup: private` (the default on cgroup v2) with `RUNNER_NATIVE_CGROUP=self`:
-  the container's root is then its own cgroup, and the runner moves itself into a leaf of it.
+  `iptables`, and needs none since P5: the rules are made over netlink. For the jobs' cgroups,
+  `cgroup: private` (the default on cgroup v2) with `RUNNER_NATIVE_CGROUP=self`: the container's
+  root is then its own cgroup, and the runner moves itself into a leaf of it.
 - Under `deploy/zig-runner.service` on razorbill (not changed by P1): the unit runs as root with
   `ProtectSystem=strict`, which makes the store's default and `/run` read-only. It needs
   `StateDirectory=zig-runner` (or `ReadWritePaths=/var/lib/zig-runner`) for the store, and
@@ -346,9 +352,9 @@ What it covers, as built:
   on (`Backend.below`): the store's format (`Store.store_format`), the job's cache scope and
   repository, the rootfs's fingerprint (a walk of its metadata, ctimes and inodes among it, kept
   per process and checked again for every job against the root's and the provisioning stamp's
-  identity and ctime), how ids are mapped, on a root runner the slot's first id (a layer's files are owned by its job's
-  range, so it is reused only by jobs with the same range: only misses come of it), and the binds'
-  places (never their content). Under step caching the event payload is a variable each step
+  identity and ctime), how ids are mapped (the userns mode: a root runner's and a rootless one's
+  layers never meet), and the binds' places (never their content). Not the slot: a stored layer has
+  the canonical ids (below), so a job in any slot replays what a job in another stored. Under step caching the event payload is a variable each step
   writes to the file, as `set_up.writeRunEnv` gives it, so the base is the same for every run.
 - **The store's format** (`Store.store_format`) is bumped with any change to what a layer or its
   record means: the sandbox's trees, the record's files and how they replay, the key's extras.
@@ -365,7 +371,8 @@ What it covers, as built:
   under Dagger its new parent makes every later key new), and no layer or log holds a secret. A
   step that printed more than `dagger.max_recorded_bytes` is not kept, nor a record its kind may
   not have (a step's file commands without their ran marker, a base's or a fetch's not empty),
-  nor a layer whose size cannot be counted whole (a directory it cannot read). A commit's checkout
+  nor a layer whose size cannot be counted whole (a directory it cannot read). On a root runner the
+  layer is first given the canonical ids (`Store.unshift`, below). A commit's checkout
   (a fetch of a full SHA) is a layer like a step's, keyed on its script and never on the token;
   a branch or tag moves, so its fetch always runs. The upper is moved under `layers/.tmp-<key>-<n>`
   with its record, held, written to disk (`syncfs`), and published by one
@@ -381,8 +388,8 @@ What it covers, as built:
   is touched only once it passed.
 - **Locks**: one flock per key while its exec runs (polled, so a cancel or a timeout ends the
   wait), so two jobs sharing the store do not run one key at once: the second replays the
-  first's. On a root runner two jobs at once take two slots, so their keys differ anyway. A job
-  holds a shared flock on each store layer it uses until it ends.
+  first's, on a root runner too, whatever their slots. A job holds a shared flock on each store
+  layer it uses until it ends.
 - **GC** (`Store.collect`, after each job): past `RUNNER_NATIVE_STORE_MAX_MB` (default 10240),
   the layers no job holds go, least recently used first (the lock file's mtime is the last use),
   each renamed away under its lock taken exclusively, then deleted. Half-built and half-evicted
@@ -398,7 +405,37 @@ What it covers, as built:
   (other host ids as the overflow id), the xattrs that say what it is (overlay's bookkeeping left
   out), and its content (a file's bytes, a link's target, a device's numbers, so whiteouts too).
   No times, inodes, link counts or host ids. Nothing asks for them yet: output keys stay off on
-  native.
+  native. A layer's digest is the same before and after its ids are shifted (`Store.unshift`
+  maps owners as the digest does), but for the ids inside xattrs, which the digest hashes raw: a
+  file capability's root id and ACL entries' named users and groups are host ids, shifted with the
+  layer, so a layer with either digests differently after. Before the shift they named the slot,
+  so such a digest was never the same across slots either.
+- **The canonical ids (layers shared across slots).** On a root runner each job has a slot, its
+  own 65536 host ids, and a step's upper is written in them. A layer is published with the ids
+  the job's namespace saw (`Store.unshift`, as `ImageStore.flatten` shifts a provisioned rootfs):
+  the slot's host ids become 0 to 65535, any other host id the overflow id (65534, as the digest
+  maps it), set-id bits (which `chown` clears) put back, file capabilities put back with their
+  root's id shifted (dropped when it is outside the range), ACL entries' ids shifted; through no
+  symlink (directories opened with `openat2`'s `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`, each entry
+  changed through an `O_PATH` descriptor checked against the walk's inode), with no depth limit,
+  each inode once. It relies on nothing writing the tree meanwhile (the step's processes are gone)
+  but does not trust it. A failure ends the job, and the layer is never shifted again, rather than
+  leave a layer half one range's or shift it twice. Each step mounts every lower with the canonical ids (the rootfs, the
+  seeds, the stored layers, a flattened stack) idmapped onto its job's range
+  (`sandbox.idmapLowers`, `Spec.canonical`), read-only, nosuid and nodev; the step's upper is
+  not idmapped (an idmapped upper is newer and unverified here, and not needed), so what a step
+  writes, copy-ups included, has its slot's ids until it is published. A job's own unpublished
+  uppers keep the slot's ids; flattening gives them the canonical ids first, so the merged layer
+  is one tree with one set of ids. Rootless runners have no slots and shift nothing.
+- **The store is a security boundary, so the runner checks it.** With the canonical ids, a
+  job's set-uid-root file or file capability is the host's root's on disk. Whoever can reach the
+  store, or replace it or a directory on the way to it, has the host's root. So every start
+  (`Store.prepare`, and the probe, which keeps native off and says why) makes the store directory
+  the runner's own (root on a root runner, set through a descriptor opened `O_NOFOLLOW`) and mode
+  0700. It refuses a store it cannot make so, a store that is a symlink, and one under any
+  directory (along the path as given and as it resolves) that another user owns or that others (or
+  a group other than root) can write without the sticky bit. A rootless runner's store must be its own user's,
+  under directories that are root's or its own.
 
 #### Measured (laptop "cowbird", balanced profile, 2026-11-01, load about 5.5)
 
@@ -427,6 +464,11 @@ directories and the step's file-command files at a 4 KiB block each.
   and content-addressed blobs.
 - Provisioning becomes a native step of its own, keyed like any other.
 - `container:` jobs move to native.
+- Services' images (P6) come from the store: `services.startOne` calls `images.find(dir, ref)` for
+  an `Image` (a rootfs directory and the configuration a container takes), and
+  `Backend.servicesUnsupported` calls `images.has`. The store answers the same question by
+  pulling, with the service's `credentials:` (`username`, `password`, which P6 does not use), and
+  `RUNNER_NATIVE_IMAGES` goes.
 - Exit: no Dagger session is needed to make the rootfs. Measure: cold pull of `ubuntu:24.04`
   against Dagger's.
 
@@ -552,6 +594,9 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
 - **Debt from P1, paid here:** P1 has no per-job cgroup and no pids limit, so one native job's
   fork bomb or memory hog reaches the host's limits and every other job's. The same cgroup that
   gives the gate its accounting gives each job its `pids.max` and `memory.max`.
+- Services (P6) go in the job's cgroup with its steps: each service's helper (`services.serve`,
+  through `sandbox.run`) and the port relay (`forward.start`) are spawned into it, and "Stop
+  containers" and `Backend.deinit` stop them with `cgroup.kill` instead of each helper's lifeline.
 - Exit: a runaway job is OOM-killed in its own cgroup without touching its neighbours. Measure:
   gate accuracy against the engine-wide reading.
 
@@ -634,7 +679,9 @@ remains before native steps may run jobs the runner does not vouch for:
 - Resource limits came with phase 4's cgroups; P5 must refuse an untrusted job on a runner where
   the job would get no cgroup (a rootless runner without delegation, `RUNNER_NATIVE_CGROUP=none`).
 - Seccomp as Docker's allow list rather than its deny list.
-- The NAT and forwarding rules over nftables netlink instead of `iptables` (P1's debt).
+- The NAT and forwarding rules over nftables netlink instead of `iptables` (P1's debt), with P6's
+  rule among them: nothing goes to `zr0` that is not a reply, from the host (`OUTPUT`) or routed
+  (`FORWARD`, `DOCKER-USER`).
 - Rootless: a userspace network stack for the job's network (the parts of pasta or slirp4netns it
   needs, ported) and subordinate ids through `newuidmap`.
 - `trust.zig` is unchanged: it decides before any step. Until P5 lands, native runs only jobs the
@@ -642,12 +689,139 @@ remains before native steps may run jobs the runner does not vouch for:
 - Exit: the hostile-job tests (fork bomb, memory hog, mount escape attempts, network to the host's
   services, a kernel-interface sweep) are contained.
 
+**Status: in progress.** Landed in the first pull request:
+
+- **Seccomp as Docker's allow list** (`runner/src/native/seccomp.zig`): moby/profiles'
+  `seccomp/default.json` at 6fe7deb1b9fb (2026-09-17), as Docker applies it to a container with
+  its default capabilities (of the capability-gated rules only `chroot`; `ptrace` and
+  `process_vm_*` as on Linux 4.8 and later). A call the profile does not name gets EPERM; one
+  numbered past every call it names gets ENOSYS, as runc gives it, so a C library falls back. Its
+  argument conditions stay: `clone` without namespace flags, `clone3` ENOSYS, `personality` with
+  Docker's five values, `socket` with Docker's address families. The calls are named, and numbered
+  from std's x86_64 and aarch64 tables; a test runs both filters in a small BPF interpreter, and
+  another fails when a call std knows is neither named by the profile nor known to be refused (a
+  name spelt otherwise would drop out quietly).
+- **The rules over nftables netlink** (`runner/src/native/nft.zig`), no binary: "What it changes on
+  the host" under P1 has them. `zig-runner native-nft <subnet> [uplink...]` makes them in the
+  caller's network namespace.
+- **The gate for untrusted jobs** (`Backend.untrustedRefusal`): a job the runner does not vouch for
+  runs natively only when `Config.job_limits` is set, on a root runner. Phase 4 sets it once each
+  job's cgroup has `memory.max` and `pids.max`; until then such jobs keep falling back.
+
+Still to do in P5: the hostile-job tests (the fork bomb and the memory hog need P4's cgroups), and
+the rootless part (a userspace network stack for the job's network, subordinate ids through
+`newuidmap`), each its own pull request. Until the rootless part, a rootless runner never runs an
+untrusted job natively.
+
 ### P6: services
 
 - A job network namespace shared by steps and service containers, services as long-running
   namespace processes from the image store, health checks, `/etc/hosts` aliases, port mapping for
   host-mode jobs, and teardown with `cgroup.kill`.
 - Exit: the services tests pass on native. Measure: "Initialize containers" time.
+
+**Status: landed (behind the knob), on a root runner.** What it covers, as built:
+
+- `runner/src/native/services.zig` is the runner's side: "Initialize containers" (`start`) and
+  "Stop containers" (`stop`), which `dagger/services.zig` hands over when the job is native (two
+  lines), with the Dagger path's log lines and its spec evaluation (`serviceSpec`) reused.
+  `native/health.zig` is the helper's side of readiness, `native/images.zig` the image source,
+  `native/forward.zig` the port relay. `sandbox.zig` gained a `service` field on its spec, an
+  `exec` field (an image's entrypoint is looked up in its PATH; a step's shell stays `/bin/sh`),
+  and `Running.stop`, which stops a helper that has not started yet as soon as it does.
+- **A service is a sandbox like a step's, run until stopped**: the same helper, a fresh overlay
+  over the image's filesystem (its writes go with the job), its own mount, PID, UTS and IPC
+  namespaces, the job's range of ids (its root is nobody on the host), Docker's capabilities, the
+  seccomp filter and `no_new_privs` as for a root step, a /dev, /proc and /sys as a step's. Its
+  first process is PID 1 of its namespace: its entrypoint and command as the image says, its env
+  the image's, then `GITHUB_ACTIONS` and `CI` (as the Dagger path sets them), then `env:`, its user
+  the image's `USER` resolved in the image's own /etc/passwd and /etc/group, its working directory
+  the image's (made when missing).
+- **The job's network is shared**: services join the job's namespace, as steps do. A step reaches
+  a service by name (`postgres:5432`: the job's hosts file, the host's with a line naming the
+  loopback for every service, bound over the image's in every step and every service) and on
+  `localhost` at each published port. A port published as itself (`5432:5432`, `6379`) is the
+  service's own listener; one published under another number (`15432:5432`) is relayed by
+  `forward.zig`, a helper in the job's namespace that binds 127.0.0.1 and ::1 and then becomes the
+  job's `nobody` with `no_new_privs`. A bare port keeps its own number, as on the Dagger path (on
+  GitHub it gets a random one, which `job.services.<id>.ports` reports either way).
+- **Ready** as on GitHub when a health check passes: `--health-cmd` with `--health-interval`,
+  `-timeout`, `-retries` and `-start-period`, over the image's `HEALTHCHECK` (`CMD` and
+  `CMD-SHELL`; `NONE` and `--no-healthcheck` turn it off). The check runs inside the service: the
+  helper forks it, so it is in the service's PID namespace (a fork fails once the service is gone,
+  so no other process can be joined), its mount namespace and root, with its user, env,
+  capabilities and filter, its output dropped as Docker keeps it out of the logs. Failures count
+  as Docker counts them (once an interval, after the start period, unhealthy after `retries` in a
+  row), but the helper tries from 10 ms, doubling up to the interval, so a database up after
+  three seconds is ready after three seconds. Without a health check a service is ready when its
+  published ports accept connections on the job's loopback (the Dagger path's `start` waits so;
+  5 minutes at most); with neither, once started. The answer is one line the helper writes to a
+  file of the job's, outside the service's root, which the runner reads every 10 ms. An unhealthy
+  service, or one that ends first, fails the job before its steps, with its output so far.
+- **Stopped** in "Stop containers" (after the post scripts), all at once, then each one's output
+  printed, as GitHub prints `docker logs`. Stopping closes the helper's lifeline and the helper
+  kills the service's PID 1, and with it everything in its PID namespace, as `docker rm --force`
+  does. However the job ends, `Backend.deinit` stops them first, so their layers and the job's
+  network go with the job; the runner dying closes every lifeline too.
+- **The images** are pulled by P3 (`Backend.pullImage`, with the service's `credentials:`), the
+  configuration read from the store's `config.json` (`images.fromPulled`). Before P3 they came
+  from a directory an operator filled (`RUNNER_NATIVE_IMAGES`, now gone); the tests and the
+  real-images root test still use such a directory (`Config.images`), one entry per reference
+  with each `/` as `+`, holding `rootfs/` and `config.json`.
+  `.github/scripts/native-service-images.sh <dir>` makes one for CI, and shows how:
+
+  ```
+  docker create --name x postgres:17-alpine
+  sudo mkdir -p images/postgres:17-alpine/rootfs
+  docker export x | sudo tar -x -C images/postgres:17-alpine/rootfs   # owners kept
+  docker image inspect --format '{{json .}}' postgres:17-alpine > images/postgres:17-alpine/config.json
+  ```
+
+  An overlay layer's path may not hold a `:` (overlay's separator): the service's layer is a link
+  in the job's directory (`V<n>/I`), so the image's own path never reaches overlay's options.
+- Falls back to Dagger, with the reason in "Set up job": a rootless runner (services there would
+  share the host's network, so it is not configurable; the tests have a switch of their own), no
+  `RUNNER_NATIVE_IMAGES`, an image given by an expression, or one the directory does not have.
+  `options:` the native path does not carry out are reported as on the Dagger path ("Service
+  options not supported and ignored"); `volumes:` too.
+- Tests (`services.zig`): the end-to-end job (two services, reached by name, relayed and plain, a
+  health check and a port probe, env, the log, teardown) runs rootless and as root; an unhealthy
+  service and one that ends first fail the job; as root, the host knocks on the job's addresses
+  while a service listens and is not let in; and as root on CI, `postgres:17-alpine` and
+  `redis:7-alpine` from real images, health-checked with `pg_isready` and `redis-cli ping`, reached
+  by name, on `localhost` and through the relay.
+
+What it does not do yet, and where it is paid:
+
+- **Resource limits and `cgroup.kill`**: services, like steps, have no cgroup before phase 4,
+  which puts them in the job's and stops them with `cgroup.kill` (the lifeline does it now).
+- **The image pull**: phase 3. Until then a missing image sends the job to Dagger, and private
+  registries' credentials are not used.
+- **Rootless services**: they need the job's own network, phase 5's userspace stack.
+- **One port space per job**: services and steps share the job's loopback, so two services that
+  listen on one port cannot both run (the second fails to start, and the job with it), and a step
+  cannot listen on a service's port. On GitHub each container has its own. A namespace per service
+  joined by a bridge inside the job would lift it; no workflow of ours needs it yet.
+- **Smaller ones**: the health check stops once it has decided (GitHub reads it only at start;
+  Docker keeps checking); `job.services.<id>.network` says `dagger`, as on the Dagger path;
+  `--health-start-interval` is read as nothing (the quick tries cover it).
+
+#### Measured (laptop "cowbird", balanced profile, 2026-11-01, other agents building alongside)
+
+"Initialize containers", from its start to every service ready, through the whole runner path
+(`dagger.run`), the runner built `Debug`:
+
+| | native | Dagger |
+|---|---|---|
+| `traefik/whoami`, ready on its port, rootless (median of 5, load average about 6) | **21 ms** | not yet taken (below) |
+| two fixture services, a health check and a port probe, rootless | 67–78 ms | |
+| `postgres:17-alpine` and `redis:7-alpine`, health-checked, root, GitHub's hosted runner | 3.1 s | |
+
+The postgres figure is mostly postgres's own first start (`initdb`, its set-up server, then the
+real one); the sandbox's part is about the 21 ms above. Dagger's side is the test "Initialize
+containers against Dagger's", run by hand with a v0.21.10 engine container
+(`ZIG_RUNNER_MEASURE_SERVICES=<images> ZIG_RUNNER_MEASURE_ENGINE=<container>`); the agent that
+built this phase was not allowed to start one on the laptop, so that figure is still to be taken.
 
 ### P7: Docker actions
 
@@ -683,9 +857,10 @@ than replacing it, since both backends ship (proofs/README.md, "On the native ba
   directory and kept files, each field prefixed with its length as a u64 little-endian. A base has
   no parent: in its place is the untagged digest below it (`Backend.below`: the store's format
   `Store.store_format`, the trust scope, the repository, the rootfs's fingerprint, the userns mode,
-  the slot's first id, the binds). `fork_keys_apart`: a fork's pull request (scope `untrusted`) and
-  the repository's own jobs (`repo`) never ask the same key, so neither replays what the other
-  stored.
+  the binds; the slot's first id until stored layers took the canonical ids). `fork_keys_apart`: a
+  fork's pull request (scope `untrusted`) and the repository's own jobs (`repo`) never ask the same
+  key, so neither replays what the other stored; `userns_apart`: nor do a root and a rootless
+  runner's jobs.
   The extras are not new inputs: a step's are its job's, fixed with the base (`Format.stepExtra`), and a base's are part of what the
   model's base is (`BaseSpec`). `encState_injective`, `belowPreimage_inj`, `encKey_injective` and
   `native_key_iff`: the format keeps exactly what the model's key keeps, so P2 and P3 hold of it;
@@ -956,11 +1131,17 @@ What BuildKit's cache did implicitly, now explicit in `native/Store.zig`:
   binds' places) is listed beside it for P8 to add. The ran marker, the markers' secret and the
   event were volatile variables under Dagger; natively they are plain variables, so the key must
   leave them out by name, or every job would miss.
-- **A layer belongs to an id range.** On a root runner a layer's files are owned by its job's
-  host ids. Unlike the rootfs, which an idmapped mount shifts per slot, a stored layer is not
-  shifted: it is keyed by the slot's first id, which costs misses across slots (a pool's
-  concurrent jobs do not share layers) and keeps a job's files from appearing under another
-  range. An idmapped mount per stored layer would lift that; it is the helper's work.
+- **A layer has the canonical ids** (it first belonged to an id range). On a root runner a
+  layer's files were owned by its job's host ids and, unlike the rootfs, which an idmapped mount
+  shifts per slot, a stored layer was not shifted: it was keyed by the slot's first id. In a busy
+  pool reruns mostly missed (the end-to-end job's rerun landed in slot 0 after the first run used
+  slot 2, and needed a third try). Now a layer is shifted to the canonical ids when published and
+  idmapped onto each job's range when mounted, the rootfs's own arrangement, and the slot left
+  the key (store format 3). Lessons: every piece was already there (the provisioning's shift back,
+  the seeds' idmapped lowers), so the cost of the first cut was one key field and a doc line, and
+  the price of keeping it was paid in misses no test saw, since tests run one job at a time and
+  take slot 0. And a shift by `chown` is lossy unless told otherwise: it clears set-id bits and
+  file capabilities, misses ACLs, and sees a hard link twice.
 - **Masks are secrets for the cache.** A step that names a value an earlier step masked always
   runs (`holdsSecret` counts masks), on native as on Dagger; the first replay test tripped on it.
 - **Publish must never replace, and a reader must never trust a half.** `RENAME_NOREPLACE` keeps a
@@ -969,7 +1150,10 @@ What BuildKit's cache did implicitly, now explicit in `native/Store.zig`:
   from taking it between the rename and the job's use.
 - **The store's mode is a security boundary.** Its layers hold job-written files owned by the
   jobs' ids, setuid ones among them: at 0755 a host user could run one as the job's root's host id.
-  The store is 0700 (P1's job directories, under it, were exposed the same way).
+  The store is 0700 (P1's job directories, under it, were exposed the same way). Since layers have
+  the canonical ids, a job's set-uid-root file is one of the host's root on disk, as the pulled
+  images' `sudo` already was: the 0700 store is what keeps every host user from it, and `prepare`
+  sets the mode on every start.
 - **What the review found (after merge, fixed in a follow-up).** A fingerprint kept per process
   by path missed a rootfs provisioned again in place: `tar -x` restores mtimes, so size and mtime
   match; ctimes do not, and every job now checks the root and a stamp. Layers outlived runner
@@ -1127,8 +1311,8 @@ specification:
   yet, so no stored digest changed meaning; the rootfs's fingerprint, the same walk, changed once,
   which costs one round of misses.
 - **What P2 hashes beyond the model added no input to it.** P2's key carries the uid, gid, working
-  directory and kept files, and the digest below a base (store format, rootfs, id mapping, slot,
-  binds). Each is
+  directory and kept files, and the digest below a base (store format, rootfs, id mapping, binds;
+  the slot too, until stored layers took the canonical ids and it left the key). Each is
   either part of what the model's base is or fixed with it for every step of the job, so the proof
   needed a richer `Format`, not a richer model: the base became a `BaseSpec` and a step's extras its
   base's (`stepExtra`). One consequence worth knowing: when the event payload is too large for a
@@ -1155,3 +1339,66 @@ specification:
   both streams (`dup2(1, 2)` before `execve` in `sandbox.zig`), so a store that records that pipe
   replays the run without merging. The script keeps the line because both backends run the same
   script, and its text is in the key.
+
+### P5: Docker's allow list, the rules over netlink
+
+- **A filter of names is only as good as its table.** Docker's profile names calls; the filter
+  needs numbers, per architecture. A name std spells otherwise (`_sysctl`, `newfstatat`) would be
+  left out without a sound, so the test walks every call of both architectures' tables and
+  requires each to be named by the profile or known refused. Unknown calls get ENOSYS, not EPERM,
+  as runc found: a C library falls back on ENOSYS only.
+- **Long filters need short jumps.** Classic BPF's conditional jumps reach 255 instructions; an
+  allow list of about 370 calls compared one by one would need longer ones. Runs of consecutive
+  numbers, each block ending in its own returns, keep every jump short, and a call costs two
+  comparisons per run below its own rather than one per allowed call.
+- **An accept in our table cannot overturn a drop in theirs.** nftables runs every base chain on a
+  hook and a packet must pass them all. So the deciding moves into the runner's own table, where a
+  drop holds whatever else the host has, and the host's iptables-nft chains only get the two
+  plainest accepts (`-i zr0`, `-o zr0`). The reply-only rule needs no conntrack match in their
+  table, since ours enforces it.
+- **Write into iptables' table only as iptables would.** A rule iptables-nft cannot translate makes
+  it call the whole table incompatible and refuse to change it, which would break Docker. The rules
+  there are iptables' own encoding (meta, cmp with the name's terminating zero, a counter, an
+  immediate), checked against `iptables-nft -S` and `nft --debug=netlink` in an unprivileged
+  `unshare -rn` namespace, which needs no root: nftables works in a network namespace a user
+  namespace owns.
+- **Kernel modules.** `nft_masq`, `nft_ct` and `nft_chain_nat` may not be loaded on a host whose
+  firewall is iptables-nft (Docker's MASQUERADE uses the xtables target). The root runner's first
+  batch loads them; a test that makes the rules in an unprivileged namespace first may find them
+  missing.
+
+### P6: services
+
+What Docker and Dagger did implicitly for services, now explicit in `native/`:
+
+- **A container's entrypoint is looked up in its PATH.** Steps always ran `/bin/sh`; an image's
+  `docker-entrypoint.sh` is a name, found in the image's own PATH once inside its root
+  (`sandbox.lookPath`), as runc finds it. Some images have no shell at all (`traefik/whoami`).
+- **`USER` is a name in the image's files**, not the host's: resolved in the image's /etc/passwd
+  and /etc/group, read inside it.
+- **Readiness was Docker's state machine.** GitHub's runner polls Docker's health status; Dagger
+  waited for ports. Natively the helper that holds the service's first process is the place to
+  decide it: a check forked there is in the service's namespaces without a `setns`, and the pid it
+  joins cannot be another process's, since the helper has not reaped it. A separate helper joining
+  by pid would have raced pid reuse, as the host's root.
+- **Published ports were Docker's proxy.** In one shared namespace a port published as itself
+  needs nothing, which is most of them; the rest take a relay of ours, which binds as root in the
+  job's namespace and then drops to the job's `nobody`.
+- **Docker's bridge kept the host out.** P1's rules kept jobs from the host and from each other,
+  but not the host from the jobs: any process on the host could connect to a job's address over
+  `zr0`. Harmless while only steps listened; a database whose password is `postgres` is another
+  matter. `OUTPUT` and `FORWARD` now drop what goes to `zr0` and is not a reply, and the root test
+  knocks while a service listens.
+
+Surprises:
+
+- **The first readiness try's delay was the whole cost.** A service up in 5 ms was ready at
+  122 ms: 100 ms of first delay in the helper and 20 ms of the runner's polling. From 10 ms,
+  doubling, and read every 10 ms, it is 21 ms.
+- **`pg_isready` passes against postgres's set-up server**, which the image's entrypoint starts on
+  its socket alone and stops again before the real one listens on TCP; workflows on GitHub have
+  the same race. The test checks over TCP (`pg_isready -h 127.0.0.1`).
+- **An image's path can hold overlay's separator.** `postgres:17-alpine` is a fine directory name
+  and an impossible `lowerdir=`; the layer is a link in the job's directory instead.
+- **The boundary held again**: two lines in `dagger/services.zig` hand "Initialize containers"
+  and "Stop containers" over, and `JobLog.serviceLine` became public. No Dagger path changed.

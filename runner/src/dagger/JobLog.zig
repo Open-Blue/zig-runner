@@ -670,7 +670,9 @@ pub fn takeServiceLog(sh: *JobLog, n: usize) []const []const u8 {
     return sh.service_logs[n].items;
 }
 
-fn serviceLine(sh: *JobLog, n: u32, line: []const u8) void {
+/// Keeps a line of service `n`'s output for "Stop containers" (the native backend's services
+/// hand theirs here directly, `native/services.zig`).
+pub fn serviceLine(sh: *JobLog, n: u32, line: []const u8) void {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
     if (n >= sh.service_logs.len) return;

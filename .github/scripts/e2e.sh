@@ -258,10 +258,6 @@ check_replay() {
 	echo "rerun (attempt $1): $(grep -cF 'Reused from' "$log" || true) steps replayed"
 }
 
-# slot_of ATTEMPT: the host ids that attempt of `cache` ran in natively ("Native steps: ids 0-65535
-# are host ids ..." in "Set up job").
-slot_of() { grep -oE 'are host ids [0-9]+' "$out/logs/$backend-e2e-cache-$1.log" | head -n1 | grep -oE '[0-9]+$' || true; }
-
 # The suite's runs, cancelled if still going# The suite's runs, cancelled if still going, when it ends early.
 cancel_runs() {
 	local r
@@ -341,20 +337,10 @@ check() {
 
 	# The rerun of `cache`: the same steps with the same nonce, so the step cache replays them, and
 	# the runner notes each one "Reused from Dagger's cache" or "... the native step store".
-	# Natively a stored layer belongs to the slot (the range of host ids) its job ran in, and only a
-	# job in the same slot reuses it (docs/native-backend.md, "A layer belongs to an id range"). A
-	# job alone takes the first free slot, but the first run shared the pool with the whole suite:
-	# when the rerun landed in another slot, its miss is expected, and the job is rerun once more,
-	# in the slot the rerun just filled, where it must replay.
+	# Natively in whichever slot the rerun lands: a stored layer has the canonical ids, which every
+	# slot's job sees as its own (docs/native-backend.md, "A layer has the canonical ids").
 	rerun_cache 2
-	if [[ $backend == native ]] && ! grep -qF 'Reused from' "$out/logs/$backend-e2e-cache-2.log" &&
-		[[ $(slot_of 1) != "$(slot_of 2)" ]]; then
-		echo "rerun: in host ids $(slot_of 2), not $(slot_of 1) as the first run: a miss, by design; once more"
-		rerun_cache 3
-		check_replay 3
-	else
-		check_replay 2
-	fi
+	check_replay 2
 
 	trap - EXIT
 	echo "timings ($backend):"
