@@ -69,14 +69,15 @@ jobs:
           - { target: minisign, runs: 1M }
           - { target: workflow commands, runs: 3M }
           - { target: problem matchers, runs: 3M }
-          # The text paths that guard secrets and a job's environment, about ten minutes each,
-          # from a laptop's speeds halved: 550 runs a second for secret masking (each run a
-          # whole step's log through records, line cuts, commands and masking), 1,000 for file
-          # commands and job messages, 1,400 for HTTP2 frames.
-          - { target: secret masking, runs: 150K }
-          - { target: file commands, runs: 300K }
-          - { target: job messages, runs: 300K }
-          - { target: HTTP2 frames, runs: 400K }
+          # The text paths that guard secrets and a job's environment: about ten minutes of
+          # fuzzing each, from their first run here (pull request #300): 600 runs a second for
+          # secret masking (each run a whole step's log through records, line cuts, commands and
+          # masking), 2,300 for file commands, 4,600 for job messages, 1,400 for HTTP2 frames,
+          # with room for corpora that grow.
+          - { target: secret masking, runs: 300K }
+          - { target: file commands, runs: 1M }
+          - { target: job messages, runs: 2M }
+          - { target: HTTP2 frames, runs: 800K }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
