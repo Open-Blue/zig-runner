@@ -1,8 +1,9 @@
 name: proofs
 
-# The Lean proofs in proofs/ (proofs/README.md): `lake build` checks every theorem, and the hashFiles
-# model is compared with runner/src/glob.zig on random cases (glob-lean-diff.sh), so the proof about
-# the walk holds of the walk that ships; runner/src/native/testdata/step_keys.tsv, which the Zig
+# The Lean proofs in proofs/ (proofs/README.md): `lake build --wfail` checks every theorem (a `sorry`
+# or any other warning fails it), leanchecker replays them in the kernel, Axioms.lean fails on an
+# axiom outside its allow list; and the hashFiles model is compared with runner/src/glob.zig on
+# random cases (glob-lean-diff.sh), so the proof about the walk holds of the walk that ships; runner/src/native/testdata/step_keys.tsv, which the Zig
 # tests check the native store's key against, is checked to be the model's (key-vectors.sh). On
 # every pull request, merge group and push to main, and weekly on fresh cases. The seed is the run
 # number, and is printed: a failure reproduces locally with the same seed. A required check: on a
@@ -51,10 +52,25 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
+      # --wfail: a warning fails the build, and a `sorry` is a warning.
       - name: Check the proofs
         if: steps.scope.outputs.run == 'true'
         working-directory: proofs
-        run: lake build
+        run: lake build --wfail
+
+      # The kernel replays every declaration from the .olean files, so what the build wrote is what
+      # the kernel accepts (no environment hacking by a tactic or an elaborator).
+      - name: Replay the proofs in the kernel
+        if: steps.scope.outputs.run == 'true'
+        working-directory: proofs
+        run: lake env leanchecker Runner Glob Oracle KeyOracle
+
+      # Every declaration in Runner and Glob depends on no axiom outside Axioms.lean's allow list,
+      # and the main theorems' axioms are printed.
+      - name: The axioms the proofs rely on
+        if: steps.scope.outputs.run == 'true'
+        working-directory: proofs
+        run: lake env lean -DwarningAsError=true Axioms.lean
 
       - name: The native key's vectors are the model's
         if: steps.scope.outputs.run == 'true'
