@@ -64,7 +64,9 @@ decide the version, write the changelog and tag the release alongside this, disa
 `ci` checks every pull request: the branch name, the workflows (actionlint, and
 [zizmor](https://docs.zizmor.sh) for security), the format, build and tests, the database tests
 against TimescaleDB, and the release's own builds, for both targets in ReleaseSafe ("Release
-builds"), so code that does not compile for aarch64 fails here rather than after the tag;
+builds"), so code that does not compile for aarch64 fails here rather than after the tag, and
+the same builds on GitHub's arm64 runner, where the aarch64 binary is run and the tests run
+natively on arm64, as on razorbill ("Release builds and tests (arm64)");
 `proofs` checks the Lean proofs and `release` the packaging (below). Every one of these is a
 required check, and reports on every pull request and in the merge queue: on a change that cannot
 affect what a job checks, it reports without running its steps
@@ -159,8 +161,8 @@ repository:
   (IBT and shadow stacks) is not available: Zig 0.17 has no `-fcf-protection` for Zig code, so the
   binaries carry no CET note. [checksec](https://github.com/slimm609/checksec) 3.2
   (`.github/scripts/checksec.sh`, pinned by version and checksum) fails the release, and on pull
-  requests "Release builds" and "Binaries (check)", on any binary without PIE, full RELRO, NX or
-  W^X:
+  requests "Release builds", "Release builds and tests (arm64)" and "Binaries (check)", on any
+  binary without PIE, full RELRO, NX or W^X:
 
   ```sh
   .github/scripts/checksec.sh zig-runner-linux-x86_64 zig-runner-linux-aarch64

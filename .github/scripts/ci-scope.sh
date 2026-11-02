@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Whether a pull request or a merge group can change what a group of CI's checks checks:
 #
-#   ci-scope.sh tests        Format, build and test; Database tests (ci.yml)
-#   ci-scope.sh binaries     Release builds (ci.yml)
+#   ci-scope.sh tests        Format, build and test; Database tests; Release builds and tests
+#                            (arm64) (ci.yml)
+#   ci-scope.sh binaries     Release builds; Release builds and tests (arm64) (ci.yml)
 #   ci-scope.sh e2e          End to end (ci.yml)
 #   ci-scope.sh proofs       Proofs (proofs.yml)
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)

@@ -289,6 +289,65 @@ jobs:
           .github/scripts/checksec.sh "$RUNNER_TEMP/dist/zig-runner-linux-x86_64" "$RUNNER_TEMP/dist/zig-runner-linux-aarch64"
           "$RUNNER_TEMP/dist/zig-runner-linux-x86_64" --version
 
+  # The aarch64 release binary, run where it runs: on GitHub's arm64 runner, as on razorbill (a Pi,
+  # prod), which would otherwise be the first machine ever to execute it. The release's builds
+  # (build-binaries.sh, both targets, so the same commands as Release builds and the tag), checked
+  # for their hardening (checksec.sh: static PIE, full RELRO, NX, W^X), the aarch64 binary run once
+  # (a static PIE relocates itself at startup, before anything else), then the tests natively on
+  # arm64 as the hosted test job runs them on x86_64: rootless, then the native backend's as root.
+  # Skipped, still reporting, on a change that can affect neither the release's builds nor the
+  # tests (ci-scope.sh binaries and tests); not on main, as Release builds.
+  arm64:
+    name: Release builds and tests (arm64)
+    if: github.event_name != 'push'
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether this change can affect the release's builds or the tests
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          GITHUB_OUTPUT="$RUNNER_TEMP/scope-binaries" .github/scripts/ci-scope.sh binaries
+          GITHUB_OUTPUT="$RUNNER_TEMP/scope-tests" .github/scripts/ci-scope.sh tests
+          if grep -qx run=true "$RUNNER_TEMP/scope-binaries" "$RUNNER_TEMP/scope-tests"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Zig
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/install-zig.sh
+
+      - name: Build for x86_64 and aarch64
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/build-binaries.sh v0.0.0-ci "$RUNNER_TEMP/dist"
+
+      - name: Hardening, and the aarch64 binary run
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          .github/scripts/checksec.sh "$RUNNER_TEMP/dist/zig-runner-linux-aarch64" "$RUNNER_TEMP/dist/zig-runner-linux-x86_64"
+          "$RUNNER_TEMP/dist/zig-runner-linux-aarch64" --version
+
+      # As the hosted test job's Test step: the native backend's tests must run here, not skip.
+      - name: Test
+        if: steps.scope.outputs.run == 'true'
+        working-directory: runner
+        run: |
+          # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
+          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/zig-test.sh
+          ../.github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
+          ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 \
+            ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" ../.github/scripts/zig-test.sh
+
   # The end-to-end suite (.github/scripts/e2e.sh): the runner built from this change serves
   # runner-bench's e2e workflows (Open-Blue/runner-bench, e2e.yml and e2e-cancel.yml) on GitHub's
   # runner, through GitHub's broker and a real Dagger engine, once on Dagger and once native, and
