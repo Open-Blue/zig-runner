@@ -236,15 +236,31 @@ pub const Client = struct {
     /// One request, following redirects itself. A 401 sets `challenge` (its `WWW-Authenticate`)
     /// and returns. The authorization goes to the registry's own host only: never to where a
     /// redirect leads (a blob's CDN, with a signed URL of its own).
+    ///
+    /// A request that meets a kept-alive connection the server has closed is sent again on
+    /// another, up to `http.staleRetries` times (one more than the idle connections the pool
+    /// keeps). Docker Hub closes a connection idle for about a minute, and the runner's client
+    /// is the process's (`http.client`), so its next pull, minutes or hours later, took the dead
+    /// connection from the pool and failed with `HttpConnectionClosing` (razorbill, 2026-11-01).
+    /// Nothing came back on it, so nothing was read into `body`; every other error stands.
     fn once(c: *Client, url: []const u8, accept: []const u8, body: *Body, challenge: *?[]const u8) ![]const u8 {
         var uri = try std.Uri.parse(url);
         var redirects: u32 = 0;
-        while (true) : (redirects += 1) {
+        var stale: u32 = 0;
+        while (true) {
             if (redirects > max_redirects) {
                 c.why = try std.fmt.allocPrint(c.arena, "{s}: too many redirects", .{url});
                 return error.TooManyRedirects;
             }
-            uri = try c.onceAt(uri, accept, body, challenge) orelse return c.content_type;
+            const next = c.onceAt(uri, accept, body, challenge) catch |e| switch (e) {
+                error.HttpConnectionClosing => if (stale < http.staleRetries(c.http)) {
+                    stale += 1;
+                    continue;
+                } else return e,
+                else => return e,
+            };
+            uri = next orelse return c.content_type;
+            redirects += 1;
         }
     }
 
@@ -358,8 +374,9 @@ pub const Client = struct {
         try std.Uri.Component.percentEncode(&url.writer, scope, isQueryChar);
         const auth: ?[]const u8 = if (c.creds) |cr| try basic(c.arena, cr) else null;
         var body: std.Io.Writer.Allocating = .init(c.arena);
-        // No redirect is followed: the credentials would go with it (see `onceAt`).
-        const res = c.http.fetch(.{
+        // No redirect is followed: the credentials would go with it (see `onceAt`). Sent again on
+        // a kept-alive connection the token service had closed, as the registry's are (`once`).
+        const res = http.fetch(c.http, .{
             .location = .{ .url = url.written() },
             .headers = .{
                 .user_agent = .{ .override = "zig-runner" },

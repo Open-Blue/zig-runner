@@ -449,9 +449,10 @@ const Message = struct {
 /// - The jobs' rules, over nftables netlink (`nft.zig`): their addresses masqueraded on the way
 ///   out; from `zr0` nothing into the host but replies, and nothing forwarded but out through the
 ///   host's uplinks (the interfaces of its default routes), so never to another job, to Docker's
-///   containers or to the host's other networks; to `zr0` replies only. The host's iptables-nft
-///   `FORWARD` and `DOCKER-USER` chains (Docker's and ufw's, whose policies drop) accept the
-///   bridge's traffic and leave the deciding to the runner's table.
+///   containers or to the host's other networks; but DNS to the jobs' nameservers (`dns`,
+///   `Resolver`), on port 53 only, wherever they are; to `zr0` replies only. The host's
+///   iptables-nft `FORWARD` and `DOCKER-USER` chains (Docker's and ufw's, whose policies drop)
+///   accept the bridge's traffic and leave the deciding to the runner's table.
 /// - To `zr0` from the host's own processes (`OUTPUT`), replies only, as routed traffic to it:
 ///   nothing reaches a job that the job did not ask for, its services' ports included (P6).
 ///
@@ -461,6 +462,7 @@ pub fn natRules(
     io: std.Io,
     subnet: Subnet,
     ups: []const []const u8,
+    dns: []const [4]u8,
 ) !?[]const u8 {
     if (ups.len == 0) return "the host has no default route for the jobs' traffic to leave by";
     const cwd = std.Io.Dir.cwd();
@@ -485,7 +487,7 @@ pub fn natRules(
         std.log.warn("native: this host has iptables-legacy tables (/proc/net/ip_tables_names), " ++
             "which the jobs' nftables rules do not reach; a legacy FORWARD policy of DROP " ++
             "would cut the jobs' traffic", .{});
-    return nft.apply(subnet, ups);
+    return nft.apply(subnet, ups, dns);
 }
 
 /// The host's uplinks: the interfaces of its IPv4 default routes (`/proc/net/route`), the bridge
@@ -581,39 +583,162 @@ fn fromRouteHex(v: u32) u32 {
     return std.mem.readInt(u32, &b, .big);
 }
 
-/// The resolver a job's steps get: its own namespace cannot reach a resolver on the host's
-/// loopback (systemd-resolved's 127.0.0.53), so the upstream servers systemd-resolved lists, or
-/// the host's /etc/resolv.conf when it names no loopback server. Null when neither will do.
-pub fn resolvConf(arena: Allocator, io: std.Io) ?[]const u8 {
-    for ([_][]const u8{ "/run/systemd/resolve/resolv.conf", "/etc/resolv.conf" }) |p| {
+/// The resolver a job's steps get on a root runner, made from the host's as Docker makes a
+/// container's on its default bridge: the host's /etc/resolv.conf with the nameservers a job's
+/// network cannot reach left out (the loopback's, such as systemd-resolved's 127.0.0.53 stub, and
+/// IPv6 ones, as the job has no IPv6), its search domains and options kept. Where that leaves
+/// none, systemd-resolved's own list of upstream servers is tried, and then Docker's and
+/// BuildKit's fallback, Google's public resolvers.
+///
+/// The nameservers it names are what the jobs' rules let through, on port 53 only, out of
+/// whichever interface the host routes them by (`nft.zig`): Tailscale's MagicDNS (100.100.100.100
+/// through `tailscale0`), a resolver on the LAN or on the host itself, none of them behind an
+/// uplink. Read again for each job, so a host whose resolver changes while the runner runs
+/// (Tailscale coming up) gives the next job the new one, and the rules follow
+/// (`Backend.natRulesFor`).
+pub const Resolver = struct {
+    /// The job's /etc/resolv.conf.
+    conf: []const u8,
+    /// Its nameservers: IPv4, none on the loopback or in the jobs' subnet, at most `max_nameservers`.
+    nameservers: []const [4]u8,
+    /// The host's resolver named none a job can reach: these are the public fallback's.
+    fallback: bool,
+    /// The host's file it was made from; "" with only the fallback's.
+    source: []const u8,
+};
+
+/// The host's resolver files, in the order they are tried: /etc/resolv.conf, then the upstream
+/// servers systemd-resolved lists when /etc/resolv.conf names only its stub.
+pub const resolv_paths = [_][]const u8{ "/etc/resolv.conf", "/run/systemd/resolve/resolv.conf" };
+
+/// glibc's MAXNS: the resolver reads no more than three nameservers.
+pub const max_nameservers = 3;
+
+/// What Docker and BuildKit fall back to when the host names no nameserver a container can
+/// reach.
+pub const fallback_nameservers = [_][4]u8{ .{ 8, 8, 8, 8 }, .{ 8, 8, 4, 4 } };
+
+/// The job's resolver from the first of `paths` that names a nameserver it can reach, else the
+/// first readable one's search domains and options with the public fallback.
+pub fn jobResolver(arena: Allocator, io: std.Io, paths: []const []const u8, subnet: Subnet) !Resolver {
+    var first: ?Resolver = null;
+    for (paths) |p| {
         const text = std.Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(64 * 1024)) catch
             continue;
-        if (namesOnlyReachable(text)) return p;
+        const r = try filterResolvConf(arena, text, subnet, p);
+        if (!r.fallback) return r;
+        if (first == null) first = r;
     }
-    return null;
+    return first orelse try filterResolvConf(arena, "", subnet, "");
 }
 
-/// Whether a resolv.conf names at least one nameserver, and none on the loopback.
-pub fn namesOnlyReachable(text: []const u8) bool {
-    var any = false;
+/// A host's resolv.conf for a job's network (`Resolver`): every line kept but the nameservers a
+/// job cannot reach, and those past `max_nameservers`.
+pub fn filterResolvConf(arena: Allocator, text: []const u8, subnet: Subnet, source: []const u8) !Resolver {
+    var out: std.ArrayList(u8) = .empty;
+    var kept: std.ArrayList([4]u8) = .empty;
+    try out.print(arena, "# The host's resolver ({s}) for the job's network: only its IPv4 " ++
+        "nameservers off the loopback (zig-runner).\n", .{if (source.len > 0) source else "none"});
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
-        var words = std.mem.tokenizeAny(u8, raw, " \t");
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        var words = std.mem.tokenizeAny(u8, line, " \t");
         const key = words.next() orelse continue;
-        if (!std.mem.eql(u8, key, "nameserver")) continue;
-        const addr = words.next() orelse continue;
-        if (std.mem.startsWith(u8, addr, "127.") or std.mem.eql(u8, addr, "::1")) return false;
-        any = true;
+        if (std.mem.eql(u8, key, "nameserver")) {
+            const addr = parseIp4(words.next() orelse continue) orelse continue;
+            if (!reachableNameserver(addr, subnet) or kept.items.len == max_nameservers) continue;
+            for (kept.items) |k| {
+                if (std.mem.eql(u8, &k, &addr)) break;
+            } else try kept.append(arena, addr);
+            continue;
+        }
+        try out.print(arena, "{s}\n", .{line});
     }
-    return any;
+    const fallback = kept.items.len == 0;
+    if (fallback) try kept.appendSlice(arena, &fallback_nameservers);
+    for (kept.items) |a| try out.print(arena, "nameserver {d}.{d}.{d}.{d}\n", .{ a[0], a[1], a[2], a[3] });
+    return .{ .conf = out.items, .nameservers = kept.items, .fallback = fallback, .source = source };
 }
 
-test "a resolv.conf for a job's namespace names no loopback server" {
-    try std.testing.expect(!namesOnlyReachable("nameserver 127.0.0.53\noptions edns0\n"));
-    try std.testing.expect(namesOnlyReachable("# upstream\nnameserver 1.1.1.1\n" ++
-        "nameserver 8.8.8.8\n"));
-    try std.testing.expect(!namesOnlyReachable("search example.com\n"));
-    try std.testing.expect(!namesOnlyReachable("nameserver 10.0.0.2\nnameserver ::1\n"));
+/// Whether a job's network can reach a nameserver at `addr`: not on the loopback (the host's own,
+/// out of a job's namespace), not 0.0.0.0/8, and not in the jobs' subnet (the bridge's address,
+/// where nothing of the host's answers a job, or another job's).
+fn reachableNameserver(addr: [4]u8, subnet: Subnet) bool {
+    if (addr[0] == 127 or addr[0] == 0) return false;
+    return !subnet.overlaps(std.mem.readInt(u32, &addr, .big), ~@as(u32, 0));
+}
+
+/// A dotted IPv4 address, or null for anything else (an IPv6 address, a name).
+pub fn parseIp4(text: []const u8) ?[4]u8 {
+    var out: [4]u8 = undefined;
+    var parts = std.mem.splitScalar(u8, text, '.');
+    for (&out) |*b| {
+        const part = parts.next() orelse return null;
+        if (part.len == 0 or part.len > 3) return null;
+        b.* = std.fmt.parseInt(u8, part, 10) catch return null;
+    }
+    if (parts.next() != null) return null;
+    return out;
+}
+
+test "a host's resolver for a job's network: loopback and IPv6 nameservers out, search and options kept" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const sub = Subnet.default;
+    // Tailscale's, as razorbill has it: MagicDNS over IPv4 and IPv6.
+    const ts = try filterResolvConf(arena, "# generated by tailscale\nnameserver 100.100.100.100\n" ++
+        "nameserver fd7a:115c:a1e0::53\nsearch tail74f5b5.ts.net\n", sub, "/etc/resolv.conf");
+    try std.testing.expect(!ts.fallback);
+    try std.testing.expectEqual(@as(usize, 1), ts.nameservers.len);
+    try std.testing.expectEqual([4]u8{ 100, 100, 100, 100 }, ts.nameservers[0]);
+    try std.testing.expect(std.mem.indexOf(u8, ts.conf, "nameserver 100.100.100.100\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts.conf, "search tail74f5b5.ts.net\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ts.conf, "fd7a") == null);
+    // systemd-resolved's stub: nothing reachable, so the fallback, with its options kept.
+    const stub = try filterResolvConf(arena, "nameserver 127.0.0.53\noptions edns0 trust-ad\n" ++
+        "search lan\n", sub, "/etc/resolv.conf");
+    try std.testing.expect(stub.fallback);
+    try std.testing.expectEqualSlices([4]u8, &fallback_nameservers, stub.nameservers);
+    try std.testing.expect(std.mem.indexOf(u8, stub.conf, "options edns0 trust-ad\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stub.conf, "127.0.0.53") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stub.conf, "nameserver 8.8.8.8\n") != null);
+    // IPv6 only, the jobs' own subnet, 0.0.0.0 and a name: none reachable.
+    const none = try filterResolvConf(arena, "nameserver ::1\nnameserver 2001:4860:4860::8888\n" ++
+        "nameserver 10.211.0.1\nnameserver 0.0.0.0\nnameserver dns.example\n", sub, "x");
+    try std.testing.expect(none.fallback);
+    // At most three, each once; the order kept.
+    const many = try filterResolvConf(arena, "nameserver 10.0.0.1\nnameserver 10.0.0.1\n" ++
+        "nameserver 127.0.0.1\nnameserver 192.168.1.1\nnameserver 1.1.1.1\nnameserver 9.9.9.9\n", sub, "x");
+    try std.testing.expectEqualSlices([4]u8, &.{ .{ 10, 0, 0, 1 }, .{ 192, 168, 1, 1 }, .{ 1, 1, 1, 1 } }, many.nameservers);
+    try std.testing.expect(std.mem.indexOf(u8, many.conf, "9.9.9.9") == null);
+    try std.testing.expectEqual(@as(?[4]u8, null), parseIp4("1.2.3"));
+    try std.testing.expectEqual(@as(?[4]u8, null), parseIp4("1.2.3.256"));
+    try std.testing.expectEqual(@as(?[4]u8, null), parseIp4("1.2.3.4.5"));
+}
+
+test "the job's resolver: the first file with a nameserver a job can reach, else the first one read" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "stub", .data = "nameserver 127.0.0.53\nsearch lan\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "upstream", .data = "nameserver 192.168.1.1\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const stub = try std.fmt.allocPrint(arena, "{s}/stub", .{root});
+    const upstream = try std.fmt.allocPrint(arena, "{s}/upstream", .{root});
+    const missing = try std.fmt.allocPrint(arena, "{s}/missing", .{root});
+    const r = try jobResolver(arena, io, &.{ missing, stub, upstream }, Subnet.default);
+    try std.testing.expectEqualStrings(upstream, r.source);
+    try std.testing.expectEqual([4]u8{ 192, 168, 1, 1 }, r.nameservers[0]);
+    const only_stub = try jobResolver(arena, io, &.{stub}, Subnet.default);
+    try std.testing.expect(only_stub.fallback);
+    try std.testing.expect(std.mem.indexOf(u8, only_stub.conf, "search lan\n") != null);
+    const nothing = try jobResolver(arena, io, &.{missing}, Subnet.default);
+    try std.testing.expect(nothing.fallback);
+    try std.testing.expectEqualStrings("", nothing.source);
 }
 
 test "slots' addresses and links" {

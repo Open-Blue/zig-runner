@@ -8,7 +8,12 @@
 //!   /v2/<repo>/blobs/<digest>      the same; a route with `redirect` answers 307 to /cdn/...
 //!   /cdn/<digest>                  the blob, on any host; 400 when it comes with an Authorization
 //!
-//! Every request is counted in `Server.requests`.
+//! Every request is counted in `Server.requests`, every connection in `Server.connections`.
+//!
+//! Each connection is closed once its request is answered. Normally the answer says so
+//! (`Connection: close`); with `Server.stale` it does not, so the client keeps the connection for
+//! its next request and finds it closed, as a connection Docker Hub closed after a minute idle
+//! is found; with `Server.mute`, no request is ever answered.
 
 const std = @import("std");
 const Io = std.Io;
@@ -32,7 +37,12 @@ pub const Server = struct {
     routes: []const Route = &.{},
     /// Token auth on the API, with these Basic credentials for the token.
     private: bool = false,
+    /// Answers as if the connection were kept, then closes it.
+    stale: bool = false,
+    /// Closes every connection once its request is read, without answering it.
+    mute: bool = false,
     requests: std.atomic.Value(u32) = .init(0),
+    connections: std.atomic.Value(u32) = .init(0),
 
     pub fn start(s: *Server) !void {
         const io = std.testing.io;
@@ -65,6 +75,7 @@ pub const Server = struct {
     fn serve(s: *Server) void {
         while (true) {
             const conn = s.listener.accept(std.testing.io) catch return;
+            _ = s.connections.fetchAdd(1, .acq_rel);
             const quit = answer(s, conn);
             conn.close(std.testing.io);
             if (quit) return;
@@ -107,6 +118,7 @@ fn answer(s: *Server, conn: Io.net.Stream) bool {
     }
     if (std.mem.eql(u8, path, "/quit")) return true;
     _ = s.requests.fetchAdd(1, .acq_rel);
+    if (s.mute) return false;
     var wb: [64 * 1024]u8 = undefined;
     var w = conn.writer(io, &wb);
     const out = &w.interface;
@@ -114,36 +126,37 @@ fn answer(s: *Server, conn: Io.net.Stream) bool {
 
     if (std.mem.startsWith(u8, path, "/token?")) {
         if (s.private and !std.mem.eql(u8, auth, "Basic dXNlcjpwYXNz"))
-            return respond(out, "401 Unauthorized", "", "text/plain", "bad credentials");
-        return respond(out, "200 OK", "", "application/json", "{\"token\":\"tok\"}");
+            return respond(s, out, "401 Unauthorized", "", "text/plain", "bad credentials");
+        return respond(s, out, "200 OK", "", "application/json", "{\"token\":\"tok\"}");
     }
     if (std.mem.startsWith(u8, path, "/cdn/")) {
-        if (auth.len > 0) return respond(out, "400 Bad Request", "", "text/plain", "credentials sent to the CDN");
+        if (auth.len > 0) return respond(s, out, "400 Bad Request", "", "text/plain", "credentials sent to the CDN");
         for (s.routes) |rt| if (rt.redirect and std.mem.endsWith(u8, rt.path, path["/cdn/".len..]))
-            return respond(out, "200 OK", "", rt.content_type, rt.body);
-        return respond(out, "404 Not Found", "", "text/plain", "");
+            return respond(s, out, "200 OK", "", rt.content_type, rt.body);
+        return respond(s, out, "404 Not Found", "", "text/plain", "");
     }
     if (std.mem.startsWith(u8, path, "/v2/")) {
         if (s.private and !std.mem.eql(u8, auth, "Bearer tok")) {
             const ch = std.fmt.bufPrint(&hb, "WWW-Authenticate: Bearer realm=\"http://127.0.0.1:{d}/token\",service=\"test\"\r\n", .{s.port}) catch return false;
-            return respond(out, "401 Unauthorized", ch, "application/json", "{\"errors\":[{\"code\":\"UNAUTHORIZED\"}]}");
+            return respond(s, out, "401 Unauthorized", ch, "application/json", "{\"errors\":[{\"code\":\"UNAUTHORIZED\"}]}");
         }
         for (s.routes) |rt| if (std.mem.eql(u8, rt.path, path)) {
             if (rt.redirect) {
                 const digest = path[std.mem.lastIndexOfScalar(u8, path, '/').? + 1 ..];
                 const loc = std.fmt.bufPrint(&hb, "Location: http://localhost:{d}/cdn/{s}\r\n", .{ s.port, digest }) catch return false;
-                return respond(out, "307 Temporary Redirect", loc, "text/plain", "");
+                return respond(s, out, "307 Temporary Redirect", loc, "text/plain", "");
             }
-            return respond(out, "200 OK", "", rt.content_type, rt.body);
+            return respond(s, out, "200 OK", "", rt.content_type, rt.body);
         };
-        return respond(out, "404 Not Found", "", "application/json", "{\"errors\":[{\"code\":\"MANIFEST_UNKNOWN\"}]}");
+        return respond(s, out, "404 Not Found", "", "application/json", "{\"errors\":[{\"code\":\"MANIFEST_UNKNOWN\"}]}");
     }
-    return respond(out, "404 Not Found", "", "text/plain", "");
+    return respond(s, out, "404 Not Found", "", "text/plain", "");
 }
 
-fn respond(out: *Io.Writer, status: []const u8, extra: []const u8, ct: []const u8, body: []const u8) bool {
-    out.print("HTTP/1.1 {s}\r\n{s}Content-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{
-        status, extra, ct, body.len,
+fn respond(s: *const Server, out: *Io.Writer, status: []const u8, extra: []const u8, ct: []const u8, body: []const u8) bool {
+    const close: []const u8 = if (s.stale) "" else "Connection: close\r\n";
+    out.print("HTTP/1.1 {s}\r\n{s}Content-Type: {s}\r\nContent-Length: {d}\r\n{s}\r\n", .{
+        status, extra, ct, body.len, close,
     }) catch return false;
     out.writeAll(body) catch return false;
     out.flush() catch {};
@@ -325,6 +338,55 @@ test "native oci pull: a blob that does not match its digest is refused and not 
     try testing.expectError(error.FileNotFound, tmp.dir.access(io, try std.fmt.allocPrint(arena, "oci/images/{s}.rootless", .{img.manifest["sha256:".len..]}), .{}));
 }
 
+test "native oci pull: a kept-alive connection the registry closed is replaced; a registry that never answers fails, after a bounded number of tries" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    var t: layer.TestTar = .{ .a = arena };
+    try t.add(.{ .path = "f", .body = "kept" });
+    const img = try testImage(arena, "test/stale", "1", &.{ try t.finish(), &layer.test_gzip }, "", true);
+    const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(io, ".", arena) };
+    const creds: @import("registry.zig").Credentials = .{ .username = "user", .password = "pass" };
+
+    // Every answer looks kept alive and its connection is then closed: each request after the
+    // first (the token's, on the registry's host here, the manifests', the blobs', the CDN's)
+    // finds its kept connection closed, as Docker Hub's are after a minute idle, and goes on
+    // another.
+    var server: Server = .{ .routes = img.routes, .private = true, .stale = true };
+    try server.start();
+    defer server.stop();
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = io };
+    defer client.deinit();
+    var why: []const u8 = "";
+    const got = image.pull(arena, testing.allocator, io, &client, store, .{
+        .image = try server.image(arena, "test/stale:1"),
+        .creds = creds,
+        .owners = false,
+    }, &why) catch |e| {
+        std.debug.print("pull: {s}\n", .{why});
+        return e;
+    };
+    try testing.expectEqualStrings(img.manifest, got.manifest);
+    try testing.expect(server.requests.load(.acquire) >= 6);
+
+    // A registry that closes every connection unanswered is no stale connection: the pull fails
+    // with the error, once every kept connection the pool could hold has been tried.
+    var mute: Server = .{ .routes = img.routes, .mute = true };
+    try mute.start();
+    defer mute.stop();
+    why = "";
+    try testing.expectError(error.HttpConnectionClosing, image.pull(arena, testing.allocator, io, &client, store, .{
+        .image = try mute.image(arena, "test/stale:2"),
+        .owners = false,
+    }, &why));
+    try testing.expect(std.mem.indexOf(u8, why, "could not fetch its manifest: HttpConnectionClosing") != null);
+    const tries = mute.requests.load(.acquire);
+    try testing.expectEqual(@import("../../github/http.zig").staleRetries(&client) + 1, tries);
+}
+
 test "native oci pull of the default image from Docker Hub (ZIG_RUNNER_TEST_PULL=1; measures a cold pull)" {
     var a: std.heap.ArenaAllocator = .init(testing.allocator);
     defer a.deinit();
@@ -358,4 +420,16 @@ test "native oci pull of the default image from Docker Hub (ZIG_RUNNER_TEST_PULL
     const warm = try image.pull(arena, testing.allocator, io, &client, store, .{ .image = dagger.default_image, .owners = std.os.linux.geteuid() == 0 }, &why);
     std.debug.print("warm (pinned, in the store): {d} ms\n", .{std.Io.Clock.awake.now(io).toMilliseconds() - t1});
     try testing.expect(warm.pulled == null);
+    // A pull by tag, so it asks the registry, after the client's kept connections have sat idle
+    // past Docker Hub's minute: they are closed, and the pull goes on new ones (razorbill failed
+    // here with HttpConnectionClosing). The same client, as the runner's is the process's.
+    try io.sleep(.fromSeconds(70), .awake);
+    const idle = image.pull(arena, testing.allocator, io, &client, store, .{
+        .image = "alpine:3.22",
+        .owners = std.os.linux.geteuid() == 0,
+    }, &why) catch |e| {
+        std.debug.print("pull after a minute idle: {s}\n", .{why});
+        return e;
+    };
+    std.debug.print("after 70 s idle: {s}\n", .{idle.digest});
 }
