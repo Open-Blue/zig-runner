@@ -123,6 +123,9 @@ how: Launch,
 /// network namespace's file.
 slot: ?Slot = null,
 netns: ?[]const u8 = null,
+/// On a root runner, the nameservers the job's resolver names (`net.Resolver`), which the jobs'
+/// rules let its DNS through to (`natRulesFor`).
+nameservers: []const [4]u8 = &.{},
 /// `Config.subid_base`: the job's ids start at it plus its slot's offset (`idBase`).
 subid_base: u32 = default_subid_base,
 /// `Config.subnet`: the job's address is its slot's in it.
@@ -201,6 +204,9 @@ pub const Config = struct {
     /// Tests: off, as their stores are under a checkout a non-root user owns
     /// (`Store.Prepare.check_parents`).
     check_store_parents: bool = true,
+    /// Tests: the host's resolver file a root runner's jobs get theirs from (`net.jobResolver`),
+    /// instead of the host's own (`net.resolv_paths`).
+    test_resolv_conf: []const u8 = "",
 };
 
 /// One layer of the job's overlay.
@@ -462,7 +468,8 @@ fn probe(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !?[]const u8
     if (std.os.linux.geteuid() == 0) {
         if (try idsClash(arena, io, cfg.subid_base, host_id_files)) |why| return why;
         if (try net.subnetClash(arena, io, cfg.subnet)) |why| return why;
-        if (try natRulesFor(arena, io, cfg.subnet, true)) |why| return why;
+        const resolver = try net.jobResolver(arena, io, resolvPaths(&cfg), cfg.subnet);
+        if (try natRulesFor(arena, io, cfg.subnet, resolver.nameservers, true)) |why| return why;
     }
     // A store another user could reach or replace would hand them the host's root (its layers'
     // set-uid files and capabilities are the host's on disk): native stays off, saying why.
@@ -494,18 +501,29 @@ fn probe(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !?[]const u8
     return null;
 }
 
-/// The NAT rules for the host's uplinks now, remembered so a job finds out cheaply whether the
-/// uplinks changed since (a laptop moving from cable to Wi-Fi), and makes the new ones' rules
-/// (`jobNetwork`). With no default route, the probe fails, and a job goes on without the rules:
-/// it has no way out, as the host has none.
-fn natRulesFor(arena: Allocator, io: std.Io, subnet: net.Subnet, probing: bool) !?[]const u8 {
+/// The NAT rules for the host's uplinks and the jobs' nameservers (`dns`) now, remembered so a
+/// job finds out cheaply whether either changed since (a laptop moving from cable to Wi-Fi,
+/// Tailscale coming up and naming its resolver), and makes the new rules (`jobNetwork`). With no
+/// default route, the probe fails, and a job goes on without the rules: it has no way out, as
+/// the host has none.
+fn natRulesFor(
+    arena: Allocator,
+    io: std.Io,
+    subnet: net.Subnet,
+    dns: []const [4]u8,
+    probing: bool,
+) !?[]const u8 {
     const ups = try net.uplinks(arena, io);
     if (ups.len == 0 and !probing) return null;
-    const joined = try std.mem.join(arena, "\x00", ups);
+    const joined = try std.mem.concat(arena, u8, &.{
+        try std.mem.join(arena, "\x00", ups),
+        "\x01",
+        std.mem.sliceAsBytes(dns),
+    });
     rules_mu.lockUncancelable(io);
     defer rules_mu.unlock(io);
     if (ups.len > 0 and std.mem.eql(u8, joined, rules_for[0..rules_len])) return null;
-    if (try net.natRules(arena, io, subnet, ups)) |why| return why;
+    if (try net.natRules(arena, io, subnet, ups, dns)) |why| return why;
     // Too long to keep: the rules are made again next time.
     rules_len = if (joined.len <= rules_for.len) joined.len else 0;
     @memcpy(rules_for[0..rules_len], joined[0..rules_len]);
@@ -513,7 +531,8 @@ fn natRulesFor(arena: Allocator, io: std.Io, subnet: net.Subnet, probing: bool) 
 }
 
 var rules_mu: std.Io.Mutex = .init;
-/// The uplinks the rules were made for, joined by zero bytes.
+/// The uplinks the rules were made for, joined by zero bytes, then a one and the nameservers'
+/// addresses.
 var rules_for: [256]u8 = undefined;
 var rules_len: usize = 0;
 
@@ -724,18 +743,32 @@ const Limit = struct {
 };
 
 /// The host's resolver and hosts over the image's (over files the image has), and the
-/// configured binds. On a root runner, the job's own network cannot reach a resolver on the
-/// host's loopback (`net.resolvConf`).
+/// configured binds. On a root runner, a resolver of the job's own, made from the host's for its
+/// network (`net.Resolver`: no loopback or IPv6 nameservers), whose nameservers the jobs' rules
+/// let its DNS through to (`jobNetwork`).
 fn jobBinds(b: *Backend, cfg: Config) ![]const sandbox.Spec.Bind {
-    const resolv = if (b.how.userns == .mapped)
-        net.resolvConf(b.arena, b.io) orelse return error.NoReachableResolver
-    else
-        "/etc/resolv.conf";
+    const resolv = if (b.how.userns == .mapped) resolv: {
+        const r = try net.jobResolver(b.arena, b.io, resolvPaths(&cfg), cfg.subnet);
+        b.nameservers = r.nameservers;
+        if (r.fallback) try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Native " ++
+            "steps: the host's resolver ({s}) names no nameserver the job's network can reach " ++
+            "(only loopback or IPv6 ones), so the job resolves through 8.8.8.8 and 8.8.4.4, as " ++
+            "Docker's containers then do.", .{if (r.source.len > 0) r.source else "none"}));
+        const path = try std.fmt.allocPrint(b.arena, "{s}/resolv.conf", .{b.dir});
+        try std.Io.Dir.cwd().writeFile(b.io, .{ .sub_path = path, .data = r.conf });
+        break :resolv path;
+    } else "/etc/resolv.conf";
     b.etc_binds = try b.arena.dupe(sandbox.Spec.Bind, &.{
         .{ .host = resolv, .at = "/etc/resolv.conf", .optional = true },
         .{ .host = "/etc/hosts", .at = "/etc/hosts", .optional = true },
     });
     return std.mem.concat(b.arena, sandbox.Spec.Bind, &.{ cfg.binds, b.etc_binds });
+}
+
+/// The host's resolver files a root runner's jobs get theirs from.
+fn resolvPaths(cfg: *const Config) []const []const u8 {
+    if (cfg.test_resolv_conf.len > 0) return (&cfg.test_resolv_conf)[0..1];
+    return &net.resolv_paths;
 }
 
 /// The job's services by name, for its steps and its services: a hosts file of the job's (the
@@ -828,8 +861,8 @@ fn jobNetwork(b: *Backend, cfg: Config) !void {
     var sock = try net.Socket.open();
     sock.deleteVeth(n);
     sock.close();
-    // The host's uplinks may have changed since the probe made their rules.
-    if (try natRulesFor(arena, b.io, cfg.subnet, false)) |why| {
+    // The host's uplinks and its resolver may have changed since the probe made their rules.
+    if (try natRulesFor(arena, b.io, cfg.subnet, b.nameservers, false)) |why| {
         std.log.warn("native: the jobs' NAT rules: {s}", .{why});
         return error.JobNetworkFailed;
     }
@@ -1775,13 +1808,22 @@ fn below(b: *Backend) ?Store.Key {
         b.store = null;
         return null;
     };
+    // A root runner's job has a resolver of its own, in its own directory (`jobBinds`): keyed as
+    // the host's, which it is made from, so jobs replay one another's layers.
+    const binds = b.arena.dupe(sandbox.Spec.Bind, b.binds) catch {
+        b.store = null;
+        return null;
+    };
+    for (binds) |*bd| if (std.mem.eql(u8, bd.at, "/etc/resolv.conf")) {
+        bd.host = "/etc/resolv.conf";
+    };
     return belowKey(.{
         .format = Store.store_format,
         .scope = b.scope,
         .repository = b.repository,
         .fingerprint = &fp,
         .userns = @tagName(b.how.userns),
-        .binds = b.binds,
+        .binds = binds,
         .seeds = b.seed_layers.items,
     }, null);
 }
@@ -3504,6 +3546,164 @@ test "root runner: a job's own network, out of reach of the host's services and 
     try expectLines(r.text, &.{ "dns-ok", "http 200" });
 }
 
+test "root runner: a native job resolves through a nameserver only another interface reaches, and reaches nothing else there" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const env = try std.testing.environ.createMap(arena);
+    const required = std.mem.eql(u8, env.get("ZIG_RUNNER_REQUIRE_NATIVE") orelse "", "1");
+
+    // A resolver as Tailscale's MagicDNS is to razorbill: on no uplink, but on an interface of its
+    // own (here a veth to a network namespace of the test's, TEST-NET-2), with two addresses, and
+    // a TCP port that is not DNS. The host routes there, but the jobs' rules forward nothing
+    // there but DNS to the nameservers the job's resolver names.
+    const ns = "zrtest-dns";
+    const ip = struct {
+        fn run(ar: Allocator, args: []const []const u8) !void {
+            const argv = try std.mem.concat(ar, []const u8, &.{ &.{"ip"}, args });
+            const r = try std.process.run(ar, std.testing.io, .{ .argv = argv });
+            if (r.term != .exited or r.term.exited != 0) {
+                std.debug.print("ip {s}: {s}\n", .{ try std.mem.join(ar, " ", args), r.stderr });
+                return error.IpFailed;
+            }
+        }
+    };
+    _ = std.process.run(arena, io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch
+        return skip(required, "this machine has no `ip` (iproute2) for the resolver's network");
+    defer _ = std.process.run(arena, io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch {};
+    try ip.run(arena, &.{ "netns", "add", ns });
+    try ip.run(arena, &.{ "link", "add", "zrtdns0", "type", "veth", "peer", "name", "eth0", "netns", ns });
+    try ip.run(arena, &.{ "addr", "add", "198.51.100.1/24", "dev", "zrtdns0" });
+    try ip.run(arena, &.{ "link", "set", "zrtdns0", "up" });
+    try ip.run(arena, &.{ "-n", ns, "addr", "add", "198.51.100.53/24", "dev", "eth0" });
+    try ip.run(arena, &.{ "-n", ns, "addr", "add", "198.51.100.54/24", "dev", "eth0" });
+    try ip.run(arena, &.{ "-n", ns, "link", "set", "eth0", "up" });
+    try ip.run(arena, &.{ "-n", ns, "link", "set", "lo", "up" });
+    // Every name under zr.test is 192.0.2.77, over UDP and TCP; any other is NXDOMAIN. A UDP
+    // socket for each address, so each answer comes from the address it was asked at.
+    const responder =
+        \\import socket, struct, sys, threading
+        \\def answer(q):
+        \\    i, labels = 12, []
+        \\    while q[i]:
+        \\        labels.append(q[i + 1:i + 1 + q[i]].decode()); i += 1 + q[i]
+        \\    qtype = struct.unpack(">H", q[i + 1:i + 3])[0]
+        \\    name = ".".join(labels).lower()
+        \\    rcode, an, ans = 3, 0, b""
+        \\    if name == "zr.test" or name.endswith(".zr.test"):
+        \\        rcode = 0
+        \\        if qtype == 1:
+        \\            an, ans = 1, b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4) + bytes([192, 0, 2, 77])
+        \\    return q[:2] + struct.pack(">HHHHH", 0x8180 | rcode, 1, an, 0, 0) + q[12:i + 5] + ans
+        \\def udp(s):
+        \\    while True:
+        \\        q, peer = s.recvfrom(512)
+        \\        try: s.sendto(answer(q), peer)
+        \\        except Exception: pass
+        \\def tcp_one(c):
+        \\    with c:
+        \\        try:
+        \\            n = struct.unpack(">H", c.recv(2))[0]; q = b""
+        \\            while len(q) < n: q += c.recv(n - len(q))
+        \\            r = answer(q); c.sendall(struct.pack(">H", len(r)) + r)
+        \\        except Exception: pass
+        \\def tcp(s, dns):
+        \\    while True:
+        \\        c, _ = s.accept()
+        \\        if dns: threading.Thread(target=tcp_one, args=(c,), daemon=True).start()
+        \\        else: c.close()
+        \\def udp_on(addr):
+        \\    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind((addr, 53)); return u
+        \\def listener(port):
+        \\    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        \\    s.bind(("0.0.0.0", port)); s.listen(16); return s
+        \\for addr in ("198.51.100.53", "198.51.100.54"):
+        \\    threading.Thread(target=udp, args=(udp_on(addr),), daemon=True).start()
+        \\threading.Thread(target=tcp, args=(listener(53), True), daemon=True).start()
+        \\threading.Thread(target=tcp, args=(listener(8080), False), daemon=True).start()
+        \\print("ready", flush=True)
+        \\sys.stdin.read()
+    ;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "ip", "netns", "exec", ns, "python3", "-c", responder },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .inherit,
+    });
+    defer {
+        child.kill(io);
+    }
+    var ready_buf: [64]u8 = undefined;
+    var ready = child.stdout.?.readerStreaming(io, &ready_buf);
+    const line = (try ready.interface.takeDelimiter('\n')) orelse return error.ResponderDidNotStart;
+    try std.testing.expectEqualStrings("ready", line);
+
+    // A host service on the resolver's network, at the host's own address there.
+    const host_side = try listen(47126, 0);
+    defer _ = std.os.linux.close(host_side);
+
+    // The host's resolver as Tailscale writes it, with systemd-resolved's stub first: the job
+    // gets only the nameserver its network can reach, the search domain kept.
+    const resolv = try std.fmt.allocPrint(arena, "{s}/host-resolv.conf", .{
+        try tmp.dir.realPathFileAlloc(io, ".", arena),
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = resolv, .data = "# a host's\n" ++
+        "nameserver 127.0.0.53\nnameserver 198.51.100.53\nnameserver fd7a:115c:a1e0::53\n" ++
+        "search zr.test\noptions timeout:2 attempts:2\n" });
+    cfg.test_resolv_conf = resolv;
+    const script =
+        \\cat /etc/resolv.conf
+        \\getent hosts probe || echo "probe un""resolved"
+        \\python3 - <<'EOF'
+        \\import socket
+        \\def reach(host, port):
+        \\    try:
+        \\        socket.create_connection((host, port), 3).close(); return True
+        \\    except OSError: return False
+        \\for name, host, port in (("dns53", "198.51.100.53", 53), ("dns54", "198.51.100.54", 53),
+        \\        ("other port", "198.51.100.53", 8080), ("host side", "198.51.100.1", 47126)):
+        \\    print(name, "reached" if reach(host, port) else "unreachable")
+        \\EOF
+    ;
+    const first = try runNativeJob(arena, cfg, testJob(&.{testStep(script)}), .root);
+    if (!first.res.succeeded) std.debug.print("{s}\n", .{first.text});
+    try std.testing.expect(first.res.succeeded);
+    try expectLines(first.text, &.{
+        "nameserver 198.51.100.53",
+        "search zr.test",
+        "options timeout:2 attempts:2",
+        "192.0.2.77",
+        "probe.zr.test",
+        "dns53 reached",
+        "dns54 unreachable",
+        "other port unreachable",
+        "host side unreachable",
+    });
+    // Not in the script as written, which the log shows too.
+    for ([_][]const u8{ "127.0.0.53", "fd7a:", "probe unresolved" }) |no|
+        try std.testing.expect(std.mem.indexOf(u8, first.text, no) == null);
+
+    // The host's resolver changes while the runner runs (Tailscale's address moving): the next
+    // job resolves through the new one, and the old one is out of reach.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = resolv, .data = "nameserver 198.51.100.54\n" ++
+        "search zr.test\n" });
+    const second = try runNativeJob(arena, cfg, testJob(&.{testStep(script)}), .root);
+    if (!second.res.succeeded) std.debug.print("{s}\n", .{second.text});
+    try std.testing.expect(second.res.succeeded);
+    try expectLines(second.text, &.{
+        "nameserver 198.51.100.54",
+        "192.0.2.77",
+        "dns53 unreachable",
+        "dns54 reached",
+        "other port unreachable",
+    });
+}
+
 /// A TCP listener of the test's on the host, on `port` at `addr` (host order; 0 for every
 /// address).
 pub fn listen(port: u16, addr: u32) !std.os.linux.fd_t {
@@ -3736,13 +3936,50 @@ test "a container job on the native backend: its image pulled with its credentia
     try std.testing.expect(std.mem.indexOf(u8, w2.written(), "Image: from the native store") != null);
     try std.testing.expect(server.requests.load(.acquire) - before <= 4);
 
-    // Without its credentials, the job fails in "Set up job", saying why.
+    // Without its credentials, the native pull is refused, before any step: the job goes to
+    // Dagger (here a scripted session, which pulls the image as it is given it), "Set up job"
+    // saying why, and the memory gate, told of the job's native cgroup, measures it on the
+    // engine again. Dagger's own failure would be the job's: nothing native is tried again.
     job.container.?.password = null;
+    var slots: [1]admission.Admission.Slot = undefined;
+    var pool: admission.Admission = .init(std.testing.io, .{}, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    var gate: admission.Gate = .{ .pool = &pool };
+    gate.leave(true);
+    gate.assigned(admission.jobKey("o/r", "ci.yml", "refused natively"));
+    var gated = cfg;
+    gated.gate = &gate;
+    const answers = [_][]const u8{
+        "{\"data\":{\"container\":{\"from\":{\"zig_runtime_path\":\"/usr/bin:/bin\"," ++
+            "\"withWorkdir\":{\"id\":\"C0\"}}}}}",
+        "{\"data\":{\"container\":{\"from\":{\"imageRef\":\"img\"}}}}",
+        "{\"data\":{\"container\":{\"from\":{\"directory\":{\"entries\":[]}}}}}",
+        try execAnswer(arena, "C1", 0, "on dagger\\n"),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
     var w3: std.Io.Writer.Allocating = .init(arena);
     var log3: sink.LogSink = .{ .stdout = .{ .writer = &w3.writer } };
-    const res3 = try dagger.run(arena, std.testing.io, &env, .{ .native = cfg, .step_user = .root, .gpa = std.testing.allocator }, job, &log3);
-    try std.testing.expect(!res3.succeeded);
-    try std.testing.expect(std.mem.indexOf(u8, res3.engine_error.?, "credentials") != null);
+    const res3 = try dagger.run(arena, std.testing.io, &env, .{
+        .native = gated,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+    }, job, &log3);
+    const text3 = w3.written();
+    if (!res3.succeeded) std.debug.print("{s}\n", .{text3});
+    try std.testing.expect(res3.succeeded);
+    for ([_][]const u8{
+        "This job runs on Dagger: the native set-up failed (could not pull 127.0.0.1:",
+        "credentials",
+        "Engine: Dagger",
+        "on dagger",
+    }) |e| if (std.mem.indexOf(u8, text3, e) == null) {
+        std.debug.print("missing {s} in:\n{s}\n", .{ e, text3 });
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(std.mem.indexOf(u8, text3, "Engine: native") == null);
+    try std.testing.expect(!slots[0].native);
 }
 
 test "native provisioning: a step on the pulled image, flattened and kept under its key" {

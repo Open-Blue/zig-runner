@@ -5,11 +5,16 @@
 //! (one netlink batch) whenever they are made:
 //!
 //! - `postrouting` (nat): the jobs' subnet masqueraded on its way out, not towards the bridge.
-//! - `input` (filter): from the bridge, replies only. A job reaches no service of the host's, at
+//! - `input` (filter): from the bridge, replies only, and DNS to the jobs' nameservers (`dns`
+//!   below) where one is the host's own address. A job reaches no other service of the host's, at
 //!   the bridge's address or any other.
 //! - `forward` (filter): from the bridge, out through an uplink only (the interfaces of the host's
 //!   default routes), so never to another job, to Docker's containers, or to another network the
-//!   host routes to but does not leave by; to the bridge, replies only.
+//!   host routes to but does not leave by; to the bridge, replies only. The one exception is DNS:
+//!   UDP and TCP to port 53 of the jobs' nameservers (`net.Resolver`, at most three IPv4
+//!   addresses), out of whichever interface the host routes them by, so a resolver behind
+//!   Tailscale (MagicDNS's 100.100.100.100 through `tailscale0`) or on another network of the
+//!   host's answers a job, and nothing else there is reached.
 //! - `output` (filter): to the bridge, replies only. No process of the host's reaches a job, its
 //!   services' ports included (P6's `not_asked`).
 //!
@@ -35,16 +40,29 @@ const net = @import("net.zig");
 pub const table = "zig_runner";
 
 /// The helper's subcommand that makes the rules in the caller's network namespace (`main.zig`
-/// dispatches it): `zig-runner native-nft <subnet> [uplink...]`. The runner makes them itself
+/// dispatches it): `zig-runner native-nft <subnet> [uplink...] [dns=<IPv4>...]`. The runner makes
+/// them itself
 /// (`net.natRules`); this is for the tests, which make them in a namespace of their own, and for
 /// an operator making them ahead of the runner.
 pub const command = "native-nft";
 
 pub fn main(args: []const []const u8) u8 {
-    if (args.len < 1) return fail("native nft: usage: native-nft <subnet> [uplink...]");
+    if (args.len < 1) return fail("native nft: usage: native-nft <subnet> [uplink...] [dns=<IPv4>...]");
     const subnet = net.Subnet.parse(args[0]) catch return fail("native nft: a subnet");
-    for (args[1..]) |up| if (up.len == 0 or up.len >= 16) return fail("native nft: an uplink");
-    if (apply(subnet, args[1..])) |why| {
+    var ups_buf: [16][]const u8 = undefined;
+    var ups: std.ArrayList([]const u8) = .initBuffer(&ups_buf);
+    var dns_buf: [net.max_nameservers][4]u8 = undefined;
+    var dns: std.ArrayList([4]u8) = .initBuffer(&dns_buf);
+    for (args[1..]) |arg| {
+        if (std.mem.cutPrefix(u8, arg, "dns=")) |addr| {
+            const a = net.parseIp4(addr) orelse return fail("native nft: a nameserver");
+            dns.appendBounded(a) catch return fail("native nft: too many nameservers");
+        } else {
+            if (arg.len == 0 or arg.len >= 16) return fail("native nft: an uplink");
+            ups.appendBounded(arg) catch return fail("native nft: too many uplinks");
+        }
+    }
+    if (apply(subnet, ups.items, dns.items)) |why| {
         var buf: [512]u8 = undefined;
         return fail(std.fmt.bufPrint(&buf, "native nft: {s}", .{why}) catch "native nft: failed");
     }
@@ -57,15 +75,16 @@ fn fail(msg: []const u8) u8 {
     return 1;
 }
 
-/// Makes the rules for `subnet` and the host's `uplinks` (see the file's comment). Null when they
-/// were made, else why not. A batch that fails because another program changed a chain between
-/// the rules being read and replaced (Docker starting, ufw reloading) is tried again.
-pub fn apply(subnet: net.Subnet, uplinks: []const []const u8) ?[]const u8 {
+/// Makes the rules for `subnet`, the host's `uplinks` and the jobs' nameservers `dns` (see the
+/// file's comment). Null when they were made, else why not. A batch that fails because another
+/// program changed a chain between the rules being read and replaced (Docker starting, ufw
+/// reloading) is tried again.
+pub fn apply(subnet: net.Subnet, uplinks: []const []const u8, dns: []const [4]u8) ?[]const u8 {
     var sock = Socket.open() catch return "cannot open an nftables netlink socket";
     defer sock.close();
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
-        const e = sock.replace(subnet, uplinks) catch |err| return @errorName(err);
+        const e = sock.replace(subnet, uplinks, dns) catch |err| return @errorName(err);
         switch (e) {
             .SUCCESS => return null,
             // A rule removed or a chain made under us: read again.
@@ -116,7 +135,13 @@ const bridge_name = net.bridge ++ "\x00";
 
 /// `ip zig_runner` replaced, and the jobs' accepts in the iptables-nft chains made again, in one
 /// batch: the kernel's errno for it (`.SUCCESS` when it was committed).
-fn ruleBatch(b: *Batch, subnet: net.Subnet, uplinks: []const []const u8, host: HostChains) void {
+fn ruleBatch(
+    b: *Batch,
+    subnet: net.Subnet,
+    uplinks: []const []const u8,
+    dns: []const [4]u8,
+    host: HostChains,
+) void {
     // Made if missing, then removed and made afresh: one batch is one transaction, so no packet
     // ever meets a half-made table.
     b.tableMsg(.NEWTABLE, linux.NLM_F_CREATE);
@@ -127,7 +152,8 @@ fn ruleBatch(b: *Batch, subnet: net.Subnet, uplinks: []const []const u8, host: H
     b.baseChain("output", "filter", hook_output, priority_filter);
     b.baseChain("postrouting", "nat", hook_postrouting, priority_srcnat);
 
-    // forward: from the bridge out through an uplink, nothing else from it; to it, replies only.
+    // forward: from the bridge out through an uplink, and DNS to the jobs' nameservers out of
+    // any interface, nothing else from it; to it, replies only.
     for (uplinks) |up| {
         const r = b.rule(table, "forward", linux.NLM_F_APPEND);
         b.ifname(.iif, .eq, bridge_name);
@@ -137,6 +163,7 @@ fn ruleBatch(b: *Batch, subnet: net.Subnet, uplinks: []const []const u8, host: H
         b.verdict(nf_accept);
         b.endRule(r);
     }
+    dnsRules(b, "forward", dns);
     var r = b.rule(table, "forward", linux.NLM_F_APPEND);
     b.ifname(.iif, .eq, bridge_name);
     b.verdict(nf_drop);
@@ -151,12 +178,13 @@ fn ruleBatch(b: *Batch, subnet: net.Subnet, uplinks: []const []const u8, host: H
     b.verdict(nf_drop);
     b.endRule(r);
 
-    // input: from the bridge, replies only.
+    // input: from the bridge, replies only, and DNS to a nameserver that is the host's own.
     r = b.rule(table, "input", linux.NLM_F_APPEND);
     b.ifname(.iif, .eq, bridge_name);
     b.replies();
     b.verdict(nf_accept);
     b.endRule(r);
+    dnsRules(b, "input", dns);
     r = b.rule(table, "input", linux.NLM_F_APPEND);
     b.ifname(.iif, .eq, bridge_name);
     b.verdict(nf_drop);
@@ -190,6 +218,19 @@ fn ruleBatch(b: *Batch, subnet: net.Subnet, uplinks: []const []const u8, host: H
         b.counter();
         b.verdict(nf_accept);
         b.endRule(h);
+    };
+}
+
+/// In `chain`: from the bridge, UDP and TCP to port 53 of each of the jobs' nameservers accepted.
+fn dnsRules(b: *Batch, chain: []const u8, dns: []const [4]u8) void {
+    for (dns) |addr| for ([_]u8{ ipproto_udp, ipproto_tcp }) |proto| {
+        const r = b.rule(table, chain, linux.NLM_F_APPEND);
+        b.ifname(.iif, .eq, bridge_name);
+        b.payloadEq(nft_payload_network_header, 16, &addr);
+        b.l4proto(proto);
+        b.payloadEq(nft_payload_transport_header, 2, &.{ 0, 53 });
+        b.verdict(nf_accept);
+        b.endRule(r);
     };
 }
 
@@ -257,6 +298,10 @@ const nfta_payload_base = 2;
 const nfta_payload_offset = 3;
 const nfta_payload_len = 4;
 const nft_payload_network_header = 1;
+const nft_payload_transport_header = 2;
+const nft_meta_l4proto = 16;
+const ipproto_tcp = 6;
+const ipproto_udp = 17;
 const nfta_bitwise_sreg = 1;
 const nfta_bitwise_dreg = 2;
 const nfta_bitwise_len = 3;
@@ -499,6 +544,29 @@ const Batch = struct {
         b.endExpr(d);
     }
 
+    /// `payload load <value.len>b @ <base> + <offset> => reg 1; cmp eq reg 1 <value>`: `ip daddr`
+    /// at the network header's 16, `th dport` at the transport header's 2.
+    fn payloadEq(b: *Batch, base: u32, offset: u32, value: []const u8) void {
+        b.expr("payload");
+        const d = b.begin(nfta_expr_data);
+        b.attrBe32(nfta_payload_dreg, nft_reg_1);
+        b.attrBe32(nfta_payload_base, base);
+        b.attrBe32(nfta_payload_offset, offset);
+        b.attrBe32(nfta_payload_len, std.math.lossyCast(u32, value.len));
+        b.endExpr(d);
+        b.cmp(.eq, value);
+    }
+
+    /// `meta l4proto <proto>`.
+    fn l4proto(b: *Batch, proto: u8) void {
+        b.expr("meta");
+        const d = b.begin(nfta_expr_data);
+        b.attrBe32(nfta_meta_key, nft_meta_l4proto);
+        b.attrBe32(nfta_meta_dreg, nft_reg_1);
+        b.endExpr(d);
+        b.cmp(.eq, &.{proto});
+    }
+
     /// `ip saddr <subnet>`: the source address loaded, masked, compared.
     fn sourceIn(b: *Batch, subnet: net.Subnet) void {
         b.expr("payload");
@@ -537,7 +605,12 @@ const Socket = struct {
     }
 
     /// Reads the host's chains, then replaces the rules in one batch: its errno.
-    fn replace(s: *Socket, subnet: net.Subnet, uplinks: []const []const u8) !linux.E {
+    fn replace(
+        s: *Socket,
+        subnet: net.Subnet,
+        uplinks: []const []const u8,
+        dns: []const [4]u8,
+    ) !linux.E {
         var stale_buf: [64]Stale = undefined;
         var stale: std.ArrayList(Stale) = .initBuffer(&stale_buf);
         var accept_buf: [2][]const u8 = undefined;
@@ -554,7 +627,7 @@ const Socket = struct {
         for (scanned) |tc| try s.bridgeRules(tc[0], tc[1], &stale);
         var buf: [32 * 1024]u8 align(4) = undefined;
         var b: Batch = .init(&buf, s.seq);
-        ruleBatch(&b, subnet, uplinks, .{ .accept_in = accept.items, .stale = stale.items });
+        ruleBatch(&b, subnet, uplinks, dns, .{ .accept_in = accept.items, .stale = stale.items });
         const bytes = b.finish();
         if (b.overflow) return error.TooManyRules;
         s.seq = b.seq + 1;
@@ -783,7 +856,8 @@ test "the batch: begin, every message acknowledged, end, within its buffer" {
     var buf: [32 * 1024]u8 align(4) = undefined;
     var b: Batch = .init(&buf, 100);
     const stale = [_]Stale{.{ .table = "filter", .chain = "FORWARD", .handle = 7 }};
-    ruleBatch(&b, net.Subnet.default, &.{ "eth0", "wlp0s20f3" }, .{
+    const dns = [_][4]u8{ .{ 100, 100, 100, 100 }, .{ 192, 168, 1, 1 } };
+    ruleBatch(&b, net.Subnet.default, &.{ "eth0", "wlp0s20f3" }, &dns, .{
         .accept_in = &.{ "FORWARD", "DOCKER-USER" },
         .stale = &stale,
     });
@@ -795,8 +869,8 @@ test "the batch: begin, every message acknowledged, end, within its buffer" {
     while (it.next()) |m| try types.append(std.testing.allocator, m.hdr.type);
     try std.testing.expectEqual(@as(u16, nfnl_msg_batch_begin), types.items[0]);
     try std.testing.expectEqual(@as(u16, nfnl_msg_batch_end), types.getLast());
-    // 3 table messages, 4 chains, 2 uplinks' accepts and 8 more rules of ours, 1 removal, and 2
-    // accepts in each of the host's 2 chains.
-    try std.testing.expectEqual(@as(u32, 3 + 4 + 10 + 1 + 4), b.acks);
+    // 3 table messages, 4 chains, 2 uplinks' accepts and 8 more rules of ours, UDP and TCP to 2
+    // nameservers in forward and input, 1 removal, and 2 accepts in each of the host's 2 chains.
+    try std.testing.expectEqual(@as(u32, 3 + 4 + 10 + 2 * 2 * 2 + 1 + 4), b.acks);
     try std.testing.expectEqual(@as(usize, b.acks + 2), types.items.len);
 }

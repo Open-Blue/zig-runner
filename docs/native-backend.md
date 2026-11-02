@@ -154,9 +154,17 @@ On a root runner, each step runs:
   job's `eth0` and on the bridge, so no link-local address slips past those IPv4 rules (`lo` keeps
   its ::1). Ports below 1024 and ping work without capabilities on the host's
   (`ip_unprivileged_port_start=0`, `ping_group_range`, set in the job's namespace only). Its
-  resolver is the host's upstream servers (`/run/systemd/resolve/resolv.conf`, or the host's
-  resolv.conf when it names no loopback server), since systemd-resolved's 127.0.0.53 is the host's
-  loopback; a resolver on one of the host's own addresses is out of reach too.
+  resolver is a resolv.conf of its own, made from the host's as Docker makes a container's on its
+  default bridge (`net.Resolver`): the loopback's nameservers left out (systemd-resolved's
+  127.0.0.53 is the host's loopback; its upstream list, `/run/systemd/resolve/resolv.conf`, is
+  used behind its stub) and IPv6 ones too (the job has none), search domains and options kept, and
+  Google's 8.8.8.8 and 8.8.4.4 when nothing else is left, as Docker and BuildKit do ("Set up job"
+  says so). The jobs' rules let UDP and TCP to port 53 of those nameservers through, out of
+  whichever interface the host routes them by, and on to the host itself when one is its own
+  address: a resolver that is not behind the default route answers a job (Tailscale's MagicDNS,
+  100.100.100.100 through `tailscale0`, on razorbill, where jobs had no DNS before this), and
+  nothing else on that network is reached. The resolver is read again for each job and the rules
+  follow it when it changes.
 - in **mount, PID, UTS and IPC namespaces** of its own, with the overlay as `/` by `pivot_root`
   and the host's root detached (no chroot to climb out of), a /dev of six nodes plus devpts, shm
   and mqueue, /proc with runc's masked paths (`kcore`, `keys`, `timer_list`, `sched_debug`,
@@ -1204,6 +1212,21 @@ user then pulled the job's ids, its network and the sandbox hardening into P1. W
 - **The resolver Dagger got for free.** BuildKit's CNI network hands each exec a working
   resolv.conf. A job's own namespace cannot reach systemd-resolved on the host's 127.0.0.53; the
   runner binds the upstream list systemd-resolved keeps (`/run/systemd/resolve/resolv.conf`).
+  Nor, with rules that forward a job's traffic out of the uplinks only, a resolver behind another
+  interface: razorbill's is Tailscale's MagicDNS (100.100.100.100 through `tailscale0`), and its
+  first native jobs could not resolve anything. CI never saw it: GitHub's runners resolve through
+  their uplink. Each job now gets its resolver made from the host's as Docker does, and the rules
+  let DNS to its nameservers out of any interface.
+- **A kept-alive connection the registry closed.** The pull uses the runner's process-wide HTTP
+  client, whose pool keeps connections between pulls; Docker Hub closes one idle for about a
+  minute, and std's client hands it out again, so a pull minutes after the last one failed at
+  once with `HttpConnectionClosing` (razorbill). The tests' clients were fresh each time. A
+  request that meets such a connection is now sent again on another (`registry.Client.once`),
+  as the GitHub API's requests already were (`http.staleRetries`).
+- **A native set-up that fails is not the job's failure.** Before any step, a failed pull,
+  provisioning or base, or a job sandbox that could not be made, sends the job to Dagger with the
+  reason in "Set up job" (`dagger.setUpFallback`), as an unsupported job goes there; razorbill's
+  first native jobs failed instead.
 - **NAT on a Docker host.** Docker sets the FORWARD policy to drop; a rule in another table cannot
   overturn it, only `DOCKER-USER` can. P1 makes its NAT and forwarding rules with `iptables` (debt:
   links, addresses and routes are rtnetlink already; nftables over netlink is phase 5's), not

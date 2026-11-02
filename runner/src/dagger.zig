@@ -23,6 +23,7 @@
 //! marker text), not simply the last `begin`. A step served
 //! from cache prints no log lines at all; its stdout/stderr from the query result are replayed.
 const std = @import("std");
+const builtin = @import("builtin");
 const job_mod = @import("job.zig");
 const sink = @import("sink.zig");
 const redact = @import("redact.zig");
@@ -486,8 +487,10 @@ pub const Observer = struct {
 
 pub const Options = struct {
     observer: ?Observer = null,
-    /// The `dagger` command.
-    dagger_cmd: []const u8 = "dagger",
+    /// The `dagger` command. In the tests, one that is never there: a job they did not mean for
+    /// Dagger (a native job whose set-up failed, `setUpFallback`) fails to start a session
+    /// instead of starting a real engine on the machine running them.
+    dagger_cmd: []const u8 = if (builtin.is_test) "/nonexistent/dagger" else "dagger",
     image: []const u8 = default_image,
     /// Installed into the image before the job (one cached exec). Used for the default image only,
     /// which has no git; a custom image is expected to bring what it needs.
@@ -831,7 +834,8 @@ pub fn run(
             return r;
         } else if (cfg.gate) |g| {
             // Native set the job up (its cgroup told the gate) and then sent it here (P7's
-            // preload): the gate measures it on the engine again, learning nothing from it.
+            // preload), or its set-up failed (`setUpFallback`): the gate measures it on the
+            // engine again, learning nothing from it.
             g.backToEngine();
         }
     }
@@ -924,6 +928,13 @@ fn runNative(
                 "which could not be made for it.";
             return null;
         }
+        // Its store, cgroup, slot, resolver or network could not be made: to Dagger as well,
+        // which needs none of them.
+        if (setUpFallback(opts, e)) {
+            dagger_note.* = try std.fmt.allocPrint(arena, "This job runs on Dagger: the native " ++
+                "set-up failed (could not make the job's sandbox: {s}).", .{@errorName(e)});
+            return null;
+        }
         return try fail(
             &sh,
             results,
@@ -950,6 +961,15 @@ fn runNative(
         },
         else => return e,
     };
+}
+
+/// Whether a native set-up that failed with `e`, before any step ran, sends the job to Dagger
+/// (`runNative`): yes, unless the job was cancelled meanwhile or the runner ran out of memory,
+/// where the job ends as it would have. It cannot come back: Dagger is never sent a job to native.
+fn setUpFallback(opts: Options, e: anyerror) bool {
+    if (e == error.OutOfMemory or e == error.Canceled) return false;
+    if (opts.cancel) |c| if (c.requested.load(.acquire)) return false;
+    return true;
 }
 
 /// What every task of a job shares: the log, and one slot per log step — the job's steps, then
@@ -1847,9 +1867,19 @@ fn runSteps(
         else => return e,
     };
     const base: Base = if (native) |b| base: {
-        b.base(&ev, plan, &err_msg) catch |e| switch (e) {
-            error.BaseContainerFailed => return fail(sh, results, err_msg),
-            else => return e,
+        b.base(&ev, plan, &err_msg) catch |e| {
+            if (e == error.NativeToDagger) return e;
+            // Before any step, and before "Set up job" has said anything: a native set-up that
+            // failed (the image's pull, its provisioning, the base) sends the job to Dagger,
+            // which pulls and sets up on its own and fails the job itself if the job is at fault
+            // (`runNative`). Not once the job is cancelled, nor out of memory.
+            const why = if (e == error.BaseContainerFailed) err_msg else @errorName(e);
+            if (setUpFallback(opts, e)) {
+                b.to_dagger = try std.fmt.allocPrint(arena, "the native set-up failed ({s})", .{why});
+                return error.NativeToDagger;
+            }
+            if (e == error.BaseContainerFailed) return fail(sh, results, err_msg);
+            return e;
         };
         break :base .{ .id = "native", .runtime_path = b.runtime_path };
     } else baseContainerId(arena, transport, &ev, job, plan, &secrets, &err_msg) catch |e|
