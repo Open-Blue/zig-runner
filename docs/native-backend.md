@@ -1399,7 +1399,13 @@ What BuildKit's cache did implicitly, now explicit in `native/Store.zig`:
   store, a cap small enough that every job's end evicts) found it in seconds. `publish` now
   refuses without the lock. Lessons: a precondition another function relies on belongs in a check,
   not a doc comment; and a store shared between processes needs a test with processes, many, for
-  long enough, checking every invariant at once.
+  long enough, checking every invariant at once. Its first ten-minute nightly run found the
+  same mistake one level up, in P1's job directories: a job's removal took its lock file first,
+  and another runner's sweep made a new one, found it free and removed the directory alongside
+  its owner. A job's directory now goes lock last, and the sweep opens a lock without making
+  one and checks it is still the file its path names, as `lockKey` does. A lock that lives
+  inside what it guards has to be the last thing removed, and whoever finds it must never make
+  it.
 - **Dagger's replay limit is not ours.** Dagger replays a step past 4 MiB of output with a warning
   instead of its log; natively such a step is not published and runs again.
 
