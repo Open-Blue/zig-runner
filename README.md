@@ -128,8 +128,8 @@ repository:
   (`runner/src/dagger.zig`, checked by `.github/scripts/ubuntu-pin.sh`); the packages provisioning
   installs into it come from the Ubuntu archive on the day the engine builds them, and the pre-warm
   logs their fingerprint. tls.zig and GitHub's expression
-  test cases are pinned by commit. Zig and changie are checked against pinned checksums before they
-  run, tls.zig against its `.hash` as well; a Renovate pull request for a new Zig, tls.zig or
+  test cases are pinned by commit. Zig, changie and checksec are checked against pinned checksums
+  before they run, tls.zig against its `.hash` as well; a Renovate pull request for a new Zig, tls.zig or
   changie fails until its checksums are updated (changie's by the Workflows job, which downloads
   it on every pull request, though only the release runs it).
 - **Verifiable releases.** Every binary and image has a signed provenance attestation saying which
@@ -148,6 +148,23 @@ repository:
   standard library, the only code compiled in besides the runner's own), attested too, and both
   attestations' bundles for checking offline (`--bundle zig-runner.provenance.jsonl`). A release is
   published only once all of it is attached.
+- **Hardened binaries.** The runner runs as root on prod and parses what GitHub, the engine and
+  jobs send it, so its binaries are made hard to exploit, and the release checks that they are
+  before publishing them. Both are static position-independent executables (`-fPIE`;
+  `runner/build.zig`'s `pie`, on by default, so `zig build`, the image and the release make the
+  same binary): the kernel loads each at a random address, where before they sat at the fixed
+  0x1000000. They have full RELRO (what is relocated at startup is read-only before the runner's
+  code runs), a non-executable stack, and no segment both writable and executable (W^X). PIE costs
+  nothing measurable ([BENCHMARKS.md](BENCHMARKS.md), "Position-independent executable"). Intel CET
+  (IBT and shadow stacks) is not available: Zig 0.17 has no `-fcf-protection` for Zig code, so the
+  binaries carry no CET note. [checksec](https://github.com/slimm609/checksec) 3.2
+  (`.github/scripts/checksec.sh`, pinned by version and checksum) fails the release, and on pull
+  requests "Release builds" and "Binaries (check)", on any binary without PIE, full RELRO, NX or
+  W^X:
+
+  ```sh
+  .github/scripts/checksec.sh zig-runner-linux-x86_64 zig-runner-linux-aarch64
+  ```
 - **Scanned.** Trivy checks the Dockerfile and the image before a push, with its vulnerability
   database fetched once, with retries, from Google's mirror first; accepted findings are in
   `.trivyignore.yaml`, each with why. GitHub's secret scanning blocks pushes carrying credentials.

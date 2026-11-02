@@ -5,7 +5,9 @@
 # build-binaries.sh (the release's binaries), from runner/.
 #
 # The graph must match build.zig's: src/main.zig as the root; build_version, a file holding the
-# version; and tls, the package build.zig.zon pins. "Binaries (same as zig build)" in release.yml,
+# version; and tls, the package build.zig.zon pins. And the executable is a position-independent
+# one (-fPIE, build.zig's `pie`, on by default): static, it loads at a random address (README,
+# "Hardening"). "Binaries (same as zig build)" in release.yml,
 # on pull requests that touch the packaging, builds the x86_64 binary both ways and compares the two
 # byte for byte, so a difference between the graphs fails there.
 #
@@ -17,7 +19,7 @@
 # zig_modules SCRATCH VERSION_FILE [FLAG...]: fetches the tls package into SCRATCH/tls (once) and sets
 # `modules` to the arguments that declare the graph, each module preceded by FLAG... (per-module
 # flags such as -OReleaseSafe, -target or -fsanitize-thread, which the compiler takes before each
-# module they apply to).
+# module they apply to), after -fPIE, which applies to the whole executable.
 zig_modules() {
 	local scratch=$1 version=$2
 	shift 2
@@ -38,7 +40,7 @@ zig_modules() {
 		fi
 	fi
 	# shellcheck disable=SC2034 # for the caller
-	modules=("$@" --dep build_version --dep tls -Mroot=src/main.zig
+	modules=(-fPIE "$@" --dep build_version --dep tls -Mroot=src/main.zig
 		"$@" -Mbuild_version="$version" "$@" -Mtls="$scratch/tls/src/root.zig")
 }
 

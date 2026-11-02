@@ -3,8 +3,9 @@
 # would first spend about 100 s compiling Zig's build system, on runners whose cache is always
 # empty), and the runner image (linux/amd64 and linux/arm64) on GitHub's container registry, made
 # from those same binaries rather than a second build. Both carry signed build provenance
-# (`gh attestation verify`), the binaries an attested SPDX SBOM too; the image is scanned by Trivy
-# before it is pushed.
+# (`gh attestation verify`), the binaries an attested SPDX SBOM too; the binaries are checked by
+# checksec for their hardening (static PIE, full RELRO, NX, W^X: checksec.sh) and the image is
+# scanned by Trivy, before either is published.
 # On pull requests and in the merge queue, the same builds and scans, publishing nothing: required
 # checks, which skip their steps, still reporting, on a change that cannot affect the packaging
 # (ci-scope.sh packaging), as a path filter would not report at all.
@@ -90,6 +91,11 @@ jobs:
         if: steps.published.outputs.published == 'false'
         run: .github/scripts/build-binaries.sh "$TAG" dist
 
+      # Static PIE, full RELRO, NX and W^X, or nothing is published (README, "Hardening").
+      - name: Hardening
+        if: steps.published.outputs.published == 'false'
+        run: .github/scripts/checksec.sh dist/zig-runner-linux-x86_64 dist/zig-runner-linux-aarch64
+
       # A draft until it is attested and complete (below). A draft a failed run left is replaced.
       # The version's changie notes, or GitHub's generated ones when they have no entries: changie
       # writes the version's heading regardless, so a release of Renovate's updates alone (which add
@@ -174,6 +180,10 @@ jobs:
       - name: Build
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/build-binaries.sh "$TAG" dist
+
+      - name: Hardening
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/checksec.sh dist/zig-runner-linux-x86_64 dist/zig-runner-linux-aarch64
 
       - name: SBOM
         if: steps.scope.outputs.run == 'true'

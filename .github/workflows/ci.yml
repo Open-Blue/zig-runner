@@ -280,6 +280,15 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/build-binaries.sh v0.0.0-ci "$RUNNER_TEMP/dist"
 
+      # The hardening the release gates on (checksec.sh: static PIE, full RELRO, NX, W^X), checked
+      # here too, so a change that loses any of it fails before the tag, not at the release. The
+      # x86_64 binary is run once: a static PIE relocates itself at startup, before anything else.
+      - name: Hardening
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          .github/scripts/checksec.sh "$RUNNER_TEMP/dist/zig-runner-linux-x86_64" "$RUNNER_TEMP/dist/zig-runner-linux-aarch64"
+          "$RUNNER_TEMP/dist/zig-runner-linux-x86_64" --version
+
   # The end-to-end suite (.github/scripts/e2e.sh): the runner built from this change serves
   # runner-bench's e2e workflows (Open-Blue/runner-bench, e2e.yml and e2e-cancel.yml) on GitHub's
   # runner, through GitHub's broker and a real Dagger engine, once on Dagger and once native, and
