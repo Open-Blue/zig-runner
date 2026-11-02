@@ -7,14 +7,30 @@ Companion: [MEASURE.md](https://github.com/Lementknight/zig-actions-runner/blob/
 [SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/SPEC.md) §6
 
 ```
-cd proofs && lake build
+cd proofs
+lake build --wfail
+lake env leanchecker Runner Glob Oracle KeyOracle
+lake env lean -DwarningAsError=true Axioms.lean
 ```
 
 That checks two libraries: `Runner` (the step cache and the regex matcher's loops) and `Glob` (the
 `hashFiles()` walk), plus the `globoracle` and `keyoracle` executables. They use Lean core only — no Mathlib, no
 Batteries — and the toolchain is pinned by `lean-toolchain`. Nothing in `Runner/` uses `sorry`,
-`axiom`, `native_decide`, `unsafe` or `partial`; `#print axioms` on the main theorems shows at most
-`propext` and `Quot.sound`. A clean build is the whole claim.
+`axiom`, `native_decide`, `unsafe` or `partial`; every declaration in `Runner` and `Glob` depends on at
+most `propext` and `Quot.sound`. The three commands are the whole claim, and CI (`proofs.yml`) runs
+each as its own step:
+
+| Gate | Fails when |
+|---|---|
+| `lake build --wfail` | a theorem does not check, or anything logs a warning: a `sorry` is a warning, so is an unused variable or a deprecated name. There is no `set_option` silencing a linter; a warning that has to stay takes a targeted option on that declaration, with the reason beside it |
+| `leanchecker` | the kernel, replaying every declaration of those modules from the `.olean` files into the environment it was elaborated in, rejects one: what the build wrote is what the kernel accepts, so a tactic or elaborator that added a declaration without checking it is caught. It ships with Lean (since v4.28; the standalone lean4checker is archived), and it is not an independent kernel |
+| `Axioms.lean` | a declaration in a module under `Runner` or `Glob` depends on an axiom outside its allow list (`propext`, `Quot.sound`), a module there declares an axiom, or a main theorem it names is missing. It prints `#print axioms` for each of the main theorems — those the tables below name |
+
+The allow list is what the proofs use now; `Classical.choice` is not used, so it is not on it. `sorryAx`
+(a `sorry`), `Lean.ofReduceBool` (`native_decide`, which trusts the compiler) and `Lean.trustCompiler`
+never go on it. Widening it is a reviewed change to `Axioms.lean`, never a side effect of a proof.
+The executables' roots (`Oracle.lean`, `KeyOracle.lean`) use `partial` and prove nothing, so the
+kernel replays them but the axioms gate does not cover them.
 
 The `Runner` library is a port of the Agda proofs in
 [zig-actions-runner](https://github.com/Lementknight/zig-actions-runner) at commit
@@ -36,6 +52,7 @@ lists where the encoding differs.
 | `Runner/Native.lean` | the native backend's store as a refinement of the model: the key's bytes, replay, concurrency, eviction, layer digests |
 | `Runner/Regex.lean` | why the regex matcher's loops terminate |
 | `Glob/Match.lean`, `Glob/Walk.lean` | the `hashFiles()` matcher and walk |
+| `Axioms.lean` | the axioms gate: the allow list, and the main theorems it prints |
 
 ## The step cache
 

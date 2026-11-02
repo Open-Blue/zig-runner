@@ -170,6 +170,8 @@ pub fn pullJobContainer(x: *Exec, ls: u32, jc: job_mod.Service) !bool {
     // On the native backend the image was pulled for the job's base (`Backend.prepareRootfs`).
     if (x.native) |b| {
         if (b.image) |img| x.sh.append(ls, try std.fmt.allocPrint(arena, "Digest: {s}", .{img.digest}));
+        // Whether its JavaScript actions need the musl runtime, as below.
+        x.musl = b.isMusl();
         x.sh.append(ls, "##[endgroup]");
         return true;
     }

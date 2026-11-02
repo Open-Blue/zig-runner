@@ -109,6 +109,9 @@ pub const Spec = struct {
         /// Its mount point is made when the overlay has none, owned by the job's root, as Dagger
         /// makes a cache mount's missing parents.
         make: bool = false,
+        /// nosuid and nodev (a JavaScript runtime's files from the store, `Backend.applyMounts`):
+        /// a setuid file or a device node there is never one for the step.
+        nosuid: bool = false,
     };
 
     /// The job's overlay (`lowers`, `upper`) is still mounted, and this step's layer is where
@@ -612,7 +615,10 @@ fn bindAll(arena: Allocator, spec: Spec, volume_ns: ?linux.fd_t) void {
         }
         const required = !bd.optional and spec.container == null;
         if (!bindIn(arena, root, bd.host, bd.at, required)) continue;
-        if (bd.read_only) remountReadOnly(arena, root, bd.at);
+        var add: u32 = 0;
+        if (bd.read_only) add |= linux.MS.RDONLY;
+        if (bd.nosuid) add |= linux.MS.NOSUID | linux.MS.NODEV;
+        if (add != 0) remountWith(arena, root, bd.at, add);
     }
 }
 
@@ -1300,10 +1306,11 @@ fn moveTree(arena: Allocator, tree: linux.fd_t, target: linux.fd_t, what: []cons
     ));
 }
 
-/// Makes the mount at `at` read-only, and fails the step when it cannot. The mount's own flags
-/// go with it: in a user namespace, those a more privileged one set (nosuid, nodev, noexec, the
-/// atime ones) are locked, and a remount that drops any of them is refused, as runc found.
-fn remountReadOnly(arena: Allocator, root: linux.fd_t, at: []const u8) void {
+/// Remounts the bind at `at` with `add` (`MS.RDONLY`, `MS.NOSUID`, `MS.NODEV`), and fails the
+/// step when it cannot. The mount's own flags go with it: in a user namespace, those a more
+/// privileged one set (nosuid, nodev, noexec, the atime ones) are locked, and a remount that drops
+/// any of them is refused, as runc found.
+fn remountWith(arena: Allocator, root: linux.fd_t, at: []const u8, add: u32) void {
     const fd = targetIn(arena, root, at, false) orelse
         fatal(about(arena, "find", at), @as(u32, 2));
     defer _ = linux.close(fd);
@@ -1320,11 +1327,11 @@ fn remountReadOnly(arena: Allocator, root: linux.fd_t, at: []const u8) void {
     }
     const st_relatime = 4096;
     if (st_flags & st_relatime != 0) keep |= linux.MS.RELATIME;
-    check("remount read-only", linux.mount(
+    check("remount a bind", linux.mount(
         null,
         procFd(arena, fd),
         null,
-        linux.MS.REMOUNT | linux.MS.BIND | linux.MS.RDONLY | keep,
+        linux.MS.REMOUNT | linux.MS.BIND | add | keep,
         0,
     ));
 }

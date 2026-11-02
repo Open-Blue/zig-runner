@@ -886,14 +886,13 @@ Dagger.** What it covers, as built:
 
 What it does not do yet, and who pays:
 
-- **JavaScript actions.** They need a JavaScript runtime mounted into the job's image, which the
-  Dagger path takes from its own runtime image (`js.zig`); natively that is a pull of that image
-  (P3) and a bind. Until then a job with one, at any depth of composite actions, goes to Dagger.
-  Debt of P7, paid once P3's store lands.
-- **Local actions** (`uses: ./path`, at the top or nested). They are read from the workspace
-  once a step has checked it out, after the backend is chosen, so the job goes to Dagger. A
-  pre-flight that reads the job's own repository at its commit (as the checkout will) would
-  decide them; debt of P7.
+- **Local actions built from a Dockerfile.** Their tree is only in the workspace, spread over
+  the job's layers, where the builder needs one host directory. They send the job to Dagger;
+  debt of P7 (a build context read from the layers).
+- **A local action that differs at run time from the job's commit** (a step rewrote it): the
+  pre-flight judged the commit's. With every kind of action native, the only way that bites is an
+  image the commit's version did not need and the store lacks: the step fails saying so, where
+  Dagger would have pulled it. Gone with P3's pull.
 - **Images with a non-root `USER`, and a `RUN` as one.** They need the shares idmapped so the
   image's user owns them, as Dagger's `owner:` does. Debt of P7.
 - **The pull.** Images come from the operator's directory until P3's store replaces
@@ -953,8 +952,31 @@ through no symlink) and composite actions (their steps are the shared code's: sc
 `uses:`, nested checkouts through `Backend.fetchCheckout`, `docker://` steps). In a container,
 the job's binds go only where the image has the path.
 
+**JavaScript actions.** The Dagger path's own code runs them (`js.zig`: `runJs`, `runJsScript`,
+`jsEnv`, pre, main, post and `post-if`, `STATE_*`, the node, npx and npm shims, Node when Bun
+refuses an action). What changed is where the runtime comes from: `js.runtimeFiles` answers the
+runtime's files from the native image store (`oven/bun:1.4.3`'s or `node:24-bookworm-slim`'s
+rootfs, as `js.runtimes` names them) as `host:<path>` ids, and the native backend now applies
+Dagger's mounts (`Backend.applyMounts`): a new file (a shim) written into the step's layer, a
+host file or directory bound read-only, nosuid and nodev into that step and every later one, as
+Dagger's copy stays in the container. The runtime is pulled by P3 (`docker_action.find`). In a
+musl image (`container: alpine`, told by an `ld-musl-*` in its /lib, `Backend.isMusl`) it is the
+musl build of `js.runtimes_musl`, with the C++ runtime it needs copied from that image's
+/usr/lib (`libstdc++.so*`, `libgcc_s.so*`), as Dagger's query filters it. A job whose
+JavaScript action's runtime cannot be pulled goes to Dagger (`actions.preload`).
+
+**Local actions.** `preload` judges a local action (top level or nested) from the job's own
+repository at the job's commit, which is what a checkout of it gives: a blobless fetch of that
+one commit by git in the job's image (the job's token, as the checkout's), and only its
+`action.yml` read (`git cat-file`), then the look's layer dropped, so no unkeyed layer is left
+below the base (`Backend.dropTop`). One that is not there (made by a step, another
+repository checked out there) sends the job to Dagger. At run time the step reads the workspace,
+as on Dagger (`actions.loadLocal`, through `Backend.readFile`).
+
 **For P3 and P2, what to swap when they land:**
 
+- P3's pull also serves the JavaScript runtimes: `js.runtimeFiles` calls `images.lookup` for
+  `js.runtimes`' images; with the pull it gets them on a miss, and `preload`'s runtime check goes.
 - P3's image store replaces `images.lookup(arena, io, dir, ref)`: return `Image{ rootfs, entrypoint,
   cmd, env, user }` for the reference, pulled when missing. `docker_action.unsupported` then needs
   no store check (an image is pulled, not refused) but keeps the `USER` check until the idmapped
@@ -1605,3 +1627,15 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
 - **Testing a fetch without a network.** The job's `server_url` can be a `file://` URL inside
   the sandbox, with the test's bare repositories bound there, so the loader's tests run the real
   git fetch in both native passes and never reach Dagger.
+
+### P7: JavaScript and local actions
+
+- **Mounts were the whole difference.** Dagger's JavaScript path is a script plus mounts: the
+  runtime's binary, its shims and npm, and the action's directory. Once the native backend
+  applied mounts (binds for host files, files written for new ones, nothing for trees already in
+  the layers) the shared code ran pre, main and post unchanged. The one fault was the native
+  backend's own: it removed every file it wrote after a step, which was right for a script holding
+  a secret and wrong for a shim that must outlive it.
+- **Judging a local action needs one blob, not the repository.** A blobless fetch of the job's
+  commit and `git cat-file` of one path costs a commit and its trees, and leaves nothing in the
+  job but an empty layer; the checkout still does its own fetch.
