@@ -286,7 +286,7 @@ pub fn execScript(
     mounts: []const Mount,
 ) !Out {
     // A checkout's tree is already in the native layers (`Backend.fetchCheckout`): no mounts.
-    if (x.native) |b| return b.execScript(x, num, fc, resolved_in, action_name, secret_env_in);
+    if (x.native) |b| return b.execScript(x, num, fc, resolved_in, action_name, secret_env_in, mounts);
     const arena = x.arena;
     // What the runner adds for the step, apart from its secrets: the variables earlier steps
     // set, which the container before this step lacks, and the mounts. `outputKeyed` reuses

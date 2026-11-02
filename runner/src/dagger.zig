@@ -937,6 +937,8 @@ fn runNative(
     };
     defer b.deinit();
     b.caches = .of(opts_in);
+    // The runtime its JavaScript actions get, for the preload in the base (`native/actions.zig`).
+    b.js_runtime = opts.js_runtime;
     // Which ids the job's steps have, as "Set up job" says (`Backend.idsNote`).
     opts.backend_note = try b.idsNote(arena);
     return runSteps(arena, io, opts, job, &sh, results, b.transport(), &b) catch |e| switch (e) {

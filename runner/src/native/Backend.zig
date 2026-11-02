@@ -66,6 +66,10 @@ runtime_path: ?[]const u8 = null,
 notes: std.ArrayList([]const u8) = .empty,
 /// Remote actions fetched before "Set up job" (`actions.preload`), by `Exec.loadAction`'s key.
 actions: std.StringHashMapUnmanaged(Exec.LoadResult) = .empty,
+/// The JavaScript runtime JavaScript actions run with (`Options.js_runtime`, `actions.preload`).
+js_runtime: config.JsRuntime = .bun,
+/// Local actions read so far before the job (`actions.readOwn`), naming their files.
+preflights: u32 = 0,
 /// Why the last Dockerfile could not be planned or built, for the step's message.
 build_reason: []const u8 = "",
 /// Why the job runs on Dagger after all, found in `base` (`error.NativeToDagger`): one of its
@@ -1010,7 +1014,7 @@ pub fn base(
         const workdir = b.workdir;
         b.workdir = "/";
         defer b.workdir = workdir;
-        if (try native_actions.preload(b, ev.job.*)) |why| {
+        if (try native_actions.preload(b, ev.job.*, b.js_runtime)) |why| {
             b.to_dagger = why;
             return error.NativeToDagger;
         }
@@ -1133,9 +1137,14 @@ pub fn execScript(
     resolved_in: dagger.Resolved,
     action_name: []const u8,
     secret_env_in: []const dagger.SecretRef,
+    mounts: []const dagger.Mount,
 ) !Exec.Out {
     const arena = b.arena;
     try b.applyPendingEnv(x);
+    // The step's mounts (a JavaScript action's runtime and shims, `js.zig`): bound for every
+    // step after, their mount points made once.
+    var mount_files: std.ArrayList(sandbox.Spec.File) = .empty;
+    try b.applyMounts(mounts, &mount_files);
     // Why the step runs again rather than replay its record (`Exec.execScript`'s, #229).
     var rerun: ?[]const u8 = null;
     while (true) {
@@ -1153,6 +1162,7 @@ pub fn execScript(
         });
         // A script holding a secret is a file the sandbox writes and removes, as Dagger mounts it.
         var files: std.ArrayList(sandbox.Spec.File) = .empty;
+        try files.appendSlice(arena, mount_files.items);
         if (step_run.script_secret != null) try files.append(arena, .{
             .path = try scripts.scriptPath(arena, fc, resolved.run.shell),
             .contents = resolved.run.script,
@@ -1212,8 +1222,8 @@ pub fn execScript(
         );
         const layer = b.layers.items[b.layers.items.len - 1].path;
         // The helper removes it; when it was stopped before it could, the runner does, so no later
-        // step's layers hold the secret.
-        for (files.items) |f| sandbox.unlinkIn(arena, layer, f.path);
+        // step's layers hold the secret. A mount's file (a runtime's shim) stays for the steps after.
+        for (files.items) |f| if (!f.keep) sandbox.unlinkIn(arena, layer, f.path);
         // Every line is in: the pipe is closed only once every process of the step has ended.
         demux.flushPartial();
         try b.limitsReached(x, num);
@@ -1405,6 +1415,45 @@ fn dropLastLayer(b: *Backend) void {
     removeTree(b.arena, b.io, b.layers.items[b.layers.items.len - 1].path);
     _ = b.layers.pop();
 }
+
+/// Dagger's mounts for a step, as the native backend has them (`Exec.execScript`). A new file
+/// (a shim) is written into the step's layer, as `withNewFile` leaves it. A file or directory
+/// whose id is a host path (`host_id`: the JavaScript runtime from the image store, `js.zig`) is
+/// bound read-only from then on, into this step and every later one, as Dagger's copy stays in
+/// the container; its mount point is made first, by a step of its own. Other ids are trees the
+/// native backend has in the job's layers already (a fetched action, a checkout): nothing to do.
+fn applyMounts(b: *Backend, mounts: []const dagger.Mount, files: *std.ArrayList(sandbox.Spec.File)) !void {
+    const arena = b.arena;
+    var binds: std.ArrayList(sandbox.Spec.Bind) = .empty;
+    var points: std.ArrayList(sandbox.Spec.File) = .empty;
+    var dirs: std.Io.Writer.Allocating = .init(arena);
+    for (mounts) |m| switch (m) {
+        .new_file => |f| try files.append(arena, .{
+            .path = f.path,
+            .contents = f.contents,
+            .mode = f.permissions,
+            .keep = true,
+        }),
+        .file => |f| if (std.mem.startsWith(u8, f.id, host_id)) {
+            try points.append(arena, .{ .path = f.path, .contents = "", .mode = 0o755, .keep = true });
+            try binds.append(arena, .{ .host = f.id[host_id.len..], .at = f.path, .nosuid = true });
+        },
+        .dir => |d| if (std.mem.startsWith(u8, d.id, host_id)) {
+            try dirs.writer.writeAll(" ");
+            try dagger.shellQuote(&dirs.writer, d.path);
+            try binds.append(arena, .{ .host = d.id[host_id.len..], .at = d.path, .nosuid = true });
+        },
+    };
+    if (binds.items.len == 0) return;
+    var out: Captured = .{ .arena = arena };
+    const script = try std.fmt.allocPrint(arena, "mkdir -p /{s}", .{dirs.written()});
+    const ended = try b.exec(script, &.{"PATH=" ++ image_path}, points.items, 0, 0, out.output());
+    if (ended.failure.len > 0 or ended.code != 0) return error.MountPointsFailed;
+    b.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ b.binds, binds.items });
+}
+
+/// A mount's id that names a host path (`applyMounts`): `host:<absolute path>`.
+pub const host_id = "host:";
 
 /// The built-in checkout on this backend: the repository fetched by git in the job's image, as
 /// actions/checkout fetches it, into the tree Dagger's `git` gives (`checkout.query`): the commit
@@ -1911,6 +1960,15 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) 
     top.* = .{ .name = name, .path = layer.fs, .key = key, .canonical = canonical };
 }
 
+/// The stack's top layer, the job's own (not the store's), dropped and removed: an exec whose
+/// layer nothing after it may see (`actions.readOwn`).
+pub fn dropTop(b: *Backend) void {
+    const top = b.layers.getLastOrNull() orelse return;
+    if (top.key != null) return;
+    _ = b.layers.pop();
+    Store.removeTree(b.arena, b.io, top.path);
+}
+
 /// The stack's top layer, a tree git fetched at a commit (an action's, `actions.fetch`), keyed by
 /// what it holds rather than by how it was made: `what` names the repository, where it is and the
 /// commit, as Dagger's `git` keys a tree. Under step caching the store's layer under that key
@@ -2046,6 +2104,51 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
         b.image_uid = user_ids[0];
         b.image_gid = user_ids[1];
     }
+}
+
+/// Whether the job's image is musl-based: an `ld-musl-*` in its /lib, as the Dagger path asks
+/// (`services.pullJobContainer`), for its JavaScript actions' runtime (`js.zig`). A /lib that is
+/// a symlink (a merged /usr, glibc's) or missing is not musl; nothing is followed.
+pub fn isMusl(b: *Backend) bool {
+    return rootfsIsMusl(b.arena, b.io, b.rootfs);
+}
+
+fn rootfsIsMusl(arena: Allocator, io: std.Io, rootfs: []const u8) bool {
+    const lib = std.fmt.allocPrint(arena, "{s}/lib", .{rootfs}) catch return false;
+    var dir = std.Io.Dir.cwd().openDir(io, lib, .{ .iterate = true, .follow_symlinks = false }) catch
+        return false;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        if (std.mem.startsWith(u8, e.name, "ld-musl-")) return true;
+    }
+    return false;
+}
+
+test "a musl image is told by its /lib, never through a symlink" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try tmp.dir.createDirPath(io, "alpine/lib");
+    try tmp.dir.writeFile(io, .{ .sub_path = "alpine/lib/ld-musl-x86_64.so.1", .data = "" });
+    try tmp.dir.createDirPath(io, "debian/usr/lib");
+    try tmp.dir.symLink(io, "usr/lib", "debian/lib", .{});
+    // A /lib that leads to another tree's musl loader is not followed.
+    try tmp.dir.createDirPath(io, "odd");
+    try tmp.dir.symLink(io, "../alpine/lib", "odd/lib", .{});
+    const p = struct {
+        fn f(ar: Allocator, r: []const u8, name: []const u8) []const u8 {
+            return std.fmt.allocPrint(ar, "{s}/{s}", .{ r, name }) catch unreachable;
+        }
+    }.f;
+    try std.testing.expect(rootfsIsMusl(arena, io, p(arena, root, "alpine")));
+    try std.testing.expect(!rootfsIsMusl(arena, io, p(arena, root, "debian")));
+    try std.testing.expect(!rootfsIsMusl(arena, io, p(arena, root, "odd")));
+    try std.testing.expect(!rootfsIsMusl(arena, io, p(arena, root, "missing")));
 }
 
 /// `image` pulled into the store, or found there (`oci/image.zig`), within `pull_deadline`.

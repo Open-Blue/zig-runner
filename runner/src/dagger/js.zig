@@ -36,6 +36,8 @@ const usesStep = @import("testing.zig").usesStep;
 const braceBalanced = @import("testing.zig").braceBalanced;
 
 const Allocator = std.mem.Allocator;
+const Backend = @import("../native/Backend.zig");
+const docker_action = @import("../native/docker_action.zig");
 
 /// JavaScript actions run with this binary, named `node` so that Bun behaves as Node. The shim on
 /// PATH answers `node --version`, which Bun named `node` does not handle, and runs the binary
@@ -96,6 +98,90 @@ fn runtimeQuery(arena: Allocator, rt: RuntimeSource, musl: bool) ![]const u8 {
     return q.finish();
 }
 
+/// The ids of a runtime's files (`runtimeQuery`'s answer): from Dagger, or on the native backend
+/// the files' host paths in the native store, the image pulled by P3 (`docker_action.find`), as
+/// `host:<path>` ids that the native backend binds (`Backend.applyMounts`), nosuid and nodev. On
+/// musl (any image is native since P3: `container: alpine`), the musl runtime with its C++ runtime
+/// (`libs`), as Dagger's query filters it from the image's /usr/lib. Null with `msg` when the
+/// image cannot be had.
+fn runtimeFiles(x: *Exec, rt: RuntimeSource, msg: *[]const u8) !?std.json.Value {
+    const arena = x.arena;
+    const b = x.native orelse
+        return gql(arena, x.transport, try runtimeQuery(arena, rt, x.musl), msg) catch null;
+    // P3's pull (or the tests' images directory), as Dagger pulls the runtime's image.
+    const img = switch (try docker_action.find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, rt.image)) {
+        .image => |i| i,
+        .missing => |why| {
+            msg.* = why;
+            return null;
+        },
+    };
+    var obj: std.json.ObjectMap = .empty;
+    const id = struct {
+        fn f(ar: Allocator, rootfs: []const u8, path: []const u8) !std.json.Value {
+            var o: std.json.ObjectMap = .empty;
+            try o.put(ar, "id", .{ .string = try std.fmt.allocPrint(ar, "{s}{s}{s}", .{
+                Backend.host_id,
+                rootfs,
+                path,
+            }) });
+            return .{ .object = o };
+        }
+    }.f;
+    try obj.put(arena, "bin", try id(arena, img.rootfs, rt.binary));
+    if (rt.npm_dir) |npm| try obj.put(arena, "npm", try id(arena, img.rootfs, npm));
+    if (x.musl) {
+        const libs = cxxRuntime(arena, b.io, b.dir, img.rootfs, rt.image) catch |e| {
+            msg.* = try std.fmt.allocPrint(arena, "its C++ runtime could not be taken: {s}", .{
+                @errorName(e),
+            });
+            return null;
+        };
+        try obj.put(arena, "libs", try id(arena, libs, ""));
+    }
+    return .{ .object = obj };
+}
+
+/// The C++ runtime a musl runtime needs (`libstdc++.so*`, `libgcc_s.so*`), copied from its
+/// image's /usr/lib into a directory of the job's own, as Dagger's `filter` takes them: binding the
+/// whole /usr/lib would put the image's other libraries on the runtime's library path. Its
+/// symlinks are copied as symlinks (they name their neighbours), nothing is followed out of it.
+fn cxxRuntime(
+    arena: Allocator,
+    io: std.Io,
+    job_dir: []const u8,
+    rootfs: []const u8,
+    image: []const u8,
+) ![]const u8 {
+    const out = try std.fmt.allocPrint(arena, "{s}/JSLIB-{x}", .{ job_dir, std.hash.Wyhash.hash(0, image) });
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, out) catch {};
+    try cwd.createDirPath(io, out);
+    var to = try cwd.openDir(io, out, .{});
+    defer to.close(io);
+    const lib = try std.fmt.allocPrint(arena, "{s}/usr/lib", .{rootfs});
+    var from = try cwd.openDir(io, lib, .{ .iterate = true, .follow_symlinks = false });
+    defer from.close(io);
+    var it = from.iterate();
+    var found = false;
+    while (try it.next(io)) |e| {
+        if (!std.mem.startsWith(u8, e.name, "libstdc++.so") and
+            !std.mem.startsWith(u8, e.name, "libgcc_s.so")) continue;
+        switch (e.kind) {
+            .sym_link => {
+                var buf: [std.fs.max_path_bytes]u8 = undefined;
+                const n = try from.readLink(io, e.name, &buf);
+                try to.symLink(io, buf[0..n], e.name, .{});
+            },
+            .file => try from.copyFile(e.name, to, e.name, io, .{ .permissions = .fromMode(0o755) }),
+            else => continue,
+        }
+        found = true;
+    }
+    if (!found) return error.NoCxxRuntime;
+    return out;
+}
+
 /// Runs the musl Node with its own C++ runtime first on the library path.
 const node_fallback_wrapper = "#!/bin/sh\nLD_LIBRARY_PATH=" ++ fallback_dir ++
     "/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} exec " ++ fallback_dir ++ "/node-musl \"$@\"\n";
@@ -108,13 +194,13 @@ fn newFileMount(path: []const u8, contents: []const u8) Mount {
     return .{ .new_file = .{ .path = path, .contents = contents, .permissions = 0o755 } };
 }
 
-const RuntimeSource = struct {
+pub const RuntimeSource = struct {
     image: []const u8,
     binary: []const u8,
     npm_dir: ?[]const u8 = null,
 };
 /// Bun is pinned to the version the repository's images use (see api/Dockerfile).
-const runtimes: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
+pub const runtimes: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
     .bun = .{ .image = "oven/bun:1.4.3", .binary = "/usr/local/bin/bun" },
     .node = .{
         .image = "node:24-bookworm-slim",
@@ -124,7 +210,7 @@ const runtimes: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
 });
 /// For a musl job image (`container: alpine`): the runtimes' Alpine builds, which also need the
 /// C++ runtime from their image (mounted at `lib_dir`).
-const runtimes_musl: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
+pub const runtimes_musl: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
     .bun = .{ .image = "oven/bun:1.4.3-alpine", .binary = "/usr/local/bin/bun" },
     .node = .{
         .image = "node:24-alpine",
@@ -322,7 +408,7 @@ pub fn appendJsRuntimeMounts(x: *Exec, num: u32, mounts: *std.ArrayList(Mount)) 
     const arena = x.arena;
     const rt = (if (x.musl) runtimes_musl else runtimes).get(x.js_runtime);
     var msg: []const u8 = "";
-    const data = gql(arena, x.transport, try runtimeQuery(arena, rt, x.musl), &msg) catch {
+    const data = (try runtimeFiles(x, rt, &msg)) orelse {
         _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}: {s}", .{
             rt.image,
             msg,
@@ -376,7 +462,7 @@ pub fn nodeFallback(x: *Exec, num: u32) !?[]const Mount {
     const arena = x.arena;
     const rt = (if (x.musl) runtimes_musl else runtimes).get(.node);
     var msg: []const u8 = "";
-    const data = gql(arena, x.transport, try runtimeQuery(arena, rt, x.musl), &msg) catch {
+    const data = (try runtimeFiles(x, rt, &msg)) orelse {
         _ = try x.actionFailed(num, "could not get Node from {s}: {s}", .{ rt.image, msg });
         return null;
     };
@@ -590,4 +676,39 @@ test "a JavaScript action runs its main with the runtime, inputs as INPUT_*, the
     try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Post") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Run actions/github-script@v9") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "  script: return 42") != null);
+}
+
+test "native: a musl runtime's C++ runtime is its image's libstdc++ and libgcc_s, nothing else" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "img/usr/lib");
+    try tmp.dir.createDirPath(io, "job");
+    try tmp.dir.writeFile(io, .{ .sub_path = "img/usr/lib/libstdc++.so.6.0.33", .data = "cxx" });
+    try tmp.dir.symLink(io, "libstdc++.so.6.0.33", "img/usr/lib/libstdc++.so.6", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "img/usr/lib/libgcc_s.so.1", .data = "gcc" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "img/usr/lib/libssl.so.3", .data = "other" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const rootfs = try std.fmt.allocPrint(arena, "{s}/img", .{root});
+    const job = try std.fmt.allocPrint(arena, "{s}/job", .{root});
+    const out = try cxxRuntime(arena, io, job, rootfs, "node:24-alpine");
+    var dir = try std.Io.Dir.cwd().openDir(io, out, .{ .iterate = true });
+    defer dir.close(io);
+    var names: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        names += 1;
+        try std.testing.expect(!std.mem.startsWith(u8, e.name, "libssl"));
+    }
+    try std.testing.expectEqual(@as(usize, 3), names);
+    var buf: [64]u8 = undefined;
+    const n = try dir.readLink(io, "libstdc++.so.6", &buf);
+    try std.testing.expectEqualStrings("libstdc++.so.6.0.33", buf[0..n]);
+    // An image without one cannot run the musl runtime: refused, not bound empty.
+    try tmp.dir.createDirPath(io, "bare/usr/lib");
+    const bare = try std.fmt.allocPrint(arena, "{s}/bare", .{root});
+    try std.testing.expectError(error.NoCxxRuntime, cxxRuntime(arena, io, job, bare, "x"));
 }

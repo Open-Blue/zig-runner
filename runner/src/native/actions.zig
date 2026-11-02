@@ -26,6 +26,8 @@ const sandbox = @import("sandbox.zig");
 const images = @import("images.zig");
 const docker_action = @import("docker_action.zig");
 const Exec = @import("../dagger/Exec.zig");
+const js = @import("../dagger/js.zig");
+const config = @import("../config.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -37,7 +39,8 @@ pub fn key(arena: Allocator, u: job_mod.Uses) ![]const u8 {
 /// Fetches and reads every remote action of `job` into `b.actions`, and says why the job cannot
 /// run natively, or null. An action that cannot be fetched or read is not a reason: native
 /// "Set up job" fails with it, as Dagger's would.
-pub fn preload(b: *Backend, job: job_mod.Job) !?[]const u8 {
+pub fn preload(b: *Backend, job: job_mod.Job, js_runtime: config.JsRuntime) !?[]const u8 {
+    b.js_runtime = js_runtime;
     for (job.steps) |step| switch (step.action) {
         .uses => |u| if (try reasonFor(b, job, u, 0)) |why| return why,
         else => {},
@@ -50,9 +53,8 @@ const max_depth = 10;
 
 fn reasonFor(b: *Backend, job: job_mod.Job, u: job_mod.Uses, depth: u32) anyerror!?[]const u8 {
     const arena = b.arena;
-    if (u.local) return "local actions (`uses: ./...`) are read once the workspace is checked " ++
-        "out, after the job's backend is chosen";
     if (depth > max_depth) return null;
+    if (u.local) return localReason(b, job, u.path, depth);
     const k = try key(arena, u);
     const lr = b.actions.get(k) orelse lr: {
         const fetched = fetch(b, job, u) catch |e| switch (e) {
@@ -67,27 +69,60 @@ fn reasonFor(b: *Backend, job: job_mod.Job, u: job_mod.Uses, depth: u32) anyerro
         .ok => |a| a,
         .failed, .unresolved => return null,
     };
-    switch (act.meta.runs) {
-        .node => return try std.fmt.allocPrint(arena, "{s} is a JavaScript action, and native " ++
-            "steps have no JavaScript runtime yet", .{act.ref_label}),
+    return judge(b, job, act.meta, act.ref_label, .{
+        .dir = act.dir,
+        .sub = act.sub,
+    }, depth);
+}
+
+/// Where a fetched action's Dockerfile is, for `docker_action.buildReason`; null for a local
+/// action, whose tree is only in the workspace.
+const Tree = struct { dir: []const u8, sub: []const u8 };
+
+/// Why an action with metadata `meta` cannot run natively, or null.
+fn judge(
+    b: *Backend,
+    job: job_mod.Job,
+    meta: action.Metadata,
+    label: []const u8,
+    tree: ?Tree,
+    depth: u32,
+) anyerror!?[]const u8 {
+    const arena = b.arena;
+    switch (meta.runs) {
+        // The runtime from the image store, as Dagger takes it from its image (`js.zig`).
+        .node => {
+            // The musl build on a musl image (`container: alpine`), as `js.zig` mounts it.
+            const rt = (if (b.isMusl()) js.runtimes_musl else js.runtimes).get(b.js_runtime);
+            return switch (try docker_action.find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, rt.image)) {
+                .image => null,
+                .missing => |why| try std.fmt.allocPrint(arena, "{s} is a JavaScript action, " ++
+                    "and its runtime is not here: {s}", .{ label, why }),
+            };
+        },
         .docker => |dk| {
             if (std.mem.startsWith(u8, dk.image, "docker://"))
                 return imageReason(b, dk.image["docker://".len..]);
-            const from = if (act.sub.len > 0) act.sub else ".";
+            const t = tree orelse return try std.fmt.allocPrint(arena, "{s} is built from a " ++
+                "Dockerfile in the workspace, which native steps build only from a fetched " ++
+                "action yet", .{label});
+            const from = if (t.sub.len > 0) t.sub else ".";
             const rel = try std.fs.path.resolvePosix(arena, &.{ from, dk.image });
             return docker_action.buildReason(b, .{
-                .dir = act.dir,
+                .dir = t.dir,
                 .context = std.fs.path.dirnamePosix(rel) orelse ".",
                 .dockerfile = std.fs.path.basenamePosix(rel),
-            }, act.ref_label);
+            }, label);
         },
         .composite => |steps| for (steps) |st| {
             const text = st.uses orelse continue;
             const parsed = action.parseUses(text) orelse continue;
             switch (parsed) {
                 .docker => |image| if (try imageReason(b, image)) |why| return why,
-                .local => return "a composite action uses a local action, read from the " ++
-                    "workspace after the job's backend is chosen",
+                .local => |raw| {
+                    const dir = job_mod.localActionPath(raw) orelse continue;
+                    if (try localReason(b, job, dir, depth + 1)) |why| return why;
+                },
                 .repo => |r| {
                     const checkout = std.ascii.eqlIgnoreCase(r.owner, "actions") and
                         std.ascii.eqlIgnoreCase(r.name, "checkout") and r.path.len == 0;
@@ -107,6 +142,89 @@ fn reasonFor(b: *Backend, job: job_mod.Job, u: job_mod.Uses, depth: u32) anyerro
     return null;
 }
 
+/// A local action (`uses: ./<path>`) judged from the job's own repository at the job's commit,
+/// which is what a checkout of it puts in the workspace: its `action.yml` read by git in the
+/// job's image, without the rest of the tree (a blobless fetch of that one commit). The step
+/// itself reads the workspace, as on Dagger (`loadLocal`). One that is not in the repository at
+/// that commit (made by a step, or another repository checked out there) sends the job to
+/// Dagger, since nothing can be known of it before the job.
+fn localReason(b: *Backend, job: job_mod.Job, path: []const u8, depth: u32) anyerror!?[]const u8 {
+    const arena = b.arena;
+    const label = try std.fmt.allocPrint(arena, "./{s}", .{path});
+    const not_known = try std.fmt.allocPrint(arena, "the local action {s} is not in {s} at " ++
+        "{s}, so what it is cannot be known before the job", .{ label, job.github.repository, job.github.sha });
+    if (job.github.repository.len == 0 or job.github.sha.len == 0) return not_known;
+    const text = (try readOwn(b, job, path)) orelse return not_known;
+    const meta = switch (try action.parse(arena, text)) {
+        .ok => |m| m,
+        // The step reads it again and fails with why, as on Dagger.
+        .invalid => return null,
+    };
+    return judge(b, job, meta, label, null, depth);
+}
+
+/// `<path>/action.yml` (or `.yaml`) of the job's repository at its commit, or null.
+fn readOwn(b: *Backend, job: job_mod.Job, path: []const u8) !?[]const u8 {
+    const arena = b.arena;
+    const server = std.mem.trimEnd(u8, job.github.server_url, "/");
+    b.preflights += 1;
+    const out_path = try std.fmt.allocPrint(arena, "/tmp/zig-runner-preflight-{d}.yml", .{b.preflights});
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("set -e\nd=$(mktemp -d)\ntrap 'rm -rf \"$d\"' EXIT\ncd \"$d\"\ngit init -q\n" ++
+        "git remote add origin ");
+    try dagger.shellQuote(w, try std.fmt.allocPrint(arena, "{s}/{s}.git", .{ server, job.github.repository }));
+    try w.writeAll("\ngit -c protocol.version=2 fetch -q --depth=1 --filter=blob:none --no-tags origin ");
+    try dagger.shellQuote(w, job.github.sha);
+    try w.writeAll("\nfor f in action.yml action.yaml; do\n  if git cat-file -e FETCH_HEAD:");
+    try dagger.shellQuote(w, try std.fmt.allocPrint(arena, "{s}{s}", .{ path, if (path.len > 0) "/" else "" }));
+    try w.writeAll("\"$f\" 2>/dev/null; then git cat-file -p FETCH_HEAD:");
+    try dagger.shellQuote(w, try std.fmt.allocPrint(arena, "{s}{s}", .{ path, if (path.len > 0) "/" else "" }));
+    try w.print("\"$f\" > {s}; exit 0; fi\ndone\nexit 3\n", .{out_path});
+    var out: Backend.Captured = .{ .arena = arena };
+    const ended = try b.execOn(&.{ "sh", "-c", aw.written() }, try gitEnv(b, job, true), &.{}, 0, 0, out.output(), null);
+    const layer = try b.layerPath(b.layers.items.len - 1);
+    // Its layer is a look, nothing the job keeps: dropped, so it leaves no unkeyed layer below
+    // the base, and the job's steps keep their keys (P2).
+    defer b.dropTop();
+    if (ended.failure.len > 0 or ended.code != 0) return null;
+    return switch (try sandbox.readIn(arena, layer, out_path, Backend.max_read)) {
+        .text => |t| t,
+        .missing, .whiteout => null,
+    };
+}
+
+/// `Exec.loadLocal` on this backend: the local action's `action.yml` read from the workspace as
+/// the job's last step left it, layer by layer through no symlink (`Backend.readFile`), with
+/// Dagger's messages. Its files are in the job's layers already: nothing is mounted.
+pub fn loadLocal(b: *Backend, x: *Exec, u: job_mod.Uses) !Exec.LoadResult {
+    const arena = b.arena;
+    const abs = if (u.path.len > 0)
+        try std.fmt.allocPrint(arena, "{s}/{s}", .{ x.ev.workspace, u.path })
+    else
+        x.ev.workspace;
+    const label = try std.fmt.allocPrint(arena, "./{s}", .{u.path});
+    for ([_][]const u8{ "action.yml", "action.yaml" }) |name| {
+        const text = b.readFile(try std.fmt.allocPrint(arena, "{s}/{s}", .{ abs, name })) orelse continue;
+        const meta = switch (try action.parse(arena, text)) {
+            .ok => |m| m,
+            .invalid => |why| return .{ .failed = try std.fmt.allocPrint(
+                arena,
+                "{s} of {s} {s}",
+                .{ name, label, why },
+            ) },
+        };
+        try x.mounted_actions.put(arena, abs, {});
+        return .{ .ok = .{ .meta = meta, .dir = "native", .mount = abs, .path = abs, .ref_label = label } };
+    }
+    return .{ .failed = try std.fmt.allocPrint(
+        arena,
+        "Can't find 'action.yml' or 'action.yaml' under '{s}'. Did you forget to run " ++
+            "actions/checkout before running your local action?",
+        .{abs},
+    ) };
+}
+
 fn imageReason(b: *Backend, image: []const u8) !?[]const u8 {
     return switch (try docker_action.find(b.arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, image)) {
         .missing => |why| why,
@@ -116,6 +234,39 @@ fn imageReason(b: *Backend, image: []const u8) !?[]const u8 {
             .{ image, img.user },
         ),
     };
+}
+
+/// git's environment in the job's image before the base is made (the container's env is not set
+/// yet): its PATH and HOME, no prompt, and its config through the environment, never a command
+/// line: the job's token for the job's own repository (`own`), as Dagger's `git` has it, and
+/// `safe.directory` (the fetch is the job's root's; a file:// source is the host's, and git's
+/// ownership check would refuse to read it).
+fn gitEnv(b: *Backend, job: job_mod.Job, own: bool) ![]const []const u8 {
+    const arena = b.arena;
+    const server = std.mem.trimEnd(u8, job.github.server_url, "/");
+    var env: std.ArrayList([]const u8) = .empty;
+    try env.appendSlice(arena, &.{
+        "PATH=" ++ Backend.image_path,
+        "HOME=/root",
+        "GIT_TERMINAL_PROMPT=0",
+    });
+    var git_config: std.ArrayList([2][]const u8) = .empty;
+    try git_config.append(arena, .{ "safe.directory", "*" });
+    if (own and job.job_token.len > 0) {
+        const basic = try std.fmt.allocPrint(arena, "x-access-token:{s}", .{job.job_token});
+        const enc = std.base64.standard.Encoder;
+        const b64 = try arena.alloc(u8, enc.calcSize(basic.len));
+        try git_config.append(arena, .{
+            try std.fmt.allocPrint(arena, "http.{s}/.extraheader", .{server}),
+            try std.fmt.allocPrint(arena, "AUTHORIZATION: basic {s}", .{enc.encode(b64, basic)}),
+        });
+    }
+    try env.append(arena, try std.fmt.allocPrint(arena, "GIT_CONFIG_COUNT={d}", .{git_config.items.len}));
+    for (git_config.items, 0..) |c, i| {
+        try env.append(arena, try std.fmt.allocPrint(arena, "GIT_CONFIG_KEY_{d}={s}", .{ i, c[0] }));
+        try env.append(arena, try std.fmt.allocPrint(arena, "GIT_CONFIG_VALUE_{d}={s}", .{ i, c[1] }));
+    }
+    return env.items;
 }
 
 /// The action's repository fetched at its ref into a new layer of the job, as the built-in
@@ -142,33 +293,9 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
     try w.writeAll("\ngit checkout -q --detach FETCH_HEAD\nrm -f .git/FETCH_HEAD\n" ++
         "git rev-parse HEAD\n");
 
-    // Below the base's layer, and not with the container's env: git gets what it needs here.
-    var env: std.ArrayList([]const u8) = .empty;
-    try env.appendSlice(arena, &.{
-        "PATH=" ++ Backend.image_path,
-        "HOME=/root",
-        "GIT_TERMINAL_PROMPT=0",
-    });
-    // The repository was made by another user (the fetch is the job's root, a file:// source is
-    // the host's): git's ownership check would refuse to read it.
-    var config: std.ArrayList([2][]const u8) = .empty;
-    try config.append(arena, .{ "safe.directory", "*" });
-    if (std.mem.eql(u8, repository, job.github.repository) and job.job_token.len > 0) {
-        const basic = try std.fmt.allocPrint(arena, "x-access-token:{s}", .{job.job_token});
-        const enc = std.base64.standard.Encoder;
-        const b64 = try arena.alloc(u8, enc.calcSize(basic.len));
-        try config.append(arena, .{
-            try std.fmt.allocPrint(arena, "http.{s}/.extraheader", .{server}),
-            try std.fmt.allocPrint(arena, "AUTHORIZATION: basic {s}", .{enc.encode(b64, basic)}),
-        });
-    }
-    try env.append(arena, try std.fmt.allocPrint(arena, "GIT_CONFIG_COUNT={d}", .{config.items.len}));
-    for (config.items, 0..) |c, i| {
-        try env.append(arena, try std.fmt.allocPrint(arena, "GIT_CONFIG_KEY_{d}={s}", .{ i, c[0] }));
-        try env.append(arena, try std.fmt.allocPrint(arena, "GIT_CONFIG_VALUE_{d}={s}", .{ i, c[1] }));
-    }
+    const env = try gitEnv(b, job, std.mem.eql(u8, repository, job.github.repository));
     var out: Backend.Captured = .{ .arena = arena };
-    const ended = try b.execOn(&.{ "sh", "-c", aw.written() }, env.items, &.{}, 0, 0, out.output(), null);
+    const ended = try b.execOn(&.{ "sh", "-c", aw.written() }, env, &.{}, 0, 0, out.output(), null);
     // `sh` found no git in the image (any image is native since P3, not only the provisioned
     // default one): Dagger fetches with git of its own.
     if (ended.failure.len == 0 and ended.code == 127) return error.NoGit;
@@ -440,7 +567,7 @@ test "preload: a JavaScript action, a local one, or an image not in the store se
     local.action = .{ .uses = .{ .owner = "", .name = "", .path = "act", .ref = "", .local = true } };
     for ([_]Case{
         .{ .step = usesStep("j", "o", "js", "v1", &.{}), .why = "o/js@v1 is a JavaScript action" },
-        .{ .step = local, .why = "local actions" },
+        .{ .step = local, .why = "is not in o/r at" },
         .{ .step = usesStep("f", "o", "far", "v1", &.{}), .why = "zr-test/other:1 is not in the tests' images directory" },
         .{ .step = usesStep("m", "o", "multi", "v1", &.{}), .why = "line 1: multi-stage" },
         // One that cannot be fetched is not a reason: native "Set up job" fails with it.
@@ -450,10 +577,180 @@ test "preload: a JavaScript action, a local one, or an image not in the store se
         job.github.server_url = "file:///srv/git";
         var b = try Backend.init(arena, std.testing.io, std.testing.allocator, cfg);
         defer b.deinit();
-        const why = try preload(&b, job);
+        const why = try preload(&b, job, .bun);
         if (c.why) |want| {
             errdefer std.debug.print("got: {?s}\n", .{why});
             try std.testing.expect(std.mem.indexOf(u8, why orelse "", want) != null);
         } else try std.testing.expect(why == null);
+    }
+}
+
+test "JavaScript actions natively: pre, main and post with their inputs, state, outputs and post-if" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    // The runtime's image, as `js.runtimes` names it, with a stand-in for Bun that runs the
+    // "JavaScript" as a shell script: what is tested is everything around the runtime.
+    const rt = js.runtimes.get(.bun);
+    cfg.images = try docker_action.testImage(arena, &tmp, rt.image, "{}");
+    const bin = try std.fmt.allocPrint(arena, "images/{s}/rootfs{s}", .{ try images.key(arena, rt.image), rt.binary });
+    try tmp.dir.createDirPath(io, std.fs.path.dirnamePosix(bin).?);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = bin,
+        .data = "#!/bin/sh\nexec /bin/sh \"$@\"\n",
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
+    try testRepo(arena, &tmp, "js", &.{
+        .{
+            "action.yml",
+            \\inputs:
+            \\  who:
+            \\    default: nobody
+            \\runs:
+            \\  using: node24
+            \\  pre: pre.js
+            \\  main: main.js
+            \\  post: post.js
+            \\  post-if: success()
+        },
+        .{ "pre.js", "echo \"pre $INPUT_WHO\"; echo phase=pre >> \"$GITHUB_STATE\"\n" },
+        .{ "main.js", "echo \"main $INPUT_WHO state=$STATE_phase repo=$GITHUB_ACTION_REPOSITORY " ++
+            "node=$(command -v node) npx=$(command -v npx)\"\n" ++
+            "echo out=42 >> \"$GITHUB_OUTPUT\"; echo phase=main >> \"$GITHUB_STATE\"\n" },
+        .{ "post.js", "echo \"post state=$STATE_phase\"\n" },
+    });
+    try testRepo(arena, &tmp, "jsno", &.{
+        .{ "action.yml", "runs:\n  using: node20\n  main: main.js\n  post: post.js\n  post-if: failure()\n" },
+        .{ "main.js", "echo second main\n" },
+        .{ "post.js", "echo never\n" },
+    });
+    const who = [_]job_mod.Input{.{ .name = "who", .value = .{ .lit = "world" } }};
+    var s2 = testStep("echo OUT=$OUT");
+    s2.env = &.{.{ .name = "OUT", .value = .{ .expr = "steps.js.outputs.out" } }};
+    var job = testJob(&.{ usesStep("js", "o", "js", "v1", &who), s2, usesStep("no", "o", "jsno", "v1", &.{}) });
+    job.github.server_url = "file:///srv/git";
+
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const text = w.written();
+    errdefer std.debug.print("{s}\n", .{text});
+    try std.testing.expect(res.succeeded);
+    const expect = [_][]const u8{
+        "Engine: native",
+        "pre world",
+        "main world state=pre repo=o/js node=/github/_runtime/bin/node npx=/github/_runtime/bin/npx",
+        "OUT=42",
+        "second main",
+        "post state=main",
+    };
+    for (expect) |e| if (std.mem.indexOf(u8, text, e) == null) {
+        std.debug.print("missing {s}\n", .{e});
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(std.mem.indexOf(u8, text, "never") == null);
+}
+
+/// The job's own repository `o/r` with `files`, served so a job can fetch its commit by sha with
+/// no blobs (a checkout, `readOwn`); its commit.
+fn ownRepo(arena: Allocator, tmp: *std.testing.TmpDir, files: []const [2][]const u8) ![]const u8 {
+    try testRepo(arena, tmp, "r", files);
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena);
+    const script = try std.fmt.allocPrint(arena,
+        \\set -e
+        \\cd '{s}/git/o/r.git'
+        \\git config uploadpack.allowFilter true
+        \\git config uploadpack.allowAnySHA1InWant true
+        \\git rev-parse v1
+    , .{root});
+    const res = try std.process.run(arena, std.testing.io, .{ .argv = &.{ "sh", "-c", script } });
+    if (res.term != .exited or res.term.exited != 0) return error.GitFailed;
+    return std.mem.trim(u8, res.stdout, "\n");
+}
+
+test "local actions natively: judged from the job's commit before the job, read from the workspace in it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testActions(arena, &tmp);
+    try tmp.dir.createDirPath(std.testing.io, "work/r/.github/actions/hello");
+    try tmp.dir.createDirPath(std.testing.io, "work/r/.github/actions/img");
+    try tmp.dir.createDirPath(std.testing.io, "work/r/.github/actions/built");
+    const sha = try ownRepo(arena, &tmp, &.{
+        .{
+            ".github/actions/hello/action.yml",
+            \\inputs:
+            \\  x: {}
+            \\runs:
+            \\  using: composite
+            \\  steps:
+            \\    - shell: bash
+            \\      run: echo local composite ${{ inputs.x }}
+            \\    - uses: ./.github/actions/img
+        },
+        .{
+            ".github/actions/img/action.yml",
+            \\runs:
+            \\  using: docker
+            \\  image: docker://zr-test/base:1
+            \\  entrypoint: sh
+            \\  args: ["-c", "echo local image action in $PWD"]
+        },
+        .{ ".github/actions/built/action.yml", "runs:\n  using: docker\n  image: Dockerfile\n" },
+        .{ ".github/actions/built/Dockerfile", "FROM zr-test/base:1\n" },
+    });
+    const x = [_]job_mod.Input{.{ .name = "x", .value = .{ .lit = "yes" } }};
+    var co = testStep("");
+    co.action = .{ .checkout = &.{} };
+    var hello = testStep("");
+    hello.action = .{ .uses = .{ .owner = "", .name = "", .path = ".github/actions/hello", .ref = "", .inputs = &x, .local = true } };
+    var job = testJob(&.{ co, hello });
+    job.github.server_url = "file:///srv/git";
+    job.github.sha = sha;
+
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const text = w.written();
+    errdefer std.debug.print("{s}\n", .{text});
+    try std.testing.expect(res.succeeded);
+    for ([_][]const u8{ "Engine: native", "local composite yes", "local image action in /github/workspace" }) |e|
+        if (std.mem.indexOf(u8, text, e) == null) {
+            std.debug.print("missing {s}\n", .{e});
+            return error.TestUnexpectedResult;
+        };
+
+    // Not at the job's commit, or built from a Dockerfile in the workspace: to Dagger.
+    const Case = struct { path: []const u8, why: []const u8 };
+    for ([_]Case{
+        .{ .path = "made/by/a/step", .why = "is not in o/r at" },
+        .{ .path = ".github/actions/built", .why = "Dockerfile in the workspace" },
+    }) |c| {
+        var st = testStep("");
+        st.action = .{ .uses = .{ .owner = "", .name = "", .path = c.path, .ref = "", .local = true } };
+        var j = testJob(&.{st});
+        j.github.server_url = "file:///srv/git";
+        j.github.sha = sha;
+        var b = try Backend.init(arena, std.testing.io, std.testing.allocator, cfg);
+        defer b.deinit();
+        const why = try preload(&b, j, .bun);
+        errdefer std.debug.print("got: {?s}\n", .{why});
+        try std.testing.expect(std.mem.indexOf(u8, why orelse "", c.why) != null);
     }
 }

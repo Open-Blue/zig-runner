@@ -1161,6 +1161,7 @@ pub fn actionTreeQuery(
 /// so the repository must have been checked out first (GitHub says the same). Nothing is
 /// mounted: the action's files are already there.
 pub fn loadLocal(x: *Exec, u: job_mod.Uses) !LoadResult {
+    if (x.native) |b| return @import("../native/actions.zig").loadLocal(b, x, u);
     const arena = x.arena;
     const abs = if (u.path.len > 0) try std.fmt.allocPrint(
         arena,
