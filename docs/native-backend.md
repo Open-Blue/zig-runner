@@ -106,8 +106,9 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
   `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:` or `options:`, `services:`
   on a rootless runner or with an image given by an expression (native since P6, below, their
-  images pulled by P3), `uses:` actions, `docker://` steps whose image cannot be pulled or runs as a non-root `USER`
-  (P7), Dagger in steps
+  images pulled by P3), JavaScript and local `uses:` actions (P7, `actions.preload`), remote `uses:` actions in an
+  image with no git to fetch them with, `docker://` images
+  that cannot be pulled or run as a non-root `USER` (P7), Dagger in steps
   (`RUNNER_DAGGER_NESTING`), `hashFiles()`
   anywhere in the job (it reads the container through Dagger), a checkout with submodules, and a
   machine whose probe fails (no user namespaces, nftables refusing the jobs' rules, no default
@@ -875,9 +876,8 @@ Dagger.** What it covers, as built:
 - Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a `docker://` image
   that is not in the store (or no store), and an image whose `USER` is not root (GitHub's
   documentation requires root for Docker actions; Dagger's path gives another user the
-  directories it writes, which here needs an idmapped share, below). `uses:` actions, Docker ones
-  among them, still go to Dagger: which kind an action is, is known only once its `action.yml` is
-  fetched, and the choice of backend is made before the job starts.
+  directories it writes, which here needs an idmapped share, below). For `uses:` actions, see
+  "The action loader" below.
 - Parity kept explicitly: on a root runner with steps as the runner user, what the action made or
   changed in the workspace is given to the runner user afterwards (the files in the step's layer
   under the workspace, through no symlink), as Dagger copies the workspace back owned by it; a
@@ -886,14 +886,16 @@ Dagger.** What it covers, as built:
 
 What it does not do yet, and who pays:
 
-- **`uses:` Docker actions** (an `action.yml` with `image: docker://...` or a Dockerfile). They
-  need the action's metadata before the job starts: a native action loader (the action's
-  `action.yml` fetched over GitHub's API, then the action's tree for a Dockerfile), which is the
-  same work JavaScript actions need. Debt of P7's next pull request, with the Dockerfile builder
-  (a native interpreter of `FROM`, `RUN`, `COPY`/`ADD`, `ENV`, `WORKDIR`, `ENTRYPOINT`, `CMD`,
-  `ARG`, `USER`, `LABEL`, each instruction a keyed layer on P2's store).
-- **Images with a non-root `USER`.** They need the shares idmapped so the image's user owns them,
-  as Dagger's `owner:` does. Debt of the same pull request.
+- **JavaScript actions.** They need a JavaScript runtime mounted into the job's image, which the
+  Dagger path takes from its own runtime image (`js.zig`); natively that is a pull of that image
+  (P3) and a bind. Until then a job with one, at any depth of composite actions, goes to Dagger.
+  Debt of P7, paid once P3's store lands.
+- **Local actions** (`uses: ./path`, at the top or nested). They are read from the workspace
+  once a step has checked it out, after the backend is chosen, so the job goes to Dagger. A
+  pre-flight that reads the job's own repository at its commit (as the checkout will) would
+  decide them; debt of P7.
+- **Images with a non-root `USER`, and a `RUN` as one.** They need the shares idmapped so the
+  image's user owns them, as Dagger's `owner:` does. Debt of P7.
 - **The pull.** Images come from the operator's directory until P3's store replaces
   `images.lookup`.
 - **Small differences from Dagger's path**, none visible to an action that follows GitHub's
@@ -906,8 +908,7 @@ What it does not do yet, and who pays:
   on GitHub (`docker run`). Nothing the runner does can hide a program's own arguments; secrets
   belong in `env:`.
 
-**The Dockerfile builder** (`runner/src/native/dockerfile.zig`, a stacked pull request, not yet
-reachable: it waits for the action loader above). `parse` reads a Dockerfile as Docker's parser
+**The Dockerfile builder** (`runner/src/native/dockerfile.zig`). `parse` reads a Dockerfile as Docker's parser
 does (comments, parser directives, `\` continuations, either case, JSON and shell forms); `plan`
 evaluates `FROM`, `RUN`, `COPY`, `ADD`, `ENV`, `WORKDIR`, `ENTRYPOINT`, `CMD`, `ARG`, `USER` and
 `LABEL` into the image's config and one key per instruction, chained from the base's:
@@ -919,10 +920,38 @@ layer from the store by its key, or makes it (`COPY`/`ADD` by the runner, as Doc
 sources; `RUN` through a `Runner`, the sandbox) and publishes it (`layers.zig`, the stand-in for
 P2's store: "the layer under K, or store this directory under K", by rename). It refuses, with
 the line and why: multi-stage builds, `COPY --from`, wildcards, `ADD` of a URL or an archive,
-`SHELL`, `ONBUILD`, heredocs, sources outside the context, and `--chown` by name. Left for the
-loader's pull request: a `Runner` over the sandbox (`Spec.Container` with the built layers as
-its lowers instead of one rootfs), the build context taken from the fetched action, and the
-image config's `USER` honoured.
+`SHELL`, `ONBUILD`, heredocs, sources outside the context, and `--chown` by name.
+
+The `Runner` is the sandbox (`docker_action.BuildRunner`): a `RUN` runs as a container whose
+lowers are the image's layers so far, each idmapped on a root runner, and whose upper is the
+build's new layer in the store (`Backend.execBuild`: the job gets no layer). What it writes has
+the job's host ids; they are shifted back to the image's own afterwards (`unshift`), so a stored
+layer is the same whichever job's range built it and can be idmapped into any job, as the
+`COPY` layers the runner writes are. The built image runs as a `docker://` one does, with its
+layers as the container's lowers. Layers live under `RUNNER_NATIVE_STORE/layers`, in P2's store,
+each under the builder's key hashed with the store's format and the job's trust scope
+(`layers.Store.key`): a job the runner does not vouch for, or a vouched fork's pull request,
+builds its own layers and never leaves one a trusted job takes.
+
+**The action loader** (`runner/src/native/actions.zig`). The backend stays chosen per job, never
+per step (a switch would need the native layers exported into Dagger). What a `uses:` action is
+is in its `action.yml`, so before "Set up job", with nothing logged, `preload` fetches every
+remote action of the job, composite actions' nested ones too, by git in the job's image into
+the job's layers at the path Dagger mounts them (`/github/_actions/<owner>/<repo>/<ref>`): only
+the commit, the job's token for its own repository and none for others, as Dagger's `git` does.
+It runs in the base (`Backend.base`), once the job's image is pulled and provisioned and before
+the base's own layer, so any image fetches with its own git (an image with none sends the job to
+Dagger, whose git is its own). Each fetched tree is keyed by its repository, place and resolved
+commit (`Backend.keyFetched`), not by when it was fetched: under step caching it is stored or
+taken from the store like a step's layer, and the base and the steps above it keep their keys
+from job to job. If one is something native cannot run yet (below), the job goes to Dagger with
+the reason (`error.NativeToDagger`), and Dagger fetches again; otherwise "Set up job" takes them from the Backend (`Exec.loadAction`) and
+logs "Download action repository ... (SHA:...)" as on Dagger. An action that cannot be fetched
+is not a reason: native "Set up job" fails with it, as Dagger's does. Native runs Docker actions
+(a `docker://` image, or built from the Dockerfile in the fetched tree, the context opened
+through no symlink) and composite actions (their steps are the shared code's: scripts, nested
+`uses:`, nested checkouts through `Backend.fetchCheckout`, `docker://` steps). In a container,
+the job's binds go only where the image has the path.
 
 **For P3 and P2, what to swap when they land:**
 
@@ -1558,3 +1587,21 @@ Surprises:
 
 Measured: 11.3 ms a `docker://` step natively on the laptop (rootless), against a cold `run:` step
 at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
+
+### P7: the action loader and the builder's runner
+
+- **Per job, still.** The request was to choose the backend per step where needed. A step that
+  switched would start from layers the other backend does not have, so the choice stays per job,
+  and what needed per step was only the knowledge: fetching the actions before the choice gives
+  it. The fetch is not wasted when native runs: the trees are in the job's layers already, where
+  composite steps and Dockerfile contexts read them.
+- **Stored layers must not carry a job's ids.** On a root runner what a sandbox writes has the
+  job's host range; a layer stored that way would be another job's nobody. Overlay cannot idmap
+  its upper, so a build's `RUN` layer is shifted back to the image's ids when it ends and every
+  stored layer is idmapped when mounted, as the rootfs is.
+- **The job's binds are for the job's image.** Binding them into a Docker action's image, where
+  the target may not exist, failed the build's first `RUN` (a test bind at `/srv/git`); GitHub
+  gives an action's container none of the host's paths but the four it documents.
+- **Testing a fetch without a network.** The job's `server_url` can be a `file://` URL inside
+  the sandbox, with the test's bare repositories bound there, so the loader's tests run the real
+  git fetch in both native passes and never reach Dagger.

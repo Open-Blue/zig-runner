@@ -340,6 +340,19 @@ pub const Gate = struct {
     }
 
     /// The runner's native job's cgroup is about to be removed: read a last time, then no more.
+    /// The job went to the Dagger engine after `native` (a native set-up that found it cannot
+    /// run there): it takes the engine's cap again, and with no engine baseline nothing is learned
+    /// from it, rather than its native cgroup's few MB.
+    pub fn backToEngine(g: *Gate) void {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const s = &a.slots[g.slot];
+        s.native = false;
+        s.cgroup_len = 0;
+        s.base_mb = null;
+    }
+
     pub fn nativeDone(g: *Gate) void {
         const a = g.pool;
         a.mu.lockUncancelable(a.io);

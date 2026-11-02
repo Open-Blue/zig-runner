@@ -44,6 +44,7 @@ comptime {
     _ = @import("native/docker_action.zig");
     _ = @import("native/dockerfile.zig");
     _ = @import("native/layers.zig");
+    _ = @import("native/actions.zig");
     _ = @import("redact.zig");
     _ = @import("yaml.zig");
     _ = @import("action.zig");

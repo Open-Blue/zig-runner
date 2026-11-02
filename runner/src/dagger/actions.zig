@@ -585,7 +585,10 @@ pub fn runNestedCheckout(
         .ok => |c| c,
         .unsupported => |why| return x.actionFailed(num, "{s}", .{why}),
     };
-    const f = try checkout.fetch(arena, x.transport, x.job.*, co, x.gitAuth());
+    const f = if (x.native) |b|
+        try b.fetchCheckout(x, co)
+    else
+        try checkout.fetch(arena, x.transport, x.job.*, co, x.gitAuth());
     if (f.result == .failed) return x.actionFailed(num, "{s}", .{f.result.failed});
     const m = [_]Mount{.{ .dir = .{
         .path = f.mount,
@@ -1065,6 +1068,12 @@ pub fn nestedFailed(
 pub fn loadAction(x: *Exec, u: job_mod.Uses) !LoadResult {
     const key = try std.fmt.allocPrint(x.arena, "{s}/{s}/{s}@{s}", .{ u.owner, u.name, u.path, u.ref });
     if (x.actions.get(key)) |lr| return lr;
+    // On the native backend every remote action was fetched before the job started
+    // (`native/actions.zig`).
+    if (x.native) |b| if (b.actions.get(key)) |lr| {
+        try x.actions.put(x.arena, key, lr);
+        return lr;
+    };
     const lr = try x.fetchAction(u);
     try x.actions.put(x.arena, key, lr);
     return lr;

@@ -832,6 +832,10 @@ pub fn run(
             });
         } else if (try runNative(arena, io, opts, cfg, job, log, &opts.backend_note)) |r| {
             return r;
+        } else if (cfg.gate) |g| {
+            // Native set the job up (its cgroup told the gate) and then sent it here (P7's
+            // preload): the gate measures it on the engine again, learning nothing from it.
+            g.backToEngine();
         }
     }
     var env = try environ.clone(arena);
@@ -935,7 +939,18 @@ fn runNative(
     b.caches = .of(opts_in);
     // Which ids the job's steps have, as "Set up job" says (`Backend.idsNote`).
     opts.backend_note = try b.idsNote(arena);
-    return try runSteps(arena, io, opts, job, &sh, results, b.transport(), &b);
+    return runSteps(arena, io, opts, job, &sh, results, b.transport(), &b) catch |e| switch (e) {
+        // What its `uses:` actions are is known once they are fetched, in the job's image as the
+        // base pulled and provisioned it: one native cannot run yet sends the job to Dagger,
+        // before anything is logged (`native/actions.zig`).
+        error.NativeToDagger => {
+            dagger_note.* = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{
+                b.to_dagger,
+            });
+            return null;
+        },
+        else => return e,
+    };
 }
 
 /// What every task of a job shares: the log, and one slot per log step — the job's steps, then

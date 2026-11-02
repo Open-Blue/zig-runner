@@ -1,0 +1,3 @@
+kind: Added
+body: 'Native steps run `uses:` actions (behind `RUNNER_BACKEND=native`): every remote action is fetched by git in the job''s image before "Set up job" and read from there, Docker actions run natively (with a `docker://` image from the native image store, or built from their Dockerfile into keyed layers kept under the native store and reused across jobs), and composite actions run their steps natively. A job with a JavaScript action or a local action (`uses: ./...`) still runs on Dagger, and "Set up job" says why.'
+time: 2026-11-01T18:00:00.000000-04:00
