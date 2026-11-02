@@ -466,21 +466,29 @@ fn readSpec(arena: Allocator) !Spec {
     return readJsonLine(Spec, arena);
 }
 
-/// A helper's spec: one line of JSON on stdin (`readSpec`; `forward.zig`'s too).
+/// A helper's spec: one line of JSON on stdin (`readSpec`; `forward.zig`'s too). Read as it comes,
+/// not a byte at a time (a step's spec, its env and files, is tens of KB: as many reads, the
+/// larger part of a helper's start): its writer writes the line and nothing after it, keeping
+/// the pipe open only as the lifeline, so no read takes anything past the line's end.
 pub fn readJsonLine(comptime T: type, arena: Allocator) !T {
     var data: std.ArrayList(u8) = .empty;
-    while (true) {
-        var c: [1]u8 = undefined;
-        const rc = linux.read(0, &c, 1);
+    var buf: [64 * 1024]u8 = undefined;
+    const line = while (true) {
+        const rc = linux.read(0, &buf, buf.len);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
             else => return error.ReadFailed,
         }
-        if (rc == 0 or c[0] == '\n') break;
-        try data.append(arena, c[0]);
-    }
-    return std.json.parseFromSliceLeaky(T, arena, data.items, .{ .allocate = .alloc_always });
+        if (rc == 0) break data.items;
+        const got = buf[0..rc];
+        if (std.mem.indexOfScalar(u8, got, '\n')) |end| {
+            try data.appendSlice(arena, got[0..end]);
+            break data.items;
+        }
+        try data.appendSlice(arena, got);
+    };
+    return std.json.parseFromSliceLeaky(T, arena, line, .{ .allocate = .alloc_always });
 }
 
 fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper) u8 {
