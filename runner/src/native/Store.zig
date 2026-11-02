@@ -1862,6 +1862,70 @@ test "native store: collect keeps a whole layer no job holds while the store is 
     try std.testing.expect(try s.open(arena, io, k) == null);
 }
 
+test "native store: over its cap, collect evicts the least recently used layers until it fits, no more" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    var keys: [3]Key = undefined;
+    var bytes: u64 = 0;
+    for (&keys, [_][]const u8{ "up0", "up1", "up2" }) |*k, name| {
+        k.*, const l = try testLayer(arena, io, tmp, &s, name);
+        bytes = try treeBytes(arena, io, l.fs);
+        l.lock.close(io);
+    }
+    // Used in the order 1, 0, 2 (an open is a use): room for two, so 1 goes, and only 1.
+    for ([_]usize{ 1, 0, 2 }) |i| {
+        (try s.open(arena, io, keys[i])).?.layer.lock.close(io);
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    s.max_bytes = 2 * bytes;
+    s.collect(arena, io);
+    try std.testing.expect(try s.open(arena, io, keys[1]) == null);
+    (try s.open(arena, io, keys[0])).?.layer.lock.close(io);
+    (try s.open(arena, io, keys[2])).?.layer.lock.close(io);
+}
+
+test "native store: a step's log past the limit, or a base's file commands, are not published" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}) };
+    try prepare(arena, io, s.root, .{ .check_parents = false });
+    try tmp.dir.createDirPath(io, "up");
+    const upper = try std.fmt.allocPrint(arena, "{s}/up", .{root});
+    var kh: KeyHasher = .plain("test");
+    const k = kh.final();
+    const big = try arena.alloc(u8, max_record_bytes + 1);
+    @memset(big, 'x');
+    const ran = "::zig-file-command::ran\nj1\n";
+    try std.testing.expectError(error.RecordTooLarge, s.publish(arena, io, k, .step, upper, .{ .log = big, .fc = ran }));
+    try std.testing.expectError(error.ShortRecord, s.publish(arena, io, k, .base, upper, .{ .log = "", .fc = "x" }));
+    try std.testing.expectError(error.ShortRecord, s.publish(arena, io, k, .fetch, upper, .{ .log = "", .fc = "x" }));
+    try tmp.dir.access(io, "up", .{});
+    // At the limit, both are: and a base, whose record is empty, is kept by `collect` too.
+    const fc = try arena.alloc(u8, max_record_bytes);
+    @memset(fc, 'x');
+    @memcpy(fc[0..ran.len], ran);
+    (try s.publish(arena, io, k, .step, upper, .{ .log = big[0..max_record_bytes], .fc = fc })).lock.close(io);
+    (try s.open(arena, io, k)).?.layer.lock.close(io);
+    try tmp.dir.createDirPath(io, "base");
+    var kb: KeyHasher = .plain("base");
+    const k_base = kb.final();
+    const base_up = try std.fmt.allocPrint(arena, "{s}/base", .{root});
+    (try s.publish(arena, io, k_base, .base, base_up, .{ .log = "", .fc = "" })).lock.close(io);
+    s.collect(arena, io);
+    (try s.open(arena, io, k_base)).?.layer.lock.close(io);
+    (try s.open(arena, io, k)).?.layer.lock.close(io);
+}
+
 test "native store: a layer whose file commands or tree changed is not replayed" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
