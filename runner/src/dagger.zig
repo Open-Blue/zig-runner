@@ -39,6 +39,7 @@ const basePlan = @import("dagger/set_up.zig").basePlan;
 const baseContainerId = @import("dagger/set_up.zig").baseContainerId;
 const Base = @import("dagger/set_up.zig").Base;
 pub const Backend = @import("native/Backend.zig");
+const docker_action = @import("native/docker_action.zig");
 const execFor = @import("dagger/set_up.zig").execFor;
 const setUpJob = @import("dagger/set_up.zig").setUpJob;
 const package_cache_dirs = @import("dagger/set_up.zig").package_cache_dirs;
@@ -823,6 +824,7 @@ pub fn run(
     if (opts.native) |cfg| {
         // What the job uses, then what this machine can do (found once per process).
         const why = Backend.unsupported(io, job, opts, cfg) orelse
+            try docker_action.unsupported(arena, opts.gpa, io, job, cfg) orelse
             Backend.usable(arena, io, opts.gpa, cfg);
         if (why) |w| {
             opts.backend_note = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{

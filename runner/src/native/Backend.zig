@@ -315,7 +315,8 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         "runner)";
     for (job.steps) |step| switch (step.action) {
         .uses => return "`uses:` actions are not native yet (phase 7)",
-        .docker => return "`docker://` steps are not native yet (phase 7)",
+        // Native when their image is in the native store (`docker_action.unsupported`).
+        .docker => {},
         .checkout => |inputs| for (inputs) |in| {
             if (!std.mem.eql(u8, in.name, "submodules")) continue;
             const lit = switch (in.value) {
@@ -936,7 +937,7 @@ fn detachNetns(arena: Allocator, path: []const u8) void {
     _ = std.os.linux.umount2(p, std.os.linux.MNT.DETACH);
 }
 
-const removeTree = Store.removeTree;
+pub const removeTree = Store.removeTree;
 
 /// Removes the job directories no runner holds (their runner died), their network namespaces'
 /// mounts, and their cgroups under `cg_parent`. A directory still being made (`.new-`) is left
@@ -1502,7 +1503,12 @@ pub fn readFile(b: *Backend, path: []const u8) ?[]const u8 {
     };
 }
 
-const max_read = 16 * 1024 * 1024;
+pub const max_read = 16 * 1024 * 1024;
+
+/// Layer `i`'s path (P7's callers; P2's `Layer.path`).
+pub fn layerPath(b: *Backend, i: usize) ![]const u8 {
+    return b.layers.items[i].path;
+}
 
 /// `dagger.Transport` for the shared code: the native backend has no Dagger session, so a query
 /// is a bug in what decided the job could run here (`unsupported`).
@@ -1534,6 +1540,21 @@ fn exec(
     uid: u32,
     gid: u32,
     out: sandbox.Output,
+) !sandbox.Ended {
+    return b.execOn(&.{ "sh", "-c", script }, env, files, uid, gid, out, null);
+}
+
+/// `exec` of `argv`, in a Docker action's `container` when it has one (`docker_action.zig`):
+/// the new layer is then where what it writes into the job's shared directories lands.
+pub fn execOn(
+    b: *Backend,
+    argv: []const []const u8,
+    env: []const []const u8,
+    files: []const sandbox.Spec.File,
+    uid: u32,
+    gid: u32,
+    out: sandbox.Output,
+    container: ?sandbox.Spec.Container,
 ) !sandbox.Ended {
     const arena = b.arena;
     if (b.layers.items.len >= b.flatten_at) b.flatten() catch |e| return if (e == error.LayerNotShifted) e else .{
@@ -1572,7 +1593,7 @@ fn exec(
         .workdir = b.workdir,
         .uid = uid,
         .gid = gid,
-        .argv = &.{ "sh", "-c", script },
+        .argv = argv,
         .env = env,
         .files = files,
         .binds = b.binds,
@@ -1584,6 +1605,7 @@ fn exec(
         .image_layers = @intCast(b.seed_layers.items.len + 1),
         .canonical = canonical,
         .volume_id_base = volumeIdBase(b.subid_base),
+        .container = container,
     }, &b.running, out);
     try b.layers.append(arena, .{ .name = upper, .path = upper_path });
     return ended;
@@ -1940,16 +1962,31 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
 
 /// `image` pulled into the store, or found there (`oci/image.zig`), within `pull_deadline`.
 fn pull(b: *Backend, image: []const u8, creds: ?registry.Credentials, why: *[]const u8) !oci.Image {
+    return pullAt(b.arena, b.gpa, b.io, b.store_cfg.root, b.how.userns == .mapped, image, creds, why);
+}
+
+/// `pull` without a job (`docker_action.unsupported`, which decides the backend before the job
+/// starts): into the store at `root`, with the image's owners when `owners` (a root runner).
+pub fn pullAt(
+    arena: Allocator,
+    gpa: Allocator,
+    io: std.Io,
+    root: []const u8,
+    owners: bool,
+    image: []const u8,
+    creds: ?registry.Credentials,
+    why: *[]const u8,
+) !oci.Image {
     var local: std.http.Client = .{
-        .allocator = b.gpa,
-        .io = b.io,
+        .allocator = gpa,
+        .io = io,
         .write_buffer_size = http.write_buffer_size,
     };
     defer local.deinit();
-    const store: ImageStore = .{ .root = b.store_cfg.root };
-    const req: oci.Request = .{ .image = image, .creds = creds, .owners = b.how.userns == .mapped };
-    const r = try http.within(b.io, pull_deadline, pullWithin, .{
-        b.arena, b.gpa, b.io, http.client(&local), store, req, why,
+    const store: ImageStore = .{ .root = root };
+    const req: oci.Request = .{ .image = image, .creds = creds, .owners = owners };
+    const r = try http.within(io, pull_deadline, pullWithin, .{
+        arena, gpa, io, http.client(&local), store, req, why,
     });
     return (r orelse {
         why.* = "it took longer than 30 minutes";
@@ -2176,21 +2213,21 @@ fn envStrings(b: *Backend, extra: []const job_mod.EnvVar) ![]const []const u8 {
 
 /// A secret's value from its id. On this backend `Secrets` registers values without a session
 /// (`Secrets.local`), so the id is only a name for the value.
-fn plaintext(x: *Exec, id: []const u8) []const u8 {
+pub fn plaintext(x: *Exec, id: []const u8) []const u8 {
     var it = x.secrets.ids.iterator();
     while (it.next()) |e| if (std.mem.eql(u8, e.value_ptr.*, id)) return e.key_ptr.*;
     return "";
 }
 
 /// A step's output fed to the job's log as Dagger's log stream feeds it: one span per exec.
-const Live = struct {
+pub const Live = struct {
     demux: *SpanDemux,
     arena: Allocator,
     /// Under step caching, the output as printed, for the store (`Store.Record.log`); null past
     /// `Store.max_record_bytes`, and the step is then not published.
     record: ?std.ArrayList(u8),
 
-    fn output(l: *Live) sandbox.Output {
+    pub fn output(l: *Live) sandbox.Output {
         return .{ .ptr = l, .chunkFn = chunk };
     }
 

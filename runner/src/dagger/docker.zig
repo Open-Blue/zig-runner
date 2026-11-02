@@ -468,6 +468,8 @@ pub fn runContainer(
 ) !?Exec.Out {
     const arena = x.arena;
     if (phase == .main) try x.logContainerStart(num, phase, dr);
+    // The native backend runs it in its image's filesystem (`native/docker_action.zig`).
+    if (x.native) |b| return @import("../native/docker_action.zig").run(b, x, num, dr, state);
     const busybox = (try x.busyboxFile(num)) orelse return null;
     const img = (try x.imageInfo(num, dr.image, dr.label)) orelse return null;
     const argv = (try x.containerArgv(num, dr, img)) orelse return null;

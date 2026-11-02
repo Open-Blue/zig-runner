@@ -1,10 +1,13 @@
-//! The images native services start from (docs/native-backend.md, P6): what a service needs of an
-//! image is its filesystem as a directory and its configuration (`Image`). P3's pull gives them
-//! (`fromPulled`, through `Backend.pullImage`).
+//! The images native services and Docker actions start from (docs/native-backend.md, P6, P7):
+//! what they need of an image is its filesystem as a directory and its configuration (`Image`).
+//! P3's pull gives them (`fromPulled`, through `Backend.pullImage` and `Backend.pullAt`).
 //!
-//! Tests (and the real-images root test) can instead fill a directory (`Backend.Config.images`):
-//! one entry per reference, named as the reference is written with each `/` as `+`
-//! (`postgres:17`, `ghcr.io+o+db:1`), holding `rootfs/` (the image's filesystem, as
+//! Tests (and the real-images root test) can instead fill a directory (`Backend.Config.images`),
+//! in one of two layouts, P6's for services (`find`) and P7's for Docker actions (`lookup`; its
+//! `<key>` is the normalised reference, percent-encoded, `key`). Debt: one layout.
+//!
+//! P6's layout (`find`): one entry per reference, named as the reference is written with each `/`
+//! as `+` (`postgres:17`, `ghcr.io+o+db:1`), holding `rootfs/` (the image's filesystem, as
 //! `docker export` gives it, owned as in the image) and `config.json` (its configuration, as
 //! `docker image inspect --format '{{json .}}'` prints it, or an OCI image configuration). A
 //! reference with no tag or digest is also looked for as `:latest`.
@@ -171,9 +174,9 @@ pub fn userIds(user: []const u8, passwd: []const u8, group: []const u8) ?Ids {
     var gid: ?u32 = null;
     if (std.fmt.parseInt(u32, u, 10)) |n| {
         uid = n;
-        gid = if (lookup(passwd, null, n)) |f| std.fmt.parseInt(u32, f[3], 10) catch null else null;
+        gid = if (entryOf(passwd, null, n)) |f| std.fmt.parseInt(u32, f[3], 10) catch null else null;
     } else |_| {
-        const f = lookup(passwd, u, null) orelse return null;
+        const f = entryOf(passwd, u, null) orelse return null;
         uid = std.fmt.parseInt(u32, f[2], 10) catch return null;
         gid = std.fmt.parseInt(u32, f[3], 10) catch return null;
     }
@@ -182,7 +185,7 @@ pub fn userIds(user: []const u8, passwd: []const u8, group: []const u8) ?Ids {
         if (std.fmt.parseInt(u32, g, 10)) |n| {
             gid = n;
         } else |_| {
-            const f = lookup(group, g, null) orelse return null;
+            const f = entryOf(group, g, null) orelse return null;
             gid = std.fmt.parseInt(u32, f[2], 10) catch return null;
         }
     }
@@ -193,7 +196,7 @@ pub const Ids = struct { uid: u32, gid: u32 };
 
 /// The fields of the line of an /etc/passwd or /etc/group naming `name` or id `id` (its third
 /// field).
-fn lookup(text: []const u8, name: ?[]const u8, id: ?u32) ?[4][]const u8 {
+fn entryOf(text: []const u8, name: ?[]const u8, id: ?u32) ?[4][]const u8 {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         var it = std.mem.splitScalar(u8, line, ':');
@@ -208,6 +211,80 @@ fn lookup(text: []const u8, name: ?[]const u8, id: ?u32) ?[4][]const u8 {
         if (id) |want| if ((std.fmt.parseInt(u32, f[2], 10) catch continue) == want) return f;
     }
     return null;
+}
+
+/// The reference as Docker resolves it: a registry host first (`docker.io` when the first part
+/// names none: no dot, no port, not `localhost`), `library/` for Docker Hub's official images, and
+/// `:latest` when there is neither a tag nor a digest. `alpine:3.22` is
+/// `docker.io/library/alpine:3.22`.
+pub fn normalize(arena: Allocator, ref: []const u8) ![]const u8 {
+    const slash = std.mem.indexOfScalar(u8, ref, '/');
+    const names_host = if (slash) |s| blk: {
+        const first = ref[0..s];
+        break :blk std.mem.indexOfAny(u8, first, ".:") != null or
+            std.mem.eql(u8, first, "localhost");
+    } else false;
+    const host = if (names_host) ref[0..slash.?] else "docker.io";
+    const path = if (names_host) ref[slash.? + 1 ..] else ref;
+    const library = std.mem.eql(u8, host, "docker.io") and
+        std.mem.indexOfScalar(u8, path, '/') == null;
+    const last = path[(std.mem.lastIndexOfScalar(u8, path, '/') orelse 0)..];
+    const tagged = std.mem.indexOfScalar(u8, path, '@') != null or
+        std.mem.indexOfScalar(u8, last, ':') != null;
+    return std.fmt.allocPrint(arena, "{s}/{s}{s}{s}", .{
+        host,
+        if (library) "library/" else "",
+        path,
+        if (tagged) "" else ":latest",
+    });
+}
+
+/// The directory name of `ref`'s image in the store: its normalised form, with every byte outside
+/// `[A-Za-z0-9._-]` as `%XX`, so two references never share one and none names a path.
+pub fn key(arena: Allocator, ref: []const u8) ![]const u8 {
+    const full = try normalize(arena, ref);
+    var out: std.ArrayList(u8) = .empty;
+    for (full) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-')
+            try out.append(arena, c)
+        else
+            try out.print(arena, "%{X:0>2}", .{c});
+    }
+    return out.items;
+}
+
+/// Whether an image's `USER` is root: unset, `root` or uid 0, with or without a group.
+pub fn runsAsRoot(user: []const u8) bool {
+    const name = user[0 .. std.mem.indexOfScalar(u8, user, ':') orelse user.len];
+    return name.len == 0 or std.mem.eql(u8, name, "root") or std.mem.eql(u8, name, "0");
+}
+
+/// `ref`'s image in the store at `dir`, or why it is not there.
+pub const Found = union(enum) { image: Image, missing: []const u8 };
+
+pub fn lookup(arena: Allocator, io: std.Io, dir: []const u8, ref: []const u8) !Found {
+    if (dir.len == 0) return .{ .missing = "there is no images directory" };
+    const k = try key(arena, ref);
+    const rootfs = try std.fmt.allocPrint(arena, "{s}/{s}/rootfs", .{ dir, k });
+    std.Io.Dir.accessAbsolute(io, rootfs, .{}) catch return .{ .missing = try std.fmt.allocPrint(
+        arena,
+        "the image {s} is not in the tests' images directory (as {s})",
+        .{ ref, k },
+    ) };
+    const config_path = try std.fmt.allocPrint(arena, "{s}/{s}/config.json", .{ dir, k });
+    const text = std.Io.Dir.cwd().readFileAlloc(io, config_path, arena, .limited(4 << 20)) catch
+        return .{ .missing = try std.fmt.allocPrint(
+            arena,
+            "the image {s} has no config.json in the native image store",
+            .{ref},
+        ) };
+    var image = parseConfig(arena, text) catch return .{ .missing = try std.fmt.allocPrint(
+        arena,
+        "the image {s} has a config.json the runner cannot read",
+        .{ref},
+    ) };
+    image.rootfs = rootfs;
+    return .{ .image = image };
 }
 
 test "an image's configuration, from docker image inspect or an OCI configuration" {
@@ -274,4 +351,49 @@ test "an image's USER as ids, from its own /etc/passwd and /etc/group" {
     try std.testing.expectEqual(Ids{ .uid = 5, .gid = 6 }, userIds("5:6", passwd, group).?);
     try std.testing.expect(userIds("nobody", passwd, group) == null);
     try std.testing.expect(userIds("postgres:nogroup", passwd, group) == null);
+}
+
+test "references normalise as Docker resolves them, and key one directory each" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const Case = struct { []const u8, []const u8 };
+    for ([_]Case{
+        .{ "alpine", "docker.io/library/alpine:latest" },
+        .{ "alpine:3.22", "docker.io/library/alpine:3.22" },
+        .{ "bitnami/postgresql:17", "docker.io/bitnami/postgresql:17" },
+        .{ "docker.io/library/alpine:3", "docker.io/library/alpine:3" },
+        .{ "ghcr.io/acme/tool", "ghcr.io/acme/tool:latest" },
+        .{ "localhost:5000/x", "localhost:5000/x:latest" },
+        .{ "localhost/x:1", "localhost/x:1" },
+        .{ "alpine@sha256:abcd", "docker.io/library/alpine@sha256:abcd" },
+    }) |c| try std.testing.expectEqualStrings(c[1], try normalize(arena, c[0]));
+    try std.testing.expectEqualStrings(
+        "docker.io%2Flibrary%2Falpine%3A3.22",
+        try key(arena, "alpine:3.22"),
+    );
+    // Nothing in a key leaves its directory.
+    try std.testing.expectEqualStrings(
+        "..%2F..%2Fetc%3Alatest",
+        try key(arena, "../../etc"),
+    );
+}
+
+test "an OCI image config gives the entrypoint, command, env and user" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const img = try parseConfig(arena,
+        \\{"architecture":"amd64","config":{"Env":["PATH=/usr/bin","X=1"],
+        \\"Entrypoint":["/entry.sh"],"Cmd":null,"User":"","WorkingDir":"/app"},"rootfs":{}}
+    );
+    try std.testing.expectEqual(@as(usize, 1), img.entrypoint.len);
+    try std.testing.expectEqualStrings("/entry.sh", img.entrypoint[0]);
+    try std.testing.expectEqual(@as(usize, 0), img.cmd.len);
+    try std.testing.expectEqualStrings("X=1", img.env[1]);
+    try std.testing.expect(runsAsRoot(img.user));
+    try std.testing.expect(runsAsRoot("0:0") and runsAsRoot("root"));
+    try std.testing.expect(!runsAsRoot("1000") and !runsAsRoot("actionuser:actionuser"));
+    const bare = try parseConfig(arena, "{}");
+    try std.testing.expectEqual(@as(usize, 0), bare.env.len);
 }

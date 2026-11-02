@@ -106,7 +106,8 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
   `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:` or `options:`, `services:`
   on a rootless runner or with an image given by an expression (native since P6, below, their
-  images pulled by P3), `uses:` actions, `docker://` steps, Dagger in steps
+  images pulled by P3), `uses:` actions, `docker://` steps whose image cannot be pulled or runs as a non-root `USER`
+  (P7), Dagger in steps
   (`RUNNER_DAGGER_NESTING`), `hashFiles()`
   anywhere in the job (it reads the container through Dagger), a checkout with submodules, and a
   machine whose probe fails (no user namespaces, nftables refusing the jobs' rules, no default
@@ -832,6 +833,108 @@ built this phase was not allowed to start one on the laptop, so that figure is s
 - JavaScript actions move over here too, since they are scripts plus a runtime mount.
 - Exit: the actions tests pass on native.
 
+**Status: `docker://` steps landed (behind the knob); `uses:` Docker actions still go to
+Dagger.** What it covers, as built:
+
+- `runner/src/native/docker_action.zig` runs a `docker://` step as a sandbox in its image:
+  `sandbox.Spec.Container` gives the helper a second overlay (the image's filesystem, idmapped on
+  a root runner as the job's rootfs is, under a layer of the container's own that goes when the
+  step ends, as `docker run --rm`), and binds into it, from the job's overlay, the four
+  directories GitHub binds (`ContainerActionHandler.cs`): the workspace at `/github/workspace`,
+  and `/github/home`, `/github/file_commands` and `/github/workflow`. The job's overlay gets a
+  new layer as for any step, so what the action writes in the workspace, deletions included, is
+  in the job's next step without a copy. The command is started as `docker run` starts it (the
+  action's or the image's entrypoint, then its args or the image's command,
+  `Exec.containerArgv`, looked up in the image's PATH; 127 with Docker's message when it is not
+  there), in `/github/workspace`, as root, in the job's network, with the same capabilities,
+  seccomp filter and `no_new_privs` as a root step.
+- Everything the action is given is the Dagger path's, shared: `runImageStep` (inputs, `with:
+  args` split as a command line, `with: entrypoint`), the log group with its `image:` line,
+  `Exec.containerEnv` (the job's env without what GitHub sets again, the step's and the action's
+  env, INPUT_*, `HOME=/github/home`, the runtime's variables and the OIDC token), and
+  `Exec.collect` for the file commands. On top of the image's own `ENV`, as the container Dagger
+  starts from has it. The shared code changed in two lines: `runContainer` hands the run to
+  `docker_action.run` after the log group, and `dagger.run` asks `docker_action.unsupported`.
+- `runner/src/native/images.zig` is the narrowest image interface the actions need: for a
+  reference, its rootfs and the parts of its OCI config an action starts from (entrypoint, command,
+  env, user). Since the integration with P3 a `docker://` image is pulled natively
+  (`docker_action.find`, `Backend.pullAt`, before the job for `unsupported`). Before, and still in
+  the tests (`Config.images`), it read a directory (`RUNNER_NATIVE_IMAGES`, now gone), one image
+  per reference, keyed by the normalised reference with every byte outside `[A-Za-z0-9._-]`
+  percent-encoded (`alpine:3.22` is `docker.io%2Flibrary%2Falpine%3A3.22`):
+
+  ```
+  k='docker.io%2Flibrary%2Falpine%3A3.22'
+  mkdir -p "/var/lib/zig-runner/images/$k/rootfs"
+  docker create --name zr-img alpine:3.22 && docker export zr-img |
+    tar -x -C "/var/lib/zig-runner/images/$k/rootfs" && docker rm zr-img
+  docker image inspect --format '{"config":{{json .Config}}}' alpine:3.22 \
+    > "/var/lib/zig-runner/images/$k/config.json"
+  ```
+
+- Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a `docker://` image
+  that is not in the store (or no store), and an image whose `USER` is not root (GitHub's
+  documentation requires root for Docker actions; Dagger's path gives another user the
+  directories it writes, which here needs an idmapped share, below). `uses:` actions, Docker ones
+  among them, still go to Dagger: which kind an action is, is known only once its `action.yml` is
+  fetched, and the choice of backend is made before the job starts.
+- Parity kept explicitly: on a root runner with steps as the runner user, what the action made or
+  changed in the workspace is given to the runner user afterwards (the files in the step's layer
+  under the workspace, through no symlink), as Dagger copies the workspace back owned by it; a
+  later step can change what the action wrote. The runner's markers and the event variable are
+  not in the action's env, as the script's `env -u` leaves them out.
+
+What it does not do yet, and who pays:
+
+- **`uses:` Docker actions** (an `action.yml` with `image: docker://...` or a Dockerfile). They
+  need the action's metadata before the job starts: a native action loader (the action's
+  `action.yml` fetched over GitHub's API, then the action's tree for a Dockerfile), which is the
+  same work JavaScript actions need. Debt of P7's next pull request, with the Dockerfile builder
+  (a native interpreter of `FROM`, `RUN`, `COPY`/`ADD`, `ENV`, `WORKDIR`, `ENTRYPOINT`, `CMD`,
+  `ARG`, `USER`, `LABEL`, each instruction a keyed layer on P2's store).
+- **Images with a non-root `USER`.** They need the shares idmapped so the image's user owns them,
+  as Dagger's `owner:` does. Debt of the same pull request.
+- **The pull.** Images come from the operator's directory until P3's store replaces
+  `images.lookup`.
+- **Small differences from Dagger's path**, none visible to an action that follows GitHub's
+  documentation: `/github/home` is in the job's filesystem (Dagger keeps it beside the job's
+  container), `/github/file_commands` holds the earlier steps' files (Dagger's is empty per
+  action, as is GitHub's per step), and a command that cannot be found prints Docker's message
+  where busybox's `env` printed its own; both exit 127.
+- **A secret in `with: args`** is in the action's own command line, readable by the host's users
+  through `/proc/<pid>/cmdline`, as under Dagger (where busybox expands it into the command) and
+  on GitHub (`docker run`). Nothing the runner does can hide a program's own arguments; secrets
+  belong in `env:`.
+
+**For P3 and P2, what to swap when they land:**
+
+- P3's image store replaces `images.lookup(arena, io, dir, ref)`: return `Image{ rootfs, entrypoint,
+  cmd, env, user }` for the reference, pulled when missing. `docker_action.unsupported` then needs
+  no store check (an image is pulled, not refused) but keeps the `USER` check until the idmapped
+  shares; `Config.images` and `RUNNER_NATIVE_IMAGES` go.
+- P2's per-job helper: `sandbox.Spec.Container` is a field of the step's spec; the per-job helper
+  takes it with the step and mounts the container's overlay in the step's own namespace (the
+  job's overlay and its layer as for any step). Its layer store: the action's step always runs
+  (it has the job token) and is never keyed or replayed, as on Dagger; its layer is the job's
+  next one as any step's. The Dockerfile builder will store each instruction's layer under its
+  key there (`key = sha256(parent key, instruction, build args)`).
+
+**Measured** (laptop "cowbird", balanced profile, 2026-11-01, load about 3, rootless under
+`unshare`, the runner built `ReleaseSafe`, `--exec-job`, plain `ubuntu:24.04` as the rootfs and
+`alpine:3.22` in the image store, per step = (20-step job − 1-step job) / 19, median of 7):
+
+| | native | Dagger |
+|---|---|---|
+| `docker://alpine:3.22` with `entrypoint: true` | **11.3 ms** a step (1-step job 32 ms) | not measured here, see below |
+| `run: true`, same machine and load, for scale | 21.3 ms a step (1-step job 41 ms) | ~224 ms (P1) |
+
+A Docker action costs less than a `run:` step natively: no bash and no step script, and the
+image is a single small layer. On Dagger the same step is three queries (the workspace's
+directory, the exec with the busybox script, the copy back) besides the image's `from`, so it is
+at least the cold `run:` step's ~224 ms. Dagger could not be timed for this pull request: the
+laptop's engine for this runner's Dagger version was stopped, and starting one was not done
+without the user (the PR says how to take the figure).
+
 ### P8: remapping the Lean proofs
 
 - The theorems keep their shape; the code they cite changes. The "a container *is* its recipe"
@@ -1402,3 +1505,37 @@ Surprises:
   and an impossible `lowerdir=`; the layer is a link in the job's directory instead.
 - **The boundary held again**: two lines in `dagger/services.zig` hand "Initialize containers"
   and "Stop containers" over, and `JobLog.serviceLine` became public. No Dagger path changed.
+
+### P7: Docker actions (`docker://` steps)
+
+- **The script was the busybox's, not the action's.** Dagger's path starts a Docker action's
+  command under a static busybox it copies into the image, because the step script (markers, file
+  commands, the event, `env -u`) needs a shell and the image may have none. Natively the runner is
+  already outside the container with the output pipe in hand, so it writes the markers into the
+  log itself and makes and reads the file-command files from the job's layer; the action's own
+  command is PID 1's exec. It is also what GitHub's runner does: it binds host files in and reads
+  them afterwards, and runs no shell in the image.
+- **A bind is the copy back, for free.** Dagger copies the workspace into the action's container
+  and the result back over the job's (`withoutDirectory` + `withDirectory`). Mounting the job's
+  overlay with a new layer and binding its workspace into the container makes the action's writes,
+  deletions included, the job's next layer directly, as GitHub's `docker run -v` does.
+- **Two overlays in one helper.** On a root runner the job's overlay and the image's are both
+  mounted by the host's root before the helper enters the job's user namespace (the image's
+  filesystem idmapped like the rootfs), and the shares are bound in the step's own mount
+  namespace, recursively: a non-recursive bind of part of a mount made in a more privileged
+  namespace is refused.
+- **Ownership was Dagger's implicit gift.** `withDirectory(owner:)` gave the runner user every
+  file a root action wrote in the workspace; GitHub leaves them root's (a known annoyance). The
+  native path keeps Dagger's behaviour by walking only the step's layer under the workspace,
+  which holds exactly what the action changed, rather than the whole workspace.
+- **Deciding per job limits what can move.** `docker://` steps name their image in the job, so
+  the decision can be made before the job starts; a `uses:` action's kind is in its `action.yml`.
+  Moving `uses:` actions (Docker and JavaScript alike) needs their metadata fetched before the
+  choice, which is why the loader is the next piece, not the builder.
+- **`GITHUB_ACTION`, exit codes and logs follow Dagger's path, not GitHub's.** Dagger's path sets
+  `GITHUB_ACTION` to the step's label (`docker://alpine:3.22`) and logs no "Process completed with
+  exit code" for a Docker action; the native path does the same, so a job's results do not depend
+  on the backend.
+
+Measured: 11.3 ms a `docker://` step natively on the laptop (rootless), against a cold `run:` step
+at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
