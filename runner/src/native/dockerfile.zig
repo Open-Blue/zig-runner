@@ -875,7 +875,7 @@ test "build: COPY into its layer, RUN through the runner, and a second build tak
     const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
     const ctx = try std.fmt.allocPrint(arena, "{s}/ctx", .{root});
     const store_dir = try std.fmt.allocPrint(arena, "{s}/store", .{root});
-    try @import("Store.zig").prepare(arena, io, store_dir);
+    try @import("Store.zig").prepare(arena, io, store_dir, .{ .check_parents = false });
     var held: std.ArrayList(std.Io.File) = .empty;
     defer for (held.items) |f| f.close(io);
     const store: layers.Store = .{ .dir = store_dir, .store = .{ .root = store_dir }, .held = &held, .scope = "repo" };

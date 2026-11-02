@@ -23,6 +23,7 @@ const Exec = @import("../dagger/Exec.zig");
 const SpanDemux = @import("../dagger/JobLog.zig").SpanDemux;
 const scripts = @import("../dagger/scripts.zig");
 const dockerfile = @import("dockerfile.zig");
+const Store = @import("Store.zig");
 const layers = @import("layers.zig");
 
 const Allocator = std.mem.Allocator;
@@ -402,7 +403,7 @@ fn buildImage(b: *Backend, bd: Build) !Built {
 /// `dockerfile.Runner` over the sandbox: a RUN on the image's layers so far (each idmapped on a
 /// root runner, as the image's are when it runs), writing into the build's new layer. On a root
 /// runner what the RUN writes has the job's host ids; they are shifted back to the image's own
-/// (`unshift`), so the layer is the same whichever job's range built it.
+/// (`Store.unshift`), so the layer is the same whichever job's range built it.
 const BuildRunner = struct {
     b: *Backend,
     last: Backend.Captured = undefined,
@@ -443,52 +444,16 @@ const BuildRunner = struct {
             r.failure = ended.failure;
             return 125;
         }
-        if (mapped) unshift(b.io, upper, b.idBase());
+        // The layer gets the canonical ids, as P2 gives a step's before it is stored
+        // (`Store.unshift`, #276), so it serves every slot. Half shifted, it must not be stored.
+        if (mapped) Store.unshift(b.arena, b.io, upper, b.slotIds()) catch |e| {
+            r.failure = try std.fmt.allocPrint(b.arena, "the RUN's layer could not be given the " ++
+                "image's ids: {s}", .{@errorName(e)});
+            return 125;
+        };
         return ended.code;
     }
 };
-
-/// Gives everything in `layer` with an id of the job's range (`base` onwards) the image's own id
-/// (base subtracted), through no symlink.
-fn unshift(io: std.Io, layer: []const u8, base: u32) void {
-    var dir = std.Io.Dir.cwd().openDir(io, layer, .{ .follow_symlinks = false, .iterate = true }) catch return;
-    defer dir.close(io);
-    shiftOne(dir.handle, "", base, std.os.linux.AT.EMPTY_PATH);
-    shiftTree(io, dir, base, 0);
-}
-
-fn shiftOne(fd: std.os.linux.fd_t, name: [*:0]const u8, base: u32, flags: u32) void {
-    const linux = std.os.linux;
-    var st: linux.Statx = undefined;
-    const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true, .GID = true };
-    if (linux.errno(linux.statx(fd, name, flags | linux.AT.SYMLINK_NOFOLLOW, mask, &st)) != .SUCCESS)
-        return;
-    const in = struct {
-        fn f(id: u32, b: u32) u32 {
-            return if (id >= b and id - b < Backend.ids_per_slot) id - b else id;
-        }
-    }.f;
-    _ = linux.fchownat(fd, name, in(st.uid, base), in(st.gid, base), flags | linux.AT.SYMLINK_NOFOLLOW);
-    // chown clears set-id bits; the layer keeps the modes the RUN gave.
-    if (st.mode & (linux.S.ISUID | linux.S.ISGID) != 0 and st.mode & linux.S.IFMT != linux.S.IFLNK)
-        _ = linux.fchmodat(fd, name, st.mode & 0o7777);
-}
-
-fn shiftTree(io: std.Io, dir: std.Io.Dir, base: u32, depth: u32) void {
-    if (depth > 256) return;
-    var name: [std.fs.max_name_bytes + 1]u8 = undefined;
-    var it = dir.iterate();
-    while (it.next(io) catch null) |e| {
-        if (e.name.len >= name.len) continue;
-        @memcpy(name[0..e.name.len], e.name);
-        name[e.name.len] = 0;
-        shiftOne(dir.handle, name[0..e.name.len :0], base, 0);
-        if (e.kind != .directory) continue;
-        var sub = dir.openDir(io, e.name, .{ .follow_symlinks = false, .iterate = true }) catch continue;
-        defer sub.close(io);
-        shiftTree(io, sub, base, depth + 1);
-    }
-}
 
 /// The action's environment, as the Dagger path's container gives its command
 /// (`containerScript`): the image's `ENV`, GitHub's default variables with GITHUB_WORKSPACE at

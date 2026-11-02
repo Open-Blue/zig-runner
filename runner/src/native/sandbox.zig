@@ -79,6 +79,11 @@ pub const Spec = struct {
     /// by ids 0 to 65535 and, on a root runner, seen through the job's ids (`idmapLowers`). The
     /// Zig cache seeds' layers sit just above the rootfs (`volumes.zig`).
     image_layers: u32 = 1,
+    /// `mapped`: for each of the job's own layers (the first `lowers.len - image_layers`), whether
+    /// its files have the canonical ids, 0 to 65535 on disk (a stored layer: `Store.unshift`), and
+    /// are seen through the job's ids as the image's are; the others have the slot's host ids.
+    /// Missing entries are false.
+    canonical: []const bool = &.{},
     /// `mapped`: the first on-disk id of the cache volumes' range (`Bind.volume`), which the job
     /// sees as its 0 onwards.
     volume_id_base: u32 = 0,
@@ -474,7 +479,7 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
                 null;
             check("unshare(mount)", linux.unshare(linux.CLONE.NEWNS));
             makePrivate();
-            lowers = idmapLowers(arena, spec.lowers, spec.image_layers, userns);
+            lowers = idmapLowers(arena, spec.lowers, spec.image_layers, spec.canonical, userns);
             mountOverlay(arena, spec, lowers, false);
             if (spec.container) |c| {
                 const mapped = arena.alloc([]const u8, c.lowers.len) catch oom();
@@ -778,14 +783,17 @@ fn mappedUserns(inside: u32, base: u32, count: u32) linux.fd_t {
     return @intCast(fd);
 }
 
-/// The lower layers with the image's (the last `image_layers`: the rootfs, and the Zig cache
-/// seeds above it) replaced by `R`, `R1`, ..., each mounted there idmapped through `userns`: the
-/// host's root's files are the job's root's, its uid 1001's the job's 1001's, without a copy of
-/// a layer per range. Linux 5.19 lets overlay take an idmapped layer.
+/// The lower layers with the canonical ids replaced by mounts of them idmapped through `userns`:
+/// the image's (the last `image_layers`: the rootfs, and the Zig cache seeds above it) at `R`,
+/// `R1`, ..., and the job's own that are stored (`canonical`) at `S0`, `S1`, ... by position. The
+/// host's root's files are the job's root's, its uid 1001's the job's 1001's, whichever slot's
+/// range the job has, without a copy of a layer per range. Linux 5.19 lets overlay take an
+/// idmapped layer. The step's upper is not idmapped: what it writes has the slot's host ids.
 fn idmapLowers(
     arena: Allocator,
     lowers: []const []const u8,
     image_layers: u32,
+    canonical: []const bool,
     userns: linux.fd_t,
 ) []const []const u8 {
     const out = arena.dupe([]const u8, lowers) catch oom();
@@ -795,24 +803,37 @@ fn idmapLowers(
         idmapLayer(arena, lowers[lowers.len - 1 - k], at, userns);
         out[out.len - 1 - k] = at;
     }
+    for (0..lowers.len - n) |k| {
+        if (k >= canonical.len or !canonical[k]) continue;
+        const at = std.fmt.allocPrint(arena, "S{d}", .{k}) catch oom();
+        idmapLayer(arena, lowers[k], at, userns);
+        out[k] = at;
+    }
     return out;
 }
 
-/// One image layer `layer` mounted at `at` (in the job's directory) idmapped through `userns`.
+/// One layer `layer` with the canonical ids mounted at `at` (in the job's directory) idmapped
+/// through `userns`, read-only, nosuid and nodev. Overlay only reads a lower, and a step never
+/// sees this mount (its root is the overlay, the host's detached), so the flags take nothing from
+/// it: a set-id file in a layer works in the overlay as in the image, as the job's own ids
+/// (exec checks the overlay's mount, not the lower's). They keep the mount itself, should it ever
+/// be reached, from being written or lending its set-id files or devices.
 fn idmapLayer(arena: Allocator, layer: []const u8, at: []const u8, userns: linux.fd_t) void {
-    const rootfs = layer;
     const open_tree_clone = 1;
     const at_recursive = 0x8000;
     const tree = linux.syscall3(
         .open_tree,
         @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))),
-        @intFromPtr(z(arena, rootfs)),
+        @intFromPtr(z(arena, layer)),
         open_tree_clone | at_recursive | linux.SOCK.CLOEXEC,
     );
-    check("open the rootfs's mount", tree);
+    check("open a lower layer's mount", tree);
+    const rdonly = 0x1;
+    const nosuid = 0x2;
+    const nodev = 0x4;
     const idmap = 0x00100000;
-    var attr: MountAttr = .{ .set = idmap, .userns_fd = @intCast(userns) };
-    check("idmap the rootfs", linux.syscall5(
+    var attr: MountAttr = .{ .set = idmap | rdonly | nosuid | nodev, .userns_fd = @intCast(userns) };
+    check("idmap a lower layer", linux.syscall5(
         .mount_setattr,
         tree,
         @intFromPtr(""),
@@ -823,7 +844,7 @@ fn idmapLayer(arena: Allocator, layer: []const u8, at: []const u8, userns: linux
     const at_z = z(arena, at);
     _ = linux.mkdir(at_z, 0o755);
     const move_mount_f_empty_path = 4;
-    check("mount the idmapped rootfs", linux.syscall5(
+    check("mount an idmapped lower layer", linux.syscall5(
         .move_mount,
         tree,
         @intFromPtr(""),
