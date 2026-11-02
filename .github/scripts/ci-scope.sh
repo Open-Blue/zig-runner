@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Whether a pull request or a merge group can change what a group of CI's checks checks:
 #
-#   ci-scope.sh tests        Format, build and test; Database tests (ci.yml)
-#   ci-scope.sh binaries     Release builds (ci.yml)
+#   ci-scope.sh tests        Format, build and test; Database tests; Release builds and tests
+#                            (arm64) (ci.yml)
+#   ci-scope.sh binaries     Release builds; Release builds and tests (arm64) (ci.yml)
 #   ci-scope.sh e2e          End to end (ci.yml)
 #   ci-scope.sh proofs       Proofs (proofs.yml)
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)
@@ -59,11 +60,13 @@ needed() {
 	binaries)
 		# The release's binaries as build-binaries.sh compiles them: runner/src through the module
 		# graph zig-modules.sh gives the compiler, from the packages build.zig.zon pins (build.zig
-		# is listed too, so a change to the graph there builds them as well).
+		# is listed too, so a change to the graph there builds them as well), and the hardening
+		# checksec.sh checks them for.
 		case $1 in
 		runner/src/* | runner/build.zig | runner/build.zig.zon | .github/workflows/ci.yml | \
 			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
-			.github/scripts/build-binaries.sh | .github/scripts/zig-modules.sh) return 0 ;;
+			.github/scripts/build-binaries.sh | .github/scripts/zig-modules.sh | \
+			.github/scripts/checksec.sh) return 0 ;;
 		*) return 1 ;;
 		esac
 		;;
@@ -97,8 +100,8 @@ needed() {
 	packaging)
 		# How the release is built, not what: build-binaries.sh compiles runner/src through the module
 		# graph zig-modules.sh gives the compiler, from the packages build.zig.zon pins (a tls bump
-		# skipped these checks before it was listed, #107), and checked against build.zig's; sbom.sh
-		# reads build.zig.zon too. The image is the Dockerfile's, from a context .dockerignore trims,
+		# skipped these checks before it was listed, #107), and checked against build.zig's and for
+		# their hardening (checksec.sh); sbom.sh reads build.zig.zon too. The image is the Dockerfile's, from a context .dockerignore trims,
 		# scanned with .trivyignore.yaml's exceptions. deploy/, which runs the image (compose.yaml)
 		# and installs the binaries (zig-runner-deploy), is read by none of them, and listed as
 		# release.yml's path filter listed it. runner/src is ci.yml's: its tests, and the release's
@@ -108,7 +111,7 @@ needed() {
 			deploy/* | .trivyignore.yaml | .github/workflows/release.yml | \
 			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
 			.github/scripts/build-binaries.sh | .github/scripts/zig-modules.sh | \
-			.github/scripts/sbom.sh) return 0 ;;
+			.github/scripts/sbom.sh | .github/scripts/checksec.sh) return 0 ;;
 		*) return 1 ;;
 		esac
 		;;
