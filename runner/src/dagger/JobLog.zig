@@ -889,9 +889,15 @@ pub const SpanDemux = struct {
         // `max_line` what has come is a line of its own, rather than all of it held here. Cut
         // where no secret spans the cut (`redact.cut`): cut anywhere, a secret split between two
         // lines was shown, half on each. Held up to four times as long for such a place.
+        // A workflow command is not cut before then at all: its head would be carried out as a
+        // command of its own and its tail logged as text, so `::add-mask::` with a long value
+        // masked the value's start and logged the rest.
         if (span.partial.items.len >= d.max_line) {
-            const force = span.partial.items.len >= 4 * d.max_line;
-            if (d.sh.cutLine(span.partial.items, force)) |c| {
+            const p = span.partial.items;
+            const force = p.len >= 4 * d.max_line;
+            const command = std.mem.startsWith(u8, std.mem.trimStart(u8, p, &std.ascii.whitespace), "::") or
+                std.mem.indexOf(u8, p, "##[") != null;
+            if (if (command and !force) null else d.sh.cutLine(p, force)) |c| {
                 d.line(span, if (c.masked) redact.mask else span.partial.items[0..c.at]);
                 span.partial.replaceRangeAssumeCapacity(0, c.at, &.{});
                 if (span.partial.items.len == 0) span.partial.clearAndFree(d.gpa);
@@ -1319,6 +1325,13 @@ test "a long line is cut where it splits no secret" {
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "s3cret") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "value") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "***") != null);
+    // A command is not cut short of four times the length: cut, `::add-mask::` masked its
+    // value's start and logged the rest.
+    const add = "::add-mask::a-long-added-mask-value\n";
+    for (add) |ch| SpanDemux.onRecord(&sd, .{ .span = "s", .stream = 1, .text = &.{ch} });
+    SpanDemux.onRecord(&sd, .{ .span = "s", .stream = 1, .text = "then a-long-added-mask-value\n" });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "mask-value") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "then ***") != null);
 }
 
 test "output with no newline is cut into lines of max_line_bytes, not held whole" {
