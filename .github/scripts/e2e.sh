@@ -132,7 +132,7 @@ start() {
 			sleep 1
 		done
 		sudo test -e "$rootfs.ok" || { echo "no native rootfs (e2e.sh rootfs)" >&2 && exit 1; }
-		# Ubuntu 24.04's AppArmor blocks unprivileged user namespaces; ci.yml's Test lifts it too.
+		# Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; ci.yml's Test lifts it too.
 		sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
 		native=(RUNNER_NATIVE_ROOTFS="$rootfs")
 	fi
