@@ -3558,90 +3558,11 @@ test "root runner: a native job resolves through a nameserver only another inter
     const env = try std.testing.environ.createMap(arena);
     const required = std.mem.eql(u8, env.get("ZIG_RUNNER_REQUIRE_NATIVE") orelse "", "1");
 
-    // A resolver as Tailscale's MagicDNS is to razorbill: on no uplink, but on an interface of its
-    // own (here a veth to a network namespace of the test's, TEST-NET-2), with two addresses, and
-    // a TCP port that is not DNS. The host routes there, but the jobs' rules forward nothing
-    // there but DNS to the nameservers the job's resolver names.
-    const ns = "zrtest-dns";
-    const ip = struct {
-        fn run(ar: Allocator, args: []const []const u8) !void {
-            const argv = try std.mem.concat(ar, []const u8, &.{ &.{"ip"}, args });
-            const r = try std.process.run(ar, std.testing.io, .{ .argv = argv });
-            if (r.term != .exited or r.term.exited != 0) {
-                std.debug.print("ip {s}: {s}\n", .{ try std.mem.join(ar, " ", args), r.stderr });
-                return error.IpFailed;
-            }
-        }
+    var dns = TestResolver.start(arena) catch |e| switch (e) {
+        error.NoIp => return skip(required, "this machine has no `ip` (iproute2) for the resolver's network"),
+        else => return e,
     };
-    _ = std.process.run(arena, io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch
-        return skip(required, "this machine has no `ip` (iproute2) for the resolver's network");
-    defer _ = std.process.run(arena, io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch {};
-    try ip.run(arena, &.{ "netns", "add", ns });
-    try ip.run(arena, &.{ "link", "add", "zrtdns0", "type", "veth", "peer", "name", "eth0", "netns", ns });
-    try ip.run(arena, &.{ "addr", "add", "198.51.100.1/24", "dev", "zrtdns0" });
-    try ip.run(arena, &.{ "link", "set", "zrtdns0", "up" });
-    try ip.run(arena, &.{ "-n", ns, "addr", "add", "198.51.100.53/24", "dev", "eth0" });
-    try ip.run(arena, &.{ "-n", ns, "addr", "add", "198.51.100.54/24", "dev", "eth0" });
-    try ip.run(arena, &.{ "-n", ns, "link", "set", "eth0", "up" });
-    try ip.run(arena, &.{ "-n", ns, "link", "set", "lo", "up" });
-    // Every name under zr.test is 192.0.2.77, over UDP and TCP; any other is NXDOMAIN. A UDP
-    // socket for each address, so each answer comes from the address it was asked at.
-    const responder =
-        \\import socket, struct, sys, threading
-        \\def answer(q):
-        \\    i, labels = 12, []
-        \\    while q[i]:
-        \\        labels.append(q[i + 1:i + 1 + q[i]].decode()); i += 1 + q[i]
-        \\    qtype = struct.unpack(">H", q[i + 1:i + 3])[0]
-        \\    name = ".".join(labels).lower()
-        \\    rcode, an, ans = 3, 0, b""
-        \\    if name == "zr.test" or name.endswith(".zr.test"):
-        \\        rcode = 0
-        \\        if qtype == 1:
-        \\            an, ans = 1, b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4) + bytes([192, 0, 2, 77])
-        \\    return q[:2] + struct.pack(">HHHHH", 0x8180 | rcode, 1, an, 0, 0) + q[12:i + 5] + ans
-        \\def udp(s):
-        \\    while True:
-        \\        q, peer = s.recvfrom(512)
-        \\        try: s.sendto(answer(q), peer)
-        \\        except Exception: pass
-        \\def tcp_one(c):
-        \\    with c:
-        \\        try:
-        \\            n = struct.unpack(">H", c.recv(2))[0]; q = b""
-        \\            while len(q) < n: q += c.recv(n - len(q))
-        \\            r = answer(q); c.sendall(struct.pack(">H", len(r)) + r)
-        \\        except Exception: pass
-        \\def tcp(s, dns):
-        \\    while True:
-        \\        c, _ = s.accept()
-        \\        if dns: threading.Thread(target=tcp_one, args=(c,), daemon=True).start()
-        \\        else: c.close()
-        \\def udp_on(addr):
-        \\    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind((addr, 53)); return u
-        \\def listener(port):
-        \\    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        \\    s.bind(("0.0.0.0", port)); s.listen(16); return s
-        \\for addr in ("198.51.100.53", "198.51.100.54"):
-        \\    threading.Thread(target=udp, args=(udp_on(addr),), daemon=True).start()
-        \\threading.Thread(target=tcp, args=(listener(53), True), daemon=True).start()
-        \\threading.Thread(target=tcp, args=(listener(8080), False), daemon=True).start()
-        \\print("ready", flush=True)
-        \\sys.stdin.read()
-    ;
-    var child = try std.process.spawn(io, .{
-        .argv = &.{ "ip", "netns", "exec", ns, "python3", "-c", responder },
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .inherit,
-    });
-    defer {
-        child.kill(io);
-    }
-    var ready_buf: [64]u8 = undefined;
-    var ready = child.stdout.?.readerStreaming(io, &ready_buf);
-    const line = (try ready.interface.takeDelimiter('\n')) orelse return error.ResponderDidNotStart;
-    try std.testing.expectEqualStrings("ready", line);
+    defer dns.stop(arena);
 
     // A host service on the resolver's network, at the host's own address there.
     const host_side = try listen(47126, 0);
@@ -3702,6 +3623,171 @@ test "root runner: a native job resolves through a nameserver only another inter
         "dns54 reached",
         "other port unreachable",
     });
+}
+
+/// A resolver for the root tests, as Tailscale's MagicDNS is to razorbill: on no uplink, but on
+/// an interface of its own (a veth to a network namespace of the test's, TEST-NET-2, the host at
+/// 198.51.100.1), at 198.51.100.53 and .54, with a TCP port that is not DNS (8080). The host routes
+/// there, but the jobs' rules forward nothing there but DNS to the nameservers the job's resolver
+/// names. Over UDP and TCP, `git.zr.test` is 127.0.0.1 (a job's own loopback, where a fetch that
+/// resolved finds nothing listening), every other name under zr.test 192.0.2.77, and any other
+/// name NXDOMAIN. A UDP socket for each address, so each answer comes from the address it was
+/// asked at. `error.NoIp` without iproute2's `ip`.
+const TestResolver = struct {
+    child: std.process.Child,
+
+    const ns = "zrtest-dns";
+
+    fn start(arena: Allocator) !TestResolver {
+        const io = std.testing.io;
+        _ = std.process.run(arena, io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch
+            return error.NoIp;
+        errdefer _ = std.process.run(arena, io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch {};
+        try ip(arena, &.{ "netns", "add", ns });
+        try ip(arena, &.{ "link", "add", "zrtdns0", "type", "veth", "peer", "name", "eth0", "netns", ns });
+        try ip(arena, &.{ "addr", "add", "198.51.100.1/24", "dev", "zrtdns0" });
+        try ip(arena, &.{ "link", "set", "zrtdns0", "up" });
+        try ip(arena, &.{ "-n", ns, "addr", "add", "198.51.100.53/24", "dev", "eth0" });
+        try ip(arena, &.{ "-n", ns, "addr", "add", "198.51.100.54/24", "dev", "eth0" });
+        try ip(arena, &.{ "-n", ns, "link", "set", "eth0", "up" });
+        try ip(arena, &.{ "-n", ns, "link", "set", "lo", "up" });
+        const responder =
+            \\import socket, struct, sys, threading
+            \\def answer(q):
+            \\    i, labels = 12, []
+            \\    while q[i]:
+            \\        labels.append(q[i + 1:i + 1 + q[i]].decode()); i += 1 + q[i]
+            \\    qtype = struct.unpack(">H", q[i + 1:i + 3])[0]
+            \\    name = ".".join(labels).lower()
+            \\    rcode, an, ans = 3, 0, b""
+            \\    if name == "zr.test" or name.endswith(".zr.test"):
+            \\        rcode = 0
+            \\        addr = [127, 0, 0, 1] if name == "git.zr.test" else [192, 0, 2, 77]
+            \\        if qtype == 1:
+            \\            an, ans = 1, b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4) + bytes(addr)
+            \\    return q[:2] + struct.pack(">HHHHH", 0x8180 | rcode, 1, an, 0, 0) + q[12:i + 5] + ans
+            \\def udp(s):
+            \\    while True:
+            \\        q, peer = s.recvfrom(512)
+            \\        try: s.sendto(answer(q), peer)
+            \\        except Exception: pass
+            \\def tcp_one(c):
+            \\    with c:
+            \\        try:
+            \\            n = struct.unpack(">H", c.recv(2))[0]; q = b""
+            \\            while len(q) < n: q += c.recv(n - len(q))
+            \\            r = answer(q); c.sendall(struct.pack(">H", len(r)) + r)
+            \\        except Exception: pass
+            \\def tcp(s, dns):
+            \\    while True:
+            \\        c, _ = s.accept()
+            \\        if dns: threading.Thread(target=tcp_one, args=(c,), daemon=True).start()
+            \\        else: c.close()
+            \\def udp_on(addr):
+            \\    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind((addr, 53)); return u
+            \\def listener(port):
+            \\    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            \\    s.bind(("0.0.0.0", port)); s.listen(16); return s
+            \\for addr in ("198.51.100.53", "198.51.100.54"):
+            \\    threading.Thread(target=udp, args=(udp_on(addr),), daemon=True).start()
+            \\threading.Thread(target=tcp, args=(listener(53), True), daemon=True).start()
+            \\threading.Thread(target=tcp, args=(listener(8080), False), daemon=True).start()
+            \\print("ready", flush=True)
+            \\sys.stdin.read()
+        ;
+        var child = try std.process.spawn(io, .{
+            .argv = &.{ "ip", "netns", "exec", ns, "python3", "-c", responder },
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .inherit,
+        });
+        errdefer child.kill(io);
+        var ready_buf: [64]u8 = undefined;
+        var ready = child.stdout.?.readerStreaming(io, &ready_buf);
+        const line = (try ready.interface.takeDelimiter('\n')) orelse return error.ResponderDidNotStart;
+        try std.testing.expectEqualStrings("ready", line);
+        return .{ .child = child };
+    }
+
+    fn stop(r: *TestResolver, arena: Allocator) void {
+        r.child.kill(std.testing.io);
+        _ = std.process.run(arena, std.testing.io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch {};
+    }
+
+    fn ip(arena: Allocator, args: []const []const u8) !void {
+        const argv = try std.mem.concat(arena, []const u8, &.{ &.{"ip"}, args });
+        const r = try std.process.run(arena, std.testing.io, .{ .argv = argv });
+        if (r.term != .exited or r.term.exited != 0) {
+            std.debug.print("ip {s}: {s}\n", .{ try std.mem.join(arena, " ", args), r.stderr });
+            return error.IpFailed;
+        }
+    }
+};
+
+test "root runner: a native checkout and an action's fetch resolve through the job's resolver, as root and as the runner user, with a Zig seed below" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const env = try std.testing.environ.createMap(arena);
+    const required = std.mem.eql(u8, env.get("ZIG_RUNNER_REQUIRE_NATIVE") orelse "", "1");
+    if (std.process.run(arena, io, .{ .argv = &.{ "git", "--version" } })) |_| {} else |_| return skip(required, "git is not installed");
+    var dns = TestResolver.start(arena) catch |e| switch (e) {
+        error.NoIp => return skip(required, "this machine has no `ip` (iproute2) for the resolver's network"),
+        else => return e,
+    };
+    defer dns.stop(arena);
+    const resolv = try std.fmt.allocPrint(arena, "{s}/host-resolv.conf", .{
+        try tmp.dir.realPathFileAlloc(io, ".", arena),
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = resolv, .data = "nameserver 198.51.100.53\n" ++
+        "search zr.test\noptions timeout:1 attempts:2\n" });
+    cfg.test_resolv_conf = resolv;
+    // As razorbill's toolcache job (runner-bench 41391500747) ran: a Zig seed below the job's
+    // layers, the package caches bound, the steps as the runner user.
+    cfg.test_seed_script = "mkdir -p /zig-seed/o/s && echo seeded > /zig-seed/o/s/f";
+    try sudoRootfs(arena, try tmp.dir.realPathFileAlloc(io, ".", arena));
+    const caches: volumes.Options = .{
+        .package_caches = true,
+        .trusted = true,
+        .zig_seeds = &.{.{ .version = "0.0.1", .sha256 = "00" }},
+    };
+
+    for ([_]config.StepUser{ .root, .runner }) |user| {
+        // The repository's server is `git.zr.test`, which only the test's resolver knows: a fetch
+        // that resolved it fails to connect to the job's own loopback, one that did not says so.
+        const look = testStep("echo uid=$(id -u); ls -ln /etc/resolv.conf; cat /etc/resolv.conf # zig\n" ++
+            "getent hosts git.zr.test || echo \"git.zr.test un\"\"resolved\"");
+        var co = testStep("");
+        co.name = "checkout";
+        co.action = .{ .checkout = &.{.{ .name = "repository", .value = .{ .lit = "o/other" } }} };
+        var act = testStep("");
+        act.name = "action";
+        act.condition = "always()";
+        act.action = .{ .uses = .{ .owner = "o", .name = "act", .ref = "v1" } };
+        var job = testJob(&.{ look, co, act });
+        job.github.server_url = "http://git.zr.test:9";
+        const r = try runCachedJob(arena, cfg, job, caches, .{ .user = user });
+        try expectLines(r.text, &.{
+            "Zig global cache seeded from Zig 0.0.1",
+            if (user == .root) "uid=0" else "uid=1001",
+            "nameserver 198.51.100.53",
+            "127.0.0.1",
+            // The checkout's and the action's fetches, each through the resolver.
+            "could not fetch o/other",
+            "Unable to resolve action `o/act@v1`",
+            "git.zr.test port 9",
+        });
+        for ([_][]const u8{ "Could not resolve host", "git.zr.test unresolved" }) |no|
+            if (std.mem.indexOf(u8, r.text, no) != null) {
+                std.debug.print("{s} ({s}) in:\n{s}\n", .{ no, @tagName(user), r.text });
+                return error.TestUnexpectedResult;
+            };
+    }
 }
 
 /// A TCP listener of the test's on the host, on `port` at `addr` (host order; 0 for every
