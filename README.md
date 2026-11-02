@@ -82,7 +82,12 @@ tags the release, and the tag runs `release`: the binaries (compiled directly,
 [Trivy](https://trivy.dev) scan, each with signed build provenance. On pull requests and in the
 merge queue, `release` builds and scans the same, publishing nothing ("Binaries (check)", "Binaries
 (same as zig build)" and "Image"), when the change touches the packaging. `scorecard` grades the
-repository weekly with [OpenSSF Scorecard](https://scorecard.dev).
+repository weekly with [OpenSSF Scorecard](https://scorecard.dev). `codeql` runs
+[CodeQL](https://codeql.github.com) with its `security-extended` queries over what it has a
+language for (the workflows, the Go comparison tools under `runner/tools`, the Python generator),
+one job per language, on every pull request, in the merge queue, on `main` and weekly; it is a
+checked-in workflow rather than the repository's default setup, which must stay off for its
+uploads to be accepted.
 "End to end" (`ci`, `.github/scripts/e2e.sh`) runs the runner built from the pull request for
 real, on GitHub's runner: it starts the pinned Dagger engine as `deploy/compose.yaml` does,
 registers the runner's just-in-time runners on the private `Open-Blue/runner-bench` under a label
