@@ -14,7 +14,13 @@ cd "$(dirname "$0")/../../runner"
 . ../.github/scripts/zig-modules.sh
 
 scratch=$(mktemp -d)
-trap 'rm -rf "$scratch"' EXIT
+# The tests' output is only text to the job running this, never its workflow commands: the native
+# backend's tests write `##[error]` lines into their jobs' logs (the process and memory limits),
+# which would otherwise become CI's own annotations. On stderr, where the tests write, so each
+# lands before and after their output; the exit status is the tests' still.
+stop="tests-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+echo "::stop-commands::$stop" >&2
+trap 'echo "::$stop::" >&2; rm -rf "$scratch"' EXIT
 git describe --tags --always --dirty --abbrev=8 >"$scratch/version"
 
 zig_modules "$scratch" "$scratch/version"

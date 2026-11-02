@@ -28,7 +28,7 @@ concurrency:
 jobs:
   proofs:
     name: Proofs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
       contents: read # to check out the code

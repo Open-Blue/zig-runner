@@ -1,0 +1,6 @@
+# GitHub-hosted labels newer than actionlint's own list (v1.7.12 stops at ubuntu-24.04). The
+# hosted jobs are pinned to ubuntu-26.04 on purpose (ci.yml, the test job); drop an entry once
+# actionlint knows it.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
