@@ -189,6 +189,40 @@ the run's ID.
 On razorbill the same new-commit job takes about 76 s, against 41 s on GitHub's runner: the Pi, not
 the runner, is the difference (the runner's own work is 0.11 s of CPU a job, see above).
 
+## Position-independent executable
+
+*2026-11-01, zig-runner at main (after v0.23.0).* The release's binaries became static
+position-independent executables (README, "Hardened binaries"), which the rule allowed only if it
+cost no more than about 3%. Measured on the laptop (Ryzen 5 PRO 4650U, on AC and the balanced power
+profile, sampled every 2 s throughout; not a quiet machine: load average 5-6 from other work), both
+builds ReleaseSafe for x86_64-linux-musl as the release builds them, run alternately so drift falls
+on both.
+
+**The runner's hot paths** (`.github/scripts/hotbench.sh 21 10`, `runner/tools/hotbench.zig`): 210
+timed rounds per benchmark and build, from 10 runs of each binary in turn. Milliseconds a round;
+"change" is the PIE median against no-PIE's.
+
+| Benchmark (one round) | no-PIE median (IQR) | PIE median (IQR) | Change |
+| --- | --- | --- | --- |
+| Expressions: 10 workflow expressions and an interpolation, 4,000 times | 90.6 (84.8-99.9) | 91.3 (85.2-97.7) | +0.9% |
+| YAML: ci.yml and release.yml parsed, 200 times | 51.8 (48.2-55.4) | 49.7 (46.1-53.2) | -4.1% |
+| HPACK: RFC 7541's request and response examples, a decoder each, 16,000 times | 116.4 (107.8-123.3) | 113.9 (106.8-122.0) | -2.2% |
+| hashFiles() glob: 4 patterns over a 5,500-entry in-memory workspace, 6 times | 93.0 (88.7-97.6) | 94.6 (88.1-101.8) | +1.7% |
+| SHA-256 of 32 MiB | 144.9 (135.4-154.6) | 146.8 (133.1-159.8) | +1.4% |
+
+**The test suite** (`zig-test.sh`, compiles cached, so this is the tests running; the native
+backend's root tests not included), five runs of each, alternately: no-PIE median 45.6 s
+(44.9-47.5 s), PIE 44.4 s (44.2-45.3 s), 2.6% faster.
+
+- **PIE costs nothing measurable.** No median moved by more than 1.7% the slow way, each well
+  inside its own interquartile range (5-10% wide on this machine), and two of the five moved the
+  other way. On x86_64 Zig's code already addresses its data relative to the instruction pointer; a
+  static PIE adds only its own relocation, once, at startup.
+- **The first run is not in the table:** the battery was at 18% and the laptop had moved itself to
+  the low-power profile (not by hand). Its medians agreed (+2.4% to -5.6%), with wider spread.
+- The binaries grew by 0.6% (x86_64, 3,533,136 to 3,554,000 bytes) and 1.6% (aarch64), for the
+  relocations.
+
 ## Earlier measurements
 
 These come from the study in

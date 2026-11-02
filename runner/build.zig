@@ -7,6 +7,11 @@ pub fn build(b: *std.Build) void {
     const strip = b.option(bool, "strip", "Omit debug information") orelse null;
     // `zig build test -Dsanitize-thread`: ThreadSanitizer reports data races the tests run into.
     const sanitize_thread = b.option(bool, "sanitize-thread", "Build with ThreadSanitizer") orelse null;
+    // A position-independent executable, static still: the kernel loads it at a random address, so
+    // its code is not where an exploit of the runner (root on prod, reading untrusted input) knows
+    // to find it. On by default, so the release (build-binaries.sh, zig-modules.sh's -fPIE), the
+    // image and a developer's build are the same binary; it costs nothing measurable (BENCHMARKS.md).
+    const pie = b.option(bool, "pie", "Build a position-independent executable (default: true)") orelse true;
 
     // The build's own version, in every job's "Set up job" and in `--version`. Answering "which
     // binary is on that machine?" by comparing file sizes and timestamps is how an hour went
@@ -30,6 +35,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.pie = pie;
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -38,6 +44,7 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run the runner").dependOn(&run_cmd.step);
 
     const tests = b.addTest(.{ .root_module = exe.root_module });
+    tests.pie = pie;
     const test_step = b.step("test", "Run tests");
     const run_tests = b.addRunArtifact(tests);
     // Which tests run depends on the environment (PG*, ZIG_TEST_PG_URL, ZIG_TEST_REQUIRE_DB), which
