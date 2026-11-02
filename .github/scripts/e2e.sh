@@ -20,11 +20,14 @@
 # CI's "End to end" job (ci.yml) builds the runner and serves the suite itself, on GitHub's runner,
 # root through sudo, once on Dagger and once native:
 #
-#   e2e.sh build BIN                the runner, x86_64 ReleaseSafe, compiled directly (zig-modules.sh)
+#   e2e.sh build BIN [tsan]         the runner, x86_64 ReleaseSafe, compiled directly (zig-modules.sh);
+#                                   with tsan, under ThreadSanitizer (analysis.yml, nightly)
 #   e2e.sh engine                   start the pinned engine, as deploy/compose.yaml runs it
 #   e2e.sh rootfs BIN               the native backend's rootfs: ubuntu:24.04, provisioned
 #   e2e.sh start BIN BACKEND LABEL  a pool of the runner, in the background, serving LABEL
 #   e2e.sh stop                     stop it, as a deployment stops it (SIGTERM)
+#   e2e.sh races BACKEND            fails on a ThreadSanitizer report in that pass's runner log or
+#                                   job logs (a tsan build's; stop the runner first)
 #
 # Settings: E2E_REPO (Open-Blue/runner-bench), E2E_REF (main: the workflows' ref, and the one ref
 # CI's runner trusts), E2E_TIMEOUT (seconds to wait for each run, 600), E2E_OUT (where the
@@ -55,15 +58,21 @@ usage() {
 # --- the runner, its engine and rootfs (CI) -------------------------------------------------------
 
 build() {
-	local bin scratch
+	local bin scratch target=(-target x86_64-linux-musl)
 	bin=$(realpath -m "${1:?}")
+	# ThreadSanitizer's runtime needs glibc's dynamic loader: built for the native target (glibc,
+	# dynamic, a PIE still), as zig-test.sh's are, since the release's static PIE (musl, #283)
+	# crashes at startup with it. The runner re-executes itself for the native backend's steps
+	# (`zig-runner native-step`), so the helpers run under it too, their reports on their stderr,
+	# which the runner writes into the job's log as the sandbox's failure.
+	if [[ ${2:-} == tsan ]]; then target=(-fsanitize-thread); fi
 	mkdir -p "$(dirname "$bin")"
 	scratch=$(mktemp -d)
 	cd runner
 	# shellcheck source=.github/scripts/zig-modules.sh
 	. ../.github/scripts/zig-modules.sh
 	printf '%s' "e2e-$(git rev-parse --short HEAD)" >"$scratch/version"
-	zig_modules "$scratch" "$scratch/version" -OReleaseSafe -target x86_64-linux-musl
+	zig_modules "$scratch" "$scratch/version" -OReleaseSafe "${target[@]}"
 	zig build-exe "${modules[@]}" --name runner -femit-bin="$bin"
 	rm -rf "$scratch"
 	"$bin" --version
@@ -166,6 +175,31 @@ stop() {
 	done
 	echo "the runner did not stop within 60 s: killed" >&2
 	sudo kill -KILL "$pid" 2>/dev/null || true
+}
+
+# A ThreadSanitizer report anywhere in a pass's logs: the runner's own (its threads), and the
+# jobs' (a helper's report is the step's failure). Each report is printed, with any token-shaped
+# string masked, as ci.yml's log step does, and only as text: the jobs' logs hold their workflow
+# commands.
+races() {
+	local backend=${1:?} f n total=0 stop
+	stop="races-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+	echo "::stop-commands::$stop"
+	for f in "$out/runner-$backend.log" "$out/logs/$backend-"*.log; do
+		[[ -e $f ]] || continue
+		n=$(grep -c 'WARNING: ThreadSanitizer' "$f" || true)
+		((n > 0)) || continue
+		total=$((total + n))
+		echo "== $(basename "$f"): $n"
+		awk '/WARNING: ThreadSanitizer/ { p = 1 } p { print } /^SUMMARY: ThreadSanitizer/ { p = 0; print "" }' "$f" |
+			sed -E 's/(gh[opsu]|github_pat)_[A-Za-z0-9_]{20,}/***/g'
+	done
+	echo "::$stop::"
+	if ((total > 0)); then
+		echo "::error::e2e ($backend): $total ThreadSanitizer reports (above)"
+		return 1
+	fi
+	echo "e2e ($backend): no ThreadSanitizer reports"
 }
 
 # --- the suite ----------------------------------------------------------------------------------
@@ -354,11 +388,12 @@ check() {
 }
 
 case ${1:-} in
-build) build "${2:?}" ;;
+build) build "${2:?}" "${3:-}" ;;
 engine) engine ;;
 rootfs) make_rootfs "${2:?}" ;;
 start) start "$@" ;;
 stop) stop ;;
+races) races "${2:?}" ;;
 check) check "$@" ;;
 *) usage ;;
 esac
