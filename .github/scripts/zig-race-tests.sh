@@ -21,6 +21,8 @@ race_filters=(
 	broker.test. poll
 	# Log uploads, each step's as it ends and the rest at the job's end.
 	upload
+	# The step cache's output keys after an always() step: it failed once in the merge queue (#293).
+	'output keys: the step after one that always runs'
 )
 
 # race_build SCRATCH [FLAG...]: compiles the runner (for the native backend's tests, which run steps

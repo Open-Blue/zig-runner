@@ -63,6 +63,7 @@ comptime {
     _ = @import("job.zig");
     _ = @import("trust.zig");
     _ = @import("dagger.zig");
+    _ = @import("dagger/output_keys.zig");
     _ = @import("engine.zig");
     _ = @import("hpack.zig");
     _ = @import("loop.zig");
