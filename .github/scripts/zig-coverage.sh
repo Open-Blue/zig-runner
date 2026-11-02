@@ -22,6 +22,10 @@
 #              native-step`, `native-net`, ...: the sandbox's own side of sandbox.zig, net.zig and
 #              nft.zig, which no test process runs), each run under kcov too
 #
+# Each pass runs its tests twice: under kcov with the helpers as compiled, then as compiled with
+# each helper under kcov. kcov cannot run inside a process kcov traces (the helper's kcov fails to
+# start it), and the tests themselves take seconds without it.
+#
 # kcov sets a breakpoint on each line the DWARF line table names and counts the lines hit. What it
 # takes for kcov 43 to read Zig 0.17's tests:
 #
@@ -66,26 +70,26 @@ cat >"$scratch/runner-kcov" <<EOF
 exec "$kcov" --include-path="$src" "$raw/helper-\$\$" "$scratch/runner" "\$@"
 EOF
 chmod +x "$scratch/runner-kcov"
-export ZIG_RUNNER_TEST_EXE="$scratch/runner-kcov"
 
-# measure NAME [PREFIX...] TEST: TEST under kcov into raw/NAME; its output is only text to the job
-# (zig-test.sh), and failed tests a warning.
-measure() {
-	local name=$1 status=0
+# pass NAME [PREFIX...] TEST: TEST under kcov into raw/NAME, then TEST with each helper under kcov.
+# The output is only text to the job (zig-test.sh), and failed tests a warning.
+pass() {
+	local name=$1 stop status=0
 	shift
-	local stop
 	stop="coverage-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 	echo "::stop-commands::$stop"
-	"${@:1:$#-1}" "$kcov" --include-path="$src" "$raw/$name" "${@: -1}" 2>&1 || status=$?
+	ZIG_RUNNER_TEST_EXE="$scratch/runner" "${@:1:$#-1}" \
+		"$kcov" --include-path="$src" "$raw/$name" "${@: -1}" 2>&1 || status=$?
+	ZIG_RUNNER_TEST_EXE="$scratch/runner-kcov" "$@" 2>&1 || status=$?
 	echo "::$stop::"
 	if ((status != 0)); then
-		echo "::warning title=Coverage::the $name pass exited $status under kcov (failed tests, most likely; the tests' own job judges them): its coverage still counts"
+		echo "::warning title=Coverage::tests failed in the $name pass under kcov (exit $status; the tests' own job judges them): its coverage still counts"
 	fi
 }
 
-measure rootless "$scratch/test"
+pass rootless "$scratch/test"
 if [[ ${ZIG_COVERAGE_ROOT:-} == 1 ]]; then
-	measure root sudo --preserve-env=ZIG_RUNNER_TEST_EXE,ZIG_RUNNER_REQUIRE_NATIVE,ZIG_RUNNER_SERVICE_IMAGES \
+	pass root sudo --preserve-env=ZIG_RUNNER_TEST_EXE,ZIG_RUNNER_REQUIRE_NATIVE,ZIG_RUNNER_SERVICE_IMAGES \
 		"$scratch/test-native"
 	sudo chown -R "$(id -u):$(id -g)" "$raw"
 fi
