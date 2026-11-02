@@ -135,16 +135,23 @@ fn problemMatchers(_: void, smith: *Smith) !void {
 }
 
 test "fuzz: regular expressions" {
-    try std.testing.fuzz({}, regularExpressions, .{ .corpus = comptime seeds(&.{
-        &.{ "^(.+):(\\d+):(\\d+): (error|warning): (.*)$", "src/a.zig:1:2: error: x" },
-        &.{ "(a|ab)(c|bcd)(d*)", "abcd" },
-        &.{ "(?:(a)|b)\\1", "aa ba" },
-        &.{ "(?<=\\$)\\d+(?!\\.)", "$12.5 $30" },
-        &.{ "[^\\]a-c-]+?x{2,3}\\b", "zzxxx yx" },
-        &.{ "(a+)+$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab" },
-        &.{ "\\101\\x41\\u0041\\cA[\\b]", "AAA\x01\x08" },
-        &.{ "(?(1)a|b)(x)?", "bx" },
-    }) });
+    try std.testing.fuzz({}, regularExpressions, .{
+        .corpus = comptime seeds(&.{
+            &.{ "^(.+):(\\d+):(\\d+): (error|warning): (.*)$", "src/a.zig:1:2: error: x" },
+            &.{ "(a|ab)(c|bcd)(d*)", "abcd" },
+            &.{ "(?:(a)|b)\\1", "aa ba" },
+            &.{ "(?<=\\$)\\d+(?!\\.)", "$12.5 $30" },
+            &.{ "[^\\]a-c-]+?x{2,3}\\b", "zzxxx yx" },
+            &.{ "(a+)+$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab" },
+            &.{ "\\101\\x41\\u0041\\cA[\\b]", "AAA\x01\x08" },
+            &.{ "(?(1)a|b)(x)?", "bx" },
+            // Each stepped back past the start of the input from inside a character: an empty match
+            // moved `from` into the 4-byte U+101DFE (the fuzzer's, cut down), and `\1` matched the
+            // lone 0xC3 to the first byte of À.
+            &.{ "(?<=\\$.)'\x9f\x84\x9e\xdb|", "H\xf4\x81\xb7\xbe{" },
+            &.{ "(?=.(.))\\1(?<=.)", "\xc3\x80\xc3" },
+        }),
+    });
 }
 
 fn regularExpressions(_: void, smith: *Smith) !void {

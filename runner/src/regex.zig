@@ -94,14 +94,18 @@ fn decodeAt(s: []const u8, i: usize) ?Decoded {
     return .{ .c = 0xDC00 | @as(u21, s[i]), .len = 1 };
 }
 
-/// The character that ends at `s[i]` (what a backwards step consumes).
+/// The character that ends at `s[i]` (what a backwards step consumes): the last of `s[0..i]`, so
+/// never longer than `i`. From inside a character (a `find` from there), the byte before is one of
+/// its own; decoded from all of `s`, the character it starts ran past `i`, and a step back by its
+/// length went past the start of the input.
 fn decodeBefore(s: []const u8, i: usize) ?Decoded {
     if (i == 0) return null;
+    const before = s[0..i];
     var start = i - 1;
     var n: usize = 0;
-    while (start > 0 and n < 3 and s[start] & 0xC0 == 0x80) : (n += 1) start -= 1;
-    if (decodeAt(s, start)) |d| if (start + d.len == i) return d;
-    return decodeAt(s, i - 1);
+    while (start > 0 and n < 3 and before[start] & 0xC0 == 0x80) : (n += 1) start -= 1;
+    if (decodeAt(before, start)) |d| if (start + d.len == i) return d;
+    return decodeAt(before, i - 1);
 }
 
 /// Simple lower-case mapping (CultureInvariant): ASCII, Latin-1, Latin Extended-A, Greek, Cyrillic,
@@ -1452,49 +1456,30 @@ const Vm = struct {
         return end;
     }
 
-    /// `text` at `pos` (or, backwards, ending there), case folded when `fold`: where it ends. Each
-    /// character compared is a step (bytes, unfolded), so a long backreference tried at every
-    /// position, `(.*)\1b`, runs into the budget instead of costing one step each.
+    /// `text` at `pos` (or, backwards, ending there), case folded when `fold`: where it ends, or
+    /// null when the input runs out first (a backreference longer than what is left fails, as in
+    /// .NET). Compared a character at a time, as .NET compares its UTF-16 characters: bytes alone
+    /// matched a lone lead byte to the first half of a character and ended inside it. Each
+    /// character compared is a step, so a long backreference tried at every position, `(.*)\1b`,
+    /// runs into the budget instead of costing one step each.
     fn matchText(vm: *Vm, text: []const u8, pos: usize, fold: bool, back: bool) ?usize {
-        if (!fold) {
-            // The bytes that match, before the first that does not (or the input's end).
-            const room = if (back) pos else vm.input.len - pos;
-            const n = @min(text.len, room);
-            const there = if (back) vm.input[pos - n .. pos] else vm.input[pos..][0..n];
-            const want = if (back) text[text.len - n ..] else text[0..n];
-            const same = if (back) blk: {
-                var k: usize = 0;
-                while (k < n and there[n - 1 - k] == want[n - 1 - k]) k += 1;
-                break :blk k;
-            } else std.mem.indexOfDiff(u8, there, want) orelse n;
-            vm.steps.* += same;
-            if (same < text.len) return null;
-            return if (back) pos - text.len else pos + text.len;
-        }
         var compared: usize = 0;
         defer vm.steps.* += compared;
-        if (back) {
-            var at = pos;
-            var j = text.len;
-            while (j > 0) {
-                compared += 1;
-                const want = decodeBefore(text, j).?;
-                const got = decodeBefore(vm.input, at) orelse return null;
-                if (!foldEq(want.c, got.c)) return null;
+        var at = pos;
+        var j: usize = if (back) text.len else 0;
+        while (if (back) j > 0 else j < text.len) {
+            compared += 1;
+            const want = (if (back) decodeBefore(text, j) else decodeAt(text, j)).?;
+            const got = (if (back) decodeBefore(vm.input, at) else decodeAt(vm.input, at)) orelse return null;
+            if (!(want.c == got.c or (fold and foldEq(want.c, got.c)))) return null;
+            // Both decoders stay within their text, so neither steps past its end or start.
+            if (back) {
                 j -= want.len;
                 at -= got.len;
+            } else {
+                j += want.len;
+                at += got.len;
             }
-            return at;
-        }
-        var at = pos;
-        var j: usize = 0;
-        while (j < text.len) {
-            compared += 1;
-            const want = decodeAt(text, j).?;
-            const got = decodeAt(vm.input, at) orelse return null;
-            if (!foldEq(want.c, got.c)) return null;
-            j += want.len;
-            at += got.len;
         }
         return at;
     }
@@ -1876,4 +1861,62 @@ test "a backreference costs a step per character it compares" {
         // Short ones are as they were.
         try testing.expect((try re.find(ar, "aabaacaac", 0)) != null);
     }
+}
+
+test "a step back from inside a character never goes past the start of the input" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // From inside a character, the byte before is a character of its own. Each of these stepped
+    // back by the whole character that byte starts, past the start: an integer overflow panic.
+    for ([_]struct { []const u8, []const u8, usize, ?usize }{
+        // The fuzzer's (the empty alternative matches anywhere), inside the 4-byte U+101DFE.
+        .{ "(?<=\\$.)'\x9f\x84\x9e\xdb|", "H\xf4\x81\xb7\xbe{", 2, 2 },
+        .{ "(?<=.)", "é", 1, 1 },
+        .{ "(?<=[^a])", "é", 1, 1 },
+        .{ "(?<=\\W)", "中", 1, 1 },
+        // A backreference, folded or not: the `é` after is not the lone 0xC3 before; at 2 it is.
+        .{ "(?i)(?=.*(.))(?<=\\1)", "éé", 1, 2 },
+        .{ "(?=.*(.))(?<=\\1)", "éé", 1, 2 },
+    }) |c| {
+        const re = try Regex.compile(ar, c[0]);
+        const m = try re.find(ar, c[1], c[2]);
+        testing.expectEqual(c[3], if (m) |got| got.whole.start else null) catch |e| {
+            std.debug.print("{s}\n", .{c[0]});
+            return e;
+        };
+    }
+}
+
+test "a backreference matches whole characters, not the bytes that start one" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // A lone 0xC3 (U+FFFD to .NET) is not the first half of À (C3 80). Compared as bytes, `\1`
+    // matched it and ended inside the À, where a lookbehind's step back then overflowed: reachable
+    // from any problem matcher's pattern on a line that is not valid UTF-8.
+    try testing.expectEqual(null, try whole(ar, "(?=.(.))\\1(?<=.)", "\xc3\x80\xc3"));
+    try testing.expectEqual(null, try whole(ar, "(?=.(.))\\1", "\xc3\x80\xc3"));
+    try testing.expectEqual(null, try whole(ar, "(?i)(?=.(.))\\1", "\xc3\x80\xc3"));
+    // Backwards: a lone 0x80 is not the last half of À.
+    try testing.expectEqual(null, try whole(ar, "^(.).(?<=\\1)", "\x80\xc3\x80"));
+    // The same bytes, whole characters, still match.
+    try testing.expectEqualStrings("\xc3", (try whole(ar, "(?=.(.))\\1", "\xc3\xc3")).?);
+    try testing.expectEqualStrings("\x80\x80", (try whole(ar, "^(.).(?<=\\1)", "\x80\x80")).?);
+}
+
+test "a backreference longer than the text left before or after it fails to match" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // As in .NET: at 1, `aa` does not fit before; at 2 it does.
+    for ([_][]const u8{ "(?=(aa))a(?<=\\1)", "(?i)(?=(aa))a(?<=\\1)" }) |pattern| {
+        const re = try Regex.compile(ar, pattern);
+        const m = (try re.find(ar, "aaa", 0)).?;
+        try testing.expectEqual(1, m.whole.start);
+    }
+    try testing.expectEqualStrings("é", (try whole(ar, "(?=(éé))é(?<=\\1)", "ééé")).?);
+    // Nor past the end.
+    try testing.expectEqual(null, try whole(ar, "(?<=(aa))\\1", "aaa"));
+    try testing.expectEqual(null, try whole(ar, "(?i)(?<=(éé))\\1", "ééé"));
 }
