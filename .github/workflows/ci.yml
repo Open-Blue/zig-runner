@@ -72,6 +72,15 @@ jobs:
       - name: changie's checksum
         run: .github/scripts/install-changie.sh
 
+      # Every unreleased entry, batched as the release will (dry run): a change file that is not
+      # valid YAML (an unescaped ' in a single-quoted body broke v0.24.0's Tag step) fails here, on
+      # the pull request that adds it, not after the release is approved.
+      - name: changie's entries
+        run: |
+          if compgen -G '.changes/unreleased/*.yaml' >/dev/null; then
+            changie batch auto --dry-run >/dev/null
+          fi
+
       # The busybox the runner puts into job containers (runner/src/dagger.zig), pinned by digest:
       # checked to be a pullable multi-arch index (amd64 and arm64) with the applets Docker actions,
       # services and output keys use, so a Renovate busybox pull request, or a re-wrapped literal,
