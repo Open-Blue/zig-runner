@@ -551,13 +551,25 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
 /// Removes one layer no job holds: renamed away under its lock taken exclusively (no job can
 /// take it after that: the path names nothing), then deleted. False when a job holds it.
 fn evict(s: Store, arena: Allocator, io: std.Io, name: []const u8) bool {
-    const cwd = std.Io.Dir.cwd();
     const full = std.fmt.allocPrint(arena, "{s}/layers/{s}", .{ s.root, name }) catch return false;
     // An entry without its lock file (a broken one) no job can hold.
-    const lock: ?std.Io.File = cwd.openFile(io, join(arena, full, "lock") catch return false, .{}) catch |e|
+    const lock: ?std.Io.File = std.Io.Dir.cwd().openFile(io, join(arena, full, "lock") catch return false, .{}) catch |e|
         if (e == error.FileNotFound) null else return false;
     defer if (lock) |l| l.close(io);
-    if (lock) |l| if (!flock(l, lock_ex | lock_nb)) return false;
+    return s.evictOpened(arena, io, name, lock);
+}
+
+/// `evict` once the entry's lock file is open (`lock`, null when it has none). The lock counts only
+/// on the file the path names now, as in `open` and `lockKey`: an entry evicted by another runner
+/// since the file was opened leaves it unlinked and free, and the rename by name would then take
+/// the entry published there since, which a job holds (proofs/tla/StoreLocking.tla).
+fn evictOpened(s: Store, arena: Allocator, io: std.Io, name: []const u8, lock: ?std.Io.File) bool {
+    const cwd = std.Io.Dir.cwd();
+    const full = std.fmt.allocPrint(arena, "{s}/layers/{s}", .{ s.root, name }) catch return false;
+    if (lock) |l| {
+        if (!flock(l, lock_ex | lock_nb)) return false;
+        if (!sameFile(arena, l, join(arena, full, "lock") catch return false)) return false;
+    }
     var raw: [8]u8 = undefined;
     io.random(&raw);
     const dead = std.fmt.allocPrint(arena, "{s}/layers/.dead-{s}", .{
@@ -1792,6 +1804,42 @@ test "native store: a record that cannot be replayed is refused, and a broken en
     try tmp.dir.writeFile(io, .{ .sub_path = log_path, .data = "a who" });
     s.collect(arena, io);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, log_path, .{}));
+}
+
+test "native store: an eviction whose entry went meanwhile leaves the one published since" {
+    // The counterexample of proofs/tla/StoreLocking.tla: `collect` opened an entry's lock file to
+    // evict it; another runner, finding the entry broken, evicted it first, and a job published the
+    // key again and held it; `collect`'s LOCK_EX on the old, unlinked lock file succeeded, and its
+    // rename by name took the new entry from under the job.
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}) };
+    try prepare(arena, io, s.root, .{ .check_parents = false });
+    var kh: KeyHasher = .plain("test");
+    const k = kh.final();
+    try tmp.dir.createDirPath(io, "up1");
+    const up1 = try std.fmt.allocPrint(arena, "{s}/up1", .{root});
+    (try s.publish(arena, io, k, .base, up1, .{ .log = "", .fc = "" })).lock.close(io);
+    const lock_path = try std.fmt.allocPrint(arena, "{s}/layers/{s}/lock", .{ s.root, &hex(k) });
+    // `collect`'s eviction has the first entry's lock file open.
+    const stale = try std.Io.Dir.cwd().openFile(io, lock_path, .{});
+    defer stale.close(io);
+    // Another runner evicts it, and a job publishes the key again and holds it until it ends.
+    try std.testing.expect(s.evict(arena, io, &hex(k)));
+    try tmp.dir.createDirPath(io, "up2");
+    const up2 = try std.fmt.allocPrint(arena, "{s}/up2", .{root});
+    const held = try s.publish(arena, io, k, .base, up2, .{ .log = "", .fc = "" });
+    defer held.lock.close(io);
+    // The old lock file is unlinked and free: the eviction must not take the new entry.
+    try std.testing.expect(!s.evictOpened(arena, io, &hex(k), stale));
+    try std.Io.Dir.cwd().access(io, held.fs, .{});
+    const hit = (try s.open(arena, io, k)).?;
+    hit.layer.lock.close(io);
 }
 
 test "native store: a tree's walk has no depth limit, and fails closed on what it cannot read" {
