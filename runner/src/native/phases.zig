@@ -59,13 +59,16 @@ pub const Phase = enum {
     }
 };
 
-const n = @typeInfo(Phase).@"enum".field_names.len;
+const phases_in_order = std.enums.values(Phase);
+const n = phases_in_order.len;
 
 /// Nanoseconds on the host's monotonic clock: the runner's and its helpers' alike.
 pub fn now() u64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    const sec = std.math.cast(u64, ts.sec) orelse 0;
+    const nsec = std.math.cast(u64, ts.nsec) orelse 0;
+    return sec * std.time.ns_per_s + nsec;
 }
 
 pub const Phases = struct {
@@ -79,7 +82,7 @@ pub const Phases = struct {
     }
 
     pub fn add(ps: *Phases, arena: Allocator, p: Phase, ns: u64) void {
-        const us: u32 = @intCast(@min(ns / std.time.ns_per_us, std.math.maxInt(u32)));
+        const us = std.math.cast(u32, ns / std.time.ns_per_us) orelse std.math.maxInt(u32);
         ps.samples[@backingInt(p)].append(arena, us) catch {};
     }
 
@@ -102,7 +105,7 @@ pub const Phases = struct {
 
     pub fn mark(ps: *const Phases) Mark {
         var m: Mark = undefined;
-        for (&m, ps.samples) |*c, s| c.* = @intCast(s.items.len);
+        for (&m, ps.samples) |*c, s| c.* = std.math.cast(u32, s.items.len) orelse std.math.maxInt(u32);
         return m;
     }
 
@@ -115,8 +118,7 @@ pub const Phases = struct {
         which: enum { all, set_up, steps },
     ) std.Io.Writer.Error!void {
         var first = true;
-        for (ps.samples, 0..) |s, i| {
-            const p: Phase = @fromBackingInt(@intCast(i));
+        for (ps.samples, phases_in_order, 0..) |s, p, i| {
             switch (which) {
                 .all => {},
                 .set_up => if (!p.setUp()) continue,
@@ -137,7 +139,7 @@ pub const Phases = struct {
     /// The set-up phases' total, in milliseconds.
     pub fn setUpMs(ps: *const Phases) u64 {
         var us: u64 = 0;
-        for (ps.samples, 0..) |s, i| if ((@as(Phase, @fromBackingInt(@intCast(i)))).setUp()) {
+        for (ps.samples, phases_in_order) |s, p| if (p.setUp()) {
             for (s.items) |v| us += v;
         };
         return us / 1000;
