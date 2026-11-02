@@ -5,7 +5,9 @@ name: analysis
 #
 #   Fuzz (TARGET)  runner/src/fuzz.zig's targets, each with Zig's coverage-guided fuzzer for a
 #                  bounded number of runs (.github/scripts/zig-fuzz.sh): the parsers that read what
-#                  registries, workflows, jobs and servers hand the runner. The corpus each finds
+#                  registries, workflows, jobs and servers hand the runner, and the text paths
+#                  that guard secrets and a job's environment (masking, file commands, the
+#                  broker's messages, HTTP/2 framing) held to GitHub's runner. The corpus each finds
 #                  is kept from night to night in the Actions cache; a crash, a failed check, a
 #                  leak or a hang fails the job, named after its target, with the input as an
 #                  artifact (fuzz-TARGET).
@@ -67,6 +69,14 @@ jobs:
           - { target: minisign, runs: 1M }
           - { target: workflow commands, runs: 3M }
           - { target: problem matchers, runs: 3M }
+          # The text paths that guard secrets and a job's environment, about ten minutes each,
+          # from a laptop's speeds halved: 550 runs a second for secret masking (each run a
+          # whole step's log through records, line cuts, commands and masking), 1,000 for file
+          # commands and job messages, 1,400 for HTTP2 frames.
+          - { target: secret masking, runs: 150K }
+          - { target: file commands, runs: 300K }
+          - { target: job messages, runs: 300K }
+          - { target: HTTP2 frames, runs: 400K }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
