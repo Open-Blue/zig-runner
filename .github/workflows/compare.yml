@@ -15,6 +15,9 @@ name: compare
 #
 # The seed is the run number (or the one given), and is printed: a failure reproduces locally with
 # the same script and seed.
+#
+# The tools' own Go is linted here too (go-lint.sh: go vet, staticcheck, and govulncheck for
+# information), as ci.yml does on a pull request that changes them.
 
 on:
   schedule:
@@ -62,3 +65,26 @@ jobs:
             hpack-diff) .github/scripts/hpack-diff.sh 3000 "$SEED" ;;
             rsa-diff) .github/scripts/rsa-diff.sh 2000 "$SEED" ;;
           esac
+
+  # The tools' own Go, linted (go-lint.sh) as on a pull request that changes them, so a new
+  # staticcheck check or a new toolchain's vet finds what pull requests have not touched. Then
+  # govulncheck, informational: the tools only read inputs CI makes or pins, so a vulnerability
+  # shows as a failed step to look at, not a failed run.
+  lint:
+    name: Go tools
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: go vet and staticcheck
+        run: .github/scripts/go-lint.sh
+
+      - name: govulncheck (informational)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: .github/scripts/go-lint.sh vuln

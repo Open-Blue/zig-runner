@@ -234,7 +234,7 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .results_endpoint = variable(root, "system.github.results_endpoint") orelse "",
         .runtime = runtime(root),
         .github = github: {
-            var g = githubContext(arena, root);
+            var g = try githubContext(arena, root);
             // GitHub leaves `job` out of the github context. The job's key in the workflow is the
             // `system.github.job` variable (`jobName` is a matrix job's leg, such as "zig").
             if (g.job.len == 0) g.job = variable(
@@ -773,7 +773,7 @@ fn inList(list: []const []const u8, name: []const u8) bool {
 }
 
 /// `contextData.github` is `{t, d:[{k, v}]}` with plain string values.
-fn githubContext(arena: Allocator, root: Value) Github {
+fn githubContext(arena: Allocator, root: Value) Allocator.Error!Github {
     var g: Github = .{};
     for (contextEntries(root, "github")) |e| {
         if (e != .object) continue;
@@ -785,7 +785,7 @@ fn githubContext(arena: Allocator, root: Value) Github {
             if (v == .string) {
                 g.run_id = v.string;
             } else if (v == .integer) {
-                g.run_id = std.fmt.allocPrint(arena, "{d}", .{v.integer}) catch "";
+                g.run_id = try std.fmt.allocPrint(arena, "{d}", .{v.integer});
             }
             continue;
         }
@@ -1415,4 +1415,24 @@ test "actionsEnvironment: the name, and the url as a token or a plain string" {
     try std.testing.expect(no_url.environment.url == null);
     const none = try parse(arena, head ++ "\"jobName\":\"x\"}");
     try std.testing.expect(none.environment.url == null and none.environment.name.len == 0);
+}
+
+test "allocation failures: the job message" {
+    const af = @import("alloc_failures.zig");
+    const S = struct {
+        fn run(a: Allocator, json: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            const job = try parse(arena.allocator(), json);
+            try std.testing.expectEqualStrings("jobtok", job.job_token);
+        }
+    };
+    // A numeric run_id is formatted: out of memory there once left it empty.
+    const run_id =
+        \\{"plan":{"planId":"p"},"jobId":"j","steps":[],
+        \\ "resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"jobtok"}}}]},
+        \\ "contextData":{"github":{"t":2,"d":[{"k":"run_id","v":12345},{"k":"job","v":"build"}]}}}
+    ;
+    try af.checkOne(S.run, .{run_id});
+    try af.checkOne(S.run, .{fixture});
 }

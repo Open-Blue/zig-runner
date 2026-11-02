@@ -2141,14 +2141,14 @@ test "a musl image is told by its /lib, never through a symlink" {
     try tmp.dir.createDirPath(io, "odd");
     try tmp.dir.symLink(io, "../alpine/lib", "odd/lib", .{});
     const p = struct {
-        fn f(ar: Allocator, r: []const u8, name: []const u8) []const u8 {
-            return std.fmt.allocPrint(ar, "{s}/{s}", .{ r, name }) catch unreachable;
+        fn f(ar: Allocator, r: []const u8, name: []const u8) Allocator.Error![]const u8 {
+            return std.fmt.allocPrint(ar, "{s}/{s}", .{ r, name });
         }
     }.f;
-    try std.testing.expect(rootfsIsMusl(arena, io, p(arena, root, "alpine")));
-    try std.testing.expect(!rootfsIsMusl(arena, io, p(arena, root, "debian")));
-    try std.testing.expect(!rootfsIsMusl(arena, io, p(arena, root, "odd")));
-    try std.testing.expect(!rootfsIsMusl(arena, io, p(arena, root, "missing")));
+    try std.testing.expect(rootfsIsMusl(arena, io, try p(arena, root, "alpine")));
+    try std.testing.expect(!rootfsIsMusl(arena, io, try p(arena, root, "debian")));
+    try std.testing.expect(!rootfsIsMusl(arena, io, try p(arena, root, "odd")));
+    try std.testing.expect(!rootfsIsMusl(arena, io, try p(arena, root, "missing")));
 }
 
 /// `image` pulled into the store, or found there (`oci/image.zig`), within `pull_deadline`.

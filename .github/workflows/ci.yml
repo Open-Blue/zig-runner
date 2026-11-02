@@ -61,6 +61,12 @@ jobs:
       - name: shellcheck
         run: .github/scripts/shellcheck.sh
 
+      # The casts and assertions that skip Zig's checks (@bitCast, @ptrCast, @alignCast, @intCast,
+      # `catch unreachable`) in runner/src, against their checked-in counts: a new one raises
+      # unsafe-ratchet.baseline in the same pull request, where a reviewer sees it.
+      - name: Unsafe constructs ratchet
+        run: .github/scripts/unsafe-ratchet.sh
+
       # The runner's check of the tool cache's trees (runner/src/dagger/tool_trees.sh), on a small
       # fake tree: its lists let it skip re-reading unchanged files, never a changed, added or
       # deleted one, and a list a job writes into the tool cache is never read.
@@ -71,6 +77,15 @@ jobs:
       # fails here until the checksum is updated, not at the release, after it was approved.
       - name: changie's checksum
         run: .github/scripts/install-changie.sh
+
+      # Every unreleased entry, batched as the release will (dry run): a change file that is not
+      # valid YAML (an unescaped ' in a single-quoted body broke v0.24.0's Tag step) fails here, on
+      # the pull request that adds it, not after the release is approved.
+      - name: changie's entries
+        run: |
+          if compgen -G '.changes/unreleased/*.yaml' >/dev/null; then
+            changie batch auto --dry-run >/dev/null
+          fi
 
       # The busybox the runner puts into job containers (runner/src/dagger.zig), pinned by digest:
       # checked to be a pullable multi-arch index (amd64 and arm64) with the applets Docker actions,
@@ -143,6 +158,32 @@ jobs:
       - name: ZLint
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/zlint.sh
+
+  # The comparison tools' Go (runner/tools/*diff), with go vet and staticcheck (go-lint.sh): they
+  # are test oracles, so a bug in one hides one in the runner. Skipped, still reporting, on a change
+  # that cannot affect them (ci-scope.sh go); compare.yml runs it weekly whatever changed.
+  go:
+    name: Go tools
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether this change can affect the Go tools
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh go
+
+      # Go is on GitHub's runner; it fetches the pinned staticcheck and the toolchain the go.mods
+      # name, checked against Go's checksum database.
+      - name: go vet and staticcheck
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/go-lint.sh
 
   # The database tests, which skip themselves without a database: here against TimescaleDB, as
   # deployments use, and required to run (ZIG_TEST_REQUIRE_DB), so this job cannot pass by skipping

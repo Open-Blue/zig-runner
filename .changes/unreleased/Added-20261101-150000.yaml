@@ -1,3 +1,0 @@
-kind: Added
-body: 'A native Dockerfile interpreter for Docker actions, not yet wired to jobs (they need the native action loader first): it parses a Dockerfile as Docker does and builds `FROM`, `RUN`, `COPY`, `ADD`, `ENV`, `WORKDIR`, `ENTRYPOINT`, `CMD`, `ARG`, `USER` and `LABEL` as a chain of keyed layers (each key from its parent''s, the instruction as evaluated, and what it reads: the build arguments for `RUN`, the sources'' content for `COPY`), taken from a layer store when the key is there. Multi-stage builds, wildcards, `ADD` of URLs or archives, `SHELL`, `ONBUILD` and heredocs are refused with the line and the reason.'
-time: 2026-11-01T15:00:00.000000-04:00

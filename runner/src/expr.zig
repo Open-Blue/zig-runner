@@ -67,7 +67,7 @@ pub const Scope = struct {
     filtered: ?*Filtered = null,
 
     fn fail(s: Scope, comptime fmt: []const u8, args: anytype, arena: Allocator) Error {
-        if (s.diag) |d| d.* = std.fmt.allocPrint(arena, fmt, args) catch "expression error";
+        if (s.diag) |d| d.* = std.fmt.allocPrint(arena, fmt, args) catch return error.OutOfMemory;
         return error.EvalError;
     }
 
@@ -258,7 +258,7 @@ const Lexer = struct {
             l.arena,
             fmt ++ " (in expression: {s})",
             args ++ .{l.src},
-        ) catch "invalid expression";
+        ) catch return error.OutOfMemory;
         return error.ParseError;
     }
 
@@ -933,7 +933,7 @@ fn evalNode(arena: Allocator, n: *const Node, scope: Scope, level: usize) Error!
                     arena,
                     "the '{s}' context is not supported yet",
                     .{name},
-                ) catch "unsupported context";
+                ) catch return error.OutOfMemory;
                 return error.Unsupported;
             };
             return .{ .v = lookupEntry(scope.contexts, name) orelse .null, .data = true };
@@ -1138,8 +1138,10 @@ fn callFromJson(arena: Allocator, args: []const Value, scope: Scope) Error!Value
     const text = try toStr(arena, args[0]);
     if (jsonNesting(text) > max_json_nesting)
         return scope.fail("fromJSON(): nested more than {d} deep", .{max_json_nesting}, arena);
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch
-        return scope.fail("fromJSON(): invalid JSON", .{}, arena);
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return scope.fail("fromJSON(): invalid JSON", .{}, arena),
+    };
     return fromJsonValue(arena, parsed);
 }
 
@@ -1530,9 +1532,13 @@ fn expressionEnd(text: []const u8, from: usize) ?usize {
     return null;
 }
 
-/// Whether an `if:` expression calls success(), always(), failure() or cancelled().
-pub fn hasStatusFunction(arena: Allocator, text: []const u8) bool {
-    const n = parse(arena, text, null, null) catch return false;
+/// Whether an `if:` expression calls success(), always(), failure() or cancelled(). Running out of
+/// memory is an error, not "no": read as one, `always()` after a failed step skipped the step.
+pub fn hasStatusFunction(arena: Allocator, text: []const u8) Allocator.Error!bool {
+    const n = parse(arena, text, null, null) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
     return nodeHasStatus(n);
 }
 
@@ -1561,7 +1567,7 @@ pub fn evalCondition(arena: Allocator, cond: []const u8, scope: Scope) Error!boo
         text = std.mem.trim(u8, text[3 .. text.len - 2], " \t\r\n");
     if (text.len == 0) return !scope.job_failed and !scope.cancelled;
     const v = try evaluate(arena, text, scope);
-    if (!hasStatusFunction(arena, text) and (scope.job_failed or scope.cancelled)) return false;
+    if (!try hasStatusFunction(arena, text) and (scope.job_failed or scope.cancelled)) return false;
     return toBool(v);
 }
 
@@ -1742,8 +1748,8 @@ test "status functions and the implicit success()" {
     // empty condition and ${{ }} wrapper
     try std.testing.expect(try evalCondition(ar, "", ok));
     try std.testing.expect(try evalCondition(ar, "${{ 1 == 1 }}", ok));
-    try std.testing.expect(hasStatusFunction(ar, "github.ref == 'x' && !cancelled()"));
-    try std.testing.expect(!hasStatusFunction(ar, "github.ref == 'x'"));
+    try std.testing.expect(try hasStatusFunction(ar, "github.ref == 'x' && !cancelled()"));
+    try std.testing.expect(!try hasStatusFunction(ar, "github.ref == 'x'"));
 }
 
 test "errors say what is wrong" {

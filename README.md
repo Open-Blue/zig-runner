@@ -104,7 +104,9 @@ It is not a required check yet. Before a release, run the same suite by hand aga
 `compare` runs the comparison tools weekly
 (`.github/scripts/*-diff.sh`): the expression evaluator, YAML reader, `hashFiles()`, problem
 matcher regular expressions, HPACK decoder and RS256 signing against the implementations they
-follow, on fresh random cases.
+follow, on fresh random cases; and lints the tools' own Go (`.github/scripts/go-lint.sh`: `go vet`
+and a pinned staticcheck, which "Go tools" in `ci` also runs on a pull request that changes them,
+and govulncheck for information).
 CodeQL and Semgrep read no Zig, so the runner's own code has analysis of its own. "Lint (ZLint)"
 (`ci`, `.github/scripts/zlint.sh`) runs [ZLint](https://github.com/DonIsaac/zlint) on every pull
 request, pinned and checked against its release's checksum, with the rules that find bugs
@@ -168,7 +170,8 @@ repository:
   `.trivyignore.yaml`, each with why. GitHub's secret scanning blocks pushes carrying credentials.
 - **Checked.** actionlint and zizmor check the workflows, shellcheck every shell script
   (`.github/scripts/shellcheck.sh`), `busybox-pin.sh` the runner's busybox pin, and CodeQL the
-  workflows, the Go tools and the Python generators; every job has a time limit. The Database
+  workflows, the Go tools and the Python generators, which `go vet` and staticcheck lint too
+  (`.github/scripts/go-lint.sh`); every job has a time limit. The Database
   tests job runs every test under
   ThreadSanitizer (`zig build test -Dsanitize-thread` locally); ZLint checks the runner's Zig, and
   `analysis` fuzzes its parsers and runs its tests under Valgrind nightly (above). Vulnerabilities

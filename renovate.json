@@ -225,6 +225,18 @@
       "datasourceTemplate": "go"
     },
     {
+      "description": "staticcheck and govulncheck, built by version from Go in go-lint.sh (the comparison tools' lint).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/scripts/go-lint\\.sh$/"
+      ],
+      "matchStrings": [
+        "(?<depName>honnef\\.co/go/tools)/cmd/staticcheck@(?<currentValue>v[0-9][^\\s]*)",
+        "(?<depName>golang\\.org/x/vuln)/cmd/govulncheck@(?<currentValue>v[0-9.]+)"
+      ],
+      "datasourceTemplate": "go"
+    },
+    {
       "description": "zizmor, run by version from PyPI in CI and the pre-push hook.",
       "customType": "regex",
       "managerFilePatterns": [

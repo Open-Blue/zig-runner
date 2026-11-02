@@ -1,3 +1,0 @@
-kind: Added
-body: 'Native steps run JavaScript actions (node20, node24) with pre, main, post and `post-if`, through the same code as on Dagger, with the runtime pulled natively (its musl build in a musl image) and bound nosuid and nodev; and local actions (`uses: ./...`), judged before the job from the job''s own repository at its commit and read from the workspace when they run. A local action built from a Dockerfile, or one not in the repository at the job''s commit, still sends its job to Dagger.'
-time: 2026-11-01T21:00:00.000000-04:00

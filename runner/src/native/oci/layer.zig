@@ -255,6 +255,7 @@ pub const TarReader = struct {
         for (hdr, 0..) |c, i| {
             const b: u8 = if (i >= 148 and i < 156) ' ' else c;
             sum += b;
+            // Some old tars summed the bytes as signed chars: each byte's two's complement value.
             signed += @as(i8, @bitCast(b));
         }
         if (want != sum and @as(i64, @intCast(want)) != signed) return error.BadTarHeader;
@@ -921,6 +922,45 @@ test "native oci layer: base-256 numbers and checksums in tar headers" {
     var r: std.Io.Reader = .fixed(bad);
     var tr: TarReader = .{ .in = &r, .scratch = a.allocator() };
     try testing.expectError(error.BadTarHeader, tr.next());
+}
+
+test "allocation failures: a layer applied, with PAX headers, whiteouts and gzip" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try openRoot(testing.io, &tmp, arena);
+    defer _ = linux.close(root);
+
+    var t: TestTar = .{ .a = arena };
+    try t.add(.{ .path = "./", .kind = .directory, .mode = 0o755 });
+    try t.add(.{ .path = "d/", .kind = .directory, .mode = 0o755 });
+    try t.add(.{ .path = "x", .body = "pax", .pax = try std.mem.concat(arena, u8, &.{
+        try paxRecord(arena, "path", "d/" ++ repeat('p', 110)),
+        try paxRecord(arena, "SCHILY.xattr.user.a", "1"),
+    }) });
+    try t.add(.{ .path = "d/gone", .body = "x" });
+    try t.add(.{ .path = "d/.wh.gone" });
+    try t.add(.{ .path = "o/old", .body = "x" });
+    try t.add(.{ .path = "o/.wh..wh..opq" });
+    try t.add(.{ .path = "l", .kind = .symlink, .link = "d" });
+    const plain = try t.finish();
+
+    // Every failure from one on, the layer's memory freed each time. A run may still succeed:
+    // each entry's memory is an arena reset with `.retain_capacity`, which keeps what it has when
+    // the larger block it tries for fails, on purpose (`checkNoLeaks`). Each run applies the
+    // layer over the last one's rootfs, as a layer over a lower one.
+    const S = struct {
+        fn run(gpa: Allocator, fd: linux.fd_t, bytes: []const u8) !void {
+            var r: std.Io.Reader = .fixed(bytes);
+            var totals: Totals = .{};
+            try apply(gpa, testing.io, fd, &r, "", .{ .owners = false }, &totals);
+        }
+    };
+    const af = @import("../../alloc_failures.zig");
+    try af.checkNoLeaks(S.run, .{ root, plain });
+    try af.checkNoLeaks(S.run, .{ root, @as([]const u8, &test_gzip) });
 }
 
 /// The fixtures of the gzip and zstd test (see there).

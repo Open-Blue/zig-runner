@@ -1,3 +1,0 @@
-kind: Added
-body: 'Native steps run `uses: docker://<image>` steps (behind `RUNNER_BACKEND=native`): the action runs in its image''s filesystem in a sandbox of its own, with the job''s workspace and its home, workflow and file-command directories bound in at the paths GitHub binds them, its entrypoint, args, env, inputs and file commands as on Dagger, and what it writes in the workspace in the job''s next layer without a copy (given to the runner user, as Dagger gives it). Its image comes from the native image pull; a step whose image runs as a non-root `USER` sends its job to Dagger, as `uses:` Docker actions still do. On the laptop a `docker://` step takes about 11 ms natively.'
-time: 2026-11-01T12:07:00.000000-04:00

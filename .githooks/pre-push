@@ -6,7 +6,7 @@
 #   - zig fmt, GitHub's expression cases, and the build and tests ("Format, build and test");
 #     the database tests run too when PG* or ZIG_TEST_PG_URL point at a database;
 #   - actionlint and zizmor, when workflows changed, and shellcheck, when shell scripts did
-#     ("Workflows");
+#     ("Workflows"), and the unsafe constructs ratchet, always;
 #   - gofmt and go vet for the Go tools under runner/tools, when they changed;
 #   - the Lean proofs, and the hashFiles model against glob.zig, when either changed ("Proofs").
 #
@@ -63,6 +63,8 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 		grep "passed;" "$log" | tail -1 | sed "s/^/$hook: /" >&2
 		rm -f "$log"
 	)
+	say "unsafe constructs ratchet"
+	(cd "$tree" && .github/scripts/unsafe-ratchet.sh >/dev/null) || fail "more unsafe casts than the baseline: .github/scripts/unsafe-ratchet.sh shows which"
 	if grep -qE '\.sh$|^\.githooks/|^deploy/zig-runner-deploy$' <<<"$changed"; then
 		say "shellcheck"
 		(cd "$tree" && .github/scripts/shellcheck.sh >/dev/null) || fail "shellcheck found problems: .github/scripts/shellcheck.sh shows them"

@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Native steps get the tool cache, as Dagger steps do (#261): each job''s base makes `/opt/hostedtoolcache` (`RUNNER_TOOL_CACHE`) owned by the step user, so a script that installs into it, such as zig-runner''s `install-zig.sh`, no longer fails natively with `mkdir: cannot create directory ''/opt/hostedtoolcache'': Permission denied`. What a step puts there is in its layer and comes back with its replay, until phase 4''s cache volume takes the directory''s place. Native stays off by default; the Dagger backend is unchanged.'
-time: 2026-11-01T20:00:00.000000-04:00

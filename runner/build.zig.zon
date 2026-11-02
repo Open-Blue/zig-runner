@@ -1,6 +1,6 @@
 .{
     .name = .zig_actions_runner,
-    .version = "0.23.0",
+    .version = "0.24.0",
     .dependencies = .{
         .tls = .{
             .url = "https://github.com/ianic/tls.zig/archive/bd22bcb73f423389441a1de80bf031ef1b623cce.tar.gz",
