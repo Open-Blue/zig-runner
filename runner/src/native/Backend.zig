@@ -2671,8 +2671,25 @@ pub fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
         .sub_path = try std.fmt.allocPrint(arena, "rootfs/etc/{s}", .{f}),
         .data = "",
     });
-    const root = try d.realPathFileAlloc(io, ".", arena);
-    const cfg: Config = .{
+    const cfg = try testConfigAt(arena, try d.realPathFileAlloc(io, ".", arena), exe);
+    // One sandbox, to see whether this machine lets us make them at all.
+    var b = try init(arena, io, std.testing.allocator, cfg);
+    defer b.deinit();
+    var out: Captured = .{ .arena = arena };
+    const ended = try b.exec("true", &.{"PATH=/usr/bin"}, &.{}, 0, 0, out.output());
+    if (ended.failure.len > 0 or ended.code != 0)
+        return skip(required, try std.fmt.allocPrint(arena, "this machine cannot make a " ++
+            "native step's sandbox ({s}, exit {d})", .{ ended.failure, ended.code }));
+    // What `dagger.run` asks before a job goes native: a refusal here would send the tests' jobs
+    // to Dagger, which is not there.
+    if (usable(arena, io, std.testing.allocator, cfg)) |why| return skip(required, why);
+    return cfg;
+}
+
+/// `testConfig`'s backend over the directory `root` it made, with the runner binary `exe`: for a
+/// process of a test's own (`store_stress.zig`), whose jobs must key alike with the test's.
+pub fn testConfigAt(arena: Allocator, root: []const u8, exe: []const u8) !Config {
+    return .{
         .rootfs = try std.fmt.allocPrint(arena, "{s}/rootfs", .{root}),
         .store = try std.fmt.allocPrint(arena, "{s}/store", .{root}),
         .self_exe = exe,
@@ -2686,18 +2703,6 @@ pub fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
             .{ .host = "/etc/ssl", .at = "/etc/ssl" },
         },
     };
-    // One sandbox, to see whether this machine lets us make them at all.
-    var b = try init(arena, io, std.testing.allocator, cfg);
-    defer b.deinit();
-    var out: Captured = .{ .arena = arena };
-    const ended = try b.exec("true", &.{"PATH=/usr/bin"}, &.{}, 0, 0, out.output());
-    if (ended.failure.len > 0 or ended.code != 0)
-        return skip(required, try std.fmt.allocPrint(arena, "this machine cannot make a " ++
-            "native step's sandbox ({s}, exit {d})", .{ ended.failure, ended.code }));
-    // What `dagger.run` asks before a job goes native: a refusal here would send the tests' jobs
-    // to Dagger, which is not there.
-    if (usable(arena, io, std.testing.allocator, cfg)) |why| return skip(required, why);
-    return cfg;
 }
 
 pub fn skip(required: bool, why: []const u8) error{ SkipZigTest, NativeTestsRequired } {

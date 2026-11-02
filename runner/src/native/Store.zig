@@ -382,6 +382,27 @@ fn readEntry(arena: Allocator, io: std.Io, dir: []const u8) !Record {
     return rec;
 }
 
+/// The published entry `name` (under `layers/`) checked as a replay checks it (`readEntry`),
+/// held shared meanwhile as `open` holds it, and its tree the bytes its meta counted: its bytes,
+/// or null when it was evicted before it could be held. An error says what is wrong with it. For
+/// the stress test (`store_stress.zig`), which checks every entry while jobs publish, replay and
+/// evict around it.
+pub fn checkEntry(s: Store, arena: Allocator, io: std.Io, name: []const u8) !?u64 {
+    const dir = try std.fmt.allocPrint(arena, "{s}/layers/{s}", .{ s.root, name });
+    const lock_path = try join(arena, dir, "lock");
+    const f = std.Io.Dir.cwd().openFile(io, lock_path, .{}) catch |e| {
+        // Published whole, so with its lock: gone since the listing, or broken.
+        if (e == error.FileNotFound and !isDir(arena, dir)) return null;
+        return e;
+    };
+    defer f.close(io);
+    if (!flock(f, lock_sh) or !sameFile(arena, f, lock_path)) return null;
+    _ = try readEntry(arena, io, dir);
+    const m = try metaOf(arena, io, dir);
+    if (try treeBytes(arena, io, try join(arena, dir, "fs")) != m.bytes) return error.TreeBytes;
+    return m.bytes;
+}
+
 fn metaOf(arena: Allocator, io: std.Io, dir: []const u8) !Meta {
     const text = try std.Io.Dir.cwd().readFileAlloc(io, try join(arena, dir, "meta"), arena, .limited(1024));
     return Meta.parse(text);

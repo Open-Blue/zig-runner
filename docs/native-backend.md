@@ -1389,6 +1389,17 @@ What BuildKit's cache did implicitly, now explicit in `native/Store.zig`:
   depth limit and fail closed. Lesson: an entry in a cache shared between jobs is input the next
   job trusts, so every way it can be partial, stale or someone else's has to be in its key or
   checked on read.
+- **Every publisher holds the key's lock, or a collect deletes its work.** `collect` tells a dead
+  runner's half-built entry from a live one by the key's lock, which steps held while publishing
+  and P7's Dockerfile builds (`layers.zig`) did not. Another runner's collect then removed a
+  build's entry mid-publish: the build lost its layer, or the rename that publishes moved the
+  directory the delete was walking, and a whole-looking entry with part of its tree gone was
+  published for the next job to mount (the record's checks do not read the tree). The one-job and
+  two-job tests could not see it; a stress test (`store_stress.zig`: several processes, one
+  store, a cap small enough that every job's end evicts) found it in seconds. `publish` now
+  refuses without the lock. Lessons: a precondition another function relies on belongs in a check,
+  not a doc comment; and a store shared between processes needs a test with processes, many, for
+  long enough, checking every invariant at once.
 - **Dagger's replay limit is not ours.** Dagger replays a step past 4 MiB of output with a warning
   instead of its log; natively such a step is not published and runs again.
 
