@@ -347,9 +347,9 @@ What it covers, as built:
   on (`Backend.below`): the store's format (`Store.store_format`), the job's cache scope and
   repository, the rootfs's fingerprint (a walk of its metadata, ctimes and inodes among it, kept
   per process and checked again for every job against the root's and the provisioning stamp's
-  identity and ctime), how ids are mapped, on a root runner the slot's first id (a layer's files are owned by its job's
-  range, so it is reused only by jobs with the same range: only misses come of it), and the binds'
-  places (never their content). Under step caching the event payload is a variable each step
+  identity and ctime), how ids are mapped (the userns mode: a root runner's and a rootless one's
+  layers never meet), and the binds' places (never their content). Not the slot: a stored layer has
+  the canonical ids (below), so a job in any slot replays what a job in another stored. Under step caching the event payload is a variable each step
   writes to the file, as `set_up.writeRunEnv` gives it, so the base is the same for every run.
 - **The store's format** (`Store.store_format`) is bumped with any change to what a layer or its
   record means: the sandbox's trees, the record's files and how they replay, the key's extras.
@@ -366,7 +366,8 @@ What it covers, as built:
   under Dagger its new parent makes every later key new), and no layer or log holds a secret. A
   step that printed more than `dagger.max_recorded_bytes` is not kept, nor a record its kind may
   not have (a step's file commands without their ran marker, a base's or a fetch's not empty),
-  nor a layer whose size cannot be counted whole (a directory it cannot read). A commit's checkout
+  nor a layer whose size cannot be counted whole (a directory it cannot read). On a root runner the
+  layer is first given the canonical ids (`Store.unshift`, below). A commit's checkout
   (a fetch of a full SHA) is a layer like a step's, keyed on its script and never on the token;
   a branch or tag moves, so its fetch always runs. The upper is moved under `layers/.tmp-<key>-<n>`
   with its record, held, written to disk (`syncfs`), and published by one
@@ -382,8 +383,8 @@ What it covers, as built:
   is touched only once it passed.
 - **Locks**: one flock per key while its exec runs (polled, so a cancel or a timeout ends the
   wait), so two jobs sharing the store do not run one key at once: the second replays the
-  first's. On a root runner two jobs at once take two slots, so their keys differ anyway. A job
-  holds a shared flock on each store layer it uses until it ends.
+  first's, on a root runner too, whatever their slots. A job holds a shared flock on each store
+  layer it uses until it ends.
 - **GC** (`Store.collect`, after each job): past `RUNNER_NATIVE_STORE_MAX_MB` (default 10240),
   the layers no job holds go, least recently used first (the lock file's mtime is the last use),
   each renamed away under its lock taken exclusively, then deleted. Half-built and half-evicted
@@ -399,7 +400,37 @@ What it covers, as built:
   (other host ids as the overflow id), the xattrs that say what it is (overlay's bookkeeping left
   out), and its content (a file's bytes, a link's target, a device's numbers, so whiteouts too).
   No times, inodes, link counts or host ids. Nothing asks for them yet: output keys stay off on
-  native.
+  native. A layer's digest is the same before and after its ids are shifted (`Store.unshift`
+  maps owners as the digest does), but for the ids inside xattrs, which the digest hashes raw: a
+  file capability's root id and ACL entries' named users and groups are host ids, shifted with the
+  layer, so a layer with either digests differently after. Before the shift they named the slot,
+  so such a digest was never the same across slots either.
+- **The canonical ids (layers shared across slots).** On a root runner each job has a slot, its
+  own 65536 host ids, and a step's upper is written in them. A layer is published with the ids
+  the job's namespace saw (`Store.unshift`, as `ImageStore.flatten` shifts a provisioned rootfs):
+  the slot's host ids become 0 to 65535, any other host id the overflow id (65534, as the digest
+  maps it), set-id bits (which `chown` clears) put back, file capabilities put back with their
+  root's id shifted (dropped when it is outside the range), ACL entries' ids shifted; through no
+  symlink (directories opened with `openat2`'s `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`, each entry
+  changed through an `O_PATH` descriptor checked against the walk's inode), with no depth limit,
+  each inode once. It relies on nothing writing the tree meanwhile (the step's processes are gone)
+  but does not trust it. A failure ends the job, and the layer is never shifted again, rather than
+  leave a layer half one range's or shift it twice. Each step mounts every lower with the canonical ids (the rootfs, the
+  seeds, the stored layers, a flattened stack) idmapped onto its job's range
+  (`sandbox.idmapLowers`, `Spec.canonical`), read-only, nosuid and nodev; the step's upper is
+  not idmapped (an idmapped upper is newer and unverified here, and not needed), so what a step
+  writes, copy-ups included, has its slot's ids until it is published. A job's own unpublished
+  uppers keep the slot's ids; flattening gives them the canonical ids first, so the merged layer
+  is one tree with one set of ids. Rootless runners have no slots and shift nothing.
+- **The store is a security boundary, so the runner checks it.** With the canonical ids, a
+  job's set-uid-root file or file capability is the host's root's on disk. Whoever can reach the
+  store, or replace it or a directory on the way to it, has the host's root. So every start
+  (`Store.prepare`, and the probe, which keeps native off and says why) makes the store directory
+  the runner's own (root on a root runner, set through a descriptor opened `O_NOFOLLOW`) and mode
+  0700. It refuses a store it cannot make so, a store that is a symlink, and one under any
+  directory (along the path as given and as it resolves) that another user owns or that others (or
+  a group other than root) can write without the sticky bit. A rootless runner's store must be its own user's,
+  under directories that are root's or its own.
 
 #### Measured (laptop "cowbird", balanced profile, 2026-11-01, load about 5.5)
 
@@ -708,9 +739,10 @@ than replacing it, since both backends ship (proofs/README.md, "On the native ba
   directory and kept files, each field prefixed with its length as a u64 little-endian. A base has
   no parent: in its place is the untagged digest below it (`Backend.below`: the store's format
   `Store.store_format`, the trust scope, the repository, the rootfs's fingerprint, the userns mode,
-  the slot's first id, the binds). `fork_keys_apart`: a fork's pull request (scope `untrusted`) and
-  the repository's own jobs (`repo`) never ask the same key, so neither replays what the other
-  stored.
+  the binds; the slot's first id until stored layers took the canonical ids). `fork_keys_apart`: a
+  fork's pull request (scope `untrusted`) and the repository's own jobs (`repo`) never ask the same
+  key, so neither replays what the other stored; `userns_apart`: nor do a root and a rootless
+  runner's jobs.
   The extras are not new inputs: a step's are its job's, fixed with the base (`Format.stepExtra`), and a base's are part of what the
   model's base is (`BaseSpec`). `encState_injective`, `belowPreimage_inj`, `encKey_injective` and
   `native_key_iff`: the format keeps exactly what the model's key keeps, so P2 and P3 hold of it;
@@ -981,11 +1013,17 @@ What BuildKit's cache did implicitly, now explicit in `native/Store.zig`:
   binds' places) is listed beside it for P8 to add. The ran marker, the markers' secret and the
   event were volatile variables under Dagger; natively they are plain variables, so the key must
   leave them out by name, or every job would miss.
-- **A layer belongs to an id range.** On a root runner a layer's files are owned by its job's
-  host ids. Unlike the rootfs, which an idmapped mount shifts per slot, a stored layer is not
-  shifted: it is keyed by the slot's first id, which costs misses across slots (a pool's
-  concurrent jobs do not share layers) and keeps a job's files from appearing under another
-  range. An idmapped mount per stored layer would lift that; it is the helper's work.
+- **A layer has the canonical ids** (it first belonged to an id range). On a root runner a
+  layer's files were owned by its job's host ids and, unlike the rootfs, which an idmapped mount
+  shifts per slot, a stored layer was not shifted: it was keyed by the slot's first id. In a busy
+  pool reruns mostly missed (the end-to-end job's rerun landed in slot 0 after the first run used
+  slot 2, and needed a third try). Now a layer is shifted to the canonical ids when published and
+  idmapped onto each job's range when mounted, the rootfs's own arrangement, and the slot left
+  the key (store format 3). Lessons: every piece was already there (the provisioning's shift back,
+  the seeds' idmapped lowers), so the cost of the first cut was one key field and a doc line, and
+  the price of keeping it was paid in misses no test saw, since tests run one job at a time and
+  take slot 0. And a shift by `chown` is lossy unless told otherwise: it clears set-id bits and
+  file capabilities, misses ACLs, and sees a hard link twice.
 - **Masks are secrets for the cache.** A step that names a value an earlier step masked always
   runs (`holdsSecret` counts masks), on native as on Dagger; the first replay test tripped on it.
 - **Publish must never replace, and a reader must never trust a half.** `RENAME_NOREPLACE` keeps a
@@ -994,7 +1032,10 @@ What BuildKit's cache did implicitly, now explicit in `native/Store.zig`:
   from taking it between the rename and the job's use.
 - **The store's mode is a security boundary.** Its layers hold job-written files owned by the
   jobs' ids, setuid ones among them: at 0755 a host user could run one as the job's root's host id.
-  The store is 0700 (P1's job directories, under it, were exposed the same way).
+  The store is 0700 (P1's job directories, under it, were exposed the same way). Since layers have
+  the canonical ids, a job's set-uid-root file is one of the host's root on disk, as the pulled
+  images' `sudo` already was: the 0700 store is what keeps every host user from it, and `prepare`
+  sets the mode on every start.
 - **What the review found (after merge, fixed in a follow-up).** A fingerprint kept per process
   by path missed a rootfs provisioned again in place: `tar -x` restores mtimes, so size and mtime
   match; ctimes do not, and every job now checks the root and a stamp. Layers outlived runner
@@ -1152,8 +1193,8 @@ specification:
   yet, so no stored digest changed meaning; the rootfs's fingerprint, the same walk, changed once,
   which costs one round of misses.
 - **What P2 hashes beyond the model added no input to it.** P2's key carries the uid, gid, working
-  directory and kept files, and the digest below a base (store format, rootfs, id mapping, slot,
-  binds). Each is
+  directory and kept files, and the digest below a base (store format, rootfs, id mapping, binds;
+  the slot too, until stored layers took the canonical ids and it left the key). Each is
   either part of what the model's base is or fixed with it for every step of the job, so the proof
   needed a richer `Format`, not a richer model: the base became a `BaseSpec` and a step's extras its
   base's (`stepExtra`). One consequence worth knowing: when the event payload is too large for a
