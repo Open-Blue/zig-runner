@@ -1537,6 +1537,39 @@ test "stop-commands lasts to the end of its exec, and a refused token stops noth
     try std.testing.expect(!sh.holdsSecret("x", 1));
 }
 
+test "a stop-commands token longer than six bytes is masked; set-env and add-path keep what they set" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f: LogPathFixture = undefined;
+    f.init(a.allocator());
+    const sh = &f.sh;
+    sh.beginCommands(1, &.{});
+    // Six bytes: not masked, as GitHub's runner leaves it. Seven: masked from then on.
+    sh.stepOutput(1, "::stop-commands::tok123");
+    sh.stepOutput(1, "::tok123::");
+    try std.testing.expect(!sh.holdsSecret("tok123", 1));
+    sh.stepOutput(1, "::stop-commands::tok1234");
+    sh.stepOutput(1, "::tok1234::");
+    try std.testing.expect(sh.holdsSecret("tok1234", 1));
+
+    // Allowed, set-env and add-path keep their values, a one-byte name or path too.
+    sh.beginCommands(1, &.{.{ .name = "ACTIONS_ALLOW_UNSECURE_COMMANDS", .value = "true" }});
+    sh.stepOutput(1, "::set-env name=A::one");
+    sh.stepOutput(1, "::set-env name=LONGER::two");
+    sh.stepOutput(1, "::add-path::/");
+    const u = sh.takeUnsecure(1);
+    try std.testing.expect(!u.failed);
+    try std.testing.expectEqual(@as(usize, 2), u.env.len);
+    try std.testing.expectEqualStrings("A", u.env[0].name);
+    try std.testing.expectEqualStrings("one", u.env[0].value);
+    try std.testing.expectEqualStrings("LONGER", u.env[1].name);
+    try std.testing.expectEqual(@as(usize, 1), u.paths.len);
+    try std.testing.expectEqualStrings("/", u.paths[0]);
+    // Taken: the next call has nothing.
+    const again = sh.takeUnsecure(1);
+    try std.testing.expectEqual(@as(usize, 0), again.env.len + again.paths.len);
+}
+
 test "a matched line is logged as the issue; a file outside the workspace is dropped" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
