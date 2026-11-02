@@ -5,8 +5,8 @@
 #   - the branch name's prefix (CI's "Branch name"; it decides the release, README "Versioning");
 #   - zig fmt, GitHub's expression cases, and the build and tests ("Format, build and test");
 #     the database tests run too when PG* or ZIG_TEST_PG_URL point at a database;
-#   - actionlint and zizmor, when workflows changed, and shellcheck, when shell scripts did
-#     ("Workflows"), and the unsafe constructs ratchet, always;
+#   - actionlint and zizmor, when workflows changed, shellcheck and shfmt, when shell scripts did,
+#     and hadolint, when the Dockerfile did ("Workflows"), and the unsafe constructs ratchet, always;
 #   - gofmt and go vet for the Go tools under runner/tools, when they changed;
 #   - the Lean proofs, and the hashFiles model against glob.zig, when either changed ("Proofs").
 #
@@ -68,6 +68,12 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 	if grep -qE '\.sh$|^\.githooks/|^deploy/zig-runner-deploy$' <<<"$changed"; then
 		say "shellcheck"
 		(cd "$tree" && .github/scripts/shellcheck.sh >/dev/null) || fail "shellcheck found problems: .github/scripts/shellcheck.sh shows them"
+		say "shfmt"
+		(cd "$tree" && .github/scripts/shfmt.sh >/dev/null 2>&1) || fail "shell scripts not formatted: .github/scripts/shfmt.sh -w formats them"
+	fi
+	if grep -qE '(^|/)Dockerfile' <<<"$changed"; then
+		say "hadolint"
+		(cd "$tree" && .github/scripts/hadolint.sh >/dev/null) || fail "hadolint found problems: .github/scripts/hadolint.sh shows them"
 	fi
 	if grep -q '^\.github/workflows/' <<<"$changed"; then
 		say "actionlint and zizmor"

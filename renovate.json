@@ -154,6 +154,32 @@
       "extractVersionTemplate": "^v(?<version>.*)$"
     },
     {
+      "description": "hadolint, pinned by version in hadolint.sh. A new version also needs its checksums from the release's checksums.sha256, updated by hand, which CI enforces by failing until they are (the Workflows job runs hadolint.sh).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/scripts/hadolint\\.sh$/"
+      ],
+      "matchStrings": [
+        "\\nversion=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "hadolint/hadolint",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "description": "shfmt, pinned by version in shfmt.sh. A new version also needs its checksums (GitHub's digest of each release asset; the release publishes no checksum file), updated by hand, which CI enforces by failing until they are (the Workflows job runs shfmt.sh).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/scripts/shfmt\\.sh$/"
+      ],
+      "matchStrings": [
+        "\\nversion=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "mvdan/sh",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
       "description": "checksec, pinned by version in checksec.sh. A new version also needs its checksums from the release's checksec_checksums.sha512, updated by hand, which CI enforces by failing until they are (Release builds runs checksec.sh on a change to it).",
       "customType": "regex",
       "managerFilePatterns": [

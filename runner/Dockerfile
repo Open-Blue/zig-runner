@@ -14,11 +14,15 @@
 
 # Pinned by digest, which a moved tag cannot change; Renovate moves the pin.
 FROM --platform=$BUILDPLATFORM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS certs
-RUN apk add --no-cache ca-certificates
-# An empty /tmp for the image, which has none: each job's log is spooled there
+# Packages unversioned (hadolint DL3018): the image's digest pins the release, and Alpine keeps
+# only the newest build of each package in it, so a pinned version stops installing at its next
+# security fix.
+# And an empty /tmp for the image, which has none: each job's log is spooled there
 # (`RUNNER_LOG_SPOOL_DIR`). Without it every job kept its log in memory instead, up to 64 MB of
 # lines and as much again in bookkeeping: a job that logged 200 MB grew the runner by 170 MB.
-RUN mkdir -m 1777 /image-tmp
+# hadolint ignore=DL3018
+RUN apk add --no-cache ca-certificates \
+ && mkdir -m 1777 /image-tmp
 
 FROM scratch AS prebuilt
 ARG TARGETARCH
@@ -40,7 +44,11 @@ ARG TARGETARCH
 # nothing about which build it is. Pass `--build-arg VERSION=...`; the release's image is
 # `prebuilt`, whose binaries carry theirs.
 ARG VERSION=
+# Unversioned, as in `certs` above.
+# hadolint ignore=DL3018
 RUN apk add --no-cache curl xz ca-certificates
+# A failed command anywhere in a pipeline fails the step (busybox's ash has pipefail).
+SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 RUN arch="$(uname -m)" \
  && case "$arch" in \
       x86_64) sum="$ZIG_SHA256_X86_64" ;; \
