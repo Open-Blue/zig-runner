@@ -426,6 +426,14 @@ def main():
     try:
         results = [r for r in (run_module(n, args, base) for n in names) if r]
     finally:
+        # A test a mutant stopped halfway can leave a directory it took every permission from
+        # (the store's walk test does), which must be given them back before it can go.
+        for root, dirs, _ in os.walk(base):
+            for d in dirs:
+                try:
+                    os.chmod(os.path.join(root, d), 0o700)
+                except OSError:
+                    pass
         shutil.rmtree(base, ignore_errors=True)
     if results:
         write(results, args.out)
