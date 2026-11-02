@@ -72,6 +72,13 @@ pub const Spec = struct {
     id_count: u32 = 0,
     /// The job's network namespace (a bind-mounted namespace file), when it has one.
     netns: ?[]const u8 = null,
+    /// A layer below every other, the image's included (and below a container's image), with
+    /// empty files where the job's resolver and hosts file are bound (`/etc/resolv.conf`,
+    /// `/etc/hosts`): an image without them (Alpine's, most of Docker Hub's but Debian's and
+    /// Ubuntu's) still gets them, as Docker and BuildKit make them, and no step's layer ever
+    /// holds the mount point. An image's own file is above it, and its directories' owners and
+    /// modes win. Relative to `root`, as the job's layers are; seen as the image's own ids.
+    mount_points: ?[]const u8 = null,
     /// The job's cgroup (`cgroup.zig`), which the helper joins before anything else, so every
     /// process of the step is born in it and held to its limits.
     cgroup: ?[]const u8 = null,
@@ -461,8 +468,16 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
     // helper is still the host's user that may.
     const status: linux.fd_t = if (spec.service) |s| health.openStatus(arena, s.status) else -1;
 
-    // 1. The user namespace, and the overlay mounted in a mount namespace the helper owns.
-    var lowers = spec.lowers;
+    // 1. The user namespace, and the overlay mounted in a mount namespace the helper owns. The
+    // mount points' layer, when there is one, lowest of all, as the image's own.
+    const mp: []const []const u8 = if (spec.mount_points) |m| &.{m} else &.{};
+    var lowers: []const []const u8 =
+        std.mem.concat(arena, []const u8, &.{ spec.lowers, mp }) catch oom();
+    const image_layers = spec.image_layers + @intFromBool(spec.mount_points != null);
+    const c_lowers: []const []const u8 = if (spec.container) |c|
+        std.mem.concat(arena, []const u8, &.{ c.lowers, mp }) catch oom()
+    else
+        &.{};
     switch (spec.userns) {
         .mapped => {
             // As the host's root: into the job's network, then a namespace of the job's ids, the
@@ -479,11 +494,11 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
                 null;
             check("unshare(mount)", linux.unshare(linux.CLONE.NEWNS));
             makePrivate();
-            lowers = idmapLowers(arena, spec.lowers, spec.image_layers, spec.canonical, userns);
+            lowers = idmapLowers(arena, lowers, image_layers, spec.canonical, userns);
             mountOverlay(arena, spec, lowers, false);
             if (spec.container) |c| {
-                const mapped = arena.alloc([]const u8, c.lowers.len) catch oom();
-                for (c.lowers, mapped, 0..) |l, *m, i| {
+                const mapped = arena.alloc([]const u8, c_lowers.len) catch oom();
+                for (c_lowers, mapped, 0..) |l, *m, i| {
                     const at = std.fmt.allocPrintSentinel(arena, "I{d}", .{i}, 0) catch oom();
                     m.* = idmapped(arena, l, userns, at);
                 }
@@ -507,7 +522,7 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
             if (spec.userns == .self) enterUserns();
             makePrivate();
             mountOverlay(arena, spec, lowers, true);
-            if (spec.container) |c| mountContainer(arena, c, c.lowers, true);
+            if (spec.container) |c| mountContainer(arena, c, c_lowers, true);
         },
     }
 

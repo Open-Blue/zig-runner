@@ -259,6 +259,7 @@ fn startOne(
         .id_base = b.idBase(),
         .id_count = Backend.ids_per_slot,
         .netns = b.netns,
+        .mount_points = Backend.mount_points,
         // P4: the service's helper and everything it starts are in the job's cgroup, held to
         // the job's limits and measured with it.
         .cgroup = if (b.job_cgroup) |j| j.dir else null,
