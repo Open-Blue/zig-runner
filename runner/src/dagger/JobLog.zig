@@ -557,6 +557,14 @@ fn dupeOpt(a: Allocator, s: ?[]const u8) Allocator.Error!?[]const u8 {
     return if (s) |t| try a.dupe(u8, t) else null;
 }
 
+/// Where to cut `text`, the start of a line too long to hold whole, under the job's secrets and
+/// masks so far (`redact.cut`); null to hold it longer, unless `force`.
+pub fn cutLine(sh: *JobLog, text: []const u8, force: bool) ?redact.Cut {
+    sh.mu.lockUncancelable(sh.io);
+    defer sh.mu.unlock(sh.io);
+    return redact.cut(text, sh.log.currentSecrets(), sh.masks, force);
+}
+
 /// `text` with the job's secrets and masks so far replaced, for what leaves the runner other
 /// than through the log (a step's evaluated name, a job output).
 pub fn redacted(sh: *JobLog, arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
@@ -843,6 +851,9 @@ pub const SpanDemux = struct {
     gpa: Allocator,
     mu: std.Io.Mutex = .init,
     spans: std.StringHashMapUnmanaged(Span) = .empty,
+    /// From this many bytes, a line joined from a span's pieces is cut (`onRecord`); tests make
+    /// it smaller.
+    max_line: usize = max_line_bytes,
 
     pub const Span = struct {
         step: ?u32 = null,
@@ -851,8 +862,7 @@ pub const SpanDemux = struct {
         partial: std.ArrayList(u8) = .empty,
     };
 
-    /// The longest line joined from a span's pieces (`onRecord`).
-    const max_line_bytes = 1024 * 1024;
+    pub const max_line_bytes = 1024 * 1024;
 
     pub fn onRecord(ptr: *anyopaque, rec: engine.LogRecord) void {
         const d: *SpanDemux = @ptrCast(@alignCast(ptr));
@@ -876,10 +886,16 @@ pub const SpanDemux = struct {
         }
         span.partial.replaceRangeAssumeCapacity(0, start, &.{});
         // Output with no newline in it (`head -c 200M /dev/zero`) is a line that never ends: past
-        // `max_line_bytes` what has come is a line of its own, rather than all of it held here.
-        if (span.partial.items.len >= max_line_bytes) {
-            d.line(span, span.partial.items);
-            span.partial.clearAndFree(d.gpa);
+        // `max_line` what has come is a line of its own, rather than all of it held here. Cut
+        // where no secret spans the cut (`redact.cut`): cut anywhere, a secret split between two
+        // lines was shown, half on each. Held up to four times as long for such a place.
+        if (span.partial.items.len >= d.max_line) {
+            const force = span.partial.items.len >= 4 * d.max_line;
+            if (d.sh.cutLine(span.partial.items, force)) |c| {
+                d.line(span, if (c.masked) redact.mask else span.partial.items[0..c.at]);
+                span.partial.replaceRangeAssumeCapacity(0, c.at, &.{});
+                if (span.partial.items.len == 0) span.partial.clearAndFree(d.gpa);
+            }
         }
         if (rec.eof and span.partial.items.len > 0) {
             d.line(span, span.partial.items);
@@ -1278,6 +1294,31 @@ test "a marker a step prints itself, naming no step of the job, is output, not a
     try std.testing.expect(std.mem.indexOf(u8, out, "still step 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "step 4000000000") == null);
     try std.testing.expect(ended[0].load(.acquire));
+}
+
+test "a long line is cut where it splits no secret" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f: LogPathFixture = undefined;
+    f.init(a.allocator());
+    var out: std.Io.Writer.Allocating = .init(a.allocator());
+    f.log = .{ .stdout = .{ .writer = &out.writer } };
+    f.log.setSecrets(try redact.expand(a.allocator(), &.{"s3cret-value"}));
+    f.sh.mark = "m";
+    var sd: SpanDemux = .{ .sh = &f.sh, .gpa = std.testing.allocator, .max_line = 16 };
+    defer sd.deinit();
+    SpanDemux.onRecord(&sd, .{ .span = "s", .stream = 1, .text = marker ++ "begin 1 m\n" });
+    // 32 bytes with no newline, the secret across byte 16, in pieces of 5.
+    const text = "0123456789abc s3cret-value 98765";
+    var i: usize = 0;
+    while (i < text.len) : (i += 5)
+        SpanDemux.onRecord(&sd, .{ .span = "s", .stream = 1, .text = text[i..@min(i + 5, text.len)] });
+    SpanDemux.onRecord(&sd, .{ .span = "s", .stream = 1, .text = "\n" });
+    // Cut where the secret was not, so it is masked whole: cut at byte 16, its two halves
+    // were each shown.
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "s3cret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "value") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "***") != null);
 }
 
 test "output with no newline is cut into lines of max_line_bytes, not held whole" {

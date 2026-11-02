@@ -171,6 +171,82 @@ pub fn alloc(arena: std.mem.Allocator, text: []const u8, secrets: []const []cons
     return aw.written();
 }
 
+/// Where a line too long to hold whole is cut (`cut`): the first `at` bytes are logged as a line of
+/// their own and the rest kept for the next; with `masked`, the first `at` bytes are one masked
+/// span, logged as `***`.
+pub const Cut = struct { at: usize, masked: bool = false };
+
+/// Where to cut `text`, the start of a line too long to hold whole, so that the parts masked each
+/// on its own show what the whole line masked would (`write`): the last place no occurrence of a
+/// secret spans, at least the longest secret's length less one before the end, since the text
+/// after the end, not here yet, could finish a secret begun before it. Null when there is no such
+/// place, unless `force`: then the place a span of secrets reaching from the start ends, all of
+/// it masked (only a run of overlapping secrets longer than the line gets there), or, when
+/// `text` is shorter than a secret, all of it.
+///
+/// A cut anywhere else could split a secret between two lines, each part then shown.
+pub fn cut(text: []const u8, secrets: []const []const u8, index: ?*const Set, force: bool) ?Cut {
+    var longest: usize = 0;
+    for (secrets) |s| longest = @max(longest, s.len);
+    if (longest <= 1) return .{ .at = text.len };
+    if (text.len < longest) return if (force) .{ .at = text.len } else null;
+    const limit = text.len - (longest - 1);
+    const list: List = .{ .secrets = secrets };
+    // How far the secrets that start before each place reach.
+    var reach: usize = 0;
+    var best: ?usize = null;
+    for (0..limit) |j| {
+        const n = if (index) |ix| ix.longestAt(text[j..]) else list.longestAt(text[j..]);
+        reach = @max(reach, j + n);
+        if (reach <= j + 1) best = j + 1;
+    }
+    if (best) |at| return .{ .at = at };
+    // Every place up to `limit` is inside a secret, so all of `text[0..reach]` is one span.
+    return if (force) .{ .at = reach, .masked = true } else null;
+}
+
+test "a long line is cut where no secret spans the cut, so each part masks as the whole does" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const secrets: []const []const u8 = &.{ "s3cret-value", "ab", "bcdef", "aaa" };
+    var set: Set = .{};
+    for (secrets) |s| try set.add(ar, s);
+    // The cut never splits `s3cret-value`, however the line ends.
+    try std.testing.expectEqual(Cut{ .at = 9 }, cut("xxxxxxxx s3cret-value", secrets, null, false).?);
+    try std.testing.expectEqual(Cut{ .at = 9 }, cut("xxxxxxxx s3cret-value", secrets, &set, false).?);
+    try std.testing.expectEqual(Cut{ .at = 6 }, cut("xxxxxxxx s3cret-v", secrets, &set, false).?);
+    // No secrets: anywhere.
+    try std.testing.expectEqual(Cut{ .at = 5 }, cut("hello", &.{}, null, false).?);
+    // Too short to know: held, unless forced.
+    try std.testing.expect(cut("s3cret", secrets, null, false) == null);
+    try std.testing.expectEqual(Cut{ .at = 6 }, cut("s3cret", secrets, null, true).?);
+    // Secrets that touch can be cut between; ones that overlap from the start cannot: held, and
+    // forced, one masked span.
+    try std.testing.expectEqual(Cut{ .at = 6 }, cut("ababababababababab", secrets, &set, false).?);
+    const run = "aaaaaaaaaaaaaaaaaa";
+    try std.testing.expect(cut(run, secrets, &set, false) == null);
+    try std.testing.expectEqual(Cut{ .at = 9, .masked = true }, cut(run, secrets, &set, true).?);
+    // Against masking the whole: random lines over a small alphabet.
+    var prng: std.Random.DefaultPrng = .init(3);
+    const r = prng.random();
+    const small: []const []const u8 = &.{ "abc", "ca", "bcbcb" };
+    for (0..3000) |_| {
+        var text: [40]u8 = undefined;
+        const len = r.uintAtMost(usize, text.len);
+        for (text[0..len]) |*c| c.* = "abcd"[r.uintLessThan(usize, 4)];
+        const c = cut(text[0..len], small, null, false) orelse continue;
+        const whole = try alloc(ar, text[0..len], small);
+        const parts = try std.mem.concat(ar, u8, &.{
+            try alloc(ar, text[0..c.at], small),
+            try alloc(ar, text[c.at..len], small),
+        });
+        // A part's last `***` and the next part's first are one span in the whole.
+        const joined = try std.mem.replaceOwned(u8, ar, parts, mask ++ mask, mask);
+        try std.testing.expectEqualStrings(whole, joined);
+    }
+}
+
 /// The shortest line of a multi-line secret masked on its own. A JSON key file's `{` and `}` lines
 /// would otherwise mask every brace of every log; the whole value and its longer lines still are.
 pub const min_line = 4;
