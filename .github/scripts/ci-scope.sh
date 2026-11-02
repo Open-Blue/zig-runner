@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Whether a pull request or a merge group can change what a group of CI's checks checks:
 #
-#   ci-scope.sh tests        Format, build and test; Database tests; Release builds and tests
-#                            (arm64) (ci.yml)
+#   ci-scope.sh tests        Format, build and test; Database tests; Lint; Release builds and
+#                            tests (arm64) (ci.yml)
 #   ci-scope.sh binaries     Release builds; Release builds and tests (arm64) (ci.yml)
 #   ci-scope.sh e2e          End to end (ci.yml)
 #   ci-scope.sh proofs       Proofs (proofs.yml)
@@ -48,7 +48,7 @@ needed() {
 		runner/* | db/* | .github/workflows/ci.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/install-zig.sh | .github/scripts/ci-database.sh | \
 			.github/scripts/zig-test.sh | .github/scripts/zig-modules.sh | \
-			.github/scripts/expr-conformance.sh) return 0 ;;
+			.github/scripts/expr-conformance.sh | .github/scripts/zlint.sh) return 0 ;;
 		# Cannot change the runner's build or tests. The Workflows job checks the workflows, scripts
 		# and deployment scripts on every change; proofs and packaging check theirs.
 		*.md | docs/* | .changes/* | .changie.yaml | proofs/* | deploy/* | LICENSE | renovate.json | \

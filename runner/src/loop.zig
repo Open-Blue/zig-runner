@@ -304,8 +304,10 @@ pub fn serve(c: Runner) !Exit {
                 try c.err.flush();
                 // In steps, so a stop is not kept waiting.
                 var waited: u32 = 0;
+                // A cancel (`serve`'s pool, when another runner could not start) ends the slot:
+                // swallowed, it was lost, and the slot retried until a stop while the pool waited.
                 while (waited < wait * 5 and !stopRequested()) : (waited += 1) {
-                    c.io.sleep(.fromMilliseconds(200), .awake) catch {};
+                    try c.io.sleep(.fromMilliseconds(200), .awake);
                 }
                 if (stopRequested()) return .done;
             },
@@ -323,7 +325,7 @@ fn admit(c: Runner, g: *admission.Gate, hold: admission.Hold) !bool {
         var left = g.pool.recheck.toMilliseconds();
         while (left > 0) : (left -= @min(left, 200)) {
             if (stopRequested()) return false;
-            c.io.sleep(.fromMilliseconds(@min(left, 200)), .awake) catch {};
+            try c.io.sleep(.fromMilliseconds(@min(left, 200)), .awake); // a cancel ends the slot (`serve`)
         }
         if (stopRequested()) return false;
         if (checkGate(c, g) == null) break;
@@ -1032,6 +1034,8 @@ fn registrationFailed(
     status: std.http.Status,
     message: []const u8,
 ) !Cycle {
+    // The slot was cancelled (`serve`'s pool): not a failure to retry.
+    if (e == error.Canceled) return error.Canceled;
     try c.err.writeAll("github error: ");
     try redact.write(c.err, @errorName(e), c.secrets);
     try c.err.print(" (HTTP {d})", .{@backingInt(status)});
