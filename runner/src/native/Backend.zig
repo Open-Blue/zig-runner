@@ -27,6 +27,8 @@ const docker = @import("../dagger/docker.zig");
 const cgroup = @import("cgroup.zig");
 const volumes = @import("volumes.zig");
 const admission = @import("../admission.zig");
+const services = @import("services.zig");
+const images = @import("images.zig");
 const Exec = @import("../dagger/Exec.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
 const SpanDemux = @import("../dagger/JobLog.zig").SpanDemux;
@@ -62,6 +64,16 @@ runtime_path: ?[]const u8 = null,
 /// What "Set up job" says of the image and its provisioning, the job's cgroup and its caches.
 notes: std.ArrayList([]const u8) = .empty,
 binds: []const sandbox.Spec.Bind,
+/// The host's resolver and hosts file over the image's (`jobBinds`), in `binds` too; services get
+/// these and `service_binds` (`serviceBinds`).
+etc_binds: []const sandbox.Spec.Bind = &.{},
+service_binds: []const sandbox.Spec.Bind = &.{},
+/// `Config.images`: the tests' images directory, "" to pull (`pullImage`).
+images_dir: []const u8 = "",
+/// This binary, for helpers that are not a step's (`forward.zig`).
+self_exe: []const u8 = "",
+/// The job's running services (`services.zig`), stopped however the job ends (`deinit`).
+service_set: services.Set = .{},
 /// Held while the job runs (`lock`): a directory whose lock is free is stale (`sweep`).
 lock: std.Io.File,
 /// The overlay's layers above the rootfs, oldest first.
@@ -157,6 +169,14 @@ pub const Config = struct {
     store_max_bytes: u64 = Store.default_max_bytes,
     /// Tests: the stack of layers is flattened past this many (`flatten`).
     flatten_at: usize = default_flatten_at,
+    /// Tests: services' images from a directory filled ahead (`images.find`: `rootfs/` and
+    /// `config.json` per reference) instead of P3's pull; "" pulls them, as in production.
+    images: []const u8 = "",
+    /// Host paths mounted into every service: tests bind the host's /usr into a fixture image.
+    service_binds: []const sandbox.Spec.Bind = &.{},
+    /// Tests: services on a rootless runner, in the host's network, as its steps are. Never
+    /// configurable: a service listening there would be the host's neighbours' to reach.
+    test_rootless_services: bool = false,
     /// Tests: `init` fails once the job's lock is the Backend's, as a failed network does.
     test_fail_after_lock: bool = false,
     /// Where the jobs' cgroups go and their limits (`RUNNER_NATIVE_CGROUP`,
@@ -278,7 +298,7 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         "anyway; subordinate ids are phase 5's)";
     if (job.container) |jc| if (jc.ports.len > 0 or jc.volumes.len > 0 or jc.options != null)
         return "a job container's `ports:`, `volumes:` and `options:` are not native yet (phase 6)";
-    if (job.services.len > 0) return "`services:` are not native yet (phase 6)";
+    if (job.services.len > 0) if (servicesUnsupported(job, cfg)) |why| return why;
     if (opts.nesting) return "steps that use the Dagger engine (RUNNER_DAGGER_NESTING) need Dagger";
     if (usesHashFiles(job)) return "`hashFiles()` reads the job's container through Dagger";
     // dpkg gives files to other users and groups (`root:adm`), which one mapped id cannot hold.
@@ -319,6 +339,18 @@ pub fn untrustedRefusal(cfg: Config) ?[]const u8 {
         "(RUNNER_TRUSTED_REFS) until each job has cgroup limits of its own (phase 4)";
     if (std.os.linux.geteuid() != 0) return "native steps run jobs this runner does not vouch " ++
         "for only on a root runner (a rootless job's own network and ids are phase 5's)";
+    return null;
+}
+
+/// Why the job's services cannot be native: they need the job's own network (a root runner), and
+/// each its image named literally (pulled natively, `pullImage`). Null when they can.
+fn servicesUnsupported(job: job_mod.Job, cfg: Config) ?[]const u8 {
+    if (std.os.linux.geteuid() != 0 and !cfg.test_rootless_services) return "native `services:` " ++
+        "need the job's own network, which a rootless runner does not give (phase 5)";
+    for (job.services) |svc| switch (svc.image) {
+        .lit => {},
+        .expr => return "a service's image given by an expression is not native yet",
+    };
     return null;
 }
 
@@ -611,6 +643,9 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
         .flatten_at = @max(2, cfg.flatten_at),
         .gate = cfg.gate,
         .test_seed_script = cfg.test_seed_script,
+        .images_dir = cfg.images,
+        .service_binds = cfg.service_binds,
+        .self_exe = cfg.self_exe,
     };
     errdefer b.deinit();
     if (cfg.test_fail_after_lock) return error.TestFailure;
@@ -682,10 +717,89 @@ fn jobBinds(b: *Backend, cfg: Config) ![]const sandbox.Spec.Bind {
         net.resolvConf(b.arena, b.io) orelse return error.NoReachableResolver
     else
         "/etc/resolv.conf";
-    return std.mem.concat(b.arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{
+    b.etc_binds = try b.arena.dupe(sandbox.Spec.Bind, &.{
         .{ .host = resolv, .at = "/etc/resolv.conf", .optional = true },
         .{ .host = "/etc/hosts", .at = "/etc/hosts", .optional = true },
-    } });
+    });
+    return std.mem.concat(b.arena, sandbox.Spec.Bind, &.{ cfg.binds, b.etc_binds });
+}
+
+/// The job's services by name, for its steps and its services: a hosts file of the job's (the
+/// host's, as steps get it, and a line naming the loopback, `services.hostsLine`) bound in place
+/// of the host's, read-only.
+pub fn serviceHosts(b: *Backend, names: []const []const u8) !void {
+    const line = try services.hostsLine(b.arena, names);
+    if (line.len == 0) return;
+    const cwd = std.Io.Dir.cwd();
+    const host = cwd.readFileAlloc(b.io, "/etc/hosts", b.arena, .limited(1 << 20)) catch
+        "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n";
+    const sep: []const u8 = if (host.len > 0 and host[host.len - 1] != '\n') "\n" else "";
+    const path = try std.fmt.allocPrint(b.arena, "{s}/hosts", .{b.dir});
+    try cwd.writeFile(b.io, .{
+        .sub_path = path,
+        .data = try std.mem.concat(b.arena, u8, &.{ host, sep, line }),
+    });
+    b.binds = try withHosts(b.arena, b.binds, path);
+    b.etc_binds = try withHosts(b.arena, b.etc_binds, path);
+}
+
+fn withHosts(
+    arena: Allocator,
+    binds: []const sandbox.Spec.Bind,
+    path: []const u8,
+) ![]const sandbox.Spec.Bind {
+    const out = try arena.dupe(sandbox.Spec.Bind, binds);
+    for (out) |*bd| if (std.mem.eql(u8, bd.at, "/etc/hosts")) {
+        bd.host = path;
+    };
+    return out;
+}
+
+/// What every service gets mounted (`services.zig`): the job's resolver and hosts file, and
+/// `Config.service_binds`. Never the steps' binds (phase 4's cache volumes will be those).
+pub fn serviceBinds(b: *Backend) []const sandbox.Spec.Bind {
+    return std.mem.concat(b.arena, sandbox.Spec.Bind, &.{ b.service_binds, b.etc_binds }) catch
+        b.etc_binds;
+}
+
+pub const ServiceDirs = struct {
+    image: []const u8,
+    upper: []const u8,
+    work: []const u8,
+    merged: []const u8,
+    status: []const u8,
+};
+
+/// Service `n`'s directories in the job's (`V<n>`): its layer, overlay work directory and mount
+/// point, its status file (empty), and `I`, a link to its image's filesystem, so the image's path
+/// (which may hold a `:`, overlay's separator) never reaches overlay's options.
+pub fn serviceDirs(b: *Backend, n: u32, rootfs: []const u8) !ServiceDirs {
+    const arena = b.arena;
+    const cwd = std.Io.Dir.cwd();
+    const v = try std.fmt.allocPrint(arena, "V{d}", .{n});
+    const out: ServiceDirs = .{
+        .image = try std.fmt.allocPrint(arena, "{s}/I", .{v}),
+        .upper = try std.fmt.allocPrint(arena, "{s}/U", .{v}),
+        .work = try std.fmt.allocPrint(arena, "{s}/W", .{v}),
+        .merged = try std.fmt.allocPrint(arena, "{s}/M", .{v}),
+        .status = try std.fmt.allocPrint(arena, "{s}/{s}/status", .{ b.dir, v }),
+    };
+    for ([_][]const u8{ out.upper, out.work, out.merged }) |d|
+        try cwd.createDirPath(b.io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, d }));
+    const full_image = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, out.image });
+    try cwd.symLink(b.io, rootfs, full_image, .{ .is_directory = true });
+    try cwd.writeFile(b.io, .{ .sub_path = out.status, .data = "" });
+    // The layer's root is the overlay's `/`: the job's root's, as for a step's (`exec`).
+    if (b.how.userns == .mapped) {
+        const base_id = b.idBase();
+        const p = try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/{s}", .{
+            b.dir,
+            out.upper,
+        }), 0);
+        _ = std.os.linux.chown(p, base_id, base_id);
+        _ = std.os.linux.chmod(p, 0o755);
+    }
+    return out;
 }
 
 /// A slot of its own (the first free one on the host, held by its lock, `net.slots_dir`), and
@@ -773,7 +887,7 @@ pub fn idsNote(b: *const Backend, arena: Allocator) ![]const u8 {
 }
 
 /// The first of the 65536 host ids the job's slot maps.
-fn idBase(b: *const Backend) u32 {
+pub fn idBase(b: *const Backend) u32 {
     return b.subid_base + (if (b.slot) |s| s.n else 0) * ids_per_slot;
 }
 
@@ -794,6 +908,8 @@ fn lockFile(arena: Allocator, io: std.Io, path: []const u8, wait: bool) !std.Io.
 /// The job's network taken down, its layers removed, its volumes, cgroup, slot and lock let go.
 pub fn deinit(b: *Backend) void {
     const arena = b.arena;
+    // First: their helpers hold the job's directory and network, and are in its cgroup.
+    b.service_set.stopAll(b.io);
     b.cache_plan.release(b.io);
     if (b.job_cgroup) |j| {
         if (b.gate) |g| g.nativeDone();
@@ -864,7 +980,9 @@ pub fn base(
     // On the job's image (the seed's build and the roll run on `b.rootfs`).
     try b.setUpCaches(ev, plan);
     try b.baseEnv(ev, plan);
-    if (plan.step_cache) b.store = b.store_cfg;
+    // Not with services (P6): what a step got from a service (its image, its env, its data) is
+    // in no key, so a replay could stand for a run against another service.
+    if (plan.step_cache and ev.job.services.len == 0) b.store = b.store_cfg;
     b.repository = ev.job.github.repository;
     b.scope = try set_up.packageCacheScope(arena, ev, b.repository, b.vouched);
     const event = try ev.eventJson();
@@ -1839,6 +1957,26 @@ fn pull(b: *Backend, image: []const u8, creds: ?registry.Credentials, why: *[]co
     });
 }
 
+/// A service's or an action's image (`images.Image`: its rootfs and its configuration), pulled
+/// natively or found in the store (`pull`). Tests may give a directory of images instead
+/// (`Config.images`).
+pub fn pullImage(
+    b: *Backend,
+    image: []const u8,
+    creds: ?registry.Credentials,
+    why: *[]const u8,
+) !images.Image {
+    if (b.images_dir.len > 0) return (try images.find(b.arena, b.io, b.images_dir, image)) orelse {
+        why.* = try std.fmt.allocPrint(b.arena, "it is not in the tests' images ({s})", .{b.images_dir});
+        return error.ImageNotFound;
+    };
+    const img = try b.pull(image, creds, why);
+    return images.fromPulled(b.arena, b.io, img.rootfs, img.digest) catch |e| {
+        why.* = "its configuration cannot be read";
+        return e;
+    };
+}
+
 fn pullWithin(
     arena: Allocator,
     gpa: Allocator,
@@ -2123,7 +2261,7 @@ const execAnswer = @import("../dagger/testing.zig").exec;
 /// must run): a rootfs of a few directories with the host's /usr bound over it, in the
 /// test's directory, and the runner binary the build copied for the tests (`ZIG_RUNNER_TEST_EXE`).
 /// Rootless unless the tests run as root, where the job gets its range of ids and its network.
-fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
+pub fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
     const io = std.testing.io;
     var env = try std.testing.environ.createMap(arena);
     const required = std.mem.eql(u8, env.get("ZIG_RUNNER_REQUIRE_NATIVE") orelse "", "1");
@@ -2181,7 +2319,7 @@ fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
     return cfg;
 }
 
-fn skip(required: bool, why: []const u8) error{ SkipZigTest, NativeTestsRequired } {
+pub fn skip(required: bool, why: []const u8) error{ SkipZigTest, NativeTestsRequired } {
     std.debug.print("native backend test {s}: {s}\n", .{
         if (required) "failed (ZIG_RUNNER_REQUIRE_NATIVE=1)" else "skipped",
         why,
@@ -2331,9 +2469,19 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     uses.action = .{ .uses = .{ .owner = "actions", .name = "setup-node", .ref = "v4" } };
     try expectReason("`uses:`", unsupported(io, testJob(&.{uses}), root, ok));
 
-    var services = run_only;
-    services.services = &.{.{ .name = "pg", .image = .{ .lit = "postgres" } }};
-    try expectReason("`services:`", unsupported(io, services, root, ok));
+    var with_services = run_only;
+    with_services.services = &.{.{ .name = "pg", .image = .{ .lit = "postgres" } }};
+    // Services are native on a root runner, their images pulled by P3 (before, P6 refused them
+    // without its images directory); rootless they have no network of the job's own.
+    if (std.os.linux.geteuid() == 0)
+        try std.testing.expect(unsupported(io, with_services, root, ok) == null)
+    else
+        try expectReason("`services:`", unsupported(io, with_services, root, ok));
+    // An image given by an expression is not native on a root runner either.
+    if (std.os.linux.geteuid() == 0) {
+        with_services.services = &.{.{ .name = "pg", .image = .{ .expr = "matrix.db" } }};
+        try expectReason("expression", unsupported(io, with_services, root, ok));
+    }
     // `container:` jobs and any image are pulled natively; a job container's ports, volumes and
     // options are not native yet.
     var container = run_only;
@@ -2655,7 +2803,7 @@ fn stepLines(arena: Allocator, text: []const u8) ![]const []const u8 {
 }
 
 /// Runs `job` natively with `cfg` as `user`, and its log.
-fn runNativeJob(
+pub fn runNativeJob(
     arena: Allocator,
     cfg: Config,
     job: job_mod.Job,
@@ -2672,7 +2820,7 @@ fn runNativeJob(
     return .{ .res = res, .text = w.written() };
 }
 
-fn expectLines(text: []const u8, expect: []const []const u8) !void {
+pub fn expectLines(text: []const u8, expect: []const []const u8) !void {
     for (expect) |e| if (std.mem.indexOf(u8, text, e) == null) {
         std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
         return error.TestUnexpectedResult;
@@ -2919,7 +3067,7 @@ test "a native step cannot follow a symlink it planted out to the host's files" 
 
 /// Skips a test that needs the runner to be root (its ids and network): CI runs the native tests
 /// a second time under sudo for them.
-fn requireRoot() !void {
+pub fn requireRoot() !void {
     if (std.os.linux.geteuid() != 0) {
         std.debug.print("native backend test skipped: it needs root\n", .{});
         return error.SkipZigTest;
@@ -3129,7 +3277,7 @@ test "root runner: a job's own network, out of reach of the host's services and 
 
 /// A TCP listener of the test's on the host, on `port` at `addr` (host order; 0 for every
 /// address).
-fn listen(port: u16, addr: u32) !std.os.linux.fd_t {
+pub fn listen(port: u16, addr: u32) !std.os.linux.fd_t {
     const linux = std.os.linux;
     const sock = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(sock) != .SUCCESS) return error.Socket;

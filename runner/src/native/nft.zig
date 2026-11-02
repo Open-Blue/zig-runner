@@ -10,6 +10,8 @@
 //! - `forward` (filter): from the bridge, out through an uplink only (the interfaces of the host's
 //!   default routes), so never to another job, to Docker's containers, or to another network the
 //!   host routes to but does not leave by; to the bridge, replies only.
+//! - `output` (filter): to the bridge, replies only. No process of the host's reaches a job, its
+//!   services' ports included (P6's `not_asked`).
 //!
 //! nftables runs every base chain on a hook, and a packet must be accepted by all of them: a drop
 //! in ours holds whatever the host's other tables say, but an accept in ours cannot overturn a
@@ -106,6 +108,7 @@ const nf_drop = 0;
 const nf_accept = 1;
 const hook_input = 1;
 const hook_forward = 2;
+const hook_output = 3;
 const hook_postrouting = 4;
 const priority_filter = 0;
 const priority_srcnat = 100;
@@ -123,6 +126,7 @@ fn ruleBatch(b: *Batch, subnet: net.Subnet, uplinks: []const []const u8, host: H
     b.tableMsg(.NEWTABLE, linux.NLM_F_CREATE);
     b.baseChain("forward", "filter", hook_forward, priority_filter);
     b.baseChain("input", "filter", hook_input, priority_filter);
+    b.baseChain("output", "filter", hook_output, priority_filter);
     b.baseChain("postrouting", "nat", hook_postrouting, priority_srcnat);
 
     // forward: from the bridge out through an uplink, nothing else from it; to it, replies only.
@@ -157,6 +161,17 @@ fn ruleBatch(b: *Batch, subnet: net.Subnet, uplinks: []const []const u8, host: H
     b.endRule(r);
     r = b.rule(table, "input", linux.NLM_F_APPEND);
     b.ifname(.iif, .eq, bridge_name);
+    b.verdict(nf_drop);
+    b.endRule(r);
+
+    // output: to the bridge, replies only (P6): what the host's own processes send a job.
+    r = b.rule(table, "output", linux.NLM_F_APPEND);
+    b.ifname(.oif, .eq, bridge_name);
+    b.replies();
+    b.verdict(nf_accept);
+    b.endRule(r);
+    r = b.rule(table, "output", linux.NLM_F_APPEND);
+    b.ifname(.oif, .eq, bridge_name);
     b.verdict(nf_drop);
     b.endRule(r);
 
@@ -780,8 +795,8 @@ test "the batch: begin, every message acknowledged, end, within its buffer" {
     while (it.next()) |m| try types.append(std.testing.allocator, m.hdr.type);
     try std.testing.expectEqual(@as(u16, nfnl_msg_batch_begin), types.items[0]);
     try std.testing.expectEqual(@as(u16, nfnl_msg_batch_end), types.getLast());
-    // 3 table messages, 3 chains, 2 uplinks' accepts and 6 more rules of ours, 1 removal, and 2
+    // 3 table messages, 4 chains, 2 uplinks' accepts and 8 more rules of ours, 1 removal, and 2
     // accepts in each of the host's 2 chains.
-    try std.testing.expectEqual(@as(u32, 3 + 3 + 8 + 1 + 4), b.acks);
+    try std.testing.expectEqual(@as(u32, 3 + 4 + 10 + 1 + 4), b.acks);
     try std.testing.expectEqual(@as(usize, b.acks + 2), types.items.len);
 }

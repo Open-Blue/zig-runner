@@ -54,7 +54,8 @@ run+=(--test-cmd bash --test-cmd -c --test-cmd 'until [ -e "$0" ]; do sleep 0.2;
 filter=()
 if [[ ${ZIG_TEST_NATIVE_AS_ROOT:-} == 1 ]]; then
 	filter=(--test-filter native)
-	run+=(--test-cmd sudo --test-cmd '--preserve-env=ZIG_RUNNER_TEST_EXE,ZIG_RUNNER_REQUIRE_NATIVE')
+	run+=(--test-cmd sudo
+		--test-cmd '--preserve-env=ZIG_RUNNER_TEST_EXE,ZIG_RUNNER_REQUIRE_NATIVE,ZIG_RUNNER_SERVICE_IMAGES')
 fi
 run+=(--test-cmd-bin)
 zig test "${tests[@]}" "${filter[@]}" "${run[@]}"

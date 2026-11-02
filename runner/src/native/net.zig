@@ -452,6 +452,8 @@ const Message = struct {
 ///   containers or to the host's other networks; to `zr0` replies only. The host's iptables-nft
 ///   `FORWARD` and `DOCKER-USER` chains (Docker's and ufw's, whose policies drop) accept the
 ///   bridge's traffic and leave the deciding to the runner's table.
+/// - To `zr0` from the host's own processes (`OUTPUT`), replies only, as routed traffic to it:
+///   nothing reaches a job that the job did not ask for, its services' ports included (P6).
 ///
 /// On failure, what went wrong.
 pub fn natRules(

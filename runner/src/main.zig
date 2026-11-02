@@ -7,6 +7,8 @@ const set_up = @import("dagger/set_up.zig");
 const sandbox = @import("native/sandbox.zig");
 const net = @import("native/net.zig");
 const nft = @import("native/nft.zig");
+
+const forward = @import("native/forward.zig");
 const trust = @import("trust.zig");
 const job_mod = @import("job.zig");
 const db = @import("db.zig");
@@ -35,6 +37,10 @@ comptime {
     _ = @import("native/oci/image.zig");
     _ = @import("native/oci/testregistry.zig");
     _ = @import("native/key_vectors.zig");
+    _ = @import("native/services.zig");
+    _ = @import("native/health.zig");
+    _ = @import("native/images.zig");
+    _ = @import("native/forward.zig");
     _ = @import("redact.zig");
     _ = @import("yaml.zig");
     _ = @import("action.zig");
@@ -87,6 +93,7 @@ pub fn main(init: std.process.Init) !u8 {
     // A native step's sandbox (`native/sandbox.zig`): before anything else, so nothing has
     // started a thread when it makes its namespaces.
     if (args.len == 2 and std.mem.eql(u8, args[1], sandbox.command)) return sandbox.main(arena);
+    if (args.len == 2 and std.mem.eql(u8, args[1], forward.command)) return forward.main(arena);
     if (args.len == 5 and std.mem.eql(u8, args[1], net.command))
         return net.upMain(arena, args[2], args[3], args[4]);
     if (args.len >= 3 and std.mem.eql(u8, args[1], nft.command)) return nft.main(args[2..]);

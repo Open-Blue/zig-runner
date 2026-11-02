@@ -25,6 +25,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const seccomp = @import("seccomp.zig");
+const health = @import("health.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -53,6 +54,9 @@ pub const Spec = struct {
     uid: u32 = 0,
     gid: u32 = 0,
     argv: []const []const u8,
+    /// What is executed: a path inside the root, or "" for `argv[0]` looked up in the env's PATH
+    /// there, as Docker starts an image's entrypoint (a service's, `services.zig`).
+    exec: []const u8 = "/bin/sh",
     /// `NAME=value`, the whole environment.
     env: []const []const u8,
     /// Files written into the overlay before the step and removed after it, as Dagger mounts a
@@ -83,6 +87,9 @@ pub const Spec = struct {
     /// `mapped`: the first on-disk id of the cache volumes' range (`Bind.volume`), which the job
     /// sees as its 0 onwards.
     volume_id_base: u32 = 0,
+    /// A service (`services.zig`): it runs until it is stopped, and the helper says when it is
+    /// ready (`health.supervise`).
+    service: ?health.Ready = null,
 
     pub const Bind = struct {
         host: []const u8,
@@ -207,10 +214,17 @@ pub const Running = struct {
     mu: std.Io.Mutex = .init,
     lifeline: ?std.Io.File = null,
     killed: bool = false,
+    /// `stop` was called: a helper not started yet is stopped as soon as it is (a service).
+    stopped: bool = false,
 
     fn begin(r: *Running, io: std.Io, lifeline: std.Io.File) void {
         r.mu.lockUncancelable(io);
         defer r.mu.unlock(io);
+        if (r.stopped) {
+            lifeline.close(io);
+            r.killed = true;
+            return;
+        }
         r.lifeline = lifeline;
         r.killed = false;
     }
@@ -238,6 +252,18 @@ pub const Running = struct {
         r.lifeline = null;
         r.killed = true;
         return true;
+    }
+
+    /// Stops a service for good: as `kill`, and a helper still starting is stopped once it has
+    /// its lifeline (`begin`). Steps use `kill`, which leaves the next step alone.
+    pub fn stop(r: *Running, io: std.Io) void {
+        r.mu.lockUncancelable(io);
+        defer r.mu.unlock(io);
+        r.stopped = true;
+        const f = r.lifeline orelse return;
+        f.close(io);
+        r.lifeline = null;
+        r.killed = true;
     }
 };
 
@@ -376,6 +402,11 @@ pub fn main(arena: Allocator) u8 {
 /// The spec's one line from stdin, read a byte at a time so nothing after it is taken: what
 /// follows on the pipe is the lifeline's end.
 fn readSpec(arena: Allocator) !Spec {
+    return readJsonLine(Spec, arena);
+}
+
+/// A helper's spec: one line of JSON on stdin (`readSpec`; `forward.zig`'s too).
+pub fn readJsonLine(comptime T: type, arena: Allocator) !T {
     var data: std.ArrayList(u8) = .empty;
     while (true) {
         var c: [1]u8 = undefined;
@@ -388,7 +419,7 @@ fn readSpec(arena: Allocator) !Spec {
         if (rc == 0 or c[0] == '\n') break;
         try data.append(arena, c[0]);
     }
-    return std.json.parseFromSliceLeaky(Spec, arena, data.items, .{ .allocate = .alloc_always });
+    return std.json.parseFromSliceLeaky(T, arena, data.items, .{ .allocate = .alloc_always });
 }
 
 fn runStep(arena: Allocator, spec: Spec) u8 {
@@ -397,6 +428,9 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
     // Files a step creates get the modes they get under runc.
     _ = linux.syscall1(.umask, 0o022);
     check("chdir to the job directory", linux.chdir(z(arena, spec.root)));
+    // A service's state goes to a file of the job's (`health.Ready.status`), opened while the
+    // helper is still the host's user that may.
+    const status: linux.fd_t = if (spec.service) |s| health.openStatus(arena, s.status) else -1;
 
     // 1. The user namespace, and the overlay mounted in a mount namespace the helper owns.
     var lowers = spec.lowers;
@@ -476,7 +510,8 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
     // 3. PID 1, told by `alive` whether the helper is still there once it has re-armed its
     // parent-death signal; then until the step ends or the lifeline closes.
     const argv = zList(arena, spec.argv);
-    const envp = zList(arena, withHome(arena, root, spec));
+    const env = withHome(arena, root, spec);
+    const envp = zList(arena, env);
     const workdir = z(arena, spec.workdir);
     var alive: [2]linux.fd_t = undefined;
     check("make a pipe", linux.pipe2(&alive, .{ .CLOEXEC = true }));
@@ -487,10 +522,17 @@ fn runStep(arena: Allocator, spec: Spec) u8 {
         // no_new_privs for every step but the runner user's on a root runner: its sudo can
         // reach only the job's own root, bounded still by the capabilities and seccomp below.
         const nnp = spec.userns != .mapped or spec.uid == 0;
-        stepInit(arena, root, workdir, spec.uid, spec.gid, nnp, alive[0], argv, envp);
+        const program: Program = if (spec.exec.len > 0)
+            .{ .path = spec.exec }
+        else
+            .{ .search = .{ .name = spec.argv[0], .env = env } };
+        stepInit(arena, root, workdir, spec.uid, spec.gid, nnp, alive[0], program, argv, envp);
     }
     _ = linux.close(alive[0]);
-    const st = superviseStep(@intCast(pid));
+    const st = if (spec.service) |s|
+        health.supervise(arena, spec, s, @intCast(pid), root, status, env)
+    else
+        superviseStep(@intCast(pid));
     for (spec.files) |f| if (!f.keep) {
         // Its bind first: a mount point cannot be removed in the namespace it is mounted in.
         if (targetIn(arena, root, f.path, false)) |fd| {
@@ -594,7 +636,7 @@ fn makeDirsIn(arena: Allocator, root: linux.fd_t, path: []const u8, owner: ?u32)
 }
 
 /// Moves the helper into the job's cgroup: `0` written to its `cgroup.procs`.
-fn joinCgroup(arena: Allocator, dir: []const u8) void {
+pub fn joinCgroup(arena: Allocator, dir: []const u8) void {
     const path = z(arena, std.fmt.allocPrint(arena, "{s}/cgroup.procs", .{dir}) catch oom());
     const fd = linux.open(path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
     check("open the job's cgroup", fd);
@@ -806,6 +848,7 @@ fn stepInit(
     gid: u32,
     no_new_privs: bool,
     alive: linux.fd_t,
+    program: Program,
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
 ) noreturn {
@@ -854,12 +897,41 @@ fn stepInit(
     // From here the helper's failures would be the step's output; the step's stderr is its
     // stdout, as the script's `exec 2>&1` would make it anyway.
     _ = linux.dup2(1, 2);
-    const rc = linux.execve("/bin/sh", argv, envp);
-    fatal("exec /bin/sh", @backingInt(linux.errno(rc)));
+    const path = switch (program) {
+        .path => |p| z(arena, p),
+        .search => |s| lookPath(arena, s.name, s.env),
+    };
+    const rc = linux.execve(path, argv, envp);
+    fatal(about(arena, "exec", std.mem.span(path)), @backingInt(linux.errno(rc)));
+}
+
+/// What a sandbox's first process executes: a path, or a name looked up in PATH once inside.
+const Program = union(enum) {
+    path: []const u8,
+    search: struct { name: []const u8, env: []const []const u8 },
+};
+
+/// `name` as `execvp` finds it, inside the current root: itself when it holds a slash, else the
+/// first executable of that name in `env`'s PATH (the image's, Docker's default when none). Itself
+/// when none is found, so the exec fails with ENOENT and says so.
+pub fn lookPath(arena: Allocator, name: []const u8, env: []const []const u8) [*:0]const u8 {
+    if (std.mem.indexOfScalar(u8, name, '/') != null or name.len == 0) return z(arena, name);
+    var path: []const u8 = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    for (env) |e| if (std.mem.startsWith(u8, e, "PATH=")) {
+        path = e["PATH=".len..];
+    };
+    var dirs = std.mem.splitScalar(u8, path, ':');
+    while (dirs.next()) |d| {
+        const dir = if (d.len == 0) "." else d;
+        const full = std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, name }) catch oom();
+        const p = z(arena, full);
+        if (linux.errno(linux.access(p, linux.X_OK)) == .SUCCESS) return p;
+    }
+    return z(arena, name);
 }
 
 /// No supplementary groups at all: `setgroups(0, NULL)`.
-const no_groups: [*]const linux.gid_t = @ptrFromInt(@alignOf(linux.gid_t));
+pub const no_groups: [*]const linux.gid_t = @ptrFromInt(@alignOf(linux.gid_t));
 
 /// Dies with the helper, and exits at once if the helper is already gone (its end of `alive` then
 /// reads as hung up): the helper is how the runner stops a step.
@@ -920,7 +992,7 @@ fn existingIn(arena: Allocator, root: linux.fd_t, at: []const u8, dir: bool) ?li
 
 /// Docker's default capabilities: the bounding set cut to them, so a root step has these and no
 /// more (no CAP_SYS_ADMIN, no CAP_NET_ADMIN), and the ambient set cleared.
-fn dropCapabilities() void {
+pub fn dropCapabilities() void {
     const keep = [_]u6{ 0, 1, 3, 4, 5, 6, 7, 8, 10, 13, 18, 27, 29, 31 };
     var cap: u6 = 0;
     while (true) : (cap += 1) {
@@ -945,7 +1017,7 @@ fn dropCapabilities() void {
 pub const docker_caps: u64 = 0xa80425fb;
 
 /// Docker's default seccomp profile, its allow list (`seccomp.zig`).
-fn installSeccomp() void {
+pub fn installSeccomp() void {
     check("install the seccomp filter", seccomp.install());
 }
 
@@ -1197,7 +1269,7 @@ fn writeProc(path: [*:0]const u8, text: []const u8) void {
 
 /// The env, with HOME from the image's /etc/passwd when it has none: runc sets it so, and every
 /// step under Dagger saw it.
-fn withHome(arena: Allocator, root: linux.fd_t, spec: Spec) []const []const u8 {
+pub fn withHome(arena: Allocator, root: linux.fd_t, spec: Spec) []const []const u8 {
     for (spec.env) |e| if (std.mem.startsWith(u8, e, "HOME=")) return spec.env;
     const home = passwdHome(arena, root, spec.uid) orelse "/";
     const extra = std.fmt.allocPrint(arena, "HOME={s}", .{home}) catch oom();
@@ -1235,11 +1307,11 @@ pub fn homeOf(passwd: []const u8, uid: u32) ?[]const u8 {
     return null;
 }
 
-fn z(arena: Allocator, s: []const u8) [*:0]const u8 {
+pub fn z(arena: Allocator, s: []const u8) [*:0]const u8 {
     return (arena.dupeSentinel(u8, s, 0) catch oom()).ptr;
 }
 
-fn zList(arena: Allocator, items: []const []const u8) [*:null]const ?[*:0]const u8 {
+pub fn zList(arena: Allocator, items: []const []const u8) [*:null]const ?[*:0]const u8 {
     const out = arena.allocSentinel(?[*:0]const u8, items.len, null) catch oom();
     for (items, out) |s, *o| o.* = z(arena, s);
     return out.ptr;
@@ -1247,17 +1319,17 @@ fn zList(arena: Allocator, items: []const []const u8) [*:null]const ?[*:0]const 
 
 /// A failed system call ends the helper with the reason on its stderr, which the runner reports
 /// as the sandbox's failure, not the step's.
-fn check(what: []const u8, rc: usize) void {
+pub fn check(what: []const u8, rc: usize) void {
     const e = linux.errno(rc);
     if (e != .SUCCESS) fatal(what, @backingInt(e));
 }
 
 /// "<what> <path>", for `fatal`.
-fn about(arena: Allocator, what: []const u8, path: []const u8) []const u8 {
+pub fn about(arena: Allocator, what: []const u8, path: []const u8) []const u8 {
     return std.fmt.allocPrint(arena, "{s} {s}", .{ what, path }) catch what;
 }
 
-fn fatal(what: []const u8, code: anytype) noreturn {
+pub fn fatal(what: []const u8, code: anytype) noreturn {
     var buf: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "native step: {s} failed (errno {d})\n", .{
         what,
@@ -1267,7 +1339,7 @@ fn fatal(what: []const u8, code: anytype) noreturn {
     linux.exit_group(125);
 }
 
-fn oom() noreturn {
+pub fn oom() noreturn {
     fatal("allocate", @as(u32, 12));
 }
 

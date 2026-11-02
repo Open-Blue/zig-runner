@@ -149,6 +149,7 @@ pub const Config = struct {
     native_cgroup: []const u8 = "",
     native_memory_max_mb: ?u32 = null,
     native_pids_max: u32 = native_cgroup.default_pids_max,
+
     /// Experimental: key the steps after one that always runs on what it produced rather than on
     /// the step itself (see `dagger.Options.output_keys`).
     output_keys: bool = false,
@@ -419,6 +420,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_CGROUP")) |v| c.native_cgroup = v;
         if (environ.get("RUNNER_NATIVE_MEMORY_MAX_MB")) |v| c.native_memory_max_mb = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_PIDS_MAX")) |v| c.native_pids_max = try num(u32, v);
+
         if (environ.get("RUNNER_OUTPUT_KEYS")) |v| c.output_keys = try boolean(v);
         if (environ.get("RUNNER_ENFORCE_VOLATILE")) |v| c.enforce_volatile = try boolean(v);
         if (environ.get("RUNNER_LOG_SPOOL_DIR")) |v| c.log_spool_dir = v;
@@ -495,6 +497,7 @@ pub const Config = struct {
         else if (eq(key, "native-cgroup")) c.native_cgroup = val //
         else if (eq(key, "native-memory-max-mb")) c.native_memory_max_mb = try num(u32, val) //
         else if (eq(key, "native-pids-max")) c.native_pids_max = try num(u32, val) //
+
         else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache")) c.zig_local_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache-max-mb")) c.zig_local_cache_max_mb = try num(u32, val) //

@@ -104,8 +104,10 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   checkout runs).
 - Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a job the runner
   does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
-  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:` or `options:`, `services:`,
-  `uses:` actions, `docker://` steps, Dagger in steps (`RUNNER_DAGGER_NESTING`), `hashFiles()`
+  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:` or `options:`, `services:`
+  on a rootless runner or with an image given by an expression (native since P6, below, their
+  images pulled by P3), `uses:` actions, `docker://` steps, Dagger in steps
+  (`RUNNER_DAGGER_NESTING`), `hashFiles()`
   anywhere in the job (it reads the container through Dagger), a checkout with submodules, and a
   machine whose probe fails (no user namespaces, nftables refusing the jobs' rules, no default
   route, the jobs' ids taken on the host, the jobs' subnet overlapping a route of the host's). A
@@ -143,7 +145,9 @@ On a root runner, each step runs:
   ranges, and refused when it overlaps a route of the host's), a default route out through NAT. Two
   jobs can both listen on :5432. The job reaches nothing on the host: not its 127.0.0.1, and not a
   service on any of its addresses (the bridge's included), since `INPUT` drops whatever comes from
-  `zr0` and is not a reply. Jobs cannot reach each other: each veth is an isolated bridge port
+  `zr0` and is not a reply. Nor does anything reach the job that it did not ask for: `OUTPUT` and
+  `FORWARD` drop what goes to `zr0` and is not a reply (added in P6, when services began to listen
+  there). Jobs cannot reach each other: each veth is an isolated bridge port
   (`IFLA_BRPORT_ISOLATED`), and `FORWARD` drops traffic from `zr0` back to `zr0`. IPv6 is off on the
   job's `eth0` and on the bridge, so no link-local address slips past those IPv4 rules (`lo` keeps
   its ::1). Ports below 1024 and ping work without capabilities on the host's
@@ -252,7 +256,8 @@ What it changes on the host, which is shared by every runner on it:
   would then route for any neighbour; set that policy to DROP (Docker does).
 - **nftables rules** (since P5, over netlink; P1 made the same with `iptables`): a table of the
   runner's own, `ip zig_runner`, replaced atomically whenever the rules are made. It masquerades
-  the subnet; drops what comes from `zr0` to the host and is not a reply; forwards from `zr0` only
+  the subnet; drops what comes from `zr0` to the host and is not a reply; drops what the host's own
+  processes send to `zr0` and is not a reply (`output`, P6); forwards from `zr0` only
   out through an uplink (the interfaces of the default routes; a job remakes the rules for a new
   one, a laptop moving from cable to Wi-Fi), so never `zr0` to `zr0`, to Docker's containers or to
   the host's other networks; and forwards to `zr0` replies only. Since every base chain on a hook
@@ -459,6 +464,11 @@ directories and the step's file-command files at a 4 KiB block each.
   and content-addressed blobs.
 - Provisioning becomes a native step of its own, keyed like any other.
 - `container:` jobs move to native.
+- Services' images (P6) come from the store: `services.startOne` calls `images.find(dir, ref)` for
+  an `Image` (a rootfs directory and the configuration a container takes), and
+  `Backend.servicesUnsupported` calls `images.has`. The store answers the same question by
+  pulling, with the service's `credentials:` (`username`, `password`, which P6 does not use), and
+  `RUNNER_NATIVE_IMAGES` goes.
 - Exit: no Dagger session is needed to make the rootfs. Measure: cold pull of `ubuntu:24.04`
   against Dagger's.
 
@@ -584,6 +594,9 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
 - **Debt from P1, paid here:** P1 has no per-job cgroup and no pids limit, so one native job's
   fork bomb or memory hog reaches the host's limits and every other job's. The same cgroup that
   gives the gate its accounting gives each job its `pids.max` and `memory.max`.
+- Services (P6) go in the job's cgroup with its steps: each service's helper (`services.serve`,
+  through `sandbox.run`) and the port relay (`forward.start`) are spawned into it, and "Stop
+  containers" and `Backend.deinit` stop them with `cgroup.kill` instead of each helper's lifeline.
 - Exit: a runaway job is OOM-killed in its own cgroup without touching its neighbours. Measure:
   gate accuracy against the engine-wide reading.
 
@@ -666,7 +679,9 @@ remains before native steps may run jobs the runner does not vouch for:
 - Resource limits came with phase 4's cgroups; P5 must refuse an untrusted job on a runner where
   the job would get no cgroup (a rootless runner without delegation, `RUNNER_NATIVE_CGROUP=none`).
 - Seccomp as Docker's allow list rather than its deny list.
-- The NAT and forwarding rules over nftables netlink instead of `iptables` (P1's debt).
+- The NAT and forwarding rules over nftables netlink instead of `iptables` (P1's debt), with P6's
+  rule among them: nothing goes to `zr0` that is not a reply, from the host (`OUTPUT`) or routed
+  (`FORWARD`, `DOCKER-USER`).
 - Rootless: a userspace network stack for the job's network (the parts of pasta or slirp4netns it
   needs, ported) and subordinate ids through `newuidmap`.
 - `trust.zig` is unchanged: it decides before any step. Until P5 lands, native runs only jobs the
@@ -704,6 +719,109 @@ untrusted job natively.
   namespace processes from the image store, health checks, `/etc/hosts` aliases, port mapping for
   host-mode jobs, and teardown with `cgroup.kill`.
 - Exit: the services tests pass on native. Measure: "Initialize containers" time.
+
+**Status: landed (behind the knob), on a root runner.** What it covers, as built:
+
+- `runner/src/native/services.zig` is the runner's side: "Initialize containers" (`start`) and
+  "Stop containers" (`stop`), which `dagger/services.zig` hands over when the job is native (two
+  lines), with the Dagger path's log lines and its spec evaluation (`serviceSpec`) reused.
+  `native/health.zig` is the helper's side of readiness, `native/images.zig` the image source,
+  `native/forward.zig` the port relay. `sandbox.zig` gained a `service` field on its spec, an
+  `exec` field (an image's entrypoint is looked up in its PATH; a step's shell stays `/bin/sh`),
+  and `Running.stop`, which stops a helper that has not started yet as soon as it does.
+- **A service is a sandbox like a step's, run until stopped**: the same helper, a fresh overlay
+  over the image's filesystem (its writes go with the job), its own mount, PID, UTS and IPC
+  namespaces, the job's range of ids (its root is nobody on the host), Docker's capabilities, the
+  seccomp filter and `no_new_privs` as for a root step, a /dev, /proc and /sys as a step's. Its
+  first process is PID 1 of its namespace: its entrypoint and command as the image says, its env
+  the image's, then `GITHUB_ACTIONS` and `CI` (as the Dagger path sets them), then `env:`, its user
+  the image's `USER` resolved in the image's own /etc/passwd and /etc/group, its working directory
+  the image's (made when missing).
+- **The job's network is shared**: services join the job's namespace, as steps do. A step reaches
+  a service by name (`postgres:5432`: the job's hosts file, the host's with a line naming the
+  loopback for every service, bound over the image's in every step and every service) and on
+  `localhost` at each published port. A port published as itself (`5432:5432`, `6379`) is the
+  service's own listener; one published under another number (`15432:5432`) is relayed by
+  `forward.zig`, a helper in the job's namespace that binds 127.0.0.1 and ::1 and then becomes the
+  job's `nobody` with `no_new_privs`. A bare port keeps its own number, as on the Dagger path (on
+  GitHub it gets a random one, which `job.services.<id>.ports` reports either way).
+- **Ready** as on GitHub when a health check passes: `--health-cmd` with `--health-interval`,
+  `-timeout`, `-retries` and `-start-period`, over the image's `HEALTHCHECK` (`CMD` and
+  `CMD-SHELL`; `NONE` and `--no-healthcheck` turn it off). The check runs inside the service: the
+  helper forks it, so it is in the service's PID namespace (a fork fails once the service is gone,
+  so no other process can be joined), its mount namespace and root, with its user, env,
+  capabilities and filter, its output dropped as Docker keeps it out of the logs. Failures count
+  as Docker counts them (once an interval, after the start period, unhealthy after `retries` in a
+  row), but the helper tries from 10 ms, doubling up to the interval, so a database up after
+  three seconds is ready after three seconds. Without a health check a service is ready when its
+  published ports accept connections on the job's loopback (the Dagger path's `start` waits so;
+  5 minutes at most); with neither, once started. The answer is one line the helper writes to a
+  file of the job's, outside the service's root, which the runner reads every 10 ms. An unhealthy
+  service, or one that ends first, fails the job before its steps, with its output so far.
+- **Stopped** in "Stop containers" (after the post scripts), all at once, then each one's output
+  printed, as GitHub prints `docker logs`. Stopping closes the helper's lifeline and the helper
+  kills the service's PID 1, and with it everything in its PID namespace, as `docker rm --force`
+  does. However the job ends, `Backend.deinit` stops them first, so their layers and the job's
+  network go with the job; the runner dying closes every lifeline too.
+- **The images** are pulled by P3 (`Backend.pullImage`, with the service's `credentials:`), the
+  configuration read from the store's `config.json` (`images.fromPulled`). Before P3 they came
+  from a directory an operator filled (`RUNNER_NATIVE_IMAGES`, now gone); the tests and the
+  real-images root test still use such a directory (`Config.images`), one entry per reference
+  with each `/` as `+`, holding `rootfs/` and `config.json`.
+  `.github/scripts/native-service-images.sh <dir>` makes one for CI, and shows how:
+
+  ```
+  docker create --name x postgres:17-alpine
+  sudo mkdir -p images/postgres:17-alpine/rootfs
+  docker export x | sudo tar -x -C images/postgres:17-alpine/rootfs   # owners kept
+  docker image inspect --format '{{json .}}' postgres:17-alpine > images/postgres:17-alpine/config.json
+  ```
+
+  An overlay layer's path may not hold a `:` (overlay's separator): the service's layer is a link
+  in the job's directory (`V<n>/I`), so the image's own path never reaches overlay's options.
+- Falls back to Dagger, with the reason in "Set up job": a rootless runner (services there would
+  share the host's network, so it is not configurable; the tests have a switch of their own), no
+  `RUNNER_NATIVE_IMAGES`, an image given by an expression, or one the directory does not have.
+  `options:` the native path does not carry out are reported as on the Dagger path ("Service
+  options not supported and ignored"); `volumes:` too.
+- Tests (`services.zig`): the end-to-end job (two services, reached by name, relayed and plain, a
+  health check and a port probe, env, the log, teardown) runs rootless and as root; an unhealthy
+  service and one that ends first fail the job; as root, the host knocks on the job's addresses
+  while a service listens and is not let in; and as root on CI, `postgres:17-alpine` and
+  `redis:7-alpine` from real images, health-checked with `pg_isready` and `redis-cli ping`, reached
+  by name, on `localhost` and through the relay.
+
+What it does not do yet, and where it is paid:
+
+- **Resource limits and `cgroup.kill`**: services, like steps, have no cgroup before phase 4,
+  which puts them in the job's and stops them with `cgroup.kill` (the lifeline does it now).
+- **The image pull**: phase 3. Until then a missing image sends the job to Dagger, and private
+  registries' credentials are not used.
+- **Rootless services**: they need the job's own network, phase 5's userspace stack.
+- **One port space per job**: services and steps share the job's loopback, so two services that
+  listen on one port cannot both run (the second fails to start, and the job with it), and a step
+  cannot listen on a service's port. On GitHub each container has its own. A namespace per service
+  joined by a bridge inside the job would lift it; no workflow of ours needs it yet.
+- **Smaller ones**: the health check stops once it has decided (GitHub reads it only at start;
+  Docker keeps checking); `job.services.<id>.network` says `dagger`, as on the Dagger path;
+  `--health-start-interval` is read as nothing (the quick tries cover it).
+
+#### Measured (laptop "cowbird", balanced profile, 2026-11-01, other agents building alongside)
+
+"Initialize containers", from its start to every service ready, through the whole runner path
+(`dagger.run`), the runner built `Debug`:
+
+| | native | Dagger |
+|---|---|---|
+| `traefik/whoami`, ready on its port, rootless (median of 5, load average about 6) | **21 ms** | not yet taken (below) |
+| two fixture services, a health check and a port probe, rootless | 67–78 ms | |
+| `postgres:17-alpine` and `redis:7-alpine`, health-checked, root, GitHub's hosted runner | 3.1 s | |
+
+The postgres figure is mostly postgres's own first start (`initdb`, its set-up server, then the
+real one); the sandbox's part is about the 21 ms above. Dagger's side is the test "Initialize
+containers against Dagger's", run by hand with a v0.21.10 engine container
+(`ZIG_RUNNER_MEASURE_SERVICES=<images> ZIG_RUNNER_MEASURE_ENGINE=<container>`); the agent that
+built this phase was not allowed to start one on the laptop, so that figure is still to be taken.
 
 ### P7: Docker actions
 
@@ -1248,3 +1366,39 @@ specification:
   firewall is iptables-nft (Docker's MASQUERADE uses the xtables target). The root runner's first
   batch loads them; a test that makes the rules in an unprivileged namespace first may find them
   missing.
+
+### P6: services
+
+What Docker and Dagger did implicitly for services, now explicit in `native/`:
+
+- **A container's entrypoint is looked up in its PATH.** Steps always ran `/bin/sh`; an image's
+  `docker-entrypoint.sh` is a name, found in the image's own PATH once inside its root
+  (`sandbox.lookPath`), as runc finds it. Some images have no shell at all (`traefik/whoami`).
+- **`USER` is a name in the image's files**, not the host's: resolved in the image's /etc/passwd
+  and /etc/group, read inside it.
+- **Readiness was Docker's state machine.** GitHub's runner polls Docker's health status; Dagger
+  waited for ports. Natively the helper that holds the service's first process is the place to
+  decide it: a check forked there is in the service's namespaces without a `setns`, and the pid it
+  joins cannot be another process's, since the helper has not reaped it. A separate helper joining
+  by pid would have raced pid reuse, as the host's root.
+- **Published ports were Docker's proxy.** In one shared namespace a port published as itself
+  needs nothing, which is most of them; the rest take a relay of ours, which binds as root in the
+  job's namespace and then drops to the job's `nobody`.
+- **Docker's bridge kept the host out.** P1's rules kept jobs from the host and from each other,
+  but not the host from the jobs: any process on the host could connect to a job's address over
+  `zr0`. Harmless while only steps listened; a database whose password is `postgres` is another
+  matter. `OUTPUT` and `FORWARD` now drop what goes to `zr0` and is not a reply, and the root test
+  knocks while a service listens.
+
+Surprises:
+
+- **The first readiness try's delay was the whole cost.** A service up in 5 ms was ready at
+  122 ms: 100 ms of first delay in the helper and 20 ms of the runner's polling. From 10 ms,
+  doubling, and read every 10 ms, it is 21 ms.
+- **`pg_isready` passes against postgres's set-up server**, which the image's entrypoint starts on
+  its socket alone and stops again before the real one listens on TCP; workflows on GitHub have
+  the same race. The test checks over TCP (`pg_isready -h 127.0.0.1`).
+- **An image's path can hold overlay's separator.** `postgres:17-alpine` is a fine directory name
+  and an impossible `lowerdir=`; the layer is a link in the job's directory instead.
+- **The boundary held again**: two lines in `dagger/services.zig` hand "Initialize containers"
+  and "Stop containers" over, and `JobLog.serviceLine` became public. No Dagger path changed.

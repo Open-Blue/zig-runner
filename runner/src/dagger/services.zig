@@ -19,6 +19,7 @@ const marker = @import("../dagger.zig").marker;
 const registryHost = @import("docker.zig").registryHost;
 const RegistryAuth = @import("docker.zig").RegistryAuth;
 const registryAuth = @import("docker.zig").registryAuth;
+const native_services = @import("../native/services.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -103,6 +104,7 @@ fn ignoredOptions(arena: Allocator, options: []const u8) ![]const u8 {
 /// their published ports to localhost in every step. False when one could not start: the job
 /// then fails without running its steps, as on GitHub.
 pub fn startServices(x: *Exec) !bool {
+    if (x.native) |b| return native_services.start(b, x);
     const arena = x.arena;
     const ev = x.ev;
     const ls = x.next_log_step;
@@ -514,6 +516,7 @@ pub fn writeServiceBindings(x: *Exec, q: *Query) !void {
 
 /// "Stop containers", after the post scripts, as GitHub's runner ends a job with services.
 pub fn stopServices(x: *Exec) !void {
+    if (x.native) |b| return native_services.stop(b, x);
     if (x.services.items.len == 0 and x.job.container == null) return;
     const ls = x.next_log_step;
     x.next_log_step += 1;
