@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Lints the comparison tools' Go: every module under runner/tools (each *diff directory has a
-# go.mod of its own), with `go vet` and staticcheck. They are test oracles, so a bug in one hides a
-# bug in the runner. CI runs this on a pull request that changes them (ci.yml, "Go tools") and
-# weekly (compare.yml). A finding fails; one that is wrong for this code is silenced where it is,
-# with `//lint:ignore <check> <reason>` on the line before.
+# go.mod of its own), with `go vet` and staticcheck, and Go's race detector. They are test oracles,
+# so a bug in one hides a bug in the runner. CI runs this on a pull request that changes them
+# (ci.yml, "Go tools") and weekly (compare.yml). A finding fails; one that is wrong for this code is
+# silenced where it is, with `//lint:ignore <check> <reason>` on the line before.
 #
-#   go-lint.sh          go vet and staticcheck
+#   go-lint.sh          go vet, staticcheck and the race detector
 #   go-lint.sh vuln     govulncheck instead: known vulnerabilities in what the tools call. Weekly
 #                       and informational, as the tools only read inputs CI makes or pins.
 #
@@ -49,9 +49,18 @@ for m in "${modules[@]}"; do
 	lint)
 		(cd "$m" && go vet ./...) || status=1
 		(cd "$m" && "$bin/staticcheck" ./...) || status=1
+		# The tests under the race detector, once a module has any (none has yet), and the module
+		# built with it, kept for the run below.
+		(cd "$m" && go test -race ./... && go build -race -o "$bin/race-${m##*/}" .) || status=1
 		;;
 	vuln) (cd "$m" && "$bin/govulncheck" ./...) || status=1 ;;
 	esac
 done
+# The one tool with goroutines of its own, run small with the race detector: rsadiff makes its keys
+# in parallel (two keys, 2048 and 4096 bits, for 100 messages). The others run on one goroutine.
+if [[ $mode == lint && -x $bin/race-rsadiff ]]; then
+	echo "== rsadiff, raced"
+	"$bin/race-rsadiff" -out "$bin/rsa.jsonl" -n 100 || status=1
+fi
 ((status == 0)) && echo "go-lint $mode: ${#modules[@]} modules, no findings"
 exit "$status"
