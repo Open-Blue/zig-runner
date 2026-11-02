@@ -159,9 +159,10 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/zlint.sh
 
-  # The comparison tools' Go (runner/tools/*diff), with go vet and staticcheck (go-lint.sh): they
-  # are test oracles, so a bug in one hides one in the runner. Skipped, still reporting, on a change
-  # that cannot affect them (ci-scope.sh go); compare.yml runs it weekly whatever changed.
+  # The comparison tools' Go (runner/tools/*diff), with go vet, staticcheck and the race detector
+  # (go-lint.sh): they are test oracles, so a bug in one hides one in the runner. Skipped, still
+  # reporting, on a change that cannot affect them (ci-scope.sh go); compare.yml runs it weekly
+  # whatever changed.
   go:
     name: Go tools
     runs-on: ubuntu-26.04
@@ -181,7 +182,7 @@ jobs:
 
       # Go is on GitHub's runner; it fetches the pinned staticcheck and the toolchain the go.mods
       # name, checked against Go's checksum database.
-      - name: go vet and staticcheck
+      - name: go vet, staticcheck and the race detector
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/go-lint.sh
 

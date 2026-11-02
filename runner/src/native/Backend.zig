@@ -156,8 +156,12 @@ pub const Config = struct {
     /// Where jobs' layers live while they run, and pulled images and provisioned rootfs
     /// (`RUNNER_NATIVE_STORE`).
     store: []const u8 = "",
-    /// This binary, which runs each step's sandbox (`sandbox.command`).
+    /// This binary, which runs each step's sandbox (`sandbox.command`): `exeOf` the runner.
     self_exe: []const u8 = "",
+    /// The path the runner was started from, when a deployment has replaced the binary there
+    /// since (`Exe.replaced`): "Set up job" says the helpers run the runner's own until it
+    /// restarts.
+    self_exe_replaced: []const u8 = "",
     /// The runner vouches for the job (`trust.vouches`). Jobs it does not vouch for run natively
     /// only once `job_limits` holds, on a root runner (`untrustedRefusal`).
     vouched: bool = false,
@@ -259,10 +263,12 @@ pub fn configFor(
         .memory_max_mb = cfg.native_memory_max_mb,
         .pids_max = cfg.native_pids_max,
     };
+    const exe = exeOf(arena, io, std.os.linux.getpid());
     return .{
         .rootfs = cfg.native_rootfs,
         .store = try cfg.nativeStore(arena, environ),
-        .self_exe = std.process.executablePathAlloc(io, arena) catch "",
+        .self_exe = exe.path,
+        .self_exe_replaced = exe.replaced,
         .vouched = vouched,
         .rootless = cfg.native_rootless,
         .subid_base = cfg.native_subid_base,
@@ -271,6 +277,35 @@ pub fn configFor(
         .cgroup = cg,
         .job_limits = jobLimits(arena, io, cg),
     };
+}
+
+/// A process's executable, for the helpers it starts (`Config.self_exe`).
+pub const Exe = struct {
+    /// What runs it: its path, or `/proc/<pid>/exe` once that path is gone.
+    path: []const u8,
+    /// The path it was started from, once that is gone or another file is there; else "".
+    replaced: []const u8 = "",
+};
+
+/// Process `pid`'s executable, which its helpers run: its path as `/proc/<pid>/exe` names it,
+/// while that is still the file it runs. A deployment that renames a new release over it
+/// (`zig-runner-deploy`, `install` then `mv -f`) leaves the link saying "<path> (deleted)", a
+/// path that is not there (exec: FileNotFound), and the path itself, if read, the new release,
+/// whose helpers need not speak this one's protocol: then `/proc/<pid>/exe`, which the kernel
+/// still executes as the very file the process started from, until it restarts onto the new
+/// one. Not `/proc/self/exe`: `unshare` (`launch`) would find itself there; nor can `unshare`
+/// run `/proc/<pid>/exe` from its new user namespace, so a rootless runner that starts its
+/// helpers under it sends its jobs to Dagger until it restarts (`unsupported`). "" when
+/// unreadable.
+pub fn exeOf(arena: Allocator, io: std.Io, pid: std.os.linux.pid_t) Exe {
+    const link = std.fmt.allocPrint(arena, "/proc/{d}/exe", .{pid}) catch return .{ .path = "" };
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = std.Io.Dir.readLinkAbsolute(io, link, &buf) catch return .{ .path = "" };
+    const named = arena.dupe(u8, buf[0..n]) catch return .{ .path = "" };
+    const deleted = " (deleted)";
+    if (std.mem.endsWith(u8, named, deleted))
+        return .{ .path = link, .replaced = named[0 .. named.len - deleted.len] };
+    return .{ .path = named };
 }
 
 /// Whether each job gets a cgroup of its own with `memory.max` and `pids.max` (P5's
@@ -310,6 +345,11 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         return "the native rootfs (RUNNER_NATIVE_ROOTFS) cannot be read";
     if (oci.hostPlatform() == null) return "there are no images for this machine's architecture";
     if (cfg.self_exe.len == 0 or cfg.store.len == 0) return "the native store is not set up";
+    // `/proc/<pid>/exe` is the runner's to execute, not `unshare`'s from its new user namespace.
+    if (cfg.self_exe_replaced.len > 0 and usernsHere(io) == .inherited) return "the runner's " ++
+        "binary was replaced since it started, and rootless native steps start under " ++
+        "`unshare`, which cannot run the one the runner started from (restarting the runner " ++
+        "onto the new one runs them natively again)";
     if (!cfg.vouched) if (untrustedRefusal(cfg)) |why| return why;
     if (std.os.linux.geteuid() != 0 and !cfg.rootless) return "the runner is not root, and " ++
         "rootless native steps have only one id mapped (RUNNER_NATIVE_ROOTLESS=1 runs them " ++
@@ -631,7 +671,20 @@ fn usernsHere(io: std.Io) sandbox.Userns {
 /// A job's directory in the store, locked, and on a root runner its slot and network. Stale
 /// directories (a runner that died) are removed first (`sweep`).
 pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend {
-    try Store.prepare(arena, io, cfg.store, .{ .check_parents = cfg.check_store_parents });
+    var why: []const u8 = "";
+    return initWhy(arena, io, gpa, cfg, &why);
+}
+
+/// `init`, saying in `why` what failed and on which path ("making /var/lib/.../P/etc:
+/// FileNotFound"), for "Set up job": an error's name alone does not say which of the job's
+/// directories, locks, helpers or files it was.
+pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *[]const u8) !Backend {
+    if (Store.secure(arena, io, cfg.store, .{ .check_parents = cfg.check_store_parents }) catch |e|
+        return failed(why, arena, "preparing the native store", cfg.store, e)) |unsafe|
+    {
+        why.* = unsafe;
+        return error.StoreUnsafe;
+    }
     const cg_parent = cgroup.parent(arena, io, cfg.cgroup.parent);
     sweep(arena, io, cfg.store, switch (cg_parent) {
         .dir => |d| d,
@@ -644,24 +697,30 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
     const new = try std.fmt.allocPrint(arena, "{s}/jobs/.new-{s}", .{ cfg.store, &id });
     const dir = try std.fmt.allocPrint(arena, "{s}/jobs/{s}", .{ cfg.store, &id });
     const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, new);
+    cwd.createDirPath(io, new) catch |e| return failed(why, arena, "making", new, e);
     // Until the lock is the Backend's, a failure removes the directory and closes the lock here;
     // from then on `deinit` does both, once.
     errdefer removeTree(arena, io, new);
-    for ([_][]const u8{ "W", "M", sandbox.secrets_dir, mount_points ++ "/etc" }) |d|
-        try cwd.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ new, d }));
-    for (mount_point_files) |f| try cwd.writeFile(io, .{
-        .sub_path = try std.fmt.allocPrint(arena, "{s}/{s}{s}", .{ new, mount_points, f }),
-        .data = "",
-    });
-    const lock = try lockFile(arena, io, try std.fmt.allocPrint(arena, "{s}/lock", .{new}), true);
+    for ([_][]const u8{ "W", "M", sandbox.secrets_dir, mount_points ++ "/etc" }) |d| {
+        const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ new, d });
+        cwd.createDirPath(io, path) catch |e| return failed(why, arena, "making", path, e);
+    }
+    for (mount_point_files) |f| {
+        const path = try std.fmt.allocPrint(arena, "{s}/{s}{s}", .{ new, mount_points, f });
+        cwd.writeFile(io, .{ .sub_path = path, .data = "" }) catch |e|
+            return failed(why, arena, "writing", path, e);
+    }
+    const lock_path = try std.fmt.allocPrint(arena, "{s}/lock", .{new});
+    const lock = lockFile(arena, io, lock_path, true) catch |e|
+        return failed(why, arena, "locking", lock_path, e);
     const how = launch(arena, io, cfg) catch |e| {
         lock.close(io);
         return e;
     };
     cwd.rename(new, cwd, dir, io) catch |e| {
         lock.close(io);
-        return e;
+        const paths = try std.fmt.allocPrint(arena, "{s} to {s}", .{ new, dir });
+        return failed(why, arena, "renaming", paths, e);
     };
     var b: Backend = .{
         .arena = arena,
@@ -686,10 +745,24 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
     };
     errdefer b.deinit();
     if (cfg.test_fail_after_lock) return error.TestFailure;
+    if (cfg.self_exe_replaced.len > 0) try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native " ++
+        "steps: {s} was replaced since this runner started (a deployment), so its helpers run " ++
+        "the binary it started from ({s}) until it restarts onto the new one.", .{
+        cfg.self_exe_replaced,
+        cfg.self_exe,
+    }));
     try b.jobCgroup(cfg, cg_parent, &id);
-    b.binds = try b.jobBinds(cfg);
-    if (b.how.userns == .mapped) try b.jobNetwork(cfg);
+    b.binds = try b.jobBinds(cfg, why);
+    if (b.how.userns == .mapped) try b.jobNetwork(cfg, why);
     return b;
+}
+
+/// Says in `why` that `what` failed on `path` with `e`, as "Set up job" shows it (`initWhy`),
+/// and returns `e`.
+fn failed(why: *[]const u8, arena: Allocator, what: []const u8, path: []const u8, e: anyerror) anyerror {
+    why.* = std.fmt.allocPrint(arena, "{s} {s}: {s}", .{ what, path, @errorName(e) }) catch
+        @errorName(e);
+    return e;
 }
 
 /// The job's cgroup under `parent`, named as its directory is, with its limits; or none, and
@@ -762,16 +835,20 @@ const Limit = struct {
 /// configured binds. On a root runner, a resolver of the job's own, made from the host's for its
 /// network (`net.Resolver`: no loopback or IPv6 nameservers), whose nameservers the jobs' rules
 /// let its DNS through to (`jobNetwork`).
-fn jobBinds(b: *Backend, cfg: Config) ![]const sandbox.Spec.Bind {
+fn jobBinds(b: *Backend, cfg: Config, why: *[]const u8) ![]const sandbox.Spec.Bind {
     const resolv = if (b.how.userns == .mapped) resolv: {
-        const r = try net.jobResolver(b.arena, b.io, resolvPaths(&cfg), cfg.subnet);
+        const r = net.jobResolver(b.arena, b.io, resolvPaths(&cfg), cfg.subnet) catch |e| {
+            const from = try std.mem.join(b.arena, ", ", resolvPaths(&cfg));
+            return failed(why, b.arena, "making the job's resolver from", from, e);
+        };
         b.nameservers = r.nameservers;
         if (r.fallback) try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Native " ++
             "steps: the host's resolver ({s}) names no nameserver the job's network can reach " ++
             "(only loopback or IPv6 ones), so the job resolves through 8.8.8.8 and 8.8.4.4, as " ++
             "Docker's containers then do.", .{if (r.source.len > 0) r.source else "none"}));
         const path = try std.fmt.allocPrint(b.arena, "{s}/resolv.conf", .{b.dir});
-        try std.Io.Dir.cwd().writeFile(b.io, .{ .sub_path = path, .data = r.conf });
+        std.Io.Dir.cwd().writeFile(b.io, .{ .sub_path = path, .data = r.conf }) catch |e|
+            return failed(why, b.arena, "writing", path, e);
         break :resolv path;
     } else "/etc/resolv.conf";
     b.etc_binds = try b.arena.dupe(sandbox.Spec.Bind, &.{
@@ -875,29 +952,33 @@ pub fn serviceDirs(b: *Backend, n: u32, rootfs: []const u8) !ServiceDirs {
 /// A slot of its own (the first free one on the host, held by its lock, `net.slots_dir`), and
 /// the job's network namespace on the runner's bridge (`net.zig`), made by a helper
 /// (`net.command`), since a thread of the runner must not change its namespace.
-fn jobNetwork(b: *Backend, cfg: Config) !void {
+fn jobNetwork(b: *Backend, cfg: Config, why: *[]const u8) !void {
     const arena = b.arena;
-    b.slot = try lockSlot(arena, b.io, net.slots_dir);
+    b.slot = lockSlot(arena, b.io, net.slots_dir) catch |e|
+        return failed(why, arena, "taking a slot in", net.slots_dir, e);
     const n = b.slot.?.n;
     // A veth of this slot is a dead job's: its runner let the lock go, by ending or dying. Only
     // the slot's holder removes it, so a live job's network is never touched.
-    var sock = try net.Socket.open();
+    var sock = net.Socket.open() catch |e| return failed(why, arena, "opening", "a netlink socket", e);
     sock.deleteVeth(n);
     sock.close();
+    const subnet = try std.fmt.allocPrint(arena, "{f}", .{cfg.subnet});
     // The host's uplinks and its resolver may have changed since the probe made their rules.
-    if (try natRulesFor(arena, b.io, cfg.subnet, b.nameservers, false)) |why| {
-        std.log.warn("native: the jobs' NAT rules: {s}", .{why});
+    const rules = natRulesFor(arena, b.io, cfg.subnet, b.nameservers, false) catch |e|
+        return failed(why, arena, "making the jobs' NAT rules for", subnet, e);
+    if (rules) |no| {
+        std.log.warn("native: the jobs' NAT rules: {s}", .{no});
+        why.* = try std.fmt.allocPrint(arena, "making the jobs' NAT rules for {s}: {s}", .{ subnet, no });
         return error.JobNetworkFailed;
     }
     const path = try std.fmt.allocPrint(arena, "{s}/netns", .{b.dir});
     const slot = try std.fmt.allocPrint(arena, "{d}", .{n});
-    const subnet = try std.fmt.allocPrint(arena, "{f}", .{cfg.subnet});
-    var child = try std.process.spawn(b.io, .{
+    var child = std.process.spawn(b.io, .{
         .argv = &.{ cfg.self_exe, net.command, path, slot, subnet },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .pipe,
-    });
+    }) catch |e| return failed(why, arena, "starting the job's network helper", cfg.self_exe, e);
     var err: std.ArrayList(u8) = .empty;
     var buf: [4096]u8 = undefined;
     while (true) {
@@ -905,10 +986,15 @@ fn jobNetwork(b: *Backend, cfg: Config) !void {
         if (got == 0) break;
         try err.appendSlice(arena, buf[0..got]);
     }
-    const term = try child.wait(b.io);
+    const term = child.wait(b.io) catch |e|
+        return failed(why, arena, "waiting for the job's network helper", cfg.self_exe, e);
     b.netns = path;
     if (term != .exited or term.exited != 0) {
-        std.log.warn("native: the job's network: {s}", .{std.mem.trim(u8, err.items, " \n")});
+        const said = std.mem.trim(u8, err.items, " \n");
+        std.log.warn("native: the job's network: {s}", .{said});
+        why.* = try std.fmt.allocPrint(arena, "making the job's network {s} ({s} {s}): {s}", .{
+            path, cfg.self_exe, net.command, if (said.len > 0) said else "it failed",
+        });
         return error.JobNetworkFailed;
     }
 }
@@ -2547,6 +2633,7 @@ const testStep = @import("../dagger/testing.zig").testStep;
 const testJob = @import("../dagger/testing.zig").testJob;
 const FakeSession = @import("../dagger/testing.zig").FakeSession;
 const fake_child = @import("../dagger/testing.zig").fake_child;
+const forward = @import("forward.zig");
 const base_answer = @import("../dagger/testing.zig").base_answer;
 const execAnswer = @import("../dagger/testing.zig").exec;
 
@@ -5125,4 +5212,111 @@ test "root runner: a native job's cgroup gets memory.high from what the gate res
         try std.fmt.allocPrint(arena, "Native steps: memory.high {d} MB, from ", .{high}),
     });
     _ = gate.ended();
+}
+
+test "a runner whose binary a deployment replaced runs native jobs on the binary it started from" {
+    // razorbill, 2026-11-02: zig-runner-deploy renamed v0.24.2 over /usr/local/bin/zig-runner
+    // while zig-runner@bench.service, not among its UNITS, kept running v0.24.1. The runner read
+    // its own path from /proc/self/exe for each job, "/usr/local/bin/zig-runner (deleted)", and
+    // every job's helper failed to start: "could not make the job's sandbox: FileNotFound".
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const cwd = std.Io.Dir.cwd();
+    // The runner, installed from the tests' binary, running (a helper waiting for its spec on
+    // stdin stands in for the runner's own process: it is the same binary).
+    try tmp.dir.createDirPath(io, "bin");
+    const installed = try std.fmt.allocPrint(arena, "{s}/bin/zig-runner", .{
+        try tmp.dir.realPathFileAlloc(io, ".", arena),
+    });
+    try std.Io.Dir.copyFileAbsolute(cfg.self_exe, installed, io, .{});
+    var runner = try std.process.spawn(io, .{
+        .argv = &.{ installed, forward.command },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer runner.kill(io);
+    // Deployed over, as zig-runner-deploy puts a release: written beside it, renamed over it.
+    const next = try std.fmt.allocPrint(arena, "{s}.new", .{installed});
+    try cwd.writeFile(io, .{ .sub_path = next, .data = "#!/bin/sh\nexit 3\n" });
+    try cwd.rename(next, cwd, installed, io);
+
+    // What /proc/<pid>/exe names now is no file at all: razorbill's FileNotFound.
+    const pid = runner.id.?;
+    const link = try std.fmt.allocPrint(arena, "/proc/{d}/exe", .{pid});
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const named = try arena.dupe(u8, buf[0..try std.Io.Dir.readLinkAbsolute(io, link, &buf)]);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{s} (deleted)", .{installed}), named);
+    try std.testing.expectError(error.FileNotFound, std.process.spawn(io, .{ .argv = &.{ named, "x" } }));
+
+    // The runner's helpers run the binary it started from, and "Set up job" says why.
+    const exe = exeOf(arena, io, pid);
+    try std.testing.expectEqualStrings(link, exe.path);
+    try std.testing.expectEqualStrings(installed, exe.replaced);
+    cfg.self_exe = exe.path;
+    cfg.self_exe_replaced = exe.replaced;
+    const job = testJob(&.{testStep("echo ran-natively")});
+    // Started under `unshare` (Ubuntu's restricted user namespaces), the helper cannot be that
+    // binary: the job goes to Dagger, saying why, before anything native is tried.
+    if (usernsHere(io) == .inherited) {
+        const why = unsupported(io, job, .{}, cfg) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, why, "binary was replaced since it started") != null);
+        return;
+    }
+    const r = try runNativeJob(arena, cfg, job, .root);
+    if (!r.res.succeeded) std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(r.res.succeeded);
+    try expectLines(r.text, &.{
+        "ran-natively",
+        try std.fmt.allocPrint(arena, "Native steps: {s} was replaced since this runner started", .{installed}),
+    });
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "This job runs on Dagger") == null);
+
+    // As the runner had it, on a root runner, whose set-up starts the job's network helper: the
+    // set-up says which helper it could not start, and from where.
+    if (std.os.linux.geteuid() == 0) {
+        var stale = cfg;
+        stale.self_exe = named;
+        stale.self_exe_replaced = "";
+        var why: []const u8 = "";
+        try std.testing.expectError(error.FileNotFound, initWhy(arena, io, std.testing.allocator, stale, &why));
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "starting the job's " ++
+            "network helper {s}: FileNotFound", .{named}), why);
+    }
+    // An unchanged binary is named by its own path.
+    const self = exeOf(arena, io, std.os.linux.getpid());
+    try std.testing.expect(self.replaced.len == 0 and std.mem.startsWith(u8, self.path, "/") and
+        !std.mem.startsWith(u8, self.path, "/proc/"));
+}
+
+test "a native set-up that fails says what it did and on which path" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    // A store whose jobs directory is a file: nothing of the job's can be made in it.
+    const store = try std.fmt.allocPrint(arena, "{s}/blocked", .{try tmp.dir.realPathFileAlloc(io, ".", arena)});
+    for ([_][]const u8{ "layers", "keys" }) |d|
+        try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "blocked/{s}", .{d}));
+    try tmp.dir.writeFile(io, .{ .sub_path = "blocked/jobs", .data = "" });
+    cfg.store = store;
+    var why: []const u8 = "";
+    if (initWhy(arena, io, std.testing.allocator, cfg, &why)) |made| {
+        var b = made;
+        b.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    const expect = try std.fmt.allocPrint(arena, "preparing the native store {s}: ", .{store});
+    if (!std.mem.startsWith(u8, why, expect)) {
+        std.debug.print("why: {s}\n", .{why});
+        return error.TestUnexpectedResult;
+    }
 }
