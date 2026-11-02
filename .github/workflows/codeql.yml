@@ -1,0 +1,81 @@
+# CodeQL: GitHub's code scanning of the code it has a language for, written down here instead of
+# the repository's "default setup", so it runs on the pinned ubuntu-26.04 like every other job and
+# its choices are reviewed like any other change. The runner itself is Zig, which CodeQL does not
+# read; what it does read:
+#
+#   actions  the workflows (.github/workflows), and the scripts they run inline
+#   go       the comparison tools (runner/tools/*diff, one module each, `go run` by
+#            .github/scripts/*-diff.sh and the weekly `compare`)
+#   python   the generator of runner/src/unicode_tables.zig (runner/tools/gen_unicode_tables.py)
+#
+# Results go to the repository's code scanning alerts. Uploads from this workflow are refused while
+# default setup is on (Settings, Code security, CodeQL analysis: "Not configured").
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # The merge queue tests each pull request on top of main; without this the check never reports
+  # there, and could not be made required without holding the queue.
+  merge_group:
+  # Weekly, as default setup did: new queries find old code.
+  schedule:
+    - cron: "41 6 * * 1"
+
+# Nothing by default; the job asks for what it needs.
+permissions: {}
+
+# A pull request's new push replaces the run of its old one; main's runs all finish.
+concurrency:
+  group: codeql-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Every job runs, on every change: an analysis takes a few minutes, and code scanning compares a
+# pull request's results with its base's, so a run left out would show as missing rather than as
+# clean. ci-scope.sh's skips suit Zig's long builds, not this.
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+      actions: read # to read the workflow run the results belong to
+      security-events: write # to upload the results to code scanning
+    strategy:
+      # One language's failure says nothing about the others'.
+      fail-fast: false
+      matrix:
+        include:
+          # Read as written: nothing to build.
+          - language: actions
+            build-mode: none
+          # Go has no `none`: CodeQL watches a build. autobuild builds each module under
+          # runner/tools, as default setup did, with the Go the image has fetching the toolchain
+          # each go.mod asks for (GOTOOLCHAIN=auto); the modules' dependencies come through Go's
+          # module proxy and checksum database, as in `compare`.
+          - language: go
+            build-mode: autobuild
+          # Read as written: nothing to build.
+          - language: python
+            build-mode: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # security-extended: the default suite and the lower-precision security queries besides.
+      # There is more for them to read than when default setup was chosen (the e2e harness, the
+      # native backend's tooling), and its few extra false positives are cheap to dismiss with a
+      # reason. The same suite for all three languages.
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-extended
+
+      # With build-mode autobuild, analyze runs the build itself before it analyzes.
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:${{ matrix.language }}

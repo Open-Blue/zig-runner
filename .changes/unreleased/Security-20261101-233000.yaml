@@ -1,0 +1,3 @@
+kind: Security
+body: 'CodeQL runs from a checked-in workflow (`.github/workflows/codeql.yml`) in place of the repository''s default setup: the workflows (actions), the comparison tools under `runner/tools` (Go, built by autobuild) and the Unicode table generator (Python), each a job of its own on the pinned `ubuntu-26.04` (ending default setup''s `ubuntu-latest` migration notice), with the `security-extended` queries instead of the default suite, on every pull request, in the merge queue (so it can become a required check), on every push to main and weekly. Its uploads are refused until default setup is turned off. The runner itself is unchanged.'
+time: 2026-11-01T23:30:00.000000-04:00
