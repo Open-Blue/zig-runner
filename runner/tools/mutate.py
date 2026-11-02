@@ -44,19 +44,26 @@ import time
 RUNNER = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 # Each module: the files mutated, and the test filters that select the tests covering them (a test
-# runs when its fully qualified name, "dagger.JobLog.test.<name>", contains any of them).
+# runs when its fully qualified name, "dagger.JobLog.test.<name>", contains any of them). The
+# jobs dagger.zig's tests run through a fake engine count: they are where most of a job's
+# commands and masks are checked end to end.
 MODULES = {
     "masking": {
         "files": ["src/redact.zig", "src/dagger/JobLog.zig"],
-        "filters": ["redact", "JobLog.test", "sink.test", "mask"],
+        "filters": ["redact", "JobLog.test", "sink.test", "mask", "dagger.test.workflow commands",
+                    "dagger.test.stop-commands", "dagger.test.job outputs",
+                    "dagger.test.environment.url", "dagger.test.a replay logs"],
     },
     "commands": {
         "files": ["src/commands.zig"],
-        "filters": ["commands", "JobLog.test"],
+        "filters": ["commands", "JobLog.test", "dagger.test.workflow commands",
+                    "dagger.test.stop-commands", "dagger.test.set-env", "dagger.test.file commands",
+                    "fuzz: workflow commands"],
     },
+    # Also GitHub's own expression cases, with --expr-cases (expr-conformance.sh's).
     "expr": {
         "files": ["src/expr.zig"],
-        "filters": ["expr.test", "Evaluator.test"],
+        "filters": ["expr.test", "Evaluator.test", "fuzz: expressions"],
     },
     "store": {
         "files": ["src/native/Store.zig"],
@@ -204,7 +211,7 @@ def tls_root():
 class Worker:
     """A copy of runner/src to mutate, and a cache of its own."""
 
-    def __init__(self, base, filters, timeout):
+    def __init__(self, base, filters, timeout, expr_cases=None):
         self.dir = tempfile.mkdtemp(prefix="w", dir=base)
         shutil.copytree(os.path.join(RUNNER, "src"), os.path.join(self.dir, "src"))
         with open(os.path.join(self.dir, "version"), "w") as f:
@@ -212,6 +219,7 @@ class Worker:
         self.filters = filters
         self.timeout = timeout
         self.tls = tls_root()
+        self.expr_cases = expr_cases
 
     def build(self):
         cmd = ["zig", "test", "-fPIE", "--dep", "build_version", "--dep", "tls", "-Mroot=src/main.zig",
@@ -231,6 +239,24 @@ class Worker:
             return "timeout", ""
         return ("passed" if p.returncode == 0 else "failed"), p.stderr
 
+    def cases_agree(self):
+        """Whether expr.zig fails exactly the GitHub cases it is known to fail
+        (tools/exprcorpus-failing.txt), as expr-conformance.sh checks."""
+        b = subprocess.run(["zig", "build-exe", "--dep", "expr",
+                            f"-Mroot={RUNNER}/tools/exprcorpus.zig", "-Mexpr=src/expr.zig",
+                            "--cache-dir", "cache", "-femit-bin=exprcorpus"],
+                           cwd=self.dir, capture_output=True, text=True, timeout=600)
+        if b.returncode != 0:
+            return False
+        try:
+            p = subprocess.run([os.path.join(self.dir, "exprcorpus"), self.expr_cases, "--failing"],
+                               capture_output=True, text=True, timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            return False
+        with open(os.path.join(RUNNER, "tools", "exprcorpus-failing.txt")) as f:
+            want = sorted(line for line in f.read().split("\n") if line)
+        return sorted(line for line in p.stdout.split("\n") if line) == want
+
     def trial(self, mutant):
         path = os.path.join(self.dir, mutant["file"])
         with open(path) as f:
@@ -241,6 +267,8 @@ class Worker:
             if self.build().returncode != 0:
                 return "uncompiled"
             outcome, _ = self.run()
+            if outcome == "passed" and self.expr_cases and not self.cases_agree():
+                return "killed"
             return {"passed": "survived", "failed": "killed", "timeout": "timeout"}[outcome]
         except subprocess.TimeoutExpired:
             return "timeout"
@@ -270,7 +298,8 @@ def run_module(name, args, base):
             print(f'{m["file"]}:{m["line"]} [{m["op"]}] {m["new"] or "(line removed)"}')
         return None
 
-    workers = [Worker(base, spec["filters"], args.timeout) for _ in range(args.jobs)]
+    cases = args.expr_cases if name == "expr" else None
+    workers = [Worker(base, spec["filters"], args.timeout, cases) for _ in range(args.jobs)]
     # The unchanged code must pass its tests, and how long they take bounds a mutant's run: ten
     # times as long, and at least 10 s (a loop a mutant never leaves is a timeout, not a hang).
     b = workers[0].build()
@@ -281,6 +310,9 @@ def run_module(name, args, base):
     took = time.monotonic() - t0
     if outcome != "passed":
         sys.exit(f"{name}: the unchanged code fails its tests ({outcome}):\n{out[-4000:]}")
+    if cases and not workers[0].cases_agree():
+        sys.exit(f"{name}: the unchanged code does not fail exactly the cases in "
+                 "tools/exprcorpus-failing.txt (expr-conformance.sh says which)")
     for w in workers:
         w.timeout = args.timeout or max(10.0, 10 * took)
     ran = len(re.findall(r"\.\.\.OK", out))
@@ -362,6 +394,9 @@ def main():
     p.add_argument("--merge", nargs="+", metavar="JSON",
                    help="no mutants: one report from these results.json files (of shards)")
     p.add_argument("--list", action="store_true", help="print the mutants and run none")
+    p.add_argument("--expr-cases", metavar="DIR", help="GitHub's expression cases "
+                   "(actions/languageservices' expressions/testdata, at expr-conformance.sh's "
+                   "commit): expr's mutants must also fail exactly the known ones")
     p.add_argument("--out", help="write report.md and results.json here, not the report to stdout")
     args = p.parse_args()
     if args.merge:

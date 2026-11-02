@@ -61,6 +61,17 @@ jobs:
         working-directory: runner
         run: zig build --fetch
 
+      # expr's mutants also meet GitHub's own expression cases, at expr-conformance.sh's commit.
+      - name: GitHub's expression cases
+        if: ${{ matrix.module == 'expr' }}
+        run: |
+          rev=$(sed -n 's/^LANGUAGESERVICES_REV=//p' .github/scripts/expr-conformance.sh)
+          git init -q "$RUNNER_TEMP/ls"
+          git -C "$RUNNER_TEMP/ls" fetch -q --depth 1 --filter=blob:none https://github.com/actions/languageservices "$rev"
+          git -C "$RUNNER_TEMP/ls" sparse-checkout set --no-cone /expressions/testdata/ >/dev/null
+          git -C "$RUNNER_TEMP/ls" checkout -q FETCH_HEAD
+          echo "EXPR_CASES=$RUNNER_TEMP/ls/expressions/testdata" >>"$GITHUB_ENV"
+
       - name: Mutate
         env:
           MODULE: ${{ matrix.module }}
@@ -68,7 +79,8 @@ jobs:
           SHARD: ${{ matrix.shard }}
         run: |
           python3 runner/tools/mutate.py "$MODULE" --jobs "$(nproc)" --shard "$SHARD/4" \
-            ${SAMPLE:+--sample "$SAMPLE"} --out "$RUNNER_TEMP/mutation"
+            ${SAMPLE:+--sample "$SAMPLE"} ${EXPR_CASES:+--expr-cases "$EXPR_CASES"} \
+            --out "$RUNNER_TEMP/mutation"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

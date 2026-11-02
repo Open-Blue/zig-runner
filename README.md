@@ -135,7 +135,8 @@ masking (`masking`: `redact.zig`, `dagger/JobLog.zig`), workflow commands (`comm
 expressions (`expr`), the native store's keys and publishing (`store`) and `minisign`. Locally,
 after `zig build --fetch` in `runner/`: `python3 runner/tools/mutate.py masking` (`--all --out DIR`
 for every module, `--sample N` for a quicker look, `--list` for the mutants alone, `--shard K/N`
-and `--merge` to split a run and join its results). The five modules make about 2,400 mutants,
+and `--merge` to split a run and join its results; `--expr-cases DIR` holds `expr`'s mutants to
+GitHub's own expression cases too, as `expr-conformance.sh` does). The five modules make about 2,400 mutants,
 each a compile, which is hours of every core: too slow for a pull request, and for a laptop doing
 anything else. `mutation` runs it for one module when asked for (Actions, "Run workflow"), over
 four of GitHub's runners, with the report in the last job's summary and as the `mutation-report`
