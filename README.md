@@ -116,7 +116,10 @@ and problem matchers) with Zig's coverage-guided fuzzer (`.github/scripts/zig-fu
 for a bounded number of runs), keeping each target's corpus in the Actions cache and failing,
 named after the target, on a crash, a failed check, a leak or a hang, with the input as an
 artifact; `zig build test` runs the same targets over their seed corpus every time. Locally:
-`zig build test -Dllvm --fuzz` (add `-Dtest-filter='fuzz: YAML'` for one target).
+`zig build test -Dllvm --fuzz` (add `-Dtest-filter='fuzz: YAML'` for one target). "Valgrind" runs
+every test under memcheck (`.github/scripts/zig-valgrind.sh`), for reads of memory never written
+and accesses outside an allocation, which Debug's safety checks miss; known-benign reports are
+suppressed in `.github/valgrind.supp`, each with why.
 `proofs` checks the [Lean proofs](proofs/README.md) (the step cache, the regex matcher's loops, and
 the `hashFiles()` walk) and compares the walk's model with `runner/src/glob.zig` on random cases,
 when either changes and weekly ("Proofs"). The workflows are written to be hard to turn against the
@@ -168,7 +171,8 @@ repository:
   workflows, the Go tools and the Python generators; every job has a time limit. The Database
   tests job runs every test under
   ThreadSanitizer (`zig build test -Dsanitize-thread` locally); ZLint checks the runner's Zig, and
-  `analysis` fuzzes its parsers nightly (above). Vulnerabilities are reported privately ([docs/SECURITY.md](docs/SECURITY.md)).
+  `analysis` fuzzes its parsers and runs its tests under Valgrind nightly (above). Vulnerabilities
+  are reported privately ([docs/SECURITY.md](docs/SECURITY.md)).
 - **One secret, one step.** The deploy key that may push to `main` is the `prod` environment's,
   which deploys only from `main` and waits for approval; it is loaded only in the step that pushes,
   and pushes only to GitHub's pinned host key.
