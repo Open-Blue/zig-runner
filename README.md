@@ -123,7 +123,20 @@ artifact; `zig build test` runs the same targets over their seed corpus every ti
 `zig build test -Dllvm --fuzz` (add `-Dtest-filter='fuzz: YAML'` for one target). "Valgrind" runs
 every test under memcheck (`.github/scripts/zig-valgrind.sh`), for reads of memory never written
 and accesses outside an allocation, which Debug's safety checks miss; known-benign reports are
-suppressed in `.github/valgrind.supp`, each with why.
+suppressed in `.github/valgrind.supp`, each with why. "Coverage" (`.github/scripts/zig-coverage.sh`)
+measures which lines the tests reach with [kcov](https://github.com/SimonKagstrom/kcov) (Ubuntu's
+package, pinned to the version checked): the rootless tests, the native backend's tests as root,
+and the runner binary those tests start for their sandboxes and networks, merged into one report.
+The `coverage` artifact holds kcov's HTML report, Cobertura XML and JSON, with the total, each
+directory's and every file's line coverage in `summary.json`; the job summary lists the
+security-relevant files (masking in `dagger/JobLog.zig`, workflow commands, expressions, YAML, the
+native store, sandbox, networks and image handling, minisign and the GitHub client) least-covered
+first. Nothing is sent to a coverage service. It runs nightly and on every pull request that changes
+`runner/src`, reporting without failing; `COVERAGE_MIN=<percent>` on its step makes it fail below
+that total, the way to hold a floor once the numbers have settled. kcov needs the tests compiled
+by LLVM and not position-independent (the script says why), which changes nothing they test.
+Locally, with kcov installed: `.github/scripts/zig-coverage.sh /tmp/coverage`, then open
+`/tmp/coverage/html/index.html`.
 `proofs` checks the [Lean proofs](proofs/README.md) (the step cache, the regex matcher's loops, and
 the `hashFiles()` walk) and compares the walk's model with `runner/src/glob.zig` on random cases,
 when either changes and weekly ("Proofs"). The workflows are written to be hard to turn against the
@@ -193,7 +206,7 @@ repository:
   (`.github/scripts/go-lint.sh`); every job has a time limit. The Database
   tests job runs every test under
   ThreadSanitizer (`zig build test -Dsanitize-thread` locally); ZLint checks the runner's Zig, and
-  `analysis` fuzzes its parsers and runs its tests under Valgrind nightly (above). Vulnerabilities
+  `analysis` fuzzes its parsers, runs its tests under Valgrind and measures their coverage nightly (above). Vulnerabilities
   are reported privately ([docs/SECURITY.md](docs/SECURITY.md)).
 - **One secret, one step.** The deploy key that may push to `main` is the `prod` environment's,
   which deploys only from `main` and waits for approval; it is loaded only in the step that pushes,

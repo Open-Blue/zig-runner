@@ -11,9 +11,18 @@ name: analysis
 #                  artifact (fuzz-TARGET).
 #   Valgrind       every test under Valgrind's memcheck (.github/scripts/zig-valgrind.sh): reads
 #                  of memory never written, and accesses outside what was allocated.
+#   Coverage       the lines the tests reach, with kcov (.github/scripts/zig-coverage.sh): the
+#                  rootless tests and the native backend's root pass merged, as an HTML report and
+#                  Cobertura and JSON (the coverage artifact), with the total, each area and the
+#                  least-covered security-relevant files in the job summary. Nothing leaves
+#                  GitHub: no coverage service is sent anything.
 #
 # Each search costs more than a pull request should wait for, so they run here and not in ci; a
-# failure is a case for an issue (or a fix), not a broken main.
+# failure is a case for an issue (or a fix), not a broken main. Coverage also runs on a pull
+# request that changes the runner's code, so its numbers can be compared with main's nightly ones;
+# it reports only, failing on nothing but a report that did not come out. To hold the total above
+# a floor later, set COVERAGE_MIN (a percentage) on its Coverage step, and make "Coverage" a
+# required check once the floor has held for a while (zig-coverage.sh).
 
 on:
   schedule:
@@ -25,13 +34,17 @@ on:
         required: false
   # A pull request that changes this workflow or its scripts runs it, so a change to them is seen
   # working before it merges (workflow_dispatch reaches a workflow only once the default branch
-  # has it). Not a required check, so the path filter leaves nothing waiting.
+  # has it); one that changes the runner's code runs Coverage alone (ci-scope.sh analysis and
+  # coverage, in the Scope job). Not a required check, so the path filter leaves nothing waiting.
   pull_request:
     paths:
       - .github/workflows/analysis.yml
+      - .github/scripts/ci-scope.sh
       - .github/scripts/zig-fuzz.sh
       - .github/scripts/zig-valgrind.sh
+      - .github/scripts/zig-coverage.sh
       - .github/valgrind.supp
+      - runner/src/**
 
 permissions: {}
 
@@ -41,8 +54,38 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Which jobs a pull request runs (ci-scope.sh analysis and coverage); everything, otherwise. Not a
+  # required check, so a job its `if:` leaves out holds nothing up.
+  scope:
+    name: Scope
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read # to check out the code and fetch the base commit
+    outputs:
+      analysis: ${{ steps.analysis.outputs.run }}
+      coverage: ${{ steps.coverage.outputs.run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether this change can affect Fuzz and Valgrind
+        id: analysis
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: .github/scripts/ci-scope.sh analysis
+
+      - name: Whether this change can affect Coverage
+        id: coverage
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: .github/scripts/ci-scope.sh coverage
+
   fuzz:
     name: Fuzz (${{ matrix.target }})
+    needs: scope
+    if: needs.scope.outputs.analysis == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     permissions:
@@ -112,6 +155,8 @@ jobs:
   # About ten minutes on GitHub's runner.
   valgrind:
     name: Valgrind
+    needs: scope
+    if: needs.scope.outputs.analysis == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     permissions:
@@ -133,3 +178,53 @@ jobs:
 
       - name: Tests under memcheck
         run: .github/scripts/zig-valgrind.sh
+
+  # kcov over the tests on GitHub's runner, which can make the native backend's sandboxes (as ci's
+  # hosted test job): rootless, then the native tests as root, merged (zig-coverage.sh).
+  coverage:
+    name: Coverage
+    needs: scope
+    if: needs.scope.outputs.coverage == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      # Ubuntu's own package, checked by apt against the archive's signed index, at the version
+      # zig-coverage.sh was checked with: a new one fails here until it is checked and bumped.
+      - name: Install kcov
+        env:
+          KCOV_VERSION: 43+dfsg-2
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends "kcov=$KCOV_VERSION"
+          kcov --version
+
+      - name: Coverage
+        run: |
+          # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
+          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          # The root pass's services test runs real postgres and redis images (ci.yml's Test).
+          .github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
+          ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_COVERAGE_ROOT=1 \
+            ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" \
+            .github/scripts/zig-coverage.sh "$RUNNER_TEMP/coverage"
+          cat "$RUNNER_TEMP/coverage/summary.md" >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: |
+            ${{ runner.temp }}/coverage/html
+            ${{ runner.temp }}/coverage/cobertura.xml
+            ${{ runner.temp }}/coverage/coverage.json
+            ${{ runner.temp }}/coverage/summary.json
+            ${{ runner.temp }}/coverage/summary.md
+          retention-days: 30
