@@ -24,7 +24,7 @@ jobs:
   branch:
     name: Branch name
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Check the prefix
@@ -44,7 +44,7 @@ jobs:
   # they and the deployment run, with shellcheck (README, "Pipeline").
   workflows:
     name: Workflows
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read # to check out the workflows
@@ -128,7 +128,7 @@ jobs:
   # that cannot affect the tests (ci-scope.sh).
   database:
     name: Database tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       contents: read # to check out the code
@@ -171,10 +171,12 @@ jobs:
   # requests and the merge queue run on GitHub's runner on purpose, cold every time, the worst case
   # for a build (README, "Environments"). The repository variables PROD_RUNNER and PREPROD_RUNNER
   # hold runs-on labels as JSON (["self-hosted","prod"]); PREPROD_RUNNER is left unset, and unset
-  # means GitHub's runner.
+  # means GitHub's runner. Its image is pinned (ubuntu-26.04, not ubuntu-latest) on purpose: an
+  # image change moves what the native passes stand on (AppArmor's userns restriction, idmapped
+  # mounts, nftables), so upgrade it deliberately, here and in the other workflows together.
   test:
     name: Format, build and test
-    runs-on: ${{ fromJSON(github.event_name == 'push' && (vars.PROD_RUNNER || '"ubuntu-latest"') || (vars.PREPROD_RUNNER || '"ubuntu-latest"')) }}
+    runs-on: ${{ fromJSON(github.event_name == 'push' && (vars.PROD_RUNNER || '"ubuntu-26.04"') || (vars.PREPROD_RUNNER || '"ubuntu-26.04"')) }}
     timeout-minutes: 30
     permissions:
       contents: read # to check out the code
@@ -212,7 +214,10 @@ jobs:
       # -j1 compiles the tests and the runner one after the other: together they peak at about
       # 1.7 GB, one at a time about 1 GB, so two jobs fit under the engine's 4 GB cap instead of
       # queueing behind its memory gate. Each job takes about 25 s longer, and the pool finishes
-      # about 38% more of them.
+      # about 38% more of them. The tests' output is only text to this job, never its workflow
+      # commands: the native backend's tests write `##[error]` lines into their jobs' logs (the
+      # process and memory limits), which would otherwise become this job's annotations
+      # (zig-test.sh does the same for its own runs).
       - name: Test
         if: steps.scope.outputs.run == 'true'
         working-directory: runner
@@ -221,7 +226,7 @@ jobs:
             # GitHub's runner can make the native backend's sandboxes, so its tests must run here,
             # not skip (src/native/Backend.zig, `testConfig`): rootless, then as root, the path
             # with each job's own ids and network (nft makes its NAT).
-            # Ubuntu 24.04 AppArmor blocks unprivileged user namespaces; lift it on this throwaway VM.
+            # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
             sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
             ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/zig-test.sh
             # Real postgres and redis images for the native services test (native/services.zig),
@@ -229,10 +234,17 @@ jobs:
             ../.github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
             ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 \
               ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" ../.github/scripts/zig-test.sh
-          elif [ "$RUNNER_ARCH" = ARM64 ]; then
-            zig build test -j1 --summary all
           else
-            zig build test --summary all
+            stop="tests-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+            echo "::stop-commands::$stop" >&2
+            status=0
+            if [ "$RUNNER_ARCH" = ARM64 ]; then
+              zig build test -j1 --summary all || status=$?
+            else
+              zig build test --summary all || status=$?
+            fi
+            echo "::$stop::" >&2
+            exit "$status"
           fi
 
   # The release's own builds, both targets in ReleaseSafe (build-binaries.sh), which nothing else
@@ -245,7 +257,7 @@ jobs:
   binaries:
     name: Release builds
     if: github.event_name != 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read # to check out the code
@@ -288,7 +300,7 @@ jobs:
   e2e:
     name: End to end
     if: github.event_name != 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 25
     environment: e2e
     permissions:
