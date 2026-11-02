@@ -76,6 +76,11 @@ build() {
 	zig build-exe "${modules[@]}" --name runner -femit-bin="$bin"
 	rm -rf "$scratch"
 	"$bin" --version
+	# A tsan build that is not one would pass `races` with nothing to report.
+	if [[ ${2:-} == tsan ]] && ! grep -qaF __tsan_init "$bin"; then
+		echo "the runner was built without ThreadSanitizer" >&2
+		exit 1
+	fi
 }
 
 engine() {
