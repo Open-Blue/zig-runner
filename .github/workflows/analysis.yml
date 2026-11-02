@@ -180,7 +180,8 @@ jobs:
         run: .github/scripts/zig-valgrind.sh
 
   # kcov over the tests on GitHub's runner, which can make the native backend's sandboxes (as ci's
-  # hosted test job): rootless, then the native tests as root, merged (zig-coverage.sh).
+  # hosted test job): rootless, then the native tests as root, merged (zig-coverage.sh). About 18
+  # minutes: each pass runs twice, and the helpers start some 570 times under kcov.
   coverage:
     name: Coverage
     needs: scope

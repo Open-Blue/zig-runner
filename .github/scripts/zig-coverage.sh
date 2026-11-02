@@ -37,8 +37,10 @@
 # Neither changes what the tests test. A test's own lines count as covered lines of its file, as
 # kcov cannot tell them from the code's; the per-file numbers are for finding what no test reaches,
 # not a measure of how well it is tested. Tests that fail under kcov are a warning: what judges
-# them is the tests' own job, at full speed (kcov runs each line's first hit through a trap). What
-# fails is a report that did not come out.
+# them is the tests' own job, at full speed (kcov runs each line's first hit through a trap). Three
+# native tests fail under it on GitHub's runner, as expected of a traced process: containment
+# (what a traced step can see), cancel's timing, and the replaced binary (the helper here is a
+# script). What fails is a report that did not come out.
 set -euo pipefail
 out=$(realpath -m "${1:?usage: zig-coverage.sh OUT}")
 cd "$(dirname "$0")/../../runner"
