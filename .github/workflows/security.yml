@@ -1,0 +1,87 @@
+name: security
+
+# Secrets and dependencies (README, "Pipeline"):
+#
+#   Secrets             gitleaks over a pull request's own commits, and weekly over main's whole
+#                       history (with the rules a newer gitleaks brings). Any finding fails the job;
+#                       one that is not a secret is allowed, narrowly and with why, in
+#                       .gitleaks.toml. The log shows the rule, file, line and commit, never the
+#                       value (--redact).
+#   Dependency review   the dependencies a pull request adds or changes, as GitHub's dependency
+#                       graph sees them (the Go tools' go.mod files and the workflows' actions; not
+#                       runner/build.zig.zon or the Dockerfile's images), failing on a known
+#                       vulnerability of moderate severity or worse, or a license outside the list
+#                       below.
+#
+# Neither is skipped by ci-scope.sh: a secret can be in any file, and dependency review reads only
+# the graph's diff, in seconds, finding nothing when no manifest changed.
+
+on:
+  pull_request:
+  schedule:
+    - cron: "37 6 * * 1" # Mondays, 06:37 UTC
+  workflow_dispatch:
+
+# Nothing by default; each job asks for what it needs.
+permissions: {}
+
+# A pull request's new push replaces the run of its old one.
+concurrency:
+  group: security-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gitleaks:
+    name: Secrets
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # to check out the history
+    steps:
+      # The whole history: a pull request's range is from its base, which a shallow clone lacks.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Pinned by version and checksum, as changie is.
+      - name: Install gitleaks
+        run: .github/scripts/install-gitleaks.sh
+
+      # A pull request: the commits on its branch since its base (not main's, already scanned).
+      # Anything else: everything reachable from the commit checked out. `gitleaks:allow` comments
+      # are ignored: a finding is allowed only in .gitleaks.toml, where its reason is written down.
+      - name: Scan
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          range=()
+          if [[ -n "$BASE" ]]; then
+            range=(--log-opts="$BASE..$HEAD")
+          fi
+          gitleaks git --config .gitleaks.toml --redact --ignore-gitleaks-allow --no-banner --verbose "${range[@]}" .
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # to read the dependency graph's diff
+    steps:
+      # The license list is what can be compiled into, or run beside, an MIT-licensed project
+      # without changing its terms (THIRD_PARTY.md: MIT, Apache-2.0, BSD, ISC, Unicode so far).
+      # Copyleft (GPL, LGPL, MPL) is not on it: such a dependency needs a decision, not a merge.
+      # A dependency whose license the graph does not know is reported, not failed (the actions).
+      #
+      # golang.org/x/net is BSD-3-Clause with Go's patent grant, which the graph reads as a
+      # second license (LicenseRef-scancode-google-patent-license-golang) that no SPDX list names;
+      # the grant only adds rights. hpackdiff's go.mod pins it (THIRD_PARTY.md).
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+          allow-licenses: >-
+            MIT, MIT-0, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, 0BSD, Zlib, Unicode-3.0,
+            Unicode-DFS-2016
+          allow-dependencies-licenses: pkg:golang/golang.org/x/net

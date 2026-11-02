@@ -90,6 +90,24 @@ language for (the workflows, the Go comparison tools under `runner/tools`, the P
 one job per language, on every pull request, in the merge queue, on `main` and weekly; it is a
 checked-in workflow rather than the repository's default setup, which must stay off for its
 uploads to be accepted.
+`security` runs on every pull request, and neither of its checks is required yet. "Secrets" runs
+[gitleaks](https://github.com/gitleaks/gitleaks) (`.github/scripts/install-gitleaks.sh`, pinned by
+version and checksum) over the pull request's own commits, and weekly over `main`'s whole history,
+failing on any finding; the log names the rule, file, line and commit, never the value. A finding
+that is not a secret (a test fixture, an example key, a hash) is allowed in `.gitleaks.toml`, as
+narrowly as it can be (one rule, one file, the line's shape) and with a comment saying why;
+`gitleaks:allow` comments in the code are ignored, so every exception is in that one file.
+"Dependency review" runs
+[`actions/dependency-review-action`](https://github.com/actions/dependency-review-action) on the
+dependencies a pull request adds or changes, failing on a known vulnerability of moderate severity
+or worse, or on a license outside the permissive ones an MIT project can take in (MIT, Apache-2.0,
+BSD, ISC, Zlib, Unicode; the list and its one exception are in `security.yml`). It reads GitHub's
+dependency graph, which sees the Go tools' modules under `runner/tools/` (indirect ones included)
+and the actions the workflows use. It does not see `runner/build.zig.zon` (no Zig support:
+tls.zig, the one dependency compiled into the runner, is followed by Renovate and listed in
+[THIRD_PARTY.md](THIRD_PARTY.md) by hand), the images `runner/Dockerfile`, `deploy/compose.yaml`
+and the scripts pin (Trivy scans the release's image), or the .NET reference program, which has no
+packages.
 "End to end" (`ci`, `.github/scripts/e2e.sh`) runs the runner built from the pull request for
 real, on GitHub's runner: it starts the pinned Dagger engine as `deploy/compose.yaml` does,
 registers the runner's just-in-time runners on the private `Open-Blue/runner-bench` under a label
@@ -151,11 +169,11 @@ repository:
   (`runner/src/dagger.zig`, checked by `.github/scripts/ubuntu-pin.sh`); the packages provisioning
   installs into it come from the Ubuntu archive on the day the engine builds them, and the pre-warm
   logs their fingerprint. tls.zig and GitHub's expression
-  test cases are pinned by commit. Zig, changie, checksec, ZLint, hadolint and shfmt are checked
-  against pinned checksums before they run, tls.zig against its `.hash` as well; a Renovate pull
-  request for a new Zig, tls.zig, changie, hadolint or shfmt fails until its checksums are updated
-  (changie's by the Workflows job, which downloads it on every pull request, though only the
-  release runs it).
+  test cases are pinned by commit. Zig, changie, checksec, gitleaks, ZLint, hadolint and shfmt are
+  checked against pinned checksums before they run, tls.zig against its `.hash` as well; a Renovate
+  pull request for a new Zig, tls.zig, changie, hadolint or shfmt fails until its checksums are
+  updated (changie's by the Workflows job, which downloads it on every pull request, though only
+  the release runs it).
 - **Verifiable releases.** Every binary and image has a signed provenance attestation saying which
   workflow built it from which commit. Check a binary as razorbill does, built by `release.yml` from
   its tag on GitHub's own runners:
@@ -191,7 +209,9 @@ repository:
   ```
 - **Scanned.** Trivy checks the Dockerfile and the image before a push, with its vulnerability
   database fetched once, with retries, from Google's mirror first; accepted findings are in
-  `.trivyignore.yaml`, each with why. GitHub's secret scanning blocks pushes carrying credentials.
+  `.trivyignore.yaml`, each with why. GitHub's secret scanning blocks pushes carrying credentials
+  (push protection), and gitleaks scans every pull request's commits and, weekly, the whole history
+  (`security`, above); dependency review checks the dependencies a pull request brings.
 - **Checked.** actionlint and zizmor check the workflows, shellcheck every shell script
   (`.github/scripts/shellcheck.sh`) and shfmt its format (`.github/scripts/shfmt.sh`, shfmt's
   defaults: tabs; `-w` formats), hadolint the Dockerfile (`.github/scripts/hadolint.sh`; a finding

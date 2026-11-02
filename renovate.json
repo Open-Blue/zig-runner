@@ -154,6 +154,19 @@
       "extractVersionTemplate": "^v(?<version>.*)$"
     },
     {
+      "description": "gitleaks, pinned by version in install-gitleaks.sh. A new version also needs its checksum from the release's checksums file, updated by hand, which CI enforces by failing until it is (security.yml's Secrets job runs install-gitleaks.sh on every pull request).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/scripts/install-gitleaks\\.sh$/"
+      ],
+      "matchStrings": [
+        "\\nversion=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "gitleaks/gitleaks",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
       "description": "hadolint, pinned by version in hadolint.sh. A new version also needs its checksums from the release's checksums.sha256, updated by hand, which CI enforces by failing until they are (the Workflows job runs hadolint.sh).",
       "customType": "regex",
       "managerFilePatterns": [
