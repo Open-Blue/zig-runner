@@ -101,6 +101,9 @@ next_layer: u32 = 0,
 store: ?Store = null,
 /// The store's settings, for `base` to turn it on.
 store_cfg: Store = .{ .root = "" },
+/// A layer of the job's was published (`publishTop`): its end syncs the layers' directory, so
+/// the renames outlive a crash (`Store.syncLayers`).
+published: bool = false,
 /// `Config.vouched`, and the job's cache scope and repository from it (`base`): a vouched fork's
 /// pull request keys its layers apart from its repository's own jobs, as its package caches are
 /// (`set_up.packageCacheScope`).
@@ -1104,6 +1107,7 @@ pub fn deinit(b: *Backend) void {
     for (b.held.items) |f| f.close(b.io);
     if (b.slot) |s| s.lock.close(b.io);
     b.lock.close(b.io);
+    if (b.published) b.store_cfg.syncLayers(arena);
     // The store kept under its cap, now that this job holds none of its layers: whether or not
     // the job cached steps, as Dockerfile builds publish layers too (`layers.zig`).
     if (b.store_cfg.root.len > 0) b.store_cfg.collect(arena, b.io);
@@ -2151,6 +2155,7 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) 
         return;
     };
     b.held.appendAssumeCapacity(layer.lock);
+    b.published = true;
     const canonical = top.canonical;
     top.* = .{ .name = name, .path = layer.fs, .key = key, .canonical = canonical };
 }
