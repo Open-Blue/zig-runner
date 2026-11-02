@@ -12,6 +12,7 @@
 //! allows by default; a token realm elsewhere must be HTTPS, since the credentials go to it.
 
 const std = @import("std");
+const http = @import("../../github/http.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
