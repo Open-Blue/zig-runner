@@ -259,9 +259,11 @@ jobs:
           KEY: ${{ secrets.E2E_GH_APP_PRIVATE_KEY }}
         run: (umask 077 && printf '%s\n' "$KEY" >"$RUNNER_TEMP/e2e-app.pem")
 
-      # A pass's suite failing and its races are both reported, the races last. A runner that
-      # had to be killed (not stopped within 60 s of its SIGTERM) fails it too: it may be stuck on
-      # a lock, and its log is printed below.
+      # A pass's suite failing and its races are both reported, the races last. The TSan runner
+      # does not stop on its SIGTERM, and `stop` kills it after 60 s: TSan defers a signal to its
+      # thread's next call into libc, and Zig's std.Io parks its threads in raw futex syscalls,
+      # so a signal that lands on a parked thread is never handled (the plain runner stops at
+      # once). Reports are written as races happen, so only a race in the shutdown itself is lost.
       - name: End to end on Dagger
         if: steps.go.outputs.run == 'true'
         env:
@@ -273,9 +275,7 @@ jobs:
           GH_APP_PRIVATE_KEY_FILE="$RUNNER_TEMP/e2e-app.pem" .github/scripts/e2e.sh start "$RUNNER_TEMP/zig-runner" dagger "$label"
           status=0
           .github/scripts/e2e.sh check "$label" dagger || status=$?
-          stopped=$(.github/scripts/e2e.sh stop 2>&1) || status=1
-          echo "$stopped"
-          [ "$stopped" = "runner stopped" ] || status=1
+          .github/scripts/e2e.sh stop
           .github/scripts/e2e.sh races dagger || status=1
           exit "$status"
 
@@ -290,9 +290,7 @@ jobs:
           GH_APP_PRIVATE_KEY_FILE="$RUNNER_TEMP/e2e-app.pem" .github/scripts/e2e.sh start "$RUNNER_TEMP/zig-runner" native "$label"
           status=0
           .github/scripts/e2e.sh check "$label" native || status=$?
-          stopped=$(.github/scripts/e2e.sh stop 2>&1) || status=1
-          echo "$stopped"
-          [ "$stopped" = "runner stopped" ] || status=1
+          .github/scripts/e2e.sh stop
           .github/scripts/e2e.sh races native || status=1
           exit "$status"
 
