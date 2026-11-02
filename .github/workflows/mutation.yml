@@ -1,0 +1,100 @@
+name: mutation
+
+# Mutation testing of one module, by hand (README, "Mutation testing"): runner/tools/mutate.py
+# changes the module's code one thing at a time (a comparison flipped, `and` for `or`, a
+# `return error.X` guard taken away, a constant off by one, a statement deleted) and runs the
+# module's tests on each change. A change the tests pass is a survivor, listed with its file and
+# line in the report: most point at a missing test. A module takes one to several hours of
+# compiling, too slow for a pull request, so this runs only when asked for, split over four jobs
+# (`--shard`) whose results the last job puts into one report (in its summary, and the
+# `mutation-report` artifact).
+
+on:
+  workflow_dispatch:
+    inputs:
+      module:
+        description: The module to mutate (mutate.py's MODULES)
+        required: true
+        type: choice
+        options:
+          - masking
+          - commands
+          - expr
+          - store
+          - minisign
+      sample:
+        description: Mutants to try, picked at random (all of the module's when empty)
+        required: false
+
+permissions: {}
+
+jobs:
+  mutation:
+    name: Mutation testing (${{ matrix.module }}, ${{ matrix.shard }}/4)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 150
+    permissions:
+      contents: read # to check out the code
+    strategy:
+      fail-fast: false
+      matrix:
+        # The module asked for; every module when there is none to ask (a run on a pull request
+        # that adds a temporary `pull_request` trigger, to see the whole report).
+        module: ${{ fromJSON(inputs.module && format('["{0}"]', inputs.module) || '["masking", "commands", "expr", "store", "minisign"]') }}
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      # The tls package build.zig.zon pins, unpacked into runner/zig-pkg, which the module graph
+      # imports (this compiles Zig's build system first, about 100 s with an empty cache).
+      - name: Fetch dependencies
+        working-directory: runner
+        run: zig build --fetch
+
+      - name: Mutate
+        env:
+          MODULE: ${{ matrix.module }}
+          SAMPLE: ${{ inputs.sample }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          python3 runner/tools/mutate.py "$MODULE" --jobs "$(nproc)" --shard "$SHARD/4" \
+            ${SAMPLE:+--sample "$SAMPLE"} --out "$RUNNER_TEMP/mutation"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutation-${{ matrix.module }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/mutation/results.json
+
+  report:
+    name: Mutation testing (report)
+    needs: mutation
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: mutation-*
+          path: ${{ runner.temp }}/shards
+
+      - name: Report
+        run: |
+          python3 runner/tools/mutate.py --merge "$RUNNER_TEMP"/shards/*/results.json \
+            --out "$RUNNER_TEMP/mutation"
+          cat "$RUNNER_TEMP/mutation/report.md" >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutation-report
+          path: ${{ runner.temp }}/mutation

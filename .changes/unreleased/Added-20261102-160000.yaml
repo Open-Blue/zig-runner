@@ -1,0 +1,3 @@
+kind: Added
+body: 'Mutation testing of the security-critical modules (secret masking, workflow commands, expressions, the native store, minisign): runner/tools/mutate.py changes a module''s code one thing at a time (a comparison flipped, `and` for `or`, a `return error.X` guard taken away, a constant off by one, a statement deleted), runs that module''s tests on each change, and reports every change they let through by file and line. The `mutation` workflow runs it for one module when asked for, with the report as an artifact; it is too slow for a pull request. New tests kill the most important survivors of the first run, in masking and the store above all.'
+time: 2026-11-02T16:00:00.000000-05:00
