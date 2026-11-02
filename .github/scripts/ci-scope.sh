@@ -6,6 +6,7 @@
 #   ci-scope.sh e2e          End to end (ci.yml)
 #   ci-scope.sh proofs       Proofs (proofs.yml)
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)
+#   ci-scope.sh go           Go tools (ci.yml)
 #
 # Sets `run=true` or `run=false` in GITHUB_OUTPUT, and says why. The jobs still run, and report,
 # either way: a required check that never reports holds the merge queue forever, which a
@@ -16,7 +17,7 @@
 # Each scope's list below is of the files that can change what its checks find; a check is skipped
 # only when no changed file is on it. `tests` also lists the files that cannot change the build or
 # the tests, and runs everything for a file on neither list: most new files are the runner's. The
-# proofs and the packaging read a few files, named, so a file not on their list is one they do not
+# proofs, the packaging and the Go tools read a few files, named, so a file not on their list is one they do not
 # read. Every scope runs everything for anything that is not a pull request or a merge group (a push
 # to main, a tag, a schedule, a run by hand), and for anything this cannot work out (no base
 # commit, a failed fetch).
@@ -36,7 +37,8 @@ decide() {
 }
 
 # needed FILE: whether a change to FILE can change what the scope's checks find. Every scope lists
-# this script, which decides it, and install-zig.sh, whose Zig compiles what each of them checks.
+# this script, which decides it, and each but `go` lists install-zig.sh, whose Zig compiles what
+# its checks check.
 needed() {
 	case $scope in
 	tests)
@@ -110,13 +112,22 @@ needed() {
 		*) return 1 ;;
 		esac
 		;;
+	go)
+		# go-lint.sh lints the comparison tools' modules under runner/tools (each with its own go.mod
+		# and go.sum), with the Go each go.mod names; nothing else it reads is in this repository.
+		case $1 in
+		runner/tools/* | .github/workflows/ci.yml | .github/scripts/ci-scope.sh | \
+			.github/scripts/go-lint.sh) return 0 ;;
+		*) return 1 ;;
+		esac
+		;;
 	esac
 }
 
 case $scope in
-tests | binaries | e2e | proofs | packaging) ;;
+tests | binaries | e2e | proofs | packaging | go) ;;
 *)
-	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging" >&2
+	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go" >&2
 	exit 2
 	;;
 esac
