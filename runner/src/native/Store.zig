@@ -505,58 +505,117 @@ pub fn publishTimed(
 /// `p`'s files and directories written to disk, and nothing else of its filesystem: what a
 /// publish needs before its entry is visible, without waiting for every other write to the same
 /// disk (another job's tool cache volume being filled, its workspace), which `syncfs` waited
-/// for. In two passes: writeback started for every file's data (`sync_file_range`), so their
-/// blocks go out together and a journaling filesystem commits them in one transaction, then
-/// every file and directory `fsync`ed, which then finds most of it written. Only regular files
-/// and directories hold anything to write: a symlink's, a device node's or a fifo's inode is
-/// metadata, committed with its directory. `error.Unreadable` when a file cannot be opened (a
-/// step's `chmod 000` on a rootless runner, whose user is no one's superuser): the caller then
-/// syncs the whole filesystem, as before.
+/// for. Writeback is started for every file's data as the tree is walked (`sync_file_range`),
+/// then every file and directory is `fsync`ed from `sync_threads` threads at once: one at a time,
+/// each `fsync` was a journal commit and a flush of the disk's cache of its own (a small layer's
+/// 15 took 86 ms on a laptop's NVMe, where `syncfs` took 15 ms), while fsyncs that wait together
+/// share commits. Only regular files and directories hold anything to write: a symlink's, a
+/// device node's or a fifo's inode is metadata, committed with its directory.
+/// `error.Unreadable` when a file cannot be opened (a step's `chmod 000` on a rootless runner,
+/// whose user is no one's superuser): the caller then syncs the whole filesystem, as before.
 pub fn syncTree(arena: Allocator, io: std.Io, p: []const u8) !void {
-    for ([_]bool{ false, true }) |wait| {
-        const root = try openRoot(arena, p);
-        defer _ = linux.close(root);
-        var stack: std.ArrayList([]const u8) = .empty;
-        try stack.append(arena, "");
-        while (stack.pop()) |rel| {
-            const fd = if (rel.len == 0) root else try openRel(arena, root, rel);
-            defer if (fd != root) {
-                _ = linux.close(fd);
-            };
-            for (try listDir(arena, io, fd)) |n| switch (n.kind()) {
-                linux.S.IFREG => if (wait or n.st.size > 0) try syncFile(fd, n.name, wait),
-                linux.S.IFDIR => try stack.append(arena, if (rel.len == 0)
+    const root = try openRoot(arena, p);
+    defer _ = linux.close(root);
+    var todo: std.ArrayList(Synced) = .empty;
+    try todo.append(arena, .{ .dir = "", .name = "" });
+    var stack: std.ArrayList([]const u8) = .empty;
+    try stack.append(arena, "");
+    while (stack.pop()) |rel| {
+        const fd = if (rel.len == 0) root else try openRel(arena, root, rel);
+        defer if (fd != root) {
+            _ = linux.close(fd);
+        };
+        for (try listDir(arena, io, fd)) |n| switch (n.kind()) {
+            linux.S.IFREG => {
+                try todo.append(arena, .{ .dir = rel, .name = n.name });
+                // Only a head start: what it does not do, `fsync` does.
+                if (n.st.size > 0) {
+                    const f = try openFileAt(fd, n.name);
+                    defer _ = linux.close(f);
+                    _ = linux.syscall4(.sync_file_range, @abs(f), 0, 0, sync_file_range_write);
+                }
+            },
+            linux.S.IFDIR => {
+                const sub = if (rel.len == 0)
                     try arena.dupe(u8, n.name)
                 else
-                    try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, n.name })),
-                else => {},
-            };
-            if (wait and linux.errno(linux.fsync(fd)) != .SUCCESS) return error.Sync;
-        }
+                    try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, n.name });
+                try stack.append(arena, sub);
+                try todo.append(arena, .{ .dir = sub, .name = "" });
+            },
+            else => {},
+        };
     }
+    var work: SyncWork = .{ .root = root, .todo = todo.items };
+    var threads: [sync_threads]?std.Thread = @splat(null);
+    for (threads[0..@min(sync_threads, todo.items.len)]) |*t|
+        t.* = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, SyncWork.run, .{&work}) catch null;
+    // This thread too, so the work is done when no thread could be started.
+    work.run();
+    for (threads) |t| if (t) |th| th.join();
+    if (work.unreadable.load(.acquire)) return error.Unreadable;
+    if (work.failed.load(.acquire)) return error.Sync;
 }
 
 /// `SYNC_FILE_RANGE_WRITE`: writeback started, not waited for.
 const sync_file_range_write = 2;
 
-/// The file `name` in `dir`: its writeback started, or, `wait`, `fsync`ed.
-fn syncFile(dir: linux.fd_t, name: [*:0]const u8, wait: bool) !void {
+/// How many threads `syncTree` fsyncs from.
+const sync_threads = 16;
+
+/// What `syncTree` fsyncs: the directory `dir` under its root when `name` is empty, else the file
+/// `name` in it.
+const Synced = struct { dir: []const u8, name: [:0]const u8 };
+
+/// `syncTree`'s fsyncs, taken in turn by its threads.
+const SyncWork = struct {
+    root: linux.fd_t,
+    todo: []const Synced,
+    next: std.atomic.Value(usize) = .init(0),
+    unreadable: std.atomic.Value(bool) = .init(false),
+    failed: std.atomic.Value(bool) = .init(false),
+
+    fn run(w: *SyncWork) void {
+        var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        defer arena_state.deinit();
+        while (true) {
+            const i = w.next.fetchAdd(1, .monotonic);
+            if (i >= w.todo.len) return;
+            _ = arena_state.reset(.retain_capacity);
+            w.one(arena_state.allocator(), w.todo[i]) catch |e| switch (e) {
+                error.Unreadable => w.unreadable.store(true, .release),
+                else => w.failed.store(true, .release),
+            };
+        }
+    }
+
+    fn one(w: *SyncWork, arena: Allocator, s: Synced) !void {
+        const dir = if (s.dir.len == 0) w.root else openRel(arena, w.root, s.dir) catch
+            return error.Unreadable;
+        defer if (dir != w.root) {
+            _ = linux.close(dir);
+        };
+        if (s.name.len == 0) {
+            if (linux.errno(linux.fsync(dir)) != .SUCCESS) return error.Sync;
+            return;
+        }
+        const f = try openFileAt(dir, s.name);
+        defer _ = linux.close(f);
+        if (linux.errno(linux.fsync(f)) != .SUCCESS) return error.Sync;
+    }
+};
+
+/// The regular file `name` in `dir`, read-only, never through a symlink.
+fn openFileAt(dir: linux.fd_t, name: [*:0]const u8) !linux.fd_t {
     const flags: linux.O = .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true, .NONBLOCK = true };
     const rc = linux.openat(dir, name, flags, 0);
     if (linux.errno(rc) != .SUCCESS) return error.Unreadable;
-    const fd = std.math.cast(linux.fd_t, rc) orelse return error.Unreadable;
-    defer _ = linux.close(fd);
-    if (!wait) {
-        // Only a head start: what it does not do, `fsync` does.
-        _ = linux.syscall4(.sync_file_range, rc, 0, 0, sync_file_range_write);
-        return;
-    }
-    if (linux.errno(linux.fsync(fd)) != .SUCCESS) return error.Sync;
+    return std.math.cast(linux.fd_t, rc) orelse error.Unreadable;
 }
 
 /// The most entries (files, directories, anything) of an upper whose own files a publish syncs
-/// (`syncTree`); past it, it syncs the filesystem (`syncfs`). Each `fsync` flushes the disk's
-/// cache: on a laptop's NVMe, 3000 empty files took 297 ms one by one, the filesystem 21 ms.
+/// (`syncTree`); past it, it syncs the filesystem (`syncfs`), as fsyncs that share commits still
+/// cost the disk's cache a flush each now and then.
 pub const sync_tree_max = 256;
 
 /// The layers' directory synced, so the renames that published this job's layers outlive a
