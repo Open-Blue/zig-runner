@@ -26,11 +26,16 @@ git describe --tags --always --dirty --abbrev=8 >"$scratch/version"
 zig_modules "$scratch" "$scratch/version"
 plain=("${modules[@]}")
 # ZIG_TEST_SANITIZE_THREAD=1: the tests under ThreadSanitizer (build.zig's -Dsanitize-thread), which
-# fails them on a data race they run into.
+# fails them on a data race they run into; and the runner binary below, the native backend's helper
+# (one `zig-runner native-step` per step), whose report lands on its stderr, which the runner takes
+# for the sandbox's failure. TSan's runtime needs glibc's dynamic loader: the native target links
+# it, a PIE still, where the release's static PIE (musl, #283) crashes at startup.
 tests=("${plain[@]}")
+runner=("${plain[@]}")
 if [[ ${ZIG_TEST_SANITIZE_THREAD:-} == 1 ]]; then
 	zig_modules "$scratch" "$scratch/version" -fsanitize-thread
 	tests=("${modules[@]}")
+	runner=("${modules[@]}")
 fi
 
 # ZIG_TEST_WAIT_FOR_DB=1: between compiling the tests and running them, wait for the database
@@ -48,7 +53,7 @@ fi
 export ZIG_RUNNER_TEST_EXE="$scratch/runner"
 (
 	rc=0
-	zig build-exe "${plain[@]}" --name runner -femit-bin="$scratch/runner" || rc=$?
+	zig build-exe "${runner[@]}" --name runner -femit-bin="$scratch/runner" || rc=$?
 	echo "$rc" >"$scratch/runner.rc"
 ) &
 exe=$!

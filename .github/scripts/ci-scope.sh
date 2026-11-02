@@ -8,7 +8,7 @@
 #   ci-scope.sh proofs       Proofs (proofs.yml)
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)
 #   ci-scope.sh go           Go tools (ci.yml)
-#   ci-scope.sh analysis     Fuzz, Valgrind (analysis.yml)
+#   ci-scope.sh analysis     Fuzz, Valgrind, ThreadSanitizer (analysis.yml)
 #   ci-scope.sh coverage     Coverage (analysis.yml)
 #
 # Sets `run=true` or `run=false` in GITHUB_OUTPUT, and says why. The jobs still run, and report,

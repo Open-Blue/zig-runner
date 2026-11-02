@@ -11,6 +11,16 @@ name: analysis
 #                  artifact (fuzz-TARGET).
 #   Valgrind       every test under Valgrind's memcheck (.github/scripts/zig-valgrind.sh): reads
 #                  of memory never written, and accesses outside what was allocated.
+#   ThreadSanitizer, native (ARCH)
+#                  the native backend's tests under ThreadSanitizer, on x86_64 and arm64, rootless
+#                  and as root, the runner binary they start for each step (its helper) built
+#                  with it too: ci's pass runs where the native backend cannot make a sandbox, so
+#                  its tests skip there.
+#   ThreadSanitizer, end to end
+#                  the end-to-end suite (ci's "End to end", .github/scripts/e2e.sh) on both
+#                  backends with a runner built under ThreadSanitizer: the runner's main loop, its
+#                  pool and its helpers, which no test reaches. Any report in the runner's log or
+#                  the jobs' fails it.
 #   Coverage       the lines the tests reach, with kcov (.github/scripts/zig-coverage.sh): the
 #                  rootless tests and the native backend's root pass merged, as an HTML report and
 #                  Cobertura and JSON (the coverage artifact), with the total, each area and the
@@ -45,6 +55,8 @@ on:
       - .github/scripts/zig-coverage.sh
       - .github/valgrind.supp
       - runner/src/**
+  # zig-test.sh and e2e.sh are not listed: ci runs them on every change that touches them, and
+  # their ThreadSanitizer options only add a compiler flag.
 
 permissions: {}
 
@@ -70,7 +82,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Whether this change can affect Fuzz and Valgrind
+      - name: Whether this change can affect Fuzz, Valgrind and ThreadSanitizer
         id: analysis
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
@@ -178,6 +190,177 @@ jobs:
 
       - name: Tests under memcheck
         run: .github/scripts/zig-valgrind.sh
+
+  # The native backend's tests under ThreadSanitizer, as ci's hosted Test step runs them (rootless,
+  # then as root with the service images) with ZIG_TEST_SANITIZE_THREAD=1 (zig-test.sh): the tests
+  # and the runner binary they start for each step (`zig-runner native-step`), whose reports land
+  # on its stderr, the step's failure. Both dynamically linked against glibc, as TSan's runtime
+  # needs; zig-test.sh says why not the release's static PIE.
+  tsan-native:
+    name: ThreadSanitizer, native (${{ matrix.arch }})
+    needs: scope
+    if: needs.scope.outputs.analysis == 'true'
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    permissions:
+      contents: read # to check out the code
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runs-on: ubuntu-26.04 }
+          - { arch: arm64, runs-on: ubuntu-26.04-arm }
+    env:
+      ZIG_RUNNER_REQUIRE_NATIVE: "1"
+      ZIG_TEST_SANITIZE_THREAD: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway
+      # VM. And the address space's randomness down to 28 bits (Ubuntu's is 32): TSan's runtime
+      # cannot place its shadow memory in more, so it re-executes itself with ADDR_NO_RANDOMIZE,
+      # which every process it starts inherits, the steps' too, where the containment test finds
+      # it ("personality query 0" fails).
+      - name: Rootless
+        run: |
+          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo sysctl -q -w vm.mmap_rnd_bits=28
+          .github/scripts/zig-test.sh
+
+      - name: As root, with the service images
+        run: |
+          .github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
+          ZIG_TEST_NATIVE_AS_ROOT=1 ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" \
+            .github/scripts/zig-test.sh
+
+  # ci's "End to end" (its comments say what each step is for), with the runner built under
+  # ThreadSanitizer (`e2e.sh build BIN tsan`), and each pass followed by `e2e.sh races`, which
+  # fails on any report in the runner's log or the jobs' logs. The same e2e environment, App and
+  # runner-bench workflows; skipped, still reporting, without its key.
+  tsan-e2e:
+    name: ThreadSanitizer, end to end
+    needs: scope
+    if: needs.scope.outputs.analysis == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    environment: e2e
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether the suite's GitHub App is set up
+        id: go
+        env:
+          HAVE_KEY: ${{ secrets.E2E_GH_APP_PRIVATE_KEY != '' }}
+          APP_ID: ${{ vars.E2E_GH_APP_ID }}
+        run: |
+          if [ "$HAVE_KEY" != true ] || [ -z "$APP_ID" ]; then
+            echo "::notice::ThreadSanitizer, end to end skipped: the e2e environment's secret E2E_GH_APP_PRIVATE_KEY or variable E2E_GH_APP_ID is not available"
+            echo "run=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "run=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Start the engine
+        if: steps.go.outputs.run == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/e2e"
+          nohup .github/scripts/e2e.sh engine >"$RUNNER_TEMP/e2e/engine.log" 2>&1 &
+
+      - name: Install Zig
+        if: steps.go.outputs.run == 'true'
+        run: .github/scripts/install-zig.sh
+
+      # The address space's randomness down to 28 bits, as for the native tests: otherwise the
+      # runner re-executes itself with ADDR_NO_RANDOMIZE, and every step it starts runs without
+      # ASLR.
+      - name: Build the runner, under ThreadSanitizer
+        if: steps.go.outputs.run == 'true'
+        run: |
+          sudo sysctl -q -w vm.mmap_rnd_bits=28
+          .github/scripts/e2e.sh build "$RUNNER_TEMP/zig-runner" tsan
+
+      - name: Make the native rootfs
+        if: steps.go.outputs.run == 'true'
+        run: nohup .github/scripts/e2e.sh rootfs "$RUNNER_TEMP/zig-runner" >"$RUNNER_TEMP/e2e/rootfs.log" 2>&1 &
+
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        if: steps.go.outputs.run == 'true'
+        id: app
+        with:
+          client-id: ${{ vars.E2E_GH_APP_ID }}
+          private-key: ${{ secrets.E2E_GH_APP_PRIVATE_KEY }}
+          owner: Open-Blue
+          repositories: runner-bench
+          permission-actions: write
+
+      - name: The runner's key
+        if: steps.go.outputs.run == 'true'
+        env:
+          KEY: ${{ secrets.E2E_GH_APP_PRIVATE_KEY }}
+        run: (umask 077 && printf '%s\n' "$KEY" >"$RUNNER_TEMP/e2e-app.pem")
+
+      # A pass's suite failing and its races are both reported, the races last. The TSan runner
+      # does not stop on its SIGTERM, and `stop` kills it after 60 s: TSan defers a signal to its
+      # thread's next call into libc, and Zig's std.Io parks its threads in raw futex syscalls,
+      # so a signal that lands on a parked thread is never handled (the plain runner stops at
+      # once). Reports are written as races happen, so only a race in the shutdown itself is lost.
+      - name: End to end on Dagger
+        if: steps.go.outputs.run == 'true'
+        env:
+          GH_APP_ID: ${{ vars.E2E_GH_APP_ID }}
+          E2E_GH_TOKEN: ${{ steps.app.outputs.token }}
+          E2E_ZIG_RUNNER_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          label="tsan-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-dagger"
+          GH_APP_PRIVATE_KEY_FILE="$RUNNER_TEMP/e2e-app.pem" .github/scripts/e2e.sh start "$RUNNER_TEMP/zig-runner" dagger "$label"
+          status=0
+          .github/scripts/e2e.sh check "$label" dagger || status=$?
+          .github/scripts/e2e.sh stop
+          .github/scripts/e2e.sh races dagger || status=1
+          exit "$status"
+
+      - name: End to end, native
+        if: ${{ !cancelled() && steps.go.outputs.run == 'true' }}
+        env:
+          GH_APP_ID: ${{ vars.E2E_GH_APP_ID }}
+          E2E_GH_TOKEN: ${{ steps.app.outputs.token }}
+          E2E_ZIG_RUNNER_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          label="tsan-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-native"
+          GH_APP_PRIVATE_KEY_FILE="$RUNNER_TEMP/e2e-app.pem" .github/scripts/e2e.sh start "$RUNNER_TEMP/zig-runner" native "$label"
+          status=0
+          .github/scripts/e2e.sh check "$label" native || status=$?
+          .github/scripts/e2e.sh stop
+          .github/scripts/e2e.sh races native || status=1
+          exit "$status"
+
+      - name: The runner's log, on a failure
+        if: ${{ failure() && steps.go.outputs.run == 'true' }}
+        run: |
+          for f in "$RUNNER_TEMP"/e2e/engine.log "$RUNNER_TEMP"/e2e/rootfs.log "$RUNNER_TEMP"/e2e/runner-*.log; do
+            [ -e "$f" ] || continue
+            stop="e2e-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+            echo "::group::$(basename "$f")"
+            echo "::stop-commands::$stop"
+            tail -n 300 "$f" | sed -E 's/(gh[opsu]|github_pat)_[A-Za-z0-9_]{20,}/***/g'
+            echo "::$stop::"
+            echo "::endgroup::"
+          done
+
+      - name: Clean up
+        if: ${{ always() && steps.go.outputs.run == 'true' }}
+        run: |
+          .github/scripts/e2e.sh stop || true
+          rm -f "$RUNNER_TEMP/e2e-app.pem"
 
   # kcov over the tests on GitHub's runner, which can make the native backend's sandboxes (as ci's
   # hosted test job): rootless, then the native tests as root, merged (zig-coverage.sh). About 18
