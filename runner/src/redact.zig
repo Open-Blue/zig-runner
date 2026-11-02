@@ -265,3 +265,59 @@ test "a set masks as write does with its list, longest first, whatever order mas
     try set.write(&got.writer, "abcde bc abx");
     try std.testing.expectEqualStrings("***e ***c ***x", got.written());
 }
+
+test "a lone secret is masked by alloc, whatever its length, one byte too" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // The only secret, and in the text: alloc's look for one before writing must find it.
+    try std.testing.expectEqualStrings("tok=***", try alloc(ar, "tok=abc", &.{"abc"}));
+    try std.testing.expectEqualStrings("a=*** b", try alloc(ar, "a=x b", &.{"x"}));
+    // Through its forms too: a one-byte secret is a secret.
+    try std.testing.expectEqualStrings("a=*** b", try alloc(ar, "a=x b", try expand(ar, &.{"x"})));
+    // Nothing to mask (an empty secret is none): the text itself, not a copy.
+    const text = "no secret here";
+    try std.testing.expectEqual(text.ptr, (try alloc(ar, text, &.{ "", "abc" })).ptr);
+}
+
+test "a multi-line secret's lines of min_line bytes are masked on their own, shorter ones are not" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const list = try expand(ar, &.{"head\nabcd\nxyz\nmore lines"});
+    try std.testing.expectEqual(@as(usize, 4), min_line);
+    try std.testing.expectEqualStrings("***", try alloc(ar, "abcd", list));
+    try std.testing.expectEqualStrings("xyz", try alloc(ar, "xyz", list));
+}
+
+test "a secret's URL-encoded form keeps the unreserved -._~ and encodes the rest" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const list = try expand(ar, &.{"a-b.c_d~e f/g"});
+    try std.testing.expectEqualStrings("u=***", try alloc(ar, "u=a-b.c_d~e%20f%2Fg", list));
+}
+
+test "a set masks bytes past ASCII as write does, and keeps a secret once" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    var set: Set = .{};
+    // UTF-8 secrets, whose bytes 0x80 and up share their low seven bits with ASCII ones.
+    const alphabet = "a\xe1b\xe2\xc3\x83 ";
+    for ([_][]const u8{ "x", "x", "a\xe1", "\xe1a", "aa\xe1b", "\xe2\xe2", "\xc3\x83a", "ba" }) |s|
+        try set.add(ar, s);
+    try std.testing.expectEqual(@as(usize, 7), set.all.items.len);
+    var prng: std.Random.DefaultPrng = .init(7);
+    const r = prng.random();
+    var text: [64]u8 = undefined;
+    for (0..2000) |_| {
+        const len = r.uintAtMost(usize, text.len);
+        for (text[0..len]) |*c| c.* = alphabet[r.uintLessThan(usize, alphabet.len)];
+        var want: std.Io.Writer.Allocating = .init(ar);
+        var got: std.Io.Writer.Allocating = .init(ar);
+        try write(&want.writer, text[0..len], set.all.items);
+        try set.write(&got.writer, text[0..len]);
+        try std.testing.expectEqualStrings(want.written(), got.written());
+    }
+}
