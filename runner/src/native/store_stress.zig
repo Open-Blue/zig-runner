@@ -135,7 +135,7 @@ test "native store under load: processes share one store under a small cap" {
         var pass: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer pass.deinit();
         peak = @max(peak, (try checkEntries(pass.allocator(), io, s, &faults)).bytes);
-        io.sleep(.fromMilliseconds(20), .awake) catch {};
+        try io.sleep(.fromMilliseconds(20), .awake);
     }
     for (children, 0..) |*child, i| {
         const term = try child.wait(io);
@@ -334,10 +334,10 @@ const Worker = struct {
 
     /// A fault: its first line in the result, all of it (a log, maybe) on stderr.
     fn fault(w: *Worker, comptime fmt: []const u8, args: anytype) void {
-        const text = print(w.arena, fmt ++ "\n", args) catch return;
+        const text = print(w.arena, fmt ++ "\n", args) catch @panic("out of memory recording a fault");
         std.debug.print("worker {d}: {s}", .{ w.index, text });
         const first = std.mem.indexOfScalar(u8, text, '\n').? + 1;
-        w.faults.appendSlice(w.arena, text[0..first]) catch {};
+        w.faults.appendSlice(w.arena, text[0..first]) catch @panic("out of memory recording a fault");
     }
 
     /// A job's log for a fault, the first few times: the rest would bury the first.
@@ -398,7 +398,7 @@ test "native store under load: one worker (run only by the test above, in a proc
         if (n > 1 and fds > fds_kept) w.fault("{d} fds open after {s} {d}, {d} before", .{ fds, what, n, fds_kept });
         const locks = try countLocks(job_arena.allocator(), io);
         if (locks > 0) w.fault("{d} flocks held after {s} {d}", .{ locks, what, n });
-        io.sleep(.fromMilliseconds(w.rand.uintLessThan(u32, 30)), .awake) catch {};
+        try io.sleep(.fromMilliseconds(w.rand.uintLessThan(u32, 30)), .awake);
     }
 
     var out: std.Io.Writer.Allocating = .init(arena);
@@ -526,7 +526,7 @@ fn runBuild(w: *Worker, arena: Allocator, io: std.Io, dir: []const u8, n: usize)
         };
         checkBuild(w, arena, io, got[b].?, b, n, "found");
     }
-    io.sleep(.fromMilliseconds(w.rand.uintLessThan(u32, 60)), .awake) catch {};
+    try io.sleep(.fromMilliseconds(w.rand.uintLessThan(u32, 60)), .awake);
     for (got, 0..) |p, b| if (p) |path| checkBuild(w, arena, io, path, b, n, "held");
     for (held.items) |l| l.close(io);
     held.clearRetainingCapacity();
