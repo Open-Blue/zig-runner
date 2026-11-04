@@ -153,6 +153,24 @@ store's locks, the database, the broker's long-poll, log uploads;
 `.github/scripts/zig-race-tests.sh` names them) 100 times over under stress-ng's CPU and memory
 load, with the database, and fails on the first round that fails, its output an artifact
 (`.github/scripts/zig-stress.sh`).
+**Mutation testing** asks whether the tests would notice the code being wrong:
+`runner/tools/mutate.py` changes a module's code one thing at a time (a comparison flipped, `and`
+for `or`, `true` for `false`, a `return error.X` guard taken away, an integer constant off by one,
+a statement deleted), compiles each change from a copy of `runner/src` with only that module's
+tests (`--test-filter`), runs them with a timeout, and counts each mutant killed, survived, timed
+out or not compiled. Its report lists every survivor by file, line and change: most are a missing
+test, a few a change that means the same thing. The modules are the security-critical ones: secret
+masking (`masking`: `redact.zig`, `dagger/JobLog.zig`), workflow commands (`commands`),
+expressions (`expr`), the native store's keys and publishing (`store`) and `minisign`. Locally,
+after `zig build --fetch` in `runner/`: `python3 runner/tools/mutate.py masking` (`--all --out DIR`
+for every module, `--sample N` for a quicker look, `--list` for the mutants alone, `--shard K/N`
+and `--merge` to split a run and join its results; `--expr-cases DIR` holds `expr`'s mutants to
+GitHub's own expression cases too, as `expr-conformance.sh` does). The five modules make about 2,400 mutants,
+each a compile, which is hours of every core: too slow for a pull request, and for a laptop doing
+anything else. `mutation` runs it for one module when asked for (Actions, "Run workflow"), over
+four of GitHub's runners, with the report in the last job's summary and as the `mutation-report`
+artifact. Mull and other LLVM-level tools cannot be used: they instrument through a clang pass
+plugin, which Zig has no way to load.
 `proofs` checks the [Lean proofs](proofs/README.md) (the step cache, the regex matcher's loops, and
 the `hashFiles()` walk) and compares the walk's model with `runner/src/glob.zig` on random cases,
 when either changes and weekly ("Proofs"). The workflows are written to be hard to turn against the
