@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A native job''s directory is no longer removed by another runner while its own runner is removing it: the job''s lock file went early in that removal, and another runner sharing the store, starting a job, made a new lock in its place, found it free, took the directory for a dead runner''s and removed it at the same time (logging `AccessDenied` when the two collided). A job''s directory is now removed with its lock last, and a runner''s sweep opens a lock without making one; a directory a dead runner really left is removed with a warning. Found by the store''s stress test in its first ten-minute nightly run.'
-time: 2026-11-02T10:15:00.000000-05:00
