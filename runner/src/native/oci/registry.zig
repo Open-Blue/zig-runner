@@ -381,18 +381,29 @@ pub const Client = struct {
         const auth: ?[]const u8 = if (c.creds) |cr| try basic(c.arena, cr) else null;
         var body: std.Io.Writer.Allocating = .init(c.arena);
         // No redirect is followed: the credentials would go with it (see `onceAt`). Sent again on
-        // a kept-alive connection the token service had closed, as the registry's are (`once`).
-        const res = http.fetch(c.http, .{
-            .location = .{ .url = url.written() },
-            .headers = .{
-                .user_agent = .{ .override = "zig-runner" },
-                .authorization = if (auth) |a| .{ .override = a } else .omit,
-            },
-            .redirect_behavior = .unhandled,
-            .response_writer = &body.writer,
-        }) catch |e| {
-            c.why = try std.fmt.allocPrint(c.arena, "{f}: the token service: {s}", .{ c.ref, @errorName(e) });
-            return error.Unauthorized;
+        // a kept-alive connection the token service had closed, as the registry's are (`once`):
+        // `http.fetch` does when it read an end of stream, and here when it read a reset, as a
+        // request reaching a socket closed unread does. `http.fetch` leaves that to its callers
+        // because a POST may have been processed; this GET may be sent again whatever came back.
+        var stale: u32 = 0;
+        const res = while (true) {
+            break http.fetch(c.http, .{
+                .location = .{ .url = url.written() },
+                .headers = .{
+                    .user_agent = .{ .override = "zig-runner" },
+                    .authorization = if (auth) |a| .{ .override = a } else .omit,
+                },
+                .redirect_behavior = .unhandled,
+                .response_writer = &body.writer,
+            }) catch |e| {
+                if (e == error.ReadFailed and stale < http.staleRetries(c.http)) {
+                    stale += 1;
+                    body.clearRetainingCapacity();
+                    continue;
+                }
+                c.why = try std.fmt.allocPrint(c.arena, "{f}: the token service: {s}", .{ c.ref, @errorName(e) });
+                return error.Unauthorized;
+            };
         };
         if (res.status != .ok) {
             c.why = try std.fmt.allocPrint(c.arena, "{f}: the token service answered HTTP {d}{s}", .{
