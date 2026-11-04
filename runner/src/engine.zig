@@ -318,6 +318,13 @@ pub const h2 = struct {
     const padded = 0x8;
     const priority = 0x20;
 
+    /// The longest frame a peer may send: SETTINGS_MAX_FRAME_SIZE's initial value, which this
+    /// server's SETTINGS leave as it is.
+    pub const max_frame = 16 * 1024;
+    /// The longest header block (a HEADERS frame and its CONTINUATIONs) read: a call's headers
+    /// are a few hundred bytes.
+    pub const max_header_block = 64 * 1024;
+
     /// `:status: 200` (static entry 8) and `content-type: application/grpc` (literal, name from
     /// static entry 31): HPACK without the dynamic table, so no encoder state is needed.
     const response_headers = [_]u8{ 0x88, 0x0f, 0x10, 0x10 } ++ "application/grpc".*;
@@ -421,6 +428,13 @@ pub const h2 = struct {
     /// call is answered when its headers arrive: health checks SERVING, the engine's questions
     /// about the client's files (`FileSync/DiffCopy`: an absolute path, a stat, a file) with
     /// `host_root` or NOT_FOUND, anything else UNIMPLEMENTED. Returns how many calls it answered.
+    ///
+    /// A connection that breaks HTTP/2's framing (RFC 9113) ends with `error.BadFrame`: a frame
+    /// longer than `max_frame` (this server's SETTINGS leave SETTINGS_MAX_FRAME_SIZE at its
+    /// default), a CONTINUATION that follows no HEADERS without END_HEADERS or is for another
+    /// stream, any other frame between them, or a header block longer than `max_header_block`
+    /// (CONTINUATION frames without END_HEADERS once grew the block without end: all the memory
+    /// a peer cared to send).
     pub fn serve(gpa: Allocator, in: *In, w: *Io.Writer) !usize {
         const got = try in.take(preface.len);
         if (!std.mem.eql(u8, got, preface)) return error.NotHttp2;
@@ -433,6 +447,8 @@ pub const h2 = struct {
         var block: std.ArrayList(u8) = .empty;
         defer block.deinit(gpa);
         var answered: usize = 0;
+        // The stream whose header block CONTINUATION frames are finishing, if any.
+        var continuing: ?u32 = null;
         while (true) {
             const hdr = in.take(9) catch |e| switch (e) {
                 error.EndOfStream => return answered,
@@ -442,6 +458,11 @@ pub const h2 = struct {
             const kind = hdr[3];
             const flags = hdr[4];
             const stream = std.mem.readInt(u32, hdr[5..9], .big) & 0x7fff_ffff;
+            if (len > max_frame) return error.BadFrame;
+            // Only the rest of a header block may come between its HEADERS and END_HEADERS.
+            if (continuing) |c| {
+                if (kind != continuation or stream != c) return error.BadFrame;
+            } else if (kind == continuation) return error.BadFrame;
             payload.clearRetainingCapacity();
             var left: usize = len;
             while (left > 0) {
@@ -462,6 +483,7 @@ pub const h2 = struct {
                     try frame(w, window_update, 0, 0, &inc);
                 },
                 headers, continuation => {
+                    if (stream == 0) return error.BadFrame;
                     var frag = p;
                     if (kind == headers) {
                         block.clearRetainingCapacity();
@@ -474,7 +496,9 @@ pub const h2 = struct {
                             frag = frag[5..];
                         }
                     }
+                    if (frag.len > max_header_block - block.items.len) return error.BadFrame;
                     try block.appendSlice(gpa, frag);
+                    continuing = if (flags & end_headers == 0) stream else null;
                     if (flags & end_headers != 0) {
                         var req: Request = .{};
                         try dec.decode(block.items, &req, Request.on);
@@ -1382,6 +1406,49 @@ test "h2: settings and pings are acknowledged; health checks, path questions and
     try std.testing.expect(std.mem.indexOf(u8, out, &([_]u8{ 0x0a, 15 } ++ "/zig-runner/sub".*)) != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "grpc-status" ++ [_]u8{ 1, '5' }) != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "grpc-status" ++ [_]u8{ 2, '1', '2' }) != null);
+}
+
+test "h2: a frame too long, CONTINUATION out of place or a header block without end ends the connection" {
+    const gpa = std.testing.allocator;
+    const Frames = struct {
+        fn add(list: *std.ArrayList(u8), kind: u8, flags: u8, stream: u32, payload: []const u8) !void {
+            var hdr: [9]u8 = undefined;
+            std.mem.writeInt(u24, hdr[0..3], @truncate(payload.len), .big);
+            hdr[3] = kind;
+            hdr[4] = flags;
+            std.mem.writeInt(u32, hdr[5..9], stream, .big);
+            try list.appendSlice(gpa, &hdr);
+            try list.appendSlice(gpa, payload);
+        }
+        fn serve(input: []const u8) !usize {
+            var src: SliceSource = .{ .data = input, .step = 4096 };
+            var in = src.in();
+            var w: Io.Writer.Discarding = .init(&.{});
+            return h2.serve(gpa, &in, &w.writer);
+        }
+    };
+    const filler: [h2.max_frame]u8 = @splat(0x40);
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(gpa);
+    // HEADERS without END_HEADERS, then CONTINUATIONs, none ending the block: each was kept,
+    // as much as the peer sent.
+    try input.appendSlice(gpa, h2.preface);
+    try Frames.add(&input, 0x1, 0, 1, &filler);
+    for (0..8) |_| try Frames.add(&input, 0x9, 0, 1, &filler);
+    try std.testing.expectError(error.BadFrame, Frames.serve(input.items));
+    // A CONTINUATION after no HEADERS, one for another stream, or another frame in between.
+    for ([_][2]u8{ .{ 0x9, 1 }, .{ 0x9, 3 }, .{ 0x6, 0 } }, 0..) |next, i| {
+        input.clearRetainingCapacity();
+        try input.appendSlice(gpa, h2.preface);
+        if (i > 0) try Frames.add(&input, 0x1, 0, 1, &.{0x82});
+        try Frames.add(&input, next[0], 0, next[1], if (next[0] == 0x6) "12345678" else &.{0x84});
+        try std.testing.expectError(error.BadFrame, Frames.serve(input.items));
+    }
+    // A frame longer than the 16 KiB a peer may send unasked.
+    input.clearRetainingCapacity();
+    try input.appendSlice(gpa, h2.preface);
+    try Frames.add(&input, 0x0, 0, 1, &(filler ++ [_]u8{0}));
+    try std.testing.expectError(error.BadFrame, Frames.serve(input.items));
 }
 
 test "server-sent events of OTLP log records" {
