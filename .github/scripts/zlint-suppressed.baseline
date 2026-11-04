@@ -94,6 +94,7 @@ src/native/oci/registry.zig	be34d0c30edff64d	err_body.take(r) catch {};
 src/native/oci/registry.zig	cc416da0ad22cd76	_ = r.discardRemaining() catch {};
 src/native/oci/testregistry.zig	641c633e4cf85866	w.interface.flush() catch {};
 src/native/oci/testregistry.zig	9554515ba43a452a	out.flush() catch {};
+src/native/phases.zig	2cef8856c3f43536	ps.samples[@backingInt(p)].append(arena, us) catch {};
 src/native/sandbox.zig	05169a418336f801	child.stdin.?.writeStreamingAll(io, json.written()) catch {};
 src/native/sandbox.zig	1c2ee73f6b79fba8	}) catch unreachable);
 src/native/sandbox.zig	32eadf891d0254aa	unreachable;
