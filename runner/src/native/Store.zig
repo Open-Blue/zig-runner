@@ -246,6 +246,16 @@ pub fn lockKey(
     }
 }
 
+/// Whether some process holds the key's lock (`lockKey`): this one's own holder too, as a lock
+/// taken through another open of the file conflicts with it.
+fn keyLocked(s: Store, arena: Allocator, io: std.Io, key: Key) bool {
+    const path = std.fmt.allocPrint(arena, "{s}/keys/{s}.lock", .{ s.root, &hex(key) }) catch
+        return false;
+    const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+    defer f.close(io);
+    return !flock(f, lock_ex | lock_nb);
+}
+
 /// A layer a job uses, held shared until the job ends: eviction takes the lock exclusively, so
 /// it never removes a layer under a running job.
 pub const Layer = struct {
@@ -373,6 +383,31 @@ fn readEntry(arena: Allocator, io: std.Io, dir: []const u8) !Record {
     return rec;
 }
 
+/// The published entry `name` (under `layers/`) checked as a replay checks it (`readEntry`),
+/// held shared meanwhile as `open` holds it, and its tree the bytes its meta counted: its bytes,
+/// or null when it was evicted before it could be held. An error says what is wrong with it. For
+/// the stress test (`store_stress.zig`), which checks every entry while jobs publish, replay and
+/// evict around it.
+pub fn checkEntry(s: Store, arena: Allocator, io: std.Io, name: []const u8) !?u64 {
+    const dir = try std.fmt.allocPrint(arena, "{s}/layers/{s}", .{ s.root, name });
+    const lock_path = try join(arena, dir, "lock");
+    const f = std.Io.Dir.cwd().openFile(io, lock_path, .{}) catch |e| {
+        // Published whole, so with its lock: gone since the listing, or broken.
+        if (e == error.FileNotFound and !isDir(arena, dir)) return null;
+        return e;
+    };
+    defer f.close(io);
+    if (!flock(f, lock_sh) or !sameFile(arena, f, lock_path)) return null;
+    _ = try readEntry(arena, io, dir);
+    const m = try metaOf(arena, io, dir);
+    const bytes = try treeBytes(arena, io, try join(arena, dir, "fs"));
+    if (bytes != m.bytes) {
+        std.debug.print("native store: {s}'s tree takes {d} bytes, its meta says {d}\n", .{ name, bytes, m.bytes });
+        return error.TreeBytes;
+    }
+    return m.bytes;
+}
+
 fn metaOf(arena: Allocator, io: std.Io, dir: []const u8) !Meta {
     const text = try std.Io.Dir.cwd().readFileAlloc(io, try join(arena, dir, "meta"), arena, .limited(1024));
     return Meta.parse(text);
@@ -409,8 +444,12 @@ fn isDir(arena: Allocator, p: []const u8) bool {
 /// holds it for the job. Built under a temporary name, written to disk (`syncfs`) before it is
 /// visible, held before it is visible (so an eviction cannot take it at once), and published by
 /// one rename that never replaces. On failure the upper is back where it was, or, if it cannot be
-/// put back, left in the temporary entry and logged, never deleted. The caller holds the key's
-/// lock (`lockKey`) throughout: `collect` removes a temporary entry whose key's lock is free.
+/// put back, left in the temporary entry and logged, never deleted.
+///
+/// The caller holds the key's lock (`lockKey`) until this returns: `collect` takes a temporary
+/// entry whose key's lock is free for one a dead runner left, and removes it
+/// (proofs/tla/StoreLocking.tla). Refused (`error.KeyNotLocked`) when no one holds it, before
+/// anything moves.
 pub fn publish(
     s: Store,
     arena: Allocator,
@@ -421,6 +460,7 @@ pub fn publish(
     rec: Record,
 ) !Layer {
     if (recordFault(kind, rec)) |e| return e;
+    if (!s.keyLocked(arena, io, key)) return error.KeyNotLocked;
     const cwd = std.Io.Dir.cwd();
     var raw: [8]u8 = undefined;
     io.random(&raw);
@@ -443,7 +483,7 @@ pub fn publish(
     }
     var m: Meta = .{
         .kind = kind,
-        .bytes = try treeBytes(arena, io, upper),
+        .bytes = undefined,
         .log_len = rec.log.len,
         .fc_len = rec.fc.len,
         .log_sha = undefined,
@@ -453,7 +493,6 @@ pub fn publish(
     Sha256.hash(rec.fc, &m.fc_sha, .{});
     try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "log"), .data = rec.log });
     try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "fc"), .data = rec.fc });
-    try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "meta"), .data = try m.write(arena) });
     lock = try cwd.createFile(io, try join(arena, tmp, "lock"), .{});
     if (!flock(lock.?, lock_sh)) return error.Locked;
     try cwd.rename(upper, cwd, fs_tmp, io);
@@ -461,6 +500,15 @@ pub fn publish(
     // On disk before it is visible: a crash after the rename must not leave a whole-looking
     // entry whose files are empty or short.
     if (linux.errno(linux.syncfs(lock.?.handle)) != .SUCCESS) return error.Sync;
+    // Measured once written: a file the kernel is still writing back can show fewer blocks
+    // than it takes (a block short, the stress test found, under other publishers' syncfs),
+    // and the store would count less than it holds. The meta, written after the syncfs, is
+    // synced itself before the rename.
+    m.bytes = try treeBytes(arena, io, fs_tmp);
+    const meta = try cwd.createFile(io, try join(arena, tmp, "meta"), .{});
+    defer meta.close(io);
+    try meta.writeStreamingAll(io, try m.write(arena));
+    if (linux.errno(linux.fsync(meta.handle)) != .SUCCESS) return error.Sync;
     const dir = try s.layerDir(arena, key);
     // One rename that never replaces: a layer published meanwhile stays, and this one is not.
     const rc = linux.renameat2(
@@ -1789,6 +1837,12 @@ test "native store: a record that cannot be replayed is refused, and a broken en
     var kh: KeyHasher = .plain("test");
     const k = kh.final();
     const ran = "::zig-file-command::ran\nj1\n";
+    // Refused without the key's lock, which `collect` would take for a dead publisher's.
+    try std.testing.expectError(error.KeyNotLocked, s.publish(arena, io, k, .base, upper, .{ .log = "", .fc = "" }));
+    try tmp.dir.access(io, "up", .{});
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, k, &never);
+    defer kl.close(io);
     // Refused, and the upper left where it was: a step's file commands without their ran marker
     // or empty, a base's with any, and file commands past the limit.
     const big = try arena.alloc(u8, max_record_bytes + 1);
@@ -1812,6 +1866,8 @@ test "native store: a record that cannot be replayed is refused, and a broken en
     // published again.
     var kh2: KeyHasher = .plain("test 2");
     const k2 = kh2.final();
+    const kl2 = try s.lockKey(arena, io, k2, &never);
+    defer kl2.close(io);
     try tmp.dir.createDirPath(io, "up2");
     const up2 = try std.fmt.allocPrint(arena, "{s}/up2", .{root});
     const l = try s.publish(arena, io, k2, .step, up2, .{ .log = "a whole log\n", .fc = ran });
@@ -1845,6 +1901,10 @@ test "native store: an eviction whose entry went meanwhile leaves the one publis
     try prepare(arena, io, s.root, .{ .check_parents = false });
     var kh: KeyHasher = .plain("test");
     const k = kh.final();
+    // Each publish under the key's lock, as `publish` requires.
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, k, &never);
+    defer kl.close(io);
     try tmp.dir.createDirPath(io, "up1");
     const up1 = try std.fmt.allocPrint(arena, "{s}/up1", .{root});
     (try s.publish(arena, io, k, .base, up1, .{ .log = "", .fc = "" })).lock.close(io);
@@ -1909,6 +1969,9 @@ fn testLayer(arena: Allocator, io: std.Io, tmp: std.testing.TmpDir, s: *Store, n
     try tmp.dir.createDirPath(io, name);
     try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/f", .{name}), .data = &@as([5000]u8, @splat('x')) });
     const upper = try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, name });
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, k, &never);
+    defer kl.close(io);
     const l = try s.publish(arena, io, k, .step, upper, .{ .log = "a log\n", .fc = "::zig-file-command::ran\nj1\n" });
     return .{ k, l };
 }
@@ -1974,6 +2037,9 @@ test "native store: a key published already stays, and the second upper is put b
     try tmp.dir.createDirPath(io, "again");
     try tmp.dir.writeFile(io, .{ .sub_path = "again/g", .data = "second" });
     const again = try std.fmt.allocPrint(arena, "{s}/again", .{try tmp.dir.realPathFileAlloc(io, ".", arena)});
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, k, &never);
+    defer kl.close(io);
     try std.testing.expectError(error.Publish, s.publish(arena, io, k, .step, again, .{ .log = "b\n", .fc = "::zig-file-command::ran\nj2\n" }));
     // The upper is back, whole, and nothing of the attempt is left in the store.
     try tmp.dir.access(io, "again/g", .{});
@@ -1990,7 +2056,10 @@ test "native store: a key published already stays, and the second upper is put b
     // An upper that cannot be read fails before it moves: its temporary entry is removed.
     var other: KeyHasher = .plain("other");
     const missing = try std.fmt.allocPrint(arena, "{s}/missing", .{s.root});
-    try std.testing.expect(std.meta.isError(s.publish(arena, io, other.final(), .step, missing, .{ .log = "", .fc = "::zig-file-command::ran\n" })));
+    const k_other = other.final();
+    const ol = try s.lockKey(arena, io, k_other, &never);
+    defer ol.close(io);
+    try std.testing.expect(std.meta.isError(s.publish(arena, io, k_other, .step, missing, .{ .log = "", .fc = "::zig-file-command::ran\n" })));
     var after = try tmp.dir.openDir(io, "store/layers", .{ .iterate = true });
     defer after.close(io);
     var it2 = after.iterate();
@@ -2031,6 +2100,8 @@ test "native store: a step's log past the limit, or a base's file commands, are 
     const big = try arena.alloc(u8, max_record_bytes + 1);
     @memset(big, 'x');
     const ran = "::zig-file-command::ran\nj1\n";
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, k, &never);
     try std.testing.expectError(error.RecordTooLarge, s.publish(arena, io, k, .step, upper, .{ .log = big, .fc = ran }));
     try std.testing.expectError(error.ShortRecord, s.publish(arena, io, k, .base, upper, .{ .log = "", .fc = "x" }));
     try std.testing.expectError(error.ShortRecord, s.publish(arena, io, k, .fetch, upper, .{ .log = "", .fc = "x" }));
@@ -2040,12 +2111,15 @@ test "native store: a step's log past the limit, or a base's file commands, are 
     @memset(fc, 'x');
     @memcpy(fc[0..ran.len], ran);
     (try s.publish(arena, io, k, .step, upper, .{ .log = big[0..max_record_bytes], .fc = fc })).lock.close(io);
+    kl.close(io);
     (try s.open(arena, io, k)).?.layer.lock.close(io);
     try tmp.dir.createDirPath(io, "base");
     var kb: KeyHasher = .plain("base");
     const k_base = kb.final();
     const base_up = try std.fmt.allocPrint(arena, "{s}/base", .{root});
+    const bl = try s.lockKey(arena, io, k_base, &never);
     (try s.publish(arena, io, k_base, .base, base_up, .{ .log = "", .fc = "" })).lock.close(io);
+    bl.close(io);
     s.collect(arena, io);
     (try s.open(arena, io, k_base)).?.layer.lock.close(io);
     (try s.open(arena, io, k)).?.layer.lock.close(io);

@@ -61,12 +61,18 @@ exe=$!
 run+=(--test-cmd bash --test-cmd -c --test-cmd 'until [ -e "$0" ]; do sleep 0.2; done; exec "$@"'
 	--test-cmd "$scratch/runner.rc")
 # ZIG_TEST_NATIVE_AS_ROOT=1: only the native backend's tests, as root (sudo), where they take the
-# root runner's path: each job its own range of ids and its own network.
+# root runner's path: each job its own range of ids and its own network. The store's stress test
+# (src/native/store_stress.zig) keeps its settings under sudo.
+# ZIG_TEST_FILTER: only the tests whose names contain it (with ZIG_TEST_NATIVE_AS_ROOT=1, it
+# should name native tests only), as the nightly analysis workflow runs the stress test alone.
 filter=()
 if [[ ${ZIG_TEST_NATIVE_AS_ROOT:-} == 1 ]]; then
 	filter=(--test-filter native)
 	run+=(--test-cmd sudo
-		--test-cmd '--preserve-env=ZIG_RUNNER_TEST_EXE,ZIG_RUNNER_REQUIRE_NATIVE,ZIG_RUNNER_SERVICE_IMAGES')
+		--test-cmd '--preserve-env=ZIG_RUNNER_TEST_EXE,ZIG_RUNNER_REQUIRE_NATIVE,ZIG_RUNNER_SERVICE_IMAGES,ZIG_TEST_STORE_STRESS_SECONDS,ZIG_TEST_STORE_STRESS_PROCS,ZIG_TEST_STORE_STRESS_SEED')
+fi
+if [[ -n ${ZIG_TEST_FILTER:-} ]]; then
+	filter=(--test-filter "$ZIG_TEST_FILTER")
 fi
 run+=(--test-cmd-bin)
 zig test "${tests[@]}" "${filter[@]}" "${run[@]}"
