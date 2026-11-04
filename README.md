@@ -90,6 +90,24 @@ language for (the workflows, the Go comparison tools under `runner/tools`, the P
 one job per language, on every pull request, in the merge queue, on `main` and weekly; it is a
 checked-in workflow rather than the repository's default setup, which must stay off for its
 uploads to be accepted.
+`security` runs on every pull request, and neither of its checks is required yet. "Secrets" runs
+[gitleaks](https://github.com/gitleaks/gitleaks) (`.github/scripts/install-gitleaks.sh`, pinned by
+version and checksum) over the pull request's own commits, and weekly over `main`'s whole history,
+failing on any finding; the log names the rule, file, line and commit, never the value. A finding
+that is not a secret (a test fixture, an example key, a hash) is allowed in `.gitleaks.toml`, as
+narrowly as it can be (one rule, one file, the line's shape) and with a comment saying why;
+`gitleaks:allow` comments in the code are ignored, so every exception is in that one file.
+"Dependency review" runs
+[`actions/dependency-review-action`](https://github.com/actions/dependency-review-action) on the
+dependencies a pull request adds or changes, failing on a known vulnerability of moderate severity
+or worse, or on a license outside the permissive ones an MIT project can take in (MIT, Apache-2.0,
+BSD, ISC, Zlib, Unicode; the list and its one exception are in `security.yml`). It reads GitHub's
+dependency graph, which sees the Go tools' modules under `runner/tools/` (indirect ones included)
+and the actions the workflows use. It does not see `runner/build.zig.zon` (no Zig support:
+tls.zig, the one dependency compiled into the runner, is followed by Renovate and listed in
+[THIRD_PARTY.md](THIRD_PARTY.md) by hand), the images `runner/Dockerfile`, `deploy/compose.yaml`
+and the scripts pin (Trivy scans the release's image), or the .NET reference program, which has no
+packages.
 "End to end" (`ci`, `.github/scripts/e2e.sh`) runs the runner built from the pull request for
 real, on GitHub's runner: it starts the pinned Dagger engine as `deploy/compose.yaml` does,
 registers the runner's just-in-time runners on the private `Open-Blue/runner-bench` under a label
@@ -106,9 +124,9 @@ It is not a required check yet. Before a release, run the same suite by hand aga
 `compare` runs the comparison tools weekly
 (`.github/scripts/*-diff.sh`): the expression evaluator, YAML reader, `hashFiles()`, problem
 matcher regular expressions, HPACK decoder and RS256 signing against the implementations they
-follow, on fresh random cases; and lints the tools' own Go (`.github/scripts/go-lint.sh`: `go vet`
-and a pinned staticcheck, which "Go tools" in `ci` also runs on a pull request that changes them,
-and govulncheck for information).
+follow, on fresh random cases; and lints the tools' own Go (`.github/scripts/go-lint.sh`: `go vet`,
+a pinned staticcheck and Go's race detector, which "Go tools" in `ci` also runs on a pull request
+that changes them, and govulncheck for information).
 CodeQL and Semgrep read no Zig, so the runner's own code has analysis of its own. "Lint (ZLint)"
 (`ci`, `.github/scripts/zlint.sh`) runs [ZLint](https://github.com/DonIsaac/zlint) on every pull
 request, pinned and checked against its release's checksum, with the rules that find bugs
@@ -123,7 +141,36 @@ artifact; `zig build test` runs the same targets over their seed corpus every ti
 `zig build test -Dllvm --fuzz` (add `-Dtest-filter='fuzz: YAML'` for one target). "Valgrind" runs
 every test under memcheck (`.github/scripts/zig-valgrind.sh`), for reads of memory never written
 and accesses outside an allocation, which Debug's safety checks miss; known-benign reports are
-suppressed in `.github/valgrind.supp`, each with why.
+suppressed in `.github/valgrind.supp`, each with why. "ThreadSanitizer, native" runs the native
+backend's tests under ThreadSanitizer on x86_64 and arm64, rootless and as root, with the runner
+binary they start for each step built with it too (`ZIG_TEST_SANITIZE_THREAD=1`, which ci's
+Database tests job sets where those tests skip); "ThreadSanitizer, end to end" runs ci's end-to-end
+suite on both backends with a runner built under it (`e2e.sh build BIN tsan`), failing on any report
+in the runner's log or the jobs' (`e2e.sh races`). TSan's runtime needs glibc's dynamic loader, so
+these builds are dynamically linked PIEs, not the release's static PIE.
+"Stress" runs the concurrency-sensitive tests (cancels, deadlines, the memory gate, the native
+store's locks, the database, the broker's long-poll, log uploads;
+`.github/scripts/zig-race-tests.sh` names them) 100 times over under stress-ng's CPU and memory
+load, with the database, and fails on the first round that fails, its output an artifact
+(`.github/scripts/zig-stress.sh`).
+**Mutation testing** asks whether the tests would notice the code being wrong:
+`runner/tools/mutate.py` changes a module's code one thing at a time (a comparison flipped, `and`
+for `or`, `true` for `false`, a `return error.X` guard taken away, an integer constant off by one,
+a statement deleted), compiles each change from a copy of `runner/src` with only that module's
+tests (`--test-filter`), runs them with a timeout, and counts each mutant killed, survived, timed
+out or not compiled. Its report lists every survivor by file, line and change: most are a missing
+test, a few a change that means the same thing. The modules are the security-critical ones: secret
+masking (`masking`: `redact.zig`, `dagger/JobLog.zig`), workflow commands (`commands`),
+expressions (`expr`), the native store's keys and publishing (`store`) and `minisign`. Locally,
+after `zig build --fetch` in `runner/`: `python3 runner/tools/mutate.py masking` (`--all --out DIR`
+for every module, `--sample N` for a quicker look, `--list` for the mutants alone, `--shard K/N`
+and `--merge` to split a run and join its results; `--expr-cases DIR` holds `expr`'s mutants to
+GitHub's own expression cases too, as `expr-conformance.sh` does). The five modules make about 2,400 mutants,
+each a compile, which is hours of every core: too slow for a pull request, and for a laptop doing
+anything else. `mutation` runs it for one module when asked for (Actions, "Run workflow"), over
+four of GitHub's runners, with the report in the last job's summary and as the `mutation-report`
+artifact. Mull and other LLVM-level tools cannot be used: they instrument through a clang pass
+plugin, which Zig has no way to load.
 `proofs` checks the [Lean proofs](proofs/README.md) (the step cache, the regex matcher's loops, and
 the `hashFiles()` walk) and compares the walk's model with `runner/src/glob.zig` on random cases,
 when either changes and weekly ("Proofs"). The workflows are written to be hard to turn against the
@@ -147,7 +194,7 @@ repository:
   (`runner/src/dagger.zig`, checked by `.github/scripts/ubuntu-pin.sh`); the packages provisioning
   installs into it come from the Ubuntu archive on the day the engine builds them, and the pre-warm
   logs their fingerprint. tls.zig and GitHub's expression
-  test cases are pinned by commit. Zig, changie and checksec are checked against pinned checksums
+  test cases are pinned by commit. Zig, changie, checksec and gitleaks are checked against pinned checksums
   before they run, tls.zig against its `.hash` as well; a Renovate pull request for a new Zig, tls.zig or
   changie fails until its checksums are updated (changie's by the Workflows job, which downloads
   it on every pull request, though only the release runs it).
@@ -186,14 +233,20 @@ repository:
   ```
 - **Scanned.** Trivy checks the Dockerfile and the image before a push, with its vulnerability
   database fetched once, with retries, from Google's mirror first; accepted findings are in
-  `.trivyignore.yaml`, each with why. GitHub's secret scanning blocks pushes carrying credentials.
+  `.trivyignore.yaml`, each with why. GitHub's secret scanning blocks pushes carrying credentials
+  (push protection), and gitleaks scans every pull request's commits and, weekly, the whole history
+  (`security`, above); dependency review checks the dependencies a pull request brings.
 - **Checked.** actionlint and zizmor check the workflows, shellcheck every shell script
-  (`.github/scripts/shellcheck.sh`), `busybox-pin.sh` the runner's busybox pin, and CodeQL the
-  workflows, the Go tools and the Python generators, which `go vet` and staticcheck lint too
-  (`.github/scripts/go-lint.sh`); every job has a time limit. The Database
+  (`.github/scripts/shellcheck.sh`) and shfmt its format (`.github/scripts/shfmt.sh`, shfmt's
+  defaults: tabs; `-w` formats), hadolint the Dockerfile (`.github/scripts/hadolint.sh`; a finding
+  kept is ignored on its instruction, with why), `busybox-pin.sh` the runner's busybox pin, and CodeQL the
+  workflows, the Go tools and the Python generators, which `go vet`, staticcheck and the race
+  detector check too (`.github/scripts/go-lint.sh`); every job has a time limit. The Database
   tests job runs every test under
   ThreadSanitizer (`zig build test -Dsanitize-thread` locally); ZLint checks the runner's Zig, and
-  `analysis` fuzzes its parsers and runs its tests under Valgrind nightly (above). Vulnerabilities
+  `analysis` fuzzes its parsers, runs its tests under Valgrind, its native backend's tests and the
+  end-to-end suite under ThreadSanitizer, and its concurrency-sensitive tests under load nightly
+  (above). Vulnerabilities
   are reported privately ([docs/SECURITY.md](docs/SECURITY.md)).
 - **One secret, one step.** The deploy key that may push to `main` is the `prod` environment's,
   which deploys only from `main` and waits for approval; it is loaded only in the step that pushes,

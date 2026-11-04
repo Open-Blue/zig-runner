@@ -5,12 +5,46 @@ name: analysis
 #
 #   Fuzz (TARGET)  runner/src/fuzz.zig's targets, each with Zig's coverage-guided fuzzer for a
 #                  bounded number of runs (.github/scripts/zig-fuzz.sh): the parsers that read what
-#                  registries, workflows, jobs and servers hand the runner. The corpus each finds
+#                  registries, workflows, jobs and servers hand the runner, and the text paths
+#                  that guard secrets and a job's environment (masking, file commands, the
+#                  broker's messages, HTTP/2 framing) held to GitHub's runner. The corpus each finds
 #                  is kept from night to night in the Actions cache; a crash, a failed check, a
 #                  leak or a hang fails the job, named after its target, with the input as an
 #                  artifact (fuzz-TARGET).
 #   Valgrind       every test under Valgrind's memcheck (.github/scripts/zig-valgrind.sh): reads
 #                  of memory never written, and accesses outside what was allocated.
+#   ZLint (suppressed-errors)
+#                  ZLint's `catch {}` and `catch unreachable` rule, which ci's Lint job cannot run
+#                  (ZLint does not yet apply line-level disables), against the sites read and
+#                  meant (.github/scripts/zlint-suppressed.baseline): fails on one not in it,
+#                  listed and annotated on its line (.github/scripts/zlint.sh says how).
+#   ThreadSanitizer, native (ARCH)
+#                  the native backend's tests under ThreadSanitizer, on x86_64 and arm64, rootless
+#                  and as root, the runner binary they start for each step (its helper) built
+#                  with it too: ci's pass runs where the native backend cannot make a sandbox, so
+#                  its tests skip there.
+#   ThreadSanitizer, end to end
+#                  the end-to-end suite (ci's "End to end", .github/scripts/e2e.sh) on both
+#                  backends with a runner built under ThreadSanitizer: the runner's main loop, its
+#                  pool and its helpers, which no test reaches. Any report in the runner's log or
+#                  the jobs' fails it.
+#   Stress         the concurrency-sensitive tests (.github/scripts/zig-race-tests.sh: cancels,
+#                  deadlines, the memory gate, the native store's locks, the database, the
+#                  broker's long-poll, log uploads) 100 times over under CPU and memory load
+#                  (.github/scripts/zig-stress.sh), with the database; the first failing round
+#                  fails the job, its output an artifact (stress-output).
+#   Store stress   the native layer store under load (runner/src/native/store_stress.zig): eight
+#                  processes sharing one store under a small cap, ten minutes rootless and ten as
+#                  root, on x86_64 and arm64, where ci runs it for 30 s each. A failure prints the
+#                  seed that runs the same workers again (ZIG_TEST_STORE_STRESS_SEED).
+#
+# Not here, as they cannot work on these tests (measured 2026-11-02): rr, which needs the CPU's
+# performance counters, and GitHub's runner (an Azure VM) exposes none (no `cpu` event source,
+# even with perf_event_paranoid at 1: "Unable to open performance counter"); and Valgrind's
+# Helgrind and DRD, which know only pthreads' locks and their own annotations, and Zig's std
+# builds every lock on raw futexes and atomics (Io.Threaded's own run queue is the first of
+# 109,234 Helgrind and 105,938 DRD reports from pg.zig's one deadline test).
+# ThreadSanitizer, here and in ci, sees those locks.
 #
 # Each search costs more than a pull request should wait for, so they run here and not in ci; a
 # failure is a case for an issue (or a fix), not a broken main.
@@ -32,6 +66,12 @@ on:
       - .github/scripts/zig-fuzz.sh
       - .github/scripts/zig-valgrind.sh
       - .github/valgrind.supp
+      - .github/scripts/zig-race-tests.sh
+      - .github/scripts/zig-stress.sh
+      - .github/scripts/zlint.sh
+      - .github/scripts/zlint-suppressed.baseline
+  # zig-test.sh and e2e.sh are not listed: ci runs them on every change that touches them, and
+  # their ThreadSanitizer options only add a compiler flag.
 
 permissions: {}
 
@@ -67,6 +107,15 @@ jobs:
           - { target: minisign, runs: 1M }
           - { target: workflow commands, runs: 3M }
           - { target: problem matchers, runs: 3M }
+          # The text paths that guard secrets and a job's environment: about ten minutes of
+          # fuzzing each, from their first run here (pull request #300): 600 runs a second for
+          # secret masking (each run a whole step's log through records, line cuts, commands and
+          # masking), 2,300 for file commands, 4,600 for job messages, 1,400 for HTTP2 frames,
+          # with room for corpora that grow.
+          - { target: secret masking, runs: 300K }
+          - { target: file commands, runs: 1M }
+          - { target: job messages, runs: 2M }
+          - { target: HTTP2 frames, runs: 800K }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -133,3 +182,269 @@ jobs:
 
       - name: Tests under memcheck
         run: .github/scripts/zig-valgrind.sh
+
+  # The native backend's tests under ThreadSanitizer, as ci's hosted Test step runs them (rootless,
+  # then as root with the service images) with ZIG_TEST_SANITIZE_THREAD=1 (zig-test.sh): the tests
+  # and the runner binary they start for each step (`zig-runner native-step`), whose reports land
+  # on its stderr, the step's failure. Both dynamically linked against glibc, as TSan's runtime
+  # needs; zig-test.sh says why not the release's static PIE.
+  tsan-native:
+    name: ThreadSanitizer, native (${{ matrix.arch }})
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    permissions:
+      contents: read # to check out the code
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runs-on: ubuntu-26.04 }
+          - { arch: arm64, runs-on: ubuntu-26.04-arm }
+    env:
+      ZIG_RUNNER_REQUIRE_NATIVE: "1"
+      ZIG_TEST_SANITIZE_THREAD: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway
+      # VM. And the address space's randomness down to 28 bits (Ubuntu's is 32): TSan's runtime
+      # cannot place its shadow memory in more, so it re-executes itself with ADDR_NO_RANDOMIZE,
+      # which every process it starts inherits, the steps' too, where the containment test finds
+      # it ("personality query 0" fails).
+      - name: Rootless
+        run: |
+          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo sysctl -q -w vm.mmap_rnd_bits=28
+          .github/scripts/zig-test.sh
+
+      - name: As root, with the service images
+        run: |
+          .github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
+          ZIG_TEST_NATIVE_AS_ROOT=1 ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" \
+            .github/scripts/zig-test.sh
+
+  # ci's "End to end" (its comments say what each step is for), with the runner built under
+  # ThreadSanitizer (`e2e.sh build BIN tsan`), and each pass followed by `e2e.sh races`, which
+  # fails on any report in the runner's log or the jobs' logs. The same e2e environment, App and
+  # runner-bench workflows; skipped, still reporting, without its key.
+  tsan-e2e:
+    name: ThreadSanitizer, end to end
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    environment: e2e
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether the suite's GitHub App is set up
+        id: go
+        env:
+          HAVE_KEY: ${{ secrets.E2E_GH_APP_PRIVATE_KEY != '' }}
+          APP_ID: ${{ vars.E2E_GH_APP_ID }}
+        run: |
+          if [ "$HAVE_KEY" != true ] || [ -z "$APP_ID" ]; then
+            echo "::notice::ThreadSanitizer, end to end skipped: the e2e environment's secret E2E_GH_APP_PRIVATE_KEY or variable E2E_GH_APP_ID is not available"
+            echo "run=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "run=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Start the engine
+        if: steps.go.outputs.run == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/e2e"
+          nohup .github/scripts/e2e.sh engine >"$RUNNER_TEMP/e2e/engine.log" 2>&1 &
+
+      - name: Install Zig
+        if: steps.go.outputs.run == 'true'
+        run: .github/scripts/install-zig.sh
+
+      # The address space's randomness down to 28 bits, as for the native tests: otherwise the
+      # runner re-executes itself with ADDR_NO_RANDOMIZE, and every step it starts runs without
+      # ASLR.
+      - name: Build the runner, under ThreadSanitizer
+        if: steps.go.outputs.run == 'true'
+        run: |
+          sudo sysctl -q -w vm.mmap_rnd_bits=28
+          .github/scripts/e2e.sh build "$RUNNER_TEMP/zig-runner" tsan
+
+      - name: Make the native rootfs
+        if: steps.go.outputs.run == 'true'
+        run: nohup .github/scripts/e2e.sh rootfs "$RUNNER_TEMP/zig-runner" >"$RUNNER_TEMP/e2e/rootfs.log" 2>&1 &
+
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        if: steps.go.outputs.run == 'true'
+        id: app
+        with:
+          client-id: ${{ vars.E2E_GH_APP_ID }}
+          private-key: ${{ secrets.E2E_GH_APP_PRIVATE_KEY }}
+          owner: Open-Blue
+          repositories: runner-bench
+          permission-actions: write
+
+      - name: The runner's key
+        if: steps.go.outputs.run == 'true'
+        env:
+          KEY: ${{ secrets.E2E_GH_APP_PRIVATE_KEY }}
+        run: (umask 077 && printf '%s\n' "$KEY" >"$RUNNER_TEMP/e2e-app.pem")
+
+      # A pass's suite failing and its races are both reported, the races last. The TSan runner
+      # does not stop on its SIGTERM, and `stop` kills it after 60 s: TSan defers a signal to its
+      # thread's next call into libc, and Zig's std.Io parks its threads in raw futex syscalls,
+      # so a signal that lands on a parked thread is never handled (the plain runner stops at
+      # once). Reports are written as races happen, so only a race in the shutdown itself is lost.
+      - name: End to end on Dagger
+        if: steps.go.outputs.run == 'true'
+        env:
+          GH_APP_ID: ${{ vars.E2E_GH_APP_ID }}
+          E2E_GH_TOKEN: ${{ steps.app.outputs.token }}
+          E2E_ZIG_RUNNER_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          label="tsan-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-dagger"
+          GH_APP_PRIVATE_KEY_FILE="$RUNNER_TEMP/e2e-app.pem" .github/scripts/e2e.sh start "$RUNNER_TEMP/zig-runner" dagger "$label"
+          status=0
+          .github/scripts/e2e.sh check "$label" dagger || status=$?
+          .github/scripts/e2e.sh stop
+          .github/scripts/e2e.sh races dagger || status=1
+          exit "$status"
+
+      - name: End to end, native
+        if: ${{ !cancelled() && steps.go.outputs.run == 'true' }}
+        env:
+          GH_APP_ID: ${{ vars.E2E_GH_APP_ID }}
+          E2E_GH_TOKEN: ${{ steps.app.outputs.token }}
+          E2E_ZIG_RUNNER_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          label="tsan-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-native"
+          GH_APP_PRIVATE_KEY_FILE="$RUNNER_TEMP/e2e-app.pem" .github/scripts/e2e.sh start "$RUNNER_TEMP/zig-runner" native "$label"
+          status=0
+          .github/scripts/e2e.sh check "$label" native || status=$?
+          .github/scripts/e2e.sh stop
+          .github/scripts/e2e.sh races native || status=1
+          exit "$status"
+
+      - name: The runner's log, on a failure
+        if: ${{ failure() && steps.go.outputs.run == 'true' }}
+        run: |
+          for f in "$RUNNER_TEMP"/e2e/engine.log "$RUNNER_TEMP"/e2e/rootfs.log "$RUNNER_TEMP"/e2e/runner-*.log; do
+            [ -e "$f" ] || continue
+            stop="e2e-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+            echo "::group::$(basename "$f")"
+            echo "::stop-commands::$stop"
+            tail -n 300 "$f" | sed -E 's/(gh[opsu]|github_pat)_[A-Za-z0-9_]{20,}/***/g'
+            echo "::$stop::"
+            echo "::endgroup::"
+          done
+
+      - name: Clean up
+        if: ${{ always() && steps.go.outputs.run == 'true' }}
+        run: |
+          .github/scripts/e2e.sh stop || true
+          rm -f "$RUNNER_TEMP/e2e-app.pem"
+
+  # The concurrency-sensitive tests under load. About 11 s a round on an idle runner.
+  stress:
+    name: Stress
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    permissions:
+      contents: read # to check out the code
+    # The database's tests run too (ci.yml's Database tests job, whose database this is), and fail
+    # without it rather than skip.
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: ci-only
+      PGDATABASE: tsdb
+      PGSSLMODE: disable
+      ZIG_TEST_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Start the database
+        run: .github/scripts/ci-database.sh start
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      # Ubuntu's own package, checked by apt against the archive's signed index, at the version
+      # pinned here, so every night loads the machine the same way.
+      - name: Install stress-ng
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends stress-ng=0.20.01-1
+          stress-ng --version
+
+      - name: Wait for the database
+        run: .github/scripts/ci-database.sh wait
+
+      - name: Tests under load
+        run: .github/scripts/zig-stress.sh 100 "$RUNNER_TEMP/stress"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: stress-output
+          path: ${{ runner.temp }}/stress
+          if-no-files-found: ignore
+
+  # Under a minute: ZLint reads the sources, nothing is compiled.
+  zlint-suppressed-errors:
+    name: ZLint (suppressed-errors)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: suppressed-errors against its baseline
+        run: .github/scripts/zlint.sh suppressed-errors
+
+  # About 25 minutes each: two ten-minute passes after the build.
+  store-stress:
+    name: Store stress (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read # to check out the code
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-26.04 }
+          - { arch: arm64, runner: ubuntu-26.04-arm }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      # As ci's Test step runs the native tests: rootless, then as root.
+      - name: Stress, rootless and as root
+        working-directory: runner
+        env:
+          ZIG_RUNNER_REQUIRE_NATIVE: "1"
+          ZIG_TEST_FILTER: native store under load
+          ZIG_TEST_STORE_STRESS_SECONDS: "600"
+          ZIG_TEST_STORE_STRESS_PROCS: "8"
+        run: |
+          # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
+          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          ../.github/scripts/zig-test.sh
+          ZIG_TEST_NATIVE_AS_ROOT=1 ../.github/scripts/zig-test.sh

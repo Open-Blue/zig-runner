@@ -2186,3 +2186,22 @@ test "interpolation stops at its limit, and what each expression builds on the w
     }
     try refused.await(io);
 }
+
+test "an if: runs after a failure or a cancel only through a status function, wherever it is" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const failed: Scope = .{ .contexts = &.{}, .job_failed = true };
+    const cancelled: Scope = .{ .contexts = &.{}, .cancelled = true };
+    // An empty condition is success(): neither after a failure nor after a cancel.
+    try std.testing.expect(!try evalCondition(ar, "", failed));
+    try std.testing.expect(!try evalCondition(ar, "", cancelled));
+    try std.testing.expect(try evalCondition(ar, "", .{ .contexts = &.{} }));
+    // A status function anywhere counts: in an index, or as another function's argument.
+    try std.testing.expect(try hasStatusFunction(ar, "fromJSON('[1]')[failure() && 0]"));
+    try std.testing.expect(try hasStatusFunction(ar, "format('{0}', always())"));
+    try std.testing.expect(!try hasStatusFunction(ar, "format('{0}', github.sha)[0]"));
+    // Status functions take no arguments.
+    for ([_][]const u8{ "always(1)", "failure(1)", "success(1)", "cancelled(1)" }) |e|
+        try std.testing.expect(std.meta.isError(evaluate(ar, e, failed)));
+}

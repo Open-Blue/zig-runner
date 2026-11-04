@@ -45,6 +45,7 @@ comptime {
     _ = @import("native/docker_action.zig");
     _ = @import("native/dockerfile.zig");
     _ = @import("native/layers.zig");
+    _ = @import("native/store_stress.zig");
     _ = @import("native/actions.zig");
     _ = @import("redact.zig");
     _ = @import("yaml.zig");
@@ -64,9 +65,11 @@ comptime {
     _ = @import("job.zig");
     _ = @import("trust.zig");
     _ = @import("dagger.zig");
+    _ = @import("dagger/output_keys.zig");
     _ = @import("engine.zig");
     _ = @import("hpack.zig");
     _ = @import("loop.zig");
+    _ = @import("loop/upload.zig");
     _ = @import("timefmt.zig");
     _ = @import("expr.zig");
     _ = @import("glob.zig");

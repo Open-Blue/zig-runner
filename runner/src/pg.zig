@@ -1032,6 +1032,11 @@ test "a server that accepts and never answers is given up, connecting and in a s
     var serving = try io.concurrent(Server.run, .{&ready});
     defer serving.await(io) catch {};
     cfg.port = ready.socket.address.getPort();
+    // This connect must succeed: within the bound the test allows, not the 200 ms meant to run
+    // out. Valgrind (or a loaded machine) can take longer than that to answer the startup, and the
+    // test would then fail here with error.Timeout, and cancel the connect above before its own
+    // timer fired (`expected error.Timeout, found error.Canceled`, the test's own cancel).
+    cfg.connect_timeout = .fromSeconds(10);
     const c = try Client.connect(gpa, io, cfg);
     defer c.close();
     const started = Io.Clock.awake.now(io);

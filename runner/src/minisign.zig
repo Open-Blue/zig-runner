@@ -143,6 +143,28 @@ test "minisign: Zig's published public key parses" {
     const pk = try PublicKey.parse("RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U");
     try std.testing.expectEqual(@as(u8, 0x86), pk.key_id[0]);
     try std.testing.expectError(error.InvalidPublicKey, PublicKey.parse("RWSG"));
+    // The same key under another algorithm's tag (`Et`, not `Ed`).
+    try std.testing.expectError(error.InvalidPublicKey, PublicKey.parse("RXSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"));
+}
+
+test "minisign: the trusted comment: its prefix, and up to 1024 bytes of it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const kp = try Ed25519.KeyPair.generateDeterministic(@splat(7));
+    const blob = "a release";
+    const longest = try arena.alloc(u8, 1024);
+    @memset(longest, 'c');
+    const f = try Fixture.make(arena, kp, blob, longest);
+    const pk = try PublicKey.parse(&f.pk);
+    try std.testing.expectEqualStrings(longest, try verify(pk, blob, f.minisig));
+    // One byte more is refused before it is checked, signed or not.
+    const too_long = try Fixture.make(arena, kp, blob, try std.mem.concat(arena, u8, &.{ longest, "c" }));
+    try std.testing.expectError(error.InvalidSignature, verify(pk, blob, too_long.minisig));
+    // Its line must say what it is.
+    const short = try Fixture.make(arena, kp, blob, "timestamp:1");
+    const renamed = try std.mem.replaceOwned(u8, arena, short.minisig, "\ntrusted comment: ", "\ntrusted_comment: ");
+    try std.testing.expectError(error.InvalidSignature, verify(pk, blob, renamed));
 }
 
 pub const testing = struct {

@@ -16,7 +16,10 @@
 #
 #   checksec.sh BINARY...
 set -euo pipefail
-(($# > 0)) || { echo "usage: checksec.sh BINARY..." >&2; exit 2; }
+(($# > 0)) || {
+	echo "usage: checksec.sh BINARY..." >&2
+	exit 2
+}
 
 version=3.2.0
 # checksec_<version>_linux_<arch>.tar.gz in the release's checksec_checksums.sha512.

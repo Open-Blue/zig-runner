@@ -4616,6 +4616,11 @@ test "a container job's env gives way to the job's env of the same name" {
         "value:\"from-the-job\")"));
 }
 
+/// A combined file holding only GITHUB_ENV's `text` (`scripts.combine`).
+fn envPart(comptime text: []const u8) []const u8 {
+    return "::zig-file-command::env " ++ std.fmt.comptimePrint("{d}", .{text.len}) ++ "\n" ++ text ++ "\n";
+}
+
 test "a secret passed on through GITHUB_ENV reaches later steps as a Dagger secret, and they always run" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -4629,7 +4634,7 @@ test "a secret passed on through GITHUB_ENV reaches later steps as a Dagger secr
     job.secrets = &.{secret};
     const files = [_][2][]const u8{.{
         "/github/file_commands/all_1",
-        "::zig-file-command::env\nTOKEN=" ++ secret ++ "\nREGION=eu\n",
+        envPart("TOKEN=" ++ secret ++ "\nREGION=eu\n"),
     }};
     for ([_]Options{
         .{ .step_cache = true, .test_ran_marker = "j1" },
@@ -4660,7 +4665,7 @@ test "a value masked before it is passed on through GITHUB_ENV is a secret to th
     const steps = [_]job_mod.Step{ testStep("./mint-token"), testStep("./deploy.sh") };
     const files = [_][2][]const u8{.{
         "/github/file_commands/all_1",
-        "::zig-file-command::env\nTOKEN=" ++ minted ++ "\n",
+        envPart("TOKEN=" ++ minted ++ "\n"),
     }};
     var auto: AutoSession = .{
         .arena = arena,
@@ -4687,7 +4692,7 @@ test "a value in GITHUB_ENV masked by a later step makes the steps after that on
     };
     const files = [_][2][]const u8{.{
         "/github/file_commands/all_1",
-        "::zig-file-command::env\nVALUE=" ++ late ++ "\n",
+        envPart("VALUE=" ++ late ++ "\n"),
     }};
     var auto: AutoSession = .{
         .arena = arena,
@@ -4717,7 +4722,7 @@ test "a secret variable set again through GITHUB_ENV as a plain value loses its 
     job.env = &.{.{ .name = "TOKEN", .value = .{ .lit = secret } }};
     const files = [_][2][]const u8{.{
         "/github/file_commands/all_1",
-        "::zig-file-command::env\nTOKEN=anonymous\n",
+        envPart("TOKEN=anonymous\n"),
     }};
     var auto: AutoSession = .{ .arena = arena, .files = &files };
     _ = try roundTrips(arena, &auto, .{}, job);

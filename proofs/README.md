@@ -54,6 +54,11 @@ lists where the encoding differs.
 | `Glob/Match.lean`, `Glob/Walk.lean` | the `hashFiles()` matcher and walk |
 | `Axioms.lean` | the axioms gate: the allow list, and the main theorems it prints |
 
+One model here is not Lean: `tla/StoreLocking.tla`, the native store's locking protocol at the level
+of system calls, model-checked with TLC in `store-model.yml` ([The store's locking, in
+TLA+](#the-stores-locking-in-tla)). It checks what `Runner/Native.lean` assumes when it takes store
+operations as whole entries.
+
 ## The step cache
 
 [MEASURE.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/MEASURE.md) §4 lists
@@ -241,7 +246,8 @@ passing, something has changed.
 Not proof of anything about: hash collisions (the key is a projection, so two different recipes never
 collide here); the *interleaving* of concurrent jobs, only the shared cache they end up with
 (`Elsewhere`), and for the native store whole-entry operations in any order (`Native.Op`), which
-atomic publish is what justifies — Dagger's output store's first-writer-wins `mv -T` is not
+atomic publish is what justifies (model-checked below the Lean model, in [The store's locking, in
+TLA+](#the-stores-locking-in-tla)) — Dagger's output store's first-writer-wins `mv -T` is not
 modelled; anything bash does; and every
 question of *cost* — nothing here says a replay is faster, only that it is right. Experiment 5's +28%
 and +85% are why `Runner.Declared`'s mechanism is shelved, and no theorem in it argues otherwise.
@@ -335,6 +341,161 @@ UTF-8).
 through P2's own `Store.KeyHasher` and `Store.stableEnv`, the digest below a base through
 `Backend.belowKey` (which `below` calls), and layer digests by making each tree and running
 `Store.treeDigestTo` on it.
+
+## The store's locking, in TLA+
+
+`Runner/Native.lean` takes a store operation as one step on whole entries, in any order: a publish is
+one rename of a complete entry, an eviction one entry removed, a reader takes an entry whole or
+misses (`Native.Op`, `ops_keep_honest`, `Torn`), and `race_irrelevant` shows which of two racing
+writers wins does not matter. Those are hypotheses about the system calls under it, with several
+runners sharing one store and any of them dying between any two calls. `tla/StoreLocking.tla` is a
+TLA+ model of that layer, checked with TLC, and what it shows is what lets the Lean model have whole
+entries:
+
+```
+.github/scripts/tlc.sh    # fetches tla2tools.jar v1.7.4, checks its sha256, runs every configuration
+```
+
+CI runs it (`store-model.yml`) on pull requests and pushes that touch `runner/src/native/Store.zig`,
+`Backend.zig`, `layers.zig` or the model, and weekly with the proofs. It is not a proof: TLC
+explores every state of a bounded instance, and the bounds are below.
+
+**What is modelled**, each action citing the code it stands for (file:line, in the module):
+
+- `Store.lockKey`: `keys/<key>.lock` made if missing, `LOCK_EX | LOCK_NB`, polled, the lock kept
+  only on the inode the path names now (`sameFile`), a step's wait ended by a cancel. A lock file
+  is an inode with an identity, so a file `collect` deleted and a runner made again is a new one.
+- `Store.open`: the entry's lock opened, `LOCK_SH` (blocking: it waits out an eviction), the path
+  checked again, the entry read (`readEntry`); a broken one closed and evicted by name, and
+  `error.Invalid` (the step runs uncached, `Backend.claimKey`) when another job holds it.
+- `Store.publish`: `layers/.tmp-<key>-<n>` made, the record and meta written, the lock made and
+  held shared, the upper renamed in, `syncfs`, `renameat2(RENAME_NOREPLACE)`, and its `errdefer`
+  (the upper put back, the temporary entry removed, or left when it cannot be).
+- `Store.evict`: the lock by name, `LOCK_EX | LOCK_NB`, the path checked again (`sameFile`),
+  renamed to `.dead-<n>` by name, removed under the lock; an entry without a lock file taken
+  without one.
+- `Store.collect`: `gc.lock`; `.dead-` removed; `.tmp-` removed only when its key's lock is free
+  (taken, and held while it is removed); an entry that does not look whole (`entryLooksWhole`)
+  evicted; past the cap any entry no job holds (the LRU order is over-approximated: any may go);
+  `dropKeyLocks`.
+- `removeTree` as `std.Io.Dir.deleteTree` does it: entries deleted one at a time, in any order,
+  through the descriptor it opened (so a directory renamed meanwhile is emptied where it went), the
+  tree's contents before the tree, the directory removed by its old name last, a missing name no
+  error.
+- The callers: `Backend.claimKey` and `publishTop` (a step's key held from the claim through its
+  publish), the job's end (its layers let go, then `collect`), and `layers.zig` (a Dockerfile
+  build's layer: `open` without the key's lock, a publish, and on a lost race `open` again).
+- Flocks per open file description, not per process: a job that holds a layer and opens it again
+  holds two locks, and closing one keeps the other.
+- A process crash between any two actions (its flocks released by the kernel, its files left), a
+  machine crash (every process, and the data no one synced: the record and meta are taken to
+  survive and the tree not, the worst case for a reader; metadata is kept in order, as a journal
+  keeps it, so a crash keeping less is a crash at an earlier state), and a hand changing a
+  published entry's record without changing its length (seen only by `open`'s sha256).
+
+**What is checked**:
+
+| Property | Says |
+|---|---|
+| `NoBadRead` | a job never takes (replays, or stacks as a build layer) an entry that is not published, every file there, its tree whole |
+| `HeldIntact` | an entry a job holds stays published and whole until the job lets go: never evicted, renamed or emptied under it |
+| `KeyMutex` | at most one process runs a step's key at a time |
+| `NoWrongValid` | in no state, after any crash, is there an entry `readEntry` would accept whose tree is not whole |
+| `NoLostUpper` | a step's upper is never deleted under it by another process |
+| `OnePub` | one entry per key |
+| `NoBuildLost` | a build that built its layer gets one: its own published, or the one another builder stored |
+| `WaitEnds` | a claim waiting on its key's lock gets it, is cancelled, or its process dies: a holder that finishes or crashes lets it go on (weak fairness of each process) |
+| `AllEnd` | every job ends, so no blocking flock waits for ever |
+
+And four mutants, each the code with one guard taken away, which TLC must reject with the
+invariant the configuration's first line names (`tlc.sh` fails if it does not, so a model that
+could no longer see a broken protocol fails CI): `StoreLocking-unlocked-build.cfg` (`layers.zig`'s
+publish without the key's lock, as it was: `NoWrongValid`), `StoreLocking-unchecked-evict.cfg`
+(`Store.evict` without `sameFile` after its exclusive lock, as it was: `HeldIntact`),
+`StoreLocking-no-sync.cfg` (`Store.publish` without its `syncfs`: `NoWrongValid`) and
+`StoreLocking-publish-first.cfg` (`layers.zig`'s publish under the key's lock but publishing
+before it looks the key up, as #299 had it: `NoBuildLost`).
+
+**Bounds** (the processes run one job each; a job's steps pick their keys freely):
+
+| Configuration | Runners | Keys | Steps a job | Process crashes | Machine crashes | Hand's changes | Checks |
+|---|---|---|---|---|---|---|---|
+| `StoreLocking.cfg` | 3 | a step's, a build's | 1 | 1 | 0 | 0 | safety, with the runners' symmetry |
+| `StoreLocking-crash.cfg` | 2 | a step's, a build's | 2 | 1 | 1 | 1 | safety, with the runners' symmetry |
+| `StoreLocking-liveness.cfg` | 2 | a step's, a build's | 1 | 1 | 0 | 1 | safety and liveness, no symmetry |
+
+One step key is enough for the protocol: keys share nothing but `collect` and `gc.lock`, so a
+second step key adds interleavings, not cases. The build key is there for `layers.zig`'s path, which
+holds no key lock while it builds. Two steps a job give a job a layer it holds while it goes on (and
+opens again: two flocks on one file). Each configuration is a few minutes or less on a laptop
+("cowbird", 12 threads, under load, `-workers auto`, 2026-11-02):
+
+| Configuration | Distinct states | Depth | Time |
+|---|---|---|---|
+| `StoreLocking.cfg` | 1,710,952 | 104 | 1 min 25 s |
+| `StoreLocking-crash.cfg` | 1,592,386 | 120 | 36 s |
+| `StoreLocking-liveness.cfg` | 122,080 | 68 | 21 s |
+| the three mutants | under 50,000 each, to the first violation | | seconds |
+
+Two larger runs were made while the model was written and are left out of CI for its time: three
+runners with a hand's change (6.7 million states, 3 minutes, no error), and three runners with two
+steps each, stopped unfinished at 3 million states with no error. The
+model folds a process's purely local steps (choosing the next key, the poll's sleep) into the
+actions around them, which removes interleavings without removing a behaviour.
+
+**What it found**: two races, both in the code since P2 and P7, both fixed with a test that fails
+without the fix.
+
+1. *A build layer's publish without its key's lock.* `collect` takes a `.tmp-` entry whose key's
+   lock is free for a dead runner's, but `layers.Store.publish` (a Dockerfile build's layer, P7 on
+   P2's store) held no key lock. TLC's trace (16 states, `StoreLocking-unlocked-build.cfg`): runner
+   1 builds a layer, and `Store.publish` has written the record and meta and made and locked the
+   lock file in `layers/.tmp-<key>-<n>`; runner 2's job ends, its `collect` finds the key's lock
+   free and starts `removeTree` on the entry, deleting its lock file; runner 1 moves its upper in,
+   syncs, and `renameat2` makes the entry visible. It is published without a lock file, so no job
+   can hold it (the builder's shared lock is on the unlinked file) and the next eviction removes
+   it from under the builder; with the deletions in another order the entry is visible with a
+   half-deleted tree, which `readEntry` (it does not look inside the tree) accepts, or the
+   builder's upper is deleted under it. Fixed by taking the key's lock around
+   `layers.Store.publish`, as `claimKey` does for a step; `Store.publish` now says its caller holds
+   it. Test: "a layer is published under its key's lock" (layers.zig).
+2. *An eviction that renamed away the wrong entry.* `Store.evict` opened the entry's lock file by
+   path, took it `LOCK_EX | LOCK_NB`, and renamed `layers/<key>` by name, without checking the lock
+   was still on the file the path names, as `open` and `lockKey` do. TLC's trace (48 states,
+   `StoreLocking-unchecked-evict.cfg`): runner 1 publishes a build layer and its job ends; a hand
+   changes the entry's record; runner 1's `collect` opens the entry's lock file to evict it (the
+   cap); runner 2's `open` finds the record broken and evicts the entry itself; runner 2 builds the
+   layer again, publishes it and holds it; runner 1's exclusive lock on the old, unlinked lock file
+   succeeds (no one holds that file), and its rename takes runner 2's new entry. Any reason
+   `readEntry` fails (a disk that filled, a part cut short) does as well as the hand. Fixed:
+   `evict` checks `sameFile` after the lock (`Store.evictOpened`). Test: "an eviction whose entry
+   went meanwhile leaves the one published since" (Store.zig).
+
+A third race the store's stress test (`runner/src/native/store_stress.zig`) found, and the model
+then took in. With the key's lock, `layers.Store.publish` still published first and looked the key
+up only once `renameat2` refused, as the code had it before the lock: the model counted a build
+that then found nothing as a legal outcome. But the key's lock does not keep `collect` out: runner
+1 publishes a build layer and its job ends; runner 2 builds it too, takes the key's lock, and its
+rename is refused; runner 1's `collect` evicts the layer, which no job holds; runner 2's lookup
+misses, and its build fails with a layer it built and none stored (TLC's trace,
+`StoreLocking-publish-first.cfg`, under 4,000 states). `NoBuildLost` is the property, and
+`BuildLooksUpFirst` the fix: under the key's lock, the key is looked up first, so a layer that is
+there is used and one that is not cannot appear before the publish.
+
+A fourth thing it turned up is about the model, not the code: a flock belongs to an open file
+description, and the first version of the model, which kept one lock per process, reported a
+held layer evicted that the kernel would have protected.
+
+**What it does not model**: the keys' meaning and the record's content (the Lean model's); a
+step's parent being in the store (each key here stands alone); the bytes a meta counts (the stress
+test found `publish` measuring a tree while the kernel still wrote it back, a block short: a
+tree whole on disk, counted low against the cap, and now measured after the `syncfs`); the LRU
+order and the byte cap
+(over-approximated by "any entry may go"); `layerDigest`'s file (written aside and renamed, never
+read by `open`); the rootfs, the provisioning store (`oci/Store.zig`) and flattening, which write
+into the job's own directory; a hand deleting an entry's lock file (`evict` would then remove an
+entry a job holds: the store is the runner's alone, `Store.prepare`); readdir returning an entry
+twice; and more runners, keys or steps than the bounds.
 
 ## Why the regex matcher terminates
 

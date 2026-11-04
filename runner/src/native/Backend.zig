@@ -1102,7 +1102,7 @@ pub fn deinit(b: *Backend) void {
     }
     if (b.netns) |p| detachNetns(arena, p);
     t = b.timings.since(arena, .veth_rm, t);
-    removeTree(arena, b.io, b.dir);
+    removeJobDir(arena, b.io, b.dir);
     t = b.timings.since(arena, .tree_rm, t);
     for (b.held.items) |f| f.close(b.io);
     if (b.slot) |s| s.lock.close(b.io);
@@ -1132,15 +1132,48 @@ fn sweep(arena: Allocator, io: std.Io, store: []const u8, cg_parent: ?[]const u8
     while (it.next(io) catch null) |e| {
         if (e.kind != .directory or std.mem.startsWith(u8, e.name, ".new-")) continue;
         const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ jobs, e.name }) catch return;
-        const lock = std.fmt.allocPrint(arena, "{s}/lock", .{path}) catch return;
-        const held = lockFile(arena, io, lock, false) catch continue;
+        const lock_path = std.fmt.allocPrint(arena, "{s}/lock", .{path}) catch return;
+        // Opened, never made: a directory without its lock is one its runner is removing, lock
+        // last (`removeJobDir`), or a dead runner left empty after that; a lock made here would
+        // be free, and the directory taken for stale while its runner still removes it.
+        const held = std.Io.Dir.cwd().openFile(io, lock_path, .{}) catch |err| {
+            if (err == error.FileNotFound) {
+                const z = arena.dupeSentinel(u8, path, 0) catch return;
+                _ = std.os.linux.rmdir(z);
+            }
+            continue;
+        };
         defer held.close(io);
+        if (std.os.linux.errno(std.os.linux.flock(held.handle, 2 | 4)) != .SUCCESS) continue;
+        // Free because its runner let go of it just now, the directory removed: not stale.
+        if (!sameFile(arena, held, lock_path)) continue;
+        // Only a runner that died leaves one: worth seeing (and the stress test fails on it, as
+        // a live job's directory taken for stale did before `removeJobDir`).
+        std.log.warn("native: removing {s}, a job directory a runner left (it died)", .{path});
         detachNetns(arena, std.fmt.allocPrint(arena, "{s}/netns", .{path}) catch return);
         if (cg_parent) |p| (cgroup.Job{
             .dir = std.fmt.allocPrint(arena, "{s}/{s}", .{ p, e.name }) catch return,
         }).remove(arena, io);
-        removeTree(arena, io, path);
+        removeJobDir(arena, io, path);
     }
+}
+
+/// A job's directory removed with its lock last, while the lock is held: until the directory is
+/// empty its lock file is there, held, so `sweep` in another runner finds it taken and leaves it.
+fn removeJobDir(arena: Allocator, io: std.Io, path: []const u8) void {
+    const cwd = std.Io.Dir.cwd();
+    var dir = cwd.openDir(io, path, .{ .iterate = true }) catch return removeTree(arena, io, path);
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        if (std.mem.eql(u8, e.name, "lock")) continue;
+        names.append(arena, arena.dupe(u8, e.name) catch break) catch break;
+    }
+    dir.close(io);
+    for (names.items) |name|
+        removeTree(arena, io, std.fmt.allocPrint(arena, "{s}/{s}", .{ path, name }) catch return);
+    // Anything left (a name the listing missed, a failure above) is removed whole.
+    removeTree(arena, io, path);
 }
 
 /// The base every step starts from, as `set_up.baseContainerId` builds Dagger's: the image's
@@ -2086,6 +2119,12 @@ fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
     const lock = s.lockKey(arena, b.io, k, &b.stop_wait) catch |e| {
         b.waiting.store(false, .release);
         if (e == error.Stopped) return error.Stopped;
+        // The task's cancel stops the step as `abort` does. std.Io delivers it once: re-armed, so
+        // what runs next sees it too, instead of the job going on uncached.
+        if (e == error.Canceled) {
+            b.io.recancel();
+            return error.Stopped;
+        }
         std.log.warn("native: the step store's lock: {s}", .{@errorName(e)});
         return .{};
     };
@@ -2728,8 +2767,25 @@ pub fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
         .sub_path = try std.fmt.allocPrint(arena, "rootfs/etc/{s}", .{f}),
         .data = "",
     });
-    const root = try d.realPathFileAlloc(io, ".", arena);
-    const cfg: Config = .{
+    const cfg = try testConfigAt(arena, try d.realPathFileAlloc(io, ".", arena), exe);
+    // One sandbox, to see whether this machine lets us make them at all.
+    var b = try init(arena, io, std.testing.allocator, cfg);
+    defer b.deinit();
+    var out: Captured = .{ .arena = arena };
+    const ended = try b.exec("true", &.{"PATH=/usr/bin"}, &.{}, 0, 0, out.output());
+    if (ended.failure.len > 0 or ended.code != 0)
+        return skip(required, try std.fmt.allocPrint(arena, "this machine cannot make a " ++
+            "native step's sandbox ({s}, exit {d})", .{ ended.failure, ended.code }));
+    // What `dagger.run` asks before a job goes native: a refusal here would send the tests' jobs
+    // to Dagger, which is not there.
+    if (usable(arena, io, std.testing.allocator, cfg)) |why| return skip(required, why);
+    return cfg;
+}
+
+/// `testConfig`'s backend over the directory `root` it made, with the runner binary `exe`: for a
+/// process of a test's own (`store_stress.zig`), whose jobs must key alike with the test's.
+pub fn testConfigAt(arena: Allocator, root: []const u8, exe: []const u8) !Config {
+    return .{
         .rootfs = try std.fmt.allocPrint(arena, "{s}/rootfs", .{root}),
         .store = try std.fmt.allocPrint(arena, "{s}/store", .{root}),
         .self_exe = exe,
@@ -2743,18 +2799,6 @@ pub fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
             .{ .host = "/etc/ssl", .at = "/etc/ssl" },
         },
     };
-    // One sandbox, to see whether this machine lets us make them at all.
-    var b = try init(arena, io, std.testing.allocator, cfg);
-    defer b.deinit();
-    var out: Captured = .{ .arena = arena };
-    const ended = try b.exec("true", &.{"PATH=/usr/bin"}, &.{}, 0, 0, out.output());
-    if (ended.failure.len > 0 or ended.code != 0)
-        return skip(required, try std.fmt.allocPrint(arena, "this machine cannot make a " ++
-            "native step's sandbox ({s}, exit {d})", .{ ended.failure, ended.code }));
-    // What `dagger.run` asks before a job goes native: a refusal here would send the tests' jobs
-    // to Dagger, which is not there.
-    if (usable(arena, io, std.testing.allocator, cfg)) |why| return skip(required, why);
-    return cfg;
 }
 
 pub fn skip(required: bool, why: []const u8) error{ SkipZigTest, NativeTestsRequired } {
@@ -4170,6 +4214,44 @@ test "root runner: slots are the host's, so two runners with different stores ne
     var buf: [16]u8 = undefined;
     try std.testing.expect(sock.index(net.hostLink(&buf, first.slot.?.n)) != null);
     try std.testing.expect(sock.index(net.hostLink(&buf, second.slot.?.n)) != null);
+}
+
+test "native sweep: a job's directory its runner is removing is left to it; a dead runner's goes" {
+    // Found by the store's stress test: a runner's removal took the lock file early, another
+    // runner's sweep made a new one, found it free, and removed the directory alongside its
+    // owner (`AccessDenied` from one of the two).
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    for ([_][]const u8{ "jobs/live/W/x", "jobs/removing/W/x", "jobs/dead/W/x", "jobs/emptied" }) |d|
+        try tmp.dir.createDirPath(io, d);
+    // A live job holds its lock; one being removed holds it too, its file not yet gone (lock
+    // last); a dead runner's is free.
+    const live = try lockFile(arena, io, try std.fmt.allocPrint(arena, "{s}/jobs/live/lock", .{store}), false);
+    defer live.close(io);
+    const removing = try lockFile(arena, io, try std.fmt.allocPrint(arena, "{s}/jobs/removing/lock", .{store}), false);
+    defer removing.close(io);
+    try tmp.dir.writeFile(io, .{ .sub_path = "jobs/dead/lock", .data = "" });
+    // Midway through `removeJobDir`: everything but the lock gone.
+    try tmp.dir.deleteTree(io, "jobs/removing/W");
+    sweep(arena, io, store, null);
+    try tmp.dir.access(io, "jobs/live/W/x", .{});
+    try tmp.dir.access(io, "jobs/removing/lock", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "jobs/dead", .{}));
+    // An empty directory without a lock (a runner that died after removing it) goes; one whose
+    // lock its runner removed while it still has files is not given a lock of the sweep's.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "jobs/emptied", .{}));
+    try tmp.dir.createDirPath(io, "jobs/unlocked/W");
+    sweep(arena, io, store, null);
+    try tmp.dir.access(io, "jobs/unlocked/W", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "jobs/unlocked/lock", .{}));
+    // Its runner's removal ends with the lock, while held.
+    removeJobDir(arena, io, try std.fmt.allocPrint(arena, "{s}/jobs/live", .{store}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "jobs/live", .{}));
 }
 
 test "a job's directory and lock are let go once, when its set-up fails after the lock is taken" {

@@ -26,11 +26,16 @@ git describe --tags --always --dirty --abbrev=8 >"$scratch/version"
 zig_modules "$scratch" "$scratch/version"
 plain=("${modules[@]}")
 # ZIG_TEST_SANITIZE_THREAD=1: the tests under ThreadSanitizer (build.zig's -Dsanitize-thread), which
-# fails them on a data race they run into.
+# fails them on a data race they run into; and the runner binary below, the native backend's helper
+# (one `zig-runner native-step` per step), whose report lands on its stderr, which the runner takes
+# for the sandbox's failure. TSan's runtime needs glibc's dynamic loader: the native target links
+# it, a PIE still, where the release's static PIE (musl, #283) crashes at startup.
 tests=("${plain[@]}")
+runner=("${plain[@]}")
 if [[ ${ZIG_TEST_SANITIZE_THREAD:-} == 1 ]]; then
 	zig_modules "$scratch" "$scratch/version" -fsanitize-thread
 	tests=("${modules[@]}")
+	runner=("${modules[@]}")
 fi
 
 # ZIG_TEST_WAIT_FOR_DB=1: between compiling the tests and running them, wait for the database
@@ -48,7 +53,7 @@ fi
 export ZIG_RUNNER_TEST_EXE="$scratch/runner"
 (
 	rc=0
-	zig build-exe "${plain[@]}" --name runner -femit-bin="$scratch/runner" || rc=$?
+	zig build-exe "${runner[@]}" --name runner -femit-bin="$scratch/runner" || rc=$?
 	echo "$rc" >"$scratch/runner.rc"
 ) &
 exe=$!
@@ -56,12 +61,18 @@ exe=$!
 run+=(--test-cmd bash --test-cmd -c --test-cmd 'until [ -e "$0" ]; do sleep 0.2; done; exec "$@"'
 	--test-cmd "$scratch/runner.rc")
 # ZIG_TEST_NATIVE_AS_ROOT=1: only the native backend's tests, as root (sudo), where they take the
-# root runner's path: each job its own range of ids and its own network.
+# root runner's path: each job its own range of ids and its own network. The store's stress test
+# (src/native/store_stress.zig) keeps its settings under sudo.
+# ZIG_TEST_FILTER: only the tests whose names contain it (with ZIG_TEST_NATIVE_AS_ROOT=1, it
+# should name native tests only), as the nightly analysis workflow runs the stress test alone.
 filter=()
 if [[ ${ZIG_TEST_NATIVE_AS_ROOT:-} == 1 ]]; then
 	filter=(--test-filter native)
 	run+=(--test-cmd sudo
-		--test-cmd '--preserve-env=ZIG_RUNNER_TEST_EXE,ZIG_RUNNER_REQUIRE_NATIVE,ZIG_RUNNER_SERVICE_IMAGES')
+		--test-cmd '--preserve-env=ZIG_RUNNER_TEST_EXE,ZIG_RUNNER_REQUIRE_NATIVE,ZIG_RUNNER_SERVICE_IMAGES,ZIG_TEST_STORE_STRESS_SECONDS,ZIG_TEST_STORE_STRESS_PROCS,ZIG_TEST_STORE_STRESS_SEED')
+fi
+if [[ -n ${ZIG_TEST_FILTER:-} ]]; then
+	filter=(--test-filter "$ZIG_TEST_FILTER")
 fi
 run+=(--test-cmd-bin)
 zig test "${tests[@]}" "${filter[@]}" "${run[@]}"

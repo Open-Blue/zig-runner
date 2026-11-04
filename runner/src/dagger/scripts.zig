@@ -194,10 +194,17 @@ fn writeRunScript(
     try w.writeAll(")\nrc=$?\n");
 }
 
-/// After a step: its file commands in one file (`all_<fc>`), each after a
-/// `::zig-file-command::<kind>` line and followed by one newline, so the query reads one file
-/// instead of one per kind (each read mounts the step's snapshot in the engine). Only `cat` and
-/// `printf` are needed.
+/// After a step: its file commands in one file (`all_<fc>`), so the query reads one file instead
+/// of one per kind (each read mounts the step's snapshot in the engine). Each kind's file follows a
+/// `::zig-file-command::<kind> <bytes>` line, which says how long it is, and one newline; the
+/// job's ran marker comes last, on the line after `::zig-file-command::ran` (`combinedPart` reads
+/// it). Only `cat`, `wc` and `printf` are needed.
+///
+/// The lengths are what keep one file's text from passing for another's: the file commands are
+/// the step's to write, and a step's output or summary often holds text it does not control (a
+/// pull request's title). When each file instead ran to the next marker line, a value holding
+/// `::zig-file-command::env` and lines after it, in a heredoc of GITHUB_OUTPUT, was read as the
+/// step's GITHUB_ENV: `BASH_ENV=...` there ran code in every later step.
 pub fn writeCombinedFileCommands(
     w: *std.Io.Writer,
     arena: Allocator,
@@ -205,16 +212,126 @@ pub fn writeCombinedFileCommands(
     fc: u32,
 ) !void {
     try w.writeAll("{ ");
-    for (fc_kinds) |k| try w.print(
-        "printf '%s\\n' '" ++ fc_marker ++ "{s}'; {s}cat {s}; printf '\\n'; ",
-        .{ k, prefix, try fcPath(arena, k, fc) },
-    );
+    for (fc_kinds) |k| {
+        const path = try fcPath(arena, k, fc);
+        try w.print(
+            "printf '%s %s\\n' '" ++ fc_marker ++ "{s}' \"$({s}wc -c < {s})\"; {s}cat {s}; printf '\\n'; ",
+            .{ k, prefix, path, prefix, path },
+        );
+    }
     // The job's marker (see `ran_env`): a result replayed from Dagger's cache has an earlier job's.
     try w.writeAll("printf '%s\\n%s\\n' '" ++ fc_marker ++ "ran' \"${" ++ ran_env ++ "-}\"; ");
     try w.print("}} > {s}\n", .{try fcPath(arena, "all", fc)});
 }
 
 pub const fc_marker = "::zig-file-command::";
+
+/// `parts` (a kind and its file's text each) and then `ran`, as `writeCombinedFileCommands`'s
+/// script writes them.
+pub fn combine(arena: Allocator, parts: []const [2][]const u8, ran: []const u8) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    for (parts) |p| try w.print(fc_marker ++ "{s} {d}\n{s}\n", .{ p[0], p[1].len, p[1] });
+    try w.print(fc_marker ++ "ran\n{s}\n", .{ran});
+    return aw.written();
+}
+
+/// One kind's text in a combined file (`writeCombinedFileCommands`); for `ran`, the ran marker's
+/// value. Null when the file has no such kind, or is not whole: a part's length (`wc` failed, or
+/// the file grew while it was read) or the newline after a part out of place, or no ran marker
+/// at the end. The parts are read in turn, each its length long, so nothing inside one is ever
+/// taken for a marker.
+pub fn combinedPart(all: []const u8, kind: []const u8) ?[]const u8 {
+    var rest = all;
+    while (true) {
+        if (!std.mem.startsWith(u8, rest, fc_marker)) return null;
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse return null;
+        const head = rest[fc_marker.len..nl];
+        const body = rest[nl + 1 ..];
+        const space = std.mem.indexOfScalar(u8, head, ' ') orelse {
+            // The ran marker, last: its value up to the newline the script ends it with.
+            if (!std.mem.eql(u8, head, "ran")) return null;
+            const value = if (std.mem.endsWith(u8, body, "\n")) body[0 .. body.len - 1] else body;
+            return if (std.mem.eql(u8, kind, "ran")) value else null;
+        };
+        const len = std.fmt.parseInt(usize, std.mem.trim(u8, head[space + 1 ..], " \t"), 10) catch
+            return null;
+        if (body.len <= len or body[len] != '\n') return null;
+        if (std.mem.eql(u8, head[0..space], kind)) return body[0..len];
+        rest = body[len + 1 ..];
+    }
+}
+
+/// Whether a combined file is well formed (`combinedPart`): every part where its length says,
+/// up to its end or its ran marker. (Whether the ran marker is there is `combinedPart`'s to say.)
+pub fn combinedWhole(all: []const u8) bool {
+    var rest = all;
+    while (rest.len > 0) {
+        if (!std.mem.startsWith(u8, rest, fc_marker)) return false;
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse return false;
+        const head = rest[fc_marker.len..nl];
+        const body = rest[nl + 1 ..];
+        const space = std.mem.indexOfScalar(u8, head, ' ') orelse return std.mem.eql(u8, head, "ran");
+        const len = std.fmt.parseInt(usize, std.mem.trim(u8, head[space + 1 ..], " \t"), 10) catch
+            return false;
+        if (body.len <= len or body[len] != '\n') return false;
+        rest = body[len + 1 ..];
+    }
+    return true;
+}
+
+test "a combined file's parts are read by their lengths: a marker inside one is its text" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // GITHUB_OUTPUT's value holds what passed for the env part, and the ran marker.
+    const output = "title<<EOF_7f3a\n::zig-file-command::env 13\nBASH_ENV=/x\n\n" ++
+        "::zig-file-command::ran\nforged\nEOF_7f3a\n";
+    const all = try combine(ar, &.{
+        .{ "output", output },
+        .{ "env", "" },
+        .{ "path", "/opt/x/bin\n" },
+        .{ "step_summary", "no newline at end" },
+        .{ "state", "" },
+    }, "j1");
+    try std.testing.expectEqualStrings(output, combinedPart(all, "output").?);
+    try std.testing.expectEqualStrings("", combinedPart(all, "env").?);
+    try std.testing.expectEqualStrings("/opt/x/bin\n", combinedPart(all, "path").?);
+    try std.testing.expectEqualStrings("no newline at end", combinedPart(all, "step_summary").?);
+    try std.testing.expectEqualStrings("j1", combinedPart(all, "ran").?);
+    try std.testing.expect(combinedPart(all, "missing") == null);
+    try std.testing.expect(combinedWhole(all));
+    // Cut short, a length wrong, or `wc`'s answer missing: nothing is read from it.
+    try std.testing.expect(!combinedWhole(all[0 .. all.len - 40]));
+    try std.testing.expect(combinedPart(all[0 .. all.len - 40], "ran") == null);
+    try std.testing.expect(combinedPart("::zig-file-command::env 2\nA=1\n::zig-file-command::ran\nj\n", "env") == null);
+    try std.testing.expect(combinedPart("::zig-file-command::env \nA=1\n::zig-file-command::ran\nj\n", "env") == null);
+    // As wc may pad it.
+    try std.testing.expectEqualStrings("A=1\n", combinedPart("::zig-file-command::env    4\nA=1\n\n::zig-file-command::ran\nj\n", "env").?);
+}
+
+test "the combined file the script writes is read back part by part" {
+    const io = std.testing.io;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", ar);
+    var script: std.Io.Writer.Allocating = .init(ar);
+    try writeCombinedFileCommands(&script.writer, ar, "", 3);
+    // The script's paths, under the test's directory.
+    const text = try std.mem.replaceOwned(u8, ar, script.written(), fc_dir, dir);
+    const contents = [_][]const u8{ "a<<E\n::zig-file-command::env 4\nX=1\n\nE\n", "", "/p\n", "no newline", "s=1\n" };
+    for (fc_kinds, contents) |k, c| try tmp.dir.writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(ar, "{s}_3", .{k}),
+        .data = c,
+    });
+    _ = try std.process.run(ar, io, .{ .argv = &.{ "sh", "-c", text } });
+    const all = try tmp.dir.readFileAlloc(io, "all_3", ar, .limited(1 << 20));
+    for (fc_kinds, contents) |k, c| try std.testing.expectEqualStrings(c, combinedPart(all, k).?);
+    try std.testing.expectEqualStrings("", combinedPart(all, "ran").?);
+}
 
 /// `<env_cmd>-u <aliases> NAME=value ... GITHUB_OUTPUT=... GITHUB_ACTION=... `: what a step's
 /// command starts with, so it gets its env (secret values expanded from their aliases, see

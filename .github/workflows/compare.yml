@@ -16,8 +16,8 @@ name: compare
 # The seed is the run number (or the one given), and is printed: a failure reproduces locally with
 # the same script and seed.
 #
-# The tools' own Go is linted here too (go-lint.sh: go vet, staticcheck, and govulncheck for
-# information), as ci.yml does on a pull request that changes them.
+# The tools' own Go is linted here too (go-lint.sh: go vet, staticcheck, the race detector, and
+# govulncheck for information), as ci.yml does on a pull request that changes them.
 
 on:
   schedule:
@@ -81,7 +81,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: go vet and staticcheck
+      - name: go vet, staticcheck and the race detector
         run: .github/scripts/go-lint.sh
 
       - name: govulncheck (informational)

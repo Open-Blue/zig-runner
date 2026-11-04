@@ -25,6 +25,9 @@ pub const Store = struct {
     held: *std.ArrayList(std.Io.File),
     /// The job's trust scope (`set_up.packageCacheScope`: `repo` or `untrusted`), in every key.
     scope: []const u8,
+    /// Ends `publish`'s wait for its key's lock (`P2Store.lockKey`). That wait is only for another
+    /// builder's publish of the same layer, so nothing sets it but the tests.
+    stop: *const std.atomic.Value(bool) = &never_stop,
 
     fn key(s: Store, hex: []const u8) !P2Store.Key {
         var k: P2Store.Key = undefined;
@@ -59,20 +62,31 @@ pub const Store = struct {
 
     /// Stores the directory `begin` gave under `key`, held for the job, and returns the layer's
     /// path. When another builder stored the key first, its layer is used and this one removed.
+    /// Under the key's lock, as a step's publish is (`Backend.claimKey`): `collect` takes a
+    /// `.tmp-` entry whose key's lock is free for a dead runner's and removes it, which, under a
+    /// publish, would empty the entry the rename makes visible (proofs/tla/StoreLocking.tla).
     pub fn publish(s: Store, arena: Allocator, io: std.Io, built: []const u8, hex: []const u8) ![]const u8 {
         const k = try s.key(hex);
-        // Kind `fetch`: a tree with an empty record, never replayed as a step's (P2 has no
-        // `build` kind yet).
-        const layer = s.store.publish(arena, io, k, .fetch, built, .{ .log = "", .fc = "" }) catch |e| {
-            const first = (try s.store.open(arena, io, k)) orelse return e;
+        const key_lock = try s.store.lockKey(arena, io, k, s.stop);
+        defer key_lock.close(io);
+        // Looked up first, under the lock: a layer another builder stored is used, and one that
+        // is not there cannot appear before this publish. Publishing first and looking up on a
+        // refused rename failed the build when a collect evicted the other builder's layer in
+        // between (the store's stress test, `store_stress.zig`).
+        if (try s.store.open(arena, io, k)) |first| {
             P2Store.removeTree(arena, io, built);
             try s.held.append(arena, first.layer.lock);
             return first.layer.fs;
-        };
+        }
+        // Kind `fetch`: a tree with an empty record, never replayed as a step's (P2 has no
+        // `build` kind yet).
+        const layer = try s.store.publish(arena, io, k, .fetch, built, .{ .log = "", .fc = "" });
         try s.held.append(arena, layer.lock);
         return layer.fs;
     }
 };
+
+const never_stop: std.atomic.Value(bool) = .init(false);
 
 test "a layer is published once, whole, under its key" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -100,4 +114,52 @@ test "a layer is published once, whole, under its key" {
     // Another trust scope's jobs never take it (finding 4 of the trial integration, #275).
     const untrusted: Store = .{ .dir = root, .store = .{ .root = root }, .held = &held, .scope = "untrusted" };
     try std.testing.expect(try untrusted.get(arena, io, key) == null);
+}
+
+test "a layer is published under its key's lock, so collect never takes its entry for a dead one's" {
+    // The counterexample of proofs/tla/StoreLocking.tla: a build's publish ran without the key's
+    // lock, so another runner's `collect`, finding the lock free, removed the `.tmp-` entry while
+    // it was renamed into place, and readers took a layer emptied under them.
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try P2Store.prepare(arena, io, root, .{ .check_parents = false });
+    var held: std.ArrayList(std.Io.File) = .empty;
+    defer for (held.items) |f| f.close(io);
+    const store: Store = .{ .dir = root, .store = .{ .root = root }, .held = &held, .scope = "repo" };
+    const key = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    const built = try store.begin(arena, io, key);
+    const file = try std.fmt.allocPrint(arena, "{s}/f", .{built});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = "layer" });
+
+    // Another runner holds the key's lock (a builder publishing it, or `collect` checking a
+    // `.tmp-` entry of it): this publish waits for it, here until stopped, and begins nothing.
+    var never: std.atomic.Value(bool) = .init(false);
+    const other = try store.store.lockKey(arena, io, try store.key(key), &never);
+    var stop: std.atomic.Value(bool) = .init(true);
+    var stopped = store;
+    stopped.stop = &stop;
+    try std.testing.expectError(error.Stopped, stopped.publish(arena, io, built, key));
+    const layers_path = try std.fmt.allocPrint(arena, "{s}/layers", .{root});
+    var layers = try std.Io.Dir.cwd().openDir(io, layers_path, .{ .iterate = true });
+    defer layers.close(io);
+    var it = layers.iterate();
+    if (try it.next(io)) |e| {
+        std.debug.print("an entry in layers/ the stopped publish began: {s}\n", .{e.name});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(try store.get(arena, io, key) == null);
+    const kept = try std.Io.Dir.cwd().readFileAlloc(io, file, arena, .limited(16));
+    try std.testing.expectEqualStrings("layer", kept);
+
+    // Once the lock is free the publish goes through, and lets the lock go after it.
+    other.close(io);
+    const p = try store.publish(arena, io, built, key);
+    try std.testing.expectEqualStrings(p, (try store.get(arena, io, key)).?);
+    const again = try store.store.lockKey(arena, io, try store.key(key), &stop);
+    again.close(io);
 }

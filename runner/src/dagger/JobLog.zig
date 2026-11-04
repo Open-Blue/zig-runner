@@ -557,6 +557,14 @@ fn dupeOpt(a: Allocator, s: ?[]const u8) Allocator.Error!?[]const u8 {
     return if (s) |t| try a.dupe(u8, t) else null;
 }
 
+/// Where to cut `text`, the start of a line too long to hold whole, under the job's secrets and
+/// masks so far (`redact.cut`); null to hold it longer, unless `force`.
+pub fn cutLine(sh: *JobLog, text: []const u8, force: bool) ?redact.Cut {
+    sh.mu.lockUncancelable(sh.io);
+    defer sh.mu.unlock(sh.io);
+    return redact.cut(text, sh.log.currentSecrets(), sh.masks, force);
+}
+
 /// `text` with the job's secrets and masks so far replaced, for what leaves the runner other
 /// than through the log (a step's evaluated name, a job output).
 pub fn redacted(sh: *JobLog, arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
@@ -843,6 +851,9 @@ pub const SpanDemux = struct {
     gpa: Allocator,
     mu: std.Io.Mutex = .init,
     spans: std.StringHashMapUnmanaged(Span) = .empty,
+    /// From this many bytes, a line joined from a span's pieces is cut (`onRecord`); tests make
+    /// it smaller.
+    max_line: usize = max_line_bytes,
 
     pub const Span = struct {
         step: ?u32 = null,
@@ -851,8 +862,7 @@ pub const SpanDemux = struct {
         partial: std.ArrayList(u8) = .empty,
     };
 
-    /// The longest line joined from a span's pieces (`onRecord`).
-    const max_line_bytes = 1024 * 1024;
+    pub const max_line_bytes = 1024 * 1024;
 
     pub fn onRecord(ptr: *anyopaque, rec: engine.LogRecord) void {
         const d: *SpanDemux = @ptrCast(@alignCast(ptr));
@@ -876,10 +886,22 @@ pub const SpanDemux = struct {
         }
         span.partial.replaceRangeAssumeCapacity(0, start, &.{});
         // Output with no newline in it (`head -c 200M /dev/zero`) is a line that never ends: past
-        // `max_line_bytes` what has come is a line of its own, rather than all of it held here.
-        if (span.partial.items.len >= max_line_bytes) {
-            d.line(span, span.partial.items);
-            span.partial.clearAndFree(d.gpa);
+        // `max_line` what has come is a line of its own, rather than all of it held here. Cut
+        // where no secret spans the cut (`redact.cut`): cut anywhere, a secret split between two
+        // lines was shown, half on each. Held up to four times as long for such a place.
+        // A workflow command is not cut before then at all: its head would be carried out as a
+        // command of its own and its tail logged as text, so `::add-mask::` with a long value
+        // masked the value's start and logged the rest.
+        if (span.partial.items.len >= d.max_line) {
+            const p = span.partial.items;
+            const force = p.len >= 4 * d.max_line;
+            const command = std.mem.startsWith(u8, std.mem.trimStart(u8, p, &std.ascii.whitespace), "::") or
+                std.mem.indexOf(u8, p, "##[") != null;
+            if (if (command and !force) null else d.sh.cutLine(p, force)) |c| {
+                d.line(span, if (c.masked) redact.mask else span.partial.items[0..c.at]);
+                span.partial.replaceRangeAssumeCapacity(0, c.at, &.{});
+                if (span.partial.items.len == 0) span.partial.clearAndFree(d.gpa);
+            }
         }
         if (rec.eof and span.partial.items.len > 0) {
             d.line(span, span.partial.items);
@@ -1280,6 +1302,38 @@ test "a marker a step prints itself, naming no step of the job, is output, not a
     try std.testing.expect(ended[0].load(.acquire));
 }
 
+test "a long line is cut where it splits no secret" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f: LogPathFixture = undefined;
+    f.init(a.allocator());
+    var out: std.Io.Writer.Allocating = .init(a.allocator());
+    f.log = .{ .stdout = .{ .writer = &out.writer } };
+    f.log.setSecrets(try redact.expand(a.allocator(), &.{"s3cret-value"}));
+    f.sh.mark = "m";
+    var sd: SpanDemux = .{ .sh = &f.sh, .gpa = std.testing.allocator, .max_line = 16 };
+    defer sd.deinit();
+    SpanDemux.onRecord(&sd, .{ .span = "s", .stream = 1, .text = marker ++ "begin 1 m\n" });
+    // 32 bytes with no newline, the secret across byte 16, in pieces of 5.
+    const text = "0123456789abc s3cret-value 98765";
+    var i: usize = 0;
+    while (i < text.len) : (i += 5)
+        SpanDemux.onRecord(&sd, .{ .span = "s", .stream = 1, .text = text[i..@min(i + 5, text.len)] });
+    SpanDemux.onRecord(&sd, .{ .span = "s", .stream = 1, .text = "\n" });
+    // Cut where the secret was not, so it is masked whole: cut at byte 16, its two halves
+    // were each shown.
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "s3cret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "value") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "***") != null);
+    // A command is not cut short of four times the length: cut, `::add-mask::` masked its
+    // value's start and logged the rest.
+    const add = "::add-mask::a-long-added-mask-value\n";
+    for (add) |ch| SpanDemux.onRecord(&sd, .{ .span = "s", .stream = 1, .text = &.{ch} });
+    SpanDemux.onRecord(&sd, .{ .span = "s", .stream = 1, .text = "then a-long-added-mask-value\n" });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "mask-value") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "then ***") != null);
+}
+
 test "output with no newline is cut into lines of max_line_bytes, not held whole" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -1489,9 +1543,10 @@ test "masks cost memory in proportion to their number, and a repeated one costs 
     const n = 2000;
     const before = a.queryCapacity();
     for (0..n) |i| sh.stepOutput(1, try std.fmt.bufPrint(&buf, "::add-mask::secret-value-{d}", .{i}));
-    // About 470 bytes each (930 KB), the trie and the arena's spare room included. Each
-    // mask copied the whole list and sorted it again: 130 MB here, 5.8 GB for 20000.
-    try std.testing.expect(a.queryCapacity() - before < n * 1024);
+    // About 2.1 KB each (4.2 MB), the trie and the arena's spare room included: each mask is
+    // kept in its forms, base64 at three offsets among them (redact.forms). Each mask copied
+    // the whole list and sorted it again: 130 MB here, 5.8 GB for 20000.
+    try std.testing.expect(a.queryCapacity() - before < n * 4096);
     const after_masks = a.queryCapacity();
     for (0..n) |_| sh.stepOutput(1, "::add-mask::secret-value-7");
     try std.testing.expect(a.queryCapacity() - after_masks < 16 * 1024);
@@ -1535,6 +1590,39 @@ test "stop-commands lasts to the end of its exec, and a refused token stops noth
     sh.stepOutput(1, "::add-mask::x");
     try std.testing.expect(f.cmds[0].stop_token == null);
     try std.testing.expect(!sh.holdsSecret("x", 1));
+}
+
+test "a stop-commands token longer than six bytes is masked; set-env and add-path keep what they set" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f: LogPathFixture = undefined;
+    f.init(a.allocator());
+    const sh = &f.sh;
+    sh.beginCommands(1, &.{});
+    // Six bytes: not masked, as GitHub's runner leaves it. Seven: masked from then on.
+    sh.stepOutput(1, "::stop-commands::tok123");
+    sh.stepOutput(1, "::tok123::");
+    try std.testing.expect(!sh.holdsSecret("tok123", 1));
+    sh.stepOutput(1, "::stop-commands::tok1234");
+    sh.stepOutput(1, "::tok1234::");
+    try std.testing.expect(sh.holdsSecret("tok1234", 1));
+
+    // Allowed, set-env and add-path keep their values, a one-byte name or path too.
+    sh.beginCommands(1, &.{.{ .name = "ACTIONS_ALLOW_UNSECURE_COMMANDS", .value = "true" }});
+    sh.stepOutput(1, "::set-env name=A::one");
+    sh.stepOutput(1, "::set-env name=LONGER::two");
+    sh.stepOutput(1, "::add-path::/");
+    const u = sh.takeUnsecure(1);
+    try std.testing.expect(!u.failed);
+    try std.testing.expectEqual(@as(usize, 2), u.env.len);
+    try std.testing.expectEqualStrings("A", u.env[0].name);
+    try std.testing.expectEqualStrings("one", u.env[0].value);
+    try std.testing.expectEqualStrings("LONGER", u.env[1].name);
+    try std.testing.expectEqual(@as(usize, 1), u.paths.len);
+    try std.testing.expectEqualStrings("/", u.paths[0]);
+    // Taken: the next call has nothing.
+    const again = sh.takeUnsecure(1);
+    try std.testing.expectEqual(@as(usize, 0), again.env.len + again.paths.len);
 }
 
 test "a matched line is logged as the issue; a file outside the workspace is dropped" {
