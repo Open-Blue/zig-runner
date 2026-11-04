@@ -1,0 +1,56 @@
+name: store model
+
+# The native layer store's locking protocol, model-checked with TLC (proofs/tla/StoreLocking.tla,
+# proofs/README.md "The store's locking, in TLA+"): its safety and liveness must hold, and each
+# mutant (the code with one guard taken away) must fail. tla2tools.jar is pinned with its sha256 in
+# tlc.sh. On pull requests and pushes to main that touch the store, its callers or the model, and
+# weekly with the proofs. Not a required check, so a path filter is enough (proofs.yml needs
+# ci-scope.sh because it is one), and the merge queue does not run it.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - proofs/tla/**
+      - runner/src/native/Store.zig
+      - runner/src/native/Backend.zig
+      - runner/src/native/layers.zig
+      - .github/workflows/store-model.yml
+      - .github/scripts/tlc.sh
+  pull_request:
+    paths:
+      - proofs/tla/**
+      - runner/src/native/Store.zig
+      - runner/src/native/Backend.zig
+      - runner/src/native/layers.zig
+      - .github/workflows/store-model.yml
+      - .github/scripts/tlc.sh
+  schedule:
+    - cron: "41 5 * * 1" # Mondays, 05:41 UTC, with proofs.yml
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: store-model-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tlc:
+    name: TLC
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Check the store's locking protocol
+        run: .github/scripts/tlc.sh

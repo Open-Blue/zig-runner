@@ -22,6 +22,7 @@ const expr = @import("../expr.zig");
 const Exec = @import("../dagger/Exec.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
 const JobLog = @import("../dagger/JobLog.zig");
+const redact = @import("../redact.zig");
 const Backend = @import("Backend.zig");
 const sandbox = @import("sandbox.zig");
 const health = @import("health.zig");
@@ -90,7 +91,12 @@ const Lines = struct {
             rest = rest[nl + 1 ..];
         }
         l.partial.appendSlice(l.arena, rest) catch return;
-        if (l.partial.items.len >= max_line) l.emit();
+        // Cut where no secret spans the cut (`JobLog.cutLine`), as a step's long line is.
+        if (l.partial.items.len >= max_line) {
+            const c = l.sh.cutLine(l.partial.items, l.partial.items.len >= 4 * max_line) orelse return;
+            l.sh.serviceLine(l.n, if (c.masked) redact.mask else l.partial.items[0..c.at]);
+            l.partial.replaceRangeAssumeCapacity(0, c.at, &.{});
+        }
     }
 
     fn emit(l: *Lines) void {

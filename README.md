@@ -124,17 +124,13 @@ It is not a required check yet. Before a release, run the same suite by hand aga
 `compare` runs the comparison tools weekly
 (`.github/scripts/*-diff.sh`): the expression evaluator, YAML reader, `hashFiles()`, problem
 matcher regular expressions, HPACK decoder and RS256 signing against the implementations they
-follow, on fresh random cases; and lints the tools' own Go (`.github/scripts/go-lint.sh`: `go vet`
-and a pinned staticcheck, which "Go tools" in `ci` also runs on a pull request that changes them,
-and govulncheck for information).
+follow, on fresh random cases; and lints the tools' own Go (`.github/scripts/go-lint.sh`: `go vet`,
+a pinned staticcheck and Go's race detector, which "Go tools" in `ci` also runs on a pull request
+that changes them, and govulncheck for information).
 CodeQL and Semgrep read no Zig, so the runner's own code has analysis of its own. "Lint (ZLint)"
 (`ci`, `.github/scripts/zlint.sh`) runs [ZLint](https://github.com/DonIsaac/zlint) on every pull
 request, pinned and checked against its release's checksum, with the rules that find bugs
-(`runner/zlint.json`; the script says why each other rule is off). `analysis` runs nightly: "ZLint
-(suppressed-errors)" runs the rule for `catch {}` and `catch unreachable`, which ZLint cannot yet
-disable line by line, against the sites read and meant (`.github/scripts/zlint-suppressed.baseline`,
-each by its file and a fingerprint of its line, so moved lines stay known), failing on a new one,
-listed (`.github/scripts/zlint.sh suppressed-errors`; `--update` rewrites the baseline); "Fuzz"
+(`runner/zlint.json`; the script says why each other rule is off). `analysis` runs nightly: "Fuzz"
 runs each of `runner/src/fuzz.zig`'s targets (an image layer's tar, PAX and paths applied beside a
 directory it must not reach; image references, registry challenges and manifests; expressions,
 YAML, regular expressions, HPACK, `hashFiles()` patterns, minisign signatures, workflow commands
@@ -145,7 +141,18 @@ artifact; `zig build test` runs the same targets over their seed corpus every ti
 `zig build test -Dllvm --fuzz` (add `-Dtest-filter='fuzz: YAML'` for one target). "Valgrind" runs
 every test under memcheck (`.github/scripts/zig-valgrind.sh`), for reads of memory never written
 and accesses outside an allocation, which Debug's safety checks miss; known-benign reports are
-suppressed in `.github/valgrind.supp`, each with why.
+suppressed in `.github/valgrind.supp`, each with why. "ThreadSanitizer, native" runs the native
+backend's tests under ThreadSanitizer on x86_64 and arm64, rootless and as root, with the runner
+binary they start for each step built with it too (`ZIG_TEST_SANITIZE_THREAD=1`, which ci's
+Database tests job sets where those tests skip); "ThreadSanitizer, end to end" runs ci's end-to-end
+suite on both backends with a runner built under it (`e2e.sh build BIN tsan`), failing on any report
+in the runner's log or the jobs' (`e2e.sh races`). TSan's runtime needs glibc's dynamic loader, so
+these builds are dynamically linked PIEs, not the release's static PIE.
+"Stress" runs the concurrency-sensitive tests (cancels, deadlines, the memory gate, the native
+store's locks, the database, the broker's long-poll, log uploads;
+`.github/scripts/zig-race-tests.sh` names them) 100 times over under stress-ng's CPU and memory
+load, with the database, and fails on the first round that fails, its output an artifact
+(`.github/scripts/zig-stress.sh`).
 `proofs` checks the [Lean proofs](proofs/README.md) (the step cache, the regex matcher's loops, and
 the `hashFiles()` walk) and compares the walk's model with `runner/src/glob.zig` on random cases,
 when either changes and weekly ("Proofs"). The workflows are written to be hard to turn against the
@@ -169,11 +176,10 @@ repository:
   (`runner/src/dagger.zig`, checked by `.github/scripts/ubuntu-pin.sh`); the packages provisioning
   installs into it come from the Ubuntu archive on the day the engine builds them, and the pre-warm
   logs their fingerprint. tls.zig and GitHub's expression
-  test cases are pinned by commit. Zig, changie, checksec, gitleaks, ZLint, hadolint and shfmt are
-  checked against pinned checksums before they run, tls.zig against its `.hash` as well; a Renovate
-  pull request for a new Zig, tls.zig, changie, hadolint or shfmt fails until its checksums are
-  updated (changie's by the Workflows job, which downloads it on every pull request, though only
-  the release runs it).
+  test cases are pinned by commit. Zig, changie, checksec and gitleaks are checked against pinned checksums
+  before they run, tls.zig against its `.hash` as well; a Renovate pull request for a new Zig, tls.zig or
+  changie fails until its checksums are updated (changie's by the Workflows job, which downloads
+  it on every pull request, though only the release runs it).
 - **Verifiable releases.** Every binary and image has a signed provenance attestation saying which
   workflow built it from which commit. Check a binary as razorbill does, built by `release.yml` from
   its tag on GitHub's own runners:
@@ -216,11 +222,13 @@ repository:
   (`.github/scripts/shellcheck.sh`) and shfmt its format (`.github/scripts/shfmt.sh`, shfmt's
   defaults: tabs; `-w` formats), hadolint the Dockerfile (`.github/scripts/hadolint.sh`; a finding
   kept is ignored on its instruction, with why), `busybox-pin.sh` the runner's busybox pin, and CodeQL the
-  workflows, the Go tools and the Python generators, which `go vet` and staticcheck lint too
-  (`.github/scripts/go-lint.sh`); every job has a time limit. The Database
+  workflows, the Go tools and the Python generators, which `go vet`, staticcheck and the race
+  detector check too (`.github/scripts/go-lint.sh`); every job has a time limit. The Database
   tests job runs every test under
   ThreadSanitizer (`zig build test -Dsanitize-thread` locally); ZLint checks the runner's Zig, and
-  `analysis` fuzzes its parsers and runs its tests under Valgrind nightly (above). Vulnerabilities
+  `analysis` fuzzes its parsers, runs its tests under Valgrind, its native backend's tests and the
+  end-to-end suite under ThreadSanitizer, and its concurrency-sensitive tests under load nightly
+  (above). Vulnerabilities
   are reported privately ([docs/SECURITY.md](docs/SECURITY.md)).
 - **One secret, one step.** The deploy key that may push to `main` is the `prod` environment's,
   which deploys only from `main` and waits for approval; it is loaded only in the step that pushes,
