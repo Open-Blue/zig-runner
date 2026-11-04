@@ -8,6 +8,8 @@
 #   ci-scope.sh proofs       Proofs (proofs.yml)
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)
 #   ci-scope.sh go           Go tools (ci.yml)
+#   ci-scope.sh analysis     Fuzz, Valgrind, ThreadSanitizer, Stress, Store stress, ZLint (suppressed-errors) (analysis.yml)
+#   ci-scope.sh coverage     Coverage (analysis.yml)
 #
 # Sets `run=true` or `run=false` in GITHUB_OUTPUT, and says why. The jobs still run, and report,
 # either way: a required check that never reports holds the merge queue forever, which a
@@ -124,13 +126,35 @@ needed() {
 		*) return 1 ;;
 		esac
 		;;
+	analysis)
+		# Only the searches themselves, on a pull request: a change to the runner's code is the
+		# nightly run's to search, not every pull request's (each costs minutes per target).
+		case $1 in
+		.github/workflows/analysis.yml | .github/scripts/ci-scope.sh | \
+			.github/scripts/zig-fuzz.sh | .github/scripts/zig-valgrind.sh | \
+			.github/scripts/zig-race-tests.sh | .github/scripts/zig-stress.sh | \
+			.github/scripts/zlint.sh | .github/scripts/zlint-suppressed.baseline | \
+			.github/valgrind.supp) return 0 ;;
+		*) return 1 ;;
+		esac
+		;;
+	coverage)
+		# The runner's code and its tests as zig-coverage.sh compiles and measures them.
+		case $1 in
+		runner/src/* | runner/build.zig.zon | .github/workflows/analysis.yml | \
+			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
+			.github/scripts/zig-modules.sh | .github/scripts/zig-coverage.sh | \
+			.github/scripts/native-service-images.sh) return 0 ;;
+		*) return 1 ;;
+		esac
+		;;
 	esac
 }
 
 case $scope in
-tests | binaries | e2e | proofs | packaging | go) ;;
+tests | binaries | e2e | proofs | packaging | go | analysis | coverage) ;;
 *)
-	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go" >&2
+	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|analysis|coverage" >&2
 	exit 2
 	;;
 esac
