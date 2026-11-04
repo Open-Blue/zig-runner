@@ -37,7 +37,10 @@ mkdir -p "$out"
 setsid "${STRESS_NG:-stress-ng}" --cpu "$(nproc)" --vm 2 --vm-bytes 50% --timeout 0 --quiet &
 load=$!
 sleep 2
-kill -0 "$load" || { echo "::error title=Stress::stress-ng did not start"; exit 1; }
+kill -0 "$load" || {
+	echo "::error title=Stress::stress-ng did not start"
+	exit 1
+}
 
 # A round takes about 11 s on an idle 4-core runner; 300 s is a hang.
 stop="stress-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"

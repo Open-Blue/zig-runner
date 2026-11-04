@@ -2074,6 +2074,12 @@ fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
     const lock = s.lockKey(arena, b.io, k, &b.stop_wait) catch |e| {
         b.waiting.store(false, .release);
         if (e == error.Stopped) return error.Stopped;
+        // The task's cancel stops the step as `abort` does. std.Io delivers it once: re-armed, so
+        // what runs next sees it too, instead of the job going on uncached.
+        if (e == error.Canceled) {
+            b.io.recancel();
+            return error.Stopped;
+        }
         std.log.warn("native: the step store's lock: {s}", .{@errorName(e)});
         return .{};
     };
