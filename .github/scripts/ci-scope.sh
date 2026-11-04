@@ -8,7 +8,8 @@
 #   ci-scope.sh proofs       Proofs (proofs.yml)
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)
 #   ci-scope.sh go           Go tools (ci.yml)
-#   ci-scope.sh analysis     Fuzz, Valgrind, ThreadSanitizer, Stress, Store stress, ZLint (suppressed-errors) (analysis.yml)
+#   ci-scope.sh analysis     Fuzz, Valgrind, ThreadSanitizer, Stress, ZLint (suppressed-errors) (analysis.yml)
+#   ci-scope.sh store        Store stress (analysis.yml)
 #   ci-scope.sh coverage     Coverage (analysis.yml)
 #
 # Sets `run=true` or `run=false` in GITHUB_OUTPUT, and says why. The jobs still run, and report,
@@ -138,6 +139,19 @@ needed() {
 		*) return 1 ;;
 		esac
 		;;
+	store)
+		# What its jobs run through: the store and its layers, the key locks and publishes in
+		# Backend, the mounts in sandbox. A change there can lose a layer in ways ci's 30 s of
+		# the same test rarely shows, so it is searched before it merges, not only that night.
+		case $1 in
+		runner/src/native/Store.zig | runner/src/native/store_stress.zig | \
+			runner/src/native/layers.zig | runner/src/native/Backend.zig | \
+			runner/src/native/sandbox.zig | .github/workflows/analysis.yml | \
+			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
+			.github/scripts/zig-test.sh) return 0 ;;
+		*) return 1 ;;
+		esac
+		;;
 	coverage)
 		# The runner's code and its tests as zig-coverage.sh compiles and measures them.
 		case $1 in
@@ -152,9 +166,9 @@ needed() {
 }
 
 case $scope in
-tests | binaries | e2e | proofs | packaging | go | analysis | coverage) ;;
+tests | binaries | e2e | proofs | packaging | go | analysis | store | coverage) ;;
 *)
-	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|analysis|coverage" >&2
+	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|analysis|store|coverage" >&2
 	exit 2
 	;;
 esac
