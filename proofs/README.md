@@ -403,15 +403,18 @@ explores every state of a bounded instance, and the bounds are below.
 | `NoWrongValid` | in no state, after any crash, is there an entry `readEntry` would accept whose tree is not whole |
 | `NoLostUpper` | a step's upper is never deleted under it by another process |
 | `OnePub` | one entry per key |
+| `NoBuildLost` | a build that built its layer gets one: its own published, or the one another builder stored |
 | `WaitEnds` | a claim waiting on its key's lock gets it, is cancelled, or its process dies: a holder that finishes or crashes lets it go on (weak fairness of each process) |
 | `AllEnd` | every job ends, so no blocking flock waits for ever |
 
-And three mutants, each the code with one guard taken away, which TLC must reject with the
+And four mutants, each the code with one guard taken away, which TLC must reject with the
 invariant the configuration's first line names (`tlc.sh` fails if it does not, so a model that
 could no longer see a broken protocol fails CI): `StoreLocking-unlocked-build.cfg` (`layers.zig`'s
 publish without the key's lock, as it was: `NoWrongValid`), `StoreLocking-unchecked-evict.cfg`
-(`Store.evict` without `sameFile` after its exclusive lock, as it was: `HeldIntact`) and
-`StoreLocking-no-sync.cfg` (`Store.publish` without its `syncfs`: `NoWrongValid`).
+(`Store.evict` without `sameFile` after its exclusive lock, as it was: `HeldIntact`),
+`StoreLocking-no-sync.cfg` (`Store.publish` without its `syncfs`: `NoWrongValid`) and
+`StoreLocking-publish-first.cfg` (`layers.zig`'s publish under the key's lock but publishing
+before it looks the key up, as #299 had it: `NoBuildLost`).
 
 **Bounds** (the processes run one job each; a job's steps pick their keys freely):
 
@@ -468,12 +471,26 @@ without the fix.
    `evict` checks `sameFile` after the lock (`Store.evictOpened`). Test: "an eviction whose entry
    went meanwhile leaves the one published since" (Store.zig).
 
-A third thing it turned up is about the model, not the code: a flock belongs to an open file
+A third race the store's stress test (`runner/src/native/store_stress.zig`) found, and the model
+then took in. With the key's lock, `layers.Store.publish` still published first and looked the key
+up only once `renameat2` refused, as the code had it before the lock: the model counted a build
+that then found nothing as a legal outcome. But the key's lock does not keep `collect` out: runner
+1 publishes a build layer and its job ends; runner 2 builds it too, takes the key's lock, and its
+rename is refused; runner 1's `collect` evicts the layer, which no job holds; runner 2's lookup
+misses, and its build fails with a layer it built and none stored (TLC's trace,
+`StoreLocking-publish-first.cfg`, under 4,000 states). `NoBuildLost` is the property, and
+`BuildLooksUpFirst` the fix: under the key's lock, the key is looked up first, so a layer that is
+there is used and one that is not cannot appear before the publish.
+
+A fourth thing it turned up is about the model, not the code: a flock belongs to an open file
 description, and the first version of the model, which kept one lock per process, reported a
 held layer evicted that the kernel would have protected.
 
 **What it does not model**: the keys' meaning and the record's content (the Lean model's); a
-step's parent being in the store (each key here stands alone); the LRU order and the byte cap
+step's parent being in the store (each key here stands alone); the bytes a meta counts (the stress
+test found `publish` measuring a tree while the kernel still wrote it back, a block short: a
+tree whole on disk, counted low against the cap, and now measured after the `syncfs`); the LRU
+order and the byte cap
 (over-approximated by "any entry may go"); `layerDigest`'s file (written aside and renamed, never
 read by `open`); the rootfs, the provisioning store (`oci/Store.zig`) and flattening, which write
 into the job's own directory; a hand deleting an entry's lock file (`evict` would then remove an

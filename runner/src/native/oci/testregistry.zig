@@ -41,6 +41,9 @@ pub const Server = struct {
     stale: bool = false,
     /// Closes every connection once its request is read, without answering it.
     mute: bool = false,
+    /// How many token requests are answered with a reset, as a socket closed with the request
+    /// unread answers one.
+    resets: std.atomic.Value(u32) = .init(0),
     requests: std.atomic.Value(u32) = .init(0),
     connections: std.atomic.Value(u32) = .init(0),
 
@@ -119,6 +122,13 @@ fn answer(s: *Server, conn: Io.net.Stream) bool {
     if (std.mem.eql(u8, path, "/quit")) return true;
     _ = s.requests.fetchAdd(1, .acq_rel);
     if (s.mute) return false;
+    if (std.mem.startsWith(u8, path, "/token?") and s.resets.load(.acquire) > 0) {
+        _ = s.resets.fetchSub(1, .acq_rel);
+        // No lingering: the close sends a reset, not an end of stream.
+        const linger: std.os.linux.linger = .{ .onoff = 1, .linger = 0 };
+        std.posix.setsockopt(conn.socket.handle, std.os.linux.SOL.SOCKET, std.os.linux.SO.LINGER, std.mem.asBytes(&linger)) catch return false;
+        return false;
+    }
     var wb: [64 * 1024]u8 = undefined;
     var w = conn.writer(io, &wb);
     const out = &w.interface;
@@ -385,6 +395,52 @@ test "native oci pull: a kept-alive connection the registry closed is replaced; 
     try testing.expect(std.mem.indexOf(u8, why, "could not fetch its manifest: HttpConnectionClosing") != null);
     const tries = mute.requests.load(.acquire);
     try testing.expectEqual(@import("../../github/http.zig").staleRetries(&client) + 1, tries);
+}
+
+test "native oci pull: a token request reset is sent again, a bounded number of times" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    var t: layer.TestTar = .{ .a = arena };
+    try t.add(.{ .path = "f", .body = "kept" });
+    const img = try testImage(arena, "test/reset", "1", &.{try t.finish()}, "", false);
+    const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(io, ".", arena) };
+    const creds: @import("registry.zig").Credentials = .{ .username = "user", .password = "pass" };
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = io };
+    defer client.deinit();
+
+    var server: Server = .{ .routes = img.routes, .private = true, .resets = .init(1) };
+    try server.start();
+    defer server.stop();
+    var why: []const u8 = "";
+    const got = image.pull(arena, testing.allocator, io, &client, store, .{
+        .image = try server.image(arena, "test/reset:1"),
+        .creds = creds,
+        .owners = false,
+    }, &why) catch |e| {
+        std.debug.print("pull: {s}\n", .{why});
+        return e;
+    };
+    try testing.expectEqualStrings(img.manifest, got.manifest);
+    try testing.expectEqual(@as(u32, 0), server.resets.load(.acquire));
+
+    // Reset every time: the error stands, once the kept connections could all have been tried.
+    const http = @import("../../github/http.zig");
+    const tries = http.staleRetries(&client) + 1;
+    var always: Server = .{ .routes = img.routes, .private = true, .resets = .init(tries + 5) };
+    try always.start();
+    defer always.stop();
+    why = "";
+    try testing.expectError(error.Unauthorized, image.pull(arena, testing.allocator, io, &client, store, .{
+        .image = try always.image(arena, "test/reset:2"),
+        .creds = creds,
+        .owners = false,
+    }, &why));
+    try testing.expect(std.mem.indexOf(u8, why, "the token service: ReadFailed") != null);
+    try testing.expectEqual(@as(u32, 5), always.resets.load(.acquire));
 }
 
 test "native oci pull of the default image from Docker Hub (ZIG_RUNNER_TEST_PULL=1; measures a cold pull)" {
