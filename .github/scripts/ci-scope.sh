@@ -8,7 +8,7 @@
 #   ci-scope.sh proofs       Proofs (proofs.yml)
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)
 #   ci-scope.sh go           Go tools (ci.yml)
-#   ci-scope.sh analysis     Fuzz, Valgrind, ThreadSanitizer, Stress (analysis.yml)
+#   ci-scope.sh analysis     Fuzz, Valgrind, ThreadSanitizer, Stress, ZLint (suppressed-errors) (analysis.yml)
 #   ci-scope.sh coverage     Coverage (analysis.yml)
 #
 # Sets `run=true` or `run=false` in GITHUB_OUTPUT, and says why. The jobs still run, and report,
@@ -133,6 +133,7 @@ needed() {
 		.github/workflows/analysis.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/zig-fuzz.sh | .github/scripts/zig-valgrind.sh | \
 			.github/scripts/zig-race-tests.sh | .github/scripts/zig-stress.sh | \
+			.github/scripts/zlint.sh | .github/scripts/zlint-suppressed.baseline | \
 			.github/valgrind.supp) return 0 ;;
 		*) return 1 ;;
 		esac

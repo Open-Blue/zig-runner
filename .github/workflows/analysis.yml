@@ -13,6 +13,11 @@ name: analysis
 #                  artifact (fuzz-TARGET).
 #   Valgrind       every test under Valgrind's memcheck (.github/scripts/zig-valgrind.sh): reads
 #                  of memory never written, and accesses outside what was allocated.
+#   ZLint (suppressed-errors)
+#                  ZLint's `catch {}` and `catch unreachable` rule, which ci's Lint job cannot run
+#                  (ZLint does not yet apply line-level disables), against the sites read and
+#                  meant (.github/scripts/zlint-suppressed.baseline): fails on one not in it,
+#                  listed and annotated on its line (.github/scripts/zlint.sh says how).
 #   ThreadSanitizer, native (ARCH)
 #                  the native backend's tests under ThreadSanitizer, on x86_64 and arm64, rootless
 #                  and as root, the runner binary they start for each step (its helper) built
@@ -72,6 +77,8 @@ on:
       - .github/scripts/zig-race-tests.sh
       - .github/scripts/zig-stress.sh
       - runner/src/**
+      - .github/scripts/zlint.sh
+      - .github/scripts/zlint-suppressed.baseline
   # zig-test.sh and e2e.sh are not listed: ci runs them on every change that touches them, and
   # their ThreadSanitizer options only add a compiler flag.
 
@@ -438,6 +445,23 @@ jobs:
           name: stress-output
           path: ${{ runner.temp }}/stress
           if-no-files-found: ignore
+
+  # Under a minute: ZLint reads the sources, nothing is compiled.
+  zlint-suppressed-errors:
+    name: ZLint (suppressed-errors)
+    needs: scope
+    if: needs.scope.outputs.analysis == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: suppressed-errors against its baseline
+        run: .github/scripts/zlint.sh suppressed-errors
 
   # kcov over the tests on GitHub's runner, which can make the native backend's sandboxes (as ci's
   # hosted test job): rootless, then the native tests as root, merged (zig-coverage.sh). About 18

@@ -153,6 +153,24 @@ store's locks, the database, the broker's long-poll, log uploads;
 `.github/scripts/zig-race-tests.sh` names them) 100 times over under stress-ng's CPU and memory
 load, with the database, and fails on the first round that fails, its output an artifact
 (`.github/scripts/zig-stress.sh`).
+**Mutation testing** asks whether the tests would notice the code being wrong:
+`runner/tools/mutate.py` changes a module's code one thing at a time (a comparison flipped, `and`
+for `or`, `true` for `false`, a `return error.X` guard taken away, an integer constant off by one,
+a statement deleted), compiles each change from a copy of `runner/src` with only that module's
+tests (`--test-filter`), runs them with a timeout, and counts each mutant killed, survived, timed
+out or not compiled. Its report lists every survivor by file, line and change: most are a missing
+test, a few a change that means the same thing. The modules are the security-critical ones: secret
+masking (`masking`: `redact.zig`, `dagger/JobLog.zig`), workflow commands (`commands`),
+expressions (`expr`), the native store's keys and publishing (`store`) and `minisign`. Locally,
+after `zig build --fetch` in `runner/`: `python3 runner/tools/mutate.py masking` (`--all --out DIR`
+for every module, `--sample N` for a quicker look, `--list` for the mutants alone, `--shard K/N`
+and `--merge` to split a run and join its results; `--expr-cases DIR` holds `expr`'s mutants to
+GitHub's own expression cases too, as `expr-conformance.sh` does). The five modules make about 2,400 mutants,
+each a compile, which is hours of every core: too slow for a pull request, and for a laptop doing
+anything else. `mutation` runs it for one module when asked for (Actions, "Run workflow"), over
+four of GitHub's runners, with the report in the last job's summary and as the `mutation-report`
+artifact. Mull and other LLVM-level tools cannot be used: they instrument through a clang pass
+plugin, which Zig has no way to load.
 "Coverage" (`.github/scripts/zig-coverage.sh`)
 measures which lines the tests reach with [kcov](https://github.com/SimonKagstrom/kcov) (Ubuntu's
 package, pinned to the version checked): the rootless tests, the native backend's tests as root,
@@ -233,7 +251,9 @@ repository:
   (push protection), and gitleaks scans every pull request's commits and, weekly, the whole history
   (`security`, above); dependency review checks the dependencies a pull request brings.
 - **Checked.** actionlint and zizmor check the workflows, shellcheck every shell script
-  (`.github/scripts/shellcheck.sh`), `busybox-pin.sh` the runner's busybox pin, and CodeQL the
+  (`.github/scripts/shellcheck.sh`) and shfmt its format (`.github/scripts/shfmt.sh`, shfmt's
+  defaults: tabs; `-w` formats), hadolint the Dockerfile (`.github/scripts/hadolint.sh`; a finding
+  kept is ignored on its instruction, with why), `busybox-pin.sh` the runner's busybox pin, and CodeQL the
   workflows, the Go tools and the Python generators, which `go vet`, staticcheck and the race
   detector check too (`.github/scripts/go-lint.sh`); every job has a time limit. The Database
   tests job runs every test under

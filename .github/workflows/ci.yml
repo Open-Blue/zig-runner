@@ -40,8 +40,9 @@ jobs:
               ;;
           esac
 
-  # The workflows themselves: actionlint for mistakes, zizmor for security; and the shell scripts
-  # they and the deployment run, with shellcheck (README, "Pipeline").
+  # The workflows themselves: actionlint for mistakes, zizmor for security; the shell scripts
+  # they and the deployment run, with shellcheck and shfmt; and the Dockerfile, with hadolint
+  # (README, "Pipeline").
   workflows:
     name: Workflows
     runs-on: ubuntu-26.04
@@ -60,6 +61,14 @@ jobs:
       # The image is pinned by digest. deploy/zig-runner-deploy runs on prod every minute.
       - name: shellcheck
         run: .github/scripts/shellcheck.sh
+
+      # The release binaries, against their pinned checksums: a new version (Renovate's) fails
+      # here until they are updated. shfmt shows the diff that would format a script.
+      - name: shfmt
+        run: .github/scripts/shfmt.sh
+
+      - name: hadolint
+        run: .github/scripts/hadolint.sh
 
       # The casts and assertions that skip Zig's checks (@bitCast, @ptrCast, @alignCast, @intCast,
       # `catch unreachable`) in runner/src, against their checked-in counts: a new one raises

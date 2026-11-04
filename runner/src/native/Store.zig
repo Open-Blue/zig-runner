@@ -221,7 +221,8 @@ fn flock(f: std.Io.File, how: i32) bool {
 
 /// Held while a step with this key runs, so two jobs sharing the store (a pool's runners, or two
 /// jobs of one) never run one key at once: the second waits, then finds the first's layer.
-/// Polled, so `stop` (a cancel or a timeout while it waits) ends the wait with `error.Stopped`.
+/// Polled, so `stop` (a cancel or a timeout while it waits) ends the wait with `error.Stopped`;
+/// the waiting task's own cancel ends it with `error.Canceled`.
 /// A lock file `collect` removed while it was being taken is not trusted: the lock is taken only
 /// on the file the path names.
 pub fn lockKey(
@@ -241,7 +242,7 @@ pub fn lockKey(
         }
         f.close(io);
         if (stop.load(.acquire)) return error.Stopped;
-        io.sleep(.fromMilliseconds(50), .awake) catch {};
+        try io.sleep(.fromMilliseconds(50), .awake);
     }
 }
 
@@ -1541,6 +1542,28 @@ test "native store: a key's lock: a second taker waits, and a stop ends its wait
     second.close(io);
 }
 
+test "native store: a key's lock: the waiting task's cancel ends its wait" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const s: Store = .{ .root = root };
+    try prepare(arena, io, root, .{ .check_parents = false });
+    var kh: KeyHasher = .plain("test");
+    const k = kh.final();
+    var never: std.atomic.Value(bool) = .init(false);
+    const first = try s.lockKey(arena, io, k, &never);
+    defer first.close(io);
+    // Its own arena: the waiter allocates while this thread does not.
+    var wa: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer wa.deinit();
+    var waiter = try io.concurrent(lockKey, .{ s, wa.allocator(), io, k, &never });
+    try std.testing.expectError(error.Canceled, waiter.cancel(io));
+}
+
 test "native store: a key's preimage is P8's: tag, parent, script, then the stable env counted" {
     // P8's vector `volatile-absent` (native/testdata/step_keys.tsv on its branch): GITHUB_RUN_ID
     // is volatile, so the env counts 2.
@@ -1871,4 +1894,243 @@ test "native store: a tree's walk has no depth limit, and fails closed on what i
     // Removed whole all the same.
     removeTree(arena, io, deep);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "deep", .{}));
+}
+
+/// A store under `tmp`, and a step's layer published in it under `key` (held: the caller closes
+/// it), with a 5000-byte file in its tree.
+fn testLayer(arena: Allocator, io: std.Io, tmp: std.testing.TmpDir, s: *Store, name: []const u8) !struct { Key, Layer } {
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    if (s.root.len == 0) {
+        s.root = try std.fmt.allocPrint(arena, "{s}/store", .{root});
+        try prepare(arena, io, s.root, .{ .check_parents = false });
+    }
+    var kh: KeyHasher = .plain(name);
+    const k = kh.final();
+    try tmp.dir.createDirPath(io, name);
+    try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/f", .{name}), .data = &@as([5000]u8, @splat('x')) });
+    const upper = try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, name });
+    const l = try s.publish(arena, io, k, .step, upper, .{ .log = "a log\n", .fc = "::zig-file-command::ran\nj1\n" });
+    return .{ k, l };
+}
+
+test "native store: collect keeps a whole layer no job holds while the store is at or under its cap" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    const k, const l = try testLayer(arena, io, tmp, &s, "up");
+    const bytes = try treeBytes(arena, io, l.fs);
+    l.lock.close(io);
+    // Exactly at the cap: nothing goes.
+    s.max_bytes = bytes;
+    s.collect(arena, io);
+    (try s.open(arena, io, k)).?.layer.lock.close(io);
+    // A byte under it: the layer goes, since no job holds it.
+    s.max_bytes = bytes - 1;
+    s.collect(arena, io);
+    try std.testing.expect(try s.open(arena, io, k) == null);
+}
+
+test "native store: over its cap, collect evicts the least recently used layers until it fits, no more" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    var keys: [3]Key = undefined;
+    var bytes: u64 = 0;
+    for (&keys, [_][]const u8{ "up0", "up1", "up2" }) |*k, name| {
+        k.*, const l = try testLayer(arena, io, tmp, &s, name);
+        bytes = try treeBytes(arena, io, l.fs);
+        l.lock.close(io);
+    }
+    // Used in the order 1, 0, 2 (an open is a use): room for two, so 1 goes, and only 1.
+    for ([_]usize{ 1, 0, 2 }) |i| {
+        (try s.open(arena, io, keys[i])).?.layer.lock.close(io);
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    s.max_bytes = 2 * bytes;
+    s.collect(arena, io);
+    try std.testing.expect(try s.open(arena, io, keys[1]) == null);
+    (try s.open(arena, io, keys[0])).?.layer.lock.close(io);
+    (try s.open(arena, io, keys[2])).?.layer.lock.close(io);
+}
+
+test "native store: a key published already stays, and the second upper is put back where it was" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    const k, const l = try testLayer(arena, io, tmp, &s, "up");
+    l.lock.close(io);
+    try tmp.dir.createDirPath(io, "again");
+    try tmp.dir.writeFile(io, .{ .sub_path = "again/g", .data = "second" });
+    const again = try std.fmt.allocPrint(arena, "{s}/again", .{try tmp.dir.realPathFileAlloc(io, ".", arena)});
+    try std.testing.expectError(error.Publish, s.publish(arena, io, k, .step, again, .{ .log = "b\n", .fc = "::zig-file-command::ran\nj2\n" }));
+    // The upper is back, whole, and nothing of the attempt is left in the store.
+    try tmp.dir.access(io, "again/g", .{});
+    var layers = try tmp.dir.openDir(io, "store/layers", .{ .iterate = true });
+    defer layers.close(io);
+    var it = layers.iterate();
+    var n: usize = 0;
+    while (try it.next(io)) |e| : (n += 1) try std.testing.expectEqualStrings(&hex(k), e.name);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    // The first layer is the one replayed.
+    const hit = (try s.open(arena, io, k)).?;
+    hit.layer.lock.close(io);
+    try std.testing.expectEqualStrings("a log\n", hit.rec.log);
+    // An upper that cannot be read fails before it moves: its temporary entry is removed.
+    var other: KeyHasher = .plain("other");
+    const missing = try std.fmt.allocPrint(arena, "{s}/missing", .{s.root});
+    try std.testing.expect(std.meta.isError(s.publish(arena, io, other.final(), .step, missing, .{ .log = "", .fc = "::zig-file-command::ran\n" })));
+    var after = try tmp.dir.openDir(io, "store/layers", .{ .iterate = true });
+    defer after.close(io);
+    var it2 = after.iterate();
+    n = 0;
+    while (try it2.next(io)) |_| n += 1;
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+
+test "native store: a key's tag is part of its preimage, output-keyed's as 2" {
+    var buf: [8]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var k: KeyHasher = .{ .h = .init(.{}), .bytes = &w };
+    k.int(@backingInt(Tag.output_keyed));
+    try std.testing.expectEqualSlices(u8, &.{ 2, 0, 0, 0, 0, 0, 0, 0 }, w.buffered());
+    var base: KeyHasher = .init(.base);
+    var step: KeyHasher = .init(.step);
+    var keyed: KeyHasher = .init(.output_keyed);
+    const kb = base.final();
+    const ks = step.final();
+    const kk = keyed.final();
+    try std.testing.expect(!std.mem.eql(u8, &kb, &ks) and !std.mem.eql(u8, &ks, &kk) and !std.mem.eql(u8, &kb, &kk));
+}
+
+test "native store: a step's log past the limit, or a base's file commands, are not published" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}) };
+    try prepare(arena, io, s.root, .{ .check_parents = false });
+    try tmp.dir.createDirPath(io, "up");
+    const upper = try std.fmt.allocPrint(arena, "{s}/up", .{root});
+    var kh: KeyHasher = .plain("test");
+    const k = kh.final();
+    const big = try arena.alloc(u8, max_record_bytes + 1);
+    @memset(big, 'x');
+    const ran = "::zig-file-command::ran\nj1\n";
+    try std.testing.expectError(error.RecordTooLarge, s.publish(arena, io, k, .step, upper, .{ .log = big, .fc = ran }));
+    try std.testing.expectError(error.ShortRecord, s.publish(arena, io, k, .base, upper, .{ .log = "", .fc = "x" }));
+    try std.testing.expectError(error.ShortRecord, s.publish(arena, io, k, .fetch, upper, .{ .log = "", .fc = "x" }));
+    try tmp.dir.access(io, "up", .{});
+    // At the limit, both are: and a base, whose record is empty, is kept by `collect` too.
+    const fc = try arena.alloc(u8, max_record_bytes);
+    @memset(fc, 'x');
+    @memcpy(fc[0..ran.len], ran);
+    (try s.publish(arena, io, k, .step, upper, .{ .log = big[0..max_record_bytes], .fc = fc })).lock.close(io);
+    (try s.open(arena, io, k)).?.layer.lock.close(io);
+    try tmp.dir.createDirPath(io, "base");
+    var kb: KeyHasher = .plain("base");
+    const k_base = kb.final();
+    const base_up = try std.fmt.allocPrint(arena, "{s}/base", .{root});
+    (try s.publish(arena, io, k_base, .base, base_up, .{ .log = "", .fc = "" })).lock.close(io);
+    s.collect(arena, io);
+    (try s.open(arena, io, k_base)).?.layer.lock.close(io);
+    (try s.open(arena, io, k)).?.layer.lock.close(io);
+}
+
+test "native store: a layer whose file commands or tree changed is not replayed" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    // The file commands changed in place, their length kept: a miss, and evicted.
+    const k, const l = try testLayer(arena, io, tmp, &s, "up");
+    l.lock.close(io);
+    const fc = try std.fmt.allocPrint(arena, "store/layers/{s}/fc", .{&hex(k)});
+    try tmp.dir.writeFile(io, .{ .sub_path = fc, .data = "::zig-file-command::ran\nj2\n" });
+    try std.testing.expect(try s.open(arena, io, k) == null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, fc, .{}));
+    // The log, likewise.
+    const k3, const l3 = try testLayer(arena, io, tmp, &s, "up3");
+    l3.lock.close(io);
+    const log = try std.fmt.allocPrint(arena, "store/layers/{s}/log", .{&hex(k3)});
+    try tmp.dir.writeFile(io, .{ .sub_path = log, .data = "A log\n" });
+    try std.testing.expect(try s.open(arena, io, k3) == null);
+    // Its tree gone: a miss for `open`.
+    const k4, const l4 = try testLayer(arena, io, tmp, &s, "up4");
+    l4.lock.close(io);
+    removeTree(arena, io, l4.fs);
+    try std.testing.expect(try s.open(arena, io, k4) == null);
+    // And `collect`, which reads no record, removes it too.
+    const k2, const l2 = try testLayer(arena, io, tmp, &s, "up2");
+    l2.lock.close(io);
+    removeTree(arena, io, l2.fs);
+    s.collect(arena, io);
+    const dir2 = try std.fmt.allocPrint(arena, "store/layers/{s}", .{&hex(k2)});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, dir2, .{}));
+}
+
+test "native store: collect removes a half-built layer whose publisher died, not one still building" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}) };
+    try prepare(arena, io, s.root, .{ .check_parents = false });
+    var building: KeyHasher = .plain("building");
+    var dead: KeyHasher = .plain("dead");
+    const kb = building.final();
+    const kd = dead.final();
+    // A publisher holds its key's lock while it builds `.tmp-KEY-RANDOM`.
+    var never: std.atomic.Value(bool) = .init(false);
+    const held = try s.lockKey(arena, io, kb, &never);
+    defer held.close(io);
+    const tmp_b = try std.fmt.allocPrint(arena, "store/layers/.tmp-{s}-0123456789abcdef", .{&hex(kb)});
+    const tmp_d = try std.fmt.allocPrint(arena, "store/layers/.tmp-{s}-0123456789abcdef", .{&hex(kd)});
+    try tmp.dir.createDirPath(io, tmp_b);
+    try tmp.dir.createDirPath(io, tmp_d);
+    s.collect(arena, io);
+    try tmp.dir.access(io, tmp_b, .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, tmp_d, .{}));
+}
+
+test "native store: sameFile tells the file a path names from another on the same disk" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try tmp.dir.writeFile(io, .{ .sub_path = "one", .data = "1" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "two", .data = "2" });
+    const f = try tmp.dir.openFile(io, "one", .{});
+    defer f.close(io);
+    const one = try std.fmt.allocPrint(arena, "{s}/one", .{root});
+    try std.testing.expect(sameFile(arena, f, one));
+    try std.testing.expect(!sameFile(arena, f, try std.fmt.allocPrint(arena, "{s}/two", .{root})));
+    try std.testing.expect(!sameFile(arena, f, try std.fmt.allocPrint(arena, "{s}/none", .{root})));
+    // Replaced under the same name, as an eviction leaves it: no longer the file held.
+    try tmp.dir.deleteFile(io, "one");
+    try tmp.dir.writeFile(io, .{ .sub_path = "one", .data = "1" });
+    try std.testing.expect(!sameFile(arena, f, one));
 }
