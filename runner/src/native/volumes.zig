@@ -40,6 +40,7 @@ const dagger = @import("../dagger.zig");
 const job_mod = @import("../job.zig");
 const set_up = @import("../dagger/set_up.zig");
 const sandbox = @import("sandbox.zig");
+const OciStore = @import("oci/Store.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -385,6 +386,8 @@ pub fn adoptSeed(
     const p = try std.fmt.allocPrintSentinel(arena, "{s}/p", .{into}, 0);
     _ = linux.mkdir(p, 0o755);
     if (user) |u| _ = linux.lchown(p, u, u);
+    // A seed's key is its path alone, so nothing below would notice one a crash emptied.
+    try OciStore.syncFilesystem(arena, new);
     cwd.rename(new, cwd, seed.dir, io) catch |e| switch (e) {
         error.DirNotEmpty => {
             cwd.deleteTree(io, new) catch {};

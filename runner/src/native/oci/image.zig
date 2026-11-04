@@ -8,10 +8,10 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const linux = std.os.linux;
 const registry = @import("registry.zig");
 const layer = @import("layer.zig");
 const Store = @import("Store.zig");
+const linux = std.os.linux;
 
 const Allocator = std.mem.Allocator;
 
@@ -192,7 +192,13 @@ fn writeRef(arena: Allocator, io: std.Io, path: []const u8, manifest: []const u8
     io.random(&raw);
     const tmp = std.fmt.allocPrint(arena, "{s}.tmp-{s}", .{ path, &std.fmt.bytesToHex(raw, .lower) }) catch return;
     const cwd = std.Io.Dir.cwd();
-    cwd.writeFile(io, .{ .sub_path = tmp, .data = manifest }) catch return;
+    {
+        const f = cwd.createFile(io, tmp, .{}) catch return;
+        defer f.close(io);
+        f.writeStreamingAll(io, manifest) catch return;
+        // On disk before its name is: a crash must not leave an empty record under it.
+        if (linux.errno(linux.fsync(f.handle)) != .SUCCESS) return;
+    }
     cwd.rename(tmp, cwd, path, io) catch cwd.deleteFile(io, tmp) catch {};
 }
 
@@ -369,6 +375,9 @@ const Unpack = struct {
             defer f.close(io);
             errdefer cwd.deleteFile(io, tmp) catch {};
             try u.client.blob(l.digest, l.size, f);
+            // On disk before its name is: a blob is trusted by its path, and an unpacked one is
+            // not fetched again.
+            if (linux.errno(linux.fsync(f.handle)) != .SUCCESS) return error.Sync;
         }
         u.bytes += l.size;
         try cwd.rename(tmp, cwd, path, io);

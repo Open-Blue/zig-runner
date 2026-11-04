@@ -790,8 +790,8 @@ fn mountOverlay(arena: Allocator, spec: Spec, lowers: []const []const u8, userxa
 /// filesystem, which otherwise its unmount does, whole (`sync_filesystem` of the upper's
 /// superblock), at every step's end: a step then waited for every other write to that disk, a
 /// tool cache being filled by another job, 5.7 s a step on a laptop's NVMe under one writer. What
-/// must outlive a crash is synced on its own: a layer before it is published (`Store.publish`).
-/// An upper is never mounted again after a crash (a dead runner's job directory is swept), and
+/// must outlive a crash is synced on its own, before the rename that names it: a layer
+/// (`Store.publish`), a rootfs or image (`oci.Store.ensure`), a seed (`volumes.adoptSeed`). An upper is never mounted again after a crash (a dead runner's job directory is swept), and
 /// `volatile`'s mark in the work directory, which would refuse the next step's mount on it, is
 /// removed first. A kernel without it gets the overlay as before.
 fn mountVolatile(arena: Allocator, what: []const u8, merged: []const u8, work: []const u8, opts: []const u8) void {

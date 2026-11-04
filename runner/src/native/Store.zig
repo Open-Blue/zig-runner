@@ -603,8 +603,7 @@ pub fn syncTree(arena: Allocator, io: std.Io, p: []const u8) !void {
     // This thread too, so the work is done when no thread could be started.
     work.run();
     for (threads) |t| if (t) |th| th.join();
-    if (work.unreadable.load(.acquire)) return error.Unreadable;
-    if (work.failed.load(.acquire)) return error.Sync;
+    return work.result();
 }
 
 /// `SYNC_FILE_RANGE_WRITE`: writeback started, not waited for.
@@ -624,6 +623,13 @@ const SyncWork = struct {
     next: std.atomic.Value(usize) = .init(0),
     unreadable: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
+
+    /// A failed `fsync` first: `error.Unreadable` sends the caller to `syncfs`, which may not
+    /// report a write error an `fsync` has already taken, and the layer would be published.
+    fn result(w: *const SyncWork) !void {
+        if (w.failed.load(.acquire)) return error.Sync;
+        if (w.unreadable.load(.acquire)) return error.Unreadable;
+    }
 
     fn run(w: *SyncWork) void {
         var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
@@ -1670,6 +1676,15 @@ test "native store: flattening layers: later entries win, whiteouts are kept, op
     _ = linux.statx(linux.AT.FDCWD, a0, 0, .{ .INO = true }, &s0);
     _ = linux.statx(linux.AT.FDCWD, a1, 0, .{ .INO = true }, &s1);
     try std.testing.expectEqual(s0.ino, s1.ino);
+}
+
+test "native store: a failed fsync is not lost to an unreadable file's fallback" {
+    var w: SyncWork = .{ .root = -1, .todo = &.{} };
+    try w.result();
+    w.unreadable.store(true, .release);
+    try std.testing.expectError(error.Unreadable, w.result());
+    w.failed.store(true, .release);
+    try std.testing.expectError(error.Sync, w.result());
 }
 
 test "native store: a publish syncs the entry's own tree, and a file it cannot open falls back to the filesystem's" {
