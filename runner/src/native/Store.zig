@@ -1969,6 +1969,9 @@ fn testLayer(arena: Allocator, io: std.Io, tmp: std.testing.TmpDir, s: *Store, n
     try tmp.dir.createDirPath(io, name);
     try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/f", .{name}), .data = &@as([5000]u8, @splat('x')) });
     const upper = try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, name });
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, k, &never);
+    defer kl.close(io);
     const l = try s.publish(arena, io, k, .step, upper, .{ .log = "a log\n", .fc = "::zig-file-command::ran\nj1\n" });
     return .{ k, l };
 }
@@ -2034,6 +2037,9 @@ test "native store: a key published already stays, and the second upper is put b
     try tmp.dir.createDirPath(io, "again");
     try tmp.dir.writeFile(io, .{ .sub_path = "again/g", .data = "second" });
     const again = try std.fmt.allocPrint(arena, "{s}/again", .{try tmp.dir.realPathFileAlloc(io, ".", arena)});
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, k, &never);
+    defer kl.close(io);
     try std.testing.expectError(error.Publish, s.publish(arena, io, k, .step, again, .{ .log = "b\n", .fc = "::zig-file-command::ran\nj2\n" }));
     // The upper is back, whole, and nothing of the attempt is left in the store.
     try tmp.dir.access(io, "again/g", .{});
@@ -2050,7 +2056,10 @@ test "native store: a key published already stays, and the second upper is put b
     // An upper that cannot be read fails before it moves: its temporary entry is removed.
     var other: KeyHasher = .plain("other");
     const missing = try std.fmt.allocPrint(arena, "{s}/missing", .{s.root});
-    try std.testing.expect(std.meta.isError(s.publish(arena, io, other.final(), .step, missing, .{ .log = "", .fc = "::zig-file-command::ran\n" })));
+    const k_other = other.final();
+    const ol = try s.lockKey(arena, io, k_other, &never);
+    defer ol.close(io);
+    try std.testing.expect(std.meta.isError(s.publish(arena, io, k_other, .step, missing, .{ .log = "", .fc = "::zig-file-command::ran\n" })));
     var after = try tmp.dir.openDir(io, "store/layers", .{ .iterate = true });
     defer after.close(io);
     var it2 = after.iterate();
@@ -2091,6 +2100,8 @@ test "native store: a step's log past the limit, or a base's file commands, are 
     const big = try arena.alloc(u8, max_record_bytes + 1);
     @memset(big, 'x');
     const ran = "::zig-file-command::ran\nj1\n";
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, k, &never);
     try std.testing.expectError(error.RecordTooLarge, s.publish(arena, io, k, .step, upper, .{ .log = big, .fc = ran }));
     try std.testing.expectError(error.ShortRecord, s.publish(arena, io, k, .base, upper, .{ .log = "", .fc = "x" }));
     try std.testing.expectError(error.ShortRecord, s.publish(arena, io, k, .fetch, upper, .{ .log = "", .fc = "x" }));
@@ -2100,12 +2111,15 @@ test "native store: a step's log past the limit, or a base's file commands, are 
     @memset(fc, 'x');
     @memcpy(fc[0..ran.len], ran);
     (try s.publish(arena, io, k, .step, upper, .{ .log = big[0..max_record_bytes], .fc = fc })).lock.close(io);
+    kl.close(io);
     (try s.open(arena, io, k)).?.layer.lock.close(io);
     try tmp.dir.createDirPath(io, "base");
     var kb: KeyHasher = .plain("base");
     const k_base = kb.final();
     const base_up = try std.fmt.allocPrint(arena, "{s}/base", .{root});
+    const bl = try s.lockKey(arena, io, k_base, &never);
     (try s.publish(arena, io, k_base, .base, base_up, .{ .log = "", .fc = "" })).lock.close(io);
+    bl.close(io);
     s.collect(arena, io);
     (try s.open(arena, io, k_base)).?.layer.lock.close(io);
     (try s.open(arena, io, k)).?.layer.lock.close(io);
