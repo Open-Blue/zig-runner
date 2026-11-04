@@ -3673,9 +3673,10 @@ test "root runner: a job's own network, out of reach of the host's services and 
 
     // Listeners on the host's 127.0.0.1 and on all its addresses (the bridge's among them), which
     // a step must not reach.
-    const loopback = try listen(47123, 0x7f000001);
+    // Below the kernel's ephemeral ports, so no outgoing connection on the host holds them.
+    const loopback = try listen(17123, 0x7f000001);
     defer _ = std.os.linux.close(loopback);
-    const any = try listen(47124, 0);
+    const any = try listen(17124, 0);
     defer _ = std.os.linux.close(any);
 
     // Two jobs at once, both serving on :5432 and on their own lo, neither reaching the host's
@@ -3694,8 +3695,8 @@ test "root runner: a job's own network, out of reach of the host's services and 
         \\    try:
         \\        socket.create_connection((host, port), 2).close(); return True
         \\    except OSError: return False
-        \\print("host loopback", "reached" if reach("127.0.0.1", 47123) else "unreachable")
-        \\print("host via bridge", "reached" if reach("{d}.{d}.{d}.{d}", 47124) else "unreachable")
+        \\print("host loopback", "reached" if reach("127.0.0.1", 17123) else "unreachable")
+        \\print("host via bridge", "reached" if reach("{d}.{d}.{d}.{d}", 17124) else "unreachable")
         \\time.sleep(2)
         \\base = "{d}.{d}.{d}."
         \\peers = [base + str(i) for i in range({d}, {d} + 4) if base + str(i) != me]
@@ -3777,7 +3778,8 @@ test "root runner: a native job resolves through a nameserver only another inter
     defer dns.stop(arena);
 
     // A host service on the resolver's network, at the host's own address there.
-    const host_side = try listen(47126, 0);
+    // Below the kernel's ephemeral ports, so no outgoing connection on the host holds it.
+    const host_side = try listen(17126, 0);
     defer _ = std.os.linux.close(host_side);
 
     // The host's resolver as Tailscale writes it, with systemd-resolved's stub first: the job
@@ -3799,7 +3801,7 @@ test "root runner: a native job resolves through a nameserver only another inter
         \\        socket.create_connection((host, port), 3).close(); return True
         \\    except OSError: return False
         \\for name, host, port in (("dns53", "198.51.100.53", 53), ("dns54", "198.51.100.54", 53),
-        \\        ("other port", "198.51.100.53", 8080), ("host side", "198.51.100.1", 47126)):
+        \\        ("other port", "198.51.100.53", 8080), ("host side", "198.51.100.1", 17126)):
         \\    print(name, "reached" if reach(host, port) else "unreachable")
         \\EOF
     ;
