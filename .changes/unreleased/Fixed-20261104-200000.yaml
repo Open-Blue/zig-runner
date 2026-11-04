@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A rootfs, a seed, an image, and an image''s blobs are on disk before their names are, so a power loss cannot leave one empty under the name that says it is whole; a failed fsync in a publish is no longer lost when another file of the layer could not be opened.'
+time: 2026-11-04T20:00:00.000000-05:00

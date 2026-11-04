@@ -37,6 +37,7 @@ comptime {
     _ = @import("native/oci/image.zig");
     _ = @import("native/oci/testregistry.zig");
     _ = @import("native/key_vectors.zig");
+    _ = @import("native/phases.zig");
     _ = @import("native/services.zig");
     _ = @import("native/health.zig");
     _ = @import("native/images.zig");

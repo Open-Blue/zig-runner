@@ -83,8 +83,26 @@ pub fn ensure(
     try cwd.createDirPath(io, tmp);
     errdefer removeTree(arena, io, tmp);
     try make.makeFn(make.ptr, tmp);
+    try syncFilesystem(arena, tmp);
     try cwd.rename(tmp, cwd, dir, io);
     return .{ .dir = dir, .made = true };
+}
+
+/// `path`'s filesystem written to disk: for a tree about to be renamed to the name that says it
+/// is whole. Nothing checks such a tree when it is found, so a crash must not leave that name on
+/// files whose contents were lost, and a step's overlay does not sync them at its unmount
+/// (`sandbox.mountVolatile`). The whole filesystem, as these trees are rare and large (a layer's
+/// are often small: `Store.syncTree`).
+pub fn syncFilesystem(arena: Allocator, path: []const u8) !void {
+    const rc = linux.open(try arena.dupeSentinel(u8, path, 0), .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.Sync;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return error.Sync;
+    defer _ = linux.close(fd);
+    if (linux.errno(linux.syncfs(fd)) != .SUCCESS) return error.Sync;
 }
 
 /// Removes a tree, giving directories their permissions back first when that is what stops it

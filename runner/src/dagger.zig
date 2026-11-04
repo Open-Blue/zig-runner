@@ -296,6 +296,9 @@ pub const Result = struct {
     annotations: []const Annotation = &.{},
     /// $GITHUB_STEP_SUMMARY per log step (index = log step - 1; empty when none was written).
     summaries: []const []const u8 = &.{},
+    /// On the native backend: where the job's time went, phase by phase (`native/phases.zig`),
+    /// its teardown included, for the runner's own log (.github/scripts/native-phases.sh).
+    native_phases: ?[]const u8 = null,
     /// With output keys: how many always-run steps keyed the steps after them on their output, how
     /// many fell back, and why the last one did. For the runner's own log, so an operator sees how
     /// often they apply without turning on step debug.
@@ -946,13 +949,15 @@ fn runNative(
             try std.fmt.allocPrint(arena, "could not make the job's native store: {s}", .{what}),
         );
     };
-    defer b.deinit();
+    // Once, after the steps (so its teardown is timed into the result) or on an error.
+    var torn_down = false;
+    defer if (!torn_down) b.deinit();
     b.caches = .of(opts_in);
     // The runtime its JavaScript actions get, for the preload in the base (`native/actions.zig`).
     b.js_runtime = opts.js_runtime;
     // Which ids the job's steps have, as "Set up job" says (`Backend.idsNote`).
     opts.backend_note = try b.idsNote(arena);
-    return runSteps(arena, io, opts, job, &sh, results, b.transport(), &b) catch |e| switch (e) {
+    var result = runSteps(arena, io, opts, job, &sh, results, b.transport(), &b) catch |e| switch (e) {
         // What its `uses:` actions are is known once they are fetched, in the job's image as the
         // base pulled and provisioned it: one native cannot run yet sends the job to Dagger,
         // before anything is logged (`native/actions.zig`).
@@ -964,6 +969,10 @@ fn runNative(
         },
         else => return e,
     };
+    b.deinit();
+    torn_down = true;
+    result.native_phases = b.timings.text(arena, null, .all) catch null;
+    return result;
 }
 
 /// Whether a native set-up that failed with `e`, before any step ran, sends the job to Dagger
@@ -1913,6 +1922,8 @@ fn runSteps(
     if (base.tool_trees_note) |note| x.setUpLine(note);
     if (opts.backend_note) |note| x.setUpLine(note);
     if (native) |b| for (b.notes.items) |note| x.setUpLine(note);
+    if (native) |b| if (sh.step_debug) x.setUpLine(try std.fmt.allocPrint(arena, "##[debug]Native " ++
+        "set-up took {d} ms: {s}", .{ b.timings.setUpMs(), try b.timings.text(arena, null, .set_up) }));
 
     if (job.container != null or !no_services) {
         if (!try x.startServices()) return servicesFailed(&x, arena, sh, results);

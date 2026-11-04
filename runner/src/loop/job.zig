@@ -689,6 +689,12 @@ fn reportCacheAndKeys(
     log: *sink.LogSink,
     result: dagger.Result,
 ) !void {
+    // Where a native job's time went (`dagger.Result.native_phases`), for native-phases.sh.
+    if (result.native_phases) |p| try c.err.print("job {d} '{s}': native phases (ms): {s}\n", .{
+        job.check_run_id,
+        jobName(job),
+        p,
+    });
     if (c.cfg.step_cache and job.steps.len > 0) {
         var replayed: usize = 0;
         // Read a line at a time, not held: the log can be the 64 MiB it keeps.

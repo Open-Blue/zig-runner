@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The first native job after a boot checks every stored layer''s tree against what was published and evicts one a crash damaged. A large layer''s publish reports a write error from since its job began even if another job''s sync was told first, and a kept layer digest is on disk before its name and refused unless whole.'
+time: 2026-11-04T21:00:00.000000-05:00
