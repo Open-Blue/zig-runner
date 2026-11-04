@@ -147,7 +147,13 @@ binary they start for each step built with it too (`ZIG_TEST_SANITIZE_THREAD=1`,
 Database tests job sets where those tests skip); "ThreadSanitizer, end to end" runs ci's end-to-end
 suite on both backends with a runner built under it (`e2e.sh build BIN tsan`), failing on any report
 in the runner's log or the jobs' (`e2e.sh races`). TSan's runtime needs glibc's dynamic loader, so
-these builds are dynamically linked PIEs, not the release's static PIE. "Coverage" (`.github/scripts/zig-coverage.sh`)
+these builds are dynamically linked PIEs, not the release's static PIE.
+"Stress" runs the concurrency-sensitive tests (cancels, deadlines, the memory gate, the native
+store's locks, the database, the broker's long-poll, log uploads;
+`.github/scripts/zig-race-tests.sh` names them) 100 times over under stress-ng's CPU and memory
+load, with the database, and fails on the first round that fails, its output an artifact
+(`.github/scripts/zig-stress.sh`).
+"Coverage" (`.github/scripts/zig-coverage.sh`)
 measures which lines the tests reach with [kcov](https://github.com/SimonKagstrom/kcov) (Ubuntu's
 package, pinned to the version checked): the rootless tests, the native backend's tests as root,
 and the runner binary those tests start for their sandboxes and networks, merged into one report.
@@ -232,9 +238,9 @@ repository:
   detector check too (`.github/scripts/go-lint.sh`); every job has a time limit. The Database
   tests job runs every test under
   ThreadSanitizer (`zig build test -Dsanitize-thread` locally); ZLint checks the runner's Zig, and
-  `analysis` fuzzes its parsers, runs its tests under Valgrind and its native backend's tests and
-  the end-to-end suite under ThreadSanitizer, and measures the tests' coverage, nightly (above).
-  Vulnerabilities
+  `analysis` fuzzes its parsers, runs its tests under Valgrind, its native backend's tests and the
+  end-to-end suite under ThreadSanitizer, its concurrency-sensitive tests under load, and measures
+  the tests' coverage, nightly (above). Vulnerabilities
   are reported privately ([docs/SECURITY.md](docs/SECURITY.md)).
 - **One secret, one step.** The deploy key that may push to `main` is the `prod` environment's,
   which deploys only from `main` and waits for approval; it is loaded only in the step that pushes,

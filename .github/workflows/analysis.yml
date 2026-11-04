@@ -5,7 +5,9 @@ name: analysis
 #
 #   Fuzz (TARGET)  runner/src/fuzz.zig's targets, each with Zig's coverage-guided fuzzer for a
 #                  bounded number of runs (.github/scripts/zig-fuzz.sh): the parsers that read what
-#                  registries, workflows, jobs and servers hand the runner. The corpus each finds
+#                  registries, workflows, jobs and servers hand the runner, and the text paths
+#                  that guard secrets and a job's environment (masking, file commands, the
+#                  broker's messages, HTTP/2 framing) held to GitHub's runner. The corpus each finds
 #                  is kept from night to night in the Actions cache; a crash, a failed check, a
 #                  leak or a hang fails the job, named after its target, with the input as an
 #                  artifact (fuzz-TARGET).
@@ -21,11 +23,24 @@ name: analysis
 #                  backends with a runner built under ThreadSanitizer: the runner's main loop, its
 #                  pool and its helpers, which no test reaches. Any report in the runner's log or
 #                  the jobs' fails it.
+#   Stress         the concurrency-sensitive tests (.github/scripts/zig-race-tests.sh: cancels,
+#                  deadlines, the memory gate, the native store's locks, the database, the
+#                  broker's long-poll, log uploads) 100 times over under CPU and memory load
+#                  (.github/scripts/zig-stress.sh), with the database; the first failing round
+#                  fails the job, its output an artifact (stress-output).
 #   Coverage       the lines the tests reach, with kcov (.github/scripts/zig-coverage.sh): the
 #                  rootless tests and the native backend's root pass merged, as an HTML report and
 #                  Cobertura and JSON (the coverage artifact), with the total, each area and the
 #                  least-covered security-relevant files in the job summary. Nothing leaves
 #                  GitHub: no coverage service is sent anything.
+#
+# Not here, as they cannot work on these tests (measured 2026-11-02): rr, which needs the CPU's
+# performance counters, and GitHub's runner (an Azure VM) exposes none (no `cpu` event source,
+# even with perf_event_paranoid at 1: "Unable to open performance counter"); and Valgrind's
+# Helgrind and DRD, which know only pthreads' locks and their own annotations, and Zig's std
+# builds every lock on raw futexes and atomics (Io.Threaded's own run queue is the first of
+# 109,234 Helgrind and 105,938 DRD reports from pg.zig's one deadline test).
+# ThreadSanitizer, here and in ci, sees those locks.
 #
 # Each search costs more than a pull request should wait for, so they run here and not in ci; a
 # failure is a case for an issue (or a fix), not a broken main. Coverage also runs on a pull
@@ -54,6 +69,8 @@ on:
       - .github/scripts/zig-valgrind.sh
       - .github/scripts/zig-coverage.sh
       - .github/valgrind.supp
+      - .github/scripts/zig-race-tests.sh
+      - .github/scripts/zig-stress.sh
       - runner/src/**
   # zig-test.sh and e2e.sh are not listed: ci runs them on every change that touches them, and
   # their ThreadSanitizer options only add a compiler flag.
@@ -122,6 +139,15 @@ jobs:
           - { target: minisign, runs: 1M }
           - { target: workflow commands, runs: 3M }
           - { target: problem matchers, runs: 3M }
+          # The text paths that guard secrets and a job's environment: about ten minutes of
+          # fuzzing each, from their first run here (pull request #300): 600 runs a second for
+          # secret masking (each run a whole step's log through records, line cuts, commands and
+          # masking), 2,300 for file commands, 4,600 for job messages, 1,400 for HTTP2 frames,
+          # with room for corpora that grow.
+          - { target: secret masking, runs: 300K }
+          - { target: file commands, runs: 1M }
+          - { target: job messages, runs: 2M }
+          - { target: HTTP2 frames, runs: 800K }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -361,6 +387,57 @@ jobs:
         run: |
           .github/scripts/e2e.sh stop || true
           rm -f "$RUNNER_TEMP/e2e-app.pem"
+
+  # The concurrency-sensitive tests under load. About 11 s a round on an idle runner.
+  stress:
+    name: Stress
+    needs: scope
+    if: needs.scope.outputs.analysis == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    permissions:
+      contents: read # to check out the code
+    # The database's tests run too (ci.yml's Database tests job, whose database this is), and fail
+    # without it rather than skip.
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: ci-only
+      PGDATABASE: tsdb
+      PGSSLMODE: disable
+      ZIG_TEST_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Start the database
+        run: .github/scripts/ci-database.sh start
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      # Ubuntu's own package, checked by apt against the archive's signed index, at the version
+      # pinned here, so every night loads the machine the same way.
+      - name: Install stress-ng
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends stress-ng=0.20.01-1
+          stress-ng --version
+
+      - name: Wait for the database
+        run: .github/scripts/ci-database.sh wait
+
+      - name: Tests under load
+        run: .github/scripts/zig-stress.sh 100 "$RUNNER_TEMP/stress"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: stress-output
+          path: ${{ runner.temp }}/stress
+          if-no-files-found: ignore
 
   # kcov over the tests on GitHub's runner, which can make the native backend's sandboxes (as ci's
   # hosted test job): rootless, then the native tests as root, merged (zig-coverage.sh). About 18
