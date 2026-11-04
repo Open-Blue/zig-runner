@@ -25,13 +25,25 @@ pub const Parsed = struct {
 /// `GITHUB_STATE` file, in the order written, up to the first malformed line, and why that one is.
 /// GitHub's runner reads the entries one at a time and applies each as it goes, so those before a
 /// bad line take effect (`EnvFileKeyValuePairs` in FileCommandManager.cs).
+///
+/// Read as GitHub's runner reads them on Linux: lines end at `\n` alone, so a `\r` before it is
+/// the line's (a CRLF file's `a=1` is `1\r`, and a line holding only `\r` is malformed), a value
+/// ends only at a line that is its delimiter exactly, `\r` and all, and a value's lines are kept
+/// as written. Taking `\r\n` as the end of a line let a value's `EOF\r` line end a value whose
+/// delimiter is `EOF`, where GitHub reads it as part of the value, and the lines after it were then
+/// read as more variables. A UTF-8 byte order mark at the start is not part of the first name
+/// (`File.ReadAllText`).
+///
+/// One difference: a `=value` line, which GitHub reads as a variable with an empty name (it
+/// checks the line instead of the name), is malformed here: an empty name breaks every later
+/// step's environment.
 pub fn parseKeyValues(arena: Allocator, text: []const u8) Allocator.Error!Parsed {
     var out: std.ArrayList(job_mod.EnvVar) = .empty;
-    var lines = std.mem.splitScalar(u8, text, '\n');
+    var lines: Lines = .{ .text = withoutBom(text) };
     var line_no: usize = 0;
-    const why: []const u8 = while (lines.next()) |raw| {
+    const why: []const u8 = while (lines.next()) |l| {
         line_no += 1;
-        const line = std.mem.trimEnd(u8, raw, "\r");
+        const line = l.text;
         if (line.len == 0) continue;
         const eq = std.mem.indexOfScalar(u8, line, '=');
         const heredoc = std.mem.indexOf(u8, line, "<<");
@@ -44,7 +56,7 @@ pub fn parseKeyValues(arena: Allocator, text: []const u8) Allocator.Error!Parsed
                 "invalid format '{s}' on line {d}: expected name<<DELIMITER",
                 .{ line, line_no },
             );
-            const value = try heredocValue(arena, &lines, &line_no, delim) orelse
+            const value = heredocValue(&lines, &line_no, delim) orelse
                 break try std.fmt.allocPrint(
                     arena,
                     "matching delimiter '{s}' not found for '{s}'",
@@ -68,33 +80,56 @@ pub fn parseKeyValues(arena: Allocator, text: []const u8) Allocator.Error!Parsed
     return .{ .pairs = out.items, .invalid = why };
 }
 
-/// The lines of a multi-line value up to the line that is `delim`, joined with `\n` and taken from
-/// `lines`; null when the file ends first. `line_no` counts the lines taken.
-fn heredocValue(
-    arena: Allocator,
-    lines: *std.mem.SplitIterator(u8, .scalar),
-    line_no: *usize,
-    delim: []const u8,
-) Allocator.Error!?[]const u8 {
-    var value: std.ArrayList(u8) = .empty;
-    var first = true;
-    while (lines.next()) |raw| {
+/// `text` without a UTF-8 byte order mark at its start.
+fn withoutBom(text: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) text[3..] else text;
+}
+
+/// A file command's lines as GitHub's runner reads them on Linux (`ReadLine` in
+/// FileCommandManager.cs): each up to a `\n`, without it, and the text after the last `\n` a line
+/// of its own only when there is some.
+const Lines = struct {
+    text: []const u8,
+    pos: usize = 0,
+
+    const Line = struct { text: []const u8, start: usize, ended: bool };
+
+    fn next(l: *Lines) ?Line {
+        if (l.pos >= l.text.len) return null;
+        const start = l.pos;
+        if (std.mem.indexOfScalarPos(u8, l.text, start, '\n')) |nl| {
+            l.pos = nl + 1;
+            return .{ .text = l.text[start..nl], .start = start, .ended = true };
+        }
+        l.pos = l.text.len;
+        return .{ .text = l.text[start..], .start = start, .ended = false };
+    }
+};
+
+/// The text of a multi-line value: the lines after its `name<<DELIMITER` line up to the line that
+/// is `delim` exactly, as written, without the newline before that line; null when the file
+/// ends first, or a line before the delimiter has no newline (`Invalid value. EOF marker missing
+/// new line.`). `line_no` counts the lines taken.
+fn heredocValue(lines: *Lines, line_no: *usize, delim: []const u8) ?[]const u8 {
+    const start = lines.pos;
+    var end = start;
+    while (lines.next()) |l| {
         line_no.* += 1;
-        const line = std.mem.trimEnd(u8, raw, "\r");
-        if (std.mem.eql(u8, line, delim)) return value.items;
-        if (!first) try value.append(arena, '\n');
-        try value.appendSlice(arena, line);
-        first = false;
+        if (std.mem.eql(u8, l.text, delim)) return lines.text[start..end];
+        if (!l.ended) return null;
+        end = l.start + l.text.len;
     }
     return null;
 }
 
-/// Directories from a GITHUB_PATH file, in the order written.
+/// Directories from a GITHUB_PATH file, in the order written: its lines as `File.ReadAllLines`
+/// reads them (ending at `\n`, `\r\n` or `\r`, after any byte order mark), without the spaces and
+/// tabs around them (GitHub keeps those), the empty ones left out.
 pub fn parsePaths(arena: Allocator, text: []const u8) Allocator.Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
-    var lines = std.mem.splitScalar(u8, text, '\n');
+    var lines = std.mem.tokenizeAny(u8, withoutBom(text), "\r\n");
     while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
+        const line = std.mem.trim(u8, raw, " \t");
         if (line.len > 0) try out.append(arena, line);
     }
     return out.items;
@@ -139,12 +174,47 @@ test "multi-line values with a delimiter, including = and << inside the value" {
     try std.testing.expectEqualStrings("ok", p.pairs[1].value);
 }
 
-test "CRLF line endings" {
+test "CRLF line endings are read as GitHub's runner reads them on Linux" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
-    const p = try parseKeyValues(a.allocator(), "a=1\r\nb<<D\r\nx\r\nD\r\n");
-    try std.testing.expectEqualStrings("1", p.pairs[0].value);
-    try std.testing.expectEqualStrings("x", p.pairs[1].value);
+    const ar = a.allocator();
+    // The `\r` is the line's: in a value, and in the delimiter, which a CRLF file's own
+    // delimiter line then matches.
+    const p = try parseKeyValues(ar, "a=1\r\nb<<D\r\nx\r\ny\r\nD\r\n");
+    try std.testing.expectEqual(@as(usize, 2), p.pairs.len);
+    try std.testing.expectEqualStrings("1\r", p.pairs[0].value);
+    try std.testing.expectEqualStrings("x\r\ny\r", p.pairs[1].value);
+    try std.testing.expect(p.invalid == null);
+    // A value's `EOF\r` line is not the delimiter `EOF`: it is part of the value, and the line
+    // after it cannot set another variable. Taking `\r\n` for a line's end once ended the value
+    // there and set INJECTED.
+    const v = try parseKeyValues(ar, "v<<EOF\nfirst\nEOF\r\nINJECTED=1\nEOF\nafter=2\n");
+    try std.testing.expectEqual(@as(usize, 2), v.pairs.len);
+    try std.testing.expectEqualStrings("first\nEOF\r\nINJECTED=1", v.pairs[0].value);
+    try std.testing.expectEqualStrings("after", v.pairs[1].name);
+    // Nor does ` EOF`, `EOF ` or `xEOF`; and a CRLF line holding only `\r` is malformed.
+    const w = try parseKeyValues(ar, "w<<EOF\n EOF\nEOF \nxEOF\nEOF\n");
+    try std.testing.expectEqualStrings(" EOF\nEOF \nxEOF", w.pairs[0].value);
+    try std.testing.expect((try parseKeyValues(ar, "a=1\r\n\r\nb=2\r\n")).invalid != null);
+    // A byte order mark is not the first name's.
+    try std.testing.expectEqualStrings("a", (try parseKeyValues(ar, "\xEF\xBB\xBFa=1\n")).pairs[0].name);
+}
+
+test "a value ends only at its delimiter's own line, which must end in a newline unless it is last" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // The delimiter as the file's last line, with no newline, ends the value.
+    try std.testing.expectEqualStrings("x", (try parseKeyValues(ar, "a<<E\nx\nE")).pairs[0].value);
+    // A value line with no newline after it fails, as GitHub's `EOF marker missing new line`.
+    const cut = try parseKeyValues(ar, "a<<E\nx");
+    try std.testing.expectEqual(@as(usize, 0), cut.pairs.len);
+    try std.testing.expect(cut.invalid != null);
+    try std.testing.expect((try parseKeyValues(ar, "a<<E\n")).invalid != null);
+    // An empty value, and a value with empty lines and multi-byte UTF-8 kept as written.
+    try std.testing.expectEqualStrings("", (try parseKeyValues(ar, "a<<E\nE\n")).pairs[0].value);
+    const u = try parseKeyValues(ar, "a<<É\n\nnaïve ✓\n\nÉ\n");
+    try std.testing.expectEqualStrings("\nnaïve ✓\n", u.pairs[0].value);
 }
 
 test "malformed input is reported with the line" {

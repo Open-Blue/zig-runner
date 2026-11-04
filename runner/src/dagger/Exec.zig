@@ -20,7 +20,8 @@ const replayNotLive = @import("JobLog.zig").replayNotLive;
 const Evaluator = @import("Evaluator.zig");
 const stepScriptFc = @import("scripts.zig").stepScriptFc;
 const fcPath = @import("scripts.zig").fcPath;
-const fc_marker = @import("scripts.zig").fc_marker;
+const combinedPart = @import("scripts.zig").combinedPart;
+const combinedWhole = @import("scripts.zig").combinedWhole;
 const secretAlias = @import("scripts.zig").secretAlias;
 const scriptPath = @import("scripts.zig").scriptPath;
 const Port = @import("services.zig").Port;
@@ -846,6 +847,15 @@ pub fn collect(x: *Exec, num: u32, data: std.json.Value, recorded: Recorded) !Ou
     // fails the step, each file on its own (`ProcessFiles` in FileCommandManager.cs).
     var outputs: []const job_mod.EnvVar = &.{};
     var file_failed = false;
+    // A combined file not whole (a part longer than its length says: a process the step left
+    // behind still writing) is read for none of its parts, and fails a step that passed.
+    if (jsonFind(data, "fc_all")) |all| if (jsonFindString(all, "contents")) |text| {
+        if (!combinedWhole(text) and code == 0) {
+            x.sh.errorLine(num, "Unable to process the step's file commands successfully: " ++
+                "they changed while they were read.");
+            file_failed = true;
+        }
+    };
     if (fileCommand(data, "fc_output")) |text| {
         const parsed = try commands.parseKeyValues(arena, text);
         outputs = parsed.pairs;
@@ -1480,7 +1490,7 @@ fn exitCode(data: std.json.Value) i32 {
 
 fn fileCommand(data: std.json.Value, alias: []const u8) ?[]const u8 {
     if (jsonFind(data, "fc_all")) |all| {
-        const text = combinedFileCommand(
+        const text = combinedPart(
             jsonFindString(all, "contents") orelse return null,
             alias["fc_".len..],
         ) orelse return null;
@@ -1489,25 +1499,6 @@ fn fileCommand(data: std.json.Value, alias: []const u8) ?[]const u8 {
     const f = jsonFind(data, alias) orelse return null;
     const text = jsonFindString(f, "contents") orelse return null;
     return if (text.len == 0) null else text;
-}
-
-/// One kind's contents in a combined file (see `writeCombinedFileCommands`).
-fn combinedFileCommand(all: []const u8, kind: []const u8) ?[]const u8 {
-    var start: usize = 0;
-    while (std.mem.indexOfPos(u8, all, start, fc_marker)) |i| {
-        const line_end = std.mem.indexOfScalarPos(u8, all, i, '\n') orelse return null;
-        const body = line_end + 1;
-        // The next marker starts a line; the newline before it is the one added after the contents.
-        const next = std.mem.indexOfPos(u8, all, body, "\n" ++ fc_marker) orelse all.len;
-        if (std.mem.eql(u8, all[i + fc_marker.len .. line_end], kind)) {
-            const at_end = next == all.len;
-            const trailing_newline = at_end and all.len > body and all[all.len - 1] == '\n';
-            const end = if (trailing_newline) all.len - 1 else next;
-            return all[body..@max(body, end)];
-        }
-        start = if (next == all.len) all.len else next + 1;
-    }
-    return null;
 }
 
 test "a failed answer without a ran marker is an earlier run's unless the step showed it ran here" {
@@ -1574,14 +1565,4 @@ test "a cached exec is replayed though the exec before it, of the same step, is 
     ended[0].store(true, .release);
     try std.testing.expect(liveThisExec(std.testing.io, &sh, 1, true));
     try std.testing.expect(liveThisExec(std.testing.io, &sh, 1, null));
-}
-
-test "file commands come back from one combined file" {
-    const all = "::zig-file-command::output\nversion=1\nnotes<<EOF\na\nEOF\n\n::zig-file-command::env\n\n::zig-file-command::path\n/opt/x/bin\n\n::zig-file-command::step_summary\nno newline at end\n::zig-file-command::state\n\n";
-    try std.testing.expectEqualStrings("version=1\nnotes<<EOF\na\nEOF\n", combinedFileCommand(all, "output").?);
-    try std.testing.expectEqualStrings("", combinedFileCommand(all, "env").?);
-    try std.testing.expectEqualStrings("/opt/x/bin\n", combinedFileCommand(all, "path").?);
-    try std.testing.expectEqualStrings("no newline at end", combinedFileCommand(all, "step_summary").?);
-    try std.testing.expectEqualStrings("", combinedFileCommand(all, "state").?);
-    try std.testing.expect(combinedFileCommand(all, "missing") == null);
 }

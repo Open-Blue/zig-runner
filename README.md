@@ -148,6 +148,11 @@ Database tests job sets where those tests skip); "ThreadSanitizer, end to end" r
 suite on both backends with a runner built under it (`e2e.sh build BIN tsan`), failing on any report
 in the runner's log or the jobs' (`e2e.sh races`). TSan's runtime needs glibc's dynamic loader, so
 these builds are dynamically linked PIEs, not the release's static PIE.
+"Stress" runs the concurrency-sensitive tests (cancels, deadlines, the memory gate, the native
+store's locks, the database, the broker's long-poll, log uploads;
+`.github/scripts/zig-race-tests.sh` names them) 100 times over under stress-ng's CPU and memory
+load, with the database, and fails on the first round that fails, its output an artifact
+(`.github/scripts/zig-stress.sh`).
 **Mutation testing** asks whether the tests would notice the code being wrong:
 `runner/tools/mutate.py` changes a module's code one thing at a time (a comparison flipped, `and`
 for `or`, `true` for `false`, a `return error.X` guard taken away, an integer constant off by one,
@@ -237,8 +242,9 @@ repository:
   detector check too (`.github/scripts/go-lint.sh`); every job has a time limit. The Database
   tests job runs every test under
   ThreadSanitizer (`zig build test -Dsanitize-thread` locally); ZLint checks the runner's Zig, and
-  `analysis` fuzzes its parsers, runs its tests under Valgrind and its native backend's tests and
-  the end-to-end suite under ThreadSanitizer nightly (above). Vulnerabilities
+  `analysis` fuzzes its parsers, runs its tests under Valgrind, its native backend's tests and the
+  end-to-end suite under ThreadSanitizer, and its concurrency-sensitive tests under load nightly
+  (above). Vulnerabilities
   are reported privately ([docs/SECURITY.md](docs/SECURITY.md)).
 - **One secret, one step.** The deploy key that may push to `main` is the `prod` environment's,
   which deploys only from `main` and waits for approval; it is loaded only in the step that pushes,

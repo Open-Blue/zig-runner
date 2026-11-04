@@ -47,7 +47,7 @@ pub fn hex(k: Key) [2 * Sha256.digest_length]u8 {
 /// record's files and how they replay, the key's extras). Part of every base's parent
 /// (`Backend.below`), so every key: bump it with any change to those, and a runner upgraded
 /// finds none of the layers an older one left (they age out under the cap).
-pub const store_format = "zig-runner native store 3";
+pub const store_format = "zig-runner native store 4";
 
 /// What a key is of (P8's tag, proofs/Runner/Native.lean): a job's base, a step's container (a
 /// `run:` step's exec, or a checkout's fetch), or one keyed on what a step produced.
@@ -290,16 +290,16 @@ pub const Record = struct { log: []const u8, fc: []const u8 };
 /// Dagger's limit on a recorded output (`dagger.max_recorded_bytes`).
 pub const max_record_bytes = dagger.max_recorded_bytes;
 
-const fc_ran = @import("../dagger/scripts.zig").fc_marker ++ "ran\n";
+const combinedPart = @import("../dagger/scripts.zig").combinedPart;
 
 /// Why a record cannot be stored or replayed as a `kind`'s, or null when it can.
 fn recordFault(kind: Kind, rec: Record) ?anyerror {
     if (rec.log.len > max_record_bytes or rec.fc.len > max_record_bytes)
         return error.RecordTooLarge;
     return switch (kind) {
-        // Its file commands end with its ran marker (`scripts.writeCombinedFileCommands`):
-        // without it, they were cut short.
-        .step => if (std.mem.indexOf(u8, rec.fc, fc_ran) == null) error.ShortRecord else null,
+        // Its file commands are whole, every part its length and the ran marker last
+        // (`scripts.combinedPart`): otherwise they were cut short.
+        .step => if (combinedPart(rec.fc, "ran") == null) error.ShortRecord else null,
         .base, .fetch => if (rec.fc.len > 0) error.ShortRecord else null,
     };
 }
@@ -1771,7 +1771,7 @@ test "native store: a record that cannot be replayed is refused, and a broken en
     const big = try arena.alloc(u8, max_record_bytes + 1);
     @memset(big, 'x');
     const refused = [_]struct { Kind, Record }{
-        .{ .step, .{ .log = "", .fc = "::zig-file-command::env\n" } },
+        .{ .step, .{ .log = "", .fc = "::zig-file-command::env 4\nA=1\n\n" } },
         .{ .step, .{ .log = "", .fc = "" } },
         .{ .base, .{ .log = "", .fc = ran } },
         .{ .step, .{ .log = "", .fc = big } },
