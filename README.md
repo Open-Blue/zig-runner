@@ -237,7 +237,9 @@ repository:
   (push protection), and gitleaks scans every pull request's commits and, weekly, the whole history
   (`security`, above); dependency review checks the dependencies a pull request brings.
 - **Checked.** actionlint and zizmor check the workflows, shellcheck every shell script
-  (`.github/scripts/shellcheck.sh`), `busybox-pin.sh` the runner's busybox pin, and CodeQL the
+  (`.github/scripts/shellcheck.sh`) and shfmt its format (`.github/scripts/shfmt.sh`, shfmt's
+  defaults: tabs; `-w` formats), hadolint the Dockerfile (`.github/scripts/hadolint.sh`; a finding
+  kept is ignored on its instruction, with why), `busybox-pin.sh` the runner's busybox pin, and CodeQL the
   workflows, the Go tools and the Python generators, which `go vet`, staticcheck and the race
   detector check too (`.github/scripts/go-lint.sh`); every job has a time limit. The Database
   tests job runs every test under

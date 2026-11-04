@@ -344,7 +344,8 @@ fn waitReady(x: *Exec, ls: u32, s: *Service) !bool {
                 "was not ready after {d} minutes.", .{ s.name, ready_cap_ms / 60_000 }));
             return false;
         }
-        io.sleep(.fromMilliseconds(poll_ms), .awake) catch {};
+        // A cancel ends the wait, up the stack: std.Io delivers it once.
+        try io.sleep(.fromMilliseconds(poll_ms), .awake);
     }
 }
 
