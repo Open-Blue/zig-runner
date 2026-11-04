@@ -77,6 +77,7 @@ src/main.zig	cb383b40dafe78f0	s.log.say(line) catch {};
 src/native/Backend.zig	74206249ad4c0349	errdefer _ = std.process.run(arena, io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch {};
 src/native/Backend.zig	7a6a1cb23d998554	_ = std.process.run(arena, std.testing.io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch {};
 src/native/Backend.zig	bf37938eff44209b	cwd.deleteFile(b.io, link) catch {};
+src/native/Store.zig	33d1532fa2a72caa	cwd.deleteFile(io, tmp) catch {};
 src/native/Store.zig	7e43621e7c6aab95	cwd.deleteFile(io, full) catch {};
 src/native/Store.zig	ec349ee7ec5bdb4e	cwd.rename(tmp, cwd, kept, io) catch cwd.deleteFile(io, tmp) catch {};
 src/native/dockerfile.zig	015b34e4915c7fe7	std.Io.Dir.cwd().deleteTree(io, upper) catch {};

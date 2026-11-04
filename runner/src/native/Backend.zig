@@ -699,6 +699,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .dir => |d| d,
         .none => null,
     });
+    (Store{ .root = cfg.store }).checkOncePerBoot(arena, io);
     t = ph.since(arena, .sweep, t);
     var raw: [8]u8 = undefined;
     io.random(&raw);
@@ -746,7 +747,11 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .how = how,
         .subid_base = cfg.subid_base,
         .subnet = cfg.subnet,
-        .store_cfg = .{ .root = cfg.store, .max_bytes = cfg.store_max_bytes },
+        .store_cfg = .{
+            .root = cfg.store,
+            .max_bytes = cfg.store_max_bytes,
+            .sync_fd = Store.syncCursor(arena, cfg.store),
+        },
         .vouched = cfg.vouched,
         .flatten_at = @max(2, cfg.flatten_at),
         .gate = cfg.gate,
@@ -1108,6 +1113,7 @@ pub fn deinit(b: *Backend) void {
     if (b.slot) |s| s.lock.close(b.io);
     b.lock.close(b.io);
     if (b.published) b.store_cfg.syncLayers(arena);
+    if (b.store_cfg.sync_fd) |fd| _ = std.os.linux.close(fd);
     // The store kept under its cap, now that this job holds none of its layers: whether or not
     // the job cached steps, as Dockerfile builds publish layers too (`layers.zig`).
     if (b.store_cfg.root.len > 0) b.store_cfg.collect(arena, b.io);

@@ -35,6 +35,10 @@ const phases = @import("phases.zig");
 root: []const u8,
 /// Past this many bytes of layers, the least recently used go (`collect`).
 max_bytes: u64 = default_max_bytes,
+/// A descriptor on the store's filesystem, opened when the job began (`syncCursor`): `syncfs` on
+/// it reports a write error since then even if another job's `syncfs` was told first, which one
+/// opened at the publish would miss. Null: the publish's own.
+sync_fd: ?linux.fd_t = null,
 
 pub const default_max_bytes: u64 = 10 * 1024 * 1024 * 1024;
 
@@ -409,6 +413,59 @@ pub fn checkEntry(s: Store, arena: Allocator, io: std.Io, name: []const u8) !?u6
     return m.bytes;
 }
 
+/// The first job after a boot checks every layer's tree against the bytes its meta counted, and
+/// evicts one that differs: nothing else compares a tree (`open` reads only its record, and
+/// walking the tree there would cost every replay), and a crash, the one thing that could leave
+/// a whole-looking entry with files short or empty, only shows across a boot. Later jobs read
+/// the boot's id and stop. A job waits for the check, so no job holds a layer it could evict, and
+/// a false difference is only a miss.
+pub fn checkOncePerBoot(s: Store, arena: Allocator, io: std.Io) void {
+    const cwd = std.Io.Dir.cwd();
+    const mark = join(arena, s.root, "boot") catch return;
+    const boot = cwd.readFileAlloc(io, "/proc/sys/kernel/random/boot_id", arena, .limited(64)) catch return;
+    if (checkedIn(arena, io, mark, boot)) return;
+    const gc = cwd.createFile(io, join(arena, s.root, "gc.lock") catch return, .{
+        .truncate = false,
+    }) catch return;
+    defer gc.close(io);
+    if (!flock(gc, lock_ex)) return;
+    if (checkedIn(arena, io, mark, boot)) return;
+
+    const layers = join(arena, s.root, "layers") catch return;
+    var dir = cwd.openDir(io, layers, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.name[0] == '.') continue;
+        var pass: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        defer pass.deinit();
+        const a = pass.allocator();
+        const full = join(a, layers, e.name) catch return;
+        if (treeAsCounted(a, io, full)) continue;
+        std.log.warn("native: layer {s}'s tree is not what was published; evicted", .{e.name});
+        _ = s.evict(a, io, e.name);
+    }
+
+    const tmp = std.fmt.allocPrint(arena, "{s}.tmp", .{mark}) catch return;
+    const f = cwd.createFile(io, tmp, .{}) catch return;
+    defer f.close(io);
+    f.writeStreamingAll(io, boot) catch return;
+    if (linux.errno(linux.fsync(f.handle)) != .SUCCESS) return;
+    cwd.rename(tmp, cwd, mark, io) catch |e|
+        std.log.warn("native: cannot mark {s}, so the next job checks it again: {s}", .{ mark, @errorName(e) });
+}
+
+fn checkedIn(arena: Allocator, io: std.Io, mark: []const u8, boot: []const u8) bool {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, mark, arena, .limited(64)) catch return false;
+    return std.mem.eql(u8, text, boot);
+}
+
+fn treeAsCounted(arena: Allocator, io: std.Io, dir: []const u8) bool {
+    const m = metaOf(arena, io, dir) catch return false;
+    const fs = join(arena, dir, "fs") catch return false;
+    return m.bytes == (treeBytes(arena, io, fs) catch return false);
+}
+
 fn metaOf(arena: Allocator, io: std.Io, dir: []const u8) !Meta {
     const text = try std.Io.Dir.cwd().readFileAlloc(io, try join(arena, dir, "meta"), arena, .limited(1024));
     return Meta.parse(text);
@@ -525,7 +582,8 @@ pub fn publishTimed(
         error.Unreadable => false,
         else => return error.Sync,
     };
-    if (!synced and linux.errno(linux.syncfs(lock.?.handle)) != .SUCCESS) return error.Sync;
+    if (!synced and linux.errno(linux.syncfs(s.sync_fd orelse lock.?.handle)) != .SUCCESS)
+        return error.Sync;
     // Measured once written: a file the kernel is still writing back can show fewer blocks
     // than it takes (a block short, the stress test found, under other publishers' syncfs),
     // and the store would count less than it holds. The meta, written after the sync, is
@@ -677,6 +735,11 @@ pub const sync_tree_max = 256;
 /// The layers' directory synced, so the renames that published this job's layers outlive a
 /// crash: once a job, at its end, rather than once a publish. A failure is logged: it loses only
 /// entries, which are then misses.
+/// `sync_fd` for a job beginning now; null when the store cannot be opened.
+pub fn syncCursor(arena: Allocator, root: []const u8) ?linux.fd_t {
+    return openRoot(arena, root) catch null;
+}
+
 pub fn syncLayers(s: Store, arena: Allocator) void {
     const p = join(arena, s.root, "layers") catch return;
     const fd = openRoot(arena, p) catch return;
@@ -1360,7 +1423,11 @@ pub fn layerDigest(s: Store, arena: Allocator, io: std.Io, key: Key, ids: Ids) !
     const kept = try join(arena, dir, "digest");
     if (cwd.readFileAlloc(io, kept, arena, .limited(128))) |text| {
         var d: Key = undefined;
-        if (std.fmt.hexToBytes(&d, std.mem.trim(u8, text, " \n"))) |_| return d else |_| {}
+        const digest = std.mem.trim(u8, text, " \n");
+        // Whole: `hexToBytes` takes an empty file too, and fills in nothing.
+        if (digest.len == d.len * 2) {
+            if (std.fmt.hexToBytes(&d, digest)) |_| return d else |_| {}
+        }
     } else |_| {}
     const d = try treeDigest(arena, io, try join(arena, dir, "fs"), .content, ids);
     // Written aside and renamed, so a reader never sees half of it.
@@ -1370,7 +1437,16 @@ pub fn layerDigest(s: Store, arena: Allocator, io: std.Io, key: Key, ids: Ids) !
         kept,
         &std.fmt.bytesToHex(raw, .lower),
     });
-    try cwd.writeFile(io, .{ .sub_path = tmp, .data = &hex(d) });
+    {
+        const f = try cwd.createFile(io, tmp, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, &hex(d));
+        // On disk before its name is. Kept only to save a walk: without it, it is walked again.
+        if (linux.errno(linux.fsync(f.handle)) != .SUCCESS) {
+            cwd.deleteFile(io, tmp) catch {};
+            return d;
+        }
+    }
     cwd.rename(tmp, cwd, kept, io) catch cwd.deleteFile(io, tmp) catch {};
     return d;
 }
@@ -1676,6 +1752,38 @@ test "native store: flattening layers: later entries win, whiteouts are kept, op
     _ = linux.statx(linux.AT.FDCWD, a0, 0, .{ .INO = true }, &s0);
     _ = linux.statx(linux.AT.FDCWD, a1, 0, .{ .INO = true }, &s1);
     try std.testing.expectEqual(s0.ino, s1.ino);
+}
+
+test "native store: after a boot a layer whose tree changed is evicted, once" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    const kept, const l1 = try testLayer(arena, io, tmp, &s, "kept");
+    l1.lock.close(io);
+    const cut, const l2 = try testLayer(arena, io, tmp, &s, "cut");
+    l2.lock.close(io);
+    // This boot's check passes both, and marks the store.
+    s.checkOncePerBoot(arena, io);
+    (try s.open(arena, io, kept)).?.layer.lock.close(io);
+    (try s.open(arena, io, cut)).?.layer.lock.close(io);
+
+    // What a crash leaves: a file emptied under a whole-looking entry. `open` cannot see it.
+    const file = try std.fmt.allocPrint(arena, "store/layers/{s}/fs/f", .{&hex(cut)});
+    try tmp.dir.writeFile(io, .{ .sub_path = file, .data = "" });
+    (try s.open(arena, io, cut)).?.layer.lock.close(io);
+    // In the same boot, nothing looks.
+    s.checkOncePerBoot(arena, io);
+    (try s.open(arena, io, cut)).?.layer.lock.close(io);
+
+    // After another boot it is gone, and the whole one stays.
+    try tmp.dir.writeFile(io, .{ .sub_path = "store/boot", .data = "another boot\n" });
+    s.checkOncePerBoot(arena, io);
+    try std.testing.expect(try s.open(arena, io, cut) == null);
+    (try s.open(arena, io, kept)).?.layer.lock.close(io);
 }
 
 test "native store: a failed fsync is not lost to an unreadable file's fallback" {
