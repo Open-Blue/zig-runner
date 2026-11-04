@@ -68,8 +68,9 @@ on:
         required: false
   # A pull request that changes this workflow or its scripts runs it, so a change to them is seen
   # working before it merges (workflow_dispatch reaches a workflow only once the default branch
-  # has it); one that changes the runner's code runs Coverage alone (ci-scope.sh analysis and
-  # coverage, in the Scope job). Not a required check, so the path filter leaves nothing waiting.
+  # has it); one that changes the runner's code runs Coverage, and Store stress when that code is
+  # the native store's (ci-scope.sh analysis, store and coverage, in the Scope job). Not a required
+  # check, so the path filter leaves nothing waiting.
   pull_request:
     paths:
       - .github/workflows/analysis.yml
@@ -94,7 +95,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Which jobs a pull request runs (ci-scope.sh analysis and coverage); everything, otherwise. Not a
+  # Which jobs a pull request runs (ci-scope.sh analysis, store and coverage); everything, otherwise. Not a
   # required check, so a job its `if:` leaves out holds nothing up.
   scope:
     name: Scope
@@ -104,6 +105,7 @@ jobs:
       contents: read # to check out the code and fetch the base commit
     outputs:
       analysis: ${{ steps.analysis.outputs.run }}
+      store: ${{ steps.store.outputs.run }}
       coverage: ${{ steps.coverage.outputs.run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -115,6 +117,12 @@ jobs:
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: .github/scripts/ci-scope.sh analysis
+
+      - name: Whether this change can affect Store stress
+        id: store
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: .github/scripts/ci-scope.sh store
 
       - name: Whether this change can affect Coverage
         id: coverage
@@ -522,7 +530,7 @@ jobs:
   store-stress:
     name: Store stress (${{ matrix.arch }})
     needs: scope
-    if: needs.scope.outputs.analysis == 'true'
+    if: needs.scope.outputs.store == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     permissions:
