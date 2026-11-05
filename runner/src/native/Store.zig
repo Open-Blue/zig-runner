@@ -806,7 +806,12 @@ fn openFileAt(dir: linux.fd_t, name: [*:0]const u8) !linux.fd_t {
 /// The most entries (files, directories, anything) of an upper whose own files a publish syncs
 /// (`writeBack`, `syncEntries`); past it, it syncs the filesystem (`syncfs`), as fsyncs that share commits still
 /// cost the disk's cache a flush each now and then.
-pub const sync_tree_max = 256;
+///
+/// A checkout of this repository is about 370 entries, and took `syncfs`, so it waited for
+/// whatever else the disk was writing: twice as long beside a writer, on a laptop's NVMe. Around
+/// 800 `syncfs` is twice as fast on a tree already written, and slower only on one just written
+/// beside a writer.
+pub const sync_tree_max = 512;
 
 /// The layers' directory synced, so the renames that published this job's layers outlive a
 /// crash: once a job, at its end, rather than once a publish. A failure is logged: it loses only
