@@ -428,6 +428,12 @@ fn fail(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: S
     };
     const eq = std.mem.eql;
     if (eq(u8, sp.arg, "sync-tree")) {
+        // Gone where a publish syncs its files another way (a branch that moved it): then the
+        // `small` case, a publish, is the fsync path's test.
+        if (!@hasDecl(Store, "syncTree")) {
+            std.debug.print("native store crash: Store.syncTree is not there; the small publish covers the fsync path\n", .{});
+            return;
+        }
         // The fsync path itself: a small tree whose writes fail.
         const dir = try print(arena, "{s}/uppers/t", .{sp.root});
         try makeTree(arena, io, dir, "a");
