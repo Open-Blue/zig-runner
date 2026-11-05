@@ -194,6 +194,19 @@ fn runOne(run: *Run, shard: *?Shard, index: u32) void {
         });
     } else if (flags.status == .skip) {
         _ = run.skipped.fetchAdd(1, .monotonic);
+        // A test that says why it skipped (a native one that cannot make a sandbox) keeps saying
+        // it, on one line; a silent skip is silent.
+        const why = std.mem.trim(u8, text, " \r\n");
+        if (why.len > 0) {
+            const line = run.gpa.dupe(u8, why) catch return;
+            defer run.gpa.free(line);
+            std.mem.replaceScalar(u8, line, '\n', ' ');
+            run.say_lock.lockUncancelable(run.io);
+            defer run.say_lock.unlock(run.io);
+            std.debug.print("{d}/{d} {s}...SKIP ({s})\n", .{
+                index + 1, run.names.len, run.names[index], line,
+            });
+        }
     } else _ = run.passed.fetchAdd(1, .monotonic);
 }
 
