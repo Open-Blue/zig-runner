@@ -1,3 +1,3 @@
 kind: Added
-body: The tests run in as many processes as the machine has cores, in `zig build test`, CI and the pre-push hook alike (`runner/tools/test_shards.zig`; `ZIG_TEST_SHARDS=1` for one). The tests that use fixed ports on the host (the native services' and the root runner's) still run one at a time.
+body: The tests run in as many processes as the machine has cores, in `zig build test`, CI and the pre-push hook alike (`runner/tools/test_shards.zig`; `ZIG_TEST_SHARDS=1` for one). The tests that use fixed ports on the host, and as root all the native backend's, still run one at a time.
 time: 2026-11-05T10:00:00.000000-05:00

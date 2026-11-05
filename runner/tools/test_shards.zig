@@ -28,12 +28,13 @@ const Results = std.zig.Server.Message.TestResults;
 /// The tests that cannot run beside each other: those that listen on fixed ports on the host, or
 /// publish a service on one (services.zig: 5432, 16379, 47321, 47999), and those that look for what
 /// a job can reach from the host's own listeners (Backend.zig: 17123, 17124, 17126; all named
-/// "root runner"). The rest of the native backend's tests run side by side: each has its own
-/// store and directory, and as root a job's slot of ids and addresses is the first free one on
-/// the host (`net.slots_dir`, held by a lock), as with jobs of several runners.
-fn serial(name: []const u8) bool {
+/// "root runner"). As root, all the native backend's: a root job takes the first free slot of ids
+/// and addresses on the host (`net.slots_dir`), and the tests that name its ids expect the first.
+/// Rootless, they have a store and a directory of their own and run side by side.
+fn serial(name: []const u8, root: bool) bool {
     return std.mem.indexOf(u8, name, "native.services.") != null or
-        std.mem.indexOf(u8, name, "root runner") != null;
+        std.mem.indexOf(u8, name, "root runner") != null or
+        root and std.mem.indexOf(u8, name, "native") != null;
 }
 
 /// The tests that take seconds, which start first: the run ends with its last test, so one that
@@ -96,12 +97,13 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
 
+    const root = std.os.linux.geteuid() == 0;
     var free: std.ArrayList(u32) = .empty;
     var alone: std.ArrayList(u32) = .empty;
     for ([_]bool{ true, false }) |slow_first| {
         for (names, 0..) |name, i| {
             if (slow(name) == slow_first)
-                try (if (serial(name)) &alone else &free).append(arena, @intCast(i));
+                try (if (serial(name, root)) &alone else &free).append(arena, @intCast(i));
         }
     }
     var run: Run = .{
