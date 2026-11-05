@@ -25,21 +25,25 @@ const Request = std.zig.Client.Message.Header;
 const Reply = std.zig.Server.Message.Header;
 const Results = std.zig.Server.Message.TestResults;
 
-/// The tests that cannot run beside each other: the native backend's (`--test-filter native`, which
-/// ZIG_TEST_NATIVE_AS_ROOT runs, is the project's own name for them). They make real sandboxes,
-/// and as root each takes the first free slot of ids and addresses on the host's bridge, so two at
-/// once take the same one; some listen on fixed ports on the host (Backend.zig, services.zig) and
-/// look for what a job can reach, which another test's job would change.
+/// The tests that cannot run beside each other: those that listen on fixed ports on the host, or
+/// publish a service on one (services.zig: 5432, 16379, 47321, 47999), and those that look for what
+/// a job can reach from the host's own listeners (Backend.zig: 17123, 17124, 17126; all named
+/// "root runner"). The rest of the native backend's tests run side by side: each has its own
+/// store and directory, and as root a job's slot of ids and addresses is the first free one on
+/// the host (`net.slots_dir`, held by a lock), as with jobs of several runners.
 fn serial(name: []const u8) bool {
-    return std.mem.indexOf(u8, name, "native") != null;
+    return std.mem.indexOf(u8, name, "native.services.") != null or
+        std.mem.indexOf(u8, name, "root runner") != null;
 }
 
 /// The tests that take seconds, which start first: the run ends with its last test, so one that
 /// starts late makes the others wait for it. The first is work (6 s alone, an allocation failure at
-/// a time over a whole job), the others wait for a peer. A test missing here only starts later
-/// than it could.
+/// a time over a whole job), the others wait for a peer, and the last is 30 s of workers on a
+/// store. A test missing here only starts later than it could.
 fn slow(name: []const u8) bool {
-    const parts = [_][]const u8{ "allocation failures", "never answers", "slow to answer" };
+    const parts = [_][]const u8{
+        "allocation failures", "never answers", "slow to answer", "store under load",
+    };
     for (parts) |part| {
         if (std.mem.indexOf(u8, name, part) != null) return true;
     }
@@ -115,8 +119,8 @@ pub fn main(init: std.process.Init) !u8 {
     for (threads) |t| t.join();
 
     const failed = run.failed.load(.monotonic);
-    const seconds = @as(f64, @floatFromInt(started.durationTo(Io.Clock.awake.now(io)).toNanoseconds())) /
-        std.time.ns_per_s;
+    const took = started.durationTo(Io.Clock.awake.now(io));
+    const seconds = @as(f64, @floatFromInt(took.toNanoseconds())) / std.time.ns_per_s;
     std.debug.print("{d} passed; {d} skipped; {d} failed ({d} shards, {d:.1} s).\n", .{
         run.passed.load(.monotonic), run.skipped.load(.monotonic), failed, shards, seconds,
     });
