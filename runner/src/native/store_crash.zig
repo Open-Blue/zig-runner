@@ -12,7 +12,7 @@
 //!   write   runs step ARG (1-6) of a sequence, as a job would, and marks the log at the points
 //!           the checks need (ZIG_TEST_STORE_CRASH_MARK NAME):
 //!             1  a job publishes three small layers (`syncTree`) and syncs the layers' directory;
-//!             2  the next publishes a large one (over `sync_tree_max`: `syncfs`) and a small
+//!             2  the next publishes a large one (over `sync_tree_max` entries: `syncfs`) and a small
 //!                one;
 //!             3  the first job after a reboot (the boot mark removed): `checkOncePerBoot`, then
 //!                one more small layer;
@@ -49,7 +49,7 @@ const flip_env = "ZIG_TEST_STORE_CRASH_FLIP";
 
 /// The layers the sequence publishes, in order (step 1: a, b, c; 2: big, d; 3: e; 4: f).
 const names = [_][]const u8{ "a", "b", "c", "big", "d", "e", "f" };
-/// Over `Store.sync_tree_max` entries: 10 directories of 30 files.
+/// Over `Store.sync_tree_max` entries, whatever it is: directories of 30 files.
 const big = "big";
 const ensure_key = "k1";
 const seed_cache = "root/.cache/zig";
@@ -72,7 +72,7 @@ fn makeTree(arena: Allocator, io: std.Io, dir: []const u8, name: []const u8) !vo
     const rand = prng.random();
     try cwd.createDirPath(io, dir);
     if (std.mem.eql(u8, name, big)) {
-        for (0..10) |d| for (0..30) |i| {
+        for (0..Store.sync_tree_max / 30 + 2) |d| for (0..30) |i| {
             try cwd.createDirPath(io, try print(arena, "{s}/d{d}", .{ dir, d }));
             const data = try arena.alloc(u8, if (i == 0) 70_000 else 4096);
             rand.bytes(data);
