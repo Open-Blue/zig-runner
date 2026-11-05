@@ -52,7 +52,23 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = exe.root_module, .filters = test_filters, .use_llvm = use_llvm });
     tests.pie = pie;
     const test_step = b.step("test", "Run tests");
-    const run_tests = b.addRunArtifact(tests);
+    // The tests run in as many processes as the machine has cores (`tools/test_shards.zig`), which
+    // the build system's runner, one test at a time, does not. `--fuzz` needs that runner, and so
+    // `-Dllvm`, which it needs too, turns this off.
+    const shard_tests = b.option(bool, "shard-tests", "Run the tests in several processes (default: unless -Dllvm)") orelse
+        (use_llvm != true);
+    const run_tests = if (shard_tests) run: {
+        const shards = b.addExecutable(.{
+            .name = "test_shards",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/test_shards.zig"),
+                .target = target,
+            }),
+        });
+        const run_shards = b.addRunArtifact(shards);
+        run_shards.addArtifactArg(tests);
+        break :run run_shards;
+    } else b.addRunArtifact(tests);
     // Which tests run depends on the environment (PG*, ZIG_TEST_PG_URL, ZIG_TEST_REQUIRE_DB), which
     // the cache does not see: a run without a database would otherwise be replayed as the run with.
     run_tests.has_side_effects = true;
