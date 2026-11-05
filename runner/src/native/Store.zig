@@ -806,7 +806,12 @@ fn openFileAt(dir: linux.fd_t, name: [*:0]const u8) !linux.fd_t {
 /// The most entries (files, directories, anything) of an upper whose own files a publish syncs
 /// (`writeBack`, `syncEntries`); past it, it syncs the filesystem (`syncfs`), as fsyncs that share commits still
 /// cost the disk's cache a flush each now and then.
-pub const sync_tree_max = 256;
+///
+/// A checkout of this repository is about 370 entries, and took `syncfs`, so it waited for
+/// whatever else the disk was writing: twice as long beside a writer, on a laptop's NVMe. Around
+/// 800 `syncfs` is twice as fast on a tree already written, and slower only on one just written
+/// beside a writer.
+pub const sync_tree_max = 512;
 
 /// The layers' directory synced, so the renames that published this job's layers outlive a
 /// crash: once a job, at its end, rather than once a publish. A failure is logged: it loses only
@@ -1935,6 +1940,32 @@ test "native store: a walk that passes the limit stops, and a large entry syncs 
     );
     try tmp.dir.access(io, "t/d/g0", .{});
     try std.testing.expect(try s.open(arena, io, large) == null);
+}
+
+test "native store: a checkout's size of entries is synced on its own, not with the whole disk" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try tmp.dir.createDirPath(io, "t/d");
+    for (0..370) |i| try tmp.dir.writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "t/d/f{d}", .{i}),
+        .data = "x",
+    });
+    // A descriptor that fails: `syncfs` would refuse the publish, so it was not called.
+    const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}), .sync_fd = -1 };
+    try prepare(arena, io, s.root, .{ .check_parents = false });
+    var kh: KeyHasher = .plain("checkout");
+    const k = kh.final();
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, k, &never);
+    defer kl.close(io);
+    const upper = try std.fmt.allocPrint(arena, "{s}/t", .{root});
+    const l = try s.publish(arena, io, k, .fetch, upper, .{ .log = "", .fc = "" });
+    l.lock.close(io);
 }
 
 test "native store: a publish syncs the entry's own tree, and a file it cannot open falls back to the filesystem's" {
