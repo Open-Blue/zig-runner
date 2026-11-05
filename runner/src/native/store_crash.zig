@@ -273,6 +273,7 @@ fn required(mark: []const u8) []const []const u8 {
         .{ .mark = "after-4", .names = names[6..7] },
         .{ .mark = "after-5", .names = names[6..7] },
         .{ .mark = "after-6", .names = names[6..7] },
+        .{ .mark = "synced", .names = names[6..7] },
     };
     for (table) |m| if (std.mem.eql(u8, m.mark, mark)) return m.names;
     return &.{};
