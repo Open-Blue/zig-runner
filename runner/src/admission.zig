@@ -40,7 +40,8 @@
 //! jobs of a few MB for 87-150 s each behind 1.5 GB reserved per job not learned yet, sized for
 //! `zig build test` on the engine. What lets a native default be low is the cgroup: a native job
 //! that outgrows its estimate meets its `memory.high` (`nativeHighMb`) and is slowed and reclaimed
-//! there, rather than taking memory its neighbours were admitted against.
+//! there, rather than taking memory its neighbours were admitted against; while the host has
+//! memory to spare the limit moves out of its way (`Admission.growHigh`).
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -79,12 +80,18 @@ pub const Limits = struct {
 /// which the estimate does not (`workingSetMb`): a checkout's or a build's file cache is reclaimed
 /// there, cheaply, instead of growing until the host's memory runs short. Past it the kernel
 /// reclaims the job's memory and then slows its allocations; it kills nothing, which stays
-/// `memory.max`'s (`RUNNER_NATIVE_MEMORY_MAX_MB`) to do. A job not learned yet gets 1 GB.
+/// `memory.max`'s (`RUNNER_NATIVE_MEMORY_MAX_MB`) to do. A job not learned yet gets 1 GB. This is
+/// where a job starts: `Admission.growHigh` raises it while the host has memory to spare.
 pub fn nativeHighMb(est_mb: u32) u32 {
     return est_mb *| 2 +| high_headroom_mb;
 }
 
 pub const high_headroom_mb = 512;
+
+/// How much a native job's `memory.high` grows at a time (`Admission.growHigh`), and how close to
+/// it its working set comes first.
+pub const high_step_mb = 256;
+pub const high_grow_margin_mb = 256;
 
 /// Where the signals are read; tests point these at fixtures.
 pub const Paths = struct {
@@ -151,8 +158,9 @@ pub const Admission = struct {
         native: bool = false,
         cgroup_buf: [256]u8 = @splat(0),
         cgroup_len: usize = 0,
-        /// The native job's `memory.high` in MB (`nativeHighMb`), null for none; and whether its
-        /// cgroup went over it (memory.events `high`), read as the cgroup goes.
+        /// The native job's `memory.high` in MB (`nativeHighMb`, then `Admission.growHigh`), null
+        /// for none; and whether its cgroup went over it (memory.events `high`), read as the
+        /// cgroup goes.
         high_mb: ?u32 = null,
         over_high: bool = false,
 
@@ -263,6 +271,7 @@ pub const Admission = struct {
             if (s.native) {
                 if (s.cgroup()) |dir| if (workingSetMb(a.io, dir)) |mb| {
                     s.peak_mb = @max(s.peak_mb, mb);
+                    a.growHigh(s, dir, mb);
                 };
                 continue;
             }
@@ -272,6 +281,33 @@ pub const Admission = struct {
             }
             if (engine) |e| s.peak_mb = @max(s.peak_mb, e.used_mb);
         }
+    }
+
+    /// A native job near its `memory.high` gets more of it while the host has the memory: the limit
+    /// is there for the job's neighbours, and with none to protect it only harms. A build three
+    /// times its limit, on a machine with 4 GB free, was reclaimed into swap on an SD card and
+    /// took over an hour where the engine took 2 minutes (razorbill, 2026-11-05). What is left
+    /// above the step is the floor every job was let in against, and what jobs still ramping up
+    /// reserved; runners only polling reserve nothing here, as the gate holds them back itself
+    /// once this shows in `MemAvailable`. Measured by working set, so a job full of page cache,
+    /// which is cheap to reclaim, stays at its limit.
+    fn growHigh(a: *Admission, s: *Slot, dir: []const u8, working_mb: u64) void {
+        const high = s.high_mb orelse return;
+        if (working_mb +| high_grow_margin_mb < high) return;
+        const available = read(a.io, a.paths, null).available_mb orelse return;
+        const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
+        const others = a.reserved(now_ms, 0).mb;
+        if (available < @as(u64, a.limits.min_available_mb) + others + high_step_mb) return;
+        const next = high +| high_step_mb;
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var text_buf: [32]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/memory.high", .{dir}) catch return;
+        const text = std.fmt.bufPrint(&text_buf, "{d}", .{@as(u64, next) << 20}) catch return;
+        std.Io.Dir.cwd().writeFile(a.io, .{ .sub_path = path, .data = text }) catch |e| {
+            std.log.warn("native: cannot raise {s}: {s}", .{ path, @errorName(e) });
+            return;
+        };
+        s.high_mb = next;
     }
 
     /// How often the engine started again since the runner did (`Engine.returns`), or null while
@@ -1887,6 +1923,82 @@ test "a native job is learned from its own cgroup under its name, apart from the
     // case is the engine's.
     try std.testing.expectEqual(@as(u32, 600), pool.unknown());
     try std.testing.expectEqual(@as(u32, 1600), pool.worstCase(false));
+}
+
+test "a native job at its memory.high gets more while the host has memory to spare" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var job_buf: [256]u8 = undefined;
+    const job = try std.fmt.bufPrint(&job_buf, ".zig-cache/tmp/{s}/job", .{tmp.sub_path});
+    var mem_buf: [256]u8 = undefined;
+    const meminfo = try std.fmt.bufPrint(&mem_buf, ".zig-cache/tmp/{s}/meminfo", .{tmp.sub_path});
+    var slots: [2]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
+    pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
+    var gate: Gate = .{ .pool = &pool };
+    const available = struct {
+        fn set(dir: std.Io.Dir, mb: u64) !void {
+            var buf: [64]u8 = undefined;
+            try dir.writeFile(std.testing.io, .{
+                .sub_path = "meminfo",
+                .data = try std.fmt.bufPrint(&buf, "MemAvailable: {d} kB\n", .{mb * 1024}),
+            });
+        }
+    }.set;
+    const high = struct {
+        fn get(dir: std.Io.Dir) !u64 {
+            var buf: [32]u8 = undefined;
+            const text = try dir.readFile(std.testing.io, "job/memory.high", &buf);
+            return try std.fmt.parseInt(u64, std.mem.trim(u8, text, " \n"), 10) >> 20;
+        }
+    }.get;
+
+    gate.leave(true);
+    gate.assigned(jobKey("o/r", "o/r/.github/workflows/ci.yml", "test (zig)"));
+    try writeCgroup(tmp.dir, "job", "max", 0, .{}, null);
+    try std.testing.expectEqual(@as(?u32, 1024), gate.native(job));
+    try tmp.dir.writeFile(io, .{ .sub_path = "job/memory.high", .data = "1073741824\n" });
+    // Past its ramp: what it took shows in MemAvailable now, and nothing else may start.
+    pool.slots[0].started_ms = std.math.minInt(i64) + 1;
+    pool.polling = 5;
+
+    // Well under its limit: left alone.
+    try available(tmp.dir, 6000);
+    try writeCgroup(tmp.dir, "job", "max", 500 * mib, .{}, null);
+    pool.samplePeaks();
+    try std.testing.expectEqual(@as(u64, 1024), try high(tmp.dir));
+
+    // At it, on an idle machine: a build a 1 GB limit would hold down for an hour (razorbill,
+    // 2026-11-05). Idle runners reserve nothing here.
+    try writeCgroup(tmp.dir, "job", "max", 900 * mib, .{}, null);
+    pool.samplePeaks();
+    try std.testing.expectEqual(@as(u64, 1024 + high_step_mb), try high(tmp.dir));
+    try std.testing.expectEqual(@as(?u32, 1024 + high_step_mb), pool.slots[0].high_mb);
+
+    // At it on page cache alone, which is cheap to reclaim: left alone.
+    try writeCgroup(tmp.dir, "job", "max", 1200 * mib, .{ .inactive_file = 900 * mib }, null);
+    pool.samplePeaks();
+    try std.testing.expectEqual(@as(u64, 1024 + high_step_mb), try high(tmp.dir));
+
+    // The host at its floor: the limit holds, as it must for the job's neighbours.
+    try writeCgroup(tmp.dir, "job", "max", 1200 * mib, .{}, null);
+    try available(tmp.dir, 1536 + high_step_mb - 1);
+    pool.samplePeaks();
+    try std.testing.expectEqual(@as(u64, 1024 + high_step_mb), try high(tmp.dir));
+
+    // Above the floor but for another job still ramping up, which reserves its share.
+    pool.slots[1].started_ms = std.math.maxInt(i64) / 2;
+    pool.slots[1].est_mb = 512;
+    try available(tmp.dir, 1536 + high_step_mb + 100);
+    pool.samplePeaks();
+    try std.testing.expectEqual(@as(u64, 1024 + high_step_mb), try high(tmp.dir));
+    pool.slots[1] = .{};
+
+    // A host it cannot read: the limit holds.
+    pool.paths.meminfo = "/nonexistent";
+    pool.samplePeaks();
+    try std.testing.expectEqual(@as(u64, 1024 + high_step_mb), try high(tmp.dir));
 }
 
 test "a native job held down at its memory.high is learned at no less than it, so its next limit is higher" {
