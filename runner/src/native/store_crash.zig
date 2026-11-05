@@ -89,6 +89,10 @@ fn makeTree(arena: Allocator, io: std.Io, dir: []const u8, name: []const u8) !vo
     }
     try cwd.writeFile(io, .{ .sub_path = try print(arena, "{s}/empty", .{dir}), .data = "" });
     try cwd.symLink(io, "d/f2", try print(arena, "{s}/link", .{dir}), .{});
+    // Too long for the inode (ext4 keeps a target of up to 59 bytes there): it takes a block of
+    // its own, which `syncTree` never fsyncs (it skips symlinks) and the directory's commit must carry.
+    const long_target = try print(arena, "d/e/{s}-{s}-the-target-of-a-symlink-too-long-for-its-inode-and-so-kept-in-a-block-of-its-own-on-disk", .{ name, name });
+    try cwd.symLink(io, long_target, try print(arena, "{s}/longlink", .{dir}), .{});
 }
 
 fn digestOf(arena: Allocator, io: std.Io, dir: []const u8) !Store.Key {
@@ -291,6 +295,18 @@ const Faults = struct {
     }
 };
 
+/// Why a tree differs, when its long symlink (a target ext4 keeps in a block) is the reason.
+fn longLinkLost(arena: Allocator, name: []const u8, fs: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, name, big)) return "";
+    var buf: [linux.PATH_MAX]u8 = undefined;
+    const p = try std.fmt.allocPrintSentinel(arena, "{s}/longlink", .{fs}, 0);
+    const rc = linux.readlink(p, &buf, buf.len);
+    if (linux.errno(rc) != .SUCCESS) return try print(arena, " (its long symlink: {t})", .{linux.errno(rc)});
+    if (rc == 0 or buf[0] == 0) return " (its long symlink's target is empty)";
+    if (std.mem.indexOfScalar(u8, buf[0..rc], 0) != null) return " (its long symlink's target has zeros)";
+    return "";
+}
+
 fn exists(io: std.Io, p: []const u8) bool {
     return if (std.Io.Dir.cwd().access(io, p, .{})) |_| true else |_| false;
 }
@@ -321,7 +337,9 @@ fn verify(arena: Allocator, io: std.Io, sp: Spec) !void {
             continue;
         };
         const exp = try expectedDigest(arena, io, sp.scratch, n);
-        if (!std.mem.eql(u8, &got, &exp)) try faults.add("layer {s}: a hit whose tree is not what was published", .{n});
+        if (!std.mem.eql(u8, &got, &exp)) {
+            try faults.add("layer {s}: a hit whose tree is not what was published{s}", .{ n, try longLinkLost(arena, n, hit.layer.fs) });
+        }
         if (!std.mem.eql(u8, hit.rec.log, try logOf(arena, n)) or !std.mem.eql(u8, hit.rec.fc, record_fc))
             try faults.add("layer {s}: a hit whose record is not what was published", .{n});
     }
