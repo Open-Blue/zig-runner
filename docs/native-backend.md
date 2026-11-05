@@ -368,6 +368,12 @@ What it covers, as built:
   layers never meet), and the binds' places (never their content). Not the slot: a stored layer has
   the canonical ids (below), so a job in any slot replays what a job in another stored. Under step caching the event payload is a variable each step
   writes to the file, as `set_up.writeRunEnv` gives it, so the base is the same for every run.
+- **A key stands on keys.** `keyFor` has a key only on a keyed top (or on an empty stack, the
+  digest below a base), and every other way a layer joins the stack leaves it unkeyed: a Docker
+  action's step, a JavaScript action's mount points, a step that always ran or failed. What an image
+  or a mount holds is in no key, so nothing above such a layer is keyed, replayed or published: a
+  job's later steps run, however little changed (`Native.ops_keep_chained`). The price of that is
+  cached steps, never a wrong replay.
 - **The store's format** (`Store.store_format`) is bumped with any change to what a layer or its
   record means: the sandbox's trees, the record's files and how they replay, the key's extras.
   A runner upgraded across a bump finds none of the older runner's layers; they age out under
@@ -971,9 +977,18 @@ the job's host ids; they are shifted back to the image's own afterwards (`unshif
 layer is the same whichever job's range built it and can be idmapped into any job, as the
 `COPY` layers the runner writes are. The built image runs as a `docker://` one does, with its
 layers as the container's lowers. Layers live under `RUNNER_NATIVE_STORE/layers`, in P2's store,
-each under the builder's key hashed with the store's format and the job's trust scope
-(`layers.Store.key`): a job the runner does not vouch for, or a vouched fork's pull request,
-builds its own layers and never leaves one a trusted job takes.
+each under the builder's key hashed with the store's format, the job's trust scope and how ids are
+mapped (`layers.layerKey`): a job the runner does not vouch for, or a vouched fork's pull request,
+builds its own layers and never leaves one a trusted job takes, and a root and a rootless runner's
+layers never meet.
+
+Such a layer is replayed: `build` takes it by key and nothing runs, whatever the action's step
+does. So its key holds all it was made from. The chain starts from the base's reference and what
+the image is (`docker_action.baseId`: the platform's manifest's digest, or the tree's fingerprint
+for an image that was not pulled), since every pull asks the registry what a tag names and a tag
+moves. Each instruction adds its kind, its text as evaluated and what it reads, in P8's format
+(`dockerfile.fromKey`, `stepKey`, `contextDigest`): every field length-prefixed and every list
+counted, so a source's content cannot pass for the entries after it.
 
 **The action loader** (`runner/src/native/actions.zig`). The backend stays chosen per job, never
 per step (a switch would need the native layers exported into Dagger). What a `uses:` action is
@@ -1100,8 +1115,14 @@ than replacing it, since both backends ship (proofs/README.md, "On the native ba
 - **The tie to the code.** `keyoracle` (`proofs/KeyOracle.lean`) writes
   `runner/src/native/testdata/step_keys.tsv`, `.github/scripts/key-vectors.sh` checks in the proofs
   workflow that it is the model's, and `runner/src/native/key_vectors.zig` checks the preimages
-  (29 key vectors: steps, bases, the digest below a base; 4 layer vectors: modes, an xattr and a
-  symlink, an opaque directory, a whiteout) and the equal/differ relation against it.
+  (key vectors: steps, bases, the digest below a base, a Dockerfile build's keys; 4 layer vectors:
+  modes, an xattr and a symlink, an opaque directory, a whiteout) and the equal/differ relation
+  against it.
+- **Keys on keys, and builds.** `ops_keep_chained`: no order of the stack's operations puts a key
+  above a layer with none, so what an image or a mount added cannot be behind a replay.
+  `encBuild_injective`, `encBuildLayer_injective`: a Dockerfile build's keys tell apart everything
+  they hash; `build_base_matters`: a base image that changed under its reference changes every key
+  of the build.
 
 **What is left**: if P2's format changes, change `Native.encState` (and `keyPreimage`,
 `belowPreimage`, `walkPreimage`) and `KeyOracle.lean` to match, keep `Format.Sound` proved, and

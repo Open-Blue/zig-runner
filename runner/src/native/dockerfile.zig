@@ -5,12 +5,14 @@
 //! `parse` reads the file as Docker's parser does (comments, parser directives, `\` continuations,
 //! instruction words in any case, JSON and shell forms); `plan` evaluates it: substitutions in the
 //! instructions Docker substitutes, the image config the instructions leave (what
-//! `images.Image` carries), and a key per instruction chained from the base image's,
+//! `images.Image` carries), and a key per instruction chained from the base image's (`fromKey`, on
+//! what the image is, not only its reference: a tag moves), `stepKey`'s
 //! `key = sha256(parent key, instruction as evaluated, what it reads)`, where what it reads is the
 //! build arguments in effect for `RUN` and the content of the sources for `COPY` and `ADD`
 //! (`contextDigest`). An instruction that changes only the config gets a key and no layer, so a
 //! later `RUN` that sees it is keyed on it. `build` makes the layers that are not in the store
 //! yet (`layers.zig`): `COPY` and `ADD` by the runner, `RUN` through `Runner`, the sandbox.
+//! Every preimage is in P8's format (proofs/Runner/Native.lean, `encBuild`).
 //!
 //! What it refuses, with the reason, so the action fails as a build that cannot run would:
 //! multi-stage builds (`FROM ... AS`, `COPY --from`), `ADD` from a URL or of an archive,
@@ -21,6 +23,7 @@
 const std = @import("std");
 const images = @import("images.zig");
 const layers = @import("layers.zig");
+const KeyHasher = @import("Store.zig").KeyHasher;
 
 const Allocator = std.mem.Allocator;
 
@@ -275,11 +278,12 @@ pub const Context = struct {
 
 /// Evaluates `instructions` over the base image's config (`base_config`, its `rootfs` unused),
 /// with `build_args` given to the build (`--build-arg`, which Docker actions never get, so
-/// usually none).
+/// usually none). `base_id` says what the base is (`docker_action.baseId`), and is in every key.
 pub fn plan(
     arena: Allocator,
     instructions: []const Instruction,
     base_config: images.Image,
+    base_id: []const u8,
     build_args: []const Var,
     context: Context,
 ) !Planned {
@@ -305,7 +309,7 @@ pub fn plan(
     }
     var workdir: []const u8 = "/";
     args.clearRetainingCapacity();
-    var key = sha(&.{ "FROM", try images.normalize(arena, base) });
+    var key = fromKey(try images.normalize(arena, base), base_id, null);
     var steps: std.ArrayList(Step) = .empty;
     for (instructions[i + 1 ..]) |ins| {
         // What substitution sees: the build arguments, then the env, which wins.
@@ -350,7 +354,7 @@ pub fn plan(
                     .user = cfg.user,
                 } };
                 // A RUN's result depends on the build arguments it sees, as BuildKit keys it.
-                reads = try std.mem.join(arena, "\x00", run_env.items);
+                reads = try arena.dupe(u8, &listDigest(run_env.items));
             },
             .copy, .add => {
                 const ws = try words(arena, try substitute(arena, ins.text, scope));
@@ -389,12 +393,13 @@ pub fn plan(
                 op = .{ .copy = .{ .sources = sources, .dest = dest, .chown = chown, .chmod = chmod } };
                 const digest = try context.digestFn(context.ptr, arena, sources);
                 reads = try arena.dupe(u8, &digest);
-                evaluated = try std.fmt.allocPrint(arena, "{s} {s} {s} {?o}", .{
-                    try std.mem.join(arena, " ", sources), dest, chown, chmod,
-                });
+                var fields: std.ArrayList([]const u8) = .empty;
+                try fields.appendSlice(arena, sources);
+                try fields.appendSlice(arena, &.{ dest, chown, try std.fmt.allocPrint(arena, "{?o}", .{chmod}) });
+                evaluated = try arena.dupe(u8, &listDigest(fields.items));
             },
         }
-        key = sha(&.{ &key, @tagName(ins.kind), evaluated, reads });
+        key = stepKey(&key, @tagName(ins.kind), evaluated, reads, null);
         try steps.append(arena, .{ .key = key, .line = ins.line, .op = op });
     }
     var env_out: std.ArrayList([]const u8) = .empty;
@@ -444,15 +449,43 @@ fn insideContext(src: []const u8) bool {
     return true;
 }
 
-fn sha(parts: []const []const u8) [64]u8 {
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
-    for (parts) |p| {
-        var len: [8]u8 = undefined;
-        std.mem.writeInt(u64, &len, p.len, .little);
-        h.update(&len);
-        h.update(p);
-    }
-    return std.fmt.bytesToHex(h.finalResult(), .lower);
+/// What a key is of: a build's base, or an instruction on a parent's key (the model's `BuildState`).
+const Tag = enum(u64) { from = 0, step = 1 };
+
+/// A build's first key (the model's `encBuild`, `.from`): the base's reference and what the image
+/// behind it is. `bytes`, when given, receives the preimage (`key_vectors.zig`), as in `Backend.belowKey`.
+pub fn fromKey(reference: []const u8, base_id: []const u8, bytes: ?*std.Io.Writer) [64]u8 {
+    var h: KeyHasher = .{ .h = .init(.{}), .bytes = bytes };
+    h.int(@backingInt(Tag.from));
+    h.field(reference);
+    h.field(base_id);
+    return std.fmt.bytesToHex(h.final(), .lower);
+}
+
+/// An instruction's key on its parent's (the model's `encBuild`, `.step`). What it reads and how
+/// it evaluated are one field each: a digest (`listDigest`) where they are a list.
+pub fn stepKey(
+    parent: []const u8,
+    kind: []const u8,
+    evaluated: []const u8,
+    reads: []const u8,
+    bytes: ?*std.Io.Writer,
+) [64]u8 {
+    var h: KeyHasher = .{ .h = .init(.{}), .bytes = bytes };
+    h.int(@backingInt(Tag.step));
+    h.field(parent);
+    h.field(kind);
+    h.field(evaluated);
+    h.field(reads);
+    return std.fmt.bytesToHex(h.final(), .lower);
+}
+
+/// A list of strings as one field: counted, each length-prefixed, so two lists never hash alike.
+fn listDigest(parts: []const []const u8) [64]u8 {
+    var h: KeyHasher = .plain("a build's list");
+    h.int(parts.len);
+    for (parts) |p| h.field(p);
+    return std.fmt.bytesToHex(h.final(), .lower);
 }
 
 /// A source's place in the context: the directory holding it, reached through no symlink, and its
@@ -478,20 +511,21 @@ fn placeOf(arena: Allocator, io: std.Io, root: std.Io.Dir, src: []const u8) !Pla
 }
 
 /// The content of `sources` under the directory `context` for a `COPY`'s key: a sorted walk of
-/// each source's paths, with each entry's kind, mode bits, link target and file content. No
-/// symlink is followed, and a source missing is an error (`error.SourceMissing`).
+/// each source's paths, with each entry's kind, mode bits, link target and file content, every
+/// field length-prefixed and every list counted (a file's content cannot pass for the entries
+/// after it). No symlink is followed, and a source missing is an error (`error.SourceMissing`).
 pub fn contextDigest(arena: Allocator, io: std.Io, context: []const u8, sources: []const []const u8) ![64]u8 {
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var h: KeyHasher = .plain("a build's sources");
+    h.int(sources.len);
     var root = try std.Io.Dir.cwd().openDir(io, context, .{});
     defer root.close(io);
     for (sources) |src| {
         const place = try placeOf(arena, io, root, src);
         defer if (place.owned) place.dir.close(io);
-        h.update(try std.fs.path.resolvePosix(arena, &.{src}));
-        h.update("\x00");
+        h.field(try std.fs.path.resolvePosix(arena, &.{src}));
         try digestEntry(arena, io, place.dir, place.name, &h, 0);
     }
-    return std.fmt.bytesToHex(h.finalResult(), .lower);
+    return std.fmt.bytesToHex(h.final(), .lower);
 }
 
 fn digestEntry(
@@ -499,34 +533,32 @@ fn digestEntry(
     io: std.Io,
     parent: std.Io.Dir,
     name: []const u8,
-    h: *std.crypto.hash.sha2.Sha256,
+    h: *KeyHasher,
     depth: u32,
 ) !void {
     if (depth > 128) return error.ContextTooDeep;
     const st = parent.statFile(io, name, .{ .follow_symlinks = false }) catch return error.SourceMissing;
-    var meta: [16]u8 = undefined;
-    std.mem.writeInt(u64, meta[0..8], @backingInt(st.kind), .little);
-    std.mem.writeInt(u64, meta[8..16], @as(u64, st.permissions.toMode()) & 0o7777, .little);
-    h.update(&meta);
+    h.int(@backingInt(st.kind));
+    h.int(@as(u64, st.permissions.toMode()) & 0o7777);
     switch (st.kind) {
-        .file => h.update(try parent.readFileAlloc(io, name, arena, .limited(1 << 30))),
+        .file => h.field(try parent.readFileAlloc(io, name, arena, .limited(1 << 30))),
         .sym_link => {
             var buf: [std.fs.max_path_bytes]u8 = undefined;
             const n = try parent.readLink(io, name, &buf);
-            h.update(buf[0..n]);
+            h.field(buf[0..n]);
         },
         .directory => {
             var dir = try parent.openDir(io, name, .{ .iterate = true, .follow_symlinks = false });
             defer dir.close(io);
-            for (try sortedNames(arena, io, dir)) |sub| {
-                h.update(sub);
-                h.update("\x00");
+            const names = try sortedNames(arena, io, dir);
+            h.int(names.len);
+            for (names) |sub| {
+                h.field(sub);
                 try digestEntry(arena, io, dir, sub, h, depth + 1);
             }
         },
         else => {},
     }
-    h.update("\x01");
 }
 
 fn sortedNames(arena: Allocator, io: std.Io, dir: std.Io.Dir) ![]const []const u8 {
@@ -779,7 +811,7 @@ test "plan: the config the instructions leave, and a key per instruction that ch
     const ins = (try parse(arena, text)).ok;
     const base: images.Image = .{ .rootfs = "", .env = &.{"PATH=/usr/bin:/bin"}, .cmd = &.{"/bin/sh"} };
     var ctx: Fixed = .{};
-    const p = (try plan(arena, ins, base, &.{}, ctx.context())).ok;
+    const p = (try plan(arena, ins, base, "base", &.{}, ctx.context())).ok;
     try std.testing.expectEqualStrings("alpine:3.22", p.base);
     try std.testing.expectEqual(@as(usize, 10), p.steps.len);
     const run = p.steps[4].op.run;
@@ -797,12 +829,12 @@ test "plan: the config the instructions leave, and a key per instruction that ch
     try std.testing.expectEqualStrings("TOOL_HOME=/opt/tool", p.config.env[1]);
 
     // A build argument changes the RUN's key and every key after it, not the ones before.
-    const p2 = (try plan(arena, ins, base, &.{.{ .name = "VERSION", .value = "2" }}, ctx.context())).ok;
+    const p2 = (try plan(arena, ins, base, "base", &.{.{ .name = "VERSION", .value = "2" }}, ctx.context())).ok;
     for (p.steps[0..4], p2.steps[0..4]) |x, y| try std.testing.expectEqualSlices(u8, &x.key, &y.key);
     for (p.steps[4..], p2.steps[4..]) |x, y| try std.testing.expect(!std.mem.eql(u8, &x.key, &y.key));
     // The context's content changes the COPY's key and the later ones only.
     var ctx3: Fixed = .{ .digest = @splat('1') };
-    const p3 = (try plan(arena, ins, base, &.{}, ctx3.context())).ok;
+    const p3 = (try plan(arena, ins, base, "base", &.{}, ctx3.context())).ok;
     for (p.steps[0..5], p3.steps[0..5]) |x, y| try std.testing.expectEqualSlices(u8, &x.key, &y.key);
     for (p.steps[5..], p3.steps[5..]) |x, y| try std.testing.expect(!std.mem.eql(u8, &x.key, &y.key));
 
@@ -815,9 +847,78 @@ test "plan: the config the instructions leave, and a key per instruction that ch
         .{ "FROM a\nADD https://x/y /y", "URL" },
         .{ "FROM a\nCOPY ../secret /x", "outside the build context" },
     }) |b| {
-        const got = try plan(arena, (try parse(arena, b[0])).ok, base, &.{}, ctx.context());
+        const got = try plan(arena, (try parse(arena, b[0])).ok, base, "base", &.{}, ctx.context());
         try std.testing.expect(std.mem.indexOf(u8, got.refused.why, b[1]) != null);
     }
+}
+
+test "plan: what the base image is changes every key, though its reference did not" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const ins = (try parse(arena, "FROM alpine:3.22\nENV X=1\nRUN apk add curl\nCOPY a /a\n")).ok;
+    var ctx: Fixed = .{};
+    const old = (try plan(arena, ins, .{ .rootfs = "" }, "sha256:old", &.{}, ctx.context())).ok;
+    const new = (try plan(arena, ins, .{ .rootfs = "" }, "sha256:new", &.{}, ctx.context())).ok;
+    for (old.steps, new.steps) |x, y| try std.testing.expect(!std.mem.eql(u8, &x.key, &y.key));
+    const same = (try plan(arena, ins, .{ .rootfs = "" }, "sha256:old", &.{}, ctx.context())).ok;
+    for (old.steps, same.steps) |x, y| try std.testing.expectEqualSlices(u8, &x.key, &y.key);
+}
+
+test "plan: fields of an instruction never run into one another in its key" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var ctx: Fixed = .{};
+    const copy = struct {
+        fn key(ar: Allocator, c: *Fixed, text: []const u8) ![64]u8 {
+            const p = try plan(ar, (try parse(ar, text)).ok, .{ .rootfs = "" }, "base", &.{}, c.context());
+            return p.ok.steps[0].key;
+        }
+    }.key;
+    // Spaces in a destination, which joined with spaces read as a source and an owner.
+    const one = try copy(arena, &ctx, "FROM a\nCOPY [\"s\", \"/d 1\"]");
+    const two = try copy(arena, &ctx, "FROM a\nCOPY --chown=1 s /d");
+    try std.testing.expect(!std.mem.eql(u8, &one, &two));
+    // An environment's boundaries: one variable holding what looks like two.
+    const nul = (try plan(arena, (try parse(arena, "FROM a\nENV A=1\nRUN x")).ok, .{
+        .rootfs = "",
+        .env = &.{"B=2"},
+    }, "base", &.{}, ctx.context())).ok;
+    const joined = (try plan(arena, (try parse(arena, "FROM a\nENV A=1\nRUN x")).ok, .{
+        .rootfs = "",
+        .env = &.{"B=2\x00A=1"},
+    }, "base", &.{}, ctx.context())).ok;
+    try std.testing.expect(!std.mem.eql(u8, &nul.steps[1].key, &joined.steps[1].key));
+}
+
+test "contextDigest: a file's content cannot pass for the entries after it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "one/d");
+    try tmp.dir.createDirPath(io, "two/d");
+    // The walk as it was written, with no lengths: `a`, then its end, then `b`'s name and metadata.
+    var meta: [16]u8 = undefined;
+    std.mem.writeInt(u64, meta[0..8], @backingInt(std.Io.File.Kind.file), .little);
+    std.mem.writeInt(u64, meta[8..16], 0o644, .little);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const Plant = struct { path: []const u8, data: []const u8 };
+    for ([_]Plant{
+        .{ .path = "one/d/a", .data = "X" },
+        .{ .path = "one/d/b", .data = "Y" },
+        .{ .path = "two/d/a", .data = "X\x01b\x00" ++ meta ++ "Y" },
+    }) |f| {
+        try tmp.dir.writeFile(io, .{ .sub_path = f.path, .data = f.data });
+        const z = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ root, f.path }, 0);
+        _ = std.os.linux.chmod(z, 0o644);
+    }
+    const one = try contextDigest(arena, io, try std.fmt.allocPrint(arena, "{s}/one", .{root}), &.{"d"});
+    const two = try contextDigest(arena, io, try std.fmt.allocPrint(arena, "{s}/two", .{root}), &.{"d"});
+    try std.testing.expect(!std.mem.eql(u8, &one, &two));
 }
 
 test "contextDigest walks the sources in order, through no symlink" {
@@ -878,7 +979,7 @@ test "build: COPY into its layer, RUN through the runner, and a second build tak
     try @import("Store.zig").prepare(arena, io, store_dir, .{ .check_parents = false });
     var held: std.ArrayList(std.Io.File) = .empty;
     defer for (held.items) |f| f.close(io);
-    const store: layers.Store = .{ .dir = store_dir, .store = .{ .root = store_dir }, .held = &held, .scope = "repo" };
+    const store: layers.Store = .{ .dir = store_dir, .store = .{ .root = store_dir }, .held = &held, .scope = "repo", .userns = "mapped" };
     const rootfs = try std.fmt.allocPrint(arena, "{s}/rootfs", .{root});
     const text =
         \\FROM alpine:3.22
@@ -895,7 +996,7 @@ test "build: COPY into its layer, RUN through the runner, and a second build tak
         }
     };
     var c: Ctx = .{ .dir = ctx };
-    const p = (try plan(arena, (try parse(arena, text)).ok, .{ .rootfs = "" }, &.{}, .{ .ptr = &c, .digestFn = Ctx.digest })).ok;
+    const p = (try plan(arena, (try parse(arena, text)).ok, .{ .rootfs = "" }, "base", &.{}, .{ .ptr = &c, .digestFn = Ctx.digest })).ok;
     var rec: Recorder = .{ .arena = arena };
     const built = (try build(arena, io, p, rootfs, ctx, store, rec.runner())).ok;
     try std.testing.expectEqual(@as(usize, 4), built.lowers.len);
@@ -916,8 +1017,17 @@ test "build: COPY into its layer, RUN through the runner, and a second build tak
     try std.testing.expectEqual(@as(usize, 0), again.runs.items.len);
     for (built.lowers, second.lowers) |x, y| try std.testing.expectEqualStrings(x, y);
 
+    // The same Dockerfile, its tag moved to another image: nothing of the first is taken, and
+    // the RUN runs on the new image, not on layers built on the old one.
+    const moved = (try plan(arena, (try parse(arena, text)).ok, .{ .rootfs = "" }, "moved", &.{}, .{ .ptr = &c, .digestFn = Ctx.digest })).ok;
+    var third: Recorder = .{ .arena = arena };
+    const rootfs2 = try std.fmt.allocPrint(arena, "{s}/rootfs2", .{root});
+    const on_new = (try build(arena, io, moved, rootfs2, ctx, store, third.runner())).ok;
+    try std.testing.expectEqual(@as(usize, 1), third.runs.items.len);
+    for (built.lowers[0..3], on_new.lowers[0..3]) |x, y| try std.testing.expect(!std.mem.eql(u8, x, y));
+
     // A failing RUN stores nothing for its key.
-    const bad = (try plan(arena, (try parse(arena, "FROM alpine\nRUN exit 3")).ok, .{ .rootfs = "" }, &.{}, .{ .ptr = &c, .digestFn = Ctx.digest })).ok;
+    const bad = (try plan(arena, (try parse(arena, "FROM alpine\nRUN exit 3")).ok, .{ .rootfs = "" }, "base", &.{}, .{ .ptr = &c, .digestFn = Ctx.digest })).ok;
     const failed = (try build(arena, io, bad, rootfs, ctx, store, rec.runner())).failed;
     try std.testing.expectEqual(@as(i32, 3), failed.code);
     try std.testing.expect(try store.get(arena, io, &bad.steps[0].key) == null);
