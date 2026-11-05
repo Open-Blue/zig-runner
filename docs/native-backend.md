@@ -387,8 +387,9 @@ What it covers, as built:
   layer is first given the canonical ids (`Store.unshift`, below). A commit's checkout
   (a fetch of a full SHA) is a layer like a step's, keyed on its script and never on the token;
   a branch or tag moves, so its fetch always runs. The upper is moved under `layers/.tmp-<key>-<n>`
-  with its record, held, written to disk (`syncfs`), and published by one
-  `renameat2(RENAME_NOREPLACE)`. An upper that cannot be put back after a failure is left there
+  with its record, held, written to disk (its own files' data, then its meta, then one fsync of
+  each file and directory, which ext4 serves with one journal commit; a large layer's `syncfs`
+  instead), and published by one `renameat2(RENAME_NOREPLACE)`. An upper that cannot be put back after a failure is left there
   and logged, never deleted.
 - **Replay**: the stored raw output (markers and all) and combined file commands go through
   `Exec.collect` as Dagger's answer for a cached exec does, with the earlier job's ran marker, so
