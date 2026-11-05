@@ -137,7 +137,7 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             status=0
-            pipx run zizmor==1.31.1 --format github .github/workflows || status=$?
+            .github/scripts/zizmor.sh --format github .github/workflows || status=$?
             ((status == 1 && attempt < 3)) || exit "$status"
             echo "::warning::zizmor could not run (exit 1; attempt $attempt of 3), most likely a failed request to GitHub: trying again"
             sleep $((attempt * 15))

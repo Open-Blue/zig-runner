@@ -1,0 +1,3 @@
+kind: Security
+body: 'The inputs #107 listed as untracked are pinned and tracked: the JavaScript runtime images for actions (`oven/bun`, `node`) by multi-arch index digest, zizmor by version and file hashes (`.github/zizmor-requirements.txt`, installed by `.github/scripts/zizmor.sh` with `--require-hashes`), and the `@actions/glob` of the hashFiles comparison from a lockfile (`npm ci`). Renovate moves all three.'
+time: 2026-11-05T10:03:00.000000-05:00

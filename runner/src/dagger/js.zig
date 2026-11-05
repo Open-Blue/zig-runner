@@ -199,11 +199,18 @@ pub const RuntimeSource = struct {
     binary: []const u8,
     npm_dir: ?[]const u8 = null,
 };
-/// Bun is pinned to the version the repository's images use (see api/Dockerfile).
+/// The runtimes' images, each pinned by its multi-arch index digest, which a moved tag cannot
+/// change: one pin serves amd64 and arm64, as for `default_image`. Renovate moves them (the
+/// literals are split over two lines with ++, the shape renovate.json reads).
 pub const runtimes: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
-    .bun = .{ .image = "oven/bun:1.4.3", .binary = "/usr/local/bin/bun" },
+    .bun = .{
+        .image = "oven/bun:1.4.3" ++
+            "@sha256:ec06c3b6cea04192ae6770c434f668ca41d343ad19fa6472216c7b48be39c598",
+        .binary = "/usr/local/bin/bun",
+    },
     .node = .{
-        .image = "node:24-bookworm-slim",
+        .image = "node:24-bookworm-slim" ++
+            "@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc9749addbf383b1920c",
         .binary = "/usr/local/bin/node",
         .npm_dir = "/usr/local/lib/node_modules/npm",
     },
@@ -211,9 +218,14 @@ pub const runtimes: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
 /// For a musl job image (`container: alpine`): the runtimes' Alpine builds, which also need the
 /// C++ runtime from their image (mounted at `lib_dir`).
 pub const runtimes_musl: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
-    .bun = .{ .image = "oven/bun:1.4.3-alpine", .binary = "/usr/local/bin/bun" },
+    .bun = .{
+        .image = "oven/bun:1.4.3-alpine" ++
+            "@sha256:629e17411f1f129dbec3af78d5af9c9f2a937435c80349437206c6b0b7422373",
+        .binary = "/usr/local/bin/bun",
+    },
     .node = .{
-        .image = "node:24-alpine",
+        .image = "node:24-alpine" ++
+            "@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85",
         .binary = "/usr/local/bin/node",
         .npm_dir = "/usr/local/lib/node_modules/npm",
     },
@@ -526,7 +538,7 @@ test "a JavaScript action Bun refuses to load runs again with Node" {
     for (seen) |d| try std.testing.expect(braceBalanced(d));
     // Bun first; then Node, from the image RUNNER_JS_RUNTIME=node uses, for the same script.
     try std.testing.expect(std.mem.indexOf(u8, seen[4], "exec /github/_runtime/node/node") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[5], "from(address:\"node:24-bookworm-slim\") { bin: file(path:\"/usr/local/bin/node\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "from(address:\"" ++ runtimes.get(.node).image ++ "\") { bin: file(path:\"/usr/local/bin/node\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[6], "withFile(path:\"/github/_runtime/fallback/node\",source:\"NODE\"") != null);
     // From where the first try started, not from its result, with the action's code mounted again.
     try std.testing.expect(std.mem.startsWith(u8, seen[6], "{ loadContainerFromID(id:\"C0\")"));
@@ -633,7 +645,7 @@ test "a JavaScript action runs its main with the runtime, inputs as INPUT_*, the
     try std.testing.expect(std.mem.indexOf(u8, seen[0], "withNewFile(path:\"/github/workflow/event.json\",contents:\"{\\n  \\\"ref\\\": \\\"refs/heads/x\\\"\\n}\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[0], "withEnvVariable(name:\"GITHUB_EVENT_PATH\",value:\"/github/workflow/event.json\")") != null);
     // Bun comes from its image, once per job.
-    try std.testing.expect(std.mem.indexOf(u8, seen[3], "from(address:\"oven/bun:1.4.3\") { bin: file(path:\"/usr/local/bin/bun\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "from(address:\"" ++ runtimes.get(.bun).image ++ "\") { bin: file(path:\"/usr/local/bin/bun\")") != null);
     const run1 = seen[5];
     try std.testing.expect(std.mem.indexOf(u8, run1, "withFile(path:\"/github/_runtime/node/node\",source:\"BUN\",permissions:493)") != null);
     try std.testing.expect(std.mem.indexOf(u8, run1, "withNewFile(path:\"/github/_runtime/bin/node\"") != null);
@@ -694,7 +706,7 @@ test "native: a musl runtime's C++ runtime is its image's libstdc++ and libgcc_s
     const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
     const rootfs = try std.fmt.allocPrint(arena, "{s}/img", .{root});
     const job = try std.fmt.allocPrint(arena, "{s}/job", .{root});
-    const out = try cxxRuntime(arena, io, job, rootfs, "node:24-alpine");
+    const out = try cxxRuntime(arena, io, job, rootfs, runtimes_musl.get(.node).image);
     var dir = try std.Io.Dir.cwd().openDir(io, out, .{ .iterate = true });
     defer dir.close(io);
     var names: usize = 0;
