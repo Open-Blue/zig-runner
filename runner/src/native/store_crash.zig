@@ -11,7 +11,7 @@
 //!
 //!   write   runs step ARG (1-6) of a sequence, as a job would, and marks the log at the points
 //!           the checks need (ZIG_TEST_STORE_CRASH_MARK NAME):
-//!             1  a job publishes three small layers (`syncTree`) and syncs the layers' directory;
+//!             1  a job publishes three small layers (`writeBack`, `syncEntries`) and syncs the layers' directory;
 //!             2  the next publishes a large one (over `sync_tree_max` entries: `syncfs`) and a small
 //!                one;
 //!             3  the first job after a reboot (the boot mark removed): `checkOncePerBoot`, then
@@ -28,7 +28,7 @@
 //!   corrupt a layer changed on purpose (ARG: `truncate` or `flip`), for the script to show that
 //!           `verify` fails on it.
 //!   fail    a publish on a disk that fails writes (ZIG_TEST_STORE_CRASH_FLIP on|off switches
-//!           them; ARG: `sync-tree`, `small`, `large`, `cursor` or `no-cursor`): it must fail,
+//!           them; ARG: `small`, `large`, `cursor` or `no-cursor`): it must fail,
 //!           and publish nothing.
 //!   absent  that no layer is published under ROOT (after the disk was mounted again).
 //!
@@ -90,7 +90,8 @@ fn makeTree(arena: Allocator, io: std.Io, dir: []const u8, name: []const u8) !vo
     try cwd.writeFile(io, .{ .sub_path = try print(arena, "{s}/empty", .{dir}), .data = "" });
     try cwd.symLink(io, "d/f2", try print(arena, "{s}/link", .{dir}), .{});
     // Too long for the inode (ext4 keeps a target of up to 59 bytes there): it takes a block of
-    // its own, which `syncTree` never fsyncs (it skips symlinks) and the directory's commit must carry.
+    // its own, which a publish never fsyncs (`writeBack`: a symlink is its directory's metadata) and the
+    // directory's commit must carry.
     const long_target = try print(arena, "d/e/{s}-{s}-the-target-of-a-symlink-too-long-for-its-inode-and-so-kept-in-a-block-of-its-own-on-disk", .{ name, name });
     try cwd.symLink(io, long_target, try print(arena, "{s}/longlink", .{dir}), .{});
 }
@@ -438,23 +439,6 @@ fn fail(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: S
         _ = linux.close(fd);
     };
     const eq = std.mem.eql;
-    if (eq(u8, sp.arg, "sync-tree")) {
-        // Gone where a publish syncs its files another way (a branch that moved it): then the
-        // `small` case, a publish, is the fsync path's test.
-        if (!@hasDecl(Store, "syncTree")) {
-            std.debug.print("native store crash: Store.syncTree is not there; the small publish covers the fsync path\n", .{});
-            return;
-        }
-        // The fsync path itself: a small tree whose writes fail.
-        const dir = try print(arena, "{s}/uppers/t", .{sp.root});
-        try makeTree(arena, io, dir, "a");
-        try hook(io, env, flip_env, "on");
-        const r = Store.syncTree(arena, io, dir);
-        try hook(io, env, flip_env, "off");
-        try std.testing.expectError(error.Sync, r);
-        std.debug.print("native store crash: syncTree on a disk that fails writes: error.Sync\n", .{});
-        return;
-    }
     const name: []const u8 = if (eq(u8, sp.arg, "small")) "a" else big;
     var other: ?std.Io.File = null;
     var other_fd: ?linux.fd_t = null;

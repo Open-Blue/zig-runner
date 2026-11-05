@@ -26,7 +26,7 @@
 # must fail it, or it would pass whatever the store did.
 #
 # The write errors. dm-flakey is switched to fail every write (error_writes) around the call
-# that must notice: `syncTree` itself, a publish of a small layer (its fsyncs) and of a large one
+# that must notice: a publish of a small layer (its fsyncs) and of a large one
 # (`syncfs`), and a publish whose own writes succeed but whose job saw another write fail
 # (`Store.sync_fd`, the descriptor opened at the job's start: a `syncfs` on one opened at the
 # publish would not report an error another job's `syncfs` had already). Each must fail, with
@@ -248,7 +248,7 @@ errors() {
 	need_target dm-flakey
 	local w=$work arg failed=0
 	mkdir -p "$w/mnt" "$w/scratch"
-	for arg in sync-tree small large cursor no-cursor; do
+	for arg in small large cursor no-cursor; do
 		echo "--- $arg"
 		if ! error_case "$arg"; then
 			failed=$((failed + 1))
