@@ -37,6 +37,14 @@ name: analysis
 #                  processes sharing one store under a small cap, ten minutes rootless and ten as
 #                  root, on x86_64 and arm64, where ci runs it for 30 s each. A failure prints the
 #                  seed that runs the same workers again (ZIG_TEST_STORE_STRESS_SEED).
+#   Store crash    the native layer store across a crash and on a disk that fails writes
+#                  (.github/scripts/store-crash.sh): ext4 over dm-log-writes while a sequence of
+#                  publishes, an eviction, the once-per-boot check, `oci.Store.ensure` and
+#                  `volumes.adoptSeed` runs; the disk put back to every flush, FUA and mark of the
+#                  log with xfstests' replay-log, mounted, and the store checked (a layer `open`
+#                  accepts is what was published; none a finished job synced is missing); and
+#                  ext4 over dm-flakey failing writes during a publish, which must fail rather
+#                  than publish. On x86_64 only: nothing in it depends on the architecture.
 #   Coverage       the lines the tests reach, with kcov (.github/scripts/zig-coverage.sh): the
 #                  rootless tests and the native backend's root pass merged, as an HTML report and
 #                  Cobertura and JSON (the coverage artifact), with the total, each area and the
@@ -68,7 +76,7 @@ on:
         required: false
   # A pull request that changes this workflow or its scripts runs it, so a change to them is seen
   # working before it merges (workflow_dispatch reaches a workflow only once the default branch
-  # has it); one that changes the runner's code runs Coverage, and Store stress when that code is
+  # has it); one that changes the runner's code runs Coverage, and Store stress and Store crash when that code is
   # the native store's (ci-scope.sh analysis, store and coverage, in the Scope job). Not a required
   # check, so the path filter leaves nothing waiting.
   pull_request:
@@ -81,6 +89,7 @@ on:
       - .github/valgrind.supp
       - .github/scripts/zig-race-tests.sh
       - .github/scripts/zig-stress.sh
+      - .github/scripts/store-crash.sh
       - runner/src/**
       - .github/scripts/zlint.sh
       - .github/scripts/zlint-suppressed.baseline
@@ -118,7 +127,7 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: .github/scripts/ci-scope.sh analysis
 
-      - name: Whether this change can affect Store stress
+      - name: Whether this change can affect Store stress and Store crash
         id: store
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
@@ -563,21 +572,39 @@ jobs:
           ../.github/scripts/zig-test.sh
           ZIG_TEST_NATIVE_AS_ROOT=1 ../.github/scripts/zig-test.sh
 
+  # About 10 minutes: the build, and then a hundred or so disks mounted and checked.
   store-crash:
-    name: Store crash probe
+    name: Store crash
+    needs: scope
+    if: needs.scope.outputs.store == 'true'
     runs-on: ubuntu-26.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     permissions:
       contents: read # to check out the code
     steps:
-      - name: Probe
-        run: |
-          uname -r; lsb_release -d; id; nproc; free -m | head -2; df -h / /mnt | cat
-          for m in dm-log-writes dm-flakey dm-error dm-linear; do sudo modprobe "$m" && echo "loaded $m" || echo "NO $m"; done
-          sudo dmsetup targets
-          find /lib/modules/"$(uname -r)" -name 'dm-log-writes*' -o -name 'dm-flakey*' | head
-          apt-cache policy xfstests | head -3
-          which gcc cc dmsetup losetup mkfs.ext4 sudo
-          ls /dev/loop* | head -3
-          git ls-remote https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git HEAD
-          git ls-remote https://github.com/kdave/xfstests HEAD
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      # replay-log, from xfstests at a pinned commit, and the store's checks, compiled.
+      - name: Build
+        run: .github/scripts/store-crash.sh build "$RUNNER_TEMP/store-crash"
+
+      # Root on a throwaway VM, where device-mapper is the kernel's: dm-flakey and dm-log-writes
+      # are modules of this image's kernel, loaded here, and the script fails saying so if not.
+      - name: Write errors
+        run: sudo .github/scripts/store-crash.sh errors "$RUNNER_TEMP/store-crash"
+
+      - name: Crash points
+        run: sudo .github/scripts/store-crash.sh crash "$RUNNER_TEMP/store-crash"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: store-crash
+          path: |
+            ${{ runner.temp }}/store-crash/keep
+          if-no-files-found: ignore
