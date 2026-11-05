@@ -382,8 +382,14 @@ check() {
 	# the runner notes each one "Reused from Dagger's cache" or "... the native step store".
 	# Natively in whichever slot the rerun lands: a stored layer has the canonical ids, which every
 	# slot's job sees as its own (docs/native-backend.md, "A layer has the canonical ids").
+	#
+	# Attempt 2 only has to succeed. The run's jobs share one tool cache, and `toolcache` installs
+	# into it while `cache` runs: a tree added between two attempts changes the tree list that
+	# every step's key carries (`ZIG_RUNNER_TOOL_TREES`), so the next attempt runs its steps
+	# again, once. By attempt 3 nothing is changing it.
 	rerun_cache 2
-	check_replay 2
+	rerun_cache 3
+	check_replay 3
 
 	trap - EXIT
 	echo "timings ($backend):"
