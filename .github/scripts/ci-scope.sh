@@ -51,7 +51,8 @@ needed() {
 		runner/* | db/* | .github/workflows/ci.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/install-zig.sh | .github/scripts/ci-database.sh | \
 			.github/scripts/zig-test.sh | .github/scripts/zig-modules.sh | \
-			.github/scripts/expr-conformance.sh | .github/scripts/zlint.sh) return 0 ;;
+			.github/scripts/expr-conformance.sh | .github/scripts/zlint.sh | \
+			.github/scripts/native-service-images.sh) return 0 ;;
 		# Cannot change the runner's build or tests. The Workflows job checks the workflows, scripts
 		# and deployment scripts on every change; proofs and packaging check theirs.
 		*.md | docs/* | .changes/* | .changie.yaml | proofs/* | deploy/* | LICENSE | renovate.json | \

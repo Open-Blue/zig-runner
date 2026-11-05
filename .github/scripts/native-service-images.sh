@@ -15,7 +15,7 @@ set -euo pipefail
 dir=${1:?usage: native-service-images.sh <dir>}
 images=(
 	"postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5"
-	"redis:7-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f"
+	"redis:8-alpine@sha256:21090af93f8324db2f0f0f4f38a7c60369d47d917e000c3423d89d2ae2883537"
 )
 as_root=()
 if [[ $(id -u) != 0 ]]; then as_root=(sudo); fi
