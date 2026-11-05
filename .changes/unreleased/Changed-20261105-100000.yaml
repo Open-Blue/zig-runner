@@ -1,0 +1,3 @@
+kind: Changed
+body: The allocation-failure tests rerun on a faster allocator and count what is left themselves, so they cost a third less with the same checks, and the suite spends less of every build and push on them.
+time: 2026-11-05T10:00:00.000000-05:00
