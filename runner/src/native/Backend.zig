@@ -1982,8 +1982,10 @@ fn layerName(b: *Backend, kind: u8) ![]const u8 {
 /// The key of an exec of `script` on the stack as it is, in P8's format (`Store.KeyHasher`):
 /// the model's `Key = parent · script · stable env` (proofs/Runner/Model.lean, `keyOf`). Null
 /// without the store, or when the stack's top is not in it (a step that always runs, or failed,
-/// or was not published): nothing after such a step is replayed or published, as under Dagger a
-/// new parent makes every later key new. The env is the container's in its order, without the
+/// or was not published, a Docker action's step, a JavaScript action's mount points): nothing
+/// after such a layer is replayed or published, as under Dagger a new parent makes every later
+/// key new, so what an image or a mount holds never needs to be in a key
+/// (`Native.ops_keep_chained`). The env is the container's in its order, without the
 /// volatile names (`Store.stableEnv`). After P8's core come what its model does not have yet: who
 /// runs it and where, and the files written for it that stay (the event file, when it is not a
 /// variable). A base has no parent: in its place, the digest of what every layer above it
@@ -2486,7 +2488,7 @@ pub fn pullImage(
         return error.ImageNotFound;
     };
     const img = try b.pull(image, creds, why);
-    return images.fromPulled(b.arena, b.io, img.rootfs, img.digest) catch |e| {
+    return images.fromPulled(b.arena, b.io, img.rootfs, img.digest, img.manifest) catch |e| {
         why.* = "its configuration cannot be read";
         return e;
     };
@@ -4776,6 +4778,64 @@ test "native step cache: steps with secrets or run-specific values always run, a
     out.env = &.{.{ .name = "ZIG_RUNNER_STEP_CACHE", .value = .{ .lit = "false" } }};
     for ([_][]const u8{ "j3", "j4" }) |ran| try expectSucceeded(try runCached(arena, c.cfg, out, ran));
     try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "opted-out"));
+}
+
+test "nothing is keyed above a layer with no key: what a Docker action or a mount left is in no key" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var b: Backend = undefined;
+    b.store = .{ .root = "/nowhere" };
+    b.env = .empty;
+    b.workdir = "/w";
+    b.layers = .empty;
+    const stored: Store.Key = @splat(7);
+    try b.layers.append(arena, .{ .name = "l0", .path = "/l0", .key = stored });
+    try std.testing.expect(try b.keyFor(.step, "true", &.{}, 0, 0) != null);
+    // What `execIn` leaves for a Docker action's step, a JavaScript action's mount points (bound in
+    // every later step from then on) or an always-run step.
+    try b.layers.append(arena, .{ .name = "L1", .path = "/L1" });
+    try std.testing.expect(try b.keyFor(.step, "true", &.{}, 0, 0) == null);
+    // A fetched tree on it stays the job's own: `claimKey` is never reached.
+    try b.layers.append(arena, .{ .name = "L2", .path = "/L2" });
+    try b.keyFetched("an action's tree");
+    try std.testing.expectEqual(@as(usize, 3), b.layers.items.len);
+    try std.testing.expect(b.layers.items[2].key == null);
+    try std.testing.expect(try b.keyFor(.step, "true", &.{}, 0, 0) == null);
+}
+
+test "native step cache: nothing after a Docker action is replayed or kept, nor can its image be stale" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try cachedConfig(arena, &tmp);
+    const image = "zr-test/tool:1";
+    c.cfg.images = try @import("docker_action.zig").testImage(arena, &tmp, image, "{\"config\":{\"Env\":[\"PATH=/usr/bin:/bin\"]}}");
+    var docker_step = testStep("");
+    docker_step.action = .{ .docker = .{ .image = image, .inputs = &.{
+        .{ .name = "entrypoint", .value = .{ .lit = "sh" } },
+        .{ .name = "args", .value = .{ .lit = "-c \"cat /image-marker > from-image\"" } },
+    } } };
+    const job = testJob(&.{
+        testStep("echo x >> /shared/before"),
+        docker_step,
+        testStep("echo x >> /shared/after; cat from-image"),
+    });
+    const first = try runCached(arena, c.cfg, job, "j1");
+    try expectSucceeded(first);
+    try expectLines(first.text, &.{"in the image"});
+    // The tag now names another image: the step after it sees what the new one gave.
+    const marker = try std.fmt.allocPrint(arena, "images/{s}/rootfs/image-marker", .{try images.key(arena, image)});
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = marker, .data = "moved under its tag\n" });
+    const second = try runCached(arena, c.cfg, job, "j2");
+    try expectSucceeded(second);
+    try expectLines(second.text, &.{"moved under its tag"});
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "before"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "after"));
+    // The base and the step before the action.
+    try std.testing.expectEqual(@as(usize, 2), try storeLayers(arena, c.cfg.store));
 }
 
 test "native step cache: two jobs with one key at once run it once; the other replays it" {
