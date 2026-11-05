@@ -353,7 +353,7 @@ pub const Transport = struct {
         limit: usize,
     ) anyerror![]const u8,
     /// Ends the document being sent, from another task, so `send` fails; false when none was in
-    /// flight. Null when the transport cannot (the `dagger run` CLI): steps then run to their end.
+    /// flight. Null when the transport cannot: its steps then run to their end.
     abortFn: ?*const fn (ptr: *anyopaque) bool = null,
 
     fn send(t: Transport, arena: Allocator, doc: []const u8, limit: usize) ![]const u8 {
@@ -580,9 +580,53 @@ const HttpTransport = struct {
     io: std.Io,
     url: []const u8,
     auth: []const u8,
+    /// A query is being sent, and `abort` asked for it to end. Atomic: `abort` runs on the
+    /// `Watch`'s task.
+    in_flight: std.atomic.Value(bool) = .init(false),
+    aborted: std.atomic.Value(bool) = .init(false),
 
+    /// The query, ended early by `abort` with `error.QueryAborted`: it runs next to a wait for
+    /// the abort, and whichever ends first cancels the other (as `http.within` does for a
+    /// deadline). Cancelling the request closes its connection, and `dagger run`'s session sees
+    /// its client go and cancels the query and the exec it runs, as the engine does for the
+    /// direct session (`engine.Session.abort`). The session itself stays, for the `always()`
+    /// steps after a cancel; killing `dagger run` instead would end those too.
     fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8, limit: usize) anyerror![]const u8 {
         const self: *HttpTransport = @ptrCast(@alignCast(ptr));
+        self.aborted.store(false, .release);
+        self.in_flight.store(true, .release);
+        defer self.in_flight.store(false, .release);
+        const Ended = union(enum) { answer: anyerror![]const u8, aborted: void };
+        var buf: [2]Ended = undefined;
+        var sel: std.Io.Select(Ended) = .init(self.io, &buf);
+        // Without a task to run it in, it runs here, and cannot be aborted.
+        sel.concurrent(.answer, query, .{ self, arena, doc, limit }) catch
+            return self.query(arena, doc, limit);
+        sel.concurrent(.aborted, waitAborted, .{self}) catch {};
+        const first = sel.await() catch |e| {
+            while (sel.cancel()) |_| {}
+            return e;
+        };
+        while (sel.cancel()) |_| {}
+        return switch (first) {
+            .answer => |a| a,
+            .aborted => error.QueryAborted,
+        };
+    }
+
+    /// Ends the query being sent, if any; false when there is none.
+    fn abort(ptr: *anyopaque) bool {
+        const self: *HttpTransport = @ptrCast(@alignCast(ptr));
+        if (!self.in_flight.load(.acquire)) return false;
+        self.aborted.store(true, .release);
+        return true;
+    }
+
+    fn waitAborted(self: *HttpTransport) void {
+        while (!self.aborted.load(.acquire)) self.io.sleep(.fromMilliseconds(50), .awake) catch return;
+    }
+
+    fn query(self: *HttpTransport, arena: Allocator, doc: []const u8, limit: usize) anyerror![]const u8 {
         var body: std.Io.Writer.Allocating = .init(arena);
         try body.writer.writeAll("{\"query\":");
         try std.json.Stringify.value(doc, .{}, &body.writer);
@@ -889,7 +933,7 @@ pub fn run(
         .transport => |t| t,
     };
     const transport: Transport = opts.test_transport orelse
-        .{ .ptr = &http, .sendFn = HttpTransport.send };
+        .{ .ptr = &http, .sendFn = HttpTransport.send, .abortFn = HttpTransport.abort };
     return runSteps(arena, io, opts, job, &sh, results, transport, null);
 }
 
@@ -2351,6 +2395,54 @@ const FakeAbort = struct {
         return .{ .ptr = f, .sendFn = send, .abortFn = abort };
     }
 };
+
+test "the CLI session's query in flight is ended by abort, and its connection closed" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    // Takes the query and never answers it; notes when the client goes (what `dagger run` sees).
+    const Fake = struct {
+        got_query: std.atomic.Value(bool) = .init(false),
+        client_gone: std.atomic.Value(bool) = .init(false),
+
+        fn run(f: *@This(), l: *std.Io.net.Server) void {
+            const s = l.accept(std.testing.io) catch return;
+            defer s.close(std.testing.io);
+            var buf: [4096]u8 = undefined;
+            var r = s.reader(std.testing.io, &buf);
+            f.got_query.store(true, .release);
+            while (true) _ = r.interface.takeByte() catch break;
+            f.client_gone.store(true, .release);
+        }
+    };
+    var fake: Fake = .{};
+    const t = try std.Thread.spawn(.{}, Fake.run, .{ &fake, &listener });
+    defer t.join();
+
+    var url_buf: [64]u8 = undefined;
+    var http: HttpTransport = .{
+        .io = io,
+        .url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/query", .{
+            listener.socket.address.getPort(),
+        }),
+        .auth = "Basic x",
+    };
+    const transport: Transport = .{
+        .ptr = &http,
+        .sendFn = HttpTransport.send,
+        .abortFn = HttpTransport.abort,
+    };
+    try std.testing.expect(!transport.abort()); // nothing in flight yet
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var sending = try io.concurrent(Transport.send, .{ transport, arena.allocator(), "{ a }", 1024 });
+    while (!fake.got_query.load(.acquire)) try io.sleep(.fromMilliseconds(10), .awake);
+    while (!transport.abort()) try io.sleep(.fromMilliseconds(10), .awake);
+    try std.testing.expectError(error.QueryAborted, sending.await(io));
+    while (!fake.client_gone.load(.acquire)) try io.sleep(.fromMilliseconds(10), .awake);
+    try std.testing.expect(!transport.abort()); // and nothing in flight again
+}
 
 test "a step past its timeout is stopped, and only that step" {
     var f: FakeAbort = .{};
