@@ -252,22 +252,58 @@ wait_run() {
 }
 
 jobs_of() { api "repos/$repo/actions/runs/$1/attempts/${2:-1}/jobs?per_page=50"; }
-# job_log JOB_ID: its log, which GitHub may take a few seconds after the job ends to serve.
-job_log() {
-	local log
-	for _ in $(seq 10); do
-		log=$(api "repos/$repo/actions/jobs/$1/logs" 2>/dev/null) && [[ -n $log ]] &&
-			{ printf '%s\n' "$log" && return 0; }
+# jobs_settled ID [ATTEMPT]: the run's jobs once each has a conclusion. The run being completed does
+# not mean the jobs list says so yet: during an incident it showed `null` for jobs that had
+# succeeded. Re-reads for up to a minute; what it last read, if some job never settles.
+jobs_settled() {
+	local jobs=""
+	for _ in $(seq 20); do
+		jobs=$(jobs_of "$@" 2>/dev/null) || jobs=""
+		jq -e '(.jobs | length) > 0 and all(.jobs[]; .status == "completed" and .conclusion != null)' \
+			<<<"$jobs" >/dev/null 2>&1 && break
 		sleep 3
 	done
-	echo "(no log)"
+	printf '%s\n' "$jobs"
+}
+
+# run_conclusion ID: the run's conclusion, re-read while it is still null.
+run_conclusion() {
+	local c=""
+	for _ in $(seq 20); do
+		c=$(api "repos/$repo/actions/runs/$1" --jq '.conclusion // empty' 2>/dev/null) || c=""
+		[[ -n $c ]] && break
+		sleep 3
+	done
+	echo "$c"
+}
+
+# job_log JOB_ID [CONCLUSION]: its log, which GitHub may take a few seconds after the job ends to
+# serve. GitHub answers 404 for a log it does not have (a job that never started has none, nor has
+# one still running), so the wait is bounded twice: a skipped job is asked once, and every other
+# job's waits draw on one budget for the whole suite ($log_budget s), so a lagging API costs at
+# most that, not half a minute per job.
+log_budget=${E2E_LOG_WAIT:-60}
+job_log() {
+	local log why="" i tries=8
+	[[ ${2:-} == skipped ]] && tries=1
+	for ((i = 1; i <= tries; i++)); do
+		if log=$(api "repos/$repo/actions/jobs/$1/logs" 2>"$out/log.err") && [[ -n $log ]]; then
+			printf '%s\n' "$log"
+			return 0
+		fi
+		why=$(tr '\n' ' ' <"$out/log.err")
+		((i < tries && log_budget >= 3)) || break
+		sleep 3
+		log_budget=$((log_budget - 3))
+	done
+	echo "(no log: ${why:-empty})"
 }
 
 # record WORKFLOW ATTEMPT JOBS_JSON: a row of timings.tsv for each job, with its log in $out/logs.
 record() {
 	local wf=$1 attempt=$2 jobs=$3 id name conclusion queue run on
 	while IFS=$'\t' read -r id name conclusion queue run; do
-		job_log "$id" >"$out/logs/$backend-$wf-$name-$attempt.log"
+		job_log "$id" "$conclusion" >"$out/logs/$backend-$wf-$name-$attempt.log"
 		# Native only where "Set up job" says so ("Engine: native"); a job native cannot run yet
 		# says "This job runs on Dagger: ..." instead.
 		on=dagger
@@ -289,7 +325,7 @@ rerun_cache() {
 	fi
 	wait_run "$main" "$1" || { fail "e2e/cache, attempt $1: not done within $timeout s" && return 0; }
 	# The attempt's own `cache` job: the newest of that name.
-	record e2e "$1" "$(jobs_of "$main" "$1" | jq '{jobs: [[.jobs[] | select(.name == "cache")] | max_by(.id)]}')"
+	record e2e "$1" "$(jobs_settled "$main" "$1" | jq '{jobs: [[.jobs[] | select(.name == "cache")] | max_by(.id)]}')"
 }
 
 # check_replay ATTEMPT: that attempt of `cache` succeeded with its steps replayed.
@@ -315,7 +351,7 @@ expect() { grep -qF -- "$2" "$1" || fail "${3:-$(basename "$1" .log)}: no \"$2\"
 check() {
 	label=${2:?}
 	backend=${3:-dagger}
-	local nonce tag jobs state started
+	local nonce tag jobs state started running
 	if [[ -n ${E2E_GH_TOKEN:-} ]]; then
 		export GH_TOKEN=$E2E_GH_TOKEN
 	else
@@ -338,11 +374,24 @@ check() {
 	cancel=$(find_run e2e-cancel.yml "e2e-cancel $tag") || { fail "the e2e-cancel run never appeared" && exit 1; }
 	echo "runs: https://github.com/$repo/actions/runs/$main and .../$cancel"
 
-	# The cancel, once its long step has started (its step list says so).
-	started=""
+	# The cancel, once its long step has started. The step list says so, but it can lag behind the
+	# job (during an incident `hog` started in 3 s and the list never showed it), so a job that has
+	# plainly been running for 30 s on a runner counts too. That cannot let a Hog that never started
+	# pass: the checks below need the step cancelled (not skipped) and its output in the log.
+	started="" running=0
 	for _ in $(seq $((timeout / 5))); do
-		state=$(jobs_of "$cancel" | jq -r '.jobs[0].steps[]? | select(.name == "Hog") | .status')
+		jobs=$(jobs_of "$cancel" 2>/dev/null) || jobs=""
+		state=$(jq -r '.jobs[0].steps[]? | select(.name == "Hog") | .status' <<<"$jobs" 2>/dev/null) || state=""
 		[[ $state == in_progress || $state == completed ]] && { started=1 && break; }
+		if jq -e '.jobs[0] | .status == "in_progress" and ((.runner_name // "") != "")' <<<"$jobs" >/dev/null 2>&1; then
+			running=$((running + 1))
+		else
+			running=0
+		fi
+		if ((running >= 6)); then
+			echo "e2e-cancel: the step list does not show Hog after 30 s of the job running; cancelling anyway"
+			started=1 && break
+		fi
 		sleep 5
 	done
 	if [[ -n $started ]]; then sleep 3; else fail "e2e-cancel: its Hog step never started"; fi
@@ -351,7 +400,7 @@ check() {
 	wait_run "$main" || fail "e2e: not done within $timeout s"
 	wait_run "$cancel" || fail "e2e-cancel: not done within $timeout s"
 
-	jobs=$(jobs_of "$main")
+	jobs=$(jobs_settled "$main")
 	record e2e 1 "$jobs"
 	local job
 	for job in toolcache service docker js files secret cache; do
@@ -368,13 +417,14 @@ check() {
 	! grep -qE 'added-[0-9a-f]{16}' "$out/logs/$backend-e2e-secret-1.log" ||
 		fail "e2e/secret: a value given to ::add-mask:: is in its log unmasked"
 
-	jobs=$(jobs_of "$cancel")
+	jobs=$(jobs_settled "$cancel")
 	record e2e-cancel 1 "$jobs"
-	state=$(api "repos/$repo/actions/runs/$cancel" --jq .conclusion)
+	state=$(run_conclusion "$cancel")
 	[[ $state == cancelled ]] || fail "e2e-cancel: the run is $state, not cancelled"
 	state=$(jq -r '[.jobs[0].steps[] | "\(.name)=\(.conclusion)"] | join(" ")' <<<"$jobs")
-	[[ $state == *"Always=success"* && $state == *"On cancel=success"* && $state != *"After=success"* ]] ||
-		fail "e2e-cancel: steps $state; expected Always and On cancel to succeed, After not to run"
+	[[ $state == *"Hog=cancelled"* && $state == *"Always=success"* && $state == *"On cancel=success"* && $state != *"After=success"* ]] ||
+		fail "e2e-cancel: steps $state; expected Hog cancelled, Always and On cancel to succeed, After not to run"
+	expect "$out/logs/$backend-e2e-cancel-hog-1.log" "e2e-hog started" e2e-cancel
 	expect "$out/logs/$backend-e2e-cancel-hog-1.log" "e2e-always ran" e2e-cancel
 	expect "$out/logs/$backend-e2e-cancel-hog-1.log" "e2e-cancelled ran" e2e-cancel
 
