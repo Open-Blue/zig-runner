@@ -6,10 +6,11 @@
 //! replayed as a step.
 //!
 //! The keys are the builder's own 64-hex sha256 (`dockerfile.plan`), hashed with the store's
-//! format and the job's trust scope (`Backend.scope`) into a P2 key: a job the runner does not
-//! vouch for, or a vouched fork's pull request, builds its own layers and never leaves one a
-//! trusted job takes, as `Backend.below` keeps a step's layers apart. A build layer's files have
-//! the image's ids (`docker_action.unshift`), not a job's range, so one layer serves every slot.
+//! format, the job's trust scope (`Backend.scope`) and how ids are mapped into a P2 key: a job the
+//! runner does not vouch for, or a vouched fork's pull request, builds its own layers and never
+//! leaves one a trusted job takes, as `Backend.below` keeps a step's layers apart, and neither do
+//! a root and a rootless runner's jobs meet. A build layer's files have the image's ids
+//! (`docker_action.unshift`), not a job's range, so one layer serves every slot.
 
 const std = @import("std");
 const P2Store = @import("Store.zig");
@@ -25,6 +26,9 @@ pub const Store = struct {
     held: *std.ArrayList(std.Io.File),
     /// The job's trust scope (`set_up.packageCacheScope`: `repo` or `untrusted`), in every key.
     scope: []const u8,
+    /// How the job's ids are mapped (the userns mode's name, as in `Backend.below`), in every key:
+    /// a rootless runner's layers are owned by its own user, a root runner's by the image's ids.
+    userns: []const u8,
     /// Ends `publish`'s wait for its key's lock (`P2Store.lockKey`). That wait is only for another
     /// builder's publish of the same layer, so nothing sets it but the tests.
     stop: *const std.atomic.Value(bool) = &never_stop,
@@ -33,11 +37,7 @@ pub const Store = struct {
         var k: P2Store.Key = undefined;
         if (hex.len != 2 * k.len) return error.BadLayerKey;
         _ = std.fmt.hexToBytes(&k, hex) catch return error.BadLayerKey;
-        var h: P2Store.KeyHasher = .plain("a Dockerfile build's layer");
-        h.field(P2Store.store_format);
-        h.field(s.scope);
-        h.field(&k);
-        return h.final();
+        return layerKey(P2Store.store_format, s.scope, s.userns, k, null);
     }
 
     /// The layer stored under `key`, held for the job, or null.
@@ -86,6 +86,24 @@ pub const Store = struct {
     }
 };
 
+/// A build's key as the store keeps it (the model's `buildLayerPreimage`). `bytes`, when given,
+/// receives the preimage (`key_vectors.zig`).
+pub fn layerKey(
+    format: []const u8,
+    scope: []const u8,
+    userns: []const u8,
+    key: P2Store.Key,
+    bytes: ?*std.Io.Writer,
+) P2Store.Key {
+    var h: P2Store.KeyHasher = .{ .h = .init(.{}), .bytes = bytes };
+    h.field("a Dockerfile build's layer");
+    h.field(format);
+    h.field(scope);
+    h.field(userns);
+    h.field(&key);
+    return h.final();
+}
+
 const never_stop: std.atomic.Value(bool) = .init(false);
 
 test "a layer is published once, whole, under its key" {
@@ -99,7 +117,7 @@ test "a layer is published once, whole, under its key" {
     try P2Store.prepare(arena, io, root, .{ .check_parents = false });
     var held: std.ArrayList(std.Io.File) = .empty;
     defer for (held.items) |f| f.close(io);
-    const store: Store = .{ .dir = root, .store = .{ .root = root }, .held = &held, .scope = "repo" };
+    const store: Store = .{ .dir = root, .store = .{ .root = root }, .held = &held, .scope = "repo", .userns = "mapped" };
     const key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     try std.testing.expect(try store.get(arena, io, key) == null);
     const first = try store.begin(arena, io, key);
@@ -112,8 +130,11 @@ test "a layer is published once, whole, under its key" {
     const got = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(arena, "{s}/f", .{p}), arena, .limited(16));
     try std.testing.expectEqualStrings("one", got);
     // Another trust scope's jobs never take it (finding 4 of the trial integration, #275).
-    const untrusted: Store = .{ .dir = root, .store = .{ .root = root }, .held = &held, .scope = "untrusted" };
+    const untrusted: Store = .{ .dir = root, .store = .{ .root = root }, .held = &held, .scope = "untrusted", .userns = "mapped" };
     try std.testing.expect(try untrusted.get(arena, io, key) == null);
+    // Nor do a root and a rootless runner's: the files' ids mean different things.
+    const rootless: Store = .{ .dir = root, .store = .{ .root = root }, .held = &held, .scope = "repo", .userns = "inherited" };
+    try std.testing.expect(try rootless.get(arena, io, key) == null);
 }
 
 test "a layer is published under its key's lock, so collect never takes its entry for a dead one's" {
@@ -130,7 +151,7 @@ test "a layer is published under its key's lock, so collect never takes its entr
     try P2Store.prepare(arena, io, root, .{ .check_parents = false });
     var held: std.ArrayList(std.Io.File) = .empty;
     defer for (held.items) |f| f.close(io);
-    const store: Store = .{ .dir = root, .store = .{ .root = root }, .held = &held, .scope = "repo" };
+    const store: Store = .{ .dir = root, .store = .{ .root = root }, .held = &held, .scope = "repo", .userns = "mapped" };
     const key = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
     const built = try store.begin(arena, io, key);
     const file = try std.fmt.allocPrint(arena, "{s}/f", .{built});

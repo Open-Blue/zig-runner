@@ -16,6 +16,9 @@
 //! writer) and `Store.stableEnv`, with `keyFor`'s tail, which needs a `Backend`, written out here
 //! as `keyFor` writes it; the digest below a base through `Backend.belowKey`, which `below` calls.
 //!
+//! `buildfrom`, `buildstep` and `buildlayer` lines are a Dockerfile build's keys, through
+//! `dockerfile.fromKey`, `dockerfile.stepKey` and `layers.layerKey`.
+//!
 //! `layer` lines are small trees (modes, an xattr, a symlink, an opaque directory, a whiteout) and
 //! the model's `walkPreimage` of each: the last test makes each tree and checks
 //! `Store.treeDigestTo`, the walk `Store.layerDigest` hashes, writes the same bytes.
@@ -23,6 +26,8 @@
 const std = @import("std");
 const Store = @import("Store.zig");
 const Backend = @import("Backend.zig");
+const dockerfile = @import("dockerfile.zig");
+const layers = @import("layers.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
@@ -57,6 +62,26 @@ pub const BelowInput = struct {
     binds: []const Bind,
     /// P4's Zig cache seeds' layers; which binds are cache volumes is `Bind.volume`.
     seeds: []const []const u8 = &.{},
+};
+
+/// What a Dockerfile build's first key is of (`dockerfile.fromKey`).
+pub const BuildFromInput = struct { reference: []const u8, id: []const u8 };
+
+/// What an instruction's key is of (`dockerfile.stepKey`).
+pub const BuildStepInput = struct {
+    parent: []const u8,
+    kind: []const u8,
+    evaluated: []const u8,
+    reads: []const u8,
+};
+
+/// What a build's layer is kept under (`layers.layerKey`); `label` is the model's, `layerKey`'s own.
+pub const BuildLayerInput = struct {
+    label: []const u8,
+    format: []const u8,
+    scope: []const u8,
+    userns: []const u8,
+    key: [32]u8,
 };
 
 pub const KeyFn = fn (Allocator, KeyInput) anyerror![32]u8;
@@ -120,6 +145,27 @@ fn sha(gpa: Allocator, bytes: []u8) [32]u8 {
     return key;
 }
 
+fn buildFromPreimage(gpa: Allocator, in: BuildFromInput) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    errdefer w.deinit();
+    _ = dockerfile.fromKey(in.reference, in.id, &w.writer);
+    return w.toOwnedSlice();
+}
+
+fn buildStepPreimage(gpa: Allocator, in: BuildStepInput) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    errdefer w.deinit();
+    _ = dockerfile.stepKey(in.parent, in.kind, in.evaluated, in.reads, &w.writer);
+    return w.toOwnedSlice();
+}
+
+fn buildLayerPreimage(gpa: Allocator, in: BuildLayerInput) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    errdefer w.deinit();
+    _ = layers.layerKey(in.format, in.scope, in.userns, in.key, &w.writer);
+    return w.toOwnedSlice();
+}
+
 /// The key P2 gives, through `Store.KeyHasher`.
 pub fn storeKey(gpa: Allocator, in: KeyInput) ![32]u8 {
     return sha(gpa, try keyPreimage(gpa, in));
@@ -135,6 +181,9 @@ pub fn storeBelow(gpa: Allocator, in: BelowInput) ![32]u8 {
 const Side = union(enum) {
     key: struct { in: KeyInput, preimage: []const u8 },
     below: struct { in: BelowInput, preimage: []const u8 },
+    build_from: struct { in: BuildFromInput, preimage: []const u8 },
+    build_step: struct { in: BuildStepInput, preimage: []const u8 },
+    build_layer: struct { in: BuildLayerInput, preimage: []const u8 },
 };
 
 const Vector = struct { name: []const u8, equal: bool, a: Side, b: Side };
@@ -230,6 +279,47 @@ fn belowSide(arena: Allocator, it: *Fields) !Side {
     } };
 }
 
+fn buildFromSide(arena: Allocator, it: *Fields) !Side {
+    return .{ .build_from = .{
+        .in = .{ .reference = try unhex(arena, it.next().?), .id = try unhex(arena, it.next().?) },
+        .preimage = try unhex(arena, it.next().?),
+    } };
+}
+
+fn buildStepSide(arena: Allocator, it: *Fields) !Side {
+    return .{ .build_step = .{
+        .in = .{
+            .parent = try unhex(arena, it.next().?),
+            .kind = try unhex(arena, it.next().?),
+            .evaluated = try unhex(arena, it.next().?),
+            .reads = try unhex(arena, it.next().?),
+        },
+        .preimage = try unhex(arena, it.next().?),
+    } };
+}
+
+fn buildLayerSide(arena: Allocator, it: *Fields) !Side {
+    const label = try unhex(arena, it.next().?);
+    const format = try unhex(arena, it.next().?);
+    const scope = try unhex(arena, it.next().?);
+    const userns = try unhex(arena, it.next().?);
+    const key = try unhex(arena, it.next().?);
+    try std.testing.expectEqual(32, key.len);
+    return .{ .build_layer = .{
+        .in = .{ .label = label, .format = format, .scope = scope, .userns = userns, .key = key[0..32].* },
+        .preimage = try unhex(arena, it.next().?),
+    } };
+}
+
+fn side(arena: Allocator, kind: []const u8, it: *Fields) !Side {
+    if (std.mem.eql(u8, kind, "key")) return keySide(arena, it);
+    if (std.mem.eql(u8, kind, "below")) return belowSide(arena, it);
+    if (std.mem.eql(u8, kind, "buildfrom")) return buildFromSide(arena, it);
+    if (std.mem.eql(u8, kind, "buildstep")) return buildStepSide(arena, it);
+    if (std.mem.eql(u8, kind, "buildlayer")) return buildLayerSide(arena, it);
+    return error.UnknownVector;
+}
+
 fn parse(arena: Allocator) ![]Vector {
     var out: std.ArrayList(Vector) = .empty;
     var lines = std.mem.splitScalar(u8, vectors, '\n');
@@ -240,12 +330,11 @@ fn parse(arena: Allocator) ![]Vector {
         if (std.mem.eql(u8, kind, "layer")) continue;
         const name = it.next().?;
         const rel = it.next().?;
-        const key = std.mem.eql(u8, kind, "key");
         try out.append(arena, .{
             .name = name,
             .equal = std.mem.eql(u8, rel, "equal"),
-            .a = if (key) try keySide(arena, &it) else try belowSide(arena, &it),
-            .b = if (key) try keySide(arena, &it) else try belowSide(arena, &it),
+            .a = try side(arena, kind, &it),
+            .b = try side(arena, kind, &it),
         });
         try std.testing.expect(it.next() == null);
     }
@@ -262,6 +351,15 @@ pub fn checkRelation(comptime keyFn: KeyFn, comptime belowFn: BelowFn) !void {
         const ka: [32]u8, const kb: [32]u8 = switch (v.a) {
             .key => |a| .{ try keyFn(gpa, a.in), try keyFn(gpa, v.b.key.in) },
             .below => |a| .{ try belowFn(gpa, a.in), try belowFn(gpa, v.b.below.in) },
+            .build_from => |a| .{
+                sha256(dockerfile.fromKey(a.in.reference, a.in.id, null)),
+                sha256(dockerfile.fromKey(v.b.build_from.in.reference, v.b.build_from.in.id, null)),
+            },
+            .build_step => |a| .{
+                sha256(stepKeyOf(a.in)),
+                sha256(stepKeyOf(v.b.build_step.in)),
+            },
+            .build_layer => |a| .{ layerKeyOf(a.in), layerKeyOf(v.b.build_layer.in) },
         };
         std.testing.expectEqual(v.equal, std.mem.eql(u8, &ka, &kb)) catch |err| {
             std.debug.print("key vector {s}: the model says {s}\n", .{
@@ -271,6 +369,20 @@ pub fn checkRelation(comptime keyFn: KeyFn, comptime belowFn: BelowFn) !void {
             return err;
         };
     }
+}
+
+fn sha256(key: [64]u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    Sha256.hash(&key, &out, .{});
+    return out;
+}
+
+fn stepKeyOf(in: BuildStepInput) [64]u8 {
+    return dockerfile.stepKey(in.parent, in.kind, in.evaluated, in.reads, null);
+}
+
+fn layerKeyOf(in: BuildLayerInput) [32]u8 {
+    return layers.layerKey(in.format, in.scope, in.userns, in.key, null);
 }
 
 test "the native key's preimage is the model's" {
@@ -283,6 +395,9 @@ test "the native key's preimage is the model's" {
         const want: []const u8, const got: []const u8 = switch (s) {
             .key => |k| .{ k.preimage, try keyPreimage(arena, k.in) },
             .below => |b| .{ b.preimage, try belowPreimage(arena, b.in) },
+            .build_from => |b| .{ b.preimage, try buildFromPreimage(arena, b.in) },
+            .build_step => |b| .{ b.preimage, try buildStepPreimage(arena, b.in) },
+            .build_layer => |b| .{ b.preimage, try buildLayerPreimage(arena, b.in) },
         };
         std.testing.expectEqualSlices(u8, want, got) catch |err| {
             std.debug.print("key vector {s}: the preimage is not the model's\n", .{v.name});

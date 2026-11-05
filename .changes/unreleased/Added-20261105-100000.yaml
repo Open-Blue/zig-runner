@@ -1,0 +1,3 @@
+kind: Added
+body: 'The native layer store is crash-tested. In CI, `Store.publish`, the once-per-boot check, `oci.Store.ensure` and `volumes.adoptSeed` run on ext4 over dm-log-writes, the disk is put back to every flush, FUA and mark of the log and mounted, and no layer `open` accepts differs from what was published; and a publish on a disk that fails writes (dm-flakey) must fail, in `syncTree`, in `syncfs` and through the job''s descriptor, rather than publish.'
+time: 2026-11-05T10:00:00.000000-05:00

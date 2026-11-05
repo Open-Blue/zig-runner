@@ -504,7 +504,7 @@ fn runJob(w: *Worker, arena: Allocator, io: std.Io, n: usize) !void {
 fn runBuild(w: *Worker, arena: Allocator, io: std.Io, dir: []const u8, n: usize) !void {
     var held: std.ArrayList(std.Io.File) = .empty;
     defer for (held.items) |l| l.close(io);
-    const ls: layers.Store = .{ .dir = dir, .store = w.store, .held = &held, .scope = "repo" };
+    const ls: layers.Store = .{ .dir = dir, .store = w.store, .held = &held, .scope = "repo", .userns = "mapped" };
     var got: [builds]?[]const u8 = @splat(null);
     for (0..1 + w.rand.uintLessThan(usize, 3)) |_| {
         const b = w.rand.uintLessThan(usize, builds);
