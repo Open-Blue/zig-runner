@@ -32,6 +32,10 @@ pub const Image = struct {
     healthcheck: ?health.ImageCheck = null,
     /// `sha256:...`, when the configuration says which digest it was pulled as.
     digest: ?[]const u8 = null,
+    /// The platform's manifest's digest, when P3's pull gave the image (`fromPulled`): what the
+    /// image is, config and layers. A tag moved, or an index that changed for another platform,
+    /// is told apart by this and not by the reference (or by `digest`, an index's).
+    manifest: ?[]const u8 = null,
 };
 
 /// The entry's name in the images directory: the reference with each `/` as `+`, which no
@@ -94,8 +98,14 @@ pub fn find(arena: Allocator, io: std.Io, dir: []const u8, ref: []const u8) !?Im
 
 /// An image P3's pull gave (`oci.Image`): its rootfs, and its configuration from the
 /// `config.json` beside it in the store (`oci/images/<manifest>/`), with the digest the reference
-/// resolved to.
-pub fn fromPulled(arena: Allocator, io: std.Io, rootfs: []const u8, digest: []const u8) !Image {
+/// resolved to and the platform's manifest's.
+pub fn fromPulled(
+    arena: Allocator,
+    io: std.Io,
+    rootfs: []const u8,
+    digest: []const u8,
+    manifest: []const u8,
+) !Image {
     const dir = std.fs.path.dirname(rootfs) orelse return error.BadImageConfig;
     const text = std.Io.Dir.cwd().readFileAlloc(
         io,
@@ -106,6 +116,7 @@ pub fn fromPulled(arena: Allocator, io: std.Io, rootfs: []const u8, digest: []co
     var image = parseConfig(arena, text) catch return error.BadImageConfig;
     image.rootfs = rootfs;
     image.digest = digest;
+    image.manifest = manifest;
     return image;
 }
 

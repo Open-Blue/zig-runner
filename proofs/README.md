@@ -116,6 +116,8 @@ All names are under `Runner.`; `Build.`, `OutputKeys.` and so on are the modules
 | **P1 on the native backend** | `Native.native_replay_eq_run`, and `native_eq_dagger`: both backends give what the job gives with the cache off | `Runner/Native.lean` |
 | a fork's pull request never shares a key with the repository's own jobs | `Native.scope_apart`, `fork_keys_apart` | `Runner/Native.lean` |
 | the native key keeps what `Key` keeps | `Native.encState_injective`, `belowPreimage_inj` (with `belowTail_inj`), `encKey_injective`, `native_key_iff`, `native_mounts_invisible`, `native_volatile_invisible`, `native_event_invisible`; `Native.Ambiguous` without the lengths | `Runner/Native.lean` |
+| a key stands on keys: nothing is keyed above a layer with none (a Docker action's, a JavaScript action's mount points) | `Native.ops_keep_chained` | `Runner/Native.lean` |
+| a Dockerfile build's keys hold what its layers were made from, the base image's identity first | `Native.encBuild_injective`, `build_base_matters`, `encBuildLayer_injective` | `Runner/Native.lean` |
 | native concurrency and eviction | `Native.ops_keep_honest`, `race_irrelevant`, `readWhole_agrees`, `Native.Torn`; a lost read in `nbuild` | `Runner/Native.lean` |
 | native layer digests | `Native.walk_injective` (P2's walk as written), `digest_deterministic`, `digest_injective`, `same_layer_same_container`, `different_layer_different_container` | `Runner/Native.lean` |
 | a shared cache is safe | `Build.elsewhere_ahead`: no other job can write under this job's nonce, which is why a pool may share one cache | `Runner/Build.lean` |
@@ -311,6 +313,8 @@ key format is the one proved here.
 | `Output.log`, `Logs` | `layers/<key>/log`, the step's output as the one pipe recorded it, so a replay is the run without `exec 2>&1` (`Logs.native_replay`); the script keeps it, since both backends run one script |
 | `Cache`, `look` | `Store.open`: `layers/<key>` for the key's sha256 (`Native.Store`, `slook`) |
 | `replayable`, `mark st = .everyRun` | `Backend.execScript` publishes (`publishTop`) only a step that exited 0, does not always run, and whose parent is in the store (`keyFor` is null otherwise): `Native.record`, so every hit is a success of an unmarked step (`hit_succeeds`, `marked_misses`) |
+| `Stack`, `StackOp` | the job's `Backend.layers`: `execIn` adds a layer with no key, `claimKey` and `publishTop` give one a key only on a keyed top (`keyFor`), `keyFetched`, `dropTop`, `flatten` |
+| `BuildState`, `encBuild`, `encBuildLayer` | `dockerfile.fromKey`, `stepKey` (each instruction's layer, `dockerfile.build`) and `layers.layerKey`; `.from`'s `id` is `docker_action.baseId`, `evaluated` and `reads` a digest where they are lists (`listDigest`, `contextDigest`) |
 | `Subset` | `Store.collect`, LRU under `max_bytes` (`Native.evict`), and an entry `open` will not take (`lost`) |
 | `Elsewhere` | a store a pool's runners share, `Store.lockKey` per key: what they do between steps is `Native.Op`s (`ops_keep_honest`) |
 
