@@ -733,7 +733,8 @@ fn openFileAt(dir: linux.fd_t, name: [*:0]const u8) !linux.fd_t {
 ///
 /// A checkout of this repository is about 370 entries, and took `syncfs`, so it waited for
 /// whatever else the disk was writing: twice as long beside a writer, on a laptop's NVMe. Around
-/// 800 the two cross: `syncfs` is then no slower beside a writer and twice as fast without one.
+/// 800 `syncfs` is twice as fast on a tree already written, and slower only on one just written
+/// beside a writer.
 pub const sync_tree_max = 512;
 
 /// The layers' directory synced, so the renames that published this job's layers outlive a
