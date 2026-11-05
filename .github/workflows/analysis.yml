@@ -562,3 +562,22 @@ jobs:
           sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
           ../.github/scripts/zig-test.sh
           ZIG_TEST_NATIVE_AS_ROOT=1 ../.github/scripts/zig-test.sh
+
+  store-crash:
+    name: Store crash probe
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - name: Probe
+        run: |
+          uname -r; lsb_release -d; id; nproc; free -m | head -2; df -h / /mnt | cat
+          for m in dm-log-writes dm-flakey dm-error dm-linear; do sudo modprobe "$m" && echo "loaded $m" || echo "NO $m"; done
+          sudo dmsetup targets
+          find /lib/modules/"$(uname -r)" -name 'dm-log-writes*' -o -name 'dm-flakey*' | head
+          apt-cache policy xfstests | head -3
+          which gcc cc dmsetup losetup mkfs.ext4 sudo
+          ls /dev/loop* | head -3
+          git ls-remote https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git HEAD
+          git ls-remote https://github.com/kdave/xfstests HEAD
