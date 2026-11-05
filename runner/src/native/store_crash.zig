@@ -224,7 +224,7 @@ fn write(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: 
                 hit.layer.lock.close(io);
             }
             _ = try expectedDigest(arena, io, sp.scratch, big);
-            const kept = (try Store.treeSize(arena, io, try print(arena, "{s}/expected/{s}", .{ sp.scratch, big }))).bytes;
+            const kept = try Store.treeBytes(arena, io, try print(arena, "{s}/expected/{s}", .{ sp.scratch, big }));
             s.max_bytes = kept + 40_000;
             try hook(io, env, mark_env, "before-collect");
             s.collect(arena, io);
