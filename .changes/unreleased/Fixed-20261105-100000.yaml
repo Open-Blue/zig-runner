@@ -1,3 +1,3 @@
 kind: Fixed
-body: 'The end-to-end suite tolerates GitHub''s API lag: it re-reads jobs and runs that are completed but still list no conclusion, starts the cancel when the job has plainly been running for 30 s even if the step list does not show Hog (the checks still need Hog cancelled and its output in the log), and bounds the wait for job logs GitHub does not serve (one 60 s budget for the suite, and a skipped job is asked once).'
+body: A native publish commits a layer in one journal commit, not two or three. The layer's data is written back first and its `meta` written before the fsyncs, so a small layer's publish takes about half the time.
 time: 2026-11-05T10:00:00.000000-05:00

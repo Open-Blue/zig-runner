@@ -86,7 +86,7 @@ pub fn find(
     const img = Backend.pullAt(arena, gpa, io, store, owners, ref, null, &why) catch |e|
         return .{ .missing = try std.fmt.allocPrint(arena, "the image {s} could not be pulled " ++
             "natively: {s}", .{ ref, if (why.len > 0) why else @errorName(e) }) };
-    return .{ .image = images.fromPulled(arena, io, img.rootfs, img.digest) catch
+    return .{ .image = images.fromPulled(arena, io, img.rootfs, img.digest, img.manifest) catch
         return .{ .missing = try std.fmt.allocPrint(arena, "the image {s} has a config the " ++
             "runner cannot read", .{ref}) } };
 }
@@ -284,8 +284,18 @@ fn openContext(arena: Allocator, io: std.Io, bd: Build) !struct { path: []const 
     return .{ .path = try std.fmt.allocPrint(arena, "/proc/self/fd/{d}", .{dir.handle}), .dir = dir };
 }
 
+/// What a build's base image is, for its keys (`dockerfile.fromKey`): its reference only names it,
+/// and a tag moves. A pulled image has its platform's manifest's digest, which is what it holds; any
+/// other (`images.lookup`'s directory, in no way content-addressed) is known by its tree, as
+/// `Backend.below` knows the job's.
+fn baseId(arena: Allocator, io: std.Io, base: images.Image) ![]const u8 {
+    if (base.manifest) |m| return m;
+    return arena.dupe(u8, &Store.hex(try Store.rootfsFingerprint(arena, io, base.rootfs)));
+}
+
 /// The Dockerfile of `bd` read and planned on its base image from the native store; `digests`:
-/// the COPY sources' content keyed (a build), else a fixed one (only whether it can be built).
+/// the COPY sources' content and the base's identity keyed (a build), else fixed ones (only
+/// whether it can be built).
 fn planBuild(b: *Backend, bd: Build, ctx: []const u8, digests: bool) !struct { dockerfile.Plan, images.Image } {
     const arena = b.arena;
     const text = switch (try sandbox.readIn(arena, ctx, bd.dockerfile, 1 << 20)) {
@@ -312,7 +322,7 @@ fn planBuild(b: *Backend, bd: Build, ctx: []const u8, digests: bool) !struct { d
     var c: Ctx = .{ .dir = ctx, .io = b.io, .digests = digests };
     const context: dockerfile.Context = .{ .ptr = &c, .digestFn = Ctx.digest };
     // The base's reference first (it may come from an ARG), then the plan on its config.
-    const first = try dockerfile.plan(arena, ins, .{ .rootfs = "" }, &.{}, context);
+    const first = try dockerfile.plan(arena, ins, .{ .rootfs = "" }, "", &.{}, context);
     const base_ref = switch (first) {
         .ok => |p| p.base,
         .refused => |r| {
@@ -327,7 +337,7 @@ fn planBuild(b: *Backend, bd: Build, ctx: []const u8, digests: bool) !struct { d
             return error.Refused;
         },
     };
-    const p = (try dockerfile.plan(arena, ins, base, &.{}, context)).ok;
+    const p = (try dockerfile.plan(arena, ins, base, if (digests) try baseId(arena, b.io, base) else "", &.{}, context)).ok;
     if (!images.runsAsRoot(p.config.user)) {
         b.build_reason = try std.fmt.allocPrint(arena, "the image runs as USER {s}, and native " ++
             "Docker actions run as root only yet", .{p.config.user});
@@ -383,6 +393,7 @@ fn buildImage(b: *Backend, bd: Build) !Built {
         .store = b.store_cfg,
         .held = &b.held,
         .scope = b.scope,
+        .userns = @tagName(b.how.userns),
     };
     var runner: BuildRunner = .{ .b = b };
     return switch (try dockerfile.build(arena, b.io, p, base.rootfs, ctx.path, store, runner.runner())) {
