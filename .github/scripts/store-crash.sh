@@ -130,6 +130,10 @@ crash() {
 		}
 		tail -n 1 "$w/step.log"
 	done
+	# Then everything written, so the last renames (the seed's, the directory's) are on the disk at
+	# a point too: the sequence itself syncs nothing of them.
+	sync
+	"$w/mark" synced
 	"$w/mark" end
 	umount "$w/mnt"
 	dmsetup remove store-log
@@ -228,7 +232,7 @@ controls() {
 		restore "$1"
 		mount_point
 		store_test corrupt "$work/check/w" "$how" >/dev/null 2>&1
-		if store_test verify "$work/check/w" after-6 >"$work/control.log" 2>&1; then
+		if store_test verify "$work/check/w" synced >"$work/control.log" 2>&1; then
 			umount "$work/check"
 			losetup -d "$point_dev"
 			echo "::error title=Store crash::the check passed a layer changed on purpose ($how)"
