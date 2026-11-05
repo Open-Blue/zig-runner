@@ -212,7 +212,10 @@ fn write(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: 
         },
         3 => {
             // A reboot: the next job to start is the first of its boot.
-            cwd.deleteFile(io, try print(arena, "{s}/boot", .{s.root})) catch {};
+            cwd.deleteFile(io, try print(arena, "{s}/boot", .{s.root})) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
             s.checkOncePerBoot(arena, io);
             try publishLayer(s, arena, io, sp, "e");
             s.syncLayers(arena);
@@ -316,7 +319,10 @@ fn verify(arena: Allocator, io: std.Io, sp: Spec) !void {
     var faults: Faults = .{ .arena = arena };
     // The first job after the crash is the first of a boot.
     const s: Store = .{ .root = try sp.store(arena) };
-    std.Io.Dir.cwd().deleteFile(io, try print(arena, "{s}/boot", .{s.root})) catch {};
+    std.Io.Dir.cwd().deleteFile(io, try print(arena, "{s}/boot", .{s.root})) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
     s.checkOncePerBoot(arena, io);
 
     var hits: usize = 0;
