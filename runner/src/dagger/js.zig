@@ -538,7 +538,8 @@ test "a JavaScript action Bun refuses to load runs again with Node" {
     for (seen) |d| try std.testing.expect(braceBalanced(d));
     // Bun first; then Node, from the image RUNNER_JS_RUNTIME=node uses, for the same script.
     try std.testing.expect(std.mem.indexOf(u8, seen[4], "exec /github/_runtime/node/node") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[5], "from(address:\"" ++ runtimes.get(.node).image ++ "\") { bin: file(path:\"/usr/local/bin/node\")") != null);
+    const from_node = try std.fmt.allocPrint(arena, "from(address:\"{s}\") {{ bin: file(path:\"/usr/local/bin/node\")", .{runtimes.get(.node).image});
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], from_node) != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[6], "withFile(path:\"/github/_runtime/fallback/node\",source:\"NODE\"") != null);
     // From where the first try started, not from its result, with the action's code mounted again.
     try std.testing.expect(std.mem.startsWith(u8, seen[6], "{ loadContainerFromID(id:\"C0\")"));
@@ -645,7 +646,8 @@ test "a JavaScript action runs its main with the runtime, inputs as INPUT_*, the
     try std.testing.expect(std.mem.indexOf(u8, seen[0], "withNewFile(path:\"/github/workflow/event.json\",contents:\"{\\n  \\\"ref\\\": \\\"refs/heads/x\\\"\\n}\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[0], "withEnvVariable(name:\"GITHUB_EVENT_PATH\",value:\"/github/workflow/event.json\")") != null);
     // Bun comes from its image, once per job.
-    try std.testing.expect(std.mem.indexOf(u8, seen[3], "from(address:\"" ++ runtimes.get(.bun).image ++ "\") { bin: file(path:\"/usr/local/bin/bun\")") != null);
+    const from_bun = try std.fmt.allocPrint(arena, "from(address:\"{s}\") {{ bin: file(path:\"/usr/local/bin/bun\")", .{runtimes.get(.bun).image});
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], from_bun) != null);
     const run1 = seen[5];
     try std.testing.expect(std.mem.indexOf(u8, run1, "withFile(path:\"/github/_runtime/node/node\",source:\"BUN\",permissions:493)") != null);
     try std.testing.expect(std.mem.indexOf(u8, run1, "withNewFile(path:\"/github/_runtime/bin/node\"") != null);
