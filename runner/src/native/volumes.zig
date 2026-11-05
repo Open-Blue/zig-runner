@@ -170,6 +170,9 @@ pub const Plan = struct {
     tool_cache: ?[]const u8 = null,
     /// Zig's local cache volume, when its generations are rolled (`zig_local_cache_max_mb`).
     zig_local_roll: ?[]const u8 = null,
+    /// The volume of the `builtin.zig` files the local cache's manifests name, bound once the
+    /// seeds are in (`Backend.seedBuiltin`) because its mount hides the seed's own `b/`.
+    zig_builtin: ?sandbox.Spec.Bind = null,
     /// The Zig cache seeds the job runs with, built if missing (`Seed`).
     seeds: std.ArrayList(Seed) = .empty,
     /// What "Set up job" says of them.
@@ -269,6 +272,22 @@ pub fn plan(
                 .make = true,
             });
             if (opts.zig_local_cache_max_mb > 0) p.zig_local_roll = v.dir;
+            // The `builtin.zig` files its manifests name, which Zig keeps in the global cache
+            // that is otherwise the job's own (`set_up.zigBuiltinDir`).
+            const builtin_key = [_][]const u8{ repo_owner, repo_name, scope, "zig-builtin" };
+            const builtin_keyed = if (as_runner)
+                try std.mem.concat(arena, []const u8, &.{ &builtin_key, &.{dagger.runner_user} })
+            else
+                &builtin_key;
+            const b = try open(arena, io, store, builtin_keyed, .shared, owner);
+            try p.held.append(arena, b);
+            p.zig_builtin = .{
+                .host = b.dir,
+                .at = try set_up.zigBuiltinDir(arena, as_runner),
+                .read_only = false,
+                .volume = true,
+                .make = true,
+            };
         } else try p.notes.append(arena, "Zig local cache: this job's own (not kept between " ++
             "untrusted jobs)");
     }
@@ -527,6 +546,8 @@ test "native volumes: the job's caches, by scope and step user, as the Dagger ba
         trusted.early_env.items[0].value,
     );
     try std.testing.expect(trusted.zig_local_roll != null);
+    try std.testing.expectEqualStrings("/home/runner/.cache/zig/b", trusted.zig_builtin.?.at);
+    try std.testing.expect(std.mem.endsWith(u8, trusted.zig_builtin.?.host, "/runner"));
     try std.testing.expectEqual(@as(usize, 1), trusted.seeds.items.len);
     try std.testing.expectEqualStrings("home/runner/.cache/zig", trusted.seeds.items[0].cache);
     // The tool cache is bound where Dagger mounts it, for every step user.
@@ -540,6 +561,7 @@ test "native volumes: the job's caches, by scope and step user, as the Dagger ba
         try std.testing.expect(!std.mem.eql(u8, b.at, "/root/.cache/zig-local"));
     }
     try std.testing.expect(untrusted.zig_local_roll == null);
+    try std.testing.expect(untrusted.zig_builtin == null);
     try std.testing.expectEqualStrings("Zig local cache: this job's own (not kept between " ++
         "untrusted jobs)", untrusted.notes.items[0]);
 
