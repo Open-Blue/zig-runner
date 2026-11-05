@@ -795,7 +795,7 @@ test "native services: postgres and redis from real images (ZIG_RUNNER_SERVICE_I
         },
         .{
             .name = "redis",
-            .image = .{ .lit = "redis:7-alpine" },
+            .image = .{ .lit = "redis:8-alpine" },
             .ports = &.{.{ .lit = "16379:6379" }},
             .options = .{ .lit = "--health-cmd \"redis-cli ping\" --health-interval 10s " ++
                 "--health-timeout 5s --health-retries 5" },
@@ -817,7 +817,7 @@ test "native services: postgres and redis from real images (ZIG_RUNNER_SERVICE_I
         "Ready to accept connections",
     });
     for (r.res.extra) |e| if (e.kind == .initialize) std.debug.print("native services: " ++
-        "Initialize containers took {d} ms (postgres:18-alpine, redis:7-alpine)\n", .{
+        "Initialize containers took {d} ms (postgres:18-alpine, redis:8-alpine)\n", .{
         e.completed_ms - e.started_ms,
     });
 }
