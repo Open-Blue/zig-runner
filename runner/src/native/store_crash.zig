@@ -230,8 +230,8 @@ fn write(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: 
         5 => {
             const oci: OciStore = .{ .root = try print(arena, "{s}/oci", .{sp.root}) };
             try oci.prepare(arena, io);
-            var m: Made = .{ .arena = arena, .io = io };
-            const r = try oci.ensure(arena, io, "rootfs", ensure_key, .{ .ptr = &m, .makeFn = Made.make });
+            var unused: u8 = 0;
+            const r = try oci.ensure(arena, io, "rootfs", ensure_key, .{ .ptr = &unused, .makeFn = makeRootfs });
             if (!r.made) return error.NotMade;
         },
         6 => {
@@ -252,15 +252,11 @@ fn write(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: 
 }
 
 /// What `ensure` makes: the tree of the name "rootfs".
-const Made = struct {
-    arena: Allocator,
-    io: std.Io,
-
-    fn make(ptr: *anyopaque, dir: []const u8) anyerror!void {
-        const m: *Made = @ptrCast(@alignCast(ptr));
-        try makeTree(m.arena, m.io, dir, "rootfs");
-    }
-};
+fn makeRootfs(_: *anyopaque, dir: []const u8) anyerror!void {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    try makeTree(a.allocator(), std.testing.io, dir, "rootfs");
+}
 
 /// Layers' names a job that had finished and synced would have to find, as of the last mark the
 /// log passed. Not after the mark before a collect, which may have evicted any.
