@@ -686,8 +686,12 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   is for what `memory.high` counts and the estimate does not: page cache and reclaimable slab. A
   job that outgrew its estimate and went over `memory.high` (memory.events `high`) is learned at
   no less than that limit, since what it was seen to take is what the throttle let it, so its
-  next limit doubles until a run fits. Without the gate (`RUNNER_ADMISSION=false`) or with
-  `RUNNER_NATIVE_MEM_PER_JOB_MB=0`, no `memory.high` is set.
+  next limit doubles until a run fits. A job near its limit gets 256 MB more a second while the
+  host has that above its floor and the reservations of jobs still ramping up
+  (`Admission.growHigh`): the limit protects neighbours, and it held a first `zig build test` on
+  razorbill at 1 GB, three times under what it needed, for over an hour with 4 GB free. Without
+  the gate (`RUNNER_ADMISSION=false`) or with `RUNNER_NATIVE_MEM_PER_JOB_MB=0`, no `memory.high`
+  is set.
 - On P2's step store: the digest below a base (`Backend.belowKey`) holds the seeds' layers and
   which binds are cache volumes, after the model's fields and only when the job has either, so a
   stored layer is never replayed over a different seed and a job with neither keys as before (the

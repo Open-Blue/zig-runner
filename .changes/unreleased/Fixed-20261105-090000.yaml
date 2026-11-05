@@ -1,0 +1,3 @@
+kind: Fixed
+body: A native job near its `memory.high` gets more while the host has memory to spare. A first `zig build test` was held at the 1 GB a job with no history gets, and spent over an hour in swap with 4 GB free, where the Dagger backend took 2 minutes.
+time: 2026-11-05T09:00:00.000000-05:00
