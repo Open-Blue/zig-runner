@@ -406,7 +406,11 @@ fn absent(arena: Allocator, io: std.Io, sp: Spec) !void {
             return error.TestUnexpectedResult;
         }
     }
-    var d = try std.Io.Dir.cwd().openDir(io, try print(arena, "{s}/layers", .{s.root}), .{ .iterate = true });
+    // A journal that aborted may have lost the directories too.
+    var d = std.Io.Dir.cwd().openDir(io, try print(arena, "{s}/layers", .{s.root}), .{ .iterate = true }) catch |e| {
+        std.debug.print("native store crash: no layer is published (layers/: {s})\n", .{@errorName(e)});
+        return;
+    };
     defer d.close(io);
     var it = d.iterate();
     while (try it.next(io)) |e| {
