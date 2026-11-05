@@ -201,7 +201,7 @@ fn uploadInner(arena: Allocator, io: std.Io, job: job_mod.Job, which: Which, blo
         try ids(arena, job, which, null),
     );
     if (signed.status.class() != .success) return failed(arena, get_method, signed);
-    const logs_url = jsonString(arena, signed.body, "logs_url") orelse return .{
+    const logs_url = (try jsonString(arena, signed.body, "logs_url")) orelse return .{
         .ok = false,
         .detail = try std.fmt.allocPrint(arena, "{s}: no logs_url in response", .{get_method}),
     };
@@ -266,7 +266,7 @@ fn uploadSummaryInner(
         "GetStepSummarySignedBlobURL",
         signed,
     );
-    const url = jsonString(arena, signed.body, "summary_url") orelse return .{
+    const url = (try jsonString(arena, signed.body, "summary_url")) orelse return .{
         .ok = false,
         .detail = "GetStepSummarySignedBlobURL: no summary_url in response",
     };
@@ -381,8 +381,13 @@ fn failed(arena: Allocator, what: []const u8, r: broker.Response) !Result {
     };
 }
 
-fn jsonString(arena: Allocator, body: []const u8, key: []const u8) ?[]const u8 {
-    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return null;
+/// The string at `key` in the JSON object `body`, or null when it is not one. Running out of memory
+/// is an error, not a missing key: read as one, a response was reported as having no `logs_url`.
+fn jsonString(arena: Allocator, body: []const u8, key: []const u8) Allocator.Error!?[]const u8 {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     if (v != .object) return null;
     const s = v.object.get(key) orelse return null;
     return if (s == .string) s.string else null;
@@ -510,4 +515,29 @@ test "request bodies" {
         try ids(a.allocator(), job, .{ .step = "S" }, .{ .uploaded_at = "T", .line_count = 3 }),
     );
     try std.testing.expectEqualStrings("https://r.test/twirp/" ++ service ++ "/X", try twirpUrl(a.allocator(), "https://r.test/", "X"));
+}
+
+test "allocation failures: a response's string" {
+    const af = @import("../alloc_failures.zig");
+    const S = struct {
+        fn run(a: Allocator, body: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            const url = (try jsonString(arena.allocator(), body, "logs_url")) orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("https://blob.test/x", url);
+        }
+    };
+    try af.checkOne(S.run, .{
+        \\{"logs_url":"https://blob.test/x","expires":["a","b"],"n":{"k":1}}
+    });
+}
+
+test "jsonString: no string at the key is null, not an error" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    try std.testing.expect(try jsonString(a.allocator(), "{\"logs_url\":1}", "logs_url") == null);
+    try std.testing.expect(try jsonString(a.allocator(), "{}", "logs_url") == null);
+    try std.testing.expect(try jsonString(a.allocator(), "[1]", "logs_url") == null);
+    try std.testing.expect(try jsonString(a.allocator(), "not json", "logs_url") == null);
 }
