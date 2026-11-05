@@ -112,7 +112,10 @@ crash() {
 	mapped+=(store-log)
 	# Marks into the log, in order: the log says where a mark is, not what it is called.
 	: >"$w/marks.txt"
-	printf '#!/bin/sh\ndmsetup message store-log 0 "mark $1" && echo "$1" >>%s\n' "$w/marks.txt" >"$w/mark"
+	cat >"$w/mark" <<-EOF
+		#!/bin/sh
+		dmsetup message store-log 0 "mark \$1" && echo "\$1" >>$w/marks.txt
+	EOF
 	chmod +x "$w/mark"
 	export ZIG_TEST_STORE_CRASH_MARK=$w/mark
 	mount_at /dev/mapper/store-log "$w/mnt"
@@ -267,8 +270,14 @@ error_case() {
 	mapped+=(store-fail)
 	# Switched with no sync of the filesystem (--nolockfs): that would write what the test needs
 	# written later, and nothing is queued behind a suspend of a device nothing is writing.
-	printf '#!/bin/sh\nset -e\ncase $1 in\non) t="%s" ;;\n*) t="%s" ;;\nesac\n' "$down" "$up" >"$w/flip"
-	printf 'dmsetup suspend --nolockfs --noflush store-fail\ndmsetup load store-fail --table "$t"\ndmsetup resume store-fail\n' >>"$w/flip"
+	cat >"$w/flip" <<-EOF
+		#!/bin/sh
+		set -e
+		if [ "\$1" = on ]; then t="$down"; else t="$up"; fi
+		dmsetup suspend --nolockfs --noflush store-fail
+		dmsetup load store-fail --table "\$t"
+		dmsetup resume store-fail
+	EOF
 	chmod +x "$w/flip"
 	export ZIG_TEST_STORE_CRASH_FLIP=$w/flip
 	# commit=300: no journal commit while the disk fails, which would end the filesystem.
