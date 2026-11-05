@@ -268,3 +268,21 @@ reading taken too few times to rule out noise.
 Together they explain the numbers above. The runner is cheap. The engine's fixed cost per step is
 small next to real work. What decides a job's time on this machine is whether the engine's caches
 survive and how fast the SD card is.
+
+## A publish's disk cost
+
+*2026-11-04, a laptop's NVMe (ext4, Samsung PM981), load 3-13 from other work, so medians of 15
+alternating rounds; Store-level, no sandbox.* Publishing a small step's layer (2 files) took 24.7 ms
+and 2 journal commits; with the tree's data written back first and the meta written before the
+fsyncs, 13.7 ms and 1 commit. Beside a writer on the same disk, 35.0 ms and 3 commits against 18.1
+ms and 1. razorbill's own lines give a small layer 15-25 ms of sync, so the change there is to be
+read from `native-phases.sh`, not from this table.
+
+What was measured and left out, on the same laptop:
+
+| Tried | Result | Why it stays out |
+|---|---|---|
+| `fdatasync` in place of `fsync` | 23.0 against 24.7 ms, the same commits | A new file's size and blocks need the same commit, and a chown, mode or xattr is not promised |
+| Inode order before a cold walk (30000 files, caches dropped through a cgroup) | 257 against 249 ms, 646 against 634 reads | The same inode-table blocks are read either way; a warm walk costs more |
+| Reading a Zig tree ahead of a compile | 5.65 s and 254 MiB against 4.87 s and 90 MiB, cold | A compile reads a third of the tree; warm, the pass adds 136 ms for nothing |
+| Zig's caches on tmpfs (`zig build test`, 5 rounds) | 132.9 against 124.5 s, no trend between pairs | 198 MiB stays in the cache, all of it written once on either disk: nothing is saved unless it is thrown away |

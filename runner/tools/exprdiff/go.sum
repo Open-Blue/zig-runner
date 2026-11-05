@@ -1,5 +1,7 @@
 gitea.dev/actionslib v1.5.0 h1:dC3v2HTWbbvyNBSdg2W3kd4WNC/p+FnZaKpl1MdzM00=
 gitea.dev/actionslib v1.5.0/go.mod h1:C9wmOFgDBCXyRvg4A3KTX8Vszs8v9+elH4QLGVDolqU=
+gitea.dev/actionslib v1.5.1 h1:QVOaENNWx4EFRlZvrWmMTKaKLbaqxdlhWLtsI4kf2v8=
+gitea.dev/actionslib v1.5.1/go.mod h1:C9wmOFgDBCXyRvg4A3KTX8Vszs8v9+elH4QLGVDolqU=
 github.com/bmatcuk/doublestar/v4 v4.10.3 h1:1UIv1+fqH3++ViVkpnaPTB+Pi1UHycnPFAq14zgK+gI=
 github.com/bmatcuk/doublestar/v4 v4.10.3/go.mod h1:xBQ8jztBU6kakFMg+8WGxn0c6z1fTSPVIjEY1Wr7jzc=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=

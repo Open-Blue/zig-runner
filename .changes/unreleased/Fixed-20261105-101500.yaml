@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A rerun of the same commit replays its steps again. `RUNNER_TOOL_TREES` (on by default) reached `--exec-job` but never the jobs the runner''s loop runs, so "Set up job" did not check the tool cache''s trees, and a replayed step that put a directory of the tool cache on the PATH (`Install Zig`) ran again, with every step after it: a rerun took as long as the first run, 41-48 s against 2 s on the laptop.'
+time: 2026-11-05T10:10:00.000000-05:00
