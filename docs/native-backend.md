@@ -709,9 +709,10 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   model's `belowTail`; P8's vectors gained `below-seed` and friends, the old ones unchanged). The
   tool cache is the `toolcache` volume, keyed by the job's image as on Dagger; the base makes
   `/opt/hostedtoolcache` only for a job with no volumes (#274). What a step installs there is in no
-  layer, so a stored step whose `$GITHUB_PATH` or `$GITHUB_ENV` points into it runs again instead
-  of replaying (`Exec.tool_cache`, `toolDirNotHeld`, #229): natively no tree is checked, so every
-  such record does.
+  layer, so a stored step whose `$GITHUB_PATH` or `$GITHUB_ENV` points into it replays only when
+  "Set up job" checked a tree that holds the directory, and otherwise runs again
+  (`Exec.tool_cache`, `toolDirNotHeld`, #229). The check is `native/tool_trees.zig`, a port of
+  `dagger/tool_trees.sh` (below, "The tool cache's trees").
 - Debt: volumes and seeds are never evicted (the engine's GC prunes Dagger's). P2's `collect`
   walks only `layers/`, whose entries carry their size in `meta`; a volume has no size record, and
   walking every volume at each job's end to learn one would cost more than the eviction saves. The
@@ -721,10 +722,138 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   `evict` does for a layer. A step whose processes still hold all of `pids.max` when its script
   ends fails with exit 2 and loses its file commands: the wrapper's `sh`, the step's PID 1, cannot
   fork its epilogue (its log says the job reached its process limit). Fixing that needs a PID 1
-  that reaps and kills a step's leftovers before the epilogue. The tool cache's checked trees (`set_up.verifyToolTrees`) and the seed
-  registry's discovery from them are off natively: steps check the trees they use themselves, as on
-  Dagger without the check. Rootless runners without delegation have no limits (P5 must refuse untrusted jobs
-  there).
+  that reaps and kills a step's leftovers before the epilogue. The seed registry's discovery from the tool cache's trees
+  (`zig_release.Registry.discover`) is off natively. Rootless runners without delegation have no
+  limits (P5 must refuse untrusted jobs there).
+
+#### The tool cache's trees
+
+A rerun of a job that installs a tool took 49 s natively and 2 s on Dagger (razorbill, v0.25.0, a
+real `zig build test` job): the `Install Zig` step names a directory in the tool cache, a volume in
+no layer, so its record was never trusted. On Dagger "Set up job" checks the trees of the tool cache
+(`tool_trees.sh`, `set_up.verifyToolTrees`) and a record is replayed when a checked tree holds the
+directory it names. Natively the same check runs in the runner (`native/tool_trees.zig`,
+`Backend.checkToolTrees`), after the volumes are open, and gives the same two things:
+
+- `ZIG_RUNNER_TOOL_TREES`, one `DIGEST TREE` line per directory `TOOL/VERSION/NAME` of the tool
+  cache, TREE as the step sees it, DIGEST what `install-zig.sh` pins (`find . -type f -print0 |
+  LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum` in the tree; the port's tests compare it with
+  those commands, and with the digest pinned for Zig 0.17.0). A script that pins a tree's digest
+  skips its own read of the tree when the two match.
+- `Exec.toolDirNotHeld` with a tree list, so a replayed step that names a held tree's directory
+  replays. A record naming a directory no tree holds (a tree that was removed, an unfinished one,
+  `..`) runs again, as before.
+
+**What replay can rely on.** The pinned digest is over regular files, and nothing else: not a
+link, a mode, a pipe, an empty directory. A tree whose link `gcc -> ../../.evil/gcc` was changed,
+or whose `zig` was made set-uid, has the same pinned digest, and `install-zig.sh` (and Dagger's
+check, which is the same) takes it as checked. So the native check makes a second variable,
+`ZIG_RUNNER_TOOL_TREES_FULL` (`FULL TREE` lines), over every entry: type, mode, path, a regular
+file's sha256 and a link's target. Both variables are in the key of every step (neither is
+volatile, so `Store.stableEnv` hashes them), hence in the base's key and every layer above it. A
+tree that changed in any of these ways is a tree no record was made against, so the step that
+installs runs again and repairs it. A tree with a link that may leave it is left out of both: what a link
+points at outside the tree is in no digest, so no record naming such a tree is replayed. "May
+leave" is judged from the link's text and is strict: an absolute target, more leading `..` than
+there are directories above the link inside the tree, or any `..` after a name. The last is
+refused because a name can be a link itself (`lib/d -> ..` then `gcc -> lib/d/../../.evil/gcc`
+leaves the tree, though the text of `gcc` goes up no more than the tree is deep). With `..` only
+first, a link that stays in the tree from where it is can only reach a place in the tree, whatever
+links lie on its way, since each of those was judged the same. A real tool tree with a link of the
+second kind (`../lib/x/../y`) is left out too, and its steps run as they did before this change. This holds for the native
+backend. On Dagger the second variable does not exist and the claim does not hold: a modified link
+or mode in a tree with the same pinned digest is replayed against, and what it would take there is
+the same second digest in `tool_trees.sh` and in `Exec.tool_trees`' parser. `install-zig.sh`'s own
+check is of regular files too, so it is blind to a link planted in its tree whoever says the tree
+was checked: that put a planted tool on PATH with no replay involved. The script now uses a tree
+only if nothing in it is neither a file nor a directory (`plain`; Zig 0.17.0's tarballs hold
+neither a link nor anything else of the kind, for x86_64 and aarch64, checked against the pinned
+checksums), and `tool-trees-test.sh` covers it.
+
+The cost is also Dagger's: a tree added, removed or changed makes every step of every job of the
+scope new once. Narrowing it (a key of only the trees a step puts on PATH) was considered and not
+done. A step's key is made before it runs, and which trees it names is only in its record, so it
+needs the digests the tree had when the step finished stored in the record and compared at replay,
+which means hashing the tree again after every step that names one, and a change to the record's
+format. A job's first rerun after an install is the one that pays: job 1 finds no tree and
+installs, job 2 sees the tree (new keys) and finds it installed, job 3 replays.
+
+The check differs from the script where it runs. The script runs as root in the job's image, in a
+container; the port runs in the runner's process, on a directory a job can write, so it is confined
+and bounded:
+
+- Every look at the volume is relative to a directory descriptor, through `sandbox.openIn` with
+  `RESOLVE_NO_SYMLINKS` and `RESOLVE_NO_XDEV`, so a link a job planted (a tree that is a link to
+  `/`, a file that is one) is never taken and the check cannot be made to read outside the volume.
+  Only directories and regular files are opened, the latter `O_NONBLOCK` and checked to be regular
+  after opening, so a pipe or a device cannot hold the check. A link is read, not followed.
+- A tree whose names have a control character or a backslash (`sha256sum` escapes those), a name
+  over 255 bytes or a path over 4,000, is left out, and a step checks it itself. So is a tree the
+  check gave up on for a limit, one with unreadable files, and one with a link that leaves it.
+  "Set up job" says which and why ("left out: zig/0.17.0/x (too many entries)").
+- Limits (`tool_trees.Limits`). Each tree: 65,536 regular files, 100,000 entries, 8 MiB of paths,
+  1 GiB read, 60 s (the check's, because a tree that gives up keeps no list and the next job
+  starts cold: Zig's cold check is 10-19 s on razorbill, and a loaded one must not give up at
+  20). The check: 400,000 entries and 4 GiB read, past which no more files are read; 60 s of
+  reading, past which none are either; 48 directories deep, 512 trees, 1,024 names a level. The
+  job's cancel (seen at every file and every 64 KiB read) and 90 s end the check itself. A tree
+  over a limit of its own is left out and the others are checked. A budget that is spent ends the
+  reading, not the check: trees whose lists are whole need none and are still reported. Zig 0.17.0 has 19,505 files and 1.2 MB of paths. Both variables are
+  capped at 64 KiB (one string of an environment may not pass 128 KiB, and one over it made every
+  later job's `exec` fail with E2BIG); a tree that does not fit is left out, and so is one that
+  would not fit the Dagger path's variable (`set_up.toolTreesVerdict`, the same 64 KiB).
+- Memory: a tree is held in memory while it is checked (a path, an entry and a list line each:
+  about 7 MB for Zig). Every byte is charged to a counter shared by all the checks of the process
+  (`tool_trees.held`, `Limits.memory`, 128 MiB), and a tree that would pass it is left out, so
+  concurrent checks of hostile trees hold 128 MiB between them, not each their own. When #327's
+  process-wide `Budget` (`native/hash_files.zig`) is merged, `held` should become that budget's
+  counter and `Limits.memory` its limit, so the runner has one number for what jobs' checks and
+  `hashFiles()` may hold.
+- Order, and what one job can starve. Each tree has a `<tree>.born` file in the lists: when this
+  runner first saw it. Trees are checked oldest first (ties in byte order); at each level of the
+  walk to them the names that have a `.born` come first, so a level full of planted names does not
+  hide the trees seen before (among those, in byte order). What a job adds to the volume is
+  younger than the tools installed before it, so it spends the budgets, and the room in the
+  environment, after them: an earlier cut ordered by "has a list", which a job's own trees get
+  too, and two attacks showed it (six trees grown to 2 GiB of holes after a check listed them,
+  which spent the reading budget before the honest tree; 380 trees that filled the environment's
+  64 KiB first, so `install` reran in every job). What is left is what age cannot tell: a job that
+  makes its trees before the honest tool is installed, or a new version of a tool installed after
+  a job's trees, is younger than them, and can be left out for as long as the volume holds them.
+  Its steps then run, as before this change; it cannot make a job fail. "Set up job" counts every
+  tree left out ("left out 382: ...") and names as many as fit in 4 KiB.
+- The lists are in the store beside `volumes/` (`tool-trees/<digest of the volume's path>/`), never
+  in a volume a step mounts. They are a cache of what a check read: store eviction may remove all of
+  `tool-trees/` at any time, and a check without them reads the trees again. A list that would be
+  over 32 MiB (the most that is read) is not written. A list of a tree that is gone, its `.born`,
+  and the directories that leaves empty, are removed by the next complete check; half-written
+  lists (`*.stat.<random>`, `*.born.<random>`) older than five minutes by every check. A check is
+  not complete when a level holds more names than are looked at (17,000 top-level directories do
+  it), so a job that does that stops the removal and the lists of gone trees stay and grow, for
+  as long as the volume holds the names; eviction of `tool-trees/` is what bounds them.
+
+The cost is the script's lists, kept: one line per regular file (path, size, inode, mtime, ctime,
+sha256), and only files whose line changed are read again. A write sets the file's ctime to now and
+a step cannot set it back (that takes the clock); a file whose ctime is within 2 s of the check is
+listed as racy and read next time; a list that does not name exactly the tree's files in order is
+not believed. That is not enough alone: a writable shared mapping, once its page is dirty, writes
+again without changing ctime or mtime, whatever the descriptor (it can be closed). So the check
+takes a read lease (`F_SETLEASE`, `F_RDLCK`) on each file it reads, which the kernel refuses while
+any writer or writable mapping holds the file, and lists a refused file as racy. A lease is broken
+with a signal to the process, SIGIO by default, which ends a process that does not handle it and
+which `std.Io` uses to interrupt blocked calls (a job's cancel, a timeout): the check must not
+ignore it (an earlier cut did, and a native end-to-end job never got its cancel). `F_SETSIG` makes
+it SIGURG, whose default is to be ignored. The writer's open then waits until the check lets go of
+the file, or fails with EAGAIN if it does not wait. On the
+laptop, for the real Zig 0.17.0 tree (19,505 files), a check is 0.5 s with no list and 0.1 s with
+one, with 22 MiB of peak memory in the test process; the script reads the same tree in about 1 s,
+by its own comment. A tree of 65,532 hard links of 3.8 KB paths (the case that took 1.5 GB, or 6.1
+GB with four checks at once) is left out in 8 ms with 9 MiB, and 27 MiB with four at once.
+
+Not proven or not done: the lease needs the file's owner to be the runner's user or CAP_LEASE
+(a refused lease only makes the file racy, so the cost is a read, never trust); lists of Dagger's
+check are unchanged; the seed registry's discovery from the trees
+(`zig_release.Registry.discover`) is off natively.
 
 ### P5: isolation for untrusted jobs
 

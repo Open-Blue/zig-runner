@@ -1900,7 +1900,11 @@ fn runSteps(
             if (e == error.BaseContainerFailed) return fail(sh, results, err_msg);
             return e;
         };
-        break :base .{ .id = "native", .runtime_path = b.runtime_path };
+        break :base .{
+            .id = "native",
+            .runtime_path = b.runtime_path,
+            .tool_trees = b.tool_trees,
+        };
     } else baseContainerId(arena, transport, &ev, job, plan, &secrets, &err_msg) catch |e|
         switch (e) {
             error.BaseContainerFailed => return fail(sh, results, err_msg),
@@ -1911,7 +1915,8 @@ fn runSteps(
     x.native = native;
     x.tool_trees = base.tool_trees;
     // A native job's tool cache is its `toolcache` volume, in no layer, so a replayed step that
-    // points at a tree there runs again (#229): no tree is checked natively (`tool_trees`).
+    // points at a tree there runs again (#229), unless "Set up job" checked a tree that holds it
+    // (`Backend.checkToolTrees`).
     if (native) |b| x.tool_cache = b.cache_plan.tool_cache;
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 
