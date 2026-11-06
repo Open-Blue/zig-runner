@@ -5037,7 +5037,7 @@ test "a container job's options on the native backend: --user and --env, the res
     const as_root = std.os.linux.geteuid() == 0;
     const user = if (as_root) "app" else "root";
     var job = testJob(&.{testStep("echo uid=$(id -u) gid=$(id -g); echo A=$A BOTH=$BOTH; " ++
-        "echo SPACED=$SPACED; echo HOME=$HOME; pwd; touch /__w/_temp/mine && echo wrote")});
+        "echo SPACED=$SPACED; echo home-is[$HOME]; pwd; touch /__w/_temp/mine && echo wrote")});
     job.container = .{
         .name = "",
         .image = .{ .lit = try server.image(arena, "test/opts:1") },
@@ -5076,7 +5076,7 @@ test "a container job's options on the native backend: --user and --env, the res
         return error.TestUnexpectedResult;
     };
     // `-e HOME=` loses to GitHub's `HOME=/github/home`: never the option's value.
-    try std.testing.expect(std.mem.indexOf(u8, text, "HOME=/elsewhere") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "home-is[/elsewhere]") == null);
 }
 
 test "the base hands a work root to the user, and the tool cache only when it is not theirs" {
