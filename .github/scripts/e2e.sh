@@ -214,6 +214,10 @@ races() {
 # --- the suite ----------------------------------------------------------------------------------
 
 api() { gh api -H 'X-GitHub-Api-Version: 2022-11-28' "$@"; }
+# gh 2.103 refuses a response with terminal escape sequences (a job's log with colour) unless told
+# to allow them; an older gh has no such flag and does not refuse.
+escapes=()
+if gh api --help 2>&1 | grep -q -- --allow-escape-sequences; then escapes=(--allow-escape-sequences); fi
 failures=0
 fail() {
 	echo "::error::e2e ($backend): $*"
@@ -287,7 +291,7 @@ job_log() {
 	local log why="" i tries=8
 	[[ ${2:-} == skipped ]] && tries=1
 	for ((i = 1; i <= tries; i++)); do
-		if log=$(api "repos/$repo/actions/jobs/$1/logs" 2>"$out/log.err") && [[ -n $log ]]; then
+		if log=$(api "${escapes[@]}" "repos/$repo/actions/jobs/$1/logs" 2>"$out/log.err") && [[ -n $log ]]; then
 			printf '%s\n' "$log"
 			return 0
 		fi
