@@ -99,8 +99,15 @@ fn memTotal(io: std.Io) ?usize {
 /// allowance, and the one whose turn it is waits for nothing, so there is nothing to wait in a
 /// circle on: a big call is delayed by the big calls before it, one turn each, and is failed only
 /// when it is too big alone.
+///
+/// The tool trees' checks (`tool_trees.zig`) share the number, not the queue: `held` is every
+/// byte that calls and checks hold now. A check never waits and is refused (its tree left out, the
+/// job goes on) when `held` would pass its limit; a call is never refused for what checks hold, so
+/// a check cannot fail a `hashFiles()`, and a check holds memory only for as long as it takes.
 pub const Budget = struct {
     spin: std.atomic.Value(bool) = .init(false),
+    /// Bytes held now by the calls (under their allowance and in their turn) and by the checks.
+    held: std.atomic.Value(u64) = .init(0),
     /// The ticket the next call to ask gets, and the one whose turn it is.
     next: u64 = 0,
     serving: u64 = 0,
@@ -263,6 +270,7 @@ const Counted = struct {
     fn take(c: *Counted, n: usize) bool {
         if (c.free_used + n <= c.allowance and !c.turn) {
             c.free_used += n;
+            _ = c.budget.held.fetchAdd(n, .acq_rel);
             return true;
         }
         // Refused already: the arena tries again after a resize, and a second wait would be for
@@ -274,13 +282,16 @@ const Counted = struct {
             return false;
         }
         c.pool_used += n;
+        _ = c.budget.held.fetchAdd(n, .acq_rel);
         return true;
     }
 
     fn give(c: *Counted, n: usize) void {
         const from_pool = @min(n, c.pool_used);
+        const from_free = @min(n - from_pool, c.free_used);
         c.pool_used -= from_pool;
-        c.free_used -= @min(n - from_pool, c.free_used);
+        c.free_used -= from_free;
+        _ = c.budget.held.fetchSub(from_pool + from_free, .acq_rel);
     }
 
     /// Waits for the turn, in the queue's order.
@@ -1800,6 +1811,48 @@ const Runner = struct {
 
 fn sleepMs(ms: i64) void {
     std.testing.io.sleep(.fromMilliseconds(ms), .awake) catch {};
+}
+
+test "native hashFiles: the memory a call holds is in the budget's number, and given back" {
+    var budget: Budget = .{};
+    var counted: Counted = .{
+        .child = std.testing.allocator,
+        .io = std.testing.io,
+        .budget = &budget,
+        .limit = 1 << 20,
+        .allowance = 1000,
+        .cancel = null,
+        .cancelled_before = false,
+        .wait_limit_ms = 1000,
+    };
+    defer counted.release();
+    const al = counted.allocator();
+    // Under the allowance, then in the turn.
+    const small = try al.alloc(u8, 600);
+    try std.testing.expectEqual(@as(u64, 600), budget.held.load(.acquire));
+    const big = try al.alloc(u8, 5000);
+    try std.testing.expectEqual(@as(u64, 5600), budget.held.load(.acquire));
+    al.free(big);
+    al.free(small);
+    try std.testing.expectEqual(@as(u64, 0), budget.held.load(.acquire));
+}
+
+test "native hashFiles: what the tool trees' checks hold does not refuse a call" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try deepDir(&f, 8, 400);
+    var budget: Budget = .{};
+    // Checks hold more than the whole limit (a tree that overshoots, as many at once can).
+    _ = budget.held.fetchAdd(64 << 20, .acq_rel);
+    const stack = try f.stackOf(
+        &.{"l0"},
+        .{ .memory = 8 << 20, .allowance = 64 << 10, .budget = &budget },
+    );
+    const r = try f.hashWith(stack, &.{"**"});
+    try std.testing.expect(r == .ok);
+    try std.testing.expectEqual(@as(u64, 64 << 20), budget.held.load(.acquire));
 }
 
 test "native hashFiles: a call too big for the memory alone fails at once, without waiting" {
