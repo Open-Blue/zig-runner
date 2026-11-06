@@ -7,7 +7,8 @@ name: compare
 #   expr-diff.sh       runner/src/expr.zig against Gitea's actionslib, on random expressions
 #   yaml-diff.sh       runner/src/yaml.zig against go.yaml.in/yaml/v3, on popular actions' action.yml
 #                      and random YAML
-#   hashfiles-diff.sh  hashFiles() (runner/src/glob.zig) against GitHub's own script on @actions/glob
+#   hashfiles-diff.sh  hashFiles() (runner/src/glob.zig, and the native backend's) against GitHub's own
+#                      script on @actions/glob
 #   regex-diff.sh      runner/src/regex.zig against .NET, as GitHub's runner compiles problem matchers
 #   hpack-diff.sh      runner/src/hpack.zig against golang.org/x/net/http2/hpack, on random connections
 #                      (dynamic table, size updates, evictions) and broken blocks
