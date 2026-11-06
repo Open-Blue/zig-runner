@@ -1602,6 +1602,9 @@ fn renameUntil(dir: linux.fd_t, stop: *std.atomic.Value(bool)) void {
 }
 
 test "openIn: a rename elsewhere on the machine does not fail a `..` on the way" {
+    // Valgrind runs one thread at a time, and threads this busy never hand it over: the job's 45
+    // minutes pass with the test on its first open. It is a race, which memcheck would not see.
+    if (std.valgrind.runningOnValgrind() != 0) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
