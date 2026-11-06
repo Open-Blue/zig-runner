@@ -10,6 +10,11 @@
 //! every process of the step is born in it; the runner never is. Between steps the cgroup is
 //! empty and kept: its peak and events are the job's, across its steps.
 //!
+//! All jobs together are bounded on their parent (`Limits`, `Job.make`): a job's own limit cannot
+//! stop two jobs at once from taking the machine. Page cache counts towards these limits and is
+//! reclaimed at them, and swap is off below the parent, so a job past its memory is killed in its
+//! own tree instead of taking the machine into swap (#367).
+//!
 //! Where the jobs' cgroups go (`parent`, `RUNNER_NATIVE_CGROUP`):
 //! - On a root runner, by default, a tree of the runner's own at `/sys/fs/cgroup/zig-runner`, as
 //!   Docker's cgroupfs driver makes `/sys/fs/cgroup/docker`. It is the host's, like the slots'
@@ -23,8 +28,10 @@
 //!   In a container with a cgroup namespace of its own, the container's root is its cgroup, and
 //!   `self` works there too.
 //! - A path under /sys/fs/cgroup: that cgroup, made if missing.
-//! - `none`, or a rootless runner without `self`: no cgroup. Native jobs then run as in P1, with
-//!   no limit of their own, and "Set up job" says why.
+//! - `none`: no cgroup, on the operator's word: the job runs unbounded, and "Set up job" says so
+//!   plainly. Nothing else runs a job without limits: a rootless runner without `self`, or a
+//!   parent that cannot be made, sends it to Dagger, or fails it where there is no engine
+//!   (`Backend.jobCgroup`).
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -40,31 +47,100 @@ pub const default_parent = mount_point ++ "/zig-runner";
 /// test` on 16 cores runs about 100, a browser test suite a few hundred), and far below what lets
 /// a fork bomb take a machine. Every thread counts.
 pub const default_pids_max: u32 = 8192;
+/// How many jobs' `pids.max` all jobs together may hold (`Limits.pids_total`): a pool's jobs reach
+/// a few hundred each, and this keeps four fork bombs at once short of a machine's `threads-max`
+/// (about 60 000 on 8 GB).
+pub const pids_total_jobs = 4;
+/// What the machine keeps from native jobs, at the least and at the most (`totalOf`).
+const reserve_min: u64 = 2 << 30;
+const reserve_max: u64 = 12 << 30;
+/// The machine's memory when /proc/meminfo cannot be read: a bound that is too small fails a large
+/// job and says so; none takes the machine down.
+const assumed_memory: u64 = 4 << 30;
 
 /// What the runner configures.
 pub const Config = struct {
     /// `RUNNER_NATIVE_CGROUP`: "" (the default above), "self", "none", or a cgroup's path.
     parent: []const u8 = "",
-    /// `RUNNER_NATIVE_MEMORY_MAX_MB`: each job's `memory.max`; null for three quarters of the
-    /// machine's memory (`MemTotal`), 0 for no limit.
+    /// `RUNNER_NATIVE_MEMORY_MAX_MB`: each job's `memory.max`; null for two thirds of all jobs'
+    /// together, 0 for no limit.
     memory_max_mb: ?u32 = null,
-    /// `RUNNER_NATIVE_PIDS_MAX`: each job's `pids.max`; 0 for no limit.
+    /// `RUNNER_NATIVE_MEMORY_TOTAL_MB`: all jobs' under the parent together; null for what
+    /// `totalOf` leaves, 0 for no limit.
+    memory_total_mb: ?u32 = null,
+    /// `RUNNER_NATIVE_SWAP`: whether jobs may swap (`memory.swap.max` on the parent).
+    swap: bool = false,
+    /// `RUNNER_NATIVE_PIDS_MAX`: each job's `pids.max`, and `pids_total_jobs` times it for all
+    /// jobs together; 0 for no limit.
     pids_max: u32 = default_pids_max,
 };
 
-/// A job's limits, as written: null is `max`.
+/// The limits of a job and of all jobs under its parent, as written: null is `max`.
 pub const Limits = struct {
     memory_max: ?u64,
     pids_max: ?u32,
+    memory_total: ?u64 = null,
+    pids_total: ?u32 = null,
+    swap: bool = false,
 
-    /// From the configuration and, for the default memory limit, the machine's memory.
-    pub fn of(io: std.Io, cfg: Config) Limits {
-        const memory: ?u64 = if (cfg.memory_max_mb) |mb|
+    /// From the configuration and, for the defaults, the memory jobs under `parent_dir` can have
+    /// (`memoryUnder`): null when there is no parent to look above.
+    pub fn of(io: std.Io, cfg: Config, parent_dir: ?[]const u8) Limits {
+        return compute(cfg, memoryUnder(io, mount_point, parent_dir));
+    }
+
+    /// An operator's number always wins, and 0 is theirs to give: an explicit per-job limit above
+    /// the default total raises the total with it, and "no limit" on a job leaves all jobs without
+    /// one too, unless `memory_total_mb` says otherwise. The default depends on the machine alone,
+    /// so every runner sharing a parent and these settings writes the same numbers on it.
+    pub fn compute(cfg: Config, memory: ?u64) Limits {
+        const fair = totalOf(memory orelse assumed_memory);
+        const set_total: ?u64 = if (cfg.memory_total_mb) |mb|
             (if (mb == 0) null else @as(u64, mb) << 20)
-        else if (memTotal(io)) |total| total / 4 * 3 else null;
-        return .{ .memory_max = memory, .pids_max = if (cfg.pids_max == 0) null else cfg.pids_max };
+        else
+            fair;
+        const job: ?u64 = if (cfg.memory_max_mb) |mb|
+            (if (mb == 0) null else @as(u64, mb) << 20)
+        else
+            (set_total orelse fair) / 3 * 2;
+        const total: ?u64 = if (cfg.memory_total_mb != null)
+            set_total
+        else if (job) |j| @max(fair, j) else null;
+        return .{
+            .memory_max = job,
+            .pids_max = if (cfg.pids_max == 0) null else cfg.pids_max,
+            .memory_total = total,
+            .pids_total = if (cfg.pids_max == 0) null else cfg.pids_max *| pids_total_jobs,
+            .swap = cfg.swap,
+        };
     }
 };
+
+/// What all native jobs may hold of `memory` by default: a third is kept for the rest of the
+/// machine (the runner, the engine, a desktop), at least 2 GiB and at most 12 GiB so that a small
+/// machine stays usable and a large one is not wasted, and jobs get at least half whatever the
+/// reserve says. 20 GiB of a 30 GiB laptop, 5.3 GiB of an 8 GiB Pi, and each job two thirds of
+/// that (`Limits.compute`): 3.6 GiB on the Pi, well above the 2.4 GB of anonymous memory
+/// razorbill's build reaches, while a job that runs away still leaves its neighbours a third.
+fn totalOf(memory: u64) u64 {
+    const reserve = std.math.clamp(memory / 3, reserve_min, reserve_max);
+    return @max(memory -| reserve, memory / 2);
+}
+
+/// The memory jobs under `parent_dir` can have: the machine's, or the tightest `memory.max` above
+/// the parent, where something put the runner in a container or a slice with a limit of its own
+/// (in a cgroup namespace, `mount` itself is that container's). The parent's own is left out: it
+/// is ours, written from this.
+fn memoryUnder(io: std.Io, mount: []const u8, parent_dir: ?[]const u8) ?u64 {
+    var least = memTotal(io);
+    var at = parent_dir orelse return least;
+    while (std.fs.path.dirname(at)) |up| : (at = up) {
+        if (up.len < mount.len) break;
+        const cap = admission.readCgroupBytes(io, up, "memory.max") orelse continue;
+        least = if (least) |l| @min(l, cap) else cap;
+    }
+    return least;
+}
 
 /// `MemTotal` in /proc/meminfo, in bytes.
 fn memTotal(io: std.Io) ?u64 {
@@ -280,15 +356,39 @@ fn mkdir(arena: Allocator, dir: []const u8) !void {
     }
 }
 
+/// All jobs' limits, on their parent: hierarchical, so they hold whatever a job's own say, and
+/// over every runner on the parent. Written for each job, so a limit changed under the runner
+/// (a restart with another setting, a hand on the file) lasts until the next job at the most.
+/// Returns whether swap is held to `limits.swap`: without swap accounting (`swapaccount=0`, a
+/// kernel without it) the file is not there, and the job's memory is still bounded.
+fn limitAll(arena: Allocator, dir: []const u8, limits: Limits) !bool {
+    const memory = if (limits.memory_total) |m|
+        try std.fmt.allocPrint(arena, "{d}", .{m})
+    else
+        "max";
+    if (write(arena, dir, "memory.max", memory) != .SUCCESS) return error.TotalMemoryLimitFailed;
+    const pids = if (limits.pids_total) |p| try std.fmt.allocPrint(arena, "{d}", .{p}) else "max";
+    if (write(arena, dir, "pids.max", pids) != .SUCCESS) return error.TotalPidsLimitFailed;
+    return switch (write(arena, dir, "memory.swap.max", if (limits.swap) "max" else "0")) {
+        .SUCCESS => true,
+        .NOENT => false,
+        else => error.SwapLimitFailed,
+    };
+}
+
 /// One job's cgroup.
 pub const Job = struct {
     dir: []const u8,
+    /// `Limits.swap` holds (`limitAll`).
+    swap_held: bool = true,
 
-    /// `<parent>/<name>`, with the job's limits. One left by a runner that died is taken over.
+    /// `<parent>/<name>`, with the job's limits, and all jobs' on the parent. One left by a runner
+    /// that died is taken over.
     pub fn make(arena: Allocator, parent_dir: []const u8, name: []const u8, limits: Limits) !Job {
+        const swap_held = try limitAll(arena, parent_dir, limits);
         const dir = try std.fmt.allocPrint(arena, "{s}/{s}", .{ parent_dir, name });
         try mkdir(arena, dir);
-        const j: Job = .{ .dir = dir };
+        const j: Job = .{ .dir = dir, .swap_held = swap_held };
         errdefer j.remove(arena, null);
         const memory = if (limits.memory_max) |m|
             try std.fmt.allocPrint(arena, "{d}", .{m})
@@ -316,6 +416,7 @@ pub const Job = struct {
         var events_buf: [512]u8 = undefined;
         const memory_events = readIn(io, j.dir, "memory.events", &events_buf) catch "";
         const oom_kills = admission.parseStat(memory_events, "oom_kill") orelse 0;
+        const ooms = admission.parseStat(memory_events, "oom") orelse 0;
         const pids_events = readIn(io, j.dir, "pids.events", &events_buf) catch "";
         return .{
             .working_set_mb = admission.workingSetMb(io, j.dir),
@@ -324,6 +425,7 @@ pub const Job = struct {
             else
                 null,
             .oom_kills = oom_kills,
+            .ooms = ooms,
             .pids_max_hits = admission.parseStat(pids_events, "max") orelse 0,
         };
     }
@@ -364,6 +466,9 @@ pub const Usage = struct {
     peak_mb: ?u64,
     /// Processes the kernel's OOM killer ended in it (`memory.events`).
     oom_kills: u64,
+    /// Times the job's own `memory.max` ran out (`memory.events`): an OOM kill without one came
+    /// from above it, all jobs' limit or the machine's.
+    ooms: u64,
     /// Forks refused at `pids.max` (`pids.events`).
     pids_max_hits: u64,
 };
@@ -395,16 +500,141 @@ fn readIn(io: std.Io, dir: []const u8, name: []const u8, buf: []u8) ![]u8 {
     return std.Io.Dir.cwd().readFile(io, path, buf);
 }
 
-test "native cgroup: limits from the configuration and the machine's memory" {
-    const io = std.testing.io;
-    const derived = Limits.of(io, .{});
-    try std.testing.expectEqual(@as(?u32, default_pids_max), derived.pids_max);
-    if (memTotal(io)) |total| try std.testing.expectEqual(@as(?u64, total / 4 * 3), derived.memory_max);
-    const set = Limits.of(io, .{ .memory_max_mb = 512, .pids_max = 64 });
+const gib: u64 = 1 << 30;
+
+test "native cgroup: all jobs' limit and each job's leave the machine room, on 8 and 30 GiB" {
+    // A Pi: a third kept, and razorbill's build (2.4 GB of anonymous memory) well inside a job's.
+    const pi = Limits.compute(.{}, 8 * gib);
+    try std.testing.expectEqual(@as(?u64, 8 * gib - 8 * gib / 3), pi.memory_total);
+    try std.testing.expectEqual(@as(?u64, pi.memory_total.? / 3 * 2), pi.memory_max);
+    try std.testing.expect(pi.memory_max.? >= 3 * gib);
+    // What a kernel reports of an 8 GB board.
+    try std.testing.expect(Limits.compute(.{}, 77 * gib / 10).memory_max.? >= 3 * gib);
+    // And under deploy/zig-runner.service's `MemoryMax=90%`, with `self`.
+    try std.testing.expect(Limits.compute(.{}, 693 * gib / 100).memory_max.? >= 3 * gib);
+    // A 30 GiB laptop: 10 GiB kept whatever the jobs do, where one job could take 22.5 GiB, and
+    // several all of it (#367). Swap is off, so that is all they get.
+    const laptop = Limits.compute(.{}, 30 * gib);
+    try std.testing.expectEqual(@as(?u64, 20 * gib), laptop.memory_total);
+    try std.testing.expectEqual(@as(?u64, 20 * gib / 3 * 2), laptop.memory_max);
+    try std.testing.expect(!laptop.swap);
+    // Small and large: half at the least, 12 GiB kept at the most, and never more than the total.
+    try std.testing.expectEqual(@as(?u64, 1 * gib), Limits.compute(.{}, 2 * gib).memory_total);
+    try std.testing.expectEqual(@as(?u64, 2 * gib), Limits.compute(.{}, 4 * gib).memory_total);
+    try std.testing.expectEqual(@as(?u64, 116 * gib), Limits.compute(.{}, 128 * gib).memory_total);
+    for ([_]u64{ gib / 2, gib, 2 * gib, 8 * gib, 30 * gib, 128 * gib, 1024 * gib }) |m| {
+        const l = Limits.compute(.{}, m);
+        try std.testing.expect(l.memory_max.? <= l.memory_total.?);
+        try std.testing.expect(l.memory_total.? < m);
+    }
+    // Memory that cannot be read is still a bound.
+    try std.testing.expectEqual(@as(?u64, 2 * gib), Limits.compute(.{}, null).memory_total);
+    // Processes too: four jobs' worth by default.
+    try std.testing.expectEqual(@as(?u32, default_pids_max), pi.pids_max);
+    try std.testing.expectEqual(@as(?u32, 4 * default_pids_max), pi.pids_total);
+}
+
+test "native cgroup: what the operator sets wins, and 0 is no limit" {
+    // A job's limit under the default total leaves the total.
+    const set = Limits.compute(.{ .memory_max_mb = 512, .pids_max = 64 }, 30 * gib);
     try std.testing.expectEqual(@as(?u64, 512 << 20), set.memory_max);
+    try std.testing.expectEqual(@as(?u64, 20 * gib), set.memory_total);
     try std.testing.expectEqual(@as(?u32, 64), set.pids_max);
-    const off = Limits.of(io, .{ .memory_max_mb = 0, .pids_max = 0 });
+    try std.testing.expectEqual(@as(?u32, 256), set.pids_total);
+    // One above it is honoured, the total raised with it.
+    const big = Limits.compute(.{ .memory_max_mb = 28 * 1024 }, 30 * gib);
+    try std.testing.expectEqual(@as(?u64, 28 * gib), big.memory_max);
+    try std.testing.expectEqual(@as(?u64, 28 * gib), big.memory_total);
+    // A total sets the default job's, and is kept to even under a job's limit above it.
+    const total = Limits.compute(.{ .memory_total_mb = 3 * 1024 }, 30 * gib);
+    try std.testing.expectEqual(@as(?u64, 3 * gib), total.memory_total);
+    try std.testing.expectEqual(@as(?u64, 2 * gib), total.memory_max);
+    const both = Limits.compute(.{ .memory_max_mb = 4096, .memory_total_mb = 2048 }, 30 * gib);
+    try std.testing.expectEqual(@as(?u64, 4 * gib), both.memory_max);
+    try std.testing.expectEqual(@as(?u64, 2 * gib), both.memory_total);
+    // 0: no limit, and none on all jobs either, unless a total is set.
+    const off = Limits.compute(.{ .memory_max_mb = 0, .pids_max = 0 }, 30 * gib);
     try std.testing.expect(off.memory_max == null and off.pids_max == null);
+    try std.testing.expect(off.memory_total == null and off.pids_total == null);
+    const no_total = Limits.compute(.{ .memory_total_mb = 0 }, 30 * gib);
+    try std.testing.expect(no_total.memory_total == null);
+    try std.testing.expectEqual(@as(?u64, 20 * gib / 3 * 2), no_total.memory_max);
+    const job_off = Limits.compute(.{ .memory_max_mb = 0, .memory_total_mb = 1024 }, 30 * gib);
+    try std.testing.expect(job_off.memory_max == null);
+    try std.testing.expectEqual(@as(?u64, 1 * gib), job_off.memory_total);
+    try std.testing.expect(Limits.compute(.{ .swap = true }, 8 * gib).swap);
+}
+
+test "native cgroup: the tightest limit above the parent counts, the parent's own does not" {
+    const io = std.testing.io;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "unit/slice/jobs");
+    const mount = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const jobs = try std.fmt.allocPrint(arena, "{s}/unit/slice/jobs", .{mount});
+    const machine = memTotal(io);
+    // No limit anywhere: the machine's memory.
+    try std.testing.expectEqual(machine, memoryUnder(io, mount, jobs));
+    try std.testing.expectEqual(machine, memoryUnder(io, mount, null));
+    // The parent's own, written from this number, must not shrink it job after job.
+    try tmp.dir.writeFile(io, .{ .sub_path = "unit/slice/jobs/memory.max", .data = "4096\n" });
+    try std.testing.expectEqual(machine, memoryUnder(io, mount, jobs));
+    // A `max` is no limit; the mount itself is one in a cgroup namespace.
+    try tmp.dir.writeFile(io, .{ .sub_path = "unit/slice/memory.max", .data = "max\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "unit/memory.max", .data = "8388608\n" });
+    try std.testing.expectEqual(@as(?u64, 8 << 20), memoryUnder(io, mount, jobs));
+    try tmp.dir.writeFile(io, .{ .sub_path = "memory.max", .data = "4194304\n" });
+    try std.testing.expectEqual(@as(?u64, 4 << 20), memoryUnder(io, mount, jobs));
+}
+
+test "native cgroup: every job's start holds all jobs to their limits on the parent" {
+    const io = std.testing.io;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const Files = struct {
+        fn empty(t: *std.testing.TmpDir, swap: bool) !void {
+            for ([_][]const u8{ "memory.max", "pids.max" }) |f|
+                try t.dir.writeFile(std.testing.io, .{ .sub_path = f, .data = "" });
+            if (swap) try t.dir.writeFile(std.testing.io, .{
+                .sub_path = "memory.swap.max",
+                .data = "",
+            });
+        }
+    };
+    // Without swap accounting there is no file: the memory is bounded all the same.
+    try Files.empty(&tmp, false);
+    const limits = Limits.compute(.{ .memory_total_mb = 1024 }, 30 * gib);
+    try std.testing.expect(!try limitAll(arena, dir, limits));
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("1073741824", try tmp.dir.readFile(io, "memory.max", &buf));
+    try std.testing.expectEqualStrings("32768", try tmp.dir.readFile(io, "pids.max", &buf));
+    // With it, swap is off unless the operator allows it.
+    try Files.empty(&tmp, true);
+    try std.testing.expect(try limitAll(arena, dir, limits));
+    try std.testing.expectEqualStrings("0", try tmp.dir.readFile(io, "memory.swap.max", &buf));
+    var allowed = limits;
+    allowed.swap = true;
+    try Files.empty(&tmp, true);
+    try std.testing.expect(try limitAll(arena, dir, allowed));
+    try std.testing.expectEqualStrings("max", try tmp.dir.readFile(io, "memory.swap.max", &buf));
+    // The operator's no limit takes an old limit away.
+    try Files.empty(&tmp, true);
+    try std.testing.expect(try limitAll(arena, dir, Limits.compute(.{
+        .memory_total_mb = 0,
+        .pids_max = 0,
+    }, 30 * gib)));
+    try std.testing.expectEqualStrings("max", try tmp.dir.readFile(io, "memory.max", &buf));
+    try std.testing.expectEqualStrings("max", try tmp.dir.readFile(io, "pids.max", &buf));
+    // A parent that takes no limit is not one to run jobs under.
+    try tmp.dir.deleteFile(io, "memory.max");
+    try std.testing.expectError(error.TotalMemoryLimitFailed, limitAll(arena, dir, limits));
 }
 
 test "native cgroup: a parent must be a cgroup's path, through no dot directory" {

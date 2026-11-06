@@ -211,14 +211,16 @@ On a root runner, each step runs:
 - with every path inside the overlay resolved inside it (`openat2(RESOLVE_IN_ROOT)`), by the
   helper and by the runner, so a symlink a step plants never leads them to the host's files.
 
-- in a **cgroup v2 of the job's own** (since P4) with `memory.max` and `pids.max`, where the runner
-  is root or has a cgroup delegated to it ("P4" below).
+- in a **cgroup v2 of the job's own** (since P4) with `memory.max` and `pids.max`, under a parent
+  that bounds all jobs together, with no swap ("Bounded jobs" below). A job that cannot have one
+  does not run natively unless the operator accepts that with `RUNNER_NATIVE_CGROUP=none`.
 
 What it does not provide yet:
 
 - **Resource limits on a rootless runner without delegation.** P4's cgroup needs root or a
-  delegated cgroup (`RUNNER_NATIVE_CGROUP=self`); without one a job runs as P1 did, and "Set up
-  job" says so. A job the runner does not vouch for never runs without one (P5).
+  delegated cgroup (`RUNNER_NATIVE_CGROUP=self`); without one a job goes to Dagger, or fails saying
+  so with `RUNNER_ENGINE=none`, unless `RUNNER_NATIVE_CGROUP=none` accepts it. A job the runner
+  does not vouch for never runs without one (P5).
 - **Rootless runners.** Only one id is mapped and steps share the host's network: off unless
   `RUNNER_NATIVE_ROOTLESS=1`, for tests and the laptop. A rootless job network needs a userspace
   stack (a Zig port of the parts of pasta or slirp4netns it needs), and full ids need
@@ -239,16 +241,78 @@ RUNNER_NATIVE_VOLUMES_MAX_MB=16384                # default; the cache volumes' 
 RUNNER_NATIVE_IMAGES_MAX_MB=8192                  # default; images', rootfs' and seeds' cap, 0 for none ("Eviction")
 RUNNER_NATIVE_MIN_FREE_PCT=10                     # default; the disk's floor, 0 for none ("Eviction")
 RUNNER_NATIVE_ROOTLESS=0                          # default; 1 for a rootless runner
-RUNNER_NATIVE_CGROUP=                             # default: /sys/fs/cgroup/zig-runner as root,
-                                                  # none rootless; `self`, `none`, or a path
-RUNNER_NATIVE_MEMORY_MAX_MB=                      # default 3/4 of MemTotal; 0 for no limit
-RUNNER_NATIVE_PIDS_MAX=8192                       # default; 0 for no limit
+RUNNER_NATIVE_CGROUP=                             # default: /sys/fs/cgroup/zig-runner as root;
+                                                  # `self`, a path, or `none`: no limits at all
+RUNNER_NATIVE_MEMORY_TOTAL_MB=                    # all jobs' together; default a third kept for
+                                                  # the machine ("Bounded jobs"); 0 for no limit
+RUNNER_NATIVE_MEMORY_MAX_MB=                      # each job's; default 2/3 of the total; 0 for no
+                                                  # limit
+RUNNER_NATIVE_SWAP=false                          # default; true lets jobs swap
+RUNNER_NATIVE_PIDS_MAX=8192                       # each job's, default, and 4 times it for all
+                                                  # jobs; 0 for no limit
 RUNNER_NATIVE_HASHFILES_MEMORY_MB=                # default min(1 GiB, MemTotal/8), for all jobs'
                                                   # hashFiles() together; 0 for no limit
 RUNNER_NATIVE_HASHFILES_TIMEOUT_S=120             # default, GitHub's; 0 for no limit
 RUNNER_NATIVE_MEM_PER_JOB_MB=256                  # default; the memory gate's reservation for a
                                                   # native job not learned yet (P4); 0 for none
 ```
+
+**Bounded jobs (#367).** All native jobs under one parent cgroup stay under a limit written on that
+parent, with no setting and no host tuning, and each job under a limit of its own:
+
+| Machine | Kept for the rest | All jobs (`memory.max` on the parent) | One job |
+|---|---|---|---|
+| 8 GiB Pi | 2.7 GiB | 5.3 GiB | 3.6 GiB |
+| 16 GiB | 5.3 GiB | 10.7 GiB | 7.1 GiB |
+| 30 GiB laptop | 10 GiB | 20 GiB | 13.3 GiB |
+| 128 GiB | 12 GiB | 116 GiB | 77.3 GiB |
+
+- **Why these.** A third of the machine is kept, at least 2 GiB and at most 12 GiB, and jobs get at
+  least half whatever that says. Three quarters per job, as it was, left a laptop's desktop 7.5 GiB
+  beside one job, and nothing at all beside two. One job gets two thirds of the total, so a
+  runaway still leaves its neighbours a third, and razorbill's build, which reaches about 2.4 GB of
+  anonymous memory, has 1.2 GiB to spare. A job that needs more than this fails where it passed
+  before: its step says which limit and which setting.
+- **"The machine"** is `MemTotal`, or the tightest `memory.max` above the parent where the runner is
+  in a container or a slice with a limit of its own, which `MemTotal` does not show. The parent's
+  own is left out, since it is written from this number.
+- **Swap.** `memory.swap.max` is 0 on the parent: page cache is reclaimed at a limit, anonymous
+  memory stays in RAM, and a job past its limit is killed instead of taking the machine into swap
+  death. A swapped-out job also looks small to the gate, which held `memory.high` down
+  (`Admission.growHigh`) on the job razorbill's compressed swap slowed for an hour.
+  `RUNNER_NATIVE_SWAP=true` gives swap back, as a kernel without swap accounting does ("Set up job"
+  says which); the memory limits hold either way.
+- **Processes.** `pids.max` on the parent is four jobs' (32768 by default).
+- **The operator's numbers win.** `RUNNER_NATIVE_MEMORY_TOTAL_MB` sets the total, and the default job
+  is two thirds of it. An explicit `RUNNER_NATIVE_MEMORY_MAX_MB` above the default total raises the
+  total with it, and `0` leaves all jobs without a limit too, unless a total is set. A total below a
+  job's limit holds: limits are hierarchical.
+- **Several runners.** The default total depends on the machine alone, so every runner sharing a
+  parent, which root runners do by default (`/sys/fs/cgroup/zig-runner`), writes the same numbers,
+  and their jobs together stay under one bound, whichever started last. They must use the same
+  settings, as they must the same `RUNNER_NATIVE_SUBNET`: each job's start rewrites the parent's
+  limits with its runner's. What does not hold: runners with **different parents**, such as units
+  each with `RUNNER_NATIVE_CGROUP=self`, get a bound each, and cannot see each other. Give them one
+  parent (a path), or a slice with its own `MemoryMax=`, which then counts as the machine for all of
+  them.
+- **The memory gate** (`admission.zig`) still decides on `MemAvailable`, and does not know the total.
+  On a 30 GiB machine it may let in a job when the parent is full and the machine is not; the parent
+  then kills the largest process under it. `memory.high` stays below `memory.max`: `Admission.growHigh`
+  may raise it past the job's `memory.max`, where it has no effect.
+- **A job that cannot be bounded is refused**, by default: a rootless runner without delegation, a
+  parent that cannot be made or limited, a root runner in a container whose root holds processes
+  (use `self` there). It goes to Dagger, whose engine holds it, or fails saying why with
+  `RUNNER_ENGINE=none`. `RUNNER_NATIVE_CGROUP=none` is the operator accepting the risk, and "Set up
+  job" then says the job runs UNBOUNDED. A runner in a container with a memory limit of its own is
+  bounded by it, jobs and runner alike, and `none` is the setting for it where no cgroup can be
+  written.
+- **Not a per-process limit in place of the cgroup.** `RLIMIT_AS` or `RLIMIT_DATA` in the helper would
+  keep rootless jobs running: measured on a 30 GiB laptop, Go, Node, Bun and .NET start under an
+  `RLIMIT_AS` of 4 GiB, and only the JVM needs more (it reserves a quarter of the machine and starts
+  at 8 GiB), and all of them run under `RLIMIT_DATA`. But it is a limit on each process, which every
+  process of a job gets in full: the incident's were several `python3` at once, and an RLIMIT at a
+  job's share would have let through what took the machine down. It bounds no job, and nothing
+  bounds how many processes a rootless job has.
 
 **The rootfs.** Since P3 the runner pulls and provisions the image itself (see P3), and this
 directory is an optional override for the provisioned default image. P1 took a directory holding
@@ -294,7 +358,8 @@ What it changes on the host, which is shared by every runner on it:
 - **Cgroups.** As root, by default, the jobs' cgroups go under `/sys/fs/cgroup/zig-runner` (made
   on the first job, with the memory and pids controllers for its children, as Docker's cgroupfs
   driver makes `/sys/fs/cgroup/docker`). It is the host's, like the slots: each job's cgroup is
-  named by its directory, and only the runner holding a job's lock removes it. Under a unit with
+  named by its directory, and only the runner holding a job's lock removes it. All jobs' limits go
+  on it ("Bounded jobs"), and each job's start writes them again. Under a unit with
   `Delegate=yes`, `RUNNER_NATIVE_CGROUP=self` keeps them in the unit's own tree instead.
 - **IPv4 forwarding** (`net.ipv4.ip_forward`) is turned on if it is off, and stays on: other
   runners' jobs need it, and turning it off under them would cut their network. The runner logs
@@ -324,7 +389,9 @@ What it changes on the host, which is shared by every runner on it:
   container's own /run would give each its own slot 0 on the shared bridge). The image has no
   `iptables`, and needs none since P5: the rules are made over netlink. For the jobs' cgroups,
   `cgroup: private` (the default on cgroup v2) with `RUNNER_NATIVE_CGROUP=self`: the container's
-  root is then its own cgroup, and the runner moves itself into a leaf of it.
+  root is then its own cgroup, and the runner moves itself into a leaf of it. The setting is needed
+  there: the default parent cannot be made below a root that holds processes, and a job with no
+  cgroup is refused ("Bounded jobs").
 - Under `deploy/zig-runner.service` on razorbill (not changed by P1): the unit runs as root with
   `ProtectSystem=strict`, which makes the store's default and `/run` read-only. It needs
   `StateDirectory=zig-runner` (or `ReadWritePaths=/var/lib/zig-runner`) for the store, and
@@ -689,15 +756,15 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   between the rootfs and the job's layers, seen through the job's ids as the rootfs is
   (`sandbox.idmapLowers`), so a job's own writes to its global cache stay in its layers.
 - `runner/src/native/cgroup.zig` is the job's cgroup: `memory.max` (`RUNNER_NATIVE_MEMORY_MAX_MB`,
-  three quarters of `MemTotal` by default), `pids.max` (`RUNNER_NATIVE_PIDS_MAX`, 8192), and
+  two thirds of all jobs' by default, "Bounded jobs"), `pids.max` (`RUNNER_NATIVE_PIDS_MAX`, 8192), and
   `memory.peak`, `memory.events` and `pids.events` read back. Each step's helper joins it before
   anything else (`sandbox.joinCgroup`), so every process of the step is born in it and the runner
   never is. It is kept, empty, between steps, and killed (`cgroup.kill`) and removed when the job
   ends, or by the sweep after a crash. When a step's processes were OOM-killed or refused a fork,
   its log says so in an error line. Where it goes: `/sys/fs/cgroup/zig-runner` as root; the
   runner's own delegated cgroup with `self` (the runner moves its processes into a `runner` leaf and
-  makes the jobs' under `jobs`, systemd's rule for delegation); a path; or none, rootless without
-  `self`, where the job runs as in P1 and "Set up job" says why.
+  makes the jobs' under `jobs`, systemd's rule for delegation); a path; or none, with
+  `RUNNER_NATIVE_CGROUP=none`, where the job runs as in P1 and "Set up job" says it is unbounded.
 - The memory gate (`admission.zig`) is told of a native job's cgroup (`Gate.native`) and measures
   the job there, from nothing, with the engine's own definition of a working set
   (`workingSetMb`: `memory.current` less `inactive_file` and `slab_reclaimable`), so the same
@@ -724,8 +791,8 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   up job" says it, as the kernel holds it. Past it the kernel reclaims the job's page cache, then
   slows its allocations; it never kills, so a job that outgrows its estimate is throttled in its
   own cgroup instead of taking memory its neighbours were admitted against, or meeting the OOM
-  killer. `memory.max` stays the hard cap above it (three quarters of `MemTotal` by default; a
-  `memory.high` above it is simply never reached), and the host's `MemAvailable` floor
+  killer. `memory.max` stays the hard cap above it (a `memory.high` above it is simply never
+  reached), and the host's `MemAvailable` floor
   (`RUNNER_MIN_MEM_AVAILABLE_MB`), pressure and swap growth still hold every runner. The headroom
   is for what `memory.high` counts and the estimate does not: page cache and reclaimable slab. A
   job that outgrew its estimate and went over `memory.high` (memory.events `high`) is learned at
@@ -2187,6 +2254,24 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
   the gain is a hash of a file in the job's own container; so it is not done.
 - **A file is looked at before it is opened.** Its type is read from an `O_PATH` descriptor and
   the file opened through that descriptor, so a pipe is refused and not waited for.
+
+### Bounded jobs (#367)
+
+- **The incident was not the limit being too high.** Two `python3` of 22.6 and 25.9 GB in the
+  journal looked like the 22.5 GiB `memory.max` of a 30 GiB machine, but 25.9 is over it, and the
+  kernel's own line says otherwise: `global_oom`, `task_memcg=/system.slice/docker-<id>.scope`. The
+  processes were in their containers' cgroups, in no job's. The tests ran as root in a container
+  whose root held processes, so no parent could be made, `cgroup.resolve` said `none`, and the
+  runaway test's `while True` went on with no limit until the machine ran out. Runs where the parent
+  worked show up as `CONSTRAINT_MEMCG` in `/zig-runner-test/<job>`, and hurt nothing.
+- **Parallel tests did not undo each other's limits.** Each job's cgroup is its own and written once;
+  the one shared write was the gate test's 64 GiB on the parent, which bounded nothing. Limits on
+  the parent changed that, so a test that sets them now has a parent of its own (`testCgroup`).
+- **Tests must not lean on what they test.** The runaway and the bomb end by themselves now
+  (`hogStep`, `bombStep`), at 1 GiB and 1023 processes, and `testCgroup` skips before any step runs
+  if there is no parent. A test of a limit whose failure mode is the host's outage is a hazard.
+- **`native/cgroup.zig` was not in the test root,** so its tests had never run: a file's tests count
+  only when `main.zig`'s test block imports it.
 
 ### Running with no engine
 

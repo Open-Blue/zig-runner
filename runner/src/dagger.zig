@@ -959,12 +959,10 @@ fn runNative(
     var why: []const u8 = "";
     var b = Backend.initWhy(arena, io, opts.gpa, cfg, &why) catch |e| {
         const what = if (why.len > 0) why else @errorName(e);
-        // A job the runner does not vouch for whose cgroup could not be made with its limits
-        // after all (P4, P5's `job_limits`): not native, and not failed either.
+        // A job that would have no limits (P4, P5's `job_limits`, #367): not native, and not
+        // failed either, where there is an engine to hold it (`Backend.jobCgroup` says why).
         if (e == error.NoJobLimits) {
-            dagger_note.* = "This job runs on Dagger: native steps run a job this runner does " ++
-                "not vouch for only within a cgroup of its own with memory and process limits, " ++
-                "which could not be made for it.";
+            dagger_note.* = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{what});
             return null;
         }
         // Its store, cgroup, slot, resolver or network could not be made: to Dagger as well,

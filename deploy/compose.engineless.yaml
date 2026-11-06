@@ -17,6 +17,9 @@ services:
     environment:
       RUNNER_BACKEND: native
       RUNNER_ENGINE: none
+      # The jobs' cgroups: the container's root is its own (`cgroup: private`, the default), and
+      # holds the runner, which moves to a leaf of it. Without one a native job does not run.
+      RUNNER_NATIVE_CGROUP: self
       # The engine socket's volume is not there to mount.
       RUNNER_ENGINE_HOST: ""
     volumes: !reset []
