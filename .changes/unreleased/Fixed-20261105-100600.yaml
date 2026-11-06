@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'With `RUNNER_ZIG_LOCAL_CACHE`, an unchanged commit no longer recompiles. Zig''s local cache names the `builtin.zig` files it generated in the global cache''s `b/`, which is each job''s own, so every job found them gone and compiled the tests and the runner again (9 s and 8 s on the laptop, `cached` now). `b/` has a volume of its own beside the local cache''s, in the same `repo` scope, filled from the seed''s so that the seed''s build runner still hits; on the Dagger and the native backends.'
-time: 2026-11-05T10:00:00.000000-05:00

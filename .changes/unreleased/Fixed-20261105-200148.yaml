@@ -1,3 +1,0 @@
-kind: Fixed
-body: A native job no longer fails at random unpacking an image with a `..` symlink while another job publishes a layer. The kernel refuses such a lookup with EAGAIN when any rename on the machine races it, and `openIn` now tries again.
-time: 2026-11-05T20:01:48.570390918-05:00

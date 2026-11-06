@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The end-to-end suite checks the replay of `cache` on its third attempt. With the tool cache''s trees checked (`RUNNER_TOOL_TREES`), the tree list is in every step''s key, so a tree installed by the run''s `toolcache` job between two attempts makes the next one run its steps again, once; the second attempt now only has to succeed.'
-time: 2026-11-05T10:20:00.000000-05:00
