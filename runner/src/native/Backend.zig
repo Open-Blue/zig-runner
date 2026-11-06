@@ -1266,13 +1266,7 @@ pub fn base(
             ev.temp,
             tool_dir,
             link,
-            if (unprivileged) try std.fmt.allocPrint(arena, " && chown -R {d}:{d} {s}{s}", .{
-                b.uid,
-                b.gid,
-                // Where the workspace is: a `container:` job's is under /__w.
-                if (ev.job.container != null) dagger.container_work_root else dagger.work_root,
-                tool_dir,
-            }) else chown,
+            if (unprivileged) try ownedBy(arena, b.uid, b.gid, tool_dir, ev.job.container != null) else chown,
         })
     else
         try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s} 2>/dev/null{s} || true", .{
@@ -1312,6 +1306,21 @@ pub fn base(
         });
         return error.BaseContainerFailed;
     }
+}
+
+/// The shell that gives the job's work root, and the tool cache when it is made in the base
+/// (`tool_dir`, a path with a leading space or empty), to `uid:gid`. The tool cache is only
+/// chowned when it is not theirs already: an image's own `/opt/hostedtoolcache` may be large, and
+/// a recursive chown copies every file of it up into the layer.
+fn ownedBy(arena: Allocator, uid: u32, gid: u32, tool_dir: []const u8, container: bool) ![]const u8 {
+    // A `container:` job's work root is /__w.
+    const work = if (container) dagger.container_work_root else dagger.work_root;
+    const tool = if (tool_dir.len == 0) "" else try std.fmt.allocPrint(
+        arena,
+        " && {{ [ \"$(stat -c %u:%g{s})\" = {d}:{d} ] || chown -R {d}:{d}{s}; }}",
+        .{ tool_dir, uid, gid, uid, gid, tool_dir },
+    );
+    return std.fmt.allocPrint(arena, " && chown -R {d}:{d} {s}{s}", .{ uid, gid, work, tool });
 }
 
 /// The base's environment, user and working directory (`base`), as `set_up.writeImage`,
@@ -5068,6 +5077,19 @@ test "a container job's options on the native backend: --user and --env, the res
     };
     // `-e HOME=` loses to GitHub's `HOME=/github/home`: never the option's value.
     try std.testing.expect(std.mem.indexOf(u8, text, "HOME=/elsewhere") == null);
+}
+
+test "the base hands a work root to the user, and the tool cache only when it is not theirs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const none = try ownedBy(arena, 1002, 1003, "", true);
+    try std.testing.expectEqualStrings(" && chown -R 1002:1003 /__w", none);
+    const with = try ownedBy(arena, 1002, 1003, " /opt/hostedtoolcache", false);
+    const head = " && chown -R 1002:1003 /home/runner/work && { [ ";
+    try std.testing.expect(std.mem.startsWith(u8, with, head));
+    const tail = "= 1002:1003 ] || chown -R 1002:1003 /opt/hostedtoolcache; }";
+    try std.testing.expect(std.mem.indexOf(u8, with, tail) != null);
 }
 
 test "a container job's --user the image does not know fails the job, never runs it as root" {
