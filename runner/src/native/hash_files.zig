@@ -215,6 +215,8 @@ const Counted = struct {
     pool_used: usize = 0,
     ticket: ?u64 = null,
     turn: bool = false,
+    /// The task was cancelled during a wait (`nap`), which ended it.
+    io_cancelled: bool = false,
     /// How long the call waited in all, so that its own clock leaves it out.
     waited_ms: i64 = 0,
     refused: Refusal = .none,
@@ -277,7 +279,8 @@ const Counted = struct {
             }
             if (c.wait_limit_ms != std.math.maxInt(u64) and nowMs(c.io, .awake) - moved > c.wait_limit_ms)
                 return c.abandon(.waited_too_long);
-            c.io.sleep(.fromMilliseconds(2), .awake) catch {};
+            c.nap();
+            if (c.io_cancelled) return c.abandon(.cancelled);
         }
         c.waited_ms += nowMs(c.io, .awake) - began;
         c.turn = true;
@@ -291,10 +294,20 @@ const Counted = struct {
         c.ticket = null;
         if (!c.budget.done(t)) {
             // Too many have given up for it to be remembered: it stays until its turn, then ends.
-            while (!c.budget.isTurn(t)) c.io.sleep(.fromMilliseconds(2), .awake) catch {};
+            while (!c.budget.isTurn(t)) c.nap();
             _ = c.budget.done(t);
         }
+        // std.Io delivers a cancel once: re-armed for what runs after the call. Not sooner, or
+        // each nap above would return at once and the wait would spin.
+        if (c.io_cancelled) c.io.recancel();
         return false;
+    }
+
+    /// One look's wait. An allocator's callback can return no error, so a cancel is kept for later.
+    fn nap(c: *Counted) void {
+        c.io.sleep(.fromMilliseconds(2), .awake) catch {
+            c.io_cancelled = true;
+        };
     }
 
     /// The call is over (its arena freed): the next in the queue has the turn.
@@ -1593,6 +1606,33 @@ test "native hashFiles: a call waiting for the turn is ended by the job's cancel
     _ = budget.done(held);
     try std.testing.expectEqual(budget.next, budget.serving);
     try std.testing.expect(budget.isTurn(budget.next));
+}
+
+test "native hashFiles: a task's cancel ends a wait for the turn, and is there for what runs next" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try deepDir(&f, 8, 400);
+    var budget: Budget = .{};
+    const held = budget.ticket();
+    defer _ = budget.done(held);
+    const Task = struct {
+        fn run(r: *Runner, kept: *bool) void {
+            r.run();
+            std.testing.io.sleep(.fromSeconds(30), .awake) catch {
+                kept.* = true;
+            };
+        }
+    };
+    var r: Runner = .{ .fx = &f, .stack = try f.stackOf(&.{"l0"}, .{ .allowance = 64 << 10, .budget = &budget }), .args = &.{"**"} };
+    var kept = false;
+    var task = try std.testing.io.concurrent(Task.run, .{ &r, &kept });
+    sleepMs(200);
+    task.cancel(std.testing.io);
+    try expectFailed("cancelled", r.result.?);
+    try std.testing.expect(r.took_ms < 3000);
+    try std.testing.expect(kept);
 }
 
 test "native hashFiles: a queue that moves outlasts the wait's limit, so calls ahead only delay a call" {

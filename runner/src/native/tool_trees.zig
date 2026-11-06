@@ -332,7 +332,7 @@ const Check = struct {
         const listed = names.items.len;
         var it = (std.Io.Dir{ .handle = dir }).iterate();
         var looked: usize = 0;
-        while (it.next(c.io) catch return error.Unreadable) |e| {
+        while (it.next(c.io) catch |e| return rearmed(c.io, e, error.Unreadable)) |e| {
             try c.visit();
             if (e.kind != .directory or !treeName(e.name)) continue;
             looked += 1;
@@ -387,10 +387,10 @@ const Check = struct {
         seen: *std.StringHashMapUnmanaged(void),
     ) Allocator.Error!void {
         const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ lists, prefix });
-        var dir = std.Io.Dir.cwd().openDir(c.io, path, .{ .iterate = true }) catch return;
+        var dir = std.Io.Dir.cwd().openDir(c.io, path, .{ .iterate = true }) catch |e| return rearm(c.io, e);
         defer dir.close(c.io);
         var it = dir.iterate();
-        while (it.next(c.io) catch null) |e| {
+        while (it.next(c.io) catch |e| noEntry(c.io, e)) |e| {
             if (names.items.len >= max_names) break;
             const name = if (depth == 2)
                 (if (e.kind == .file and std.mem.endsWith(u8, e.name, ".born"))
@@ -438,7 +438,7 @@ const Check = struct {
         const path = std.fmt.allocPrint(arena, "{s}/{s}.born", .{ lists, rel }) catch return now;
         if (std.Io.Dir.cwd().readFileAlloc(c.io, path, arena, .limited(64))) |text| {
             if (std.fmt.parseInt(i128, std.mem.trim(u8, text, "\n"), 10)) |t| return t else |_| {}
-        } else |_| {}
+        } else |e| rearm(c.io, e);
         const text = std.fmt.allocPrint(arena, "{d}\n", .{now}) catch return now;
         keepList(arena, c.io, path, text);
         return now;
@@ -555,7 +555,7 @@ const Check = struct {
         const here = if (prefix.len == 0) "." else prefix;
         var subdirs: std.ArrayList([]const u8) = .empty;
         var it = (std.Io.Dir{ .handle = dir }).iterate();
-        while (it.next(c.io) catch return error.Unreadable) |e| {
+        while (it.next(c.io) catch |e| return rearmed(c.io, e, error.Unreadable)) |e| {
             try c.visit();
             // A name sha256sum would escape, or one a list's line cannot hold: not listed.
             for (e.name) |ch| if (ch < 0x20 or ch == 0x7f or ch == '\\')
@@ -678,8 +678,10 @@ const Check = struct {
     /// The list at `path`, when it holds exactly the regular files' paths in order and each line
     /// parses; otherwise null and every file is read.
     fn readList(c: *Check, t: Allocator, path: []const u8, entries: []const Entry) ?[]Line {
-        const text = std.Io.Dir.cwd().readFileAlloc(c.io, path, t, .limited(max_list_bytes)) catch
+        const text = std.Io.Dir.cwd().readFileAlloc(c.io, path, t, .limited(max_list_bytes)) catch |e| {
+            rearm(c.io, e);
             return null;
+        };
         c.charge(text.len) catch return null;
         const lines = t.alloc(Line, entries.len) catch return null;
         c.charge(lines.len * @sizeOf(Line)) catch return null;
@@ -838,15 +840,35 @@ fn openDir(parent: linux.fd_t, name: [:0]const u8) ?linux.fd_t {
 /// check a read of the tree.
 fn keepList(t: Allocator, io: std.Io, path: []const u8, text: []const u8) void {
     const cwd = std.Io.Dir.cwd();
-    if (std.fs.path.dirname(path)) |dir| cwd.createDirPath(io, dir) catch return;
+    if (std.fs.path.dirname(path)) |dir| cwd.createDirPath(io, dir) catch |e| return rearm(io, e);
     var raw: [8]u8 = undefined;
     io.random(&raw);
     const part = std.fmt.allocPrint(t, "{s}.{x}", .{ path, &raw }) catch return;
-    cwd.writeFile(io, .{ .sub_path = part, .data = text }) catch {
-        cwd.deleteFile(io, part) catch {};
+    cwd.writeFile(io, .{ .sub_path = part, .data = text }) catch |e| {
+        rearm(io, e);
+        cwd.deleteFile(io, part) catch |d| rearm(io, d);
         return;
     };
-    cwd.rename(part, cwd, path, io) catch cwd.deleteFile(io, part) catch {};
+    cwd.rename(part, cwd, path, io) catch |e| {
+        rearm(io, e);
+        cwd.deleteFile(io, part) catch |d| rearm(io, d);
+    };
+}
+
+/// These lists are a cache: a failure here costs a read later, and is dropped. A cancel is not:
+/// std.Io delivers it once, so it is re-armed for what runs next.
+fn rearm(io: std.Io, e: anyerror) void {
+    if (e == error.Canceled) io.recancel();
+}
+
+fn rearmed(io: std.Io, e: anyerror, as: anytype) @TypeOf(as) {
+    rearm(io, e);
+    return as;
+}
+
+fn noEntry(io: std.Io, e: anyerror) ?std.Io.Dir.Entry {
+    rearm(io, e);
+    return null;
 }
 
 /// How old a half-written list (`keepList`'s file before it is moved) must be to be a leftover of
@@ -873,27 +895,36 @@ fn walkLists(
     leftovers: bool,
 ) void {
     const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
-    var tools = std.Io.Dir.cwd().openDir(io, lists, .{ .iterate = true }) catch return;
+    var tools = std.Io.Dir.cwd().openDir(io, lists, .{ .iterate = true }) catch |e| return rearm(io, e);
     defer tools.close(io);
     var t_it = tools.iterate();
-    while (t_it.next(io) catch null) |tool| {
+    while (t_it.next(io) catch |e| noEntry(io, e)) |tool| {
         if (tool.kind != .directory) continue;
-        var versions = tools.openDir(io, tool.name, .{ .iterate = true }) catch continue;
+        var versions = tools.openDir(io, tool.name, .{ .iterate = true }) catch |e| {
+            rearm(io, e);
+            continue;
+        };
         defer versions.close(io);
         var v_it = versions.iterate();
-        while (v_it.next(io) catch null) |version| {
+        while (v_it.next(io) catch |e| noEntry(io, e)) |version| {
             if (version.kind != .directory) continue;
-            var names = versions.openDir(io, version.name, .{ .iterate = true }) catch continue;
+            var names = versions.openDir(io, version.name, .{ .iterate = true }) catch |e| {
+                rearm(io, e);
+                continue;
+            };
             defer names.close(io);
             var n_it = names.iterate();
-            while (n_it.next(io) catch null) |list| {
+            while (n_it.next(io) catch |e| noEntry(io, e)) |list| {
                 if (list.kind != .file) continue;
                 if (leftovers) {
                     if (std.mem.indexOf(u8, list.name, ".stat.") == null and
                         std.mem.indexOf(u8, list.name, ".born.") == null) continue;
-                    const st = names.statFile(io, list.name, .{}) catch continue;
+                    const st = names.statFile(io, list.name, .{}) catch |e| {
+                        rearm(io, e);
+                        continue;
+                    };
                     if (now_ms - st.mtime.toMilliseconds() > leftover_age_ms)
-                        names.deleteFile(io, list.name) catch {};
+                        names.deleteFile(io, list.name) catch |e| rearm(io, e);
                     continue;
                 }
                 const stem = if (std.mem.endsWith(u8, list.name, ".stat"))
@@ -910,11 +941,11 @@ fn walkLists(
                 const present = for (found) |f| {
                     if (std.mem.eql(u8, f, rel)) break true;
                 } else false;
-                if (!present) names.deleteFile(io, list.name) catch {};
+                if (!present) names.deleteFile(io, list.name) catch |e| rearm(io, e);
             }
-            if (!leftovers) versions.deleteDir(io, version.name) catch {};
+            if (!leftovers) versions.deleteDir(io, version.name) catch |e| rearm(io, e);
         }
-        if (!leftovers) tools.deleteDir(io, tool.name) catch {};
+        if (!leftovers) tools.deleteDir(io, tool.name) catch |e| rearm(io, e);
     }
 }
 
@@ -1470,4 +1501,31 @@ test "tool trees: trees a job made fill the environment after the tool, not befo
     const lines = std.mem.count(u8, v.env, "\n") + 1;
     const want = try std.fmt.allocPrint(arena, "; left out {d}: ", .{482 - lines});
     try expectIn(v.note, want);
+}
+
+test "tool trees: a cancel that lands in the lists' upkeep is there for what runs next" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const arena_state = struct {
+        fn run(path: []const u8, cancelled: *bool) void {
+            const io = std.testing.io;
+            // Not a point of cancellation: the cancel is waiting when this ends.
+            const until = nowMs(io) + 200;
+            while (nowMs(io) < until) {}
+            var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer a.deinit();
+            keepList(a.allocator(), io, path, "x\n");
+            io.sleep(.fromSeconds(30), .awake) catch {
+                cancelled.* = true;
+            };
+        }
+    };
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPathFile(std.testing.io, ".", &buf);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/sub/list", .{buf[0..n]});
+    defer std.testing.allocator.free(path);
+    var cancelled = false;
+    var task = try std.testing.io.concurrent(arena_state.run, .{ path, &cancelled });
+    task.cancel(std.testing.io);
+    try std.testing.expect(cancelled);
 }
