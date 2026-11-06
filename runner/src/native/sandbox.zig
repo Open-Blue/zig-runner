@@ -339,6 +339,11 @@ const resolve_no_symlinks = 0x04;
 
 const OpenHow = extern struct { flags: u64, mode: u64, resolve: u64 };
 
+/// Tries of an `openat2` the kernel gave up on. A `..` on the way fails with EAGAIN when any rename
+/// or mount on the machine races it, as it cannot tell the race from an escape, and it says to
+/// try again: another job publishing a layer is enough.
+const open_tries = 64;
+
 /// Opens `path` under `root`, resolved inside it (see the file's comment). A file descriptor, or
 /// the errno.
 pub fn openIn(
@@ -355,15 +360,19 @@ pub fn openIn(
         .mode = mode,
         .resolve = resolve | resolve_in_root | resolve_no_magiclinks,
     };
-    const rc = linux.syscall4(
-        .openat2,
-        @as(usize, @bitCast(@as(isize, root))),
-        @intFromPtr(path),
-        @intFromPtr(&how),
-        @sizeOf(OpenHow),
-    );
-    const e = linux.errno(rc);
-    return if (e == .SUCCESS) .{ .fd = @intCast(rc) } else .{ .err = e };
+    for (0..open_tries) |_| {
+        const rc = linux.syscall4(
+            .openat2,
+            @as(usize, @bitCast(@as(isize, root))),
+            @intFromPtr(path),
+            @intFromPtr(&how),
+            @sizeOf(OpenHow),
+        );
+        const e = linux.errno(rc);
+        if (e == .AGAIN) continue;
+        return if (e == .SUCCESS) .{ .fd = @intCast(rc) } else .{ .err = e };
+    }
+    return .{ .err = .AGAIN };
 }
 
 /// The contents of `path` in a layer, read by the runner: resolved inside the layer and through no
@@ -1582,6 +1591,40 @@ test "homeOf reads the home directory of a uid from /etc/passwd" {
     try std.testing.expectEqualStrings("/home/runner", homeOf(passwd, 1001).?);
     try std.testing.expect(homeOf(passwd, 7) == null);
     try std.testing.expect(homeOf("garbage", 0) == null);
+}
+
+/// Renames a file back and forth in `dir` until `stop`, to race what follows a `..`.
+fn renameUntil(dir: linux.fd_t, stop: *std.atomic.Value(bool)) void {
+    while (!stop.load(.monotonic)) {
+        _ = linux.renameat(dir, "a", dir, "b");
+        _ = linux.renameat(dir, "b", dir, "a");
+    }
+}
+
+test "openIn: a rename elsewhere on the machine does not fail a `..` on the way" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "root");
+    try tmp.dir.createDirPath(io, "busy");
+    try tmp.dir.writeFile(io, .{ .sub_path = "busy/a", .data = "" });
+    try tmp.dir.symLink(io, "/../../..", "root/up", .{});
+    const root = try tmp.dir.openDir(io, "root", .{});
+    defer root.close(io);
+    const busy = try tmp.dir.openDir(io, "busy", .{});
+    defer busy.close(io);
+
+    var stop: std.atomic.Value(bool) = .init(false);
+    var threads: [2]std.Thread = undefined;
+    for (&threads) |*t| t.* = try .spawn(.{}, renameUntil, .{ busy.handle, &stop });
+    defer for (threads) |t| t.join();
+    defer stop.store(true, .monotonic);
+
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .PATH = true };
+    for (0..20_000) |_| switch (openIn(root.handle, "up", flags, 0, 0)) {
+        .fd => |fd| _ = linux.close(fd),
+        .err => |e| return std.debug.panic("openIn through a `..`: {t}", .{e}),
+    };
 }
 
 test "readIn reads inside a layer: no symlink is followed, and a whiteout is told apart" {
