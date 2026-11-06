@@ -4995,13 +4995,9 @@ test "a container job's options on the native backend: --user and --env, the res
     defer tmp.cleanup();
     const cfg = try testConfig(arena, &tmp);
 
-    // A user other than root cannot make /__w itself, as in any image: this one has it, for `app`.
-    var work: oci_layer.TestTar = .{ .a = arena };
-    try work.add(.{ .path = "__w/", .kind = .directory, .mode = 0o777 });
-    const layers = try std.mem.concat(arena, []const u8, &.{
-        try testImageLayers(arena),
-        &.{try work.finish()},
-    });
+    // No `/__w` in the image, as in most: `app` cannot make it, so the base makes it as root and
+    // hands it over (GitHub mounts it from the host, where it always exists).
+    const layers = try testImageLayers(arena);
     const image_env = "\"PATH=/usr/bin:/bin\",\"BOTH=image\"";
     const img = try testregistry.testImage(arena, "test/opts", "1", layers, image_env, false);
     var server: testregistry.Server = .{ .routes = img.routes };
@@ -5012,7 +5008,7 @@ test "a container job's options on the native backend: --user and --env, the res
     const as_root = std.os.linux.geteuid() == 0;
     const user = if (as_root) "app" else "root";
     var job = testJob(&.{testStep("echo uid=$(id -u) gid=$(id -g); echo A=$A BOTH=$BOTH; " ++
-        "echo SPACED=$SPACED; pwd")});
+        "echo SPACED=$SPACED; echo HOME=$HOME; pwd; touch /__w/_temp/mine && echo wrote")});
     job.container = .{
         .name = "",
         .image = .{ .lit = try server.image(arena, "test/opts:1") },
@@ -5020,8 +5016,8 @@ test "a container job's options on the native backend: --user and --env, the res
         // The image's /etc/passwd has `app` as 1002:1003. `--workdir` and `--health-*` are the
         // runner's, not the steps': `docker exec -w` and the services' health only.
         .options = .{ .lit = try std.fmt.allocPrint(arena, "--user {s} -e A=1 --env " ++
-            "BOTH=options -e \"SPACED=two words\" --workdir /nowhere --health-cmd true " ++
-            "--health-interval 5s", .{user}) },
+            "BOTH=options -e \"SPACED=two words\" -e HOME=/elsewhere --workdir /nowhere " ++
+            "--health-cmd true --health-interval 5s", .{user}) },
     };
     var env: std.process.Environ.Map = .init(arena);
     var w: std.Io.Writer.Allocating = .init(arena);
@@ -5038,16 +5034,55 @@ test "a container job's options on the native backend: --user and --env, the res
         "Engine: native",
         // `--user` over the image's USER (none here), `--env` over the container's `env:`.
         if (as_root) "uid=1002 gid=1003" else "uid=0 gid=0",
-        "A=1 BOTH=options",
+        // The container's `env:` is after the options on `docker create`: it wins.
+        "A=1 BOTH=container",
         "SPACED=two words",
         "/__w/r/r",
-        try std.fmt.allocPrint(arena, "Container options: 3 `--env`, `--user` {s}; 3 understood " ++
+        "wrote",
+        try std.fmt.allocPrint(arena, "Container options: 3 `--env`, `--user` {s}; 4 understood " ++
             "and without effect natively", .{user}),
     };
     for (expect) |e| if (std.mem.indexOf(u8, text, e) == null) {
         std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
         return error.TestUnexpectedResult;
     };
+    // `-e HOME=` loses to GitHub's `HOME=/github/home`: never the option's value.
+    try std.testing.expect(std.mem.indexOf(u8, text, "HOME=/elsewhere") == null);
+}
+
+test "a container job's --user the image does not know fails the job, never runs it as root" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const layers = try testImageLayers(arena);
+    const img = try testregistry.testImage(arena, "test/typo", "1", layers, "\"PATH=/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    var job = testJob(&.{testStep("echo ran as $(id -u)")});
+    job.container = .{
+        .name = "",
+        .image = .{ .lit = try server.image(arena, "test/typo:1") },
+        .options = .{ .lit = "--user typo" },
+    };
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const text = w.written();
+    try std.testing.expect(!res.succeeded);
+    const reason = "--user typo: not in its /etc/passwd";
+    try std.testing.expect(std.mem.indexOf(u8, text, reason) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ran as") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "runs on Dagger") == null);
 }
 
 test "native provisioning: a step on the pulled image, flattened and kept under its key" {

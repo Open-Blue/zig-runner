@@ -195,6 +195,12 @@ test "options honoured: --env and --user in every form docker reads, the others 
     try std.testing.expectEqualStrings("URL", u.env[0].name);
     try std.testing.expectEqualStrings("http://h/?a=b", u.env[0].value);
 
+    // GitHub's `HOME=/github/home` comes after the options, so `-e HOME` never takes effect.
+    const h = try parse(arena, "-e HOME=/x --env=HOME=/y -e B=1", &why);
+    try std.testing.expectEqual(@as(usize, 1), h.env.len);
+    try std.testing.expectEqualStrings("B", h.env[0].name);
+    try std.testing.expectEqual(@as(u32, 2), h.no_effect);
+
     // Understood, and with no effect natively: counted so "Set up job" can say so.
     const n = try parse(arena, "--workdir /w -w/x --health-cmd \"pg_isready\" " ++
         "--health-interval 5s --health-timeout=1m30s --health-retries 3 " ++
@@ -253,8 +259,11 @@ test "unsupported: ports and volumes fall back, options by what they hold" {
 
     jc.options = .{ .lit = "--privileged" };
     try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false).?, "--privileged") != null);
+    // Dagger reads none of `options:`: the note says the flag is dropped there, not carried out.
+    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false).?, "drops") != null);
     jc.options = .{ .expr = "matrix.options" };
     try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false).?, "expression") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false).?, "drops") != null);
 
     jc = base;
     jc.ports = &.{.{ .lit = "8080:80" }};
