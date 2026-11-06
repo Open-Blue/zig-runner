@@ -30,10 +30,54 @@ const linux = std.os.linux;
 const expr = @import("../expr.zig");
 const glob = @import("../glob.zig");
 const sandbox = @import("sandbox.zig");
+const dagger = @import("../dagger.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Error = glob.Fs.Error;
+
+/// GitHub's own limit for one `hashFiles()` (`_hashFileTimeoutSeconds` in actions/runner's
+/// `HashFilesFunction.cs`, which throws "couldn't finish within 120 seconds").
+pub const default_timeout_s: u32 = 120;
+
+/// What the runner configures (`RUNNER_NATIVE_HASHFILES_MEMORY_MB`, `RUNNER_NATIVE_HASHFILES_TIMEOUT_S`).
+pub const Settings = struct {
+    /// What all the calls of this process may hold together; null for the smaller of 1 GiB and an
+    /// eighth of the machine's memory, 0 for no limit.
+    memory_mb: ?u32 = null,
+    /// How long one call may take; 0 for no limit.
+    timeout_s: u32 = default_timeout_s,
+
+    pub fn limits(s: Settings, io: std.Io) Limits {
+        const memory: usize = if (s.memory_mb) |mb|
+            (if (mb == 0) std.math.maxInt(usize) else @as(usize, mb) << 20)
+        else
+            @min(1 << 30, (memTotal(io) orelse (8 << 30)) / 8);
+        return .{
+            .memory = memory,
+            .timeout_ms = if (s.timeout_s == 0) std.math.maxInt(u64) else @as(u64, s.timeout_s) * 1000,
+        };
+    }
+};
+
+/// `MemTotal` in /proc/meminfo, in bytes.
+fn memTotal(io: std.Io) ?usize {
+    var buf: [4096]u8 = undefined;
+    const text = std.Io.Dir.cwd().readFile(io, "/proc/meminfo", &buf) catch return null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "MemTotal:")) continue;
+        var words = std.mem.tokenizeScalar(u8, line["MemTotal:".len..], ' ');
+        const kb = std.fmt.parseInt(usize, words.next() orelse return null, 10) catch return null;
+        return kb * 1024;
+    }
+    return null;
+}
+
+/// What the calls of this process hold now, in bytes. The memory is the runner's, not the job's
+/// cgroup's, and there is one process for all the jobs of a machine, so the limit is for all of
+/// them at once (`Limits.memory`).
+pub var process_held: std.atomic.Value(usize) = .init(0);
 
 /// What one call may use. A job's own files decide how much work they are.
 pub const Limits = struct {
@@ -42,10 +86,15 @@ pub const Limits = struct {
     /// Path components taken, one for each name of each path looked up and each entry listed: a
     /// real tree of a million files at depth ten is about twenty million.
     steps: u64 = 200_000_000,
-    /// Bytes of the call's arena. A walk of `nodes` entries takes about 1 KB each.
-    memory: usize = 2 << 30,
-    /// Set when the job is cancelled (`dagger.Cancel.requested`): the call ends at once.
-    cancel: ?*const std.atomic.Value(bool) = null,
+    /// Bytes all the calls sharing `held` may hold together; a call that would take more fails.
+    memory: usize = 1 << 30,
+    held: *std.atomic.Value(usize) = &process_held,
+    /// How long a call may take, as GitHub's does (`default_timeout_s`).
+    timeout_ms: u64 = default_timeout_s * 1000,
+    /// The job's cancel. A call it interrupts stops at once; one that began after it (an
+    /// `if: always()` step, the job's outputs) runs on, as GitHub's does in the grace period, until
+    /// its `hard_deadline_ms`.
+    cancel: ?*const dagger.Cancel = null,
 };
 
 /// The layers of the job's overlay, as it would mount them for the next step.
@@ -59,10 +108,81 @@ pub const Stack = struct {
     limits: Limits = .{},
 };
 
+/// An allocator that counts what it hands out against the limit all calls share, and refuses what
+/// would pass it, so a call that grows too far stops where it is, whatever it was doing.
+const Counted = struct {
+    child: Allocator,
+    held: *std.atomic.Value(usize),
+    limit: usize,
+    /// A request was refused, for the limit: the `OutOfMemory` that follows is this call's doing.
+    refused: bool = false,
+
+    fn allocator(c: *Counted) Allocator {
+        return .{ .ptr = c, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn of(ctx: *anyopaque) *Counted {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn take(c: *Counted, n: usize) bool {
+        var cur = c.held.load(.monotonic);
+        while (true) {
+            if (n > c.limit or cur > c.limit - n) {
+                c.refused = true;
+                return false;
+            }
+            cur = c.held.cmpxchgWeak(cur, cur + n, .monotonic, .monotonic) orelse return true;
+        }
+    }
+
+    fn give(c: *Counted, n: usize) void {
+        _ = c.held.fetchSub(n, .monotonic);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const c = of(ctx);
+        if (!c.take(len)) return null;
+        return c.child.rawAlloc(len, alignment, ra) orelse {
+            c.give(len);
+            return null;
+        };
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const c = of(ctx);
+        if (new_len > memory.len and !c.take(new_len - memory.len)) return false;
+        if (!c.child.rawResize(memory, alignment, new_len, ra)) {
+            if (new_len > memory.len) c.give(new_len - memory.len);
+            return false;
+        }
+        if (new_len < memory.len) c.give(memory.len - new_len);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const c = of(ctx);
+        if (new_len > memory.len and !c.take(new_len - memory.len)) return null;
+        const p = c.child.rawRemap(memory, alignment, new_len, ra) orelse {
+            if (new_len > memory.len) c.give(new_len - memory.len);
+            return null;
+        };
+        if (new_len < memory.len) c.give(memory.len - new_len);
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const c = of(ctx);
+        c.child.rawFree(memory, alignment, ra);
+        c.give(memory.len);
+    }
+};
+
 /// `hashFiles(args)` over `stack`: the SHA-256 of the SHA-256 digests of the files the patterns
 /// find under `ws`, in GitHub's order; "" when none. As GitHub's script does, a name that is a
 /// directory once links are followed is skipped, and a link is hashed as the file it leads to.
-/// The call works in an arena of its own, freed on return: only the result is copied to `out`.
+/// The call works in an arena of its own, freed on return, whose every byte is counted against
+/// `Limits.memory`: only the result is copied to `out`.
 pub fn hashFiles(
     gpa: Allocator,
     out: Allocator,
@@ -72,9 +192,20 @@ pub fn hashFiles(
     home: []const u8,
     args: []const []const u8,
 ) Allocator.Error!expr.HashFiles.Result {
-    var scratch: std.heap.ArenaAllocator = .init(gpa);
+    var counted: Counted = .{ .child = gpa, .held = stack.limits.held, .limit = stack.limits.memory };
+    var scratch: std.heap.ArenaAllocator = .init(counted.allocator());
     defer scratch.deinit();
-    return switch (try run(&scratch, io, stack, ws, home, args)) {
+    const result = run(&scratch, io, stack, ws, home, args) catch |e| {
+        if (e == error.OutOfMemory and counted.refused) return .{ .failed = try std.fmt.allocPrint(
+            out,
+            "hashFiles() would take more than {d} MiB of memory, which the runner's hashFiles() " ++
+                "calls may hold together (RUNNER_NATIVE_HASHFILES_MEMORY_MB): the job's tree is too " ++
+                "large or too tangled to search, or other jobs are searching theirs",
+            .{stack.limits.memory >> 20},
+        ) };
+        return e;
+    };
+    return switch (result) {
         .ok => |h| .{ .ok = try out.dupe(u8, h) },
         .failed => |why| .{ .failed = try out.dupe(u8, why) },
     };
@@ -91,15 +222,21 @@ fn run(
 ) Allocator.Error!expr.HashFiles.Result {
     var m: Merged = .{
         .arena = scratch.allocator(),
-        .scratch = scratch,
         .io = io,
         .roots = &.{},
         .opaque_xattr = stack.opaque_xattr,
         .limits = stack.limits,
+        .began_ms = nowMs(io, .awake),
     };
+    // A call that began after the cancel is not cut short by it: see `Limits.cancel`.
+    if (m.limits.cancel) |c| m.cancelled_before = c.requested.load(.acquire);
     m.openLayers(stack.layers) catch |e| return failed(&m, e);
     defer m.close();
     return hashAll(&m, ws, home, args) catch |e| failed(&m, e);
+}
+
+fn nowMs(io: std.Io, clock: std.Io.Clock) i64 {
+    return clock.now(io).toMilliseconds();
 }
 
 fn failed(m: *const Merged, e: Error) Allocator.Error!expr.HashFiles.Result {
@@ -156,14 +293,18 @@ const path_max = 4096;
 /// What a path resolves to: the real path and what it is.
 const Resolved = struct { path: []const u8, node: Node };
 
+/// Where a followed link leads, and how many links that took.
+const Lead = struct { to: Resolved, cost: u32 };
+
 /// The merged view of a stack of layers. Paths are absolute, `/` the job's root, with no symlink,
 /// `.` or `..` in a path that names a real entry (`resolve` makes them so); the root is "".
 const Merged = struct {
     arena: Allocator,
-    /// `arena`'s owner, for its size.
-    scratch: *std.heap.ArenaAllocator,
     io: std.Io,
     limits: Limits,
+    /// When the call began (the monotonic clock, ms), and whether the job had been cancelled then.
+    began_ms: i64,
+    cancelled_before: bool = false,
     /// The layers' directories, opened, topmost first.
     roots: []linux.fd_t,
     opaque_xattr: [:0]const u8,
@@ -175,9 +316,14 @@ const Merged = struct {
     nodes: std.StringHashMapUnmanaged(Node) = .empty,
     dirs: std.StringHashMapUnmanaged(?[]const u32) = .empty,
     /// Where each link that was followed leads (what its target resolves to), by the link's path.
-    leads: std.StringHashMapUnmanaged(Resolved) = .empty,
+    leads: std.StringHashMapUnmanaged(Lead) = .empty,
     /// The path a top-level `resolve` builds, kept between calls.
     path: std.ArrayList(u8) = .empty,
+    /// The directory the last `resolve` was in as it was asked, where that really is, and the
+    /// links it took to get there.
+    dir_in: std.ArrayList(u8) = .empty,
+    dir_real: std.ArrayList(u8) = .empty,
+    dir_links: u32 = 0,
     steps: u64 = 0,
     /// What went wrong, for `Error.FsFailed`.
     why: []const u8 = "",
@@ -211,20 +357,33 @@ const Merged = struct {
         return error.FsFailed;
     }
 
-    /// One unit of work: counted, and the job's cancel and the call's memory looked at, so a call
-    /// the job made too big or that the job gave up on ends here.
+    /// One unit of work: counted, and the job's cancel seen, and every 1024th the clock read, so
+    /// a call the job made too big, or took too long, or that the job gave up on, ends here.
+    /// (The memory is counted by the allocator, which refuses what is over the limit.)
     fn tick(m: *Merged) Error!void {
         m.steps += 1;
         if (m.steps > m.limits.steps) return m.fail("hashFiles() took more than {d} steps through the " ++
             "job's files: its tree is too deep or too tangled to search", .{m.limits.steps});
-        if (m.limits.cancel) |c| if (c.load(.monotonic)) return m.fail("hashFiles() stopped: the job was cancelled", .{});
-        if (m.steps % 1024 == 0 and m.scratch.queryCapacity() > m.limits.memory)
-            return m.fail("hashFiles() needed more than {d} MiB of memory: the job's tree is too " ++
-                "large or too tangled to search", .{m.limits.memory >> 20});
+        if (m.limits.cancel) |c| if (!m.cancelled_before and c.requested.load(.acquire))
+            return m.fail("hashFiles() stopped: the job was cancelled", .{});
+        if (m.steps % 1024 != 0) return;
+        if (m.limits.timeout_ms != std.math.maxInt(u64) and
+            nowMs(m.io, .awake) - m.began_ms > m.limits.timeout_ms)
+            return m.fail("couldn't finish within {d} seconds", .{(m.limits.timeout_ms + 999) / 1000});
+        // Begun after the cancel, it runs to the end of the grace period GitHub gives.
+        if (m.limits.cancel) |c| if (m.cancelled_before) {
+            const hard = c.hard_deadline_ms.load(.acquire);
+            if (hard > 0 and nowMs(m.io, .real) > hard)
+                return m.fail("hashFiles() stopped: the job's grace period after its cancel is over", .{});
+        };
     }
 
     fn fs(m: *Merged) glob.Fs {
-        return .{ .ptr = m, .vtable = &.{ .stat = statAll, .list = listAll, .realpath = realpathAll } };
+        return .{ .ptr = m, .vtable = &.{ .stat = statAll, .list = listAll, .realpath = realpathAll, .poll = pollAll } };
+    }
+
+    fn pollAll(ptr: *anyopaque) Error!void {
+        return erased(ptr).tick();
     }
 
     // --- one layer ---
@@ -279,8 +438,17 @@ const Merged = struct {
         var proc: [32]u8 = undefined;
         const p = std.mem.printSentinel(&proc, "/proc/self/fd/{d}", .{fd}, 0) catch
             return m.fail("cannot look at {s}'s attributes in the job's layers", .{path});
-        var list: [4096]u8 = undefined;
-        const n = linux.listxattr(p, &list, list.len);
+        var small: [1024]u8 = undefined;
+        var list: []u8 = &small;
+        var n = linux.listxattr(p, list.ptr, list.len);
+        // A list that does not fit (a tmpfs holds up to 128 KiB of attributes) is asked its size.
+        if (linux.errno(n) == .RANGE) {
+            const size = linux.listxattr(p, list.ptr, 0);
+            if (linux.errno(size) != .SUCCESS)
+                return m.fail("cannot read {s}'s attributes in the job's layers: {t}", .{ path, linux.errno(size) });
+            list = try m.arena.alloc(u8, size + 4096);
+            n = linux.listxattr(p, list.ptr, list.len);
+        }
         switch (linux.errno(n)) {
             .SUCCESS => {},
             // A file system without attributes cannot have marked anything.
@@ -298,7 +466,14 @@ const Merged = struct {
         if (!opaque_dir) return false;
         var value: [1]u8 = undefined;
         const got = linux.getxattr(p, m.opaque_xattr, &value, value.len);
-        return linux.errno(got) == .SUCCESS and got == 1 and value[0] == 'y';
+        return switch (linux.errno(got)) {
+            .SUCCESS => got == 1 and value[0] == 'y',
+            // Gone since it was listed, or longer than one byte (so not "y").
+            .NODATA, .RANGE, .OPNOTSUPP => false,
+            // Not being able to read it (a directory the runner may not read, rootless) must not
+            // read as "not opaque": the entries below it would show through.
+            else => |e| m.fail("cannot read {s}'s attributes in the job's layers: {t}", .{ path, e }),
+        };
     }
 
     // --- the merge ---
@@ -344,7 +519,11 @@ const Merged = struct {
             }
             break;
         };
-        try m.nodes.put(m.arena, try m.arena.dupe(u8, path), node);
+        // A file is looked at once for the search and once for its hash, and a tree of a million
+        // of them would hold each name twice over for that: only what has to be found again, for
+        // the paths below it (directories, links) and what is not there, is kept.
+        if (node.kind != .file and node.kind != .other)
+            try m.nodes.put(m.arena, try m.arena.dupe(u8, path), node);
         return node;
     }
 
@@ -353,13 +532,37 @@ const Merged = struct {
     /// loop. The path it returns is real, and good until the next call.
     fn resolve(m: *Merged, path: []const u8, follow_last: bool) Error!?Resolved {
         m.path.clearRetainingCapacity();
-        return m.walkPath(&m.path, path, follow_last, 0);
+        var links: u32 = 0;
+        // The files of a directory are asked about one after another: the directory is resolved
+        // once, not for each of them (a path 1,900 names deep is 1,900 lookups).
+        if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
+            const name = path[slash + 1 ..];
+            if (slash > 0 and name.len > 0 and !std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..")) {
+                const dir = path[0..slash];
+                if (!std.mem.eql(u8, dir, m.dir_in.items)) {
+                    const at = (try m.walkPath(&m.path, dir, true, &links)) orelse return null;
+                    if (at.node.kind != .dir) return null;
+                    m.dir_in.clearRetainingCapacity();
+                    try m.dir_in.appendSlice(m.arena, dir);
+                    m.dir_real.clearRetainingCapacity();
+                    if (!std.mem.eql(u8, at.path, "/")) try m.dir_real.appendSlice(m.arena, at.path);
+                    m.dir_links = links;
+                }
+                links = m.dir_links;
+                m.path.clearRetainingCapacity();
+                try m.path.appendSlice(m.arena, m.dir_real.items);
+                return m.walkPath(&m.path, name, follow_last, &links);
+            }
+        }
+        return m.walkPath(&m.path, path, follow_last, &links);
     }
 
     /// `path` taken from the real directory `buf` holds ("" the root), which it leaves holding
     /// where the path leads. Names are added to `buf` and cut off it again, and looked up where
-    /// they are, so a long path costs no copy of itself for each of its names.
-    fn walkPath(m: *Merged, buf: *std.ArrayList(u8), path: []const u8, follow_last: bool, links: u32) Error!?Resolved {
+    /// they are, so a long path costs no copy of itself for each of its names. `links` counts the
+    /// links taken in all of one resolution, nested ones too, as the kernel counts them (40, then
+    /// ELOOP).
+    fn walkPath(m: *Merged, buf: *std.ArrayList(u8), path: []const u8, follow_last: bool, links: *u32) Error!?Resolved {
         const arena = m.arena;
         var rest = path;
         while (true) {
@@ -384,7 +587,12 @@ const Merged = struct {
                 .file, .other => if (rest.len > 0) return null,
                 .symlink => {
                     if (rest.len == 0 and !follow_last) break;
-                    const to = (try m.follow(buf.items, parent_len, node.target, links + 1)) orelse return null;
+                    links.* += 1;
+                    if (links.* > max_links) return null;
+                    const to = (try m.follow(buf.items, parent_len, node.target, links)) orelse return null;
+                    // Something is still to be taken from where the link leads, so it must be a
+                    // directory (`lf/../real`, with `lf` a link to a file, is ENOTDIR).
+                    if (rest.len > 0 and to.node.kind != .dir) return null;
                     buf.clearRetainingCapacity();
                     if (!std.mem.eql(u8, to.path, "/")) try buf.appendSlice(arena, to.path);
                 },
@@ -394,14 +602,18 @@ const Merged = struct {
     }
 
     /// Where the link at `link` (in the directory its first `parent_len` bytes are) leads, once
-    /// all its links are taken. Kept: a thousand links to one chain take it once.
-    fn follow(m: *Merged, link: []const u8, parent_len: usize, target: []const u8, links: u32) Error!?Resolved {
-        if (links > max_links) return null;
-        if (m.leads.get(link)) |r| return r;
+    /// all its links are taken, and `links` is counted for them. Kept, with the links it took, so
+    /// that a thousand links to one chain take it once and still count it each time.
+    fn follow(m: *Merged, link: []const u8, parent_len: usize, target: []const u8, links: *u32) Error!?Resolved {
+        if (m.leads.get(link)) |lead| {
+            links.* += lead.cost;
+            return if (links.* > max_links) null else lead.to;
+        }
         var local: std.ArrayList(u8) = .empty;
         if (target.len == 0 or target[0] != '/') try local.appendSlice(m.arena, link[0..parent_len]);
+        const before = links.*;
         const to = (try m.walkPath(&local, target, true, links)) orelse return null;
-        try m.leads.put(m.arena, try m.arena.dupe(u8, link), to);
+        try m.leads.put(m.arena, try m.arena.dupe(u8, link), .{ .to = to, .cost = links.* - before });
         return to;
     }
 
@@ -842,11 +1054,11 @@ test "native hashFiles: the job's cancel ends a call in the middle of a file" {
     const big = try f.tmp.dir.createFile(std.testing.io, "l0/ws/big", .{});
     defer big.close(std.testing.io);
     big.setLength(std.testing.io, 16 << 30) catch return error.SkipZigTest;
-    var cancel: std.atomic.Value(bool) = .init(false);
+    var cancel: dagger.Cancel = .{};
     const Canceller = struct {
-        fn run(c: *std.atomic.Value(bool), io: std.Io) void {
+        fn run(c: *dagger.Cancel, io: std.Io) void {
             io.sleep(.fromMilliseconds(300), .awake) catch return;
-            c.store(true, .release);
+            c.request(std.Io.Clock.real.now(io).toMilliseconds() + 60_000);
         }
     };
     const thread = try std.Thread.spawn(.{}, Canceller.run, .{ &cancel, std.testing.io });
@@ -877,4 +1089,214 @@ test "native hashFiles: a redirect or metacopy in a layer fails the call, for a 
     if (linux.errno(linux.setxattr(try f.abs("l1/ws/copied.txt"), "user.overlay.metacopy", "", 0, 0)) != .SUCCESS)
         return error.SkipZigTest;
     try expectFailed("copied.txt is renamed or copied up", try f.hash(&.{ "l1", "l0" }, &.{"**"}));
+}
+
+/// `files` files of one byte ("x") in a directory `depth` deep under the workspace.
+fn deepDir(f: *Fixture, depth: usize, files: usize) !void {
+    var dir: std.ArrayList(u8) = .empty;
+    try dir.appendSlice(f.arena, "l0/ws");
+    for (0..depth) |_| try dir.appendSlice(f.arena, "/n");
+    try f.tmp.dir.createDirPath(std.testing.io, dir.items);
+    for (0..files) |n| try f.put(try std.fmt.allocPrint(f.arena, "{s}/f{d}", .{ dir.items, n }), "x");
+}
+
+test "native hashFiles: a directory of thousands of entries costs its entries, not the matching of each" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try deepDir(&f, 200, 12000);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const got = try hashFiles(failing.allocator(), f.arena, std.testing.io, try f.stackOf(&.{"l0"}, .{}), "/ws", "/home/runner", &.{"**"});
+    try expectHash(&hashOf(try many(f.arena, "x", 12000)), got);
+    // The matching of each path (with 200 segments) took 8 KB each and was never given back: 96 MB.
+    errdefer std.debug.print("the call took {d} bytes\n", .{failing.allocated_bytes});
+    try std.testing.expect(failing.allocated_bytes < 48 << 20);
+}
+
+test "native hashFiles: a call that would pass its memory stops at the limit, with a message" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try deepDir(&f, 100, 4000);
+    var held: std.atomic.Value(usize) = .init(0);
+    const stack = try f.stackOf(&.{"l0"}, .{ .memory = 2 << 20, .held = &held });
+    // An error of its own, not the allocator's `OutOfMemory`, and everything given back.
+    try expectFailed("would take more than 2 MiB", try f.hashWith(stack, &.{"**"}));
+    try std.testing.expectEqual(@as(usize, 0), held.load(.monotonic));
+}
+
+test "native hashFiles: the memory limit is for all calls together" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.put("l0/ws/a.txt", "a");
+    var held: std.atomic.Value(usize) = .init(0);
+    // Another call holds all but 100 bytes of the 8 MiB: this one, which needs more, fails.
+    held.store((8 << 20) - 100, .monotonic);
+    const stack = try f.stackOf(&.{"l0"}, .{ .memory = 8 << 20, .held = &held });
+    try expectFailed("would take more than 8 MiB", try f.hashWith(stack, &.{"**"}));
+    try std.testing.expectEqual(@as(usize, (8 << 20) - 100), held.load(.monotonic));
+    // With the others gone it fits.
+    held.store(0, .monotonic);
+    try expectHash(&hashOf(&.{"a"}), try f.hashWith(stack, &.{"**"}));
+}
+
+test "native hashFiles: calls running together share one limit, and give it all back" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try deepDir(&f, 60, 3000);
+    var held: std.atomic.Value(usize) = .init(0);
+    const stack = try f.stackOf(&.{"l0"}, .{ .memory = 12 << 20, .held = &held });
+    const Caller = struct {
+        fn run(st: Stack, ok: *std.atomic.Value(u32), refused: *std.atomic.Value(u32)) void {
+            const gpa = std.heap.smp_allocator;
+            const got = hashFiles(gpa, gpa, std.testing.io, st, "/ws", "/home/runner", &.{"**"}) catch return;
+            switch (got) {
+                .ok => _ = ok.fetchAdd(1, .monotonic),
+                .failed => |why| if (std.mem.indexOf(u8, why, "would take more than") != null) {
+                    _ = refused.fetchAdd(1, .monotonic);
+                },
+            }
+        }
+    };
+    var ok: std.atomic.Value(u32) = .init(0);
+    var refused: std.atomic.Value(u32) = .init(0);
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Caller.run, .{ stack, &ok, &refused });
+    for (threads) |t| t.join();
+    // Each is a result or a refusal for the limit, never a crash, and none is left holding.
+    try std.testing.expectEqual(@as(u32, 4), ok.load(.monotonic) + refused.load(.monotonic));
+    try std.testing.expect(ok.load(.monotonic) >= 1);
+    try std.testing.expectEqual(@as(usize, 0), held.load(.monotonic));
+}
+
+test "native hashFiles: a call that began after the job's cancel runs through the grace period" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try deepDir(&f, 3, 1500);
+    var cancel: dagger.Cancel = .{};
+    const now = std.Io.Clock.real.now(std.testing.io).toMilliseconds();
+    cancel.request(now + 60_000);
+    const stack = try f.stackOf(&.{"l0"}, .{ .cancel = &cancel });
+    // An `if: always()` step, or the job's outputs: evaluated as they are on GitHub.
+    try expectHash(&hashOf(try many(f.arena, "x", 1500)), try f.hashWith(stack, &.{"**"}));
+    // Past the grace period it ends.
+    cancel.hard_deadline_ms.store(now - 1000, .release);
+    try expectFailed("grace period", try f.hashWith(stack, &.{"**"}));
+}
+
+test "native hashFiles: a call that takes longer than its limit fails as GitHub's does" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.tmp.dir.createDirPath(std.testing.io, "l0/ws");
+    const big = try f.tmp.dir.createFile(std.testing.io, "l0/ws/big", .{});
+    defer big.close(std.testing.io);
+    big.setLength(std.testing.io, 4 << 30) catch return error.SkipZigTest;
+    const t0 = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    const got = try f.hashWith(try f.stackOf(&.{"l0"}, .{ .timeout_ms = 500 }), &.{"big"});
+    const took = std.Io.Clock.awake.now(std.testing.io).toMilliseconds() - t0;
+    try expectFailed("couldn't finish within 1 seconds", got);
+    errdefer std.debug.print("it took {d} ms\n", .{took});
+    try std.testing.expect(took < 5000);
+}
+
+test "native hashFiles: the settings give GitHub's 120 seconds and a share of the machine's memory" {
+    const d = (Settings{}).limits(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 120_000), d.timeout_ms);
+    try std.testing.expect(d.memory > 0 and d.memory <= 1 << 30);
+    const set = (Settings{ .memory_mb = 64, .timeout_s = 7 }).limits(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 64 << 20), set.memory);
+    try std.testing.expectEqual(@as(u64, 7000), set.timeout_ms);
+    const none = (Settings{ .memory_mb = 0, .timeout_s = 0 }).limits(std.testing.io);
+    try std.testing.expectEqual(std.math.maxInt(usize), none.memory);
+    try std.testing.expectEqual(std.math.maxInt(u64), none.timeout_ms);
+}
+
+test "native hashFiles: a directory whose opaque mark cannot be read fails the call; what is below does not show" {
+    // As root nothing is unreadable.
+    if (linux.geteuid() == 0) return error.SkipZigTest;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.put("l0/ws/d/f", "deleted below");
+    try f.tmp.dir.createDirPath(std.testing.io, "l1/ws/d");
+    if (linux.errno(linux.setxattr(try f.abs("l1/ws/d"), "user.overlay.opaque", "y", 1, 0)) != .SUCCESS)
+        return error.SkipZigTest;
+    // `rm -rf d; mkdir d; chmod 111 d`: opaque, and not readable by the runner's user.
+    const unreadable = try f.abs("l1/ws/d");
+    _ = linux.chmod(unreadable, 0o111);
+    defer _ = linux.chmod(unreadable, 0o755);
+    try expectFailed("attributes", try f.hash(&.{ "l1", "l0" }, &.{"d/f"}));
+}
+
+test "native hashFiles: a path through a link to a file is not found" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    // `lf/../real` where `lf` leads to a file: the kernel says ENOTDIR, not `real`'s contents.
+    try f.put("l0/ws/real", "real");
+    try f.put("l0/ws/real2", "real2");
+    try f.link("l0/ws/lf", "real2");
+    try f.link("l0/ws/x", "lf/../real");
+    try expectFailed("x: No such file", try f.hash(&.{"l0"}, &.{"x"}));
+}
+
+test "native hashFiles: 40 links in one path are the most, however they are nested" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    // Three chains of 20 links, one in each directory: 61 links with the one that names the path.
+    try f.put("l0/ws/end.txt", "end");
+    try f.tmp.dir.createDirPath(std.testing.io, "l0/ws/d1");
+    try f.tmp.dir.createDirPath(std.testing.io, "l0/ws/d2");
+    for ([_][2][]const u8{
+        .{ "l0/ws/a", "d1" },
+        .{ "l0/ws/d1/b", "../d2" },
+        .{ "l0/ws/d2/c", "../end.txt" },
+    }) |chain| {
+        var i: usize = 1;
+        while (i <= 20) : (i += 1) {
+            const target = if (i == 20) chain[1] else try std.fmt.allocPrint(f.arena, "{s}{d}", .{ std.fs.path.basename(chain[0]), i + 1 });
+            try f.link(try std.fmt.allocPrint(f.arena, "{s}{d}", .{ chain[0], i }), target);
+        }
+    }
+    try f.link("l0/ws/long", "a1/b1/c1");
+    try expectFailed("long: No such file", try f.hash(&.{"l0"}, &.{"long"}));
+    // 21 links are fine (the chain in `d2` is 20, and the one that names the path).
+    try f.link("l0/ws/ok", "d2/c1");
+    try expectHash(&hashOf(&.{"end"}), try f.hash(&.{"l0"}, &.{"ok"}));
+}
+
+test "native hashFiles: a file with more attributes than a short list holds is read" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    // A tmpfs keeps up to 128 KiB of them; ext4, where the tests' directories are, 4 KiB in all.
+    var raw: [6]u8 = undefined;
+    io.random(&raw);
+    const dir = try std.fmt.allocPrint(arena, "/dev/shm/zr-hashfiles-{s}", .{&std.fmt.bytesToHex(raw, .lower)});
+    std.Io.Dir.cwd().createDirPath(io, try std.fmt.allocPrint(arena, "{s}/ws", .{dir})) catch return error.SkipZigTest;
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const file = try std.fmt.allocPrintSentinel(arena, "{s}/ws/a.txt", .{dir}, 0);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = "a" });
+    for (0..400) |i| {
+        const name = try std.fmt.allocPrintSentinel(arena, "user.zr-test-attribute-with-a-long-name-{d}", .{i}, 0);
+        if (linux.errno(linux.setxattr(file, name, "v", 1, 0)) != .SUCCESS) return error.SkipZigTest;
+    }
+    const stack: Stack = .{ .layers = &.{dir}, .opaque_xattr = "user.overlay.opaque" };
+    const got = try hashFiles(std.testing.allocator, arena, io, stack, "/ws", "/home/runner", &.{"**"});
+    try expectHash(&hashOf(&.{"a"}), got);
 }

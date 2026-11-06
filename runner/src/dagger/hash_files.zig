@@ -43,7 +43,7 @@ pub fn hashFiles(
     // A native job has no Dagger session: its files are in the layers (`native/hash_files.zig`).
     if (x.native) |b| return b.hashFiles(arena, ws, args);
     var dfs: Fs = .{ .x = x };
-    const files = switch (try glob.find(arena, dfs.fs(), args, ws, runner_home, glob.max_nodes, &dfs.why)) {
+    const files = switch (try glob.find(arena, dfs.fs(), args, ws, runner_home, std.math.maxInt(usize), &dfs.why)) {
         .failed => |msg| return .{ .failed = msg },
         .files => |f| f,
     };

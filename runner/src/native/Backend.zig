@@ -76,6 +76,8 @@ js_runtime: config.JsRuntime = .bun,
 /// Set when the job is cancelled, which ends a `hashFiles()` in the middle of a file; the runner's
 /// (`dagger.runNative` hands it over).
 cancel: ?*dagger.Cancel = null,
+/// What a `hashFiles()` may use (`Config.hash_files`).
+hash_settings: hash_files.Settings = .{},
 /// Local actions read so far before the job (`actions.readOwn`), naming their files.
 preflights: u32 = 0,
 /// Why the last Dockerfile could not be planned or built, for the step's message.
@@ -212,6 +214,9 @@ pub const Config = struct {
     /// Where the jobs' cgroups go and their limits (`RUNNER_NATIVE_CGROUP`,
     /// `RUNNER_NATIVE_MEMORY_MAX_MB`, `RUNNER_NATIVE_PIDS_MAX`).
     cgroup: cgroup.Config = .{},
+    /// What a `hashFiles()` may use: the memory all of them may hold together, and the time one
+    /// may take (`RUNNER_NATIVE_HASHFILES_MEMORY_MB`, `RUNNER_NATIVE_HASHFILES_TIMEOUT_S`).
+    hash_files: hash_files.Settings = .{},
     /// The runner's place at the memory gate: told of the job's cgroup (`admission.Gate.native`).
     gate: ?*admission.Gate = null,
     /// Tests: see `Backend.test_seed_script`.
@@ -286,6 +291,10 @@ pub fn configFor(
         .subnet = try net.Subnet.parse(cfg.native_subnet),
         .store_max_bytes = cfg.native_store_max_mb * 1024 * 1024,
         .cgroup = cg,
+        .hash_files = .{
+            .memory_mb = cfg.native_hashfiles_memory_mb,
+            .timeout_s = cfg.native_hashfiles_timeout_s,
+        },
         .job_limits = jobLimits(arena, io, cg),
     };
 }
@@ -723,6 +732,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .images_dir = cfg.images,
         .service_binds = cfg.service_binds,
         .self_exe = cfg.self_exe,
+        .hash_settings = cfg.hash_files,
     };
     errdefer b.deinit();
     if (cfg.test_fail_after_lock) return error.TestFailure;
@@ -1815,11 +1825,9 @@ pub fn hashFiles(
     for (b.layers.items, 0..) |l, i| layers[n - 1 - i] = l.path;
     @memcpy(layers[n..][0..b.seed_layers.items.len], b.seed_layers.items);
     layers[layers.len - 1] = b.rootfs;
-    const stack: hash_files.Stack = .{
-        .layers = layers,
-        .opaque_xattr = b.opaqueXattr(),
-        .limits = .{ .cancel = if (b.cancel) |c| &c.requested else null },
-    };
+    var limits = b.hash_settings.limits(b.io);
+    limits.cancel = b.cancel;
+    const stack: hash_files.Stack = .{ .layers = layers, .opaque_xattr = b.opaqueXattr(), .limits = limits };
     // The call's own memory is freed when it returns; the job's arena gets the result only.
     return hash_files.hashFiles(b.gpa, arena, b.io, stack, ws, dagger.runner_home, args);
 }

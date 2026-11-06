@@ -705,6 +705,11 @@ pub const Fs = struct {
         list: *const fn (ptr: *anyopaque, arena: Allocator, dirs: []const []const u8) Error![]const []const []const u8,
         /// Each path with every symbolic link resolved; null when this file system cannot.
         realpath: ?*const fn (ptr: *anyopaque, arena: Allocator, paths: []const []const u8) Error![]const []const u8,
+        /// Called for each path the walk matches and each directory it lists, between the calls
+        /// above: an error ends the walk. The walk itself can run long without asking `fs`
+        /// anything (a directory of a million entries), so this is where a caller counts its
+        /// work, watches its clock and sees a cancel.
+        poll: ?*const fn (ptr: *anyopaque) Error!void = null,
     };
 };
 
@@ -749,20 +754,25 @@ pub fn find(
     return .{ .files = files.items };
 }
 
+/// One path the walk visits. 32 bytes: a monorepo is a million of them.
 const Node = struct {
     path: []const u8,
-    parent: ?u32,
-    real: []const u8 = "",
+    parent: u32,
     yield_file: bool = false,
-    children: []const u32 = &.{},
+    /// Its children, which were made together: the nodes `first` to `first + count`.
+    first: u32 = 0,
+    count: u32 = 0,
 };
 
-/// How many files and directories one walk may visit. With `--follow-symbolic-links` a tree of
+const no_node = std.math.maxInt(u32);
+
+/// How many files and directories one walk may visit on the native backend (`walk` itself, and the
+/// Dagger path, have no limit). With `--follow-symbolic-links` a tree of
 /// links can name the same directory by exponentially many paths (a directory whose two links lead
 /// to the next, twenty-five deep), and @actions/glob only breaks cycles through a directory's own
 /// ancestors. A real monorepo with its `node_modules` has a few hundred thousand entries (the
 /// Linux kernel has about 90,000 files), so a million leaves room, and costs a few hundred MB of
-/// the call's memory at most before the walk stops.
+/// memory (`native/hash_files.zig`, Limits) before the walk stops.
 pub const max_nodes: usize = 1_000_000;
 
 /// @actions/glob's walk (`globGenerator`), batched: each level of the tree is matched, looked at
@@ -777,7 +787,7 @@ pub fn walk(
     within: []const u8,
     why: *[]const u8,
 ) Allocator.Error!Walked {
-    return walkLimited(arena, fs, patterns_in, follow, within, max_nodes, why);
+    return walkLimited(arena, fs, patterns_in, follow, within, std.math.maxInt(usize), why);
 }
 
 /// `walk`, failing when it would visit more than `limit` files and directories.
@@ -795,30 +805,44 @@ pub fn walkLimited(
     var nodes: std.ArrayList(Node) = .empty;
     var roots: std.ArrayList(u32) = .empty;
     var frontier: std.ArrayList(u32) = .empty;
+    // Where each directory really is, when links are followed: to see a cycle.
+    var where: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
     for (try searchPaths(arena, patterns)) |sp| {
         if (!relevant(sp, within)) continue;
         try roots.append(arena, @intCast(nodes.items.len));
         try frontier.append(arena, @intCast(nodes.items.len));
-        try nodes.append(arena, .{ .path = sp, .parent = null });
+        try nodes.append(arena, .{ .path = sp, .parent = no_node });
     }
 
+    // What the walk keeps is the nodes (and their paths) in `arena`; what it needs to look at one
+    // path, one level, is in arenas that are reset after, so a directory of a million entries
+    // costs its entries and not also the matching of each.
+    var scratch: std.heap.ArenaAllocator = .init(arena);
+    defer scratch.deinit();
+    var level_arena: std.heap.ArenaAllocator = .init(arena);
+    defer level_arena.deinit();
+
     while (frontier.items.len > 0) {
+        try recycle(&level_arena);
+        const level = level_arena.allocator();
         // Match first, as @actions/glob does: what cannot match, and has nothing below that can,
         // is not even looked at.
         var kept: std.ArrayList(u32) = .empty;
         var kinds_of: std.ArrayList(u2) = .empty;
         var paths: std.ArrayList([]const u8) = .empty;
         for (frontier.items) |n| {
+            if (fs.vtable.poll) |poll| poll(fs.ptr) catch |e| return failed(arena, e, why);
             const path = nodes.items[n].path;
-            const m = try matchAll(arena, patterns, path);
-            const partial = m != MatchKind.none or try partialAll(arena, patterns, path);
+            try recycle(&scratch);
+            const m = try matchAll(scratch.allocator(), patterns, path);
+            const partial = m != MatchKind.none or try partialAll(scratch.allocator(), patterns, path);
             if (m == MatchKind.none and !partial) continue;
-            try kept.append(arena, n);
-            try kinds_of.append(arena, if (partial and m == MatchKind.none) 0 else m);
-            try paths.append(arena, path);
+            try kept.append(level, n);
+            try kinds_of.append(level, if (partial and m == MatchKind.none) 0 else m);
+            try paths.append(level, path);
         }
         if (kept.items.len == 0) break;
-        const kinds = fs.vtable.stat(fs.ptr, arena, paths.items, follow) catch |e| return failed(e, why);
+        const kinds = fs.vtable.stat(fs.ptr, level, paths.items, follow) catch |e| return failed(arena, e, why);
 
         var dirs: std.ArrayList(u32) = .empty;
         var dir_paths: std.ArrayList([]const u8) = .empty;
@@ -829,8 +853,8 @@ pub fn walkLimited(
                 .directory => {
                     // `match & Directory` yields the directory (not wanted here) and descends;
                     // otherwise only a partial match descends, and everything kept is one.
-                    try dirs.append(arena, n);
-                    try dir_paths.append(arena, nodes.items[n].path);
+                    try dirs.append(level, n);
+                    try dir_paths.append(level, nodes.items[n].path);
                 },
                 else => if (m & MatchKind.file != 0) {
                     nodes.items[n].yield_file = true;
@@ -839,47 +863,53 @@ pub fn walkLimited(
         }
         if (follow and dirs.items.len > 0) {
             // A directory that is one of its own ancestors, through a link, is a cycle: skipped.
-            const reals = fs.vtable.realpath.?(fs.ptr, arena, dir_paths.items) catch |e| return failed(e, why);
+            const reals = fs.vtable.realpath.?(fs.ptr, level, dir_paths.items) catch |e| return failed(arena, e, why);
             var acyclic: std.ArrayList(u32) = .empty;
             var acyclic_paths: std.ArrayList([]const u8) = .empty;
             for (dirs.items, reals) |n, real| {
-                nodes.items[n].real = real;
+                try where.put(arena, n, try arena.dupe(u8, real));
                 var cycle = false;
                 var a = nodes.items[n].parent;
-                while (a) |i| : (a = nodes.items[i].parent) {
-                    if (std.mem.eql(u8, nodes.items[i].real, real)) cycle = true;
+                while (a != no_node) : (a = nodes.items[a].parent) {
+                    if (where.get(a)) |r| if (std.mem.eql(u8, r, real)) {
+                        cycle = true;
+                    };
                 }
                 if (cycle) continue;
-                try acyclic.append(arena, n);
-                try acyclic_paths.append(arena, nodes.items[n].path);
+                try acyclic.append(level, n);
+                try acyclic_paths.append(level, nodes.items[n].path);
             }
             dirs = acyclic;
             dir_paths = acyclic_paths;
         }
         frontier.clearRetainingCapacity();
         if (dirs.items.len == 0) break;
-        const listed = fs.vtable.list(fs.ptr, arena, dir_paths.items) catch |e| return failed(e, why);
+        const listed = fs.vtable.list(fs.ptr, level, dir_paths.items) catch |e| return failed(arena, e, why);
         for (dirs.items, listed) |n, names_in| {
+            if (fs.vtable.poll) |poll| poll(fs.ptr) catch |e| return failed(arena, e, why);
             // In byte order, as libuv's scandir gives them to Node.
-            const names = try arena.dupe([]const u8, names_in);
+            const names = try level.dupe([]const u8, names_in);
             std.mem.sort([]const u8, names, {}, struct {
                 fn lt(_: void, l: []const u8, r: []const u8) bool {
                     return std.mem.lessThan(u8, l, r);
                 }
             }.lt);
-            var children: std.ArrayList(u32) = .empty;
+            const first = std.math.cast(u32, nodes.items.len) orelse return error.OutOfMemory;
+            const parent = nodes.items[n].path;
+            const slash = if (std.mem.endsWith(u8, parent, "/")) "" else "/";
             for (names) |name| {
-                const parent = nodes.items[n].path;
-                const child = try std.mem.concat(arena, u8, &.{ parent, if (std.mem.endsWith(u8, parent, "/")) "" else "/", name });
+                if (fs.vtable.poll) |poll| poll(fs.ptr) catch |e| return failed(arena, e, why);
+                try recycle(&scratch);
+                const child = try std.mem.concat(scratch.allocator(), u8, &.{ parent, slash, name });
                 if (!relevant(child, within)) continue;
                 if (nodes.items.len >= limit) return .{ .failed = try std.fmt.allocPrint(arena, "the search " ++
                     "met more than {d} files and directories (links that lead to the same directories " ++
                     "by many paths, perhaps): narrow the patterns", .{limit}) };
-                try children.append(arena, @intCast(nodes.items.len));
                 try frontier.append(arena, @intCast(nodes.items.len));
-                try nodes.append(arena, .{ .path = child, .parent = n });
+                try nodes.append(arena, .{ .path = try arena.dupe(u8, child), .parent = n });
             }
-            nodes.items[n].children = children.items;
+            nodes.items[n].first = first;
+            nodes.items[n].count = std.math.cast(u32, nodes.items.len - first) orelse return error.OutOfMemory;
         }
     }
 
@@ -891,19 +921,27 @@ pub fn walkLimited(
         while (stack.pop()) |n| {
             const node = nodes.items[n];
             if (node.yield_file) try out.append(arena, node.path);
-            var i = node.children.len;
+            var i = node.count;
             while (i > 0) {
                 i -= 1;
-                try stack.append(arena, node.children[i]);
+                try stack.append(arena, node.first + i);
             }
         }
     }
     return .{ .files = out.items };
 }
 
-fn failed(e: Fs.Error, why: *[]const u8) Allocator.Error!Walked {
+/// Empties the arena for its next use, keeping what it holds. `reset` answers false when it could
+/// not keep it, having made do without: that is an allocation that failed, and not one to pass over.
+fn recycle(a: *std.heap.ArenaAllocator) Allocator.Error!void {
+    if (!a.reset(.retain_capacity)) return error.OutOfMemory;
+}
+
+/// The walk failed because its file system did; its words (which may be in a level's arena, gone
+/// when the walk returns) are copied to `arena`.
+fn failed(arena: Allocator, e: Fs.Error, why: *[]const u8) Allocator.Error!Walked {
     if (e == error.OutOfMemory) return error.OutOfMemory;
-    return .{ .failed = if (why.*.len > 0) why.* else "the file system could not be read" };
+    return .{ .failed = if (why.*.len > 0) try arena.dupe(u8, why.*) else "the file system could not be read" };
 }
 
 /// Whether anything at or below `path` can be inside `within`: it is inside, or on the way there.
@@ -1236,4 +1274,65 @@ test "remembering failed globstar tries agrees with backtracking" {
             };
         }
     }
+}
+
+/// A workspace of one directory of `names` files, which only counts what it is asked, and says
+/// "stop" from its `poll` once it has been asked `stop_after` times.
+const Wide = struct {
+    names: usize,
+    stop_after: usize,
+    polls: usize = 0,
+    stats: usize = 0,
+
+    fn of(ptr: *anyopaque) *Wide {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn fs(w: *Wide) Fs {
+        return .{ .ptr = w, .vtable = &.{ .stat = stat, .list = list, .realpath = null, .poll = poll } };
+    }
+
+    fn stat(ptr: *anyopaque, arena: Allocator, paths: []const []const u8, _: bool) Fs.Error![]const Kind {
+        const w = Wide.of(ptr);
+        w.stats += 1;
+        const out = try arena.alloc(Kind, paths.len);
+        for (paths, out) |p, *k| k.* = if (std.mem.eql(u8, p, "/w")) .directory else .file;
+        return out;
+    }
+
+    fn list(ptr: *anyopaque, arena: Allocator, dirs: []const []const u8) Fs.Error![]const []const []const u8 {
+        const w = Wide.of(ptr);
+        const out = try arena.alloc([]const []const u8, dirs.len);
+        for (out) |*names| {
+            const l = try arena.alloc([]const u8, w.names);
+            for (l, 0..) |*n, i| n.* = try std.fmt.allocPrint(arena, "f{d}", .{i});
+            names.* = l;
+        }
+        return out;
+    }
+
+    fn poll(ptr: *anyopaque) Fs.Error!void {
+        const w = Wide.of(ptr);
+        w.polls += 1;
+        if (w.polls > w.stop_after) return error.FsFailed;
+    }
+};
+
+test "the walk asks its file system whether to go on for each path it matches, not only between calls" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    var wide: Wide = .{ .names = 3000, .stop_after = 500 };
+    var why: []const u8 = "";
+    const p = try testPattern(ar, "**");
+    // The first level has one directory; the second 3000 files, matched one after the other:
+    // it stops among them, before the second `stat`.
+    const got = try walk(ar, wide.fs(), &.{p}, false, "/w", &why);
+    try std.testing.expect(got == .failed);
+    try std.testing.expectEqual(@as(usize, 1), wide.stats);
+    try std.testing.expect(wide.polls < 700);
+    // Not stopped, the same walk goes through every file.
+    var open: Wide = .{ .names = 3000, .stop_after = std.math.maxInt(usize) };
+    const all = try walk(ar, open.fs(), &.{p}, false, "/w", &why);
+    try std.testing.expectEqual(@as(usize, 3000), all.files.len);
 }

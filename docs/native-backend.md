@@ -211,6 +211,9 @@ RUNNER_NATIVE_CGROUP=                             # default: /sys/fs/cgroup/zig-
                                                   # none rootless; `self`, `none`, or a path
 RUNNER_NATIVE_MEMORY_MAX_MB=                      # default 3/4 of MemTotal; 0 for no limit
 RUNNER_NATIVE_PIDS_MAX=8192                       # default; 0 for no limit
+RUNNER_NATIVE_HASHFILES_MEMORY_MB=                # default min(1 GiB, MemTotal/8), for all jobs'
+                                                  # hashFiles() together; 0 for no limit
+RUNNER_NATIVE_HASHFILES_TIMEOUT_S=120             # default, GitHub's; 0 for no limit
 RUNNER_NATIVE_MEM_PER_JOB_MB=256                  # default; the memory gate's reservation for a
                                                   # native job not learned yet (P4); 0 for none
 ```
@@ -1786,21 +1789,42 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
   `hashFiles()` there is an error and the variable stays unset, on both backends (GitHub does not
   allow it there either).
 - **The job decides how much work a call is, so a call has limits** (`hash_files.Limits`, the
-  walk's in `glob.zig`). The walk visits at most 1,000,000 files and directories: with
-  `--follow-symbolic-links` two links per directory, twenty-five deep, name one directory by 2^25
-  paths (72 inodes took 4 GB), and @actions/glob only breaks cycles through a directory's own
-  ancestors. A monorepo with its `node_modules` is a few hundred thousand entries (the Linux
-  kernel about 90,000 files), so a million leaves room; the Dagger path shares the walk and the
-  limit. A call takes at most 200 million path components and 2 GiB, in an arena of its own that is
-  freed when it returns (only the result goes to the job's), and each path name is looked up in
-  place and each followed link remembered, so a path 1,000 deep or a chain of 4 KB links costs
-  what it holds, not a copy of the path for every name of it (a 300-deep path with 1,500 files
-  took 387 MB before and 18 MB after; 3,000 links to one chain 497 MB before and 17 MB after).
-  The job's cancel (`dagger.Cancel.requested`, handed to the backend) is polled at every step
-  and every 64 KiB read, so a cancelled or timed-out job stops within a block: `Watch` cannot,
-  as no sandbox runs while expressions are evaluated. A file is read in full however large and
-  sparse, since the hash is GitHub's and has no shortcut for holes (`SEEK_HOLE` would change it);
-  a 16 TiB file takes hours until the job is cancelled, as it does on GitHub.
+  walk's in `glob.zig`). Only the native path has them; the Dagger path's walk has none, as before.
+  - *Files and directories:* at most 1,000,000 a walk. With `--follow-symbolic-links` two links
+    per directory, twenty-five deep, name one directory by 2^25 paths (72 inodes took 4 GB), and
+    @actions/glob only breaks cycles through a directory's own ancestors. A monorepo with its
+    `node_modules` is a few hundred thousand entries (the Linux kernel about 90,000 files), so a
+    million leaves room.
+  - *Memory, for all calls of the process together:* an allocator under each call's arena counts
+    every byte against one process-wide budget and refuses what would pass it, wherever the call
+    is (matching, listing, building paths), so the call fails with a message where it stands. The
+    default is the smaller of 1 GiB and an eighth of `MemTotal`; `RUNNER_NATIVE_HASHFILES_MEMORY_MB`
+    sets it (0 for none). The memory is the runner's, outside the job's cgroup, so it is one limit
+    for all slots: two big calls that do not fit together make one fail. What a walk keeps is 32
+    bytes a node and its path; the rest of what it needs is reset per path and per level. Measured
+    (counted bytes, which run about twice the resident ones): a 900,000-entry monorepo with
+    `hashFiles('**/package-lock.json', '!**/node_modules/**')` takes under 1 GiB counted and 450 MB
+    resident, in 15 s; `**` over it takes 1.4 GiB counted, about 1.5 KB an entry (the earlier "1 KB
+    each" was a guess), so it needs the setting raised on a big host and fails with the message on
+    a small one.
+  - *Steps:* at most 200 million path components, and each path name is looked up in place, each
+    followed link remembered (with the links it took, as the kernel counts them: 40 in one path,
+    nested ones too) and a directory resolved once for its files, so a path 1,900 deep or a chain
+    of 4 KB links costs what it holds, not a copy of the path for every name of it.
+  - *Time:* GitHub's own limit. actions/runner's `HashFilesFunction.cs` has
+    `_hashFileTimeoutSeconds = 120` and throws "hashFiles(...) couldn't finish within 120
+    seconds", so a file that takes hours does not on GitHub either (an earlier version of this
+    note said it did). The clock is read every 1,024 steps (every 64 MiB of a file), and
+    `RUNNER_NATIVE_HASHFILES_TIMEOUT_S` sets the seconds (0 for none), since a Pi on an SD card is
+    far slower. A step's `timeout-minutes` does not reach an expression, so this is the bound. A
+    file is read in full however large and sparse: the hash is GitHub's, which has no shortcut for
+    holes.
+  - *Cancel:* the job's cancel (`dagger.Cancel`, handed to the backend) is seen at every step, the
+    walk's included (`glob.Fs.poll`), so a cancelled job stops within a second in the middle of
+    matching, listing or a file; `Watch` cannot, as no sandbox runs while expressions are
+    evaluated. A call that *begins* after the cancel (an `if: always()` or `if: cancelled()`
+    cleanup step, the job's outputs) is not cut short, as on GitHub in the grace period: it ends
+    at the cancel's `hard_deadline_ms`, or at the time limit.
 - **Overlay's redirects and metacopy fail the call.** `Merged` does not follow them, and a hash
   of what they hide would be wrong without a word, so a layer entry that has either attribute
   fails `hashFiles()` with a message. The runner never asks for them, but a host's kernel may
