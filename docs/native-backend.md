@@ -61,6 +61,32 @@ migration is a hybrid by construction, and each phase shrinks the list of reason
 per job, never per step: switching mid-job would mean exporting native layers into Dagger at each
 switch and splitting the step cache's key chain across two stores (DESIGN.md, "Per job").
 
+### Running with no engine
+
+`RUNNER_ENGINE=none` (or `--engine=none`), with `RUNNER_BACKEND=native` (any other backend is a
+configuration error, `EngineNoneNeedsNative`), is a runner with no Dagger engine at all. It is a
+setting, not a detection: a runner that noticed the engine's absence and changed what it does would
+turn a stopped engine, which today makes a job wait, into failed jobs nobody asked for, so the
+default (`direct`) behaves exactly as before. With `none`:
+
+- **Start-up.** No engine is looked for. The pre-warm is skipped ("pre-warm skipped:
+  RUNNER_ENGINE=none"), so there is no socket to poll every 5 s and no lock on the engine's
+  directory. The memory gate has no engine source (as `RUNNER_ENGINE_CGROUP=none`): it holds on the
+  machine and on each job's cgroup, and logs nothing about an engine cgroup. The silence-timeout
+  line is not printed.
+- **Jobs.** A job native can run runs natively as always. One it cannot (`Backend.unsupported` or
+  `usable` give a reason, or the set-up falls back) fails before any step, in "Set up job", with
+  "this job needs the Dagger engine, and this runner has none (RUNNER_ENGINE=none). This job runs on
+  Dagger: <the reason native gave>." It does not start a `dagger` child or connect to a socket.
+- **Deploy.** `deploy/compose.engineless.yaml` layered over `compose.yaml` drops the engine service,
+  its volumes and the runner's `depends_on`. The native backend needs the privileges
+  the engine service has today (`privileged: true`, or `cap_add: [SYS_ADMIN, ...]`, above): give them
+  to the runner in your override.
+
+What still needs an engine: steps that use the Dagger engine (`RUNNER_DAGGER_NESTING`), and
+whatever native lists as unsupported at the time. This is the list the fallbacks are being retired
+from; a job on it fails fast instead of waiting.
+
 ## Phases
 
 Each phase lands behind the knob with the default unchanged, its tests green, its measurements in
@@ -2104,3 +2130,14 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
   the gain is a hash of a file in the job's own container; so it is not done.
 - **A file is looked at before it is opened.** Its type is read from an `O_PATH` descriptor and
   the file opened through that descriptor, so a pipe is refused and not waited for.
+
+### Running with no engine
+
+- **A setting beats a probe.** "No engine reachable" cannot tell an engine that is restarting (jobs
+  should wait, as they do) from one that was never there. `RUNNER_ENGINE=none` says it, and the
+  default path is not touched: the only new branch on it is a boolean that is false.
+- **Everything that waited for the engine was already off the native path.** A native job never
+  opened an engine session, so the cost of a missing engine was in the background and in the
+  fallback: the pre-warm polling the socket and queueing for the engine's turn, the gate looking
+  for the engine's cgroup, and a job sent to Dagger (`backToEngine`) hanging on a socket that is
+  not there. The last is the one that mattered: it now fails at once with the reason native gave.
