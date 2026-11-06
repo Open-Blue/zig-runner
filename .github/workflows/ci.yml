@@ -137,7 +137,7 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             status=0
-            pipx run zizmor==1.31.1 --format github .github/workflows || status=$?
+            .github/scripts/zizmor.sh --format github .github/workflows || status=$?
             ((status == 1 && attempt < 3)) || exit "$status"
             echo "::warning::zizmor could not run (exit 1; attempt $attempt of 3), most likely a failed request to GitHub: trying again"
             sleep $((attempt * 15))
@@ -322,6 +322,13 @@ jobs:
             echo "::$stop::" >&2
             exit "$status"
           fi
+
+      # Every test in runner/src is one the test binary has: a file that nothing reached compiled
+      # and passed with its tests never run (github/http.zig's, until #326). Its compile is the
+      # tests' on a runner that ran them with zig-test.sh, cached.
+      - name: Every test file is compiled
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/test-files.sh
 
   # The release's own builds, both targets in ReleaseSafe (build-binaries.sh), which nothing else
   # compiles before the tag: the tests build x86_64 in Debug, and release.yml's checks run only for

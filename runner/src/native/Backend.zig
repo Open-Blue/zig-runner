@@ -15,6 +15,7 @@ const Backend = @This();
 const std = @import("std");
 const job_mod = @import("../job.zig");
 const config = @import("../config.zig");
+const expr = @import("../expr.zig");
 const dagger = @import("../dagger.zig");
 const sandbox = @import("sandbox.zig");
 const net = @import("net.zig");
@@ -25,10 +26,13 @@ const ImageStore = @import("oci/Store.zig");
 const http = @import("../github/http.zig");
 const docker = @import("../dagger/docker.zig");
 const cgroup = @import("cgroup.zig");
+const evict = @import("evict.zig");
 const volumes = @import("volumes.zig");
+const trees_check = @import("tool_trees.zig");
 const admission = @import("../admission.zig");
 const services = @import("services.zig");
 const images = @import("images.zig");
+const container_options = @import("container_options.zig");
 const native_actions = @import("actions.zig");
 const Exec = @import("../dagger/Exec.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
@@ -37,6 +41,7 @@ const checkout = @import("../dagger/checkout.zig");
 const scripts = @import("../dagger/scripts.zig");
 const set_up = @import("../dagger/set_up.zig");
 const phases = @import("phases.zig");
+const hash_files = @import("hash_files.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -61,6 +66,8 @@ image_env: []const []const u8 = &.{"PATH=" ++ image_path},
 /// Who the image's `USER` is, for steps that do not run as the runner user.
 image_uid: u32 = 0,
 image_gid: u32 = 0,
+/// What a `container:` job's `options:` ask for (`container_options.zig`), read by `base`.
+container_opts: container_options.Options = .{},
 /// A `container:` job's PATH once its env is set (`dagger.Base.runtime_path`).
 runtime_path: ?[]const u8 = null,
 /// Where the job's time went (`phases.zig`): its set-up, each sandbox and publish, its teardown.
@@ -71,6 +78,11 @@ notes: std.ArrayList([]const u8) = .empty,
 actions: std.StringHashMapUnmanaged(Exec.LoadResult) = .empty,
 /// The JavaScript runtime JavaScript actions run with (`Options.js_runtime`, `actions.preload`).
 js_runtime: config.JsRuntime = .bun,
+/// Set when the job is cancelled, which ends a `hashFiles()` in the middle of a file; the runner's
+/// (`dagger.runNative` hands it over).
+cancel: ?*dagger.Cancel = null,
+/// What a `hashFiles()` may use (`Config.hash_files`).
+hash_settings: hash_files.Settings = .{},
 /// Local actions read so far before the job (`actions.readOwn`), naming their files.
 preflights: u32 = 0,
 /// Why the last Dockerfile could not be planned or built, for the step's message.
@@ -148,8 +160,15 @@ gate: ?*admission.Gate = null,
 /// What the job's options say of caches, and what it got of them (`setUpCaches`).
 caches: volumes.Options = .{},
 cache_plan: volumes.Plan = .{},
+/// `ZIG_RUNNER_TOOL_TREES`' value, when "Set up job" checked the tool cache's trees
+/// (`checkToolTrees`): a step's key holds it, and `Exec.toolDirNotHeld` reads it.
+tool_trees: ?[]const u8 = null,
+/// `trees_check.full_env`'s value, set with it.
+tool_trees_full: ?[]const u8 = null,
 /// The Zig cache seeds' layers, between the job's layers and the rootfs.
 seed_layers: std.ArrayList([]const u8) = .empty,
+/// What the keys know each seed by (`volumes.seedId`): its path, and which build it is.
+seed_ids: std.ArrayList([]const u8) = .empty,
 /// Tests: the Zig cache seed's build, in place of downloading and running a Zig release.
 test_seed_script: ?[]const u8 = null,
 
@@ -192,6 +211,8 @@ pub const Config = struct {
     /// Past this many bytes, the store's least recently used layers go
     /// (`RUNNER_NATIVE_STORE_MAX_MB`, `Store.collect`).
     store_max_bytes: u64 = Store.default_max_bytes,
+    /// What the store keeps beside the layers (`evict.zig`).
+    store_limits: evict.Limits = .{},
     /// Tests: the stack of layers is flattened past this many (`flatten`).
     flatten_at: usize = default_flatten_at,
     /// Tests: services' images from a directory filled ahead (`images.find`: `rootfs/` and
@@ -207,6 +228,9 @@ pub const Config = struct {
     /// Where the jobs' cgroups go and their limits (`RUNNER_NATIVE_CGROUP`,
     /// `RUNNER_NATIVE_MEMORY_MAX_MB`, `RUNNER_NATIVE_PIDS_MAX`).
     cgroup: cgroup.Config = .{},
+    /// What a `hashFiles()` may use: the memory all of them may hold together, and the time one
+    /// may take (`RUNNER_NATIVE_HASHFILES_MEMORY_MB`, `RUNNER_NATIVE_HASHFILES_TIMEOUT_S`).
+    hash_files: hash_files.Settings = .{},
     /// The runner's place at the memory gate: told of the job's cgroup (`admission.Gate.native`).
     gate: ?*admission.Gate = null,
     /// Tests: see `Backend.test_seed_script`.
@@ -280,7 +304,16 @@ pub fn configFor(
         .subid_base = cfg.native_subid_base,
         .subnet = try net.Subnet.parse(cfg.native_subnet),
         .store_max_bytes = cfg.native_store_max_mb * 1024 * 1024,
+        .store_limits = .{
+            .volumes_max_bytes = cfg.native_volumes_max_mb * 1024 * 1024,
+            .images_max_bytes = cfg.native_images_max_mb * 1024 * 1024,
+            .min_free_pct = cfg.native_min_free_pct,
+        },
         .cgroup = cg,
+        .hash_files = .{
+            .memory_mb = cfg.native_hashfiles_memory_mb,
+            .timeout_s = cfg.native_hashfiles_timeout_s,
+        },
         .job_limits = jobLimits(arena, io, cg),
     };
 }
@@ -360,11 +393,15 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
     if (std.os.linux.geteuid() != 0 and !cfg.rootless) return "the runner is not root, and " ++
         "rootless native steps have only one id mapped (RUNNER_NATIVE_ROOTLESS=1 runs them " ++
         "anyway; subordinate ids are phase 5's)";
-    if (job.container) |jc| if (jc.ports.len > 0 or jc.volumes.len > 0 or jc.options != null)
-        return "a job container's `ports:`, `volumes:` and `options:` are not native yet (phase 6)";
+    if (job.container) |jc| {
+        const default_image = switch (jc.image) {
+            .lit => |l| std.mem.eql(u8, dagger.resolveImage(l), dagger.default_image),
+            .expr => true,
+        };
+        if (container_options.unsupported(jc, opts.provision and default_image)) |why| return why;
+    }
     if (job.services.len > 0) if (servicesUnsupported(job, cfg)) |why| return why;
     if (opts.nesting) return "steps that use the Dagger engine (RUNNER_DAGGER_NESTING) need Dagger";
-    if (usesHashFiles(job)) return "`hashFiles()` reads the job's container through Dagger";
     // dpkg gives files to other users and groups (`root:adm`), which one mapped id cannot hold.
     if (std.os.linux.geteuid() != 0 and cfg.rootfs.len == 0 and opts.provision and
         std.mem.eql(u8, dagger.resolveImage(if (job.container) |jc| switch (jc.image) {
@@ -382,16 +419,7 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         .uses => {},
         // Native when their image is in the native store (`docker_action.unsupported`).
         .docker => {},
-        .checkout => |inputs| for (inputs) |in| {
-            if (!std.mem.eql(u8, in.name, "submodules")) continue;
-            const lit = switch (in.value) {
-                .lit => |l| l,
-                else => "true",
-            };
-            if (!std.mem.eql(u8, lit, "false")) return "a checkout with submodules is not " ++
-                "native yet";
-        },
-        .script, .unsupported => {},
+        .checkout, .script, .unsupported => {},
     };
     return null;
 }
@@ -418,46 +446,6 @@ fn servicesUnsupported(job: job_mod.Job, cfg: Config) ?[]const u8 {
         .expr => return "a service's image given by an expression is not native yet",
     };
     return null;
-}
-
-/// Whether any expression of the job calls `hashFiles` (function names are not case-sensitive).
-fn usesHashFiles(job: job_mod.Job) bool {
-    const call = "hashfiles(";
-    for (job.env) |e| if (std.ascii.findIgnoreCase(templateText(e.value), call) != null)
-        return true;
-    for (job.outputs) |o| if (std.ascii.findIgnoreCase(templateText(o.value), call) != null)
-        return true;
-    if (job.environment.url) |u| if (std.ascii.findIgnoreCase(templateText(u), call) != null)
-        return true;
-    for (job.steps) |step| {
-        const texts = [_][]const u8{
-            step.condition,
-            step.name_expr orelse "",
-            templateText(step.continue_on_error),
-            if (step.timeout_minutes) |t| templateText(t) else "",
-        };
-        for (texts) |t| if (std.ascii.findIgnoreCase(t, call) != null) return true;
-        for (step.env) |e| if (std.ascii.findIgnoreCase(templateText(e.value), call) != null)
-            return true;
-        switch (step.action) {
-            .script => |sc| {
-                const more = [_]?job_mod.Template{ sc.script, sc.shell, sc.working_directory };
-                for (more) |m| if (m) |t|
-                    if (std.ascii.findIgnoreCase(templateText(t), call) != null) return true;
-            },
-            .checkout => |inputs| for (inputs) |in| {
-                if (std.ascii.findIgnoreCase(templateText(in.value), call) != null) return true;
-            },
-            else => {},
-        }
-    }
-    return false;
-}
-
-fn templateText(t: job_mod.Template) []const u8 {
-    return switch (t) {
-        .lit, .expr => |s| s,
-    };
 }
 
 /// Whether this machine can run native steps, found with one sandbox; null when it can, else
@@ -721,6 +709,10 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         cwd.writeFile(io, .{ .sub_path = path, .data = "" }) catch |e|
             return failed(why, arena, "writing", path, e);
     }
+    // Before the rename, so no job of this binary is ever seen without it (`evict.jobsInTheWay`).
+    const mark = try std.fmt.allocPrint(arena, "{s}/{s}", .{ new, evict.job_mark });
+    cwd.writeFile(io, .{ .sub_path = mark, .data = "" }) catch |e|
+        return failed(why, arena, "writing", mark, e);
     const lock_path = try std.fmt.allocPrint(arena, "{s}/lock", .{new});
     const lock = lockFile(arena, io, lock_path, true) catch |e|
         return failed(why, arena, "locking", lock_path, e);
@@ -750,6 +742,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .store_cfg = .{
             .root = cfg.store,
             .max_bytes = cfg.store_max_bytes,
+            .limits = cfg.store_limits,
             .sync_fd = Store.syncCursor(arena, cfg.store),
         },
         .vouched = cfg.vouched,
@@ -759,6 +752,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .images_dir = cfg.images,
         .service_binds = cfg.service_binds,
         .self_exe = cfg.self_exe,
+        .hash_settings = cfg.hash_files,
     };
     errdefer b.deinit();
     if (cfg.test_fail_after_lock) return error.TestFailure;
@@ -1136,7 +1130,7 @@ fn sweep(arena: Allocator, io: std.Io, store: []const u8, cg_parent: ?[]const u8
     defer dir.close(io);
     var it = dir.iterate();
     while (it.next(io) catch null) |e| {
-        if (e.kind != .directory or std.mem.startsWith(u8, e.name, ".new-")) continue;
+        if (!evict.isDirEntry(arena, jobs, e) or std.mem.startsWith(u8, e.name, ".new-")) continue;
         const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ jobs, e.name }) catch return;
         const lock_path = std.fmt.allocPrint(arena, "{s}/lock", .{path}) catch return;
         // Opened, never made: a directory without its lock is one its runner is removing, lock
@@ -1144,6 +1138,9 @@ fn sweep(arena: Allocator, io: std.Io, store: []const u8, cg_parent: ?[]const u8
         // be free, and the directory taken for stale while its runner still removes it.
         const held = std.Io.Dir.cwd().openFile(io, lock_path, .{}) catch |err| {
             if (err == error.FileNotFound) {
+                // A crash can leave the mark behind (`removeJobDir` takes the two in listing order).
+                const mark = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ path, evict.job_mark }, 0) catch return;
+                _ = std.os.linux.unlink(mark);
                 const z = arena.dupeSentinel(u8, path, 0) catch return;
                 _ = std.os.linux.rmdir(z);
             }
@@ -1172,7 +1169,8 @@ fn removeJobDir(arena: Allocator, io: std.Io, path: []const u8) void {
     var names: std.ArrayList([]const u8) = .empty;
     var it = dir.iterate();
     while (it.next(io) catch null) |e| {
-        if (std.mem.eql(u8, e.name, "lock")) continue;
+        // The mark too: its job would look like an older runner's while this removes it.
+        if (std.mem.eql(u8, e.name, "lock") or std.mem.eql(u8, e.name, evict.job_mark)) continue;
         names.append(arena, arena.dupe(u8, e.name) catch break) catch break;
     }
     dir.close(io);
@@ -1198,6 +1196,7 @@ pub fn base(
     err_msg: *[]const u8,
 ) !void {
     const arena = b.arena;
+    try b.readContainerOptions(ev, err_msg);
     try b.prepareRootfs(ev, plan, err_msg);
     var t = phases.now();
     // On the job's image (the seed's build and the roll run on `b.rootfs`).
@@ -1315,6 +1314,8 @@ fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
     // A `container:` job's own env, as `docker create -e` sets it; its PATH is the container's
     // (`Exec.container_path`).
     for (plan.container_env) |e| try b.put(e.name, e.value);
+    // Then its `options: --env`, which `docker create` reads after the `-e` of its `env:`.
+    for (b.container_opts.env) |e| try b.put(e.name, e.value);
     if (ev.job.container != null) b.runtime_path = b.envValue("PATH");
     b.uid = b.image_uid;
     b.gid = b.image_gid;
@@ -1327,6 +1328,10 @@ fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
     for (b.cache_plan.env.items) |e| try b.put(e.name, e.value);
     for (try ev.defaultEnv()) |e| try b.put(e.name, e.value);
     for (try ev.withoutReapplied(ev.job_env.items)) |e| try b.put(e.name, e.value);
+    // Last, and set even when no tree was found, so a workflow's own value never stands in for
+    // the runner's. Part of every step's key, as on Dagger: see `checkToolTrees`.
+    if (b.tool_trees) |v| try b.put(set_up.tool_trees_env, v);
+    if (b.tool_trees_full) |v| try b.put(trees_check.full_env, v);
     b.workdir = ev.workspace;
 }
 
@@ -1407,7 +1412,7 @@ pub fn execScript(
         if (claim.hit) |rec| {
             const data = try recordAnswer(arena, rec);
             // A record that points into the tool cache's volume, which is in no layer: the volume
-            // may have lost the tree since, and no tree is checked natively, so the step runs again.
+            // may have lost the tree since, and no checked tree holds it, so the step runs again.
             if (rerun == null) if (try x.toolDirNotHeld(data)) |dir| {
                 rerun = try std.fmt.allocPrint(arena, "its record names {s} in the tool cache, " ++
                     "a volume in no layer", .{dir});
@@ -1546,7 +1551,75 @@ fn setUpCaches(b: *Backend, ev: *Evaluator, plan: anytype) !void {
     // jobs run with.
     if (b.cache_plan.seeds.items.len > 0) try b.seeds(plan.as_runner);
     b.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ b.binds, b.cache_plan.binds.items });
+    if (b.cache_plan.zig_builtin) |v| {
+        if (b.seed_layers.items.len > 0) b.seedBuiltin(v, plan.as_runner);
+        b.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ b.binds, &.{v} });
+    }
     if (b.cache_plan.zig_local_roll != null) b.rollZigLocal(plan.as_runner);
+    if (b.caches.tool_trees) try b.checkToolTrees();
+}
+
+/// "Set up job"'s check of the tool cache's trees, as `set_up.verifyToolTrees` does it on Dagger
+/// (`tool_trees.zig`): what steps are given is each tree's digest and path (`tool_trees`), and a
+/// replayed step that names a directory in the volume replays only when a tree holds it
+/// (`Exec.toolDirNotHeld`). The values (the digest `install-zig.sh` pins, and a second over every
+/// entry of the tree, `trees_check.full_env`) are in every step's key (the variables are not
+/// volatile), so a tree added, removed or changed makes every step of the job new once, and no
+/// record made against another state of a tree is replayed. Narrower keys (only the trees a step
+/// puts on PATH) are not possible here: a step's key is made before it runs, and which trees it
+/// names is in its record.
+fn checkToolTrees(b: *Backend) !void {
+    const arena = b.arena;
+    const volume = b.cache_plan.tool_cache_host orelse return;
+    const mount = b.cache_plan.tool_cache.?;
+    // In the runner's store beside the volumes, where no step can write: a list a job could
+    // forge would pass a changed file (`tool_trees.zig`).
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(volume, &digest, .{});
+    const root = b.store_cfg.root;
+    const lists = try std.fmt.allocPrint(arena, "{s}/tool-trees/{x}", .{ root, digest[0..16] });
+    const verdict = try trees_check.check(
+        arena,
+        b.gpa,
+        b.io,
+        volume,
+        lists,
+        mount,
+        .{},
+        b.caches.cancel,
+    );
+    b.tool_trees = verdict.env;
+    b.tool_trees_full = verdict.full;
+    try b.notes.append(arena, verdict.note);
+}
+
+/// `set_up.zig_builtin_seed_script` on the `builtin.zig` volume, bound beside the seed's own `b/`
+/// (which its mount over the global cache's hides), in a sandbox whose layer is dropped, as the
+/// Dagger backend runs it in a container of its own. Nothing of it fails the job: a volume that
+/// was not filled costs one build of Zig's build runner.
+fn seedBuiltin(b: *Backend, volume: sandbox.Spec.Bind, as_runner: bool) void {
+    const arena = b.arena;
+    const saved = b.binds;
+    defer b.binds = saved;
+    const at = "/zig-runner-builtin";
+    var beside = volume;
+    beside.at = at;
+    b.binds = std.mem.concat(arena, sandbox.Spec.Bind, &.{ saved, &.{beside} }) catch return;
+    const dir = set_up.zigBuiltinDir(arena, as_runner) catch return;
+    const script = std.fmt.allocPrint(arena, "set -- {s} {s} ''\n{s}", .{
+        at,
+        dir,
+        set_up.zig_builtin_seed_script,
+    }) catch return;
+    var out: Captured = .{ .arena = arena };
+    const user: u32 = if (as_runner) runner_uid else 0;
+    const ended = b.exec(script, &.{"PATH=" ++ image_path}, &.{}, user, user, out.output()) catch |e| {
+        std.log.warn("native: Zig builtin volume not filled: {s}", .{@errorName(e)});
+        return;
+    };
+    b.dropLastLayer();
+    if (ended.failure.len > 0 or ended.code != 0)
+        std.log.warn("native: Zig builtin volume not filled: {s}{s}", .{ ended.failure, out.tail() });
 }
 
 /// `set_up.zig_local_roll_script` on the job's Zig local-cache volume, as root, in a sandbox
@@ -1587,6 +1660,7 @@ fn seeds(b: *Backend, as_runner: bool) !void {
             continue;
         }
         try b.seed_layers.append(arena, s.dir);
+        try b.seed_ids.append(arena, try volumes.seedId(arena, s.dir));
         try seeded.append(arena, s.seed.version);
     }
     if (try volumes.seedNote(arena, b.caches, seeded.items, failure)) |note|
@@ -1597,16 +1671,36 @@ fn seeds(b: *Backend, as_runner: bool) !void {
 fn seed(b: *Backend, s: volumes.Seed, as_runner: bool) ?[]const u8 {
     const arena = b.arena;
     const cwd = std.Io.Dir.cwd();
-    if (cwd.access(b.io, s.dir, .{})) |_| return null else |_| {}
     const seeds_dir = std.fs.path.dirname(s.dir).?;
     cwd.createDirPath(b.io, seeds_dir) catch |e| return @errorName(e);
     // Only the runner's user may look in, as in the volumes'.
     const seeds_z = arena.dupeSentinel(u8, seeds_dir, 0) catch return "out of memory";
     _ = std.os.linux.chmod(seeds_z, 0o700);
-    const lock = lockFile(arena, b.io, std.fmt.allocPrint(arena, "{s}.lock", .{s.dir}) catch
-        return "out of memory", true) catch |e| return @errorName(e);
-    defer lock.close(b.io);
-    if (cwd.access(b.io, s.dir, .{})) |_| return null else |_| {}
+    if (b.holdSeed(s.dir)) |held| {
+        if (held) return null;
+    } else |e| return @errorName(e);
+    {
+        const lock = ImageStore.lockDir(arena, b.io, s.dir, 2) catch |e| return @errorName(e);
+        defer lock.close(b.io);
+        if (cwd.access(b.io, s.dir, .{})) |_| {} else |_| if (b.buildSeed(s, as_runner)) |why| return why;
+    }
+    // Held as any job holds it, past the lock let go. Evicted in that moment, the job runs unseeded.
+    const held = b.holdSeed(s.dir) catch |e| return @errorName(e);
+    return if (held) null else "it was evicted as it was built";
+}
+
+/// Whether the seed `dir` is there, then held for the job (`ImageStore.holdDir`).
+fn holdSeed(b: *Backend, dir: []const u8) !bool {
+    const lock = try ImageStore.holdDir(b.arena, b.io, dir) orelse return false;
+    errdefer lock.close(b.io);
+    try b.held.append(b.arena, lock);
+    return true;
+}
+
+/// `seed`'s build, under the seed's lock, moved into place (`volumes.adoptSeed`); null when it
+/// worked, else why not.
+fn buildSeed(b: *Backend, s: volumes.Seed, as_runner: bool) ?[]const u8 {
+    const arena = b.arena;
     const script = b.test_seed_script orelse set_up.zigSeedScript(arena, s.seed) catch
         return "out of memory";
     const files = [_]sandbox.Spec.File{.{
@@ -1704,8 +1798,30 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     try w.writeAll(" origin ");
     try dagger.shellQuote(w, f.want);
     if (f.tags) try w.writeAll("\ngit fetch -q --tags origin");
-    try w.print("\ngit checkout -q --detach FETCH_HEAD\nrm -f .git/FETCH_HEAD\n" ++
-        "find . -exec touch -h -d @{d} {{}} +\n", .{checkout.mtime});
+    try w.writeAll("\ngit checkout -q --detach FETCH_HEAD\nrm -f .git/FETCH_HEAD\n");
+    // Submodules as actions/checkout fetches them: `true` the first level, `recursive` all, each
+    // to the commit the tree records and as shallow as the checkout (`fetch-depth`), with
+    // `git@<host>:` rewritten to HTTPS, where the token's header applies. The script is the
+    // step's key (below), so it holds the flags: a checkout with and without them never
+    // replays one another, and the recorded commits are in the tree of the key's commit.
+    if (co.submodules) {
+        const recursive: []const u8 = if (co.submodules_recursive) " --recursive" else "";
+        const server = std.mem.trimEnd(u8, x.job.github.server_url, "/");
+        try w.print("git submodule sync -q{s}\ngit ", .{recursive});
+        if (std.mem.startsWith(u8, server, "https://")) {
+            try w.writeAll("-c ");
+            try dagger.shellQuote(w, try std.fmt.allocPrint(
+                arena,
+                "url.{s}/.insteadOf=git@{s}:",
+                .{ server, server["https://".len..] },
+            ));
+            try w.writeAll(" ");
+        }
+        try w.writeAll("-c protocol.version=2 submodule update -q --init --force");
+        if (f.depth > 0) try w.print(" --depth={d}", .{f.depth});
+        try w.print("{s}\n", .{recursive});
+    }
+    try w.print("find . -exec touch -h -d @{d} {{}} +\n", .{checkout.mtime});
 
     // The job's token as GitHub expects it over HTTPS, in git's environment, never on its
     // command line.
@@ -1733,11 +1849,17 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     try extra.append(arena, .{ .name = "GIT_TERMINAL_PROMPT", .value = "0" });
     // A commit fetched is the same tree every time, as Dagger's `git` keys it, so under step
     // caching it is a layer like a step's, keyed on its script (the URL and the commit), never
-    // on the token in `extra`. A branch or tag moves, so its fetch always runs.
-    const key = if (checkout.isSha(f.want))
-        try b.keyFor(.step, aw.written(), &.{}, b.uid, b.gid)
+    // on the token in `extra`. A branch or tag moves, so its fetch always runs. The tags it reads
+    // move too, with the commit staying: their digest is part of the key (`tagsDigest`).
+    const env = try b.envStrings(extra.items);
+    const tags: ?[]const u8 = if (f.tags and checkout.isSha(f.want))
+        try b.tagsDigest(f.url, env)
     else
-        null;
+        "";
+    const key = if (tags == null or !checkout.isSha(f.want))
+        null
+    else
+        try b.keyFor(.step, try std.fmt.allocPrint(arena, "{s}\n# tags {s}", .{ aw.written(), tags.? }), &.{}, b.uid, b.gid);
     const claim = b.claimKey(key) catch |e| switch (e) {
         error.Stopped => {
             f.result = .{ .failed = "the step was stopped" };
@@ -1753,7 +1875,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     var out: Captured = .{ .arena = arena };
     const ended = try b.exec(
         aw.written(),
-        try b.envStrings(extra.items),
+        env,
         &.{},
         b.uid,
         b.gid,
@@ -1773,6 +1895,23 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
             "the job's own repository; another private one cannot be checked out)" else "",
     }) };
     return f;
+}
+
+/// A digest of the tags `url`'s repository has and where they point, as `git fetch --tags` reads
+/// them: a checkout of a commit is the same tree every time, but its tags are not, so a replay
+/// keyed without them would keep the old ones. Null when they could not be listed: the fetch then
+/// runs, and says why it cannot.
+fn tagsDigest(b: *Backend, url: []const u8, env: []const []const u8) !?[]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(b.arena);
+    try aw.writer.writeAll("tags=$(git ls-remote --tags -- ");
+    try dagger.shellQuote(&aw.writer, try std.fmt.allocPrint(b.arena, "{s}.git", .{url}));
+    try aw.writer.writeAll(") && printf '%s' \"$tags\" | sha256sum");
+    var out: Captured = .{ .arena = b.arena };
+    const ended = try b.exec(aw.written(), env, &.{}, b.uid, b.gid, out.output());
+    defer b.dropLastLayer();
+    if (ended.code != 0 or ended.failure.len > 0 or ended.killed) return null;
+    const digest = std.mem.trim(u8, out.text.items, " \n");
+    return if (digest.len == 0) null else digest;
 }
 
 /// The contents of `path` as the job's last step left it (a problem matcher's file), relative
@@ -1801,6 +1940,35 @@ pub fn readFile(b: *Backend, path: []const u8) ?[]const u8 {
 }
 
 pub const max_read = 16 * 1024 * 1024;
+
+/// `hashFiles(args)` over the job's files as the next step would see them (`native/hash_files.zig`):
+/// the layers as they are now, so what earlier steps wrote is there, read by the runner with no
+/// mount. `ws` is the workspace.
+pub fn hashFiles(
+    b: *Backend,
+    arena: Allocator,
+    ws: []const u8,
+    args: []const []const u8,
+) Allocator.Error!expr.HashFiles.Result {
+    // Topmost first, as `execIn`'s overlay stacks them.
+    const n = b.layers.items.len;
+    const layers = try b.gpa.alloc([]const u8, n + b.seed_layers.items.len + 1);
+    defer b.gpa.free(layers);
+    for (b.layers.items, 0..) |l, i| layers[n - 1 - i] = l.path;
+    @memcpy(layers[n..][0..b.seed_layers.items.len], b.seed_layers.items);
+    layers[layers.len - 1] = b.rootfs;
+    var limits = b.hash_settings.limits(b.io);
+    limits.cancel = b.cancel;
+    const stack: hash_files.Stack = .{ .layers = layers, .opaque_xattr = b.opaqueXattr(), .limits = limits };
+    // The call's own memory is freed when it returns; the job's arena gets the result only.
+    return hash_files.hashFiles(b.gpa, arena, b.io, stack, ws, dagger.runner_home, args);
+}
+
+/// Overlay's attribute that marks a directory opaque: `trusted.` when the job's overlay is mounted
+/// as the host's root, `user.` under `userxattr` (a rootless runner's).
+fn opaqueXattr(b: *const Backend) [:0]const u8 {
+    return if (b.how.userns == .mapped) "trusted.overlay.opaque" else "user.overlay.opaque";
+}
 
 /// Layer `i`'s path (P7's callers; P2's `Layer.path`).
 pub fn layerPath(b: *Backend, i: usize) ![]const u8 {
@@ -1949,8 +2117,10 @@ fn layerName(b: *Backend, kind: u8) ![]const u8 {
 /// The key of an exec of `script` on the stack as it is, in P8's format (`Store.KeyHasher`):
 /// the model's `Key = parent · script · stable env` (proofs/Runner/Model.lean, `keyOf`). Null
 /// without the store, or when the stack's top is not in it (a step that always runs, or failed,
-/// or was not published): nothing after such a step is replayed or published, as under Dagger a
-/// new parent makes every later key new. The env is the container's in its order, without the
+/// or was not published, a Docker action's step, a JavaScript action's mount points): nothing
+/// after such a layer is replayed or published, as under Dagger a new parent makes every later
+/// key new, so what an image or a mount holds never needs to be in a key
+/// (`Native.ops_keep_chained`). The env is the container's in its order, without the
 /// volatile names (`Store.stableEnv`). After P8's core come what its model does not have yet: who
 /// runs it and where, and the files written for it that stay (the event file, when it is not a
 /// variable). A base has no parent: in its place, the digest of what every layer above it
@@ -1993,7 +2163,7 @@ fn keyFor(
 /// slot's job sees as its own (`Store.unshift`, `Spec.canonical`). Null, and the job uncached, when
 /// the rootfs cannot be read.
 fn below(b: *Backend) ?Store.Key {
-    const fp = Store.rootfsFingerprint(b.arena, b.io, b.rootfs) catch |e| {
+    const fp = Store.rootfsFingerprint(b.arena, b.io, b.rootfs, b.store_cfg.root) catch |e| {
         std.log.warn("native: the rootfs's fingerprint: {s}; the job's steps are not cached", .{
             @errorName(e),
         });
@@ -2016,7 +2186,7 @@ fn below(b: *Backend) ?Store.Key {
         .fingerprint = &fp,
         .userns = @tagName(b.how.userns),
         .binds = binds,
-        .seeds = b.seed_layers.items,
+        .seeds = b.seed_ids.items,
     }, null);
 }
 
@@ -2028,8 +2198,9 @@ pub const Below = struct {
     fingerprint: []const u8,
     userns: []const u8,
     binds: []const sandbox.Spec.Bind,
-    /// The Zig cache seeds' layers (`volumes.Seed`), by path, which names the release,
-    /// architecture and step user each was built for, once.
+    /// The Zig cache seeds' layers (`volumes.Seed`), by `volumes.seedId`: the path, which names the
+    /// release, architecture and step user each was built for, and which build it is, as one
+    /// evicted is built again and need not be the same tree.
     seeds: []const []const u8 = &.{},
 };
 
@@ -2268,12 +2439,7 @@ fn flatten(b: *Backend) !void {
     }
     const name = try b.layerName('F');
     const out = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name });
-    // Overlay's xattrs are `trusted.` when mounted as the host's root, `user.` under `userxattr`.
-    const opaque_xattr = if (b.how.userns == .mapped)
-        "trusted.overlay.opaque"
-    else
-        "user.overlay.opaque";
-    try Store.flatten(arena, b.io, paths, out, opaque_xattr);
+    try Store.flatten(arena, b.io, paths, out, b.opaqueXattr());
     const top_key = b.layers.items[b.layers.items.len - 1].key;
     b.layers.clearRetainingCapacity();
     try b.layers.append(arena, .{
@@ -2342,10 +2508,14 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
         err_msg,
     );
     _ = b.timings.since(arena, .provision, t);
-    if (!plan.as_runner and img.user.len > 0) {
-        const user_ids = b.imageUser(img.user) catch |e| {
-            err_msg.* = try std.fmt.allocPrint(arena, "the image's USER {s}: {s}", .{
-                img.user,
+    // `options: --user` over the image's `USER`, as `docker create` has it. (Never with the
+    // provisioned image: `container_options.unsupported` sends that job to Dagger.)
+    const user = b.container_opts.user orelse img.user;
+    if (!plan.as_runner and user.len > 0) {
+        const user_ids = b.imageUser(user) catch |e| {
+            err_msg.* = try std.fmt.allocPrint(arena, "the {s} {s}: {s}", .{
+                if (b.container_opts.user != null) "container's --user" else "image's USER",
+                user,
                 switch (e) {
                     error.UnknownUser => "not in its /etc/passwd",
                     error.UnknownGroup => "its group is not in its /etc/group",
@@ -2358,6 +2528,33 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
         b.image_uid = user_ids[0];
         b.image_gid = user_ids[1];
     }
+}
+
+/// The job container's `options:`, read (`container_options.parse`; `unsupported` has already
+/// refused what it does not carry out, so this is not expected to fail), with a note in "Set up
+/// job" for what was honoured and for what is understood and has no effect here.
+fn readContainerOptions(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void {
+    const jc = ev.job.container orelse return;
+    const text = switch (jc.options orelse return) {
+        .lit => |l| l,
+        .expr => {
+            err_msg.* = "the job container's `options:` is an expression";
+            return error.BaseContainerFailed;
+        },
+    };
+    var why: []const u8 = "";
+    const o = container_options.parse(b.arena, text, &why) catch |e| {
+        err_msg.* = if (why.len > 0) why else @errorName(e);
+        return error.BaseContainerFailed;
+    };
+    b.container_opts = o;
+    try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Container options: {d} " ++
+        "`--env`{s}{s}; {d} understood and without effect natively (`--workdir`, `--health-*`)", .{
+        o.env.len,
+        if (o.user != null) ", `--user` " else "",
+        o.user orelse "",
+        o.no_effect,
+    }));
 }
 
 /// Whether the job's image is musl-based: an `ld-musl-*` in its /lib, as the Dagger path asks
@@ -2407,11 +2604,16 @@ test "a musl image is told by its /lib, never through a symlink" {
 
 /// `image` pulled into the store, or found there (`oci/image.zig`), within `pull_deadline`.
 fn pull(b: *Backend, image: []const u8, creds: ?registry.Credentials, why: *[]const u8) !oci.Image {
-    return pullAt(b.arena, b.gpa, b.io, b.store_cfg.root, b.how.userns == .mapped, image, creds, why);
+    const img = try pullAt(b.arena, b.gpa, b.io, b.store_cfg.root, b.how.userns == .mapped, image, creds, why);
+    errdefer img.lock.close(b.io);
+    // Held to the job's end, as its layers are: eviction leaves it alone (`evict.zig`).
+    try b.held.append(b.arena, img.lock);
+    return img;
 }
 
 /// `pull` without a job (`docker_action.unsupported`, which decides the backend before the job
-/// starts): into the store at `root`, with the image's owners when `owners` (a root runner).
+/// starts): into the store at `root`, with the image's owners when `owners` (a root runner). The
+/// caller closes the image's lock (`oci.Image.lock`).
 pub fn pullAt(
     arena: Allocator,
     gpa: Allocator,
@@ -2453,7 +2655,7 @@ pub fn pullImage(
         return error.ImageNotFound;
     };
     const img = try b.pull(image, creds, why);
-    return images.fromPulled(b.arena, b.io, img.rootfs, img.digest) catch |e| {
+    return images.fromPulled(b.arena, b.io, img.rootfs, img.digest, img.manifest) catch |e| {
         why.* = "its configuration cannot be read";
         return e;
     };
@@ -2509,6 +2711,10 @@ fn provision(b: *Backend, img: oci.Image, script: []const u8, err_msg: *[]const 
             if (p.why.len > 0) p.why else @errorName(e),
         });
         return error.BaseContainerFailed;
+    };
+    b.held.append(arena, made.lock) catch |e| {
+        made.lock.close(b.io);
+        return e;
     };
     try b.notes.append(arena, if (made.made) try std.fmt.allocPrint(
         arena,
@@ -2950,8 +3156,11 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     var co = testStep("");
     co.action = .{ .checkout = &.{} };
     try std.testing.expect(unsupported(io, testJob(&.{co}), root, ok) == null);
-    co.action = .{ .checkout = &.{.{ .name = "submodules", .value = .{ .lit = "true" } }} };
-    try expectReason("submodules", unsupported(io, testJob(&.{co}), root, ok));
+    // Submodules are fetched natively (`fetchCheckout`), whether literal or an expression.
+    for ([_]job_mod.Template{ .{ .lit = "true" }, .{ .lit = "recursive" }, .{ .expr = "inputs.s" } }) |v| {
+        co.action = .{ .checkout = &.{.{ .name = "submodules", .value = v }} };
+        try std.testing.expect(unsupported(io, testJob(&.{co}), root, ok) == null);
+    }
 
     var uses = testStep("");
     uses.action = .{ .uses = .{ .owner = "actions", .name = "setup-node", .ref = "v4" } };
@@ -2971,16 +3180,25 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
         with_services.services = &.{.{ .name = "pg", .image = .{ .expr = "matrix.db" } }};
         try expectReason("expression", unsupported(io, with_services, root, ok));
     }
-    // `container:` jobs and any image are pulled natively; a job container's ports, volumes and
-    // options are not native yet.
+    // `container:` jobs and any image are pulled natively; a job container's ports and volumes
+    // are not native yet, and its options only the ones `container_options.zig` carries out.
     var container = run_only;
     container.container = .{ .name = "", .image = .{ .lit = "node:22" } };
     try std.testing.expect(unsupported(io, container, root, ok) == null);
     container.container.?.ports = &.{.{ .lit = "8080:80" }};
     try expectReason("`ports:`", unsupported(io, container, root, ok));
     container.container.?.ports = &.{};
+    container.container.?.volumes = &.{.{ .lit = "/srv:/srv" }};
+    try expectReason("`volumes:`", unsupported(io, container, root, ok));
+    container.container.?.volumes = &.{};
+    // An option the sandbox does not carry out is named, never dropped; the others are native.
     container.container.?.options = .{ .lit = "--cpus 1" };
-    try expectReason("`options:`", unsupported(io, container, root, ok));
+    try expectReason("`--cpus`", unsupported(io, container, root, ok));
+    container.container.?.options = .{ .lit = "--user 1001 -e A=1 --workdir /w --health-cmd true" };
+    try std.testing.expect(unsupported(io, container, root, ok) == null);
+    container.container.?.options = .{ .expr = "matrix.options" };
+    try expectReason("expression", unsupported(io, container, root, ok));
+    container.container.?.options = null;
     var custom = root;
     custom.image = "alpine:3";
     try std.testing.expect(unsupported(io, run_only, custom, ok) == null);
@@ -3007,13 +3225,14 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
         try expectReason("RUNNER_NATIVE_ROOTLESS", unsupported(io, run_only, root, rootless));
     }
 
-    // `hashFiles()` anywhere in the job's expressions, in any case.
+    // `hashFiles()` is native: the runner reads the job's layers (`hash_files.zig`), in any
+    // expression and in any case.
     var hashed = testStep("true");
     hashed.env = &.{.{ .name = "K", .value = .{ .expr = "HASHFILES('**/go.sum')" } }};
-    try expectReason("hashFiles", unsupported(io, testJob(&.{hashed}), root, ok));
+    try std.testing.expect(unsupported(io, testJob(&.{hashed}), root, ok) == null);
     var hashed_if = testStep("true");
     hashed_if.condition = "hashFiles('x') != ''";
-    try expectReason("hashFiles", unsupported(io, testJob(&.{hashed_if}), root, ok));
+    try std.testing.expect(unsupported(io, testJob(&.{hashed_if}), root, ok) == null);
 
     // Without the operator's rootfs the default image is pulled natively; one that is set must
     // be there.
@@ -3063,6 +3282,23 @@ test "a job that cannot be native runs on Dagger, and Set up job says why" {
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "This job runs on Dagger: the " ++
         "native store is not set up") != null);
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "Engine: Dagger") != null);
+}
+
+test "a job sent to Dagger that cannot start it fails with the reason it was sent and what Dagger lacked" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    // No `dagger_cmd` that exists (a test's is /nonexistent/dagger), as in a stress test's workers.
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = .{ .vouched = true, .rootless = true },
+    }, testJob(&.{testStep("echo hi")}), &log);
+    try std.testing.expect(!res.succeeded);
+    const msg = res.engine_error orelse "";
+    try std.testing.expect(std.mem.indexOf(u8, msg, "could not start Dagger (FileNotFound). " ++
+        "This job runs on Dagger: the native store is not set up") != null);
 }
 
 test "parity: a native job's base has the environment of Dagger's base container" {
@@ -3208,6 +3444,145 @@ test "the native checkout: the commit, its .git, and the checkout's fixed time" 
     };
 }
 
+/// A repository with a submodule that has a submodule: `o/r.git` holds `sub` (file `in-sub`), which
+/// holds `deep` (file `in-deep`), all at file:// URLs under the returned root, which the job's
+/// sandbox sees at the same path (`cfg.binds`). Null when git is missing.
+fn submoduleRepos(arena: Allocator, cfg: *Config, tmp: *std.testing.TmpDir) !?struct {
+    root: []const u8,
+    sha: []const u8,
+} {
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const g = "git -c user.name=t -c user.email=t@t -c protocol.file.allow=always";
+    const make = try std.fmt.allocPrint(arena, "set -e; cd '{[r]s}'; " ++
+        "for n in deep sub r; do git init -q -b main --bare o/$n.git; git init -q -b main src-$n; done; " ++
+        "cd src-deep; echo in-deep > in-deep; git add .; {[g]s} commit -q -m deep; " ++
+        "git push -q ../o/deep.git HEAD:refs/heads/main; cd ../src-sub; echo in-sub > in-sub; " ++
+        "{[g]s} submodule add -q file://{[r]s}/o/deep.git deep; git add .; " ++
+        "{[g]s} commit -q -m sub; git push -q ../o/sub.git HEAD:refs/heads/main; cd ../src-r; " ++
+        "echo in-r > in-r; {[g]s} submodule add -q file://{[r]s}/o/sub.git sub; git add .; " ++
+        "{[g]s} commit -q -m r; git push -q ../o/r.git HEAD:refs/heads/main", .{
+        .r = root,
+        .g = g,
+    });
+    const made = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", make } }) catch return null;
+    if (made.term != .exited or made.term.exited != 0) {
+        std.debug.print("git could not make the repositories: {s}\n", .{made.stderr});
+        return null;
+    }
+    const sha = std.mem.trim(u8, (try std.process.run(arena, io, .{
+        .argv = &.{ "git", "-C", try std.fmt.allocPrint(arena, "{s}/src-r", .{root}), "rev-parse", "HEAD" },
+    })).stdout, "\n");
+    try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "rootfs/{s}", .{root}));
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{
+        cfg.binds,
+        &.{.{ .host = root, .at = root }},
+    });
+    return .{ .root = root, .sha = sha };
+}
+
+/// The job's env for a checkout from those repositories: the owner check off (they are the host's
+/// root's, nobody in the job's namespace) and the file transport on for submodules (git refuses it
+/// by default; GitHub's are HTTPS).
+const file_repos_env = [_]job_mod.Input{.{
+    .name = "GIT_CONFIG_PARAMETERS",
+    .value = .{ .lit = "'safe.directory=*' 'protocol.file.allow=always'" },
+}};
+
+test "the native checkout's submodules: `true` the first level, `recursive` all, `false` none" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const repos = (try submoduleRepos(arena, &cfg, &tmp)) orelse
+        return skip(false, "git is not installed");
+
+    // What actions/checkout leaves for each: the submodule's files and its own submodule's.
+    const cases = [_]struct { input: ?[]const u8, sub: bool, deep: bool }{
+        .{ .input = null, .sub = false, .deep = false },
+        .{ .input = "false", .sub = false, .deep = false },
+        .{ .input = "true", .sub = true, .deep = false },
+        .{ .input = "recursive", .sub = true, .deep = true },
+    };
+    for (cases) |c| {
+        var co = testStep("");
+        co.name = "checkout";
+        co.action = .{ .checkout = if (c.input) |v| &.{
+            .{ .name = "submodules", .value = .{ .lit = v } },
+        } else &.{} };
+        const check = testStep("echo r=$(cat in-r) sub=$(test -f sub/in-sub && echo yes || " ++
+            "echo no) deep=$(test -f sub/deep/in-deep && echo yes || echo no); " ++
+            "echo mtime=$(stat -c %Y in-r)");
+        var job = testJob(&.{ co, check });
+        job.github.server_url = try std.fmt.allocPrint(arena, "file://{s}", .{repos.root});
+        job.github.sha = repos.sha;
+        job.env = &file_repos_env;
+        var env: std.process.Environ.Map = .init(arena);
+        var w: std.Io.Writer.Allocating = .init(arena);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+        const res = try dagger.run(arena, std.testing.io, &env, .{
+            .native = cfg,
+            .step_user = .root,
+            .gpa = std.testing.allocator,
+        }, job, &log);
+        const text = w.written();
+        const want = try std.fmt.allocPrint(arena, "r=in-r sub={s} deep={s}", .{
+            if (c.sub) "yes" else "no",
+            if (c.deep) "yes" else "no",
+        });
+        if (res.steps[0].outcome != .success or res.steps[1].outcome != .success or
+            std.mem.indexOf(u8, text, want) == null)
+        {
+            std.debug.print("submodules {s}: wanted {s}; engine {s}\n{s}\n", .{
+                c.input orelse "(unset)", want, res.engine_error orelse "-", text,
+            });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "native step cache: a checkout with submodules never replays one without, or with fewer" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try cachedConfig(arena, &tmp);
+    const repos = (try submoduleRepos(arena, &c.cfg, &tmp)) orelse
+        return skip(false, "git is not installed");
+
+    // The same commit three ways, each leaving something else: each runs its checkout once and
+    // is replayed after that, never from another's layer.
+    const inputs = [_][]const u8{ "false", "true", "recursive" };
+    const seen = [_][]const u8{ "sub=no deep=no", "sub=yes deep=no", "sub=yes deep=yes" };
+    for (inputs, seen, 0..) |input, want, i| {
+        var co = testStep("");
+        co.name = "checkout";
+        co.action = .{ .checkout = &.{
+            .{ .name = "ref", .value = .{ .lit = repos.sha } },
+            .{ .name = "submodules", .value = .{ .lit = input } },
+        } };
+        const check = testStep("echo sub=$(test -f sub/in-sub && echo yes || echo no) " ++
+            "deep=$(test -f sub/deep/in-deep && echo yes || echo no)");
+        var job = testJob(&.{ co, check });
+        job.github.server_url = try std.fmt.allocPrint(arena, "file://{s}", .{repos.root});
+        job.env = &file_repos_env;
+        const first = try runCached(arena, c.cfg, job, try std.fmt.allocPrint(arena, "a{d}", .{i}));
+        try expectSucceeded(first);
+        if (std.mem.indexOf(u8, first.text, want) == null) {
+            std.debug.print("wanted {s} on the first run:\n{s}\n", .{ want, first.text });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first.text, dagger.native_reused_note));
+        const again = try runCached(arena, c.cfg, job, try std.fmt.allocPrint(arena, "b{d}", .{i}));
+        try expectSucceeded(again);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, again.text, dagger.native_reused_note));
+        try std.testing.expect(std.mem.indexOf(u8, again.text, want) != null);
+    }
+}
+
 test "a native checkout that cannot fetch fails its step with why" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -3229,6 +3604,66 @@ test "a native checkout that cannot fetch fails its step with why" {
     }, job, &log);
     try std.testing.expectEqual(dagger.Outcome.failure, res.steps[0].outcome);
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "could not fetch o/r@0123456") != null);
+}
+
+test "native step cache: a checkout of a commit with fetch-tags sees the tags as they are now" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try cachedConfig(arena, &tmp);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const git = try std.fmt.allocPrint(arena, "git -c user.name=t -c user.email=t@t -C '{s}/src'", .{root});
+    const make = try std.fmt.allocPrint(arena, "set -e; cd '{s}'; git init -q --bare o/r.git; " ++
+        "git init -q src; cd src; echo one > file; git add file; {s} commit -q -m one; " ++
+        "{s} tag v1; {s} push -q ../o/r.git HEAD:refs/heads/main v1; " ++
+        "echo two > file; {s} commit -qam two; {s} push -q ../o/r.git HEAD:refs/heads/main", .{
+        root, git, git, git, git, git,
+    });
+    const made = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", make } }) catch
+        return skip(false, "git is not installed");
+    if (made.term != .exited or made.term.exited != 0)
+        return skip(false, "git could not make a repository");
+    const sha = std.mem.trim(u8, (try std.process.run(arena, io, .{
+        .argv = &.{ "git", "-C", try std.fmt.allocPrint(arena, "{s}/src", .{root}), "rev-parse", "HEAD" },
+    })).stdout, "\n");
+    try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "rootfs/{s}", .{root}));
+    c.cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{
+        c.cfg.binds,
+        &.{.{ .host = root, .at = root }},
+    });
+
+    var co = testStep("");
+    co.name = "checkout";
+    co.action = .{ .checkout = &.{
+        .{ .name = "ref", .value = .{ .lit = sha } },
+        .{ .name = "fetch-tags", .value = .{ .lit = "true" } },
+    } };
+    const check = testStep("echo tag-v1=$(git rev-parse --short v1)");
+    var job = testJob(&.{ co, check });
+    job.github.server_url = try std.fmt.allocPrint(arena, "file://{s}", .{root});
+    job.env = &.{.{ .name = "GIT_CONFIG_PARAMETERS", .value = .{ .lit = "'safe.directory=*'" } }};
+    const first = try runCached(arena, c.cfg, job, "j1");
+    try expectSucceeded(first);
+
+    // v1 moves to the second commit, as a release tag does, and the job runs again.
+    const moved = try std.process.run(arena, io, .{ .argv = &.{
+        "sh", "-c", try std.fmt.allocPrint(arena, "set -e; {s} tag -f v1 {s}; {s} push -q -f ../o/r.git v1", .{ git, sha, git }),
+    } });
+    try std.testing.expectEqual(@as(u8, 0), moved.term.exited);
+    const second = try runCached(arena, c.cfg, job, "j2");
+    try expectSucceeded(second);
+    const now = try std.fmt.allocPrint(arena, "tag-v1={s}", .{sha[0..7]});
+    if (std.mem.indexOf(u8, second.text, now) == null) {
+        std.debug.print("the second run did not see v1 at {s}:\n{s}\n", .{ sha[0..7], second.text });
+        return error.TestUnexpectedResult;
+    }
+    // With the tags as they were, the checkout and the step after it are replayed.
+    const third = try runCached(arena, c.cfg, job, "j3");
+    try expectSucceeded(third);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, third.text, dagger.native_reused_note));
 }
 
 test "parity: a run-only job gives the same results and step output on Dagger and native" {
@@ -3425,7 +3860,8 @@ test "native tool cache volume: a replayed step that points into it runs again (
     _ = try runCachedJob(arena, c.cfg, plain, caches, .{ .ran = "j2" });
     try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "plain"));
     // One that installs into the tool cache and puts the tree on PATH: its tree is in the
-    // volume, in no layer, and no tree is checked natively, so its record is not trusted.
+    // volume, in no layer, and no checked tree holds it (the check is off here), so its record is
+    // not trusted.
     const install = testJob(&.{testStep("echo x >> /shared/install; " ++
         "mkdir -p $RUNNER_TOOL_CACHE/t/1 && echo $RUNNER_TOOL_CACHE/t/1 >> $GITHUB_PATH")});
     _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j3" });
@@ -3437,6 +3873,76 @@ test "native tool cache volume: a replayed step that points into it runs again (
     _ = try runCachedJob(arena, c.cfg, in_layer, .{}, .{ .ran = "j5" });
     _ = try runCachedJob(arena, c.cfg, in_layer, .{}, .{ .ran = "j6" });
     try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "layer"));
+}
+
+test "native tool trees: an installing step replays while its tree is held, not once changed" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    const caches: volumes.Options = .{
+        .package_caches = true,
+        .trusted = true,
+        .tool_trees = true,
+    };
+    // What install-zig.sh does: a tree TOOL/VERSION/NAME in the tool cache, on PATH, and the
+    // digest it pins read from the variable "Set up job" sets. The step is the same text every job.
+    const install = testJob(&.{
+        testStep("echo x >> /shared/install; " ++
+            "echo \"trees=[$ZIG_RUNNER_TOOL_TREES] full=[$ZIG_RUNNER_TOOL_TREES_FULL]\"; " ++
+            "mkdir -p $RUNNER_TOOL_CACHE/t/1/x64 && echo v1 > $RUNNER_TOOL_CACHE/t/1/x64/bin && " ++
+            "echo $RUNNER_TOOL_CACHE/t/1/x64 >> $GITHUB_PATH"),
+        testStep("echo y >> /shared/after"),
+    });
+    // The first job finds no tree, and leaves one. The second sees it in "Set up job", so its
+    // steps' keys are new (the variable is part of each), and the step finds the tree installed.
+    const j1 = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j1" });
+    try expectLines(j1.text, &.{"trees=[] full=[]"});
+    const j2 = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j2" });
+    try expectLines(j2.text, &.{
+        "Tool cache: checked t/1/x64 (1 files, ",
+        "/opt/hostedtoolcache/t/1/x64] full=[",
+    });
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "install"));
+    // The third has the same tree, so the install step replays, though it names a directory in
+    // a volume that is in no layer (#229), and so does the step after it.
+    const j3 = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j3" });
+    try expectLines(j3.text, &.{"/opt/hostedtoolcache/t/1/x64]"});
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "install"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "after"));
+    // A tree another job changed (the volume's file, from the host) is not replayed against: the
+    // digest, and with it every step's key, is new.
+    const tools = try std.fmt.allocPrint(arena, "{s}/volumes/o/r/repo/toolcache", .{c.cfg.store});
+    var dir = try std.Io.Dir.cwd().openDir(io, tools, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    // Beside the volume's directory is its lock file.
+    const image = while (try it.next(io)) |e| {
+        if (e.kind == .directory) break e;
+    } else return error.TestUnexpectedResult;
+    const bin = try std.fmt.allocPrint(arena, "{s}/{s}/t/1/x64/bin", .{ tools, image.name });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = bin, .data = "v2\n" });
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j4" });
+    try std.testing.expectEqual(@as(usize, 3), runs(arena, c.shared, "install"));
+    try std.testing.expectEqual(@as(usize, 3), runs(arena, c.shared, "after"));
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j5" });
+    try std.testing.expectEqual(@as(usize, 3), runs(arena, c.shared, "install"));
+    // A link added to the tree is in no digest the install script pins, and in the other one:
+    // the step runs again.
+    const link = try std.fmt.allocPrint(arena, "{s}/{s}/t/1/x64/lnk", .{ tools, image.name });
+    try std.Io.Dir.cwd().symLink(io, "bin", link, .{});
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j5b" });
+    try std.testing.expectEqual(@as(usize, 4), runs(arena, c.shared, "install"));
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j5c" });
+    try std.testing.expectEqual(@as(usize, 4), runs(arena, c.shared, "install"));
+    // With the check off, as before: the step runs again every job.
+    const off: volumes.Options = .{ .package_caches = true, .trusted = true };
+    _ = try runCachedJob(arena, c.cfg, install, off, .{ .ran = "j6" });
+    _ = try runCachedJob(arena, c.cfg, install, off, .{ .ran = "j7" });
+    try std.testing.expectEqual(@as(usize, 6), runs(arena, c.shared, "install"));
 }
 
 test "a native step is contained: pivot_root, masked /proc, Docker's capabilities, no_new_privs" {
@@ -4262,6 +4768,60 @@ test "native sweep: a job's directory its runner is removing is left to it; a de
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "jobs/live", .{}));
 }
 
+test "native eviction under a real job: its directory has the mark, and no step can see it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var b = try init(arena, io, std.testing.allocator, cfg);
+    defer b.deinit();
+    const mark = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, evict.job_mark });
+    try std.Io.Dir.cwd().access(io, mark, .{});
+    var out: Captured = .{ .arena = arena };
+    const step = try b.exec(
+        try std.fmt.allocPrint(arena, "! test -e {s} && ! find / -xdev -name {s} | grep .", .{ mark, evict.job_mark }),
+        &.{"PATH=/usr/bin:/bin"},
+        &.{},
+        0,
+        0,
+        out.output(),
+    );
+    try std.testing.expectEqual(@as(i32, 0), step.code);
+}
+
+test "native sweep: a crash that left only a job's mark leaves nothing" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try tmp.dir.createDirPath(io, "jobs/crashed");
+    try tmp.dir.writeFile(io, .{ .sub_path = "jobs/crashed/" ++ evict.job_mark, .data = "" });
+    sweep(arena, io, store, null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "jobs/crashed", .{}));
+}
+
+test "native sweep: a dead runner's directory goes where a listing does not say what is a directory" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try tmp.dir.createDirPath(io, "jobs/dead/W");
+    try tmp.dir.writeFile(io, .{ .sub_path = "jobs/dead/lock", .data = "" });
+    evict.test_unknown_kinds = true;
+    defer evict.test_unknown_kinds = false;
+    sweep(arena, io, store, null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "jobs/dead", .{}));
+}
+
 test "a job's directory and lock are let go once, when its set-up fails after the lock is taken" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -4396,6 +4956,7 @@ test "a container job on the native backend: its image pulled with its credentia
     const answers = [_][]const u8{
         "{\"data\":{\"container\":{\"from\":{\"zig_runtime_path\":\"/usr/bin:/bin\"," ++
             "\"withWorkdir\":{\"id\":\"C0\"}}}}}",
+        "{\"data\":{\"container\":{\"from\":{\"entrypoint\":[]}}}}",
         "{\"data\":{\"container\":{\"from\":{\"imageRef\":\"img\"}}}}",
         "{\"data\":{\"container\":{\"from\":{\"directory\":{\"entries\":[]}}}}}",
         try execAnswer(arena, "C1", 0, "on dagger\\n"),
@@ -4424,6 +4985,69 @@ test "a container job on the native backend: its image pulled with its credentia
     };
     try std.testing.expect(std.mem.indexOf(u8, text3, "Engine: native") == null);
     try std.testing.expect(!slots[0].native);
+}
+
+test "a container job's options on the native backend: --user and --env, the rest noted" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+
+    // A user other than root cannot make /__w itself, as in any image: this one has it, for `app`.
+    var work: oci_layer.TestTar = .{ .a = arena };
+    try work.add(.{ .path = "__w/", .kind = .directory, .mode = 0o777 });
+    const layers = try std.mem.concat(arena, []const u8, &.{
+        try testImageLayers(arena),
+        &.{try work.finish()},
+    });
+    const image_env = "\"PATH=/usr/bin:/bin\",\"BOTH=image\"";
+    const img = try testregistry.testImage(arena, "test/opts", "1", layers, image_env, false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    // A rootless runner maps only root, so there the user is root; `app` needs a root runner.
+    const as_root = std.os.linux.geteuid() == 0;
+    const user = if (as_root) "app" else "root";
+    var job = testJob(&.{testStep("echo uid=$(id -u) gid=$(id -g); echo A=$A BOTH=$BOTH; " ++
+        "echo SPACED=$SPACED; pwd")});
+    job.container = .{
+        .name = "",
+        .image = .{ .lit = try server.image(arena, "test/opts:1") },
+        .env = &.{.{ .name = "BOTH", .value = .{ .lit = "container" } }},
+        // The image's /etc/passwd has `app` as 1002:1003. `--workdir` and `--health-*` are the
+        // runner's, not the steps': `docker exec -w` and the services' health only.
+        .options = .{ .lit = try std.fmt.allocPrint(arena, "--user {s} -e A=1 --env " ++
+            "BOTH=options -e \"SPACED=two words\" --workdir /nowhere --health-cmd true " ++
+            "--health-interval 5s", .{user}) },
+    };
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const text = w.written();
+    if (!res.succeeded) std.debug.print("{s}\n", .{text});
+    try std.testing.expect(res.succeeded);
+    const expect = [_][]const u8{
+        "Engine: native",
+        // `--user` over the image's USER (none here), `--env` over the container's `env:`.
+        if (as_root) "uid=1002 gid=1003" else "uid=0 gid=0",
+        "A=1 BOTH=options",
+        "SPACED=two words",
+        "/__w/r/r",
+        try std.fmt.allocPrint(arena, "Container options: 3 `--env`, `--user` {s}; 3 understood " ++
+            "and without effect natively", .{user}),
+    };
+    for (expect) |e| if (std.mem.indexOf(u8, text, e) == null) {
+        std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
+        return error.TestUnexpectedResult;
+    };
 }
 
 test "native provisioning: a step on the pulled image, flattened and kept under its key" {
@@ -4471,6 +5095,131 @@ test "native provisioning: a step on the pulled image, flattened and kept under 
     // A failing script fails with its output's last line, and leaves nothing under its key.
     try std.testing.expectError(error.BaseContainerFailed, b.provision(pulled, "echo the reason; exit 7", &err_msg));
     try std.testing.expect(std.mem.indexOf(u8, err_msg, "the reason (exit 7)") != null);
+}
+
+/// A runner's job ends, again and again, while the test's job runs: what it holds must stay.
+const Evictor = struct {
+    s: Store,
+    stop: std.atomic.Value(bool) = .init(false),
+
+    fn hostile(root: []const u8) Evictor {
+        return .{ .s = .{ .root = root, .max_bytes = 1, .limits = .{
+            .volumes_max_bytes = 1,
+            .images_max_bytes = 1,
+            .min_free_pct = 0,
+            .idle_s = 0,
+            .recent_s = 0,
+            .remeasure_s = 0,
+        } } };
+    }
+
+    fn run(e: *Evictor) void {
+        while (!e.stop.load(.acquire)) {
+            var a: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            defer a.deinit();
+            e.s.collect(a.allocator(), std.testing.io);
+            std.testing.io.sleep(.fromMilliseconds(5), .awake) catch {};
+        }
+    }
+
+    fn end(e: *Evictor, t: std.Thread) void {
+        e.stop.store(true, .release);
+        t.join();
+    }
+};
+
+test "native eviction under a real job: its rootfs and image are its overlay's lowers, and stay" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const img = try testregistry.testImage(arena, "test/prov", "1", try testImageLayers(arena), "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    var evictor: Evictor = .hostile(cfg.store);
+    var b = try init(arena, io, std.testing.allocator, cfg);
+    var ended = false;
+    defer if (!ended) b.deinit();
+    var why: []const u8 = "";
+    const pulled = try b.pull(try server.image(arena, "test/prov:1"), null, &why);
+    var err_msg: []const u8 = "";
+    const rootfs = try b.provision(pulled, "mkdir -p /opt/tool && echo new > /opt/tool/f", &err_msg);
+    const t: std.Thread = try .spawn(.{}, Evictor.run, .{&evictor});
+    {
+        defer evictor.end(t);
+        b.rootfs = rootfs;
+        var out: Captured = .{ .arena = arena };
+        const step = try b.exec(
+            \\for i in 1 2 3 4 5 6 7 8 9 10; do
+            \\  [ "$(cat /opt/tool/f)" = new ] && [ "$(cat /etc/marker)" = "from the image" ] || exit 9
+            \\  sleep 0.1
+            \\done
+        , &.{"PATH=" ++ image_path}, &.{}, 0, 0, out.output());
+        try std.testing.expectEqual(@as(i32, 0), step.code);
+    }
+    try std.Io.Dir.cwd().access(io, rootfs, .{});
+    try std.Io.Dir.cwd().access(io, pulled.rootfs, .{});
+    // Let go, both can go: they were kept by the job's locks, and nothing else.
+    b.deinit();
+    ended = true;
+    var after: Evictor = .hostile(cfg.store);
+    for (0..8) |_| after.s.collect(arena, io);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, rootfs, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, pulled.rootfs, .{}));
+}
+
+test "native eviction under a real job: a seed and a volume stay until it ends, and a seed built again is a new key" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    cfg.test_seed_script = "mkdir -p /zig-seed/o/s && echo seeded > /zig-seed/o/s/f";
+    const caches: volumes.Options = .{
+        .package_caches = true,
+        .trusted = true,
+        .zig_seeds = &.{.{ .version = "0.0.1", .sha256 = "00" }},
+    };
+    const job = testJob(&.{testStep(
+        \\echo mine > /root/.npm/f # npm zig build
+        \\for i in 1 2 3 4 5 6 7 8 9 10; do
+        \\  [ "$(cat /root/.cache/zig/o/s/f)" = seeded ] && [ "$(cat /root/.npm/f)" = mine ] || exit 9
+        \\  sleep 0.1
+        \\done
+        \\echo whole-to-the-end
+    )});
+    var evictor: Evictor = .hostile(cfg.store);
+    const t: std.Thread = try .spawn(.{}, Evictor.run, .{&evictor});
+    const first = first: {
+        defer evictor.end(t);
+        break :first try runCachedJob(arena, cfg, job, caches, .{});
+    };
+    try expectLines(first.text, &.{ "whole-to-the-end", "Zig global cache seeded from Zig 0.0.1" });
+    // Let go, it can go: the job's lock was what kept it.
+    var after: Evictor = .hostile(cfg.store);
+    for (0..8) |_| after.s.collect(arena, io);
+    const dir = try std.fmt.allocPrint(arena, "{s}/seeds", .{cfg.store});
+    try std.testing.expectError(error.NoSeed, seedIn(arena, io, dir));
+    // Built again, the job's layer on the old one is not replayed over it.
+    const second = try runCachedJob(arena, cfg, job, caches, .{});
+    try expectLines(second.text, &.{"whole-to-the-end"});
+}
+
+/// The one seed under `dir`.
+fn seedIn(arena: Allocator, io: std.Io, dir: []const u8) ![]const u8 {
+    var d = try std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
+    defer d.close(io);
+    var it = d.iterate();
+    while (try it.next(io)) |e| if (e.kind == .directory and e.name[0] != '.')
+        return std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, e.name });
+    return error.NoSeed;
 }
 
 test "an image's USER: by name, by uid, with a group, and what a rootless runner cannot map" {
@@ -4743,6 +5492,64 @@ test "native step cache: steps with secrets or run-specific values always run, a
     out.env = &.{.{ .name = "ZIG_RUNNER_STEP_CACHE", .value = .{ .lit = "false" } }};
     for ([_][]const u8{ "j3", "j4" }) |ran| try expectSucceeded(try runCached(arena, c.cfg, out, ran));
     try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "opted-out"));
+}
+
+test "nothing is keyed above a layer with no key: what a Docker action or a mount left is in no key" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var b: Backend = undefined;
+    b.store = .{ .root = "/nowhere" };
+    b.env = .empty;
+    b.workdir = "/w";
+    b.layers = .empty;
+    const stored: Store.Key = @splat(7);
+    try b.layers.append(arena, .{ .name = "l0", .path = "/l0", .key = stored });
+    try std.testing.expect(try b.keyFor(.step, "true", &.{}, 0, 0) != null);
+    // What `execIn` leaves for a Docker action's step, a JavaScript action's mount points (bound in
+    // every later step from then on) or an always-run step.
+    try b.layers.append(arena, .{ .name = "L1", .path = "/L1" });
+    try std.testing.expect(try b.keyFor(.step, "true", &.{}, 0, 0) == null);
+    // A fetched tree on it stays the job's own: `claimKey` is never reached.
+    try b.layers.append(arena, .{ .name = "L2", .path = "/L2" });
+    try b.keyFetched("an action's tree");
+    try std.testing.expectEqual(@as(usize, 3), b.layers.items.len);
+    try std.testing.expect(b.layers.items[2].key == null);
+    try std.testing.expect(try b.keyFor(.step, "true", &.{}, 0, 0) == null);
+}
+
+test "native step cache: nothing after a Docker action is replayed or kept, nor can its image be stale" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try cachedConfig(arena, &tmp);
+    const image = "zr-test/tool:1";
+    c.cfg.images = try @import("docker_action.zig").testImage(arena, &tmp, image, "{\"config\":{\"Env\":[\"PATH=/usr/bin:/bin\"]}}");
+    var docker_step = testStep("");
+    docker_step.action = .{ .docker = .{ .image = image, .inputs = &.{
+        .{ .name = "entrypoint", .value = .{ .lit = "sh" } },
+        .{ .name = "args", .value = .{ .lit = "-c \"cat /image-marker > from-image\"" } },
+    } } };
+    const job = testJob(&.{
+        testStep("echo x >> /shared/before"),
+        docker_step,
+        testStep("echo x >> /shared/after; cat from-image"),
+    });
+    const first = try runCached(arena, c.cfg, job, "j1");
+    try expectSucceeded(first);
+    try expectLines(first.text, &.{"in the image"});
+    // The tag now names another image: the step after it sees what the new one gave.
+    const marker = try std.fmt.allocPrint(arena, "images/{s}/rootfs/image-marker", .{try images.key(arena, image)});
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = marker, .data = "moved under its tag\n" });
+    const second = try runCached(arena, c.cfg, job, "j2");
+    try expectSucceeded(second);
+    try expectLines(second.text, &.{"moved under its tag"});
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "before"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "after"));
+    // The base and the step before the action.
+    try std.testing.expectEqual(@as(usize, 2), try storeLayers(arena, c.cfg.store));
 }
 
 test "native step cache: two jobs with one key at once run it once; the other replays it" {
@@ -5077,6 +5884,7 @@ fn runCachedJob(
         .zig_local_cache_max_mb = caches.zig_local_cache_max_mb,
         .zig_seeds = caches.zig_seeds,
         .zig_seeds_unverified = caches.zig_seeds_unverified,
+        .tool_trees = caches.tool_trees,
     }, job, &log);
     const text = w.written();
     for (res.steps) |s| if (s.outcome != .success) {
@@ -5508,4 +6316,207 @@ test "a native set-up that fails says what it did and on which path" {
         std.debug.print("why: {s}\n", .{why});
         return error.TestUnexpectedResult;
     }
+}
+
+/// GitHub's `hashFiles()` of files with these contents, in this order.
+fn hashOfFiles(contents: []const []const u8) [64]u8 {
+    var all = std.crypto.hash.sha2.Sha256.init(.{});
+    for (contents) |c| {
+        var d: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(c, &d, .{});
+        all.update(&d);
+    }
+    return std.fmt.bytesToHex(all.finalResult(), .lower);
+}
+
+/// The steps of `hashFiles()`'s tests: one writes the files (`lock` is the first one's text), the
+/// others read them where an expression can: a script, `env:`, `if:`, a name, the job's outputs.
+/// Step 4 deletes a file written below it (a whiteout) and makes a link; step 5 reads the tree
+/// again, and hashes it as the step's own overlay sees it (the oracle) as well.
+fn hashingJob(arena: Allocator, lock: []const u8) !job_mod.Job {
+    const s1 = testStep(try std.fmt.allocPrint(arena, "echo x >> /shared/s1; printf '{s}' > lock.txt; " ++
+        "mkdir -p sub; printf two > sub/lock.txt", .{lock}));
+    var s2 = testStep("");
+    s2.action.script.script = .{ .expr = "format('echo x >> /shared/s2; echo key={0}.', hashFiles('**/lock.txt'))" };
+    var s3 = testStep("echo x >> /shared/s3; echo env=$K.");
+    s3.env = &.{.{ .name = "K", .value = .{ .expr = "hashFiles('**/lock.txt', '!sub/**')" } }};
+    s3.condition = "hashFiles('**/lock.txt') != ''";
+    s3.name_expr = "format('named-{0}', hashFiles('sub/lock.txt'))";
+    const s4 = testStep("echo x >> /shared/s4; printf changed > lock.txt; rm sub/lock.txt; " ++
+        "mkdir sub2; printf z > sub2/a; ln -s sub2 dl");
+    var s5 = testStep("echo x >> /shared/s5; echo key2=$KEY2. follow=$FOLLOW. link=$LINK. gone=$GONE. all=$ALL.\n" ++
+        "echo oracle=$(python3 -c \"import hashlib,os\n" ++
+        "h=hashlib.sha256()\n" ++
+        "def walk(d):\n" ++
+        "  for n in sorted(os.listdir(d)):\n" ++
+        "    p=d+'/'+n\n" ++
+        "    if os.path.isdir(p):\n" ++
+        "      if not os.path.islink(p): walk(p)\n" ++
+        "    else: h.update(hashlib.sha256(open(p,'rb').read()).digest())\n" ++
+        "walk('.')\n" ++
+        "print(h.hexdigest())\")");
+    s5.env = &.{
+        .{ .name = "KEY2", .value = .{ .expr = "hashFiles('**/lock.txt')" } },
+        .{ .name = "FOLLOW", .value = .{ .expr = "hashFiles('--follow-symbolic-links', 'dl/**')" } },
+        .{ .name = "LINK", .value = .{ .expr = "hashFiles('dl')" } },
+        .{ .name = "GONE", .value = .{ .expr = "hashFiles('sub/lock.txt')" } },
+        .{ .name = "ALL", .value = .{ .expr = "hashFiles('**')" } },
+    };
+    var s6 = testStep("echo x >> /shared/s6; echo ran-if");
+    s6.condition = "hashFiles('sub/lock.txt') == '' && hashFiles('dl/*') == ''";
+    var job = testJob(try arena.dupe(job_mod.Step, &.{ s1, s2, s3, s4, s5, s6 }));
+    job.outputs = &.{.{ .name = "key", .value = .{ .expr = "hashFiles('**/lock.txt')" } }};
+    return job;
+}
+
+test "native hashFiles: steps read the files the steps before them left, replayed or run, and a changed file is not served a stale replay" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+
+    const one = hashOfFiles(&.{ "one", "two" });
+    const first_only = hashOfFiles(&.{"one"});
+    const sub_only = hashOfFiles(&.{"two"});
+    const upper = hashOfFiles(&.{ "ONE", "two" });
+    const changed = hashOfFiles(&.{"changed"});
+    // What step 5 sees: lock.txt as step 4 wrote it, sub/lock.txt gone, `dl` (to a directory) not
+    // a file, `sub2/a` through it when links are followed, and the whole tree as the oracle walks.
+    const whole = hashOfFiles(&.{ "changed", "z" });
+    const via_link = hashOfFiles(&.{"z"});
+
+    const first = try runCached(arena, c.cfg, try hashingJob(arena, "one"), "j1");
+    try expectSucceeded(first);
+    try expectLines(first.text, &.{
+        try std.fmt.allocPrint(arena, "key={s}.", .{&one}),
+        try std.fmt.allocPrint(arena, "env={s}.", .{&first_only}),
+        try std.fmt.allocPrint(arena, "key2={s}. follow={s}. link=. gone=. all={s}.", .{ &changed, &via_link, &whole }),
+        // The overlay a step sees, walked and hashed in the step: the runner's merge of the layers
+        // gave the same files, in the same order, with the same hash.
+        try std.fmt.allocPrint(arena, "oracle={s}", .{&whole}),
+        "ran-if",
+    });
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "named-{s}", .{&sub_only}), first.res.steps[2].name);
+    // The job's outputs are read once the last step has run.
+    try std.testing.expectEqualStrings(&changed, first.res.outputs[0].value);
+
+    // The same job again: every step replayed, the hash read from the layers the store gave back,
+    // and the replayed log the live one.
+    const second = try runCached(arena, c.cfg, try hashingJob(arena, "one"), "j2");
+    try expectSucceeded(second);
+    for ([_][]const u8{ "s1", "s2", "s3", "s4", "s5", "s6" }) |name|
+        try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, name));
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, second.text, dagger.native_reused_note));
+    try std.testing.expectEqualStrings(&changed, second.res.outputs[0].value);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "named-{s}", .{&sub_only}), second.res.steps[2].name);
+    const live = try replayableLines(arena, first.text);
+    const replayed = try replayableLines(arena, second.text);
+    try std.testing.expectEqual(live.len, replayed.len);
+    for (live, replayed) |l, r| try std.testing.expectEqualStrings(l, r);
+
+    // Another first file: the steps that read it print its hash and run again, none is served the
+    // earlier job's output (whose `key=` has the other hash).
+    const third = try runCached(arena, c.cfg, try hashingJob(arena, "ONE"), "j3");
+    try expectSucceeded(third);
+    for ([_][]const u8{ "s1", "s2", "s3", "s4", "s5", "s6" }) |name|
+        try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, name));
+    try expectLines(third.text, &.{try std.fmt.allocPrint(arena, "key={s}.", .{&upper})});
+    try std.testing.expect(std.mem.indexOf(u8, third.text, &one) == null);
+}
+
+test "native hashFiles: no match is an empty string, a pattern with `..` fails the step, as on Dagger" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var none = testStep("");
+    none.action.script.script = .{ .expr = "format('echo none-{0}. {1}.', hashFiles('**/missing.lock'), hashFiles('/elsewhere/x', '!a'))" };
+    var dots = testStep("echo not-reached");
+    dots.action.script.script = .{ .expr = "format('echo {0}', hashFiles('sub/../lock.txt'))" };
+    const r = try runNativeJob(arena, cfg, testJob(&.{ none, dots }), .root);
+    try std.testing.expectEqual(dagger.Outcome.success, r.res.steps[0].outcome);
+    try expectLines(r.text, &.{"none-. ."});
+    try std.testing.expectEqual(dagger.Outcome.failure, r.res.steps[1].outcome);
+    try expectLines(r.text, &.{"could not evaluate the script: hashFiles(sub/../lock.txt) failed"});
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "not-reached") == null);
+}
+
+test "native hashFiles: a link a step planted out of the job's tree does not read the host's files" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    try tmp.dir.createDirPath(io, "host-dir");
+    try tmp.dir.writeFile(io, .{ .sub_path = "host-dir/secret.txt", .data = "host secret" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const host_dir = try std.fmt.allocPrint(arena, "{s}/host-dir", .{root});
+    // The host's directory under the workspace, by an absolute link and by one of `..` (as many as
+    // reach the host's root, if the job's were it).
+    const plant = try std.fmt.allocPrint(arena, "printf ok > ok.txt; ln -s {s} abs-dir; " ++
+        "ln -s {s}/secret.txt abs-file; ln -s ../../../../../../../../../../../../../../../..{s} rel-dir; " ++
+        "true", .{ host_dir, host_dir, host_dir });
+    var follow = testStep("");
+    follow.action.script.script = .{ .expr = "format('echo follow={0}.', hashFiles('--follow-symbolic-links', '**'))" };
+    var plain = testStep("");
+    plain.action.script.script = .{ .expr = "format('echo plain={0}.', hashFiles('abs-file'))" };
+    const r = try runNativeJob(arena, cfg, testJob(&.{ testStep(plant), follow, plain }), .root);
+    const ok = hashOfFiles(&.{"ok"});
+    // Followed, the links lead to nothing in the job's tree: only `ok.txt` is hashed. Not followed,
+    // a link to a file that is not there fails the call, rather than hash the host's file.
+    try expectLines(r.text, &.{try std.fmt.allocPrint(arena, "follow={s}.", .{&ok})});
+    try std.testing.expectEqual(dagger.Outcome.failure, r.res.steps[2].outcome);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "plain=") == null);
+    var dir = try tmp.dir.openDir(io, "host-dir", .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |e| try std.testing.expectEqualStrings("secret.txt", e.name);
+}
+
+/// Two steps whose text is the same in every job: the first writes the file from its env, the
+/// second reads its hash through its own env. Only `content` differs between jobs.
+fn envJob(arena: Allocator, content: []const u8) !job_mod.Job {
+    var write = testStep("echo x >> /shared/w; printf '%s' \"$SEED\" > seed.txt");
+    write.env = try arena.dupe(job_mod.Input, &.{.{ .name = "SEED", .value = .{ .lit = content } }});
+    var read = testStep("echo x >> /shared/r; echo read=$K.");
+    read.env = &.{.{ .name = "K", .value = .{ .expr = "hashFiles('seed.txt')" } }};
+    return testJob(try arena.dupe(job_mod.Step, &.{ write, read }));
+}
+
+test "native hashFiles: a change only in a step's env, or in the file that gives it the hash, is not replayed from the old job" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    const one = hashOfFiles(&.{"one"});
+    const two = hashOfFiles(&.{"two"});
+
+    const first = try runCached(arena, c.cfg, try envJob(arena, "one"), "j1");
+    try expectSucceeded(first);
+    try expectLines(first.text, &.{try std.fmt.allocPrint(arena, "read={s}.", .{&one})});
+    const again = try runCached(arena, c.cfg, try envJob(arena, "one"), "j2");
+    try expectSucceeded(again);
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "w"));
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "r"));
+    // Neither step's text changes, only the writer's env: the writer runs again, the reader's hash
+    // is of the new file, and it runs again too. A replay of either would print `one`'s hash.
+    const other = try runCached(arena, c.cfg, try envJob(arena, "two"), "j3");
+    try expectSucceeded(other);
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "w"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "r"));
+    try expectLines(other.text, &.{try std.fmt.allocPrint(arena, "read={s}.", .{&two})});
+    try std.testing.expect(std.mem.indexOf(u8, other.text, &one) == null);
+    // And the first job's own steps are still kept: `one` replays again.
+    const back = try runCached(arena, c.cfg, try envJob(arena, "one"), "j4");
+    try expectSucceeded(back);
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "w"));
+    try expectLines(back.text, &.{try std.fmt.allocPrint(arena, "read={s}.", .{&one})});
 }

@@ -1,7 +1,7 @@
 name: store model
 
-# The native layer store's locking protocol, model-checked with TLC (proofs/tla/StoreLocking.tla,
-# proofs/README.md "The store's locking, in TLA+"): its safety and liveness must hold, and each
+# The native store's locking protocols, model-checked with TLC (proofs/tla/StoreLocking.tla and
+# StoreEviction.tla, proofs/README.md "The store's locking, in TLA+"): its safety and liveness must hold, and each
 # mutant (the code with one guard taken away) must fail. tla2tools.jar is pinned with its sha256 in
 # tlc.sh. On pull requests and pushes to main that touch the store, its callers or the model, and
 # weekly with the proofs. Not a required check, so a path filter is enough (proofs.yml needs
@@ -15,6 +15,9 @@ on:
       - runner/src/native/Store.zig
       - runner/src/native/Backend.zig
       - runner/src/native/layers.zig
+      - runner/src/native/evict.zig
+      - runner/src/native/volumes.zig
+      - runner/src/native/oci/Store.zig
       - .github/workflows/store-model.yml
       - .github/scripts/tlc.sh
   pull_request:
@@ -23,6 +26,9 @@ on:
       - runner/src/native/Store.zig
       - runner/src/native/Backend.zig
       - runner/src/native/layers.zig
+      - runner/src/native/evict.zig
+      - runner/src/native/volumes.zig
+      - runner/src/native/oci/Store.zig
       - .github/workflows/store-model.yml
       - .github/scripts/tlc.sh
   schedule:

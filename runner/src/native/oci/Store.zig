@@ -6,20 +6,24 @@
 //! key so runners sharing the store never make one twice. Keys are P2's (`Store.KeyHasher`, in
 //! `Backend.provision`). A provisioned rootfs lives under `rootfs/`, apart from P2's `layers/`
 //! (stacked layers with records, which P2's `collect` evicts): it is a whole tree with the image's
-//! ids, flattened because only the lowest lower is idmapped. No eviction yet for `oci/` and
-//! `rootfs/`: P2's LRU under a byte cap should cover them too.
+//! ids, flattened because only the lowest lower is idmapped. A job holds what it uses shared on
+//! the lock beside it (`hold`, `ensure`) until it ends, and `evict.zig` takes what no job holds.
 //!
 //!   <store>/oci/blobs/sha256/<hex>     a blob, written only once its digest checked
 //!   <store>/oci/refs/<hex>.<platform>  a pinned index's manifest for this platform (`image.zig`)
 //!   <store>/oci/images/<hex>/          an image by its manifest's digest: `rootfs/`, `config.json`
 //!                                      (`<hex>.rootless/` for a rootless runner's, all its own)
 //!   <store>/rootfs/<key>/              a rootfs a native step made (provisioning): `rootfs/`
+//!   <dir>.lock, <dir>.size              beside each: held by the jobs using it, its mtime its last
+//!                                      use; its bytes when last measured (`evict.zig`)
+//!   <store>/oci/blobs.lock             held shared by an unpack, as the blobs have no job to hold
 
 const Store = @This();
 
 const std = @import("std");
 const linux = std.os.linux;
 const layer = @import("layer.zig");
+const LayerStore = @import("../Store.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -37,6 +41,10 @@ pub fn blobTemp(s: Store, arena: Allocator, io: std.Io, digest: []const u8) ![]c
     return std.fmt.allocPrint(arena, "{s}/oci/blobs/sha256/.tmp-{s}-{s}", .{
         s.root, digest["sha256:".len..], &std.fmt.bytesToHex(raw, .lower),
     });
+}
+
+pub fn blobsLock(s: Store, arena: Allocator) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}/oci/blobs.lock", .{s.root});
 }
 
 pub fn refPath(s: Store, arena: Allocator, digest: []const u8, platform: []const u8) ![]const u8 {
@@ -59,9 +67,48 @@ pub const Maker = struct {
     makeFn: *const fn (ptr: *anyopaque, dir: []const u8) anyerror!void,
 };
 
+const lock_sh: i32 = 1;
+const lock_ex: i32 = 2;
+
+fn flock(f: std.Io.File, how: i32) !void {
+    if (linux.errno(linux.flock(f.handle, how)) != .SUCCESS) return error.Locked;
+}
+
+/// `dir`'s lock file (`<dir>.lock`), taken as `how` says: only on the file the path names, as an
+/// eviction removes it once the directory is gone (`evict.zig`, `Store.lockKey`).
+pub fn lockDir(arena: Allocator, io: std.Io, dir: []const u8, how: i32) !std.Io.File {
+    const path = try std.fmt.allocPrint(arena, "{s}.lock", .{dir});
+    while (true) {
+        const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+        errdefer f.close(io);
+        try flock(f, how);
+        if (LayerStore.sameFile(arena, f, path)) return f;
+        f.close(io);
+    }
+}
+
+/// The directory `dir`, held shared for a job, its last use now, until the lock this returns is
+/// closed: no eviction takes it meanwhile, on this runner or another. Null when it is not there.
+/// Waits out a runner making it and an eviction under way.
+pub fn holdDir(arena: Allocator, io: std.Io, dir: []const u8) !?std.Io.File {
+    const f = try lockDir(arena, io, dir, lock_sh);
+    if (std.Io.Dir.cwd().access(io, dir, .{})) |_| {
+        _ = linux.utimensat(f.handle, null, null, 0);
+        return f;
+    } else |_| {
+        f.close(io);
+        return null;
+    }
+}
+
+/// `<store>/<kind>/<key>`, held (`holdDir`), or null when it is not there.
+pub fn hold(s: Store, arena: Allocator, io: std.Io, kind: []const u8, key: []const u8) !?std.Io.File {
+    return holdDir(arena, io, try std.fmt.allocPrint(arena, "{s}/{s}/{s}", .{ s.root, kind, key }));
+}
+
 /// `<store>/<kind>/<key>`, made by `make` when it is not there: in a directory of its own, under
 /// the key's lock (so a runner sharing the store waits instead of making it too), then renamed into
-/// place. Whether it was made now.
+/// place. Whether it was made now, and its lock, held for the job as `hold` holds it.
 pub fn ensure(
     s: Store,
     arena: Allocator,
@@ -69,30 +116,36 @@ pub fn ensure(
     kind: []const u8,
     key: []const u8,
     make: Maker,
-) !struct { dir: []const u8, made: bool } {
+) !struct { dir: []const u8, made: bool, lock: std.Io.File } {
     const dir = try std.fmt.allocPrint(arena, "{s}/{s}/{s}", .{ s.root, kind, key });
     const cwd = std.Io.Dir.cwd();
-    if (cwd.access(io, dir, .{})) |_| return .{ .dir = dir, .made = false } else |_| {}
-    const lock = try cwd.createFile(io, try std.fmt.allocPrint(arena, "{s}.lock", .{dir}), .{ .truncate = false });
-    defer lock.close(io);
-    if (linux.errno(linux.flock(lock.handle, 2)) != .SUCCESS) return error.Locked;
-    if (cwd.access(io, dir, .{})) |_| return .{ .dir = dir, .made = false } else |_| {}
-    // A runner that died while making it left this; the lock says no one is making it now.
-    const tmp = try std.fmt.allocPrint(arena, "{s}/{s}/.tmp-{s}", .{ s.root, kind, key });
-    removeTree(arena, io, tmp);
-    try cwd.createDirPath(io, tmp);
-    errdefer removeTree(arena, io, tmp);
-    try make.makeFn(make.ptr, tmp);
-    try syncFilesystem(arena, tmp);
-    try cwd.rename(tmp, cwd, dir, io);
-    return .{ .dir = dir, .made = true };
+    var made = false;
+    while (true) {
+        if (try holdDir(arena, io, dir)) |lock| return .{ .dir = dir, .made = made, .lock = lock };
+        const lock = try lockDir(arena, io, dir, lock_ex);
+        defer lock.close(io);
+        if (cwd.access(io, dir, .{})) |_| {} else |_| {
+            // A runner that died while making it left this; the lock says no one is making it now.
+            const tmp = try std.fmt.allocPrint(arena, "{s}/{s}/.tmp-{s}", .{ s.root, kind, key });
+            removeTree(arena, io, tmp);
+            try cwd.createDirPath(io, tmp);
+            errdefer removeTree(arena, io, tmp);
+            try make.makeFn(make.ptr, tmp);
+            try syncFilesystem(arena, tmp);
+            try cwd.rename(tmp, cwd, dir, io);
+            made = true;
+        }
+        // Then held as any job holds it. Exclusive to shared in one call would give the lock up
+        // first all the same, with an eviction free to come between, so it is taken again, and
+        // what is there looked at: a tree evicted at once is made again.
+    }
 }
 
 /// `path`'s filesystem written to disk: for a tree about to be renamed to the name that says it
 /// is whole. Nothing checks such a tree when it is found, so a crash must not leave that name on
 /// files whose contents were lost, and a step's overlay does not sync them at its unmount
 /// (`sandbox.mountVolatile`). The whole filesystem, as these trees are rare and large (a layer's
-/// are often small: `Store.syncTree`).
+/// are often small: `Store.writeBack`).
 pub fn syncFilesystem(arena: Allocator, path: []const u8) !void {
     const rc = linux.open(try arena.dupeSentinel(u8, path, 0), .{
         .ACCMODE = .RDONLY,
@@ -401,6 +454,19 @@ test "native store: a key's directory is made once and published whole" {
     try testing.expect(!again.made);
     try testing.expectEqual(@as(u32, 2), ctx.calls);
     try testing.expectEqualStrings(first.dir, again.dir);
+    // Both are held, shared, by the jobs that asked: another runner's exclusive lock waits.
+    const probe = try std.Io.Dir.cwd().openFile(testing.io, try std.fmt.allocPrint(arena, "{s}.lock", .{first.dir}), .{});
+    defer probe.close(testing.io);
+    const lock_nb: i32 = 4;
+    try testing.expect(linux.errno(linux.flock(probe.handle, lock_ex | lock_nb)) != .SUCCESS);
+    first.lock.close(testing.io);
+    again.lock.close(testing.io);
+    try testing.expect(linux.errno(linux.flock(probe.handle, lock_ex | lock_nb)) == .SUCCESS);
+    _ = linux.flock(probe.handle, 8);
+    // Held again, its lock's mtime moves; a key with no directory holds nothing.
+    const held = (try s.hold(arena, testing.io, "rootfs", "k1")).?;
+    held.close(testing.io);
+    try testing.expect(try s.hold(arena, testing.io, "rootfs", "none") == null);
 }
 
 test "native store: an upper flattened onto its lower, whiteouts and opaque directories as overlay showed them" {

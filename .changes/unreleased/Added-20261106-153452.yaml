@@ -1,0 +1,3 @@
+kind: Added
+body: 'RUNNER_ENGINE=none (with RUNNER_BACKEND=native) runs the runner with no Dagger engine: no pre-warm, no engine look in the memory gate, and a job native cannot run fails at once in Set up job, naming why, instead of waiting for an engine. deploy/compose.engineless.yaml drops the engine service. The default is unchanged.'
+time: 2026-11-06T15:34:52.053197191-05:00

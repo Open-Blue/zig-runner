@@ -94,7 +94,7 @@ fn judge(
         .node => {
             // The musl build on a musl image (`container: alpine`), as `js.zig` mounts it.
             const rt = (if (b.isMusl()) js.runtimes_musl else js.runtimes).get(b.js_runtime);
-            return switch (try docker_action.find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, rt.image)) {
+            return switch (try docker_action.find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, rt.image, &b.held)) {
                 .image => null,
                 .missing => |why| try std.fmt.allocPrint(arena, "{s} is a JavaScript action, " ++
                     "and its runtime is not here: {s}", .{ label, why }),
@@ -226,7 +226,7 @@ pub fn loadLocal(b: *Backend, x: *Exec, u: job_mod.Uses) !Exec.LoadResult {
 }
 
 fn imageReason(b: *Backend, image: []const u8) !?[]const u8 {
-    return switch (try docker_action.find(b.arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, image)) {
+    return switch (try docker_action.find(b.arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, image, &b.held)) {
         .missing => |why| why,
         .image => |img| if (images.runsAsRoot(img.user)) null else try std.fmt.allocPrint(
             b.arena,
@@ -547,6 +547,49 @@ test "a job with an action keeps its steps cached: the action's tree is keyed by
     try std.testing.expect(std.mem.indexOf(u8, texts[0], dagger.native_reused_note) == null);
     try std.testing.expect(std.mem.count(u8, texts[1], dagger.native_reused_note) >= 1);
     try std.testing.expect(std.mem.indexOf(u8, texts[1], "after the action") != null);
+}
+
+test "a Dockerfile action whose base image changed under its tag is built again, not replayed" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testActions(arena, &tmp);
+    try testRepo(arena, &tmp, "dock", &.{
+        .{ "action.yml", "runs:\n  using: docker\n  image: Dockerfile\n" },
+        .{
+            "Dockerfile",
+            \\FROM zr-test/base:1
+            \\RUN cp /image-marker /built
+            \\ENTRYPOINT ["/bin/cat", "/built"]
+        },
+    });
+    var job = testJob(&.{usesStep("dock", "o", "dock", "v1", &.{})});
+    job.github.server_url = "file:///srv/git";
+    const Run = struct {
+        fn go(ar: Allocator, c: Backend.Config, j: job_mod.Job) ![]const u8 {
+            var env: std.process.Environ.Map = .init(ar);
+            var w: std.Io.Writer.Allocating = .init(ar);
+            var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+            const res = try dagger.run(ar, std.testing.io, &env, .{
+                .native = c,
+                .step_user = .root,
+                .gpa = std.testing.allocator,
+            }, j, &log);
+            errdefer std.debug.print("{s}\n", .{w.written()});
+            try std.testing.expect(res.succeeded);
+            return w.written();
+        }
+    };
+    try std.testing.expect(std.mem.indexOf(u8, try Run.go(arena, cfg, job), "in the image") != null);
+    // Replaced, as a pull of the moved tag gives a new tree (`docker_action.baseId`).
+    const marker = try std.fmt.allocPrint(arena, "images/{s}/rootfs/image-marker", .{try images.key(arena, "zr-test/base:1")});
+    try tmp.dir.deleteFile(std.testing.io, marker);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = marker, .data = "moved under its tag\n" });
+    const again = try Run.go(arena, cfg, job);
+    errdefer std.debug.print("{s}\n", .{again});
+    try std.testing.expect(std.mem.indexOf(u8, again, "moved under its tag") != null);
 }
 
 test "preload: a JavaScript action, a local one, or an image not in the store sends the job to Dagger" {

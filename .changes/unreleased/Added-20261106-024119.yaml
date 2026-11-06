@@ -1,0 +1,3 @@
+kind: Added
+body: 'Native cache volumes are evicted: past `RUNNER_NATIVE_VOLUMES_MAX_MB` (16 GiB), or with under `RUNNER_NATIVE_MIN_FREE_PCT` (10) of the disk free, those no job holds go, the longest unused first. A volume used today stays over the cap; one evicted is an empty directory to the next job.'
+time: 2026-11-06T02:41:19.630817827-05:00

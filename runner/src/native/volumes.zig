@@ -13,9 +13,13 @@
 //!
 //! Dagger's sharing modes are kept with an flock on `<volume>.lock` beside each volume, held for
 //! the job: `shared` (Dagger's default, and every volume's here) takes it shared, so jobs use a
-//! volume at once and only something that must have it alone (an eviction, when one exists)
-//! waits; `locked` takes it exclusive, so jobs take turns; `private` takes it exclusive if it is
-//! free and otherwise gives the job a fresh volume of its own, removed when the job ends.
+//! volume at once and only an eviction (`evict.zig`) has to wait, which it does not: it takes the
+//! lock non-blocking and leaves a volume in use alone. `locked` takes it exclusive, so jobs take
+//! turns; `private` takes it exclusive if it is free and otherwise gives the job a fresh volume of
+//! its own, under a lock of its own (`<volume>.private-<n>.lock`), removed when the job ends, or
+//! by the next collect when the job's runner died. The lock's mtime is the volume's last use.
+//! A volume is a cache: one that was evicted is an empty directory to the next job, as a new one
+//! is, and a job that held it to its end never sees that.
 //!
 //! Ownership. On a root runner each job's ids are its slot's range, so a volume filled by one
 //! slot's job would be nobody's to the next slot's. Its files are owned on disk by a range of
@@ -30,7 +34,8 @@
 //! backend builds it (`set_up.zigSeedScript`), and kept under `seeds/`. It sits between the
 //! rootfs and the job's layers, so what a job adds to its global cache goes in the job's own
 //! layers, as Dagger mounts the seed as a directory whose writes go with the container. Nothing a
-//! job wrote is in it, which is why one seed may go to every scope's jobs.
+//! job wrote is in it, which is why one seed may go to every scope's jobs. A job holds each seed it
+//! runs on until it ends (`Backend.holdSeed`), and `evict.zig` takes one no job holds.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -41,6 +46,8 @@ const job_mod = @import("../job.zig");
 const set_up = @import("../dagger/set_up.zig");
 const sandbox = @import("sandbox.zig");
 const OciStore = @import("oci/Store.zig");
+const Store = @import("Store.zig");
+const evict = @import("evict.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -54,6 +61,10 @@ pub const Options = struct {
     zig_local_cache_max_mb: u32 = 0,
     zig_seeds: []const config.ZigSeed = &.{},
     zig_seeds_unverified: []const []const u8 = &.{},
+    /// "Set up job" checks the tool cache's trees (`tool_trees.zig`).
+    tool_trees: bool = false,
+    /// The job's cancel, which ends that check.
+    cancel: ?*const dagger.Cancel = null,
 
     pub fn of(opts: dagger.Options) Options {
         return .{
@@ -64,6 +75,8 @@ pub const Options = struct {
             .zig_local_cache_max_mb = opts.zig_local_cache_max_mb,
             .zig_seeds = opts.zig_seeds,
             .zig_seeds_unverified = opts.zig_seeds_unverified,
+            .tool_trees = opts.tool_trees,
+            .cancel = opts.cancel,
         };
     }
 };
@@ -78,11 +91,16 @@ pub const Volume = struct {
     /// A `private` volume's copy of the job's own, removed when it is let go.
     private: bool = false,
 
-    /// Lets the volume go; a private copy is removed.
+    /// Lets the volume go; a private copy is removed, and its lock with it.
     pub fn release(v: Volume, io: std.Io) void {
-        if (v.private) std.Io.Dir.cwd().deleteTree(io, v.dir) catch |e|
+        defer v.lock.close(io);
+        if (!v.private) return;
+        const cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, v.dir) catch |e|
             std.log.warn("native: cannot remove {s}: {s}", .{ v.dir, @errorName(e) });
-        v.lock.close(io);
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const lock = std.fmt.bufPrint(&buf, "{s}.lock", .{v.dir}) catch return;
+        cwd.deleteFile(io, lock) catch {};
     }
 };
 
@@ -108,32 +126,62 @@ pub fn open(
         try path.appendSlice(arena, try component(arena, part));
     }
     const dir = path.items;
-    try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(dir).?);
     const lock_path = try std.fmt.allocPrint(arena, "{s}.lock", .{dir});
-    const lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false });
-    errdefer lock.close(io);
     const lock_sh: i32 = 1;
     const lock_ex: i32 = 2;
     const lock_nb: i32 = 4;
     var private = false;
-    switch (sharing) {
-        .shared, .locked => {
-            const op = if (sharing == .shared) lock_sh else lock_ex;
-            if (linux.errno(linux.flock(lock.handle, op)) != .SUCCESS) return error.Locked;
-        },
-        .private => private = linux.errno(linux.flock(lock.handle, lock_ex | lock_nb)) != .SUCCESS,
-    }
+    // Until the lock is on the file the path names: an eviction removes the file once it has the
+    // volume away, and can take the directory it is in (`evict.nested`).
+    var lock = while (true) {
+        try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(dir).?);
+        const f = Store.lockBeside(arena, io, lock_path) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => return e,
+        };
+        errdefer f.close(io);
+        switch (sharing) {
+            .shared, .locked => {
+                const op = if (sharing == .shared) lock_sh else lock_ex;
+                if (linux.errno(linux.flock(f.handle, op)) != .SUCCESS) return error.Locked;
+            },
+            .private => private = linux.errno(linux.flock(f.handle, lock_ex | lock_nb)) != .SUCCESS,
+        }
+        if (private or Store.sameFile(arena, f, lock_path)) break f;
+        f.close(io);
+    };
+    errdefer lock.close(io);
     const at = if (private) private: {
         var raw: [8]u8 = undefined;
         io.random(&raw);
-        break :private try std.fmt.allocPrint(arena, "{s}.private-{s}", .{
+        const copy = try std.fmt.allocPrint(arena, "{s}.private-{s}", .{
             dir,
             &std.fmt.bytesToHex(raw, .lower),
         });
+        // A lock of its own, which tells a copy in use from one a dead runner left.
+        const own = try Store.lockBeside(arena, io, try std.fmt.allocPrint(arena, "{s}.lock", .{copy}));
+        lock.close(io);
+        lock = own;
+        if (linux.errno(linux.flock(lock.handle, lock_ex | lock_nb)) != .SUCCESS) return error.Locked;
+        break :private copy;
     } else dir;
+    // Its last use, which an eviction goes by.
+    _ = linux.utimensat(lock.handle, null, null, 0);
     const at_z = try arena.dupeSentinel(u8, at, 0);
     switch (linux.errno(linux.mkdir(at_z, 0o755))) {
-        .SUCCESS, .EXIST => {},
+        .SUCCESS => {},
+        .EXIST => {
+            // The one name inside another volume, where a job may have left anything. Anywhere
+            // else no job reaches, and what is there is the store's.
+            var st: linux.Statx = undefined;
+            const rc = linux.statx(linux.AT.FDCWD, at_z, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &st);
+            if (linux.errno(rc) != .SUCCESS) return error.VolumeNotMade;
+            if (st.mode & linux.S.IFMT != linux.S.IFDIR) {
+                if (!std.mem.eql(u8, std.fs.path.basename(at), evict.nested)) return error.VolumeNotMade;
+                if (linux.errno(linux.unlink(at_z)) != .SUCCESS) return error.VolumeNotMade;
+                if (linux.errno(linux.mkdir(at_z, 0o755)) != .SUCCESS) return error.VolumeNotMade;
+            }
+        },
         else => return error.VolumeNotMade,
     }
     if (owner) |o| if (linux.errno(linux.lchown(at_z, o, o)) != .SUCCESS)
@@ -143,12 +191,20 @@ pub fn open(
 
 /// One part of a volume's key as a directory name: the characters a repository's or a tool's
 /// name has (letters, digits, `.`, `-`, `_`) kept, any other turned into `-`, and a name that is
-/// empty or all dots prefixed with `_`, so no part is `.`, `..` or a path.
+/// empty or starts with a dot marked with a leading `~`, so no part is `.`, `..` or a path. A job
+/// chooses its image, and so a part of its key: none may read as what the store keeps beside a
+/// volume or calls one that is going (`.lock`, `.size`, `.private-<n>`, `.dead-<n>`), or its sibling
+/// would take it for that, so those are marked with `~` too. No name keeps a `~` of its own, so a
+/// marked name is no other repository's, which would share its volume: Zig runs what it finds in
+/// `zig-local` unchecked.
 pub fn component(arena: Allocator, part: []const u8) ![]const u8 {
     var out = try arena.alloc(u8, part.len);
     for (part, 0..) |c, i| out[i] = if (std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or
         c == '_') c else '-';
-    if (std.mem.indexOfNone(u8, out, ".") == null) return std.mem.concat(arena, u8, &.{ "_", out });
+    while (std.mem.indexOf(u8, out, ".private-")) |at| out[at] = '~';
+    if (out.len == 0 or out[0] == '.') out = try std.mem.concat(arena, u8, &.{ "~", out });
+    if (std.mem.endsWith(u8, out, ".lock") or std.mem.endsWith(u8, out, ".size"))
+        out = try std.mem.concat(arena, u8, &.{ out, "~" });
     return out;
 }
 
@@ -168,8 +224,13 @@ pub const Plan = struct {
     /// Where the `toolcache` volume is bound (RUNNER_TOOL_CACHE), when the job has one: what a
     /// step installs there is in no layer, so a replay is checked against it (`Exec.tool_cache`).
     tool_cache: ?[]const u8 = null,
+    /// The same volume's directory on the host, where `tool_trees.check` reads the trees.
+    tool_cache_host: ?[]const u8 = null,
     /// Zig's local cache volume, when its generations are rolled (`zig_local_cache_max_mb`).
     zig_local_roll: ?[]const u8 = null,
+    /// The volume of the `builtin.zig` files the local cache's manifests name, bound once the
+    /// seeds are in (`Backend.seedBuiltin`) because its mount hides the seed's own `b/`.
+    zig_builtin: ?sandbox.Spec.Bind = null,
     /// The Zig cache seeds the job runs with, built if missing (`Seed`).
     seeds: std.ArrayList(Seed) = .empty,
     /// What "Set up job" says of them.
@@ -227,7 +288,10 @@ pub fn plan(
         const v = try open(arena, io, store, key.items, .shared, owner);
         try p.held.append(arena, v);
         const path = if (as_runner) try set_up.runnerCachePath(arena, i) else d.path;
-        if (std.mem.eql(u8, d.name, "toolcache")) p.tool_cache = path;
+        if (std.mem.eql(u8, d.name, "toolcache")) {
+            p.tool_cache = path;
+            p.tool_cache_host = v.dir;
+        }
         const zig = std.mem.eql(u8, d.name, set_up.zig_packages);
         // Zig's global cache is the job's own (its layers, over the seed); only its package
         // tarballs, which Zig hashes again when it unpacks them, are in the volume.
@@ -269,6 +333,22 @@ pub fn plan(
                 .make = true,
             });
             if (opts.zig_local_cache_max_mb > 0) p.zig_local_roll = v.dir;
+            // The `builtin.zig` files its manifests name, which Zig keeps in the global cache
+            // that is otherwise the job's own (`set_up.zigBuiltinDir`).
+            const builtin_key = [_][]const u8{ repo_owner, repo_name, scope, "zig-builtin" };
+            const builtin_keyed = if (as_runner)
+                try std.mem.concat(arena, []const u8, &.{ &builtin_key, &.{dagger.runner_user} })
+            else
+                &builtin_key;
+            const b = try open(arena, io, store, builtin_keyed, .shared, owner);
+            try p.held.append(arena, b);
+            p.zig_builtin = .{
+                .host = b.dir,
+                .at = try set_up.zigBuiltinDir(arena, as_runner),
+                .read_only = false,
+                .volume = true,
+                .make = true,
+            };
         } else try p.notes.append(arena, "Zig local cache: this job's own (not kept between " ++
             "untrusted jobs)");
     }
@@ -386,7 +466,7 @@ pub fn adoptSeed(
     const p = try std.fmt.allocPrintSentinel(arena, "{s}/p", .{into}, 0);
     _ = linux.mkdir(p, 0o755);
     if (user) |u| _ = linux.lchown(p, u, u);
-    // A seed's key is its path alone, so nothing below would notice one a crash emptied.
+    // Nothing below would notice a seed a crash emptied: a key says which build it is, not what it holds.
     try OciStore.syncFilesystem(arena, new);
     cwd.rename(new, cwd, seed.dir, io) catch |e| switch (e) {
         error.DirNotEmpty => {
@@ -395,6 +475,19 @@ pub fn adoptSeed(
         },
         else => return e,
     };
+}
+
+/// What keys know a seed by: its path, and which build lives there. A seed evicted is built again
+/// under the same path, from the same release, and need not be the same tree, so a layer on the old
+/// one must not be replayed on the new (`Backend.below`). Which directory, since when: no one
+/// changes a seed's root once it is published.
+pub fn seedId(arena: Allocator, dir: []const u8) ![]const u8 {
+    var st: linux.Statx = undefined;
+    const z = try arena.dupeSentinel(u8, dir, 0);
+    const mask: linux.STATX = .{ .INO = true, .CTIME = true };
+    if (linux.errno(linux.statx(linux.AT.FDCWD, z, linux.AT.SYMLINK_NOFOLLOW, mask, &st)) != .SUCCESS)
+        return error.SeedGone;
+    return std.fmt.allocPrint(arena, "{s}@{d}.{d}.{d}", .{ dir, st.ino, st.ctime.sec, st.ctime.nsec });
 }
 
 /// Every file under `path` owned by `user` (none followed through a symlink), and every
@@ -426,6 +519,26 @@ fn ownTree(arena: Allocator, io: std.Io, path: []const u8, user: ?u32, depth: u3
     }
 }
 
+test "native volumes: a seed built again is another seed to a key" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = std.Io.Dir.cwd();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const dir = try std.fmt.allocPrint(arena, "{s}/seed", .{root});
+    const aside = try std.fmt.allocPrint(arena, "{s}/aside", .{root});
+    try cwd.createDirPath(io, dir);
+    const first = try seedId(arena, dir);
+    try std.testing.expectEqualStrings(first, try seedId(arena, dir));
+    // The old one still there, so no inode can be used again.
+    try cwd.rename(dir, cwd, aside, io);
+    try cwd.createDirPath(io, dir);
+    try std.testing.expect(!std.mem.eql(u8, first, try seedId(arena, dir)));
+}
+
 test "native volumes: a key's parts are names of their own" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -433,9 +546,13 @@ test "native volumes: a key's parts are names of their own" {
     try std.testing.expectEqualStrings("Open-Blue", try component(arena, "Open-Blue"));
     try std.testing.expectEqualStrings("zig-runner.v2_x", try component(arena, "zig-runner.v2_x"));
     try std.testing.expectEqualStrings("a-b-c", try component(arena, "a/b c"));
-    try std.testing.expectEqualStrings("_..", try component(arena, ".."));
-    try std.testing.expectEqualStrings("_.", try component(arena, "."));
-    try std.testing.expectEqualStrings("_", try component(arena, ""));
+    try std.testing.expectEqualStrings("~..", try component(arena, ".."));
+    try std.testing.expectEqualStrings("~.", try component(arena, "."));
+    try std.testing.expectEqualStrings("~", try component(arena, ""));
+    try std.testing.expectEqualStrings("-", try component(arena, "~"));
+    try std.testing.expectEqualStrings("foo.lock~", try component(arena, "foo.lock"));
+    try std.testing.expectEqualStrings("~.github", try component(arena, ".github"));
+    try std.testing.expectEqualStrings("a~private-b", try component(arena, "a.private-b"));
 }
 
 test "native volumes: shared ones are used at once, locked ones in turn, private ones copied" {
@@ -527,6 +644,8 @@ test "native volumes: the job's caches, by scope and step user, as the Dagger ba
         trusted.early_env.items[0].value,
     );
     try std.testing.expect(trusted.zig_local_roll != null);
+    try std.testing.expectEqualStrings("/home/runner/.cache/zig/b", trusted.zig_builtin.?.at);
+    try std.testing.expect(std.mem.endsWith(u8, trusted.zig_builtin.?.host, "/runner"));
     try std.testing.expectEqual(@as(usize, 1), trusted.seeds.items.len);
     try std.testing.expectEqualStrings("home/runner/.cache/zig", trusted.seeds.items[0].cache);
     // The tool cache is bound where Dagger mounts it, for every step user.
@@ -540,6 +659,7 @@ test "native volumes: the job's caches, by scope and step user, as the Dagger ba
         try std.testing.expect(!std.mem.eql(u8, b.at, "/root/.cache/zig-local"));
     }
     try std.testing.expect(untrusted.zig_local_roll == null);
+    try std.testing.expect(untrusted.zig_builtin == null);
     try std.testing.expectEqualStrings("Zig local cache: this job's own (not kept between " ++
         "untrusted jobs)", untrusted.notes.items[0]);
 

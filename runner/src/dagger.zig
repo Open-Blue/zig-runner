@@ -215,8 +215,8 @@ pub const Resolved = union(enum) {
 /// index. Renovate moves the pin (renovate.json), and CI checks on every pull request that it is
 /// still a pullable index with the applets the runner uses (.github/scripts/busybox-pin.sh). By
 /// hand, `docker buildx imagetools inspect busybox:1.37.0-musl` prints the index digest.
-pub const busybox_image = "busybox:1.37.0-musl" ++
-    "@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478";
+pub const busybox_image = "busybox:1.38.0-musl" ++
+    "@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6";
 /// Where a Docker action's container gets its static busybox, and HOME (shared by the job's Docker
 /// actions, as GitHub mounts one /github/home into each).
 pub const busybox_path = "/github/_runtime/busybox";
@@ -560,6 +560,9 @@ pub const Options = struct {
     native: ?Backend.Config = null,
     /// Why a job that could have been native runs on Dagger, for "Set up job" (set by `run`).
     backend_note: ?[]const u8 = null,
+    /// `RUNNER_ENGINE=none`: this runner has no Dagger engine, so a job native cannot run fails at
+    /// once, saying why (`failNoEngine`), instead of waiting for one.
+    engineless: bool = false,
     /// Talk to the Dagger engine directly (`engine.zig`) instead of through a `dagger run` child.
     engine: ?engine.Endpoint = null,
     /// Backs the direct session's long-lived buffers and tasks; must be thread-safe.
@@ -580,10 +583,13 @@ const HttpTransport = struct {
     io: std.Io,
     url: []const u8,
     auth: []const u8,
-    /// A query is being sent, and `abort` asked for it to end. Atomic: `abort` runs on the
-    /// `Watch`'s task.
-    in_flight: std.atomic.Value(bool) = .init(false),
-    aborted: std.atomic.Value(bool) = .init(false),
+    /// Whether a query is being sent and whether `abort` ended it, one atomic so that an abort
+    /// and the answer cannot both win: `abort` runs on the `Watch`'s task, and it returns true
+    /// only for a query that `send` then fails (`error.QueryAborted`), even if its answer came
+    /// first. Otherwise `Watch` would count the abort done and never ask again.
+    state: std.atomic.Value(State) = .init(.idle),
+
+    const State = enum(u8) { idle, in_flight, aborted };
 
     /// The query, ended early by `abort` with `error.QueryAborted`: it runs next to a wait for
     /// the abort, and whichever ends first cancels the other (as `http.within` does for a
@@ -593,37 +599,45 @@ const HttpTransport = struct {
     /// steps after a cancel; killing `dagger run` instead would end those too.
     fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8, limit: usize) anyerror![]const u8 {
         const self: *HttpTransport = @ptrCast(@alignCast(ptr));
-        self.aborted.store(false, .release);
-        self.in_flight.store(true, .release);
-        defer self.in_flight.store(false, .release);
+        std.debug.assert(self.state.load(.acquire) == .idle); // one query at a time
         const Ended = union(enum) { answer: anyerror![]const u8, aborted: void };
         var buf: [2]Ended = undefined;
         var sel: std.Io.Select(Ended) = .init(self.io, &buf);
-        // Without a task to run it in, it runs here, and cannot be aborted.
-        sel.concurrent(.answer, query, .{ self, arena, doc, limit }) catch
+        // Without a task for each, the query runs here and is never in flight: `abort` says false
+        // for it, so `Watch` asks again, and the step is not left believing it was ended.
+        sel.concurrent(.aborted, waitAborted, .{self}) catch return self.query(arena, doc, limit);
+        sel.concurrent(.answer, query, .{ self, arena, doc, limit }) catch {
+            while (sel.cancel()) |_| {}
             return self.query(arena, doc, limit);
-        sel.concurrent(.aborted, waitAborted, .{self}) catch {};
+        };
+        self.state.store(.in_flight, .release);
         const first = sel.await() catch |e| {
             while (sel.cancel()) |_| {}
+            self.state.store(.idle, .release);
             return e;
         };
         while (sel.cancel()) |_| {}
+        // Lost to `abort` even when the answer was first: it was told it ended the query.
+        if (self.state.cmpxchgStrong(.in_flight, .idle, .acq_rel, .acquire) != null) {
+            self.state.store(.idle, .release);
+            return error.QueryAborted;
+        }
         return switch (first) {
             .answer => |a| a,
             .aborted => error.QueryAborted,
         };
     }
 
-    /// Ends the query being sent, if any; false when there is none.
+    /// Ends the query being sent, if any; false when there is none, or it has already ended.
     fn abort(ptr: *anyopaque) bool {
         const self: *HttpTransport = @ptrCast(@alignCast(ptr));
-        if (!self.in_flight.load(.acquire)) return false;
-        self.aborted.store(true, .release);
-        return true;
+        return self.state.cmpxchgStrong(.in_flight, .aborted, .acq_rel, .acquire) == null;
     }
 
     fn waitAborted(self: *HttpTransport) void {
-        while (!self.aborted.load(.acquire)) self.io.sleep(.fromMilliseconds(50), .awake) catch return;
+        while (self.state.load(.acquire) != .aborted) {
+            self.io.sleep(.fromMilliseconds(50), .awake) catch return;
+        }
     }
 
     fn query(self: *HttpTransport, arena: Allocator, doc: []const u8, limit: usize) anyerror![]const u8 {
@@ -877,17 +891,21 @@ pub fn run(
             opts.backend_note = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{
                 w,
             });
+            std.log.warn("native: {s}", .{opts.backend_note.?});
             // The gate took it for a native job (a native pool's): it is an engine job.
             if (cfg.gate) |g| g.backToEngine();
         } else if (try runNative(arena, io, opts, cfg, job, log, &opts.backend_note)) |r| {
             return r;
-        } else if (cfg.gate) |g| {
+        } else {
+            // Said here too: "Set up job" says it only if a session starts.
+            if (opts.backend_note) |note| std.log.warn("native: {s}", .{note});
             // Native set the job up (its cgroup told the gate) and then sent it here (P7's
             // preload), or its set-up failed (`setUpFallback`): the gate measures it on the
             // engine from here, and learns it under the engine.
-            g.backToEngine();
+            if (cfg.gate) |g| g.backToEngine();
         }
     }
+    if (opts.engineless) return failNoEngine(arena, io, opts, job, log);
     var env = try environ.clone(arena);
     try env.put("NO_COLOR", "1");
     try env.put("DAGGER_NO_NAG", "1");
@@ -902,10 +920,16 @@ pub fn run(
 
     const argv: []const []const u8 = opts.test_session_argv orelse
         &.{ opts.dagger_cmd, "run", "--progress=logs", "sh", "-c", session_script };
-    var child = try std.process.spawn(
+    var child = std.process.spawn(
         io,
         .{ .argv = argv, .environ_map = &env, .stdin = .pipe, .stdout = .pipe, .stderr = .pipe },
-    );
+    ) catch |e| {
+        // A job sent here from native (`backend_note`) says why, and what Dagger lacked: a bare
+        // `FileNotFound` out of `spawn` names neither.
+        const note = opts.backend_note orelse return e;
+        return fail(&sh, results, try std.fmt.allocPrint(arena, "could not start Dagger ({s}). " ++
+            "{s}", .{ @errorName(e), note }));
+    };
     // The reader must run while we wait on queries. It owns stderr: `wait` closes the pipes the
     // child still holds, and closing this one under the reader let it read whatever file next got
     // the descriptor (ThreadSanitizer, `zig build test -Dsanitize-thread`).
@@ -935,6 +959,24 @@ pub fn run(
     const transport: Transport = opts.test_transport orelse
         .{ .ptr = &http, .sendFn = HttpTransport.send, .abortFn = HttpTransport.abort };
     return runSteps(arena, io, opts, job, &sh, results, transport, null);
+}
+
+/// A job that has to run on Dagger on a runner without an engine (`Options.engineless`): fails
+/// before any step, naming why native did not take it (`backend_note`), as a missing `dagger`
+/// binary does, rather than hanging on an engine that will never come.
+fn failNoEngine(
+    arena: Allocator,
+    io: std.Io,
+    opts: Options,
+    job: job_mod.Job,
+    log: *sink.LogSink,
+) !Result {
+    const results = try arena.alloc(StepResult, job.steps.len);
+    @memset(results, .{});
+    var sh = try jobLogFor(arena, io, opts, job, log);
+    const why = opts.backend_note orelse "this runner is not set to run jobs natively.";
+    return fail(&sh, results, try std.fmt.allocPrint(arena, "this job needs the Dagger engine, " ++
+        "and this runner has none (RUNNER_ENGINE=none). {s}", .{why}));
 }
 
 /// The job on the native backend (`native/Backend.zig`): no Dagger session, the same steps code.
@@ -999,6 +1041,7 @@ fn runNative(
     b.caches = .of(opts_in);
     // The runtime its JavaScript actions get, for the preload in the base (`native/actions.zig`).
     b.js_runtime = opts.js_runtime;
+    b.cancel = opts.cancel;
     // Which ids the job's steps have, as "Set up job" says (`Backend.idsNote`).
     opts.backend_note = try b.idsNote(arena);
     var result = runSteps(arena, io, opts, job, &sh, results, b.transport(), &b) catch |e| switch (e) {
@@ -1937,7 +1980,11 @@ fn runSteps(
             if (e == error.BaseContainerFailed) return fail(sh, results, err_msg);
             return e;
         };
-        break :base .{ .id = "native", .runtime_path = b.runtime_path };
+        break :base .{
+            .id = "native",
+            .runtime_path = b.runtime_path,
+            .tool_trees = b.tool_trees,
+        };
     } else baseContainerId(arena, transport, &ev, job, plan, &secrets, &err_msg) catch |e|
         switch (e) {
             error.BaseContainerFailed => return fail(sh, results, err_msg),
@@ -1948,7 +1995,8 @@ fn runSteps(
     x.native = native;
     x.tool_trees = base.tool_trees;
     // A native job's tool cache is its `toolcache` volume, in no layer, so a replayed step that
-    // points at a tree there runs again (#229): no tree is checked natively (`tool_trees`).
+    // points at a tree there runs again (#229), unless "Set up job" checked a tree that holds it
+    // (`Backend.checkToolTrees`).
     if (native) |b| x.tool_cache = b.cache_plan.tool_cache;
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 
@@ -2396,36 +2444,74 @@ const FakeAbort = struct {
     }
 };
 
+/// A stand-in for the `dagger run` session's HTTP endpoint: takes one query, then either answers
+/// it `answer_after_ms` later or never, and notes when the client goes.
+const FakeQueryServer = struct {
+    answer_after_ms: ?i64 = null,
+    got_query: std.atomic.Value(bool) = .init(false),
+    client_gone: std.atomic.Value(bool) = .init(false),
+
+    fn run(f: *FakeQueryServer, l: *std.Io.net.Server) void {
+        const io = std.testing.io;
+        const s = l.accept(io) catch return;
+        defer s.close(io);
+        var rbuf: [4096]u8 = undefined;
+        var r = s.reader(io, &rbuf);
+        // The request ends with the JSON body's `"}`, which the document `{ a }` cannot contain.
+        var prev: u8 = 0;
+        for (0..rbuf.len) |_| {
+            const b = r.interface.takeByte() catch return;
+            if (prev == '"' and b == '}') break;
+            prev = b;
+        }
+        f.got_query.store(true, .release);
+        if (f.answer_after_ms) |ms| {
+            io.sleep(.fromMilliseconds(ms), .awake) catch return;
+            var wbuf: [256]u8 = undefined;
+            var w = s.writer(io, &wbuf);
+            w.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n" ++
+                "Connection: close\r\n\r\n{}") catch return;
+            w.interface.flush() catch return;
+            return;
+        }
+        while (true) _ = r.interface.takeByte() catch break;
+        f.client_gone.store(true, .release);
+    }
+
+    /// Waits for `flag`, at most about five seconds, so a failure is a failed test, not a hang.
+    fn waitFor(flag: *std.atomic.Value(bool)) !void {
+        for (0..500) |_| {
+            if (flag.load(.acquire)) return;
+            try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+        }
+        return error.TimedOut;
+    }
+
+    /// Lets a `run` still waiting in `accept` return: connects and goes.
+    fn release(f: *FakeQueryServer, port: u16) void {
+        if (f.got_query.load(.acquire)) return;
+        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch return;
+        const c = addr.connect(std.testing.io, .{ .mode = .stream }) catch return;
+        c.close(std.testing.io);
+    }
+};
+
 test "the CLI session's query in flight is ended by abort, and its connection closed" {
     const io = std.testing.io;
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
-    // Takes the query and never answers it; notes when the client goes (what `dagger run` sees).
-    const Fake = struct {
-        got_query: std.atomic.Value(bool) = .init(false),
-        client_gone: std.atomic.Value(bool) = .init(false),
-
-        fn run(f: *@This(), l: *std.Io.net.Server) void {
-            const s = l.accept(std.testing.io) catch return;
-            defer s.close(std.testing.io);
-            var buf: [4096]u8 = undefined;
-            var r = s.reader(std.testing.io, &buf);
-            f.got_query.store(true, .release);
-            while (true) _ = r.interface.takeByte() catch break;
-            f.client_gone.store(true, .release);
-        }
-    };
-    var fake: Fake = .{};
-    const t = try std.Thread.spawn(.{}, Fake.run, .{ &fake, &listener });
+    const port = listener.socket.address.getPort();
+    var fake: FakeQueryServer = .{};
+    const t = try std.Thread.spawn(.{}, FakeQueryServer.run, .{ &fake, &listener });
+    // The defers below run first: a failure must not leave the fake blocked with `join` waiting.
     defer t.join();
+    defer fake.release(port);
 
     var url_buf: [64]u8 = undefined;
     var http: HttpTransport = .{
         .io = io,
-        .url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/query", .{
-            listener.socket.address.getPort(),
-        }),
+        .url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/query", .{port}),
         .auth = "Basic x",
     };
     const transport: Transport = .{
@@ -2437,11 +2523,60 @@ test "the CLI session's query in flight is ended by abort, and its connection cl
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     var sending = try io.concurrent(Transport.send, .{ transport, arena.allocator(), "{ a }", 1024 });
-    while (!fake.got_query.load(.acquire)) try io.sleep(.fromMilliseconds(10), .awake);
-    while (!transport.abort()) try io.sleep(.fromMilliseconds(10), .awake);
+    // Closes the connection if the test fails before `await`, so the fake's read ends.
+    defer _ = sending.cancel(io) catch {};
+    try FakeQueryServer.waitFor(&fake.got_query);
+    var aborted = false;
+    for (0..500) |_| {
+        aborted = transport.abort();
+        if (aborted) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expect(aborted);
     try std.testing.expectError(error.QueryAborted, sending.await(io));
-    while (!fake.client_gone.load(.acquire)) try io.sleep(.fromMilliseconds(10), .awake);
+    try FakeQueryServer.waitFor(&fake.client_gone);
     try std.testing.expect(!transport.abort()); // and nothing in flight again
+}
+
+test "an abort that came as the answer did is not lost: the send fails" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    // Answers 10 ms after the query arrives, well inside `waitAborted`'s 50 ms poll, so the
+    // answer is what `send` sees first.
+    var fake: FakeQueryServer = .{ .answer_after_ms = 10 };
+    const t = try std.Thread.spawn(.{}, FakeQueryServer.run, .{ &fake, &listener });
+    defer t.join();
+    defer fake.release(port);
+
+    var url_buf: [64]u8 = undefined;
+    var http: HttpTransport = .{
+        .io = io,
+        .url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/query", .{port}),
+        .auth = "Basic x",
+    };
+    const transport: Transport = .{
+        .ptr = &http,
+        .sendFn = HttpTransport.send,
+        .abortFn = HttpTransport.abort,
+    };
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var sending = try io.concurrent(Transport.send, .{ transport, arena.allocator(), "{ a }", 1024 });
+    defer _ = sending.cancel(io) catch {};
+    try FakeQueryServer.waitFor(&fake.got_query);
+    var aborted = false;
+    for (0..5) |_| {
+        aborted = transport.abort();
+        if (aborted) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    // `Watch` takes true to mean the query ended and does not ask again, so it must have ended.
+    try std.testing.expect(aborted);
+    try std.testing.expectError(error.QueryAborted, sending.await(io));
+    try std.testing.expect(!transport.abort());
 }
 
 test "a step past its timeout is stopped, and only that step" {
@@ -3174,7 +3309,8 @@ test "GITHUB_PATH in a container job: the directories, then the container's own 
     const answers = [_][]const u8{
         "{\"data\":{\"container\":{\"from\":{\"zig_runtime_path\":\"" ++ own ++ "\"," ++
             "\"withWorkdir\":{\"id\":\"C0\"}}}}}",
-        // starting the job container: its image's digest, and whether it is musl
+        // starting the job container: its image pulled, its digest, and whether it is musl
+        "{\"data\":{\"container\":{\"from\":{\"entrypoint\":[]}}}}",
         "{\"data\":{\"container\":{\"from\":{\"imageRef\":\"node:20\"}}}}",
         "{\"data\":{\"container\":{\"from\":{\"directory\":{\"entries\":[]}}}}}",
         try execFc(arena, "C1", "", "", "", "/a\\n/b\\n"),
@@ -3190,12 +3326,12 @@ test "GITHUB_PATH in a container job: the directories, then the container's own 
     const seen = fake.seen.items;
     try std.testing.expect(std.mem.indexOf(u8, seen[0], "zig_runtime_path: envVariable(name:\"PATH\")") != null);
     // GitHub's `docker exec -e PATH="<directories>:<container PATH>"` comes after the step's env.
-    try std.testing.expect(std.mem.indexOf(u8, seen[4], "withEnvVariable(name:\"PATH\",value:\"/b:/a:" ++ own ++ "\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[4], "PATH=/b:/a:" ++ own) != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[4], "/custom") == null);
-    // ...and after a PATH written to GITHUB_ENV.
     try std.testing.expect(std.mem.indexOf(u8, seen[5], "withEnvVariable(name:\"PATH\",value:\"/b:/a:" ++ own ++ "\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[5], "/from-github-env") == null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "PATH=/b:/a:" ++ own) != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "/custom") == null);
+    // ...and after a PATH written to GITHUB_ENV.
+    try std.testing.expect(std.mem.indexOf(u8, seen[6], "withEnvVariable(name:\"PATH\",value:\"/b:/a:" ++ own ++ "\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[6], "/from-github-env") == null);
 }
 
 test "an output set twice keeps its last value, case-insensitively; GITHUB_OUTPUT beats set-output" {
@@ -4102,10 +4238,14 @@ const AutoSession = struct {
     /// An exec whose document contains [0] prints [1].
     stdout: []const [2][]const u8 = &.{},
     ids: u32 = 0,
+    /// A document that contains this is answered with an engine error, as a refused field is.
+    refuse: []const u8 = "",
 
     fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8, _: usize) anyerror![]const u8 {
         const self: *AutoSession = @ptrCast(@alignCast(ptr));
         try self.seen.append(self.arena, try self.arena.dupe(u8, doc));
+        if (self.refuse.len > 0 and std.mem.indexOf(u8, doc, self.refuse) != null)
+            return "{\"errors\":[{\"message\":\"refused\"}]}";
         var p: Answer = .{ .s = doc, .self = self, .arena = arena };
         try p.out.appendSlice(arena, "{\"data\":");
         p.ws();
@@ -4929,6 +5069,43 @@ test "a secret in a service's env reaches the service as a Dagger secret" {
         "value:\"app\")"));
 }
 
+/// A job with a service and a `container:` image, each pulled before its steps run.
+fn imageJob(steps: []const job_mod.Step) job_mod.Job {
+    var job = testJob(steps);
+    job.container = .{ .name = "", .image = .{ .lit = "node:20" } };
+    job.services = &.{.{ .name = "redis", .image = .{ .lit = "redis:7.4-alpine" } }};
+    return job;
+}
+
+test "an image digest the engine refuses to give leaves its Digest line out, and the job runs" {
+    // The engine answers `imageRef` only right after `Container.From`, and has refused it for a
+    // pull that worked: three jobs failed on it for the sake of a log line.
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var auto: AutoSession = .{ .arena = arena, .refuse = "imageRef" };
+    _ = try roundTrips(arena, &auto, .{}, imageJob(&.{testStep("true")}));
+    try std.testing.expect(auto.count("imageRef") >= 2);
+}
+
+test "a service image whose configuration the engine cannot give still fails the job" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    var auto: AutoSession = .{ .arena = arena, .refuse = "entrypoint" };
+    var job = imageJob(&.{testStep("true")});
+    job.container = null; // the service's pull is the one refused
+    const res = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = auto.transport(),
+    }, job, &log);
+    try std.testing.expect(!res.succeeded);
+}
+
 test "a Docker action's argument holding a secret reaches its command as a Dagger secret" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -4993,4 +5170,68 @@ fn expectDigest(digest: []const u8) !void {
         '0'...'9', 'a'...'f' => {},
         else => return error.TestUnexpectedResult,
     };
+}
+
+test "without an engine, a job native cannot run fails at once and says why, starting no session" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    // A session that would take a minute to answer if one were started.
+    const hang: []const []const u8 = &.{ "sh", "-c", "sleep 60" };
+    const steps = [_]job_mod.Step{ testStep("a"), testStep("b") };
+    // Native refuses it: the store is not set up.
+    var res = try run(arena, std.testing.io, &env, .{
+        .native = .{ .vouched = true, .rootless = true },
+        .engineless = true,
+        .test_session_argv = hang,
+    }, testJob(&steps), &log);
+    try std.testing.expect(!res.succeeded);
+    try std.testing.expectEqual(@as(usize, 2), res.steps.len);
+    try std.testing.expectEqual(Outcome.not_run, res.steps[0].outcome);
+    var msg = res.engine_error orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, msg, "this job needs the Dagger engine, and this " ++
+        "runner has none (RUNNER_ENGINE=none). This job runs on Dagger: the native store is not " ++
+        "set up") != null);
+    // Native refuses it for a reason only Dagger answers: steps that use the engine.
+    res = try run(arena, std.testing.io, &env, .{
+        .native = .{ .vouched = true, .rootless = true, .store = "/x", .self_exe = "/x" },
+        .nesting = true,
+        .engineless = true,
+        .test_session_argv = hang,
+    }, testJob(&steps), &log);
+    try std.testing.expect(!res.succeeded);
+    msg = res.engine_error orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, msg, "RUNNER_ENGINE=none). This job runs on " ++
+        "Dagger: steps that use the Dagger engine (RUNNER_DAGGER_NESTING) need Dagger.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "could not start Dagger") == null);
+    // No native backend at all: the same refusal, with no reason to give.
+    res = try run(arena, std.testing.io, &env, .{
+        .engineless = true,
+        .test_session_argv = hang,
+    }, testJob(&steps), &log);
+    try std.testing.expect(!res.succeeded);
+    try std.testing.expect(std.mem.indexOf(u8, res.engine_error.?, "RUNNER_ENGINE=none") != null);
+}
+
+test "with an engine, a job native cannot run still goes to Dagger and runs there" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "hi\\n") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const steps = [_]job_mod.Step{testStep("echo hi")};
+    const res = try run(arena, std.testing.io, &env, .{
+        .native = .{ .vouched = true, .rootless = true },
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+    }, testJob(&steps), &log);
+    try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
+    try std.testing.expect(std.mem.indexOf(u8, w.written(), "This job runs on Dagger: the " ++
+        "native store is not set up") != null);
 }

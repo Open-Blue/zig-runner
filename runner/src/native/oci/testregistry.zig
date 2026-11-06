@@ -16,6 +16,7 @@
 //! is found; with `Server.mute`, no request is ever answered.
 
 const std = @import("std");
+const linux = std.os.linux;
 const Io = std.Io;
 const layer = @import("layer.zig");
 
@@ -290,6 +291,14 @@ test "native oci pull: token auth with credentials, an index, gzip and zstd laye
     try testing.expectEqualStrings(img.manifest, got.manifest);
     try testing.expect(got.pulled != null);
     try testing.expectEqual(@as(usize, 4), got.pulled.?.layers);
+    // Held for whoever pulled it: an eviction's exclusive lock cannot be had until it lets go.
+    const held_path = try std.fmt.allocPrint(arena, "{s}.lock", .{std.fs.path.dirname(got.rootfs).?});
+    const probe = try std.Io.Dir.cwd().openFile(io, held_path, .{});
+    defer probe.close(io);
+    try testing.expect(linux.errno(linux.flock(probe.handle, 2 | 4)) != .SUCCESS);
+    got.lock.close(io);
+    try testing.expect(linux.errno(linux.flock(probe.handle, 2 | 4)) == .SUCCESS);
+    _ = linux.flock(probe.handle, 8);
     try testing.expectEqualStrings("FROM_IMAGE=yes", got.env[1]);
     var root = try std.Io.Dir.cwd().openDir(io, got.rootfs, .{});
     defer root.close(io);
@@ -376,7 +385,9 @@ test "native oci pull: a kept-alive connection the registry closed is replaced; 
         .creds = creds,
         .owners = false,
     }, &why) catch |e| {
-        std.debug.print("pull: {s}\n", .{why});
+        std.debug.print("pull: {s}; the server read {d} requests on {d} connections\n", .{
+            why, server.requests.load(.acquire), server.connections.load(.acquire),
+        });
         return e;
     };
     try testing.expectEqualStrings(img.manifest, got.manifest);

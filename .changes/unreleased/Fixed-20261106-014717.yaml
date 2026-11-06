@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A native checkout of a commit with fetch-tags is no longer replayed with tags that have since moved: the remote''s tags are part of its key'
+time: 2026-11-06T01:47:17.072295273-05:00

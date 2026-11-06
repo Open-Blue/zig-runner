@@ -1,0 +1,3 @@
+kind: Fixed
+body: A native Zig cache seed built again is a new key, and a rootfs in the store keeps its fingerprint while a sibling sharing its files is evicted. Layers on such a rootfs miss once at the upgrade.
+time: 2026-11-06T05:42:15.814309944-05:00

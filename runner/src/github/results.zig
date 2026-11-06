@@ -4,6 +4,7 @@
 //! signed blob URL (Twirp JSON, authorized with the job-scoped token), PUT the log text to that
 //! URL, then register the upload with a metadata call. Blob lines are `<ISO timestamp, 7 digits>
 //! <text>`. Failures never block job completion: callers log the returned detail and carry on.
+//! A failure that may pass (`transientError`, `transientStatus`) is tried again within `Retry`.
 const std = @import("std");
 const broker = @import("broker.zig");
 const http = @import("http.zig");
@@ -132,6 +133,8 @@ pub const Result = struct {
     ok: bool,
     /// Human-readable outcome; error bodies are short and carry no credentials.
     detail: []const u8,
+    /// A failure that another try may get past (`transientError`, `transientStatus`).
+    transient: bool = false,
 };
 
 /// What every call answers for a job that names no results service.
@@ -171,27 +174,95 @@ fn ids(arena: Allocator, job: job_mod.Job, which: Which, meta: ?Meta) ![]const u
     return aw.written();
 }
 
+/// How an upload is tried again, as `job.completeJob` is: after each delay in turn, while the
+/// failure is transient. No try starts after `budget` since the first one began, so a job's end
+/// waits at most the budget and one more request's deadline for a log (`http.request_deadline`,
+/// `blobDeadline`). 15 s of delays wait out a resolver that is back within seconds, which is what
+/// the failures seen were (NameServerFailure on all three uploads of one job).
+pub const Retry = struct {
+    delays_ms: []const i64 = &.{ 1000, 2000, 4000, 8000 },
+    budget: std.Io.Duration = .fromSeconds(30),
+};
+
 pub fn upload(arena: Allocator, io: std.Io, job: job_mod.Job, which: Which, blob: Blob) Result {
-    return uploadInner(
-        arena,
-        io,
-        job,
-        which,
-        blob,
-    ) catch |e| .{ .ok = false, .detail = @errorName(e) };
+    return uploadRetrying(arena, io, job, which, blob, .{});
 }
 
-fn uploadInner(arena: Allocator, io: std.Io, job: job_mod.Job, which: Which, blob: Blob) !Result {
+pub fn uploadRetrying(
+    arena: Allocator,
+    io: std.Io,
+    job: job_mod.Job,
+    which: Which,
+    blob: Blob,
+    retry: Retry,
+) Result {
     if (job.results_endpoint.len == 0) return no_endpoint;
+    // A signed URL and the PUT to it are one try: a URL that expired between two tries is asked
+    // for again, and the PUT writes the whole blob over whatever a failed one left, so a log is
+    // never doubled. Registering it is a try of its own, so a blob that is up is not sent again
+    // for a failed registration.
+    const put = retrying(io, retry, putLog, .{ arena, io, job, which, blob });
+    if (!put.ok) return put;
+    const meta = retrying(io, retry, registerLog, .{ arena, io, job, which, blob.line_count });
+    if (!meta.ok) return meta;
+    return .{
+        .ok = true,
+        .detail = std.fmt.allocPrint(arena, "{d} lines", .{blob.line_count}) catch "ok",
+    };
+}
+
+/// `try_fn(args)` until it succeeds, fails for good or `retry` runs out; the last outcome. A try
+/// that returns an error is a failed Result, transient or not by the error.
+fn retrying(io: std.Io, retry: Retry, comptime try_fn: anytype, args: anytype) Result {
+    const started = std.Io.Clock.awake.now(io).toNanoseconds();
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        const r: Result = @call(.auto, try_fn, args) catch |e| .{
+            .ok = false,
+            .detail = @errorName(e),
+            .transient = transientError(e),
+        };
+        if (r.ok or !r.transient or attempt == retry.delays_ms.len) return r;
+        const delay_ns = retry.delays_ms[attempt] * std.time.ns_per_ms;
+        const elapsed = std.Io.Clock.awake.now(io).toNanoseconds() - started;
+        if (elapsed + delay_ns >= retry.budget.nanoseconds) return r;
+        io.sleep(.fromNanoseconds(delay_ns), .awake) catch return r;
+    }
+}
+
+/// Whether a request that failed with `err` may pass when made again: the name server, the
+/// connection or the time it took, not the request (a log that changed while it went up).
+fn transientError(err: anyerror) bool {
+    return switch (err) {
+        error.NameServerFailure,
+        error.TemporaryNameServerFailure,
+        error.UnknownHostName,
+        error.ConnectionRefused,
+        error.ConnectionTimedOut,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.Timeout,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.ConnectionResetByPeer,
+        error.EndOfStream,
+        error.BrokenPipe,
+        error.HttpConnectionClosing,
+        => true,
+        else => false,
+    };
+}
+
+/// 5xx and 429 pass with time; any other status is the request's own fault.
+fn transientStatus(status: std.http.Status) bool {
+    return status.class() == .server_error or status == .too_many_requests;
+}
+
+fn putLog(arena: Allocator, io: std.Io, job: job_mod.Job, which: Which, blob: Blob) !Result {
     const get_method = switch (which) {
         .step => "GetStepLogsSignedBlobURL",
         .job => "GetJobLogsSignedBlobURL",
     };
-    const meta_method = switch (which) {
-        .step => "CreateStepLogsMetadata",
-        .job => "CreateJobLogsMetadata",
-    };
-
     const signed = try broker.call(
         arena,
         io,
@@ -201,14 +272,27 @@ fn uploadInner(arena: Allocator, io: std.Io, job: job_mod.Job, which: Which, blo
         try ids(arena, job, which, null),
     );
     if (signed.status.class() != .success) return failed(arena, get_method, signed);
-    const logs_url = jsonString(arena, signed.body, "logs_url") orelse return .{
+    const logs_url = (try jsonString(arena, signed.body, "logs_url")) orelse return .{
         .ok = false,
         .detail = try std.fmt.allocPrint(arena, "{s}: no logs_url in response", .{get_method}),
     };
 
     const put = try putBlob(arena, io, logs_url, blob);
     if (put.status.class() != .success) return failed(arena, "blob upload", put);
+    return .{ .ok = true, .detail = "" };
+}
 
+fn registerLog(
+    arena: Allocator,
+    io: std.Io,
+    job: job_mod.Job,
+    which: Which,
+    line_count: usize,
+) !Result {
+    const meta_method = switch (which) {
+        .step => "CreateStepLogsMetadata",
+        .job => "CreateJobLogsMetadata",
+    };
     const uploaded_at = try timefmt.isoTime(arena, std.Io.Clock.real.now(io).toMilliseconds());
     const meta = try broker.call(arena, io, .POST, try twirpUrl(
         arena,
@@ -216,13 +300,10 @@ fn uploadInner(arena: Allocator, io: std.Io, job: job_mod.Job, which: Which, blo
         meta_method,
     ), job.job_token, try ids(arena, job, which, .{
         .uploaded_at = uploaded_at,
-        .line_count = blob.line_count,
+        .line_count = line_count,
     }));
     if (meta.status.class() != .success) return failed(arena, meta_method, meta);
-    return .{
-        .ok = true,
-        .detail = try std.fmt.allocPrint(arena, "{d} lines", .{blob.line_count}),
-    };
+    return .{ .ok = true, .detail = "" };
 }
 
 /// Uploads what a step wrote to $GITHUB_STEP_SUMMARY, as actions/runner does: a signed URL from
@@ -235,13 +316,8 @@ pub fn uploadSummary(
     step_id: []const u8,
     markdown: []const u8,
 ) Result {
-    return uploadSummaryInner(
-        arena,
-        io,
-        job,
-        step_id,
-        markdown,
-    ) catch |e| .{ .ok = false, .detail = @errorName(e) };
+    // Tried again whole: the PUT overwrites the summary, and the metadata names its size.
+    return retrying(io, .{}, uploadSummaryInner, .{ arena, io, job, step_id, markdown });
 }
 
 fn uploadSummaryInner(
@@ -266,7 +342,7 @@ fn uploadSummaryInner(
         "GetStepSummarySignedBlobURL",
         signed,
     );
-    const url = jsonString(arena, signed.body, "summary_url") orelse return .{
+    const url = (try jsonString(arena, signed.body, "summary_url")) orelse return .{
         .ok = false,
         .detail = "GetStepSummarySignedBlobURL: no summary_url in response",
     };
@@ -373,6 +449,7 @@ pub const blob_deadline_max: std.Io.Duration = .fromSeconds(5 * 60);
 fn failed(arena: Allocator, what: []const u8, r: broker.Response) !Result {
     return .{
         .ok = false,
+        .transient = transientStatus(r.status),
         .detail = try std.fmt.allocPrint(arena, "{s}: HTTP {d}: {s}", .{
             what,
             @backingInt(r.status),
@@ -381,8 +458,13 @@ fn failed(arena: Allocator, what: []const u8, r: broker.Response) !Result {
     };
 }
 
-fn jsonString(arena: Allocator, body: []const u8, key: []const u8) ?[]const u8 {
-    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return null;
+/// The string at `key` in the JSON object `body`, or null when it is not one. Running out of memory
+/// is an error, not a missing key: read as one, a response was reported as having no `logs_url`.
+fn jsonString(arena: Allocator, body: []const u8, key: []const u8) Allocator.Error!?[]const u8 {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     if (v != .object) return null;
     const s = v.object.get(key) orelse return null;
     return if (s == .string) s.string else null;
@@ -510,4 +592,132 @@ test "request bodies" {
         try ids(a.allocator(), job, .{ .step = "S" }, .{ .uploaded_at = "T", .line_count = 3 }),
     );
     try std.testing.expectEqualStrings("https://r.test/twirp/" ++ service ++ "/X", try twirpUrl(a.allocator(), "https://r.test/", "X"));
+}
+
+test "allocation failures: a response's string" {
+    const af = @import("../alloc_failures.zig");
+    const S = struct {
+        fn run(a: Allocator, body: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            const url = (try jsonString(arena.allocator(), body, "logs_url")) orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("https://blob.test/x", url);
+        }
+    };
+    try af.checkOne(S.run, .{
+        \\{"logs_url":"https://blob.test/x","expires":["a","b"],"n":{"k":1}}
+    });
+}
+
+test "jsonString: no string at the key is null, not an error" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    try std.testing.expect(try jsonString(a.allocator(), "{\"logs_url\":1}", "logs_url") == null);
+    try std.testing.expect(try jsonString(a.allocator(), "{}", "logs_url") == null);
+    try std.testing.expect(try jsonString(a.allocator(), "[1]", "logs_url") == null);
+    try std.testing.expect(try jsonString(a.allocator(), "not json", "logs_url") == null);
+}
+
+/// A log of 3 lines (6 bytes) to the results service at `server`.
+fn testUpload(server: *const @import("testserver.zig").Server, which: Which, retry: Retry) Result {
+    var url_buf: [64]u8 = undefined;
+    const job: job_mod.Job = .{
+        .plan_id = "P",
+        .job_id = "J",
+        .job_token = "t",
+        .check_run_id = 1,
+        .secrets = &.{},
+        .steps = &.{},
+        .results_endpoint = server.url(&url_buf, "127.0.0.1", "/results"),
+    };
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const r = uploadRetrying(a.allocator(), std.testing.io, job, which, .{
+        .text = "a\nb\nc\n",
+        .line_count = 3,
+    }, retry);
+    // The detail lives in the arena; the outcome is all a test looks at.
+    return .{ .ok = r.ok, .detail = "", .transient = r.transient };
+}
+
+const quick: Retry = .{ .delays_ms = &.{ 1, 1, 1, 1 } };
+
+test "a blob upload that failed on a blip is made again, with a new signed URL, and goes up once" {
+    var server: @import("testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    server.results_fail = 1;
+    server.results_fail_on = "-blob";
+    var r = testUpload(&server, .job, quick);
+    try std.testing.expect(r.ok);
+    try std.testing.expectEqual(@as(u32, 2), server.results.urls);
+    try std.testing.expectEqual(@as(u32, 1), server.results.puts);
+    try std.testing.expectEqual(@as(usize, 6), server.results.put_bytes);
+    try std.testing.expectEqual(@as(u32, 1), server.results.metas);
+
+    // Rate limited asking for the URL.
+    server.results_fail = 1;
+    server.results_fail_on = "GetStepLogs";
+    server.results_fail_status = "429 Too Many Requests";
+    r = testUpload(&server, .{ .step = "S" }, quick);
+    try std.testing.expect(r.ok);
+    try std.testing.expectEqual(@as(u32, 2), server.results.puts);
+}
+
+test "a failed registration is made again without sending the blob again" {
+    var server: @import("testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    server.results_fail = 2;
+    server.results_fail_on = "CreateJobLogsMetadata";
+    const r = testUpload(&server, .job, quick);
+    try std.testing.expect(r.ok);
+    try std.testing.expectEqual(@as(u32, 1), server.results.urls);
+    try std.testing.expectEqual(@as(u32, 1), server.results.puts);
+    try std.testing.expectEqual(@as(u32, 1), server.results.metas);
+}
+
+test "a failure of the request itself is not tried again" {
+    var server: @import("testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    server.results_fail = 10;
+    server.results_fail_on = "SignedBlobURL";
+    server.results_fail_status = "403 Forbidden";
+    const r = testUpload(&server, .job, quick);
+    try std.testing.expect(!r.ok and !r.transient);
+    // One request answered, 9 left unused.
+    try std.testing.expectEqual(@as(u32, 9), server.results_fail);
+}
+
+test "tries stop at the budget, however many delays are left" {
+    var server: @import("testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    server.results_fail = 100;
+    server.results_fail_on = "SignedBlobURL";
+    const slow: Retry = .{
+        .delays_ms = &.{ 100, 100, 100, 100 },
+        .budget = .fromMilliseconds(150),
+    };
+    const started = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+    const r = testUpload(&server, .job, slow);
+    const took = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - started;
+    try std.testing.expect(!r.ok and r.transient);
+    // The second try, 100 ms in, is the last: a third would start at 200 ms, past the 150.
+    try std.testing.expect(100 - server.results_fail <= 2);
+    try std.testing.expect(took < 400 * std.time.ns_per_ms);
+}
+
+test "what is worth trying again" {
+    try std.testing.expect(transientError(error.NameServerFailure));
+    try std.testing.expect(transientError(error.Timeout));
+    try std.testing.expect(!transientError(error.OutOfMemory));
+    try std.testing.expect(!transientError(error.Canceled));
+    try std.testing.expect(!transientError(error.LogChangedWhileUploaded));
+    try std.testing.expect(transientStatus(.too_many_requests));
+    try std.testing.expect(transientStatus(.bad_gateway));
+    try std.testing.expect(!transientStatus(.forbidden));
+    try std.testing.expect(!transientStatus(.not_found));
 }

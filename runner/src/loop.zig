@@ -167,13 +167,7 @@ pub fn pool(c: Runner, n: u32) !Exit {
         const entries = try c.arena.alloc(admission.Admission.Slot, n + 1);
         m.* = .init(c.io, c.cfg.admission_limits, entries);
         m.native = c.cfg.backend == .native;
-        const cgroup = c.cfg.engine_cgroup;
-        m.engine.source = if (std.mem.eql(u8, cgroup, "none"))
-            .off
-        else if (cgroup.len > 0)
-            .{ .cgroup = cgroup }
-        else
-            .{ .host = c.cfg.engine_host };
+        m.engine.source = engineSource(c.cfg);
         break :m m;
     } else null;
     // Measures the jobs running, for what jobs of their names reserve next; ends with the pool.
@@ -316,19 +310,27 @@ pub fn serve(c: Runner) !Exit {
     }
 }
 
+/// How often a runner held at the memory gate looks for a stop, or a reservation that dropped
+/// (`Admission.changes`).
+const hold_step_ms = 50;
+
 /// Waits, held at the memory gate for `hold`, until the machine has the memory for one more job:
 /// true then, false if a stop is requested first. The hold and its end are each logged once, not
 /// at every look.
 fn admit(c: Runner, g: *admission.Gate, hold: admission.Hold) !bool {
     holdingBack(c, g, hold);
+    // Read before each look, so that a change between the look and the wait is not missed.
+    var seen = g.pool.changes();
     while (true) {
-        // In steps, so a stop is not kept waiting.
+        // In steps, so a stop is not kept waiting, and a reservation that dropped is looked at
+        // at once, not at the end of the `recheck`.
         var left = g.pool.recheck.toMilliseconds();
-        while (left > 0) : (left -= @min(left, 200)) {
+        while (left > 0 and g.pool.changes() == seen) : (left -= @min(left, hold_step_ms)) {
             if (stopRequested()) return false;
-            try c.io.sleep(.fromMilliseconds(@min(left, 200)), .awake); // a cancel ends the slot (`serve`)
+            try c.io.sleep(.fromMilliseconds(@min(left, hold_step_ms)), .awake); // a cancel ends the slot (`serve`)
         }
         if (stopRequested()) return false;
+        seen = g.pool.changes();
         if (checkGate(c, g) == null) break;
     }
     sayUnallocated(c, "'{s}': memory is back; taking jobs again", .{c.name});
@@ -370,6 +372,14 @@ fn runnerNameBuf(buf: []u8, c: Runner) ![]const u8 {
     var suffix: [4]u8 = undefined;
     c.io.random(&suffix);
     return std.fmt.bufPrint(buf, "{s}-{x}", .{ c.cfg.name_prefix, suffix });
+}
+
+/// Where the gate looks for the engine's cgroup: nowhere with no engine (`RUNNER_ENGINE=none`) or
+/// `RUNNER_ENGINE_CGROUP=none`, else the cgroup named, else the one of `engine_host`'s socket.
+fn engineSource(cfg: *const Config) admission.Engine.Source {
+    if (cfg.engineless() or std.mem.eql(u8, cfg.engine_cgroup, "none")) return .off;
+    if (cfg.engine_cgroup.len > 0) return .{ .cgroup = cfg.engine_cgroup };
+    return .{ .host = cfg.engine_host };
 }
 
 /// Builds what every job builds before its first step, with no job (`set_up.warm`): the base
@@ -427,6 +437,10 @@ pub const Warmer = struct {
     /// have nothing to do.
     pub fn init(c: Runner, memory: ?*admission.Admission, slot: usize) !?*Warmer {
         if (!c.cfg.prewarm) return null;
+        if (c.cfg.engineless()) {
+            try c.log.say("pre-warm skipped: RUNNER_ENGINE=none, there is no engine to warm");
+            return null;
+        }
         if (c.cfg.engineEndpoint() == null) {
             try c.log.say("pre-warm skipped: RUNNER_ENGINE=cli opens no session of its own");
             return null;
@@ -591,14 +605,16 @@ pub const Warmer = struct {
         const w: *Warmer = @ptrCast(@alignCast(ptr));
         if (w.memory != null) {
             var said = false;
+            var seen = w.gate.pool.changes();
             while (w.gate.check()) |hold| {
                 if (!said) sayUnallocated(w.c, "pre-warm holding back: {f}", .{hold});
                 said = true;
                 var left = w.gate.pool.recheck.toMilliseconds();
-                while (left > 0) : (left -= @min(left, 200)) {
+                while (left > 0 and w.gate.pool.changes() == seen) : (left -= @min(left, hold_step_ms)) {
                     if (stopRequested() or w.cancel.requested.load(.acquire)) return false;
-                    w.c.io.sleep(.fromMilliseconds(@min(left, 200)), .awake) catch return false;
+                    w.c.io.sleep(.fromMilliseconds(@min(left, hold_step_ms)), .awake) catch return false;
                 }
+                seen = w.gate.pool.changes();
             }
             w.gate.leave(true);
             w.gate.assigned(admission.jobKey("", "", job_name));
@@ -1385,6 +1401,58 @@ test "a runner short of memory stops asking for jobs, and asks again once memory
     try std.testing.expect(!try admit(c, &gate, hold));
 }
 
+test "a held runner looks again when a reservation drops, not at its next recheck" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    // Room for one runner polling (1536 + 1024), not two.
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 3072000 kB\n" });
+    var slots: [2]admission.Admission.Slot = undefined;
+    var memory: admission.Admission = .init(io, .{}, &slots);
+    memory.paths = .{
+        .meminfo = try std.fs.path.join(arena, &.{ dir, "meminfo" }),
+        .pressure = "/nonexistent",
+    };
+    // A minute: far beyond the test, so that only a change can let the held runner through.
+    memory.recheck = .fromSeconds(60);
+    var first: admission.Gate = .{ .pool = &memory, .slot = 0 };
+    var held: admission.Gate = .{ .pool = &memory, .slot = 1 };
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+    var c = testRunner(arena, &log, &err, &cfg);
+    c.gate = &held;
+
+    try std.testing.expect(first.check() == null);
+    const hold = held.check().?;
+    const Waiter = struct {
+        fn run(cc: Runner, g: *admission.Gate, h: admission.Hold) anyerror!bool {
+            return admit(cc, g, h);
+        }
+    };
+    const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
+    var waiting = try io.concurrent(Waiter.run, .{ c, &held, hold });
+    io.sleep(.fromMilliseconds(150), .awake) catch {};
+    // The first runner is handed a job and named: it reserves its worst case still, so the held
+    // runner looks again and stays held. Then the job, a short one, is over.
+    first.leave(true);
+    first.assigned(admission.jobKey("o/r", "o/r/.github/workflows/w.yml", "j"));
+    io.sleep(.fromMilliseconds(150), .awake) catch {};
+    _ = first.ended();
+    try std.testing.expect(try waiting.await(io));
+    const waited_ms = std.Io.Clock.awake.now(io).toMilliseconds() - t0;
+    try std.testing.expect(waited_ms < 10 * std.time.ms_per_s);
+    try std.testing.expectEqual(@as(u32, 1), memory.polling);
+}
+
 test "a runner holds while the engine is near its own cap, though the machine has memory" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -1789,8 +1857,28 @@ test "no pre-warm when it is off, with RUNNER_ENGINE=cli, or when the runner tru
     cfg.engine = .cli;
     try std.testing.expect(try Warmer.init(c, null, 1) == null);
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "pre-warm skipped: RUNNER_ENGINE=cli") != null);
+    cfg.engine = .none;
+    try std.testing.expect(try Warmer.init(c, null, 1) == null);
+    const none_said = "pre-warm skipped: RUNNER_ENGINE=none";
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), none_said) != null);
     cfg.engine = .direct;
     cfg.trusted_refs = "";
     try std.testing.expect(try Warmer.init(c, null, 1) == null);
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "trusts no ref") != null);
+}
+
+test "the gate looks for the engine's cgroup only where there is an engine" {
+    var cfg: Config = .{
+        .gh_token = "",
+        .scope = undefined,
+        .engine_host = "unix:///run/dagger/engine.sock",
+    };
+    try std.testing.expectEqualStrings(cfg.engine_host, engineSource(&cfg).host);
+    cfg.engine_cgroup = "/sys/fs/cgroup/engine";
+    try std.testing.expectEqualStrings(cfg.engine_cgroup, engineSource(&cfg).cgroup);
+    cfg.engine_cgroup = "none";
+    try std.testing.expect(engineSource(&cfg) == .off);
+    cfg.engine_cgroup = "";
+    cfg.engine = .none;
+    try std.testing.expect(engineSource(&cfg) == .off);
 }

@@ -1,0 +1,3 @@
+kind: Fixed
+body: A job's log and its steps' logs are uploaded again after a transient failure (DNS, connection, timeout, 5xx, 429), with a bounded backoff, instead of being lost to one network blip
+time: 2026-11-06T02:05:03.328388282-05:00

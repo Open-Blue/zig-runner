@@ -10,7 +10,7 @@
 //!     layers/<key>/fs       the layer's tree, an overlay upper become a lower
 //!     layers/<key>/log      the step's output as it was printed, markers and all
 //!     layers/<key>/fc       its combined file commands (`scripts.writeCombinedFileCommands`)
-//!     layers/<key>/size     its bytes on disk, for eviction
+//!     layers/<key>/meta     its format, kind, bytes on disk and record's lengths and sha256s
 //!     layers/<key>/lock     held shared by every job using the layer; its mtime is its last use
 //!     layers/<key>/digest   its deterministic digest, once asked for (`layerDigest`)
 //!     keys/<key>.lock       held while a step with that key runs (`lockKey`)
@@ -29,12 +29,15 @@ const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const dagger = @import("../dagger.zig");
+const Eviction = @import("evict.zig");
 const phases = @import("phases.zig");
 
 /// The store's directory.
 root: []const u8,
 /// Past this many bytes of layers, the least recently used go (`collect`).
 max_bytes: u64 = default_max_bytes,
+/// What `collect` keeps the rest of the store to (`evict.zig`).
+limits: Eviction.Limits = .{},
 /// A descriptor on the store's filesystem, opened when the job began (`syncCursor`): `syncfs` on
 /// it reports a write error since then even if another job's `syncfs` was told first, which one
 /// opened at the publish would miss. Null: the publish's own.
@@ -51,8 +54,8 @@ pub fn hex(k: Key) [2 * Sha256.digest_length]u8 {
 /// The store's format: what a layer and its record mean (the sandbox that made the tree, the
 /// record's files and how they replay, the key's extras). Part of every base's parent
 /// (`Backend.below`), so every key: bump it with any change to those, and a runner upgraded
-/// finds none of the layers an older one left (they age out under the cap).
-pub const store_format = "zig-runner native store 4";
+/// finds none of the layers an older one left (`collect` removes them, as not whole).
+pub const store_format = "zig-runner native store 5";
 
 /// What a key is of (P8's tag, proofs/Runner/Native.lean): a job's base, a step's container (a
 /// `run:` step's exec, or a checkout's fetch), or one keyed on what a step produced.
@@ -499,8 +502,8 @@ fn isDir(arena: Allocator, p: []const u8) bool {
 
 /// Moves a finished upper (`upper`, in the job's directory) into the store under `key`, with its
 /// record (`Record`, which must be one its `kind` may have and within `max_record_bytes`), and
-/// holds it for the job. Built under a temporary name, written to disk (`syncTree`) before it is
-/// visible, held before it is visible (so an eviction cannot take it at once), and published by
+/// holds it for the job. Built under a temporary name, written to disk (`writeBack`,
+/// `syncEntries`) before it is visible, held before it is visible (so an eviction cannot take it at once), and published by
 /// one rename that never replaces. On failure the upper is back where it was, or, if it cannot be
 /// put back, left in the temporary entry and logged, never deleted.
 ///
@@ -555,7 +558,6 @@ pub fn publishTimed(
         };
         if (back) removeTree(arena, io, tmp);
     }
-    const entries = (try treeSize(arena, io, upper)).entries;
     var m: Meta = .{
         .kind = kind,
         .bytes = undefined,
@@ -564,7 +566,6 @@ pub fn publishTimed(
         .log_sha = undefined,
         .fc_sha = undefined,
     };
-    if (ph) |p| t = p.since(arena, .size, t);
     Sha256.hash(rec.log, &m.log_sha, .{});
     Sha256.hash(rec.fc, &m.fc_sha, .{});
     try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "log"), .data = rec.log });
@@ -576,24 +577,45 @@ pub fn publishTimed(
     if (ph) |p| t = p.since(arena, .record, t);
     // On disk before it is visible: a crash after the rename must not leave a whole-looking
     // entry whose files are empty or short. A small entry's own files and directories
-    // (`syncTree`), so it never waits for the rest of the disk's writes; a large one's whole
-    // filesystem, as each file's `fsync` costs a flush of the disk's cache.
-    const synced = entries <= sync_tree_max and if (syncTree(arena, io, tmp)) true else |e| switch (e) {
-        error.Unreadable => false,
-        else => return error.Sync,
+    // (`writeBack`, `syncEntries`), so it never waits for the rest of the disk's writes; a large
+    // one's whole filesystem, as each file's `fsync` costs a flush of the disk's cache.
+    //
+    // The tree's data goes first and the fsyncs last, with the meta written between them, so
+    // that one journal commit takes the entry whole: fsyncs before the meta would make one
+    // commit, the meta's fsync a second, and each costs a flush.
+    const entry = try openRoot(arena, tmp);
+    defer _ = linux.close(entry);
+    var whole_disk = false;
+    const todo = writeBack(arena, io, entry, sync_tree_max) catch |e| switch (e) {
+        error.Unreadable, error.TooLarge => no: {
+            whole_disk = true;
+            break :no &.{};
+        },
+        else => return e,
     };
-    if (!synced and linux.errno(linux.syncfs(s.sync_fd orelse lock.?.handle)) != .SUCCESS)
-        return error.Sync;
+    if (whole_disk) try s.syncDisk(lock.?);
+    var sync_ns = phases.now() -| t;
+    t = phases.now();
     // Measured once written: a file the kernel is still writing back can show fewer blocks
     // than it takes (a block short, the stress test found, under other publishers' syncfs),
-    // and the store would count less than it holds. The meta, written after the sync, is
-    // synced itself before the rename.
+    // and the store would count less than it holds.
     m.bytes = try treeBytes(arena, io, fs_tmp);
+    if (ph) |p| t = p.since(arena, .size, t);
     const meta = try cwd.createFile(io, try join(arena, tmp, "meta"), .{});
     defer meta.close(io);
     try meta.writeStreamingAll(io, try m.write(arena));
+    // Its blocks allocated now, or its own fsync would need a commit of its own for them.
+    _ = syncRange(meta.handle, sync_file_range_write);
+    if (!whole_disk) syncEntries(entry, todo) catch |e| switch (e) {
+        error.Unreadable => try s.syncDisk(lock.?),
+        else => return error.Sync,
+    };
     if (linux.errno(linux.fsync(meta.handle)) != .SUCCESS) return error.Sync;
-    if (ph) |p| t = p.since(arena, .sync, t);
+    if (ph) |p| {
+        sync_ns += phases.now() -| t;
+        p.add(arena, .sync, sync_ns);
+        t = phases.now();
+    }
     const dir = try s.layerDir(arena, key);
     // One rename that never replaces: a layer published meanwhile stays, and this one is not.
     const rc = linux.renameat2(
@@ -610,53 +632,113 @@ pub fn publishTimed(
     return .{ .fs = try join(arena, dir, "fs"), .lock = lock.? };
 }
 
-/// `p`'s files and directories written to disk, and nothing else of its filesystem: what a
-/// publish needs before its entry is visible, without waiting for every other write to the same
-/// disk (another job's tool cache volume being filled, its workspace), which `syncfs` waited
-/// for. Writeback is started for every file's data as the tree is walked (`sync_file_range`),
-/// then every file and directory is `fsync`ed from `sync_threads` threads at once: one at a time,
-/// each `fsync` was a journal commit and a flush of the disk's cache of its own (a small layer's
-/// 15 took 86 ms on a laptop's NVMe, where `syncfs` took 15 ms), while fsyncs that wait together
-/// share commits. Only regular files and directories hold anything to write: a symlink's, a
-/// device node's or a fifo's inode is metadata, committed with its directory.
+/// The filesystem's writes on disk, for an entry too large for its own fsyncs: through the
+/// descriptor the job opened at its start (`sync_fd`), or `lock`, a descriptor on the same disk.
+fn syncDisk(s: Store, lock: std.Io.File) !void {
+    if (linux.errno(linux.syncfs(s.sync_fd orelse lock.handle)) != .SUCCESS) return error.Sync;
+}
+
+/// The data of the tree `root` written to disk and waited for, and nothing else of its
+/// filesystem: what a publish needs without waiting for every other write to the same disk
+/// (another job's tool cache volume being filled, its workspace), which `syncfs` waited for.
+/// Returns what `syncEntries` must then fsync: every file and directory. Only regular files and
+/// directories hold anything to write: a symlink's, a device node's or a fifo's inode is
+/// metadata, committed with its directory.
+///
+/// Writing the data back makes no journal commit, and allocates every block in one transaction,
+/// so the fsyncs that follow have only that transaction to commit. It stops being cheap only
+/// with the entries' own count: `error.TooLarge` past `max`, as soon as the walk sees it.
 /// `error.Unreadable` when a file cannot be opened (a step's `chmod 000` on a rootless runner,
-/// whose user is no one's superuser): the caller then syncs the whole filesystem, as before.
-pub fn syncTree(arena: Allocator, io: std.Io, p: []const u8) !void {
-    const root = try openRoot(arena, p);
-    defer _ = linux.close(root);
+/// whose user is no one's superuser). The caller syncs the whole filesystem instead of either.
+fn writeBack(arena: Allocator, io: std.Io, root: linux.fd_t, max: u64) ![]const Synced {
     var todo: std.ArrayList(Synced) = .empty;
     try todo.append(arena, .{ .dir = "", .name = "" });
     var stack: std.ArrayList([]const u8) = .empty;
     try stack.append(arena, "");
+    var started: [write_back_batch]linux.fd_t = undefined;
+    var n_started: usize = 0;
+    // On an early return: their writeback goes on, and nothing waits for it.
+    defer for (started[0..n_started]) |f| {
+        _ = linux.close(f);
+    };
+    var entries: u64 = 0;
     while (stack.pop()) |rel| {
         const fd = if (rel.len == 0) root else try openRel(arena, root, rel);
         defer if (fd != root) {
             _ = linux.close(fd);
         };
-        for (try listDir(arena, io, fd)) |n| switch (n.kind()) {
-            linux.S.IFREG => {
-                try todo.append(arena, .{ .dir = rel, .name = n.name });
-                // Only a head start: what it does not do, `fsync` does.
-                if (n.st.size > 0) {
+        for (try listDir(arena, io, fd)) |n| {
+            entries += 1;
+            if (entries > max) return error.TooLarge;
+            switch (n.kind()) {
+                linux.S.IFREG => {
+                    try todo.append(arena, .{ .dir = rel, .name = n.name });
+                    if (n.st.size == 0) continue;
+                    if (n_started == started.len) {
+                        const batch = started[0..n_started];
+                        n_started = 0;
+                        try waitWritten(batch);
+                    }
                     const f = try openFileAt(fd, n.name);
-                    defer _ = linux.close(f);
-                    _ = linux.syscall4(.sync_file_range, @abs(f), 0, 0, sync_file_range_write);
-                }
-            },
-            linux.S.IFDIR => {
-                const sub = if (rel.len == 0)
-                    try arena.dupe(u8, n.name)
-                else
-                    try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, n.name });
-                try stack.append(arena, sub);
-                try todo.append(arena, .{ .dir = sub, .name = "" });
-            },
-            else => {},
-        };
+                    _ = syncRange(f, sync_file_range_write);
+                    started[n_started] = f;
+                    n_started += 1;
+                },
+                linux.S.IFDIR => {
+                    const sub = if (rel.len == 0)
+                        try arena.dupe(u8, n.name)
+                    else
+                        try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, n.name });
+                    try stack.append(arena, sub);
+                    try todo.append(arena, .{ .dir = sub, .name = "" });
+                },
+                else => {},
+            }
+        }
     }
-    var work: SyncWork = .{ .root = root, .todo = todo.items };
+    const batch = started[0..n_started];
+    n_started = 0;
+    try waitWritten(batch);
+    return todo.items;
+}
+
+/// Each descriptor's writeback finished, then closed. The wait's error must be taken here: it
+/// is reported once for the file, so an `fsync` through a descriptor opened after it would not
+/// see it. A kernel or filesystem without the call leaves it to the fsyncs.
+fn waitWritten(fds: []const linux.fd_t) !void {
+    var failed = false;
+    for (fds) |f| {
+        switch (linux.errno(syncRange(f, sync_file_range_wait))) {
+            .SUCCESS, .NOSYS, .INVAL, .OPNOTSUPP => {},
+            else => failed = true,
+        }
+        _ = linux.close(f);
+    }
+    if (failed) return error.Sync;
+}
+
+fn syncRange(f: linux.fd_t, how: u32) usize {
+    return linux.syscall4(.sync_file_range, @abs(f), 0, 0, how);
+}
+
+/// `SYNC_FILE_RANGE_WRITE`: writeback started, not waited for.
+const sync_file_range_write = 2;
+/// `SYNC_FILE_RANGE_WAIT_BEFORE | WRITE | WAIT_AFTER`: all of it written, and waited for.
+const sync_file_range_wait = 7;
+
+/// How many files `writeBack` has writing at once, each with a descriptor open until it is done.
+const write_back_batch = 256;
+
+/// Every file and directory of `todo` (`writeBack`) fsynced, from `sync_threads` threads at once:
+/// one at a time, each `fsync` could be a journal commit and a flush of the disk's cache of its
+/// own (a small layer's 15 took 86 ms on a laptop's NVMe, where `syncfs` took 15 ms), while fsyncs
+/// that wait together share commits. Every one is still made, each promising its own file
+/// whatever the filesystem; on ext4 the first commits the transaction and the rest find nothing
+/// to do. `error.Unreadable` as for `writeBack`.
+fn syncEntries(root: linux.fd_t, todo: []const Synced) !void {
+    var work: SyncWork = .{ .root = root, .todo = todo };
     var threads: [sync_threads]?std.Thread = @splat(null);
-    for (threads[0..@min(sync_threads, todo.items.len)]) |*t|
+    for (threads[0..@min(sync_threads, todo.len)]) |*t|
         t.* = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, SyncWork.run, .{&work}) catch null;
     // This thread too, so the work is done when no thread could be started.
     work.run();
@@ -664,17 +746,14 @@ pub fn syncTree(arena: Allocator, io: std.Io, p: []const u8) !void {
     return work.result();
 }
 
-/// `SYNC_FILE_RANGE_WRITE`: writeback started, not waited for.
-const sync_file_range_write = 2;
-
-/// How many threads `syncTree` fsyncs from.
+/// How many threads `syncEntries` fsyncs from.
 const sync_threads = 16;
 
-/// What `syncTree` fsyncs: the directory `dir` under its root when `name` is empty, else the file
+/// What `syncEntries` fsyncs: the directory `dir` under its root when `name` is empty, else the file
 /// `name` in it.
 const Synced = struct { dir: []const u8, name: [:0]const u8 };
 
-/// `syncTree`'s fsyncs, taken in turn by its threads.
+/// `syncEntries`' fsyncs, taken in turn by its threads.
 const SyncWork = struct {
     root: linux.fd_t,
     todo: []const Synced,
@@ -728,9 +807,14 @@ fn openFileAt(dir: linux.fd_t, name: [*:0]const u8) !linux.fd_t {
 }
 
 /// The most entries (files, directories, anything) of an upper whose own files a publish syncs
-/// (`syncTree`); past it, it syncs the filesystem (`syncfs`), as fsyncs that share commits still
+/// (`writeBack`, `syncEntries`); past it, it syncs the filesystem (`syncfs`), as fsyncs that share commits still
 /// cost the disk's cache a flush each now and then.
-pub const sync_tree_max = 256;
+///
+/// A checkout of this repository is about 370 entries, and took `syncfs`, so it waited for
+/// whatever else the disk was writing: twice as long beside a writer, on a laptop's NVMe. Around
+/// 800 `syncfs` is twice as fast on a tree already written, and slower only on one just written
+/// beside a writer.
+pub const sync_tree_max = 512;
 
 /// The layers' directory synced, so the renames that published this job's layers outlive a
 /// crash: once a job, at its end, rather than once a publish. A failure is logged: it loses only
@@ -754,7 +838,8 @@ fn join(arena: Allocator, dir: []const u8, name: []const u8) ![]const u8 {
 
 /// Keeps the store under `max_bytes`: the layers no job holds go, least recently used first.
 /// Also removes what dead runners left (a layer half built, one half evicted) and the lock files
-/// of keys no step is running. One runner at a time collects; another finding it busy goes on.
+/// of keys no step is running, and keeps what is beside the layers within its own limits
+/// (`evict.run`). One runner at a time collects; another finding it busy goes on.
 pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
     const cwd = std.Io.Dir.cwd();
     const gc = cwd.createFile(io, join(arena, s.root, "gc.lock") catch return, .{
@@ -793,7 +878,7 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
             _ = s.evict(arena, io, e.name);
             continue;
         };
-        const bytes = meta.bytes;
+        const bytes = accounted(meta);
         var st: linux.Statx = undefined;
         const lock_z = arena.dupeSentinel(u8, join(arena, full, "lock") catch return, 0) catch
             return;
@@ -809,19 +894,41 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
             .used_ns = used_ns,
         }) catch return;
     }
-    if (total > s.max_bytes) {
+    // The disk's floor counts here first: a layer is the cheapest thing the store has to make
+    // again. So under it a layer goes as the rest does (`evict.floor`), sparing recent use, and
+    // only past the cap whatever its use.
+    const keep = @min(s.max_bytes, total -| (Eviction.shortOf(arena, s) orelse 0));
+    const budget: Eviction.Budget = .init(io, s.limits.budget_ms);
+    if (total > keep) {
         std.mem.sort(Entry, entries.items, {}, struct {
             fn lt(_: void, a: Entry, b: Entry) bool {
                 return a.used_ns < b.used_ns;
             }
         }.lt);
+        const recent = std.Io.Clock.real.now(io).toNanoseconds() - @as(i128, s.limits.recent_s) * std.time.ns_per_s;
+        var went = false;
         for (entries.items) |e| {
-            if (total <= s.max_bytes) break;
-            if (s.evict(arena, io, e.name)) total -|= e.bytes;
+            if (total <= keep) break;
+            // Under the cap only the disk asks, and a pass has its time for that: the next goes on.
+            if (total <= s.max_bytes and (e.used_ns >= recent or (went and budget.late()))) continue;
+            if (s.evict(arena, io, e.name)) {
+                total -|= e.bytes;
+                went = true;
+            }
         }
     }
     s.dropKeyLocks(arena, io);
+    Eviction.run(s, io);
 }
+
+/// What an entry counts for against the cap: its tree, and its record, as a step that printed much
+/// and changed little is no cheaper to keep. And `entry_overhead`: its `meta`, its directories and
+/// their inodes, or keys of steps that change nothing would grow for ever under a cap that sees 0.
+fn accounted(m: Meta) u64 {
+    return m.bytes + m.log_len + m.fc_len + entry_overhead;
+}
+
+const entry_overhead = 16 * 1024;
 
 /// Removes one layer no job holds: renamed away under its lock taken exclusively (no job can
 /// take it after that: the path names nothing), then deleted. False when a job holds it.
@@ -871,6 +978,68 @@ fn dropKeyLocks(s: Store, arena: Allocator, io: std.Io) void {
         if (!flock(f, lock_ex | lock_nb)) continue;
         cwd.deleteFile(io, full) catch {};
     }
+}
+
+/// The regular file `path`, read-only, or null: never through a symlink, and with no wait on a
+/// FIFO, as a job may have left anything where one is looked for (`evict.zig`).
+pub fn openPlain(arena: Allocator, path: []const u8) ?std.Io.File {
+    const z = arena.dupeSentinel(u8, path, 0) catch return null;
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true };
+    const rc = linux.open(z, flags, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return null;
+    if (isRegular(fd)) return .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    _ = linux.close(fd);
+    return null;
+}
+
+/// `openPlain`, of the name in `dir`.
+pub fn openPlainAt(dir: linux.fd_t, name: [*:0]const u8) ?std.Io.File {
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true };
+    const rc = linux.openat(dir, name, flags, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return null;
+    if (isRegular(fd)) return .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    _ = linux.close(fd);
+    return null;
+}
+
+fn isRegular(fd: linux.fd_t) bool {
+    var st: linux.Statx = undefined;
+    return linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &st)) == .SUCCESS and
+        st.mode & linux.S.IFMT == linux.S.IFREG;
+}
+
+/// The lock file `path`, made if it is not there, never through a symlink and with no wait on a
+/// FIFO: a lock beside a volume may be in a directory a job could write (`evict.innerLock`). A
+/// symlink or a FIFO there is no lock anyone holds, and is removed. A directory is an error,
+/// `error.Locked`: it could hold anything, and is the outer volume's to lose. The lock counts only
+/// once `sameFile` says so, as an eviction removes these.
+pub fn lockBeside(arena: Allocator, io: std.Io, path: []const u8) !std.Io.File {
+    const cwd = std.Io.Dir.cwd();
+    const z = try arena.dupeSentinel(u8, path, 0);
+    const flags: linux.O = .{
+        .ACCMODE = .RDONLY,
+        .CREAT = true,
+        .NOFOLLOW = true,
+        .NONBLOCK = true,
+        .CLOEXEC = true,
+    };
+    for (0..8) |_| {
+        const rc = linux.open(z, flags, 0o644);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const fd = std.math.cast(linux.fd_t, rc) orelse return error.Locked;
+                if (isRegular(fd)) return .{ .handle = fd, .flags = .{ .nonblocking = true } };
+                _ = linux.close(fd);
+            },
+            .LOOP => {},
+            .NOENT => return error.FileNotFound,
+            else => return error.Locked,
+        }
+        cwd.deleteFile(io, path) catch {};
+    }
+    return error.Locked;
 }
 
 /// Whether `f` is the file `path` names now.
@@ -928,7 +1097,7 @@ fn chmodDirs(arena: Allocator, io: std.Io, p: []const u8) void {
 /// (`RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`), or a component at a time, each `O_NOFOLLOW`, when
 /// the kernel has no `openat2` (before 5.6) or the path is past its limit (a step can nest
 /// directories deeper than PATH_MAX).
-fn openRel(arena: Allocator, root: linux.fd_t, rel: []const u8) !linux.fd_t {
+pub fn openRel(arena: Allocator, root: linux.fd_t, rel: []const u8) !linux.fd_t {
     if (rel.len < linux.PATH_MAX) {
         const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true };
         const how: OpenHow = .{
@@ -1018,7 +1187,7 @@ fn listDir(arena: Allocator, io: std.Io, fd: linux.fd_t) ![]Node {
     return out.items;
 }
 
-fn openDirAt(fd: linux.fd_t, name: [*:0]const u8) !linux.fd_t {
+pub fn openDirAt(fd: linux.fd_t, name: [*:0]const u8) !linux.fd_t {
     const flags: linux.O = .{
         .ACCMODE = .RDONLY,
         .DIRECTORY = true,
@@ -1030,7 +1199,7 @@ fn openDirAt(fd: linux.fd_t, name: [*:0]const u8) !linux.fd_t {
     return @intCast(rc);
 }
 
-fn openRoot(arena: Allocator, p: []const u8) !linux.fd_t {
+pub fn openRoot(arena: Allocator, p: []const u8) !linux.fd_t {
     return openDirAt(linux.AT.FDCWD, try arena.dupeSentinel(u8, p, 0));
 }
 
@@ -1038,25 +1207,18 @@ fn openRoot(arena: Allocator, p: []const u8) !linux.fd_t {
 /// any directory of it cannot be read: a count that left part out would let the store pass its
 /// cap, so such a layer is not published.
 pub fn treeBytes(arena: Allocator, io: std.Io, p: []const u8) !u64 {
-    return (try treeSize(arena, io, p)).bytes;
-}
-
-/// `treeBytes`, and how many entries the tree has, its root not counted.
-pub fn treeSize(arena: Allocator, io: std.Io, p: []const u8) !struct { bytes: u64, entries: u64 } {
     const root = try openRoot(arena, p);
     defer _ = linux.close(root);
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
     var stack: std.ArrayList([]const u8) = .empty;
     try stack.append(arena, "");
     var total: u64 = 0;
-    var entries: u64 = 0;
     while (stack.pop()) |rel| {
         const fd = if (rel.len == 0) root else try openRel(arena, root, rel);
         defer if (fd != root) {
             _ = linux.close(fd);
         };
         for (try listDir(arena, io, fd)) |n| {
-            entries += 1;
             if (n.st.nlink > 1 and n.kind() != linux.S.IFDIR) {
                 if ((try seen.getOrPut(arena, n.st.ino)).found_existing) continue;
             }
@@ -1068,7 +1230,7 @@ pub fn treeSize(arena: Allocator, io: std.Io, p: []const u8) !struct { bytes: u6
                 try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, n.name }));
         }
     }
-    return .{ .bytes = total, .entries = entries };
+    return total;
 }
 
 /// How a job's namespace sees host ids: `base` onwards, `count` of them, as 0 onwards; any other
@@ -1457,7 +1619,18 @@ pub fn layerDigest(s: Store, arena: Allocator, io: std.Io, key: Key, ids: Ids) !
 /// what changes when the rootfs is replaced or touched: the root's inode and ctime, and the
 /// provisioning stamp's (`rootfs_stamp`, which the recipe touches after changing the rootfs in
 /// place). A change the stamp does not show, under a running runner, is found at its restart.
-pub fn rootfsFingerprint(arena: Allocator, io: std.Io, rootfs: []const u8) !Key {
+///
+/// A rootfs in the store (`store`, its root; "" for none) is not walked: no one writes it, what it
+/// holds is in its key, and only making it again gives it a new root. Its files' ctimes say nothing:
+/// they share inodes with its image and siblings (`oci.Store.flatten`), so each file an eviction
+/// removes from any of those would move this digest, a little at each pass.
+pub fn rootfsFingerprint(arena: Allocator, io: std.Io, rootfs: []const u8, store: []const u8) !Key {
+    if (storeTree(rootfs, store)) {
+        var h: KeyHasher = .plain("a rootfs in the store");
+        h.field(rootfs);
+        h.field(&try rootIdentity(arena, rootfs));
+        return h.final();
+    }
     const seen = try rootfsSeen(arena, rootfs);
     fp_mu.lockUncancelable(io);
     defer fp_mu.unlock(io);
@@ -1479,6 +1652,36 @@ pub fn rootfsFingerprint(arena: Allocator, io: std.Io, rootfs: []const u8) !Key 
 /// The file, in the rootfs, that says it was provisioned again: touched after changing it in place
 /// (docs/native-backend.md, "The rootfs").
 pub const rootfs_stamp = ".zig-runner-provisioned";
+
+/// Whether `rootfs` is a tree the store made: `<store>/rootfs/<key>/rootfs` or
+/// `<store>/oci/images/<key>/rootfs`, and not whatever an operator keeps under it
+/// (`RUNNER_NATIVE_ROOTFS`), which changes in place and says so with its stamp.
+fn storeTree(rootfs: []const u8, store: []const u8) bool {
+    if (store.len == 0 or rootfs.len <= store.len + 1 or rootfs[store.len] != '/' or
+        !std.mem.startsWith(u8, rootfs, store)) return false;
+    const rel = rootfs[store.len + 1 ..];
+    const end = "/rootfs";
+    if (!std.mem.endsWith(u8, rel, end)) return false;
+    for ([_][]const u8{ "rootfs/", "oci/images/" }) |area| {
+        if (!std.mem.startsWith(u8, rel, area) or rel.len <= area.len + end.len) continue;
+        return std.mem.indexOfScalar(u8, rel[area.len .. rel.len - end.len], '/') == null;
+    }
+    return false;
+}
+
+/// A rootfs's root directory: which inode, since when.
+fn rootIdentity(arena: Allocator, rootfs: []const u8) !Key {
+    const p = try arena.dupeSentinel(u8, rootfs, 0);
+    var st: linux.Statx = undefined;
+    const mask: linux.STATX = .{ .INO = true, .CTIME = true };
+    if (linux.errno(linux.statx(linux.AT.FDCWD, p, linux.AT.SYMLINK_NOFOLLOW, mask, &st)) != .SUCCESS)
+        return error.RootfsUnreadable;
+    var h: KeyHasher = .plain("rootfs root");
+    h.int(st.ino);
+    h.int(std.math.cast(u64, st.ctime.sec) orelse 0);
+    h.int(st.ctime.nsec);
+    return h.final();
+}
 
 /// What `rootfsFingerprint` checks for every job: the root's and the stamp's identity and ctime.
 fn rootfsSeen(arena: Allocator, rootfs: []const u8) !Key {
@@ -1795,6 +1998,105 @@ test "native store: a failed fsync is not lost to an unreadable file's fallback"
     try std.testing.expectError(error.Sync, w.result());
 }
 
+/// The tree at `p` synced as a publish syncs it: what a test needs of `writeBack` and `syncEntries`.
+fn testSync(arena: Allocator, io: std.Io, p: []const u8) !void {
+    const root = try openRoot(arena, p);
+    defer _ = linux.close(root);
+    return syncEntries(root, try writeBack(arena, io, root, std.math.maxInt(u64)));
+}
+
+test "native store: a writeback's error is the publish's, which no later fsync would see" {
+    // No such descriptor.
+    const bad = [_]linux.fd_t{1 << 30};
+    try std.testing.expectError(error.Sync, waitWritten(&bad));
+    try waitWritten(&.{});
+}
+
+test "native store: a walk that passes the limit stops, and a large entry syncs the filesystem" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try tmp.dir.createDirPath(io, "t/d");
+    // More files than `write_back_batch`, so a batch is waited for on the way.
+    for (0..write_back_batch + 3) |i| try tmp.dir.writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "t/d/f{d}", .{i}),
+        .data = "x",
+    });
+    const t = try std.fmt.allocPrint(arena, "{s}/t", .{root});
+    const entries = write_back_batch + 4;
+    for ([_]u64{ entries, entries - 1 }) |max| {
+        const fd = try openRoot(arena, t);
+        defer _ = linux.close(fd);
+        if (writeBack(arena, io, fd, max)) |todo| {
+            // Each file and directory, and the tree's own root.
+            try std.testing.expectEqual(entries, max);
+            try std.testing.expectEqual(entries + 1, todo.len);
+        } else |e| {
+            try std.testing.expectEqual(error.TooLarge, e);
+            try std.testing.expectEqual(entries - 1, max);
+        }
+    }
+
+    // A descriptor that fails shows which sync a publish made: a small entry's own fsyncs never
+    // touch it, a large one's `syncfs` must, and then nothing is published and the upper is back.
+    const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}), .sync_fd = -1 };
+    try prepare(arena, io, s.root, .{ .check_parents = false });
+    var never: std.atomic.Value(bool) = .init(false);
+    var small_key: KeyHasher = .plain("small");
+    const small = small_key.final();
+    const small_lock = try s.lockKey(arena, io, small, &never);
+    defer small_lock.close(io);
+    try tmp.dir.createDirPath(io, "small");
+    try tmp.dir.writeFile(io, .{ .sub_path = "small/f", .data = "s" });
+    const small_upper = try std.fmt.allocPrint(arena, "{s}/small", .{root});
+    const l = try s.publish(arena, io, small, .fetch, small_upper, .{ .log = "", .fc = "" });
+    l.lock.close(io);
+    var large_key: KeyHasher = .plain("large");
+    const large = large_key.final();
+    const large_lock = try s.lockKey(arena, io, large, &never);
+    defer large_lock.close(io);
+    for (0..sync_tree_max) |i| try tmp.dir.writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "t/d/g{d}", .{i}),
+        .data = "",
+    });
+    try std.testing.expectError(
+        error.Sync,
+        s.publish(arena, io, large, .fetch, t, .{ .log = "", .fc = "" }),
+    );
+    try tmp.dir.access(io, "t/d/g0", .{});
+    try std.testing.expect(try s.open(arena, io, large) == null);
+}
+
+test "native store: a checkout's size of entries is synced on its own, not with the whole disk" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try tmp.dir.createDirPath(io, "t/d");
+    for (0..370) |i| try tmp.dir.writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "t/d/f{d}", .{i}),
+        .data = "x",
+    });
+    // A descriptor that fails: `syncfs` would refuse the publish, so it was not called.
+    const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}), .sync_fd = -1 };
+    try prepare(arena, io, s.root, .{ .check_parents = false });
+    var kh: KeyHasher = .plain("checkout");
+    const k = kh.final();
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, k, &never);
+    defer kl.close(io);
+    const upper = try std.fmt.allocPrint(arena, "{s}/t", .{root});
+    const l = try s.publish(arena, io, k, .fetch, upper, .{ .log = "", .fc = "" });
+    l.lock.close(io);
+}
+
 test "native store: a publish syncs the entry's own tree, and a file it cannot open falls back to the filesystem's" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -1816,13 +2118,13 @@ test "native store: a publish syncs the entry's own tree, and a file it cannot o
         linux.S.IFIFO | 0o600,
         0,
     )));
-    try syncTree(arena, io, try std.fmt.allocPrint(arena, "{s}/t", .{root}));
+    try testSync(arena, io, try std.fmt.allocPrint(arena, "{s}/t", .{root}));
     // A file nobody may read: the runner's root may open it anyway; its user may not, and then
     // the publish syncs the whole filesystem instead, and still publishes.
     try tmp.dir.writeFile(io, .{ .sub_path = "t/a/secret", .data = "s" });
     const secret = try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/t/a/secret", .{root}), 0);
     _ = linux.chmod(secret, 0);
-    if (syncTree(arena, io, try std.fmt.allocPrint(arena, "{s}/t", .{root}))) |_| {
+    if (testSync(arena, io, try std.fmt.allocPrint(arena, "{s}/t", .{root}))) |_| {
         try std.testing.expectEqual(@as(u32, 0), linux.geteuid());
     } else |e| try std.testing.expectEqual(error.Unreadable, e);
     const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}) };
@@ -1839,6 +2141,11 @@ test "native store: a publish syncs the entry's own tree, and a file it cannot o
     l.lock.close(io);
     const hit = (try s.open(arena, io, k)).?;
     hit.layer.lock.close(io);
+    // The meta was written before the tree's fsyncs, and still counts what the tree takes.
+    try std.testing.expectEqual(
+        (try metaOf(arena, io, try s.layerDir(arena, k))).bytes,
+        try treeBytes(arena, io, hit.layer.fs),
+    );
     _ = linux.chmod(try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/a/secret", .{hit.layer.fs}), 0), 0o600);
 }
 
@@ -2137,8 +2444,8 @@ test "native store: the rootfs's fingerprint changes when the rootfs is changed 
     try tmp.dir.createDirPath(io, "rootfs/usr/bin");
     try tmp.dir.writeFile(io, .{ .sub_path = "rootfs/usr/bin/tool", .data = "v1" });
     const rootfs = try tmp.dir.realPathFileAlloc(io, "rootfs", arena);
-    const first = try rootfsFingerprint(arena, io, rootfs);
-    try std.testing.expectEqualSlices(u8, &first, &try rootfsFingerprint(arena, io, rootfs));
+    const first = try rootfsFingerprint(arena, io, rootfs, "");
+    try std.testing.expectEqualSlices(u8, &first, &try rootfsFingerprint(arena, io, rootfs, ""));
     // Provisioned again in place, as `tar -x` over it does: same size, mtime set back. The ctime
     // moved, but only a new walk sees it; the stamp, touched after, makes the next job walk.
     try tmp.dir.writeFile(io, .{ .sub_path = "rootfs/usr/bin/tool", .data = "v2" });
@@ -2146,13 +2453,13 @@ test "native store: the rootfs's fingerprint changes when the rootfs is changed 
     const t = [2]linux.timespec{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } };
     _ = linux.utimensat(linux.AT.FDCWD, tool, &t, 0);
     try tmp.dir.writeFile(io, .{ .sub_path = "rootfs/" ++ rootfs_stamp, .data = "" });
-    const second = try rootfsFingerprint(arena, io, rootfs);
+    const second = try rootfsFingerprint(arena, io, rootfs, "");
     try std.testing.expect(!std.mem.eql(u8, &first, &second));
     // A walk sees an in-place change by its ctime even with the stamp untouched, as at a
     // restart, when nothing is kept.
     _ = linux.utimensat(linux.AT.FDCWD, tool, &t, 0);
     fp_len = 0;
-    const third = try rootfsFingerprint(arena, io, rootfs);
+    const third = try rootfsFingerprint(arena, io, rootfs, "");
     try std.testing.expect(!std.mem.eql(u8, &second, &third));
 }
 
@@ -2319,7 +2626,7 @@ test "native store: collect keeps a whole layer no job holds while the store is 
     defer tmp.cleanup();
     var s: Store = .{ .root = "" };
     const k, const l = try testLayer(arena, io, tmp, &s, "up");
-    const bytes = try treeBytes(arena, io, l.fs);
+    const bytes = accounted(try metaOf(arena, io, std.fs.path.dirname(l.fs).?));
     l.lock.close(io);
     // Exactly at the cap: nothing goes.
     s.max_bytes = bytes;
@@ -2343,7 +2650,7 @@ test "native store: over its cap, collect evicts the least recently used layers 
     var bytes: u64 = 0;
     for (&keys, [_][]const u8{ "up0", "up1", "up2" }) |*k, name| {
         k.*, const l = try testLayer(arena, io, tmp, &s, name);
-        bytes = try treeBytes(arena, io, l.fs);
+        bytes = accounted(try metaOf(arena, io, std.fs.path.dirname(l.fs).?));
         l.lock.close(io);
     }
     // Used in the order 1, 0, 2 (an open is a use): room for two, so 1 goes, and only 1.
@@ -2356,6 +2663,70 @@ test "native store: over its cap, collect evicts the least recently used layers 
     try std.testing.expect(try s.open(arena, io, keys[1]) == null);
     (try s.open(arena, io, keys[0])).?.layer.lock.close(io);
     (try s.open(arena, io, keys[2])).?.layer.lock.close(io);
+}
+
+test "native store: a layer counts its record and its own files, not only its tree" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    const k, const l = try testLayer(arena, io, tmp, &s, "up");
+    const tree = try treeBytes(arena, io, l.fs);
+    l.lock.close(io);
+    s.max_bytes = tree + entry_overhead;
+    s.collect(arena, io);
+    try std.testing.expect(try s.open(arena, io, k) == null);
+}
+
+test "native store: under the disk's floor a layer goes though the store is under its cap, not one just used" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    const old, const l0 = try testLayer(arena, io, tmp, &s, "up0");
+    const lock = try arena.dupeSentinel(u8, try join(arena, std.fs.path.dirname(l0.fs).?, "lock"), 0);
+    l0.lock.close(io);
+    const new, const l1 = try testLayer(arena, io, tmp, &s, "up1");
+    l1.lock.close(io);
+    const t = [2]linux.timespec{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } };
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.utimensat(linux.AT.FDCWD, lock, &t, 0)));
+    // A floor no disk meets.
+    s.limits.min_free_pct = 100;
+    s.collect(arena, io);
+    try std.testing.expect(try s.open(arena, io, old) == null);
+    (try s.open(arena, io, new)).?.layer.lock.close(io);
+}
+
+test "native store: under the disk's floor a pass takes what its budget allows of the layers" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    const t = [2]linux.timespec{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } };
+    for (0..20) |i| {
+        _, const l = try testLayer(arena, io, tmp, &s, try std.fmt.allocPrint(arena, "up{d}", .{i}));
+        const lock = try arena.dupeSentinel(u8, try join(arena, std.fs.path.dirname(l.fs).?, "lock"), 0);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.utimensat(linux.AT.FDCWD, lock, &t, 0)));
+        l.lock.close(io);
+    }
+    s.limits.min_free_pct = 100;
+    s.limits.budget_ms = 0;
+    s.collect(arena, io);
+    var left: usize = 0;
+    var d = try std.Io.Dir.cwd().openDir(io, try join(arena, s.root, "layers"), .{ .iterate = true });
+    defer d.close(io);
+    var it = d.iterate();
+    while (try it.next(io)) |_| left += 1;
+    try std.testing.expectEqual(@as(usize, 19), left);
 }
 
 test "native store: a key published already stays, and the second upper is put back where it was" {

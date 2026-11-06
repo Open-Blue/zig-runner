@@ -191,8 +191,8 @@ pub fn pullJobContainer(x: *Exec, ls: u32, jc: job_mod.Service) !bool {
     var msg: []const u8 = "";
     var ref_q: Query = .init(arena);
     try head.begin(&ref_q);
-    try ref_q.leaf("imageRef");
-    const cfg = gql(arena, x.transport, try ref_q.finish(), &msg) catch {
+    try ref_q.leaf("entrypoint");
+    _ = gql(arena, x.transport, try ref_q.finish(), &msg) catch {
         x.sh.errorLine(
             ls,
             try std.fmt.allocPrint(arena, "Failed to pull {s}: {s}", .{ x.job_image, msg }),
@@ -200,9 +200,7 @@ pub fn pullJobContainer(x: *Exec, ls: u32, jc: job_mod.Service) !bool {
         x.sh.append(ls, "##[endgroup]");
         return false;
     };
-    if (jsonFindString(cfg, "imageRef")) |ref| if (std.mem.indexOf(u8, ref, "@sha256:")) |at| {
-        x.sh.append(ls, try std.fmt.allocPrint(arena, "Digest: {s}", .{ref[at + 1 ..]}));
-    };
+    try logDigest(x, ls, head);
     // No /lib (a scratch image) is not musl.
     var lib_q: Query = .init(arena);
     try head.begin(&lib_q);
@@ -359,6 +357,22 @@ pub fn serviceHead(
     return .{ .auth = auth, .image = image };
 }
 
+/// The "Digest:" line of the image the pull resolved to, as GitHub's runner logs its `docker pull`.
+/// A query of its own, after the pull has succeeded: the engine answers `imageRef` only for a
+/// container fresh from `From`, and may refuse it even then ("Image reference can only be
+/// retrieved immediately after the 'Container.From' call"), which must not fail a pull that
+/// worked. A refused one leaves the line out.
+fn logDigest(x: *Exec, ls: u32, head: ImageHead) !void {
+    const arena = x.arena;
+    var q: Query = .init(arena);
+    try head.begin(&q);
+    try q.leaf("imageRef");
+    var ignored: []const u8 = "";
+    const r = gql(arena, x.transport, try q.finish(), &ignored) catch return;
+    if (jsonFindString(r, "imageRef")) |ref| if (std.mem.indexOf(u8, ref, "@sha256:")) |at|
+        x.sh.append(ls, try std.fmt.allocPrint(arena, "Digest: {s}", .{ref[at + 1 ..]}));
+}
+
 /// The image's configuration first: its entrypoint and command (the service runs them), and the
 /// digest it resolved to, as GitHub's runner logs its `docker pull`.
 const ServiceConfig = struct {
@@ -379,7 +393,6 @@ pub fn pullServiceConfig(
     try head.begin(&q);
     try q.leaf("entrypoint");
     try q.leaf("defaultArgs");
-    try q.leaf("imageRef");
     const cfg = gql(arena, x.transport, try q.finish(), &x.err_msg) catch {
         x.sh.errorLine(
             ls,
@@ -391,9 +404,7 @@ pub fn pullServiceConfig(
         );
         return null;
     };
-    if (jsonFindString(cfg, "imageRef")) |ref| if (std.mem.indexOf(u8, ref, "@sha256:")) |at| {
-        x.sh.append(ls, try std.fmt.allocPrint(arena, "Digest: {s}", .{ref[at + 1 ..]}));
-    };
+    try logDigest(x, ls, head);
     const entrypoint = try jsonStrings(arena, jsonFind(cfg, "entrypoint"));
     const cmd = try jsonStrings(arena, jsonFind(cfg, "defaultArgs"));
     if (entrypoint.len + cmd.len == 0) {

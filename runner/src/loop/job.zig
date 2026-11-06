@@ -590,9 +590,11 @@ fn runJobSteps(
         .image = c.cfg.image,
         .js_runtime = c.cfg.js_runtime,
         .engine = c.cfg.engineEndpoint(),
+        .engineless = c.cfg.engineless(),
         .gpa = c.gpa,
         .nesting = c.cfg.dagger_nesting,
         .package_caches = c.cfg.package_caches,
+        .tool_trees = c.cfg.tool_trees,
         // The same rule as the gate above, without its `*`: a runner that lets every job through
         // vouches for none, so none of its jobs share the trusted jobs' caches (#105).
         .trusted = trust.vouches(cfg.trusted_refs, cfg.trusted_events, job.github),
@@ -622,7 +624,10 @@ fn runJobSteps(
         result.succeeded = false;
     }
     if (result.engine_error) |msg| if (!result.cancelled) {
-        try log.append(job.check_run_id, 0, .stderr, "dagger failed before running the steps:");
+        try log.append(job.check_run_id, 0, .stderr, if (c.cfg.engineless())
+            "the job could not run before its steps:"
+        else
+            "dagger failed before running the steps:");
         try log.append(job.check_run_id, 0, .stderr, msg);
     };
     return result;

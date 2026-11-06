@@ -77,6 +77,9 @@ pub const Checkout = struct {
     /// `submodules`: false (actions/checkout's default) leaves each submodule's directory empty.
     /// Dagger's git always fetches them, recursively, so `true` gives nested ones too.
     submodules: bool = false,
+    /// `submodules: recursive`: the native backend fetches nested submodules too, as GitHub's
+    /// checkout does for `recursive` and not for `true`.
+    submodules_recursive: bool = false,
 };
 
 pub const Step = struct {
@@ -719,15 +722,16 @@ pub fn checkoutFromInputs(arena: Allocator, kv: []const EnvVar) Allocator.Error!
                     .{e.value},
                 ) };
         } else if (std.mem.eql(u8, e.name, "submodules")) {
-            co.submodules = if (e.value.len == 0) false else if (std.ascii.eqlIgnoreCase(
-                e.value,
-                "recursive",
-            )) true else parseBool(e.value) orelse
-                return .{ .unsupported = try std.fmt.allocPrint(
-                    arena,
-                    "actions/checkout submodules '{s}' is not true, false or recursive",
-                    .{e.value},
-                ) };
+            co.submodules_recursive = std.ascii.eqlIgnoreCase(e.value, "recursive");
+            co.submodules = if (e.value.len == 0) false else if (co.submodules_recursive)
+                true
+            else
+                parseBool(e.value) orelse
+                    return .{ .unsupported = try std.fmt.allocPrint(
+                        arena,
+                        "actions/checkout submodules '{s}' is not true, false or recursive",
+                        .{e.value},
+                    ) };
         } else if (inList(&ignored_checkout_inputs, e.name)) {
             continue;
         } else if (inList(&off_only_checkout_inputs, e.name)) {
@@ -1193,6 +1197,16 @@ test "parse job fixture" {
     }
     for ([_][]const u8{ "false", "" }) |v| {
         try std.testing.expect(!(try checkoutFromInputs(a.allocator(), &.{.{ .name = "submodules", .value = v }})).ok.submodules);
+    }
+    // Only `recursive` asks for nested submodules (any case); `true` stops at the first level.
+    for ([_]struct { []const u8, bool }{
+        .{ "true", false },
+        .{ "recursive", true },
+        .{ "Recursive", true },
+        .{ "false", false },
+    }) |c| {
+        const got = (try checkoutFromInputs(a.allocator(), &.{.{ .name = "submodules", .value = c[0] }})).ok;
+        try std.testing.expectEqual(c[1], got.submodules_recursive);
     }
     const bad_sub = try checkoutFromInputs(a.allocator(), &.{.{ .name = "submodules", .value = "yes" }});
     try std.testing.expect(std.mem.indexOf(u8, bad_sub.unsupported, "not true, false or recursive") != null);

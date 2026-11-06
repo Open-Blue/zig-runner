@@ -72,6 +72,20 @@
       "enabled": false
     },
     {
+      "description": "The JavaScript runtimes for actions (runner/src/dagger/js.zig): a new major changes what every action runs on, so it moves by hand, when GitHub's runner moves. Digest and minor updates within them still come.",
+      "matchFileNames": [
+        "runner/src/dagger/js.zig"
+      ],
+      "matchDepNames": [
+        "node",
+        "oven/bun"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "enabled": false
+    },
+    {
       "description": "The Dagger engine moves with the runner, by hand: the runner speaks exactly one engine version's protocol (runner/src/engine.zig, client_version), and a new engine starts with an empty cache. So no update is proposed for it, let alone merged; deploy/compose.yaml says the same.",
       "matchDepNames": [
         "registry.dagger.io/engine"
@@ -288,17 +302,15 @@
       "datasourceTemplate": "go"
     },
     {
-      "description": "zizmor, run by version from PyPI in CI and the pre-push hook.",
+      "description": "The JavaScript runtimes for actions (bun and node, runner/src/dagger/js.zig), pinned by their multi-arch index digest; each literal is split over two lines with ++. (zizmor, pinned by version and hash in .github/zizmor-requirements.txt, and @actions/glob, in runner/tools/hashfilesdiff/package-lock.json, are read by Renovate's own pip and npm managers.)",
       "customType": "regex",
       "managerFilePatterns": [
-        "/^\\.github/workflows/ci\\.yml$/",
-        "/^\\.githooks/pre-push$/"
+        "/^runner/src/dagger/js\\.zig$/"
       ],
       "matchStrings": [
-        "zizmor(?:==|@)(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+        "\"(?<depName>(?:oven/bun|node)):(?<currentValue>[A-Za-z0-9._-]+)\"\\s*\\+\\+\\s*\"@(?<currentDigest>sha256:[a-f0-9]{64})\""
       ],
-      "depNameTemplate": "zizmor",
-      "datasourceTemplate": "pypi"
+      "datasourceTemplate": "docker"
     },
     {
       "description": "tls.zig, the runner's one Zig dependency: the commit its GitHub archive URL names in runner/build.zig.zon, followed on its main branch.",

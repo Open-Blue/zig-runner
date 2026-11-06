@@ -103,19 +103,23 @@ pub fn checkOne(comptime f: anytype, args: anytype) !void {
 /// fails every allocation from the chosen one on, so a failure caught and turned into an answer
 /// goes unnoticed whenever anything is allocated later: that later allocation fails too, and the
 /// run still ends in `error.OutOfMemory`. Memory that runs out for a moment comes back, so here
-/// such a run must still end in `error.OutOfMemory`, not in an answer.
+/// such a run must still end in `error.OutOfMemory`, not in an answer. The runs grow with the
+/// square of the input, and `gpa` records a stack trace for every allocation, so they go to a
+/// faster allocator; `FailOnce` counts what is left, so a leak after a failure is still found.
 fn checkEachAllocationFailure(comptime f: anytype, args: anytype) !void {
     var n: usize = 0;
     {
-        var once: FailOnce = .{ .child = gpa };
+        var once: FailOnce = .{ .child = std.heap.smp_allocator };
         try @call(.auto, f, .{once.allocator()} ++ args);
+        try once.checkFreed();
         n = once.count;
     }
     for (0..n) |i| {
-        var once: FailOnce = .{ .child = gpa, .fail_at = i };
+        var once: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i };
         if (@call(.auto, f, .{once.allocator()} ++ args)) |_| {
             if (once.failed) return error.SwallowedOutOfMemoryError;
         } else |e| if (e != error.OutOfMemory) return e;
+        try once.checkFreed();
     }
 }
 
@@ -148,6 +152,12 @@ const FailOnce = struct {
     fail_at: ?usize = null,
     count: usize = 0,
     failed: bool = false,
+    /// Bytes allocated and not yet freed.
+    live: usize = 0,
+
+    fn checkFreed(o: *const FailOnce) !void {
+        if (o.live != 0) return error.MemoryLeakDetected;
+    }
 
     fn allocator(o: *FailOnce) Allocator {
         return .{ .ptr = o, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
@@ -160,24 +170,52 @@ const FailOnce = struct {
             o.failed = true;
             return null;
         }
-        return o.child.rawAlloc(len, alignment, ra);
+        const memory = o.child.rawAlloc(len, alignment, ra) orelse return null;
+        o.live += len;
+        return memory;
     }
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
         const o: *FailOnce = @ptrCast(@alignCast(ctx));
-        return o.child.rawResize(memory, alignment, new_len, ra);
+        if (!o.child.rawResize(memory, alignment, new_len, ra)) return false;
+        o.live = o.live - memory.len + new_len;
+        return true;
     }
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
         const o: *FailOnce = @ptrCast(@alignCast(ctx));
-        return o.child.rawRemap(memory, alignment, new_len, ra);
+        const moved = o.child.rawRemap(memory, alignment, new_len, ra) orelse return null;
+        o.live = o.live - memory.len + new_len;
+        return moved;
     }
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const o: *FailOnce = @ptrCast(@alignCast(ctx));
+        o.live -= memory.len;
         o.child.rawFree(memory, alignment, ra);
     }
 };
+
+test "allocation failures: a leak after one failure is found" {
+    const S = struct {
+        fn run(a: Allocator) !void {
+            const first = try a.alloc(u8, 8);
+            // Gives up without `first`, on the one path a run that never fails does not take.
+            const second = try a.alloc(u8, 8);
+            a.free(second);
+            a.free(first);
+        }
+        fn whole(a: Allocator) !void {
+            const first = try a.alloc(u8, 8);
+            defer a.free(first);
+            var second = try a.alloc(u8, 8);
+            defer a.free(second);
+            second = try a.realloc(second, 4096);
+        }
+    };
+    try std.testing.expectError(error.MemoryLeakDetected, checkEachAllocationFailure(S.run, .{}));
+    try checkEachAllocationFailure(S.whole, .{});
+}
 
 test "allocation failures: YAML" {
     const S = struct {

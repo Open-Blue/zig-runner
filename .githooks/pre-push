@@ -62,6 +62,8 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 		fi
 		grep "passed;" "$log" | tail -1 | sed "s/^/$hook: /" >&2
 		rm -f "$log"
+		say "every test file is compiled"
+		../.github/scripts/test-files.sh >/dev/null || fail "a file's tests are not in the test binary: ../.github/scripts/test-files.sh shows which"
 	)
 	say "unsafe constructs ratchet"
 	(cd "$tree" && .github/scripts/unsafe-ratchet.sh >/dev/null) || fail "more unsafe casts than the baseline: .github/scripts/unsafe-ratchet.sh shows which"
@@ -78,14 +80,9 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 	if grep -q '^\.github/workflows/' <<<"$changed"; then
 		say "actionlint and zizmor"
 		(cd "$tree" && go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12) || fail "actionlint found problems"
-		if command -v pipx >/dev/null; then
-			zizmor=(pipx run zizmor==1.31.1)
-		elif command -v uvx >/dev/null; then
-			zizmor=(uvx zizmor@1.31.1)
-		else
-			fail "workflows changed, and zizmor needs pipx or uv to run (CI's \"Workflows\" job runs zizmor 1.31.1)"
-		fi
-		(cd "$tree" && "${zizmor[@]}" .github/workflows) || fail "zizmor found problems"
+		command -v python3 >/dev/null ||
+			fail "workflows changed, and zizmor needs python3 with venv to run (.github/scripts/zizmor.sh)"
+		(cd "$tree" && .github/scripts/zizmor.sh .github/workflows) || fail "zizmor found problems"
 	fi
 	while read -r mod; do
 		[[ -n $mod && -f $tree/$mod/go.mod ]] || continue

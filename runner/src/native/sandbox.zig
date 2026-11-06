@@ -335,9 +335,14 @@ const MountAttr = extern struct {
 const resolve_in_root = 0x10;
 const resolve_no_magiclinks = 0x02;
 /// And no symlink at all: the runner reading a file a step left (`readIn`).
-const resolve_no_symlinks = 0x04;
+pub const resolve_no_symlinks = 0x04;
 
 const OpenHow = extern struct { flags: u64, mode: u64, resolve: u64 };
+
+/// Tries of an `openat2` the kernel gave up on. A `..` on the way fails with EAGAIN when any rename
+/// or mount on the machine races it, as it cannot tell the race from an escape, and it says to
+/// try again: another job publishing a layer is enough.
+const open_tries = 64;
 
 /// Opens `path` under `root`, resolved inside it (see the file's comment). A file descriptor, or
 /// the errno.
@@ -355,15 +360,19 @@ pub fn openIn(
         .mode = mode,
         .resolve = resolve | resolve_in_root | resolve_no_magiclinks,
     };
-    const rc = linux.syscall4(
-        .openat2,
-        @as(usize, @bitCast(@as(isize, root))),
-        @intFromPtr(path),
-        @intFromPtr(&how),
-        @sizeOf(OpenHow),
-    );
-    const e = linux.errno(rc);
-    return if (e == .SUCCESS) .{ .fd = @intCast(rc) } else .{ .err = e };
+    for (0..open_tries) |_| {
+        const rc = linux.syscall4(
+            .openat2,
+            @as(usize, @bitCast(@as(isize, root))),
+            @intFromPtr(path),
+            @intFromPtr(&how),
+            @sizeOf(OpenHow),
+        );
+        const e = linux.errno(rc);
+        if (e == .AGAIN) continue;
+        return if (e == .SUCCESS) .{ .fd = @intCast(rc) } else .{ .err = e };
+    }
+    return .{ .err = .AGAIN };
 }
 
 /// The contents of `path` in a layer, read by the runner: resolved inside the layer and through no
@@ -681,6 +690,12 @@ fn bindAll(arena: Allocator, spec: Spec, volume_ns: ?linux.fd_t) void {
     }
 }
 
+/// The directory `host` itself, held: a volume inside another (`<key>/runner`) is a name a job in
+/// the outer one can replace, and a link there must fail the step, not bind what it points at.
+fn openVolume(host: [*:0]const u8) usize {
+    return linux.open(host, .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+}
+
 /// A cache volume at `at`, writable, nosuid and nodev, and idmapped through `userns` when given:
 /// a detached clone of the host's directory, its attributes set in one `mount_setattr`, then
 /// moved into place. Fails the step when it cannot.
@@ -691,14 +706,19 @@ fn bindVolumeIn(
     at: []const u8,
     userns: ?linux.fd_t,
 ) void {
+    const opened = openVolume(z(arena, host));
+    check(about(arena, "open the cache volume for", at), opened);
+    const volume: linux.fd_t = std.math.cast(linux.fd_t, opened) orelse
+        fatal(about(arena, "open the cache volume for", at), @as(u32, 2));
+    defer _ = linux.close(volume);
     const open_tree_clone = 1;
     const tree = linux.syscall3(
         .open_tree,
-        @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))),
-        @intFromPtr(z(arena, host)),
-        open_tree_clone | linux.SOCK.CLOEXEC,
+        std.math.cast(usize, volume) orelse unreachable,
+        @intFromPtr(""),
+        open_tree_clone | linux.AT.EMPTY_PATH | linux.SOCK.CLOEXEC,
     );
-    check(about(arena, "open the cache volume for", at), tree);
+    check(about(arena, "clone the cache volume for", at), tree);
     defer _ = linux.close(@intCast(tree));
     const nosuid = 0x2;
     const nodev = 0x4;
@@ -778,8 +798,15 @@ fn overlayOptions(
         opts.appendSlice(arena, l) catch oom();
     }
     opts.print(arena, ",upperdir={s},workdir={s}", .{ spec.upper, spec.work }) catch oom();
-    if (userxattr) opts.appendSlice(arena, ",userxattr") catch oom();
+    opts.appendSlice(arena, overlayFeatures(userxattr)) catch oom();
     return opts.toOwnedSliceSentinel(arena, 0) catch oom();
+}
+
+/// No redirects and no metacopy, whatever the host's kernel defaults to: `Merged` follows neither,
+/// and a layer with either fails a `hashFiles()`. `userxattr` already turns both off (a redirect
+/// is `nofollow`) and refuses `redirect_dir=off` beside it, so asking there fails the mount.
+fn overlayFeatures(userxattr: bool) []const u8 {
+    return if (userxattr) ",userxattr" else ",redirect_dir=off,metacopy=off";
 }
 
 fn mountOverlay(arena: Allocator, spec: Spec, lowers: []const []const u8, userxattr: bool) void {
@@ -945,7 +972,7 @@ fn mountContainer(arena: Allocator, c: Spec.Container, lowers: []const []const u
         std.mem.join(arena, ":", lowers) catch oom(),
         c.upper,
         c.work,
-        if (userxattr) ",userxattr" else "",
+        overlayFeatures(userxattr),
     }) catch oom();
     mountVolatile(arena, "mount the container's overlay", c.merged, c.work, opts);
 }
@@ -1574,6 +1601,31 @@ pub fn oom() noreturn {
     fatal("allocate", @as(u32, 12));
 }
 
+test "an overlay asks for no redirects or metacopy, where the kernel lets it" {
+    try std.testing.expectEqualStrings(",redirect_dir=off,metacopy=off", overlayFeatures(false));
+    // The kernel fails a mount with `userxattr` and `redirect_dir=off` (Linux 7.0).
+    try std.testing.expectEqualStrings(",userxattr", overlayFeatures(true));
+}
+
+test "a cache volume's name replaced by a link is refused, not followed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "outer/runner");
+    try tmp.dir.createDirPath(io, "elsewhere");
+    try tmp.dir.symLink(io, "../elsewhere", "outer/link", .{});
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPathFile(io, ".", &buf);
+    var pa: [std.fs.max_path_bytes]u8 = undefined;
+    const real = try std.fmt.bufPrintSentinel(&pa, "{s}/outer/runner", .{buf[0..n]}, 0);
+    const rc = openVolume(real);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    _ = linux.close(std.math.cast(linux.fd_t, rc).?);
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const link = try std.fmt.bufPrintSentinel(&pb, "{s}/outer/link", .{buf[0..n]}, 0);
+    try std.testing.expect(linux.errno(openVolume(link)) != .SUCCESS);
+}
+
 test "homeOf reads the home directory of a uid from /etc/passwd" {
     const passwd = "root:x:0:0:root:/root:/bin/bash\n" ++
         "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n" ++
@@ -1582,6 +1634,43 @@ test "homeOf reads the home directory of a uid from /etc/passwd" {
     try std.testing.expectEqualStrings("/home/runner", homeOf(passwd, 1001).?);
     try std.testing.expect(homeOf(passwd, 7) == null);
     try std.testing.expect(homeOf("garbage", 0) == null);
+}
+
+/// Renames a file back and forth in `dir` until `stop`, to race what follows a `..`.
+fn renameUntil(dir: linux.fd_t, stop: *std.atomic.Value(bool)) void {
+    while (!stop.load(.monotonic)) {
+        _ = linux.renameat(dir, "a", dir, "b");
+        _ = linux.renameat(dir, "b", dir, "a");
+    }
+}
+
+test "openIn: a rename elsewhere on the machine does not fail a `..` on the way" {
+    // Valgrind runs one thread at a time, and threads this busy never hand it over: the job's 45
+    // minutes pass with the test on its first open. It is a race, which memcheck would not see.
+    if (std.valgrind.runningOnValgrind() != 0) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "root");
+    try tmp.dir.createDirPath(io, "busy");
+    try tmp.dir.writeFile(io, .{ .sub_path = "busy/a", .data = "" });
+    try tmp.dir.symLink(io, "/../../..", "root/up", .{});
+    const root = try tmp.dir.openDir(io, "root", .{});
+    defer root.close(io);
+    const busy = try tmp.dir.openDir(io, "busy", .{});
+    defer busy.close(io);
+
+    var stop: std.atomic.Value(bool) = .init(false);
+    var threads: [2]std.Thread = undefined;
+    for (&threads) |*t| t.* = try .spawn(.{}, renameUntil, .{ busy.handle, &stop });
+    defer for (threads) |t| t.join();
+    defer stop.store(true, .monotonic);
+
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .PATH = true };
+    for (0..20_000) |_| switch (openIn(root.handle, "up", flags, 0, 0)) {
+        .fd => |fd| _ = linux.close(fd),
+        .err => |e| return std.debug.panic("openIn through a `..`: {t}", .{e}),
+    };
 }
 
 test "readIn reads inside a layer: no symlink is followed, and a whiteout is told apart" {

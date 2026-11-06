@@ -10,6 +10,7 @@ const app = @import("github/app.zig");
 const NativeBackend = @import("native/Backend.zig");
 const native_net = @import("native/net.zig");
 const NativeStore = @import("native/Store.zig");
+const native_evict = @import("native/evict.zig");
 const native_cgroup = @import("native/cgroup.zig");
 
 pub const Scope = union(enum) {
@@ -35,8 +36,10 @@ pub const JsRuntime = enum { bun, node };
 /// Who steps run as in the default image: `runner` (uid 1001, passwordless sudo), as on GitHub's
 /// hosted runners, or root.
 pub const StepUser = enum { runner, root };
-/// How jobs reach the Dagger engine: directly (`engine.zig`), or through a `dagger run` child.
-pub const EngineMode = enum { direct, cli };
+/// How jobs reach the Dagger engine: directly (`engine.zig`), through a `dagger run` child, or not
+/// at all (`none`, for `RUNNER_BACKEND=native`: no engine is started, waited for or watched, and a
+/// job native cannot run fails at once, `dagger.Options.engineless`).
+pub const EngineMode = enum { direct, cli, none };
 /// What runs a job's steps: the Dagger engine, or the runner itself where it can
 /// (docs/native-backend.md), each job it cannot run going to Dagger.
 pub const StepBackend = enum { dagger, native };
@@ -142,6 +145,15 @@ pub const Config = struct {
     /// Past this many MiB, the native step store's least recently used layers go
     /// (`RUNNER_NATIVE_STORE_MAX_MB`, `native/Store.zig`).
     native_store_max_mb: u64 = NativeStore.default_max_bytes / (1024 * 1024),
+    /// Past this many MiB, the native cache volumes that went longest unused go
+    /// (`RUNNER_NATIVE_VOLUMES_MAX_MB`, 0 for no cap, `native/evict.zig`).
+    native_volumes_max_mb: u64 = native_evict.default_volumes_max_bytes / (1024 * 1024),
+    /// Past this many MiB of images, provisioned rootfs and Zig cache seeds together, those that
+    /// went longest unused go (`RUNNER_NATIVE_IMAGES_MAX_MB`, 0 for no cap, `native/evict.zig`).
+    native_images_max_mb: u64 = native_evict.default_images_max_bytes / (1024 * 1024),
+    /// With less than this percentage of the native store's filesystem free, what it keeps goes
+    /// whatever the caps say (`RUNNER_NATIVE_MIN_FREE_PCT`, 0 for no floor, `native/evict.zig`).
+    native_min_free_pct: u8 = native_evict.default_min_free_pct,
     /// Where native jobs' cgroups go (`RUNNER_NATIVE_CGROUP`: "", `self`, `none` or a cgroup's
     /// path), and each job's limits (`RUNNER_NATIVE_MEMORY_MAX_MB`, null for three quarters of
     /// the machine's memory and 0 for none; `RUNNER_NATIVE_PIDS_MAX`, 0 for none). See
@@ -149,6 +161,13 @@ pub const Config = struct {
     native_cgroup: []const u8 = "",
     native_memory_max_mb: ?u32 = null,
     native_pids_max: u32 = native_cgroup.default_pids_max,
+    /// What a native job's `hashFiles()` may use: the MiB all of them may hold together in this
+    /// process (`RUNNER_NATIVE_HASHFILES_MEMORY_MB`; null for the smaller of 1 GiB and an eighth of
+    /// the machine's memory, 0 for no limit), and the seconds one may take
+    /// (`RUNNER_NATIVE_HASHFILES_TIMEOUT_S`; GitHub's 120, 0 for no limit). See
+    /// `native/hash_files.zig`.
+    native_hashfiles_memory_mb: ?u32 = null,
+    native_hashfiles_timeout_s: u32 = 120,
 
     /// Experimental: key the steps after one that always runs on what it produced rather than on
     /// the step itself (see `dagger.Options.output_keys`).
@@ -260,9 +279,11 @@ pub const Config = struct {
         InvalidBackend,
         InvalidNativeRootfs,
         InvalidNativeSubnet,
+        InvalidNativeMinFree,
         InvalidNativeSubidBase,
         InvalidNativeCgroup,
         InvalidEngine,
+        EngineNoneNeedsNative,
         InvalidBool,
         InvalidZigSeed,
         UnknownFlag,
@@ -279,6 +300,7 @@ pub const Config = struct {
                 "(README, \"Environments\").",
             error.InvalidNativeRootfs => "RUNNER_NATIVE_ROOTFS is a directory's absolute path: " ++
                 "overlay takes it as a layer from the job's directory.",
+            error.InvalidNativeMinFree => "RUNNER_NATIVE_MIN_FREE_PCT is a percentage, 0 to 100",
             error.InvalidNativeSubnet => "RUNNER_NATIVE_SUBNET is an IPv4 network a.b.c.d/p " ++
                 "with no host bits set and a prefix of 8 to 23 bits (room for every job's " ++
                 "address), by default " ++ native_net.Subnet.default_text ++ ".",
@@ -332,6 +354,8 @@ pub const Config = struct {
             }
             try c.applyFlag(key, val, &creds);
         }
+        // No engine and no native backend would be a runner that can run nothing.
+        if (c.engine == .none and c.backend != .native) return error.EngineNoneNeedsNative;
         if (c.native_rootfs.len > 0 and !std.fs.path.isAbsolutePosix(c.native_rootfs))
             return error.InvalidNativeRootfs;
         _ = try native_net.Subnet.parse(c.native_subnet);
@@ -417,9 +441,16 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_SUBID_BASE")) |v| c.native_subid_base = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_SUBNET")) |v| c.native_subnet = v;
         if (environ.get("RUNNER_NATIVE_STORE_MAX_MB")) |v| c.native_store_max_mb = try num(u64, v);
+        if (environ.get("RUNNER_NATIVE_VOLUMES_MAX_MB")) |v| c.native_volumes_max_mb = try num(u64, v);
+        if (environ.get("RUNNER_NATIVE_IMAGES_MAX_MB")) |v| c.native_images_max_mb = try num(u64, v);
+        if (environ.get("RUNNER_NATIVE_MIN_FREE_PCT")) |v| c.native_min_free_pct = try minFree(v);
         if (environ.get("RUNNER_NATIVE_CGROUP")) |v| c.native_cgroup = v;
         if (environ.get("RUNNER_NATIVE_MEMORY_MAX_MB")) |v| c.native_memory_max_mb = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_PIDS_MAX")) |v| c.native_pids_max = try num(u32, v);
+        if (environ.get("RUNNER_NATIVE_HASHFILES_MEMORY_MB")) |v|
+            c.native_hashfiles_memory_mb = try num(u32, v);
+        if (environ.get("RUNNER_NATIVE_HASHFILES_TIMEOUT_S")) |v|
+            c.native_hashfiles_timeout_s = try num(u32, v);
 
         if (environ.get("RUNNER_OUTPUT_KEYS")) |v| c.output_keys = try boolean(v);
         if (environ.get("RUNNER_ENFORCE_VOLATILE")) |v| c.enforce_volatile = try boolean(v);
@@ -496,9 +527,14 @@ pub const Config = struct {
         else if (eq(key, "native-subid-base")) c.native_subid_base = try num(u32, val) //
         else if (eq(key, "native-subnet")) c.native_subnet = val //
         else if (eq(key, "native-store-max-mb")) c.native_store_max_mb = try num(u64, val) //
+        else if (eq(key, "native-volumes-max-mb")) c.native_volumes_max_mb = try num(u64, val) //
+        else if (eq(key, "native-images-max-mb")) c.native_images_max_mb = try num(u64, val) //
+        else if (eq(key, "native-min-free-pct")) c.native_min_free_pct = try minFree(val) //
         else if (eq(key, "native-cgroup")) c.native_cgroup = val //
         else if (eq(key, "native-memory-max-mb")) c.native_memory_max_mb = try num(u32, val) //
         else if (eq(key, "native-pids-max")) c.native_pids_max = try num(u32, val) //
+        else if (eq(key, "native-hashfiles-memory-mb")) c.native_hashfiles_memory_mb = try num(u32, val) //
+        else if (eq(key, "native-hashfiles-timeout-s")) c.native_hashfiles_timeout_s = try num(u32, val) //
 
         else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache")) c.zig_local_cache = try boolean(val) //
@@ -550,6 +586,11 @@ pub const Config = struct {
 
     fn engineMode(s: []const u8) error{InvalidEngine}!EngineMode {
         return std.meta.stringToEnum(EngineMode, s) orelse error.InvalidEngine;
+    }
+
+    fn minFree(s: []const u8) error{InvalidNativeMinFree}!u8 {
+        const n = std.fmt.parseInt(u8, s, 10) catch return error.InvalidNativeMinFree;
+        return if (n <= 100) n else error.InvalidNativeMinFree;
     }
 
     fn stepUser(s: []const u8) error{InvalidStepUser}!StepUser {
@@ -609,8 +650,13 @@ pub const Config = struct {
                 else
                     .fromSeconds(c.engine_silence_timeout_secs),
             },
-            .cli => null,
+            .cli, .none => null,
         };
+    }
+
+    /// `RUNNER_ENGINE=none`: no Dagger engine to start, wait for or watch.
+    pub fn engineless(c: *const Config) bool {
+        return c.engine == .none;
     }
 
     const max_millis = std.time.ms_per_hour;
@@ -698,6 +744,23 @@ test "RUNNER_ENGINE, RUNNER_ENGINE_CONTAINER and DOCKER_HOST" {
     try std.testing.expectError(error.InvalidEngine, Config.load(&env, &.{ "runner", "--engine=go" }));
     try env.put("RUNNER_ENGINE_HOST", "tcp://dagger-engine:1234");
     try std.testing.expectEqualStrings("tcp://dagger-engine:1234", (try Config.load(&env, &.{"runner"})).engineEndpoint().?.host);
+}
+
+test "RUNNER_ENGINE=none needs the native backend, and leaves no engine to reach" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).engineless());
+    try env.put("RUNNER_ENGINE", "none");
+    try std.testing.expectError(error.EngineNoneNeedsNative, Config.load(&env, &.{"runner"}));
+    try env.put("RUNNER_BACKEND", "native");
+    const c = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqual(EngineMode.none, c.engine);
+    try std.testing.expect(c.engineless());
+    try std.testing.expect(c.engineEndpoint() == null);
+    // The default is unchanged: cli and direct still reach an engine.
+    try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--engine=cli" })).engineless());
 }
 
 test "--runners and RUNNER_COUNT" {
@@ -797,6 +860,23 @@ test "dagger nesting is off by default and can be turned on" {
     try std.testing.expectError(error.InvalidBool, Config.load(&env, &.{"runner"}));
 }
 
+test "the native hashFiles() limits: GitHub's 120 seconds and a share of memory, or what is set" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    const c = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqual(@as(?u32, null), c.native_hashfiles_memory_mb);
+    try std.testing.expectEqual(@as(u32, 120), c.native_hashfiles_timeout_s);
+    try env.put("RUNNER_NATIVE_HASHFILES_MEMORY_MB", "256");
+    try env.put("RUNNER_NATIVE_HASHFILES_TIMEOUT_S", "600");
+    const set = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqual(@as(?u32, 256), set.native_hashfiles_memory_mb);
+    try std.testing.expectEqual(@as(u32, 600), set.native_hashfiles_timeout_s);
+    const flag = try Config.load(&env, &.{ "runner", "--native-hashfiles-timeout-s=0" });
+    try std.testing.expectEqual(@as(u32, 0), flag.native_hashfiles_timeout_s);
+}
+
 test "the native jobs' cgroups and limits: defaults, settings, and parents that are refused" {
     var env: std.process.Environ.Map = .init(std.testing.allocator);
     defer env.deinit();
@@ -831,6 +911,16 @@ test "the native subnet and ids: defaults, and values that are refused" {
     const c = try Config.load(&env, &.{"runner"});
     try std.testing.expectEqualStrings("10.211.0.0/16", c.native_subnet);
     try std.testing.expectEqual(NativeBackend.default_subid_base, c.native_subid_base);
+    try env.put("RUNNER_NATIVE_VOLUMES_MAX_MB", "2048");
+    try env.put("RUNNER_NATIVE_IMAGES_MAX_MB", "1024");
+    try env.put("RUNNER_NATIVE_MIN_FREE_PCT", "5");
+    const limited = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqual(@as(u64, 2048), limited.native_volumes_max_mb);
+    try std.testing.expectEqual(@as(u64, 1024), limited.native_images_max_mb);
+    try std.testing.expectEqual(@as(u8, 5), limited.native_min_free_pct);
+    try env.put("RUNNER_NATIVE_MIN_FREE_PCT", "101");
+    try std.testing.expectError(error.InvalidNativeMinFree, Config.load(&env, &.{"runner"}));
+    _ = env.swapRemove("RUNNER_NATIVE_MIN_FREE_PCT");
     try env.put("RUNNER_NATIVE_SUBNET", "10.88.0.0/24");
     try std.testing.expectError(error.InvalidNativeSubnet, Config.load(&env, &.{"runner"}));
     try std.testing.expectEqualStrings("172.30.0.0/20", (try Config.load(&env, &.{

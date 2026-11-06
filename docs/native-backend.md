@@ -61,6 +61,32 @@ migration is a hybrid by construction, and each phase shrinks the list of reason
 per job, never per step: switching mid-job would mean exporting native layers into Dagger at each
 switch and splitting the step cache's key chain across two stores (DESIGN.md, "Per job").
 
+### Running with no engine
+
+`RUNNER_ENGINE=none` (or `--engine=none`), with `RUNNER_BACKEND=native` (any other backend is a
+configuration error, `EngineNoneNeedsNative`), is a runner with no Dagger engine at all. It is a
+setting, not a detection: a runner that noticed the engine's absence and changed what it does would
+turn a stopped engine, which today makes a job wait, into failed jobs nobody asked for, so the
+default (`direct`) behaves exactly as before. With `none`:
+
+- **Start-up.** No engine is looked for. The pre-warm is skipped ("pre-warm skipped:
+  RUNNER_ENGINE=none"), so there is no socket to poll every 5 s and no lock on the engine's
+  directory. The memory gate has no engine source (as `RUNNER_ENGINE_CGROUP=none`): it holds on the
+  machine and on each job's cgroup, and logs nothing about an engine cgroup. The silence-timeout
+  line is not printed.
+- **Jobs.** A job native can run runs natively as always. One it cannot (`Backend.unsupported` or
+  `usable` give a reason, or the set-up falls back) fails before any step, in "Set up job", with
+  "this job needs the Dagger engine, and this runner has none (RUNNER_ENGINE=none). This job runs on
+  Dagger: <the reason native gave>." It does not start a `dagger` child or connect to a socket.
+- **Deploy.** `deploy/compose.engineless.yaml` layered over `compose.yaml` drops the engine service,
+  its volumes and the runner's `depends_on`. The native backend needs the privileges
+  the engine service has today (`privileged: true`, or `cap_add: [SYS_ADMIN, ...]`, above): give them
+  to the runner in your override.
+
+What still needs an engine: steps that use the Dagger engine (`RUNNER_DAGGER_NESTING`), and
+whatever native lists as unsupported at the time. This is the list the fallbacks are being retired
+from; a job on it fails fast instead of waiting.
+
 ## Phases
 
 Each phase lands behind the knob with the default unchanged, its tests green, its measurements in
@@ -100,17 +126,19 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   step's PID 1 when told), every file command, `::add-mask::` and the other workflow commands,
   problem matchers (read from the layers, relative to the working directory), step summaries,
   `id-token: write`, secrets in env, in scripts and in working directories, and the built-in
-  checkout without submodules (git in the job's image, then the same step script Dagger's
-  checkout runs).
+  checkout, submodules included (git in the job's image, then the same step script Dagger's
+  checkout runs). `submodules: true` fetches the first level and `recursive` all, as GitHub's
+  checkout does (Dagger's path always recurses), each to the commit the tree records, as shallow as
+  `fetch-depth`, with `git@<host>:` read as HTTPS; the flags are in the step's script, so in its key.
 - Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a job the runner
   does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
-  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:` or `options:`, `services:`
+  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:`, or an `options:` flag the
+  native job does not carry out (all below, "Job container options"), `services:`
   on a rootless runner or with an image given by an expression (native since P6, below, their
   images pulled by P3), JavaScript and local `uses:` actions (P7, `actions.preload`), remote `uses:` actions in an
   image with no git to fetch them with, `docker://` images
   that cannot be pulled or run as a non-root `USER` (P7), Dagger in steps
-  (`RUNNER_DAGGER_NESTING`), `hashFiles()`
-  anywhere in the job (it reads the container through Dagger), a checkout with submodules, and a
+  (`RUNNER_DAGGER_NESTING`), and a
   machine whose probe fails (no user namespaces, nftables refusing the jobs' rules, no default
   route, the jobs' ids taken on the host, the jobs' subnet overlapping a route of the host's). A
   failed probe is tried again after five minutes, not kept for the process's life. (Until P3
@@ -207,11 +235,17 @@ RUNNER_NATIVE_STORE=/var/lib/zig-runner/native    # default as root
 RUNNER_NATIVE_SUBID_BASE=1900000000               # default; at least 100000
 RUNNER_NATIVE_SUBNET=10.211.0.0/16                # default; a prefix of 8 to 23 bits
 RUNNER_NATIVE_STORE_MAX_MB=10240                  # default; the layer store's cap (P2)
+RUNNER_NATIVE_VOLUMES_MAX_MB=16384                # default; the cache volumes' cap, 0 for none ("Eviction")
+RUNNER_NATIVE_IMAGES_MAX_MB=8192                  # default; images', rootfs' and seeds' cap, 0 for none ("Eviction")
+RUNNER_NATIVE_MIN_FREE_PCT=10                     # default; the disk's floor, 0 for none ("Eviction")
 RUNNER_NATIVE_ROOTLESS=0                          # default; 1 for a rootless runner
 RUNNER_NATIVE_CGROUP=                             # default: /sys/fs/cgroup/zig-runner as root,
                                                   # none rootless; `self`, `none`, or a path
 RUNNER_NATIVE_MEMORY_MAX_MB=                      # default 3/4 of MemTotal; 0 for no limit
 RUNNER_NATIVE_PIDS_MAX=8192                       # default; 0 for no limit
+RUNNER_NATIVE_HASHFILES_MEMORY_MB=                # default min(1 GiB, MemTotal/8), for all jobs'
+                                                  # hashFiles() together; 0 for no limit
+RUNNER_NATIVE_HASHFILES_TIMEOUT_S=120             # default, GitHub's; 0 for no limit
 RUNNER_NATIVE_MEM_PER_JOB_MB=256                  # default; the memory gate's reservation for a
                                                   # native job not learned yet (P4); 0 for none
 ```
@@ -368,10 +402,16 @@ What it covers, as built:
   layers never meet), and the binds' places (never their content). Not the slot: a stored layer has
   the canonical ids (below), so a job in any slot replays what a job in another stored. Under step caching the event payload is a variable each step
   writes to the file, as `set_up.writeRunEnv` gives it, so the base is the same for every run.
+- **A key stands on keys.** `keyFor` has a key only on a keyed top (or on an empty stack, the
+  digest below a base), and every other way a layer joins the stack leaves it unkeyed: a Docker
+  action's step, a JavaScript action's mount points, a step that always ran or failed. What an image
+  or a mount holds is in no key, so nothing above such a layer is keyed, replayed or published: a
+  job's later steps run, however little changed (`Native.ops_keep_chained`). The price of that is
+  cached steps, never a wrong replay.
 - **The store's format** (`Store.store_format`) is bumped with any change to what a layer or its
   record means: the sandbox's trees, the record's files and how they replay, the key's extras.
-  A runner upgraded across a bump finds none of the older runner's layers; they age out under
-  the cap.
+  A runner upgraded across a bump finds none of the older runner's layers, and its first job's
+  end removes them: an older format's `meta` is not whole to `collect`.
 - **Forks**: a fork's pull request that `trust.vouches` accepts still runs natively, with caching,
   in a key space of its own: the scope is `set_up.packageCacheScope`'s (`untrusted` when the
   pull request's head repository is another), the same test that keeps its package cache volumes
@@ -386,9 +426,12 @@ What it covers, as built:
   nor a layer whose size cannot be counted whole (a directory it cannot read). On a root runner the
   layer is first given the canonical ids (`Store.unshift`, below). A commit's checkout
   (a fetch of a full SHA) is a layer like a step's, keyed on its script and never on the token;
-  a branch or tag moves, so its fetch always runs. The upper is moved under `layers/.tmp-<key>-<n>`
-  with its record, held, written to disk (`syncfs`), and published by one
-  `renameat2(RENAME_NOREPLACE)`. An upper that cannot be put back after a failure is left there
+  a branch or tag moves, so its fetch always runs, and with `fetch-tags` the key also holds a digest
+  of the remote's tags (`ls-remote --tags`, one more sandbox before the fetch), which move where a
+  commit does not; if they cannot be listed the fetch runs. The upper is moved under `layers/.tmp-<key>-<n>`
+  with its record, held, written to disk (its own files' data, then its meta, then one fsync of
+  each file and directory, which ext4 serves with one journal commit; a large layer's `syncfs`
+  instead), and published by one `renameat2(RENAME_NOREPLACE)`. An upper that cannot be put back after a failure is left there
   and logged, never deleted.
 - **Replay**: the stored raw output (markers and all) and combined file commands go through
   `Exec.collect` as Dagger's answer for a cached exec does, with the earlier job's ran marker, so
@@ -409,9 +452,12 @@ What it covers, as built:
   after the one it locked, both fixed.
 - **GC** (`Store.collect`, after each job): past `RUNNER_NATIVE_STORE_MAX_MB` (default 10240),
   the layers no job holds go, least recently used first (the lock file's mtime is the last use),
-  each renamed away under its lock taken exclusively, then deleted. Half-built and half-evicted
-  entries of dead runners, idle key locks, and entries that are not whole (by `meta` and their
-  files' lengths, without reading them) go too.
+  each renamed away under its lock taken exclusively, then deleted. A layer counts as its tree, its
+  record and 16 KiB for its own files, so steps that change nothing but print much are not free.
+  Half-built and half-evicted entries of dead runners, idle key locks, and entries that are not
+  whole (by `meta` and their files' lengths, without reading them) go too; so an upgrade across a
+  `store_format` bump empties `layers/` at its first job's end, as an older format's meta is not
+  whole to it. What is beside the layers is the next section's ("Eviction").
 - **Flattening**: before a step on a stack of 100 layers (`default_flatten_at`), the stack is
   merged into one (`Store.flatten`): later entries win, whiteouts are kept (they hide the
   rootfs), opaque directories stay opaque, files are hard links and directories are made with
@@ -527,9 +573,9 @@ directories and the step's file-command files at a 4 KiB block each.
 - "Set up job" says what the job got: "Image: pulled natively in N ms (L layers, K KB fetched)" or
   "Image: from the native store", and "Provisioned natively in N ms (layer <key>)" or "...made
   before".
-- Falls back to Dagger: a job container's `ports:`, `volumes:` and `options:` (phase 6 brings the
-  network that ports and volumes need), and on a rootless runner without `RUNNER_NATIVE_ROOTFS`
-  the provisioned default image (below).
+- Falls back to Dagger: a job container's `ports:`, `volumes:` and `options:` flags the native job
+  does not carry out ("Job container options", below), and on a rootless runner without
+  `RUNNER_NATIVE_ROOTFS` the provisioned default image (below).
 
 The store, under `RUNNER_NATIVE_STORE`, each directory only the runner's (mode 0700: a rootfs
 holds the image's set-uid files with the image's owners, the host's root's on a root runner):
@@ -558,8 +604,6 @@ ordinary keyed step once the sandbox can idmap more than one lower.
 
 What it does not do yet (debt, with the phase that pays it):
 
-- **No eviction.** Blobs, images and provisioned rootfs are kept for ever: P2's LRU under a byte
-  cap (`collect`) sees only `layers/`, and should cover `oci/` and `rootfs/` too.
 - **Each image is flattened whole.** Two images that share layers share their blobs on disk but
   not their unpacked files. P2's stacked layers could keep layers apart.
 - **Layers are fetched one at a time**, and a broken download starts over. Parallel fetches are a
@@ -698,22 +742,267 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   model's `belowTail`; P8's vectors gained `below-seed` and friends, the old ones unchanged). The
   tool cache is the `toolcache` volume, keyed by the job's image as on Dagger; the base makes
   `/opt/hostedtoolcache` only for a job with no volumes (#274). What a step installs there is in no
-  layer, so a stored step whose `$GITHUB_PATH` or `$GITHUB_ENV` points into it runs again instead
-  of replaying (`Exec.tool_cache`, `toolDirNotHeld`, #229): natively no tree is checked, so every
-  such record does.
-- Debt: volumes and seeds are never evicted (the engine's GC prunes Dagger's). P2's `collect`
-  walks only `layers/`, whose entries carry their size in `meta`; a volume has no size record, and
-  walking every volume at each job's end to learn one would cost more than the eviction saves. The
-  fix: a size written beside each volume when its job releases it (`<volume>.size`), a cap of its
-  own (`RUNNER_NATIVE_VOLUMES_MAX_MB`; the layers' 10 GiB would be gone in one Zig job), and
-  eviction least recently used first under the volume's lock taken exclusively and non-blocking, as
-  `evict` does for a layer. A step whose processes still hold all of `pids.max` when its script
+  layer, so a stored step whose `$GITHUB_PATH` or `$GITHUB_ENV` points into it replays only when
+  "Set up job" checked a tree that holds the directory, and otherwise runs again
+  (`Exec.tool_cache`, `toolDirNotHeld`, #229). The check is `native/tool_trees.zig`, a port of
+  `dagger/tool_trees.sh` (below, "The tool cache's trees").
+- Debt: a step whose processes still hold all of `pids.max` when its script
   ends fails with exit 2 and loses its file commands: the wrapper's `sh`, the step's PID 1, cannot
   fork its epilogue (its log says the job reached its process limit). Fixing that needs a PID 1
-  that reaps and kills a step's leftovers before the epilogue. The tool cache's checked trees (`set_up.verifyToolTrees`) and the seed
-  registry's discovery from them are off natively: steps check the trees they use themselves, as on
-  Dagger without the check. Rootless runners without delegation have no limits (P5 must refuse untrusted jobs
-  there).
+  that reaps and kills a step's leftovers before the epilogue. The seed registry's discovery from the tool cache's trees
+  (`zig_release.Registry.discover`) is off natively. Rootless runners without delegation have no
+  limits (P5 must refuse untrusted jobs there).
+
+#### The tool cache's trees
+
+A rerun of a job that installs a tool took 49 s natively and 2 s on Dagger (razorbill, v0.25.0, a
+real `zig build test` job): the `Install Zig` step names a directory in the tool cache, a volume in
+no layer, so its record was never trusted. On Dagger "Set up job" checks the trees of the tool cache
+(`tool_trees.sh`, `set_up.verifyToolTrees`) and a record is replayed when a checked tree holds the
+directory it names. Natively the same check runs in the runner (`native/tool_trees.zig`,
+`Backend.checkToolTrees`), after the volumes are open, and gives the same two things:
+
+- `ZIG_RUNNER_TOOL_TREES`, one `DIGEST TREE` line per directory `TOOL/VERSION/NAME` of the tool
+  cache, TREE as the step sees it, DIGEST what `install-zig.sh` pins (`find . -type f -print0 |
+  LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum` in the tree; the port's tests compare it with
+  those commands, and with the digest pinned for Zig 0.17.0). A script that pins a tree's digest
+  skips its own read of the tree when the two match.
+- `Exec.toolDirNotHeld` with a tree list, so a replayed step that names a held tree's directory
+  replays. A record naming a directory no tree holds (a tree that was removed, an unfinished one,
+  `..`) runs again, as before.
+
+**What replay can rely on.** The pinned digest is over regular files, and nothing else: not a
+link, a mode, a pipe, an empty directory. A tree whose link `gcc -> ../../.evil/gcc` was changed,
+or whose `zig` was made set-uid, has the same pinned digest, and `install-zig.sh` (and Dagger's
+check, which is the same) takes it as checked. So the native check makes a second variable,
+`ZIG_RUNNER_TOOL_TREES_FULL` (`FULL TREE` lines), over every entry: type, mode, path, a regular
+file's sha256 and a link's target. Both variables are in the key of every step (neither is
+volatile, so `Store.stableEnv` hashes them), hence in the base's key and every layer above it. A
+tree that changed in any of these ways is a tree no record was made against, so the step that
+installs runs again and repairs it. A tree with a link that may leave it is left out of both: what a link
+points at outside the tree is in no digest, so no record naming such a tree is replayed. "May
+leave" is judged from the link's text and is strict: an absolute target, more leading `..` than
+there are directories above the link inside the tree, or any `..` after a name. The last is
+refused because a name can be a link itself (`lib/d -> ..` then `gcc -> lib/d/../../.evil/gcc`
+leaves the tree, though the text of `gcc` goes up no more than the tree is deep). With `..` only
+first, a link that stays in the tree from where it is can only reach a place in the tree, whatever
+links lie on its way, since each of those was judged the same. A real tool tree with a link of the
+second kind (`../lib/x/../y`) is left out too, and its steps run as they did before this change. This holds for the native
+backend. On Dagger the second variable does not exist and the claim does not hold: a modified link
+or mode in a tree with the same pinned digest is replayed against, and what it would take there is
+the same second digest in `tool_trees.sh` and in `Exec.tool_trees`' parser. `install-zig.sh`'s own
+check is of regular files too, so it is blind to a link planted in its tree whoever says the tree
+was checked: that put a planted tool on PATH with no replay involved. The script now uses a tree
+only if nothing in it is neither a file nor a directory (`plain`; Zig 0.17.0's tarballs hold
+neither a link nor anything else of the kind, for x86_64 and aarch64, checked against the pinned
+checksums), and `tool-trees-test.sh` covers it.
+
+The cost is also Dagger's: a tree added, removed or changed makes every step of every job of the
+scope new once. Narrowing it (a key of only the trees a step puts on PATH) was considered and not
+done. A step's key is made before it runs, and which trees it names is only in its record, so it
+needs the digests the tree had when the step finished stored in the record and compared at replay,
+which means hashing the tree again after every step that names one, and a change to the record's
+format. A job's first rerun after an install is the one that pays: job 1 finds no tree and
+installs, job 2 sees the tree (new keys) and finds it installed, job 3 replays.
+
+The check differs from the script where it runs. The script runs as root in the job's image, in a
+container; the port runs in the runner's process, on a directory a job can write, so it is confined
+and bounded:
+
+- Every look at the volume is relative to a directory descriptor, through `sandbox.openIn` with
+  `RESOLVE_NO_SYMLINKS` and `RESOLVE_NO_XDEV`, so a link a job planted (a tree that is a link to
+  `/`, a file that is one) is never taken and the check cannot be made to read outside the volume.
+  Only directories and regular files are opened, the latter `O_NONBLOCK` and checked to be regular
+  after opening, so a pipe or a device cannot hold the check. A link is read, not followed.
+- A tree whose names have a control character or a backslash (`sha256sum` escapes those), a name
+  over 255 bytes or a path over 4,000, is left out, and a step checks it itself. So is a tree the
+  check gave up on for a limit, one with unreadable files, and one with a link that leaves it.
+  "Set up job" says which and why ("left out: zig/0.17.0/x (too many entries)").
+- Limits (`tool_trees.Limits`). Each tree: 65,536 regular files, 100,000 entries, 8 MiB of paths,
+  1 GiB read, 60 s (the check's, because a tree that gives up keeps no list and the next job
+  starts cold: Zig's cold check is 10-19 s on razorbill, and a loaded one must not give up at
+  20). The check: 400,000 entries and 4 GiB read, past which no more files are read; 60 s of
+  reading, past which none are either; 48 directories deep, 512 trees, 1,024 names a level. The
+  job's cancel (seen at every file and every 64 KiB read) and 90 s end the check itself. A tree
+  over a limit of its own is left out and the others are checked. A budget that is spent ends the
+  reading, not the check: trees whose lists are whole need none and are still reported. Zig 0.17.0 has 19,505 files and 1.2 MB of paths. Both variables are
+  capped at 64 KiB (one string of an environment may not pass 128 KiB, and one over it made every
+  later job's `exec` fail with E2BIG); a tree that does not fit is left out, and so is one that
+  would not fit the Dagger path's variable (`set_up.toolTreesVerdict`, the same 64 KiB).
+- Memory: a tree is held in memory while it is checked (a path, an entry and a list line each:
+  about 7 MB for Zig). Every byte is charged to the process's `Budget.held`
+  (`native/hash_files.zig`), the number that `hashFiles()` calls count their memory in as well, against `Limits.memory`
+  (128 MiB), and a tree that would pass it is left out, so concurrent checks of hostile trees hold
+  128 MiB between them, not each their own. A check never waits for the budget and a call is never
+  refused for what checks hold, so neither can fail a job through the other: a check that meets a
+  big call leaves its trees out (the next job checks them), and a call meets checks that are gone
+  in seconds.
+- Order, and what one job can starve. Each tree has a `<tree>.born` file in the lists: when this
+  runner first saw it. Trees are checked oldest first (ties in byte order); at each level of the
+  walk to them the names that have a `.born` come first, so a level full of planted names does not
+  hide the trees seen before (among those, in byte order). What a job adds to the volume is
+  younger than the tools installed before it, so it spends the budgets, and the room in the
+  environment, after them: an earlier cut ordered by "has a list", which a job's own trees get
+  too, and two attacks showed it (six trees grown to 2 GiB of holes after a check listed them,
+  which spent the reading budget before the honest tree; 380 trees that filled the environment's
+  64 KiB first, so `install` reran in every job). What is left is what age cannot tell: a job that
+  makes its trees before the honest tool is installed, or a new version of a tool installed after
+  a job's trees, is younger than them, and can be left out for as long as the volume holds them.
+  Its steps then run, as before this change; it cannot make a job fail. "Set up job" counts every
+  tree left out ("left out 382: ...") and names as many as fit in 4 KiB.
+- The lists are in the store beside `volumes/` (`tool-trees/<digest of the volume's path>/`), never
+  in a volume a step mounts. They are a cache of what a check read: store eviction may remove all of
+  `tool-trees/` at any time, and a check without them reads the trees again. A list that would be
+  over 32 MiB (the most that is read) is not written. A list of a tree that is gone, its `.born`,
+  and the directories that leaves empty, are removed by the next complete check; half-written
+  lists (`*.stat.<random>`, `*.born.<random>`) older than five minutes by every check. A check is
+  not complete when a level holds more names than are looked at (17,000 top-level directories do
+  it), so a job that does that stops the removal and the lists of gone trees stay and grow, for
+  as long as the volume holds the names; eviction of `tool-trees/` is what bounds them.
+
+The cost is the script's lists, kept: one line per regular file (path, size, inode, mtime, ctime,
+sha256), and only files whose line changed are read again. A write sets the file's ctime to now and
+a step cannot set it back (that takes the clock); a file whose ctime is within 2 s of the check is
+listed as racy and read next time; a list that does not name exactly the tree's files in order is
+not believed. That is not enough alone: a writable shared mapping, once its page is dirty, writes
+again without changing ctime or mtime, whatever the descriptor (it can be closed). So the check
+takes a read lease (`F_SETLEASE`, `F_RDLCK`) on each file it reads, which the kernel refuses while
+any writer or writable mapping holds the file, and lists a refused file as racy. That holds only
+where it was seen to, ext4 and tmpfs: overlayfs grants the lease over a writable mapping, as the
+mapping's file is the one beneath, so a file on any other filesystem is racy too, and read at every
+check (the test failed on main's job in a Dagger container, whose `/tmp` is overlayfs on the host's
+disk, and passed on hosted runners). A lease is broken
+with a signal to the process, SIGIO by default, which ends a process that does not handle it and
+which `std.Io` uses to interrupt blocked calls (a job's cancel, a timeout): the check must not
+ignore it (an earlier cut did, and a native end-to-end job never got its cancel). `F_SETSIG` makes
+it SIGURG, whose default is to be ignored. The writer's open then waits until the check lets go of
+the file, or fails with EAGAIN if it does not wait. On the
+laptop, for the real Zig 0.17.0 tree (19,505 files), a check is 0.5 s with no list and 0.1 s with
+one, with 22 MiB of peak memory in the test process; the script reads the same tree in about 1 s,
+by its own comment. A tree of 65,532 hard links of 3.8 KB paths (the case that took 1.5 GB, or 6.1
+GB with four checks at once) is left out in 8 ms with 9 MiB, and 27 MiB with four at once.
+
+Not proven or not done: the lease needs the file's owner to be the runner's user or CAP_LEASE
+(a refused lease only makes the file racy, so the cost is a read, never trust); lists of Dagger's
+check are unchanged; the seed registry's discovery from the trees
+(`zig_release.Registry.discover`) is off natively.
+
+### Eviction
+
+`runner/src/native/evict.zig` keeps what is beside `layers/` within limits of its own: the cache
+volumes, and together the blobs, images, provisioned rootfs and Zig cache seeds, each directory of
+which has a lock file beside it. It runs at the end of every job's `Store.collect`, under `gc.lock`,
+so one runner at a time does it and another finding it busy goes on; the proof of its locks is
+proofs/tla/StoreEviction.tla.
+
+- **The cap.** Past `RUNNER_NATIVE_VOLUMES_MAX_MB` (16 GiB) of volumes, those no job holds go, the
+  longest unused first. The last use is the mtime of the volume's lock file (`<volume>.lock`), set
+  by `volumes.open`. The size is `<volume>.size`, from a walk at the end of some job: one volume a
+  job, never measured first, a volume in use again at most once an hour, for at most a second (10 s
+  when it was never measured), never holding a lock, what it could not see left out. So the size
+  lags, and only ever matters at the margin.
+- **Trees.** Past `RUNNER_NATIVE_IMAGES_MAX_MB` (8 GiB) of images, rootfs and seeds together, the
+  blobs go first, oldest first, as they only save a download of what is unpacked already or not
+  wanted since, and then the trees no job holds, the longest unused first. A tree's size is measured
+  as a volume's is, but only once; a file a rootfs shares with its image counts half to each. A job
+  holds its image and its rootfs from the moment it asks for them to its end (`oci.Store.hold`,
+  `ensure`, each in `Backend.held`), as it does each seed (`Backend.holdSeed`), and a service's or an
+  action's image.
+- **A job of an older runner.** A runner from before these trees had locks holds none of them,
+  touches no mtime, and unpacks without `oci/blobs.lock`, so a tree or blob it is using looks unused,
+  and instances of a unit restart one at a time (`restart_all`), so such a job can share a store
+  with this code. Every job of this code has a mark, `jobs/<id>/holds-trees`, written before the
+  directory gets its name, so no job of this code is seen without it. While any `jobs/<id>` lacks
+  the mark and its `lock` is held, a pass leaves the trees and blobs alone, with what it tidies
+  there and `oci/refs/` (`evict.jobsInTheWay`, a scan of at most 4096 directories, under `gc.lock`,
+  run before the walks and again just before the tree half, logged once a pass at info with what it
+  found; past 4096 it does not know, and waits). Volumes are not affected: older runners hold those. There is no age
+  limit, as a job may run for days: a lock is free only once its runner has let go or died, so a
+  dead runner's directory stops nothing from that moment, and the next job's `sweep` removes it.
+  `jobs/` is out of a job's reach: a step sees the overlay and its binds, after `pivot_root`, and
+  none of them is the job's directory. This narrows the mixed-version window, and does not close
+  it: a job of an older runner that starts after the second scan, and takes a tree the same pass
+  evicts, still loses it. That gap is the time the evictions take, up to the walk of a tree never
+  measured (10 s) under the disk's floor. Also left as it is: the preflight of an older runner
+  (`docker_action.unsupported`) pulls before any job directory exists, so an unpack's `.tmp-` blob
+  can be lost to a pass, which sends that job to Dagger. It is survivable, and needs no fix.
+- **An image outlives its rootfs.** A rootfs is its image's files, by hard link, and a job that uses
+  a rootfs pulls its image first. So an image counts as used an hour later than it was, and the
+  rootfs goes first: an image evicted under a living rootfs would cost the next job a pull for
+  nothing. The rootfs itself loses nothing: an inode lives as long as one name does. The links an
+  eviction drops move those files' ctimes, a little at each pass as a tree goes in pieces, so a rootfs
+  in the store is not fingerprinted by walking it: what it holds is in its key, and only making it
+  again changes its root (`Store.rootfsFingerprint`).
+- **What a job sees after.** An evicted image is pulled again, needing the registry; an evicted
+  rootfs is provisioned again, under the same key; a rebuilt one has a new root directory, so a new
+  fingerprint, and every layer on it misses once and ages out under the cap. An evicted seed is
+  built again, needing its tarball, and a job that cannot build it runs unseeded with a note, as it
+  always could. A seed built again is not the same tree, so keys know it by its path and which build
+  it is (`volumes.seedId`), and layers on the old one miss too. These cost minutes, not results.
+- **An entry stays a day.** An entry used in the last 24 hours stays though its area is over its cap,
+  with a line in the runner's log. The cap is a target: a working set over it costs disk, where
+  evicting it would cost each job its caches or its base image, on a loop.
+- **The disk's floor.** With less than `RUNNER_NATIVE_MIN_FREE_PCT` of the store's filesystem free
+  (10), layers go first, as `Store.collect` runs before this and they are the cheapest to make again,
+  then blobs, then entries of either kind, the longest unused first, whatever the caps say, until
+  that much is free or all that is left was used in the last hour. An entry never measured is
+  measured first, as one counted as 0 would take them all. This is what bounds the store on a
+  machine smaller than its caps, with no setting: 10 GiB of layers, 16 of volumes and 8 of images fit
+  a 128 GB card, and on a 32 GB one the floor does the work.
+- **A job in progress loses nothing.** A job holds each of its volumes' locks shared from
+  `volumes.open` to its end. An eviction takes the lock exclusively and non-blocking, so a volume in
+  use is skipped, on this runner or any other sharing the store; a `locked` one is in use the same
+  way. A `private` copy (`<volume>.private-<n>`) has a lock of its own, so one a dead runner left is
+  told from one in use, and goes at the next collect.
+- **What a job sees after.** A new, empty directory at the same path, owned as `volumes.open` owns
+  it, as on a machine that never ran the repository: every package manager's cache is only a cache.
+  A stored step whose `$GITHUB_PATH` or `$GITHUB_ENV` names a directory in the tool cache runs again
+  rather than replay (`toolDirNotHeld`, #229), so a replay never counts on what eviction took. A step
+  replayed whose script left something else in a volume, and a later step that needs it without
+  saying so, would not find it, as on any other runner's first run of that step's successor: that
+  rests on a job's own steps, and is the same case as Dagger's own GC of a volume.
+- **A crash at any point.** The entry is renamed to `<area>/.dead-<n>` and both directories synced
+  before anything of it is deleted; a later pass finding a dead name syncs the filesystem first, as
+  the runner that renamed it may have died before it could, and which directory it came from is not
+  known. So an entry is what was left there or is gone, on a filesystem that orders its journal or
+  not. A dead maker's `.tmp-<key>` or `<name>.new-<n>` goes under the entry's free lock, which a live
+  maker holds exclusively; a blob's under `oci/blobs.lock`, which an unpack holds shared. The lock
+  file goes last, so whoever takes a lock checks it is the file the path names
+  (`Store.sameFile`), as `lockKey` does.
+- **A job writes what is in a volume**, so eviction believes nothing in there. The walk never enters
+  a volume, a size and a lock are beside it, where no job reaches, and every file the store looks
+  for is opened through no symlink and without waiting on a FIFO. A volume inside another (`<key>`
+  and `<key>/runner`, when one store has had both step users) is no entry of its own: it goes with
+  the outer one, whose eviction takes the inner lock through a descriptor and removes whatever else
+  is at that name, and a job opening the inner one meanwhile waits, finds the path gone and starts
+  over. A job in the outer volume can delete the inner lock, but it can as well delete the inner
+  volume, which is the same repository's.
+- **What will not go.** Removing a dead tree goes down by name and back by the descriptors it came
+  through, at most 32, never by `..`, so it cannot reach above the tree whatever moves meanwhile.
+  Deeper than that it moves what is below to the tree's top, as `.cut-<random>` (random, as a job can
+  read its inodes and plant any name it can work out), so a chain of directories of any depth loses
+  some of itself each pass. A dead name that still cannot be removed is logged, and stops nothing.
+  Going down a level counts against a pass's 64 entries like removing one (a chain of directories
+  with no files used to be walked to its end whatever the clock said: 2.9 s against 1.5 s at a
+  depth of 250,000), and a pass the budget stops in the middle of a chain moves the directory it
+  had reached up to the top too, so the next pass does not walk the same levels again. A level
+  costs a descent and a removal, so a pass that is late from the start clears about 32.
+- **Time and memory.** Deleting has a budget of 1.5 s a job, which evicting counts against too, and
+  which starts after the sync below. A pass removes at least 64 entries whatever the clock says, so
+  the worse the disk, the less goes, but something does. What is left stays under its dead name, the
+  next job's end goes on with it, and nothing more is evicted until it is gone. A pass holds no
+  entry's lock while it walks or deletes, so a job starting waits at most for one rename's sync. It
+  looks at up to 16,384 volumes, and a walk keeps at most 16 MiB of paths. Under the floor, layers
+  have a budget too: a pass takes one, and more while it has time.
+- **What no budget bounds.** The `syncfs` before deleting from a dead name, once a pass, takes what the
+  disk takes; each eviction's two directory fsyncs likewise, and one layer's delete. All of them are
+  at a job's end, before its result is reported. A dead tree that will not go costs that `syncfs` at
+  every job's end, for as long as it stays.
+- **When a sync fails.** A pass stops there: nothing more is evicted until what went is gone, or a
+  disk that fails writes would take entry after entry and free nothing.
+- **Costs left.** Deleting and measuring are at a job's end, before its result is reported
+  (`Backend.deinit`), so a job can end up to 1.5 s plus a walk later. A size is the runner's own
+  estimate, not the filesystem's: a file with several links counts its share per link.
 
 ### P5: isolation for untrusted jobs
 
@@ -868,6 +1157,58 @@ containers against Dagger's", run by hand with a v0.21.10 engine container
 (`ZIG_RUNNER_MEASURE_SERVICES=<images> ZIG_RUNNER_MEASURE_ENGINE=<container>`); the agent that
 built this phase was not allowed to start one on the laptop, so that figure is still to be taken.
 
+### Job container options
+
+What a `container:` job's `ports:`, `volumes:` and `options:` do on GitHub's runner, and what a
+native job does with them. GitHub's runner builds `docker create` for the job container (name,
+network, `--workdir /__w`, `-e` for the container's `env:`, `-p` for `ports:`, `-v` for `volumes:`
+and its own mounts), appends the `options:` string after those, and runs every step with
+`docker exec -w <directory>`. The runner waits for health on service containers only. (That is the
+runner's behaviour as remembered, not re-read for this change.)
+
+`runner/src/native/container_options.zig` reads `options:`. A native job carries out or accepts only
+the flags below; **any other flag, a stray word, or an `options:` with an expression in it sends
+the job to Dagger, naming the flag in "Set up job"**. Nothing is ignored silently.
+
+| Flag | Native job |
+|---|---|
+| `--env`/`-e NAME=value` (also `--env=`, `-eNAME=value`) | Carried out: set in the base environment after the container's `env:` (`docker create` reads `options:` last), before the job's own `env:`, which wins as it does over `docker exec -e`. A bare `-e NAME` is refused: it copies the *runner's* variable. |
+| `--user`/`-u` (`name`, `uid`, `name:group`, `uid:gid`) | Carried out: resolved in the image's own `/etc/passwd` and `/etc/group` as its `USER` is, over it. Refused on the runner's default image, whose step user is `RUNNER_STEP_USER`'s choice (that provisioning is not the container's). A rootless runner maps only root, so there it fails as an image `USER` does. |
+| `--workdir`/`-w` | Understood, no effect: every step is `docker exec -w`, native steps take the same directory. Counted in "Set up job". |
+| `--health-cmd`, `--health-interval`, `--health-timeout`, `--health-start-period`, `--health-start-interval`, `--health-retries`, `--no-healthcheck` | Understood, no effect: nothing waits for a job container's health. Durations and counts are checked as Docker reads them; one it would refuse is refused. |
+| Everything else: `--cpus`, `--memory`, `--privileged`, `--cap-add`, `--security-opt`, `--device`, `--gpus`, `--ulimit`, `--shm-size`, `--network`, `--add-host`, `--dns`, `--hostname`, `--init`, `-t`/`-i`, `--entrypoint`, `--name`, `--label`, `--platform`, `--pull`, `--read-only`, `--tmpfs`, `--sysctl`, `--pid`, `--ipc`, `--userns`, `-v`/`--mount`, `-p`, `--env-file`, `--group-add` | Refused (Dagger). Each changes the container: limits, privileges, devices, networks and mounts are the sandbox's (`sandbox.zig`, `seccomp.zig`, `nft.zig`, the cgroup code), which this does not touch. |
+
+What stays on Dagger, and what carrying it out would need:
+
+- **`ports:`**. On GitHub they publish the container's ports on the *host* (`-p`), so a client
+  outside the container can reach them. The job's own steps run inside it and reach those ports on
+  loopback already; services have no need of them to reach the job. Carrying
+  them out natively means a DNAT from the host's address into the job's network namespace and an
+  `nft` rule that admits it (today's rules admit nothing inbound, `nft.zig`), plus a policy for
+  which host addresses and ports a workflow may take. That is new isolation logic. (`forward.zig`
+  relays a *service's* port into the job's loopback, the other direction.)
+- **`volumes:`**. A bind from a host path, or a named volume, into the container. Needs a bind
+  mount into the job's mount namespace outside the cache volumes' fixed set (`sandbox.Spec.binds`
+  is built by the runner, never from a workflow), a policy for which host paths a job may mount
+  (the runner's own store, `/etc`, the docker socket are all host paths), nosuid/nodev and the id
+  mapping of a root runner's slot (`Bind.volume`'s shifted ids) so files the job writes are not the
+  host's root's, and a lifecycle for named volumes. That is mount and privilege code.
+- **An `options:` that is an expression** (`${{ matrix.options }}`): decided before expressions
+  are evaluated. Reading it after, with the same parser, is possible; not done here.
+- **The Dagger path carries out none of the three on a job container** (`job.container`'s
+  `options`, `ports` and `volumes` are read nowhere under `runner/src/dagger/`), so a job that
+  falls back to Dagger for one of them runs without it, without a warning. Found while reading;
+  this change does not touch it.
+
+Services' `options:` are unchanged: they still log the flags they do not carry out and go on
+(`services.zig`), as the Dagger path does. Making them refuse as the job container's do is a
+separate change.
+
+Tests: the flag table, in every spelling Docker reads, and a refusal for each of 35 flags in three
+spellings (`container_options.zig`); `unsupported`'s reasons for ports, volumes, options and
+expressions (`Backend.zig`); a native job with `--user app -e ... --workdir ... --health-*` that
+runs as the image's `app` user with the options' env over the container's (root runner, in CI).
+
 ### P7: Docker actions
 
 - Image-based actions as a run in their image with an entrypoint, on the P3 image store.
@@ -971,9 +1312,18 @@ the job's host ids; they are shifted back to the image's own afterwards (`unshif
 layer is the same whichever job's range built it and can be idmapped into any job, as the
 `COPY` layers the runner writes are. The built image runs as a `docker://` one does, with its
 layers as the container's lowers. Layers live under `RUNNER_NATIVE_STORE/layers`, in P2's store,
-each under the builder's key hashed with the store's format and the job's trust scope
-(`layers.Store.key`): a job the runner does not vouch for, or a vouched fork's pull request,
-builds its own layers and never leaves one a trusted job takes.
+each under the builder's key hashed with the store's format, the job's trust scope and how ids are
+mapped (`layers.layerKey`): a job the runner does not vouch for, or a vouched fork's pull request,
+builds its own layers and never leaves one a trusted job takes, and a root and a rootless runner's
+layers never meet.
+
+Such a layer is replayed: `build` takes it by key and nothing runs, whatever the action's step
+does. So its key holds all it was made from. The chain starts from the base's reference and what
+the image is (`docker_action.baseId`: the platform's manifest's digest, or the tree's fingerprint
+for an image that was not pulled), since every pull asks the registry what a tag names and a tag
+moves. Each instruction adds its kind, its text as evaluated and what it reads, in P8's format
+(`dockerfile.fromKey`, `stepKey`, `contextDigest`): every field length-prefixed and every list
+counted, so a source's content cannot pass for the entries after it.
 
 **The action loader** (`runner/src/native/actions.zig`). The backend stays chosen per job, never
 per step (a switch would need the native layers exported into Dagger). What a `uses:` action is
@@ -1100,8 +1450,14 @@ than replacing it, since both backends ship (proofs/README.md, "On the native ba
 - **The tie to the code.** `keyoracle` (`proofs/KeyOracle.lean`) writes
   `runner/src/native/testdata/step_keys.tsv`, `.github/scripts/key-vectors.sh` checks in the proofs
   workflow that it is the model's, and `runner/src/native/key_vectors.zig` checks the preimages
-  (29 key vectors: steps, bases, the digest below a base; 4 layer vectors: modes, an xattr and a
-  symlink, an opaque directory, a whiteout) and the equal/differ relation against it.
+  (key vectors: steps, bases, the digest below a base, a Dockerfile build's keys; 4 layer vectors:
+  modes, an xattr and a symlink, an opaque directory, a whiteout) and the equal/differ relation
+  against it.
+- **Keys on keys, and builds.** `ops_keep_chained`: no order of the stack's operations puts a key
+  above a layer with none, so what an image or a mount added cannot be behind a replay.
+  `encBuild_injective`, `encBuildLayer_injective`: a Dockerfile build's keys tell apart everything
+  they hash; `build_base_matters`: a base image that changed under its reference changes every key
+  of the build.
 
 **What is left**: if P2's format changes, change `Native.encState` (and `keyPreimage`,
 `belowPreimage`, `walkPreimage`) and `KeyOracle.lean` to match, keep `Format.Sound` proved, and
@@ -1267,8 +1623,7 @@ user then pulled the job's ids, its network and the sandbox hardening into P1. W
   links, addresses and routes are rtnetlink already; nftables over netlink is phase 5's), not
   `nft`: the hosted runner has no `nft`, and `iptables` writes into the same tables as Docker's
   own rules, whichever backend the host uses.
-- **Smaller ones.** `hashFiles()` reads the container through Dagger, so it routes a job to Dagger
-  until it is native. `--exec-job` bypassed the trusted refs; it no longer does. Overlay's
+- **Smaller ones.** `--exec-job` bypassed the trusted refs; it no longer does. Overlay's
   work directory and a step's `chmod 000` both defeat a plain recursive delete, so removal gives
   directories their permissions back and logs what still fails, and a sweep at each job's start
   removes the directories of runners that died (each job holds a lock on its own). A step killed
@@ -1741,3 +2096,105 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
 - **Judging a local action needs one blob, not the repository.** A blobless fetch of the job's
   commit and `git cat-file` of one path costs a commit and its trees, and leaves nothing in the
   job but an empty layer; the checkout still does its own fetch.
+
+### hashFiles()
+
+- **The merged view is read without mounting it.** `hashFiles()` is evaluated between steps, in
+  conditions, `env:`, names, `with:` and scripts, and at the job's end for its outputs. The runner
+  merges the layers by lookup (`native/hash_files.zig`): the topmost entry decides, a whiteout
+  deletes, a non-directory hides what is below, an opaque directory stops the ones below it. A
+  mount would need privilege a rootless runner lacks and would cost more than the walk. glob.zig,
+  the search compared with GitHub's script, runs over it as it runs over Dagger's API.
+- **Links are resolved on the merged paths, never on the host's.** Each look at a layer is
+  `sandbox.openIn` with no symlink followed. A link `hashFiles()` finds is hashed as what it leads
+  to, as GitHub's `statSync` does and `sha256sum` does in a Dagger job: with `/` the job's root and
+  `..` taken on the path already resolved, so a link to `/etc/shadow` or to `../../../..` names the
+  job's file, or nothing, and never the host's. A link to a missing file or a loop fails the call.
+- **No new key.** A `hashFiles()` result is a function of the layers below the step, which the
+  step's key already holds through its parent, and wherever it affects the step it is in the
+  script or the env that the key hashes (`env:`, `with:`, the script, the shell and the working
+  directory are all in the script). A condition, a name, a timeout and `continue-on-error` do not
+  change what a step that ran left. The test runs a job, replays it, and runs it with another first
+  file: the replay prints the same hash, and the other file's hash is not served from it.
+- **What is not read.** Mounts (the cache volumes, an action's runtime) are in no layer, as
+  Dagger's `rootfs` leaves them out. A job-level `env:` is evaluated before any container exists, so
+  `hashFiles()` there is an error and the variable stays unset, on both backends (GitHub does not
+  allow it there either).
+- **The job decides how much work a call is, so a call has limits** (`hash_files.Limits`, the
+  walk's in `glob.zig`). Only the native path has them; the Dagger path's walk has none, as before.
+  - *Files and directories:* at most 1,000,000 a walk. With `--follow-symbolic-links` two links
+    per directory, twenty-five deep, name one directory by 2^25 paths (72 inodes took 4 GB), and
+    @actions/glob only breaks cycles through a directory's own ancestors. A monorepo with its
+    `node_modules` is a few hundred thousand entries (the Linux kernel about 90,000 files), so a
+    million leaves room.
+  - *Memory, and the turn:* an allocator under each call's arena counts every byte and refuses a
+    request the call may not have, wherever the call is (matching, listing, building paths), so
+    the call fails with a message where it stands. The memory is the runner's, outside the job's
+    cgroup, and one process serves all slots, so it is limited for all of them; but a call that
+    waits for memory while it holds memory others need could wait in a circle with them, so it is
+    not shared out by the byte. Each call has an allowance of its own (64 MiB, or a quarter of the
+    limit) that nothing else's use touches, so a small call never waits. A call that goes past it
+    takes a ticket and waits for its turn, in the order calls asked, and then has the whole limit
+    to itself until it returns. While it waits it holds only its allowance, and the call whose
+    turn it is waits for nothing, so there is nothing to wait on in a circle: a big call is delayed
+    by the big calls before it, one turn each, and is failed only when it is too big alone (at
+    once, naming the setting). One job that holds the turn (a big walk, then a huge file) delays a
+    neighbour by that one turn, not fails it, and its next call queues behind the neighbour's. A
+    wait fails only when the queue stops moving for twice the timeout: each call ahead may hold the
+    turn for its own timeout, so a wait is bounded by the calls ahead (6 minutes behind 3 of them,
+    at the default), and a cancel ends it. The limit is the smaller of 1 GiB and an eighth of `MemTotal` (the host's, in a container too: the
+    runner has no reading of its own cgroup's limit), or `RUNNER_NATIVE_HASHFILES_MEMORY_MB` (0
+    for none); in all the process holds one limit and an allowance for each call running. What a
+    walk keeps is 32 bytes a node and its path; the rest of what it needs is reset per path and
+    per level. Measured (counted bytes, which run about twice the resident ones): a 900,000-entry
+    monorepo with `hashFiles('**/package-lock.json', '!**/node_modules/**')` takes under 1 GiB
+    counted and 450 MB resident, in 15 s; `**` over it takes 1.4 GiB counted, about 1.5 KB an
+    entry (the earlier "1 KB each" was a guess), so it needs the setting raised on a big host and
+    is refused at once, with the message, on a small one. Four such calls on a 300,000-entry
+    monorepo, and two on the 900,000-entry one, all succeed, in turn.
+  - *Steps:* at most 200 million path components, and each path name is looked up in place, each
+    followed link remembered (with the links it took, as the kernel counts them: 40 in one path,
+    nested ones too) and a directory resolved once for its files, so a path 1,900 deep or a chain
+    of 4 KB links costs what it holds, not a copy of the path for every name of it.
+  - *Time:* GitHub's own limit. actions/runner's `HashFilesFunction.cs` has
+    `_hashFileTimeoutSeconds = 120` and throws "hashFiles(...) couldn't finish within 120
+    seconds", so a file that takes hours does not on GitHub either (an earlier version of this
+    note said it did). The clock is read every 1,024 steps (every 64 MiB of a file), and
+    `RUNNER_NATIVE_HASHFILES_TIMEOUT_S` sets the seconds (0 for none), since a Pi on an SD card is
+    far slower. A step's `timeout-minutes` does not reach an expression, so this is the bound. A
+    file is read in full however large and sparse: the hash is GitHub's, which has no shortcut for
+    holes. The 120 seconds are the call's own work, as on GitHub, so the time it waits for its turn
+    is not counted in them; the wait has a limit of its own, as long again, which is the longest a
+    call may hold the turn it waits for (so waiting behind one call is covered, behind several
+    may not be), and the job's cancel ends it.
+  - *Cancel:* the job's cancel (`dagger.Cancel`, handed to the backend) is seen at every step, the
+    walk's included (`glob.Fs.poll`), so a cancelled job stops within a second in the middle of
+    matching, listing or a file; `Watch` cannot, as no sandbox runs while expressions are
+    evaluated. A call that *begins* after the cancel (an `if: always()` or `if: cancelled()`
+    cleanup step, the job's outputs) is not cut short, as on GitHub in the grace period: it ends
+    at the cancel's `hard_deadline_ms`, or at the time limit.
+- **Overlay's redirects and metacopy fail the call.** `Merged` does not follow them, and a hash
+  of what they hide would be wrong without a word, so a layer entry that has either attribute
+  fails `hashFiles()` with a message. The runner turns both off, whatever the host's kernel
+  defaults to: `overlayFeatures` in `sandbox.zig` passes `redirect_dir=off,metacopy=off` on a root
+  runner; a rootless one's `userxattr` already has neither, and refuses that option beside it.
+  `Store.flatten` checks only directories, which is enough with metacopy off.
+- **A file is hashed whatever its mode.** The runner reads as itself (root, or the rootless
+  user), so a non-root `container:` job can hash a file its own user could not read (`ln -s
+  /etc/shadow s`) from within its own tree. Dagger's `sha256sum` ran as the step user and would
+  fail. Matching it needs the layer's ids translated to the step's (a layer's files are the
+  canonical ids, the slot's, or the runner's own, by layer), which is not simple to get right, and
+  the gain is a hash of a file in the job's own container; so it is not done.
+- **A file is looked at before it is opened.** Its type is read from an `O_PATH` descriptor and
+  the file opened through that descriptor, so a pipe is refused and not waited for.
+
+### Running with no engine
+
+- **A setting beats a probe.** "No engine reachable" cannot tell an engine that is restarting (jobs
+  should wait, as they do) from one that was never there. `RUNNER_ENGINE=none` says it, and the
+  default path is not touched: the only new branch on it is a boolean that is false.
+- **Everything that waited for the engine was already off the native path.** A native job never
+  opened an engine session, so the cost of a missing engine was in the background and in the
+  fallback: the pre-warm polling the socket and queueing for the engine's turn, the gate looking
+  for the engine's cgroup, and a job sent to Dagger (`backToEngine`) hanging on a socket that is
+  not there. The last is the one that mattered: it now fails at once with the reason native gave.

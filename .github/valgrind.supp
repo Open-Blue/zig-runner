@@ -15,3 +15,12 @@
    fun:os.linux.futex_3arg
    fun:Io.Threaded.Thread.futexWake
 }
+
+# Zig's stack probe at the start of a function whose frame passes a page: it reads 4096 bytes below
+# the stack pointer and discards the value. Memcheck reports the read. Config.fromEnviron holds a
+# whole Config in its frame, about 7.6 KiB, and any call that loads a config reaches it.
+{
+   zig-stack-probe-config-fromenviron
+   Memcheck:Addr4
+   fun:config.Config.fromEnviron
+}

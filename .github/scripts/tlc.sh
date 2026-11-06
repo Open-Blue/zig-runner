@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Model-checks the native store's locking protocol (proofs/tla/StoreLocking.tla, proofs/README.md
-# "The store's locking, in TLA+") with TLC. tla2tools.jar is the TLA+ project's v1.7.4 release,
+# Model-checks the native store's locking protocols (proofs/tla/StoreLocking.tla and
+# StoreEviction.tla, proofs/README.md "The store's locking, in TLA+") with TLC. tla2tools.jar is the TLA+ project's v1.7.4 release,
 # checked against the sha256 pinned here, so a changed or replaced jar fails the job instead of
 # checking the model. A new version means a new checksum from that release's asset.
 #
 # The configurations under proofs/tla are of two kinds: the protocol as the code has it
-# (StoreLocking.cfg, -crash, -liveness) must hold; a mutant, the code with one guard taken away,
-# says "must fail: <invariant>" on its first line and must fail with that invariant, so a model
+# (<Module>.cfg, -crash, -liveness and the like) must hold; a mutant, the code with one guard taken away,
+# says "must fail: <invariant>" in its first line and must fail with that invariant, so a model
 # that could no longer see a broken protocol fails the job too.
 #
 # Locally: .github/scripts/tlc.sh (Java 11 or later on the PATH; the jar is kept in $TLC_DIR).
@@ -29,15 +29,16 @@ if ! echo "$sum  $jar" | sha256sum --check --quiet --status; then
 	exit 1
 fi
 
+# A configuration's module is its name up to the first `-` or `.`.
 tlc() {
-	local cfg=$1 out=$2
+	local cfg=$1 out=$2 module=${1%%[-.]*}
 	rm -rf "$dir/states"
 	(cd "$here" && java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -cleanup \
-		-metadir "$dir/states" -config "$cfg" StoreLocking.tla) >"$out" 2>&1
+		-metadir "$dir/states" -config "$cfg" "$module.tla") >"$out" 2>&1
 }
 
 status=0
-for cfg in "$here"/StoreLocking*.cfg; do
+for cfg in "$here"/Store*.cfg; do
 	cfg=$(basename "$cfg")
 	grep -q 'must fail:' "$here/$cfg" && continue
 	echo "== $cfg: must hold"
@@ -51,7 +52,7 @@ for cfg in "$here"/StoreLocking*.cfg; do
 	fi
 done
 
-for cfg in "$here"/StoreLocking-*.cfg; do
+for cfg in "$here"/Store*-*.cfg; do
 	cfg=$(basename "$cfg")
 	grep -q 'must fail:' "$here/$cfg" || continue
 	want=$(sed -n '1s/.*must fail: \([A-Za-z]*\).*/\1/p' "$here/$cfg")

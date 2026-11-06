@@ -138,6 +138,22 @@ ok "...nor another tree's" not verdict "$sum" "$tree" "$sum $tree-x"
 ok "...nor a line that only contains it" not verdict "$sum" "$tree" "x$sum $tree"
 ok "...nor no verdict" not verdict "$sum" "$tree" ""
 
+# And not for a tree that holds an entry the digest does not see: a link to a tool of the job's own.
+plain() {
+	eval "$(grep '^plain()' "$root/.github/scripts/install-zig.sh")"
+	plain "$1"
+}
+fresh
+ok "install-zig.sh uses a tree of files and directories" plain "$tree"
+ln -s /bin/sh "$tree/gcc"
+ok "...not one with a link" not plain "$tree"
+rm "$tree/gcc"
+mkfifo "$tree/pipe"
+ok "...nor one with a pipe" not plain "$tree"
+rm "$tree/pipe"
+ln -s lib "$tree/libs"
+ok "...nor one with a link inside it" not plain "$tree"
+
 if [ "$failures" != 0 ]; then
 	echo "$failures failures" >&2
 	exit 1
