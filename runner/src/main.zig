@@ -46,6 +46,7 @@ comptime {
     _ = @import("native/dockerfile.zig");
     _ = @import("native/layers.zig");
     _ = @import("native/tool_trees.zig");
+    _ = @import("native/hash_files.zig");
     _ = @import("native/store_stress.zig");
     _ = @import("native/store_crash.zig");
     _ = @import("native/actions.zig");

@@ -109,8 +109,7 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   images pulled by P3), JavaScript and local `uses:` actions (P7, `actions.preload`), remote `uses:` actions in an
   image with no git to fetch them with, `docker://` images
   that cannot be pulled or run as a non-root `USER` (P7), Dagger in steps
-  (`RUNNER_DAGGER_NESTING`), `hashFiles()`
-  anywhere in the job (it reads the container through Dagger), a checkout with submodules, and a
+  (`RUNNER_DAGGER_NESTING`), a checkout with submodules, and a
   machine whose probe fails (no user namespaces, nftables refusing the jobs' rules, no default
   route, the jobs' ids taken on the host, the jobs' subnet overlapping a route of the host's). A
   failed probe is tried again after five minutes, not kept for the process's life. (Until P3
@@ -212,6 +211,9 @@ RUNNER_NATIVE_CGROUP=                             # default: /sys/fs/cgroup/zig-
                                                   # none rootless; `self`, `none`, or a path
 RUNNER_NATIVE_MEMORY_MAX_MB=                      # default 3/4 of MemTotal; 0 for no limit
 RUNNER_NATIVE_PIDS_MAX=8192                       # default; 0 for no limit
+RUNNER_NATIVE_HASHFILES_MEMORY_MB=                # default min(1 GiB, MemTotal/8), for all jobs'
+                                                  # hashFiles() together; 0 for no limit
+RUNNER_NATIVE_HASHFILES_TIMEOUT_S=120             # default, GitHub's; 0 for no limit
 RUNNER_NATIVE_MEM_PER_JOB_MB=256                  # default; the memory gate's reservation for a
                                                   # native job not learned yet (P4); 0 for none
 ```
@@ -376,8 +378,8 @@ What it covers, as built:
   cached steps, never a wrong replay.
 - **The store's format** (`Store.store_format`) is bumped with any change to what a layer or its
   record means: the sandbox's trees, the record's files and how they replay, the key's extras.
-  A runner upgraded across a bump finds none of the older runner's layers; they age out under
-  the cap.
+  A runner upgraded across a bump finds none of the older runner's layers, and its first job's
+  end removes them: an older format's `meta` is not whole to `collect`.
 - **Forks**: a fork's pull request that `trust.vouches` accepts still runs natively, with caching,
   in a key space of its own: the scope is `set_up.packageCacheScope`'s (`untrusted` when the
   pull request's head repository is another), the same test that keeps its package cache volumes
@@ -392,7 +394,9 @@ What it covers, as built:
   nor a layer whose size cannot be counted whole (a directory it cannot read). On a root runner the
   layer is first given the canonical ids (`Store.unshift`, below). A commit's checkout
   (a fetch of a full SHA) is a layer like a step's, keyed on its script and never on the token;
-  a branch or tag moves, so its fetch always runs. The upper is moved under `layers/.tmp-<key>-<n>`
+  a branch or tag moves, so its fetch always runs, and with `fetch-tags` the key also holds a digest
+  of the remote's tags (`ls-remote --tags`, one more sandbox before the fetch), which move where a
+  commit does not; if they cannot be listed the fetch runs. The upper is moved under `layers/.tmp-<key>-<n>`
   with its record, held, written to disk (its own files' data, then its meta, then one fsync of
   each file and directory, which ext4 serves with one journal commit; a large layer's `syncfs`
   instead), and published by one `renameat2(RENAME_NOREPLACE)`. An upper that cannot be put back after a failure is left there
@@ -1418,8 +1422,7 @@ user then pulled the job's ids, its network and the sandbox hardening into P1. W
   links, addresses and routes are rtnetlink already; nftables over netlink is phase 5's), not
   `nft`: the hosted runner has no `nft`, and `iptables` writes into the same tables as Docker's
   own rules, whichever backend the host uses.
-- **Smaller ones.** `hashFiles()` reads the container through Dagger, so it routes a job to Dagger
-  until it is native. `--exec-job` bypassed the trusted refs; it no longer does. Overlay's
+- **Smaller ones.** `--exec-job` bypassed the trusted refs; it no longer does. Overlay's
   work directory and a step's `chmod 000` both defeat a plain recursive delete, so removal gives
   directories their permissions back and logs what still fails, and a sweep at each job's start
   removes the directories of runners that died (each job holds a lock on its own). A step killed
@@ -1892,3 +1895,93 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
 - **Judging a local action needs one blob, not the repository.** A blobless fetch of the job's
   commit and `git cat-file` of one path costs a commit and its trees, and leaves nothing in the
   job but an empty layer; the checkout still does its own fetch.
+
+### hashFiles()
+
+- **The merged view is read without mounting it.** `hashFiles()` is evaluated between steps, in
+  conditions, `env:`, names, `with:` and scripts, and at the job's end for its outputs. The runner
+  merges the layers by lookup (`native/hash_files.zig`): the topmost entry decides, a whiteout
+  deletes, a non-directory hides what is below, an opaque directory stops the ones below it. A
+  mount would need privilege a rootless runner lacks and would cost more than the walk. glob.zig,
+  the search compared with GitHub's script, runs over it as it runs over Dagger's API.
+- **Links are resolved on the merged paths, never on the host's.** Each look at a layer is
+  `sandbox.openIn` with no symlink followed. A link `hashFiles()` finds is hashed as what it leads
+  to, as GitHub's `statSync` does and `sha256sum` does in a Dagger job: with `/` the job's root and
+  `..` taken on the path already resolved, so a link to `/etc/shadow` or to `../../../..` names the
+  job's file, or nothing, and never the host's. A link to a missing file or a loop fails the call.
+- **No new key.** A `hashFiles()` result is a function of the layers below the step, which the
+  step's key already holds through its parent, and wherever it affects the step it is in the
+  script or the env that the key hashes (`env:`, `with:`, the script, the shell and the working
+  directory are all in the script). A condition, a name, a timeout and `continue-on-error` do not
+  change what a step that ran left. The test runs a job, replays it, and runs it with another first
+  file: the replay prints the same hash, and the other file's hash is not served from it.
+- **What is not read.** Mounts (the cache volumes, an action's runtime) are in no layer, as
+  Dagger's `rootfs` leaves them out. A job-level `env:` is evaluated before any container exists, so
+  `hashFiles()` there is an error and the variable stays unset, on both backends (GitHub does not
+  allow it there either).
+- **The job decides how much work a call is, so a call has limits** (`hash_files.Limits`, the
+  walk's in `glob.zig`). Only the native path has them; the Dagger path's walk has none, as before.
+  - *Files and directories:* at most 1,000,000 a walk. With `--follow-symbolic-links` two links
+    per directory, twenty-five deep, name one directory by 2^25 paths (72 inodes took 4 GB), and
+    @actions/glob only breaks cycles through a directory's own ancestors. A monorepo with its
+    `node_modules` is a few hundred thousand entries (the Linux kernel about 90,000 files), so a
+    million leaves room.
+  - *Memory, and the turn:* an allocator under each call's arena counts every byte and refuses a
+    request the call may not have, wherever the call is (matching, listing, building paths), so
+    the call fails with a message where it stands. The memory is the runner's, outside the job's
+    cgroup, and one process serves all slots, so it is limited for all of them; but a call that
+    waits for memory while it holds memory others need could wait in a circle with them, so it is
+    not shared out by the byte. Each call has an allowance of its own (64 MiB, or a quarter of the
+    limit) that nothing else's use touches, so a small call never waits. A call that goes past it
+    takes a ticket and waits for its turn, in the order calls asked, and then has the whole limit
+    to itself until it returns. While it waits it holds only its allowance, and the call whose
+    turn it is waits for nothing, so there is nothing to wait on in a circle: a big call is delayed
+    by the big calls before it, one turn each, and is failed only when it is too big alone (at
+    once, naming the setting). One job that holds the turn (a big walk, then a huge file) delays a
+    neighbour by that one turn, not fails it, and its next call queues behind the neighbour's. A
+    wait fails only when the queue stops moving for twice the timeout: each call ahead may hold the
+    turn for its own timeout, so a wait is bounded by the calls ahead (6 minutes behind 3 of them,
+    at the default), and a cancel ends it. The limit is the smaller of 1 GiB and an eighth of `MemTotal` (the host's, in a container too: the
+    runner has no reading of its own cgroup's limit), or `RUNNER_NATIVE_HASHFILES_MEMORY_MB` (0
+    for none); in all the process holds one limit and an allowance for each call running. What a
+    walk keeps is 32 bytes a node and its path; the rest of what it needs is reset per path and
+    per level. Measured (counted bytes, which run about twice the resident ones): a 900,000-entry
+    monorepo with `hashFiles('**/package-lock.json', '!**/node_modules/**')` takes under 1 GiB
+    counted and 450 MB resident, in 15 s; `**` over it takes 1.4 GiB counted, about 1.5 KB an
+    entry (the earlier "1 KB each" was a guess), so it needs the setting raised on a big host and
+    is refused at once, with the message, on a small one. Four such calls on a 300,000-entry
+    monorepo, and two on the 900,000-entry one, all succeed, in turn.
+  - *Steps:* at most 200 million path components, and each path name is looked up in place, each
+    followed link remembered (with the links it took, as the kernel counts them: 40 in one path,
+    nested ones too) and a directory resolved once for its files, so a path 1,900 deep or a chain
+    of 4 KB links costs what it holds, not a copy of the path for every name of it.
+  - *Time:* GitHub's own limit. actions/runner's `HashFilesFunction.cs` has
+    `_hashFileTimeoutSeconds = 120` and throws "hashFiles(...) couldn't finish within 120
+    seconds", so a file that takes hours does not on GitHub either (an earlier version of this
+    note said it did). The clock is read every 1,024 steps (every 64 MiB of a file), and
+    `RUNNER_NATIVE_HASHFILES_TIMEOUT_S` sets the seconds (0 for none), since a Pi on an SD card is
+    far slower. A step's `timeout-minutes` does not reach an expression, so this is the bound. A
+    file is read in full however large and sparse: the hash is GitHub's, which has no shortcut for
+    holes. The 120 seconds are the call's own work, as on GitHub, so the time it waits for its turn
+    is not counted in them; the wait has a limit of its own, as long again, which is the longest a
+    call may hold the turn it waits for (so waiting behind one call is covered, behind several
+    may not be), and the job's cancel ends it.
+  - *Cancel:* the job's cancel (`dagger.Cancel`, handed to the backend) is seen at every step, the
+    walk's included (`glob.Fs.poll`), so a cancelled job stops within a second in the middle of
+    matching, listing or a file; `Watch` cannot, as no sandbox runs while expressions are
+    evaluated. A call that *begins* after the cancel (an `if: always()` or `if: cancelled()`
+    cleanup step, the job's outputs) is not cut short, as on GitHub in the grace period: it ends
+    at the cancel's `hard_deadline_ms`, or at the time limit.
+- **Overlay's redirects and metacopy fail the call.** `Merged` does not follow them, and a hash
+  of what they hide would be wrong without a word, so a layer entry that has either attribute
+  fails `hashFiles()` with a message. The runner never asks for them, but a host's kernel may
+  default to them: `overlayOptions` in `sandbox.zig` does not pass `redirect_dir=off,metacopy=off`,
+  and `Store.flatten` checks only directories. Both are the owner's to settle.
+- **A file is hashed whatever its mode.** The runner reads as itself (root, or the rootless
+  user), so a non-root `container:` job can hash a file its own user could not read (`ln -s
+  /etc/shadow s`) from within its own tree. Dagger's `sha256sum` ran as the step user and would
+  fail. Matching it needs the layer's ids translated to the step's (a layer's files are the
+  canonical ids, the slot's, or the runner's own, by layer), which is not simple to get right, and
+  the gain is a hash of a file in the job's own container; so it is not done.
+- **A file is looked at before it is opened.** Its type is read from an `O_PATH` descriptor and
+  the file opened through that descriptor, so a pipe is refused and not waited for.

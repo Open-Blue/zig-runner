@@ -316,19 +316,27 @@ pub fn serve(c: Runner) !Exit {
     }
 }
 
+/// How often a runner held at the memory gate looks for a stop, or a reservation that dropped
+/// (`Admission.changes`).
+const hold_step_ms = 50;
+
 /// Waits, held at the memory gate for `hold`, until the machine has the memory for one more job:
 /// true then, false if a stop is requested first. The hold and its end are each logged once, not
 /// at every look.
 fn admit(c: Runner, g: *admission.Gate, hold: admission.Hold) !bool {
     holdingBack(c, g, hold);
+    // Read before each look, so that a change between the look and the wait is not missed.
+    var seen = g.pool.changes();
     while (true) {
-        // In steps, so a stop is not kept waiting.
+        // In steps, so a stop is not kept waiting, and a reservation that dropped is looked at
+        // at once, not at the end of the `recheck`.
         var left = g.pool.recheck.toMilliseconds();
-        while (left > 0) : (left -= @min(left, 200)) {
+        while (left > 0 and g.pool.changes() == seen) : (left -= @min(left, hold_step_ms)) {
             if (stopRequested()) return false;
-            try c.io.sleep(.fromMilliseconds(@min(left, 200)), .awake); // a cancel ends the slot (`serve`)
+            try c.io.sleep(.fromMilliseconds(@min(left, hold_step_ms)), .awake); // a cancel ends the slot (`serve`)
         }
         if (stopRequested()) return false;
+        seen = g.pool.changes();
         if (checkGate(c, g) == null) break;
     }
     sayUnallocated(c, "'{s}': memory is back; taking jobs again", .{c.name});
@@ -591,14 +599,16 @@ pub const Warmer = struct {
         const w: *Warmer = @ptrCast(@alignCast(ptr));
         if (w.memory != null) {
             var said = false;
+            var seen = w.gate.pool.changes();
             while (w.gate.check()) |hold| {
                 if (!said) sayUnallocated(w.c, "pre-warm holding back: {f}", .{hold});
                 said = true;
                 var left = w.gate.pool.recheck.toMilliseconds();
-                while (left > 0) : (left -= @min(left, 200)) {
+                while (left > 0 and w.gate.pool.changes() == seen) : (left -= @min(left, hold_step_ms)) {
                     if (stopRequested() or w.cancel.requested.load(.acquire)) return false;
-                    w.c.io.sleep(.fromMilliseconds(@min(left, 200)), .awake) catch return false;
+                    w.c.io.sleep(.fromMilliseconds(@min(left, hold_step_ms)), .awake) catch return false;
                 }
+                seen = w.gate.pool.changes();
             }
             w.gate.leave(true);
             w.gate.assigned(admission.jobKey("", "", job_name));
@@ -1383,6 +1393,58 @@ test "a runner short of memory stops asking for jobs, and asks again once memory
     defer stop_signals.store(0, .release);
     const hold = gate.check().?;
     try std.testing.expect(!try admit(c, &gate, hold));
+}
+
+test "a held runner looks again when a reservation drops, not at its next recheck" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    // Room for one runner polling (1536 + 1024), not two.
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 3072000 kB\n" });
+    var slots: [2]admission.Admission.Slot = undefined;
+    var memory: admission.Admission = .init(io, .{}, &slots);
+    memory.paths = .{
+        .meminfo = try std.fs.path.join(arena, &.{ dir, "meminfo" }),
+        .pressure = "/nonexistent",
+    };
+    // A minute: far beyond the test, so that only a change can let the held runner through.
+    memory.recheck = .fromSeconds(60);
+    var first: admission.Gate = .{ .pool = &memory, .slot = 0 };
+    var held: admission.Gate = .{ .pool = &memory, .slot = 1 };
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+    var c = testRunner(arena, &log, &err, &cfg);
+    c.gate = &held;
+
+    try std.testing.expect(first.check() == null);
+    const hold = held.check().?;
+    const Waiter = struct {
+        fn run(cc: Runner, g: *admission.Gate, h: admission.Hold) anyerror!bool {
+            return admit(cc, g, h);
+        }
+    };
+    const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
+    var waiting = try io.concurrent(Waiter.run, .{ c, &held, hold });
+    io.sleep(.fromMilliseconds(150), .awake) catch {};
+    // The first runner is handed a job and named: it reserves its worst case still, so the held
+    // runner looks again and stays held. Then the job, a short one, is over.
+    first.leave(true);
+    first.assigned(admission.jobKey("o/r", "o/r/.github/workflows/w.yml", "j"));
+    io.sleep(.fromMilliseconds(150), .awake) catch {};
+    _ = first.ended();
+    try std.testing.expect(try waiting.await(io));
+    const waited_ms = std.Io.Clock.awake.now(io).toMilliseconds() - t0;
+    try std.testing.expect(waited_ms < 10 * std.time.ms_per_s);
+    try std.testing.expectEqual(@as(u32, 1), memory.polling);
 }
 
 test "a runner holds while the engine is near its own cap, though the machine has memory" {

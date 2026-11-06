@@ -323,6 +323,13 @@ jobs:
             exit "$status"
           fi
 
+      # Every test in runner/src is one the test binary has: a file that nothing reached compiled
+      # and passed with its tests never run (github/http.zig's, until #326). Its compile is the
+      # tests' on a runner that ran them with zig-test.sh, cached.
+      - name: Every test file is compiled
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/test-files.sh
+
   # The release's own builds, both targets in ReleaseSafe (build-binaries.sh), which nothing else
   # compiles before the tag: the tests build x86_64 in Debug, and release.yml's checks run only for
   # a change to the packaging. Code that compiles there and not for aarch64, or not in ReleaseSafe,
