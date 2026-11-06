@@ -858,10 +858,16 @@ pub fn run(
 
     const argv: []const []const u8 = opts.test_session_argv orelse
         &.{ opts.dagger_cmd, "run", "--progress=logs", "sh", "-c", session_script };
-    var child = try std.process.spawn(
+    var child = std.process.spawn(
         io,
         .{ .argv = argv, .environ_map = &env, .stdin = .pipe, .stdout = .pipe, .stderr = .pipe },
-    );
+    ) catch |e| {
+        // A job sent here from native (`backend_note`) says why, and what Dagger lacked: a bare
+        // `FileNotFound` out of `spawn` names neither.
+        const note = opts.backend_note orelse return e;
+        return fail(&sh, results, try std.fmt.allocPrint(arena, "could not start Dagger ({s}). " ++
+            "{s}", .{ @errorName(e), note }));
+    };
     // The reader must run while we wait on queries. It owns stderr: `wait` closes the pipes the
     // child still holds, and closing this one under the reader let it read whatever file next got
     // the descriptor (ThreadSanitizer, `zig build test -Dsanitize-thread`).

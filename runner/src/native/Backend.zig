@@ -3100,6 +3100,23 @@ test "a job that cannot be native runs on Dagger, and Set up job says why" {
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "Engine: Dagger") != null);
 }
 
+test "a job sent to Dagger that cannot start it fails with the reason it was sent and what Dagger lacked" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    // No `dagger_cmd` that exists (a test's is /nonexistent/dagger), as in a stress test's workers.
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = .{ .vouched = true, .rootless = true },
+    }, testJob(&.{testStep("echo hi")}), &log);
+    try std.testing.expect(!res.succeeded);
+    const msg = res.engine_error orelse "";
+    try std.testing.expect(std.mem.indexOf(u8, msg, "could not start Dagger (FileNotFound). " ++
+        "This job runs on Dagger: the native store is not set up") != null);
+}
+
 test "parity: a native job's base has the environment of Dagger's base container" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
