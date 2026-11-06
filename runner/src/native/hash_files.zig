@@ -115,6 +115,13 @@ pub const Budget = struct {
         return b.next;
     }
 
+    /// The ticket being served: it moves as the queue does.
+    pub fn position(b: *Budget) u64 {
+        b.lock();
+        defer b.unlock();
+        return b.serving;
+    }
+
     pub fn isTurn(b: *Budget, t: u64) bool {
         b.lock();
         defer b.unlock();
@@ -227,6 +234,9 @@ const Counted = struct {
             c.free_used += n;
             return true;
         }
+        // Refused already: the arena tries again after a resize, and a second wait would be for
+        // nothing.
+        if (!c.turn and c.refused != .none) return false;
         if (!c.turn and !c.acquire()) return false;
         if (n > c.limit or c.pool_used > c.limit - n) {
             c.refused = .too_big;
@@ -247,7 +257,17 @@ const Counted = struct {
         const t = c.budget.ticket();
         c.ticket = t;
         const began = nowMs(c.io, .awake);
+        // The limit is on a queue that has stopped, not on the wait: each call ahead may hold the
+        // turn for its own timeout, so a wait is as long as the calls ahead make it, and a job
+        // that keeps taking turns only delays a neighbour.
+        var moved = began;
+        var seen = c.budget.position();
         while (!c.budget.isTurn(t)) {
+            const position = c.budget.position();
+            if (position != seen) {
+                seen = position;
+                moved = nowMs(c.io, .awake);
+            }
             if (c.cancel) |cancel| {
                 if (!c.cancelled_before and cancel.requested.load(.acquire)) return c.abandon(.cancelled);
                 if (c.cancelled_before) {
@@ -255,7 +275,7 @@ const Counted = struct {
                     if (hard > 0 and nowMs(c.io, .real) > hard) return c.abandon(.cancelled);
                 }
             }
-            if (c.wait_limit_ms != std.math.maxInt(u64) and nowMs(c.io, .awake) - began > c.wait_limit_ms)
+            if (c.wait_limit_ms != std.math.maxInt(u64) and nowMs(c.io, .awake) - moved > c.wait_limit_ms)
                 return c.abandon(.waited_too_long);
             c.io.sleep(.fromMilliseconds(2), .awake) catch {};
         }
@@ -345,7 +365,7 @@ pub fn hashFiles(
         .allowance = l.allowance,
         .cancel = l.cancel,
         .cancelled_before = if (l.cancel) |c| c.requested.load(.acquire) else false,
-        .wait_limit_ms = l.timeout_ms,
+        .wait_limit_ms = l.timeout_ms *| 2,
     };
     // The turn goes on once the arena is freed (deferred first, so it runs last).
     defer counted.release();
@@ -364,9 +384,9 @@ pub fn hashFiles(
             .cancelled => try out.dupe(u8, "hashFiles() stopped: the job was cancelled"),
             .waited_too_long => try std.fmt.allocPrint(
                 out,
-                "hashFiles() waited {d} seconds for other hashFiles() calls to finish with the " ++
-                    "memory they share (RUNNER_NATIVE_HASHFILES_MEMORY_MB)",
-                .{(l.timeout_ms + 999) / 1000},
+                "hashFiles() waited {d} seconds with no other hashFiles() call finishing with " ++
+                    "the memory they share (RUNNER_NATIVE_HASHFILES_MEMORY_MB)",
+                .{(l.timeout_ms *| 2 + 999) / 1000},
             ),
         } };
     };
@@ -1558,7 +1578,7 @@ test "native hashFiles: a call waiting for the turn is ended by the job's cancel
     thread.join();
     try expectFailed("cancelled", r.result.?);
     try std.testing.expect(r.took_ms < 3000);
-    // By its time, which is as long as a call may hold the turn it waits for.
+    // By its time, which is twice as long as a call may hold the turn it waits for.
     var r2: Runner = .{ .fx = &f, .stack = try f.stackOf(&.{"l0"}, .{ .allowance = 64 << 10, .budget = &budget, .timeout_ms = 300 }), .args = &.{"**"} };
     r2.run();
     try expectFailed("waited 1 seconds", r2.result.?);
@@ -1567,6 +1587,28 @@ test "native hashFiles: a call waiting for the turn is ended by the job's cancel
     _ = budget.done(held);
     try std.testing.expectEqual(budget.next, budget.serving);
     try std.testing.expect(budget.isTurn(budget.next));
+}
+
+test "native hashFiles: a queue that moves outlasts the wait's limit, so calls ahead only delay a call" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try deepDir(&f, 8, 400);
+    var budget: Budget = .{};
+    const first = budget.ticket();
+    const second = budget.ticket();
+    var r: Runner = .{ .fx = &f, .stack = try f.stackOf(&.{"l0"}, .{ .allowance = 64 << 10, .budget = &budget, .timeout_ms = 500 }), .args = &.{"**"} };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&r});
+    // Each call ahead holds the turn for less than the limit of a second, and more than a second
+    // goes by in all.
+    sleepMs(700);
+    _ = budget.done(first);
+    sleepMs(700);
+    _ = budget.done(second);
+    thread.join();
+    try std.testing.expect(r.result.? == .ok);
+    try std.testing.expectEqual(budget.next, budget.serving);
 }
 
 test "native hashFiles: calls that each hold memory and need more run in turn, none waits on another for good" {

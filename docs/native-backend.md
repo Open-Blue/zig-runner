@@ -1807,8 +1807,10 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
     turn it is waits for nothing, so there is nothing to wait on in a circle: a big call is delayed
     by the big calls before it, one turn each, and is failed only when it is too big alone (at
     once, naming the setting). One job that holds the turn (a big walk, then a huge file) delays a
-    neighbour by that one turn, not fails it, and its next call queues behind the neighbour's. The
-    limit is the smaller of 1 GiB and an eighth of `MemTotal` (the host's, in a container too: the
+    neighbour by that one turn, not fails it, and its next call queues behind the neighbour's. A
+    wait fails only when the queue stops moving for twice the timeout: each call ahead may hold the
+    turn for its own timeout, so a wait is bounded by the calls ahead (6 minutes behind 3 of them,
+    at the default), and a cancel ends it. The limit is the smaller of 1 GiB and an eighth of `MemTotal` (the host's, in a container too: the
     runner has no reading of its own cgroup's limit), or `RUNNER_NATIVE_HASHFILES_MEMORY_MB` (0
     for none); in all the process holds one limit and an allowance for each call running. What a
     walk keeps is 32 bytes a node and its path; the rest of what it needs is reset per path and
