@@ -37,6 +37,3 @@ services:
 volumes:
   # Images, layers and cache volumes of the native jobs: the engine's cache, without the engine.
   native-store:
-  # Not used here: left out of the project's volumes so nothing creates it empty.
-  engine-state: !reset null
-  engine-socket: !reset null

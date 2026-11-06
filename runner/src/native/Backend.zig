@@ -463,6 +463,17 @@ pub fn usable(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) ?[]cons
     return probe_cache.store(now, why);
 }
 
+/// `usable`, asked again now: the remembered failure is forgotten first. For a start-up that
+/// retries (`main.nativeRefusal`), where waiting out the back-off would defeat the retry.
+pub fn reprobe(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) ?[]const u8 {
+    {
+        probe_mu.lockUncancelable(io);
+        defer probe_mu.unlock(io);
+        probe_cache = .{};
+    }
+    return usable(arena, io, gpa, cfg);
+}
+
 var probe_mu: std.Io.Mutex = .init;
 var probe_cache: ProbeCache = .{};
 pub const probe_backoff_ms = 5 * 60 * 1000;
