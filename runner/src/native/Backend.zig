@@ -1901,7 +1901,9 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
 /// Whether the tags a checkout fetches include a submodule's (`fetch-depth: 0` or `fetch-tags`
 /// with `submodules:`): they move with the commit staying, and `tagsDigest` lists only the top
 /// repository's, which a submodule's URL (in `.gitmodules`, known only once fetched) is not part
-/// of. Such a fetch is not replayed, as one of a branch is not.
+/// of. Such a fetch is not replayed, as one of a branch is not. (A submodule's clone fetches its
+/// tags whatever `fetch-tags` says, so those of a submodule checkout without tags go stale in a
+/// replay: accepted, as gating every submodule checkout would cost its replay.)
 fn tagsInSubmodules(tags: bool, co: job_mod.Checkout) bool {
     return tags and co.submodules;
 }

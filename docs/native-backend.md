@@ -132,7 +132,10 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   `fetch-depth`, with `git@<host>:` read as HTTPS; the flags are in the step's script, so in its key. With tags (`fetch-depth: 0` or `fetch-tags`)
   the key holds a digest of the top repository's tags, which move with the commit staying; a
   submodule's tags are not listed (its URL is known only once fetched), so a checkout with both is
-  not replayed at all.
+  not replayed at all. Not handled: a submodule's clone fetches its own tags whatever `fetch-tags`
+  says, so a tag added later to a submodule's same commit is stale in the replay of any checkout
+  with `submodules:` that has no tags of its own to fetch. That rarely matters to a build, and
+  gating every submodule checkout would cost its replay.
 - Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a job the runner
   does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
   `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:`, or an `options:` flag the
