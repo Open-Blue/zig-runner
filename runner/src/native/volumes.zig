@@ -185,18 +185,20 @@ pub fn open(
 
 /// One part of a volume's key as a directory name: the characters a repository's or a tool's
 /// name has (letters, digits, `.`, `-`, `_`) kept, any other turned into `-`, and a name that is
-/// empty or starts with a dot prefixed with `_`, so no part is `.`, `..` or a path. A job chooses
-/// its image, and so a part of its key: none may read as what the store keeps beside a volume or
-/// calls one that is going (`.lock`, `.size`, `.private-<n>`, `.dead-<n>`), or its sibling would
-/// take it for that.
+/// empty or starts with a dot marked with a leading `~`, so no part is `.`, `..` or a path. A job
+/// chooses its image, and so a part of its key: none may read as what the store keeps beside a
+/// volume or calls one that is going (`.lock`, `.size`, `.private-<n>`, `.dead-<n>`), or its sibling
+/// would take it for that, so those are marked with `~` too. No name keeps a `~` of its own, so a
+/// marked name is no other repository's, which would share its volume: Zig runs what it finds in
+/// `zig-local` unchecked.
 pub fn component(arena: Allocator, part: []const u8) ![]const u8 {
     var out = try arena.alloc(u8, part.len);
     for (part, 0..) |c, i| out[i] = if (std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or
         c == '_') c else '-';
-    while (std.mem.indexOf(u8, out, ".private-")) |at| out[at] = '-';
-    if (out.len == 0 or out[0] == '.') out = try std.mem.concat(arena, u8, &.{ "_", out });
+    while (std.mem.indexOf(u8, out, ".private-")) |at| out[at] = '~';
+    if (out.len == 0 or out[0] == '.') out = try std.mem.concat(arena, u8, &.{ "~", out });
     if (std.mem.endsWith(u8, out, ".lock") or std.mem.endsWith(u8, out, ".size"))
-        out = try std.mem.concat(arena, u8, &.{ out, "_" });
+        out = try std.mem.concat(arena, u8, &.{ out, "~" });
     return out;
 }
 
@@ -533,9 +535,13 @@ test "native volumes: a key's parts are names of their own" {
     try std.testing.expectEqualStrings("Open-Blue", try component(arena, "Open-Blue"));
     try std.testing.expectEqualStrings("zig-runner.v2_x", try component(arena, "zig-runner.v2_x"));
     try std.testing.expectEqualStrings("a-b-c", try component(arena, "a/b c"));
-    try std.testing.expectEqualStrings("_..", try component(arena, ".."));
-    try std.testing.expectEqualStrings("_.", try component(arena, "."));
-    try std.testing.expectEqualStrings("_", try component(arena, ""));
+    try std.testing.expectEqualStrings("~..", try component(arena, ".."));
+    try std.testing.expectEqualStrings("~.", try component(arena, "."));
+    try std.testing.expectEqualStrings("~", try component(arena, ""));
+    try std.testing.expectEqualStrings("-", try component(arena, "~"));
+    try std.testing.expectEqualStrings("foo.lock~", try component(arena, "foo.lock"));
+    try std.testing.expectEqualStrings("~.github", try component(arena, ".github"));
+    try std.testing.expectEqualStrings("a~private-b", try component(arena, "a.private-b"));
 }
 
 test "native volumes: shared ones are used at once, locked ones in turn, private ones copied" {
