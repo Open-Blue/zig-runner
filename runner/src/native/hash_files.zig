@@ -1697,13 +1697,13 @@ test "native hashFiles: a queue that moves outlasts the wait's limit, so calls a
     var budget: Budget = .{};
     const first = budget.ticket();
     const second = budget.ticket();
-    var r: Runner = .{ .fx = &f, .stack = try f.stackOf(&.{"l0"}, .{ .allowance = 64 << 10, .budget = &budget, .timeout_ms = 500 }), .args = &.{"**"} };
+    var r: Runner = .{ .fx = &f, .stack = try f.stackOf(&.{"l0"}, .{ .allowance = 64 << 10, .budget = &budget, .timeout_ms = 2500 }), .args = &.{"**"} };
     const thread = try std.Thread.spawn(.{}, Runner.run, .{&r});
-    // Each call ahead holds the turn for less than the limit of a second, and more than a second
-    // goes by in all.
-    sleepMs(700);
+    // Each call ahead holds the turn for less than the limit of 5 seconds, and more than that goes
+    // by in all. The gaps are wide: at 300 ms this failed on a Pi under load.
+    sleepMs(3000);
     _ = budget.done(first);
-    sleepMs(700);
+    sleepMs(3000);
     _ = budget.done(second);
     thread.join();
     try std.testing.expect(r.result.? == .ok);
