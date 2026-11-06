@@ -1,5 +1,6 @@
 //! Eviction of what sits beside the layers (docs/native-backend.md, "Eviction"): the cache
-//! volumes under `volumes/`, which `Store.collect` runs after each job, under its `gc.lock`, so
+//! volumes under `volumes/`, and the images, provisioned rootfs and Zig cache seeds under `oci/`,
+//! `rootfs/` and `seeds/`, which `Store.collect` runs after each job, under its `gc.lock`, so
 //! one runner at a time does this and another finding it busy goes on.
 //!
 //! Each entry is a directory with a lock file beside it (`<dir>.lock`), which a job holds shared
@@ -29,6 +30,7 @@ const Store = @import("Store.zig");
 const Allocator = std.mem.Allocator;
 
 pub const default_volumes_max_bytes: u64 = 16 * 1024 * 1024 * 1024;
+pub const default_images_max_bytes: u64 = 8 * 1024 * 1024 * 1024;
 pub const default_min_free_pct: u8 = 10;
 
 /// What `run` keeps to (`Store.limits`). A cap of 0 is no cap, as it is for the disk's floor:
@@ -37,6 +39,9 @@ pub const Limits = struct {
     /// Past this many bytes of cache volumes, the least recently used go
     /// (`RUNNER_NATIVE_VOLUMES_MAX_MB`).
     volumes_max_bytes: u64 = default_volumes_max_bytes,
+    /// Past this many bytes of blobs, images, provisioned rootfs and Zig cache seeds together,
+    /// the blobs go, then those least recently used (`RUNNER_NATIVE_IMAGES_MAX_MB`).
+    images_max_bytes: u64 = default_images_max_bytes,
     /// With less than this percentage of the store's filesystem free, entries go whatever the
     /// caps say (`RUNNER_NATIVE_MIN_FREE_PCT`).
     min_free_pct: u8 = default_min_free_pct,
@@ -72,11 +77,27 @@ fn flock(f: std.Io.File, how: i32) bool {
     return linux.errno(linux.flock(f.handle, how)) == .SUCCESS;
 }
 
+/// The directories of trees: made once under a key and published by a rename.
+const tree_areas = [_][]const u8{ "rootfs", "oci/images", "seeds" };
+const all_areas = tree_areas ++ [_][]const u8{"volumes"};
+
+/// How much sooner a rootfs goes than the image it was made from, which every job using it pulls
+/// just before: a rootfs shares its files with its image, whose eviction would move their ctimes
+/// (so `Store.rootfsFingerprint`, and every layer's key on it, at the next restart) and cost the
+/// next job a pull it would not otherwise need.
+const image_grace_s = 60 * 60;
+
 const Entry = struct {
     /// The directory's path. A `.lock` and a `.size` are beside it.
     dir: []const u8,
+    /// `all_areas`' name it is under, where its dead name goes.
+    area: []const u8,
+    /// A volume can hold a volume (`nested`), and is a job's: the tree areas hold neither.
+    volume: bool,
     /// Its last use, in seconds: the lock file's mtime.
     used_s: i64,
+    /// What the order of eviction goes by: its last use, and `image_grace_s` for an image.
+    rank_s: i64,
     /// When it was last measured, 0 when it never was: the size file's mtime.
     measured_s: i64 = 0,
     /// Its bytes when last measured.
@@ -93,14 +114,28 @@ pub fn run(s: Store, io: std.Io) void {
     const lim = s.limits;
     var budget: Budget = .init(io, lim.budget_ms);
     // What a deadline left first: nothing more goes until what already went is gone.
-    if (!removeDead(arena, io, s.root, "volumes", &budget)) return;
-    const entries = listVolumes(arena, io, s.root) catch return;
-    measureOne(arena, io, entries, lim.remeasure_s);
-    var evicted = capped(arena, io, s.root, entries, lim.volumes_max_bytes, lim);
+    for (all_areas) |a| if (!removeDead(arena, io, s.root, a, &budget)) return;
+    const vols = listVolumes(arena, io, s.root) catch return;
+    const trees = listTrees(arena, io, s.root, budget) catch return;
+    measureOne(arena, io, vols, lim.remeasure_s);
+    measureOne(arena, io, trees, lim.remeasure_s);
+    var blobs = listBlobs(arena, io, s.root) catch return;
+    var evicted = capped(arena, io, s.root, vols, lim.volumes_max_bytes, 0, lim, "volumes");
+    // A blob only saves a download, of an image already unpacked or not wanted since.
+    var tree_bytes: u64 = 0;
+    for (trees) |e| tree_bytes += e.bytes;
+    const over_by = (tree_bytes + blobs.bytes) -| lim.images_max_bytes;
+    // An image unpacking has the blobs: it may be what took the area over, so wait for its end.
+    if (lim.images_max_bytes > 0 and over_by > 0 and blobs.evict(arena, io, s.root, over_by))
+        evicted = capped(arena, io, s.root, trees, lim.images_max_bytes, blobs.bytes, lim, "images") or evicted;
     if (shortBy(arena, s.root, lim.min_free_pct)) |short| {
         var left = short;
-        std.mem.sort(Entry, entries, {}, olderFirst);
-        for (entries) |e| {
+        const before = blobs.bytes;
+        _ = blobs.evict(arena, io, s.root, left);
+        left -|= before - blobs.bytes;
+        const all = std.mem.concat(arena, Entry, &.{ vols, trees }) catch return;
+        std.mem.sort(Entry, all, {}, olderFirst);
+        for (all) |e| {
             if (left == 0) break;
             if (e.private or lim.recent_s > now(io) - e.used_s) continue;
             if (!evictEntry(arena, io, s.root, e)) continue;
@@ -108,7 +143,10 @@ pub fn run(s: Store, io: std.Io) void {
             left -|= e.bytes;
         }
     }
-    if (evicted) _ = removeDead(arena, io, s.root, "volumes", &budget);
+    if (evicted) {
+        dropRefs(arena, io, s.root);
+        for (all_areas) |a| if (!removeDead(arena, io, s.root, a, &budget)) return;
+    }
 }
 
 fn now(io: std.Io) i64 {
@@ -130,13 +168,13 @@ const Budget = struct {
 };
 
 fn olderFirst(_: void, a: Entry, b: Entry) bool {
-    return a.used_s < b.used_s;
+    return a.rank_s < b.rank_s;
 }
 
-/// Volumes evicted, the longest unused first, until the area is under `max`; whether any was. A
-/// dead runner's private copy goes first, cap or no cap.
-fn capped(arena: Allocator, io: std.Io, root: []const u8, entries: []Entry, max: u64, lim: Limits) bool {
-    var total: u64 = 0;
+/// `entries` evicted, the longest unused first, until they and `other` bytes are under `max`;
+/// whether any was. A dead runner's private copy goes first, cap or no cap.
+fn capped(arena: Allocator, io: std.Io, root: []const u8, entries: []Entry, max: u64, other: u64, lim: Limits, what: []const u8) bool {
+    var total: u64 = other;
     for (entries) |e| total += e.bytes;
     var evicted = false;
     for (entries) |e| if (e.private and evictEntry(arena, io, root, e)) {
@@ -153,8 +191,8 @@ fn capped(arena: Allocator, io: std.Io, root: []const u8, entries: []Entry, max:
         total -|= e.bytes;
         evicted = true;
     }
-    if (total > max) std.log.info("native: the volumes hold {d} MiB, over their cap of {d} MiB: " ++
-        "what is left is in use or was used today", .{ total >> 20, max >> 20 });
+    if (total > max) std.log.info("native: the {s} hold {d} MiB, over their cap of {d} MiB: " ++
+        "what is left is in use or was used today", .{ what, total >> 20, max >> 20 });
     return evicted;
 }
 
@@ -186,6 +224,125 @@ const Statfs = extern struct {
     flags: i64,
     spare: [4]i64,
 };
+
+/// The entries of the tree areas, what dead runners left of a tree they were making, and stray
+/// lock files and sizes removed on the way: `.tmp-<key>` (`ensure`), `<name>.new-<n>`
+/// (`volumes.adoptSeed`), each under the entry's lock, which its maker holds while it lives.
+fn listTrees(arena: Allocator, io: std.Io, root: []const u8, budget: Budget) ![]Entry {
+    var out: std.ArrayList(Entry) = .empty;
+    for (tree_areas) |a| {
+        const dir_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, a });
+        var d = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch continue;
+        defer d.close(io);
+        var names: std.ArrayList([]const u8) = .empty;
+        var it = d.iterate();
+        while (try it.next(io)) |e| try names.append(arena, try arena.dupe(u8, e.name));
+        for (names.items) |n| {
+            const full = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir_path, n });
+            if (std.mem.startsWith(u8, n, ".dead-")) continue;
+            if (std.mem.startsWith(u8, n, ".tmp-")) {
+                const key = n[".tmp-".len..];
+                dropUnfinished(arena, io, full, try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir_path, key }), budget);
+            } else if (std.mem.indexOf(u8, n, ".new-")) |at| {
+                dropUnfinished(arena, io, full, try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir_path, n[0..at] }), budget);
+            } else if (std.mem.endsWith(u8, n, ".lock")) {
+                const entry = full[0 .. full.len - ".lock".len];
+                if (!isDir(arena, entry)) dropStray(arena, io, entry);
+            } else if (std.mem.endsWith(u8, n, ".size")) {
+                if (!isDir(arena, full[0 .. full.len - ".size".len])) std.Io.Dir.cwd().deleteFile(io, full) catch {};
+            } else if (isDir(arena, full) and isFile(arena, try std.fmt.allocPrint(arena, "{s}.lock", .{full}))) {
+                if (out.items.len >= max_entries) return out.items;
+                var e = try entryOf(arena, io, full, a, false, false);
+                if (std.mem.eql(u8, a, "oci/images")) e.rank_s += image_grace_s;
+                try out.append(arena, e);
+            }
+        }
+    }
+    return out.items;
+}
+
+/// `tree`, a dead maker's, removed if the lock of the entry it was for is free: as far as the
+/// budget goes, and the next pass finds the rest.
+fn dropUnfinished(arena: Allocator, io: std.Io, tree: []const u8, entry: []const u8, budget: Budget) void {
+    const lock_path = std.fmt.allocPrint(arena, "{s}.lock", .{entry}) catch return;
+    const lock = Store.lockBeside(arena, io, lock_path) catch return;
+    defer lock.close(io);
+    if (!flock(lock, lock_ex | lock_nb) or !Store.sameFile(arena, lock, lock_path)) return;
+    _ = removeSome(tree, io, budget);
+}
+
+/// The blobs, with what they take, and their lock's file: they have no job holding them, so an
+/// eviction takes `oci/blobs.lock` exclusively, non-blocking, which an unpack holds shared.
+const Blobs = struct {
+    const Blob = struct { path: []const u8, used_s: i64, bytes: u64 };
+    list: []Blob = &.{},
+    bytes: u64 = 0,
+
+    /// Blobs evicted, the oldest first, until `over` bytes of them are gone, what a dead runner
+    /// left half fetched among them. False when an unpack holds them.
+    fn evict(b: *Blobs, arena: Allocator, io: std.Io, root: []const u8, over: u64) bool {
+        if (b.list.len == 0) return true;
+        const path = std.fmt.allocPrint(arena, "{s}/oci/blobs.lock", .{root}) catch return false;
+        const lock = Store.lockBeside(arena, io, path) catch return false;
+        defer lock.close(io);
+        if (!flock(lock, lock_ex | lock_nb)) return false;
+        std.mem.sort(Blob, b.list, {}, struct {
+            fn lt(_: void, x: Blob, y: Blob) bool {
+                return x.used_s < y.used_s;
+            }
+        }.lt);
+        var freed: u64 = 0;
+        for (b.list) |blob| {
+            if (freed >= over) break;
+            std.Io.Dir.cwd().deleteFile(io, blob.path) catch continue;
+            freed += blob.bytes;
+        }
+        b.bytes -|= freed;
+        return true;
+    }
+};
+
+fn listBlobs(arena: Allocator, io: std.Io, root: []const u8) !Blobs {
+    const dir_path = try std.fmt.allocPrint(arena, "{s}/oci/blobs/sha256", .{root});
+    var d = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return .{};
+    defer d.close(io);
+    var out: std.ArrayList(Blobs.Blob) = .empty;
+    var total: u64 = 0;
+    var it = d.iterate();
+    while (try it.next(io)) |e| {
+        if (out.items.len >= max_entries) break;
+        const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir_path, e.name });
+        var st: linux.Statx = undefined;
+        const z = try arena.dupeSentinel(u8, path, 0);
+        const mask: linux.STATX = .{ .TYPE = true, .MTIME = true, .BLOCKS = true };
+        if (linux.errno(linux.statx(linux.AT.FDCWD, z, linux.AT.SYMLINK_NOFOLLOW, mask, &st)) != .SUCCESS) continue;
+        // A temporary file goes as a blob does, oldest first: only a live unpack holds one, and
+        // none does while the lock is taken.
+        const bytes = st.blocks * 512;
+        total += bytes;
+        try out.append(arena, .{ .path = path, .used_s = st.mtime.sec, .bytes = bytes });
+    }
+    return .{ .list = out.items, .bytes = total };
+}
+
+/// What a pinned index's record names when its image is gone: only a shortcut past the registry,
+/// which a job would find leads nowhere, and `oci/refs/` would keep for ever.
+fn dropRefs(arena: Allocator, io: std.Io, root: []const u8) void {
+    const refs = std.fmt.allocPrint(arena, "{s}/oci/refs", .{root}) catch return;
+    var d = std.Io.Dir.cwd().openDir(io, refs, .{ .iterate = true }) catch return;
+    defer d.close(io);
+    var it = d.iterate();
+    while (it.next(io) catch null) |e| {
+        const p = std.fmt.allocPrint(arena, "{s}/{s}", .{ refs, e.name }) catch return;
+        const text = std.Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(128)) catch continue;
+        const manifest = std.mem.trim(u8, text, " \n");
+        if (!std.mem.startsWith(u8, manifest, "sha256:")) continue;
+        const hex = manifest["sha256:".len..];
+        const base = std.fmt.allocPrint(arena, "{s}/oci/images/{s}", .{ root, hex }) catch return;
+        const rootless = std.fmt.allocPrint(arena, "{s}.rootless", .{base}) catch return;
+        if (!isDir(arena, base) and !isDir(arena, rootless)) std.Io.Dir.cwd().deleteFile(io, p) catch {};
+    }
+}
 
 /// The volumes, stray lock files removed on the way.
 fn listVolumes(arena: Allocator, io: std.Io, root: []const u8) ![]Entry {
@@ -226,17 +383,21 @@ fn walkKeys(arena: Allocator, io: std.Io, dir: []const u8, out: *std.ArrayList(E
             continue;
         }
         if (out.items.len >= max_entries) return;
-        try out.append(arena, try entryOf(arena, io, full, std.mem.indexOf(u8, n, ".private-") != null));
+        try out.append(arena, try entryOf(arena, io, full, "volumes", true, std.mem.indexOf(u8, n, ".private-") != null));
         const inner = try std.fmt.allocPrint(arena, "{s}/{s}", .{ full, nested });
         if (isDir(arena, inner) and isFile(arena, try std.fmt.allocPrint(arena, "{s}.lock", .{inner})))
-            try out.append(arena, try entryOf(arena, io, inner, false));
+            try out.append(arena, try entryOf(arena, io, inner, "volumes", true, false));
     }
 }
 
-fn entryOf(arena: Allocator, io: std.Io, dir: []const u8, private: bool) !Entry {
+fn entryOf(arena: Allocator, io: std.Io, dir: []const u8, area: []const u8, volume: bool, private: bool) !Entry {
+    const used_s = mtime(arena, try std.fmt.allocPrint(arena, "{s}.lock", .{dir})) orelse 0;
     var e: Entry = .{
         .dir = dir,
-        .used_s = mtime(arena, try std.fmt.allocPrint(arena, "{s}.lock", .{dir})) orelse 0,
+        .area = area,
+        .volume = volume,
+        .used_s = used_s,
+        .rank_s = used_s,
         .private = private,
     };
     const size = try std.fmt.allocPrint(arena, "{s}.size", .{dir});
@@ -304,15 +465,18 @@ fn evictEntry(arena: Allocator, io: std.Io, root: []const u8, e: Entry) bool {
     if (!flock(lock, lock_ex | lock_nb) or !Store.sameFile(arena, lock, lock_path)) return false;
     // The one that may be inside it, whose lock would go with the rename. Taken even when no such
     // volume is there, so that one starting now waits, then finds the path gone and starts over.
-    const inner_path = std.fmt.allocPrint(arena, "{s}/{s}.lock", .{ e.dir, nested }) catch return false;
-    const inner = Store.lockBeside(arena, io, inner_path) catch inner: {
-        // A step may have left the volume's root read-only; no job is using it now.
-        _ = linux.chmod(arena.dupeSentinel(u8, e.dir, 0) catch return false, 0o700);
-        break :inner Store.lockBeside(arena, io, inner_path) catch return false;
-    };
-    defer inner.close(io);
-    if (!flock(inner, lock_ex | lock_nb) or !Store.sameFile(arena, inner, inner_path)) return false;
-    const dead = deadName(arena, io, root) catch return false;
+    var inner: ?std.Io.File = null;
+    defer if (inner) |l| l.close(io);
+    if (e.volume) {
+        const inner_path = std.fmt.allocPrint(arena, "{s}/{s}.lock", .{ e.dir, nested }) catch return false;
+        inner = Store.lockBeside(arena, io, inner_path) catch inner: {
+            // A step may have left the volume's root read-only; no job is using it now.
+            _ = linux.chmod(arena.dupeSentinel(u8, e.dir, 0) catch return false, 0o700);
+            break :inner Store.lockBeside(arena, io, inner_path) catch return false;
+        };
+        if (!flock(inner.?, lock_ex | lock_nb) or !Store.sameFile(arena, inner.?, inner_path)) return false;
+    }
+    const dead = deadName(arena, io, root, e.area) catch return false;
     cwd.rename(e.dir, cwd, dead, io) catch return false;
     syncDirOf(arena, e.dir);
     syncDirOf(arena, dead);
@@ -320,10 +484,10 @@ fn evictEntry(arena: Allocator, io: std.Io, root: []const u8, e: Entry) bool {
     return true;
 }
 
-fn deadName(arena: Allocator, io: std.Io, root: []const u8) ![]const u8 {
+fn deadName(arena: Allocator, io: std.Io, root: []const u8, area: []const u8) ![]const u8 {
     var raw: [8]u8 = undefined;
     io.random(&raw);
-    return std.fmt.allocPrint(arena, "{s}/volumes/.dead-{s}", .{ root, &std.fmt.bytesToHex(raw, .lower) });
+    return std.fmt.allocPrint(arena, "{s}/{s}/.dead-{s}", .{ root, area, &std.fmt.bytesToHex(raw, .lower) });
 }
 
 /// The directory `path` is in, synced: a rename that a crash could undo must be on disk before
@@ -834,4 +998,197 @@ test "native eviction: jobs racing collects never lose a volume they hold" {
     f.s.limits.budget_ms = 60_000;
     run(f.s, testing.io);
     try testing.expectEqual(@as(usize, 0), try f.deadLeft());
+}
+
+const OciStore = @import("oci/Store.zig");
+
+const TreeMaker = struct {
+    fn make(_: *anyopaque, dir: []const u8) anyerror!void {
+        var buf: [4096]u8 = undefined;
+        const p = try std.fmt.bufPrint(&buf, "{s}/f", .{dir});
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = p, .data = &(@as([8192]u8, @splat('t'))) });
+    }
+};
+
+fn testTree(f: *Fixture, kind: []const u8, key: []const u8, bytes: u64, days: i64) ![]const u8 {
+    const oci: OciStore = .{ .root = f.s.root };
+    try oci.prepare(f.arena(), testing.io);
+    try f.tmp.dir.createDirPath(testing.io, kind);
+    var unused: u8 = 0;
+    const r = try oci.ensure(f.arena(), testing.io, kind, key, .{ .ptr = &unused, .makeFn = TreeMaker.make });
+    r.lock.close(testing.io);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = try std.fmt.allocPrint(f.arena(), "{s}.size", .{r.dir}),
+        .data = try std.fmt.allocPrint(f.arena(), "{d}\n", .{bytes}),
+    });
+    try f.age(r.dir, days);
+    return r.dir;
+}
+
+test "native eviction: trees go past their cap, a held one stays, and a rootfs goes before its image" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const io = testing.io;
+    const old_rootfs = try testTree(f, "rootfs", "r1", 6000, 30);
+    // Pulled moments after the rootfs was last used, as every job using it does.
+    const its_image = try testTree(f, "oci/images", "i1", 6000, 30);
+    const in_use = try testTree(f, "rootfs", "r2", 6000, 40);
+    const seed = try testTree(f, "seeds", "x86_64-0.16.0-root", 6000, 20);
+    const held = (try OciStore.holdDir(f.arena(), io, in_use)).?;
+    defer held.close(io);
+    // `holdDir` touched its lock: a pass goes by that, so make it old again, as if used long ago.
+    try f.age(in_use, 40);
+    f.s.limits = .{ .images_max_bytes = 19_000, .volumes_max_bytes = 0, .min_free_pct = 0 };
+    run(f.s, io);
+    try testing.expect(f.there(in_use));
+    try testing.expect(!f.there(old_rootfs));
+    try testing.expect(f.there(its_image) and f.there(seed));
+    f.s.limits.images_max_bytes = 13_000;
+    run(f.s, io);
+    try testing.expect(!f.there(its_image));
+    try testing.expect(f.there(seed));
+    // And the seed goes to the cap too, and to the next job's build.
+    f.s.limits.images_max_bytes = 7000;
+    run(f.s, io);
+    try testing.expect(!f.there(seed));
+    // A key used today stays, whatever the cap: the base image is not thrown away on a loop.
+    const base = try testTree(f, "oci/images", "i2", 6000, 0);
+    f.s.limits.images_max_bytes = 1;
+    for (0..3) |_| run(f.s, io);
+    try testing.expect(f.there(base));
+}
+
+test "native eviction: what a dead maker left goes, what a live one is making stays" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const io = testing.io;
+    const arena = f.arena();
+    const cwd = std.Io.Dir.cwd();
+    const oci: OciStore = .{ .root = f.s.root };
+    try oci.prepare(arena, io);
+    try cwd.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/seeds", .{f.s.root}));
+    for ([_][]const u8{ "rootfs/.tmp-dead", "rootfs/.tmp-live", "seeds/z.new-00" }) |d|
+        try f.tmp.dir.createDirPath(io, d);
+    const live = try OciStore.lockDir(arena, io, try std.fmt.allocPrint(arena, "{s}/rootfs/live", .{f.s.root}), 2);
+    defer live.close(io);
+    f.s.limits = .{ .images_max_bytes = 0, .volumes_max_bytes = 0, .min_free_pct = 0 };
+    run(f.s, io);
+    try testing.expectError(error.FileNotFound, f.tmp.dir.access(io, "rootfs/.tmp-dead", .{}));
+    try testing.expectError(error.FileNotFound, f.tmp.dir.access(io, "seeds/z.new-00", .{}));
+    try f.tmp.dir.access(io, "rootfs/.tmp-live", .{});
+    // And the locks those dead makers' sweeps took or made go next time.
+    run(f.s, io);
+    try testing.expectError(error.FileNotFound, f.tmp.dir.access(io, "rootfs/dead.lock", .{}));
+    try f.tmp.dir.access(io, "rootfs/live.lock", .{});
+}
+
+test "native eviction: the blobs go first, the oldest first, and not while an image unpacks" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const io = testing.io;
+    const arena = f.arena();
+    const oci: OciStore = .{ .root = f.s.root };
+    try oci.prepare(arena, io);
+    const image = try testTree(f, "oci/images", "i1", 1000, 30);
+    const names = [_][]const u8{ "old", "new" };
+    for (names, [_]i64{ 1000, 2000 }) |n, sec| {
+        const p = try std.fmt.allocPrintSentinel(arena, "{s}/oci/blobs/sha256/{s}", .{ f.s.root, n }, 0);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = &(@as([40960]u8, @splat('b'))) });
+        const t = [2]linux.timespec{ .{ .sec = sec, .nsec = 0 }, .{ .sec = sec, .nsec = 0 } };
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.utimensat(linux.AT.FDCWD, p, &t, 0)));
+    }
+    f.s.limits = .{ .images_max_bytes = 50_000, .volumes_max_bytes = 0, .min_free_pct = 0 };
+    const unpacking = try std.Io.Dir.cwd().createFile(io, try oci.blobsLock(arena), .{ .truncate = false });
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(unpacking.handle, 1)));
+    run(f.s, io);
+    try f.tmp.dir.access(io, "oci/blobs/sha256/old", .{});
+    unpacking.close(io);
+    run(f.s, io);
+    try testing.expectError(error.FileNotFound, f.tmp.dir.access(io, "oci/blobs/sha256/old", .{}));
+    try f.tmp.dir.access(io, "oci/blobs/sha256/new", .{});
+    try testing.expect(f.there(image));
+}
+
+test "native eviction: a pin's record goes with its image, and one whose image is here stays" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const io = testing.io;
+    const arena = f.arena();
+    const hex_gone: [64]u8 = @splat('a');
+    const hex_kept: [64]u8 = @splat('b');
+    const oci: OciStore = .{ .root = f.s.root };
+    try oci.prepare(arena, io);
+    const gone = try testTree(f, "oci/images", &hex_gone, 1000, 30);
+    _ = try testTree(f, "oci/images", &hex_kept, 1000, 0);
+    for ([_][]const u8{ &hex_gone, &hex_kept }) |h|
+        try f.tmp.dir.writeFile(io, .{
+            .sub_path = try std.fmt.allocPrint(arena, "oci/refs/{s}.amd64", .{h}),
+            .data = try std.fmt.allocPrint(arena, "sha256:{s}", .{h}),
+        });
+    f.s.limits = .{ .images_max_bytes = 1500, .volumes_max_bytes = 0, .min_free_pct = 0 };
+    run(f.s, io);
+    try testing.expect(!f.there(gone));
+    try testing.expectError(error.FileNotFound, f.tmp.dir.access(io, "oci/refs/" ++ hex_gone ++ ".amd64", .{}));
+    try f.tmp.dir.access(io, "oci/refs/" ++ hex_kept ++ ".amd64", .{});
+}
+
+fn raceTree(r: *Race, arena: Allocator, i: usize, n: usize) !void {
+    const io = testing.io;
+    const oci: OciStore = .{ .root = r.s.root };
+    const keys = [_][]const u8{ "a", "b", "c" };
+    const key = keys[(i + n) % keys.len];
+    const got = try oci.ensure(arena, io, "rootfs", key, .{ .ptr = r, .makeFn = TreeMaker.make });
+    defer got.lock.close(io);
+    if (got.made) _ = r.fresh.fetchAdd(1, .monotonic);
+    const file = try std.fmt.allocPrint(arena, "{s}/f", .{got.dir});
+    for (0..2) |_| {
+        const text = std.Io.Dir.cwd().readFileAlloc(io, file, arena, .limited(16 << 10)) catch |e|
+            return r.fault("the tree {s} went while a job held it: {t}", .{ key, e });
+        if (text.len != 8192) r.fault("the tree {s} is {d} bytes", .{ key, text.len });
+        try io.sleep(.fromMilliseconds(std.math.cast(i64, n % 3).?), .awake);
+    }
+}
+
+test "native eviction: jobs racing collects never lose a tree they hold, and make one at a time" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const oci: OciStore = .{ .root = f.s.root };
+    try oci.prepare(f.arena(), testing.io);
+    f.s.limits = .{ .images_max_bytes = 1, .volumes_max_bytes = 0, .min_free_pct = 0, .idle_s = 0, .recent_s = 0, .remeasure_s = 0 };
+    try Store.prepare(f.arena(), testing.io, f.s.root, .{ .check_parents = false });
+    var r: Race = .{ .s = f.s, .deadline_ms = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 1500 };
+    try r.go(raceTree);
+}
+
+test "native eviction: a job that waited on a lock an eviction removed does not hold what is there now" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const io = testing.io;
+    const arena = f.arena();
+    const oci: OciStore = .{ .root = f.s.root };
+    try oci.prepare(arena, io);
+    const dir = try testTree(f, "rootfs", "k", 10, 0);
+    const lock_path = try std.fmt.allocPrint(arena, "{s}.lock", .{dir});
+    // An eviction under way: the lock held exclusively, the job waiting on it.
+    const eviction = try OciStore.lockDir(arena, io, dir, lock_ex);
+    const Job = struct {
+        got: ?std.Io.File = null,
+        fn run1(j: *@This(), path: []const u8) void {
+            var a: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            defer a.deinit();
+            j.got = OciStore.holdDir(a.allocator(), testing.io, path) catch null;
+        }
+    };
+    var job: Job = .{};
+    const t: std.Thread = try .spawn(.{}, Job.run1, .{ &job, dir });
+    try io.sleep(.fromMilliseconds(100), .awake);
+    // It renames the tree, removes the lock file and lets go, and another runner makes the key
+    // again meanwhile, with a lock file of its own.
+    try std.Io.Dir.cwd().deleteFile(io, lock_path);
+    const again = try OciStore.lockDir(arena, io, dir, 1);
+    defer again.close(io);
+    eviction.close(io);
+    t.join();
+    defer job.got.?.close(io);
+    try testing.expect(Store.sameFile(arena, job.got.?, lock_path));
 }

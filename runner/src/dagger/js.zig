@@ -109,7 +109,7 @@ fn runtimeFiles(x: *Exec, rt: RuntimeSource, msg: *[]const u8) !?std.json.Value 
     const b = x.native orelse
         return gql(arena, x.transport, try runtimeQuery(arena, rt, x.musl), msg) catch null;
     // P3's pull (or the tests' images directory), as Dagger pulls the runtime's image.
-    const img = switch (try docker_action.find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, rt.image)) {
+    const img = switch (try docker_action.find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, rt.image, &b.held)) {
         .image => |i| i,
         .missing => |why| {
             msg.* = why;

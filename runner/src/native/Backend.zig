@@ -285,6 +285,7 @@ pub fn configFor(
         .store_max_bytes = cfg.native_store_max_mb * 1024 * 1024,
         .store_limits = .{
             .volumes_max_bytes = cfg.native_volumes_max_mb * 1024 * 1024,
+            .images_max_bytes = cfg.native_images_max_mb * 1024 * 1024,
             .min_free_pct = cfg.native_min_free_pct,
         },
         .cgroup = cg,
@@ -1638,16 +1639,36 @@ fn seeds(b: *Backend, as_runner: bool) !void {
 fn seed(b: *Backend, s: volumes.Seed, as_runner: bool) ?[]const u8 {
     const arena = b.arena;
     const cwd = std.Io.Dir.cwd();
-    if (cwd.access(b.io, s.dir, .{})) |_| return null else |_| {}
     const seeds_dir = std.fs.path.dirname(s.dir).?;
     cwd.createDirPath(b.io, seeds_dir) catch |e| return @errorName(e);
     // Only the runner's user may look in, as in the volumes'.
     const seeds_z = arena.dupeSentinel(u8, seeds_dir, 0) catch return "out of memory";
     _ = std.os.linux.chmod(seeds_z, 0o700);
-    const lock = lockFile(arena, b.io, std.fmt.allocPrint(arena, "{s}.lock", .{s.dir}) catch
-        return "out of memory", true) catch |e| return @errorName(e);
-    defer lock.close(b.io);
-    if (cwd.access(b.io, s.dir, .{})) |_| return null else |_| {}
+    if (b.holdSeed(s.dir)) |held| {
+        if (held) return null;
+    } else |e| return @errorName(e);
+    {
+        const lock = ImageStore.lockDir(arena, b.io, s.dir, 2) catch |e| return @errorName(e);
+        defer lock.close(b.io);
+        if (cwd.access(b.io, s.dir, .{})) |_| {} else |_| if (b.buildSeed(s, as_runner)) |why| return why;
+    }
+    // Held as any job holds it, past the lock let go. Evicted in that moment, the job runs unseeded.
+    const held = b.holdSeed(s.dir) catch |e| return @errorName(e);
+    return if (held) null else "it was evicted as it was built";
+}
+
+/// Whether the seed `dir` is there, then held for the job (`ImageStore.holdDir`).
+fn holdSeed(b: *Backend, dir: []const u8) !bool {
+    const lock = try ImageStore.holdDir(b.arena, b.io, dir) orelse return false;
+    errdefer lock.close(b.io);
+    try b.held.append(b.arena, lock);
+    return true;
+}
+
+/// `seed`'s build, under the seed's lock, moved into place (`volumes.adoptSeed`); null when it
+/// worked, else why not.
+fn buildSeed(b: *Backend, s: volumes.Seed, as_runner: bool) ?[]const u8 {
+    const arena = b.arena;
     const script = b.test_seed_script orelse set_up.zigSeedScript(arena, s.seed) catch
         return "out of memory";
     const files = [_]sandbox.Spec.File{.{
@@ -2450,11 +2471,16 @@ test "a musl image is told by its /lib, never through a symlink" {
 
 /// `image` pulled into the store, or found there (`oci/image.zig`), within `pull_deadline`.
 fn pull(b: *Backend, image: []const u8, creds: ?registry.Credentials, why: *[]const u8) !oci.Image {
-    return pullAt(b.arena, b.gpa, b.io, b.store_cfg.root, b.how.userns == .mapped, image, creds, why);
+    const img = try pullAt(b.arena, b.gpa, b.io, b.store_cfg.root, b.how.userns == .mapped, image, creds, why);
+    errdefer img.lock.close(b.io);
+    // Held to the job's end, as its layers are: eviction leaves it alone (`evict.zig`).
+    try b.held.append(b.arena, img.lock);
+    return img;
 }
 
 /// `pull` without a job (`docker_action.unsupported`, which decides the backend before the job
-/// starts): into the store at `root`, with the image's owners when `owners` (a root runner).
+/// starts): into the store at `root`, with the image's owners when `owners` (a root runner). The
+/// caller closes the image's lock (`oci.Image.lock`).
 pub fn pullAt(
     arena: Allocator,
     gpa: Allocator,
@@ -2552,6 +2578,10 @@ fn provision(b: *Backend, img: oci.Image, script: []const u8, err_msg: *[]const 
             if (p.why.len > 0) p.why else @errorName(e),
         });
         return error.BaseContainerFailed;
+    };
+    b.held.append(arena, made.lock) catch |e| {
+        made.lock.close(b.io);
+        return e;
     };
     try b.notes.append(arena, if (made.made) try std.fmt.allocPrint(
         arena,

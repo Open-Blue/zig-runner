@@ -20,12 +20,13 @@
 # checks the store: the first job after the crash is the first of a boot (checkOncePerBoot); then
 # no layer that `open` accepts differs from what was published, nothing a job had finished and
 # synced is missing, and the same holds for `oci.Store.ensure`'s directory and `volumes.adoptSeed`'s
-# seed. A volume an eviction (`evict.run`) is taking is what its job left or is not there, the ones
-# it must not take are, and the next job's end finishes what a crash cut short. The last mark the log
-# passed says which jobs had finished.
+# seed. A volume or a tree an eviction (`evict.run`) is taking is what was left there or is not there,
+# the ones it must not take are, whatever links they share, and the next job's end finishes what a
+# crash cut short. The last mark the log passed says which jobs had finished.
 #
 # Checks of the check: the finished disk with a layer cut a byte short, with a byte changed, with a
-# volume half deleted under its own name and with an evicted one back must each fail it, or it would
+# volume half deleted under its own name, with an evicted one back and with a file gone from the
+# rootfs a job held must each fail it, or it would
 # pass whatever the store did. And the points must reach the eviction: a run with no point inside it
 # would pass whatever the eviction did, so one that saw no dead tree on any disk fails.
 #
@@ -126,7 +127,7 @@ crash() {
 	"$w/mark" start
 	mkdir "$w/mnt/w"
 	local step
-	for step in 1 2 3 4 5 6 7 8; do
+	for step in 1 2 3 4 5 6 7 8 9 10; do
 		store_test write "$w/mnt/w" "$step" >"$w/step.log" 2>&1 || {
 			cat "$w/step.log"
 			echo "::error title=Store crash::step $step of the sequence failed"
@@ -237,7 +238,7 @@ mount_point() {
 # the check must fail, or it checks nothing.
 controls() {
 	local how
-	for how in truncate flip halve undo; do
+	for how in truncate flip halve undo tree; do
 		restore "$1"
 		mount_point
 		store_test corrupt "$work/check/w" "$how" >/dev/null 2>&1

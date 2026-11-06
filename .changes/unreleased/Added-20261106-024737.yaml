@@ -1,0 +1,3 @@
+kind: Added
+body: 'Native images, provisioned rootfs, Zig cache seeds and blobs are evicted: past `RUNNER_NATIVE_IMAGES_MAX_MB` (8 GiB) together, or under the disk floor, the blobs go first, then what no job holds, the longest unused first, a rootfs before its image. A job holds each until it ends. Something used today stays, so the base image is not evicted on a loop.'
+time: 2026-11-06T02:47:37.364672285-05:00

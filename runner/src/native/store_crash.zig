@@ -9,7 +9,7 @@
 //! ZIG_TEST_STORE_CRASH is `MODE ROOT SCRATCH ARG`: ROOT is on the disk under test, SCRATCH is on
 //! another (what is expected is built there, never on the disk that crashes).
 //!
-//!   write   runs step ARG (1-8) of a sequence, as a job would, and marks the log at the points
+//!   write   runs step ARG (1-10) of a sequence, as a job would, and marks the log at the points
 //!           the checks need (ZIG_TEST_STORE_CRASH_MARK NAME):
 //!             1  a job publishes three small layers (`writeBack`, `syncEntries`) and syncs the layers' directory;
 //!             2  the next publishes a large one (over `sync_tree_max` entries: `syncfs`) and a small
@@ -21,7 +21,11 @@
 //!             6  `volumes.adoptSeed` makes a seed;
 //!             7  jobs fill three volumes (`volumes.open`) and the disk catches up, as it would;
 //!             8  `evict.run` under a cap evicts one, with another held by a job, and one more
-//!                pass goes on with what its deadline left of another.
+//!                pass goes on with what its deadline left of another;
+//!             9  an image (`oci.Store.ensure`), a rootfs flattened from it, whose files are its
+//!                image's by hard link, another unused, a seed and a blob;
+//!            10  `evict.run` under a cap evicts all of those but the rootfs a job holds, its image
+//!                among them, which must not reach the rootfs through the links they share.
 //!   verify  what a job finds on a disk put back to a point in the log: the first job after the
 //!           crash is a job after a reboot (`checkOncePerBoot`), and then no layer `open` accepts
 //!           differs from what was published (its tree's digest, its record), no directory
@@ -29,8 +33,8 @@
 //!           synced (ARG: the last mark the log passed) is missing, unless a collect may have
 //!           evicted it. Each volume is what its job left or is not there, never in between, and
 //!           the one a job held and the ones under the cap are there; one evicted stays evicted
-//!           once its pass ended. Then a pass finishes what a crash cut short: no dead tree, no
-//!           lock file without its volume.
+//!           once its pass ended. Each tree of steps 9 and 10 likewise. Then a pass finishes what a
+//!           crash cut short: no dead tree, no half-made tree's name, no lock file without its entry.
 //!   corrupt a layer changed on purpose (ARG: `truncate` or `flip`), or a volume half deleted under
 //!           its own name, as an eviction that deleted before it renamed would leave it (`halve`),
 //!           or evicted and back (`undo`), for the script to show that `verify` fails on each.
@@ -68,6 +72,16 @@ const vol_gone = "vol-gone";
 const vol_kept = "vol-kept";
 const vol_held = "vol-held";
 const vol_names = [_][]const u8{ vol_gone, vol_kept, vol_held };
+/// The trees of steps 9 and 10, by their place under the store. `made` is what the tree's content
+/// is named for; the held rootfs is the image's files and one of its own, as a provisioning leaves.
+const Tree = struct { dir: []const u8, made: []const u8, stays: bool = false };
+const trees = [_]Tree{
+    .{ .dir = "oci/images/img1", .made = "img1" },
+    .{ .dir = "rootfs/rf1", .made = "rf1", .stays = true },
+    .{ .dir = "rootfs/rf2", .made = "rf2" },
+    .{ .dir = "seeds/z2", .made = "z2" },
+};
+const blob_name = "b10b";
 
 fn keyOf(name: []const u8) Store.Key {
     var kh: Store.KeyHasher = .plain(name);
@@ -299,6 +313,58 @@ fn write(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: 
             s.limits.budget_ms = 60_000;
             evict.run(s, io);
         },
+        9 => {
+            const oci: OciStore = .{ .root = s.root };
+            try oci.prepare(arena, io);
+            var unused: u8 = 0;
+            const image = try oci.ensure(arena, io, "oci/images", "img1", .{ .ptr = &unused, .makeFn = makeImage });
+            image.lock.close(io);
+            var upper = try print(arena, "{s}/uppers/rf1", .{sp.root});
+            try cwd.createDirPath(io, upper);
+            try cwd.writeFile(io, .{ .sub_path = try print(arena, "{s}/own", .{upper}), .data = "rf1's own\n" });
+            flat_lower = try print(arena, "{s}/oci/images/img1/fs", .{s.root});
+            flat_upper = upper;
+            const rf1 = try oci.ensure(arena, io, "rootfs", "rf1", .{ .ptr = &unused, .makeFn = makeFlat });
+            rf1.lock.close(io);
+            const rf2 = try oci.ensure(arena, io, "rootfs", "rf2", .{ .ptr = &unused, .makeFn = makeOther });
+            rf2.lock.close(io);
+            upper = try print(arena, "{s}/uppers/z2", .{sp.root});
+            try makeTree(arena, io, upper, "z2");
+            try cwd.createDirPath(io, try print(arena, "{s}/seeds", .{s.root}));
+            // As `Backend.seed` makes one, under its lock.
+            const seed_lock = try OciStore.lockDir(arena, io, try print(arena, "{s}/seeds/z2", .{s.root}), 2);
+            defer seed_lock.close(io);
+            try volumes.adoptSeed(arena, io, upper, .{
+                .seed = .{ .version = "0.17.0", .sha256 = "" },
+                .dir = try print(arena, "{s}/seeds/z2", .{s.root}),
+                .cache = seed_cache,
+            }, try print(arena, "{s}/no-rootfs", .{s.root}), null);
+            try cwd.writeFile(io, .{
+                .sub_path = try print(arena, "{s}/oci/blobs/sha256/{s}", .{ s.root, blob_name }),
+                .data = "a blob",
+            });
+            for (trees, [_]i64{ 30, 30, 40, 20 }) |t, days|
+                try settle(arena, io, try print(arena, "{s}/{s}", .{ s.root, t.dir }), days);
+            if (linux.errno(linux.syncfs(s.sync_fd.?)) != .SUCCESS) return error.Sync;
+        },
+        10 => {
+            const rf1 = (try OciStore.holdDir(arena, io, try print(arena, "{s}/rootfs/rf1", .{s.root}))) orelse return error.NoRootfs;
+            defer rf1.close(io);
+            try settle(arena, io, try print(arena, "{s}/rootfs/rf1", .{s.root}), 30);
+            s.limits = .{
+                .images_max_bytes = 1,
+                .volumes_max_bytes = 0,
+                .min_free_pct = 0,
+                .idle_s = 0,
+                .recent_s = 0,
+                .budget_ms = -1,
+            };
+            try hook(io, env, mark_env, "before-trees");
+            evict.run(s, io);
+            try hook(io, env, mark_env, "trees-evicted");
+            s.limits.budget_ms = 60_000;
+            evict.run(s, io);
+        },
         else => return error.BadSpec,
     }
     try hook(io, env, mark_env, try print(arena, "after-{d}", .{step}));
@@ -326,6 +392,28 @@ fn settle(arena: Allocator, io: std.Io, dir: []const u8, days: i64) !void {
     });
 }
 
+/// `flatten`'s two sides for step 9, which `Maker` has no room for: `ptr` is unused.
+var flat_lower: []const u8 = "";
+var flat_upper: []const u8 = "";
+
+fn makeImage(_: *anyopaque, dir: []const u8) anyerror!void {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    try makeTree(a.allocator(), std.testing.io, try print(a.allocator(), "{s}/fs", .{dir}), "img1");
+}
+
+fn makeFlat(_: *anyopaque, dir: []const u8) anyerror!void {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    try OciStore.flatten(a.allocator(), std.testing.io, flat_lower, .{ .dir = flat_upper }, try print(a.allocator(), "{s}/fs", .{dir}));
+}
+
+fn makeOther(_: *anyopaque, dir: []const u8) anyerror!void {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    try makeTree(a.allocator(), std.testing.io, try print(a.allocator(), "{s}/fs", .{dir}), "rf2");
+}
+
 /// What `ensure` makes: the tree of the name "rootfs".
 fn makeRootfs(_: *anyopaque, dir: []const u8) anyerror!void {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -348,6 +436,10 @@ fn required(mark: []const u8) []const []const u8 {
         .{ .mark = "before-evict", .names = names[6..7] },
         .{ .mark = "evicted", .names = names[6..7] },
         .{ .mark = "after-8", .names = names[6..7] },
+        .{ .mark = "after-9", .names = names[6..7] },
+        .{ .mark = "before-trees", .names = names[6..7] },
+        .{ .mark = "trees-evicted", .names = names[6..7] },
+        .{ .mark = "after-10", .names = names[6..7] },
         .{ .mark = "synced", .names = names[6..7] },
     };
     for (table) |m| if (std.mem.eql(u8, m.mark, mark)) return m.names;
@@ -458,15 +550,18 @@ fn verify(arena: Allocator, io: std.Io, sp: Spec) !void {
         if (!std.mem.eql(u8, &got, &try expectedSeed(arena, io, sp.scratch)))
             try faults.add("adoptSeed published a seed that is not what was built", .{});
     }
+    const tree_dead = try verifyTrees(arena, io, s, sp, &faults);
     const vols = try verifyVolumes(arena, io, s, sp, &faults);
     std.debug.print("native store crash: after {s}: {d} layers hit, {d} directories published, whole, " ++
-        "{d} volumes, {d} dead\n", .{ sp.arg, hits, dirs, vols.there, vols.dead });
+        "{d} volumes, {d} dead\n", .{ sp.arg, hits, dirs, vols.there, vols.dead + tree_dead });
     try faults.done("verify");
 }
 
 /// `mark`, or one the log passed after it, in the order of the sequence's last step.
 fn past(mark: []const u8, of: []const u8) bool {
-    const order = [_][]const u8{ "after-7", "before-evict", "evicted", "after-8", "synced" };
+    const order = [_][]const u8{
+        "after-7", "before-evict", "evicted", "after-8", "after-9", "before-trees", "trees-evicted", "after-10", "synced",
+    };
     const m = for (order, 0..) |o, i| {
         if (std.mem.eql(u8, o, mark)) break i;
     } else return false;
@@ -474,6 +569,54 @@ fn past(mark: []const u8, of: []const u8) bool {
         if (std.mem.eql(u8, o, of)) break i;
     } else unreachable;
     return m >= w;
+}
+
+/// What the tree of step 9 named `made` holds, built in the scratch directory.
+fn expectedTree(arena: Allocator, io: std.Io, scratch: []const u8, t: Tree) !Store.Key {
+    const dir = try print(arena, "{s}/expected/tree-{s}", .{ scratch, t.made });
+    if (!exists(io, dir)) {
+        const fs = try print(arena, "{s}/fs", .{dir});
+        const eql = std.mem.eql;
+        if (eql(u8, t.made, "z2")) {
+            const zig = try print(arena, "{s}/{s}", .{ dir, seed_cache });
+            try makeTree(arena, io, zig, "z2");
+            try std.Io.Dir.cwd().createDirPath(io, try print(arena, "{s}/p", .{zig}));
+            for ([_][]const u8{ "root", "root/.cache", "root/.cache/zig/p" }) |d|
+                _ = linux.chmod(try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ dir, d }, 0), 0o755);
+        } else {
+            try makeTree(arena, io, fs, if (eql(u8, t.made, "rf2")) "rf2" else "img1");
+            if (eql(u8, t.made, "rf1"))
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try print(arena, "{s}/own", .{fs}), .data = "rf1's own\n" });
+        }
+    }
+    return digestOf(arena, io, dir);
+}
+
+/// Each tree is what was made or is gone, whatever stays is there, and what went stays gone once
+/// its pass had ended; the job's rootfs lost nothing to its image's eviction. How many dead trees
+/// the disk had. Then what a job's end does, which leaves none, and no half-made tree.
+fn verifyTrees(arena: Allocator, io: std.Io, s: Store, sp: Spec, faults: *Faults) !usize {
+    var dead: usize = 0;
+    for ([_][]const u8{ "rootfs", "oci/images", "seeds" }) |area|
+        dead += try countDead(arena, io, try print(arena, "{s}/{s}", .{ s.root, area }));
+    for (trees) |t| {
+        const dir = try print(arena, "{s}/{s}", .{ s.root, t.dir });
+        if (!exists(io, dir)) {
+            if (t.stays and past(sp.arg, "after-9"))
+                try faults.add("tree {s} is gone, which a job held (last mark {s})", .{ t.dir, sp.arg });
+            continue;
+        }
+        if (!past(sp.arg, "after-9")) continue;
+        if (!t.stays and past(sp.arg, "trees-evicted"))
+            try faults.add("tree {s} is back after its eviction's rename was synced (last mark {s})", .{ t.dir, sp.arg });
+        const got = digestOf(arena, io, dir) catch |e| {
+            try faults.add("tree {s} cannot be read: {s}", .{ t.dir, @errorName(e) });
+            continue;
+        };
+        if (!std.mem.eql(u8, &got, &try expectedTree(arena, io, sp.scratch, t)))
+            try faults.add("tree {s} is there, and not what was made: half evicted, or half made", .{t.dir});
+    }
+    return dead;
 }
 
 /// Each volume is what its job left or is gone, and whatever was evicted once its rename was
@@ -506,9 +649,23 @@ fn verifyVolumes(arena: Allocator, io: std.Io, s: Store, sp: Spec, faults: *Faul
     if (!exists(io, area)) return .{ .there = there, .dead = dead };
     // What the next job's end does, keeping everything that is not dead.
     var next = s;
-    next.limits = .{ .volumes_max_bytes = 0, .min_free_pct = 0 };
+    next.limits = .{ .volumes_max_bytes = 0, .images_max_bytes = 0, .min_free_pct = 0 };
     evict.run(next, io);
-    if (try countDead(arena, io, area) > 0) try faults.add("a dead tree outlived a pass", .{});
+    for ([_][]const u8{ "volumes", "rootfs", "oci/images", "seeds" }) |a|
+        if (try countDead(arena, io, try print(arena, "{s}/{s}", .{ s.root, a })) > 0)
+            try faults.add("a dead tree in {s} outlived a pass", .{a});
+    for (trees) |t| {
+        const dir = try print(arena, "{s}/{s}", .{ s.root, t.dir });
+        if (cwd.access(io, try print(arena, "{s}.lock", .{dir}), .{})) |_| {
+            if (!exists(io, dir)) {
+                // Its stray lock goes the pass after the one that swept what it was for.
+                evict.run(next, io);
+                if (cwd.access(io, try print(arena, "{s}.lock", .{dir}), .{})) |_| {
+                    try faults.add("the lock of tree {s} outlived a pass", .{t.dir});
+                } else |_| {}
+            }
+        } else |_| {}
+    }
     for (vol_names) |n| {
         const dir = try volumePath(arena, s.root, n);
         if (cwd.access(io, try print(arena, "{s}.lock", .{dir}), .{})) |_| {
@@ -535,13 +692,19 @@ fn countDead(arena: Allocator, io: std.Io, area: []const u8) !usize {
 }
 
 /// A layer's first file changed in place: shorter by a byte, or one byte different. Or what an
-/// eviction that lost its order would leave: a volume with a file gone under its own name, or
-/// one evicted that came back.
+/// eviction that lost its order would leave: a volume with a file gone under its own name, one
+/// evicted that came back, or the held rootfs's image's eviction reaching it.
 fn corrupt(arena: Allocator, io: std.Io, sp: Spec) !void {
     const cwd = std.Io.Dir.cwd();
     const root = try sp.store(arena);
     if (std.mem.eql(u8, sp.arg, "halve")) {
         const p = try print(arena, "{s}/f0", .{try volumePath(arena, root, vol_kept)});
+        try cwd.deleteFile(io, p);
+        std.debug.print("native store crash: removed {s}\n", .{p});
+        return;
+    }
+    if (std.mem.eql(u8, sp.arg, "tree")) {
+        const p = try print(arena, "{s}/rootfs/rf1/fs/f0", .{root});
         try cwd.deleteFile(io, p);
         std.debug.print("native store crash: removed {s}\n", .{p});
         return;

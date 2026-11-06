@@ -34,7 +34,8 @@
 //! backend builds it (`set_up.zigSeedScript`), and kept under `seeds/`. It sits between the
 //! rootfs and the job's layers, so what a job adds to its global cache goes in the job's own
 //! layers, as Dagger mounts the seed as a directory whose writes go with the container. Nothing a
-//! job wrote is in it, which is why one seed may go to every scope's jobs.
+//! job wrote is in it, which is why one seed may go to every scope's jobs. A job holds each seed it
+//! runs on until it ends (`Backend.holdSeed`), and `evict.zig` takes one no job holds.
 
 const std = @import("std");
 const builtin = @import("builtin");

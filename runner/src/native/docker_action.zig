@@ -53,7 +53,7 @@ pub fn unsupported(
     cfg: Backend.Config,
 ) !?[]const u8 {
     for (job.steps) |step| switch (step.action) {
-        .docker => |d| switch (try find(arena, gpa, io, cfg.images, cfg.store, d.image)) {
+        .docker => |d| switch (try find(arena, gpa, io, cfg.images, cfg.store, d.image, null)) {
             .missing => |why| return why,
             // GitHub's documentation asks for root ("Docker actions must be run by the default
             // Docker user"); Dagger's path gives another USER the directories it writes, which
@@ -72,6 +72,8 @@ pub fn unsupported(
 
 /// `ref`'s image: pulled natively into the store at `store` (P3, `Backend.pullAt`), or from the
 /// tests' directory when `dir` is set (`images.lookup`). A pull that fails is `missing`, with why.
+/// `held` is the job's list of locks (`Backend.held`), which keeps the image from eviction until
+/// the job ends; null when no job will use it.
 pub fn find(
     arena: Allocator,
     gpa: Allocator,
@@ -79,6 +81,7 @@ pub fn find(
     dir: []const u8,
     store: []const u8,
     ref: []const u8,
+    held: ?*std.ArrayList(std.Io.File),
 ) !images.Found {
     if (dir.len > 0) return images.lookup(arena, io, dir, ref);
     var why: []const u8 = "";
@@ -86,6 +89,10 @@ pub fn find(
     const img = Backend.pullAt(arena, gpa, io, store, owners, ref, null, &why) catch |e|
         return .{ .missing = try std.fmt.allocPrint(arena, "the image {s} could not be pulled " ++
             "natively: {s}", .{ ref, if (why.len > 0) why else @errorName(e) }) };
+    if (held) |h| h.append(arena, img.lock) catch |e| {
+        img.lock.close(io);
+        return e;
+    } else img.lock.close(io);
     return .{ .image = images.fromPulled(arena, io, img.rootfs, img.digest, img.manifest) catch
         return .{ .missing = try std.fmt.allocPrint(arena, "the image {s} has a config the " ++
             "runner cannot read", .{ref}) } };
@@ -105,7 +112,7 @@ pub fn run(
     const arena = b.arena;
     var img_lowers: []const []const u8 = &.{};
     const ref, const img = switch (dr.image) {
-        .pull => |r| .{ r, switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, r)) {
+        .pull => |r| .{ r, switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, r, &b.held)) {
             .image => |i| i,
             .missing => |why| {
                 _ = try x.actionFailed(num, "could not pull {s} for {s}: {s}", .{ r, dr.label, why });
@@ -330,7 +337,7 @@ fn planBuild(b: *Backend, bd: Build, ctx: []const u8, digests: bool) !struct { d
             return error.Refused;
         },
     };
-    const base = switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, base_ref)) {
+    const base = switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, base_ref, &b.held)) {
         .image => |i| i,
         .missing => |why| {
             b.build_reason = why;

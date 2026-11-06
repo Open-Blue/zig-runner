@@ -208,6 +208,7 @@ RUNNER_NATIVE_SUBID_BASE=1900000000               # default; at least 100000
 RUNNER_NATIVE_SUBNET=10.211.0.0/16                # default; a prefix of 8 to 23 bits
 RUNNER_NATIVE_STORE_MAX_MB=10240                  # default; the layer store's cap (P2)
 RUNNER_NATIVE_VOLUMES_MAX_MB=16384                # default; the cache volumes' cap, 0 for none ("Eviction")
+RUNNER_NATIVE_IMAGES_MAX_MB=8192                  # default; images', rootfs' and seeds' cap, 0 for none ("Eviction")
 RUNNER_NATIVE_MIN_FREE_PCT=10                     # default; the disk's floor, 0 for none ("Eviction")
 RUNNER_NATIVE_ROOTLESS=0                          # default; 1 for a rootless runner
 RUNNER_NATIVE_CGROUP=                             # default: /sys/fs/cgroup/zig-runner as root,
@@ -570,8 +571,6 @@ ordinary keyed step once the sandbox can idmap more than one lower.
 
 What it does not do yet (debt, with the phase that pays it):
 
-- **No eviction.** Blobs, images and provisioned rootfs are kept for ever: P2's LRU under a byte
-  cap (`collect`) sees only `layers/`, and should cover `oci/` and `rootfs/` too.
 - **Each image is flattened whole.** Two images that share layers share their blobs on disk but
   not their unpacked files. P2's stacked layers could keep layers apart.
 - **Layers are fetched one at a time**, and a broken download starts over. Parallel fetches are a
@@ -713,7 +712,7 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   layer, so a stored step whose `$GITHUB_PATH` or `$GITHUB_ENV` points into it runs again instead
   of replaying (`Exec.tool_cache`, `toolDirNotHeld`, #229): natively no tree is checked, so every
   such record does.
-- Debt: seeds are never evicted. A step whose processes still hold all of `pids.max` when its script
+- Debt: a step whose processes still hold all of `pids.max` when its script
   ends fails with exit 2 and loses its file commands: the wrapper's `sh`, the step's PID 1, cannot
   fork its epilogue (its log says the job reached its process limit). Fixing that needs a PID 1
   that reaps and kills a step's leftovers before the epilogue. The tool cache's checked trees (`set_up.verifyToolTrees`) and the seed
@@ -723,9 +722,11 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
 
 ### Eviction
 
-`runner/src/native/evict.zig` keeps what is beside `layers/` within limits of its own. It runs at the
-end of every job's `Store.collect`, under `gc.lock`, so one runner at a time does it and another
-finding it busy goes on; the proof of its locks is proofs/tla/StoreEviction.tla.
+`runner/src/native/evict.zig` keeps what is beside `layers/` within limits of its own: the cache
+volumes, and together the blobs, images, provisioned rootfs and Zig cache seeds, each directory of
+which has a lock file beside it. It runs at the end of every job's `Store.collect`, under `gc.lock`,
+so one runner at a time does it and another finding it busy goes on; the proof of its locks is
+proofs/tla/StoreEviction.tla.
 
 - **The cap.** Past `RUNNER_NATIVE_VOLUMES_MAX_MB` (16 GiB) of volumes, those no job holds go, the
   longest unused first. The last use is the mtime of the volume's lock file (`<volume>.lock`), set
@@ -733,12 +734,33 @@ finding it busy goes on; the proof of its locks is proofs/tla/StoreEviction.tla.
   job, never measured first, a volume in use again at most once an hour, for at most a second (10 s
   when it was never measured), never holding a lock, what it could not see left out. So the size
   lags, and only ever matters at the margin.
-- **An entry stays a day.** A volume used in the last 24 hours stays though the volumes are over
-  their cap, with a line in the runner's log. The cap is a target: a working set over it costs disk,
-  where evicting it would cost each job its caches, on a loop.
+- **Trees.** Past `RUNNER_NATIVE_IMAGES_MAX_MB` (8 GiB) of images, rootfs and seeds together, the
+  blobs go first, oldest first, as they only save a download of what is unpacked already or not
+  wanted since, and then the trees no job holds, the longest unused first. A tree's size is measured
+  as a volume's is, but only once; a file a rootfs shares with its image counts half to each. A job
+  holds its image and its rootfs from the moment it asks for them to its end (`oci.Store.hold`,
+  `ensure`, each in `Backend.held`), as it does each seed (`Backend.holdSeed`), and a service's or an
+  action's image.
+- **An image outlives its rootfs.** A rootfs is its image's files, by hard link, and a job that uses
+  a rootfs pulls its image first. So an image counts as used an hour later than it was, and the
+  rootfs goes first: an image evicted under a living rootfs would cost the next job a pull for
+  nothing, and the links it drops move the ctimes of the rootfs's files, which
+  `Store.rootfsFingerprint` hashes, so every layer on that rootfs would miss once after the next
+  restart. The rootfs itself loses nothing: an inode lives as long as one name does. Evicting a
+  rootfs still moves the ctimes of a sibling made from the same image, which has that cost, once.
+- **What a job sees after.** An evicted image is pulled again, needing the registry; an evicted
+  rootfs is provisioned again, under the same key; a rebuilt one has new inodes, so its fingerprint
+  is new, and every layer on it misses once and ages out under the cap. An evicted seed is built
+  again, needing its tarball, and a job that cannot build it runs unseeded with a note, as it always
+  could. These cost minutes, not results.
+- **An entry stays a day.** An entry used in the last 24 hours stays though its area is over its cap,
+  with a line in the runner's log. The cap is a target: a working set over it costs disk, where
+  evicting it would cost each job its caches or its base image, on a loop.
 - **The disk's floor.** With less than `RUNNER_NATIVE_MIN_FREE_PCT` of the store's filesystem free
-  (10), volumes go whatever the cap says, until that much is free or all that is left was used in the
-  last hour. This is what bounds the store on a machine smaller than its caps, with no setting.
+  (10), blobs, then entries of either kind, the longest unused first, go whatever the caps say, until
+  that much is free or all that is left was used in the last hour. This is what bounds the store on
+  a machine smaller than its caps, with no setting: 10 GiB of layers, 16 of volumes and 8 of images
+  fit a 128 GB card, and on a 32 GB one the floor does the work.
 - **A job in progress loses nothing.** A job holds each of its volumes' locks shared from
   `volumes.open` to its end. An eviction takes the lock exclusively and non-blocking, so a volume in
   use is skipped, on this runner or any other sharing the store; a `locked` one is in use the same
@@ -751,9 +773,11 @@ finding it busy goes on; the proof of its locks is proofs/tla/StoreEviction.tla.
   replayed whose script left something else in a volume, and a later step that needs it without
   saying so, would not find it, as on any other runner's first run of that step's successor: that
   rests on a job's own steps, and is the same case as Dagger's own GC of a volume.
-- **A crash at any point.** The volume is renamed to `volumes/.dead-<n>` and the rename synced before
-  anything of it is deleted, so a volume is what its job left or is gone, on a filesystem that
-  orders its journal or not. The lock file goes last, so whoever takes a lock checks it is the file
+- **A crash at any point.** The entry is renamed to `<area>/.dead-<n>` and the rename synced before
+  anything of it is deleted, by whichever runner finds it, so an entry is what was left there or is
+  gone, on a filesystem that orders its journal or not. A dead maker's `.tmp-<key>` or
+  `<name>.new-<n>` goes under the entry's free lock, which a live maker holds exclusively; a blob's
+  under `oci/blobs.lock`, which an unpack holds shared. The lock file goes last, so whoever takes a lock checks it is the file
   the path names (`Store.sameFile`), as `lockKey` does. A volume inside another (`<key>` and
   `<key>/runner`, when one store has had both step users) goes with it, under both locks; a job
   opening the inner one meanwhile waits, finds the path gone and starts over.
