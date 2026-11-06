@@ -898,6 +898,7 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
     // again. So under it a layer goes as the rest does (`evict.floor`), sparing recent use, and
     // only past the cap whatever its use.
     const keep = @min(s.max_bytes, total -| (Eviction.shortOf(arena, s) orelse 0));
+    const budget: Eviction.Budget = .init(io, s.limits.budget_ms);
     if (total > keep) {
         std.mem.sort(Entry, entries.items, {}, struct {
             fn lt(_: void, a: Entry, b: Entry) bool {
@@ -905,10 +906,15 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
             }
         }.lt);
         const recent = std.Io.Clock.real.now(io).toNanoseconds() - @as(i128, s.limits.recent_s) * std.time.ns_per_s;
+        var went = false;
         for (entries.items) |e| {
             if (total <= keep) break;
-            if (total <= s.max_bytes and e.used_ns >= recent) continue;
-            if (s.evict(arena, io, e.name)) total -|= e.bytes;
+            // Under the cap only the disk asks, and a pass has its time for that: the next goes on.
+            if (total <= s.max_bytes and (e.used_ns >= recent or (went and budget.late()))) continue;
+            if (s.evict(arena, io, e.name)) {
+                total -|= e.bytes;
+                went = true;
+            }
         }
     }
     s.dropKeyLocks(arena, io);
@@ -987,6 +993,17 @@ pub fn openPlain(arena: Allocator, path: []const u8) ?std.Io.File {
     return null;
 }
 
+/// `openPlain`, of the name in `dir`.
+pub fn openPlainAt(dir: linux.fd_t, name: [*:0]const u8) ?std.Io.File {
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true };
+    const rc = linux.openat(dir, name, flags, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return null;
+    if (isRegular(fd)) return .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    _ = linux.close(fd);
+    return null;
+}
+
 fn isRegular(fd: linux.fd_t) bool {
     var st: linux.Statx = undefined;
     return linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &st)) == .SUCCESS and
@@ -994,9 +1011,10 @@ fn isRegular(fd: linux.fd_t) bool {
 }
 
 /// The lock file `path`, made if it is not there, never through a symlink and with no wait on a
-/// FIFO: a lock beside a volume may be in a directory a job could write (`evict.innerLock`). What is
-/// there and is no regular file is no lock anyone holds, and is removed. The lock counts only once
-/// `sameFile` says so, as an eviction removes these.
+/// FIFO: a lock beside a volume may be in a directory a job could write (`evict.innerLock`). A
+/// symlink or a FIFO there is no lock anyone holds, and is removed. A directory is an error,
+/// `error.Locked`: it could hold anything, and is the outer volume's to lose. The lock counts only
+/// once `sameFile` says so, as an eviction removes these.
 pub fn lockBeside(arena: Allocator, io: std.Io, path: []const u8) !std.Io.File {
     const cwd = std.Io.Dir.cwd();
     const z = try arena.dupeSentinel(u8, path, 0);
@@ -1607,9 +1625,7 @@ pub fn layerDigest(s: Store, arena: Allocator, io: std.Io, key: Key, ids: Ids) !
 /// they share inodes with its image and siblings (`oci.Store.flatten`), so each file an eviction
 /// removes from any of those would move this digest, a little at each pass.
 pub fn rootfsFingerprint(arena: Allocator, io: std.Io, rootfs: []const u8, store: []const u8) !Key {
-    if (store.len > 0 and rootfs.len > store.len and rootfs[store.len] == '/' and
-        std.mem.startsWith(u8, rootfs, store))
-    {
+    if (storeTree(rootfs, store)) {
         var h: KeyHasher = .plain("a rootfs in the store");
         h.field(rootfs);
         h.field(&try rootIdentity(arena, rootfs));
@@ -1636,6 +1652,22 @@ pub fn rootfsFingerprint(arena: Allocator, io: std.Io, rootfs: []const u8, store
 /// The file, in the rootfs, that says it was provisioned again: touched after changing it in place
 /// (docs/native-backend.md, "The rootfs").
 pub const rootfs_stamp = ".zig-runner-provisioned";
+
+/// Whether `rootfs` is a tree the store made: `<store>/rootfs/<key>/rootfs` or
+/// `<store>/oci/images/<key>/rootfs`, and not whatever an operator keeps under it
+/// (`RUNNER_NATIVE_ROOTFS`), which changes in place and says so with its stamp.
+fn storeTree(rootfs: []const u8, store: []const u8) bool {
+    if (store.len == 0 or rootfs.len <= store.len + 1 or rootfs[store.len] != '/' or
+        !std.mem.startsWith(u8, rootfs, store)) return false;
+    const rel = rootfs[store.len + 1 ..];
+    const end = "/rootfs";
+    if (!std.mem.endsWith(u8, rel, end)) return false;
+    for ([_][]const u8{ "rootfs/", "oci/images/" }) |area| {
+        if (!std.mem.startsWith(u8, rel, area) or rel.len <= area.len + end.len) continue;
+        return std.mem.indexOfScalar(u8, rel[area.len .. rel.len - end.len], '/') == null;
+    }
+    return false;
+}
 
 /// A rootfs's root directory: which inode, since when.
 fn rootIdentity(arena: Allocator, rootfs: []const u8) !Key {
@@ -2669,6 +2701,32 @@ test "native store: under the disk's floor a layer goes though the store is unde
     s.collect(arena, io);
     try std.testing.expect(try s.open(arena, io, old) == null);
     (try s.open(arena, io, new)).?.layer.lock.close(io);
+}
+
+test "native store: under the disk's floor a pass takes what its budget allows of the layers" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    const t = [2]linux.timespec{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } };
+    for (0..20) |i| {
+        _, const l = try testLayer(arena, io, tmp, &s, try std.fmt.allocPrint(arena, "up{d}", .{i}));
+        const lock = try arena.dupeSentinel(u8, try join(arena, std.fs.path.dirname(l.fs).?, "lock"), 0);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.utimensat(linux.AT.FDCWD, lock, &t, 0)));
+        l.lock.close(io);
+    }
+    s.limits.min_free_pct = 100;
+    s.limits.budget_ms = 0;
+    s.collect(arena, io);
+    var left: usize = 0;
+    var d = try std.Io.Dir.cwd().openDir(io, try join(arena, s.root, "layers"), .{ .iterate = true });
+    defer d.close(io);
+    var it = d.iterate();
+    while (try it.next(io)) |_| left += 1;
+    try std.testing.expectEqual(@as(usize, 19), left);
 }
 
 test "native store: a key published already stays, and the second upper is put back where it was" {

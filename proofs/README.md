@@ -544,8 +544,10 @@ before it deletes anything there, whoever made the dead name (`StoreEviction-cra
 24 states). Syncing the area's directory alone, the first fix, was not enough: a volume's rename has
 another source directory, which a model that told the two apart showed in 25 states.
 
-**What it does not model**: sizes, the caps and the order of eviction (any entry may go, which
-over-approximates the LRU); the blobs, whose lock is a plain reader-writer lock; a volume's content,
+**What it does not model**: how `removeSome` goes through a dead tree (a tree goes in any order here;
+its descriptors, and the `.cut-` names that move what is deep to the top, are the code's and its
+tests'); time (a sync of any length is one step, so the budget is not here); sizes, the caps and the
+order of eviction (any entry may go, which over-approximates the LRU); the blobs, whose lock is a plain reader-writer lock; a volume's content,
 which no one synced and which is only a cache; and a published tree's data, synced before its rename
 as a layer's is, which `StoreLocking.tla` models for layers and the store's crash test runs on ext4.
 The bounds are small: three runners, one job each and a process crash, and two runners with a

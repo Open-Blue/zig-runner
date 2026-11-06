@@ -47,6 +47,7 @@ const set_up = @import("../dagger/set_up.zig");
 const sandbox = @import("sandbox.zig");
 const OciStore = @import("oci/Store.zig");
 const Store = @import("Store.zig");
+const evict = @import("evict.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -164,11 +165,13 @@ pub fn open(
     switch (linux.errno(linux.mkdir(at_z, 0o755))) {
         .SUCCESS => {},
         .EXIST => {
-            // Inside another volume, a job may have left anything at this name.
+            // The one name inside another volume, where a job may have left anything. Anywhere
+            // else no job reaches, and what is there is the store's.
             var st: linux.Statx = undefined;
             const rc = linux.statx(linux.AT.FDCWD, at_z, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &st);
             if (linux.errno(rc) != .SUCCESS) return error.VolumeNotMade;
             if (st.mode & linux.S.IFMT != linux.S.IFDIR) {
+                if (!std.mem.eql(u8, std.fs.path.basename(at), evict.nested)) return error.VolumeNotMade;
                 if (linux.errno(linux.unlink(at_z)) != .SUCCESS) return error.VolumeNotMade;
                 if (linux.errno(linux.mkdir(at_z, 0o755)) != .SUCCESS) return error.VolumeNotMade;
             }
@@ -182,12 +185,18 @@ pub fn open(
 
 /// One part of a volume's key as a directory name: the characters a repository's or a tool's
 /// name has (letters, digits, `.`, `-`, `_`) kept, any other turned into `-`, and a name that is
-/// empty or all dots prefixed with `_`, so no part is `.`, `..` or a path.
+/// empty or starts with a dot prefixed with `_`, so no part is `.`, `..` or a path. A job chooses
+/// its image, and so a part of its key: none may read as what the store keeps beside a volume or
+/// calls one that is going (`.lock`, `.size`, `.private-<n>`, `.dead-<n>`), or its sibling would
+/// take it for that.
 pub fn component(arena: Allocator, part: []const u8) ![]const u8 {
     var out = try arena.alloc(u8, part.len);
     for (part, 0..) |c, i| out[i] = if (std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or
         c == '_') c else '-';
-    if (std.mem.indexOfNone(u8, out, ".") == null) return std.mem.concat(arena, u8, &.{ "_", out });
+    while (std.mem.indexOf(u8, out, ".private-")) |at| out[at] = '-';
+    if (out.len == 0 or out[0] == '.') out = try std.mem.concat(arena, u8, &.{ "_", out });
+    if (std.mem.endsWith(u8, out, ".lock") or std.mem.endsWith(u8, out, ".size"))
+        out = try std.mem.concat(arena, u8, &.{ out, "_" });
     return out;
 }
 
@@ -444,7 +453,7 @@ pub fn adoptSeed(
     const p = try std.fmt.allocPrintSentinel(arena, "{s}/p", .{into}, 0);
     _ = linux.mkdir(p, 0o755);
     if (user) |u| _ = linux.lchown(p, u, u);
-    // A seed's key is its path alone, so nothing below would notice one a crash emptied.
+    // Nothing below would notice a seed a crash emptied: a key says which build it is, not what it holds.
     try OciStore.syncFilesystem(arena, new);
     cwd.rename(new, cwd, seed.dir, io) catch |e| switch (e) {
         error.DirNotEmpty => {

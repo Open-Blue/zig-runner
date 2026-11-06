@@ -13,8 +13,8 @@
 //!
 //! Nothing here blocks a job. A job waits on an entry's lock only for the moment of the rename,
 //! and on nothing else: the walks and the deletes hold no entry's lock. All of it runs at a job's
-//! end, within a budget of time (`Limits.budget_ms`), but for the syncs of what is dead, which take
-//! what the disk takes: what a deadline cut short stays under its
+//! end, within a budget of time (`Limits.budget_ms`), which starts after the sync of what is dead,
+//! as that takes what the disk takes: what a deadline cut short stays under its
 //! dead name, the next job's collect goes on with it, and nothing more is evicted until it is
 //! gone. So what eviction has freed is known before it frees more.
 //!
@@ -67,15 +67,17 @@ pub const Limits = struct {
 /// walk cut short records what it saw: too small, and only ever too small.
 const measure_new_ms = 10_000;
 const measure_again_ms = 1000;
+/// What a pass removes of a dead tree however late it is.
+const least_removed = 64;
 /// What a walk may keep in memory of the directories' paths.
 const measure_max_stack = 16 * 1024 * 1024;
 /// The most entries of an area looked at, so a store's size bounds the pass's memory.
 const max_entries = 16 * 1024;
-/// How deep `volumes/` goes above a volume: `<owner>/<repository>/<scope>/<name>/<image>/runner`.
-const max_key_depth = 7;
+/// How deep a key goes, from `<owner>`, 0: `<owner>/<repository>/<scope>/<name>/<image>/runner`.
+const max_key_depth = 5;
 /// The name a step user's volume adds below its key (`dagger.runner_user`): the only volume that
 /// can be inside another's directory (`volumes.plan`).
-const nested = "runner";
+pub const nested = "runner";
 
 const lock_ex: i32 = 2;
 const lock_nb: i32 = 4;
@@ -119,34 +121,36 @@ pub fn run(s: Store, io: std.Io) void {
     defer pass.deinit();
     const arena = pass.allocator();
     const lim = s.limits;
-    const budget: Budget = .init(io, lim.budget_ms);
-    // What a deadline left first: nothing more goes until what already went is gone. Not synced
-    // by this pass: a runner that died may not have synced it either.
-    for (all_areas) |a| if (!removeDead(arena, io, s.root, a, .sync, budget)) return;
+    // What a deadline left first: nothing more goes until what already went is gone. Synced first,
+    // and once: a runner that died may not have synced it, and a slow disk must not take what the
+    // pass has for deleting, or the worse the disk the less would ever go.
+    var synced = syncDead(arena, io, s.root);
+    var budget: Budget = .init(io, lim.budget_ms);
+    if (synced) for (all_areas) |a| if (!removeDead(arena, io, s.root, a, &budget)) return;
     const vols = listVolumes(arena, io, s.root) catch return;
-    const trees = listTrees(arena, io, s.root, budget) catch return;
+    const trees = listTrees(arena, io, s.root, &budget) catch return;
     measureOne(arena, io, vols, lim.remeasure_s);
     measureOne(arena, io, trees, lim.remeasure_s);
     var blobs = listBlobs(arena, io, s.root) catch return;
-    var evicted = capped(arena, io, s.root, vols, lim.volumes_max_bytes, 0, lim, budget, "volumes");
+    var evicted = capped(arena, io, s.root, vols, lim.volumes_max_bytes, 0, lim, &budget, &synced, "volumes");
     // A blob only saves a download, of an image already unpacked or not wanted since.
     var tree_bytes: u64 = 0;
     for (trees) |e| tree_bytes +|= e.bytes;
     const over_by = (tree_bytes +| blobs.bytes) -| lim.images_max_bytes;
     // An image unpacking has the blobs: it may be what took the area over, so wait for its end.
     if (lim.images_max_bytes > 0 and over_by > 0 and blobs.evict(arena, io, s.root, over_by))
-        evicted = capped(arena, io, s.root, trees, lim.images_max_bytes, blobs.bytes, lim, budget, "images") or evicted;
+        evicted = capped(arena, io, s.root, trees, lim.images_max_bytes, blobs.bytes, lim, &budget, &synced, "images") or evicted;
     if (shortOf(arena, s)) |short| {
         var left = short;
         const before = blobs.bytes;
         _ = blobs.evict(arena, io, s.root, left);
         left -|= before - blobs.bytes;
         const all = std.mem.concat(arena, Entry, &.{ vols, trees }) catch return;
-        evicted = floor(arena, io, s.root, all, &left, lim, budget) or evicted;
+        evicted = floor(arena, io, s.root, all, &left, lim, &budget, &synced) or evicted;
     }
     if (evicted) {
         dropRefs(arena, io, s.root);
-        for (all_areas) |a| if (!removeDead(arena, io, s.root, a, .synced, budget)) return;
+        if (synced) for (all_areas) |a| if (!removeDead(arena, io, s.root, a, &budget)) return;
     }
 }
 
@@ -158,15 +162,16 @@ pub fn shortOf(arena: Allocator, s: Store) ?u64 {
 /// Entries evicted, the longest unused first, until `left` bytes are gone, sparing what was used
 /// in the last `recent_s`; whether any was. A size not known is measured first: an upgrade on a
 /// nearly full disk finds nothing measured, and counting those as 0 would take them all. What a
-/// walk cut short is the last to go in this pass, as how much it freed is not known.
-fn floor(arena: Allocator, io: std.Io, root: []const u8, entries: []Entry, left: *u64, lim: Limits, budget: Budget) bool {
+/// walk cut short is the last to go in this pass, as how much it freed is not known. The deadline
+/// counts from the first walk: each costs up to `measure_again_ms`.
+fn floor(arena: Allocator, io: std.Io, root: []const u8, entries: []Entry, left: *u64, lim: Limits, budget: *const Budget, synced: *bool) bool {
     std.mem.sort(Entry, entries, {}, olderFirst);
     var evicted = false;
     for (entries) |*e| {
-        if (left.* == 0 or (evicted and budget.spent())) break;
+        if (left.* == 0 or (budget.late() and (evicted or e.measured_s == 0))) break;
         if (e.private or lim.recent_s > now(io) - e.used_s) continue;
         const whole = e.measured_s != 0 or measure(arena, io, e, measure_again_ms);
-        if (!evictEntry(arena, io, root, e.*)) continue;
+        if (!evictEntry(arena, io, root, e.*, synced)) continue;
         evicted = true;
         left.* -|= e.bytes;
         if (!whole) break;
@@ -179,16 +184,32 @@ fn now(io: std.Io) i64 {
 }
 
 /// A deadline in the awake clock, cheap enough to ask at every entry.
-const Budget = struct {
+pub const Budget = struct {
     io: std.Io,
     deadline_ms: i64,
+    /// What removal takes whatever the clock says, so that a pass always frees something.
+    least: u32,
 
-    fn init(io: std.Io, ms: i64) Budget {
-        return .{ .io = io, .deadline_ms = std.Io.Clock.awake.now(io).toMilliseconds() + ms };
+    /// A deadline `ms` from now. Past it from the start (`ms` negative) it leaves removal nothing.
+    pub fn init(io: std.Io, ms: i64) Budget {
+        return .{
+            .io = io,
+            .deadline_ms = std.Io.Clock.awake.now(io).toMilliseconds() + ms,
+            .least = if (ms < 0) 0 else least_removed,
+        };
     }
 
-    fn spent(b: Budget) bool {
+    pub fn late(b: Budget) bool {
         return std.Io.Clock.awake.now(b.io).toMilliseconds() >= b.deadline_ms;
+    }
+
+    /// Whether removal should stop.
+    fn spent(b: Budget) bool {
+        return b.least == 0 and b.late();
+    }
+
+    fn took(b: *Budget) void {
+        b.least -|= 1;
     }
 };
 
@@ -200,11 +221,11 @@ fn olderFirst(_: void, a: Entry, b: Entry) bool {
 /// whether any was. One not measured yet is left, as what taking it would free is not known. A dead
 /// runner's private copy goes first, cap or no cap. Each eviction syncs a directory, so the budget
 /// counts here too.
-fn capped(arena: Allocator, io: std.Io, root: []const u8, entries: []Entry, max: u64, other: u64, lim: Limits, budget: Budget, what: []const u8) bool {
+fn capped(arena: Allocator, io: std.Io, root: []const u8, entries: []Entry, max: u64, other: u64, lim: Limits, budget: *const Budget, synced: *bool, what: []const u8) bool {
     var total: u64 = other;
     for (entries) |e| total +|= e.bytes;
     var evicted = false;
-    for (entries) |e| if (e.private and evictEntry(arena, io, root, e)) {
+    for (entries) |e| if (e.private and evictEntry(arena, io, root, e, synced)) {
         total -|= e.bytes;
         evicted = true;
     };
@@ -212,9 +233,9 @@ fn capped(arena: Allocator, io: std.Io, root: []const u8, entries: []Entry, max:
     std.mem.sort(Entry, entries, {}, olderFirst);
     const t = now(io);
     for (entries) |e| {
-        if (total <= max or (evicted and budget.spent())) break;
+        if (total <= max or (evicted and budget.late())) break;
         if (e.private or e.measured_s == 0 or t - e.used_s < lim.idle_s) continue;
-        if (!evictEntry(arena, io, root, e)) continue;
+        if (!evictEntry(arena, io, root, e, synced)) continue;
         total -|= e.bytes;
         evicted = true;
     }
@@ -255,7 +276,7 @@ const Statfs = extern struct {
 /// The entries of the tree areas, what dead runners left of a tree they were making, and stray
 /// lock files and sizes removed on the way: `.tmp-<key>` (`ensure`), `<name>.new-<n>`
 /// (`volumes.adoptSeed`), each under the entry's lock, which its maker holds while it lives.
-fn listTrees(arena: Allocator, io: std.Io, root: []const u8, budget: Budget) ![]Entry {
+fn listTrees(arena: Allocator, io: std.Io, root: []const u8, budget: *Budget) ![]Entry {
     var out: std.ArrayList(Entry) = .empty;
     for (tree_areas) |a| {
         const dir_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, a });
@@ -290,7 +311,7 @@ fn listTrees(arena: Allocator, io: std.Io, root: []const u8, budget: Budget) ![]
 
 /// `tree`, a dead maker's, removed if the lock of the entry it was for is free: as far as the
 /// budget goes, and the next pass finds the rest.
-fn dropUnfinished(arena: Allocator, io: std.Io, tree: []const u8, entry: []const u8, budget: Budget) void {
+fn dropUnfinished(arena: Allocator, io: std.Io, tree: []const u8, entry: []const u8, budget: *Budget) void {
     const lock_path = std.fmt.allocPrint(arena, "{s}.lock", .{entry}) catch return;
     const lock = Store.lockBeside(arena, io, lock_path) catch return;
     defer lock.close(io);
@@ -380,7 +401,8 @@ fn listVolumes(arena: Allocator, io: std.Io, root: []const u8) ![]Entry {
 
 /// The volumes under `dir`, a directory of a key's upper parts. A directory with a lock beside it
 /// is a volume, a job's own content, which is never looked into: a volume inside it goes with it
-/// (`innerLock`). One without is a part of a key, which no job can reach.
+/// (`innerLock`). One without is a part of a key, which no job can reach, so it must look like one:
+/// the runner's own, and where a key has parts. Below the name, only an image's and the step user's.
 fn walkKeys(arena: Allocator, io: std.Io, dir: []const u8, out: *std.ArrayList(Entry), depth: u32) !void {
     if (depth > max_key_depth) return;
     var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true, .follow_symlinks = false }) catch return;
@@ -392,6 +414,7 @@ fn walkKeys(arena: Allocator, io: std.Io, dir: []const u8, out: *std.ArrayList(E
         try names.append(arena, try arena.dupe(u8, e.name));
     }
     for (names.items) |n| {
+        if (depth == max_key_depth and !std.mem.startsWith(u8, n, nested)) continue;
         const full = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, n });
         // By what it is: a repository may be named `x.lock`.
         if (!isDir(arena, full)) {
@@ -405,7 +428,7 @@ fn walkKeys(arena: Allocator, io: std.Io, dir: []const u8, out: *std.ArrayList(E
             continue;
         }
         if (!isFile(arena, try std.fmt.allocPrint(arena, "{s}.lock", .{full}))) {
-            try walkKeys(arena, io, full, out, depth + 1);
+            if (runners(arena, full)) try walkKeys(arena, io, full, out, depth + 1);
             continue;
         }
         if (out.items.len >= max_entries) return;
@@ -435,9 +458,15 @@ fn entryOf(arena: Allocator, io: std.Io, dir: []const u8, area: []const u8, volu
     return e;
 }
 
+/// Whether `p` is the runner's own: a volume's root is the volumes' range on a root runner.
+fn runners(arena: Allocator, p: []const u8) bool {
+    var st: linux.Statx = undefined;
+    return lstat(arena, p, &st) and st.uid == linux.geteuid();
+}
+
 fn lstat(arena: Allocator, p: []const u8, st: *linux.Statx) bool {
     const z = arena.dupeSentinel(u8, p, 0) catch return false;
-    const mask: linux.STATX = .{ .TYPE = true, .MTIME = true };
+    const mask: linux.STATX = .{ .TYPE = true, .MTIME = true, .UID = true };
     return linux.errno(linux.statx(linux.AT.FDCWD, z, linux.AT.SYMLINK_NOFOLLOW, mask, st)) == .SUCCESS;
 }
 
@@ -485,7 +514,8 @@ fn lockOf(arena: Allocator, io: std.Io, dir: []const u8) ?std.Io.File {
 const Inner = union(enum) {
     /// A job holds it: the outer one stays.
     held,
-    /// No job can: nothing regular can be made at its lock's name.
+    /// No job can: its lock's name is taken by a directory, or the volume's own by something else,
+    /// and `volumes.open` could make no lock there either.
     none,
     locked: linux.fd_t,
 };
@@ -520,9 +550,11 @@ fn innerLock(dir: linux.fd_t) Inner {
                 _ = linux.fchmod(dir, 0o700);
                 continue;
             },
-            else => return .none,
+            .ISDIR, .NOTDIR => return .none,
+            // Whatever else, a job may hold it for all this can tell: out of descriptors, say.
+            else => return .held,
         }
-        const fd = std.math.cast(linux.fd_t, rc) orelse return .none;
+        const fd = std.math.cast(linux.fd_t, rc) orelse return .held;
         var st: linux.Statx = undefined;
         const mask: linux.STATX = .{ .TYPE = true, .INO = true };
         if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, mask, &st)) != .SUCCESS or
@@ -544,21 +576,50 @@ fn innerLock(dir: linux.fd_t) Inner {
     return .held;
 }
 
+/// The directory that holds `dir`, a path under `root`, opened a part at a time through no
+/// symlink, or null, also when any part is a volume: what is in one is a job's. All it does to the
+/// entry goes through this, so nothing it saw can be swapped under it for another path.
+fn openHolder(arena: Allocator, root: []const u8, dir: []const u8) ?linux.fd_t {
+    if (dir.len <= root.len or !std.mem.startsWith(u8, dir, root)) return null;
+    var fd = Store.openRoot(arena, root) catch return null;
+    var parts = std.mem.splitScalar(u8, std.fs.path.dirname(dir[root.len + 1 ..]) orelse "", '/');
+    while (parts.next()) |part| {
+        const up = fd;
+        defer _ = linux.close(up);
+        var lock: std.ArrayList(u8) = .empty;
+        lock.print(arena, "{s}.lock\x00", .{part}) catch return null;
+        const z = lock.items[0 .. lock.items.len - 1 :0];
+        var st: linux.Statx = undefined;
+        if (linux.errno(linux.statx(up, z, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &st)) == .SUCCESS) return null;
+        fd = Store.openDirAt(up, (arena.dupeSentinel(u8, part, 0) catch return null).ptr) catch return null;
+    }
+    return fd;
+}
+
 /// Evicts one entry no job holds: under its lock, with the lock of the volume inside it if it can
-/// have one, renamed away and the rename synced. False when a job holds it, or it went already.
-/// The tree itself is `removeDead`'s, after the locks are let go: a job starting now has to wait
-/// for the rename, not for the delete.
-fn evictEntry(arena: Allocator, io: std.Io, root: []const u8, e: Entry) bool {
-    const cwd = std.Io.Dir.cwd();
-    const lock = lockOf(arena, io, e.dir) orelse return false;
+/// have one, renamed away and the rename synced, each through a descriptor. False when a job holds
+/// it, or it went already. The tree itself is `removeDead`'s, after the locks are let go: a job
+/// starting now has to wait for the rename, not for the delete. `synced` goes false when the
+/// rename may not be on disk, so nothing of it is deleted until a sync says it is.
+fn evictEntry(arena: Allocator, io: std.Io, root: []const u8, e: Entry, synced: *bool) bool {
+    const from = openHolder(arena, root, e.dir) orelse return false;
+    defer _ = linux.close(from);
+    const area = Store.openRoot(arena, std.fmt.allocPrint(arena, "{s}/{s}", .{ root, e.area }) catch return false) catch return false;
+    defer _ = linux.close(area);
+    const base = arena.dupeSentinel(u8, std.fs.path.basename(e.dir), 0) catch return false;
+    const lock_name = std.fmt.allocPrintSentinel(arena, "{s}.lock", .{base}, 0) catch return false;
+    const size_name = std.fmt.allocPrintSentinel(arena, "{s}.size", .{base}, 0) catch return false;
+    const lock = Store.openPlainAt(from, lock_name) orelse return false;
     defer lock.close(io);
-    const lock_path = std.fmt.allocPrint(arena, "{s}.lock", .{e.dir}) catch return false;
-    if (!flock(lock, lock_ex | lock_nb) or !Store.sameFile(arena, lock, lock_path)) return false;
-    // Used since the walk saw it, or become a part of a key's volume since (`walkKeys`).
-    if (mtime(arena, lock_path) != e.used_s) return false;
-    const up = std.fs.path.dirname(e.dir) orelse return false;
-    if (isFile(arena, std.fmt.allocPrint(arena, "{s}.lock", .{up}) catch return false)) return false;
-    const fd = Store.openRoot(arena, e.dir) catch return false;
+    if (!flock(lock, lock_ex | lock_nb)) return false;
+    // On the file the name is now, and it not used since the walk.
+    var held: linux.Statx = undefined;
+    var named: linux.Statx = undefined;
+    const mask: linux.STATX = .{ .INO = true, .MTIME = true };
+    if (linux.errno(linux.statx(lock.handle, "", linux.AT.EMPTY_PATH, mask, &held)) != .SUCCESS or
+        linux.errno(linux.statx(from, lock_name, linux.AT.SYMLINK_NOFOLLOW, mask, &named)) != .SUCCESS or
+        held.ino != named.ino or named.mtime.sec != e.used_s) return false;
+    const fd = Store.openDirAt(from, base) catch return false;
     defer _ = linux.close(fd);
     const inner: Inner = if (e.volume) innerLock(fd) else .none;
     defer switch (inner) {
@@ -566,42 +627,50 @@ fn evictEntry(arena: Allocator, io: std.Io, root: []const u8, e: Entry) bool {
         else => {},
     };
     if (inner == .held) return false;
-    const dead = deadName(arena, io, root, e.area) catch return false;
-    cwd.rename(e.dir, cwd, dead, io) catch return false;
-    syncDirOf(arena, e.dir);
-    syncDirOf(arena, dead);
-    forget(arena, io, e.dir);
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    var dead: [32:0]u8 = undefined;
+    const dead_name = std.fmt.bufPrintSentinel(&dead, ".dead-{s}", .{&std.fmt.bytesToHex(raw, .lower)}, 0) catch return false;
+    if (linux.errno(linux.renameat(from, base, area, dead_name)) != .SUCCESS) return false;
+    for ([_]linux.fd_t{ from, area }) |d| if (linux.errno(linux.fsync(d)) != .SUCCESS) {
+        std.log.warn("native: cannot sync a directory of {s}; what went from there stays until it can be", .{root});
+        synced.* = false;
+    };
+    _ = linux.unlinkat(from, lock_name, 0);
+    _ = linux.unlinkat(from, size_name, 0);
     return true;
 }
 
-fn deadName(arena: Allocator, io: std.Io, root: []const u8, area: []const u8) ![]const u8 {
-    var raw: [8]u8 = undefined;
-    io.random(&raw);
-    return std.fmt.allocPrint(arena, "{s}/{s}/.dead-{s}", .{ root, area, &std.fmt.bytesToHex(raw, .lower) });
-}
+/// How long `syncDead` takes on top of the sync, and how many it made. Tests.
+var test_sync_ms: i64 = 0;
+var test_syncs: u32 = 0;
 
-/// The directory `path` is in, synced: a rename that a crash could undo must be on disk before
-/// the tree it moved loses a file, or the old name would come back on a tree half gone.
-fn syncDirOf(arena: Allocator, path: []const u8) void {
-    const parent = std.fs.path.dirname(path) orelse return;
-    const z = arena.dupeSentinel(u8, parent, 0) catch return;
-    const rc = linux.open(z, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
-    if (linux.errno(rc) != .SUCCESS) return;
-    const fd = std.math.cast(linux.fd_t, rc) orelse return;
-    defer _ = linux.close(fd);
-    if (linux.errno(linux.fsync(fd)) != .SUCCESS)
-        std.log.warn("native: cannot sync {s}", .{parent});
+/// The filesystem synced if anything is under a dead name, so that a rename it was given by is on
+/// disk before anything of it is deleted: the runner that renamed it may have died before it
+/// synced (`evictEntry`), and which directory it came from is not known here. Once, a pass; it
+/// takes what the disk takes, which no budget can bound. Whether it is safe to delete.
+fn syncDead(arena: Allocator, io: std.Io, root: []const u8) bool {
+    for (all_areas) |a| {
+        const dir_path = std.fmt.allocPrint(arena, "{s}/{s}", .{ root, a }) catch return false;
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch null) |e| {
+            if (!std.mem.startsWith(u8, e.name, ".dead-")) continue;
+            if (test_sync_ms > 0) io.sleep(.fromMilliseconds(test_sync_ms), .awake) catch {};
+            test_syncs += 1;
+            if (linux.errno(linux.syncfs(dir.handle)) == .SUCCESS) return true;
+            std.log.warn("native: cannot sync {s}; what is dead there stays until it can be", .{dir_path});
+            return false;
+        }
+    }
+    return true;
 }
-
-/// Whether what is under a dead name is known to be there for good: the runner that renamed it
-/// may have died before it synced the rename (`evictEntry`), and which directory it came from is
-/// not known here, so `.sync` syncs the filesystem. Once, a pass.
-const Renames = enum { sync, synced };
 
 /// Every `.dead-` entry of the area removed, as far as the budget goes. False only when the budget
 /// stopped it, which tells the pass to free no more yet: one that cannot be removed is logged and
 /// stops nothing, or it would stop every eviction for good.
-fn removeDead(arena: Allocator, io: std.Io, root: []const u8, name: []const u8, renames: Renames, budget: Budget) bool {
+fn removeDead(arena: Allocator, io: std.Io, root: []const u8, name: []const u8, budget: *Budget) bool {
     const dir_path = std.fmt.allocPrint(arena, "{s}/{s}", .{ root, name }) catch return false;
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return true;
     defer dir.close(io);
@@ -610,11 +679,6 @@ fn removeDead(arena: Allocator, io: std.Io, root: []const u8, name: []const u8, 
     while (it.next(io) catch null) |e| {
         if (!std.mem.startsWith(u8, e.name, ".dead-")) continue;
         dead.append(arena, arena.dupe(u8, e.name) catch return false) catch return false;
-    }
-    if (dead.items.len == 0) return true;
-    if (renames == .sync and linux.errno(linux.syncfs(dir.handle)) != .SUCCESS) {
-        std.log.warn("native: cannot sync {s}; what is dead there stays until it can be", .{dir_path});
-        return true;
     }
     for (dead.items) |n| {
         const p = std.fmt.allocPrint(arena, "{s}/{s}", .{ dir_path, n }) catch return false;
@@ -629,15 +693,19 @@ fn removeDead(arena: Allocator, io: std.Io, root: []const u8, name: []const u8, 
 
 const Removal = enum { gone, spent, stuck };
 
-/// How deep `removeSome` goes before it moves the directory it is in up to the tree's top.
-const max_chain = 512;
+/// How many directories `removeSome` keeps open on its way down.
+const max_chain = 32;
 
-/// As much of the tree `path` removed as `budget` allows, a directory's entries before it, with two
-/// descriptors open and no path kept, to any depth, through no symlink. Nothing else uses a dead
-/// tree. What the budget leaves stays under the dead name for a later call, which starts at the
-/// top: so what is deep is moved up on the way down, in pieces of `max_chain`, or a chain deeper
-/// than a pass can walk would never lose a directory. A name that is no directory just goes.
-fn removeSome(arena: Allocator, path: []const u8, io: std.Io, budget: Budget) Removal {
+/// As much of the tree `path` removed as `budget` allows, a directory's entries before it, to any
+/// depth, through no symlink. It goes down by name and back by the descriptors it came through, up
+/// to `max_chain` of them, never by `..`: so nothing it does can reach above the tree, whatever is
+/// moved meanwhile, though nothing should touch a dead tree. Deeper than that, the directory it
+/// is about to enter moves up to the tree's top under a name of its own, and the walk goes on from
+/// there: what the budget leaves stays under the dead name for a later call, which starts at the
+/// top, so a chain deeper than a pass can walk loses some of itself every pass. The name is random,
+/// as a job can read its inodes and plant any name it can work out. A name that is no directory
+/// just goes.
+fn removeSome(arena: Allocator, path: []const u8, io: std.Io, budget: *Budget) Removal {
     const up_path = std.fs.path.dirname(path) orelse return .stuck;
     const up = Store.openRoot(arena, up_path) catch return .stuck;
     defer _ = linux.close(up);
@@ -647,18 +715,16 @@ fn removeSome(arena: Allocator, path: []const u8, io: std.Io, budget: Budget) Re
         .ISDIR, .PERM => {},
         else => return .stuck,
     }
-    _ = linux.fchmodat(up, base, 0o700);
-    const root = Store.openDirAt(up, base) catch return .stuck;
-    defer _ = linux.close(root);
-    var top: linux.Statx = undefined;
-    if (linux.errno(linux.statx(root, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &top)) != .SUCCESS) return .stuck;
-    var cur = root;
-    defer if (cur != root) {
-        _ = linux.close(cur);
+    chmodDir(up, base);
+    var chain: [max_chain]linux.fd_t = undefined;
+    chain[0] = Store.openDirAt(up, base) catch return .stuck;
+    var held: usize = 1;
+    defer for (chain[0..held]) |fd| {
+        _ = linux.close(fd);
     };
-    var depth: u32 = 0;
     var name: [256:0]u8 = undefined;
     while (true) {
+        const cur = chain[held - 1];
         const down = emptyOut(io, cur, &name, budget) catch |e| {
             if (e == error.Spent) return .spent;
             std.log.warn("native: cannot remove all of {s}: {t}", .{ path, e });
@@ -666,41 +732,60 @@ fn removeSome(arena: Allocator, path: []const u8, io: std.Io, budget: Budget) Re
         };
         if (down) |n| {
             const child = Store.openDirAt(cur, n) catch return .stuck;
-            var st: linux.Statx = undefined;
-            depth += 1;
-            if (depth >= max_chain and linux.errno(linux.statx(child, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &st)) == .SUCCESS) {
-                var cut: [32:0]u8 = undefined;
-                // Refused when a name so is there already: it is only deeper for now.
-                if (std.fmt.bufPrintSentinel(&cut, ".cut-{d}", .{st.ino}, 0)) |to| {
-                    if (linux.errno(linux.renameat2(cur, n, root, to, .{ .NOREPLACE = true })) == .SUCCESS) depth = 1;
-                } else |_| {}
+            if (held == max_chain) {
+                if (!cutUp(io, cur, n, chain[0])) {
+                    _ = linux.close(child);
+                    return .stuck;
+                }
+                for (chain[1..held]) |fd| _ = linux.close(fd);
+                held = 1;
             }
-            if (cur != root) _ = linux.close(cur);
-            cur = child;
+            chain[held] = child;
+            held += 1;
             continue;
         }
-        if (cur == root) break;
-        // Up, by `..`: back to the directory above, whose listing now finds this one empty.
-        const parent = Store.openDirAt(cur, "..") catch return .stuck;
-        _ = linux.close(cur);
-        var st: linux.Statx = undefined;
-        const at_top = linux.errno(linux.statx(parent, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &st)) == .SUCCESS and st.ino == top.ino;
-        if (at_top) {
-            _ = linux.close(parent);
-            cur = root;
-            depth = 0;
-        } else {
-            cur = parent;
-            depth -|= 1;
-        }
+        if (held == 1) break;
+        // Empty now: the listing of the directory above finds it so, and removes it.
+        held -= 1;
+        _ = linux.close(chain[held]);
     }
     return if (linux.errno(linux.unlinkat(up, base, linux.AT.REMOVEDIR)) == .SUCCESS) .gone else .stuck;
+}
+
+/// The directory `name` in `from` moved to the tree's top, `top`, under a random name.
+fn cutUp(io: std.Io, from: linux.fd_t, name: [*:0]const u8, top: linux.fd_t) bool {
+    for (0..4) |_| {
+        var raw: [8]u8 = undefined;
+        io.random(&raw);
+        var cut: [32:0]u8 = undefined;
+        const to = std.fmt.bufPrintSentinel(&cut, ".cut-{s}", .{&std.fmt.bytesToHex(raw, .lower)}, 0) catch return false;
+        switch (linux.errno(linux.renameat2(from, name, top, to, .{ .NOREPLACE = true }))) {
+            .SUCCESS => return true,
+            .EXIST => {},
+            else => return false,
+        }
+    }
+    return false;
+}
+
+/// The directory `name` in `dir` given its owner's permissions back, so it can be emptied: a step
+/// may have left it so, or a rootless runner's. Never through a symlink: through a descriptor on
+/// the name itself, which a symlink refuses.
+fn chmodDir(dir: linux.fd_t, name: [*:0]const u8) void {
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true };
+    const rc = linux.openat(dir, name, flags, 0);
+    if (linux.errno(rc) != .SUCCESS) return;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return;
+    defer _ = linux.close(fd);
+    var buf: [32:0]u8 = undefined;
+    const p = std.fmt.bufPrintSentinel(&buf, "/proc/self/fd/{d}", .{fd}, 0) catch return;
+    _ = linux.chmod(p, 0o700);
 }
 
 /// The directory `fd`'s files unlinked and its empty directories removed, until the first
 /// directory with something in it, whose name is returned to go into (`name` holds it); null when
 /// nothing is left. `error.Spent` when the budget ran out.
-fn emptyOut(io: std.Io, fd: linux.fd_t, name: *[256:0]u8, budget: Budget) !?[:0]const u8 {
+fn emptyOut(io: std.Io, fd: linux.fd_t, name: *[256:0]u8, budget: *Budget) !?[:0]const u8 {
     if (budget.spent()) return error.Spent;
     var it = (std.Io.Dir{ .handle = fd }).iterate();
     var seen: u32 = 0;
@@ -713,7 +798,10 @@ fn emptyOut(io: std.Io, fd: linux.fd_t, name: *[256:0]u8, budget: Budget) !?[:0]
         name[e.name.len] = 0;
         const z = name[0..e.name.len :0];
         switch (linux.errno(linux.unlinkat(fd, z, 0))) {
-            .SUCCESS, .NOENT => continue,
+            .SUCCESS, .NOENT => {
+                budget.took();
+                continue;
+            },
             .ISDIR, .PERM => {},
             else => {
                 failed = true;
@@ -721,10 +809,12 @@ fn emptyOut(io: std.Io, fd: linux.fd_t, name: *[256:0]u8, budget: Budget) !?[:0]
             },
         }
         switch (linux.errno(linux.unlinkat(fd, z, linux.AT.REMOVEDIR))) {
-            .SUCCESS, .NOENT => continue,
+            .SUCCESS, .NOENT => {
+                budget.took();
+                continue;
+            },
             .NOTEMPTY, .ACCES, .PERM => {
-                // Read-only as a step left it, or a rootless runner's.
-                _ = linux.fchmodat(fd, z, 0o700);
+                chmodDir(fd, z);
                 return z;
             },
             else => failed = true,
@@ -798,7 +888,7 @@ fn usage(io: std.Io, dir: []const u8, budget: Budget) struct { bytes: u64, whole
         var it = (std.Io.Dir{ .handle = fd }).iterate();
         while (it.next(io) catch null) |e| {
             seen +%= 1;
-            if (seen % 64 == 0 and budget.spent()) return .{ .bytes = total, .whole = false };
+            if (seen % 64 == 0 and budget.late()) return .{ .bytes = total, .whole = false };
             if (e.name.len > 255) continue;
             @memcpy(name[0..e.name.len], e.name);
             name[e.name.len] = 0;
@@ -1052,7 +1142,8 @@ test "native eviction: removal gets past a tree a step left unreadable, and thro
     try std.Io.Dir.cwd().symLink(io, outside, try std.fmt.allocPrint(arena, "{s}/link", .{deep}), .{});
     for ([_][]const u8{ deep, try std.fmt.allocPrint(arena, "{s}/a", .{dir}) }) |d|
         _ = linux.chmod(try arena.dupeSentinel(u8, d, 0), 0);
-    try testing.expectEqual(Removal.gone, removeSome(f.arena(), dir, io, .init(io, 60_000)));
+    var budget: Budget = .init(io, 60_000);
+    try testing.expectEqual(Removal.gone, removeSome(f.arena(), dir, io, &budget));
     try testing.expect(!f.there(dir));
     _ = try std.Io.Dir.cwd().statFile(io, try std.fmt.allocPrint(arena, "{s}/kept", .{outside}), .{});
 }
@@ -1356,7 +1447,9 @@ test "native eviction: under the floor, a volume never measured is measured befo
     }
     const short: u64 = 60 * 1024;
     var left = short;
-    _ = floor(f.arena(), testing.io, f.s.root, try listVolumes(f.arena(), testing.io, f.s.root), &left, f.s.limits, .init(testing.io, 5000));
+    var synced = true;
+    var budget: Budget = .init(testing.io, 5000);
+    _ = floor(f.arena(), testing.io, f.s.root, try listVolumes(f.arena(), testing.io, f.s.root), &left, f.s.limits, &budget, &synced);
     var there: usize = 0;
     for (dirs) |d| there += @intFromBool(f.there(d));
     try testing.expectEqual(@as(usize, 7), there);
@@ -1377,7 +1470,7 @@ test "native eviction: a volume used since the walk saw it stays" {
     const dir = try f.volume("v", 6000, 30);
     const entries = try listVolumes(f.arena(), testing.io, f.s.root);
     try f.age(dir, 0);
-    try testing.expect(!evictEntry(f.arena(), testing.io, f.s.root, entries[0]));
+    try testing.expect(!evictOne(f, entries[0]));
     try testing.expect(f.there(dir));
 }
 
@@ -1418,6 +1511,224 @@ test "native eviction: a volume's path that a job turned into a symlink is not f
     const v = try volumes.open(f.arena(), io, f.s.root, &key, .shared, null);
     defer v.release(io);
     try testing.expect(f.there(v.dir));
+}
+
+fn evictOne(f: *Fixture, e: Entry) bool {
+    var synced = true;
+    return evictEntry(f.arena(), testing.io, f.s.root, e, &synced);
+}
+
+test "native eviction: a key's part named like a lock is no sibling's lock" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const arena = f.arena();
+    const key = [_][]const u8{ "o", "r", "repo", "toolcache", "foo" };
+    const v = try volumes.open(arena, testing.io, f.s.root, &key, .shared, null);
+    defer v.release(testing.io);
+    // A job's image is its to name: `…:t` and `…:t.lock`.
+    const twin = [_][]const u8{ "o", "r", "repo", "toolcache", "foo.lock" };
+    const w = try volumes.open(arena, testing.io, f.s.root, &twin, .shared, null);
+    w.release(testing.io);
+    try testing.expect(isFile(arena, Hostile.p(f, "{s}.lock", .{v.dir})));
+    const again = try volumes.open(arena, testing.io, f.s.root, &key, .shared, null);
+    again.release(testing.io);
+    for ([_][]const u8{ "x.size", ".dead-1", "y.private-0123456789abcdef" }) |bad| {
+        const n = try volumes.component(arena, bad);
+        try testing.expect(!std.mem.endsWith(u8, n, ".size") and n[0] != '.');
+        try testing.expect(std.mem.indexOf(u8, n, ".private-") == null);
+    }
+}
+
+test "native eviction: a volume's path holding a file is an error unless a job can have left it" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const arena = f.arena();
+    const key = [_][]const u8{ "o", "r", "repo", "npm" };
+    const dir = Hostile.p(f, "{s}/volumes/o/r/repo/npm", .{f.s.root});
+    try std.Io.Dir.cwd().createDirPath(testing.io, Hostile.p(f, "{s}/volumes/o/r/repo", .{f.s.root}));
+    try Hostile.write(dir, "someone's file");
+    try testing.expectError(error.VolumeNotMade, volumes.open(arena, testing.io, f.s.root, &key, .shared, null));
+    try testing.expectEqualStrings("someone's file", try Hostile.read(f, dir));
+}
+
+test "native eviction: a directory with no lock beside it is walked only as a key's part" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const arena = f.arena();
+    const cwd = std.Io.Dir.cwd();
+    const key = [_][]const u8{ "o", "r", "repo", "toolcache", "foo" };
+    const v = try volumes.open(arena, testing.io, f.s.root, &key, .shared, null);
+    defer v.release(testing.io);
+    // Its lock file lost, whatever lost it, and what its job left in it.
+    try cwd.createDirPath(testing.io, Hostile.p(f, "{s}/sub/npm", .{v.dir}));
+    try Hostile.write(Hostile.p(f, "{s}/sub/npm.lock", .{v.dir}), "");
+    try cwd.deleteFile(testing.io, Hostile.p(f, "{s}.lock", .{v.dir}));
+    for (try listVolumes(arena, testing.io, f.s.root)) |e|
+        try testing.expect(!std.mem.endsWith(u8, e.dir, "/npm"));
+}
+
+test "native eviction: a symlink swapped into a key's part does not reach another repository" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const arena = f.arena();
+    const cwd = std.Io.Dir.cwd();
+    const other = try f.volume("npm", 10, 30);
+    const job = Hostile.p(f, "{s}/volumes/o/mine/repo/name", .{f.s.root});
+    try cwd.createDirPath(testing.io, job);
+    try cwd.symLink(testing.io, std.fs.path.dirname(other).?, Hostile.p(f, "{s}/sub", .{job}), .{});
+    // What the walk would have seen before the swap.
+    const used_s = mtime(arena, Hostile.p(f, "{s}.lock", .{other})).?;
+    const e: Entry = .{
+        .dir = Hostile.p(f, "{s}/sub/npm", .{job}),
+        .area = "volumes",
+        .volume = true,
+        .used_s = used_s,
+        .rank_s = used_s,
+        .measured_s = 1,
+    };
+    try testing.expect(!evictOne(f, e));
+    try testing.expect(f.there(other));
+}
+
+test "native eviction: names a job planted under a dead tree do not stop the removal" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const arena = f.arena();
+    const cwd = std.Io.Dir.cwd();
+    const depth: usize = 20_000;
+    const dead = Hostile.p(f, "{s}/volumes/.dead-9", .{f.s.root});
+    const build = Hostile.p(f, "{s}/build", .{f.s.root});
+    try cwd.createDirPath(testing.io, dead);
+    try cwd.createDirPath(testing.io, build);
+    var fd = try Store.openRoot(arena, build);
+    const df = try Store.openRoot(arena, dead);
+    defer _ = linux.close(df);
+    for (0..depth) |_| {
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdirat(fd, "a", 0o755)));
+        const n = try Store.openDirAt(fd, "a");
+        _ = linux.close(fd);
+        fd = n;
+        // A job reads its own inodes.
+        var st: linux.Statx = undefined;
+        _ = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &st);
+        var name: [40:0]u8 = undefined;
+        const z = try std.fmt.bufPrintSentinel(&name, ".cut-{d}", .{st.ino}, 0);
+        const made = linux.openat(df, z, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+        _ = linux.close(std.math.cast(linux.fd_t, made).?);
+    }
+    _ = linux.close(fd);
+    try cwd.rename(Hostile.p(f, "{s}/a", .{build}), cwd, Hostile.p(f, "{s}/a", .{dead}), testing.io);
+    const old = try f.volume("old", 6000, 30);
+    f.s.limits = .{ .volumes_max_bytes = 1, .min_free_pct = 0, .budget_ms = 15 };
+    var passes: usize = 0;
+    while (passes < 300 and (try f.deadLeft() > 0 or f.there(old))) : (passes += 1) run(f.s, testing.io);
+    try testing.expectEqual(@as(usize, 0), try f.deadLeft());
+    try testing.expect(!f.there(old));
+}
+
+test "native eviction: a slow sync does not eat what a pass may delete" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const dead = Hostile.p(f, "{s}/volumes/.dead-9", .{f.s.root});
+    try std.Io.Dir.cwd().createDirPath(testing.io, dead);
+    for (0..2000) |i| try Hostile.write(Hostile.p(f, "{s}/f{d}", .{ dead, i }), "x");
+    f.s.limits = .{ .volumes_max_bytes = 0, .min_free_pct = 0, .budget_ms = 300 };
+    test_sync_ms = 400;
+    defer test_sync_ms = 0;
+    for (0..2) |_| run(f.s, testing.io);
+    try testing.expectEqual(@as(usize, 0), try f.deadLeft());
+}
+
+test "native eviction: an entry no sync can see is left, with descriptors short" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const arena = f.arena();
+    const outer = try f.hold("name");
+    outer.release(testing.io);
+    const key = [_][]const u8{ "o", "r", "repo", "name", "runner" };
+    const inner = try volumes.open(arena, testing.io, f.s.root, &key, .shared, null);
+    defer inner.release(testing.io);
+    try f.age(outer.dir, 30);
+    var e: ?Entry = null;
+    for (try listVolumes(arena, testing.io, f.s.root)) |x| {
+        if (std.mem.endsWith(u8, x.dir, "/name")) e = x;
+    }
+    const probe = linux.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
+    const free: u64 = probe;
+    _ = linux.close(std.math.cast(linux.fd_t, probe).?);
+    var old: linux.rlimit = undefined;
+    _ = linux.getrlimit(.NOFILE, &old);
+    defer _ = linux.setrlimit(.NOFILE, &old);
+    // However many descriptors it can have, it must not take the inner volume a job holds.
+    for (1..10) |room| {
+        const tight: linux.rlimit = .{ .cur = free + room, .max = old.max };
+        _ = linux.setrlimit(.NOFILE, &tight);
+        const went = evictOne(f, e.?);
+        _ = linux.setrlimit(.NOFILE, &old);
+        try testing.expect(!went);
+        try testing.expect(f.there(inner.dir));
+    }
+}
+
+test "native eviction: a directory moved out of a dead tree takes no removal out with it" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const io = testing.io;
+    const cwd = std.Io.Dir.cwd();
+    const outside = Hostile.p(f, "{s}/outside", .{f.s.root});
+    try cwd.createDirPath(io, outside);
+    try Hostile.write(Hostile.p(f, "{s}/keep", .{outside}), "not in the tree");
+    const root = Hostile.p(f, "{s}/volumes/.dead-5", .{f.s.root});
+    const c = Hostile.p(f, "{s}/a/b/c", .{root});
+    try cwd.createDirPath(io, c);
+    for (0..20000) |i| try Hostile.write(Hostile.p(f, "{s}/f{d}", .{ c, i }), "");
+    const Mover = struct {
+        from: []const u8,
+        to: []const u8,
+        fn go(m: @This()) void {
+            testing.io.sleep(.fromMilliseconds(2), .awake) catch {};
+            std.Io.Dir.cwd().rename(m.from, std.Io.Dir.cwd(), m.to, testing.io) catch {};
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Mover.go, .{Mover{ .from = Hostile.p(f, "{s}/a/b", .{root}), .to = Hostile.p(f, "{s}/b", .{outside}) }});
+    var budget: Budget = .init(io, 60_000);
+    _ = removeSome(f.arena(), root, io, &budget);
+    t.join();
+    try testing.expectEqualStrings("not in the tree", try Hostile.read(f, Hostile.p(f, "{s}/keep", .{outside})));
+}
+
+test "native eviction: giving a directory its permissions back follows no symlink" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const arena = f.arena();
+    const outside = Hostile.p(f, "{s}/outside", .{f.s.root});
+    try std.Io.Dir.cwd().createDirPath(testing.io, outside);
+    _ = linux.chmod(try arena.dupeSentinel(u8, outside, 0), 0o755);
+    try std.Io.Dir.cwd().symLink(testing.io, outside, Hostile.p(f, "{s}/link", .{f.s.root}), .{});
+    const dir = try Store.openRoot(arena, f.s.root);
+    defer _ = linux.close(dir);
+    chmodDir(dir, "link");
+    try testing.expectEqual(@as(u32, 0o755), try Hostile.mode(f, outside));
+    try std.Io.Dir.cwd().createDirPath(testing.io, Hostile.p(f, "{s}/real", .{f.s.root}));
+    _ = linux.chmod(try arena.dupeSentinel(u8, Hostile.p(f, "{s}/real", .{f.s.root}), 0), 0);
+    chmodDir(dir, "real");
+    try testing.expectEqual(@as(u32, 0o700), try Hostile.mode(f, Hostile.p(f, "{s}/real", .{f.s.root})));
+}
+
+test "native eviction: past its deadline the floor measures nothing more" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const arena = f.arena();
+    var dirs: [3][]const u8 = undefined;
+    for (&dirs, 0..) |*d, i| {
+        d.* = try f.volume(Hostile.p(f, "v{d}", .{i}), 10, 30);
+        try std.Io.Dir.cwd().deleteFile(testing.io, Hostile.p(f, "{s}.size", .{d.*}));
+    }
+    var left: u64 = 1 << 40;
+    var synced = true;
+    var budget: Budget = .init(testing.io, -1);
+    try testing.expect(!floor(arena, testing.io, f.s.root, try listVolumes(arena, testing.io, f.s.root), &left, f.s.limits, &budget, &synced));
+    for (dirs) |d| try testing.expect(!isFile(arena, Hostile.p(f, "{s}.size", .{d})));
 }
 
 const OciStore = @import("oci/Store.zig");
@@ -1588,8 +1899,11 @@ test "native eviction: a rootfs's fingerprint does not move while a sibling shar
     }
     const first = try Store.rootfsFingerprint(arena, io, r1, store);
     // A pass cut short, as often as it takes.
-    while (removeSome(arena, dead, io, .init(io, 1)) != .gone)
+    while (true) {
+        var budget: Budget = .init(io, 1);
+        if (removeSome(arena, dead, io, &budget) == .gone) break;
         try testing.expectEqualSlices(u8, &first, &try Store.rootfsFingerprint(arena, io, r1, store));
+    }
     try testing.expectEqualSlices(u8, &first, &try Store.rootfsFingerprint(arena, io, r1, store));
 }
 
@@ -1635,4 +1949,33 @@ test "native eviction: a job that waited on a lock an eviction removed does not 
     t.join();
     defer job.got.?.close(io);
     try testing.expect(Store.sameFile(arena, job.got.?, lock_path));
+}
+
+test "native eviction: a pass syncs the filesystem once, however many areas have something dead" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    for ([_][]const u8{ "volumes", "rootfs", "oci/images", "seeds" }) |a|
+        try std.Io.Dir.cwd().createDirPath(testing.io, Hostile.p(f, "{s}/{s}/.dead-1", .{ f.s.root, a }));
+    f.s.limits = .{ .volumes_max_bytes = 0, .images_max_bytes = 0, .min_free_pct = 0 };
+    test_syncs = 0;
+    run(f.s, testing.io);
+    try testing.expectEqual(@as(u32, 1), test_syncs);
+    for ([_][]const u8{ "rootfs", "oci/images", "seeds" }) |a|
+        try testing.expect(!f.there(Hostile.p(f, "{s}/{s}/.dead-1", .{ f.s.root, a })));
+}
+
+test "native eviction: a rootfs an operator keeps under the store is fingerprinted as any other" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const arena = f.arena();
+    const op = Hostile.p(f, "{s}/rootfs", .{f.s.root});
+    try std.Io.Dir.cwd().createDirPath(testing.io, Hostile.p(f, "{s}/usr/bin", .{op}));
+    const deep = Hostile.p(f, "{s}/usr/bin/tool", .{op});
+    try Hostile.write(deep, "v1");
+    const stamp = Hostile.p(f, "{s}/{s}", .{ op, Store.rootfs_stamp });
+    try Hostile.write(stamp, "");
+    const before = try Store.rootfsFingerprint(arena, testing.io, op, f.s.root);
+    try Hostile.write(deep, "v2");
+    try Hostile.write(stamp, "");
+    try testing.expect(!std.mem.eql(u8, &before, &try Store.rootfsFingerprint(arena, testing.io, op, f.s.root)));
 }
