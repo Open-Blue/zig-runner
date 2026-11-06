@@ -748,13 +748,23 @@ check, which is the same) takes it as checked. So the native check makes a secon
 file's sha256 and a link's target. Both variables are in the key of every step (neither is
 volatile, so `Store.stableEnv` hashes them), hence in the base's key and every layer above it. A
 tree that changed in any of these ways is a tree no record was made against, so the step that
-installs runs again and repairs it. A tree with a link that can leave it (an absolute target, or
-more `..` than directories above the link) is left out of both: what a link points at outside the
-tree is in no digest, so no record naming such a tree is replayed. This holds for the native
+installs runs again and repairs it. A tree with a link that may leave it is left out of both: what a link
+points at outside the tree is in no digest, so no record naming such a tree is replayed. "May
+leave" is judged from the link's text and is strict: an absolute target, more leading `..` than
+there are directories above the link inside the tree, or any `..` after a name. The last is
+refused because a name can be a link itself (`lib/d -> ..` then `gcc -> lib/d/../../.evil/gcc`
+leaves the tree, though the text of `gcc` goes up no more than the tree is deep). With `..` only
+first, a link that stays in the tree from where it is can only reach a place in the tree, whatever
+links lie on its way, since each of those was judged the same. A real tool tree with a link of the
+second kind (`../lib/x/../y`) is left out too, and its steps run as they did before this change. This holds for the native
 backend. On Dagger the second variable does not exist and the claim does not hold: a modified link
 or mode in a tree with the same pinned digest is replayed against, and what it would take there is
-the same second digest in `tool_trees.sh` and in `Exec.tool_trees`' parser. `install-zig.sh` itself
-cannot see these changes either way, and that is a script of the workflow's, not the runner's.
+the same second digest in `tool_trees.sh` and in `Exec.tool_trees`' parser. `install-zig.sh`'s own
+check is of regular files too, so it is blind to a link planted in its tree whoever says the tree
+was checked: that put a planted tool on PATH with no replay involved. The script now uses a tree
+only if nothing in it is neither a file nor a directory (`plain`; Zig 0.17.0's tarballs hold
+neither a link nor anything else of the kind, for x86_64 and aarch64, checked against the pinned
+checksums), and `tool-trees-test.sh` covers it.
 
 The cost is also Dagger's: a tree added, removed or changed makes every step of every job of the
 scope new once. Narrowing it (a key of only the trees a step puts on PATH) was considered and not
@@ -778,10 +788,13 @@ and bounded:
   check gave up on for a limit, one with unreadable files, and one with a link that leaves it.
   "Set up job" says which and why ("left out: zig/0.17.0/x (too many entries)").
 - Limits (`tool_trees.Limits`). Each tree: 65,536 regular files, 100,000 entries, 8 MiB of paths,
-  1 GiB read, 20 s. The check: 400,000 entries, 4 GiB read, 48 directories deep, 512 trees, 1,024
-  names a level, 60 s. A tree over a limit of its own is left out and the others are checked; the
-  check's own limits and the job's cancel (seen at every file and every 64 KiB read) end it, and
-  what it finished stays. Zig 0.17.0 has 19,505 files and 1.2 MB of paths. Both variables are
+  1 GiB read, 60 s (the check's, because a tree that gives up keeps no list and the next job
+  starts cold: Zig's cold check is 10-19 s on razorbill, and a loaded one must not give up at
+  20). The check: 400,000 entries and 4 GiB read, past which no more files are read; 60 s of
+  reading, past which none are either; 48 directories deep, 512 trees, 1,024 names a level. The
+  job's cancel (seen at every file and every 64 KiB read) and 90 s end the check itself. A tree
+  over a limit of its own is left out and the others are checked. A budget that is spent ends the
+  reading, not the check: trees whose lists are whole need none and are still reported. Zig 0.17.0 has 19,505 files and 1.2 MB of paths. Both variables are
   capped at 64 KiB (one string of an environment may not pass 128 KiB, and one over it made every
   later job's `exec` fail with E2BIG); a tree that does not fit is left out, and so is one that
   would not fit the Dagger path's variable (`set_up.toolTreesVerdict`, the same 64 KiB).
@@ -792,20 +805,28 @@ and bounded:
   process-wide `Budget` (`native/hash_files.zig`) is merged, `held` should become that budget's
   counter and `Limits.memory` its limit, so the runner has one number for what jobs' checks and
   `hashFiles()` may hold.
-- Order, and what one job can starve. Names are looked at in the order the lists have them first
-  (trees checked once, which the volume still has), then the rest in byte order, so a job that
-  fills a level with 100,000 names, or a tree with 20 GB of holes, costs the trees that are new
-  and no tree that was checked before; the first is bounded by the limits above. A tree that is
-  never checked is a tree a step checks itself, which is the old behaviour. What one job can still
-  do is spend the check's 60 s and 4 GiB on trees that cannot be checked, and so starve a tree
-  that was never listed and sorts after them, in every job of its scope until the volume is
-  cleaned; its steps then run, as before this change. It cannot make a job fail.
+- Order, and what one job can starve. Each tree has a `<tree>.born` file in the lists: when this
+  runner first saw it. Trees are checked oldest first (ties in byte order); at each level of the
+  walk to them the names that have a `.born` come first, so a level full of planted names does not
+  hide the trees seen before (among those, in byte order). What a job adds to the volume is
+  younger than the tools installed before it, so it spends the budgets, and the room in the
+  environment, after them: an earlier cut ordered by "has a list", which a job's own trees get
+  too, and two attacks showed it (six trees grown to 2 GiB of holes after a check listed them,
+  which spent the reading budget before the honest tree; 380 trees that filled the environment's
+  64 KiB first, so `install` reran in every job). What is left is what age cannot tell: a job that
+  makes its trees before the honest tool is installed, or a new version of a tool installed after
+  a job's trees, is younger than them, and can be left out for as long as the volume holds them.
+  Its steps then run, as before this change; it cannot make a job fail. "Set up job" counts every
+  tree left out ("left out 382: ...") and names as many as fit in 4 KiB.
 - The lists are in the store beside `volumes/` (`tool-trees/<digest of the volume's path>/`), never
   in a volume a step mounts. They are a cache of what a check read: store eviction may remove all of
   `tool-trees/` at any time, and a check without them reads the trees again. A list that would be
-  over 32 MiB (the most that is read) is not written. A list of a tree that is gone, and the
-  directories that leaves empty, are removed by the next complete check; half-written lists
-  (`*.stat.<random>`) older than five minutes by every check.
+  over 32 MiB (the most that is read) is not written. A list of a tree that is gone, its `.born`,
+  and the directories that leaves empty, are removed by the next complete check; half-written
+  lists (`*.stat.<random>`, `*.born.<random>`) older than five minutes by every check. A check is
+  not complete when a level holds more names than are looked at (17,000 top-level directories do
+  it), so a job that does that stops the removal and the lists of gone trees stay and grow, for
+  as long as the volume holds the names; eviction of `tool-trees/` is what bounds them.
 
 The cost is the script's lists, kept: one line per regular file (path, size, inode, mtime, ctime,
 sha256), and only files whose line changed are read again. A write sets the file's ctime to now and

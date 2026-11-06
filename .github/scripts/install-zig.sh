@@ -20,7 +20,8 @@
 # and passes each tree's path and digest in ZIG_RUNNER_TOOL_TREES. When it names this tree with the
 # pinned digest, the tree is the one checked and this script does not read it again (0.7-1 s on
 # the laptop, 10-19 s on razorbill under load). Anything else, the variable unset on GitHub's
-# runners included, means the check here.
+# runners included, means the check here. Either way a tree with an entry that is not a file or a
+# directory is not used (`plain`).
 set -euo pipefail
 
 version=0.17.0
@@ -48,10 +49,15 @@ verified() { echo "$sum  $tarball" | sha256sum --check --quiet --status; }
 digest() { (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1); }
 
 checked() { grep -qxF "$tree_sum $tree" <<<"${ZIG_RUNNER_TOOL_TREES:-}"; }
+# The digest is of regular files only, so a link, a pipe or a device in the tree is in no digest,
+# and a job that planted one beside the files (zig -> a tool of its own) would have it on PATH
+# with the pinned digest still matching. Zig's tarballs hold none (checked for x86_64 and aarch64
+# at 0.17.0): a tree with one is not the tree, whoever says it was checked.
+plain() { [ -z "$(find "$1" ! -type f ! -type d -print -quit 2>/dev/null)" ]; }
 
-if checked && [ -d "$tree" ]; then
+if checked && [ -d "$tree" ] && plain "$tree"; then
 	echo "Zig $version: $tree is the tree zig-runner checked in Set up job"
-elif [ ! -d "$tree" ] || [ "$(digest "$tree" 2>/dev/null)" != "$tree_sum" ]; then
+elif [ ! -d "$tree" ] || ! plain "$tree" || [ "$(digest "$tree" 2>/dev/null)" != "$tree_sum" ]; then
 	if ! verified 2>/dev/null; then
 		mkdir -p "$cache"
 		curl -fsSL -o "$tarball.part" "https://ziglang.org/download/$version/$dir.tar.xz"
@@ -72,7 +78,7 @@ elif [ ! -d "$tree" ] || [ "$(digest "$tree" 2>/dev/null)" != "$tree_sum" ]; the
 		exit 1
 	fi
 	rm -rf "$tree"
-	mv -T "$part/$dir" "$tree" || [ "$(digest "$tree")" = "$tree_sum" ]
+	mv -T "$part/$dir" "$tree" || { plain "$tree" && [ "$(digest "$tree")" = "$tree_sum" ]; }
 	rm -rf "$part"
 fi
 

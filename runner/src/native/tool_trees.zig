@@ -14,8 +14,10 @@
 //! That digest sees regular files only: not a link, a pipe, a mode, an empty directory. So each
 //! tree has a second, `ZIG_RUNNER_TOOL_TREES_FULL`, over every entry (type, mode, path, a regular
 //! file's sha256, a link's target). Both are in every step's key, so a tree changed in either
-//! way is a tree no record was made against. A tree with a link that leaves it (an absolute
-//! target, or one with enough `..`) is left out: what it points at is no part of any digest.
+//! way is a tree no record was made against. A tree with a link that may leave it is left out:
+//! what it points at is no part of any digest. A target may go up only at its start (`../..`
+//! then names), never after a name, because a name may be a link itself: `lib/d -> ..` and
+//! `gcc -> lib/d/../../.evil/gcc` is a way out that a count of the `..` in one text misses.
 //!
 //! Re-reading a tree (19,500 files and 309 MB for Zig 0.17.0) costs about 1 s on the laptop and
 //! 10-19 s on razorbill, so a check keeps a list of one line per regular file (path, size,
@@ -39,9 +41,12 @@
 //! is limited for all the checks of the process at once (`Limits.memory`), the job's cancel is
 //! seen at every file and every block read, and the environment it makes is bounded. What does
 //! not fit in a limit is left out, as a tree it gives up on is: a step then checks the tree
-//! itself, and a replayed step that names it runs again. One tree's trouble never costs the
-//! others: trees with a list go first, so a tree that was checked once stays checked while
-//! another job fills the volume with trees that cannot be.
+//! itself, and a replayed step that names it runs again. Trees are checked oldest first, by when
+//! this runner first saw each (`<tree>.born` beside its list), so what a job adds to the volume
+//! is younger than the tools installed before it and cannot take the budget, or the room in the
+//! environment, from them. A budget that is spent ends the reading of files, not the check: a
+//! tree whose list is whole costs no reading and is still reported. A job that makes its trees
+//! before an honest tool exists is older than that tool; the limits bound what that costs.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -65,15 +70,18 @@ pub const Limits = struct {
     tree_path_bytes: u32 = 8 << 20,
     /// Bytes read (hashed) in one tree.
     tree_read_bytes: u64 = 1 << 30,
-    /// Time for one tree.
-    tree_ms: i64 = 20_000,
-    /// Entries visited by the whole check.
+    /// Time for one tree: the check's, since a tree that gives up keeps no list and the next job
+    /// would start cold (Zig's is 10-19 s on razorbill).
+    tree_ms: i64 = 60_000,
+    /// Entries visited by the whole check, past which no more files are read.
     visited: u32 = 400_000,
-    /// Bytes read (hashed) by the whole check: what is not in a list yet or changed since.
+    /// Bytes read (hashed) by the whole check: what is not in a list yet or changed since. Past
+    /// it no more files are read.
     read_bytes: u64 = 4 << 30,
     /// Directories deep, below the tool cache.
     depth: u32 = 48,
-    /// The whole check. Razorbill's cold check of Zig is 10-19 s.
+    /// The whole check's reading of files. Razorbill's cold check of Zig is 10-19 s. The check
+    /// itself ends at one and a half times this.
     time_ms: i64 = 60_000,
     /// See the file's comment.
     racy_s: i64 = 2,
@@ -147,16 +155,20 @@ pub fn check(
         error.OutOfMemory => return error.OutOfMemory,
         else => c.complete = false,
     };
-    const order = try c.listedFirst(arena, lists, found.items);
-    for (order) |rel| {
+    const order = try c.oldestFirst(arena, lists, found.items);
+    for (order, 0..) |rel, at| {
         const digest = c.tree(root, lists, rel) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             // This one only; the others are still checked.
             error.Unreadable => {
+                c.left_out += 1;
                 try appendCapped(arena, &skipped, rel, c.tree_why, max_note);
                 continue;
             },
-            error.Stopped => break,
+            error.Stopped => {
+                c.left_out += order.len - at;
+                break;
+            },
         };
         const env_line = try std.fmt.allocPrint(arena, "{x} {s}/{s}", .{ &digest.sum, mount, rel });
         const full_line = try std.fmt.allocPrint(
@@ -167,6 +179,7 @@ pub fn check(
         if (env.items.len + env_line.len + 1 > max_env or
             full.items.len + full_line.len + 1 > max_env)
         {
+            c.left_out += 1;
             try appendCapped(arena, &skipped, rel, "too many trees for the environment", max_note);
             continue;
         }
@@ -191,7 +204,13 @@ pub fn check(
         "Tool cache: no trees to check"
     else
         try std.fmt.allocPrint(arena, "Tool cache: checked {s}", .{note.items}));
-    if (skipped.items.len > 0) try text.print(arena, "; left out: {s}", .{skipped.items});
+    // Counted as well as named: the names stop at `max_note`.
+    if (c.left_out > 0) try text.print(arena, "; left out {d}: {s}{s}", .{
+        c.left_out,
+        skipped.items,
+        if (skipped.items.len >= max_note) ", ..." else "",
+    });
+    if (c.spent) |why| try text.print(arena, "; reading stopped: {s}", .{why});
     if (c.why) |why| try text.print(arena, "; stopped: {s}", .{why});
     return .{ .env = env.items, .full = full.items, .note = text.items };
 }
@@ -223,6 +242,11 @@ const Check = struct {
     visited: u32 = 0,
     read: u64 = 0,
     why: ?[]const u8 = null,
+    /// A budget of the check is spent (why): no more files are read, and trees that need none
+    /// are still checked.
+    spent: ?[]const u8 = null,
+    /// Trees left out, whether or not the note names them.
+    left_out: usize = 0,
     /// Every tree was found (the walk to them was not cut short), so a list without one is stale.
     complete: bool = true,
     /// The tree being checked: what it has spent, its own deadline, and why it was given up on.
@@ -242,7 +266,7 @@ const Check = struct {
     fn visit(c: *Check) Error!void {
         c.visited += 1;
         c.tree_entries += 1;
-        if (c.visited > c.limits.visited) return c.stop("too many files and directories");
+        if (c.visited > c.limits.visited) c.spent = c.spent orelse "too many entries";
         if (c.in_tree and c.tree_entries > c.limits.tree_entries)
             return c.giveUp("too many entries");
         if (c.visited % 64 == 0) try c.poll();
@@ -251,7 +275,8 @@ const Check = struct {
     fn poll(c: *Check) Error!void {
         if (c.cancel) |x| if (x.requested.load(.acquire)) return c.stop("the job was cancelled");
         const now = nowMs(c.io);
-        if (now > c.deadline_ms) return c.stop("out of time");
+        if (now > c.deadline_ms) c.spent = c.spent orelse "out of time";
+        if (now > c.deadline_ms + @divTrunc(c.limits.time_ms, 2)) return c.stop("out of time");
         if (c.in_tree and now > c.tree_deadline_ms) return c.giveUp("out of time for the tree");
     }
 
@@ -368,8 +393,8 @@ const Check = struct {
         while (it.next(c.io) catch null) |e| {
             if (names.items.len >= max_names) break;
             const name = if (depth == 2)
-                (if (e.kind == .file and std.mem.endsWith(u8, e.name, ".stat"))
-                    e.name[0 .. e.name.len - ".stat".len]
+                (if (e.kind == .file and std.mem.endsWith(u8, e.name, ".born"))
+                    e.name[0 .. e.name.len - ".born".len]
                 else
                     continue)
             else if (e.kind == .directory) e.name else continue;
@@ -381,32 +406,42 @@ const Check = struct {
         std.mem.sort([]const u8, names.items, {}, pathLess);
     }
 
-    /// `found` with the trees that have a list first, each group in byte order: a tree that was
-    /// checked once costs no more than looking at it, so a job that fills the volume with trees
-    /// that cannot be checked spends the check's time and bytes on its own, and the trees an
-    /// honest job installed earlier are not among what it can starve.
-    fn listedFirst(
+    /// `found` oldest first, by when this runner first saw each tree (`bornAt`), then in byte
+    /// order. A tree a job makes is born after the tools an honest job installed before it, so it
+    /// is checked after them, and the budget and the room in the environment it spends are the
+    /// ones left. A tree seen now for the first time is born now.
+    fn oldestFirst(
         c: *Check,
         arena: Allocator,
         lists: []const u8,
         found: []const []const u8,
     ) Allocator.Error![]const []const u8 {
-        const Row = struct { rel: []const u8, listed: bool };
+        const Row = struct { rel: []const u8, born: i128 };
         const rows = try arena.alloc(Row, found.len);
+        const now = std.Io.Clock.real.now(c.io).toNanoseconds();
         for (found, rows) |rel, *r| {
-            const path = try std.fmt.allocPrint(arena, "{s}/{s}.stat", .{ lists, rel });
-            const listed = if (std.Io.Dir.cwd().access(c.io, path, .{})) true else |_| false;
-            r.* = .{ .rel = rel, .listed = listed };
+            r.* = .{ .rel = rel, .born = c.bornAt(arena, lists, rel, now) };
         }
         std.mem.sort(Row, rows, {}, struct {
             fn less(_: void, a: Row, b: Row) bool {
-                if (a.listed != b.listed) return a.listed;
+                if (a.born != b.born) return a.born < b.born;
                 return pathLess({}, a.rel, b.rel);
             }
         }.less);
         const out = try arena.alloc([]const u8, rows.len);
         for (rows, out) |r, *o| o.* = r.rel;
         return out;
+    }
+
+    /// When the tree was first seen, from its `.born` file, which is made now if it is not there.
+    fn bornAt(c: *Check, arena: Allocator, lists: []const u8, rel: []const u8, now: i128) i128 {
+        const path = std.fmt.allocPrint(arena, "{s}/{s}.born", .{ lists, rel }) catch return now;
+        if (std.Io.Dir.cwd().readFileAlloc(c.io, path, arena, .limited(64))) |text| {
+            if (std.fmt.parseInt(i128, std.mem.trim(u8, text, "\n"), 10)) |t| return t else |_| {}
+        } else |_| {}
+        const text = std.fmt.allocPrint(arena, "{d}\n", .{now}) catch return now;
+        keepList(arena, c.io, path, text);
+        return now;
     }
 
     const Digest = struct {
@@ -586,6 +621,7 @@ const Check = struct {
     /// (`Entry.racy`): a read lease, which the kernel refuses while anything holds the file
     /// open for writing, a shared mapping that outlived its descriptor included.
     fn hashFile(c: *Check, t: Allocator, top: linux.fd_t, f: *Entry) Error!void {
+        if (c.spent) |why| return c.giveUp(why);
         const rel = try t.dupeSentinel(u8, f.path[2..], 0);
         const fd = switch (sandbox.openIn(top, rel, .{
             .ACCMODE = .RDONLY,
@@ -628,7 +664,10 @@ const Check = struct {
             if (n == 0) break;
             c.read += n;
             c.tree_read += n;
-            if (c.read > c.limits.read_bytes) return c.stop("too many bytes to read");
+            if (c.read > c.limits.read_bytes) {
+                c.spent = c.spent orelse "too many bytes to read";
+                return c.giveUp("too many bytes to read");
+            }
             if (c.tree_read > c.limits.tree_read_bytes) return c.giveUp("too many bytes to read");
             h.update(block[0..n]);
             try c.poll();
@@ -676,20 +715,26 @@ const Entry = struct {
     }
 };
 
-/// Whether the link at `path` (`./a/b`) with this `target` can lead out of the tree, taking its
-/// text only: an absolute target, or more `..` than the directories above the link.
+/// Whether the link at `path` (`./a/b`) with this `target` may lead out of the tree, taking its
+/// text only: an absolute target, more leading `..` than the directories above the link, or a
+/// `..` after a name. The last is refused whatever follows because a name may be a link (to `..`,
+/// say), and then the `..` after it is one more than the text counts. With `..` only first, a
+/// link that stays in the tree from where it is leads to a place in the tree, whatever the links
+/// on its way are, since each of those was checked the same.
 fn leavesTree(path: []const u8, target: []const u8) bool {
     if (target.len == 0 or target[0] == '/') return true;
-    var depth: i64 = -1; // "./x" has no directory above it: the "." and the name's own count
+    var above: usize = 0; // directories above the link inside the tree: "./a/b" has one
     var parts = std.mem.splitScalar(u8, path, '/');
-    while (parts.next()) |_| depth += 1;
-    depth -= 1;
+    while (parts.next()) |_| above += 1;
+    above -= 2;
     var steps = std.mem.splitScalar(u8, target, '/');
+    var leading = true;
     while (steps.next()) |s| {
         if (std.mem.eql(u8, s, "..")) {
-            depth -= 1;
-            if (depth < 0) return true;
-        } else if (s.len > 0 and !std.mem.eql(u8, s, ".")) depth += 1;
+            if (!leading) return true;
+            if (above == 0) return true;
+            above -= 1;
+        } else if (s.len > 0 and !std.mem.eql(u8, s, ".")) leading = false;
     }
     return false;
 }
@@ -844,7 +889,8 @@ fn walkLists(
             while (n_it.next(io) catch null) |list| {
                 if (list.kind != .file) continue;
                 if (leftovers) {
-                    if (std.mem.indexOf(u8, list.name, ".stat.") == null) continue;
+                    if (std.mem.indexOf(u8, list.name, ".stat.") == null and
+                        std.mem.indexOf(u8, list.name, ".born.") == null) continue;
                     const st = names.statFile(io, list.name, .{}) catch continue;
                     if (now_ms - st.mtime.toMilliseconds() > leftover_age_ms)
                         names.deleteFile(io, list.name) catch {};
@@ -852,6 +898,8 @@ fn walkLists(
                 }
                 const stem = if (std.mem.endsWith(u8, list.name, ".stat"))
                     list.name[0 .. list.name.len - ".stat".len]
+                else if (std.mem.endsWith(u8, list.name, ".born"))
+                    list.name[0 .. list.name.len - ".born".len]
                 else
                     continue;
                 const rel = std.fmt.allocPrint(arena, "{s}/{s}/{s}", .{
@@ -1030,7 +1078,7 @@ test "tool trees: a check is bounded in files, bytes and depth, and ends with th
     const f = try fixture(arena, &tmp);
     // The Zig tree has five files, and the node tree, which sorts first, one.
     const files = try checkWith(arena, f, .{ .tree_files = 3 }, null);
-    try expectIn(files.note, "left out: " ++ tree_rel ++ " (too many files)");
+    try expectIn(files.note, "left out 1: " ++ tree_rel ++ " (too many files)");
     try expectIn(files.env, "node/22.0.0/x64");
     try std.testing.expect(std.mem.indexOf(u8, files.env, tree_rel) == null);
     const bytes = try checkWith(arena, f, .{ .read_bytes = 5 }, null);
@@ -1233,7 +1281,9 @@ test "tool trees: a link that can lead out of the tree leaves the tree out" {
     try std.testing.expect(!leavesTree("./a/b", "../c"));
     try std.testing.expect(leavesTree("./b", "../c"));
     try std.testing.expect(leavesTree("./a/b", "/etc/passwd"));
-    try std.testing.expect(!leavesTree("./a/b", "../a/./c/.."));
+    try std.testing.expect(leavesTree("./a/b", "../a/./c/.."));
+    try std.testing.expect(leavesTree("./a/b", "c/../d"));
+    try std.testing.expect(!leavesTree("./a/b", "../a/c"));
     try std.testing.expect(leavesTree("./a/b", "../../c"));
 }
 
@@ -1248,7 +1298,7 @@ test "tool trees: one tree over a limit of its own costs that tree and no other"
     const v = try checkWith(arena, f, .{ .tree_read_bytes = 6 }, null);
     try expectIn(v.env, "node/22.0.0/x64");
     try std.testing.expect(std.mem.indexOf(u8, v.env, tree_rel) == null);
-    try expectIn(v.note, "left out: " ++ tree_rel ++ " (too many bytes to read)");
+    try expectIn(v.note, "left out 1: " ++ tree_rel ++ " (too many bytes to read)");
     try std.testing.expect(std.mem.indexOf(u8, v.note, "stopped") == null);
     const entries = try checkWith(arena, f, .{ .tree_entries = 3 }, null);
     try expectIn(entries.env, "node/22.0.0/x64");
@@ -1346,4 +1396,78 @@ test "tool trees: a check leaves SIGIO as it found it, for std.Io's cancels" {
     _ = linux.sigaction(linux.SIG.IO, null, &after);
     try std.testing.expectEqual(before.handler.handler, after.handler.handler);
     try std.testing.expect(after.handler.handler != linux.SIG.IGN);
+}
+
+test "tool trees: a link through a link that goes up leaves the tree, whatever its text counts" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    try tmp.dir.createDirPath(io, "cache/zig/0.17.0/.evil");
+    try tmp.dir.writeFile(io, .{ .sub_path = "cache/zig/0.17.0/.evil/gcc", .data = "evil" });
+    // Inside the tree both stay: `lib/d` is the tree's own top, and the text of `gcc` goes up
+    // two, which is one more than the tree has above `lib/d`, so it leaves the tree.
+    try tmp.dir.symLink(io, "..", "cache/" ++ tree_rel ++ "/lib/d", .{});
+    try tmp.dir.symLink(io, "lib/d/../../.evil/gcc", "cache/" ++ tree_rel ++ "/gcc", .{});
+    const v = try checkWith(arena, f, .{}, null);
+    try std.testing.expect(std.mem.indexOf(u8, v.env, tree_rel) == null);
+    try expectIn(v.env, "node/22.0.0/x64");
+}
+
+test "tool trees: trees a job made after the tool cannot spend the budget the tool needs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    _ = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    // Six trees, small until a check has listed them, that sort before the tool's.
+    for (0..6) |i| {
+        const p = try std.fmt.allocPrint(arena, "cache/0/0/t{d}", .{i});
+        try tmp.dir.createDirPath(io, p);
+        const file = try std.fmt.allocPrint(arena, "{s}/f", .{p});
+        try tmp.dir.writeFile(io, .{ .sub_path = file, .data = "x" });
+    }
+    _ = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    // Then each grows to more than a tree may read, together more than the check may.
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    for (0..6) |i| {
+        const file = try std.fmt.allocPrint(arena, "{s}/cache/0/0/t{d}/f", .{ root, i });
+        const argv: []const []const u8 = &.{ "truncate", "-s", "2M", file };
+        const grown = try std.process.run(arena, io, .{ .argv = argv });
+        try std.testing.expect(grown.term == .exited and grown.term.exited == 0);
+    }
+    const tight: Limits = .{ .racy_s = 0, .read_bytes = 3 << 20, .tree_read_bytes = 1 << 20 };
+    const v = try checkWith(arena, f, tight, null);
+    try expectIn(v.env, tree_rel);
+    try expectIn(v.env, "node/22.0.0/x64");
+}
+
+test "tool trees: trees a job made fill the environment after the tool, not before it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    _ = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    // 480 trees with names of 100 bytes, which sort between the two the tool cache had.
+    for (0..480) |i| {
+        const name = try std.fmt.allocPrint(arena, "cache/p/v/{d:0>4}{s}", .{ i, &pad_n });
+        try tmp.dir.createDirPath(io, name);
+    }
+    _ = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    const v = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    try expectIn(v.env, tree_rel);
+    try expectIn(v.env, "node/22.0.0/x64");
+    // The trees that did not fit are counted, though the note stops naming them.
+    const lines = std.mem.count(u8, v.env, "\n") + 1;
+    const want = try std.fmt.allocPrint(arena, "; left out {d}: ", .{482 - lines});
+    try expectIn(v.note, want);
 }
