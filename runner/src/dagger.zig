@@ -3094,7 +3094,8 @@ test "GITHUB_PATH in a container job: the directories, then the container's own 
     const answers = [_][]const u8{
         "{\"data\":{\"container\":{\"from\":{\"zig_runtime_path\":\"" ++ own ++ "\"," ++
             "\"withWorkdir\":{\"id\":\"C0\"}}}}}",
-        // starting the job container: its image's digest, and whether it is musl
+        // starting the job container: its image pulled, its digest, and whether it is musl
+        "{\"data\":{\"container\":{\"from\":{\"entrypoint\":[]}}}}",
         "{\"data\":{\"container\":{\"from\":{\"imageRef\":\"node:20\"}}}}",
         "{\"data\":{\"container\":{\"from\":{\"directory\":{\"entries\":[]}}}}}",
         try execFc(arena, "C1", "", "", "", "/a\\n/b\\n"),
@@ -3110,12 +3111,12 @@ test "GITHUB_PATH in a container job: the directories, then the container's own 
     const seen = fake.seen.items;
     try std.testing.expect(std.mem.indexOf(u8, seen[0], "zig_runtime_path: envVariable(name:\"PATH\")") != null);
     // GitHub's `docker exec -e PATH="<directories>:<container PATH>"` comes after the step's env.
-    try std.testing.expect(std.mem.indexOf(u8, seen[4], "withEnvVariable(name:\"PATH\",value:\"/b:/a:" ++ own ++ "\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[4], "PATH=/b:/a:" ++ own) != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[4], "/custom") == null);
-    // ...and after a PATH written to GITHUB_ENV.
     try std.testing.expect(std.mem.indexOf(u8, seen[5], "withEnvVariable(name:\"PATH\",value:\"/b:/a:" ++ own ++ "\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[5], "/from-github-env") == null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "PATH=/b:/a:" ++ own) != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "/custom") == null);
+    // ...and after a PATH written to GITHUB_ENV.
+    try std.testing.expect(std.mem.indexOf(u8, seen[6], "withEnvVariable(name:\"PATH\",value:\"/b:/a:" ++ own ++ "\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[6], "/from-github-env") == null);
 }
 
 test "an output set twice keeps its last value, case-insensitively; GITHUB_OUTPUT beats set-output" {
@@ -4022,10 +4023,14 @@ const AutoSession = struct {
     /// An exec whose document contains [0] prints [1].
     stdout: []const [2][]const u8 = &.{},
     ids: u32 = 0,
+    /// A document that contains this is answered with an engine error, as a refused field is.
+    refuse: []const u8 = "",
 
     fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8, _: usize) anyerror![]const u8 {
         const self: *AutoSession = @ptrCast(@alignCast(ptr));
         try self.seen.append(self.arena, try self.arena.dupe(u8, doc));
+        if (self.refuse.len > 0 and std.mem.indexOf(u8, doc, self.refuse) != null)
+            return "{\"errors\":[{\"message\":\"refused\"}]}";
         var p: Answer = .{ .s = doc, .self = self, .arena = arena };
         try p.out.appendSlice(arena, "{\"data\":");
         p.ws();
@@ -4847,6 +4852,43 @@ test "a secret in a service's env reaches the service as a Dagger secret" {
         try std.testing.expect(std.mem.indexOf(u8, d, "asService(") != null);
     try std.testing.expectEqual(@as(usize, 1), auto.count("withEnvVariable(name:\"POSTGRES_DB\"," ++
         "value:\"app\")"));
+}
+
+/// A job with a service and a `container:` image, each pulled before its steps run.
+fn imageJob(steps: []const job_mod.Step) job_mod.Job {
+    var job = testJob(steps);
+    job.container = .{ .name = "", .image = .{ .lit = "node:20" } };
+    job.services = &.{.{ .name = "redis", .image = .{ .lit = "redis:7.4-alpine" } }};
+    return job;
+}
+
+test "an image digest the engine refuses to give leaves its Digest line out, and the job runs" {
+    // The engine answers `imageRef` only right after `Container.From`, and has refused it for a
+    // pull that worked: three jobs failed on it for the sake of a log line.
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var auto: AutoSession = .{ .arena = arena, .refuse = "imageRef" };
+    _ = try roundTrips(arena, &auto, .{}, imageJob(&.{testStep("true")}));
+    try std.testing.expect(auto.count("imageRef") >= 2);
+}
+
+test "a service image whose configuration the engine cannot give still fails the job" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    var auto: AutoSession = .{ .arena = arena, .refuse = "entrypoint" };
+    var job = imageJob(&.{testStep("true")});
+    job.container = null; // the service's pull is the one refused
+    const res = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = auto.transport(),
+    }, job, &log);
+    try std.testing.expect(!res.succeeded);
 }
 
 test "a Docker action's argument holding a secret reaches its command as a Dagger secret" {
