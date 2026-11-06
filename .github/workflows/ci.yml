@@ -354,6 +354,13 @@ jobs:
       # Every test in runner/src is one the test binary has: a file that nothing reached compiled
       # and passed with its tests never run (github/http.zig's, until #326). Its compile is the
       # tests' on a runner that ran them with zig-test.sh, cached.
+      # Built by the weekly comparison (`hashfiles-diff.sh`), which pull requests do not run: #366
+      # would have broken it unseen.
+      - name: The hashFiles comparison tool compiles
+        if: steps.scope.outputs.run == 'true'
+        working-directory: runner
+        run: zig build-exe --dep runner -Mroot=tools/hashfilescorpus.zig -Mrunner=src/hashfiles_corpus.zig --name hashfilescorpus -fno-emit-bin
+
       - name: Every test file is compiled
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/test-files.sh

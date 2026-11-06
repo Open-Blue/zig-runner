@@ -1526,7 +1526,12 @@ test "native eviction: a dead name that is no directory goes, and one that will 
 /// (NAMETOOLONG once the path inside it is too long), and only after building most of the chain: a
 /// run in a container spent over nine minutes on the two longest before they were skipped by
 /// `goDown`. So they skip at the start there, and say why.
-fn needsDeepDirs(f: *Fixture) !void {
+fn needsDeepDirs(f: *Fixture, depth: usize) !void {
+    // Valgrind takes half an hour over the cleanup of a tree this deep, past its job's limit.
+    if (depth > 8000 and std.valgrind.runningOnValgrind() != 0) {
+        std.debug.print("test skipped: a chain this deep outlasts Valgrind's limit\n", .{});
+        return error.SkipZigTest;
+    }
     const overlayfs = 0x794c7630;
     var st: [120]u8 align(8) = undefined;
     const fd = std.math.cast(usize, f.tmp.dir.handle) orelse return;
@@ -1544,7 +1549,7 @@ fn goDown(fd: linux.fd_t) !void {
 }
 
 fn deepChain(f: *Fixture, depth: usize) !void {
-    try needsDeepDirs(f);
+    try needsDeepDirs(f, depth);
     const io = testing.io;
     try std.Io.Dir.cwd().createDirPath(io, Hostile.p(f, "{s}/volumes", .{f.s.root}));
     const vz = try f.arena().dupeSentinel(u8, Hostile.p(f, "{s}/volumes", .{f.s.root}), 0);
@@ -1760,7 +1765,7 @@ test "native eviction: names a job planted under a dead tree do not stop the rem
     defer f.deinit();
     const arena = f.arena();
     const cwd = std.Io.Dir.cwd();
-    try needsDeepDirs(f);
+    try needsDeepDirs(f, 20_000);
     const depth: usize = 20_000;
     const dead = Hostile.p(f, "{s}/volumes/.dead-9", .{f.s.root});
     const build = Hostile.p(f, "{s}/build", .{f.s.root});
