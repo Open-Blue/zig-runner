@@ -2085,9 +2085,10 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
     at the cancel's `hard_deadline_ms`, or at the time limit.
 - **Overlay's redirects and metacopy fail the call.** `Merged` does not follow them, and a hash
   of what they hide would be wrong without a word, so a layer entry that has either attribute
-  fails `hashFiles()` with a message. The runner never asks for them, but a host's kernel may
-  default to them: `overlayOptions` in `sandbox.zig` does not pass `redirect_dir=off,metacopy=off`,
-  and `Store.flatten` checks only directories. Both are the owner's to settle.
+  fails `hashFiles()` with a message. The runner turns both off, whatever the host's kernel
+  defaults to: `overlayFeatures` in `sandbox.zig` passes `redirect_dir=off,metacopy=off` on a root
+  runner; a rootless one's `userxattr` already has neither, and refuses that option beside it.
+  `Store.flatten` checks only directories, which is enough with metacopy off.
 - **A file is hashed whatever its mode.** The runner reads as itself (root, or the rootless
   user), so a non-root `container:` job can hash a file its own user could not read (`ln -s
   /etc/shadow s`) from within its own tree. Dagger's `sha256sum` ran as the step user and would
