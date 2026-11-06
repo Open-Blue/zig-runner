@@ -1,0 +1,3 @@
+kind: Security
+body: The `@actions/glob` of the hashFiles comparison is installed from a lockfile (`npm ci`), which pins every package by its integrity hash.
+time: 2026-11-05T19:48:38.909085444-05:00
