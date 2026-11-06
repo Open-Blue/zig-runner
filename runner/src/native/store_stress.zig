@@ -573,7 +573,7 @@ fn runVolumeJob(w: *Worker, arena: Allocator, io: std.Io, n: usize) !void {
         \\: $GITHUB_SHA; echo "@empty $(ls -A {s} | wc -l)"
         \\head -c 2000 /dev/urandom > {s}/{s}.data; sha256sum {s}/{s}.data > {s}/{s}.sum
         \\cd {s}; mkdir -p runner runner.d; mkfifo runner.lock runner.size 2>/dev/null || true
-        \\ln -sf /shared/canary runner.d.size; ln -sf /shared/canary runner.size.link
+        \\ln -sf /shared/canary runner.d.size || true; ln -sf /shared/canary runner.size.link || true
         \\d=chain; for i in 1 2 3 4 5 6 7 8; do mkdir -p $d/$d/$d/$d/$d/$d/$d/$d; cd $d/$d/$d/$d/$d/$d/$d/$d; done
         \\cd {s}
     , .{ cache, cache, nonce, cache, nonce, cache, nonce, cache, cache }));
