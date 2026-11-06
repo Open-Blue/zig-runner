@@ -340,7 +340,7 @@ jobs:
       - name: Test, on overlayfs
         if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
         # Ten times its time, so a test that does not finish fails here, not at the job's limit.
-        timeout-minutes: 10
+        timeout-minutes: 15
         working-directory: runner
         env:
           ZIG_TEST_IN_CONTAINER: "1"

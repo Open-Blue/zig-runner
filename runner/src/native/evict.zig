@@ -1503,6 +1503,14 @@ test "native eviction: a dead name that is no directory goes, and one that will 
     try testing.expect(!f.there(old));
 }
 
+/// One level more of a chain, or the test skipped where the filesystem will not make one so deep
+/// (overlayfs): a job on it cannot plant the chain either.
+fn goDown(fd: linux.fd_t) !void {
+    const e = linux.errno(linux.mkdirat(fd, "a", 0o755));
+    if (e == .NAMETOOLONG) return error.SkipZigTest;
+    try testing.expectEqual(linux.E.SUCCESS, e);
+}
+
 fn deepChain(f: *Fixture, depth: usize) !void {
     const io = testing.io;
     try std.Io.Dir.cwd().createDirPath(io, Hostile.p(f, "{s}/volumes", .{f.s.root}));
@@ -1513,7 +1521,7 @@ fn deepChain(f: *Fixture, depth: usize) !void {
     var fd = try Store.openDirAt(vfd, ".dead-chain");
     defer _ = linux.close(fd);
     for (0..depth) |_| {
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdirat(fd, "a", 0o755)));
+        try goDown(fd);
         const n = try Store.openDirAt(fd, "a");
         _ = linux.close(fd);
         fd = n;
@@ -1704,7 +1712,7 @@ test "native eviction: names a job planted under a dead tree do not stop the rem
     const df = try Store.openRoot(arena, dead);
     defer _ = linux.close(df);
     for (0..depth) |_| {
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdirat(fd, "a", 0o755)));
+        try goDown(fd);
         const n = try Store.openDirAt(fd, "a");
         _ = linux.close(fd);
         fd = n;
