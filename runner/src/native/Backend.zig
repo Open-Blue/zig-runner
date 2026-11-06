@@ -1269,7 +1269,8 @@ pub fn base(
             if (unprivileged) try std.fmt.allocPrint(arena, " && chown -R {d}:{d} {s}{s}", .{
                 b.uid,
                 b.gid,
-                dagger.work_root,
+                // Where the workspace is: a `container:` job's is under /__w.
+                if (ev.job.container != null) dagger.container_work_root else dagger.work_root,
                 tool_dir,
             }) else chown,
         })
