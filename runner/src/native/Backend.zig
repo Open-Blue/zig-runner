@@ -1852,11 +1852,12 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     // on the token in `extra`. A branch or tag moves, so its fetch always runs. The tags it reads
     // move too, with the commit staying: their digest is part of the key (`tagsDigest`).
     const env = try b.envStrings(extra.items);
-    const tags: ?[]const u8 = if (f.tags and checkout.isSha(f.want))
+    const submodule_tags = tagsInSubmodules(f.tags, co);
+    const tags: ?[]const u8 = if (f.tags and checkout.isSha(f.want) and !submodule_tags)
         try b.tagsDigest(f.url, env)
     else
         "";
-    const key = if (tags == null or !checkout.isSha(f.want))
+    const key = if (tags == null or !checkout.isSha(f.want) or submodule_tags)
         null
     else
         try b.keyFor(.step, try std.fmt.allocPrint(arena, "{s}\n# tags {s}", .{ aw.written(), tags.? }), &.{}, b.uid, b.gid);
@@ -1895,6 +1896,22 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
             "the job's own repository; another private one cannot be checked out)" else "",
     }) };
     return f;
+}
+
+/// Whether the tags a checkout fetches include a submodule's (`fetch-depth: 0` or `fetch-tags`
+/// with `submodules:`): they move with the commit staying, and `tagsDigest` lists only the top
+/// repository's, which a submodule's URL (in `.gitmodules`, known only once fetched) is not part
+/// of. Such a fetch is not replayed, as one of a branch is not.
+fn tagsInSubmodules(tags: bool, co: job_mod.Checkout) bool {
+    return tags and co.submodules;
+}
+
+test "a fetch with tags and submodules is never replayed, the tags of the submodules move" {
+    var co: job_mod.Checkout = .{ .submodules = true };
+    try std.testing.expect(tagsInSubmodules(true, co));
+    try std.testing.expect(!tagsInSubmodules(false, co));
+    co.submodules = false;
+    try std.testing.expect(!tagsInSubmodules(true, co));
 }
 
 /// A digest of the tags `url`'s repository has and where they point, as `git fetch --tags` reads
@@ -3581,6 +3598,34 @@ test "native step cache: a checkout with submodules never replays one without, o
         try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, again.text, dagger.native_reused_note));
         try std.testing.expect(std.mem.indexOf(u8, again.text, want) != null);
     }
+}
+
+test "native step cache: a checkout with submodules and tags is fetched again, not replayed" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try cachedConfig(arena, &tmp);
+    const repos = (try submoduleRepos(arena, &c.cfg, &tmp)) orelse
+        return skip(false, "git is not installed");
+
+    // A submodule's tags move with the commit staying, and the key has only the top repository's.
+    var co = testStep("");
+    co.name = "checkout";
+    co.action = .{ .checkout = &.{
+        .{ .name = "ref", .value = .{ .lit = repos.sha } },
+        .{ .name = "submodules", .value = .{ .lit = "true" } },
+        .{ .name = "fetch-tags", .value = .{ .lit = "true" } },
+    } };
+    var job = testJob(&.{ co, testStep("echo sub=$(test -f sub/in-sub && echo yes || echo no)") });
+    job.github.server_url = try std.fmt.allocPrint(arena, "file://{s}", .{repos.root});
+    job.env = &file_repos_env;
+    try expectSucceeded(try runCached(arena, c.cfg, job, "a"));
+    const again = try runCached(arena, c.cfg, job, "b");
+    try expectSucceeded(again);
+    try std.testing.expect(std.mem.indexOf(u8, again.text, "sub=yes") != null);
+    try std.testing.expect(std.mem.count(u8, again.text, dagger.native_reused_note) < 2);
 }
 
 test "a native checkout that cannot fetch fails its step with why" {

@@ -90,12 +90,16 @@ fn memTotal(io: std.Io) ?usize {
 ///
 /// The tool trees' checks (`tool_trees.zig`) share the number, not the queue: `held` is every
 /// byte that calls and checks hold now. A check never waits and is refused (its tree left out, the
-/// job goes on) when `held` would pass its limit; a call is never refused for what checks hold, so
-/// a check cannot fail a `hashFiles()`, and a check holds memory only for as long as it takes.
+/// job goes on) when what the checks alone hold (`checks`) would pass its limit, not `held`: a
+/// call may hold a gigabyte, and checks that were refused for it would starve. A call is never
+/// refused for what checks hold, so a check cannot fail a `hashFiles()`, and a check holds memory
+/// only for as long as it takes.
 pub const Budget = struct {
     spin: std.atomic.Value(bool) = .init(false),
     /// Bytes held now by the calls (under their allowance and in their turn) and by the checks.
     held: std.atomic.Value(u64) = .init(0),
+    /// The part of `held` that the checks hold, which is what a check is limited by.
+    checks: std.atomic.Value(u64) = .init(0),
     /// The ticket the next call to ask gets, and the one whose turn it is.
     next: u64 = 0,
     serving: u64 = 0,

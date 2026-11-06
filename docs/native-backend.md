@@ -129,7 +129,10 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   checkout, submodules included (git in the job's image, then the same step script Dagger's
   checkout runs). `submodules: true` fetches the first level and `recursive` all, as GitHub's
   checkout does (Dagger's path always recurses), each to the commit the tree records, as shallow as
-  `fetch-depth`, with `git@<host>:` read as HTTPS; the flags are in the step's script, so in its key.
+  `fetch-depth`, with `git@<host>:` read as HTTPS; the flags are in the step's script, so in its key. With tags (`fetch-depth: 0` or `fetch-tags`)
+  the key holds a digest of the top repository's tags, which move with the commit staying; a
+  submodule's tags are not listed (its URL is known only once fetched), so a checkout with both is
+  not replayed at all.
 - Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a job the runner
   does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
   `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:`, or an `options:` flag the
@@ -831,12 +834,12 @@ and bounded:
   would not fit the Dagger path's variable (`set_up.toolTreesVerdict`, the same 64 KiB).
 - Memory: a tree is held in memory while it is checked (a path, an entry and a list line each:
   about 7 MB for Zig). Every byte is charged to the process's `Budget.held`
-  (`native/hash_files.zig`), the number that `hashFiles()` calls count their memory in as well, against `Limits.memory`
-  (128 MiB), and a tree that would pass it is left out, so concurrent checks of hostile trees hold
-  128 MiB between them, not each their own. A check never waits for the budget and a call is never
-  refused for what checks hold, so neither can fail a job through the other: a check that meets a
-  big call leaves its trees out (the next job checks them), and a call meets checks that are gone
-  in seconds.
+  (`native/hash_files.zig`), the one number of what checks and `hashFiles()` calls hold now, and
+  to `Budget.checks`, the part the checks hold. A tree is left out when `checks` would pass
+  `Limits.memory` (128 MiB), so concurrent checks of hostile trees hold 128 MiB between them, not
+  each their own, and what `hashFiles()` calls hold (up to a gigabyte each in turn) never takes
+  from it. A check never waits and a call is never refused for what checks hold, so neither can
+  fail a job through the other; a call meets checks that are gone in seconds.
 - Order, and what one job can starve. Each tree has a `<tree>.born` file in the lists: when this
   runner first saw it. Trees are checked oldest first (ties in byte order); at each level of the
   walk to them the names that have a `.born` come first, so a level full of planted names does not
@@ -882,7 +885,12 @@ one, with 22 MiB of peak memory in the test process; the script reads the same t
 by its own comment. A tree of 65,532 hard links of 3.8 KB paths (the case that took 1.5 GB, or 6.1
 GB with four checks at once) is left out in 8 ms with 9 MiB, and 27 MiB with four at once.
 
-Not proven or not done: the lease needs the file's owner to be the runner's user or CAP_LEASE
+Not proven or not done: lists written by a runner before the lease was limited to filesystems
+known to refuse it (a runner of an earlier release, on overlayfs) hold non-racy lines for files the
+lease could not vouch for, and are trusted until those files change; the list's format carries no
+version, and a bump would also have to teach the leftover cleanup the old name, so it is not done:
+delete the store's `tool-trees/` once after upgrading a runner that ran on overlayfs (the next
+checks read every tree again). The lease needs the file's owner to be the runner's user or CAP_LEASE
 (a refused lease only makes the file racy, so the cost is a read, never trust); lists of Dagger's
 check are unchanged; the seed registry's discovery from the trees
 (`zig_release.Registry.discover`) is off natively.

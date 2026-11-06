@@ -847,7 +847,9 @@ fn removeSome(arena: Allocator, path: []const u8, io: std.Io, budget: *Budget) R
         if (down) |n| {
             const child = Store.openDirAt(cur, n) catch return .stuck;
             budget.took();
-            test_descents += 1;
+            // Wrapping: a counter for tests that a runner doing millions of descents a day would
+            // overflow in `ReleaseSafe`, which panics, taking every job of the process with it.
+            test_descents +%= 1;
             if (held == max_chain) {
                 if (!cutUp(io, cur, n, chain[0])) {
                     _ = linux.close(child);
@@ -1705,6 +1707,20 @@ test "native eviction: a symlink swapped into a key's part does not reach anothe
     };
     try testing.expect(!evictOne(f, e));
     try testing.expect(f.there(other));
+}
+
+test "native eviction: the descents counter wraps instead of panicking the runner" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const io = testing.io;
+    try deepChain(f, 8);
+    const dead = Hostile.p(f, "{s}/volumes/.dead-chain", .{f.s.root});
+    var budget: Budget = .init(io, 0);
+    test_descents = std.math.maxInt(u32);
+    // A chain this short may be removed whole: either way the counter wrapped, not panicked.
+    _ = removeSome(f.arena(), dead, io, &budget);
+    try testing.expect(test_descents < 16);
+    test_descents = 0;
 }
 
 test "native eviction: a chain of directories with no files is bounded by the budget, and keeps its progress" {
