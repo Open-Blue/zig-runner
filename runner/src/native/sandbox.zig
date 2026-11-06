@@ -114,6 +114,9 @@ pub const Spec = struct {
         /// on-disk ids are the volumes' range (`Spec.volume_id_base`), seen as the job's own
         /// through an idmapped mount, so a volume filled in one slot is the next slot's too.
         volume: bool = false,
+        /// A cache volume's root, `<store>/volumes`: `host` is below it. Reached as the operator
+        /// set it up, links and all; from there on no link is followed (`openVolume`).
+        volume_root: []const u8 = "",
         /// Its mount point is made when the overlay has none, owned by the job's root, as Dagger
         /// makes a cache mount's missing parents.
         make: bool = false,
@@ -678,7 +681,7 @@ fn bindAll(arena: Allocator, spec: Spec, volume_ns: ?linux.fd_t) void {
         if (spec.container != null and bd.volume) continue;
         if (bd.make and spec.container == null) makeDirsIn(arena, root, bd.at, owner);
         if (bd.volume) {
-            bindVolumeIn(arena, root, bd.host, bd.at, volume_ns);
+            bindVolumeIn(arena, root, bd.volume_root, bd.host, bd.at, volume_ns);
             continue;
         }
         const required = !bd.optional and spec.container == null;
@@ -690,10 +693,23 @@ fn bindAll(arena: Allocator, spec: Spec, volume_ns: ?linux.fd_t) void {
     }
 }
 
-/// The directory `host` itself, held: a volume inside another (`<key>/runner`) is a name a job in
-/// the outer one can replace, and a link there must fail the step, not bind what it points at.
-fn openVolume(host: [*:0]const u8) usize {
-    return linux.open(host, .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+/// The directory `host` itself, held. A volume inside another (`<key>/runner`) is a name a job in
+/// the outer one can replace, at any depth below `volume_root`, and a link anywhere there must
+/// fail the step, not bind what it points at. `volume_root` and above are the operator's.
+fn openVolume(arena: Allocator, volume_root: []const u8, host: []const u8) union(enum) {
+    fd: linux.fd_t,
+    err: linux.E,
+} {
+    std.debug.assert(volume_root.len > 0 and host.len > volume_root.len + 1);
+    std.debug.assert(std.mem.startsWith(u8, host, volume_root) and host[volume_root.len] == '/');
+    const rc = linux.open(z(arena, volume_root), .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return .{ .err = linux.errno(rc) };
+    const root = std.math.cast(linux.fd_t, rc) orelse return .{ .err = .BADF };
+    defer _ = linux.close(root);
+    return switch (openIn(root, z(arena, host[volume_root.len + 1 ..]), .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = true }, 0, resolve_no_symlinks)) {
+        .fd => |fd| .{ .fd = fd },
+        .err => |e| .{ .err = e },
+    };
 }
 
 /// A cache volume at `at`, writable, nosuid and nodev, and idmapped through `userns` when given:
@@ -702,14 +718,15 @@ fn openVolume(host: [*:0]const u8) usize {
 fn bindVolumeIn(
     arena: Allocator,
     root: linux.fd_t,
+    volume_root: []const u8,
     host: []const u8,
     at: []const u8,
     userns: ?linux.fd_t,
 ) void {
-    const opened = openVolume(z(arena, host));
-    check(about(arena, "open the cache volume for", at), opened);
-    const volume: linux.fd_t = std.math.cast(linux.fd_t, opened) orelse
-        fatal(about(arena, "open the cache volume for", at), @as(u32, 2));
+    const volume = switch (openVolume(arena, volume_root, host)) {
+        .fd => |fd| fd,
+        .err => |e| fatal(about(arena, "open the cache volume for", at), @backingInt(e)),
+    };
     defer _ = linux.close(volume);
     const open_tree_clone = 1;
     const tree = linux.syscall3(
@@ -1607,23 +1624,37 @@ test "an overlay asks for no redirects or metacopy, where the kernel lets it" {
     try std.testing.expectEqualStrings(",userxattr", overlayFeatures(true));
 }
 
-test "a cache volume's name replaced by a link is refused, not followed" {
+test "a link anywhere below a cache volume's root is refused, and above it is the operator's" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
-    try tmp.dir.createDirPath(io, "outer/runner");
-    try tmp.dir.createDirPath(io, "elsewhere");
-    try tmp.dir.symLink(io, "../elsewhere", "outer/link", .{});
+    try tmp.dir.createDirPath(io, "store/volumes/key/runner/deeper");
+    try tmp.dir.createDirPath(io, "elsewhere/runner");
+    // The operator's store behind a link, as `/var/lib` on another disk is.
+    try tmp.dir.symLink(io, "store", "linked-store", .{});
+    // What a job in the outer volume can plant: at the last name, and on the way to it.
+    try tmp.dir.symLink(io, "../../../elsewhere", "store/volumes/key/last", .{});
+    try tmp.dir.symLink(io, "../../elsewhere", "store/volumes/middle", .{});
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = try tmp.dir.realPathFile(io, ".", &buf);
-    var pa: [std.fs.max_path_bytes]u8 = undefined;
-    const real = try std.fmt.bufPrintSentinel(&pa, "{s}/outer/runner", .{buf[0..n]}, 0);
-    const rc = openVolume(real);
-    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
-    _ = linux.close(std.math.cast(linux.fd_t, rc).?);
-    var pb: [std.fs.max_path_bytes]u8 = undefined;
-    const link = try std.fmt.bufPrintSentinel(&pb, "{s}/outer/link", .{buf[0..n]}, 0);
-    try std.testing.expect(linux.errno(openVolume(link)) != .SUCCESS);
+    const base = buf[0..n];
+    const root = try std.fmt.allocPrint(arena, "{s}/store/volumes", .{base});
+    const linked = try std.fmt.allocPrint(arena, "{s}/linked-store/volumes", .{base});
+    for ([_][]const u8{ root, linked }) |r| {
+        const ok = openVolume(arena, r, try std.fmt.allocPrint(arena, "{s}/key/runner", .{r}));
+        try std.testing.expect(ok == .fd);
+        _ = linux.close(ok.fd);
+        const deep = openVolume(arena, r, try std.fmt.allocPrint(arena, "{s}/key/runner/deeper", .{r}));
+        try std.testing.expect(deep == .fd);
+        _ = linux.close(deep.fd);
+    }
+    const last = openVolume(arena, root, try std.fmt.allocPrint(arena, "{s}/key/last", .{root}));
+    try std.testing.expect(last == .err);
+    const middle = openVolume(arena, root, try std.fmt.allocPrint(arena, "{s}/middle/runner", .{root}));
+    try std.testing.expect(middle == .err);
 }
 
 test "homeOf reads the home directory of a uid from /etc/passwd" {

@@ -87,6 +87,8 @@ pub const Sharing = enum { shared, locked, private };
 /// A volume a job holds: its directory, and the lock that holds it.
 pub const Volume = struct {
     dir: []const u8,
+    /// `<store>/volumes`, which `dir` is below.
+    root: []const u8,
     lock: std.Io.File,
     /// A `private` volume's copy of the job's own, removed when it is let go.
     private: bool = false,
@@ -186,7 +188,7 @@ pub fn open(
     }
     if (owner) |o| if (linux.errno(linux.lchown(at_z, o, o)) != .SUCCESS)
         return error.VolumeNotOwned;
-    return .{ .dir = at, .lock = lock, .private = private };
+    return .{ .dir = at, .root = root, .lock = lock, .private = private };
 }
 
 /// One part of a volume's key as a directory name: the characters a repository's or a tool's
@@ -297,6 +299,7 @@ pub fn plan(
         // tarballs, which Zig hashes again when it unpacks them, are in the volume.
         try p.binds.append(arena, .{
             .host = v.dir,
+            .volume_root = v.root,
             .at = if (zig) try std.mem.concat(arena, u8, &.{ path, "/p" }) else path,
             .read_only = false,
             .volume = true,
@@ -327,6 +330,7 @@ pub fn plan(
             try p.held.append(arena, v);
             try p.binds.append(arena, .{
                 .host = v.dir,
+                .volume_root = v.root,
                 .at = set_up.zigLocalCacheDir(as_runner),
                 .read_only = false,
                 .volume = true,
@@ -344,6 +348,7 @@ pub fn plan(
             try p.held.append(arena, b);
             p.zig_builtin = .{
                 .host = b.dir,
+                .volume_root = b.root,
                 .at = try set_up.zigBuiltinDir(arena, as_runner),
                 .read_only = false,
                 .volume = true,
