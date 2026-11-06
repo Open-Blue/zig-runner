@@ -1,0 +1,3 @@
+kind: Fixed
+body: The weekly hashFiles() comparison with @actions/glob now covers the native backend's hashFiles() too, not only glob.zig
+time: 2026-11-06T15:36:22.315624533-05:00

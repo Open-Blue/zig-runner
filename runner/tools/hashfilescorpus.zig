@@ -1,15 +1,22 @@
 //! The Zig half of `.github/scripts/hashfiles-diff.sh`: runs src/glob.zig, the runner's hashFiles()
 //! search, on a tree on the local disk and compares the files it hashes, in order, and the hash
-//! with what GitHub's script (tools/hashfilesdiff/reference.mjs) reported for the same tree.
+//! with what GitHub's script (tools/hashfilesdiff/reference.mjs) reported for the same tree. It
+//! also runs the native backend's `hashFiles()` (src/native/hash_files.zig, which reads the job's
+//! layers) over the same tree as one layer, and compares its hash and its failures: it reports no
+//! file list, but its hash is of the files' digests in order.
 //!
-//!     hashfilescorpus <cases.json> <workspace> <tree> <reference.jsonl>
+//!     hashfilescorpus <cases.json> <workspace> <layer> <reference.jsonl>
 //!
-//! `workspace` is the path the reference saw the tree at (its working directory); `tree` is where
-//! the tree is here. Hashing is as GitHub's script does it: a name that is a directory once links
+//! `workspace` is the path the reference saw the tree at (its working directory); `layer` is the
+//! directory here that holds it at that path (`<layer><workspace>`), as a native job's layer
+//! holds the job's workspace. Hashing is as GitHub's script does it: a name that is a directory once links
 //! are followed is skipped, a broken link is an error, and the result is the SHA-256 of the files'
 //! SHA-256 digests, "" for none.
 const std = @import("std");
-const glob = @import("glob");
+const runner = @import("runner");
+
+const glob = runner.glob;
+const native = runner.native;
 
 const Io = std.Io;
 
@@ -18,7 +25,7 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
     if (args.len != 5) {
-        std.debug.print("usage: hashfilescorpus <cases.json> <workspace> <tree> <reference.jsonl>\n", .{});
+        std.debug.print("usage: hashfilescorpus <cases.json> <workspace> <layer> <reference.jsonl>\n", .{});
         return 2;
     }
     var out_buf: [8192]u8 = undefined;
@@ -28,7 +35,8 @@ pub fn main(init: std.process.Init) !u8 {
 
     const cwd = Io.Dir.cwd();
     const ws = args[2];
-    var disk: Disk = .{ .io = io, .ws = ws, .tree = args[3] };
+    const layer = args[3];
+    var disk: Disk = .{ .io = io, .ws = ws, .tree = try std.mem.concat(arena, u8, &.{ layer, ws }) };
     const cases = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try cwd.readFileAlloc(io, args[1], arena, .limited(1 << 28)), .{})).array.items;
     var reference: std.AutoHashMapUnmanaged(i64, std.json.ObjectMap) = .empty;
     var lines = std.mem.splitScalar(u8, try cwd.readFileAlloc(io, args[4], arena, .limited(1 << 28)), '\n');
@@ -42,6 +50,9 @@ pub fn main(init: std.process.Init) !u8 {
     var same: usize = 0;
     var differ: usize = 0;
     var both_fail: usize = 0;
+    var native_same: usize = 0;
+    var native_differ: usize = 0;
+    var native_both_fail: usize = 0;
     for (cases) |c| {
         const items = c.object.get("patterns").?.array.items;
         const pattern_args = try arena.alloc([]const u8, items.len);
@@ -49,6 +60,34 @@ pub fn main(init: std.process.Init) !u8 {
         const shown = try std.mem.join(arena, " | ", pattern_args);
         const want = reference.get(c.object.get("id").?.integer).?;
         const got = try run(arena, &disk, pattern_args, ws);
+
+        // The native backend's, on the same tree as one layer: the hash, or that it fails.
+        const native_got = try native.hashFiles(
+            init.gpa,
+            arena,
+            io,
+            .{ .layers = &.{layer}, .opaque_xattr = "user.overlay.opaque" },
+            ws,
+            "/root",
+            pattern_args,
+        );
+        switch (nativeVerdict(want, native_got)) {
+            .same => native_same += 1,
+            .both_fail => native_both_fail += 1,
+            .differs => {
+                native_differ += 1;
+                try out.print("NATIVE DIFFERS  [{s}]\n    GitHub: ", .{shown});
+                if (want.get("error")) |e| {
+                    try out.print("fails: {s}", .{e.string});
+                } else {
+                    try out.print("{s}", .{want.get("hash").?.string});
+                }
+                switch (native_got) {
+                    .ok => |h| try out.print("\n    native: {s}\n", .{h}),
+                    .failed => |why| try out.print("\n    native fails: {s}\n", .{why}),
+                }
+            },
+        }
 
         if (want.get("error")) |e| {
             if (got == .failed) {
@@ -81,13 +120,24 @@ pub fn main(init: std.process.Init) !u8 {
         try out.writeByte('\n');
     }
     try out.print("\n{d} cases hash the same files in the same order, {d} differ, {d} fail on both\n", .{ same, differ, both_fail });
-    return if (differ == 0) 0 else 1;
+    try out.print("native: {d} cases hash the same, {d} differ, {d} fail on both\n", .{ native_same, native_differ, native_both_fail });
+    return if (differ == 0 and native_differ == 0) 0 else 1;
 }
 
 const Result = union(enum) {
     ok: struct { files: []const []const u8, hash: []const u8 },
     failed: []const u8,
 };
+
+/// The native backend's answer against GitHub's: the same hash, or a failure on both. Whether a
+/// failure says the same is not compared (the words are each implementation's own).
+fn nativeVerdict(want: std.json.ObjectMap, got: runner.expr.HashFiles.Result) enum { same, both_fail, differs } {
+    if (want.get("error") != null) return if (got == .failed) .both_fail else .differs;
+    return switch (got) {
+        .ok => |h| if (std.mem.eql(u8, h, want.get("hash").?.string)) .same else .differs,
+        .failed => .differs,
+    };
+}
 
 /// hashFiles(), as the runner computes it, on the local tree.
 fn run(arena: std.mem.Allocator, disk: *Disk, args: []const []const u8, ws: []const u8) !Result {
