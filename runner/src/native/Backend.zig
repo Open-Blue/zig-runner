@@ -1322,7 +1322,7 @@ fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
     if (ev.job.container != null) b.runtime_path = b.envValue("PATH");
     b.uid = b.image_uid;
     b.gid = b.image_gid;
-    b.user = if (b.image) |img| img.user else "";
+    b.user = b.container_opts.user orelse if (b.image) |img| img.user else "";
     if (plan.as_runner) {
         b.uid = runner_uid;
         b.gid = runner_uid;
