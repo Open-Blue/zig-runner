@@ -376,8 +376,8 @@ What it covers, as built:
   cached steps, never a wrong replay.
 - **The store's format** (`Store.store_format`) is bumped with any change to what a layer or its
   record means: the sandbox's trees, the record's files and how they replay, the key's extras.
-  A runner upgraded across a bump finds none of the older runner's layers; they age out under
-  the cap.
+  A runner upgraded across a bump finds none of the older runner's layers, and its first job's
+  end removes them: an older format's `meta` is not whole to `collect`.
 - **Forks**: a fork's pull request that `trust.vouches` accepts still runs natively, with caching,
   in a key space of its own: the scope is `set_up.packageCacheScope`'s (`untrusted` when the
   pull request's head repository is another), the same test that keeps its package cache volumes
