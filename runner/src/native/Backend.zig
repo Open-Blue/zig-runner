@@ -1546,7 +1546,40 @@ fn setUpCaches(b: *Backend, ev: *Evaluator, plan: anytype) !void {
     // jobs run with.
     if (b.cache_plan.seeds.items.len > 0) try b.seeds(plan.as_runner);
     b.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ b.binds, b.cache_plan.binds.items });
+    if (b.cache_plan.zig_builtin) |v| {
+        if (b.seed_layers.items.len > 0) b.seedBuiltin(v, plan.as_runner);
+        b.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ b.binds, &.{v} });
+    }
     if (b.cache_plan.zig_local_roll != null) b.rollZigLocal(plan.as_runner);
+}
+
+/// `set_up.zig_builtin_seed_script` on the `builtin.zig` volume, bound beside the seed's own `b/`
+/// (which its mount over the global cache's hides), in a sandbox whose layer is dropped, as the
+/// Dagger backend runs it in a container of its own. Nothing of it fails the job: a volume that
+/// was not filled costs one build of Zig's build runner.
+fn seedBuiltin(b: *Backend, volume: sandbox.Spec.Bind, as_runner: bool) void {
+    const arena = b.arena;
+    const saved = b.binds;
+    defer b.binds = saved;
+    const at = "/zig-runner-builtin";
+    var beside = volume;
+    beside.at = at;
+    b.binds = std.mem.concat(arena, sandbox.Spec.Bind, &.{ saved, &.{beside} }) catch return;
+    const dir = set_up.zigBuiltinDir(arena, as_runner) catch return;
+    const script = std.fmt.allocPrint(arena, "set -- {s} {s} ''\n{s}", .{
+        at,
+        dir,
+        set_up.zig_builtin_seed_script,
+    }) catch return;
+    var out: Captured = .{ .arena = arena };
+    const user: u32 = if (as_runner) runner_uid else 0;
+    const ended = b.exec(script, &.{"PATH=" ++ image_path}, &.{}, user, user, out.output()) catch |e| {
+        std.log.warn("native: Zig builtin volume not filled: {s}", .{@errorName(e)});
+        return;
+    };
+    b.dropLastLayer();
+    if (ended.failure.len > 0 or ended.code != 0)
+        std.log.warn("native: Zig builtin volume not filled: {s}{s}", .{ ended.failure, out.tail() });
 }
 
 /// `set_up.zig_local_roll_script` on the job's Zig local-cache volume, as root, in a sandbox

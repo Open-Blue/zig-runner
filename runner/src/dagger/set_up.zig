@@ -219,6 +219,55 @@ fn rollZigLocal(
         std.log.warn("Zig local cache not rolled: {s}", .{err_msg});
 }
 
+/// Fills the `builtin.zig` volume (`zigBuiltinDir`) with what the seed has in its own `b/`, which
+/// the volume's mount hides: the seed's manifests name those files, and without them every job
+/// would build Zig's build runner again. Files that are there stay. Arguments: $1 the volume, $2 the
+/// seed's `b/`, $3 the owner (or empty).
+pub const zig_builtin_seed_script =
+    \\cp -an "$2/." "$1/" 2>/dev/null
+    \\[ -z "$3" ] || chown -hR "$3" "$1"
+    \\exit 0
+;
+
+/// Runs `zig_builtin_seed_script`, as `rollZigLocal` runs its script: in a container of its own,
+/// the volume mounted as the steps mount it, a per-job variable keeping the engine from caching
+/// the exec. Nothing of it can fail the job: a volume that was not filled costs one build of Zig's
+/// build runner, after which it has what the seed had.
+fn seedBuiltin(
+    arena: Allocator,
+    transport: Transport,
+    volume: []const u8,
+    seed: []const u8,
+    as_runner: bool,
+    nonce: []const u8,
+) !void {
+    const dir = try zigBuiltinDir(arena, as_runner);
+    var q: Query = .init(arena);
+    try q.open("container");
+    try q.call("from", .{ .address = default_image });
+    if (as_runner) try writeProvision(&q, true);
+    try q.call("withMountedDirectory", .{ .path = zig_seed_dir, .source = seed });
+    try q.call("withMountedCache", .{
+        .path = dir,
+        .cache = volume,
+        .owner = if (as_runner) runner_user else null,
+    });
+    try q.call("withEnvVariable", .{ .name = "ZIG_RUNNER_ROLL", .value = nonce });
+    try q.call("withExec", .{ .args = &[_][]const u8{
+        "sh",
+        "-c",
+        zig_builtin_seed_script,
+        "zig-builtin-seed",
+        dir,
+        zig_seed_dir ++ "/b",
+        if (as_runner) "1001:1001" else "",
+    } });
+    try q.leaf("sync");
+    var err_msg: []const u8 = "";
+    _ = gql(arena, transport, try q.finish(), &err_msg) catch
+        std.log.warn("Zig builtin volume not filled: {s}", .{err_msg});
+}
+
 /// The Zig local-cache volume's mount, one writer for the base container and the roll, so both
 /// reach the same store.
 fn writeZigLocalMount(q: *Query, volume: []const u8, as_runner: bool) !void {
@@ -227,6 +276,19 @@ fn writeZigLocalMount(q: *Query, volume: []const u8, as_runner: bool) !void {
         .cache = volume,
         .owner = if (as_runner) runner_user else null,
     });
+}
+
+/// Where Zig's global cache keeps the `builtin.zig` it generates for each compilation (`b/`).
+/// Zig names these files in the *local* cache's manifests, so with the local cache in a volume and
+/// this directory in the job's own container, every job found them gone and recompiled everything
+/// the local cache held. It has a volume of its own, in the jobs that keep the local cache
+/// (`zigLocalShared`): what Zig reads from it is as trusted as the local cache's `o/`.
+pub fn zigBuiltinDir(arena: Allocator, as_runner: bool) ![]const u8 {
+    for (package_cache_dirs, 0..) |d, i| if (std.mem.eql(u8, d.name, zig_packages)) {
+        const path = if (as_runner) try runnerCachePath(arena, i) else d.path;
+        return std.mem.concat(arena, u8, &.{ path, "/b" });
+    };
+    unreachable;
 }
 
 /// Where uv's project environment goes with `uv_env_in_cache`: inside its own cache volume, the
@@ -278,6 +340,8 @@ const BasePlan = struct {
     zig_local: ?[]const u8 = null,
     /// ZIG_LOCAL_CACHE_DIR when `zig_local` is set (`zigLocalCacheEnv`).
     zig_local_env: ?[]const u8 = null,
+    /// The volume for the `builtin.zig` files the local cache's manifests name (`zigBuiltinDir`).
+    zig_builtin: ?[]const u8 = null,
     /// The Zig cache seed's directory, for a Zig job on a runner with one (`zigSeedFor`).
     zig_seed: ?[]const u8 = null,
     /// What "Set up job" says of the seed: applied, or why not.
@@ -619,6 +683,11 @@ fn writeCacheMounts(q: *Query, arena: Allocator, plan: BasePlan) !void {
             .owner = owner,
         });
     }
+    if (plan.zig_builtin) |id| try q.call("withMountedCache", .{
+        .path = try zigBuiltinDir(arena, plan.as_runner),
+        .cache = id,
+        .owner = if (plan.as_runner) runner_user else null,
+    });
     if (plan.zig_local) |id| try writeZigLocalMount(q, id, plan.as_runner);
 }
 
@@ -745,6 +814,8 @@ pub fn basePlan(
     );
     if (volumes.zig_local) |id| if (opts.zig_local_cache_max_mb > 0)
         try rollZigLocal(arena, transport, id, opts.zig_local_cache_max_mb, as_runner, ran_marker);
+    if (volumes.zig_builtin) |id| if (zig_seed) |seed|
+        try seedBuiltin(arena, transport, id, seed, as_runner, ran_marker);
     return .{
         .container_env = container_env,
         .job_image = job_image,
@@ -755,6 +826,7 @@ pub fn basePlan(
         .cache_ids = volumes.ids,
         .cache_used = cachesUsed(job),
         .zig_local = volumes.zig_local,
+        .zig_builtin = volumes.zig_builtin,
         .zig_local_env = if (opts.zig_local_cache and opts.package_caches and
             job.github.repository.len > 0)
             zigLocalCacheEnv(as_runner, opts.zig_local_cache_max_mb)
@@ -814,6 +886,7 @@ fn uvEnvFor(
 const CacheVolumes = struct {
     ids: []const []const u8 = &.{},
     zig_local: ?[]const u8 = null,
+    zig_builtin: ?[]const u8 = null,
     outputs: ?[]const u8 = null,
     tool_trees: ?[]const u8 = null,
 };
@@ -937,6 +1010,14 @@ const SetUpQuery = struct {
                 err_msg.* = no_volume;
                 return null;
             };
+            const b = jsonFind(data, "czb") orelse {
+                err_msg.* = no_volume;
+                return null;
+            };
+            out.zig_builtin = jsonFindString(b, "id") orelse {
+                err_msg.* = no_volume;
+                return null;
+            };
         }
         return out;
     }
@@ -976,7 +1057,8 @@ fn toolTreesKey(
     });
 }
 
-/// One `cacheVolume` per package manager (`c<i>`), and Zig's local cache's (`czl`).
+/// One `cacheVolume` per package manager (`c<i>`), and Zig's local cache's (`czl`) and its
+/// `builtin.zig` files' (`czb`).
 fn writeCacheVolumes(
     q: *Query,
     arena: Allocator,
@@ -995,6 +1077,13 @@ fn writeCacheVolumes(
             .{ job.github.repository, scope, if (as_runner) "/" ++ runner_user else "" },
         );
         try q.callAs("czl", "cacheVolume", .{ .key = key });
+        try q.leaf("id");
+        try q.close(1);
+        try q.callAs("czb", "cacheVolume", .{ .key = try std.fmt.allocPrint(
+            arena,
+            "zig-runner/{s}/{s}/zig-builtin{s}",
+            .{ job.github.repository, scope, if (as_runner) "/" ++ runner_user else "" },
+        ) });
         try q.leaf("id");
         try q.close(1);
     }
@@ -1690,7 +1779,7 @@ test "the from and provisioning nodes are a byte prefix of every job's base docu
     var env: std.process.Environ.Map = .init(arena);
     const steps = [_]job_mod.Step{testStep("true")};
     var vols: std.Io.Writer.Allocating = .init(arena);
-    try vols.writer.writeAll("{\"data\":{\"czl\":{\"id\":\"VZL\"}");
+    try vols.writer.writeAll("{\"data\":{\"czl\":{\"id\":\"VZL\"},\"czb\":{\"id\":\"VZB\"}");
     for (package_cache_dirs, 0..) |_, i| try vols.writer.print(",\"c{d}\":{{\"id\":\"V{d}\"}}", .{ i, i });
     try vols.writer.writeAll("}}");
     for ([_]config.StepUser{ .runner, .root }) |step_user| {
@@ -1917,7 +2006,7 @@ test "with zig_local_cache, Zig's local cache gets a volume of its own, outside 
     const steps = [_]job_mod.Step{testStep("zig build test")};
     const job = testJob(&steps);
     var vols: std.Io.Writer.Allocating = .init(arena);
-    try vols.writer.writeAll("{\"data\":{\"czl\":{\"id\":\"VZL\"}");
+    try vols.writer.writeAll("{\"data\":{\"czl\":{\"id\":\"VZL\"},\"czb\":{\"id\":\"VZB\"}");
     for (package_cache_dirs, 0..) |_, i| try vols.writer.print(",\"c{d}\":{{\"id\":\"V{d}\"}}", .{ i, i });
     try vols.writer.writeAll("}}");
     const answers = [_][]const u8{ vols.written(), base_answer, try exec(arena, "C1", 0, "") };
@@ -1941,6 +2030,9 @@ test "with zig_local_cache, Zig's local cache gets a volume of its own, outside 
     try std.testing.expect(std.mem.indexOf(u8, keys, "czl: cacheVolume(key:\"zig-runner/o/r/repo/zig-local/runner\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, base, "withEnvVariable(name:\"ZIG_LOCAL_CACHE_DIR\",value:\"/home/runner/.cache/zig-local\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, base, "withMountedCache(path:\"/home/runner/.cache/zig-local\",cache:\"VZL\",owner:\"runner\")") != null);
+    // The `builtin.zig` files its manifests name are kept too, in the global cache's `b/`.
+    try std.testing.expect(std.mem.indexOf(u8, keys, "czb: cacheVolume(key:\"zig-runner/o/r/repo/zig-builtin/runner\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "withMountedCache(path:\"/home/runner/.cache/zig/b\",cache:\"VZB\",owner:\"runner\")") != null);
 }
 
 test "with zig_local_cache, an untrusted job's Zig local cache is its own: no volume, a Set up job note" {
@@ -1995,7 +2087,7 @@ test "with a limit, Zig's local cache rolls before the base container, under one
     var env: std.process.Environ.Map = .init(arena);
     const steps = [_]job_mod.Step{testStep("zig build test")};
     var vols: std.Io.Writer.Allocating = .init(arena);
-    try vols.writer.writeAll("{\"data\":{\"czl\":{\"id\":\"VZL\"}");
+    try vols.writer.writeAll("{\"data\":{\"czl\":{\"id\":\"VZL\"},\"czb\":{\"id\":\"VZB\"}");
     for (package_cache_dirs, 0..) |_, i| try vols.writer.print(",\"c{d}\":{{\"id\":\"V{d}\"}}", .{ i, i });
     try vols.writer.writeAll("}}");
     var bases: [2][]const u8 = undefined;
@@ -2100,6 +2192,48 @@ fn seedRun(arena: Allocator, opts: Options, job: job_mod.Job, seeds: []const []c
     const res = try run(arena, std.testing.io, &env, o, job, &log);
     try std.testing.expect(res.succeeded);
     return .{ .seen = fake.seen.items, .log = w.buffered() };
+}
+
+test "with the Zig local cache and a seed, the volume of builtin.zig files starts with the seed's own, apart from the job" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("zig build test")};
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll("{\"data\":{\"czl\":{\"id\":\"VZL\"},\"czb\":{\"id\":\"VZB\"}");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print(",\"c{d}\":{{\"id\":\"V{d}\"}}", .{ i, i });
+    try vols.writer.writeAll("}}");
+    const answers = [_][]const u8{ seed_answer, vols.written(), "{\"data\":{}}", base_answer, try exec(arena, "C1", 0, "") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{
+        .package_caches = true,
+        .trusted = true,
+        .zig_local_cache = true,
+        .zig_seeds = &.{test_zig_seed},
+        .step_user = .runner,
+        .test_ran_marker = "R1",
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+    }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    const fill = fake.seen.items[2];
+    const base = fake.seen.items[3];
+    try std.testing.expect(braceBalanced(fill));
+    // The volume mounted as the steps mount it, the seed beside it, copied in without replacing.
+    const mount = "withMountedCache(path:\"/home/runner/.cache/zig/b\",cache:\"VZB\",owner:\"runner\")";
+    try std.testing.expectEqualStrings(mount, mountArgs(fill, "\"VZB\"").?);
+    try std.testing.expectEqualStrings(mount, mountArgs(base, "\"VZB\"").?);
+    try std.testing.expect(std.mem.indexOf(u8, fill, "withMountedDirectory(path:\"/zig-seed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fill, "cp -an") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fill, "\"/zig-seed/b\",\"1001:1001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fill, "R1") != null);
+    // In the job it comes after the seed, whose `b/` its mount hides.
+    try std.testing.expect(std.mem.indexOf(u8, base, "withMountedDirectory(path:\"/home/runner/.cache/zig\"").? <
+        std.mem.indexOf(u8, base, mount).?);
 }
 
 test "the Zig cache seed: built from pinned, runner-written inputs, the same for every scope, on the Zig volume only" {
