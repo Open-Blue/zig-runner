@@ -377,6 +377,9 @@ pub fn openIn(
     return .{ .err = .AGAIN };
 }
 
+/// What `readIn` finds.
+pub const LayerFile = union(enum) { text: []const u8, missing, whiteout };
+
 /// The contents of `path` in a layer, read by the runner: resolved inside the layer and through no
 /// symlink. `missing` when it is not a regular file there; `whiteout` when the layer deletes it (an
 /// overlay whiteout, a character device), so lower layers must not be looked in.
@@ -385,7 +388,28 @@ pub fn readIn(
     layer: []const u8,
     path: []const u8,
     limit: usize,
-) !union(enum) { text: []const u8, missing, whiteout } {
+) !LayerFile {
+    return readResolved(arena, layer, path, limit, resolve_no_symlinks);
+}
+
+/// `readIn` for a tree no job wrote, an image's own, whose links are the image's: they are
+/// followed, staying inside it.
+pub fn readFollowingIn(
+    arena: Allocator,
+    layer: []const u8,
+    path: []const u8,
+    limit: usize,
+) !LayerFile {
+    return readResolved(arena, layer, path, limit, 0);
+}
+
+fn readResolved(
+    arena: Allocator,
+    layer: []const u8,
+    path: []const u8,
+    limit: usize,
+    resolve: u64,
+) !LayerFile {
     const dir = linux.open(try arena.dupeSentinel(u8, layer, 0), .{
         .ACCMODE = .RDONLY,
         .DIRECTORY = true,
@@ -398,7 +422,7 @@ pub fn readIn(
         .ACCMODE = .RDONLY,
         .NONBLOCK = true,
         .NOCTTY = true,
-    }, 0, resolve_no_symlinks)) {
+    }, 0, resolve)) {
         .fd => |f| f,
         .err => return .missing,
     };

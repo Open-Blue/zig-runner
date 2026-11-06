@@ -2211,8 +2211,9 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
     explicit group or a uid not there. They are read once, from the image, when the job starts
     (`Backend.stepGroups`), and that one list is what the step's processes have and what the call
     counts, so `hashFiles()` says yes only where the step could read. The engine read them at each
-    exec; here a step that edits `/etc/group` changes nothing for the steps after it, and a gid past
-    the job's 65,536 ids is left out.
+    exec; here a step that edits `/etc/group`, or `usermod -aG`, changes nothing for the steps after
+    it, and a gid past the job's 65,536 ids is left out. A link in them stays in the image. The list
+    is in a step's key when it has one, so the same ids without a group never replay what it read.
   - *ACLs and capabilities.* An ACL decides as the kernel's `posix_acl_permission` does, on the
     file and on each directory, with its ids shifted like the owner's. `sha256sum` as a non-root
     user had no capability to use, so none is modelled.
