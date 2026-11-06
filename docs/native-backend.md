@@ -263,6 +263,7 @@ parent, with no setting and no host tuning, and each job under a limit of its ow
 | Machine | Kept for the rest | All jobs (`memory.max` on the parent) | One job |
 |---|---|---|---|
 | 8 GiB Pi | 2.7 GiB | 5.3 GiB | 3.6 GiB |
+| razorbill with `self` under `MemoryMax=90%` (7.09 GiB) | 2.4 GiB | 4.72 GiB | 3.15 GiB |
 | 16 GiB | 5.3 GiB | 10.7 GiB | 7.1 GiB |
 | 30 GiB laptop | 10 GiB | 20 GiB | 13.3 GiB |
 | 128 GiB | 12 GiB | 116 GiB | 77.3 GiB |
@@ -270,42 +271,79 @@ parent, with no setting and no host tuning, and each job under a limit of its ow
 - **Why these.** A third of the machine is kept, at least 2 GiB and at most 12 GiB, and jobs get at
   least half whatever that says. Three quarters per job, as it was, left a laptop's desktop 7.5 GiB
   beside one job, and nothing at all beside two. One job gets two thirds of the total, so a
-  runaway still leaves its neighbours a third, and razorbill's build, which reaches about 2.4 GB of
-  anonymous memory, has 1.2 GiB to spare. A job that needs more than this fails where it passed
-  before: its step says which limit and which setting.
+  runaway still leaves its neighbours a third. A job that needs more than this fails where it
+  passed before: its step says which limit and which setting.
+- **razorbill, worked through.** Under `self` its unit's `MemoryMax` of 7608549376 bytes is the
+  machine: 5.07e9 for all jobs (4.72 GiB), 3.38e9 for one (3.15 GiB). Its build reaches about 2.4 GB
+  of anonymous memory, so one has about 0.9 GiB to spare. Two at once are 4.8e9 of 5.07e9, which is
+  tight; a third is killed, where three used to swap.
 - **"The machine"** is `MemTotal`, or the tightest `memory.max` above the parent where the runner is
   in a container or a slice with a limit of its own, which `MemTotal` does not show. The parent's
-  own is left out, since it is written from this number.
+  own is left out, since it is written from this number. A third of that is kept as of any machine,
+  so `MemoryMax=4G` on a named path gives jobs 2 GiB; `RUNNER_NATIVE_MEMORY_TOTAL_MB` says otherwise.
+- **What the total does not cover.** Other parents, below, and anything else on the machine: above
+  all a Dagger engine beside the jobs, in a cgroup of its own. On razorbill the bench pool's 4.72 GiB,
+  the engine's 4 GB cap and the machine's baseline add up to more than its RAM, so a global OOM
+  stays reachable on a machine shared with an engine. The total does not take it off: an engine's
+  cap is the gate's to find, may be absent, and taken off here would leave a job on razorbill about 1.1 GiB,
+  under its build. Where that matters, set `RUNNER_NATIVE_MEMORY_TOTAL_MB` or cap the engine lower.
 - **Swap.** `memory.swap.max` is 0 on the parent: page cache is reclaimed at a limit, anonymous
   memory stays in RAM, and a job past its limit is killed instead of taking the machine into swap
   death. A swapped-out job also looks small to the gate, which held `memory.high` down
   (`Admission.growHigh`) on the job razorbill's compressed swap slowed for an hour.
   `RUNNER_NATIVE_SWAP=true` gives swap back, as a kernel without swap accounting does ("Set up job"
   says which); the memory limits hold either way.
-- **Processes.** `pids.max` on the parent is four jobs' (32768 by default).
+- **`memory.high` goes with swap.** With nothing to reclaim anonymous memory into, `memory.high`
+  does not slow a job, it stops it, and nothing kills it: at a 50 MiB `memory.high` under a 300 MiB
+  `memory.max`, swap 0, a hog reached 50 MiB in 7 s and not 55 in the next 100, with 1328 `high`
+  events and no OOM. The gate's `growHigh` stops at the `MemAvailable` floor, so two unlearned builds
+  on razorbill could have held each other until `timeout-minutes`. So where jobs cannot swap
+  (`cgroup.canSwap`) no `memory.high` is set, `memory.max` decides, and "Set up job" says so. What
+  goes with it: a job that outgrows its estimate is no longer held to it for its neighbours' sake.
+  They are protected by its `memory.max` and by the total instead, and the gate by `MemAvailable`,
+  which falls as the job grows. What is gained: a job past its estimate runs at full speed or fails,
+  it is learned at what it really took on the first run, not by doubling, and page cache is
+  reclaimed at the limits or under pressure, as `MemAvailable` counts it. With swap, all of #306 stands.
+- **Processes.** `pids.max` on the parent is four jobs' (32768 by default), and neither it nor a
+  job's goes above the kernel's 4194304.
 - **The operator's numbers win.** `RUNNER_NATIVE_MEMORY_TOTAL_MB` sets the total, and the default job
   is two thirds of it. An explicit `RUNNER_NATIVE_MEMORY_MAX_MB` above the default total raises the
   total with it, and `0` leaves all jobs without a limit too, unless a total is set. A total below a
   job's limit holds: limits are hierarchical.
 - **Several runners.** The default total depends on the machine alone, so every runner sharing a
-  parent, which root runners do by default (`/sys/fs/cgroup/zig-runner`), writes the same numbers,
+  parent, which root runners do by default (`/sys/fs/cgroup/zig-runner`), asks for the same numbers,
   and their jobs together stay under one bound, whichever started last. They must use the same
-  settings, as they must the same `RUNNER_NATIVE_SUBNET`: each job's start rewrites the parent's
-  limits with its runner's. What does not hold: runners with **different parents**, such as units
-  each with `RUNNER_NATIVE_CGROUP=self`, get a bound each, and cannot see each other. Give them one
-  parent (a path), or a slice with its own `MemoryMax=`, which then counts as the machine for all of
-  them.
+  settings, as they must the same `RUNNER_NATIVE_SUBNET`. A runner set otherwise changes the parent's
+  limits only when no job is running under it: a lower `memory.max` over what jobs hold kills them
+  there and then, and `max` from a pool with `RUNNER_NATIVE_MEMORY_MAX_MB=0` takes the bound from
+  another's. With jobs running what stands is kept, and "Set up job" and the log say so and give the
+  limits really in force. A hand writing a lower value on the parent still kills what is over it.
+  What does not hold: runners with **different parents**, such as units each with
+  `RUNNER_NATIVE_CGROUP=self`, get a bound each, and cannot see each other. Give them one parent (a
+  path), or a slice with its own `MemoryMax=`, which then counts as the machine for all of them.
+- **A named parent stays the operator's.** With `RUNNER_NATIVE_CGROUP=<path>` the jobs go in
+  `<path>/jobs`, which is the runner's and has all jobs' limits. The path's `memory.max` and
+  `memory.swap.max` (a slice's `MemoryMax=`) are not written, and hold over everything under it.
 - **The memory gate** (`admission.zig`) still decides on `MemAvailable`, and does not know the total.
   On a 30 GiB machine it may let in a job when the parent is full and the machine is not; the parent
-  then kills the largest process under it. `memory.high` stays below `memory.max`: `Admission.growHigh`
-  may raise it past the job's `memory.max`, where it has no effect.
-- **A job that cannot be bounded is refused**, by default: a rootless runner without delegation, a
-  parent that cannot be made or limited, a root runner in a container whose root holds processes
-  (use `self` there). It goes to Dagger, whose engine holds it, or fails saying why with
-  `RUNNER_ENGINE=none`. `RUNNER_NATIVE_CGROUP=none` is the operator accepting the risk, and "Set up
-  job" then says the job runs UNBOUNDED. A runner in a container with a memory limit of its own is
-  bounded by it, jobs and runner alike, and `none` is the setting for it where no cgroup can be
-  written.
+  then kills the largest process under it.
+- **An OOM kill says which limit it came from** in the step's log: the job's, all jobs', or the
+  machine's or one above the parent, told apart by where `memory.events` counts `oom`.
+- **A job that cannot be bounded is refused**, by default: a rootless runner without delegation, or
+  a parent that cannot be made or limited. It goes to Dagger, whose engine holds it, or fails saying
+  why with `RUNNER_ENGINE=none`. `RUNNER_NATIVE_CGROUP=none` is the operator accepting the risk, and
+  "Set up job" then says the job runs UNBOUNDED. A runner in a container with a memory limit of its
+  own is bounded by it, jobs and runner alike, and `none` is the setting for it where no cgroup can
+  be written.
+- **A root runner in a container finds its own place.** The default parent cannot be made below a
+  root that holds processes. A root runner at the root of its cgroup namespace then does what
+  `self` does, without being told: only the namespace's own processes move, and only a container
+  has a root like that (the host's may hold processes and still give controllers). That needs a
+  writable cgroup mount: Docker's is read-only without `privileged: true`
+  (moby's `daemon/oci_linux.go`: `writableCgroups := c.HostConfig.Privileged`), whatever `cap_add`
+  says, or with `security_opt: [writable-cgroups=true]` (checked on Docker 29.9, with
+  `cap_add: [SYS_ADMIN]` alone reading `ro` and with the option `rw`). Without it, the job is refused
+  with that reason.
 - **Not a per-process limit in place of the cgroup.** `RLIMIT_AS` or `RLIMIT_DATA` in the helper would
   keep rootless jobs running: measured on a 30 GiB laptop, Go, Node, Bun and .NET start under an
   `RLIMIT_AS` of 4 GiB, and only the JVM needs more (it reserves a quarter of the machine and starts
@@ -359,8 +397,9 @@ What it changes on the host, which is shared by every runner on it:
   on the first job, with the memory and pids controllers for its children, as Docker's cgroupfs
   driver makes `/sys/fs/cgroup/docker`). It is the host's, like the slots: each job's cgroup is
   named by its directory, and only the runner holding a job's lock removes it. All jobs' limits go
-  on it ("Bounded jobs"), and each job's start writes them again. Under a unit with
-  `Delegate=yes`, `RUNNER_NATIVE_CGROUP=self` keeps them in the unit's own tree instead.
+  on it ("Bounded jobs"). Under a unit with `Delegate=yes`, `RUNNER_NATIVE_CGROUP=self` keeps them
+  in the unit's own tree instead, and a path keeps them in a `jobs` child of that path, whose own
+  limits stay the operator's.
 - **IPv4 forwarding** (`net.ipv4.ip_forward`) is turned on if it is off, and stays on: other
   runners' jobs need it, and turning it off under them would cut their network. The runner logs
   a warning when it turns it on, and another when the FORWARD policy is ACCEPT, since the host
@@ -382,16 +421,16 @@ What it changes on the host, which is shared by every runner on it:
 - Under `deploy/compose.yaml` (not changed by P1): the runner image is `FROM scratch` and runs as
   root. It needs `privileged: true` (as the engine service has), or `cap_add: [SYS_ADMIN,
   NET_ADMIN]` with `security_opt: [seccomp=unconfined, apparmor=unconfined,
-  systempaths=unconfined]`, and `network_mode: host` for the bridge to be the host's. The store
+  systempaths=unconfined, writable-cgroups=true]` (without the last, Docker mounts cgroups
+  read-only and every native job is refused), and `network_mode: host` for the bridge to be the
+  host's. The store
   must be a volume, not the container's own overlay filesystem (overlayfs cannot take an upper
   directory on overlayfs), and the rootfs another volume. The slots' locks must be the host's:
   bind `/run/zig-runner:/run/zig-runner` from the host into every runner container (the
   container's own /run would give each its own slot 0 on the shared bridge). The image has no
   `iptables`, and needs none since P5: the rules are made over netlink. For the jobs' cgroups,
-  `cgroup: private` (the default on cgroup v2) with `RUNNER_NATIVE_CGROUP=self`: the container's
-  root is then its own cgroup, and the runner moves itself into a leaf of it. The setting is needed
-  there: the default parent cannot be made below a root that holds processes, and a job with no
-  cgroup is refused ("Bounded jobs").
+  `cgroup: private` (the default on cgroup v2): the container's root is then its own cgroup, and
+  the runner moves itself into a leaf of it, as `RUNNER_NATIVE_CGROUP=self` does ("Bounded jobs").
 - Under `deploy/zig-runner.service` on razorbill (not changed by P1): the unit runs as root with
   `ProtectSystem=strict`, which makes the store's default and `/run` read-only. It needs
   `StateDirectory=zig-runner` (or `ReadWritePaths=/var/lib/zig-runner`) for the store, and
@@ -791,8 +830,9 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   up job" says it, as the kernel holds it. Past it the kernel reclaims the job's page cache, then
   slows its allocations; it never kills, so a job that outgrows its estimate is throttled in its
   own cgroup instead of taking memory its neighbours were admitted against, or meeting the OOM
-  killer. `memory.max` stays the hard cap above it (a `memory.high` above it is simply never
-  reached), and the host's `MemAvailable` floor
+  killer. Since #367 only where jobs can swap: with none it stops a job dead, and `memory.max`
+  decides alone ("Bounded jobs"). `memory.max` stays the hard cap above it (a `memory.high` above it
+  is simply never reached), and the host's `MemAvailable` floor
   (`RUNNER_MIN_MEM_AVAILABLE_MB`), pressure and swap growth still hold every runner. The headroom
   is for what `memory.high` counts and the estimate does not: page cache and reclaimable slab. A
   job that outgrew its estimate and went over `memory.high` (memory.events `high`) is learned at
@@ -2257,13 +2297,20 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
 
 ### Bounded jobs (#367)
 
-- **The incident was not the limit being too high.** Two `python3` of 22.6 and 25.9 GB in the
-  journal looked like the 22.5 GiB `memory.max` of a 30 GiB machine, but 25.9 is over it, and the
-  kernel's own line says otherwise: `global_oom`, `task_memcg=/system.slice/docker-<id>.scope`. The
-  processes were in their containers' cgroups, in no job's. The tests ran as root in a container
-  whose root held processes, so no parent could be made, `cgroup.resolve` said `none`, and the
-  runaway test's `while True` went on with no limit until the machine ran out. Runs where the parent
-  worked show up as `CONSTRAINT_MEMCG` in `/zig-runner-test/<job>`, and hurt nothing.
+- **The incident was not the limit being too high.** The kills were `python3` of 22.6 GB (01:41),
+  22.4 GB (16:22), 11.6 GB (16:28) and 25.9 GB (16:29). The first looked like the 22.5 GiB `memory.max`
+  of a 30 GiB machine, but 25.9 is over it, and the kernel's own line says otherwise: `global_oom`,
+  `task_memcg=/system.slice/docker-<id>.scope`. Those processes were in their containers' cgroups, in
+  no job's. A container alone is not the condition: at 15:54 a limit held inside a Docker scope.
+  That no parent could be made, `cgroup.resolve` said `none`, and the runaway test's `while True`
+  went on with no limit until the machine ran out, is inferred from the code and that line; it was
+  not reproduced. Runs where the parent worked show up as `CONSTRAINT_MEMCG` in
+  `/zig-runner-test/<job>`, and hurt nothing.
+- **`memory.high` was a safe throttle only with swap.** Turning swap off to bound a job turned the
+  throttle into a stall (#372's review, "Bounded jobs"). A limit that holds a job with no kill needs
+  a way for the job to go on, or the job only holds its runner until its timeout.
+- **A limit the operator wrote is not ours to rewrite,** and neither is one a running job depends
+  on. Each job's start writing the parent looked idempotent; it was not once settings could differ.
 - **Parallel tests did not undo each other's limits.** Each job's cgroup is its own and written once;
   the one shared write was the gate test's 64 GiB on the parent, which bounded nothing. Limits on
   the parent changed that, so a test that sets them now has a parent of its own (`testCgroup`).

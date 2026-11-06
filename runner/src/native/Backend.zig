@@ -155,6 +155,7 @@ job_cgroup: ?cgroup.Job = null,
 limits: cgroup.Limits = .{ .memory_max = null, .pids_max = null },
 oom_kills: u64 = 0,
 ooms: u64 = 0,
+parent_ooms: u64 = 0,
 pids_max_hits: u64 = 0,
 /// `Config.gate`: told of the job's cgroup, which it measures the job in.
 gate: ?*admission.Gate = null,
@@ -815,8 +816,12 @@ fn jobCgroup(
     }
     const why: []const u8 = switch (parent) {
         .none => |w| w,
-        .dir => |dir| if (cgroup.Job.make(arena, dir, name, b.limits)) |j| {
+        .dir => |dir| if (cgroup.Job.make(arena, b.io, dir, name, b.limits)) |j| {
             b.job_cgroup = j;
+            b.parent_ooms = j.usage(b.io).parent_ooms;
+            // What holds is what the log says, and what a kill is put down to.
+            b.limits.memory_total = j.all.memory;
+            b.limits.pids_total = j.all.pids;
             try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: the job's " ++
                 "cgroup is {s}, with memory.max {f} and pids.max {f}.", .{
                 j.dir,
@@ -828,16 +833,32 @@ fn jobCgroup(
                 dir,
                 Limit.memory(b.limits.memory_total),
                 Limit.count(b.limits.pids_total),
-                if (!j.swap_held)
+                if (!j.all.accounted)
                     "may swap: this kernel does not account for swap"
-                else if (b.limits.swap)
+                else if (j.all.swap)
                     "may swap (RUNNER_NATIVE_SWAP)"
                 else
                     "may not swap",
             }));
+            if (j.all.kept) {
+                const said = try std.fmt.allocPrint(arena, "Native steps: these are not this " ++
+                    "runner's limits for all jobs: another runner's jobs are running under {s} " ++
+                    "with these, and changing them could kill those jobs or leave them " ++
+                    "unbounded. Runners on one parent must use the same settings.", .{dir});
+                try b.notes.append(arena, said);
+                std.log.warn("native: {s}", .{said});
+            }
             // memory.high from what the gate reserves for the job; under memory.max, which stays
-            // the hard cap.
-            const high_mb = if (b.gate) |g| g.native(j.dir) orelse return else return;
+            // the hard cap. Only where it can slow a job, not stop it (`cgroup.canSwap`).
+            const g = b.gate orelse return;
+            const high_mb = g.native(j.dir) orelse return;
+            if (!cgroup.canSwap(j.all, b.io)) {
+                g.noHigh();
+                try b.notes.append(arena, "Native steps: no memory.high: with no swap it would " ++
+                    "stop a job past it instead of slowing it. memory.max ends one that takes " ++
+                    "too much.");
+                return;
+            }
             const high = j.setHigh(arena, b.io, @as(u64, high_mb) << 20) catch |e| {
                 try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: the " ++
                     "job's memory.high could not be set ({s}).", .{@errorName(e)}));
@@ -1558,27 +1579,51 @@ fn limitsReached(b: *Backend, x: *Exec, num: u32) !void {
     defer {
         b.oom_kills = u.oom_kills;
         b.ooms = u.ooms;
+        b.parent_ooms = u.parent_ooms;
         b.pids_max_hits = u.pids_max_hits;
     }
-    // The job's own limit ran out, or one above it: the kernel counts them apart.
-    const own = u.ooms > b.ooms;
-    if (u.oom_kills > b.oom_kills) x.sh.errorLine(num, try std.fmt.allocPrint(
-        b.arena,
-        "{s} ({f}, {s}): the kernel killed {d} process(es) of this step to stay within it.",
-        .{
-            if (own) "The job reached its memory limit" else "All native jobs together reached " ++
-                "their memory limit",
-            Limit.memory(if (own) b.limits.memory_max else b.limits.memory_total),
-            if (own) "RUNNER_NATIVE_MEMORY_MAX_MB" else "RUNNER_NATIVE_MEMORY_TOTAL_MB",
+    if (u.oom_kills > b.oom_kills) {
+        const before: cgroup.Usage = .{
+            .working_set_mb = null,
+            .peak_mb = null,
+            .oom_kills = b.oom_kills,
+            .ooms = b.ooms,
+            .parent_ooms = b.parent_ooms,
+            .pids_max_hits = 0,
+        };
+        x.sh.errorLine(num, try oomLine(
+            b.arena,
+            cgroup.Killer.of(before, u),
+            b.limits,
             u.oom_kills - b.oom_kills,
-        },
-    ));
+        ));
+    }
     if (u.pids_max_hits > b.pids_max_hits) x.sh.errorLine(num, try std.fmt.allocPrint(
         b.arena,
         "The job reached its process limit ({f}, RUNNER_NATIVE_PIDS_MAX): this step was " ++
             "refused {d} new process(es) or thread(s).",
         .{ Limit.count(b.limits.pids_max), u.pids_max_hits - b.pids_max_hits },
     ));
+}
+
+/// The error line for `killed` processes OOM-killed in a step, by the limit they were killed for.
+fn oomLine(
+    arena: Allocator,
+    killer: cgroup.Killer,
+    limits: cgroup.Limits,
+    killed: u64,
+) ![]const u8 {
+    return switch (killer) {
+        .job => std.fmt.allocPrint(arena, "The job reached its memory limit ({f}, " ++
+            "RUNNER_NATIVE_MEMORY_MAX_MB): the kernel killed {d} process(es) of this step to " ++
+            "stay within it.", .{ Limit.memory(limits.memory_max), killed }),
+        .all => std.fmt.allocPrint(arena, "All native jobs together reached their memory limit " ++
+            "({f}, RUNNER_NATIVE_MEMORY_TOTAL_MB): the kernel killed {d} process(es) of this " ++
+            "step to stay within it.", .{ Limit.memory(limits.memory_total), killed }),
+        .above => std.fmt.allocPrint(arena, "The machine ran out of memory, or a limit above " ++
+            "the native jobs' reached its own: the kernel killed {d} process(es) of this step. " ++
+            "This job was within its limits.", .{killed}),
+    };
 }
 
 /// The job's cache volumes, as the Dagger backend gives them (`volumes.plan`): held for the job
@@ -6051,12 +6096,15 @@ const test_parent = cgroup.mount_point ++ "/zig-runner-test";
 /// `ZIG_RUNNER_REQUIRE_NATIVE=1`) before it can run anything: in a container whose root holds
 /// processes no parent can be made (#367).
 const TestCgroup = struct {
+    /// Where the jobs' cgroups go.
     dir: []const u8,
-    /// Made for this test, and removed by `remove`; not a delegated `self`.
-    own: bool,
+    /// What was made for this test, and `remove` removes; null for a delegated `self`.
+    top: ?[]const u8,
 
     fn remove(t: TestCgroup, arena: Allocator) void {
-        if (t.own) (cgroup.Job{ .dir = t.dir }).remove(arena, std.testing.io);
+        const top = t.top orelse return;
+        (cgroup.Job{ .dir = t.dir }).remove(arena, std.testing.io);
+        (cgroup.Job{ .dir = top }).remove(arena, std.testing.io);
     }
 };
 
@@ -6077,7 +6125,10 @@ fn testCgroup(arena: Allocator, cfg: *Config) !TestCgroup {
         return error.SkipZigTest;
     }
     switch (cgroup.parent(arena, io, cfg.cgroup.parent)) {
-        .dir => |d| return .{ .dir = try arena.dupe(u8, d), .own = own },
+        .dir => |d| return .{
+            .dir = try arena.dupe(u8, d),
+            .top = if (own) cfg.cgroup.parent else null,
+        },
         .none => |why| {
             if (own) (cgroup.Job{ .dir = cfg.cgroup.parent }).remove(arena, io);
             const required = std.mem.eql(u8, env.get("ZIG_RUNNER_REQUIRE_NATIVE") orelse "", "1");
@@ -6350,6 +6401,10 @@ test "root runner: a native job's cgroup gets memory.high from what the gate res
     var cfg = try testConfig(arena, &tmp);
     const parent = try testCgroup(arena, &cfg);
     defer parent.remove(arena);
+    // On a machine with no swap at all it has no use (`cgroup.canSwap`), and the test below has it.
+    const can = cgroup.canSwap(.{ .swap = true }, io);
+    if (!can) return error.SkipZigTest;
+    cfg.cgroup.swap = true;
     var slots: [1]admission.Admission.Slot = undefined;
     var pool: admission.Admission = .init(io, .{}, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
@@ -6373,7 +6428,7 @@ test "root runner: a native job's cgroup gets memory.high from what the gate res
         "Native steps: all native jobs under ",
         "Native steps: memory.high 1.0 GB, from what the memory gate reserves for the job",
     });
-    // All jobs' limits are on the parent, with no swap unless the kernel cannot hold it there.
+    // All jobs' limits are on the parent.
     const all = cgroup.Limits.of(io, cfg.cgroup, parent.dir);
     // The kernel rounds it down to a page.
     const held = admission.readCgroupBytes(io, parent.dir, "memory.max").?;
@@ -6386,10 +6441,6 @@ test "root runner: a native job's cgroup gets memory.high from what the gate res
     );
     const pids_held = try std.fmt.parseInt(u32, std.mem.trim(u8, pids, "\n"), 10);
     try std.testing.expectEqual(all.pids_total.?, pids_held);
-    if (std.mem.indexOf(u8, first.text, "may not swap") != null) try std.testing.expectEqual(
-        @as(?u64, 0),
-        admission.readCgroupBytes(io, parent.dir, "memory.swap.max"),
-    );
     const learned = gate.ended() orelse return error.TestUnexpectedResult;
     try std.testing.expect(learned.native and learned.alone);
     // The job's own few MB (its shell and helper), or the 64 MB floor.
@@ -6406,6 +6457,103 @@ test "root runner: a native job's cgroup gets memory.high from what the gate res
         try std.fmt.allocPrint(arena, "Native steps: memory.high {d} MB, from ", .{high}),
     });
     _ = gate.ended();
+}
+
+test "root runner: with no swap a job past what the gate reserves is not held there" {
+    // It stops dead at a `memory.high` it cannot reclaim: nothing kills it, and it holds its runner
+    // until the job's timeout. `timeout` ends it here if it comes to that.
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    cfg.cgroup.memory_max_mb = 1536;
+    var slots: [1]admission.Admission.Slot = undefined;
+    var pool: admission.Admission = .init(io, .{}, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    pool.native = true;
+    var gate: admission.Gate = .{ .pool = &pool };
+    cfg.gate = &gate;
+    var sampling = try io.concurrent(admission.Admission.sample, .{&pool});
+    defer sampling.cancel(io);
+    gate.leave(true);
+    gate.assigned(admission.jobKey("o/r", "ci.yml", "past its high"));
+    // 1.1 GiB, over the 1 GB a job not learned yet would get, under its `memory.max`, and held for
+    // the gate to see.
+    const step = testStep("timeout 60 python3 -c 'import time; x = b\"x\" * (1100 << 20); " ++
+        "print(\"held\", len(x) >> 20, flush=True); time.sleep(4)' || echo exit=$?");
+    const r = try runNativeJob(arena, cfg, testJob(&.{step}), .root);
+    if (!r.res.succeeded) std.debug.print("{s}\n", .{r.text});
+    try expectLines(r.text, &.{ "held 1100", "Native steps: no memory.high: with no swap" });
+    try std.testing.expectEqual(@as(?u32, null), slots[0].high_mb);
+    // Seen at what it took, with nothing held down.
+    const learned = gate.ended() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(learned.seen_mb >= 1100);
+}
+
+test "the error line says which limit an OOM kill came from" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const limits: cgroup.Limits = .{
+        .memory_max = 256 << 20,
+        .pids_max = 64,
+        .memory_total = 512 << 20,
+    };
+    const job = try oomLine(arena, .job, limits, 1);
+    try std.testing.expect(std.mem.startsWith(u8, job, "The job reached its memory limit (256 "));
+    const all = try oomLine(arena, .all, limits, 2);
+    try std.testing.expect(std.mem.startsWith(u8, all, "All native jobs together reached their " ++
+        "memory limit (512 MB, "));
+    const above = try oomLine(arena, .above, limits, 1);
+    try std.testing.expect(std.mem.startsWith(u8, above, "The machine ran out of memory"));
+    try std.testing.expect(std.mem.indexOf(u8, above, "RUNNER_NATIVE") == null);
+}
+
+test "root runner: a named parent keeps the operator's limit, and a job's limits go below it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    if (parent.top == null) return error.SkipZigTest;
+    // The operator's: a slice's `MemoryMax=4G`.
+    const cap = try std.fmt.allocPrintSentinel(arena, "{s}/memory.max", .{parent.top.?}, 0);
+    const fd = std.os.linux.open(cap, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(fd));
+    _ = std.os.linux.write(@intCast(fd), "4294967296", 10);
+    _ = std.os.linux.close(@intCast(fd));
+    const r = try runNativeJob(arena, cfg, testJob(&.{testStep("echo small job")}), .root);
+    try std.testing.expect(r.res.succeeded);
+    // Its limit and its swap are as they were, ours in the `jobs` child, figured from its 4 GiB.
+    const top = parent.top.?;
+    try std.testing.expectEqual(@as(?u64, 4 << 30), admission.readCgroupBytes(io, top, "memory.max"));
+    try std.testing.expectEqual(null, admission.readCgroupBytes(io, top, "memory.swap.max"));
+    try std.testing.expect(std.mem.endsWith(u8, parent.dir, "/jobs"));
+    try std.testing.expect(admission.readCgroupBytes(io, parent.dir, "memory.max").? <= 2 << 30);
+}
+
+test "root in a container takes `self` when the default parent cannot be made" {
+    // Moves this process, so only by hand, with ZIG_RUNNER_TEST_AUTO_SELF=1, as root in a container
+    // of its own at the root of its cgroup namespace, its root cgroup holding processes.
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env = try std.testing.environ.createMap(arena);
+    if (env.get("ZIG_RUNNER_TEST_AUTO_SELF") == null) return error.SkipZigTest;
+    const found = cgroup.parent(arena, std.testing.io, "");
+    switch (found) {
+        .dir => |d| try std.testing.expectEqualStrings(cgroup.mount_point ++ "/jobs", d),
+        .none => |why| return skip(true, why),
+    }
 }
 
 test "root runner: all native jobs together stay under the limit on their parent" {
@@ -6469,11 +6617,13 @@ test "root runner: a test's cgroup parent is its own, so runs side by side keep 
     try std.testing.expect(!std.mem.eql(u8, p1.dir, p2.dir));
     one.cgroup.memory_total_mb = 256;
     other.cgroup.memory_total_mb = 512;
-    const j1 = try cgroup.Job.make(arena, p1.dir, "one", cgroup.Limits.compute(one.cgroup, null));
-    defer j1.remove(arena, std.testing.io);
-    const j2 = try cgroup.Job.make(arena, p2.dir, "two", cgroup.Limits.compute(other.cgroup, null));
-    defer j2.remove(arena, std.testing.io);
     const io = std.testing.io;
+    const l1 = cgroup.Limits.compute(one.cgroup, null);
+    const j1 = try cgroup.Job.make(arena, io, p1.dir, "one", l1);
+    defer j1.remove(arena, io);
+    const l2 = cgroup.Limits.compute(other.cgroup, null);
+    const j2 = try cgroup.Job.make(arena, io, p2.dir, "two", l2);
+    defer j2.remove(arena, io);
     const held = [_]?u64{
         admission.readCgroupBytes(io, p1.dir, "memory.max"),
         admission.readCgroupBytes(io, p2.dir, "memory.max"),

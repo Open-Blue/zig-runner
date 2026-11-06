@@ -81,7 +81,8 @@ pub const Limits = struct {
 /// there, cheaply, instead of growing until the host's memory runs short. Past it the kernel
 /// reclaims the job's memory and then slows its allocations; it kills nothing, which stays
 /// `memory.max`'s (`RUNNER_NATIVE_MEMORY_MAX_MB`) to do. A job not learned yet gets 1 GB. This is
-/// where a job starts: `Admission.growHigh` raises it while the host has memory to spare.
+/// where a job starts: `Admission.growHigh` raises it while the host has memory to spare. It takes
+/// swap to work at all: with none it stops a job dead, and it is not set (`Gate.noHigh`).
 pub fn nativeHighMb(est_mb: u32) u32 {
     return est_mb *| 2 +| high_headroom_mb;
 }
@@ -497,6 +498,16 @@ pub const Gate = struct {
         s.peak_mb = workingSetMb(a.io, d) orelse 0;
         if (est > 0) s.high_mb = nativeHighMb(est);
         return s.high_mb;
+    }
+
+    /// The job's memory cannot be reclaimed (`cgroup.canSwap`), so it gets no `memory.high`, which
+    /// would stop it instead of slowing it, and none is raised (`growHigh`): it is learned at what
+    /// it took, and `memory.max` ends it if it takes too much.
+    pub fn noHigh(g: *Gate) void {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        a.slots[g.slot].high_mb = null;
     }
 
     /// The job runs on the Dagger engine after all: a native pool's job that the native backend
@@ -2045,6 +2056,39 @@ test "a native job at its memory.high gets more while the host has memory to spa
     pool.paths.meminfo = "/nonexistent";
     pool.samplePeaks();
     try std.testing.expectEqual(@as(u64, 1024 + high_step_mb), try high(tmp.dir));
+}
+
+test "a native job that cannot swap gets no memory.high, and the gate raises none" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var meminfo_buf: [256]u8 = undefined;
+    const meminfo = try std.fmt.bufPrint(
+        &meminfo_buf,
+        ".zig-cache/tmp/{s}/meminfo",
+        .{tmp.sub_path},
+    );
+    var job_buf: [256]u8 = undefined;
+    const job = try std.fmt.bufPrint(&job_buf, ".zig-cache/tmp/{s}/job", .{tmp.sub_path});
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 6144000 kB\n" });
+    var slots: [1]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
+    pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
+    var gate: Gate = .{ .pool = &pool };
+    gate.leave(true);
+    gate.assigned(jobKey("o/r", "o/r/.github/workflows/ci.yml", "test (zig)"));
+    try writeCgroup(tmp.dir, "job", "max", 0, .{}, null);
+    try tmp.dir.writeFile(io, .{ .sub_path = "job/memory.high", .data = "max\n" });
+    try std.testing.expectEqual(@as(?u32, 1024), gate.native(job));
+    gate.noHigh();
+    pool.slots[0].started_ms = std.math.minInt(i64) + 1;
+    // At what would have been its limit, on an idle machine: a write here would stop the job.
+    try writeCgroup(tmp.dir, "job", "max", 900 * mib, .{}, null);
+    pool.samplePeaks();
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("max\n", try tmp.dir.readFile(io, "job/memory.high", &buf));
+    try std.testing.expectEqual(@as(?u32, null), pool.slots[0].high_mb);
+    _ = gate.ended();
 }
 
 test "a native job held down at its memory.high is learned at no less than it, so its next limit is higher" {
