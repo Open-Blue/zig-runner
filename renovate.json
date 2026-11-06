@@ -72,6 +72,20 @@
       "enabled": false
     },
     {
+      "description": "The JavaScript runtimes for actions (runner/src/dagger/js.zig): a new major changes what every action runs on, so it moves by hand, when GitHub's runner moves. Digest and minor updates within them still come.",
+      "matchFileNames": [
+        "runner/src/dagger/js.zig"
+      ],
+      "matchDepNames": [
+        "node",
+        "oven/bun"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "enabled": false
+    },
+    {
       "description": "The Dagger engine moves with the runner, by hand: the runner speaks exactly one engine version's protocol (runner/src/engine.zig, client_version), and a new engine starts with an empty cache. So no update is proposed for it, let alone merged; deploy/compose.yaml says the same.",
       "matchDepNames": [
         "registry.dagger.io/engine"

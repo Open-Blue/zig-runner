@@ -205,8 +205,7 @@ repository:
   version's protocol, and a new engine starts with an empty cache. The JavaScript runtimes for
   actions (`oven/bun` and `node`, `runner/src/dagger/js.zig`) are pinned by their multi-arch index
   digests too. zizmor is installed from PyPI by hash (`.github/zizmor-requirements.txt`,
-  `.github/scripts/zizmor.sh`) and the `@actions/glob` of the hashFiles comparison from a
-  lockfile (`runner/tools/hashfilesdiff/package-lock.json`). The job base image `ubuntu:24.04` (`RUNNER_IMAGE`) is pinned by its multi-arch index digest
+  `.github/scripts/zizmor.sh`). The job base image `ubuntu:24.04` (`RUNNER_IMAGE`) is pinned by its multi-arch index digest
   (`runner/src/dagger.zig`, checked by `.github/scripts/ubuntu-pin.sh`); the packages provisioning
   installs into it come from the Ubuntu archive on the day the engine builds them, and the pre-warm
   logs their fingerprint. tls.zig and GitHub's expression

@@ -1,8 +1,0 @@
-{
-  "name": "hashfilesdiff-reference",
-  "description": "GitHub's side of hashfiles-diff.sh: reference.mjs on the @actions/glob that actions/runner's hashFiles uses, installed from the lockfile beside this file (npm ci), which pins every package by its integrity hash.",
-  "private": true,
-  "dependencies": {
-    "@actions/glob": "0.7.0"
-  }
-}
