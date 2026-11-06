@@ -1265,7 +1265,12 @@ fn jobMessages(_: void, smith: *Smith) !void {
     if (!std.unicode.utf8ValidateSlice(key) or !std.unicode.utf8ValidateSlice(value)) return;
     var kw: std.Io.Writer.Allocating = .init(ar);
     try std.json.Stringify.encodeJsonString(key, .{}, &kw.writer);
-    const val = if (std.json.validate(ar, value) catch false) value else v: {
+    // Parsed, not `std.json.validate`d: that allows a repeated key, which parsing refuses.
+    const parsed = if (std.json.parseFromSliceLeaky(std.json.Value, ar, value, .{})) |_| true else |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => false,
+    };
+    const val = if (parsed) value else v: {
         var vw: std.Io.Writer.Allocating = .init(ar);
         try std.json.Stringify.encodeJsonString(value, .{}, &vw.writer);
         break :v vw.written();
