@@ -25,12 +25,26 @@
 //! cancelled, also in the middle of a file. A file is read in full, however large and however
 //! sparse: the hash is GitHub's, which has no shortcut for holes, so only the time limit or a
 //! cancel ends a read of a file that takes hours.
+//!
+//! The runner reads as itself, but a file is hashed only if the step's user could read it, as
+//! Dagger's did (`dagger/hash_files.zig`). The two halves of that call ran as different users, and
+//! this keeps them apart. The search was the engine's own (`exists` and `entries` on `rootfs`), so
+//! it sees what the step's user could not, here as there; what it finds may name such a file, and
+//! a name was all Dagger's search gave too. The read was `sha256sum` as the step's user, and
+//! `realpath` when links are followed as well: those two are `Merged.checked`. Which of the
+//! kernel's checks that takes is in `Merged.stepMay`, for a file, and in `Merged.walkPath`, for
+//! the directories on the way, where a search permission missing ends the walk before the name is
+//! looked up: to `sha256sum`, what is behind such a directory, or is not, then reads the same. The
+//! search still tells them apart, with links followed, as Dagger's did: `hashFiles()` gives away
+//! whether a path exists, what it is, and names in the job's own tree, but none of a file's content.
 
 const std = @import("std");
 const linux = std.os.linux;
 const expr = @import("../expr.zig");
 const glob = @import("../glob.zig");
 const sandbox = @import("sandbox.zig");
+const images = @import("images.zig");
+const Store = @import("Store.zig");
 const dagger = @import("../dagger.zig");
 
 const Allocator = std.mem.Allocator;
@@ -201,7 +215,24 @@ pub const Stack = struct {
     /// Overlay's opaque-directory attribute: `trusted.overlay.opaque`, or `user.overlay.opaque`
     /// under `userxattr` (`Backend.opaqueXattr`).
     opaque_xattr: [:0]const u8,
+    /// Whose permissions decide what is read; null for a step that may read everything. No
+    /// default: every caller says.
+    step: ?Step,
     limits: Limits = .{},
+};
+
+/// The step's user, for whom a call reads, as the job's namespace sees it. Null in `Stack.step`
+/// for root, which needs no check on either kind of runner: root in a step has `CAP_DAC_OVERRIDE`
+/// (`sandbox.docker_caps`), as Dagger's had, and a rootless runner's steps are all root.
+pub const Step = struct {
+    uid: u32,
+    gid: u32,
+    /// As the engine was given it: the image's `USER`, or `dagger.runner_user`. Its form decides
+    /// the supplementary groups (`Merged.supplementary`), which `uid` and `gid` cannot say.
+    user: []const u8,
+    /// How each layer's ids look from the job, by position in `Stack.layers`: a layer holds
+    /// the canonical ids, the slot's or the runner's own (`Backend.hashStep`).
+    ids: []const Store.Ids,
 };
 
 /// An allocator that counts what it hands out, and refuses what a call may not have: past its
@@ -448,6 +479,8 @@ fn runWaited(
         .arena = scratch.allocator(),
         .io = io,
         .roots = &.{},
+        .layers = stack.layers,
+        .step = stack.step,
         .opaque_xattr = stack.opaque_xattr,
         .limits = stack.limits,
         .began_ms = nowMs(io, .awake),
@@ -457,6 +490,10 @@ fn runWaited(
     if (m.limits.cancel) |c| m.cancelled_before = c.requested.load(.acquire);
     m.openLayers(stack.layers) catch |e| return failed(&m, e);
     defer m.close();
+    if (stack.step) |s| {
+        std.debug.assert(s.ids.len == stack.layers.len);
+        m.groups = m.supplementary(s.user) catch |e| return failed(&m, e);
+    }
     return hashAll(&m, ws, home, args) catch |e| failed(&m, e);
 }
 
@@ -477,20 +514,27 @@ fn hashAll(m: *Merged, ws: []const u8, home: []const u8, args: []const []const u
         .failed => |msg| return .{ .failed = msg },
         .files => |f| f,
     };
+    // The search is over: from here on it is `sha256sum`, as the step's user.
+    m.check(true);
     var all = Sha256.init(.{});
     var hashed: usize = 0;
     var path: std.ArrayList(u8) = .empty;
     for (files) |name| {
         path.clearRetainingCapacity();
         try path.print(arena, "{s}/{s}", .{ ws, name });
-        const at = (try m.resolve(path.items, true)) orelse
-            return .{ .failed = try std.fmt.allocPrint(arena, "{s}: No such file or directory", .{name}) };
+        // Not `[ -d ]`'s skip when the walk is refused: `stat` fails under a directory the user
+        // cannot enter, so Dagger's script took even a directory for a file, and `sha256sum`
+        // failed on it.
+        const at = (try m.resolve(path.items, true)) orelse return .{ .failed = if (m.denied)
+            try std.fmt.allocPrint(arena, "sha256sum: {s}: Permission denied", .{name})
+        else
+            try std.fmt.allocPrint(arena, "{s}: No such file or directory", .{name}) };
         switch (at.node.kind) {
             .dir => continue,
             .file => {},
             else => return .{ .failed = try std.fmt.allocPrint(arena, "{s}: Not a regular file", .{name}) },
         }
-        const sum = try m.digest(at.path, at.node.layer);
+        const sum = try m.digest(at.path, name, at.node.layer);
         all.update(&sum);
         hashed += 1;
     }
@@ -518,8 +562,10 @@ const path_max = 4096;
 /// What a path resolves to: the real path and what it is.
 const Resolved = struct { path: []const u8, node: Node };
 
-/// Where a followed link leads, and how many links that took.
-const Lead = struct { to: Resolved, cost: u32 };
+/// Where a followed link leads, how many links that took, and whether it was walked as the step's
+/// user: where a link leads is the same for all, but one walked only by the search does not say
+/// the step's user may take it.
+const Lead = struct { to: Resolved, cost: u32, checked: bool };
 
 /// The merged view of a stack of layers. Paths are absolute, `/` the job's root, with no symlink,
 /// `.` or `..` in a path that names a real entry (`resolve` makes them so); the root is "".
@@ -534,6 +580,17 @@ const Merged = struct {
     cancelled_before: bool = false,
     /// The layers' directories, opened, topmost first.
     roots: []linux.fd_t,
+    /// Their paths, in the same order.
+    layers: []const []const u8,
+    /// Who reads (`Stack.step`), and the supplementary groups of that user.
+    step: ?Step,
+    groups: []const u32 = &.{},
+    /// Whether walks are the step's user's, in the kernel's order (`walkPath`), or the search's.
+    checked: bool = false,
+    /// A checked walk stopped at a directory the step's user may not search, which ends the call.
+    denied: bool = false,
+    /// Whether the step's user may search each real directory walked.
+    searchable: std.StringHashMapUnmanaged(bool) = .empty,
     opaque_xattr: [:0]const u8,
     /// The attributes overlay's other features leave (same prefix as `opaque_xattr`).
     redirect_xattr: [:0]const u8 = "",
@@ -616,6 +673,137 @@ const Merged = struct {
 
     fn pollAll(ptr: *anyopaque) Error!void {
         return erased(ptr).tick();
+    }
+
+    /// Turns the step's user's walks on or off, for a step that is checked at all. The directory
+    /// `resolve` keeps was reached by the other kind of walk, so it is forgotten.
+    fn check(m: *Merged, on: bool) void {
+        if (m.step == null) return;
+        m.checked = on;
+        m.dir_in.clearRetainingCapacity();
+    }
+
+    // --- the step's user ---
+
+    /// The supplementary groups the engine gave the step's user at each exec (BuildKit's
+    /// `oci.GetUser`, moby's `user.GetExecUser`), though not a native step's own processes, which
+    /// `setgroups(0)` leaves with none until #369 (`sandbox.zig`): hashFiles() answers as Dagger
+    /// did. Those of a user named by a name or uid that is in /etc/passwd, by the first line that
+    /// matches, and none with an explicit group (`app:staff`, `1000:1000`) or for a uid not there.
+    /// Read through the job's root like any file, so no link in them leaves the tree, and from the
+    /// view the next step has, as the engine read the container's. Not there, or not a file, they
+    /// give no group. As `distinctGroups` leaves them.
+    fn supplementary(m: *Merged, user: []const u8) Error![]const u32 {
+        if (std.mem.indexOfScalar(u8, user, ':') != null) return &.{};
+        const passwd = (try m.userFile("/etc/passwd")) orelse return &.{};
+        const line = if (std.fmt.parseInt(u32, user, 10)) |uid|
+            images.entryOf(passwd, null, uid)
+        else |_|
+            images.entryOf(passwd, user, null);
+        const name = (line orelse return &.{})[0];
+        if (name.len == 0) return &.{};
+        const group = (try m.userFile("/etc/group")) orelse return &.{};
+        var groups: std.ArrayList(u32) = .empty;
+        var lines = std.mem.splitScalar(u8, group, '\n');
+        while (lines.next()) |raw| {
+            try m.tick();
+            const text = std.mem.trim(u8, raw, " \t\r");
+            if (text.len == 0 or text[0] == '#') continue;
+            var fields = std.mem.splitScalar(u8, text, ':');
+            _ = fields.next();
+            _ = fields.next();
+            const gid = std.fmt.parseInt(u32, fields.next() orelse continue, 10) catch continue;
+            var members = std.mem.splitScalar(u8, fields.next() orelse continue, ',');
+            while (members.next()) |member| if (std.mem.eql(u8, member, name)) {
+                try groups.append(m.arena, gid);
+                break;
+            };
+        }
+        return distinctGroups(groups.items);
+    }
+
+    /// `path`'s contents in the job's view, up to the engine's limit: resolved as `resolve` does,
+    /// then read from the one layer with no link taken.
+    fn userFile(m: *Merged, path: []const u8) Error!?[]const u8 {
+        const at = (try m.resolve(path, true)) orelse return null;
+        if (at.node.kind != .file) return null;
+        const max_bytes = 10 << 20;
+        return switch (try sandbox.readIn(m.arena, m.layers[at.node.layer], at.path, max_bytes)) {
+            .text => |t| t,
+            .missing, .whiteout => null,
+        };
+    }
+
+    /// Whether the step's user may search the real directory `dir`. The step's `/` is the top of
+    /// its own upper, which `Backend.execIn` leaves 0755.
+    fn canSearch(m: *Merged, s: Step, dir: []const u8) Error!bool {
+        if (dir.len == 0) return true;
+        if (m.searchable.get(dir)) |yes| return yes;
+        const layer = (try m.entry(dir)).layer;
+        var buf: [path_max]u8 = undefined;
+        const rel = try m.relativeZ(&buf, dir);
+        const fd = switch (sandbox.openIn(m.roots[layer], rel, .{
+            .PATH = true,
+            .NOFOLLOW = true,
+        }, 0, sandbox.resolve_no_symlinks)) {
+            .fd => |f| f,
+            .err => |e| return m.fail("cannot look at {s} in the job's layers: {t}", .{ dir, e }),
+        };
+        defer _ = linux.close(fd);
+        const yes = try m.stepMay(s, fd, layer, dir, may_search);
+        try m.searchable.put(m.arena, try m.arena.dupe(u8, dir), yes);
+        return yes;
+    }
+
+    /// Whether the step's user has `want` on the entry `fd` (`O_PATH`) is in `layer`, by the
+    /// kernel's `acl_permission_check`: the owner has the owner's bits, whatever the others have;
+    /// an ACL, which is consulted only with group bits set, decides for everyone else; without
+    /// one the group's bits go to its members and the others' to the rest. `CAP_DAC_OVERRIDE`, the
+    /// only other way past them, is root's (`Step`): a process that changes to another uid has
+    /// none.
+    fn stepMay(
+        m: *Merged,
+        s: Step,
+        fd: linux.fd_t,
+        layer: u32,
+        path: []const u8,
+        want: u16,
+    ) Error!bool {
+        var st: linux.Statx = undefined;
+        const mask: linux.STATX = .{ .MODE = true, .UID = true, .GID = true };
+        if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, mask, &st)) != .SUCCESS)
+            return m.fail("cannot look at {s} in the job's layers", .{path});
+        const ids = s.ids[layer];
+        if (jobId(ids, st.uid) == s.uid) return st.mode >> 6 & want == want;
+        const who: Who = .{ .uid = s.uid, .gid = s.gid, .groups = m.groups, .ids = ids };
+        if (st.mode & 0o070 != 0) {
+            var value: [64 * 1024]u8 = undefined;
+            if (try m.acl(fd, path, &value)) |entries| {
+                // Each entry may search the user's groups, and a directory of a deep tree may have
+                // thousands of them: work the job decides on, so counted, and the clocks read
+                // for every one, which `tick` alone leaves to every 1024th step.
+                m.steps +|= entries.len / acl_entry_size;
+                try m.tick();
+                try m.clocks();
+                return aclGives(entries, who, st.gid, want);
+            }
+        }
+        return (if (who.inGroup(jobId(ids, st.gid))) st.mode >> 3 else st.mode) & want == want;
+    }
+
+    /// The entry's POSIX ACL as the kernel keeps it, in `value`; null when it has none, or its
+    /// file system keeps none. `fd` is an `O_PATH` descriptor: through its link in /proc, as
+    /// `attributes` does.
+    fn acl(m: *Merged, fd: linux.fd_t, path: []const u8, value: []u8) Error!?[]const u8 {
+        var proc: [32]u8 = undefined;
+        const p = std.mem.printSentinel(&proc, "/proc/self/fd/{d}", .{fd}, 0) catch
+            return m.fail("cannot read {s}'s ACL in the job's layers", .{path});
+        const got = linux.getxattr(p, "system.posix_acl_access", value.ptr, value.len);
+        return switch (linux.errno(got)) {
+            .SUCCESS => value[0..got],
+            .NODATA, .OPNOTSUPP => null,
+            else => |e| m.fail("cannot read {s}'s ACL in the job's layers: {t}", .{ path, e }),
+        };
     }
 
     // --- one layer ---
@@ -829,6 +1017,15 @@ const Merged = struct {
             const name = rest[0 .. slash orelse rest.len];
             rest = if (slash) |s| rest[s + 1 ..] else "";
             try m.tick();
+            // As the kernel's walk: every name, `.` and `..` too, needs search permission on the
+            // directory it is in, and that comes first. Asking only once a name is found would
+            // make these walks say which names are there behind a directory the user cannot
+            // enter, which neither `sha256sum` nor `realpath` could say. (The search can: see the
+            // top of the file.)
+            if (m.checked and !try m.canSearch(m.step.?, buf.items)) {
+                m.denied = true;
+                return null;
+            }
             if (std.mem.eql(u8, name, ".")) continue;
             if (std.mem.eql(u8, name, "..")) {
                 buf.shrinkRetainingCapacity(parentOf(buf.items).len);
@@ -862,23 +1059,29 @@ const Merged = struct {
     /// all its links are taken, and `links` is counted for them. Kept, with the links it took, so
     /// that a thousand links to one chain take it once and still count it each time.
     fn follow(m: *Merged, link: []const u8, parent_len: usize, target: []const u8, links: *u32) Error!?Resolved {
-        if (m.leads.get(link)) |lead| {
+        if (m.leads.get(link)) |lead| if (lead.checked or !m.checked) {
             links.* += lead.cost;
             return if (links.* > max_links) null else lead.to;
-        }
+        };
         var local: std.ArrayList(u8) = .empty;
         if (target.len == 0 or target[0] != '/') try local.appendSlice(m.arena, link[0..parent_len]);
         const before = links.*;
         const to = (try m.walkPath(&local, target, true, links)) orelse return null;
-        try m.leads.put(m.arena, try m.arena.dupe(u8, link), .{ .to = to, .cost = links.* - before });
+        try m.leads.put(m.arena, try m.arena.dupe(u8, link), .{
+            .to = to,
+            .cost = links.* - before,
+            .checked = m.checked,
+        });
         return to;
     }
 
     /// The SHA-256 of a regular file, read from the layer that has it: no link on the way is
     /// taken. What is found is looked at (`O_PATH`, no read) before it is opened, and opened
     /// through the descriptor that was looked at, so a file that has become a pipe, which would
-    /// block, is refused and not opened. Read in blocks, between which the job's cancel is seen.
-    fn digest(m: *Merged, path: []const u8, layer: u32) Error![32]u8 {
+    /// block, is refused and not opened, and so is one the step's user may not read: that is
+    /// decided on this very inode, before anything of it is read, and `name` (as the job named it)
+    /// is what `sha256sum` said. Read in blocks, between which the job's cancel is seen.
+    fn digest(m: *Merged, path: []const u8, name: []const u8, layer: u32) Error![32]u8 {
         var buf: [path_max]u8 = undefined;
         const rel = try m.relativeZ(&buf, path);
         const looked = switch (sandbox.openIn(m.roots[layer], rel, .{ .PATH = true }, 0, sandbox.resolve_no_symlinks)) {
@@ -887,6 +1090,8 @@ const Merged = struct {
         };
         defer _ = linux.close(looked);
         if (!try m.isRegular(looked, path)) return m.fail("{s}: Not a regular file", .{path});
+        if (m.step) |s| if (!try m.stepMay(s, looked, layer, path, may_read))
+            return m.fail("sha256sum: {s}: Permission denied", .{name});
         var proc: [32]u8 = undefined;
         const p = std.mem.printSentinel(&proc, "/proc/self/fd/{d}", .{looked}, 0) catch
             return m.fail("{s}: cannot be read", .{path});
@@ -996,16 +1201,124 @@ const Merged = struct {
 
     /// Each path with every link taken. A path that is not there cannot be listed or followed:
     /// the walk asks only about directories it has just seen.
+    /// `realpath` ran as the step's user on Dagger, so these are that user's walks, which fail the
+    /// call on a directory reached through one it cannot enter.
     fn realpathAll(ptr: *anyopaque, arena: Allocator, paths: []const []const u8) Error![]const []const u8 {
         const m = erased(ptr);
+        m.check(true);
+        defer m.check(false);
         const out = try arena.alloc([]const u8, paths.len);
         for (paths, out) |p, *r| {
-            const at = (try m.resolve(p, true)) orelse return m.fail("{s}: No such file or directory", .{p});
+            const at = (try m.resolve(p, true)) orelse {
+                if (m.denied) return m.fail("realpath: {s}: Permission denied", .{p});
+                return m.fail("{s}: No such file or directory", .{p});
+            };
             r.* = try arena.dupe(u8, at.path);
         }
         return out;
     }
 };
+
+/// The permission bits `Merged.stepMay` asks for.
+const may_read: u16 = 0o4;
+const may_search: u16 = 0o1;
+
+/// The step's user, as one layer's ids compare with it.
+const Who = struct {
+    uid: u32,
+    gid: u32,
+    /// As `distinctGroups` leaves them: sorted.
+    groups: []const u32,
+    ids: Store.Ids,
+
+    /// Whether a group id, as the job sees it, is the user's primary or supplementary group.
+    fn inGroup(w: Who, gid: ?u32) bool {
+        const id = gid orelse return false;
+        const order = struct {
+            fn f(want: u32, group: u32) std.math.Order {
+                return std.math.order(want, group);
+            }
+        }.f;
+        return id == w.gid or std.sort.binarySearch(u32, w.groups, id, order) != null;
+    }
+};
+
+/// The most groups a process can have (Linux's `NGROUPS_MAX`).
+const max_groups = 65536;
+
+/// `groups` sorted, each once, the first `max_groups` of them: the job writes /etc/group, and each
+/// ACL entry asks whether a group is here. Where the kernel would have refused the engine that
+/// many, this leaves the last ones out, which can only refuse more.
+fn distinctGroups(groups: []u32) []const u32 {
+    std.mem.sort(u32, groups, {}, std.sort.asc(u32));
+    var n: usize = 0;
+    for (groups) |g| {
+        if (n > 0 and groups[n - 1] == g) continue;
+        if (n == max_groups) break;
+        groups[n] = g;
+        n += 1;
+    }
+    return groups[0..n];
+}
+
+/// The size of an entry of an ACL (`aclGives`).
+const acl_entry_size = 8;
+
+/// `id`, as a layer holds it, as the job sees it; null for one the job's ids do not reach. Not
+/// `Ids.inside`, whose overflow id is 65534: that is a real user, `nobody`, which such a file's
+/// owner is not, as an unmapped id matches no one in the kernel.
+fn jobId(ids: Store.Ids, id: u32) ?u32 {
+    if (id < ids.base or id - ids.base >= ids.count) return null;
+    return id - ids.base;
+}
+
+/// Whether an ACL gives `want` to someone who is not the file's owner, as `posix_acl_permission`
+/// decides: a named user's entry settles it, the group entries of the user's groups give it if
+/// any of them does and refuse it otherwise, and only someone in none of those has the others'
+/// entry; all but the last are cut by the mask. `value` is the kernel's format (`Store.unshiftAcl`,
+/// whose ids a layer holds as it holds its owners). `file_gid` is the group entry's id, which the
+/// entry does not hold. One not in the only format there is gives nothing.
+fn aclGives(value: []const u8, w: Who, file_gid: u32, want: u16) bool {
+    const header = 4;
+    const size = acl_entry_size;
+    const version = 2;
+    const tag_user = 0x02;
+    const tag_group_obj = 0x04;
+    const tag_group = 0x08;
+    const tag_mask = 0x10;
+    const tag_other = 0x20;
+    if (value.len < header or (value.len - header) % size != 0) return false;
+    if (std.mem.readInt(u32, value[0..4], .little) != version) return false;
+    const entries = value[header..];
+    var mask: u16 = 0o7;
+    var i: usize = 0;
+    while (i < entries.len) : (i += size) {
+        if (std.mem.readInt(u16, entries[i..][0..2], .little) == tag_mask)
+            mask = std.mem.readInt(u16, entries[i + 2 ..][0..2], .little);
+    }
+    var in_a_group = false;
+    var other: u16 = 0;
+    i = 0;
+    while (i < entries.len) : (i += size) {
+        const perm = std.mem.readInt(u16, entries[i + 2 ..][0..2], .little);
+        const id = jobId(w.ids, std.mem.readInt(u32, entries[i + 4 ..][0..4], .little));
+        const gives = perm & mask & want == want;
+        switch (std.mem.readInt(u16, entries[i..][0..2], .little)) {
+            tag_user => if (id == w.uid) return gives,
+            tag_group_obj => if (w.inGroup(jobId(w.ids, file_gid))) {
+                if (gives) return true;
+                in_a_group = true;
+            },
+            tag_group => if (w.inGroup(id)) {
+                if (gives) return true;
+                in_a_group = true;
+            },
+            tag_other => other = perm,
+            else => {},
+        }
+    }
+    return !in_a_group and other & want == want;
+}
 
 /// The path without its leading `/`, for a layer's `openat2`: "." for the root.
 fn relative(path: []const u8) []const u8 {
@@ -1054,7 +1367,7 @@ const Fixture = struct {
     fn hash(f: Fixture, layers: []const []const u8, args: []const []const u8) !expr.HashFiles.Result {
         const paths = try f.arena.alloc([]const u8, layers.len);
         for (layers, paths) |l, *p| p.* = try std.fmt.allocPrint(f.arena, "{s}/{s}", .{ f.root, l });
-        const stack_: Stack = .{ .layers = paths, .opaque_xattr = "user.overlay.opaque" };
+        const stack_: Stack = .{ .layers = paths, .opaque_xattr = "user.overlay.opaque", .step = null };
         return f.hashWith(stack_, args);
     }
 
@@ -1065,7 +1378,7 @@ const Fixture = struct {
     fn stackOf(f: Fixture, layers: []const []const u8, limits: Limits) !Stack {
         const paths = try f.arena.alloc([]const u8, layers.len);
         for (layers, paths) |l, *p| p.* = try std.fmt.allocPrint(f.arena, "{s}/{s}", .{ f.root, l });
-        return .{ .layers = paths, .opaque_xattr = "user.overlay.opaque", .limits = limits };
+        return .{ .layers = paths, .opaque_xattr = "user.overlay.opaque", .step = null, .limits = limits };
     }
 };
 
@@ -1493,7 +1806,7 @@ test "native hashFiles: a file with more attributes than a short list holds is r
         const name = try std.fmt.allocPrintSentinel(arena, "user.zr-test-attribute-with-a-long-name-{d}", .{i}, 0);
         if (linux.errno(linux.setxattr(file, name, "v", 1, 0)) != .SUCCESS) return error.SkipZigTest;
     }
-    const stack: Stack = .{ .layers = &.{dir}, .opaque_xattr = "user.overlay.opaque" };
+    const stack: Stack = .{ .layers = &.{dir}, .opaque_xattr = "user.overlay.opaque", .step = null };
     const got = try hashFiles(std.testing.allocator, arena, io, stack, "/ws", "/home/runner", &.{"**"});
     try expectHash(&hashOf(&.{"a"}), got);
 }
@@ -1515,7 +1828,7 @@ test "native hashFiles: a file whose attributes are too many to be listed is rea
         const name = try std.fmt.allocPrintSentinel(arena, "user.zr-test-attribute-with-a-long-name-{d}", .{i}, 0);
         if (linux.errno(linux.setxattr(file, name, "v", 1, 0)) != .SUCCESS) return error.SkipZigTest;
     }
-    const stack: Stack = .{ .layers = &.{dir}, .opaque_xattr = "user.overlay.opaque" };
+    const stack: Stack = .{ .layers = &.{dir}, .opaque_xattr = "user.overlay.opaque", .step = null };
     const got = try hashFiles(std.testing.allocator, arena, io, stack, "/ws", "/home/runner", &.{"**"});
     try expectHash(&hashOf(&.{"a"}), got);
 }
@@ -1733,4 +2046,399 @@ test "native hashFiles: calls that each hold memory and need more run in turn, n
     const want = hashOf(try many(f.arena, "x", 6000));
     for (runners) |r| try expectHash(&want, r.result.?);
     try std.testing.expectEqual(budget.next, budget.serving);
+}
+
+/// The id that owns `path` here (whoever runs the tests, and the group its directory gives).
+const Owner = struct { uid: u32, gid: u32 };
+
+fn ownerOf(f: Fixture, path: []const u8) !Owner {
+    var st: linux.Statx = undefined;
+    const mask: linux.STATX = .{ .UID = true, .GID = true };
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(
+        linux.AT.FDCWD,
+        try f.abs(path),
+        0,
+        mask,
+        &st,
+    )));
+    return .{ .uid = st.uid, .gid = st.gid };
+}
+
+fn setMode(f: Fixture, path: []const u8, mode: u32) !void {
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(try f.abs(path), mode)));
+}
+
+/// `hashFiles(args)` over `layers` for the user `step`, whose `ids` default to the layers' own.
+fn hashAs(f: Fixture, layers: []const []const u8, step: Step, args: []const []const u8) !expr.HashFiles.Result {
+    var st = try f.stackOf(layers, .{});
+    var s = step;
+    if (s.ids.len == 0) {
+        const ids = try f.arena.alloc(Store.Ids, layers.len);
+        @memset(ids, Store.Ids.host);
+        s.ids = ids;
+    }
+    st.step = s;
+    return f.hashWith(st, args);
+}
+
+const denied = "Permission denied";
+
+test "native hashFiles: the file's owner has the owner's bits, whatever the others have" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.put("l0/ws/a", "a");
+    const o = try ownerOf(f, "l0/ws/a");
+    const owner: Step = .{ .uid = o.uid, .gid = o.gid +% 1, .user = "app", .ids = &.{} };
+    try setMode(f, "l0/ws/a", 0o400);
+    try expectHash(&hashOf(&.{"a"}), try hashAs(f, &.{"l0"}, owner, &.{"a"}));
+    // Everyone else may read it; its owner, by the owner's bits, may not.
+    try setMode(f, "l0/ws/a", 0o044);
+    try expectFailed("sha256sum: a: " ++ denied, try hashAs(f, &.{"l0"}, owner, &.{"a"}));
+}
+
+test "native hashFiles: the file's group has the group's bits, whatever the others have" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.put("l0/ws/a", "a");
+    const o = try ownerOf(f, "l0/ws/a");
+    const member: Step = .{ .uid = o.uid +% 1, .gid = o.gid, .user = "app", .ids = &.{} };
+    try setMode(f, "l0/ws/a", 0o640);
+    try expectHash(&hashOf(&.{"a"}), try hashAs(f, &.{"l0"}, member, &.{"a"}));
+    try setMode(f, "l0/ws/a", 0o604);
+    try expectFailed("sha256sum: a: " ++ denied, try hashAs(f, &.{"l0"}, member, &.{"a"}));
+}
+
+test "native hashFiles: anyone else has the others' bits, also through a link to /etc/shadow" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.put("l0/ws/a", "a");
+    try f.put("l0/etc/shadow", "root:secret");
+    try f.link("l0/ws/s", "/etc/shadow");
+    const o = try ownerOf(f, "l0/ws/a");
+    const other: Step = .{ .uid = o.uid +% 1, .gid = o.gid +% 1, .user = "app", .ids = &.{} };
+    try setMode(f, "l0/ws/a", 0o604);
+    try expectHash(&hashOf(&.{"a"}), try hashAs(f, &.{"l0"}, other, &.{"a"}));
+    try setMode(f, "l0/ws/a", 0o640);
+    try expectFailed("sha256sum: a: " ++ denied, try hashAs(f, &.{"l0"}, other, &.{"a"}));
+    // The link is the job's, the file it leads to is not its user's. Dagger's `sha256sum` failed.
+    try setMode(f, "l0/etc/shadow", 0o640);
+    try expectFailed("sha256sum: s: " ++ denied, try hashAs(f, &.{"l0"}, other, &.{"s"}));
+    // One name it may not read fails the call, as `sha256sum`'s exit did: no hash of the rest.
+    try setMode(f, "l0/ws/a", 0o604);
+    try expectFailed("sha256sum: s: " ++ denied, try hashAs(f, &.{"l0"}, other, &.{"**"}));
+}
+
+test "native hashFiles: supplementary groups are the engine's, from the job's own /etc" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.put("l0/ws/a", "a");
+    try setMode(f, "l0/ws/a", 0o640);
+    const o = try ownerOf(f, "l0/ws/a");
+    const uid = o.uid +% 1;
+    const primary = o.gid +% 1;
+    try f.put("l0/etc/passwd", try std.fmt.allocPrint(
+        f.arena,
+        "root:x:0:0::/root:/bin/sh\napp:x:{d}:{d}::/home/app:/bin/sh\n",
+        .{ uid, primary },
+    ));
+    try f.put("l0/etc/group", try std.fmt.allocPrint(
+        f.arena,
+        "root:x:0:\n# app is a member\n  staff:x:{d}:other,app\nbad:x:nan:app\n",
+        .{o.gid},
+    ));
+    const as = struct {
+        fn user(name: []const u8, id: u32, gid: u32) Step {
+            return .{ .uid = id, .gid = gid, .user = name, .ids = &.{} };
+        }
+    };
+    const numeric = try std.fmt.allocPrint(f.arena, "{d}", .{uid});
+    const both = try std.fmt.allocPrint(f.arena, "{d}:{d}", .{ uid, primary });
+    const absent = try std.fmt.allocPrint(f.arena, "{d}", .{uid +% 1});
+    const stack = [_][]const u8{"l0"};
+    // A name, or a uid /etc/passwd has: the member's groups.
+    try expectHash(&hashOf(&.{"a"}), try hashAs(f, &stack, as.user("app", uid, primary), &.{"a"}));
+    try expectHash(&hashOf(&.{"a"}), try hashAs(f, &stack, as.user(numeric, uid, primary), &.{"a"}));
+    // An explicit group leaves them out (`GetExecUser`), and `uid:gid` looks nothing up.
+    try expectFailed(denied, try hashAs(f, &stack, as.user("app:app", uid, primary), &.{"a"}));
+    try expectFailed(denied, try hashAs(f, &stack, as.user(both, uid, primary), &.{"a"}));
+    // A uid /etc/passwd has not got has no name to be a member by.
+    try expectFailed(denied, try hashAs(f, &stack, as.user(absent, uid +% 1, primary), &.{"a"}));
+    // Membership is by the whole name.
+    try expectFailed(denied, try hashAs(f, &stack, as.user("ap", uid, primary), &.{"a"}));
+
+    // What the next step has decides: a layer above takes the user out of the group...
+    try f.put("l1/etc/group", try std.fmt.allocPrint(f.arena, "staff:x:{d}:other\n", .{o.gid}));
+    try expectFailed(denied, try hashAs(f, &.{ "l1", "l0" }, as.user("app", uid, primary), &.{"a"}));
+    // ...a link stays in the job's tree...
+    try f.put("l2/etc/members", try std.fmt.allocPrint(f.arena, "staff:x:{d}:app\n", .{o.gid}));
+    try f.link("l2/etc/group", "members");
+    try expectHash(
+        &hashOf(&.{"a"}),
+        try hashAs(f, &.{ "l2", "l1", "l0" }, as.user("app", uid, primary), &.{"a"}),
+    );
+    // ...and one out of it is not taken, so the host's file makes no one a member.
+    try f.put("host/group", try std.fmt.allocPrint(f.arena, "staff:x:{d}:app\n", .{o.gid}));
+    try f.link("l3/etc/group", try f.abs("host/group"));
+    try expectFailed(
+        denied,
+        try hashAs(f, &.{ "l3", "l1", "l0" }, as.user("app", uid, primary), &.{"a"}),
+    );
+}
+
+test "native hashFiles: a directory without search permission refuses what is in it, found or not" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.put("l0/ws/ok", "ok");
+    try f.put("l0/ws/d/f", "secret");
+    try f.put("l0/ws/d/e/g", "deep");
+    try f.tmp.dir.createDirPath(std.testing.io, "l0/ws/open");
+    try f.link("l0/ws/to-f", "d/f");
+    try f.link("l0/ws/to-none", "d/none");
+    try f.link("l0/ws/to-e", "d/e");
+    try f.link("l0/ws/through", "d/../ok");
+    try f.link("l0/ws/to-open", "open");
+    const o = try ownerOf(f, "l0/ws/d");
+    const other: Step = .{ .uid = o.uid +% 1, .gid = o.gid +% 1, .user = "app", .ids = &.{} };
+    const stack = [_][]const u8{"l0"};
+    defer setMode(f, "l0/ws/d", 0o755) catch {};
+
+    // Search, without read: only names known are reached, and the file is read.
+    try setMode(f, "l0/ws/d", 0o711);
+    try expectHash(&hashOf(&.{"secret"}), try hashAs(f, &stack, other, &.{"d/f"}));
+    // Read, without search: `sha256sum` cannot reach it. And no permission at all.
+    for ([_]u32{ 0o744, 0o700 }) |mode| {
+        try setMode(f, "l0/ws/d", mode);
+        // The search still finds the name (the engine's did), so the call fails on it. A deeper
+        // walk the search did first must not stand for the step's: `e` alone is open.
+        try expectFailed("sha256sum: d/f: " ++ denied, try hashAs(f, &stack, other, &.{"d/f"}));
+        try expectFailed("sha256sum: d/e/g: " ++ denied, try hashAs(f, &stack, other, &.{"d/e/g"}));
+        // A link into it, to what is there and to what is not: the same words. That the second
+        // is missing is what `sha256sum` could not have seen.
+        try expectFailed("sha256sum: to-f: " ++ denied, try hashAs(f, &stack, other, &.{"to-f"}));
+        try expectFailed("sha256sum: to-none: " ++ denied, try hashAs(f, &stack, other, &.{"to-none"}));
+        // A directory behind it is no directory to `[ -d ]`, whose `stat` fails: not skipped.
+        try expectFailed("sha256sum: to-e: " ++ denied, try hashAs(f, &stack, other, &.{"to-e"}));
+        // `..` is a name in `d` like any other.
+        try expectFailed("sha256sum: through: " ++ denied, try hashAs(f, &stack, other, &.{"through"}));
+    }
+    // A directory the user can reach is skipped as ever, and `ok` is the job's.
+    try expectHash("", try hashAs(f, &stack, other, &.{"to-open"}));
+    try expectHash(&hashOf(&.{"ok"}), try hashAs(f, &stack, other, &.{"ok"}));
+}
+
+test "native hashFiles: links followed are walked as the step's user, as `realpath` was" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.put("l0/ws/d/f", "secret");
+    try f.put("l0/ws/d/sub/g", "deep");
+    try f.put("l0/plain/f", "plain");
+    try f.link("l0/ws/to-f", "d/f");
+    try f.link("l0/ws/to-sub", "d/sub");
+    try f.link("l0/ws/to-d", "d");
+    try f.link("l0/ws/to-plain", "../plain");
+    const o = try ownerOf(f, "l0/ws/d");
+    const other: Step = .{ .uid = o.uid +% 1, .gid = o.gid +% 1, .user = "app", .ids = &.{} };
+    const stack = [_][]const u8{"l0"};
+    const follow = "--follow-symbolic-links";
+    try setMode(f, "l0/ws/d", 0o700);
+    defer setMode(f, "l0/ws/d", 0o755) catch {};
+    // The search took the link as itself first: what it learned is not the step's to use.
+    try expectFailed("sha256sum: to-f: " ++ denied, try hashAs(f, &stack, other, &.{ follow, "to-f" }));
+    // `realpath` reaches `d` itself, which is `ws/to-d`, and fails on what is under it.
+    try expectFailed("realpath: /ws/to-d/sub: " ++ denied, try hashAs(f, &stack, other, &.{ follow, "to-d/**" }));
+    // A directory behind it fails at once.
+    try expectFailed("realpath: /ws/to-sub: " ++ denied, try hashAs(f, &stack, other, &.{ follow, "to-sub/**" }));
+    try expectHash(&hashOf(&.{"plain"}), try hashAs(f, &stack, other, &.{ follow, "to-plain/**" }));
+}
+
+test "native hashFiles: a root step reads everything, on a root runner and on a rootless one" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.put("l0/ws/d/f", "f");
+    try f.link("l0/ws/s", "d/f");
+    try setMode(f, "l0/ws/d/f", 0o400);
+    try setMode(f, "l0/ws/d", 0o500);
+    defer setMode(f, "l0/ws/d", 0o755) catch {};
+    // `Backend.hashStep` has no user for either kind (its own test): nothing is looked at.
+    try expectHash(&hashOf(&.{ "f", "f" }), try f.hash(&.{"l0"}, &.{"**"}));
+}
+
+test "native hashFiles: a file's ids are read as its layer holds them" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.put("slot/ws/a", "a");
+    try f.put("slot/ws/g", "g");
+    try f.put("seen/ws/b", "b");
+    try setMode(f, "slot/ws/a", 0o600);
+    try setMode(f, "slot/ws/g", 0o640);
+    try setMode(f, "seen/ws/b", 0o600);
+    const o = try ownerOf(f, "slot/ws/a");
+    // The tests' own ids stand for a job's: the slot's range holds them in place.
+    const base = @min(o.uid, o.gid);
+    const slot: Store.Ids = .{ .base = base, .count = std.math.maxInt(u32) - base };
+    // Past all of the tests' ids: to this layer they are no id of the job's.
+    const far: Store.Ids = .{ .base = @max(o.uid, o.gid) + 1, .count = 65536 };
+    const ids = [_]Store.Ids{ slot, far };
+    const layers = [_][]const u8{ "slot", "seen" };
+    const step: Step = .{ .uid = o.uid - base, .gid = o.gid - base +% 1, .user = "app", .ids = &ids };
+    // The user owns `a` in the slot's ids, and the same on-disk id elsewhere is no one's.
+    try expectHash(&hashOf(&.{"a"}), try hashAs(f, &layers, step, &.{"a"}));
+    try expectFailed("sha256sum: b: " ++ denied, try hashAs(f, &layers, step, &.{"b"}));
+    // Groups too: `g` is the user's group's, with the step's id for it.
+    const member: Step = .{ .uid = o.uid - base +% 1, .gid = o.gid - base, .user = "app", .ids = &ids };
+    try expectHash(&hashOf(&.{"g"}), try hashAs(f, &layers, member, &.{"g"}));
+    // An id the job does not reach is `nobody` to `stat`, but not to the kernel's check.
+    const nobody: Step = .{ .uid = 65534, .gid = 65534, .user = "nobody", .ids = &ids };
+    try expectFailed("sha256sum: b: " ++ denied, try hashAs(f, &layers, nobody, &.{"b"}));
+}
+
+/// An ACL as the kernel keeps it: `entries` are its tag, permission and id, in the kernel's order.
+fn aclValue(arena: Allocator, entries: []const [3]u32) ![]u8 {
+    const out = try arena.alloc(u8, 4 + 8 * entries.len);
+    std.mem.writeInt(u32, out[0..4], 2, .little);
+    for (entries, 0..) |e, i| {
+        const at = out[4 + 8 * i ..][0..8];
+        std.mem.writeInt(u16, at[0..2], std.math.cast(u16, e[0]).?, .little);
+        std.mem.writeInt(u16, at[2..4], std.math.cast(u16, e[1]).?, .little);
+        std.mem.writeInt(u32, at[4..8], e[2], .little);
+    }
+    return out;
+}
+
+test "native hashFiles: an ACL decides as the kernel's does" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const user_obj = 0x01;
+    const user = 0x02;
+    const group_obj = 0x04;
+    const group = 0x08;
+    const mask = 0x10;
+    const other = 0x20;
+    const none = 0xffffffff;
+    const who: Who = .{ .uid = 5, .gid = 6, .groups = &.{7}, .ids = .{} };
+    const gives = struct {
+        fn f(ar: Allocator, w: Who, entries: []const [3]u32) !bool {
+            return aclGives(try aclValue(ar, entries), w, 6, may_read);
+        }
+    }.f;
+    const head = [_]u32{ user_obj, 6, none };
+    const tail = [_][3]u32{ .{ mask, 4, none }, .{ other, 0, none } };
+    // A named user, or one of their groups named, is let in past the others' none.
+    try std.testing.expect(try gives(arena, who, &(.{head} ++ .{[_]u32{ user, 4, 5 }} ++ tail)));
+    try std.testing.expect(try gives(arena, who, &(.{head} ++ .{[_]u32{ group, 4, 7 }} ++ tail)));
+    try std.testing.expect(try gives(arena, who, &(.{head} ++ .{[_]u32{ group_obj, 4, none }} ++ tail)));
+    // Someone else named is not them.
+    try std.testing.expect(!try gives(arena, who, &(.{head} ++ .{[_]u32{ user, 4, 9 }} ++ tail)));
+    // The mask cuts what a named entry gives.
+    try std.testing.expect(!try gives(arena, who, &.{ head, .{ user, 4, 5 }, .{ mask, 0, none }, .{ other, 4, none } }));
+    // A named entry settles it, past what the others have.
+    try std.testing.expect(!try gives(arena, who, &.{ head, .{ user, 0, 5 }, .{ mask, 7, none }, .{ other, 4, none } }));
+    // So does being in a group: only someone in none has the others' entry.
+    try std.testing.expect(!try gives(arena, who, &.{ head, .{ group_obj, 0, none }, .{ mask, 7, none }, .{ other, 4, none } }));
+    const stranger: Who = .{ .uid = 50, .gid = 60, .groups = &.{}, .ids = .{} };
+    try std.testing.expect(try gives(arena, stranger, &.{ head, .{ group_obj, 0, none }, .{ mask, 7, none }, .{ other, 4, none } }));
+    // A slot's ids are the layer's, as its owners are.
+    const in_slot: Who = .{ .uid = 5, .gid = 6, .groups = &.{}, .ids = .{ .base = 1000, .count = 65536 } };
+    try std.testing.expect(try gives(arena, in_slot, &(.{head} ++ .{[_]u32{ user, 4, 1005 }} ++ tail)));
+    try std.testing.expect(!try gives(arena, in_slot, &(.{head} ++ .{[_]u32{ user, 4, 5 }} ++ tail)));
+    // What is not an ACL gives nothing.
+    try std.testing.expect(!aclGives("\x01\x00\x00\x00", stranger, 6, may_read));
+    try std.testing.expect(!aclGives("\x02", stranger, 6, may_read));
+}
+
+test "native hashFiles: groups are kept sorted and once each, up to the kernel's most" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var few = [_]u32{ 9, 3, 9, 3, 7 };
+    try std.testing.expectEqualSlices(u32, &.{ 3, 7, 9 }, distinctGroups(&few));
+    // Many times the same group is one, and many more than the kernel's most are held to it.
+    const many_ids = try arena.alloc(u32, 3 * max_groups);
+    for (many_ids, 0..) |*g, i| g.* = @truncate(i / 2);
+    const kept = distinctGroups(many_ids);
+    try std.testing.expectEqual(@as(usize, max_groups), kept.len);
+    const who: Who = .{ .uid = 1, .gid = 1 << 30, .groups = kept, .ids = .{} };
+    try std.testing.expect(who.inGroup(0));
+    try std.testing.expect(who.inGroup(max_groups - 1));
+    try std.testing.expect(!who.inGroup(max_groups));
+    try std.testing.expect(who.inGroup(1 << 30));
+    try std.testing.expect(!who.inGroup(null));
+    const none: Who = .{ .uid = 1, .gid = 2, .groups = &.{}, .ids = .{} };
+    try std.testing.expect(!none.inGroup(3));
+}
+
+test "native hashFiles: an ACL's entries are work the call's limits count" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.put("l0/ws/a", "a");
+    const o = try ownerOf(f, "l0/ws/a");
+    const step: Step = .{ .uid = o.uid +% 1, .gid = o.gid +% 1, .user = "app", .ids = &.{} };
+    const none = 0xffffffff;
+    // Named users, in the kernel's order, none of them the step's.
+    var entries: std.ArrayList([3]u32) = .empty;
+    try entries.append(f.arena, .{ 0x01, 6, none });
+    for (0..300) |i| try entries.append(f.arena, .{ 0x02, 4, 100_000 + @as(u32, @truncate(i)) });
+    try entries.appendSlice(f.arena, &.{ .{ 0x04, 4, none }, .{ 0x10, 4, none }, .{ 0x20, 4, none } });
+    const acl = try aclValue(f.arena, entries.items);
+    if (linux.errno(linux.setxattr(try f.abs("l0/ws/a"), "system.posix_acl_access", acl.ptr, acl.len, 0)) != .SUCCESS)
+        return error.SkipZigTest;
+    var st = try f.stackOf(&.{"l0"}, .{ .steps = 200 });
+    const ids = [_]Store.Ids{Store.Ids.host};
+    var s = step;
+    s.ids = &ids;
+    st.step = s;
+    try expectFailed("more than 200 steps", try f.hashWith(st, &.{"a"}));
+    st.limits.steps = 2000;
+    try expectHash(&hashOf(&.{"a"}), try f.hashWith(st, &.{"a"}));
+}
+
+test "native hashFiles: an ACL on the file and on a directory counts, past the mode" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.put("l0/ws/d/a", "a");
+    const o = try ownerOf(f, "l0/ws/d/a");
+    const named = o.uid +% 1;
+    const step: Step = .{ .uid = named, .gid = o.gid +% 1, .user = "app", .ids = &.{} };
+    const other: Step = .{ .uid = named +% 1, .gid = o.gid +% 1, .user = "app", .ids = &.{} };
+    const none = 0xffffffff;
+    const acl = try aclValue(f.arena, &.{
+        .{ 0x01, 7, none },
+        .{ 0x02, 5, named },
+        .{ 0x04, 0, none },
+        .{ 0x10, 5, none },
+        .{ 0x20, 0, none },
+    });
+    // Where the tests' file system keeps no ACLs, this one has nothing to test.
+    for ([_][]const u8{ "l0/ws/d/a", "l0/ws/d" }) |p| {
+        if (linux.errno(linux.setxattr(try f.abs(p), "system.posix_acl_access", acl.ptr, acl.len, 0)) != .SUCCESS)
+            return error.SkipZigTest;
+    }
+    defer setMode(f, "l0/ws/d", 0o755) catch {};
+    try expectHash(&hashOf(&.{"a"}), try hashAs(f, &.{"l0"}, step, &.{"d/a"}));
+    try expectFailed("sha256sum: d/a: " ++ denied, try hashAs(f, &.{"l0"}, other, &.{"d/a"}));
+    // The entry on the directory is what lets the named user through: taken away, it refuses.
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.removexattr(try f.abs("l0/ws/d"), "system.posix_acl_access")));
+    try setMode(f, "l0/ws/d", 0o700);
+    try expectFailed("sha256sum: d/a: " ++ denied, try hashAs(f, &.{"l0"}, step, &.{"d/a"}));
 }
