@@ -1795,18 +1795,29 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
     @actions/glob only breaks cycles through a directory's own ancestors. A monorepo with its
     `node_modules` is a few hundred thousand entries (the Linux kernel about 90,000 files), so a
     million leaves room.
-  - *Memory, for all calls of the process together:* an allocator under each call's arena counts
-    every byte against one process-wide budget and refuses what would pass it, wherever the call
-    is (matching, listing, building paths), so the call fails with a message where it stands. The
-    default is the smaller of 1 GiB and an eighth of `MemTotal`; `RUNNER_NATIVE_HASHFILES_MEMORY_MB`
-    sets it (0 for none). The memory is the runner's, outside the job's cgroup, so it is one limit
-    for all slots: two big calls that do not fit together make one fail. What a walk keeps is 32
-    bytes a node and its path; the rest of what it needs is reset per path and per level. Measured
-    (counted bytes, which run about twice the resident ones): a 900,000-entry monorepo with
-    `hashFiles('**/package-lock.json', '!**/node_modules/**')` takes under 1 GiB counted and 450 MB
-    resident, in 15 s; `**` over it takes 1.4 GiB counted, about 1.5 KB an entry (the earlier "1 KB
-    each" was a guess), so it needs the setting raised on a big host and fails with the message on
-    a small one.
+  - *Memory, and the turn:* an allocator under each call's arena counts every byte and refuses a
+    request the call may not have, wherever the call is (matching, listing, building paths), so
+    the call fails with a message where it stands. The memory is the runner's, outside the job's
+    cgroup, and one process serves all slots, so it is limited for all of them; but a call that
+    waits for memory while it holds memory others need could wait in a circle with them, so it is
+    not shared out by the byte. Each call has an allowance of its own (64 MiB, or a quarter of the
+    limit) that nothing else's use touches, so a small call never waits. A call that goes past it
+    takes a ticket and waits for its turn, in the order calls asked, and then has the whole limit
+    to itself until it returns. While it waits it holds only its allowance, and the call whose
+    turn it is waits for nothing, so there is nothing to wait on in a circle: a big call is delayed
+    by the big calls before it, one turn each, and is failed only when it is too big alone (at
+    once, naming the setting). One job that holds the turn (a big walk, then a huge file) delays a
+    neighbour by that one turn, not fails it, and its next call queues behind the neighbour's. The
+    limit is the smaller of 1 GiB and an eighth of `MemTotal` (the host's, in a container too: the
+    runner has no reading of its own cgroup's limit), or `RUNNER_NATIVE_HASHFILES_MEMORY_MB` (0
+    for none); in all the process holds one limit and an allowance for each call running. What a
+    walk keeps is 32 bytes a node and its path; the rest of what it needs is reset per path and
+    per level. Measured (counted bytes, which run about twice the resident ones): a 900,000-entry
+    monorepo with `hashFiles('**/package-lock.json', '!**/node_modules/**')` takes under 1 GiB
+    counted and 450 MB resident, in 15 s; `**` over it takes 1.4 GiB counted, about 1.5 KB an
+    entry (the earlier "1 KB each" was a guess), so it needs the setting raised on a big host and
+    is refused at once, with the message, on a small one. Four such calls on a 300,000-entry
+    monorepo, and two on the 900,000-entry one, all succeed, in turn.
   - *Steps:* at most 200 million path components, and each path name is looked up in place, each
     followed link remembered (with the links it took, as the kernel counts them: 40 in one path,
     nested ones too) and a directory resolved once for its files, so a path 1,900 deep or a chain
@@ -1818,7 +1829,10 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
     `RUNNER_NATIVE_HASHFILES_TIMEOUT_S` sets the seconds (0 for none), since a Pi on an SD card is
     far slower. A step's `timeout-minutes` does not reach an expression, so this is the bound. A
     file is read in full however large and sparse: the hash is GitHub's, which has no shortcut for
-    holes.
+    holes. The 120 seconds are the call's own work, as on GitHub, so the time it waits for its turn
+    is not counted in them; the wait has a limit of its own, as long again, which is the longest a
+    call may hold the turn it waits for (so waiting behind one call is covered, behind several
+    may not be), and the job's cancel ends it.
   - *Cancel:* the job's cancel (`dagger.Cancel`, handed to the backend) is seen at every step, the
     walk's included (`glob.Fs.poll`), so a cancelled job stops within a second in the middle of
     matching, listing or a file; `Watch` cannot, as no sandbox runs while expressions are

@@ -771,8 +771,9 @@ const no_node = std.math.maxInt(u32);
 /// links can name the same directory by exponentially many paths (a directory whose two links lead
 /// to the next, twenty-five deep), and @actions/glob only breaks cycles through a directory's own
 /// ancestors. A real monorepo with its `node_modules` has a few hundred thousand entries (the
-/// Linux kernel has about 90,000 files), so a million leaves room, and costs a few hundred MB of
-/// memory (`native/hash_files.zig`, Limits) before the walk stops.
+/// Linux kernel has about 90,000 files), so a million leaves room. A walk costs about 1.5 KB of
+/// counted memory an entry with `**` (`native/hash_files.zig`, Limits), more than the default
+/// memory allows for a million: on a small host that, not this, is what stops a big walk.
 pub const max_nodes: usize = 1_000_000;
 
 /// @actions/glob's walk (`globGenerator`), batched: each level of the tree is matched, looked at

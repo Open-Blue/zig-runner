@@ -21,9 +21,10 @@
 //!
 //! The job also controls how much there is to do, so a call is bounded (`Limits`): the files and
 //! directories its walk visits, the path components it takes, the memory it holds (its own arena,
-//! freed when it returns), and it stops when the job is cancelled, also in the middle of a file.
-//! A file is read in full, however large and however sparse: the hash is GitHub's, which has no
-//! shortcut for holes, so only a cancel ends a read of a file that takes hours.
+//! freed when it returns), the time it takes (GitHub's 120 seconds), and it stops when the job is
+//! cancelled, also in the middle of a file. A file is read in full, however large and however
+//! sparse: the hash is GitHub's, which has no shortcut for holes, so only the time limit or a
+//! cancel ends a read of a file that takes hours.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -42,8 +43,9 @@ pub const default_timeout_s: u32 = 120;
 
 /// What the runner configures (`RUNNER_NATIVE_HASHFILES_MEMORY_MB`, `RUNNER_NATIVE_HASHFILES_TIMEOUT_S`).
 pub const Settings = struct {
-    /// What all the calls of this process may hold together; null for the smaller of 1 GiB and an
-    /// eighth of the machine's memory, 0 for no limit.
+    /// What one call may hold once it has its turn (see `Budget`); null for the smaller of 1 GiB
+    /// and an eighth of the machine's memory (`MemTotal`, which in a container is the host's: the
+    /// runner has no reading of its own cgroup's limit), 0 for no limit.
     memory_mb: ?u32 = null,
     /// How long one call may take; 0 for no limit.
     timeout_s: u32 = default_timeout_s,
@@ -55,6 +57,7 @@ pub const Settings = struct {
             @min(1 << 30, (memTotal(io) orelse (8 << 30)) / 8);
         return .{
             .memory = memory,
+            .allowance = @min(64 << 20, memory / 4),
             .timeout_ms = if (s.timeout_s == 0) std.math.maxInt(u64) else @as(u64, s.timeout_s) * 1000,
         };
     }
@@ -74,10 +77,84 @@ fn memTotal(io: std.Io) ?usize {
     return null;
 }
 
-/// What the calls of this process hold now, in bytes. The memory is the runner's, not the job's
-/// cgroup's, and there is one process for all the jobs of a machine, so the limit is for all of
-/// them at once (`Limits.memory`).
-pub var process_held: std.atomic.Value(usize) = .init(0);
+/// The memory the calls of this process share. The memory is the runner's, not the job's cgroup's,
+/// and there is one process for all the jobs of a machine, so the limit is for all of them: but a
+/// call cannot wait for memory it needs while holding memory others need, or two of them wait for
+/// each other for good. So the memory is not shared out by the byte. Each call has a small
+/// allowance of its own (`Limits.allowance`) that no one else's use touches, and a call that goes
+/// past it takes the turn, one at a time in the order they asked, and then has the whole of
+/// `Limits.memory` to itself until it returns. A call waiting for its turn holds only its
+/// allowance, and the one whose turn it is waits for nothing, so there is nothing to wait in a
+/// circle on: a big call is delayed by the big calls before it, one turn each, and is failed only
+/// when it is too big alone.
+pub const Budget = struct {
+    spin: std.atomic.Value(bool) = .init(false),
+    /// The ticket the next call to ask gets, and the one whose turn it is.
+    next: u64 = 0,
+    serving: u64 = 0,
+    /// Tickets of calls that gave up waiting, to be passed over when their turn comes.
+    skipped: [max_skipped]u64 = undefined,
+    n_skipped: usize = 0,
+
+    const max_skipped = 256;
+
+    fn lock(b: *Budget) void {
+        while (b.spin.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(b: *Budget) void {
+        b.spin.store(false, .release);
+    }
+
+    /// A place in the queue. It is the caller's to give back with `done`, whether it got its turn
+    /// or not.
+    pub fn ticket(b: *Budget) u64 {
+        b.lock();
+        defer b.unlock();
+        defer b.next += 1;
+        return b.next;
+    }
+
+    pub fn isTurn(b: *Budget, t: u64) bool {
+        b.lock();
+        defer b.unlock();
+        return b.serving == t;
+    }
+
+    /// Ends the turn of ticket `t`, or its wait: the next in the queue is served. False when the
+    /// ticket cannot be passed over yet (its call is far back in a queue of hundreds), and the
+    /// caller must wait for its turn first.
+    pub fn done(b: *Budget, t: u64) bool {
+        b.lock();
+        defer b.unlock();
+        if (b.serving == t) {
+            b.serving += 1;
+            b.passOver();
+            return true;
+        }
+        if (b.n_skipped == max_skipped) return false;
+        b.skipped[b.n_skipped] = t;
+        b.n_skipped += 1;
+        return true;
+    }
+
+    fn passOver(b: *Budget) void {
+        var again = true;
+        while (again) {
+            again = false;
+            for (b.skipped[0..b.n_skipped], 0..) |t, i| if (t == b.serving) {
+                b.skipped[i] = b.skipped[b.n_skipped - 1];
+                b.n_skipped -= 1;
+                b.serving += 1;
+                again = true;
+                break;
+            };
+        }
+    }
+};
+
+/// The budget of this process's calls.
+pub var process_budget: Budget = .{};
 
 /// What one call may use. A job's own files decide how much work they are.
 pub const Limits = struct {
@@ -86,14 +163,19 @@ pub const Limits = struct {
     /// Path components taken, one for each name of each path looked up and each entry listed: a
     /// real tree of a million files at depth ten is about twenty million.
     steps: u64 = 200_000_000,
-    /// Bytes all the calls sharing `held` may hold together; a call that would take more fails.
+    /// What a call may hold once it has the turn, and what it has before that (see `Budget`): a
+    /// call is held to `allowance + memory` at most, and the calls of a process to `memory` and
+    /// one allowance for each that is running.
     memory: usize = 1 << 30,
-    held: *std.atomic.Value(usize) = &process_held,
-    /// How long a call may take, as GitHub's does (`default_timeout_s`).
+    allowance: usize = 64 << 20,
+    budget: *Budget = &process_budget,
+    /// How long a call may work, as GitHub's does (`default_timeout_s`). The time it waits for its
+    /// turn is not part of it, as it is not the call's own: it is limited on its own to as long
+    /// again, which is the longest a call may hold the turn it is waiting for.
     timeout_ms: u64 = default_timeout_s * 1000,
     /// The job's cancel. A call it interrupts stops at once; one that began after it (an
     /// `if: always()` step, the job's outputs) runs on, as GitHub's does in the grace period, until
-    /// its `hard_deadline_ms`.
+    /// its `hard_deadline_ms`. Waiting for a turn is interrupted the same way.
     cancel: ?*const dagger.Cancel = null,
 };
 
@@ -108,14 +190,29 @@ pub const Stack = struct {
     limits: Limits = .{},
 };
 
-/// An allocator that counts what it hands out against the limit all calls share, and refuses what
-/// would pass it, so a call that grows too far stops where it is, whatever it was doing.
+/// An allocator that counts what it hands out, and refuses what a call may not have: past its
+/// allowance it takes the turn (waiting for it, where the job's cancel and the time it may wait
+/// are seen), and past `limit` in its turn it is refused. So a call that grows too far stops where
+/// it is, whatever it was doing.
 const Counted = struct {
     child: Allocator,
-    held: *std.atomic.Value(usize),
+    io: std.Io,
+    budget: *Budget,
     limit: usize,
-    /// A request was refused, for the limit: the `OutOfMemory` that follows is this call's doing.
-    refused: bool = false,
+    allowance: usize,
+    cancel: ?*const dagger.Cancel,
+    cancelled_before: bool,
+    wait_limit_ms: u64,
+    /// Bytes under the allowance, and bytes in the turn.
+    free_used: usize = 0,
+    pool_used: usize = 0,
+    ticket: ?u64 = null,
+    turn: bool = false,
+    /// How long the call waited in all, so that its own clock leaves it out.
+    waited_ms: i64 = 0,
+    refused: Refusal = .none,
+
+    const Refusal = enum { none, too_big, cancelled, waited_too_long };
 
     fn allocator(c: *Counted) Allocator {
         return .{ .ptr = c, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
@@ -126,18 +223,65 @@ const Counted = struct {
     }
 
     fn take(c: *Counted, n: usize) bool {
-        var cur = c.held.load(.monotonic);
-        while (true) {
-            if (n > c.limit or cur > c.limit - n) {
-                c.refused = true;
-                return false;
-            }
-            cur = c.held.cmpxchgWeak(cur, cur + n, .monotonic, .monotonic) orelse return true;
+        if (c.free_used + n <= c.allowance and !c.turn) {
+            c.free_used += n;
+            return true;
         }
+        if (!c.turn and !c.acquire()) return false;
+        if (n > c.limit or c.pool_used > c.limit - n) {
+            c.refused = .too_big;
+            return false;
+        }
+        c.pool_used += n;
+        return true;
     }
 
     fn give(c: *Counted, n: usize) void {
-        _ = c.held.fetchSub(n, .monotonic);
+        const from_pool = @min(n, c.pool_used);
+        c.pool_used -= from_pool;
+        c.free_used -= @min(n - from_pool, c.free_used);
+    }
+
+    /// Waits for the turn, in the queue's order.
+    fn acquire(c: *Counted) bool {
+        const t = c.budget.ticket();
+        c.ticket = t;
+        const began = nowMs(c.io, .awake);
+        while (!c.budget.isTurn(t)) {
+            if (c.cancel) |cancel| {
+                if (!c.cancelled_before and cancel.requested.load(.acquire)) return c.abandon(.cancelled);
+                if (c.cancelled_before) {
+                    const hard = cancel.hard_deadline_ms.load(.acquire);
+                    if (hard > 0 and nowMs(c.io, .real) > hard) return c.abandon(.cancelled);
+                }
+            }
+            if (c.wait_limit_ms != std.math.maxInt(u64) and nowMs(c.io, .awake) - began > c.wait_limit_ms)
+                return c.abandon(.waited_too_long);
+            c.io.sleep(.fromMilliseconds(2), .awake) catch {};
+        }
+        c.waited_ms += nowMs(c.io, .awake) - began;
+        c.turn = true;
+        return true;
+    }
+
+    /// Gives up the wait, which still has its place in the queue.
+    fn abandon(c: *Counted, why: Refusal) bool {
+        c.refused = why;
+        const t = c.ticket.?;
+        c.ticket = null;
+        if (!c.budget.done(t)) {
+            // Too many have given up for it to be remembered: it stays until its turn, then ends.
+            while (!c.budget.isTurn(t)) c.io.sleep(.fromMilliseconds(2), .awake) catch {};
+            _ = c.budget.done(t);
+        }
+        return false;
+    }
+
+    /// The call is over (its arena freed): the next in the queue has the turn.
+    fn release(c: *Counted) void {
+        if (c.ticket) |t| _ = c.budget.done(t);
+        c.ticket = null;
+        c.turn = false;
     }
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
@@ -181,8 +325,8 @@ const Counted = struct {
 /// `hashFiles(args)` over `stack`: the SHA-256 of the SHA-256 digests of the files the patterns
 /// find under `ws`, in GitHub's order; "" when none. As GitHub's script does, a name that is a
 /// directory once links are followed is skipped, and a link is hashed as the file it leads to.
-/// The call works in an arena of its own, freed on return, whose every byte is counted against
-/// `Limits.memory`: only the result is copied to `out`.
+/// The call works in an arena of its own, freed on return, whose every byte is counted (see
+/// `Budget`): only the result is copied to `out`.
 pub fn hashFiles(
     gpa: Allocator,
     out: Allocator,
@@ -192,24 +336,47 @@ pub fn hashFiles(
     home: []const u8,
     args: []const []const u8,
 ) Allocator.Error!expr.HashFiles.Result {
-    var counted: Counted = .{ .child = gpa, .held = stack.limits.held, .limit = stack.limits.memory };
+    const l = stack.limits;
+    var counted: Counted = .{
+        .child = gpa,
+        .io = io,
+        .budget = l.budget,
+        .limit = l.memory,
+        .allowance = l.allowance,
+        .cancel = l.cancel,
+        .cancelled_before = if (l.cancel) |c| c.requested.load(.acquire) else false,
+        .wait_limit_ms = l.timeout_ms,
+    };
+    // The turn goes on once the arena is freed (deferred first, so it runs last).
+    defer counted.release();
     var scratch: std.heap.ArenaAllocator = .init(counted.allocator());
     defer scratch.deinit();
-    const result = run(&scratch, io, stack, ws, home, args) catch |e| {
-        if (e == error.OutOfMemory and counted.refused) return .{ .failed = try std.fmt.allocPrint(
-            out,
-            "hashFiles() would take more than {d} MiB of memory, which the runner's hashFiles() " ++
-                "calls may hold together (RUNNER_NATIVE_HASHFILES_MEMORY_MB): the job's tree is too " ++
-                "large or too tangled to search, or other jobs are searching theirs",
-            .{stack.limits.memory >> 20},
-        ) };
-        return e;
+    const result = runWaited(&scratch, io, stack, ws, home, args, &counted.waited_ms) catch |e| {
+        if (e != error.OutOfMemory) return e;
+        return .{ .failed = switch (counted.refused) {
+            .none => return e,
+            .too_big => try std.fmt.allocPrint(
+                out,
+                "hashFiles() would take more than {d} MiB of memory (RUNNER_NATIVE_HASHFILES_MEMORY_MB, " ++
+                    "for one call at a time): the job's tree is too large or too tangled to search",
+                .{l.memory >> 20},
+            ),
+            .cancelled => try out.dupe(u8, "hashFiles() stopped: the job was cancelled"),
+            .waited_too_long => try std.fmt.allocPrint(
+                out,
+                "hashFiles() waited {d} seconds for other hashFiles() calls to finish with the " ++
+                    "memory they share (RUNNER_NATIVE_HASHFILES_MEMORY_MB)",
+                .{(l.timeout_ms + 999) / 1000},
+            ),
+        } };
     };
     return switch (result) {
         .ok => |h| .{ .ok = try out.dupe(u8, h) },
         .failed => |why| .{ .failed = try out.dupe(u8, why) },
     };
 }
+
+var no_wait: i64 = 0;
 
 /// `hashFiles` in `scratch`, which the caller frees.
 fn run(
@@ -220,6 +387,19 @@ fn run(
     home: []const u8,
     args: []const []const u8,
 ) Allocator.Error!expr.HashFiles.Result {
+    return runWaited(scratch, io, stack, ws, home, args, &no_wait);
+}
+
+/// As `run`, its clock leaving out `waited` milliseconds (the time spent waiting for the turn).
+fn runWaited(
+    scratch: *std.heap.ArenaAllocator,
+    io: std.Io,
+    stack: Stack,
+    ws: []const u8,
+    home: []const u8,
+    args: []const []const u8,
+    waited: *const i64,
+) Allocator.Error!expr.HashFiles.Result {
     var m: Merged = .{
         .arena = scratch.allocator(),
         .io = io,
@@ -227,6 +407,7 @@ fn run(
         .opaque_xattr = stack.opaque_xattr,
         .limits = stack.limits,
         .began_ms = nowMs(io, .awake),
+        .waited = waited,
     };
     // A call that began after the cancel is not cut short by it: see `Limits.cancel`.
     if (m.limits.cancel) |c| m.cancelled_before = c.requested.load(.acquire);
@@ -304,6 +485,8 @@ const Merged = struct {
     limits: Limits,
     /// When the call began (the monotonic clock, ms), and whether the job had been cancelled then.
     began_ms: i64,
+    /// Milliseconds the call spent waiting for its turn: its own clock leaves them out.
+    waited: *const i64,
     cancelled_before: bool = false,
     /// The layers' directories, opened, topmost first.
     roots: []linux.fd_t,
@@ -368,7 +551,7 @@ const Merged = struct {
             return m.fail("hashFiles() stopped: the job was cancelled", .{});
         if (m.steps % 1024 != 0) return;
         if (m.limits.timeout_ms != std.math.maxInt(u64) and
-            nowMs(m.io, .awake) - m.began_ms > m.limits.timeout_ms)
+            nowMs(m.io, .awake) - m.began_ms - m.waited.* > m.limits.timeout_ms)
             return m.fail("couldn't finish within {d} seconds", .{(m.limits.timeout_ms + 999) / 1000});
         // Begun after the cancel, it runs to the end of the grace period GitHub gives.
         if (m.limits.cancel) |c| if (m.cancelled_before) {
@@ -441,29 +624,54 @@ const Merged = struct {
         var small: [1024]u8 = undefined;
         var list: []u8 = &small;
         var n = linux.listxattr(p, list.ptr, list.len);
-        // A list that does not fit (a tmpfs holds up to 128 KiB of attributes) is asked its size.
+        // A list that does not fit is asked its size.
         if (linux.errno(n) == .RANGE) {
             const size = linux.listxattr(p, list.ptr, 0);
-            if (linux.errno(size) != .SUCCESS)
-                return m.fail("cannot read {s}'s attributes in the job's layers: {t}", .{ path, linux.errno(size) });
-            list = try m.arena.alloc(u8, size + 4096);
-            n = linux.listxattr(p, list.ptr, list.len);
+            if (linux.errno(size) == .SUCCESS) {
+                list = try m.arena.alloc(u8, size + 4096);
+                n = linux.listxattr(p, list.ptr, list.len);
+            } else n = size;
         }
         switch (linux.errno(n)) {
             .SUCCESS => {},
             // A file system without attributes cannot have marked anything.
             .NODATA, .OPNOTSUPP => return false,
+            // The kernel lists no more than 64 KiB (`XATTR_LIST_MAX`), and a tmpfs holds up to 128
+            // KiB of attributes: the three that matter are asked for by name.
+            .@"2BIG" => return m.attributesByName(p, path, is_dir),
             else => |e| return m.fail("cannot read {s}'s attributes in the job's layers: {t}", .{ path, e }),
         }
         var opaque_dir = false;
         var names = std.mem.splitScalar(u8, list[0..n], 0);
         while (names.next()) |name| {
             if (std.mem.eql(u8, name, m.redirect_xattr) or std.mem.eql(u8, name, m.metacopy_xattr))
-                return m.fail("{s} is renamed or copied up by overlay's redirect or metacopy in the " ++
-                    "job's layers, which hashFiles() cannot read", .{path});
+                return m.redirected(path);
             if (is_dir and std.mem.eql(u8, name, m.opaque_xattr)) opaque_dir = true;
         }
-        if (!opaque_dir) return false;
+        return opaque_dir and try m.opaqueValue(p, path);
+    }
+
+    /// `attributes` for an entry whose list of them is too long to be listed.
+    fn attributesByName(m: *Merged, p: [:0]const u8, path: []const u8, is_dir: bool) Error!bool {
+        var none: [1]u8 = undefined;
+        for ([_][:0]const u8{ m.redirect_xattr, m.metacopy_xattr }) |name| {
+            const got = linux.getxattr(p, name, &none, 0);
+            switch (linux.errno(got)) {
+                .SUCCESS => return m.redirected(path),
+                .NODATA, .OPNOTSUPP => {},
+                else => |e| return m.fail("cannot read {s}'s attributes in the job's layers: {t}", .{ path, e }),
+            }
+        }
+        return is_dir and try m.opaqueValue(p, path);
+    }
+
+    fn redirected(m: *Merged, path: []const u8) Error {
+        return m.fail("{s} is renamed or copied up by overlay's redirect or metacopy in the " ++
+            "job's layers, which hashFiles() cannot read", .{path});
+    }
+
+    /// Whether the opaque mark is the "y" overlay writes.
+    fn opaqueValue(m: *Merged, p: [:0]const u8, path: []const u8) Error!bool {
         var value: [1]u8 = undefined;
         const got = linux.getxattr(p, m.opaque_xattr, &value, value.len);
         return switch (linux.errno(got)) {
@@ -1114,67 +1322,6 @@ test "native hashFiles: a directory of thousands of entries costs its entries, n
     try std.testing.expect(failing.allocated_bytes < 48 << 20);
 }
 
-test "native hashFiles: a call that would pass its memory stops at the limit, with a message" {
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    var f = try Fixture.init(a.allocator());
-    defer f.cleanup();
-    try deepDir(&f, 100, 4000);
-    var held: std.atomic.Value(usize) = .init(0);
-    const stack = try f.stackOf(&.{"l0"}, .{ .memory = 2 << 20, .held = &held });
-    // An error of its own, not the allocator's `OutOfMemory`, and everything given back.
-    try expectFailed("would take more than 2 MiB", try f.hashWith(stack, &.{"**"}));
-    try std.testing.expectEqual(@as(usize, 0), held.load(.monotonic));
-}
-
-test "native hashFiles: the memory limit is for all calls together" {
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    var f = try Fixture.init(a.allocator());
-    defer f.cleanup();
-    try f.put("l0/ws/a.txt", "a");
-    var held: std.atomic.Value(usize) = .init(0);
-    // Another call holds all but 100 bytes of the 8 MiB: this one, which needs more, fails.
-    held.store((8 << 20) - 100, .monotonic);
-    const stack = try f.stackOf(&.{"l0"}, .{ .memory = 8 << 20, .held = &held });
-    try expectFailed("would take more than 8 MiB", try f.hashWith(stack, &.{"**"}));
-    try std.testing.expectEqual(@as(usize, (8 << 20) - 100), held.load(.monotonic));
-    // With the others gone it fits.
-    held.store(0, .monotonic);
-    try expectHash(&hashOf(&.{"a"}), try f.hashWith(stack, &.{"**"}));
-}
-
-test "native hashFiles: calls running together share one limit, and give it all back" {
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    var f = try Fixture.init(a.allocator());
-    defer f.cleanup();
-    try deepDir(&f, 60, 3000);
-    var held: std.atomic.Value(usize) = .init(0);
-    const stack = try f.stackOf(&.{"l0"}, .{ .memory = 12 << 20, .held = &held });
-    const Caller = struct {
-        fn run(st: Stack, ok: *std.atomic.Value(u32), refused: *std.atomic.Value(u32)) void {
-            const gpa = std.heap.smp_allocator;
-            const got = hashFiles(gpa, gpa, std.testing.io, st, "/ws", "/home/runner", &.{"**"}) catch return;
-            switch (got) {
-                .ok => _ = ok.fetchAdd(1, .monotonic),
-                .failed => |why| if (std.mem.indexOf(u8, why, "would take more than") != null) {
-                    _ = refused.fetchAdd(1, .monotonic);
-                },
-            }
-        }
-    };
-    var ok: std.atomic.Value(u32) = .init(0);
-    var refused: std.atomic.Value(u32) = .init(0);
-    var threads: [4]std.Thread = undefined;
-    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Caller.run, .{ stack, &ok, &refused });
-    for (threads) |t| t.join();
-    // Each is a result or a refusal for the limit, never a crash, and none is left holding.
-    try std.testing.expectEqual(@as(u32, 4), ok.load(.monotonic) + refused.load(.monotonic));
-    try std.testing.expect(ok.load(.monotonic) >= 1);
-    try std.testing.expectEqual(@as(usize, 0), held.load(.monotonic));
-}
-
 test "native hashFiles: a call that began after the job's cancel runs through the grace period" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -1299,4 +1446,150 @@ test "native hashFiles: a file with more attributes than a short list holds is r
     const stack: Stack = .{ .layers = &.{dir}, .opaque_xattr = "user.overlay.opaque" };
     const got = try hashFiles(std.testing.allocator, arena, io, stack, "/ws", "/home/runner", &.{"**"});
     try expectHash(&hashOf(&.{"a"}), got);
+}
+
+test "native hashFiles: a file whose attributes are too many to be listed is read by name" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    // 1,500 names of 46 bytes: past the 64 KiB the kernel lists (it says E2BIG), under the 128 KiB a tmpfs holds.
+    var raw: [6]u8 = undefined;
+    io.random(&raw);
+    const dir = try std.fmt.allocPrint(arena, "/dev/shm/zr-hashfiles-{s}", .{&std.fmt.bytesToHex(raw, .lower)});
+    std.Io.Dir.cwd().createDirPath(io, try std.fmt.allocPrint(arena, "{s}/ws", .{dir})) catch return error.SkipZigTest;
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const file = try std.fmt.allocPrintSentinel(arena, "{s}/ws/a.txt", .{dir}, 0);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = "a" });
+    for (0..1500) |i| {
+        const name = try std.fmt.allocPrintSentinel(arena, "user.zr-test-attribute-with-a-long-name-{d}", .{i}, 0);
+        if (linux.errno(linux.setxattr(file, name, "v", 1, 0)) != .SUCCESS) return error.SkipZigTest;
+    }
+    const stack: Stack = .{ .layers = &.{dir}, .opaque_xattr = "user.overlay.opaque" };
+    const got = try hashFiles(std.testing.allocator, arena, io, stack, "/ws", "/home/runner", &.{"**"});
+    try expectHash(&hashOf(&.{"a"}), got);
+}
+
+/// A call in a thread of its own: what it gave back, and how long it took.
+const Runner = struct {
+    fx: *const Fixture,
+    stack: Stack,
+    args: []const []const u8,
+    result: ?expr.HashFiles.Result = null,
+    took_ms: i64 = 0,
+
+    fn run(r: *Runner) void {
+        const t0 = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+        const gpa = std.heap.smp_allocator;
+        r.result = hashFiles(gpa, gpa, std.testing.io, r.stack, "/ws", "/home/runner", r.args) catch null;
+        r.took_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds() - t0;
+    }
+};
+
+fn sleepMs(ms: i64) void {
+    std.testing.io.sleep(.fromMilliseconds(ms), .awake) catch {};
+}
+
+test "native hashFiles: a call too big for the memory alone fails at once, without waiting" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try deepDir(&f, 100, 4000);
+    var budget: Budget = .{};
+    const stack = try f.stackOf(&.{"l0"}, .{ .memory = 2 << 20, .allowance = 64 << 10, .budget = &budget });
+    const t0 = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    // An error of its own, not the allocator's `OutOfMemory`, and the queue left as it was.
+    try expectFailed("would take more than 2 MiB", try f.hashWith(stack, &.{"**"}));
+    try std.testing.expect(std.Io.Clock.awake.now(std.testing.io).toMilliseconds() - t0 < 2000);
+    try std.testing.expectEqual(budget.next, budget.serving);
+}
+
+test "native hashFiles: a call that needs the turn waits for the call that has it, and then runs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try deepDir(&f, 8, 400);
+    var budget: Budget = .{};
+    const stack = try f.stackOf(&.{"l0"}, .{ .memory = 64 << 20, .allowance = 64 << 10, .budget = &budget });
+    // Another call has the turn (a big one, in a job that is hashing a huge file).
+    const held = budget.ticket();
+    try std.testing.expect(budget.isTurn(held));
+    var r: Runner = .{ .fx = &f, .stack = stack, .args = &.{"**"} };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&r});
+    sleepMs(400);
+    try std.testing.expect(r.result == null);
+    _ = budget.done(held);
+    thread.join();
+    try expectHash(&hashOf(try many(f.arena, "x", 400)), r.result.?);
+    // It waited, and the wait is not what its own clock (or its result) is.
+    try std.testing.expect(r.took_ms >= 350);
+    try std.testing.expectEqual(budget.next, budget.serving);
+}
+
+test "native hashFiles: a call with little to do never waits for the turn" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.put("l0/ws/a.txt", "a");
+    var budget: Budget = .{};
+    const held = budget.ticket();
+    // The big call that has the turn does not hold a neighbour's small one up.
+    try expectHash(&hashOf(&.{"a"}), try f.hashWith(try f.stackOf(&.{"l0"}, .{ .budget = &budget }), &.{"**"}));
+    _ = budget.done(held);
+}
+
+test "native hashFiles: a call waiting for the turn is ended by the job's cancel, and by its own time" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try deepDir(&f, 8, 400);
+    var budget: Budget = .{};
+    const held = budget.ticket();
+    // By the cancel.
+    var cancel: dagger.Cancel = .{};
+    var r: Runner = .{ .fx = &f, .stack = try f.stackOf(&.{"l0"}, .{ .allowance = 64 << 10, .budget = &budget, .cancel = &cancel }), .args = &.{"**"} };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&r});
+    sleepMs(200);
+    cancel.request(std.Io.Clock.real.now(std.testing.io).toMilliseconds() + 60_000);
+    thread.join();
+    try expectFailed("cancelled", r.result.?);
+    try std.testing.expect(r.took_ms < 3000);
+    // By its time, which is as long as a call may hold the turn it waits for.
+    var r2: Runner = .{ .fx = &f, .stack = try f.stackOf(&.{"l0"}, .{ .allowance = 64 << 10, .budget = &budget, .timeout_ms = 300 }), .args = &.{"**"} };
+    r2.run();
+    try expectFailed("waited 1 seconds", r2.result.?);
+    try std.testing.expect(r2.took_ms < 3000);
+    // Neither left its place in the queue: the turn goes on past both.
+    _ = budget.done(held);
+    try std.testing.expectEqual(budget.next, budget.serving);
+    try std.testing.expect(budget.isTurn(budget.next));
+}
+
+test "native hashFiles: calls that each hold memory and need more run in turn, none waits on another for good" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try deepDir(&f, 60, 6000);
+    // What one call takes, and a limit of two and a half times that: each fits alone (the counted bytes run a little over), four do not.
+    var alone = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try expectHash(&hashOf(try many(f.arena, "x", 6000)), try hashFiles(alone.allocator(), f.arena, std.testing.io, try f.stackOf(&.{"l0"}, .{}), "/ws", "/home/runner", &.{"**"}));
+    var budget: Budget = .{};
+    // Each is over its allowance, so each holds some and wants more; one at a time has the room.
+    const stack = try f.stackOf(&.{"l0"}, .{ .memory = alone.allocated_bytes / 4 * 10, .allowance = 64 << 10, .budget = &budget });
+    var runners: [4]Runner = undefined;
+    var threads: [4]std.Thread = undefined;
+    for (&runners, &threads) |*r, *t| {
+        r.* = .{ .fx = &f, .stack = stack, .args = &.{"**"} };
+        t.* = try std.Thread.spawn(.{}, Runner.run, .{r});
+    }
+    for (threads) |t| t.join();
+    // Together they need more than the 16 MiB: on a limit shared by the byte, some were refused.
+    const want = hashOf(try many(f.arena, "x", 6000));
+    for (runners) |r| try expectHash(&want, r.result.?);
+    try std.testing.expectEqual(budget.next, budget.serving);
 }
