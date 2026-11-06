@@ -837,7 +837,11 @@ listed as racy and read next time; a list that does not name exactly the tree's 
 not believed. That is not enough alone: a writable shared mapping, once its page is dirty, writes
 again without changing ctime or mtime, whatever the descriptor (it can be closed). So the check
 takes a read lease (`F_SETLEASE`, `F_RDLCK`) on each file it reads, which the kernel refuses while
-any writer or writable mapping holds the file, and lists a refused file as racy. A lease is broken
+any writer or writable mapping holds the file, and lists a refused file as racy. That holds only
+where it was seen to, ext4 and tmpfs: overlayfs grants the lease over a writable mapping, as the
+mapping's file is the one beneath, so a file on any other filesystem is racy too, and read at every
+check (the test failed on main's job in a Dagger container, whose `/tmp` is overlayfs on the host's
+disk, and passed on hosted runners). A lease is broken
 with a signal to the process, SIGIO by default, which ends a process that does not handle it and
 which `std.Io` uses to interrupt blocked calls (a job's cancel, a timeout): the check must not
 ignore it (an earlier cut did, and a native end-to-end job never got its cancel). `F_SETSIG` makes
