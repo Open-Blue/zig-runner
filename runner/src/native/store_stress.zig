@@ -239,7 +239,7 @@ fn checkVolumes(arena: Allocator, io: std.Io, store: []const u8, faults: *Faults
     while (try walker.next(io)) |e| {
         if (std.mem.startsWith(u8, e.basename, ".dead-")) try faults.add("left in volumes/: {s}", .{e.path});
         if (std.mem.indexOf(u8, e.path, ".private-") != null) try faults.add("left in volumes/: {s}", .{e.path});
-        if (std.mem.endsWith(u8, e.basename, ".size")) {
+        if (e.kind == .file and std.mem.endsWith(u8, e.basename, ".size")) {
             const text = try std.Io.Dir.cwd().readFileAlloc(io, try print(arena, "{s}/{s}", .{ area, e.path }), arena, .limited(32));
             bytes += std.fmt.parseInt(u64, std.mem.trim(u8, text, " \n"), 10) catch 0;
         }
