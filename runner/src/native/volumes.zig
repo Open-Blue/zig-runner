@@ -161,7 +161,17 @@ pub fn open(
     _ = linux.utimensat(lock.handle, null, null, 0);
     const at_z = try arena.dupeSentinel(u8, at, 0);
     switch (linux.errno(linux.mkdir(at_z, 0o755))) {
-        .SUCCESS, .EXIST => {},
+        .SUCCESS => {},
+        .EXIST => {
+            // Inside another volume, a job may have left anything at this name.
+            var st: linux.Statx = undefined;
+            const rc = linux.statx(linux.AT.FDCWD, at_z, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &st);
+            if (linux.errno(rc) != .SUCCESS) return error.VolumeNotMade;
+            if (st.mode & linux.S.IFMT != linux.S.IFDIR) {
+                if (linux.errno(linux.unlink(at_z)) != .SUCCESS) return error.VolumeNotMade;
+                if (linux.errno(linux.mkdir(at_z, 0o755)) != .SUCCESS) return error.VolumeNotMade;
+            }
+        },
         else => return error.VolumeNotMade,
     }
     if (owner) |o| if (linux.errno(linux.lchown(at_z, o, o)) != .SUCCESS)

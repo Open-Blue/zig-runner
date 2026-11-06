@@ -894,14 +894,20 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
             .used_ns = used_ns,
         }) catch return;
     }
-    if (total > s.max_bytes) {
+    // The disk's floor counts here first: a layer is the cheapest thing the store has to make
+    // again. So under it a layer goes as the rest does (`evict.floor`), sparing recent use, and
+    // only past the cap whatever its use.
+    const keep = @min(s.max_bytes, total -| (Eviction.shortOf(arena, s) orelse 0));
+    if (total > keep) {
         std.mem.sort(Entry, entries.items, {}, struct {
             fn lt(_: void, a: Entry, b: Entry) bool {
                 return a.used_ns < b.used_ns;
             }
         }.lt);
+        const recent = std.Io.Clock.real.now(io).toNanoseconds() - @as(i128, s.limits.recent_s) * std.time.ns_per_s;
         for (entries.items) |e| {
-            if (total <= s.max_bytes) break;
+            if (total <= keep) break;
+            if (total <= s.max_bytes and e.used_ns >= recent) continue;
             if (s.evict(arena, io, e.name)) total -|= e.bytes;
         }
     }
@@ -968,22 +974,54 @@ fn dropKeyLocks(s: Store, arena: Allocator, io: std.Io) void {
     }
 }
 
-/// The lock file `path`, made if it is not there, never through a symlink: a lock beside a volume
-/// may be in a directory a job could write (`evict.nested`). The lock counts only once `sameFile`
-/// says so, as an eviction removes these.
+/// The regular file `path`, read-only, or null: never through a symlink, and with no wait on a
+/// FIFO, as a job may have left anything where one is looked for (`evict.zig`).
+pub fn openPlain(arena: Allocator, path: []const u8) ?std.Io.File {
+    const z = arena.dupeSentinel(u8, path, 0) catch return null;
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true };
+    const rc = linux.open(z, flags, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return null;
+    if (isRegular(fd)) return .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    _ = linux.close(fd);
+    return null;
+}
+
+fn isRegular(fd: linux.fd_t) bool {
+    var st: linux.Statx = undefined;
+    return linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &st)) == .SUCCESS and
+        st.mode & linux.S.IFMT == linux.S.IFREG;
+}
+
+/// The lock file `path`, made if it is not there, never through a symlink and with no wait on a
+/// FIFO: a lock beside a volume may be in a directory a job could write (`evict.innerLock`). What is
+/// there and is no regular file is no lock anyone holds, and is removed. The lock counts only once
+/// `sameFile` says so, as an eviction removes these.
 pub fn lockBeside(arena: Allocator, io: std.Io, path: []const u8) !std.Io.File {
-    _ = arena;
     const cwd = std.Io.Dir.cwd();
-    while (true) {
-        if (cwd.openFile(io, path, .{ .follow_symlinks = false })) |f| return f else |e| switch (e) {
-            error.FileNotFound => {},
-            else => return e,
+    const z = try arena.dupeSentinel(u8, path, 0);
+    const flags: linux.O = .{
+        .ACCMODE = .RDONLY,
+        .CREAT = true,
+        .NOFOLLOW = true,
+        .NONBLOCK = true,
+        .CLOEXEC = true,
+    };
+    for (0..8) |_| {
+        const rc = linux.open(z, flags, 0o644);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const fd = std.math.cast(linux.fd_t, rc) orelse return error.Locked;
+                if (isRegular(fd)) return .{ .handle = fd, .flags = .{ .nonblocking = true } };
+                _ = linux.close(fd);
+            },
+            .LOOP => {},
+            .NOENT => return error.FileNotFound,
+            else => return error.Locked,
         }
-        return cwd.createFile(io, path, .{ .exclusive = true, .truncate = false }) catch |e| switch (e) {
-            error.PathAlreadyExists => continue,
-            else => return e,
-        };
+        cwd.deleteFile(io, path) catch {};
     }
+    return error.Locked;
 }
 
 /// Whether `f` is the file `path` names now.
@@ -1131,7 +1169,7 @@ fn listDir(arena: Allocator, io: std.Io, fd: linux.fd_t) ![]Node {
     return out.items;
 }
 
-fn openDirAt(fd: linux.fd_t, name: [*:0]const u8) !linux.fd_t {
+pub fn openDirAt(fd: linux.fd_t, name: [*:0]const u8) !linux.fd_t {
     const flags: linux.O = .{
         .ACCMODE = .RDONLY,
         .DIRECTORY = true,
@@ -2582,6 +2620,28 @@ test "native store: a layer counts its record and its own files, not only its tr
     s.max_bytes = tree + entry_overhead;
     s.collect(arena, io);
     try std.testing.expect(try s.open(arena, io, k) == null);
+}
+
+test "native store: under the disk's floor a layer goes though the store is under its cap, not one just used" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    const old, const l0 = try testLayer(arena, io, tmp, &s, "up0");
+    const lock = try arena.dupeSentinel(u8, try join(arena, std.fs.path.dirname(l0.fs).?, "lock"), 0);
+    l0.lock.close(io);
+    const new, const l1 = try testLayer(arena, io, tmp, &s, "up1");
+    l1.lock.close(io);
+    const t = [2]linux.timespec{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } };
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.utimensat(linux.AT.FDCWD, lock, &t, 0)));
+    // A floor no disk meets.
+    s.limits.min_free_pct = 100;
+    s.collect(arena, io);
+    try std.testing.expect(try s.open(arena, io, old) == null);
+    (try s.open(arena, io, new)).?.layer.lock.close(io);
 }
 
 test "native store: a key published already stays, and the second upper is put back where it was" {

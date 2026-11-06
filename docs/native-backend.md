@@ -737,8 +737,10 @@ finding it busy goes on; the proof of its locks is proofs/tla/StoreEviction.tla.
   their cap, with a line in the runner's log. The cap is a target: a working set over it costs disk,
   where evicting it would cost each job its caches, on a loop.
 - **The disk's floor.** With less than `RUNNER_NATIVE_MIN_FREE_PCT` of the store's filesystem free
-  (10), volumes go whatever the cap says, until that much is free or all that is left was used in the
-  last hour. This is what bounds the store on a machine smaller than its caps, with no setting.
+  (10), layers go first, as `Store.collect` runs before this and they are the cheapest to make again,
+  then volumes, whatever the caps say, until that much is free or all that is left was used in the
+  last hour. A volume never measured is measured first, as one counted as 0 would take them all.
+  This is what bounds the store on a machine smaller than its caps, with no setting.
 - **A job in progress loses nothing.** A job holds each of its volumes' locks shared from
   `volumes.open` to its end. An eviction takes the lock exclusively and non-blocking, so a volume in
   use is skipped, on this runner or any other sharing the store; a `locked` one is in use the same
@@ -751,16 +753,28 @@ finding it busy goes on; the proof of its locks is proofs/tla/StoreEviction.tla.
   replayed whose script left something else in a volume, and a later step that needs it without
   saying so, would not find it, as on any other runner's first run of that step's successor: that
   rests on a job's own steps, and is the same case as Dagger's own GC of a volume.
-- **A crash at any point.** The volume is renamed to `volumes/.dead-<n>` and the rename synced before
-  anything of it is deleted, so a volume is what its job left or is gone, on a filesystem that
-  orders its journal or not. The lock file goes last, so whoever takes a lock checks it is the file
-  the path names (`Store.sameFile`), as `lockKey` does. A volume inside another (`<key>` and
-  `<key>/runner`, when one store has had both step users) goes with it, under both locks; a job
-  opening the inner one meanwhile waits, finds the path gone and starts over.
-- **Time and memory.** Deleting has a budget of 1.5 s a job. What is left stays under its dead name,
-  the next job's end goes on with it, and nothing more is evicted until it is gone. A pass holds no
-  entry's lock while it walks or deletes, so a job starting waits at most for one rename's sync.
-  It looks at up to 16,384 volumes, and a walk keeps at most 16 MiB of paths.
+- **A crash at any point.** The volume is renamed to `volumes/.dead-<n>` and both directories synced
+  before anything of it is deleted; a later pass finding a dead name syncs the filesystem first, as
+  the runner that renamed it may have died before it could, and which directory it came from is not
+  known. So a volume is what its job left or is gone, on a filesystem that orders its journal or
+  not. The lock file goes last, so whoever takes a lock checks it is the file the path names
+  (`Store.sameFile`), as `lockKey` does.
+- **A job writes what is in a volume**, so eviction believes nothing in there. The walk never enters
+  a volume, a size and a lock are beside it, where no job reaches, and every file the store looks
+  for is opened through no symlink and without waiting on a FIFO. A volume inside another (`<key>`
+  and `<key>/runner`, when one store has had both step users) is no entry of its own: it goes with
+  the outer one, whose eviction takes the inner lock through a descriptor and removes whatever else
+  is at that name, and a job opening the inner one meanwhile waits, finds the path gone and starts
+  over. A job in the outer volume can delete the inner lock, but it can as well delete the inner
+  volume, which is the same repository's.
+- **What will not go.** Removing a dead tree holds two descriptors and no path, moving what is deep
+  up to the top as it goes, so a chain of directories of any depth loses some of itself each pass.
+  A dead name that still cannot be removed is logged, and stops nothing.
+- **Time and memory.** Deleting has a budget of 1.5 s a job, which evicting counts against too. What
+  is left stays under its dead name, the next job's end goes on with it, and nothing more is evicted
+  until it is gone. A pass holds no entry's lock while it walks or deletes, so a job starting waits
+  at most for one rename's sync. It looks at up to 16,384 volumes, and a walk keeps at most 16 MiB of
+  paths. A `syncfs` for a dead name is not bounded by the budget: it takes what the disk takes.
 - **Costs left.** Deleting and measuring are at a job's end, before its result is reported
   (`Backend.deinit`), so a job can end up to 1.5 s plus a walk later. A size is the runner's own
   estimate, not the filesystem's: a file with several links counts its share per link.

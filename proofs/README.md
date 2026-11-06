@@ -510,13 +510,20 @@ twice; and more runners, keys or steps than the bounds.
 shared by a job for as long as it uses the path, and which an eviction removes, so that whoever
 takes one must check it is still the file the path names. A volume is made in place, a tree aside
 and renamed in. One volume can be inside another's directory (`<key>` and `<key>/runner`), whose lock
-file then goes with the outer one's rename; a `-nested` configuration has that case.
+file then goes with the outer one's rename and is in a place a job can write: the job holding the
+outer volume may leave anything at that name (`Plant`). A `-nested` configuration has that case. It
+does not plant over a lock a job holds: that job's volume is inside this one's, which can delete it
+whatever a lock says, so no protocol here can keep it. A rename to a dead name has two directories,
+and the model tells them apart: where it went, and where it came from, which for a volume is
+another. And a dead tree may fail to go.
 
 | Property | Says |
 |---|---|
 | `HeldWhole` | what a job holds is what the path names, and nothing of it was deleted, until the job ends |
 | `NamedWhole` | no name ever names a tree something was deleted from, whatever crashes |
 | `OneMaker` | two jobs do not make one tree at once |
+| `NotPinned` | nothing a job leaves at the inner lock's name keeps a volume from going |
+| `PassGoesOn` | a dead tree that will not go ends no pass |
 | `LocksExclude` | flocks as the kernel gives them, the model's own check |
 | `AllEnd` | every job ends |
 
@@ -525,14 +532,17 @@ Mutants, each with a guard taken away: `-no-recheck` (no `sameFile` after a job'
 shared, which `flock` does not do atomically: `HeldWhole`), `-no-lock` (an eviction by age alone:
 `HeldWhole`), `-no-inner-lock` (an eviction without the inner volume's lock: `HeldWhole`),
 `-delete-first` (deleting before the rename: `NamedWhole`), `-no-rename-sync` (deleting before the
-rename is on disk: `NamedWhole`).
+rename is on disk: `NamedWhole`), `-area-sync` (a later pass syncing only the area's directory:
+`NamedWhole`), `-planted` (stopping at what a job left at the inner lock's name: `NotPinned`),
+`-stuck-stops` (a pass that ends at a dead tree it cannot remove: `PassGoesOn`).
 
 **What it found.** A runner renames a tree to `.dead-<n>` and dies before it syncs that rename;
 another runner's pass finds the dead tree and starts deleting; a machine crash keeps the deletes and
 loses the rename, and the name comes back on a tree half gone. On ext4 the journal's order rules that
-out; on a filesystem that does not promise it, nothing else did. `removeDead` now syncs the area's
-directory before it deletes anything there, whoever made the dead name (`StoreEviction-crash.cfg`
-found it, in 24 states).
+out; on a filesystem that does not promise it, nothing else did. `removeDead` now syncs the filesystem
+before it deletes anything there, whoever made the dead name (`StoreEviction-crash.cfg` found it, in
+24 states). Syncing the area's directory alone, the first fix, was not enough: a volume's rename has
+another source directory, which a model that told the two apart showed in 25 states.
 
 **What it does not model**: sizes, the caps and the order of eviction (any entry may go, which
 over-approximates the LRU); the blobs, whose lock is a plain reader-writer lock; a volume's content,

@@ -298,6 +298,7 @@ fn write(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: 
             try hook(io, env, mark_env, "evicted");
             s.limits.budget_ms = 60_000;
             evict.run(s, io);
+            evict.run(s, io);
         },
         else => return error.BadSpec,
     }

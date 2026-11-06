@@ -19,7 +19,10 @@
 //!   - no fd or lock outlives a job in a worker, and a store that works logs no warning;
 //!   - no job loses a cache volume it holds (`evict.zig`): each worker's volume jobs write a nonce
 //!     into the tool cache and find it a step later, with other jobs' ends evicting every volume no
-//!     job holds, and a volume evicted is an empty one to the next job;
+//!     job holds, and a volume evicted is an empty one to the next job. Each also leaves there what
+//!     a hostile job would: a FIFO where a size or a lock of a volume inside it goes, a symlink to a
+//!     file outside (`canary`, which must stay as it is), a deep chain of directories; a pass that
+//!     hung or followed one fails here;
 //!   - once all stopped and a last collect ran: no `.tmp-` or `.dead-` entry, no key lock, no
 //!     job's directory, the store within its cap and its volumes within theirs.
 //!
@@ -105,6 +108,7 @@ test "native store under load: processes share one store under a small cap" {
         _ = linux.chmod(try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ root, d }, 0), 0o777);
     }
     try tmp.dir.writeFile(io, .{ .sub_path = "shared/overlaps", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "shared/canary", .data = "untouched" });
     const overlaps_z = try std.fmt.allocPrintSentinel(arena, "{s}/shared/overlaps", .{root}, 0);
     _ = linux.chmod(overlaps_z, 0o666);
 
@@ -180,6 +184,8 @@ test "native store under load: processes share one store under a small cap" {
         if (told == null and faults.list.items.len > before) told = err_text[0..@min(err_text.len, 64 << 10)];
     }
     const again = try checkReplays(arena, io, root, obs.items, &faults);
+    const canary = try tmp.dir.readFileAlloc(io, "shared/canary", arena, .limited(64));
+    if (!std.mem.eql(u8, canary, "untouched")) try faults.add("a file outside the volumes was written: {s}", .{canary});
     const overlaps = try tmp.dir.readFileAlloc(io, "shared/overlaps", arena, .limited(1 << 20));
     if (overlaps.len > 0) try faults.add("keys ran in two jobs at once (chain, nonce):\n{s}", .{overlaps});
 
@@ -554,7 +560,11 @@ fn runVolumeJob(w: *Worker, arena: Allocator, io: std.Io, n: usize) !void {
     steps[0] = testStep(try print(arena,
         \\: $GITHUB_SHA; echo "@empty $(ls -A {s} | wc -l)"
         \\head -c 2000 /dev/urandom > {s}/{s}.data; sha256sum {s}/{s}.data > {s}/{s}.sum
-    , .{ cache, cache, nonce, cache, nonce, cache, nonce }));
+        \\cd {s}; mkdir -p runner runner.d; mkfifo runner.lock runner.size 2>/dev/null || true
+        \\ln -sf /shared/canary runner.d.size; ln -sf /shared/canary runner.size.link
+        \\d=chain; for i in 1 2 3 4 5 6 7 8; do mkdir -p $d/$d/$d/$d/$d/$d/$d/$d; cd $d/$d/$d/$d/$d/$d/$d/$d; done
+        \\cd {s}
+    , .{ cache, cache, nonce, cache, nonce, cache, nonce, cache, cache }));
     steps[1] = testStep(try print(arena,
         \\: $GITHUB_SHA; sleep 0.$(od -An -N1 -tu1 /dev/urandom | tr -d ' '); sha256sum -c {s}/{s}.sum
     , .{ cache, nonce }));
