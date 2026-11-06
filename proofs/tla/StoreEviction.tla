@@ -195,8 +195,9 @@ Make(p) ==
     /\ Goto(p, "down")
     /\ UNCHANGED <<lockIno, lockGen, locks, half, dead, gc, planted, counts>>
 
-(* Exclusive given up for shared, for the job: flock's conversion is not  *)
-(* atomic, so an eviction may come between (`down`, then `flock_sh2`).    *)
+(* Exclusive given up for shared, for the job: by holdDir again in the     *)
+(* code, as flock's own conversion is no more atomic, so an eviction may  *)
+(* come between (`down`, then `flock_sh2`).                               *)
 Down(p) ==
     /\ S(p).pc = "down"
     /\ Drop(S(p).fd, p)

@@ -23,8 +23,10 @@
 //!     a hostile job would: a FIFO where a size or a lock of a volume inside it goes, a symlink to a
 //!     file outside (`canary`, which must stay as it is), a deep chain of directories; a pass that
 //!     hung or followed one fails here;
+//!   - no job loses a tree it holds: each worker's tree jobs make or find a rootfs under the keys
+//!     they share (`oci.Store.ensure`) and read it whole, held a while, as a job's mounts would;
 //!   - once all stopped and a last collect ran: no `.tmp-` or `.dead-` entry, no key lock, no
-//!     job's directory, the store within its cap and its volumes within theirs.
+//!     job's directory, the store within its cap and its volumes and trees within theirs.
 //!
 //! ZIG_TEST_STORE_STRESS_SECONDS (30), ZIG_TEST_STORE_STRESS_PROCS (6) and
 //! ZIG_TEST_STORE_STRESS_SEED (random, printed) set the run; the nightly analysis workflow runs it
@@ -41,6 +43,7 @@ const Backend = @import("Backend.zig");
 const Store = @import("Store.zig");
 const evict = @import("evict.zig");
 const layers = @import("layers.zig");
+const OciStore = @import("oci/Store.zig");
 const dagger = @import("../dagger.zig");
 const sink = @import("../sink.zig");
 const job_mod = @import("../job.zig");
@@ -66,6 +69,7 @@ const cap: u64 = 256 * 1024;
 /// Volumes evicted as soon as no job holds them: this cap, and no day's grace.
 const limits: evict.Limits = .{
     .volumes_max_bytes = 8 * 1024,
+    .images_max_bytes = 8 * 1024,
     .min_free_pct = 0,
     .idle_s = 0,
     .recent_s = 0,
@@ -207,10 +211,10 @@ test "native store under load: processes share one store under a small cap" {
 
     std.debug.print("native store under load: {d} jobs ({d} steps run, {d} replayed, {d} keys " ++
         "run again after eviction), {d} builds ({d} found stored), {d} volume jobs ({d} found the " ++
-        "volume empty), {d} entry checks, at most {d} KiB stored\n", .{
-        totals.jobs,    totals.live,       totals.replayed,    again,
-        totals.builds,  totals.build_hits, totals.volume_jobs, totals.volume_new,
-        faults.checked, peak / 1024,
+        "volume empty), {d} tree jobs ({d} made one), {d} entry checks, at most {d} KiB stored\n", .{
+        totals.jobs,      totals.live,       totals.replayed,    again,
+        totals.builds,    totals.build_hits, totals.volume_jobs, totals.volume_new,
+        totals.tree_jobs, totals.tree_made,  faults.checked,     peak / 1024,
     });
     if (faults.list.items.len > 0) {
         if (told) |text| std.debug.print("the first worker that found something, on stderr:\n{s}\n", .{text});
@@ -226,6 +230,8 @@ test "native store under load: processes share one store under a small cap" {
     // And volumes were evicted between jobs: each of the three repositories' first job found one
     // empty with nothing evicted. Not how often: a short run under load may evict every time.
     try std.testing.expect(totals.volume_new > 3);
+    // Likewise a tree made again after it was evicted.
+    try std.testing.expect(totals.tree_made > 3);
 }
 
 /// After the last collect: no volume half gone, none but what the cap allows, nothing dead.
@@ -273,8 +279,13 @@ const Stats = struct {
     build_hits: u64 = 0,
     volume_jobs: u64 = 0,
     volume_new: u64 = 0,
+    tree_jobs: u64 = 0,
+    tree_made: u64 = 0,
 
-    const names = .{ "jobs", "live", "replayed", "builds", "build_hits", "volume_jobs", "volume_new" };
+    const names = .{
+        "jobs",        "live",       "replayed",  "builds",    "build_hits",
+        "volume_jobs", "volume_new", "tree_jobs", "tree_made",
+    };
 
     pub fn format(s: Stats, w: *std.Io.Writer) std.Io.Writer.Error!void {
         inline for (names) |name| try w.print("{d} ", .{@field(s, name)});
@@ -436,11 +447,12 @@ test "native store under load: one worker (run only by the test above, in a proc
     while (std.Io.Clock.real.now(io).toMilliseconds() < deadline) : (n += 1) {
         var job_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer job_arena.deinit();
-        const kind = if (n < 3) n else 1 + w.rand.uintLessThan(u32, 4);
+        const kind = if (n < 4) n else 1 + w.rand.uintLessThan(u32, 5);
         const what = if (kind == 1) "build" else "job";
         switch (kind) {
             1 => try runBuild(&w, job_arena.allocator(), io, build_dir, n),
             2 => try runVolumeJob(&w, job_arena.allocator(), io, n),
+            3 => try runTreeJob(&w, job_arena.allocator(), io, n),
             else => try runJob(&w, job_arena.allocator(), io, n),
         }
         const fds = try countFds(io);
@@ -592,6 +604,33 @@ fn runVolumeJob(w: *Worker, arena: Allocator, io: std.Io, n: usize) !void {
     if (std.mem.indexOf(u8, text, try print(arena, "@whole {s}", .{nonce})) == null)
         return w.fault("volume job {d}: its files were not whole at its end:\n{s}", .{ n, w.log(text) });
     if (std.mem.indexOf(u8, text, "@empty 0") != null) w.stats.volume_new += 1;
+}
+
+/// What a provisioned rootfs is to the store: a tree made once by whoever finds it missing, its
+/// files read by the job that holds it until its end, with a pause for other jobs' ends to evict
+/// what they can, and any key made again only after an eviction. Then a collect, as a job's end.
+fn runTreeJob(w: *Worker, arena: Allocator, io: std.Io, n: usize) !void {
+    const oci: OciStore = .{ .root = w.store.root };
+    try oci.prepare(arena, io);
+    const Make = struct {
+        fn make(_: *anyopaque, dir: []const u8) anyerror!void {
+            var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer a.deinit();
+            try fillBuild(a.allocator(), std.testing.io, dir, 5);
+        }
+    };
+    var key: [8]u8 = undefined;
+    const name = try std.fmt.bufPrint(&key, "tree{d}", .{w.rand.uintLessThan(u32, 3)});
+    const got = oci.ensure(arena, io, "rootfs", name, .{ .ptr = w, .makeFn = Make.make }) catch |e| {
+        return w.fault("tree job {d}: {s} not made: {t}", .{ n, name, e });
+    };
+    w.stats.tree_jobs += 1;
+    if (got.made) w.stats.tree_made += 1;
+    checkBuild(w, arena, io, got.dir, 5, n, "found");
+    try io.sleep(.fromMilliseconds(w.rand.uintLessThan(u32, 60)), .awake);
+    checkBuild(w, arena, io, got.dir, 5, n, "held");
+    got.lock.close(io);
+    w.store.collect(arena, io);
 }
 
 /// A Dockerfile build's layers (`layers.Store`, as `dockerfile.zig` uses it): some of the six,

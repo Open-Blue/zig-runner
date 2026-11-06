@@ -34,7 +34,8 @@
 //! backend builds it (`set_up.zigSeedScript`), and kept under `seeds/`. It sits between the
 //! rootfs and the job's layers, so what a job adds to its global cache goes in the job's own
 //! layers, as Dagger mounts the seed as a directory whose writes go with the container. Nothing a
-//! job wrote is in it, which is why one seed may go to every scope's jobs.
+//! job wrote is in it, which is why one seed may go to every scope's jobs. A job holds each seed it
+//! runs on until it ends (`Backend.holdSeed`), and `evict.zig` takes one no job holds.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -465,7 +466,7 @@ pub fn adoptSeed(
     const p = try std.fmt.allocPrintSentinel(arena, "{s}/p", .{into}, 0);
     _ = linux.mkdir(p, 0o755);
     if (user) |u| _ = linux.lchown(p, u, u);
-    // A seed's key is its path alone, so nothing below would notice one a crash emptied.
+    // Nothing below would notice a seed a crash emptied: a key says which build it is, not what it holds.
     try OciStore.syncFilesystem(arena, new);
     cwd.rename(new, cwd, seed.dir, io) catch |e| switch (e) {
         error.DirNotEmpty => {
@@ -474,6 +475,19 @@ pub fn adoptSeed(
         },
         else => return e,
     };
+}
+
+/// What keys know a seed by: its path, and which build lives there. A seed evicted is built again
+/// under the same path, from the same release, and need not be the same tree, so a layer on the old
+/// one must not be replayed on the new (`Backend.below`). Which directory, since when: no one
+/// changes a seed's root once it is published.
+pub fn seedId(arena: Allocator, dir: []const u8) ![]const u8 {
+    var st: linux.Statx = undefined;
+    const z = try arena.dupeSentinel(u8, dir, 0);
+    const mask: linux.STATX = .{ .INO = true, .CTIME = true };
+    if (linux.errno(linux.statx(linux.AT.FDCWD, z, linux.AT.SYMLINK_NOFOLLOW, mask, &st)) != .SUCCESS)
+        return error.SeedGone;
+    return std.fmt.allocPrint(arena, "{s}@{d}.{d}.{d}", .{ dir, st.ino, st.ctime.sec, st.ctime.nsec });
 }
 
 /// Every file under `path` owned by `user` (none followed through a symlink), and every
@@ -503,6 +517,26 @@ fn ownTree(arena: Allocator, io: std.Io, path: []const u8, user: ?u32, depth: u3
             },
         }
     }
+}
+
+test "native volumes: a seed built again is another seed to a key" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = std.Io.Dir.cwd();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const dir = try std.fmt.allocPrint(arena, "{s}/seed", .{root});
+    const aside = try std.fmt.allocPrint(arena, "{s}/aside", .{root});
+    try cwd.createDirPath(io, dir);
+    const first = try seedId(arena, dir);
+    try std.testing.expectEqualStrings(first, try seedId(arena, dir));
+    // The old one still there, so no inode can be used again.
+    try cwd.rename(dir, cwd, aside, io);
+    try cwd.createDirPath(io, dir);
+    try std.testing.expect(!std.mem.eql(u8, first, try seedId(arena, dir)));
 }
 
 test "native volumes: a key's parts are names of their own" {

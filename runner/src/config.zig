@@ -146,6 +146,9 @@ pub const Config = struct {
     /// Past this many MiB, the native cache volumes that went longest unused go
     /// (`RUNNER_NATIVE_VOLUMES_MAX_MB`, 0 for no cap, `native/evict.zig`).
     native_volumes_max_mb: u64 = native_evict.default_volumes_max_bytes / (1024 * 1024),
+    /// Past this many MiB of images, provisioned rootfs and Zig cache seeds together, those that
+    /// went longest unused go (`RUNNER_NATIVE_IMAGES_MAX_MB`, 0 for no cap, `native/evict.zig`).
+    native_images_max_mb: u64 = native_evict.default_images_max_bytes / (1024 * 1024),
     /// With less than this percentage of the native store's filesystem free, what it keeps goes
     /// whatever the caps say (`RUNNER_NATIVE_MIN_FREE_PCT`, 0 for no floor, `native/evict.zig`).
     native_min_free_pct: u8 = native_evict.default_min_free_pct,
@@ -434,6 +437,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_SUBNET")) |v| c.native_subnet = v;
         if (environ.get("RUNNER_NATIVE_STORE_MAX_MB")) |v| c.native_store_max_mb = try num(u64, v);
         if (environ.get("RUNNER_NATIVE_VOLUMES_MAX_MB")) |v| c.native_volumes_max_mb = try num(u64, v);
+        if (environ.get("RUNNER_NATIVE_IMAGES_MAX_MB")) |v| c.native_images_max_mb = try num(u64, v);
         if (environ.get("RUNNER_NATIVE_MIN_FREE_PCT")) |v| c.native_min_free_pct = try minFree(v);
         if (environ.get("RUNNER_NATIVE_CGROUP")) |v| c.native_cgroup = v;
         if (environ.get("RUNNER_NATIVE_MEMORY_MAX_MB")) |v| c.native_memory_max_mb = try num(u32, v);
@@ -519,6 +523,7 @@ pub const Config = struct {
         else if (eq(key, "native-subnet")) c.native_subnet = val //
         else if (eq(key, "native-store-max-mb")) c.native_store_max_mb = try num(u64, val) //
         else if (eq(key, "native-volumes-max-mb")) c.native_volumes_max_mb = try num(u64, val) //
+        else if (eq(key, "native-images-max-mb")) c.native_images_max_mb = try num(u64, val) //
         else if (eq(key, "native-min-free-pct")) c.native_min_free_pct = try minFree(val) //
         else if (eq(key, "native-cgroup")) c.native_cgroup = val //
         else if (eq(key, "native-memory-max-mb")) c.native_memory_max_mb = try num(u32, val) //
@@ -880,9 +885,11 @@ test "the native subnet and ids: defaults, and values that are refused" {
     try std.testing.expectEqualStrings("10.211.0.0/16", c.native_subnet);
     try std.testing.expectEqual(NativeBackend.default_subid_base, c.native_subid_base);
     try env.put("RUNNER_NATIVE_VOLUMES_MAX_MB", "2048");
+    try env.put("RUNNER_NATIVE_IMAGES_MAX_MB", "1024");
     try env.put("RUNNER_NATIVE_MIN_FREE_PCT", "5");
     const limited = try Config.load(&env, &.{"runner"});
     try std.testing.expectEqual(@as(u64, 2048), limited.native_volumes_max_mb);
+    try std.testing.expectEqual(@as(u64, 1024), limited.native_images_max_mb);
     try std.testing.expectEqual(@as(u8, 5), limited.native_min_free_pct);
     try env.put("RUNNER_NATIVE_MIN_FREE_PCT", "101");
     try std.testing.expectError(error.InvalidNativeMinFree, Config.load(&env, &.{"runner"}));

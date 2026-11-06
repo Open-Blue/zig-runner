@@ -56,6 +56,9 @@ pub const Image = struct {
     user: []const u8,
     /// Set when this pull fetched and unpacked it; null when the store had it.
     pulled: ?Pulled = null,
+    /// Held shared on the image in the store (`Store.hold`) until the caller closes it, which a
+    /// job does at its end: a pull's rootfs is a lower of its mounts, and of what it provisions.
+    lock: std.Io.File,
 };
 
 pub const Pulled = struct { layers: usize, bytes: u64, ms: i64, devices: u64 };
@@ -88,7 +91,11 @@ pub fn pull(
     if (ref.digest) |d| {
         const known = cwd.readFileAlloc(io, try store.refPath(arena, d, platform.name()), arena, .limited(128)) catch null;
         if (known) |m| if (registry.validDigest(m)) {
-            if (try fromStore(arena, io, store, d, m, req.owners)) |img| return img;
+            if (try store.hold(arena, io, "oci/images", try imageKey(arena, m, req.owners))) |lock| {
+                errdefer lock.close(io);
+                if (try fromStore(arena, io, store, d, m, req.owners, lock)) |img| return img;
+                lock.close(io);
+            }
         };
     }
 
@@ -130,11 +137,11 @@ pub fn pull(
         if (unpack.why.len > 0) why.* = unpack.why;
         return fail(arena, why, &c, e, "its layers");
     };
-    var img = (try fromStore(arena, io, store, top.digest, man.digest, req.owners)) orelse {
+    errdefer made.lock.close(io);
+    var img = (try fromStore(arena, io, store, top.digest, man.digest, req.owners, made.lock)) orelse {
         why.* = try std.fmt.allocPrint(arena, "{s}: the store lost the image just unpacked", .{req.image});
         return error.ImageMissing;
     };
-    _ = made.dir;
     if (made.made) img.pulled = .{
         .layers = doc.layers.?.len,
         .bytes = unpack.bytes,
@@ -161,8 +168,9 @@ fn imageKey(arena: Allocator, manifest: []const u8, owners: bool) ![]const u8 {
     return if (owners) hex else std.fmt.allocPrint(arena, "{s}.rootless", .{hex});
 }
 
-/// The image under `manifest` in the store, with its config, or null when it is not there.
-fn fromStore(arena: Allocator, io: std.Io, store: Store, digest: []const u8, manifest: []const u8, owners: bool) !?Image {
+/// The image under `manifest` in the store, with its config, or null when it is not there. `lock`
+/// holds it (`Store.hold`) and goes with the image.
+fn fromStore(arena: Allocator, io: std.Io, store: Store, digest: []const u8, manifest: []const u8, owners: bool, lock: std.Io.File) !?Image {
     const dir = try std.fmt.allocPrint(arena, "{s}/oci/images/{s}", .{ store.root, try imageKey(arena, manifest, owners) });
     const cwd = std.Io.Dir.cwd();
     // Out of memory is not "not in the store": read as one, the pull reported that the store lost
@@ -182,6 +190,7 @@ fn fromStore(arena: Allocator, io: std.Io, store: Store, digest: []const u8, man
         .manifest = manifest,
         .env = inner.Env orelse &.{},
         .user = inner.User orelse "",
+        .lock = lock,
     };
 }
 
@@ -323,6 +332,10 @@ const Unpack = struct {
                 return error.BadConfig;
             },
         };
+        // The blobs have no job to hold them: an eviction stays out while any image unpacks.
+        const blobs = try std.Io.Dir.cwd().createFile(io, try u.store.blobsLock(arena), .{ .truncate = false });
+        defer blobs.close(io);
+        if (linux.errno(linux.flock(blobs.handle, 1)) != .SUCCESS) return error.Locked;
         const layers = u.doc.layers.?;
         const diff_ids = if (cfg.rootfs) |r| r.diff_ids else &.{};
         if (diff_ids.len != layers.len) {
@@ -368,7 +381,11 @@ const Unpack = struct {
         const io = u.io;
         const path = try u.store.blobPath(arena, l.digest);
         const cwd = std.Io.Dir.cwd();
-        if (cwd.access(io, path, .{})) |_| return path else |_| {}
+        if (cwd.access(io, path, .{})) |_| {
+            // Its last use, which an eviction goes by, on the file's own mtime.
+            _ = linux.utimensat(linux.AT.FDCWD, try arena.dupeSentinel(u8, path, 0), null, 0);
+            return path;
+        } else |_| {}
         const tmp = try u.store.blobTemp(arena, io, l.digest);
         const f = try cwd.createFile(io, tmp, .{ .exclusive = true });
         {
