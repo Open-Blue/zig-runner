@@ -180,9 +180,10 @@ fn meminfo(io: std.Io, key: []const u8) ?u64 {
 /// nothing to reclaim, so each allocation waits and fails to free anything, and nothing kills the
 /// job. A hog at a 50 MiB `memory.high` under a 300 MiB `memory.max`, swap 0, reached 50 MiB in
 /// 7 s and not 55 in the next 100, with no OOM event. `memory.max` is what ends such a job, so
-/// it is left to (`Backend.jobCgroup`, `Gate.noHigh`).
+/// it is left to (`Backend.jobCgroup`, `Gate.noHigh`). Without swap accounting nothing here says
+/// how much a job may swap, so none is assumed.
 pub fn canSwap(all: All, io: std.Io) bool {
-    return all.swap and (meminfo(io, "SwapTotal:") orelse 0) > 0;
+    return all.accounted and all.swap and (meminfo(io, "SwapTotal:") orelse 0) > 0;
 }
 
 /// Where this runner's jobs' cgroups go, or why they have none.
@@ -426,48 +427,70 @@ pub const All = struct {
     /// The kernel accounts for swap (`swapaccount=0`, or one without it, has no file): without it
     /// jobs swap whatever `swap` asks, and memory is still bounded.
     accounted: bool = true,
-    /// They are not what this runner is set to: other limits were found with jobs running under
-    /// them, and left.
+    /// They are not what this runner is set to: other limits were found with jobs under them, and
+    /// left, where changing them could end those jobs or leave them unbounded.
     kept: bool = false,
 };
 
 /// All jobs' limits, on their parent: hierarchical, so they hold whatever a job's own say, and
 /// over every runner on the parent. Checked for each job, so a restart with another setting takes
-/// effect at its first job. Never changed under running jobs: a lower `memory.max` over what they
-/// hold kills them there and then (40 MiB over a job holding 100 was killed, the write
-/// succeeding), and `max` from a runner set to no limit would take the bound from another's jobs
-/// while its "Set up job" still gave one. Then what stands is left and reported (`All.kept`).
+/// effect at its first job. With jobs on the parent (`hasJobs`) only what cannot hurt them is done:
+/// a lower `memory.max` over what they hold kills them there and then (40 MiB over a job holding
+/// 100 was killed, the write succeeding), and `max` from a runner set to no limit would take the
+/// bound from another's jobs while its "Set up job" still gave one. So a limit may tighten down to
+/// what is in use, or appear where there was none (a rolling upgrade, beside an older runner's
+/// job), and nothing may loosen; what is left is reported (`All.kept`).
 fn limitAll(arena: Allocator, io: std.Io, dir: []const u8, limits: Limits) !All {
-    const now = readAll(io, dir);
-    const wanted: All = .{
-        .memory = limits.memory_total,
-        .pids = limits.pids_total,
-        .swap = limits.swap,
-        .accounted = now.accounted,
-    };
-    // The kernel rounds `memory.max` down to a page, 64 KiB at the most.
-    const memory_same = if (now.memory != null and wanted.memory != null)
-        now.memory.? <= wanted.memory.? and wanted.memory.? - now.memory.? < 1 << 16
-    else
-        now.memory == null and wanted.memory == null;
-    if (memory_same and now.pids == wanted.pids and (!now.accounted or now.swap == wanted.swap))
-        return now;
-    if (populated(io, dir)) {
-        var left = now;
-        left.kept = true;
-        return left;
+    const jobs = hasJobs(io, dir);
+    var all = readAll(io, dir);
+    if (!sameMemory(all.memory, limits.memory_total)) {
+        const wanted = limits.memory_total;
+        const current = admission.readCgroupBytes(io, dir, "memory.current");
+        if (!jobs or tightens(all.memory, wanted, current)) {
+            const text = try numberOrMax(arena, wanted);
+            if (write(arena, dir, "memory.max", text) != .SUCCESS)
+                return error.TotalMemoryLimitFailed;
+            all.memory = wanted;
+        } else all.kept = true;
     }
-    const memory = if (limits.memory_total) |m|
-        try std.fmt.allocPrint(arena, "{d}", .{m})
-    else
-        "max";
-    if (write(arena, dir, "memory.max", memory) != .SUCCESS) return error.TotalMemoryLimitFailed;
-    const pids = if (limits.pids_total) |p| try std.fmt.allocPrint(arena, "{d}", .{p}) else "max";
-    if (write(arena, dir, "pids.max", pids) != .SUCCESS) return error.TotalPidsLimitFailed;
-    if (now.accounted and
-        write(arena, dir, "memory.swap.max", if (limits.swap) "max" else "0") != .SUCCESS)
-        return error.SwapLimitFailed;
-    return wanted;
+    if (all.pids != limits.pids_total) {
+        const wanted: ?u64 = if (limits.pids_total) |w| w else null;
+        const current = admission.readCgroupBytes(io, dir, "pids.current");
+        const pids_now: ?u64 = if (all.pids) |n| n else null;
+        if (!jobs or tightens(pids_now, wanted, current)) {
+            if (write(arena, dir, "pids.max", try numberOrMax(arena, wanted)) != .SUCCESS)
+                return error.TotalPidsLimitFailed;
+            all.pids = limits.pids_total;
+        } else all.kept = true;
+    }
+    if (all.accounted and all.swap != limits.swap) {
+        // Turning it off moves nothing: what is out stays out, and no more goes.
+        if (!jobs or !limits.swap) {
+            if (write(arena, dir, "memory.swap.max", if (limits.swap) "max" else "0") != .SUCCESS)
+                return error.SwapLimitFailed;
+            all.swap = limits.swap;
+        } else all.kept = true;
+    }
+    return all;
+}
+
+fn numberOrMax(arena: Allocator, n: ?u64) ![]const u8 {
+    return if (n) |v| try std.fmt.allocPrint(arena, "{d}", .{v}) else "max";
+}
+
+/// `memory.max` as the kernel holds `wanted`: rounded down to a page, 64 KiB at the most.
+fn sameMemory(now: ?u64, wanted: ?u64) bool {
+    const n = now orelse return wanted == null;
+    const w = wanted orelse return false;
+    return n <= w and w - n < 1 << 16;
+}
+
+/// Whether `wanted` is a tighter limit than `now` that what is in use (`current`) already fits
+/// under, so that writing it ends nothing.
+fn tightens(now: ?u64, wanted: ?u64, current: ?u64) bool {
+    const w = wanted orelse return false;
+    if (now) |n| if (w >= n) return false;
+    return (current orelse return false) < w;
 }
 
 fn readAll(io: std.Io, dir: []const u8) All {
@@ -484,11 +507,13 @@ fn readAll(io: std.Io, dir: []const u8) All {
     };
 }
 
-/// Whether any process is in `dir`'s tree (`cgroup.events`).
-fn populated(io: std.Io, dir: []const u8) bool {
-    var buf: [64]u8 = undefined;
-    const text = readIn(io, dir, "cgroup.events", &buf) catch return false;
-    return (admission.parseStat(text, "populated") orelse 0) > 0;
+/// Whether any job has a cgroup under `dir` (`cgroup.stat`), a running step in it or not: between
+/// steps a job's cgroup is empty while its runner works for it (a checkout, an action's fetch),
+/// and `cgroup.events`' `populated` reads 0 with its next step to come.
+fn hasJobs(io: std.Io, dir: []const u8) bool {
+    var buf: [128]u8 = undefined;
+    const text = readIn(io, dir, "cgroup.stat", &buf) catch return false;
+    return (admission.parseStat(text, "nr_descendants") orelse 0) > 0;
 }
 
 /// One job's cgroup.
@@ -542,7 +567,8 @@ pub const Job = struct {
         const pids_events = readIn(io, j.dir, "pids.events", &events_buf) catch "";
         var parent_buf: [512]u8 = undefined;
         const parent_dir = std.fs.path.dirname(j.dir) orelse "";
-        const parent_events = readIn(io, parent_dir, "memory.events", &parent_buf) catch "";
+        // `.local`: `memory.events` above counts a neighbour's own limit running out too.
+        const parent_events = readIn(io, parent_dir, "memory.events.local", &parent_buf) catch "";
         return .{
             .working_set_mb = admission.workingSetMb(io, j.dir),
             .peak_mb = if (admission.readCgroupBytes(io, j.dir, "memory.peak")) |b|
@@ -592,8 +618,8 @@ pub const Usage = struct {
     peak_mb: ?u64,
     /// Processes the kernel's OOM killer ended in it (`memory.events`).
     oom_kills: u64,
-    /// Times the job's own `memory.max` ran out (`memory.events`), and the parent's or anything's
-    /// under it: an OOM kill with neither came from above all jobs (`Killer`).
+    /// Times the job's own `memory.max` ran out (`memory.events`), and the parent's own
+    /// (`memory.events.local`): an OOM kill with neither came from above all jobs (`Killer`).
     ooms: u64,
     parent_ooms: u64,
     /// Forks refused at `pids.max` (`pids.events`).
@@ -601,8 +627,8 @@ pub const Usage = struct {
 };
 
 /// Which limit an OOM kill in a job came from: `memory.events` counts `oom_kill` where the process
-/// was, and `oom` where the limit ran out and above. A kill for the machine's memory, or a limit
-/// above the jobs' parent, counts no `oom` here.
+/// was, and `oom` where the limit ran out. A kill for the machine's memory, or a limit above the
+/// jobs' parent, counts no `oom` here.
 pub const Killer = enum {
     job,
     all,
@@ -731,16 +757,16 @@ test "native cgroup: the tightest limit above the parent counts, the parent's ow
     try std.testing.expectEqual(@as(?u64, 4 << 20), memoryUnder(io, mount, jobs));
 }
 
-/// A parent's files as the kernel keeps them, for `limitAll`: empty is `max`, as the kernel's would
-/// read, and a write replaces what was there.
-fn writeParent(t: *std.testing.TmpDir, swap: ?[]const u8, jobs_running: bool) !void {
+/// A parent's files as the kernel keeps them, for `limitAll`, with room to be written over. Its
+/// `cgroup.stat` says whether jobs have cgroups under it.
+fn writeParent(t: *std.testing.TmpDir, swap: ?[]const u8, jobs: bool) !void {
     const io = std.testing.io;
     for ([_][]const u8{ "memory.max", "pids.max" }) |f|
         try t.dir.writeFile(io, .{ .sub_path = f, .data = "max\n\n\n\n\n\n\n\n\n\n\n\n" });
     if (swap) |text| try t.dir.writeFile(io, .{ .sub_path = "memory.swap.max", .data = text });
     try t.dir.writeFile(io, .{
-        .sub_path = "cgroup.events",
-        .data = if (jobs_running) "populated 1\nfrozen 0\n" else "populated 0\nfrozen 0\n",
+        .sub_path = "cgroup.stat",
+        .data = if (jobs) "nr_descendants 2\nnr_dying_descendants 0\n" else "nr_descendants 0\n",
     });
 }
 
@@ -792,7 +818,7 @@ test "native cgroup: every job's start holds all jobs to their limits on the par
     try std.testing.expectError(error.TotalMemoryLimitFailed, limitAll(arena, io, dir, limits));
 }
 
-test "native cgroup: all jobs' limits are not changed under running jobs" {
+test "native cgroup: under jobs, all jobs' limits only tighten, and only as far as is in use" {
     const io = std.testing.io;
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -801,14 +827,21 @@ test "native cgroup: all jobs' limits are not changed under running jobs" {
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
     var buf: [32]u8 = undefined;
-    // Another pool's jobs run under 2 GiB, and no swap.
+    // Another pool's jobs run under 2 GiB, holding 1.5, and no swap. Empty cgroups count: jobs
+    // between steps have no process there.
     const theirs = "2147483648\n";
     try writeParent(&tmp, "0\n", true);
     try tmp.dir.writeFile(io, .{ .sub_path = "memory.max", .data = theirs });
     try tmp.dir.writeFile(io, .{ .sub_path = "pids.max", .data = "32768\n" });
-    // Lower would kill them, and no limit would take theirs away: neither is written, and the
-    // job is told what stands.
-    for ([_]Config{ .{ .memory_total_mb = 1024 }, .{ .memory_max_mb = 0 } }) |other| {
+    try tmp.dir.writeFile(io, .{ .sub_path = "memory.current", .data = "1610612736\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pids.current", .data = "100\n" });
+    // Lower than they hold would kill them, and no limit or a higher one would take theirs away:
+    // none is written, and the job is told what stands.
+    for ([_]Config{
+        .{ .memory_total_mb = 1024 },
+        .{ .memory_max_mb = 0 },
+        .{ .memory_total_mb = 4096 },
+    }) |other| {
         const all = try limitAll(arena, io, dir, Limits.compute(other, 30 * gib));
         try std.testing.expect(all.kept);
         try std.testing.expectEqual(@as(?u64, 2 * gib), all.memory);
@@ -819,6 +852,71 @@ test "native cgroup: all jobs' limits are not changed under running jobs" {
     const rounded = Limits.compute(.{ .memory_total_mb = 2048 }, 30 * gib);
     const same = try limitAll(arena, io, dir, rounded);
     try std.testing.expect(!same.kept);
+    // Above what they hold, it ends nothing: a job does not run under no total, or a looser one,
+    // for an older runner's job beside it.
+    try writeParent(&tmp, "max\n", true);
+    try tmp.dir.writeFile(io, .{ .sub_path = "memory.current", .data = "1610612736\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pids.current", .data = "100\n" });
+    const tight = try limitAll(arena, io, dir, rounded);
+    try std.testing.expect(!tight.kept and !tight.swap);
+    try std.testing.expectEqual(@as(?u64, 2 * gib), tight.memory);
+    try std.testing.expectEqualStrings("2147483648", std.mem.trim(u8, try tmp.dir.readFile(
+        io,
+        "memory.max",
+        &buf,
+    ), "\n"));
+    const swap = try tmp.dir.readFile(io, "memory.swap.max", &buf);
+    try std.testing.expectEqualStrings("0", swap[0..1]);
+}
+
+test "native cgroup: a job between steps has nothing in its cgroup, and still counts" {
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    const top = try std.fmt.allocPrint(arena, "{s}/zig-runner-test-{s}", .{ mount_point, &hex });
+    defer (Job{ .dir = top }).remove(arena, io);
+    ensure(arena, top) catch return error.SkipZigTest;
+    const set: Limits = .{ .memory_max = null, .pids_max = null, .memory_total = 1 << 30 };
+    const job = try Job.make(arena, io, top, "between-steps", set);
+    defer job.remove(arena, io);
+    try std.testing.expect(!job.all.kept);
+    // No process anywhere under it, and a pool set to no limit must not take the limit away.
+    var buf: [64]u8 = undefined;
+    const events = try readIn(io, top, "cgroup.events", &buf);
+    try std.testing.expectEqual(@as(?u64, 0), admission.parseStat(events, "populated"));
+    const off: Limits = .{ .memory_max = null, .pids_max = null };
+    const all = try limitAll(arena, io, top, off);
+    try std.testing.expect(all.kept);
+    try std.testing.expectEqual(@as(?u64, 1 << 30), all.memory);
+}
+
+test "native cgroup: all jobs' limit is blamed by the parent's own events, not a neighbour's" {
+    const io = std.testing.io;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "job");
+    // A neighbour's own limit ran out: it counts in the parent's `memory.events`, not in `.local`.
+    try tmp.dir.writeFile(io, .{ .sub_path = "memory.events", .data = "oom 3\noom_kill 3\n" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "memory.events.local",
+        .data = "oom 0\noom_kill 0\n",
+    });
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const j: Job = .{ .dir = try std.fmt.allocPrint(arena, "{s}/job", .{dir}) };
+    try std.testing.expectEqual(@as(u64, 0), j.usage(io).parent_ooms);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "memory.events.local",
+        .data = "oom 2\noom_kill 0\n",
+    });
+    try std.testing.expectEqual(@as(u64, 2), j.usage(io).parent_ooms);
 }
 
 test "native cgroup: a kill is put down to the limit that ran out, or to what is above them" {
@@ -845,9 +943,67 @@ test "native cgroup: only a root runner at the root of a cgroup namespace looks 
     try std.testing.expect(!isRootCgroup(""));
 }
 
+test "native cgroup: root at a namespace's root takes `self` when the default parent cannot be made" {
+    // As a container's runner does, in a child in a cgroup and a cgroup namespace of the test's,
+    // so that nothing else is moved.
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var a: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    const top = try std.fmt.allocPrint(arena, "{s}/zig-runner-test-ns-{s}", .{ mount_point, &hex });
+    const ns = try std.fmt.allocPrint(arena, "{s}/ns", .{top});
+    defer {
+        for ([_][]const u8{ "runner", "jobs" }) |leaf| (Job{
+            .dir = std.fmt.allocPrint(arena, "{s}/{s}", .{ ns, leaf }) catch ns,
+        }).remove(arena, io);
+        (Job{ .dir = ns }).remove(arena, io);
+        (Job{ .dir = top }).remove(arena, io);
+    }
+    // Where no cgroup can be made under the root, as in a container of its own, it cannot be done.
+    ensure(arena, top) catch return error.SkipZigTest;
+    try mkdir(arena, ns);
+    const forked = linux.fork();
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(forked));
+    if (forked == 0) linux.exit(autoSelfChild(arena, io, ns));
+    var status: i32 = 0;
+    const pid = std.math.cast(linux.pid_t, forked) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(forked, linux.waitpid(pid, &status, 0));
+    // The step of `autoSelfChild` that failed, or 0.
+    try std.testing.expectEqual(@as(u32, 0), linux.W.EXITSTATUS(@bitCast(status)));
+}
+
+fn autoSelfChild(arena: Allocator, io: std.Io, ns: []const u8) u8 {
+    if (write(arena, ns, "cgroup.procs", "0") != .SUCCESS) return 1;
+    if (linux.errno(linux.unshare(linux.CLONE.NEWNS | linux.CLONE.NEWCGROUP)) != .SUCCESS) return 2;
+    if (linux.errno(linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0)) != .SUCCESS)
+        return 3;
+    // Over the old mount it would be the same one, and refused: EBUSY.
+    _ = linux.umount2(mount_point, linux.MNT.DETACH);
+    if (linux.errno(linux.mount("none", mount_point, "cgroup2", 0, 0)) != .SUCCESS) return 4;
+    if (!atNamespaceRoot(io)) return 5;
+    const found = resolve(arena, io, "");
+    if (found == .none) {
+        std.debug.print("{s}\n", .{found.none});
+        return 6;
+    }
+    if (!std.mem.eql(u8, found.dir, mount_point ++ "/jobs")) return 7;
+    // It moved itself to the leaf, and left no default parent behind.
+    var buf: [128]u8 = undefined;
+    const procs = readIn(io, mount_point ++ "/runner", "cgroup.procs", &buf) catch return 8;
+    if (procs.len == 0) return 9;
+    if (linux.errno(linux.access(default_parent, 0)) == .SUCCESS) return 10;
+    return 0;
+}
+
 test "native cgroup: no swap, or nowhere to swap to, is no use for memory.high" {
     const io = std.testing.io;
     try std.testing.expect(!canSwap(.{ .swap = false }, io));
+    // Without swap accounting, for the first job of a parent and those after it alike.
+    try std.testing.expect(!canSwap(.{ .swap = true, .accounted = false }, io));
     const has_swap = (meminfo(io, "SwapTotal:") orelse 0) > 0;
     try std.testing.expectEqual(has_swap, canSwap(.{ .swap = true }, io));
 }

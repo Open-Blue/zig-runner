@@ -817,6 +817,13 @@ fn jobCgroup(
     const why: []const u8 = switch (parent) {
         .none => |w| w,
         .dir => |dir| if (cgroup.Job.make(arena, b.io, dir, name, b.limits)) |j| {
+            // No total that could be put on, as beside an older runner's jobs holding more: as
+            // a job with no cgroup, for one the runner does not vouch for.
+            if (!cfg.vouched and (j.all.memory == null or j.all.pids == null)) {
+                j.remove(arena, b.io);
+                why_out.* = untrusted_why;
+                return error.NoJobLimits;
+            }
             b.job_cgroup = j;
             b.parent_ooms = j.usage(b.io).parent_ooms;
             // What holds is what the log says, and what a kill is put down to.
@@ -853,7 +860,7 @@ fn jobCgroup(
             const g = b.gate orelse return;
             const high_mb = g.native(j.dir) orelse return;
             if (!cgroup.canSwap(j.all, b.io)) {
-                g.noHigh();
+                g.noHigh(if (b.limits.memory_max) |m| m >> 20 else null);
                 try b.notes.append(arena, "Native steps: no memory.high: with no swap it would " ++
                     "stop a job past it instead of slowing it. memory.max ends one that takes " ++
                     "too much.");
@@ -6538,19 +6545,42 @@ test "root runner: a named parent keeps the operator's limit, and a job's limits
     try std.testing.expect(admission.readCgroupBytes(io, parent.dir, "memory.max").? <= 2 << 30);
 }
 
-test "root in a container takes `self` when the default parent cannot be made" {
-    // Moves this process, so only by hand, with ZIG_RUNNER_TEST_AUTO_SELF=1, as root in a container
-    // of its own at the root of its cgroup namespace, its root cgroup holding processes.
+test "root runner: a job the runner does not vouch for does not run where no total can hold" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
-    var env = try std.testing.environ.createMap(arena);
-    if (env.get("ZIG_RUNNER_TEST_AUTO_SELF") == null) return error.SkipZigTest;
-    const found = cgroup.parent(arena, std.testing.io, "");
-    switch (found) {
-        .dir => |d| try std.testing.expectEqualStrings(cgroup.mount_point ++ "/jobs", d),
-        .none => |why| return skip(true, why),
-    }
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    // A pool set to no limit, whose job holds 50 MB, so that a total of 1 MB would end it.
+    var open = cfg;
+    open.cgroup.memory_total_mb = 0;
+    open.cgroup.memory_max_mb = 0;
+    const Run = struct {
+        fn one(arena_: Allocator, cfg_: Config, out: *?dagger.Result) void {
+            const script = "python3 -c 'import time; x = b\"x\" * (50 << 20); time.sleep(6)'";
+            const r = runNativeJob(arena_, cfg_, testJob(&.{testStep(script)}), .root) catch return;
+            out.* = r.res;
+        }
+    };
+    var ran: ?dagger.Result = null;
+    var other_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer other_arena.deinit();
+    var holding = try io.concurrent(Run.one, .{ other_arena.allocator(), open, &ran });
+    try io.sleep(.fromSeconds(3), .awake);
+    var strict = cfg;
+    strict.vouched = false;
+    strict.cgroup.memory_total_mb = 1;
+    var why: []const u8 = "";
+    const refused = initWhy(arena, io, std.testing.allocator, strict, &why);
+    holding.await(io);
+    try std.testing.expectError(error.NoJobLimits, refused);
+    try std.testing.expect(std.mem.indexOf(u8, why, "does not vouch for") != null);
+    // And the job it would have put at risk ran through.
+    try std.testing.expect(ran != null and ran.?.succeeded);
 }
 
 test "root runner: all native jobs together stay under the limit on their parent" {

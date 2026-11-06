@@ -65,9 +65,11 @@ pub const Limits = struct {
     /// `per_job_mb` for native jobs (`RUNNER_NATIVE_MEM_PER_JOB_MB`): what one whose name has not
     /// run natively yet reserves, and what a runner of a native pool reserves while it polls (or
     /// the most any native job took, if that is more). A native job is measured in its own cgroup
-    /// with nothing of the engine's in it, and slowed at its `memory.high` (`nativeHighMb`) if it
-    /// outgrows what it reserved, so this need not cover a heavy job's first run the way
-    /// `per_job_mb` does in the engine's one cgroup. 256 MB covers what the gate counts of a
+    /// with nothing of the engine's in it. Where jobs can swap it is slowed at its `memory.high`
+    /// (`nativeHighMb`) if it outgrows what it reserved; where they cannot, the default, one not
+    /// learned yet reserves the most any native job took (`Gate.noHigh`). Either way this need not
+    /// cover the very first heavy job the way `per_job_mb` does in the engine's one cgroup, whose
+    /// `memory.max` holds it. 256 MB covers what the gate counts of a
     /// shell, checkout, uv or npm job (a few MB to about 300; page cache is not counted), and six
     /// runners' worth is razorbill's 1.5 GB floor. 0 reserves nothing for native jobs and sets no
     /// `memory.high`.
@@ -218,7 +220,8 @@ pub const Admission = struct {
     /// What a job of this name reserves once it runs natively: what it took natively, or
     /// `native_per_job_mb` for a name not seen there. Not the worst case, as on the engine: a
     /// native job that outgrows its estimate is slowed at its own `memory.high` (`nativeHighMb`)
-    /// rather than taking its neighbours' memory. 0 with the setting off.
+    /// rather than taking its neighbours' memory. Where it has none, `Gate.noHigh` raises this. 0
+    /// with the setting off.
     fn nativeEstimate(a: *Admission, key: ?u64) u32 {
         if (a.limits.native_per_job_mb == 0) return 0;
         const k = key orelse return a.limits.native_per_job_mb;
@@ -502,12 +505,22 @@ pub const Gate = struct {
 
     /// The job's memory cannot be reclaimed (`cgroup.canSwap`), so it gets no `memory.high`, which
     /// would stop it instead of slowing it, and none is raised (`growHigh`): it is learned at what
-    /// it took, and `memory.max` ends it if it takes too much.
-    pub fn noHigh(g: *Gate) void {
+    /// it took, and `memory.max` (`limit_mb`) ends it if it takes too much. With nothing to hold it
+    /// to its estimate, a job not learned yet may be as heavy as any before it, so it reserves
+    /// that while it ramps up, no more than it may take: `native_per_job_mb` would let in a burst
+    /// of new heavy names at 256 MB each. It holds the jobs after it for `ramp_ms` at the most,
+    /// and no job before it: what runners reserve to start is `worstCase` as it was.
+    pub fn noHigh(g: *Gate, limit_mb: ?u64) void {
         const a = g.pool;
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
-        a.slots[g.slot].high_mb = null;
+        defer a.changed();
+        const s = &a.slots[g.slot];
+        s.high_mb = null;
+        const learned = if (s.key) |k| a.learned_native.estimate(k) else null;
+        if (learned != null) return;
+        const worst = a.worstCase(true);
+        s.est_mb = if (limit_mb) |l| @min(worst, l) else worst;
     }
 
     /// The job runs on the Dagger engine after all: a native pool's job that the native backend
@@ -2058,6 +2071,49 @@ test "a native job at its memory.high gets more while the host has memory to spa
     try std.testing.expectEqual(@as(u64, 1024 + high_step_mb), try high(tmp.dir));
 }
 
+test "a native job not learned yet, with no memory.high, reserves the most any native job took" {
+    const io = std.testing.io;
+    var slots: [2]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    var gate: Gate = .{ .pool = &pool };
+    const new = jobKey("o/r", "o/r/.github/workflows/ci.yml", "new");
+    const light = jobKey("o/r", "o/r/.github/workflows/ci.yml", "light");
+    const start = struct {
+        fn native(g: *Gate, key: u64) void {
+            g.leave(true);
+            g.assigned(key);
+            _ = g.native(null);
+        }
+    };
+    // Nothing heavy seen: the default.
+    start.native(&gate, new);
+    gate.noHigh(3000);
+    try std.testing.expectEqual(@as(?u32, 256), pool.slots[0].est_mb);
+    pool.slots[0] = .{};
+    // After a 3 GB job: what a burst of new names reserves, each.
+    _ = pool.learned_native.record(jobKey("o/r", "x", "heavy"), 3000, true);
+    _ = pool.learned_native.record(light, 100, true);
+    start.native(&gate, new);
+    gate.noHigh(3400);
+    try std.testing.expectEqual(@as(?u32, 3000), pool.slots[0].est_mb);
+    const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+    try std.testing.expectEqual(@as(u64, 3000), pool.reserved(now_ms, 0).mb);
+    // On a machine where a job may take less, it reserves no more than that.
+    gate.noHigh(2000);
+    try std.testing.expectEqual(@as(?u32, 2000), pool.slots[0].est_mb);
+    // Once ramped up it reserves nothing: what it took shows in `MemAvailable`, and nothing after
+    // it waits on this for good.
+    try std.testing.expectEqual(@as(u64, 0), pool.reserved(now_ms + ramp_ms + 1, 0).mb);
+    pool.slots[0] = .{};
+    // A name that has run keeps what it took.
+    start.native(&gate, light);
+    const est = pool.slots[0].est_mb;
+    gate.noHigh(3400);
+    try std.testing.expectEqual(est, pool.slots[0].est_mb);
+    pool.slots[0] = .{};
+}
+
 test "a native job that cannot swap gets no memory.high, and the gate raises none" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2080,7 +2136,7 @@ test "a native job that cannot swap gets no memory.high, and the gate raises non
     try writeCgroup(tmp.dir, "job", "max", 0, .{}, null);
     try tmp.dir.writeFile(io, .{ .sub_path = "job/memory.high", .data = "max\n" });
     try std.testing.expectEqual(@as(?u32, 1024), gate.native(job));
-    gate.noHigh();
+    gate.noHigh(null);
     pool.slots[0].started_ms = std.math.minInt(i64) + 1;
     // At what would have been its limit, on an idle machine: a write here would stop the job.
     try writeCgroup(tmp.dir, "job", "max", 900 * mib, .{}, null);

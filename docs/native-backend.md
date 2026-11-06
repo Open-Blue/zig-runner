@@ -301,7 +301,10 @@ parent, with no setting and no host tuning, and each job under a limit of its ow
   (`cgroup.canSwap`) no `memory.high` is set, `memory.max` decides, and "Set up job" says so. What
   goes with it: a job that outgrows its estimate is no longer held to it for its neighbours' sake.
   They are protected by its `memory.max` and by the total instead, and the gate by `MemAvailable`,
-  which falls as the job grows. What is gained: a job past its estimate runs at full speed or fails,
+  which falls as the job grows, and by reserving more: a job not learned yet reserves the most any
+  native job took, up to its own `memory.max`, while it ramps up (`Gate.noHigh`), since nothing
+  holds it to 256 MB. Until a heavy job has finished once there is nothing to go on, so a first
+  burst of heavy names still comes in at 256 MB each, under their limits. What is gained: a job past its estimate runs at full speed or fails,
   it is learned at what it really took on the first run, not by doubling, and page cache is
   reclaimed at the limits or under pressure, as `MemAvailable` counts it. With swap, all of #306 stands.
 - **Processes.** `pids.max` on the parent is four jobs' (32768 by default), and neither it nor a
@@ -313,11 +316,14 @@ parent, with no setting and no host tuning, and each job under a limit of its ow
 - **Several runners.** The default total depends on the machine alone, so every runner sharing a
   parent, which root runners do by default (`/sys/fs/cgroup/zig-runner`), asks for the same numbers,
   and their jobs together stay under one bound, whichever started last. They must use the same
-  settings, as they must the same `RUNNER_NATIVE_SUBNET`. A runner set otherwise changes the parent's
-  limits only when no job is running under it: a lower `memory.max` over what jobs hold kills them
-  there and then, and `max` from a pool with `RUNNER_NATIVE_MEMORY_MAX_MB=0` takes the bound from
-  another's. With jobs running what stands is kept, and "Set up job" and the log say so and give the
-  limits really in force. A hand writing a lower value on the parent still kills what is over it.
+  settings, as they must the same `RUNNER_NATIVE_SUBNET`. With a job's cgroup under the parent, in a
+  step or between steps (`nr_descendants`), a runner set otherwise only tightens, down to what is in
+  use (`memory.current`, `pids.current`), or puts a limit on where there was none, as in a rolling
+  upgrade beside an older runner's job: a lower `memory.max` over what jobs hold kills them there
+  and then, and `max` from a pool with `RUNNER_NATIVE_MEMORY_MAX_MB=0` takes the bound from another's.
+  Otherwise what stands is kept, and "Set up job" and the log say so and give the limits really in
+  force. A job the runner does not vouch for does not run under no total. A hand writing a lower
+  value on the parent still kills what is over it.
   What does not hold: runners with **different parents**, such as units each with
   `RUNNER_NATIVE_CGROUP=self`, get a bound each, and cannot see each other. Give them one parent (a
   path), or a slice with its own `MemoryMax=`, which then counts as the machine for all of them.
@@ -337,8 +343,9 @@ parent, with no setting and no host tuning, and each job under a limit of its ow
   be written.
 - **A root runner in a container finds its own place.** The default parent cannot be made below a
   root that holds processes. A root runner at the root of its cgroup namespace then does what
-  `self` does, without being told: only the namespace's own processes move, and only a container
-  has a root like that (the host's may hold processes and still give controllers). That needs a
+  `self` does, without being told: only the namespace's own processes move. Any non-initial cgroup
+  namespace qualifies, not only a container's (`unshare --cgroup` with cgroup2 mounted in it): the
+  initial one's root may hold processes and still give controllers. That needs a
   writable cgroup mount: Docker's is read-only without `privileged: true`
   (moby's `daemon/oci_linux.go`: `writableCgroups := c.HostConfig.Privileged`), whatever `cap_add`
   says, or with `security_opt: [writable-cgroups=true]` (checked on Docker 29.9, with
