@@ -427,7 +427,7 @@ pub const Base = struct {
 /// The lists' volume, mounted only on the check's own branch.
 const tool_trees_dir = "/zig-runner-tool-trees";
 /// What steps are given: one `DIGEST TREE` line per tree checked, TREE an absolute path.
-const tool_trees_env = "ZIG_RUNNER_TOOL_TREES";
+pub const tool_trees_env = "ZIG_RUNNER_TOOL_TREES";
 const tool_cache_index = for (package_cache_dirs, 0..) |d, i| {
     if (std.mem.eql(u8, d.name, "toolcache")) break i;
 } else unreachable;

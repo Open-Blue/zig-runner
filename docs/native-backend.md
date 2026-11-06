@@ -705,9 +705,10 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   model's `belowTail`; P8's vectors gained `below-seed` and friends, the old ones unchanged). The
   tool cache is the `toolcache` volume, keyed by the job's image as on Dagger; the base makes
   `/opt/hostedtoolcache` only for a job with no volumes (#274). What a step installs there is in no
-  layer, so a stored step whose `$GITHUB_PATH` or `$GITHUB_ENV` points into it runs again instead
-  of replaying (`Exec.tool_cache`, `toolDirNotHeld`, #229): natively no tree is checked, so every
-  such record does.
+  layer, so a stored step whose `$GITHUB_PATH` or `$GITHUB_ENV` points into it replays only when
+  "Set up job" checked a tree that holds the directory, and otherwise runs again
+  (`Exec.tool_cache`, `toolDirNotHeld`, #229). The check is `native/tool_trees.zig`, a port of
+  `dagger/tool_trees.sh` (below, "The tool cache's trees").
 - Debt: volumes and seeds are never evicted (the engine's GC prunes Dagger's). P2's `collect`
   walks only `layers/`, whose entries carry their size in `meta`; a volume has no size record, and
   walking every volume at each job's end to learn one would cost more than the eviction saves. The
@@ -717,10 +718,74 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   `evict` does for a layer. A step whose processes still hold all of `pids.max` when its script
   ends fails with exit 2 and loses its file commands: the wrapper's `sh`, the step's PID 1, cannot
   fork its epilogue (its log says the job reached its process limit). Fixing that needs a PID 1
-  that reaps and kills a step's leftovers before the epilogue. The tool cache's checked trees (`set_up.verifyToolTrees`) and the seed
-  registry's discovery from them are off natively: steps check the trees they use themselves, as on
-  Dagger without the check. Rootless runners without delegation have no limits (P5 must refuse untrusted jobs
-  there).
+  that reaps and kills a step's leftovers before the epilogue. The seed registry's discovery from the tool cache's trees
+  (`zig_release.Registry.discover`) is off natively. Rootless runners without delegation have no
+  limits (P5 must refuse untrusted jobs there).
+
+#### The tool cache's trees
+
+A rerun of a job that installs a tool took 49 s natively and 2 s on Dagger (razorbill, v0.25.0, a
+real `zig build test` job): the `Install Zig` step names a directory in the tool cache, a volume in
+no layer, so its record was never trusted. On Dagger "Set up job" checks the trees of the tool cache
+(`tool_trees.sh`, `set_up.verifyToolTrees`) and a record is replayed when a checked tree holds the
+directory it names. Natively the same check runs in the runner (`native/tool_trees.zig`,
+`Backend.checkToolTrees`), after the volumes are open, and gives the same two things:
+
+- `ZIG_RUNNER_TOOL_TREES`, one `DIGEST TREE` line per directory `TOOL/VERSION/NAME` of the tool
+  cache, TREE as the step sees it, DIGEST what `install-zig.sh` pins (`find . -type f -print0 |
+  LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum` in the tree; the port's tests compare it with
+  those commands, and with the digest pinned for Zig 0.17.0). A script that pins a tree's digest
+  skips its own read of the tree when the two match.
+- `Exec.toolDirNotHeld` with a tree list, so a replayed step that names a held tree's directory
+  replays. A record naming a directory no tree holds (a tree that was removed, an unfinished one,
+  `..`) runs again, as before.
+
+Why that is sound is Dagger's argument, kept: the variable is in the key of every step (it is not
+volatile, so `Store.stableEnv` hashes it), hence in the base's key and every layer above it. A tree
+that was modified has another digest, so no record made against the old one is found, and the step
+that installs runs again and repairs it. The cost is also Dagger's: a tree added, removed or
+changed makes every step of every job of the scope new once. Narrowing it (a key of only the trees a
+step puts on PATH) was considered and not done. A step's key is made before it runs, and which trees
+it names is only in its record, so it needs the digests the tree had when the step finished stored
+in the record and compared at replay, which means hashing the tree again after every step that
+names one, and a change to the record's format. A job's first rerun after an install is the one that
+pays: job 1 finds no tree and installs, job 2 sees the tree (new keys) and finds it installed, job 3
+replays.
+
+The check differs from the script where it runs. The script runs as root in the job's image, in a
+container; the port runs in the runner's process, on a directory a job can write, so it is confined
+and bounded:
+
+- Every look at the volume is relative to a directory descriptor, through `sandbox.openIn` with
+  `RESOLVE_NO_SYMLINKS` and `RESOLVE_NO_XDEV`, so a link a job planted (a tree that is a link to
+  `/`, a file that is one) is never taken and the check cannot be made to read outside the volume.
+  Only directories and regular files are opened, the latter `O_NONBLOCK` and checked to be regular
+  after opening, so a pipe or a device cannot hold the check; they are not in the digest, as
+  `find -type f` leaves them out.
+- A tree whose names have a control character or a backslash (`sha256sum` escapes those) is left
+  out, and a step checks it itself. So is a tree the check stopped in, one with unreadable files,
+  and one past a limit.
+- Limits (`tool_trees.Limits`): 65,536 files a tree (Zig 0.17.0 has 19,505), 400,000 entries and
+  4 GiB read in all, 48 directories deep, 512 trees, and 60 s. The job's cancel is seen at every
+  file and every 64 KiB read. A check that stops says so in "Set up job" ("Tool cache: checked ...;
+  stopped: out of time") and keeps the trees it finished. One tree's files are held in memory at a
+  time (a few MB for Zig); there is no budget shared by the jobs of a runner, so many jobs checking
+  at once each hold their tree's, which `Limits.tree_files` bounds at some tens of MB.
+- The lists (below) are in the store beside `volumes/` (`tool-trees/<digest of the volume's
+  path>/`), never in a volume a step mounts. A name a job's volume gives them cannot collide with a
+  volume's.
+
+The cost is the script's lists, kept: one line per file (path, size, inode, mtime, ctime, sha256),
+and only files whose line changed are read again. That is sound as in the script: a write sets the
+file's ctime to now and a step cannot set it back; a file whose ctime is within 2 s of the check is
+listed as racy and read next time; a list that does not name exactly the tree's files in order is
+not believed. On the laptop, for the real Zig 0.17.0 tree (19,505 files), a check is 0.6 s with no
+list and 0.12 s with one (the script reads the same tree in about 1 s, by its own comment).
+
+Not proven or not done: jobs that write a file through a shared mapping after a check can leave a
+ctime the check does not see change (the script's lists share this); a runner-wide budget for
+checks; removing lists a crash left half written (`*.stat.<random>`); the seed registry's
+discovery.
 
 ### P5: isolation for untrusted jobs
 

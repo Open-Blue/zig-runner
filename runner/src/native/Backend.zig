@@ -26,6 +26,7 @@ const http = @import("../github/http.zig");
 const docker = @import("../dagger/docker.zig");
 const cgroup = @import("cgroup.zig");
 const volumes = @import("volumes.zig");
+const trees_check = @import("tool_trees.zig");
 const admission = @import("../admission.zig");
 const services = @import("services.zig");
 const images = @import("images.zig");
@@ -148,6 +149,9 @@ gate: ?*admission.Gate = null,
 /// What the job's options say of caches, and what it got of them (`setUpCaches`).
 caches: volumes.Options = .{},
 cache_plan: volumes.Plan = .{},
+/// `ZIG_RUNNER_TOOL_TREES`' value, when "Set up job" checked the tool cache's trees
+/// (`checkToolTrees`): a step's key holds it, and `Exec.toolDirNotHeld` reads it.
+tool_trees: ?[]const u8 = null,
 /// The Zig cache seeds' layers, between the job's layers and the rootfs.
 seed_layers: std.ArrayList([]const u8) = .empty,
 /// Tests: the Zig cache seed's build, in place of downloading and running a Zig release.
@@ -1327,6 +1331,9 @@ fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
     for (b.cache_plan.env.items) |e| try b.put(e.name, e.value);
     for (try ev.defaultEnv()) |e| try b.put(e.name, e.value);
     for (try ev.withoutReapplied(ev.job_env.items)) |e| try b.put(e.name, e.value);
+    // Last, and set even when no tree was found, so a workflow's own value never stands in for
+    // the runner's. Part of every step's key, as on Dagger: see `checkToolTrees`.
+    if (b.tool_trees) |v| try b.put(set_up.tool_trees_env, v);
     b.workdir = ev.workspace;
 }
 
@@ -1407,7 +1414,7 @@ pub fn execScript(
         if (claim.hit) |rec| {
             const data = try recordAnswer(arena, rec);
             // A record that points into the tool cache's volume, which is in no layer: the volume
-            // may have lost the tree since, and no tree is checked natively, so the step runs again.
+            // may have lost the tree since, and no checked tree holds it, so the step runs again.
             if (rerun == null) if (try x.toolDirNotHeld(data)) |dir| {
                 rerun = try std.fmt.allocPrint(arena, "its record names {s} in the tool cache, " ++
                     "a volume in no layer", .{dir});
@@ -1551,6 +1558,39 @@ fn setUpCaches(b: *Backend, ev: *Evaluator, plan: anytype) !void {
         b.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ b.binds, &.{v} });
     }
     if (b.cache_plan.zig_local_roll != null) b.rollZigLocal(plan.as_runner);
+    if (b.caches.tool_trees) try b.checkToolTrees();
+}
+
+/// "Set up job"'s check of the tool cache's trees, as `set_up.verifyToolTrees` does it on Dagger
+/// (`tool_trees.zig`): what steps are given is each tree's digest and path (`tool_trees`), and a
+/// replayed step that names a directory in the volume replays only when a tree holds it
+/// (`Exec.toolDirNotHeld`). The value is in every step's key (the variable is not volatile), so a
+/// tree added, removed or changed makes every step of the job new once, and a tree a job modified
+/// never has another job's record replayed against it. Narrower keys (only the trees a step puts
+/// on PATH) are not possible here: a step's key is made before it runs, and which trees it names
+/// is in its record.
+fn checkToolTrees(b: *Backend) !void {
+    const arena = b.arena;
+    const volume = b.cache_plan.tool_cache_host orelse return;
+    const mount = b.cache_plan.tool_cache.?;
+    // In the runner's store beside the volumes, where no step can write: a list a job could
+    // forge would pass a changed file (`tool_trees.zig`).
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(volume, &digest, .{});
+    const root = b.store_cfg.root;
+    const lists = try std.fmt.allocPrint(arena, "{s}/tool-trees/{x}", .{ root, digest[0..16] });
+    const verdict = try trees_check.check(
+        arena,
+        b.gpa,
+        b.io,
+        volume,
+        lists,
+        mount,
+        .{},
+        b.caches.cancel,
+    );
+    b.tool_trees = verdict.env;
+    try b.notes.append(arena, verdict.note);
 }
 
 /// `set_up.zig_builtin_seed_script` on the `builtin.zig` volume, bound beside the seed's own `b/`
@@ -3460,7 +3500,8 @@ test "native tool cache volume: a replayed step that points into it runs again (
     _ = try runCachedJob(arena, c.cfg, plain, caches, .{ .ran = "j2" });
     try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "plain"));
     // One that installs into the tool cache and puts the tree on PATH: its tree is in the
-    // volume, in no layer, and no tree is checked natively, so its record is not trusted.
+    // volume, in no layer, and no checked tree holds it (the check is off here), so its record is
+    // not trusted.
     const install = testJob(&.{testStep("echo x >> /shared/install; " ++
         "mkdir -p $RUNNER_TOOL_CACHE/t/1 && echo $RUNNER_TOOL_CACHE/t/1 >> $GITHUB_PATH")});
     _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j3" });
@@ -3472,6 +3513,67 @@ test "native tool cache volume: a replayed step that points into it runs again (
     _ = try runCachedJob(arena, c.cfg, in_layer, .{}, .{ .ran = "j5" });
     _ = try runCachedJob(arena, c.cfg, in_layer, .{}, .{ .ran = "j6" });
     try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "layer"));
+}
+
+test "native tool trees: an installing step replays while its tree is held, not once changed" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    const caches: volumes.Options = .{
+        .package_caches = true,
+        .trusted = true,
+        .tool_trees = true,
+    };
+    // What install-zig.sh does: a tree TOOL/VERSION/NAME in the tool cache, on PATH, and the
+    // digest it pins read from the variable "Set up job" sets. The step is the same text every job.
+    const install = testJob(&.{
+        testStep("echo x >> /shared/install; echo \"trees=[$ZIG_RUNNER_TOOL_TREES]\"; " ++
+            "mkdir -p $RUNNER_TOOL_CACHE/t/1/x64 && echo v1 > $RUNNER_TOOL_CACHE/t/1/x64/bin && " ++
+            "echo $RUNNER_TOOL_CACHE/t/1/x64 >> $GITHUB_PATH"),
+        testStep("echo y >> /shared/after"),
+    });
+    // The first job finds no tree, and leaves one. The second sees it in "Set up job", so its
+    // steps' keys are new (the variable is part of each), and the step finds the tree installed.
+    const j1 = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j1" });
+    try expectLines(j1.text, &.{"trees=[]"});
+    const j2 = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j2" });
+    try expectLines(j2.text, &.{
+        "Tool cache: checked t/1/x64 (1 files, ",
+        "/opt/hostedtoolcache/t/1/x64]",
+    });
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "install"));
+    // The third has the same tree, so the install step replays, though it names a directory in
+    // a volume that is in no layer (#229), and so does the step after it.
+    const j3 = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j3" });
+    try expectLines(j3.text, &.{"/opt/hostedtoolcache/t/1/x64]"});
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "install"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "after"));
+    // A tree another job changed (the volume's file, from the host) is not replayed against: the
+    // digest, and with it every step's key, is new.
+    const tools = try std.fmt.allocPrint(arena, "{s}/volumes/o/r/repo/toolcache", .{c.cfg.store});
+    var dir = try std.Io.Dir.cwd().openDir(io, tools, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    // Beside the volume's directory is its lock file.
+    const image = while (try it.next(io)) |e| {
+        if (e.kind == .directory) break e;
+    } else return error.TestUnexpectedResult;
+    const bin = try std.fmt.allocPrint(arena, "{s}/{s}/t/1/x64/bin", .{ tools, image.name });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = bin, .data = "v2\n" });
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j4" });
+    try std.testing.expectEqual(@as(usize, 3), runs(arena, c.shared, "install"));
+    try std.testing.expectEqual(@as(usize, 3), runs(arena, c.shared, "after"));
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j5" });
+    try std.testing.expectEqual(@as(usize, 3), runs(arena, c.shared, "install"));
+    // With the check off, as before: the step runs again every job.
+    const off: volumes.Options = .{ .package_caches = true, .trusted = true };
+    _ = try runCachedJob(arena, c.cfg, install, off, .{ .ran = "j6" });
+    _ = try runCachedJob(arena, c.cfg, install, off, .{ .ran = "j7" });
+    try std.testing.expectEqual(@as(usize, 5), runs(arena, c.shared, "install"));
 }
 
 test "a native step is contained: pivot_root, masked /proc, Docker's capabilities, no_new_privs" {
@@ -5170,6 +5272,7 @@ fn runCachedJob(
         .zig_local_cache_max_mb = caches.zig_local_cache_max_mb,
         .zig_seeds = caches.zig_seeds,
         .zig_seeds_unverified = caches.zig_seeds_unverified,
+        .tool_trees = caches.tool_trees,
     }, job, &log);
     const text = w.written();
     for (res.steps) |s| if (s.outcome != .success) {
