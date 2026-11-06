@@ -815,8 +815,11 @@ not believed. That is not enough alone: a writable shared mapping, once its page
 again without changing ctime or mtime, whatever the descriptor (it can be closed). So the check
 takes a read lease (`F_SETLEASE`, `F_RDLCK`) on each file it reads, which the kernel refuses while
 any writer or writable mapping holds the file, and lists a refused file as racy. A lease is broken
-by SIGIO to the process, which ends it unless ignored: the check ignores SIGIO (nothing else in
-the runner uses it), and the writer's open then waits until the check lets go of the file. On the
+with a signal to the process, SIGIO by default, which ends a process that does not handle it and
+which `std.Io` uses to interrupt blocked calls (a job's cancel, a timeout): the check must not
+ignore it (an earlier cut did, and a native end-to-end job never got its cancel). `F_SETSIG` makes
+it SIGURG, whose default is to be ignored. The writer's open then waits until the check lets go of
+the file, or fails with EAGAIN if it does not wait. On the
 laptop, for the real Zig 0.17.0 tree (19,505 files), a check is 0.5 s with no list and 0.1 s with
 one, with 22 MiB of peak memory in the test process; the script reads the same tree in about 1 s,
 by its own comment. A tree of 65,532 hard links of 3.8 KB paths (the case that took 1.5 GB, or 6.1

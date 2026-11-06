@@ -28,7 +28,8 @@
 //! clean" entries). And a writable shared mapping, once dirty, writes again without touching
 //! ctime or mtime: the check takes a read lease on each file it hashes (`F_SETLEASE`), which the
 //! kernel refuses while any writer, a mapping included, holds the file, and then lists the file
-//! as racy too.
+//! as racy too. The signal a lease break sends is SIGURG (`F_SETSIG`), whose default is to be
+//! ignored: SIGIO, the default, is what `std.Io` interrupts blocked calls with.
 //!
 //! Unlike the script, this runs in the runner's process, on a directory a job can write, so it is
 //! confined and bounded. Every look at the volume is relative to a directory descriptor, through
@@ -120,7 +121,6 @@ pub fn check(
     limits: Limits,
     cancel: ?*const dagger.Cancel,
 ) Allocator.Error!Verdict {
-    ignoreLeaseBreaks();
     var c: Check = .{
         .io = io,
         .gpa = gpa,
@@ -209,20 +209,6 @@ fn appendCapped(
 
 fn nowMs(io: std.Io) i64 {
     return std.Io.Clock.awake.now(io).toMilliseconds();
-}
-
-/// A read lease is broken, with SIGIO to the process that holds it, when anyone opens the file
-/// for writing, and SIGIO ends a process that does not ignore it. A job writing the file as the
-/// check reads it must not end the runner (and every job in it): the signal is ignored, as the
-/// break goes on without it (the writer's open waits for the lease to be released, which the
-/// check does as soon as the file is read). Nothing else in the runner uses SIGIO.
-fn ignoreLeaseBreaks() void {
-    const act: linux.Sigaction = .{
-        .handler = .{ .handler = linux.SIG.IGN },
-        .mask = linux.sigemptyset(),
-        .flags = 0,
-    };
-    _ = linux.sigaction(linux.SIG.IO, &act, null);
 }
 
 /// A check in progress: what it has spent, and why it stopped when it did.
@@ -610,6 +596,10 @@ const Check = struct {
             .err => return c.giveUp("cannot be read"),
         };
         defer _ = linux.close(fd);
+        // A lease is broken, when someone opens the file for writing, with a signal to the
+        // process, SIGIO unless told otherwise, and SIGIO is `std.Io`'s to interrupt a blocked
+        // call (`Threaded`): it is not ours to ignore. SIGURG is ignored by default.
+        _ = linux.fcntl(fd, linux.F.SETSIG, @backingInt(linux.SIG.URG));
         const leased = linux.errno(linux.fcntl(fd, linux.F.SETLEASE, linux.F.RDLCK)) == .SUCCESS;
         defer if (leased) {
             _ = linux.fcntl(fd, linux.F.SETLEASE, linux.F.UNLCK);
@@ -1315,4 +1305,45 @@ test "tool trees: lists are not written past what is read, and leftovers and emp
     try tmp.dir.deleteFile(io, live);
     _ = try checkWith(arena, f, .{ .racy_s = 0 }, null);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "lists/node", .{}));
+}
+
+test "tool trees: a writer opening a leased file does not end the process" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "x" });
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const path = try std.fmt.allocPrintSentinel(a.allocator(), "{s}/f", .{
+        try tmp.dir.realPathFileAlloc(io, ".", a.allocator()),
+    }, 0);
+    const held_fd = std.math.cast(linux.fd_t, linux.open(path, .{ .ACCMODE = .RDONLY }, 0)).?;
+    defer _ = linux.close(held_fd);
+    // What `hashFile` does with the file it reads.
+    _ = linux.fcntl(held_fd, linux.F.SETSIG, @backingInt(linux.SIG.URG));
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.fcntl(held_fd, linux.F.SETLEASE, linux.F.RDLCK)),
+    );
+    // A writer that would wait for the lease to be let go gets an error instead, and the signal
+    // of the break is one a process survives.
+    const w = linux.open(path, .{ .ACCMODE = .WRONLY, .NONBLOCK = true }, 0);
+    try std.testing.expectEqual(linux.E.AGAIN, linux.errno(w));
+    _ = linux.fcntl(held_fd, linux.F.SETLEASE, linux.F.UNLCK);
+}
+
+test "tool trees: a check leaves SIGIO as it found it, for std.Io's cancels" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    var before: linux.Sigaction = undefined;
+    _ = linux.sigaction(linux.SIG.IO, null, &before);
+    _ = try checkWith(arena, f, .{}, null);
+    var after: linux.Sigaction = undefined;
+    _ = linux.sigaction(linux.SIG.IO, null, &after);
+    try std.testing.expectEqual(before.handler.handler, after.handler.handler);
+    try std.testing.expect(after.handler.handler != linux.SIG.IGN);
 }
