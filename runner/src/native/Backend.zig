@@ -6526,11 +6526,8 @@ test "root runner: a named parent keeps the operator's limit, and a job's limits
     defer parent.remove(arena);
     if (parent.top == null) return error.SkipZigTest;
     // The operator's: a slice's `MemoryMax=4G`.
-    const cap = try std.fmt.allocPrintSentinel(arena, "{s}/memory.max", .{parent.top.?}, 0);
-    const fd = std.os.linux.open(cap, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
-    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(fd));
-    _ = std.os.linux.write(@intCast(fd), "4294967296", 10);
-    _ = std.os.linux.close(@intCast(fd));
+    const cap = try std.fmt.allocPrint(arena, "{s}/memory.max", .{parent.top.?});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cap, .data = "4294967296" });
     const r = try runNativeJob(arena, cfg, testJob(&.{testStep("echo small job")}), .root);
     try std.testing.expect(r.res.succeeded);
     // Its limit and its swap are as they were, ours in the `jobs` child, figured from its 4 GiB.

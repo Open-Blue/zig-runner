@@ -476,7 +476,7 @@ fn readAll(io: std.Io, dir: []const u8) All {
     return .{
         .memory = admission.readCgroupBytes(io, dir, "memory.max"),
         .pids = if (admission.readCgroupBytes(io, dir, "pids.max")) |p|
-            @intCast(@min(p, pids_limit))
+            std.math.cast(u32, p) orelse pids_limit
         else
             null,
         .swap = if (swap) |t| !std.mem.eql(u8, std.mem.trim(u8, t, " \n"), "0") else true,
