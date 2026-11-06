@@ -117,7 +117,7 @@ const Entry = struct {
 };
 
 /// The file in `jobs/<id>/` that says the job holds what it uses of the tree areas to its end. A
-/// runner from before those locks leaves none (`oldJobRunning`).
+/// runner from before those locks leaves none (`jobsInTheWay`).
 pub const job_mark = "holds-trees";
 /// Past this many directories in `jobs/` a pass stops looking and takes one to be an older job.
 const max_jobs = 4096;
@@ -136,15 +136,20 @@ pub fn run(s: Store, io: std.Io) void {
     var budget: Budget = .init(io, lim.budget_ms);
     for (all_areas) |a| if (!removeDead(arena, io, s.root, a, &budget)) return;
     const vols = listVolumes(arena, io, s.root) catch return;
-    const old_job = oldJobRunning(arena, io, s.root);
-    if (old_job) std.log.info("native: a job of an older runner is running: no tree or blob " ++
-        "goes this pass", .{});
-    const trees: []Entry = if (old_job) &.{} else listTrees(arena, io, s.root, &budget) catch return;
+    const waited = treesWait(arena, io, s.root);
+    var trees: []Entry = if (waited) &.{} else listTrees(arena, io, s.root, &budget) catch return;
     measureOne(arena, io, vols, lim.remeasure_s);
     measureOne(arena, io, trees, lim.remeasure_s);
-    var blobs: Blobs = if (old_job) .{} else listBlobs(arena, io, s.root) catch return;
+    var blobs: Blobs = if (waited) .{} else listBlobs(arena, io, s.root) catch return;
     var evicted = capped(arena, io, s.root, vols, lim.volumes_max_bytes, 0, lim, &budget, &synced, "volumes");
     if (!synced) return;
+    // Again: the walks take seconds, and a job started in them would be seen by nothing else.
+    if (test_after_walks) |f| f();
+    const wait = waited or treesWait(arena, io, s.root);
+    if (wait) {
+        trees = &.{};
+        blobs = .{};
+    }
     // A blob only saves a download, of an image already unpacked or not wanted since.
     var tree_bytes: u64 = 0;
     for (trees) |e| tree_bytes +|= e.bytes;
@@ -162,7 +167,7 @@ pub fn run(s: Store, io: std.Io) void {
         evicted = floor(arena, io, s.root, all, &left, lim, &budget, &synced) or evicted;
     }
     if (evicted) {
-        if (!old_job) dropRefs(arena, io, s.root);
+        if (!wait) dropRefs(arena, io, s.root);
         if (synced) for (all_areas) |a| if (!removeDead(arena, io, s.root, a, &budget)) return;
     }
 }
@@ -388,6 +393,29 @@ fn listBlobs(arena: Allocator, io: std.Io, root: []const u8) !Blobs {
     return .{ .list = out.items, .bytes = total };
 }
 
+const Wait = enum { older_job, too_many_jobs, job_unreadable };
+
+/// Whether the tree half of this pass waits (`jobsInTheWay`), said once if so.
+fn treesWait(arena: Allocator, io: std.Io, root: []const u8) bool {
+    const wait = jobsInTheWay(arena, io, root) orelse return false;
+    std.log.info("native: no tree or blob goes this pass: {s}", .{switch (wait) {
+        .older_job => "a job of an older runner is running",
+        .too_many_jobs => "jobs/ has too many directories to look at, so one may be an older job",
+        .job_unreadable => "a job could not be looked at, so it may be an older one",
+    }});
+    return true;
+}
+
+/// Whether `e`, listed in `parent`, is a directory, looked at when the listing does not say, as on
+/// a filesystem that reports DT_UNKNOWN: a job skipped there would be a job not seen.
+pub fn isDirEntry(arena: Allocator, parent: []const u8, e: std.Io.Dir.Entry) bool {
+    return switch (if (test_unknown_kinds) .unknown else e.kind) {
+        .directory => true,
+        .unknown => isDir(arena, std.fmt.allocPrint(arena, "{s}/{s}", .{ parent, e.name }) catch return true),
+        else => false,
+    };
+}
+
 /// Whether a job in `jobs/` may be using trees and blobs with nothing to show for it: a runner
 /// from before their locks holds none of them, and its unpack not `oci/blobs.lock`, so all of
 /// that half of the store waits for its job. Volumes do not: it holds those.
@@ -397,28 +425,29 @@ fn listBlobs(arena: Allocator, io: std.Io, root: []const u8) !Blobs {
 /// `Backend.sweep` removes the directory at the next job's start: an age would only guess at
 /// that, and a job may run for days. `.new-` directories do not count: no job uses a tree from
 /// one, and nothing removes them. A job that cannot be looked at counts.
-fn oldJobRunning(arena: Allocator, io: std.Io, root: []const u8) bool {
+fn jobsInTheWay(arena: Allocator, io: std.Io, root: []const u8) ?Wait {
     const cwd = std.Io.Dir.cwd();
-    const jobs = std.fmt.allocPrint(arena, "{s}/jobs", .{root}) catch return true;
-    var d = cwd.openDir(io, jobs, .{ .iterate = true }) catch |e| return e != error.FileNotFound;
+    const jobs = std.fmt.allocPrint(arena, "{s}/jobs", .{root}) catch return .job_unreadable;
+    var d = cwd.openDir(io, jobs, .{ .iterate = true }) catch |e|
+        return if (e == error.FileNotFound) null else .job_unreadable;
     defer d.close(io);
     var seen: usize = 0;
     var it = d.iterate();
-    while (it.next(io) catch return true) |e| {
-        if (e.kind != .directory or std.mem.startsWith(u8, e.name, ".new-")) continue;
+    while (it.next(io) catch return .job_unreadable) |e| {
+        if (!isDirEntry(arena, jobs, e) or std.mem.startsWith(u8, e.name, ".new-")) continue;
         seen += 1;
-        if (seen > max_jobs) return true;
-        const mark = std.fmt.allocPrint(arena, "{s}/{s}/{s}", .{ jobs, e.name, job_mark }) catch return true;
+        if (seen > max_jobs) return .too_many_jobs;
+        const mark = std.fmt.allocPrint(arena, "{s}/{s}/{s}", .{ jobs, e.name, job_mark }) catch return .job_unreadable;
         if (isFile(arena, mark)) continue;
-        const path = std.fmt.allocPrint(arena, "{s}/{s}/lock", .{ jobs, e.name }) catch return true;
+        const path = std.fmt.allocPrint(arena, "{s}/{s}/lock", .{ jobs, e.name }) catch return .job_unreadable;
         const lock = cwd.openFile(io, path, .{}) catch |err| {
             if (err == error.FileNotFound) continue;
-            return true;
+            return .job_unreadable;
         };
         defer lock.close(io);
-        if (!flock(lock, lock_sh | lock_nb)) return true;
+        if (!flock(lock, lock_sh | lock_nb)) return .older_job;
     }
-    return false;
+    return null;
 }
 
 /// What a pinned index's record names when its image is gone: only a shortcut past the registry,
@@ -687,7 +716,14 @@ fn evictEntry(arena: Allocator, io: std.Io, root: []const u8, e: Entry, synced: 
     io.random(&raw);
     var dead: [32:0]u8 = undefined;
     const dead_name = std.fmt.bufPrintSentinel(&dead, ".dead-{s}", .{&std.fmt.bytesToHex(raw, .lower)}, 0) catch return false;
-    if (linux.errno(linux.renameat(from, base, area, dead_name)) != .SUCCESS) return false;
+    var moved = linux.errno(linux.renameat(from, base, area, dead_name));
+    // A step may have left the volume's root read-only, and a move to another directory writes
+    // its `..`. Only then: a rename that fails must not change a volume that stays.
+    if (moved == .ACCES) {
+        _ = linux.fchmod(fd, 0o700);
+        moved = linux.errno(linux.renameat(from, base, area, dead_name));
+    }
+    if (moved != .SUCCESS) return false;
     for ([_]linux.fd_t{ from, area }) |d| if (test_sync_fails or linux.errno(linux.fsync(d)) != .SUCCESS) {
         std.log.warn("native: cannot sync a directory of {s}; what went from there stays until it can be", .{root});
         synced.* = false;
@@ -704,6 +740,10 @@ var test_syncs: u32 = 0;
 var test_sync_fails = false;
 /// `innerLock` can make no file, as on a filesystem with no inodes left. Tests.
 var test_no_inodes = false;
+/// Called between the walks and the tree half of a pass. Tests.
+var test_after_walks: ?*const fn () void = null;
+/// A directory listing says no entry's kind, as on a filesystem that reports DT_UNKNOWN. Tests.
+pub var test_unknown_kinds = false;
 
 /// The filesystem synced if anything is under a dead name, so that a rename it was given by is on
 /// disk before anything of it is deleted: the runner that renamed it may have died before it
@@ -2262,4 +2302,61 @@ test "native eviction: past the jobs a pass looks at, trees wait, the safe side"
     f.s.limits = .{ .images_max_bytes = 1, .volumes_max_bytes = 0, .min_free_pct = 0 };
     run(f.s, io);
     try testing.expect(f.there(tree));
+    try testing.expectEqual(Wait.too_many_jobs, jobsInTheWay(f.arena(), io, f.s.root).?);
+}
+
+test "native eviction: a job of an older runner that starts during the walks keeps the trees" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const io = testing.io;
+    const tree = try testTree(f, "rootfs", "r1", 6000, 30);
+    const volume = try f.volume("v", 6000, 30);
+    const late = struct {
+        var fixture: *Fixture = undefined;
+        var job: ?std.Io.File = null;
+        fn start() void {
+            job = testJob(fixture, "late", false) catch null;
+        }
+    };
+    late.fixture = f;
+    test_after_walks = late.start;
+    defer test_after_walks = null;
+    defer if (late.job) |j| j.close(io);
+    f.s.limits = .{ .images_max_bytes = 1, .volumes_max_bytes = 1, .min_free_pct = 0 };
+    run(f.s, io);
+    try testing.expect(late.job != null);
+    try testing.expect(!f.there(volume));
+    try testing.expect(f.there(tree));
+}
+
+test "native eviction: an older runner's job is seen where a listing does not say what is a directory" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const io = testing.io;
+    const tree = try testTree(f, "rootfs", "r1", 6000, 30);
+    const job = try testJob(f, "old", false);
+    defer job.close(io);
+    test_unknown_kinds = true;
+    defer test_unknown_kinds = false;
+    f.s.limits = .{ .images_max_bytes = 1, .volumes_max_bytes = 0, .min_free_pct = 0 };
+    run(f.s, io);
+    try testing.expect(f.there(tree));
+}
+
+test "native eviction: a volume left read-only with a lock for its inner volume still goes" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const io = testing.io;
+    const dir = try f.volume("v", 6000, 30);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(f.arena(), "{s}/{s}.lock", .{ dir, nested }),
+        .data = "",
+    });
+    const z = try f.arena().dupeSentinel(u8, dir, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(z, 0o500)));
+    defer _ = linux.chmod(z, 0o700);
+    f.s.limits = .{ .volumes_max_bytes = 1, .min_free_pct = 0 };
+    run(f.s, io);
+    try testing.expect(!f.there(dir));
+    try testing.expectEqual(@as(usize, 0), try f.deadLeft());
 }

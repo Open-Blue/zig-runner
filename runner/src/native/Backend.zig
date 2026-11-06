@@ -710,7 +710,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         cwd.writeFile(io, .{ .sub_path = path, .data = "" }) catch |e|
             return failed(why, arena, "writing", path, e);
     }
-    // Before the rename, so no job of this binary is ever seen without it (`evict.oldJobRunning`).
+    // Before the rename, so no job of this binary is ever seen without it (`evict.jobsInTheWay`).
     const mark = try std.fmt.allocPrint(arena, "{s}/{s}", .{ new, evict.job_mark });
     cwd.writeFile(io, .{ .sub_path = mark, .data = "" }) catch |e|
         return failed(why, arena, "writing", mark, e);
@@ -1131,7 +1131,7 @@ fn sweep(arena: Allocator, io: std.Io, store: []const u8, cg_parent: ?[]const u8
     defer dir.close(io);
     var it = dir.iterate();
     while (it.next(io) catch null) |e| {
-        if (e.kind != .directory or std.mem.startsWith(u8, e.name, ".new-")) continue;
+        if (!evict.isDirEntry(arena, jobs, e) or std.mem.startsWith(u8, e.name, ".new-")) continue;
         const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ jobs, e.name }) catch return;
         const lock_path = std.fmt.allocPrint(arena, "{s}/lock", .{path}) catch return;
         // Opened, never made: a directory without its lock is one its runner is removing, lock
@@ -1139,6 +1139,9 @@ fn sweep(arena: Allocator, io: std.Io, store: []const u8, cg_parent: ?[]const u8
         // be free, and the directory taken for stale while its runner still removes it.
         const held = std.Io.Dir.cwd().openFile(io, lock_path, .{}) catch |err| {
             if (err == error.FileNotFound) {
+                // A crash can leave the mark behind (`removeJobDir` takes the two in listing order).
+                const mark = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ path, evict.job_mark }, 0) catch return;
+                _ = std.os.linux.unlink(mark);
                 const z = arena.dupeSentinel(u8, path, 0) catch return;
                 _ = std.os.linux.rmdir(z);
             }
@@ -4581,6 +4584,36 @@ test "native eviction under a real job: its directory has the mark, and no step 
         out.output(),
     );
     try std.testing.expectEqual(@as(i32, 0), step.code);
+}
+
+test "native sweep: a crash that left only a job's mark leaves nothing" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try tmp.dir.createDirPath(io, "jobs/crashed");
+    try tmp.dir.writeFile(io, .{ .sub_path = "jobs/crashed/" ++ evict.job_mark, .data = "" });
+    sweep(arena, io, store, null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "jobs/crashed", .{}));
+}
+
+test "native sweep: a dead runner's directory goes where a listing does not say what is a directory" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try tmp.dir.createDirPath(io, "jobs/dead/W");
+    try tmp.dir.writeFile(io, .{ .sub_path = "jobs/dead/lock", .data = "" });
+    evict.test_unknown_kinds = true;
+    defer evict.test_unknown_kinds = false;
+    sweep(arena, io, store, null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "jobs/dead", .{}));
 }
 
 test "a job's directory and lock are let go once, when its set-up fails after the lock is taken" {
