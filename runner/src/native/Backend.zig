@@ -4646,6 +4646,7 @@ test "a container job on the native backend: its image pulled with its credentia
     const answers = [_][]const u8{
         "{\"data\":{\"container\":{\"from\":{\"zig_runtime_path\":\"/usr/bin:/bin\"," ++
             "\"withWorkdir\":{\"id\":\"C0\"}}}}}",
+        "{\"data\":{\"container\":{\"from\":{\"entrypoint\":[]}}}}",
         "{\"data\":{\"container\":{\"from\":{\"imageRef\":\"img\"}}}}",
         "{\"data\":{\"container\":{\"from\":{\"directory\":{\"entries\":[]}}}}}",
         try execAnswer(arena, "C1", 0, "on dagger\\n"),
