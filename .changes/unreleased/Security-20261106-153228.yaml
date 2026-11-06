@@ -1,0 +1,3 @@
+kind: Security
+body: A symlink a job swaps in at a nested cache volume is refused rather than bound, and a root runner's overlays turn off redirects and metacopy whatever the kernel defaults to
+time: 2026-11-06T15:32:28.670289346-05:00

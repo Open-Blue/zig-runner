@@ -61,6 +61,32 @@ migration is a hybrid by construction, and each phase shrinks the list of reason
 per job, never per step: switching mid-job would mean exporting native layers into Dagger at each
 switch and splitting the step cache's key chain across two stores (DESIGN.md, "Per job").
 
+### Running with no engine
+
+`RUNNER_ENGINE=none` (or `--engine=none`), with `RUNNER_BACKEND=native` (any other backend is a
+configuration error, `EngineNoneNeedsNative`), is a runner with no Dagger engine at all. It is a
+setting, not a detection: a runner that noticed the engine's absence and changed what it does would
+turn a stopped engine, which today makes a job wait, into failed jobs nobody asked for, so the
+default (`direct`) behaves exactly as before. With `none`:
+
+- **Start-up.** No engine is looked for. The pre-warm is skipped ("pre-warm skipped:
+  RUNNER_ENGINE=none"), so there is no socket to poll every 5 s and no lock on the engine's
+  directory. The memory gate has no engine source (as `RUNNER_ENGINE_CGROUP=none`): it holds on the
+  machine and on each job's cgroup, and logs nothing about an engine cgroup. The silence-timeout
+  line is not printed.
+- **Jobs.** A job native can run runs natively as always. One it cannot (`Backend.unsupported` or
+  `usable` give a reason, or the set-up falls back) fails before any step, in "Set up job", with
+  "this job needs the Dagger engine, and this runner has none (RUNNER_ENGINE=none). This job runs on
+  Dagger: <the reason native gave>." It does not start a `dagger` child or connect to a socket.
+- **Deploy.** `deploy/compose.engineless.yaml` layered over `compose.yaml` drops the engine service,
+  its volumes and the runner's `depends_on`. The native backend needs the privileges
+  the engine service has today (`privileged: true`, or `cap_add: [SYS_ADMIN, ...]`, above): give them
+  to the runner in your override.
+
+What still needs an engine: steps that use the Dagger engine (`RUNNER_DAGGER_NESTING`), and
+whatever native lists as unsupported at the time. This is the list the fallbacks are being retired
+from; a job on it fails fast instead of waiting.
+
 ## Phases
 
 Each phase lands behind the knob with the default unchanged, its tests green, its measurements in
@@ -100,16 +126,19 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   step's PID 1 when told), every file command, `::add-mask::` and the other workflow commands,
   problem matchers (read from the layers, relative to the working directory), step summaries,
   `id-token: write`, secrets in env, in scripts and in working directories, and the built-in
-  checkout without submodules (git in the job's image, then the same step script Dagger's
-  checkout runs).
+  checkout, submodules included (git in the job's image, then the same step script Dagger's
+  checkout runs). `submodules: true` fetches the first level and `recursive` all, as GitHub's
+  checkout does (Dagger's path always recurses), each to the commit the tree records, as shallow as
+  `fetch-depth`, with `git@<host>:` read as HTTPS; the flags are in the step's script, so in its key.
 - Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a job the runner
   does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
-  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:` or `options:`, `services:`
+  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:`, or an `options:` flag the
+  native job does not carry out (all below, "Job container options"), `services:`
   on a rootless runner or with an image given by an expression (native since P6, below, their
   images pulled by P3), JavaScript and local `uses:` actions (P7, `actions.preload`), remote `uses:` actions in an
   image with no git to fetch them with, `docker://` images
   that cannot be pulled or run as a non-root `USER` (P7), Dagger in steps
-  (`RUNNER_DAGGER_NESTING`), a checkout with submodules, and a
+  (`RUNNER_DAGGER_NESTING`), and a
   machine whose probe fails (no user namespaces, nftables refusing the jobs' rules, no default
   route, the jobs' ids taken on the host, the jobs' subnet overlapping a route of the host's). A
   failed probe is tried again after five minutes, not kept for the process's life. (Until P3
@@ -544,9 +573,9 @@ directories and the step's file-command files at a 4 KiB block each.
 - "Set up job" says what the job got: "Image: pulled natively in N ms (L layers, K KB fetched)" or
   "Image: from the native store", and "Provisioned natively in N ms (layer <key>)" or "...made
   before".
-- Falls back to Dagger: a job container's `ports:`, `volumes:` and `options:` (phase 6 brings the
-  network that ports and volumes need), and on a rootless runner without `RUNNER_NATIVE_ROOTFS`
-  the provisioned default image (below).
+- Falls back to Dagger: a job container's `ports:`, `volumes:` and `options:` flags the native job
+  does not carry out ("Job container options", below), and on a rootless runner without
+  `RUNNER_NATIVE_ROOTFS` the provisioned default image (below).
 
 The store, under `RUNNER_NATIVE_STORE`, each directory only the runner's (mode 0700: a rootfs
 holds the image's set-uid files with the image's owners, the host's root's on a root runner):
@@ -801,12 +830,13 @@ and bounded:
   later job's `exec` fail with E2BIG); a tree that does not fit is left out, and so is one that
   would not fit the Dagger path's variable (`set_up.toolTreesVerdict`, the same 64 KiB).
 - Memory: a tree is held in memory while it is checked (a path, an entry and a list line each:
-  about 7 MB for Zig). Every byte is charged to a counter shared by all the checks of the process
-  (`tool_trees.held`, `Limits.memory`, 128 MiB), and a tree that would pass it is left out, so
-  concurrent checks of hostile trees hold 128 MiB between them, not each their own. When #327's
-  process-wide `Budget` (`native/hash_files.zig`) is merged, `held` should become that budget's
-  counter and `Limits.memory` its limit, so the runner has one number for what jobs' checks and
-  `hashFiles()` may hold.
+  about 7 MB for Zig). Every byte is charged to the process's `Budget.held`
+  (`native/hash_files.zig`), the number that `hashFiles()` calls count their memory in as well, against `Limits.memory`
+  (128 MiB), and a tree that would pass it is left out, so concurrent checks of hostile trees hold
+  128 MiB between them, not each their own. A check never waits for the budget and a call is never
+  refused for what checks hold, so neither can fail a job through the other: a check that meets a
+  big call leaves its trees out (the next job checks them), and a call meets checks that are gone
+  in seconds.
 - Order, and what one job can starve. Each tree has a `<tree>.born` file in the lists: when this
   runner first saw it. Trees are checked oldest first (ties in byte order); at each level of the
   walk to them the names that have a `.born` come first, so a level full of planted names does not
@@ -837,7 +867,11 @@ listed as racy and read next time; a list that does not name exactly the tree's 
 not believed. That is not enough alone: a writable shared mapping, once its page is dirty, writes
 again without changing ctime or mtime, whatever the descriptor (it can be closed). So the check
 takes a read lease (`F_SETLEASE`, `F_RDLCK`) on each file it reads, which the kernel refuses while
-any writer or writable mapping holds the file, and lists a refused file as racy. A lease is broken
+any writer or writable mapping holds the file, and lists a refused file as racy. That holds only
+where it was seen to, ext4 and tmpfs: overlayfs grants the lease over a writable mapping, as the
+mapping's file is the one beneath, so a file on any other filesystem is racy too, and read at every
+check (the test failed on main's job in a Dagger container, whose `/tmp` is overlayfs on the host's
+disk, and passed on hosted runners). A lease is broken
 with a signal to the process, SIGIO by default, which ends a process that does not handle it and
 which `std.Io` uses to interrupt blocked calls (a job's cancel, a timeout): the check must not
 ignore it (an earlier cut did, and a native end-to-end job never got its cancel). `F_SETSIG` makes
@@ -948,6 +982,11 @@ proofs/tla/StoreEviction.tla.
   Deeper than that it moves what is below to the tree's top, as `.cut-<random>` (random, as a job can
   read its inodes and plant any name it can work out), so a chain of directories of any depth loses
   some of itself each pass. A dead name that still cannot be removed is logged, and stops nothing.
+  Going down a level counts against a pass's 64 entries like removing one (a chain of directories
+  with no files used to be walked to its end whatever the clock said: 2.9 s against 1.5 s at a
+  depth of 250,000), and a pass the budget stops in the middle of a chain moves the directory it
+  had reached up to the top too, so the next pass does not walk the same levels again. A level
+  costs a descent and a removal, so a pass that is late from the start clears about 32.
 - **Time and memory.** Deleting has a budget of 1.5 s a job, which evicting counts against too, and
   which starts after the sync below. A pass removes at least 64 entries whatever the clock says, so
   the worse the disk, the less goes, but something does. What is left stays under its dead name, the
@@ -958,8 +997,7 @@ proofs/tla/StoreEviction.tla.
 - **What no budget bounds.** The `syncfs` before deleting from a dead name, once a pass, takes what the
   disk takes; each eviction's two directory fsyncs likewise, and one layer's delete. All of them are
   at a job's end, before its result is reported. A dead tree that will not go costs that `syncfs` at
-  every job's end, for as long as it stays. A chain of directories with no files can overrun the
-  budget once a tree: 2.9 s against 1.5 s at a depth of 250,000.
+  every job's end, for as long as it stays.
 - **When a sync fails.** A pass stops there: nothing more is evicted until what went is gone, or a
   disk that fails writes would take entry after entry and free nothing.
 - **Costs left.** Deleting and measuring are at a job's end, before its result is reported
@@ -1118,6 +1156,58 @@ real one); the sandbox's part is about the 21 ms above. Dagger's side is the tes
 containers against Dagger's", run by hand with a v0.21.10 engine container
 (`ZIG_RUNNER_MEASURE_SERVICES=<images> ZIG_RUNNER_MEASURE_ENGINE=<container>`); the agent that
 built this phase was not allowed to start one on the laptop, so that figure is still to be taken.
+
+### Job container options
+
+What a `container:` job's `ports:`, `volumes:` and `options:` do on GitHub's runner, and what a
+native job does with them. GitHub's runner builds `docker create` for the job container (name,
+network, `--workdir /__w`, `-e` for the container's `env:`, `-p` for `ports:`, `-v` for `volumes:`
+and its own mounts), appends the `options:` string after those, and runs every step with
+`docker exec -w <directory>`. The runner waits for health on service containers only. (That is the
+runner's behaviour as remembered, not re-read for this change.)
+
+`runner/src/native/container_options.zig` reads `options:`. A native job carries out or accepts only
+the flags below; **any other flag, a stray word, or an `options:` with an expression in it sends
+the job to Dagger, naming the flag in "Set up job"**. Nothing is ignored silently.
+
+| Flag | Native job |
+|---|---|
+| `--env`/`-e NAME=value` (also `--env=`, `-eNAME=value`) | Carried out: set in the base environment after the container's `env:` (`docker create` reads `options:` last), before the job's own `env:`, which wins as it does over `docker exec -e`. A bare `-e NAME` is refused: it copies the *runner's* variable. |
+| `--user`/`-u` (`name`, `uid`, `name:group`, `uid:gid`) | Carried out: resolved in the image's own `/etc/passwd` and `/etc/group` as its `USER` is, over it. Refused on the runner's default image, whose step user is `RUNNER_STEP_USER`'s choice (that provisioning is not the container's). A rootless runner maps only root, so there it fails as an image `USER` does. |
+| `--workdir`/`-w` | Understood, no effect: every step is `docker exec -w`, native steps take the same directory. Counted in "Set up job". |
+| `--health-cmd`, `--health-interval`, `--health-timeout`, `--health-start-period`, `--health-start-interval`, `--health-retries`, `--no-healthcheck` | Understood, no effect: nothing waits for a job container's health. Durations and counts are checked as Docker reads them; one it would refuse is refused. |
+| Everything else: `--cpus`, `--memory`, `--privileged`, `--cap-add`, `--security-opt`, `--device`, `--gpus`, `--ulimit`, `--shm-size`, `--network`, `--add-host`, `--dns`, `--hostname`, `--init`, `-t`/`-i`, `--entrypoint`, `--name`, `--label`, `--platform`, `--pull`, `--read-only`, `--tmpfs`, `--sysctl`, `--pid`, `--ipc`, `--userns`, `-v`/`--mount`, `-p`, `--env-file`, `--group-add` | Refused (Dagger). Each changes the container: limits, privileges, devices, networks and mounts are the sandbox's (`sandbox.zig`, `seccomp.zig`, `nft.zig`, the cgroup code), which this does not touch. |
+
+What stays on Dagger, and what carrying it out would need:
+
+- **`ports:`**. On GitHub they publish the container's ports on the *host* (`-p`), so a client
+  outside the container can reach them. The job's own steps run inside it and reach those ports on
+  loopback already; services have no need of them to reach the job. Carrying
+  them out natively means a DNAT from the host's address into the job's network namespace and an
+  `nft` rule that admits it (today's rules admit nothing inbound, `nft.zig`), plus a policy for
+  which host addresses and ports a workflow may take. That is new isolation logic. (`forward.zig`
+  relays a *service's* port into the job's loopback, the other direction.)
+- **`volumes:`**. A bind from a host path, or a named volume, into the container. Needs a bind
+  mount into the job's mount namespace outside the cache volumes' fixed set (`sandbox.Spec.binds`
+  is built by the runner, never from a workflow), a policy for which host paths a job may mount
+  (the runner's own store, `/etc`, the docker socket are all host paths), nosuid/nodev and the id
+  mapping of a root runner's slot (`Bind.volume`'s shifted ids) so files the job writes are not the
+  host's root's, and a lifecycle for named volumes. That is mount and privilege code.
+- **An `options:` that is an expression** (`${{ matrix.options }}`): decided before expressions
+  are evaluated. Reading it after, with the same parser, is possible; not done here.
+- **The Dagger path carries out none of the three on a job container** (`job.container`'s
+  `options`, `ports` and `volumes` are read nowhere under `runner/src/dagger/`), so a job that
+  falls back to Dagger for one of them runs without it, without a warning. Found while reading;
+  this change does not touch it.
+
+Services' `options:` are unchanged: they still log the flags they do not carry out and go on
+(`services.zig`), as the Dagger path does. Making them refuse as the job container's do is a
+separate change.
+
+Tests: the flag table, in every spelling Docker reads, and a refusal for each of 35 flags in three
+spellings (`container_options.zig`); `unsupported`'s reasons for ports, volumes, options and
+expressions (`Backend.zig`); a native job with `--user app -e ... --workdir ... --health-*` that
+runs as the image's `app` user with the options' env over the container's (root runner, in CI).
 
 ### P7: Docker actions
 
@@ -2085,9 +2175,10 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
     at the cancel's `hard_deadline_ms`, or at the time limit.
 - **Overlay's redirects and metacopy fail the call.** `Merged` does not follow them, and a hash
   of what they hide would be wrong without a word, so a layer entry that has either attribute
-  fails `hashFiles()` with a message. The runner never asks for them, but a host's kernel may
-  default to them: `overlayOptions` in `sandbox.zig` does not pass `redirect_dir=off,metacopy=off`,
-  and `Store.flatten` checks only directories. Both are the owner's to settle.
+  fails `hashFiles()` with a message. The runner turns both off, whatever the host's kernel
+  defaults to: `overlayFeatures` in `sandbox.zig` passes `redirect_dir=off,metacopy=off` on a root
+  runner; a rootless one's `userxattr` already has neither, and refuses that option beside it.
+  `Store.flatten` checks only directories, which is enough with metacopy off.
 - **A file is hashed whatever its mode.** The runner reads as itself (root, or the rootless
   user), so a non-root `container:` job can hash a file its own user could not read (`ln -s
   /etc/shadow s`) from within its own tree. Dagger's `sha256sum` ran as the step user and would
@@ -2096,3 +2187,14 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
   the gain is a hash of a file in the job's own container; so it is not done.
 - **A file is looked at before it is opened.** Its type is read from an `O_PATH` descriptor and
   the file opened through that descriptor, so a pipe is refused and not waited for.
+
+### Running with no engine
+
+- **A setting beats a probe.** "No engine reachable" cannot tell an engine that is restarting (jobs
+  should wait, as they do) from one that was never there. `RUNNER_ENGINE=none` says it, and the
+  default path is not touched: the only new branch on it is a boolean that is false.
+- **Everything that waited for the engine was already off the native path.** A native job never
+  opened an engine session, so the cost of a missing engine was in the background and in the
+  fallback: the pre-warm polling the socket and queueing for the engine's turn, the gate looking
+  for the engine's cgroup, and a job sent to Dagger (`backToEngine`) hanging on a socket that is
+  not there. The last is the one that mattered: it now fails at once with the reason native gave.

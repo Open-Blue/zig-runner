@@ -560,6 +560,9 @@ pub const Options = struct {
     native: ?Backend.Config = null,
     /// Why a job that could have been native runs on Dagger, for "Set up job" (set by `run`).
     backend_note: ?[]const u8 = null,
+    /// `RUNNER_ENGINE=none`: this runner has no Dagger engine, so a job native cannot run fails at
+    /// once, saying why (`failNoEngine`), instead of waiting for one.
+    engineless: bool = false,
     /// Talk to the Dagger engine directly (`engine.zig`) instead of through a `dagger run` child.
     engine: ?engine.Endpoint = null,
     /// Backs the direct session's long-lived buffers and tasks; must be thread-safe.
@@ -847,6 +850,7 @@ pub fn run(
             if (cfg.gate) |g| g.backToEngine();
         }
     }
+    if (opts.engineless) return failNoEngine(arena, io, opts, job, log);
     var env = try environ.clone(arena);
     try env.put("NO_COLOR", "1");
     try env.put("DAGGER_NO_NAG", "1");
@@ -900,6 +904,24 @@ pub fn run(
     const transport: Transport = opts.test_transport orelse
         .{ .ptr = &http, .sendFn = HttpTransport.send };
     return runSteps(arena, io, opts, job, &sh, results, transport, null);
+}
+
+/// A job that has to run on Dagger on a runner without an engine (`Options.engineless`): fails
+/// before any step, naming why native did not take it (`backend_note`), as a missing `dagger`
+/// binary does, rather than hanging on an engine that will never come.
+fn failNoEngine(
+    arena: Allocator,
+    io: std.Io,
+    opts: Options,
+    job: job_mod.Job,
+    log: *sink.LogSink,
+) !Result {
+    const results = try arena.alloc(StepResult, job.steps.len);
+    @memset(results, .{});
+    var sh = try jobLogFor(arena, io, opts, job, log);
+    const why = opts.backend_note orelse "this runner is not set to run jobs natively.";
+    return fail(&sh, results, try std.fmt.allocPrint(arena, "this job needs the Dagger engine, " ++
+        "and this runner has none (RUNNER_ENGINE=none). {s}", .{why}));
 }
 
 /// The job on the native backend (`native/Backend.zig`): no Dagger session, the same steps code.
@@ -4958,4 +4980,68 @@ fn expectDigest(digest: []const u8) !void {
         '0'...'9', 'a'...'f' => {},
         else => return error.TestUnexpectedResult,
     };
+}
+
+test "without an engine, a job native cannot run fails at once and says why, starting no session" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    // A session that would take a minute to answer if one were started.
+    const hang: []const []const u8 = &.{ "sh", "-c", "sleep 60" };
+    const steps = [_]job_mod.Step{ testStep("a"), testStep("b") };
+    // Native refuses it: the store is not set up.
+    var res = try run(arena, std.testing.io, &env, .{
+        .native = .{ .vouched = true, .rootless = true },
+        .engineless = true,
+        .test_session_argv = hang,
+    }, testJob(&steps), &log);
+    try std.testing.expect(!res.succeeded);
+    try std.testing.expectEqual(@as(usize, 2), res.steps.len);
+    try std.testing.expectEqual(Outcome.not_run, res.steps[0].outcome);
+    var msg = res.engine_error orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, msg, "this job needs the Dagger engine, and this " ++
+        "runner has none (RUNNER_ENGINE=none). This job runs on Dagger: the native store is not " ++
+        "set up") != null);
+    // Native refuses it for a reason only Dagger answers: steps that use the engine.
+    res = try run(arena, std.testing.io, &env, .{
+        .native = .{ .vouched = true, .rootless = true, .store = "/x", .self_exe = "/x" },
+        .nesting = true,
+        .engineless = true,
+        .test_session_argv = hang,
+    }, testJob(&steps), &log);
+    try std.testing.expect(!res.succeeded);
+    msg = res.engine_error orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, msg, "RUNNER_ENGINE=none). This job runs on " ++
+        "Dagger: steps that use the Dagger engine (RUNNER_DAGGER_NESTING) need Dagger.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "could not start Dagger") == null);
+    // No native backend at all: the same refusal, with no reason to give.
+    res = try run(arena, std.testing.io, &env, .{
+        .engineless = true,
+        .test_session_argv = hang,
+    }, testJob(&steps), &log);
+    try std.testing.expect(!res.succeeded);
+    try std.testing.expect(std.mem.indexOf(u8, res.engine_error.?, "RUNNER_ENGINE=none") != null);
+}
+
+test "with an engine, a job native cannot run still goes to Dagger and runs there" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "hi\\n") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const steps = [_]job_mod.Step{testStep("echo hi")};
+    const res = try run(arena, std.testing.io, &env, .{
+        .native = .{ .vouched = true, .rootless = true },
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+    }, testJob(&steps), &log);
+    try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
+    try std.testing.expect(std.mem.indexOf(u8, w.written(), "This job runs on Dagger: the " ++
+        "native store is not set up") != null);
 }

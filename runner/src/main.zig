@@ -41,6 +41,7 @@ comptime {
     _ = @import("native/phases.zig");
     _ = @import("native/services.zig");
     _ = @import("native/health.zig");
+    _ = @import("native/container_options.zig");
     _ = @import("native/images.zig");
     _ = @import("native/forward.zig");
     _ = @import("native/docker_action.zig");
@@ -483,6 +484,7 @@ fn execJobFile(
         .image = cfg.image,
         .js_runtime = cfg.js_runtime,
         .engine = cfg.engineEndpoint(),
+        .engineless = cfg.engineless(),
         .gpa = init.gpa,
         .nesting = cfg.dagger_nesting,
         .package_caches = cfg.package_caches,

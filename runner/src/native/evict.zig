@@ -742,6 +742,8 @@ var test_sync_fails = false;
 var test_no_inodes = false;
 /// Called between the walks and the tree half of a pass. Tests.
 var test_after_walks: ?*const fn () void = null;
+/// Levels `removeSome` went down. Tests.
+var test_descents: u32 = 0;
 /// A directory listing says no entry's kind, as on a filesystem that reports DT_UNKNOWN. Tests.
 pub var test_unknown_kinds = false;
 
@@ -805,6 +807,12 @@ const max_chain = 32;
 /// top, so a chain deeper than a pass can walk loses some of itself every pass. The name is random,
 /// as a job can read its inodes and plant any name it can work out. A name that is no directory
 /// just goes.
+///
+/// Going down a level counts against the least a pass removes, as removing an entry does (F4: a
+/// chain of directories with no files removes nothing on the way down, so a pass walked all of it
+/// whatever the clock said). A call the budget stops in the middle of a chain also moves the
+/// directory it had reached up to the tree's top, so that the next call, which starts there, does
+/// not walk the same levels again.
 fn removeSome(arena: Allocator, path: []const u8, io: std.Io, budget: *Budget) Removal {
     const up_path = std.fs.path.dirname(path) orelse return .stuck;
     const up = Store.openRoot(arena, up_path) catch return .stuck;
@@ -823,15 +831,23 @@ fn removeSome(arena: Allocator, path: []const u8, io: std.Io, budget: *Budget) R
         _ = linux.close(fd);
     };
     var name: [256:0]u8 = undefined;
+    // The name each directory of the chain has in the one above it, from `chain[1]`.
+    var names: [max_chain][256:0]u8 = undefined;
     while (true) {
         const cur = chain[held - 1];
         const down = emptyOut(io, cur, &name, budget) catch |e| {
-            if (e == error.Spent) return .spent;
+            if (e == error.Spent) {
+                // At held 2 it is a level below the top already.
+                if (held > 2) _ = cutUp(io, chain[held - 2], &names[held - 1], chain[0]);
+                return .spent;
+            }
             std.log.warn("native: cannot remove all of {s}: {t}", .{ path, e });
             return .stuck;
         };
         if (down) |n| {
             const child = Store.openDirAt(cur, n) catch return .stuck;
+            budget.took();
+            test_descents += 1;
             if (held == max_chain) {
                 if (!cutUp(io, cur, n, chain[0])) {
                     _ = linux.close(child);
@@ -841,6 +857,7 @@ fn removeSome(arena: Allocator, path: []const u8, io: std.Io, budget: *Budget) R
                 held = 1;
             }
             chain[held] = child;
+            @memcpy(names[held][0 .. n.len + 1], name[0 .. n.len + 1]);
             held += 1;
             continue;
         }
@@ -1696,6 +1713,30 @@ test "native eviction: a symlink swapped into a key's part does not reach anothe
     };
     try testing.expect(!evictOne(f, e));
     try testing.expect(f.there(other));
+}
+
+test "native eviction: a chain of directories with no files is bounded by the budget, and keeps its progress" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const io = testing.io;
+    const depth = 4000;
+    try deepChain(f, depth);
+    const dead = Hostile.p(f, "{s}/volumes/.dead-chain", .{f.s.root});
+    // A budget that is late already, with the least a pass removes: removing nothing on the way
+    // down, the chain used to be walked to its end whatever the clock said.
+    var budget: Budget = .init(io, 0);
+    test_descents = 0;
+    try testing.expectEqual(Removal.spent, removeSome(f.arena(), dead, io, &budget));
+    try testing.expect(test_descents <= least_removed);
+    // Each call goes on from where the one before stopped, not from the top of the same levels:
+    // a level costs a descent and a removal, so a pass of 64 clears about 32.
+    var passes: usize = 1;
+    while (passes < depth) : (passes += 1) {
+        budget = .init(io, 0);
+        if (removeSome(f.arena(), dead, io, &budget) == .gone) break;
+    }
+    try testing.expect(passes <= depth / 16);
+    try testing.expect(!f.there(dead));
 }
 
 test "native eviction: names a job planted under a dead tree do not stop the removal" {

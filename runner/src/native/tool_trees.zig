@@ -32,6 +32,8 @@
 //! kernel refuses while any writer, a mapping included, holds the file, and then lists the file
 //! as racy too. The signal a lease break sends is SIGURG (`F_SETSIG`), whose default is to be
 //! ignored: SIGIO, the default, is what `std.Io` interrupts blocked calls with.
+//! A lease only says that where it is known to: overlayfs grants one over a writable mapping,
+//! whose file is the one beneath, so on a filesystem not known to refuse it every file is racy.
 //!
 //! Unlike the script, this runs in the runner's process, on a directory a job can write, so it is
 //! confined and bounded. Every look at the volume is relative to a directory descriptor, through
@@ -52,6 +54,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const dagger = @import("../dagger.zig");
 const sandbox = @import("sandbox.zig");
+const hash_files = @import("hash_files.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -85,9 +88,13 @@ pub const Limits = struct {
     time_ms: i64 = 60_000,
     /// See the file's comment.
     racy_s: i64 = 2,
-    /// Bytes of memory that every check running in the process holds at once (`held`): a tree
-    /// that would pass it is given up on. Zig's tree takes about 7 MB.
+    /// Bytes of memory that everything the process holds at once (`Budget.held`: the checks'
+    /// trees and `hashFiles()` calls) may come to when a tree is charged: a tree that would pass
+    /// it is given up on. Zig's tree takes about 7 MB.
     memory: u64 = 128 << 20,
+    /// The process's memory number, shared with `hashFiles()`. A check only takes from it, never
+    /// waits for it, and a call is never refused for what a check holds.
+    budget: *hash_files.Budget = &hash_files.process_budget,
 };
 
 /// What steps are given (`env`, `full`: `DIGEST TREE` lines, `Exec.tool_trees`) and the line
@@ -110,11 +117,6 @@ const max_name = 100;
 const max_env = 64 << 10;
 /// "Set up job"'s line, which lists the trees.
 const max_note = 4 << 10;
-
-/// Memory held by checks in this process now, in bytes, as each charges what it will allocate.
-/// #327's process-wide budget (`native/hash_files.zig`) is the same idea: once both are merged
-/// this counter should be that budget's, and `Limits.memory` its limit.
-var held: std.atomic.Value(u64) = .init(0);
 
 /// Checks the trees under `cache` (the tool cache volume's directory on the host), keeping their
 /// lists in `lists`, and says what steps are given. The trees' paths are `mount`'s (where steps
@@ -257,7 +259,7 @@ const Check = struct {
     tree_read: u64 = 0,
     tree_deadline_ms: i64 = 0,
     tree_why: []const u8 = "",
-    /// Bytes of `held` that this tree took.
+    /// Bytes of `limits.budget.held` that this tree took.
     mine: u64 = 0,
 
     const Error = error{ OutOfMemory, Unreadable, Stopped };
@@ -296,7 +298,7 @@ const Check = struct {
     /// `n` bytes of memory about to be allocated for the tree, against what all checks hold.
     fn charge(c: *Check, n: usize) error{Unreadable}!void {
         c.mine += n;
-        if (held.fetchAdd(n, .acq_rel) + n > c.limits.memory)
+        if (c.limits.budget.held.fetchAdd(n, .acq_rel) + n > c.limits.memory)
             return c.giveUp("too much memory in use");
     }
 
@@ -469,7 +471,7 @@ const Check = struct {
         defer {
             ta.deinit();
             c.in_tree = false;
-            _ = held.fetchSub(c.mine, .acq_rel);
+            _ = c.limits.budget.held.fetchSub(c.mine, .acq_rel);
             c.mine = 0;
         }
         const t = ta.allocator();
@@ -640,7 +642,7 @@ const Check = struct {
         defer if (leased) {
             _ = linux.fcntl(fd, linux.F.SETLEASE, linux.F.UNLCK);
         };
-        f.racy = !leased;
+        f.racy = !leased or !leasesSeeMappings(fsType(fd));
         var st: linux.Statx = undefined;
         if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{
             .TYPE = true,
@@ -855,6 +857,24 @@ fn keepList(t: Allocator, io: std.Io, path: []const u8, text: []const u8) void {
     };
 }
 
+/// The filesystem `fd` is on, 0 if that cannot be told: `struct statfs`'s `f_type`, first, a long
+/// on x86_64 and aarch64.
+fn fsType(fd: linux.fd_t) u64 {
+    var st: [120]u8 align(8) = undefined;
+    if (linux.errno(linux.syscall2(.fstatfs, std.math.cast(usize, fd) orelse return 0, @intFromPtr(&st))) != .SUCCESS)
+        return 0;
+    return std.mem.readInt(u64, st[0..8], .little);
+}
+
+/// Whether a read lease on this filesystem is refused while a writable mapping holds the file:
+/// only those it was seen on (the test "a file a shared mapping still writes"). A file anywhere
+/// else is read again at each check, which costs a read and never trust.
+fn leasesSeeMappings(fs_type: u64) bool {
+    const ext4 = 0xef53;
+    const tmpfs = 0x01021994;
+    return fs_type == ext4 or fs_type == tmpfs;
+}
+
 /// These lists are a cache: a failure here costs a read later, and is dropped. A cancel is not:
 /// std.Io delivers it once, so it is re-armed for what runs next.
 fn rearm(io: std.Io, e: anyerror) void {
@@ -1048,6 +1068,11 @@ test "tool trees: a list spares the reading, and a change it cannot hide is read
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const f = try fixture(arena, &tmp);
+    // Where a lease says nothing every file is racy, and no list spares a read.
+    const dir_fd = linux.open(try std.fmt.allocPrintSentinel(arena, "{s}", .{f.cache}, 0), .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    try std.testing.expect(linux.errno(dir_fd) == .SUCCESS);
+    defer _ = linux.close(std.math.cast(linux.fd_t, dir_fd).?);
+    if (!leasesSeeMappings(fsType(std.math.cast(linux.fd_t, dir_fd).?))) return error.SkipZigTest;
     const tree = try std.fmt.allocPrint(arena, "{s}/{s}", .{ f.cache, tree_rel });
     const first = try checkWith(arena, f, .{ .racy_s = 0 }, null);
     const second = try checkWith(arena, f, .{ .racy_s = 0 }, null);
@@ -1243,6 +1268,14 @@ test "tool trees: a file a shared mapping still writes is read again, not truste
     try expectIn(v.env, try shellDigest(arena, tree));
 }
 
+test "tool trees: a lease is believed only where a writable mapping was seen to refuse it" {
+    try std.testing.expect(leasesSeeMappings(0xef53));
+    try std.testing.expect(leasesSeeMappings(0x01021994));
+    const overlayfs = 0x794c7630;
+    try std.testing.expect(!leasesSeeMappings(overlayfs));
+    try std.testing.expect(!leasesSeeMappings(0));
+}
+
 test "tool trees: a plant of names does not cost the trees that were checked before" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -1345,16 +1378,17 @@ test "tool trees: checks together hold what the process allows and give it back"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const f = try fixture(arena, &tmp);
-    try std.testing.expectEqual(@as(u64, 0), held.load(.acquire));
-    // Other checks hold nearly all of it: this tree does not fit.
-    _ = held.fetchAdd(1000, .acq_rel);
-    const v = try checkWith(arena, f, .{ .memory = 2000 }, null);
-    _ = held.fetchSub(1000, .acq_rel);
+    var budget: hash_files.Budget = .{};
+    try std.testing.expectEqual(@as(u64, 0), budget.held.load(.acquire));
+    // Other checks, or a `hashFiles()` call, hold nearly all of it: this tree does not fit.
+    _ = budget.held.fetchAdd(1000, .acq_rel);
+    const v = try checkWith(arena, f, .{ .memory = 2000, .budget = &budget }, null);
+    _ = budget.held.fetchSub(1000, .acq_rel);
     try expectIn(v.note, "too much memory in use");
-    try std.testing.expectEqual(@as(u64, 0), held.load(.acquire));
-    const fits = try checkWith(arena, f, .{}, null);
+    try std.testing.expectEqual(@as(u64, 0), budget.held.load(.acquire));
+    const fits = try checkWith(arena, f, .{ .budget = &budget }, null);
     try expectIn(fits.env, tree_rel);
-    try std.testing.expectEqual(@as(u64, 0), held.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), budget.held.load(.acquire));
 }
 
 test "tool trees: lists are not written past what is read, and leftovers and empty directories go" {

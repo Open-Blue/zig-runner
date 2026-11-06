@@ -32,6 +32,7 @@ const trees_check = @import("tool_trees.zig");
 const admission = @import("../admission.zig");
 const services = @import("services.zig");
 const images = @import("images.zig");
+const container_options = @import("container_options.zig");
 const native_actions = @import("actions.zig");
 const Exec = @import("../dagger/Exec.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
@@ -65,6 +66,8 @@ image_env: []const []const u8 = &.{"PATH=" ++ image_path},
 /// Who the image's `USER` is, for steps that do not run as the runner user.
 image_uid: u32 = 0,
 image_gid: u32 = 0,
+/// What a `container:` job's `options:` ask for (`container_options.zig`), read by `base`.
+container_opts: container_options.Options = .{},
 /// A `container:` job's PATH once its env is set (`dagger.Base.runtime_path`).
 runtime_path: ?[]const u8 = null,
 /// Where the job's time went (`phases.zig`): its set-up, each sandbox and publish, its teardown.
@@ -390,8 +393,13 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
     if (std.os.linux.geteuid() != 0 and !cfg.rootless) return "the runner is not root, and " ++
         "rootless native steps have only one id mapped (RUNNER_NATIVE_ROOTLESS=1 runs them " ++
         "anyway; subordinate ids are phase 5's)";
-    if (job.container) |jc| if (jc.ports.len > 0 or jc.volumes.len > 0 or jc.options != null)
-        return "a job container's `ports:`, `volumes:` and `options:` are not native yet (phase 6)";
+    if (job.container) |jc| {
+        const default_image = switch (jc.image) {
+            .lit => |l| std.mem.eql(u8, dagger.resolveImage(l), dagger.default_image),
+            .expr => true,
+        };
+        if (container_options.unsupported(jc, opts.provision and default_image)) |why| return why;
+    }
     if (job.services.len > 0) if (servicesUnsupported(job, cfg)) |why| return why;
     if (opts.nesting) return "steps that use the Dagger engine (RUNNER_DAGGER_NESTING) need Dagger";
     // dpkg gives files to other users and groups (`root:adm`), which one mapped id cannot hold.
@@ -411,16 +419,7 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         .uses => {},
         // Native when their image is in the native store (`docker_action.unsupported`).
         .docker => {},
-        .checkout => |inputs| for (inputs) |in| {
-            if (!std.mem.eql(u8, in.name, "submodules")) continue;
-            const lit = switch (in.value) {
-                .lit => |l| l,
-                else => "true",
-            };
-            if (!std.mem.eql(u8, lit, "false")) return "a checkout with submodules is not " ++
-                "native yet";
-        },
-        .script, .unsupported => {},
+        .checkout, .script, .unsupported => {},
     };
     return null;
 }
@@ -1197,6 +1196,7 @@ pub fn base(
     err_msg: *[]const u8,
 ) !void {
     const arena = b.arena;
+    try b.readContainerOptions(ev, err_msg);
     try b.prepareRootfs(ev, plan, err_msg);
     var t = phases.now();
     // On the job's image (the seed's build and the roll run on `b.rootfs`).
@@ -1314,6 +1314,8 @@ fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
     // A `container:` job's own env, as `docker create -e` sets it; its PATH is the container's
     // (`Exec.container_path`).
     for (plan.container_env) |e| try b.put(e.name, e.value);
+    // Then its `options: --env`, which `docker create` reads after the `-e` of its `env:`.
+    for (b.container_opts.env) |e| try b.put(e.name, e.value);
     if (ev.job.container != null) b.runtime_path = b.envValue("PATH");
     b.uid = b.image_uid;
     b.gid = b.image_gid;
@@ -1796,8 +1798,30 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     try w.writeAll(" origin ");
     try dagger.shellQuote(w, f.want);
     if (f.tags) try w.writeAll("\ngit fetch -q --tags origin");
-    try w.print("\ngit checkout -q --detach FETCH_HEAD\nrm -f .git/FETCH_HEAD\n" ++
-        "find . -exec touch -h -d @{d} {{}} +\n", .{checkout.mtime});
+    try w.writeAll("\ngit checkout -q --detach FETCH_HEAD\nrm -f .git/FETCH_HEAD\n");
+    // Submodules as actions/checkout fetches them: `true` the first level, `recursive` all, each
+    // to the commit the tree records and as shallow as the checkout (`fetch-depth`), with
+    // `git@<host>:` rewritten to HTTPS, where the token's header applies. The script is the
+    // step's key (below), so it holds the flags: a checkout with and without them never
+    // replays one another, and the recorded commits are in the tree of the key's commit.
+    if (co.submodules) {
+        const recursive: []const u8 = if (co.submodules_recursive) " --recursive" else "";
+        const server = std.mem.trimEnd(u8, x.job.github.server_url, "/");
+        try w.print("git submodule sync -q{s}\ngit ", .{recursive});
+        if (std.mem.startsWith(u8, server, "https://")) {
+            try w.writeAll("-c ");
+            try dagger.shellQuote(w, try std.fmt.allocPrint(
+                arena,
+                "url.{s}/.insteadOf=git@{s}:",
+                .{ server, server["https://".len..] },
+            ));
+            try w.writeAll(" ");
+        }
+        try w.writeAll("-c protocol.version=2 submodule update -q --init --force");
+        if (f.depth > 0) try w.print(" --depth={d}", .{f.depth});
+        try w.print("{s}\n", .{recursive});
+    }
+    try w.print("find . -exec touch -h -d @{d} {{}} +\n", .{checkout.mtime});
 
     // The job's token as GitHub expects it over HTTPS, in git's environment, never on its
     // command line.
@@ -2484,10 +2508,14 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
         err_msg,
     );
     _ = b.timings.since(arena, .provision, t);
-    if (!plan.as_runner and img.user.len > 0) {
-        const user_ids = b.imageUser(img.user) catch |e| {
-            err_msg.* = try std.fmt.allocPrint(arena, "the image's USER {s}: {s}", .{
-                img.user,
+    // `options: --user` over the image's `USER`, as `docker create` has it. (Never with the
+    // provisioned image: `container_options.unsupported` sends that job to Dagger.)
+    const user = b.container_opts.user orelse img.user;
+    if (!plan.as_runner and user.len > 0) {
+        const user_ids = b.imageUser(user) catch |e| {
+            err_msg.* = try std.fmt.allocPrint(arena, "the {s} {s}: {s}", .{
+                if (b.container_opts.user != null) "container's --user" else "image's USER",
+                user,
                 switch (e) {
                     error.UnknownUser => "not in its /etc/passwd",
                     error.UnknownGroup => "its group is not in its /etc/group",
@@ -2500,6 +2528,33 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
         b.image_uid = user_ids[0];
         b.image_gid = user_ids[1];
     }
+}
+
+/// The job container's `options:`, read (`container_options.parse`; `unsupported` has already
+/// refused what it does not carry out, so this is not expected to fail), with a note in "Set up
+/// job" for what was honoured and for what is understood and has no effect here.
+fn readContainerOptions(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void {
+    const jc = ev.job.container orelse return;
+    const text = switch (jc.options orelse return) {
+        .lit => |l| l,
+        .expr => {
+            err_msg.* = "the job container's `options:` is an expression";
+            return error.BaseContainerFailed;
+        },
+    };
+    var why: []const u8 = "";
+    const o = container_options.parse(b.arena, text, &why) catch |e| {
+        err_msg.* = if (why.len > 0) why else @errorName(e);
+        return error.BaseContainerFailed;
+    };
+    b.container_opts = o;
+    try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Container options: {d} " ++
+        "`--env`{s}{s}; {d} understood and without effect natively (`--workdir`, `--health-*`)", .{
+        o.env.len,
+        if (o.user != null) ", `--user` " else "",
+        o.user orelse "",
+        o.no_effect,
+    }));
 }
 
 /// Whether the job's image is musl-based: an `ld-musl-*` in its /lib, as the Dagger path asks
@@ -3101,8 +3156,11 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     var co = testStep("");
     co.action = .{ .checkout = &.{} };
     try std.testing.expect(unsupported(io, testJob(&.{co}), root, ok) == null);
-    co.action = .{ .checkout = &.{.{ .name = "submodules", .value = .{ .lit = "true" } }} };
-    try expectReason("submodules", unsupported(io, testJob(&.{co}), root, ok));
+    // Submodules are fetched natively (`fetchCheckout`), whether literal or an expression.
+    for ([_]job_mod.Template{ .{ .lit = "true" }, .{ .lit = "recursive" }, .{ .expr = "inputs.s" } }) |v| {
+        co.action = .{ .checkout = &.{.{ .name = "submodules", .value = v }} };
+        try std.testing.expect(unsupported(io, testJob(&.{co}), root, ok) == null);
+    }
 
     var uses = testStep("");
     uses.action = .{ .uses = .{ .owner = "actions", .name = "setup-node", .ref = "v4" } };
@@ -3122,16 +3180,25 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
         with_services.services = &.{.{ .name = "pg", .image = .{ .expr = "matrix.db" } }};
         try expectReason("expression", unsupported(io, with_services, root, ok));
     }
-    // `container:` jobs and any image are pulled natively; a job container's ports, volumes and
-    // options are not native yet.
+    // `container:` jobs and any image are pulled natively; a job container's ports and volumes
+    // are not native yet, and its options only the ones `container_options.zig` carries out.
     var container = run_only;
     container.container = .{ .name = "", .image = .{ .lit = "node:22" } };
     try std.testing.expect(unsupported(io, container, root, ok) == null);
     container.container.?.ports = &.{.{ .lit = "8080:80" }};
     try expectReason("`ports:`", unsupported(io, container, root, ok));
     container.container.?.ports = &.{};
+    container.container.?.volumes = &.{.{ .lit = "/srv:/srv" }};
+    try expectReason("`volumes:`", unsupported(io, container, root, ok));
+    container.container.?.volumes = &.{};
+    // An option the sandbox does not carry out is named, never dropped; the others are native.
     container.container.?.options = .{ .lit = "--cpus 1" };
-    try expectReason("`options:`", unsupported(io, container, root, ok));
+    try expectReason("`--cpus`", unsupported(io, container, root, ok));
+    container.container.?.options = .{ .lit = "--user 1001 -e A=1 --workdir /w --health-cmd true" };
+    try std.testing.expect(unsupported(io, container, root, ok) == null);
+    container.container.?.options = .{ .expr = "matrix.options" };
+    try expectReason("expression", unsupported(io, container, root, ok));
+    container.container.?.options = null;
     var custom = root;
     custom.image = "alpine:3";
     try std.testing.expect(unsupported(io, run_only, custom, ok) == null);
@@ -3375,6 +3442,145 @@ test "the native checkout: the commit, its .git, and the checkout's fixed time" 
         std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
         return error.TestUnexpectedResult;
     };
+}
+
+/// A repository with a submodule that has a submodule: `o/r.git` holds `sub` (file `in-sub`), which
+/// holds `deep` (file `in-deep`), all at file:// URLs under the returned root, which the job's
+/// sandbox sees at the same path (`cfg.binds`). Null when git is missing.
+fn submoduleRepos(arena: Allocator, cfg: *Config, tmp: *std.testing.TmpDir) !?struct {
+    root: []const u8,
+    sha: []const u8,
+} {
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const g = "git -c user.name=t -c user.email=t@t -c protocol.file.allow=always";
+    const make = try std.fmt.allocPrint(arena, "set -e; cd '{[r]s}'; " ++
+        "for n in deep sub r; do git init -q -b main --bare o/$n.git; git init -q -b main src-$n; done; " ++
+        "cd src-deep; echo in-deep > in-deep; git add .; {[g]s} commit -q -m deep; " ++
+        "git push -q ../o/deep.git HEAD:refs/heads/main; cd ../src-sub; echo in-sub > in-sub; " ++
+        "{[g]s} submodule add -q file://{[r]s}/o/deep.git deep; git add .; " ++
+        "{[g]s} commit -q -m sub; git push -q ../o/sub.git HEAD:refs/heads/main; cd ../src-r; " ++
+        "echo in-r > in-r; {[g]s} submodule add -q file://{[r]s}/o/sub.git sub; git add .; " ++
+        "{[g]s} commit -q -m r; git push -q ../o/r.git HEAD:refs/heads/main", .{
+        .r = root,
+        .g = g,
+    });
+    const made = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", make } }) catch return null;
+    if (made.term != .exited or made.term.exited != 0) {
+        std.debug.print("git could not make the repositories: {s}\n", .{made.stderr});
+        return null;
+    }
+    const sha = std.mem.trim(u8, (try std.process.run(arena, io, .{
+        .argv = &.{ "git", "-C", try std.fmt.allocPrint(arena, "{s}/src-r", .{root}), "rev-parse", "HEAD" },
+    })).stdout, "\n");
+    try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "rootfs/{s}", .{root}));
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{
+        cfg.binds,
+        &.{.{ .host = root, .at = root }},
+    });
+    return .{ .root = root, .sha = sha };
+}
+
+/// The job's env for a checkout from those repositories: the owner check off (they are the host's
+/// root's, nobody in the job's namespace) and the file transport on for submodules (git refuses it
+/// by default; GitHub's are HTTPS).
+const file_repos_env = [_]job_mod.Input{.{
+    .name = "GIT_CONFIG_PARAMETERS",
+    .value = .{ .lit = "'safe.directory=*' 'protocol.file.allow=always'" },
+}};
+
+test "the native checkout's submodules: `true` the first level, `recursive` all, `false` none" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const repos = (try submoduleRepos(arena, &cfg, &tmp)) orelse
+        return skip(false, "git is not installed");
+
+    // What actions/checkout leaves for each: the submodule's files and its own submodule's.
+    const cases = [_]struct { input: ?[]const u8, sub: bool, deep: bool }{
+        .{ .input = null, .sub = false, .deep = false },
+        .{ .input = "false", .sub = false, .deep = false },
+        .{ .input = "true", .sub = true, .deep = false },
+        .{ .input = "recursive", .sub = true, .deep = true },
+    };
+    for (cases) |c| {
+        var co = testStep("");
+        co.name = "checkout";
+        co.action = .{ .checkout = if (c.input) |v| &.{
+            .{ .name = "submodules", .value = .{ .lit = v } },
+        } else &.{} };
+        const check = testStep("echo r=$(cat in-r) sub=$(test -f sub/in-sub && echo yes || " ++
+            "echo no) deep=$(test -f sub/deep/in-deep && echo yes || echo no); " ++
+            "echo mtime=$(stat -c %Y in-r)");
+        var job = testJob(&.{ co, check });
+        job.github.server_url = try std.fmt.allocPrint(arena, "file://{s}", .{repos.root});
+        job.github.sha = repos.sha;
+        job.env = &file_repos_env;
+        var env: std.process.Environ.Map = .init(arena);
+        var w: std.Io.Writer.Allocating = .init(arena);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+        const res = try dagger.run(arena, std.testing.io, &env, .{
+            .native = cfg,
+            .step_user = .root,
+            .gpa = std.testing.allocator,
+        }, job, &log);
+        const text = w.written();
+        const want = try std.fmt.allocPrint(arena, "r=in-r sub={s} deep={s}", .{
+            if (c.sub) "yes" else "no",
+            if (c.deep) "yes" else "no",
+        });
+        if (res.steps[0].outcome != .success or res.steps[1].outcome != .success or
+            std.mem.indexOf(u8, text, want) == null)
+        {
+            std.debug.print("submodules {s}: wanted {s}; engine {s}\n{s}\n", .{
+                c.input orelse "(unset)", want, res.engine_error orelse "-", text,
+            });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "native step cache: a checkout with submodules never replays one without, or with fewer" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try cachedConfig(arena, &tmp);
+    const repos = (try submoduleRepos(arena, &c.cfg, &tmp)) orelse
+        return skip(false, "git is not installed");
+
+    // The same commit three ways, each leaving something else: each runs its checkout once and
+    // is replayed after that, never from another's layer.
+    const inputs = [_][]const u8{ "false", "true", "recursive" };
+    const seen = [_][]const u8{ "sub=no deep=no", "sub=yes deep=no", "sub=yes deep=yes" };
+    for (inputs, seen, 0..) |input, want, i| {
+        var co = testStep("");
+        co.name = "checkout";
+        co.action = .{ .checkout = &.{
+            .{ .name = "ref", .value = .{ .lit = repos.sha } },
+            .{ .name = "submodules", .value = .{ .lit = input } },
+        } };
+        const check = testStep("echo sub=$(test -f sub/in-sub && echo yes || echo no) " ++
+            "deep=$(test -f sub/deep/in-deep && echo yes || echo no)");
+        var job = testJob(&.{ co, check });
+        job.github.server_url = try std.fmt.allocPrint(arena, "file://{s}", .{repos.root});
+        job.env = &file_repos_env;
+        const first = try runCached(arena, c.cfg, job, try std.fmt.allocPrint(arena, "a{d}", .{i}));
+        try expectSucceeded(first);
+        if (std.mem.indexOf(u8, first.text, want) == null) {
+            std.debug.print("wanted {s} on the first run:\n{s}\n", .{ want, first.text });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first.text, dagger.native_reused_note));
+        const again = try runCached(arena, c.cfg, job, try std.fmt.allocPrint(arena, "b{d}", .{i}));
+        try expectSucceeded(again);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, again.text, dagger.native_reused_note));
+        try std.testing.expect(std.mem.indexOf(u8, again.text, want) != null);
+    }
 }
 
 test "a native checkout that cannot fetch fails its step with why" {
@@ -4779,6 +4985,69 @@ test "a container job on the native backend: its image pulled with its credentia
     };
     try std.testing.expect(std.mem.indexOf(u8, text3, "Engine: native") == null);
     try std.testing.expect(!slots[0].native);
+}
+
+test "a container job's options on the native backend: --user and --env, the rest noted" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+
+    // A user other than root cannot make /__w itself, as in any image: this one has it, for `app`.
+    var work: oci_layer.TestTar = .{ .a = arena };
+    try work.add(.{ .path = "__w/", .kind = .directory, .mode = 0o777 });
+    const layers = try std.mem.concat(arena, []const u8, &.{
+        try testImageLayers(arena),
+        &.{try work.finish()},
+    });
+    const image_env = "\"PATH=/usr/bin:/bin\",\"BOTH=image\"";
+    const img = try testregistry.testImage(arena, "test/opts", "1", layers, image_env, false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    // A rootless runner maps only root, so there the user is root; `app` needs a root runner.
+    const as_root = std.os.linux.geteuid() == 0;
+    const user = if (as_root) "app" else "root";
+    var job = testJob(&.{testStep("echo uid=$(id -u) gid=$(id -g); echo A=$A BOTH=$BOTH; " ++
+        "echo SPACED=$SPACED; pwd")});
+    job.container = .{
+        .name = "",
+        .image = .{ .lit = try server.image(arena, "test/opts:1") },
+        .env = &.{.{ .name = "BOTH", .value = .{ .lit = "container" } }},
+        // The image's /etc/passwd has `app` as 1002:1003. `--workdir` and `--health-*` are the
+        // runner's, not the steps': `docker exec -w` and the services' health only.
+        .options = .{ .lit = try std.fmt.allocPrint(arena, "--user {s} -e A=1 --env " ++
+            "BOTH=options -e \"SPACED=two words\" --workdir /nowhere --health-cmd true " ++
+            "--health-interval 5s", .{user}) },
+    };
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const text = w.written();
+    if (!res.succeeded) std.debug.print("{s}\n", .{text});
+    try std.testing.expect(res.succeeded);
+    const expect = [_][]const u8{
+        "Engine: native",
+        // `--user` over the image's USER (none here), `--env` over the container's `env:`.
+        if (as_root) "uid=1002 gid=1003" else "uid=0 gid=0",
+        "A=1 BOTH=options",
+        "SPACED=two words",
+        "/__w/r/r",
+        try std.fmt.allocPrint(arena, "Container options: 3 `--env`, `--user` {s}; 3 understood " ++
+            "and without effect natively", .{user}),
+    };
+    for (expect) |e| if (std.mem.indexOf(u8, text, e) == null) {
+        std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
+        return error.TestUnexpectedResult;
+    };
 }
 
 test "native provisioning: a step on the pulled image, flattened and kept under its key" {
