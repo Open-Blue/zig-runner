@@ -284,6 +284,7 @@ pub const Config = struct {
         InvalidNativeCgroup,
         InvalidEngine,
         EngineNoneNeedsNative,
+        EngineNoneNoNesting,
         InvalidBool,
         InvalidZigSeed,
         UnknownFlag,
@@ -298,6 +299,8 @@ pub const Config = struct {
                 "not set, so this runner would fail every job. Set it to the refs prod may run " ++
                 "(RUNNER_TRUSTED_REFS=refs/heads/main,refs/tags/v*), or to * to trust every ref " ++
                 "(README, \"Environments\").",
+            error.EngineNoneNoNesting => "RUNNER_DAGGER_NESTING gives steps the Dagger engine, " ++
+                "and RUNNER_ENGINE=none has none: turn one of them off.",
             error.InvalidNativeRootfs => "RUNNER_NATIVE_ROOTFS is a directory's absolute path: " ++
                 "overlay takes it as a layer from the job's directory.",
             error.InvalidNativeMinFree => "RUNNER_NATIVE_MIN_FREE_PCT is a percentage, 0 to 100",
@@ -356,6 +359,8 @@ pub const Config = struct {
         }
         // No engine and no native backend would be a runner that can run nothing.
         if (c.engine == .none and c.backend != .native) return error.EngineNoneNeedsNative;
+        // Nesting gives a step the engine's session, which `none` has not: every job would fail.
+        if (c.engine == .none and c.dagger_nesting) return error.EngineNoneNoNesting;
         if (c.native_rootfs.len > 0 and !std.fs.path.isAbsolutePosix(c.native_rootfs))
             return error.InvalidNativeRootfs;
         _ = try native_net.Subnet.parse(c.native_subnet);
@@ -761,6 +766,10 @@ test "RUNNER_ENGINE=none needs the native backend, and leaves no engine to reach
     try std.testing.expect(c.engineEndpoint() == null);
     // The default is unchanged: cli and direct still reach an engine.
     try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--engine=cli" })).engineless());
+    // Steps that use the engine cannot run without one: a configuration error, not failed jobs.
+    try env.put("RUNNER_DAGGER_NESTING", "true");
+    try std.testing.expectError(error.EngineNoneNoNesting, Config.load(&env, &.{"runner"}));
+    try std.testing.expect((try Config.load(&env, &.{ "runner", "--engine=cli" })).dagger_nesting);
 }
 
 test "--runners and RUNNER_COUNT" {

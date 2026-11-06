@@ -3,10 +3,14 @@
 #
 #   docker compose -f deploy/compose.yaml -f deploy/compose.engineless.yaml up -d --build
 #
-# Jobs the native backend cannot run fail at once, saying why, instead of waiting for an engine.
-# The native backend needs privileges to make its sandboxes: the engine service has `privileged:
-# true` in compose.yaml, and the runner needs the same or `cap_add` (docs/native-backend.md, P1),
-# which this file does not grant.
+# Jobs the native backend cannot run fail at once, saying why, instead of waiting for an engine,
+# and a machine that cannot run native steps at all stops the runner at start-up with the reason.
+#
+# What the native backend needs of its container (docs/native-backend.md, P1, "Under
+# deploy/compose.yaml") is below: privileges for its sandboxes, the host's network for its bridge,
+# a store on a volume (overlayfs cannot take an upper directory on overlayfs), the host's
+# /run/zig-runner for the slots' locks, and a private cgroup that it moves itself into. A host
+# that wants less than `privileged` can use the `cap_add` and `security_opt` lines there instead.
 services:
   engine:
     # Not started: only a service in a profile that is not enabled is left out of `up`.
@@ -19,4 +23,20 @@ services:
       RUNNER_ENGINE: none
       # The engine socket's volume is not there to mount.
       RUNNER_ENGINE_HOST: ""
-    volumes: !reset []
+      # The container's own cgroup is its root: the runner makes the jobs' leaves under it.
+      RUNNER_NATIVE_CGROUP: self
+      RUNNER_NATIVE_STORE: /var/lib/zig-runner/native
+    privileged: true
+    network_mode: host
+    cgroup: private
+    # `!override` replaces compose.yaml's list (the engine socket's volume) instead of adding to it.
+    volumes: !override
+      - native-store:/var/lib/zig-runner/native
+      - /run/zig-runner:/run/zig-runner
+
+volumes:
+  # Images, layers and cache volumes of the native jobs: the engine's cache, without the engine.
+  native-store:
+  # Not used here: left out of the project's volumes so nothing creates it empty.
+  engine-state: !reset null
+  engine-socket: !reset null
