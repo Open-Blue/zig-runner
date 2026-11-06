@@ -1918,7 +1918,7 @@ fn runSteps(
             // which pulls and sets up on its own and fails the job itself if the job is at fault
             // (`runNative`). Not once the job is cancelled, nor out of memory.
             const why = if (e == error.BaseContainerFailed) err_msg else @errorName(e);
-            if (setUpFallback(opts, e)) {
+            if (setUpFallback(opts, e) and !b.job_fault) {
                 b.to_dagger = try std.fmt.allocPrint(arena, "the native set-up failed ({s})", .{why});
                 return error.NativeToDagger;
             }

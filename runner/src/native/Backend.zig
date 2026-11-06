@@ -90,6 +90,10 @@ build_reason: []const u8 = "",
 /// Why the job runs on Dagger after all, found in `base` (`error.NativeToDagger`): one of its
 /// actions is something native steps cannot run yet (`actions.preload`).
 to_dagger: []const u8 = "",
+/// Set when `base` failed because of the job itself, which Dagger would not mend (a `--user` the
+/// image does not know): the job fails with the reason instead of falling back, where the
+/// option would be dropped and the steps run as root.
+job_fault: bool = false,
 binds: []const sandbox.Spec.Bind,
 /// The host's resolver and hosts file over the image's (`jobBinds`), in `binds` too; services get
 /// these and `service_binds` (`serviceBinds`).
@@ -1230,10 +1234,9 @@ pub fn base(
     t = b.timings.since(arena, .actions, t);
     defer _ = b.timings.since(arena, .base, t);
 
-    // The workspace and RUNNER_TEMP, made as Dagger's base makes them: in the provisioned image by
-    // root, owned by the step user when it is not root; in any other image by its own user, who
-    // may be unable to (its steps then say so). From `/`, as the workspace is not there yet. The
-    // event payload goes in as `withNewFile` does.
+    // The workspace and RUNNER_TEMP, made as Dagger's base makes them: by root, owned by the step
+    // user when it is not root (see `unprivileged` below). From `/`, as the workspace is not there
+    // yet. The event payload goes in as `withNewFile` does.
     //
     // And RUNNER_TOOL_CACHE, which Dagger mounts in every job (`set_up.cachesUsed`) owned by the
     // step user: the job's `toolcache` volume, bound there in every step (`volumes.plan`). A job
@@ -1253,20 +1256,32 @@ pub fn base(
         try std.fmt.allocPrint(arena, " && ln -sfn {s} {s}/.venv", .{ e, ev.workspace })
     else
         "";
-    const mk = if (plan.provision) try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}{s}{s}", .{
-        ev.workspace,
-        ev.temp,
-        tool_dir,
-        link,
-        chown,
-    }) else try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s} 2>/dev/null{s} || true", .{
-        ev.workspace,
-        ev.temp,
-        tool_dir,
-        link,
-    });
-    const mk_uid: u32 = if (plan.provision) 0 else b.uid;
-    const mk_gid: u32 = if (plan.provision) 0 else b.gid;
+    // A user other than root cannot make `/__w` in an image that does not have it writable (GitHub
+    // mounts it from the host, so there it exists): made by root and handed to it, as provisioned
+    // images do. Root's own mkdir stays tolerant of an image that cannot be written.
+    const unprivileged = !plan.provision and (b.uid != 0 or b.gid != 0);
+    const mk = if (plan.provision or unprivileged)
+        try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}{s}{s}", .{
+            ev.workspace,
+            ev.temp,
+            tool_dir,
+            link,
+            if (unprivileged) try std.fmt.allocPrint(arena, " && chown -R {d}:{d} {s}{s}", .{
+                b.uid,
+                b.gid,
+                dagger.work_root,
+                tool_dir,
+            }) else chown,
+        })
+    else
+        try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s} 2>/dev/null{s} || true", .{
+            ev.workspace,
+            ev.temp,
+            tool_dir,
+            link,
+        });
+    const mk_uid: u32 = 0;
+    const mk_gid: u32 = 0;
     const event_file = [_]sandbox.Spec.File{.{
         .path = dagger.event_path,
         .contents = event,
@@ -1311,11 +1326,12 @@ fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
     if (b.envValue("PATH") == null) try b.put("PATH", image_path);
     // Right after the image's own env, as `set_up.writeFrom` sets it.
     for (b.cache_plan.early_env.items) |e| try b.put(e.name, e.value);
-    // A `container:` job's own env, as `docker create -e` sets it; its PATH is the container's
+    // A `container:` job's `options: --env` first, then its own `env:` over them: GitHub's
+    // `DockerCommandManager.DockerCreate` puts the `options:` string on the command line before
+    // the `-e` of the `env:`, and the later `-e` of a name wins. Its PATH is the container's
     // (`Exec.container_path`).
-    for (plan.container_env) |e| try b.put(e.name, e.value);
-    // Then its `options: --env`, which `docker create` reads after the `-e` of its `env:`.
     for (b.container_opts.env) |e| try b.put(e.name, e.value);
+    for (plan.container_env) |e| try b.put(e.name, e.value);
     if (ev.job.container != null) b.runtime_path = b.envValue("PATH");
     b.uid = b.image_uid;
     b.gid = b.image_gid;
@@ -2513,6 +2529,9 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
     const user = b.container_opts.user orelse img.user;
     if (!plan.as_runner and user.len > 0) {
         const user_ids = b.imageUser(user) catch |e| {
+            // `docker create --user typo` fails on GitHub; Dagger would not read the option.
+            b.job_fault = b.container_opts.user != null and
+                (e == error.UnknownUser or e == error.UnknownGroup);
             err_msg.* = try std.fmt.allocPrint(arena, "the {s} {s}: {s}", .{
                 if (b.container_opts.user != null) "container's --user" else "image's USER",
                 user,
