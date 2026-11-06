@@ -130,7 +130,7 @@ const Merged = struct {
                 for (roots[0..i]) |r| _ = linux.close(r);
                 return m.fail("cannot read the job's layer {s}: {t}", .{ path, linux.errno(fd) });
             }
-            roots[i] = @intCast(fd);
+            roots[i] = std.math.cast(linux.fd_t, fd).?;
         }
         m.roots = roots;
     }
@@ -211,13 +211,14 @@ const Merged = struct {
         if (m.dirs.get(dir)) |c| return c;
         var found: std.ArrayList(u32) = .empty;
         if (dir.len == 0) {
-            for (0..m.roots.len) |i| try found.append(m.arena, @intCast(i));
+            var i: u32 = 0;
+            while (i < m.roots.len) : (i += 1) try found.append(m.arena, i);
         } else if (try m.contribs(parentOf(dir))) |above| {
             for (above) |layer| {
                 switch ((try m.lstat(layer, dir)).kind) {
                     .missing => continue,
                     .dir => {
-                        try found.append(m.arena, @intCast(layer));
+                        try found.append(m.arena, layer);
                         if (try m.isOpaque(layer, dir)) break;
                     },
                     else => break,
@@ -327,8 +328,12 @@ const Merged = struct {
 
     // --- glob.Fs ---
 
+    fn erased(ptr: *anyopaque) *Merged {
+        return @ptrCast(@alignCast(ptr));
+    }
+
     fn statAll(ptr: *anyopaque, arena: Allocator, paths: []const []const u8, follow: bool) Error![]const glob.Kind {
-        const m: *Merged = @ptrCast(@alignCast(ptr));
+        const m = erased(ptr);
         const out = try arena.alloc(glob.Kind, paths.len);
         for (paths, out) |p, *k| {
             const at = (try m.resolve(p, follow)) orelse {
@@ -348,7 +353,7 @@ const Merged = struct {
 
     /// The names in each directory: the union of its layers' entries, less those a whiteout hides.
     fn listAll(ptr: *anyopaque, arena: Allocator, dirs: []const []const u8) Error![]const []const []const u8 {
-        const m: *Merged = @ptrCast(@alignCast(ptr));
+        const m = erased(ptr);
         const out = try arena.alloc([]const []const u8, dirs.len);
         for (dirs, out) |d, *list| list.* = try m.listDir(arena, d);
         return out;
@@ -391,7 +396,7 @@ const Merged = struct {
     /// Each path with every link taken. A path that is not there cannot be listed or followed:
     /// the walk asks only about directories it has just seen.
     fn realpathAll(ptr: *anyopaque, arena: Allocator, paths: []const []const u8) Error![]const []const u8 {
-        const m: *Merged = @ptrCast(@alignCast(ptr));
+        const m = erased(ptr);
         const out = try arena.alloc([]const u8, paths.len);
         for (paths, out) |p, *r| {
             const at = (try m.resolve(p, true)) orelse return m.fail("{s}: No such file or directory", .{p});
