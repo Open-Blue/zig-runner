@@ -32,6 +32,8 @@
 //! kernel refuses while any writer, a mapping included, holds the file, and then lists the file
 //! as racy too. The signal a lease break sends is SIGURG (`F_SETSIG`), whose default is to be
 //! ignored: SIGIO, the default, is what `std.Io` interrupts blocked calls with.
+//! A lease only says that where it is known to: overlayfs grants one over a writable mapping,
+//! whose file is the one beneath, so on a filesystem not known to refuse it every file is racy.
 //!
 //! Unlike the script, this runs in the runner's process, on a directory a job can write, so it is
 //! confined and bounded. Every look at the volume is relative to a directory descriptor, through
@@ -640,7 +642,7 @@ const Check = struct {
         defer if (leased) {
             _ = linux.fcntl(fd, linux.F.SETLEASE, linux.F.UNLCK);
         };
-        f.racy = !leased;
+        f.racy = !leased or !leasesSeeMappings(fsType(fd));
         var st: linux.Statx = undefined;
         if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{
             .TYPE = true,
@@ -855,6 +857,24 @@ fn keepList(t: Allocator, io: std.Io, path: []const u8, text: []const u8) void {
     };
 }
 
+/// The filesystem `fd` is on, 0 if that cannot be told: `struct statfs`'s `f_type`, first, a long
+/// on x86_64 and aarch64.
+fn fsType(fd: linux.fd_t) u64 {
+    var st: [120]u8 align(8) = undefined;
+    if (linux.errno(linux.syscall2(.fstatfs, std.math.cast(usize, fd) orelse return 0, @intFromPtr(&st))) != .SUCCESS)
+        return 0;
+    return std.mem.readInt(u64, st[0..8], .little);
+}
+
+/// Whether a read lease on this filesystem is refused while a writable mapping holds the file:
+/// only those it was seen on (the test "a file a shared mapping still writes"). A file anywhere
+/// else is read again at each check, which costs a read and never trust.
+fn leasesSeeMappings(fs_type: u64) bool {
+    const ext4 = 0xef53;
+    const tmpfs = 0x01021994;
+    return fs_type == ext4 or fs_type == tmpfs;
+}
+
 /// These lists are a cache: a failure here costs a read later, and is dropped. A cancel is not:
 /// std.Io delivers it once, so it is re-armed for what runs next.
 fn rearm(io: std.Io, e: anyerror) void {
@@ -1048,6 +1068,11 @@ test "tool trees: a list spares the reading, and a change it cannot hide is read
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const f = try fixture(arena, &tmp);
+    // Where a lease says nothing every file is racy, and no list spares a read.
+    const dir_fd = linux.open(try std.fmt.allocPrintSentinel(arena, "{s}", .{f.cache}, 0), .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    try std.testing.expect(linux.errno(dir_fd) == .SUCCESS);
+    defer _ = linux.close(std.math.cast(linux.fd_t, dir_fd).?);
+    if (!leasesSeeMappings(fsType(std.math.cast(linux.fd_t, dir_fd).?))) return error.SkipZigTest;
     const tree = try std.fmt.allocPrint(arena, "{s}/{s}", .{ f.cache, tree_rel });
     const first = try checkWith(arena, f, .{ .racy_s = 0 }, null);
     const second = try checkWith(arena, f, .{ .racy_s = 0 }, null);
@@ -1241,6 +1266,14 @@ test "tool trees: a file a shared mapping still writes is read again, not truste
     bytes[1] = 'b';
     const v = try checkWith(arena, f, .{ .racy_s = 0 }, null);
     try expectIn(v.env, try shellDigest(arena, tree));
+}
+
+test "tool trees: a lease is believed only where a writable mapping was seen to refuse it" {
+    try std.testing.expect(leasesSeeMappings(0xef53));
+    try std.testing.expect(leasesSeeMappings(0x01021994));
+    const overlayfs = 0x794c7630;
+    try std.testing.expect(!leasesSeeMappings(overlayfs));
+    try std.testing.expect(!leasesSeeMappings(0));
 }
 
 test "tool trees: a plant of names does not cost the trees that were checked before" {
