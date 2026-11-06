@@ -77,6 +77,37 @@ fi
 if [[ -n ${ZIG_TEST_FILTER:-} ]]; then
 	filter=(--test-filter "$ZIG_TEST_FILTER")
 fi
+# ZIG_TEST_IN_CONTAINER=1: the tests run in a Docker container of the default job image
+# (runner/src/dagger.zig), as the project's own runner runs them on a push to main, where the
+# working directory is the container's overlayfs: not the host's ext4 or tmpfs, which pull
+# requests test on. Overlayfs differs where tests can notice (it grants a read lease over a
+# writable mapping, #332's test relied on the opposite). The user is the host's, not root; Docker's default seccomp refuses the namespaces
+# the native backend needs, so its tests skip, as on that runner. The tests write into the
+# container's /tmp (their `.zig-cache/tmp` is relative to it); the scratch directory and the test
+# binary's are mounted read-only at their own paths.
+if [[ ${ZIG_TEST_IN_CONTAINER:-} == 1 ]]; then
+	image=$(tr -d '\n' <../runner/src/dagger.zig | grep -oE '"ubuntu:[A-Za-z0-9._-]+" *\+\+ *"@sha256:[a-f0-9]{64}"' | tr -d '" +')
+	[[ -n $image ]] || {
+		echo "zig-test.sh: no default_image in runner/src/dagger.zig" >&2
+		exit 1
+	}
+	for attempt in 1 2 3; do
+		docker pull -q "$image" >/dev/null && break
+		((attempt < 3)) || exit 1
+		sleep $((attempt * 10))
+	done
+	# The test binary's path is the compiler's, relative; the container needs it whole.
+	cat >"$scratch/in-container" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+image=$1 scratch=$2 shards=$3 bin=$(realpath "$4")
+exec docker run --rm --user "$(id -u):$(id -g)" -w /tmp \
+	-v "$scratch:$scratch:ro" -v "$(dirname "$bin"):$(dirname "$bin"):ro" \
+	-e ZIG_RUNNER_TEST_EXE -e ZIG_TEST_SHARDS "$image" "$shards" "$bin"
+SCRIPT
+	chmod +x "$scratch/in-container"
+	run+=(--test-cmd "$scratch/in-container" --test-cmd "$image" --test-cmd "$scratch")
+fi
 # The tests run in several processes (tools/test_shards.zig), which this starts; the same program
 # `zig build test` runs. ZIG_TEST_SHARDS=1 runs the test binary itself.
 run+=(--test-cmd "$scratch/test_shards" --test-cmd-bin)

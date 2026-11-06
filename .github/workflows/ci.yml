@@ -146,7 +146,10 @@ jobs:
   # ZLint over the runner's Zig (.github/scripts/zlint.sh, its rules in runner/zlint.json): CodeQL
   # and Semgrep read no Zig, so this is the only static analysis of the runner's own code besides
   # the compiler. A few seconds, with no Zig to install. Skipped, still reporting, on a change that
-  # cannot affect it (ci-scope.sh tests).
+  # cannot affect it (ci-scope.sh tests). Its suppressed-errors rule runs here too, against the
+  # baseline of the sites read and meant: the rule cannot be on in runner/zlint.json (zlint.sh says
+  # why), and run only by analysis.yml's nightly it let two `catch {}` sites (#327, #332) merge
+  # and fail that night. The same binary, so about two seconds more.
   lint:
     name: Lint (ZLint)
     runs-on: ubuntu-26.04
@@ -167,6 +170,10 @@ jobs:
       - name: ZLint
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/zlint.sh
+
+      - name: ZLint (suppressed-errors)
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/zlint.sh suppressed-errors
 
   # The comparison tools' Go (runner/tools/*diff), with go vet, staticcheck and the race detector
   # (go-lint.sh): they are test oracles, so a bug in one hides one in the runner. Skipped, still
@@ -322,6 +329,22 @@ jobs:
             echo "::$stop::" >&2
             exit "$status"
           fi
+
+      # The same tests in a Docker container, where the working directory is overlayfs, as on the
+      # project's own runner (a push to main): pull requests and the merge queue otherwise test on
+      # the VM's ext4, which agrees with overlayfs on nearly everything and not on all (#332's test
+      # passed on every pull request and failed on every push to main, as overlayfs grants a read
+      # lease over a writable mapping). The native backend's tests skip in it, as there: Docker's
+      # seccomp refuses their namespaces, and the passes above ran them. The compile is the tests'
+      # above, cached; about a minute and a half more (zig-test.sh, ZIG_TEST_IN_CONTAINER).
+      - name: Test, on overlayfs
+        if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        # Ten times its time, so a test that does not finish fails here, not at the job's limit.
+        timeout-minutes: 10
+        working-directory: runner
+        env:
+          ZIG_TEST_IN_CONTAINER: "1"
+        run: ../.github/scripts/zig-test.sh
 
       # Every test in runner/src is one the test binary has: a file that nothing reached compiled
       # and passed with its tests never run (github/http.zig's, until #326). Its compile is the
