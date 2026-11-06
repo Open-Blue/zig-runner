@@ -17,8 +17,10 @@ pub fn client(local: *std.http.Client) *std.http.Client {
     return shared.load(.acquire) orelse local;
 }
 
-/// The least time between two `renew`s, and the awake clock at the last one (0: none yet).
+/// The least time between two `renew`s, the time of the last one (0: none yet), and the age at which
+/// `keepFresh` replaces a client that has met no failure. Real time: a laptop's sleep counts.
 const renew_every_s = 15 * 60;
+const renew_age_s = 24 * 60 * 60;
 var renewed_at_s: std.atomic.Value(i64) = .init(0);
 
 /// Replaces the shared client with a new one, unless that already happened since `stale` was taken.
@@ -31,14 +33,28 @@ var renewed_at_s: std.atomic.Value(i64) = .init(0);
 /// failure with another cause, and an outage that lasts would otherwise leave a client behind on
 /// every try.
 pub fn renew(stale: *std.http.Client) void {
-    const now = std.Io.Clock.awake.now(stale.io).toSeconds();
+    const now = std.Io.Clock.real.now(stale.io).toSeconds();
     const last = renewed_at_s.load(.acquire);
     if (last != 0 and now - last < renew_every_s) return;
     if (renewed_at_s.cmpxchgStrong(last, now, .acq_rel, .acquire) != null) return;
     const gpa = stale.allocator;
     const fresh = gpa.create(std.http.Client) catch return;
     fresh.* = .{ .allocator = gpa, .io = stale.io, .write_buffer_size = stale.write_buffer_size };
-    if (shared.cmpxchgStrong(stale, fresh, .acq_rel, .acquire) != null) gpa.destroy(fresh);
+    if (shared.cmpxchgStrong(stale, fresh, .acq_rel, .acquire) != null) return gpa.destroy(fresh);
+    // Its idle connections close now, and the ones in use as they finish.
+    stale.connection_pool.resize(stale.io, 0) catch return;
+}
+
+/// Replaces the shared client once it is `renew_age_s` old, for what no failure shows: its clock
+/// also accepts a certificate that expired since it took the time. Called before a request; the
+/// first call starts the count.
+pub fn keepFresh(io: std.Io) void {
+    const c = shared.load(.acquire) orelse return;
+    const now = std.Io.Clock.real.now(io).toSeconds();
+    const last = renewed_at_s.load(.acquire);
+    if (last == 0) {
+        _ = renewed_at_s.cmpxchgStrong(0, now, .acq_rel, .acquire);
+    } else if (now - last >= renew_age_s) renew(c);
 }
 
 /// How many times a request may meet a kept-alive connection the server has closed (nothing was
@@ -79,6 +95,7 @@ pub fn fetch(
     c: *std.http.Client,
     options: std.http.Client.FetchOptions,
 ) FetchError!std.http.Client.FetchResult {
+    keepFresh(c.io);
     var attempt: u32 = 0;
     var cl = c;
     var renewed = false;
@@ -236,6 +253,30 @@ test "renew leaves one client behind at most in its interval, however long TLS k
     // The new client fails too: it stays, and no third is made.
     renew(second);
     try std.testing.expectEqual(second, shared.load(.acquire).?);
+}
+
+test "a client is replaced at its age with no failure, and its idle connections go with it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var first: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer first.deinit();
+    shared.store(&first, .release);
+    defer shared.store(null, .release);
+    renewed_at_s.store(0, .release);
+
+    // The first call starts the count, and a young client stays.
+    keepFresh(io);
+    try std.testing.expect(renewed_at_s.load(.acquire) != 0);
+    keepFresh(io);
+    try std.testing.expectEqual(&first, shared.load(.acquire).?);
+
+    renewed_at_s.store(std.Io.Clock.real.now(io).toSeconds() - renew_age_s, .release);
+    keepFresh(io);
+    const second = shared.load(.acquire).?;
+    defer gpa.destroy(second);
+    defer second.deinit();
+    try std.testing.expect(second != &first);
+    try std.testing.expectEqual(@as(usize, 0), first.connection_pool.free_size);
 }
 
 test "what std makes of a handshake's failure counts as a stale clock" {

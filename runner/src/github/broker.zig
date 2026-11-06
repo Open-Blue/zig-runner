@@ -93,6 +93,7 @@ pub fn request(
     // or write that failed): once more, on a new connection of a client of its own, so not on
     // another connection the pool kept from the same time. A log upload read such a connection
     // for 17 minutes and then failed with ReadFailed (#100).
+    http.keepFresh(io);
     var attempt: u32 = 0;
     var renewed = false;
     var fresh = false;
