@@ -517,8 +517,9 @@ test "output keys: the step after one that always runs starts from that step's o
         "-mtime +0 -o -mtime +7 \\\\)); do /bin/busybox mv -T \\\"$p\\\" \\\"$p.dead.") != null);
     try std.testing.expect(std.mem.indexOf(u8, store, "-name '*.dead.*' -exec /bin/busybox rm -rf {} +") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, store, "-exec /bin/busybox rm -rf"));
-    // Matrix jobs share the run's nonce (123.1): the temporary name is the store's own.
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], ".tmp.123") == null);
+    // Matrix jobs share the run's nonce (123.1): the temporary name is the store's own. Its random
+    // hex can start with 123, but it has no dot.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], ".tmp.123.1") == null);
     // The next container: the one before the step (with what the runner added for it), the removed
     // path deleted and the content copied in, by digest; the step itself is not part of it.
     const apply = fake.seen.items[6];
