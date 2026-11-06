@@ -248,20 +248,25 @@ jobs:
           ANALYSIS: ${{ needs.scope.outputs.analysis }}
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
+          : >"$RUNNER_TEMP/valgrind-tests"
+          if [ -n "$BASE" ]; then
+            .github/scripts/changed-tests.sh "$BASE" >"$RUNNER_TEMP/valgrind-tests"
+          fi
           if [ "$ANALYSIS" = true ]; then
             echo "mode=all" >>"$GITHUB_OUTPUT"
             echo "Valgrind: every test"
+          elif [ -s "$RUNNER_TEMP/valgrind-tests" ]; then
+            echo "mode=changed" >>"$GITHUB_OUTPUT"
+            echo "Valgrind: the tests this change adds or edits"
           else
-            .github/scripts/changed-tests.sh "$BASE" >"$RUNNER_TEMP/valgrind-tests"
-            if [ -s "$RUNNER_TEMP/valgrind-tests" ]; then
-              echo "mode=changed" >>"$GITHUB_OUTPUT"
-              echo "Valgrind: the tests this change adds or edits:"
-              cat "$RUNNER_TEMP/valgrind-tests"
-            else
-              echo "mode=none" >>"$GITHUB_OUTPUT"
-              echo "Valgrind: this change adds or edits no test: skipped"
-            fi
+            echo "mode=none" >>"$GITHUB_OUTPUT"
+            echo "Valgrind: this change adds or edits no test: skipped"
           fi
+          # Test names are the author's text: a `::error::x` in one must not be read as a command.
+          stop="tests-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+          echo "::stop-commands::$stop"
+          cat "$RUNNER_TEMP/valgrind-tests"
+          echo "::$stop::"
 
       - name: Install Zig
         if: steps.tests.outputs.mode != 'none'

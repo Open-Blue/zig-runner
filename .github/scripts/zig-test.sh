@@ -99,11 +99,23 @@ if [[ ${ZIG_TEST_IN_CONTAINER:-} == 1 ]]; then
 	# The test binary's path is the compiler's, relative; the container needs it whole.
 	cat >"$scratch/in-container" <<'SCRIPT'
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 image=$1 scratch=$2 shards=$3 bin=$(realpath "$4")
-exec docker run --rm --user "$(id -u):$(id -g)" -w /tmp \
+# ZIG_TEST_CONTAINER_ARGS: more arguments for `docker run`, such as memory limits.
+read -ra extra <<<"${ZIG_TEST_CONTAINER_ARGS:-}"
+# --init: a step's timeout sends SIGTERM, which a container's PID 1 would otherwise ignore.
+docker run --rm --init --user "$(id -u):$(id -g)" -w /tmp "${extra[@]}" \
 	-v "$scratch:$scratch:ro" -v "$(dirname "$bin"):$(dirname "$bin"):ro" \
-	-e ZIG_RUNNER_TEST_EXE -e ZIG_TEST_SHARDS "$image" "$shards" "$bin"
+	-e ZIG_RUNNER_TEST_EXE -e ZIG_TEST_SHARDS "$image" "$shards" "$bin" 2>&1 | tee "$scratch/container.log"
+status=${PIPESTATUS[0]}
+# ZIG_TEST_MIN_PASSED: a floor on the tests that passed, so a mistake that skips nearly all of
+# them (the container's directory, the runner binary) cannot stay green.
+passed=$(sed -n 's/^\([0-9][0-9]*\) passed;.*/\1/p' "$scratch/container.log" | tail -n 1)
+if ((status == 0)) && ((${passed:-0} < ${ZIG_TEST_MIN_PASSED:-1})); then
+	echo "zig-test.sh: ${passed:-0} tests passed in the container, fewer than the ${ZIG_TEST_MIN_PASSED:-1} expected" >&2
+	exit 1
+fi
+exit "$status"
 SCRIPT
 	chmod +x "$scratch/in-container"
 	run+=(--test-cmd "$scratch/in-container" --test-cmd "$image" --test-cmd "$scratch")

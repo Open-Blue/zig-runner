@@ -52,6 +52,7 @@ needed() {
 			.github/scripts/install-zig.sh | .github/scripts/ci-database.sh | \
 			.github/scripts/zig-test.sh | .github/scripts/zig-modules.sh | \
 			.github/scripts/expr-conformance.sh | .github/scripts/zlint.sh | \
+			.github/scripts/zlint-suppressed.baseline | \
 			.github/scripts/native-service-images.sh) return 0 ;;
 		# Cannot change the runner's build or tests. The Workflows job checks the workflows, scripts
 		# and deployment scripts on every change; proofs and packaging check theirs.
@@ -134,6 +135,7 @@ needed() {
 		case $1 in
 		.github/workflows/analysis.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/zig-fuzz.sh | .github/scripts/zig-valgrind.sh | \
+			.github/scripts/changed-tests.sh | \
 			.github/scripts/zig-race-tests.sh | .github/scripts/zig-stress.sh | \
 			.github/scripts/zlint.sh | .github/scripts/zlint-suppressed.baseline | \
 			.github/valgrind.supp) return 0 ;;

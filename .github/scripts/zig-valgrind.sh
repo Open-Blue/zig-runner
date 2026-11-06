@@ -61,17 +61,32 @@ export ZIG_RUNNER_TEST_EXE="$scratch/runner"
 stop="valgrind-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 echo "::stop-commands::$stop"
 set +e
+# Valgrind writes to a file and the log is read from it (`tail --pid` ends with Valgrind), not
+# through a pipe: a process the tests left running (a setsid child) would hold a pipe open past
+# the timeout, and the job would wait on it to its own limit with nothing said.
+: >"$scratch/raw"
 timeout --kill-after=30s "${ZIG_VALGRIND_TIMEOUT:-35m}" "$valgrind" -q --tool=memcheck --error-exitcode=99 --track-origins=yes --num-callers=40 \
 	--aspace-minaddr=0x200000000 --suppressions=../.github/valgrind.supp --gen-suppressions=all \
-	"$scratch/test" 2>&1 | grep --line-buffered -v 'Warning: DWARF2 reader: Badly formed extended line op' |
-	tee "$scratch/log"
-status=${PIPESTATUS[0]}
+	"$scratch/test" >"$scratch/raw" 2>&1 &
+checking=$!
+tail -n +1 -f --pid="$checking" "$scratch/raw" 2>/dev/null |
+	grep --line-buffered -v 'Warning: DWARF2 reader: Badly formed extended line op' >"$scratch/log" &
+reading=$!
+# The log as it grows, so a long run shows its progress.
+tail -n +1 -f --pid="$reading" "$scratch/log" 2>/dev/null &
+showing=$!
+wait "$checking"
+status=$?
+wait "$reading" "$showing"
 set -e
 echo "::$stop::"
 case $status in
 0) echo "Valgrind: no reports, every test passed" ;;
 1)
 	echo "Valgrind: no reports"
+	# Also for a filtered run (a pull request's own tests): ci ran them at full speed and passed
+	# them, so what fails here is Valgrind's slowdown on a deadline, not the test; the warning
+	# names each. Memcheck's own reports are the failure (99).
 	# The test each `FAIL (...)` belongs to: the last `N/M name...` line before it (a test's own
 	# output can come between the two).
 	failed=$(awk '/^[0-9]+\/[0-9]+ /{t=$0; sub(/\.\.\..*/, "", t)} /FAIL \(/{print t}' "$scratch/log" | paste -sd ';' -)
