@@ -34,7 +34,9 @@
 //! `realpath` when links are followed as well: those two are `Merged.checked`. Which of the
 //! kernel's checks that takes is in `Merged.stepMay`, for a file, and in `Merged.walkPath`, for
 //! the directories on the way, where a search permission missing ends the walk before the name is
-//! looked up: what is behind such a directory, or is not, then reads the same.
+//! looked up: to `sha256sum`, what is behind such a directory, or is not, then reads the same. The
+//! search still tells them apart, with links followed, as Dagger's did: `hashFiles()` gives away
+//! whether a path exists, what it is, and names in the job's own tree, but none of a file's content.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -685,12 +687,12 @@ const Merged = struct {
 
     /// The supplementary groups the engine gave the step's user at each exec (BuildKit's
     /// `oci.GetUser`, moby's `user.GetExecUser`), though not a native step's own processes, which
-    /// `setgroups(0)` leaves with none (`sandbox.zig`): hashFiles() answers as Dagger did. Those
-    /// of a user named by a name or uid that is in /etc/passwd, by the first line that matches,
-    /// and none with an explicit group (`app:staff`, `1000:1000`) or for a uid not there. Read
-    /// through the job's root like any file, so no link in them leaves the tree, and from the view
-    /// the next step has, as the engine read the container's. Not there, or not a file, they give
-    /// no group.
+    /// `setgroups(0)` leaves with none until #369 (`sandbox.zig`): hashFiles() answers as Dagger
+    /// did. Those of a user named by a name or uid that is in /etc/passwd, by the first line that
+    /// matches, and none with an explicit group (`app:staff`, `1000:1000`) or for a uid not there.
+    /// Read through the job's root like any file, so no link in them leaves the tree, and from the
+    /// view the next step has, as the engine read the container's. Not there, or not a file, they
+    /// give no group. As `distinctGroups` leaves them.
     fn supplementary(m: *Merged, user: []const u8) Error![]const u32 {
         if (std.mem.indexOfScalar(u8, user, ':') != null) return &.{};
         const passwd = (try m.userFile("/etc/passwd")) orelse return &.{};
@@ -704,6 +706,7 @@ const Merged = struct {
         var groups: std.ArrayList(u32) = .empty;
         var lines = std.mem.splitScalar(u8, group, '\n');
         while (lines.next()) |raw| {
+            try m.tick();
             const text = std.mem.trim(u8, raw, " \t\r");
             if (text.len == 0 or text[0] == '#') continue;
             var fields = std.mem.splitScalar(u8, text, ':');
@@ -716,7 +719,7 @@ const Merged = struct {
                 break;
             };
         }
-        return groups.items;
+        return distinctGroups(groups.items);
     }
 
     /// `path`'s contents in the job's view, up to the engine's limit: resolved as `resolve` does,
@@ -773,22 +776,31 @@ const Merged = struct {
         const ids = s.ids[layer];
         if (jobId(ids, st.uid) == s.uid) return st.mode >> 6 & want == want;
         const who: Who = .{ .uid = s.uid, .gid = s.gid, .groups = m.groups, .ids = ids };
-        if (st.mode & 0o070 != 0) if (try m.acl(fd, path)) |value|
-            return aclGives(value, who, st.gid, want);
+        if (st.mode & 0o070 != 0) {
+            var value: [64 * 1024]u8 = undefined;
+            if (try m.acl(fd, path, &value)) |entries| {
+                // Each entry may search the user's groups, and a directory of a deep tree may have
+                // thousands of them: work the job decides on, so counted, and the clocks read
+                // for every one, which `tick` alone leaves to every 1024th step.
+                m.steps +|= entries.len / acl_entry_size;
+                try m.tick();
+                try m.clocks();
+                return aclGives(entries, who, st.gid, want);
+            }
+        }
         return (if (who.inGroup(jobId(ids, st.gid))) st.mode >> 3 else st.mode) & want == want;
     }
 
-    /// The entry's POSIX ACL as the kernel keeps it, in the call's arena; null when it has none,
-    /// or its file system keeps none. `fd` is an `O_PATH` descriptor: through its link in /proc,
-    /// as `attributes` does.
-    fn acl(m: *Merged, fd: linux.fd_t, path: []const u8) Error!?[]const u8 {
+    /// The entry's POSIX ACL as the kernel keeps it, in `value`; null when it has none, or its
+    /// file system keeps none. `fd` is an `O_PATH` descriptor: through its link in /proc, as
+    /// `attributes` does.
+    fn acl(m: *Merged, fd: linux.fd_t, path: []const u8, value: []u8) Error!?[]const u8 {
         var proc: [32]u8 = undefined;
         const p = std.mem.printSentinel(&proc, "/proc/self/fd/{d}", .{fd}, 0) catch
             return m.fail("cannot read {s}'s ACL in the job's layers", .{path});
-        var value: [64 * 1024]u8 = undefined;
-        const got = linux.getxattr(p, "system.posix_acl_access", &value, value.len);
+        const got = linux.getxattr(p, "system.posix_acl_access", value.ptr, value.len);
         return switch (linux.errno(got)) {
-            .SUCCESS => try m.arena.dupe(u8, value[0..got]),
+            .SUCCESS => value[0..got],
             .NODATA, .OPNOTSUPP => null,
             else => |e| m.fail("cannot read {s}'s ACL in the job's layers: {t}", .{ path, e }),
         };
@@ -1007,8 +1019,9 @@ const Merged = struct {
             try m.tick();
             // As the kernel's walk: every name, `.` and `..` too, needs search permission on the
             // directory it is in, and that comes first. Asking only once a name is found would
-            // say which names are there behind a directory the user cannot enter, which neither
-            // `sha256sum` nor `realpath` could say.
+            // make these walks say which names are there behind a directory the user cannot
+            // enter, which neither `sha256sum` nor `realpath` could say. (The search can: see the
+            // top of the file.)
             if (m.checked and !try m.canSearch(m.step.?, buf.items)) {
                 m.denied = true;
                 return null;
@@ -1214,15 +1227,42 @@ const may_search: u16 = 0o1;
 const Who = struct {
     uid: u32,
     gid: u32,
+    /// As `distinctGroups` leaves them: sorted.
     groups: []const u32,
     ids: Store.Ids,
 
     /// Whether a group id, as the job sees it, is the user's primary or supplementary group.
     fn inGroup(w: Who, gid: ?u32) bool {
         const id = gid orelse return false;
-        return id == w.gid or std.mem.indexOfScalar(u32, w.groups, id) != null;
+        const order = struct {
+            fn f(want: u32, group: u32) std.math.Order {
+                return std.math.order(want, group);
+            }
+        }.f;
+        return id == w.gid or std.sort.binarySearch(u32, w.groups, id, order) != null;
     }
 };
+
+/// The most groups a process can have (Linux's `NGROUPS_MAX`).
+const max_groups = 65536;
+
+/// `groups` sorted, each once, the first `max_groups` of them: the job writes /etc/group, and each
+/// ACL entry asks whether a group is here. Where the kernel would have refused the engine that
+/// many, this leaves the last ones out, which can only refuse more.
+fn distinctGroups(groups: []u32) []const u32 {
+    std.mem.sort(u32, groups, {}, std.sort.asc(u32));
+    var n: usize = 0;
+    for (groups) |g| {
+        if (n > 0 and groups[n - 1] == g) continue;
+        if (n == max_groups) break;
+        groups[n] = g;
+        n += 1;
+    }
+    return groups[0..n];
+}
+
+/// The size of an entry of an ACL (`aclGives`).
+const acl_entry_size = 8;
 
 /// `id`, as a layer holds it, as the job sees it; null for one the job's ids do not reach. Not
 /// `Ids.inside`, whose overflow id is 65534: that is a real user, `nobody`, which such a file's
@@ -1240,7 +1280,7 @@ fn jobId(ids: Store.Ids, id: u32) ?u32 {
 /// entry does not hold. One not in the only format there is gives nothing.
 fn aclGives(value: []const u8, w: Who, file_gid: u32, want: u16) bool {
     const header = 4;
-    const size = 8;
+    const size = acl_entry_size;
     const version = 2;
     const tag_user = 0x02;
     const tag_group_obj = 0x04;
@@ -2321,6 +2361,54 @@ test "native hashFiles: an ACL decides as the kernel's does" {
     // What is not an ACL gives nothing.
     try std.testing.expect(!aclGives("\x01\x00\x00\x00", stranger, 6, may_read));
     try std.testing.expect(!aclGives("\x02", stranger, 6, may_read));
+}
+
+test "native hashFiles: groups are kept sorted and once each, up to the kernel's most" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var few = [_]u32{ 9, 3, 9, 3, 7 };
+    try std.testing.expectEqualSlices(u32, &.{ 3, 7, 9 }, distinctGroups(&few));
+    // Many times the same group is one, and many more than the kernel's most are held to it.
+    const many_ids = try arena.alloc(u32, 3 * max_groups);
+    for (many_ids, 0..) |*g, i| g.* = @truncate(i / 2);
+    const kept = distinctGroups(many_ids);
+    try std.testing.expectEqual(@as(usize, max_groups), kept.len);
+    const who: Who = .{ .uid = 1, .gid = 1 << 30, .groups = kept, .ids = .{} };
+    try std.testing.expect(who.inGroup(0));
+    try std.testing.expect(who.inGroup(max_groups - 1));
+    try std.testing.expect(!who.inGroup(max_groups));
+    try std.testing.expect(who.inGroup(1 << 30));
+    try std.testing.expect(!who.inGroup(null));
+    const none: Who = .{ .uid = 1, .gid = 2, .groups = &.{}, .ids = .{} };
+    try std.testing.expect(!none.inGroup(3));
+}
+
+test "native hashFiles: an ACL's entries are work the call's limits count" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.put("l0/ws/a", "a");
+    const o = try ownerOf(f, "l0/ws/a");
+    const step: Step = .{ .uid = o.uid +% 1, .gid = o.gid +% 1, .user = "app", .ids = &.{} };
+    const none = 0xffffffff;
+    // Named users, in the kernel's order, none of them the step's.
+    var entries: std.ArrayList([3]u32) = .empty;
+    try entries.append(f.arena, .{ 0x01, 6, none });
+    for (0..300) |i| try entries.append(f.arena, .{ 0x02, 4, 100_000 + @as(u32, @truncate(i)) });
+    try entries.appendSlice(f.arena, &.{ .{ 0x04, 4, none }, .{ 0x10, 4, none }, .{ 0x20, 4, none } });
+    const acl = try aclValue(f.arena, entries.items);
+    if (linux.errno(linux.setxattr(try f.abs("l0/ws/a"), "system.posix_acl_access", acl.ptr, acl.len, 0)) != .SUCCESS)
+        return error.SkipZigTest;
+    var st = try f.stackOf(&.{"l0"}, .{ .steps = 200 });
+    const ids = [_]Store.Ids{Store.Ids.host};
+    var s = step;
+    s.ids = &ids;
+    st.step = s;
+    try expectFailed("more than 200 steps", try f.hashWith(st, &.{"a"}));
+    st.limits.steps = 2000;
+    try expectHash(&hashOf(&.{"a"}), try f.hashWith(st, &.{"a"}));
 }
 
 test "native hashFiles: an ACL on the file and on a directory counts, past the mode" {

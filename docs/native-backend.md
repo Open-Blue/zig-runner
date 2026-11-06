@@ -2192,9 +2192,15 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
     directory reached with links followed. `[ -d ]` could not `stat` under a directory the user
     cannot enter, so a directory there failed too, where one the user can reach is skipped.
   - *Directories.* Each directory walked needs search permission, those a link leads through
-    and `..` included, and that is asked before the name is looked up, as the kernel does. So a
-    link to what is behind such a directory reads the same whether it is there or not, and asking
-    gives no new way to learn that a file exists.
+    and `..` included, and that is asked before the name is looked up, as the kernel does. So to
+    `sha256sum`, a link to what is behind such a directory reads the same whether it is there or
+    not.
+  - *What a job can still learn.* The search tells them apart, as Dagger's did (`exists` followed
+    links, as the engine). With `--follow-symbolic-links`, a link to a file behind such a
+    directory fails in `sha256sum:`'s words, one to a directory in `realpath:`'s, and one to
+    nothing is left out, so the call succeeds; and `entries` and a failure name what is in it. So
+    existence, type and names can be learned, one glob at a time, in the job's own tree: the same
+    as Dagger, and none of a file's content.
   - *Ids.* A layer's ids are compared as the job sees them, by layer: the job's own uppers have
     the slot's host ids, stored and flattened layers and the image's have the canonical ids
     (`Backend.hashStep`). An id the job does not reach matches no one, not `nobody`. A root step
@@ -2204,8 +2210,11 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
     a name or uid that /etc/passwd has, and none with an explicit group. They come from
     /etc/passwd and /etc/group as the next step has them, resolved like any file of the job, so
     a link in them stays in its tree. A native step's own processes have no supplementary group
-    (`setgroups(0)` in `sandbox.zig`), so a file only such a group may read is hashed but cannot
-    be `cat` by the step: that is Dagger's answer, and the difference is the sandbox's.
+    (`setgroups(0)` in `sandbox.zig`), so until #369 a file only such a group may read is hashed
+    though the step itself cannot read it. That is Dagger's answer; the difference is the
+    sandbox's. A user's groups are held to the kernel's 65536, and each ACL's entries count
+    against the call's steps, with its clocks read, so that a job's /etc/group or ACLs cannot
+    outlast its limits.
   - *ACLs and capabilities.* An ACL decides as the kernel's `posix_acl_permission` does, on the
     file and on each directory, with its ids shifted like the owner's. `sha256sum` as a non-root
     user had no capability to use, so none is modelled.

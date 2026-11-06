@@ -6528,9 +6528,12 @@ test "hashFiles reads for the steps' user, by each layer's ids, and for root che
 
     // Root sees all of it, on a root runner...
     try std.testing.expect(b.hashStep(&seen) == null);
-    // ...as a rootless one's steps, which can be no one else, do.
-    b.how.userns = .self;
-    try std.testing.expect(b.hashStep(&seen) == null);
+    // ...as a rootless one's steps, which can be no one else, do, in a namespace of their own or
+    // in one they were started in.
+    for ([_]sandbox.Userns{ .self, .inherited }) |rootless| {
+        b.how.userns = rootless;
+        try std.testing.expect(b.hashStep(&seen) == null);
+    }
 
     // The runner user on a root runner: the job's upper in the slot's ids, the stored layer and
     // the image's below it in the job's.
@@ -6543,6 +6546,13 @@ test "hashFiles reads for the steps' user, by each layer's ids, and for root che
     try std.testing.expectEqualStrings(dagger.runner_user, step.user);
     try std.testing.expectEqual(b.slotIds(), seen[0]);
     for (seen[1..]) |lower| try std.testing.expectEqual(b.ids(), lower);
+
+    // No layer of a rootless runner has a slot's ids, whoever it were asked for.
+    for ([_]sandbox.Userns{ .self, .inherited }) |rootless| {
+        b.how.userns = rootless;
+        _ = b.hashStep(&seen).?;
+        for (seen) |any| try std.testing.expectEqual(b.ids(), any);
+    }
 }
 
 /// A job that plants links to what its user may not read, in a rootfs that has such files, then
@@ -6664,6 +6674,47 @@ test "native hashFiles: a stored layer's ids are the job's, whichever slot left 
     try expectSucceeded(again);
     try expectLines(again.text, &.{want});
     try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "w"));
+}
+
+test "native hashFiles: a job container's --user is whom it reads for, its groups by its form" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    // `app` (1002:1003 in the image) is in `staff` here, and only `staff` may read the file.
+    var extra: oci_layer.TestTar = .{ .a = arena };
+    try extra.add(.{ .path = "__w/", .kind = .directory, .mode = 0o777 });
+    try extra.add(.{ .path = "etc/group", .body = "root:x:0:\napp:x:1003:\nstaff:x:50:app\n" });
+    try extra.add(.{ .path = "etc/grouped", .body = "grouped", .mode = 0o640, .gid = 50 });
+    const layers = try std.mem.concat(arena, []const u8, &.{
+        try testImageLayers(arena),
+        &.{try extra.finish()},
+    });
+    const img = try testregistry.testImage(arena, "test/user", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    var read = testStep("");
+    read.action.script.script = .{ .expr = "format('echo got={0}.', hashFiles('l'))" };
+    const steps = [_]job_mod.Step{ testStep("ln -s /etc/grouped l"), read };
+    // By name, the user's groups count; with its ids alone, as BuildKit gives them, they do not.
+    for ([_][]const u8{ "--user app", "--user 1002:1003" }, [_]bool{ true, false }) |options, member| {
+        var job = testJob(&steps);
+        job.container = .{
+            .name = "",
+            .image = .{ .lit = try server.image(arena, "test/user:1") },
+            .options = .{ .lit = options },
+        };
+        const r = try runNativeJob(arena, cfg, job, .root);
+        try expectLines(r.text, &.{if (member)
+            try std.fmt.allocPrint(arena, "got={s}.", .{&hashOfFiles(&.{"grouped"})})
+        else
+            "hashFiles(l) failed: sha256sum: l: Permission denied"});
+    }
 }
 
 test "native hashFiles: a root step's hash does not look at the file's mode" {
