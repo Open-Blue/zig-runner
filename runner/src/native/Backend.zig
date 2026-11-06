@@ -6142,13 +6142,24 @@ test "a native job that cannot be bounded is refused, unless the operator accept
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var cfg = try testConfig(arena, &tmp);
-    // No parent, on any machine, as a rootless runner without delegation has none.
-    cfg.cgroup.parent = cgroup.mount_point ++ "/../not-a-cgroup";
+    try tmp.dir.createDirPath(io, "refused/store");
+    try tmp.dir.createDirPath(io, "refused/rootfs");
+    const root = try tmp.dir.realPathFileAlloc(io, "refused", arena);
+    // No parent, on any machine, as a rootless runner without delegation has none. Refused before
+    // any sandbox, so this part needs none.
+    const no_parent = cgroup.mount_point ++ "/../not-a-cgroup";
+    const refused: Config = .{
+        .rootfs = try std.fmt.allocPrint(arena, "{s}/rootfs", .{root}),
+        .store = try std.fmt.allocPrint(arena, "{s}/store", .{root}),
+        .self_exe = "/bin/true",
+        .vouched = true,
+        .check_store_parents = false,
+        .cgroup = .{ .parent = no_parent },
+    };
     var why: []const u8 = "";
     try std.testing.expectError(
         error.NoJobLimits,
-        initWhy(arena, io, std.testing.allocator, cfg, &why),
+        initWhy(arena, io, std.testing.allocator, refused, &why),
     );
     // It says why not, and what accepts the risk.
     for ([_][]const u8{
@@ -6158,6 +6169,7 @@ test "a native job that cannot be bounded is refused, unless the operator accept
     }) |w| try std.testing.expect(std.mem.indexOf(u8, why, w) != null);
 
     // Said by the operator, it runs, saying plainly what that means.
+    var cfg = try testConfig(arena, &tmp);
     cfg.cgroup.parent = "none";
     const accepted = try runNativeJob(arena, cfg, testJob(&.{testStep("echo ran")}), .root);
     try std.testing.expect(accepted.res.succeeded);
@@ -6170,7 +6182,7 @@ test "a native job that cannot be bounded is refused, unless the operator accept
     // job's, with its reason, not a probe's error for every job.
     probe_cache = .{};
     defer probe_cache = .{};
-    cfg.cgroup.parent = cgroup.mount_point ++ "/../not-a-cgroup";
+    cfg.cgroup.parent = no_parent;
     try std.testing.expect(usable(arena, io, std.testing.allocator, cfg) == null);
 }
 
