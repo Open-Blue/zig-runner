@@ -483,6 +483,7 @@ fn execJobFile(
         .image = cfg.image,
         .js_runtime = cfg.js_runtime,
         .engine = cfg.engineEndpoint(),
+        .engineless = cfg.engineless(),
         .gpa = init.gpa,
         .nesting = cfg.dagger_nesting,
         .package_caches = cfg.package_caches,

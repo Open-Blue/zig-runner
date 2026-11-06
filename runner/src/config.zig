@@ -36,8 +36,10 @@ pub const JsRuntime = enum { bun, node };
 /// Who steps run as in the default image: `runner` (uid 1001, passwordless sudo), as on GitHub's
 /// hosted runners, or root.
 pub const StepUser = enum { runner, root };
-/// How jobs reach the Dagger engine: directly (`engine.zig`), or through a `dagger run` child.
-pub const EngineMode = enum { direct, cli };
+/// How jobs reach the Dagger engine: directly (`engine.zig`), through a `dagger run` child, or not
+/// at all (`none`, for `RUNNER_BACKEND=native`: no engine is started, waited for or watched, and a
+/// job native cannot run fails at once, `dagger.Options.engineless`).
+pub const EngineMode = enum { direct, cli, none };
 /// What runs a job's steps: the Dagger engine, or the runner itself where it can
 /// (docs/native-backend.md), each job it cannot run going to Dagger.
 pub const StepBackend = enum { dagger, native };
@@ -281,6 +283,7 @@ pub const Config = struct {
         InvalidNativeSubidBase,
         InvalidNativeCgroup,
         InvalidEngine,
+        EngineNoneNeedsNative,
         InvalidBool,
         InvalidZigSeed,
         UnknownFlag,
@@ -351,6 +354,8 @@ pub const Config = struct {
             }
             try c.applyFlag(key, val, &creds);
         }
+        // No engine and no native backend would be a runner that can run nothing.
+        if (c.engine == .none and c.backend != .native) return error.EngineNoneNeedsNative;
         if (c.native_rootfs.len > 0 and !std.fs.path.isAbsolutePosix(c.native_rootfs))
             return error.InvalidNativeRootfs;
         _ = try native_net.Subnet.parse(c.native_subnet);
@@ -645,8 +650,13 @@ pub const Config = struct {
                 else
                     .fromSeconds(c.engine_silence_timeout_secs),
             },
-            .cli => null,
+            .cli, .none => null,
         };
+    }
+
+    /// `RUNNER_ENGINE=none`: no Dagger engine to start, wait for or watch.
+    pub fn engineless(c: *const Config) bool {
+        return c.engine == .none;
     }
 
     const max_millis = std.time.ms_per_hour;
@@ -734,6 +744,23 @@ test "RUNNER_ENGINE, RUNNER_ENGINE_CONTAINER and DOCKER_HOST" {
     try std.testing.expectError(error.InvalidEngine, Config.load(&env, &.{ "runner", "--engine=go" }));
     try env.put("RUNNER_ENGINE_HOST", "tcp://dagger-engine:1234");
     try std.testing.expectEqualStrings("tcp://dagger-engine:1234", (try Config.load(&env, &.{"runner"})).engineEndpoint().?.host);
+}
+
+test "RUNNER_ENGINE=none needs the native backend, and leaves no engine to reach" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).engineless());
+    try env.put("RUNNER_ENGINE", "none");
+    try std.testing.expectError(error.EngineNoneNeedsNative, Config.load(&env, &.{"runner"}));
+    try env.put("RUNNER_BACKEND", "native");
+    const c = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqual(EngineMode.none, c.engine);
+    try std.testing.expect(c.engineless());
+    try std.testing.expect(c.engineEndpoint() == null);
+    // The default is unchanged: cli and direct still reach an engine.
+    try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--engine=cli" })).engineless());
 }
 
 test "--runners and RUNNER_COUNT" {

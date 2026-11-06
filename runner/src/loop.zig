@@ -167,13 +167,7 @@ pub fn pool(c: Runner, n: u32) !Exit {
         const entries = try c.arena.alloc(admission.Admission.Slot, n + 1);
         m.* = .init(c.io, c.cfg.admission_limits, entries);
         m.native = c.cfg.backend == .native;
-        const cgroup = c.cfg.engine_cgroup;
-        m.engine.source = if (std.mem.eql(u8, cgroup, "none"))
-            .off
-        else if (cgroup.len > 0)
-            .{ .cgroup = cgroup }
-        else
-            .{ .host = c.cfg.engine_host };
+        m.engine.source = engineSource(c.cfg);
         break :m m;
     } else null;
     // Measures the jobs running, for what jobs of their names reserve next; ends with the pool.
@@ -380,6 +374,14 @@ fn runnerNameBuf(buf: []u8, c: Runner) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}-{x}", .{ c.cfg.name_prefix, suffix });
 }
 
+/// Where the gate looks for the engine's cgroup: nowhere with no engine (`RUNNER_ENGINE=none`) or
+/// `RUNNER_ENGINE_CGROUP=none`, else the cgroup named, else the one of `engine_host`'s socket.
+fn engineSource(cfg: *const Config) admission.Engine.Source {
+    if (cfg.engineless() or std.mem.eql(u8, cfg.engine_cgroup, "none")) return .off;
+    if (cfg.engine_cgroup.len > 0) return .{ .cgroup = cfg.engine_cgroup };
+    return .{ .host = cfg.engine_host };
+}
+
 /// Builds what every job builds before its first step, with no job (`set_up.warm`): the base
 /// container, and the Zig cache seeds (`Config.zig_seeds`). On the laptop the first job after an
 /// engine wipe spent 169 s in "Set up job" on them, the next 1 s. So it warms the engine when the
@@ -435,6 +437,10 @@ pub const Warmer = struct {
     /// have nothing to do.
     pub fn init(c: Runner, memory: ?*admission.Admission, slot: usize) !?*Warmer {
         if (!c.cfg.prewarm) return null;
+        if (c.cfg.engineless()) {
+            try c.log.say("pre-warm skipped: RUNNER_ENGINE=none, there is no engine to warm");
+            return null;
+        }
         if (c.cfg.engineEndpoint() == null) {
             try c.log.say("pre-warm skipped: RUNNER_ENGINE=cli opens no session of its own");
             return null;
@@ -1851,8 +1857,28 @@ test "no pre-warm when it is off, with RUNNER_ENGINE=cli, or when the runner tru
     cfg.engine = .cli;
     try std.testing.expect(try Warmer.init(c, null, 1) == null);
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "pre-warm skipped: RUNNER_ENGINE=cli") != null);
+    cfg.engine = .none;
+    try std.testing.expect(try Warmer.init(c, null, 1) == null);
+    const none_said = "pre-warm skipped: RUNNER_ENGINE=none";
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), none_said) != null);
     cfg.engine = .direct;
     cfg.trusted_refs = "";
     try std.testing.expect(try Warmer.init(c, null, 1) == null);
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "trusts no ref") != null);
+}
+
+test "the gate looks for the engine's cgroup only where there is an engine" {
+    var cfg: Config = .{
+        .gh_token = "",
+        .scope = undefined,
+        .engine_host = "unix:///run/dagger/engine.sock",
+    };
+    try std.testing.expectEqualStrings(cfg.engine_host, engineSource(&cfg).host);
+    cfg.engine_cgroup = "/sys/fs/cgroup/engine";
+    try std.testing.expectEqualStrings(cfg.engine_cgroup, engineSource(&cfg).cgroup);
+    cfg.engine_cgroup = "none";
+    try std.testing.expect(engineSource(&cfg) == .off);
+    cfg.engine_cgroup = "";
+    cfg.engine = .none;
+    try std.testing.expect(engineSource(&cfg) == .off);
 }
