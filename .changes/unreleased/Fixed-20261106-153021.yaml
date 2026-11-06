@@ -1,0 +1,3 @@
+kind: Fixed
+body: Tool-tree checks and hashFiles() now count their memory in one number, so the runner has a single limit for what a job's checks and hashFiles() hold at once
+time: 2026-11-06T15:30:21.73165334-05:00
