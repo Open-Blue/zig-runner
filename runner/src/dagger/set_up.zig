@@ -1242,6 +1242,7 @@ pub fn setUpJob(x: *Exec, opts: Options, results: []StepResult) !?Result {
     const arena = x.arena;
     try x.logSetUp(opts);
     if (try evalRunDefaults(x)) |why| return try failSetUp(x, results, why);
+    try warnDroppedContainerSettings(x);
     var downloaded: std.StringHashMapUnmanaged(void) = .empty;
     var unresolved: std.StringArrayHashMapUnmanaged(void) = .empty;
     for (x.job.steps, 1..) |step, n| if (step.action == .uses and !step.action.uses.local) {
@@ -1275,6 +1276,37 @@ fn failSetUp(x: *Exec, results: []StepResult, why: []const u8) !Result {
     failed.engine_error = null;
     failed.set_up_failed = true;
     return failed;
+}
+
+/// A `container:` job's `options`, `ports` and `volumes` are not read on this path: the job runs
+/// without them, and the log says which (#368). A warning, not a failure, so jobs that fell back
+/// to Dagger with these set keep running. Values are rendered and logged through the job's log,
+/// which masks secrets; one that cannot be evaluated is named without its value.
+fn warnDroppedContainerSettings(x: *Exec) !void {
+    const jc = x.job.container orelse return;
+    const sc = try x.ev.scope(&.{});
+    if (jc.options) |t| {
+        const text = std.mem.trim(u8, x.ev.render(t, sc) catch "(not evaluated)", " \t\n");
+        if (text.len > 0) x.setUpLine(try std.fmt.allocPrint(
+            x.arena,
+            "##[warning]Job container options not supported here and ignored: {s}",
+            .{text},
+        ));
+    }
+    inline for (.{ .{ "ports", jc.ports }, .{ "volumes", jc.volumes } }) |field| {
+        if (field[1].len > 0) {
+            var list: std.ArrayList(u8) = .empty;
+            for (field[1]) |t| {
+                if (list.items.len > 0) try list.appendSlice(x.arena, ", ");
+                try list.appendSlice(x.arena, x.ev.render(t, sc) catch "(not evaluated)");
+            }
+            x.setUpLine(try std.fmt.allocPrint(
+                x.arena,
+                "##[warning]Job container " ++ field[0] ++ " not supported here and ignored: {s}",
+                .{list.items},
+            ));
+        }
+    }
 }
 
 /// Evaluates `defaults.run` into `Exec.default_shell` and `default_working_directory`, once for
