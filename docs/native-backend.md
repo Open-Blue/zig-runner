@@ -100,8 +100,10 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   step's PID 1 when told), every file command, `::add-mask::` and the other workflow commands,
   problem matchers (read from the layers, relative to the working directory), step summaries,
   `id-token: write`, secrets in env, in scripts and in working directories, and the built-in
-  checkout without submodules (git in the job's image, then the same step script Dagger's
-  checkout runs).
+  checkout, submodules included (git in the job's image, then the same step script Dagger's
+  checkout runs). `submodules: true` fetches the first level and `recursive` all, as GitHub's
+  checkout does (Dagger's path always recurses), each to the commit the tree records, as shallow as
+  `fetch-depth`, with `git@<host>:` read as HTTPS; the flags are in the step's script, so in its key.
 - Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a job the runner
   does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
   `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:` or `options:`, `services:`
@@ -109,7 +111,7 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   images pulled by P3), JavaScript and local `uses:` actions (P7, `actions.preload`), remote `uses:` actions in an
   image with no git to fetch them with, `docker://` images
   that cannot be pulled or run as a non-root `USER` (P7), Dagger in steps
-  (`RUNNER_DAGGER_NESTING`), a checkout with submodules, and a
+  (`RUNNER_DAGGER_NESTING`), and a
   machine whose probe fails (no user namespaces, nftables refusing the jobs' rules, no default
   route, the jobs' ids taken on the host, the jobs' subnet overlapping a route of the host's). A
   failed probe is tried again after five minutes, not kept for the process's life. (Until P3

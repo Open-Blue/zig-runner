@@ -411,16 +411,7 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         .uses => {},
         // Native when their image is in the native store (`docker_action.unsupported`).
         .docker => {},
-        .checkout => |inputs| for (inputs) |in| {
-            if (!std.mem.eql(u8, in.name, "submodules")) continue;
-            const lit = switch (in.value) {
-                .lit => |l| l,
-                else => "true",
-            };
-            if (!std.mem.eql(u8, lit, "false")) return "a checkout with submodules is not " ++
-                "native yet";
-        },
-        .script, .unsupported => {},
+        .checkout, .script, .unsupported => {},
     };
     return null;
 }
@@ -1797,6 +1788,28 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     try dagger.shellQuote(w, f.want);
     if (f.tags) try w.writeAll("\ngit fetch -q --tags origin");
     try w.writeAll("\ngit checkout -q --detach FETCH_HEAD\nrm -f .git/FETCH_HEAD\n");
+    // Submodules as actions/checkout fetches them: `true` the first level, `recursive` all, each
+    // to the commit the tree records and as shallow as the checkout (`fetch-depth`), with
+    // `git@<host>:` rewritten to HTTPS, where the token's header applies. The script is the
+    // step's key (below), so it holds the flags: a checkout with and without them never
+    // replays one another, and the recorded commits are in the tree of the key's commit.
+    if (co.submodules) {
+        const recursive: []const u8 = if (co.submodules_recursive) " --recursive" else "";
+        const server = std.mem.trimEnd(u8, x.job.github.server_url, "/");
+        try w.print("git submodule sync -q{s}\ngit ", .{recursive});
+        if (std.mem.startsWith(u8, server, "https://")) {
+            try w.writeAll("-c ");
+            try dagger.shellQuote(w, try std.fmt.allocPrint(
+                arena,
+                "url.{s}/.insteadOf=git@{s}:",
+                .{ server, server["https://".len..] },
+            ));
+            try w.writeAll(" ");
+        }
+        try w.writeAll("-c protocol.version=2 submodule update -q --init --force");
+        if (f.depth > 0) try w.print(" --depth={d}", .{f.depth});
+        try w.print("{s}\n", .{recursive});
+    }
     try w.print("find . -exec touch -h -d @{d} {{}} +\n", .{checkout.mtime});
 
     // The job's token as GitHub expects it over HTTPS, in git's environment, never on its
