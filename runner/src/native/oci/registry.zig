@@ -401,7 +401,11 @@ pub const Client = struct {
                     body.clearRetainingCapacity();
                     continue;
                 }
-                c.why = try std.fmt.allocPrint(c.arena, "{f}: the token service: {s}", .{ c.ref, @errorName(e) });
+                c.why = try std.fmt.allocPrint(c.arena, "{f}: the token service: {s} (sent {d} times)", .{
+                    c.ref,
+                    @errorName(e),
+                    stale + 1,
+                });
                 return error.Unauthorized;
             };
         };
