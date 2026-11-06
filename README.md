@@ -202,9 +202,10 @@ repository:
   (`.github/scripts/busybox-pin.sh`). [Renovate](https://docs.renovatebot.com)
   proposes updates a week after their release. The exceptions are the Dagger engine in
   `deploy/compose.yaml`, pinned by tag and held there on purpose: the runner speaks one engine
-  version's protocol, and a new engine starts with an empty cache; and, still by tag, the
-  JavaScript runtimes for actions (`oven/bun` and `node`, `runner/src/dagger/js.zig`), tracked in
-  #107. The job base image `ubuntu:24.04` (`RUNNER_IMAGE`) is pinned by its multi-arch index digest
+  version's protocol, and a new engine starts with an empty cache. The JavaScript runtimes for
+  actions (`oven/bun` and `node`, `runner/src/dagger/js.zig`) are pinned by their multi-arch index
+  digests too. zizmor is installed from PyPI by hash (`.github/zizmor-requirements.txt`,
+  `.github/scripts/zizmor.sh`). The job base image `ubuntu:24.04` (`RUNNER_IMAGE`) is pinned by its multi-arch index digest
   (`runner/src/dagger.zig`, checked by `.github/scripts/ubuntu-pin.sh`); the packages provisioning
   installs into it come from the Ubuntu archive on the day the engine builds them, and the pre-warm
   logs their fingerprint. tls.zig and GitHub's expression
@@ -297,7 +298,7 @@ git config core.hooksPath .githooks
   about 20 s.
 
 They need the project's Zig (`minimum_zig_version` in `runner/build.zig.zon`) first on `PATH`, or
-`ZIG=/path/to/zig`; Go for actionlint; pipx or uv for zizmor when workflows change; and Lean
+`ZIG=/path/to/zig`; Go for actionlint; python3 with venv for zizmor when workflows change; and Lean
 (`lake`, from [elan](https://github.com/leanprover/elan)) when the proofs or `glob.zig` change.
 `--no-verify` skips them; CI checks the same things regardless.
 
