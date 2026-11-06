@@ -415,6 +415,14 @@ jobs:
         with:
           persist-credentials: false
 
+      # Razorbill (a Pi) runs 16 KiB pages; GitHub's arm64 runner does not, so a test that depends
+      # on the page size passes here on 4 KiB and is not seen at 16: said in the log, so a runner
+      # image that changes it is noticed.
+      - name: Page size
+        run: |
+          echo "page size: $(getconf PAGESIZE) bytes, kernel $(uname -r)"
+          echo "::notice title=arm64 page size::GitHub's arm64 runner has $(getconf PAGESIZE)-byte pages; razorbill has 16384"
+
       - name: Whether this change can affect the release's builds or the tests
         id: scope
         env:
