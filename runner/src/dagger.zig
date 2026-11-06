@@ -837,11 +837,13 @@ pub fn run(
             if (cfg.gate) |g| g.backToEngine();
         } else if (try runNative(arena, io, opts, cfg, job, log, &opts.backend_note)) |r| {
             return r;
-        } else if (cfg.gate) |g| {
+        } else {
+            // Said here too: "Set up job" says it only if a session starts.
+            if (opts.backend_note) |note| std.log.warn("native: {s}", .{note});
             // Native set the job up (its cgroup told the gate) and then sent it here (P7's
             // preload), or its set-up failed (`setUpFallback`): the gate measures it on the
             // engine from here, and learns it under the engine.
-            g.backToEngine();
+            if (cfg.gate) |g| g.backToEngine();
         }
     }
     var env = try environ.clone(arena);

@@ -217,9 +217,9 @@ test "native store under load: processes share one store under a small cap" {
     }
     // It did what it is for: jobs replayed one another's steps, and evicted ones ran again.
     try std.testing.expect(totals.jobs > 0 and totals.replayed > 0 and again > 0);
-    // And jobs found volumes both ways: other jobs' files still there, and evicted.
-    // (Each of the three repositories' first job found it empty with nothing evicted.)
-    try std.testing.expect(totals.volume_new > 3 and totals.volume_new < totals.volume_jobs);
+    // And volumes were evicted between jobs: each of the three repositories' first job found one
+    // empty with nothing evicted. Not how often: a short run under load may evict every time.
+    try std.testing.expect(totals.volume_new > 3);
 }
 
 /// After the last collect: no volume half gone, none but what the cap allows, nothing dead.
