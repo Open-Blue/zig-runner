@@ -1,0 +1,3 @@
+kind: Fixed
+body: A check fails CI and the pre-push hook when a file's tests are not in the test binary, so a file left off main.zig's test block cannot pass with its tests never run
+time: 2026-11-06T01:18:31.093327347-05:00

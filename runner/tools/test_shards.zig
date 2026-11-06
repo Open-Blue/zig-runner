@@ -2,6 +2,7 @@
 //! the suite is mostly waiting (peers that never answer, timeouts) and one core's work at a time.
 //!
 //!     test_shards <test binary> [its arguments]
+//!     test_shards --names <test binary>
 //!
 //! The binary keeps Zig's own test runner. Each shard is a copy of it started with `--listen=-`
 //! and told which test to run over that runner's protocol (`std.zig.Client`), as the build system
@@ -16,7 +17,8 @@
 //!
 //! Tests that cannot run beside each other run one after another (`serial`). One shard, or one
 //! test (a `--test-filter`), runs the binary itself, as without this program.
-//! ZIG_TEST_SHARDS=N sets the number of shards; the default is the cores this process may use.
+//! `--names` only prints the binary's test names, one a line, as `.github/scripts/test-files.sh`
+//! compares them with the source's. ZIG_TEST_SHARDS=N sets the number of shards; the default is the cores this process may use.
 //! `zig build test -Dshard-tests=false` runs the tests without it.
 const std = @import("std");
 const Io = std.Io;
@@ -78,8 +80,21 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
     if (args.len < 2) {
-        std.debug.print("usage: test_shards <test binary> [its arguments]\n", .{});
+        std.debug.print("usage: test_shards [--names] <test binary> [its arguments]\n", .{});
         return 2;
+    }
+    if (std.mem.eql(u8, args[1], "--names")) {
+        if (args.len != 3) {
+            std.debug.print("usage: test_shards --names <test binary>\n", .{});
+            return 2;
+        }
+        var shard = try Shard.start(arena, io, &.{ args[2], "--listen=-" });
+        defer shard.stop(io);
+        var out_buf: [4096]u8 = undefined;
+        var out: Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
+        for (try shard.testNames(arena)) |name| try out.interface.print("{s}\n", .{name});
+        try out.interface.flush();
+        return 0;
     }
     const wanted = try shardCount(init.environ_map);
     const listening = try std.mem.concat(arena, []const u8, &.{
