@@ -80,9 +80,9 @@ pub const FakeSession = struct {
     seen: std.ArrayList([]const u8) = .empty,
     arena: Allocator,
 
-    fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8, limit: usize) anyerror![]const u8 {
+    fn send(ptr: *anyopaque, _: Allocator, doc: []const u8, limit: usize) anyerror![]const u8 {
         const self: *FakeSession = @ptrCast(@alignCast(ptr));
-        try self.seen.append(self.arena, try arena.dupe(u8, doc));
+        try self.seen.append(self.arena, try self.arena.dupe(u8, doc));
         defer self.next += 1;
         if (self.next >= self.answers.len) return error.NoMoreAnswers;
         if (self.answers[self.next].len > limit) return error.ResponseTooLarge;
