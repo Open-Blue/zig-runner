@@ -120,4 +120,7 @@ tools/hotbench.zig	79bdabb2a1be65b6	defer out.flush() catch {};
 tools/hpackcorpus.zig	79bdabb2a1be65b6	defer out.flush() catch {};
 tools/regexcorpus.zig	79bdabb2a1be65b6	defer out.flush() catch {};
 tools/rsacorpus.zig	79bdabb2a1be65b6	defer out.flush() catch {};
+tools/test_shards.zig	4fa12925106b3fd1	s.writer.interface.flush() catch {};
+tools/test_shards.zig	e0e1e9558ea2b364	Io.Dir.cwd().deleteFile(io, path) catch {};
+tools/test_shards.zig	e4721abd8d76a5bc	_ = s.child.wait(io) catch {};
 tools/yamlcorpus.zig	79bdabb2a1be65b6	defer out.flush() catch {};
