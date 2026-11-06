@@ -151,6 +151,7 @@ needed() {
 			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
 			.github/scripts/zig-test.sh | runner/src/native/store_crash.zig | \
 			runner/src/native/oci/Store.zig | runner/src/native/volumes.zig | \
+			runner/src/native/evict.zig | \
 			.github/scripts/store-crash.sh | .github/scripts/zig-modules.sh) return 0 ;;
 		*) return 1 ;;
 		esac

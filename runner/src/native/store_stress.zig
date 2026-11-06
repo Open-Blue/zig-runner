@@ -17,8 +17,14 @@
 //!   - no key runs in two jobs at once (each step marks itself running in a shared directory);
 //!     on a root runner the jobs are in different slots, with one key for all (canonical ids);
 //!   - no fd or lock outlives a job in a worker, and a store that works logs no warning;
+//!   - no job loses a cache volume it holds (`evict.zig`): each worker's volume jobs write a nonce
+//!     into the tool cache and find it a step later, with other jobs' ends evicting every volume no
+//!     job holds, and a volume evicted is an empty one to the next job. Each also leaves there what
+//!     a hostile job would: a FIFO where a size or a lock of a volume inside it goes, a symlink to a
+//!     file outside (`canary`, which must stay as it is), a deep chain of directories; a pass that
+//!     hung or followed one fails here;
 //!   - once all stopped and a last collect ran: no `.tmp-` or `.dead-` entry, no key lock, no
-//!     job's directory, and the store within its cap.
+//!     job's directory, the store within its cap and its volumes within theirs.
 //!
 //! ZIG_TEST_STORE_STRESS_SECONDS (30), ZIG_TEST_STORE_STRESS_PROCS (6) and
 //! ZIG_TEST_STORE_STRESS_SEED (random, printed) set the run; the nightly analysis workflow runs it
@@ -33,10 +39,12 @@ const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const Backend = @import("Backend.zig");
 const Store = @import("Store.zig");
+const evict = @import("evict.zig");
 const layers = @import("layers.zig");
 const dagger = @import("../dagger.zig");
 const sink = @import("../sink.zig");
 const job_mod = @import("../job.zig");
+const set_up = @import("../dagger/set_up.zig");
 const testStep = @import("../dagger/testing.zig").testStep;
 const testJob = @import("../dagger/testing.zig").testJob;
 const print = std.fmt.allocPrint;
@@ -55,6 +63,14 @@ const builds = 6;
 /// A step's layer takes 8-12 KiB, a build's about 60 KiB: the keys' layers together are about
 /// three times the cap, so most jobs leave the store over it.
 const cap: u64 = 256 * 1024;
+/// Volumes evicted as soon as no job holds them: this cap, and no day's grace.
+const limits: evict.Limits = .{
+    .volumes_max_bytes = 8 * 1024,
+    .min_free_pct = 0,
+    .idle_s = 0,
+    .recent_s = 0,
+    .remeasure_s = 0,
+};
 
 test "native store under load: processes share one store under a small cap" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -92,6 +108,7 @@ test "native store under load: processes share one store under a small cap" {
         _ = linux.chmod(try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ root, d }, 0), 0o777);
     }
     try tmp.dir.writeFile(io, .{ .sub_path = "shared/overlaps", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "shared/canary", .data = "untouched" });
     const overlaps_z = try std.fmt.allocPrintSentinel(arena, "{s}/shared/overlaps", .{root}, 0);
     _ = linux.chmod(overlaps_z, 0o666);
 
@@ -128,7 +145,7 @@ test "native store under load: processes share one store under a small cap" {
     }
 
     // Every published entry checked whole, again and again, while the workers run.
-    const s: Store = .{ .root = cfg.store, .max_bytes = cap };
+    const s: Store = .{ .root = cfg.store, .max_bytes = cap, .limits = limits };
     var faults: Faults = .{ .arena = arena };
     var peak: u64 = 0;
     while (std.Io.Clock.real.now(io).toMilliseconds() < deadline) {
@@ -167,6 +184,8 @@ test "native store under load: processes share one store under a small cap" {
         if (told == null and faults.list.items.len > before) told = err_text[0..@min(err_text.len, 64 << 10)];
     }
     const again = try checkReplays(arena, io, root, obs.items, &faults);
+    const canary = try tmp.dir.readFileAlloc(io, "shared/canary", arena, .limited(64));
+    if (!std.mem.eql(u8, canary, "untouched")) try faults.add("a file outside the volumes was written: {s}", .{canary});
     const overlaps = try tmp.dir.readFileAlloc(io, "shared/overlaps", arena, .limited(1 << 20));
     if (overlaps.len > 0) try faults.add("keys ran in two jobs at once (chain, nonce):\n{s}", .{overlaps});
 
@@ -176,6 +195,9 @@ test "native store under load: processes share one store under a small cap" {
     const left = try checkEntries(arena, io, s, &faults);
     if (left.dot > 0) try faults.add("{d} .tmp-/.dead- entries left after a collect", .{left.dot});
     if (left.bytes > cap) try faults.add("{d} bytes stored after a collect, over the cap", .{left.bytes});
+    // Measured a volume a pass, so several passes: the last leaves the volumes measured, and under.
+    for (0..16) |_| s.collect(arena, io);
+    try checkVolumes(arena, io, cfg.store, &faults);
     for ([_][]const u8{ "keys", "jobs" }) |d| {
         var dir = try std.Io.Dir.cwd().openDir(io, try print(arena, "{s}/{s}", .{ cfg.store, d }), .{ .iterate = true });
         defer dir.close(io);
@@ -184,10 +206,11 @@ test "native store under load: processes share one store under a small cap" {
     }
 
     std.debug.print("native store under load: {d} jobs ({d} steps run, {d} replayed, {d} keys " ++
-        "run again after eviction), {d} builds ({d} found stored), {d} entry checks, at most " ++
-        "{d} KiB stored\n", .{
-        totals.jobs,   totals.live,       totals.replayed, again,
-        totals.builds, totals.build_hits, faults.checked,  peak / 1024,
+        "run again after eviction), {d} builds ({d} found stored), {d} volume jobs ({d} found the " ++
+        "volume empty), {d} entry checks, at most {d} KiB stored\n", .{
+        totals.jobs,    totals.live,       totals.replayed,    again,
+        totals.builds,  totals.build_hits, totals.volume_jobs, totals.volume_new,
+        faults.checked, peak / 1024,
     });
     if (faults.list.items.len > 0) {
         if (told) |text| std.debug.print("the first worker that found something, on stderr:\n{s}\n", .{text});
@@ -200,6 +223,29 @@ test "native store under load: processes share one store under a small cap" {
     }
     // It did what it is for: jobs replayed one another's steps, and evicted ones ran again.
     try std.testing.expect(totals.jobs > 0 and totals.replayed > 0 and again > 0);
+    // And volumes were evicted between jobs: each of the three repositories' first job found one
+    // empty with nothing evicted. Not how often: a short run under load may evict every time.
+    try std.testing.expect(totals.volume_new > 3);
+}
+
+/// After the last collect: no volume half gone, none but what the cap allows, nothing dead.
+fn checkVolumes(arena: Allocator, io: std.Io, store: []const u8, faults: *Faults) !void {
+    const area = try print(arena, "{s}/volumes", .{store});
+    var d = std.Io.Dir.cwd().openDir(io, area, .{ .iterate = true }) catch return;
+    defer d.close(io);
+    var walker = try d.walk(arena);
+    defer walker.deinit();
+    var bytes: u64 = 0;
+    while (try walker.next(io)) |e| {
+        if (std.mem.startsWith(u8, e.basename, ".dead-")) try faults.add("left in volumes/: {s}", .{e.path});
+        if (std.mem.indexOf(u8, e.path, ".private-") != null) try faults.add("left in volumes/: {s}", .{e.path});
+        if (e.kind == .file and std.mem.endsWith(u8, e.basename, ".size")) {
+            const text = try std.Io.Dir.cwd().readFileAlloc(io, try print(arena, "{s}/{s}", .{ area, e.path }), arena, .limited(32));
+            bytes += std.fmt.parseInt(u64, std.mem.trim(u8, text, " \n"), 10) catch 0;
+        }
+    }
+    if (bytes > limits.volumes_max_bytes)
+        try faults.add("{d} bytes of volumes after the last collect, over their cap", .{bytes});
 }
 
 fn envInt(env: *const std.process.Environ.Map, name: []const u8, default: u32) !u32 {
@@ -225,8 +271,10 @@ const Stats = struct {
     replayed: u64 = 0,
     builds: u64 = 0,
     build_hits: u64 = 0,
+    volume_jobs: u64 = 0,
+    volume_new: u64 = 0,
 
-    const names = .{ "jobs", "live", "replayed", "builds", "build_hits" };
+    const names = .{ "jobs", "live", "replayed", "builds", "build_hits", "volume_jobs", "volume_new" };
 
     pub fn format(s: Stats, w: *std.Io.Writer) std.Io.Writer.Error!void {
         inline for (names) |name| try w.print("{d} ", .{@field(s, name)});
@@ -365,6 +413,7 @@ test "native store under load: one worker (run only by the test above, in a proc
     const exe = try std.Io.Dir.cwd().realPathFileAlloc(io, env.get("ZIG_RUNNER_TEST_EXE").?, arena);
     var cfg = try Backend.testConfigAt(arena, root, exe);
     cfg.store_max_bytes = try std.fmt.parseInt(u64, f.next().?, 10);
+    cfg.store_limits = limits;
     const shared = try print(arena, "{s}/shared", .{root});
     cfg.binds = try std.mem.concat(arena, @TypeOf(cfg.binds[0]), &.{
         cfg.binds,
@@ -373,7 +422,7 @@ test "native store under load: one worker (run only by the test above, in a proc
     var w: Worker = .{
         .index = index,
         .cfg = cfg,
-        .store = .{ .root = cfg.store, .max_bytes = cfg.store_max_bytes },
+        .store = .{ .root = cfg.store, .max_bytes = cfg.store_max_bytes, .limits = limits },
         .rand = prng.random(),
         .arena = arena,
     };
@@ -387,12 +436,13 @@ test "native store under load: one worker (run only by the test above, in a proc
     while (std.Io.Clock.real.now(io).toMilliseconds() < deadline) : (n += 1) {
         var job_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer job_arena.deinit();
-        const build = if (n < 2) n == 1 else w.rand.uintLessThan(u32, 4) == 0;
-        const what = if (build) "build" else "job";
-        if (build)
-            try runBuild(&w, job_arena.allocator(), io, build_dir, n)
-        else
-            try runJob(&w, job_arena.allocator(), io, n);
+        const kind = if (n < 3) n else 1 + w.rand.uintLessThan(u32, 4);
+        const what = if (kind == 1) "build" else "job";
+        switch (kind) {
+            1 => try runBuild(&w, job_arena.allocator(), io, build_dir, n),
+            2 => try runVolumeJob(&w, job_arena.allocator(), io, n),
+            else => try runJob(&w, job_arena.allocator(), io, n),
+        }
         const fds = try countFds(io);
         if (n == 1) fds_kept = fds;
         if (n > 1 and fds > fds_kept) w.fault("{d} fds open after {s} {d}, {d} before", .{ fds, what, n, fds_kept });
@@ -496,6 +546,52 @@ fn runJob(w: *Worker, arena: Allocator, io: std.Io, n: usize) !void {
         if (std.mem.indexOf(u8, text, want) == null)
             w.fault("job {d} ({s}): no \"{s}\" in\n{s}", .{ n, c, want, w.log(text) });
     }
+}
+
+/// A job with the tool cache, which every job has (`volumes.plan`), held from its start to its end:
+/// its first step leaves a nonce in the volume, as its name says it, and each step after finds it
+/// and what the job's other files need of it, with a pause for other jobs' ends to evict all they
+/// can. So a volume evicted under a job fails here. A volume another job's nonce is in was not
+/// evicted before this one; one with none was.
+fn runVolumeJob(w: *Worker, arena: Allocator, io: std.Io, n: usize) !void {
+    const nonce = try print(arena, "w{d}-{d}", .{ w.index, n });
+    const cache = set_up.tool_cache_dir;
+    const steps = try arena.alloc(job_mod.Step, 3);
+    steps[0] = testStep(try print(arena,
+        \\: $GITHUB_SHA; echo "@empty $(ls -A {s} | wc -l)"
+        \\head -c 2000 /dev/urandom > {s}/{s}.data; sha256sum {s}/{s}.data > {s}/{s}.sum
+        \\cd {s}; mkdir -p runner runner.d; mkfifo runner.lock runner.size 2>/dev/null || true
+        \\ln -sf /shared/canary runner.d.size || true; ln -sf /shared/canary runner.size.link || true
+        \\d=chain; for i in 1 2 3 4 5 6 7 8; do mkdir -p $d/$d/$d/$d/$d/$d/$d/$d; cd $d/$d/$d/$d/$d/$d/$d/$d; done
+        \\cd {s}
+    , .{ cache, cache, nonce, cache, nonce, cache, nonce, cache, cache }));
+    steps[1] = testStep(try print(arena,
+        \\: $GITHUB_SHA; sleep 0.$(od -An -N1 -tu1 /dev/urandom | tr -d ' '); sha256sum -c {s}/{s}.sum
+    , .{ cache, nonce }));
+    steps[2] = testStep(try print(arena,
+        \\: $GITHUB_SHA; sha256sum -c {s}/{s}.sum && echo "@whole {s}"; rm -f {s}/{s}.data
+    , .{ cache, nonce, nonce, cache, nonce }));
+    var env: std.process.Environ.Map = .init(arena);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out.writer } };
+    var job = testJob(steps);
+    // A few, so that some are free when others are not.
+    job.github.repository = try print(arena, "o/r{d}", .{n % 3});
+    const res = try dagger.run(arena, io, &env, .{
+        .native = w.cfg,
+        .step_cache = false,
+        .package_caches = true,
+        .trusted = true,
+        .test_ran_marker = try print(arena, "w{d}-{d}", .{ w.index, n }),
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const text = out.written();
+    w.stats.volume_jobs += 1;
+    if (!res.succeeded)
+        return w.fault("volume job {d} lost its volume: {s}\n{s}", .{ n, res.engine_error orelse "-", w.log(text) });
+    if (std.mem.indexOf(u8, text, try print(arena, "@whole {s}", .{nonce})) == null)
+        return w.fault("volume job {d}: its files were not whole at its end:\n{s}", .{ n, w.log(text) });
+    if (std.mem.indexOf(u8, text, "@empty 0") != null) w.stats.volume_new += 1;
 }
 
 /// A Dockerfile build's layers (`layers.Store`, as `dockerfile.zig` uses it): some of the six,

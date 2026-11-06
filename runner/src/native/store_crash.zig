@@ -9,7 +9,7 @@
 //! ZIG_TEST_STORE_CRASH is `MODE ROOT SCRATCH ARG`: ROOT is on the disk under test, SCRATCH is on
 //! another (what is expected is built there, never on the disk that crashes).
 //!
-//!   write   runs step ARG (1-6) of a sequence, as a job would, and marks the log at the points
+//!   write   runs step ARG (1-8) of a sequence, as a job would, and marks the log at the points
 //!           the checks need (ZIG_TEST_STORE_CRASH_MARK NAME):
 //!             1  a job publishes three small layers (`writeBack`, `syncEntries`) and syncs the layers' directory;
 //!             2  the next publishes a large one (over `sync_tree_max` entries: `syncfs`) and a small
@@ -18,15 +18,22 @@
 //!                one more small layer;
 //!             4  `collect` over a cap that evicts most, then one more layer;
 //!             5  `oci.Store.ensure` makes a directory;
-//!             6  `volumes.adoptSeed` makes a seed.
+//!             6  `volumes.adoptSeed` makes a seed;
+//!             7  jobs fill three volumes (`volumes.open`) and the disk catches up, as it would;
+//!             8  `evict.run` under a cap evicts one, with another held by a job, and one more
+//!                pass goes on with what its deadline left of another.
 //!   verify  what a job finds on a disk put back to a point in the log: the first job after the
 //!           crash is a job after a reboot (`checkOncePerBoot`), and then no layer `open` accepts
 //!           differs from what was published (its tree's digest, its record), no directory
 //!           `ensure` or `adoptSeed` published differs, and no layer a job had finished and
 //!           synced (ARG: the last mark the log passed) is missing, unless a collect may have
-//!           evicted it.
-//!   corrupt a layer changed on purpose (ARG: `truncate` or `flip`), for the script to show that
-//!           `verify` fails on it.
+//!           evicted it. Each volume is what its job left or is not there, never in between, and
+//!           the one a job held and the ones under the cap are there; one evicted stays evicted
+//!           once its pass ended. Then a pass finishes what a crash cut short: no dead tree, no
+//!           lock file without its volume.
+//!   corrupt a layer changed on purpose (ARG: `truncate` or `flip`), or a volume half deleted under
+//!           its own name, as an eviction that deleted before it renamed would leave it (`halve`),
+//!           or evicted and back (`undo`), for the script to show that `verify` fails on each.
 //!   fail    a publish on a disk that fails writes (ZIG_TEST_STORE_CRASH_FLIP on|off switches
 //!           them; ARG: `small`, `large`, `cursor` or `no-cursor`): it must fail,
 //!           and publish nothing.
@@ -40,6 +47,7 @@ const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const Store = @import("Store.zig");
 const OciStore = @import("oci/Store.zig");
+const evict = @import("evict.zig");
 const volumes = @import("volumes.zig");
 const print = std.fmt.allocPrint;
 
@@ -54,6 +62,12 @@ const big = "big";
 const ensure_key = "k1";
 const seed_cache = "root/.cache/zig";
 const record_fc = "::zig-file-command::ran\nj1\n";
+/// The volumes of steps 7 and 8: the one an eviction takes, the one under the cap, and the one a
+/// job holds through it, each a tree of its name's.
+const vol_gone = "vol-gone";
+const vol_kept = "vol-kept";
+const vol_held = "vol-held";
+const vol_names = [_][]const u8{ vol_gone, vol_kept, vol_held };
 
 fn keyOf(name: []const u8) Store.Key {
     var kh: Store.KeyHasher = .plain(name);
@@ -253,10 +267,64 @@ fn write(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: 
                 .cache = seed_cache,
             }, try print(arena, "{s}/no-rootfs", .{base}), null);
         },
+        7 => {
+            for (vol_names, [_]i64{ 30, 20, 40 }) |n, days| {
+                const v = try openVolume(arena, io, s.root, n);
+                defer v.release(io);
+                try makeTree(arena, io, v.dir, n);
+                try settle(arena, io, v.dir, days);
+            }
+            // What a job leaves in a volume is on the disk when the kernel gets to it: a volume
+            // has no publish. Here it has, so that any difference later is the eviction's.
+            if (linux.errno(linux.syncfs(s.sync_fd.?)) != .SUCCESS) return error.Sync;
+        },
+        8 => {
+            const held = try openVolume(arena, io, s.root, vol_held);
+            defer held.release(io);
+            // A job holds this one, unused for longest by its lock's mtime as the cap sees it.
+            try settle(arena, io, held.dir, 40);
+            const kept = try Store.treeBytes(arena, io, try volumePath(arena, s.root, vol_kept));
+            const held_bytes = try Store.treeBytes(arena, io, held.dir);
+            s.limits = .{
+                .volumes_max_bytes = kept + held_bytes + 1000,
+                .min_free_pct = 0,
+                .idle_s = 0,
+                .recent_s = 0,
+                .budget_ms = -1,
+            };
+            try hook(io, env, mark_env, "before-evict");
+            // The first pass's deadline has passed: it evicts and leaves the tree to the next.
+            evict.run(s, io);
+            try hook(io, env, mark_env, "evicted");
+            s.limits.budget_ms = 60_000;
+            evict.run(s, io);
+            evict.run(s, io);
+        },
         else => return error.BadSpec,
     }
     try hook(io, env, mark_env, try print(arena, "after-{d}", .{step}));
     std.debug.print("native store crash: step {d} done\n", .{step});
+}
+
+/// `<store>/volumes/o/r/repo/<name>`, held as a job holds it.
+fn openVolume(arena: Allocator, io: std.Io, root: []const u8, name: []const u8) !volumes.Volume {
+    return volumes.open(arena, io, root, &.{ "o", "r", "repo", name }, .shared, null);
+}
+
+fn volumePath(arena: Allocator, root: []const u8, name: []const u8) ![]const u8 {
+    return print(arena, "{s}/volumes/o/r/repo/{s}", .{ root, name });
+}
+
+/// `dir`'s last use, `days` ago, and its size beside it, as a pass would have left it.
+fn settle(arena: Allocator, io: std.Io, dir: []const u8, days: i64) !void {
+    const lock = try std.fmt.allocPrintSentinel(arena, "{s}.lock", .{dir}, 0);
+    const sec = std.Io.Clock.real.now(io).toSeconds() - days * 24 * 60 * 60;
+    const t = [2]linux.timespec{ .{ .sec = sec, .nsec = 0 }, .{ .sec = sec, .nsec = 0 } };
+    if (linux.errno(linux.utimensat(linux.AT.FDCWD, lock, &t, 0)) != .SUCCESS) return error.Touch;
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try print(arena, "{s}.size", .{dir}),
+        .data = try print(arena, "{d}\n", .{try Store.treeBytes(arena, io, dir)}),
+    });
 }
 
 /// What `ensure` makes: the tree of the name "rootfs".
@@ -277,6 +345,10 @@ fn required(mark: []const u8) []const []const u8 {
         .{ .mark = "after-4", .names = names[6..7] },
         .{ .mark = "after-5", .names = names[6..7] },
         .{ .mark = "after-6", .names = names[6..7] },
+        .{ .mark = "after-7", .names = names[6..7] },
+        .{ .mark = "before-evict", .names = names[6..7] },
+        .{ .mark = "evicted", .names = names[6..7] },
+        .{ .mark = "after-8", .names = names[6..7] },
         .{ .mark = "synced", .names = names[6..7] },
     };
     for (table) |m| if (std.mem.eql(u8, m.mark, mark)) return m.names;
@@ -387,13 +459,100 @@ fn verify(arena: Allocator, io: std.Io, sp: Spec) !void {
         if (!std.mem.eql(u8, &got, &try expectedSeed(arena, io, sp.scratch)))
             try faults.add("adoptSeed published a seed that is not what was built", .{});
     }
-    std.debug.print("native store crash: after {s}: {d} layers hit, {d} directories published, whole\n", .{ sp.arg, hits, dirs });
+    const vols = try verifyVolumes(arena, io, s, sp, &faults);
+    std.debug.print("native store crash: after {s}: {d} layers hit, {d} directories published, whole, " ++
+        "{d} volumes, {d} dead\n", .{ sp.arg, hits, dirs, vols.there, vols.dead });
     try faults.done("verify");
 }
 
-/// A layer's first file changed in place: shorter by a byte, or one byte different.
+/// `mark`, or one the log passed after it, in the order of the sequence's last step.
+fn past(mark: []const u8, of: []const u8) bool {
+    const order = [_][]const u8{ "after-7", "before-evict", "evicted", "after-8", "synced" };
+    const m = for (order, 0..) |o, i| {
+        if (std.mem.eql(u8, o, mark)) break i;
+    } else return false;
+    const w = for (order, 0..) |o, i| {
+        if (std.mem.eql(u8, o, of)) break i;
+    } else unreachable;
+    return m >= w;
+}
+
+/// Each volume is what its job left or is gone, and whatever was evicted once its rename was
+/// synced stays so; then a pass finishes what the crash cut short, and takes nothing it should
+/// not. How many volumes the crash left, and dead trees.
+fn verifyVolumes(arena: Allocator, io: std.Io, s: Store, sp: Spec, faults: *Faults) !struct { there: usize, dead: usize } {
+    const cwd = std.Io.Dir.cwd();
+    var there: usize = 0;
+    for (vol_names) |n| {
+        const dir = try volumePath(arena, s.root, n);
+        if (!exists(io, dir)) {
+            if (past(sp.arg, "after-7") and !std.mem.eql(u8, n, vol_gone))
+                try faults.add("volume {s} is gone, which no eviction may take (last mark {s})", .{ n, sp.arg });
+            continue;
+        }
+        there += 1;
+        // Before step 7 synced them its files may be anything a crash leaves of a job's writes.
+        if (!past(sp.arg, "after-7")) continue;
+        if (std.mem.eql(u8, n, vol_gone) and past(sp.arg, "evicted"))
+            try faults.add("volume {s} is back after its eviction's rename was synced (last mark {s})", .{ n, sp.arg });
+        const got = digestOf(arena, io, dir) catch |e| {
+            try faults.add("volume {s} cannot be read: {s}", .{ n, @errorName(e) });
+            continue;
+        };
+        if (!std.mem.eql(u8, &got, &try expectedDigest(arena, io, sp.scratch, n)))
+            try faults.add("volume {s} is there, and not what its job left: half evicted, or half made", .{n});
+    }
+    const area = try print(arena, "{s}/volumes", .{s.root});
+    const dead = try countDead(arena, io, area);
+    if (!exists(io, area)) return .{ .there = there, .dead = dead };
+    // What the next job's end does, keeping everything that is not dead.
+    var next = s;
+    next.limits = .{ .volumes_max_bytes = 0, .min_free_pct = 0 };
+    evict.run(next, io);
+    if (try countDead(arena, io, area) > 0) try faults.add("a dead tree outlived a pass", .{});
+    for (vol_names) |n| {
+        const dir = try volumePath(arena, s.root, n);
+        if (cwd.access(io, try print(arena, "{s}.lock", .{dir}), .{})) |_| {
+            if (!exists(io, dir)) try faults.add("the lock of volume {s} outlived a pass", .{n});
+        } else |_| {}
+        // A job finds it, or an empty one, whatever the crash left.
+        const v = openVolume(arena, io, s.root, n) catch |e| {
+            try faults.add("volume {s} cannot be opened: {s}", .{ n, @errorName(e) });
+            continue;
+        };
+        v.release(io);
+    }
+    return .{ .there = there, .dead = dead };
+}
+
+fn countDead(arena: Allocator, io: std.Io, area: []const u8) !usize {
+    _ = arena;
+    var d = std.Io.Dir.cwd().openDir(io, area, .{ .iterate = true }) catch return 0;
+    defer d.close(io);
+    var n: usize = 0;
+    var it = d.iterate();
+    while (try it.next(io)) |e| n += @intFromBool(std.mem.startsWith(u8, e.name, ".dead-"));
+    return n;
+}
+
+/// A layer's first file changed in place: shorter by a byte, or one byte different. Or what an
+/// eviction that lost its order would leave: a volume with a file gone under its own name, or
+/// one evicted that came back.
 fn corrupt(arena: Allocator, io: std.Io, sp: Spec) !void {
     const cwd = std.Io.Dir.cwd();
+    const root = try sp.store(arena);
+    if (std.mem.eql(u8, sp.arg, "halve")) {
+        const p = try print(arena, "{s}/f0", .{try volumePath(arena, root, vol_kept)});
+        try cwd.deleteFile(io, p);
+        std.debug.print("native store crash: removed {s}\n", .{p});
+        return;
+    }
+    if (std.mem.eql(u8, sp.arg, "undo")) {
+        const v = try volumePath(arena, root, vol_gone);
+        try makeTree(arena, io, v, vol_gone);
+        std.debug.print("native store crash: made {s} again\n", .{v});
+        return;
+    }
     const path = try print(arena, "{s}/store/layers/{s}/fs/f0", .{ sp.root, &Store.hex(keyOf("f")) });
     const data = try cwd.readFileAlloc(io, path, arena, .limited(1 << 20));
     if (std.mem.eql(u8, sp.arg, "truncate")) {
