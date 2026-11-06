@@ -207,6 +207,8 @@ RUNNER_NATIVE_STORE=/var/lib/zig-runner/native    # default as root
 RUNNER_NATIVE_SUBID_BASE=1900000000               # default; at least 100000
 RUNNER_NATIVE_SUBNET=10.211.0.0/16                # default; a prefix of 8 to 23 bits
 RUNNER_NATIVE_STORE_MAX_MB=10240                  # default; the layer store's cap (P2)
+RUNNER_NATIVE_VOLUMES_MAX_MB=16384                # default; the cache volumes' cap, 0 for none ("Eviction")
+RUNNER_NATIVE_MIN_FREE_PCT=10                     # default; the disk's floor, 0 for none ("Eviction")
 RUNNER_NATIVE_ROOTLESS=0                          # default; 1 for a rootless runner
 RUNNER_NATIVE_CGROUP=                             # default: /sys/fs/cgroup/zig-runner as root,
                                                   # none rootless; `self`, `none`, or a path
@@ -416,9 +418,12 @@ What it covers, as built:
   after the one it locked, both fixed.
 - **GC** (`Store.collect`, after each job): past `RUNNER_NATIVE_STORE_MAX_MB` (default 10240),
   the layers no job holds go, least recently used first (the lock file's mtime is the last use),
-  each renamed away under its lock taken exclusively, then deleted. Half-built and half-evicted
-  entries of dead runners, idle key locks, and entries that are not whole (by `meta` and their
-  files' lengths, without reading them) go too.
+  each renamed away under its lock taken exclusively, then deleted. A layer counts as its tree, its
+  record and 16 KiB for its own files, so steps that change nothing but print much are not free.
+  Half-built and half-evicted entries of dead runners, idle key locks, and entries that are not
+  whole (by `meta` and their files' lengths, without reading them) go too; so an upgrade across a
+  `store_format` bump empties `layers/` at its first job's end, as an older format's meta is not
+  whole to it. What is beside the layers is the next section's ("Eviction").
 - **Flattening**: before a step on a stack of 100 layers (`default_flatten_at`), the stack is
   merged into one (`Store.flatten`): later entries win, whiteouts are kept (they hide the
   rootfs), opaque directories stay opaque, files are hard links and directories are made with
@@ -708,19 +713,57 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   layer, so a stored step whose `$GITHUB_PATH` or `$GITHUB_ENV` points into it runs again instead
   of replaying (`Exec.tool_cache`, `toolDirNotHeld`, #229): natively no tree is checked, so every
   such record does.
-- Debt: volumes and seeds are never evicted (the engine's GC prunes Dagger's). P2's `collect`
-  walks only `layers/`, whose entries carry their size in `meta`; a volume has no size record, and
-  walking every volume at each job's end to learn one would cost more than the eviction saves. The
-  fix: a size written beside each volume when its job releases it (`<volume>.size`), a cap of its
-  own (`RUNNER_NATIVE_VOLUMES_MAX_MB`; the layers' 10 GiB would be gone in one Zig job), and
-  eviction least recently used first under the volume's lock taken exclusively and non-blocking, as
-  `evict` does for a layer. A step whose processes still hold all of `pids.max` when its script
+- Debt: seeds are never evicted. A step whose processes still hold all of `pids.max` when its script
   ends fails with exit 2 and loses its file commands: the wrapper's `sh`, the step's PID 1, cannot
   fork its epilogue (its log says the job reached its process limit). Fixing that needs a PID 1
   that reaps and kills a step's leftovers before the epilogue. The tool cache's checked trees (`set_up.verifyToolTrees`) and the seed
   registry's discovery from them are off natively: steps check the trees they use themselves, as on
   Dagger without the check. Rootless runners without delegation have no limits (P5 must refuse untrusted jobs
   there).
+
+### Eviction
+
+`runner/src/native/evict.zig` keeps what is beside `layers/` within limits of its own. It runs at the
+end of every job's `Store.collect`, under `gc.lock`, so one runner at a time does it and another
+finding it busy goes on; the proof of its locks is proofs/tla/StoreEviction.tla.
+
+- **The cap.** Past `RUNNER_NATIVE_VOLUMES_MAX_MB` (16 GiB) of volumes, those no job holds go, the
+  longest unused first. The last use is the mtime of the volume's lock file (`<volume>.lock`), set
+  by `volumes.open`. The size is `<volume>.size`, from a walk at the end of some job: one volume a
+  job, never measured first, a volume in use again at most once an hour, for at most a second (10 s
+  when it was never measured), never holding a lock, what it could not see left out. So the size
+  lags, and only ever matters at the margin.
+- **An entry stays a day.** A volume used in the last 24 hours stays though the volumes are over
+  their cap, with a line in the runner's log. The cap is a target: a working set over it costs disk,
+  where evicting it would cost each job its caches, on a loop.
+- **The disk's floor.** With less than `RUNNER_NATIVE_MIN_FREE_PCT` of the store's filesystem free
+  (10), volumes go whatever the cap says, until that much is free or all that is left was used in the
+  last hour. This is what bounds the store on a machine smaller than its caps, with no setting.
+- **A job in progress loses nothing.** A job holds each of its volumes' locks shared from
+  `volumes.open` to its end. An eviction takes the lock exclusively and non-blocking, so a volume in
+  use is skipped, on this runner or any other sharing the store; a `locked` one is in use the same
+  way. A `private` copy (`<volume>.private-<n>`) has a lock of its own, so one a dead runner left is
+  told from one in use, and goes at the next collect.
+- **What a job sees after.** A new, empty directory at the same path, owned as `volumes.open` owns
+  it, as on a machine that never ran the repository: every package manager's cache is only a cache.
+  A stored step whose `$GITHUB_PATH` or `$GITHUB_ENV` names a directory in the tool cache runs again
+  rather than replay (`toolDirNotHeld`, #229), so a replay never counts on what eviction took. A step
+  replayed whose script left something else in a volume, and a later step that needs it without
+  saying so, would not find it, as on any other runner's first run of that step's successor: that
+  rests on a job's own steps, and is the same case as Dagger's own GC of a volume.
+- **A crash at any point.** The volume is renamed to `volumes/.dead-<n>` and the rename synced before
+  anything of it is deleted, so a volume is what its job left or is gone, on a filesystem that
+  orders its journal or not. The lock file goes last, so whoever takes a lock checks it is the file
+  the path names (`Store.sameFile`), as `lockKey` does. A volume inside another (`<key>` and
+  `<key>/runner`, when one store has had both step users) goes with it, under both locks; a job
+  opening the inner one meanwhile waits, finds the path gone and starts over.
+- **Time and memory.** Deleting has a budget of 1.5 s a job. What is left stays under its dead name,
+  the next job's end goes on with it, and nothing more is evicted until it is gone. A pass holds no
+  entry's lock while it walks or deletes, so a job starting waits at most for one rename's sync.
+  It looks at up to 16,384 volumes, and a walk keeps at most 16 MiB of paths.
+- **Costs left.** Deleting and measuring are at a job's end, before its result is reported
+  (`Backend.deinit`), so a job can end up to 1.5 s plus a walk later. A size is the runner's own
+  estimate, not the filesystem's: a file with several links counts its share per link.
 
 ### P5: isolation for untrusted jobs
 

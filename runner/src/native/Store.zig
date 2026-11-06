@@ -10,7 +10,7 @@
 //!     layers/<key>/fs       the layer's tree, an overlay upper become a lower
 //!     layers/<key>/log      the step's output as it was printed, markers and all
 //!     layers/<key>/fc       its combined file commands (`scripts.writeCombinedFileCommands`)
-//!     layers/<key>/size     its bytes on disk, for eviction
+//!     layers/<key>/meta     its format, kind, bytes on disk and record's lengths and sha256s
 //!     layers/<key>/lock     held shared by every job using the layer; its mtime is its last use
 //!     layers/<key>/digest   its deterministic digest, once asked for (`layerDigest`)
 //!     keys/<key>.lock       held while a step with that key runs (`lockKey`)
@@ -29,12 +29,15 @@ const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const dagger = @import("../dagger.zig");
+const Eviction = @import("evict.zig");
 const phases = @import("phases.zig");
 
 /// The store's directory.
 root: []const u8,
 /// Past this many bytes of layers, the least recently used go (`collect`).
 max_bytes: u64 = default_max_bytes,
+/// What `collect` keeps the rest of the store to (`evict.zig`).
+limits: Eviction.Limits = .{},
 /// A descriptor on the store's filesystem, opened when the job began (`syncCursor`): `syncfs` on
 /// it reports a write error since then even if another job's `syncfs` was told first, which one
 /// opened at the publish would miss. Null: the publish's own.
@@ -835,7 +838,8 @@ fn join(arena: Allocator, dir: []const u8, name: []const u8) ![]const u8 {
 
 /// Keeps the store under `max_bytes`: the layers no job holds go, least recently used first.
 /// Also removes what dead runners left (a layer half built, one half evicted) and the lock files
-/// of keys no step is running. One runner at a time collects; another finding it busy goes on.
+/// of keys no step is running, and keeps what is beside the layers within its own limits
+/// (`evict.run`). One runner at a time collects; another finding it busy goes on.
 pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
     const cwd = std.Io.Dir.cwd();
     const gc = cwd.createFile(io, join(arena, s.root, "gc.lock") catch return, .{
@@ -874,7 +878,7 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
             _ = s.evict(arena, io, e.name);
             continue;
         };
-        const bytes = meta.bytes;
+        const bytes = accounted(meta);
         var st: linux.Statx = undefined;
         const lock_z = arena.dupeSentinel(u8, join(arena, full, "lock") catch return, 0) catch
             return;
@@ -902,7 +906,17 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
         }
     }
     s.dropKeyLocks(arena, io);
+    Eviction.run(s, io);
 }
+
+/// What an entry counts for against the cap: its tree, and its record, as a step that printed much
+/// and changed little is no cheaper to keep. And `entry_overhead`: its `meta`, its directories and
+/// their inodes, or keys of steps that change nothing would grow for ever under a cap that sees 0.
+fn accounted(m: Meta) u64 {
+    return m.bytes + m.log_len + m.fc_len + entry_overhead;
+}
+
+const entry_overhead = 16 * 1024;
 
 /// Removes one layer no job holds: renamed away under its lock taken exclusively (no job can
 /// take it after that: the path names nothing), then deleted. False when a job holds it.
@@ -951,6 +965,24 @@ fn dropKeyLocks(s: Store, arena: Allocator, io: std.Io) void {
         defer f.close(io);
         if (!flock(f, lock_ex | lock_nb)) continue;
         cwd.deleteFile(io, full) catch {};
+    }
+}
+
+/// The lock file `path`, made if it is not there, never through a symlink: a lock beside a volume
+/// may be in a directory a job could write (`evict.nested`). The lock counts only once `sameFile`
+/// says so, as an eviction removes these.
+pub fn lockBeside(arena: Allocator, io: std.Io, path: []const u8) !std.Io.File {
+    _ = arena;
+    const cwd = std.Io.Dir.cwd();
+    while (true) {
+        if (cwd.openFile(io, path, .{ .follow_symlinks = false })) |f| return f else |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        }
+        return cwd.createFile(io, path, .{ .exclusive = true, .truncate = false }) catch |e| switch (e) {
+            error.PathAlreadyExists => continue,
+            else => return e,
+        };
     }
 }
 
@@ -1009,7 +1041,7 @@ fn chmodDirs(arena: Allocator, io: std.Io, p: []const u8) void {
 /// (`RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`), or a component at a time, each `O_NOFOLLOW`, when
 /// the kernel has no `openat2` (before 5.6) or the path is past its limit (a step can nest
 /// directories deeper than PATH_MAX).
-fn openRel(arena: Allocator, root: linux.fd_t, rel: []const u8) !linux.fd_t {
+pub fn openRel(arena: Allocator, root: linux.fd_t, rel: []const u8) !linux.fd_t {
     if (rel.len < linux.PATH_MAX) {
         const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true };
         const how: OpenHow = .{
@@ -1111,7 +1143,7 @@ fn openDirAt(fd: linux.fd_t, name: [*:0]const u8) !linux.fd_t {
     return @intCast(rc);
 }
 
-fn openRoot(arena: Allocator, p: []const u8) !linux.fd_t {
+pub fn openRoot(arena: Allocator, p: []const u8) !linux.fd_t {
     return openDirAt(linux.AT.FDCWD, try arena.dupeSentinel(u8, p, 0));
 }
 
@@ -2497,7 +2529,7 @@ test "native store: collect keeps a whole layer no job holds while the store is 
     defer tmp.cleanup();
     var s: Store = .{ .root = "" };
     const k, const l = try testLayer(arena, io, tmp, &s, "up");
-    const bytes = try treeBytes(arena, io, l.fs);
+    const bytes = accounted(try metaOf(arena, io, std.fs.path.dirname(l.fs).?));
     l.lock.close(io);
     // Exactly at the cap: nothing goes.
     s.max_bytes = bytes;
@@ -2521,7 +2553,7 @@ test "native store: over its cap, collect evicts the least recently used layers 
     var bytes: u64 = 0;
     for (&keys, [_][]const u8{ "up0", "up1", "up2" }) |*k, name| {
         k.*, const l = try testLayer(arena, io, tmp, &s, name);
-        bytes = try treeBytes(arena, io, l.fs);
+        bytes = accounted(try metaOf(arena, io, std.fs.path.dirname(l.fs).?));
         l.lock.close(io);
     }
     // Used in the order 1, 0, 2 (an open is a use): room for two, so 1 goes, and only 1.
@@ -2534,6 +2566,22 @@ test "native store: over its cap, collect evicts the least recently used layers 
     try std.testing.expect(try s.open(arena, io, keys[1]) == null);
     (try s.open(arena, io, keys[0])).?.layer.lock.close(io);
     (try s.open(arena, io, keys[2])).?.layer.lock.close(io);
+}
+
+test "native store: a layer counts its record and its own files, not only its tree" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    const k, const l = try testLayer(arena, io, tmp, &s, "up");
+    const tree = try treeBytes(arena, io, l.fs);
+    l.lock.close(io);
+    s.max_bytes = tree + entry_overhead;
+    s.collect(arena, io);
+    try std.testing.expect(try s.open(arena, io, k) == null);
 }
 
 test "native store: a key published already stays, and the second upper is put back where it was" {

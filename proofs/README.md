@@ -361,7 +361,8 @@ entries:
 ```
 
 CI runs it (`store-model.yml`) on pull requests and pushes that touch `runner/src/native/Store.zig`,
-`Backend.zig`, `layers.zig` or the model, and weekly with the proofs. It is not a proof: TLC
+`Backend.zig`, `layers.zig`, `evict.zig`, `volumes.zig`, `oci/Store.zig` or the model, and weekly with
+the proofs. It is not a proof: TLC
 explores every state of a bounded instance, and the bounds are below.
 
 **What is modelled**, each action citing the code it stands for (file:line, in the module):
@@ -500,6 +501,45 @@ read by `open`); the rootfs, the provisioning store (`oci/Store.zig`) and flatte
 into the job's own directory; a hand deleting an entry's lock file (`evict` would then remove an
 entry a job holds: the store is the runner's alone, `Store.prepare`); readdir returning an entry
 twice; and more runners, keys or steps than the bounds.
+
+
+### Eviction beside the layers
+
+`tla/StoreEviction.tla` is the protocol of `runner/src/native/evict.zig` and what it shares with
+`volumes.open`, `oci.Store.hold` and `ensure`: entries whose lock is beside them (`<dir>.lock`), held
+shared by a job for as long as it uses the path, and which an eviction removes, so that whoever
+takes one must check it is still the file the path names. A volume is made in place, a tree aside
+and renamed in. One volume can be inside another's directory (`<key>` and `<key>/runner`), whose lock
+file then goes with the outer one's rename; a `-nested` configuration has that case.
+
+| Property | Says |
+|---|---|
+| `HeldWhole` | what a job holds is what the path names, and nothing of it was deleted, until the job ends |
+| `NamedWhole` | no name ever names a tree something was deleted from, whatever crashes |
+| `OneMaker` | two jobs do not make one tree at once |
+| `LocksExclude` | flocks as the kernel gives them, the model's own check |
+| `AllEnd` | every job ends |
+
+Mutants, each with a guard taken away: `-no-recheck` (no `sameFile` after a job's lock:
+`HeldWhole`), `-no-down-check` (`ensure` taking what it made to be there, once exclusive became
+shared, which `flock` does not do atomically: `HeldWhole`), `-no-lock` (an eviction by age alone:
+`HeldWhole`), `-no-inner-lock` (an eviction without the inner volume's lock: `HeldWhole`),
+`-delete-first` (deleting before the rename: `NamedWhole`), `-no-rename-sync` (deleting before the
+rename is on disk: `NamedWhole`).
+
+**What it found.** A runner renames a tree to `.dead-<n>` and dies before it syncs that rename;
+another runner's pass finds the dead tree and starts deleting; a machine crash keeps the deletes and
+loses the rename, and the name comes back on a tree half gone. On ext4 the journal's order rules that
+out; on a filesystem that does not promise it, nothing else did. `removeDead` now syncs the area's
+directory before it deletes anything there, whoever made the dead name (`StoreEviction-crash.cfg`
+found it, in 24 states).
+
+**What it does not model**: sizes, the caps and the order of eviction (any entry may go, which
+over-approximates the LRU); the blobs, whose lock is a plain reader-writer lock; a volume's content,
+which no one synced and which is only a cache; and a published tree's data, synced before its rename
+as a layer's is, which `StoreLocking.tla` models for layers and the store's crash test runs on ext4.
+The bounds are small: three runners, one job each and a process crash, and two runners with a
+machine's crash. It is not a proof beyond them.
 
 ## Why the regex matcher terminates
 

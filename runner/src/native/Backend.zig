@@ -25,6 +25,7 @@ const ImageStore = @import("oci/Store.zig");
 const http = @import("../github/http.zig");
 const docker = @import("../dagger/docker.zig");
 const cgroup = @import("cgroup.zig");
+const evict = @import("evict.zig");
 const volumes = @import("volumes.zig");
 const admission = @import("../admission.zig");
 const services = @import("services.zig");
@@ -192,6 +193,8 @@ pub const Config = struct {
     /// Past this many bytes, the store's least recently used layers go
     /// (`RUNNER_NATIVE_STORE_MAX_MB`, `Store.collect`).
     store_max_bytes: u64 = Store.default_max_bytes,
+    /// What the store keeps beside the layers (`evict.zig`).
+    store_limits: evict.Limits = .{},
     /// Tests: the stack of layers is flattened past this many (`flatten`).
     flatten_at: usize = default_flatten_at,
     /// Tests: services' images from a directory filled ahead (`images.find`: `rootfs/` and
@@ -280,6 +283,10 @@ pub fn configFor(
         .subid_base = cfg.native_subid_base,
         .subnet = try net.Subnet.parse(cfg.native_subnet),
         .store_max_bytes = cfg.native_store_max_mb * 1024 * 1024,
+        .store_limits = .{
+            .volumes_max_bytes = cfg.native_volumes_max_mb * 1024 * 1024,
+            .min_free_pct = cfg.native_min_free_pct,
+        },
         .cgroup = cg,
         .job_limits = jobLimits(arena, io, cg),
     };
@@ -750,6 +757,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .store_cfg = .{
             .root = cfg.store,
             .max_bytes = cfg.store_max_bytes,
+            .limits = cfg.store_limits,
             .sync_fd = Store.syncCursor(arena, cfg.store),
         },
         .vouched = cfg.vouched,

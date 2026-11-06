@@ -20,10 +20,14 @@
 # checks the store: the first job after the crash is the first of a boot (checkOncePerBoot); then
 # no layer that `open` accepts differs from what was published, nothing a job had finished and
 # synced is missing, and the same holds for `oci.Store.ensure`'s directory and `volumes.adoptSeed`'s
-# seed. The last mark the log passed says which jobs had finished.
+# seed. A volume an eviction (`evict.run`) is taking is what its job left or is not there, the ones
+# it must not take are, and the next job's end finishes what a crash cut short. The last mark the log
+# passed says which jobs had finished.
 #
-# Two checks of the check: the finished disk with a layer cut a byte short and with a byte changed
-# must fail it, or it would pass whatever the store did.
+# Checks of the check: the finished disk with a layer cut a byte short, with a byte changed, with a
+# volume half deleted under its own name and with an evicted one back must each fail it, or it would
+# pass whatever the store did. And the points must reach the eviction: a run with no point inside it
+# would pass whatever the eviction did, so one that saw no dead tree on any disk fails.
 #
 # The write errors. dm-flakey is switched to fail every write (error_writes) around the call
 # that must notice: a publish of a small layer (its fsyncs) and of a large one
@@ -122,7 +126,7 @@ crash() {
 	"$w/mark" start
 	mkdir "$w/mnt/w"
 	local step
-	for step in 1 2 3 4 5 6; do
+	for step in 1 2 3 4 5 6 7 8; do
 		store_test write "$w/mnt/w" "$step" >"$w/step.log" 2>&1 || {
 			cat "$w/step.log"
 			echo "::error title=Store crash::step $step of the sequence failed"
@@ -180,12 +184,17 @@ crash() {
 		if ! point "$limit" "$mark" "$kind"; then bad=$((bad + 1)); fi
 	done <"$w/points.txt"
 	echo "$count crash points in $((SECONDS - started)) s, $bad failed"
-	echo "disks seen, by layers a hit found and directories published whole (points):"
+	echo "disks seen, by layers a hit found, directories published whole, volumes and dead trees (points):"
 	sort "$w/outcomes.txt" | uniq -c | sed 's/^/  /'
 	echo "the last mark each point had passed (points):"
 	awk '{print $2}' "$w/points.txt" | sort | uniq -c | sed 's/^/  /'
 	((bad == 0)) || {
 		echo "::error title=Store crash::$bad of $count crash points failed the store's checks"
+		return 1
+	}
+	# The eviction's own crash points, not only the ones around it.
+	grep -q ' [1-9][0-9]* dead$' "$w/outcomes.txt" || {
+		echo "::error title=Store crash::no crash point fell inside an eviction: no disk had a dead tree"
 		return 1
 	}
 	controls "$(tail -n 1 "$w/points.txt" | cut -d' ' -f1)"
@@ -204,7 +213,7 @@ point() {
 	if [[ -z $why ]] && ! e2fsck -fn "$point_dev" >"$w/fsck.log" 2>&1; then
 		why="e2fsck: $(grep -m 3 -v '^$' "$w/fsck.log" | tr '\n' ';')"
 	fi
-	[[ -n $why ]] || grep -o '[0-9]* layers hit, [0-9]* directories' "$w/verify.log" >>"$w/outcomes.txt" || true
+	[[ -n $why ]] || grep -o '[0-9]* layers hit.*dead$' "$w/verify.log" >>"$w/outcomes.txt" || true
 	losetup -d "$point_dev"
 	if [[ -n $why ]]; then
 		echo "FAIL after $limit entries ($kind, last mark $mark): $why"
@@ -228,7 +237,7 @@ mount_point() {
 # the check must fail, or it checks nothing.
 controls() {
 	local how
-	for how in truncate flip; do
+	for how in truncate flip halve undo; do
 		restore "$1"
 		mount_point
 		store_test corrupt "$work/check/w" "$how" >/dev/null 2>&1

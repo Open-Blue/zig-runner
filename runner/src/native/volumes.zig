@@ -13,9 +13,13 @@
 //!
 //! Dagger's sharing modes are kept with an flock on `<volume>.lock` beside each volume, held for
 //! the job: `shared` (Dagger's default, and every volume's here) takes it shared, so jobs use a
-//! volume at once and only something that must have it alone (an eviction, when one exists)
-//! waits; `locked` takes it exclusive, so jobs take turns; `private` takes it exclusive if it is
-//! free and otherwise gives the job a fresh volume of its own, removed when the job ends.
+//! volume at once and only an eviction (`evict.zig`) has to wait, which it does not: it takes the
+//! lock non-blocking and leaves a volume in use alone. `locked` takes it exclusive, so jobs take
+//! turns; `private` takes it exclusive if it is free and otherwise gives the job a fresh volume of
+//! its own, under a lock of its own (`<volume>.private-<n>.lock`), removed when the job ends, or
+//! by the next collect when the job's runner died. The lock's mtime is the volume's last use.
+//! A volume is a cache: one that was evicted is an empty directory to the next job, as a new one
+//! is, and a job that held it to its end never sees that.
 //!
 //! Ownership. On a root runner each job's ids are its slot's range, so a volume filled by one
 //! slot's job would be nobody's to the next slot's. Its files are owned on disk by a range of
@@ -41,6 +45,7 @@ const job_mod = @import("../job.zig");
 const set_up = @import("../dagger/set_up.zig");
 const sandbox = @import("sandbox.zig");
 const OciStore = @import("oci/Store.zig");
+const Store = @import("Store.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -78,11 +83,16 @@ pub const Volume = struct {
     /// A `private` volume's copy of the job's own, removed when it is let go.
     private: bool = false,
 
-    /// Lets the volume go; a private copy is removed.
+    /// Lets the volume go; a private copy is removed, and its lock with it.
     pub fn release(v: Volume, io: std.Io) void {
-        if (v.private) std.Io.Dir.cwd().deleteTree(io, v.dir) catch |e|
+        defer v.lock.close(io);
+        if (!v.private) return;
+        const cwd = std.Io.Dir.cwd();
+        cwd.deleteTree(io, v.dir) catch |e|
             std.log.warn("native: cannot remove {s}: {s}", .{ v.dir, @errorName(e) });
-        v.lock.close(io);
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const lock = std.fmt.bufPrint(&buf, "{s}.lock", .{v.dir}) catch return;
+        cwd.deleteFile(io, lock) catch {};
     }
 };
 
@@ -108,29 +118,47 @@ pub fn open(
         try path.appendSlice(arena, try component(arena, part));
     }
     const dir = path.items;
-    try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(dir).?);
     const lock_path = try std.fmt.allocPrint(arena, "{s}.lock", .{dir});
-    const lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false });
-    errdefer lock.close(io);
     const lock_sh: i32 = 1;
     const lock_ex: i32 = 2;
     const lock_nb: i32 = 4;
     var private = false;
-    switch (sharing) {
-        .shared, .locked => {
-            const op = if (sharing == .shared) lock_sh else lock_ex;
-            if (linux.errno(linux.flock(lock.handle, op)) != .SUCCESS) return error.Locked;
-        },
-        .private => private = linux.errno(linux.flock(lock.handle, lock_ex | lock_nb)) != .SUCCESS,
-    }
+    // Until the lock is on the file the path names: an eviction removes the file once it has the
+    // volume away, and can take the directory it is in (`evict.nested`).
+    var lock = while (true) {
+        try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(dir).?);
+        const f = Store.lockBeside(arena, io, lock_path) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => return e,
+        };
+        errdefer f.close(io);
+        switch (sharing) {
+            .shared, .locked => {
+                const op = if (sharing == .shared) lock_sh else lock_ex;
+                if (linux.errno(linux.flock(f.handle, op)) != .SUCCESS) return error.Locked;
+            },
+            .private => private = linux.errno(linux.flock(f.handle, lock_ex | lock_nb)) != .SUCCESS,
+        }
+        if (private or Store.sameFile(arena, f, lock_path)) break f;
+        f.close(io);
+    };
+    errdefer lock.close(io);
     const at = if (private) private: {
         var raw: [8]u8 = undefined;
         io.random(&raw);
-        break :private try std.fmt.allocPrint(arena, "{s}.private-{s}", .{
+        const copy = try std.fmt.allocPrint(arena, "{s}.private-{s}", .{
             dir,
             &std.fmt.bytesToHex(raw, .lower),
         });
+        // A lock of its own, which tells a copy in use from one a dead runner left.
+        const own = try Store.lockBeside(arena, io, try std.fmt.allocPrint(arena, "{s}.lock", .{copy}));
+        lock.close(io);
+        lock = own;
+        if (linux.errno(linux.flock(lock.handle, lock_ex | lock_nb)) != .SUCCESS) return error.Locked;
+        break :private copy;
     } else dir;
+    // Its last use, which an eviction goes by.
+    _ = linux.utimensat(lock.handle, null, null, 0);
     const at_z = try arena.dupeSentinel(u8, at, 0);
     switch (linux.errno(linux.mkdir(at_z, 0o755))) {
         .SUCCESS, .EXIST => {},

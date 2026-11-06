@@ -10,6 +10,7 @@ const app = @import("github/app.zig");
 const NativeBackend = @import("native/Backend.zig");
 const native_net = @import("native/net.zig");
 const NativeStore = @import("native/Store.zig");
+const native_evict = @import("native/evict.zig");
 const native_cgroup = @import("native/cgroup.zig");
 
 pub const Scope = union(enum) {
@@ -142,6 +143,12 @@ pub const Config = struct {
     /// Past this many MiB, the native step store's least recently used layers go
     /// (`RUNNER_NATIVE_STORE_MAX_MB`, `native/Store.zig`).
     native_store_max_mb: u64 = NativeStore.default_max_bytes / (1024 * 1024),
+    /// Past this many MiB, the native cache volumes that went longest unused go
+    /// (`RUNNER_NATIVE_VOLUMES_MAX_MB`, 0 for no cap, `native/evict.zig`).
+    native_volumes_max_mb: u64 = native_evict.default_volumes_max_bytes / (1024 * 1024),
+    /// With less than this percentage of the native store's filesystem free, what it keeps goes
+    /// whatever the caps say (`RUNNER_NATIVE_MIN_FREE_PCT`, 0 for no floor, `native/evict.zig`).
+    native_min_free_pct: u8 = native_evict.default_min_free_pct,
     /// Where native jobs' cgroups go (`RUNNER_NATIVE_CGROUP`: "", `self`, `none` or a cgroup's
     /// path), and each job's limits (`RUNNER_NATIVE_MEMORY_MAX_MB`, null for three quarters of
     /// the machine's memory and 0 for none; `RUNNER_NATIVE_PIDS_MAX`, 0 for none). See
@@ -417,6 +424,8 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_SUBID_BASE")) |v| c.native_subid_base = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_SUBNET")) |v| c.native_subnet = v;
         if (environ.get("RUNNER_NATIVE_STORE_MAX_MB")) |v| c.native_store_max_mb = try num(u64, v);
+        if (environ.get("RUNNER_NATIVE_VOLUMES_MAX_MB")) |v| c.native_volumes_max_mb = try num(u64, v);
+        if (environ.get("RUNNER_NATIVE_MIN_FREE_PCT")) |v| c.native_min_free_pct = try num(u8, v);
         if (environ.get("RUNNER_NATIVE_CGROUP")) |v| c.native_cgroup = v;
         if (environ.get("RUNNER_NATIVE_MEMORY_MAX_MB")) |v| c.native_memory_max_mb = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_PIDS_MAX")) |v| c.native_pids_max = try num(u32, v);
@@ -496,6 +505,8 @@ pub const Config = struct {
         else if (eq(key, "native-subid-base")) c.native_subid_base = try num(u32, val) //
         else if (eq(key, "native-subnet")) c.native_subnet = val //
         else if (eq(key, "native-store-max-mb")) c.native_store_max_mb = try num(u64, val) //
+        else if (eq(key, "native-volumes-max-mb")) c.native_volumes_max_mb = try num(u64, val) //
+        else if (eq(key, "native-min-free-pct")) c.native_min_free_pct = try num(u8, val) //
         else if (eq(key, "native-cgroup")) c.native_cgroup = val //
         else if (eq(key, "native-memory-max-mb")) c.native_memory_max_mb = try num(u32, val) //
         else if (eq(key, "native-pids-max")) c.native_pids_max = try num(u32, val) //
@@ -831,6 +842,11 @@ test "the native subnet and ids: defaults, and values that are refused" {
     const c = try Config.load(&env, &.{"runner"});
     try std.testing.expectEqualStrings("10.211.0.0/16", c.native_subnet);
     try std.testing.expectEqual(NativeBackend.default_subid_base, c.native_subid_base);
+    try env.put("RUNNER_NATIVE_VOLUMES_MAX_MB", "2048");
+    try env.put("RUNNER_NATIVE_MIN_FREE_PCT", "5");
+    const limited = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqual(@as(u64, 2048), limited.native_volumes_max_mb);
+    try std.testing.expectEqual(@as(u8, 5), limited.native_min_free_pct);
     try env.put("RUNNER_NATIVE_SUBNET", "10.88.0.0/24");
     try std.testing.expectError(error.InvalidNativeSubnet, Config.load(&env, &.{"runner"}));
     try std.testing.expectEqualStrings("172.30.0.0/20", (try Config.load(&env, &.{
