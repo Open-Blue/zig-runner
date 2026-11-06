@@ -2095,11 +2095,44 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
   defaults to: `overlayFeatures` in `sandbox.zig` passes `redirect_dir=off,metacopy=off` on a root
   runner; a rootless one's `userxattr` already has neither, and refuses that option beside it.
   `Store.flatten` checks only directories, which is enough with metacopy off.
-- **A file is hashed whatever its mode.** The runner reads as itself (root, or the rootless
-  user), so a non-root `container:` job can hash a file its own user could not read (`ln -s
-  /etc/shadow s`) from within its own tree. Dagger's `sha256sum` ran as the step user and would
-  fail. Matching it needs the layer's ids translated to the step's (a layer's files are the
-  canonical ids, the slot's, or the runner's own, by layer), which is not simple to get right, and
-  the gain is a hash of a file in the job's own container; so it is not done.
+- **A file is hashed only if the step's user could read it (#360).** The runner reads as itself
+  (root, or the rootless user), so without a check a non-root `container:` job could hash a file
+  its own user cannot read (`ln -s /etc/shadow s`) from within its own tree. The owner decided
+  that it must match Dagger, whose two halves ran as different users, and this keeps them apart.
+  - *What each half is.* The search was the engine's (`exists`, `entries` on `rootfs`), so it sees
+    past permissions, and still does: a name in a directory the user cannot enter is found, and
+    so is what a followed link leads to. Only `sha256sum` and `realpath` ran as the step's user,
+    and they are what the check stands for (`Merged.checked`).
+  - *A failure, not a skip.* `sha256sum` exited non-zero, so the call fails with its words,
+    `sha256sum: <name>: Permission denied`, and `realpath: <path>: Permission denied` for a
+    directory reached with links followed. `[ -d ]` could not `stat` under a directory the user
+    cannot enter, so a directory there failed too, where one the user can reach is skipped.
+  - *Directories.* Each directory walked needs search permission, those a link leads through
+    and `..` included, and that is asked before the name is looked up, as the kernel does. So a
+    link to what is behind such a directory reads the same whether it is there or not, and asking
+    gives no new way to learn that a file exists.
+  - *Ids.* A layer's ids are compared as the job sees them, by layer: the job's own uppers have
+    the slot's host ids, stored and flattened layers and the image's have the canonical ids
+    (`Backend.hashStep`). An id the job does not reach matches no one, not `nobody`. A root step
+    on a root runner has `CAP_DAC_OVERRIDE`, and a rootless runner's steps are all root, so
+    neither is checked.
+  - *Groups.* The primary group, and the supplementary groups BuildKit's `GetUser` gave: those of
+    a name or uid that /etc/passwd has, and none with an explicit group. They come from
+    /etc/passwd and /etc/group as the next step has them, resolved like any file of the job, so
+    a link in them stays in its tree. A native step's own processes have no supplementary group
+    (`setgroups(0)` in `sandbox.zig`), so a file only such a group may read is hashed but cannot
+    be `cat` by the step: that is Dagger's answer, and the difference is the sandbox's.
+  - *ACLs and capabilities.* An ACL decides as the kernel's `posix_acl_permission` does, on the
+    file and on each directory, with its ids shifted like the owner's. `sha256sum` as a non-root
+    user had no capability to use, so none is modelled.
+  - *What is not matched.* `sha256sum` went on and named every file it could not read; this stops
+    at the first, and reads nothing of it. A workspace the user cannot reach fails with
+    `sha256sum:`'s words, not `cd`'s. The words are coreutils', also in an image whose `sha256sum`
+    is busybox's. The engine read the user's uid and gid again at each exec, and a step's are
+    settled when the job starts, so a step that edits its own /etc/passwd changes its groups
+    here, but not its ids. A rootless step's root can read a file of mode 000, and the runner, as
+    itself, cannot: that call fails, as it did before this check. ACLs in an image are not kept
+    by the native pull (`oci/layer.zig`), so the step cannot use them either. A line of
+    /etc/group whose gid is not a number is skipped, where the engine read it as 0.
 - **A file is looked at before it is opened.** Its type is read from an `O_PATH` descriptor and
   the file opened through that descriptor, so a pipe is refused and not waited for.

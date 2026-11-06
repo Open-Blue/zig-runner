@@ -132,6 +132,9 @@ env: std.ArrayList(job_mod.EnvVar) = .empty,
 /// Who steps run as, and where they start.
 uid: u32 = 0,
 gid: u32 = 0,
+/// `uid` as it was given (the image's `USER`, or `dagger.runner_user`): `hashFiles()` needs its
+/// form, which `uid` and `gid` have lost (`hash_files.Step.user`).
+user: []const u8 = "",
 workdir: []const u8 = "/",
 how: Launch,
 /// On a root runner: the job's slot (its range of ids and its address), held by a lock, and its
@@ -1308,9 +1311,11 @@ fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
     if (ev.job.container != null) b.runtime_path = b.envValue("PATH");
     b.uid = b.image_uid;
     b.gid = b.image_gid;
+    b.user = if (b.image) |img| img.user else "";
     if (plan.as_runner) {
         b.uid = runner_uid;
         b.gid = runner_uid;
+        b.user = dagger.runner_user;
         try b.put("HOME", dagger.runner_home);
     }
     try b.put(dagger.mark_env, plan.mark);
@@ -1932,7 +1937,7 @@ pub const max_read = 16 * 1024 * 1024;
 
 /// `hashFiles(args)` over the job's files as the next step would see them (`native/hash_files.zig`):
 /// the layers as they are now, so what earlier steps wrote is there, read by the runner with no
-/// mount. `ws` is the workspace.
+/// mount, for the steps' user (`hashStep`). `ws` is the workspace.
 pub fn hashFiles(
     b: *Backend,
     arena: Allocator,
@@ -1948,9 +1953,33 @@ pub fn hashFiles(
     layers[layers.len - 1] = b.rootfs;
     var limits = b.hash_settings.limits(b.io);
     limits.cancel = b.cancel;
-    const stack: hash_files.Stack = .{ .layers = layers, .opaque_xattr = b.opaqueXattr(), .limits = limits };
+    const layer_ids = try b.gpa.alloc(Store.Ids, layers.len);
+    defer b.gpa.free(layer_ids);
+    const stack: hash_files.Stack = .{
+        .layers = layers,
+        .opaque_xattr = b.opaqueXattr(),
+        .step = b.hashStep(layer_ids),
+        .limits = limits,
+    };
     // The call's own memory is freed when it returns; the job's arena gets the result only.
     return hash_files.hashFiles(b.gpa, arena, b.io, stack, ws, dagger.runner_home, args);
+}
+
+/// The steps' user for `hashFiles`, with `layer_ids` filled for its layers, topmost first; null
+/// when they run as root, which is every step of a rootless runner. A job's own upper has its
+/// slot's host ids and is seen as it is; what is seen through the job's ids (`canonical`: stored
+/// layers, a flattened one, then the seeds and the rootfs, the image's own) has the job's ids
+/// (`sandbox.idmapLowers`). Rootless, no layer has any ids but the runner's own user's.
+fn hashStep(b: *const Backend, layer_ids: []Store.Ids) ?hash_files.Step {
+    if (b.uid == 0) return null;
+    @memset(layer_ids, b.ids());
+    if (b.how.userns == .mapped) {
+        const n = b.layers.items.len;
+        for (b.layers.items, 0..) |l, i| {
+            if (!l.canonical) layer_ids[n - 1 - i] = b.slotIds();
+        }
+    }
+    return .{ .uid = b.uid, .gid = b.gid, .user = b.user, .ids = layer_ids };
 }
 
 /// Overlay's attribute that marks a directory opaque: `trusted.` when the job's overlay is mounted
@@ -6363,6 +6392,178 @@ test "native hashFiles: a link a step planted out of the job's tree does not rea
     defer dir.close(io);
     var it = dir.iterate();
     while (try it.next(io)) |e| try std.testing.expectEqualStrings("secret.txt", e.name);
+}
+
+test "hashFiles reads for the steps' user, by each layer's ids, and for root checks nothing" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var b: Backend = .{
+        .arena = arena,
+        .io = std.testing.io,
+        .gpa = std.testing.allocator,
+        .dir = "",
+        .rootfs = "",
+        .binds = &.{},
+        .lock = undefined,
+        .how = .{ .argv_prefix = &.{}, .userns = .mapped },
+    };
+    try b.layers.append(arena, .{ .name = "old", .path = "old", .canonical = true });
+    try b.layers.append(arena, .{ .name = "new", .path = "new" });
+    var seen: [4]Store.Ids = undefined;
+
+    // Root sees all of it, on a root runner...
+    try std.testing.expect(b.hashStep(&seen) == null);
+    // ...as a rootless one's steps, which can be no one else, do.
+    b.how.userns = .self;
+    try std.testing.expect(b.hashStep(&seen) == null);
+
+    // The runner user on a root runner: the job's upper in the slot's ids, the stored layer and
+    // the image's below it in the job's.
+    b.how.userns = .mapped;
+    b.uid = 1001;
+    b.gid = 1001;
+    b.user = dagger.runner_user;
+    const step = b.hashStep(&seen).?;
+    try std.testing.expectEqual(@as(u32, 1001), step.uid);
+    try std.testing.expectEqualStrings(dagger.runner_user, step.user);
+    try std.testing.expectEqual(b.slotIds(), seen[0]);
+    for (seen[1..]) |lower| try std.testing.expectEqual(b.ids(), lower);
+}
+
+/// A job that plants links to what its user may not read, in a rootfs that has such files, then
+/// asks for each in a step of its own. `hashFiles()` failing fails a step, and these run anyway.
+fn deniedJob(arena: Allocator) !job_mod.Job {
+    const plant = testStep("ln -s /etc/shadow s; ln -s /opt/shut/f behind; ln -s /opt/shut/none absent; " ++
+        "ln -s /opt/shut/sub dir-behind; ln -s /opt/grouped grouped; ln -s /opt opt-dir; " ++
+        "printf mine > mine; chmod 600 mine; mkdir own; printf x > own/f; chmod 000 own");
+    const asks = [_][]const u8{
+        "'s'",
+        "'behind'",
+        "'absent'",
+        "'dir-behind'",
+        "'own/f'",
+        "'--follow-symbolic-links', 'dir-behind/**'",
+        "'opt-dir'",
+        "'mine'",
+        "'grouped'",
+    };
+    const steps = try arena.alloc(job_mod.Step, asks.len + 1);
+    steps[0] = plant;
+    for (asks, steps[1..], 0..) |ask, *st, i| {
+        st.* = testStep("");
+        st.condition = "always()";
+        st.action.script.script = .{ .expr = try std.fmt.allocPrint(
+            arena,
+            "format('echo got{d}={{0}}.', hashFiles({s}))",
+            .{ i, ask },
+        ) };
+    }
+    return testJob(steps);
+}
+
+/// What `deniedJob` must leave: a step's failure for each file its user may not reach, in the words
+/// of Dagger's `sha256sum` and `realpath`, and the hashes of those it may.
+fn expectDenied(arena: Allocator, r: anytype) !void {
+    const ws = "/home/runner/work/r/r";
+    try expectLines(r.text, &.{
+        "hashFiles(s) failed: sha256sum: s: Permission denied",
+        "hashFiles(behind) failed: sha256sum: behind: Permission denied",
+        // What is not there behind the directory reads as what is.
+        "hashFiles(absent) failed: sha256sum: absent: Permission denied",
+        "failed: sha256sum: dir-behind: Permission denied",
+        // The user's own file, in the user's own directory, whose search it took away.
+        "hashFiles(own/f) failed: sha256sum: own/f: Permission denied",
+        "failed: realpath: " ++ ws ++ "/dir-behind: Permission denied",
+        // A link to a directory the user can reach is skipped.
+        "got6=.",
+        try std.fmt.allocPrint(arena, "got7={s}.", .{&hashOfFiles(&.{"mine"})}),
+        // By a supplementary group of /etc/group, which a step's own processes have not got.
+        try std.fmt.allocPrint(arena, "got8={s}.", .{&hashOfFiles(&.{"grouped"})}),
+    });
+    const steps = r.res.steps;
+    for (steps[1..7]) |st| try std.testing.expectEqual(dagger.Outcome.failure, st.outcome);
+    // The content of nothing refused reached the job.
+    for ([_][]const u8{ "root:secret", "behind the door", "x" }) |content| {
+        const hash = hashOfFiles(&.{content});
+        try std.testing.expect(std.mem.indexOf(u8, r.text, &hash) == null);
+    }
+}
+
+/// `deniedJob`'s rootfs, under `root`: what a provisioned image gives the runner user, and files
+/// of the job's root that it may not read.
+fn deniedRootfs(arena: Allocator, root: []const u8) !void {
+    const setup = try std.fmt.allocPrint(arena,
+        \\set -e
+        \\cd '{s}'
+        \\mkdir -p rootfs/opt/shut/sub rootfs/github rootfs/home/runner
+        \\chown 1001:1001 rootfs/github rootfs/home/runner
+        \\chmod 1777 rootfs/tmp
+        \\printf 'root:secret' > rootfs/etc/shadow
+        \\chmod 0640 rootfs/etc/shadow
+        \\printf 'behind the door' > rootfs/opt/shut/f
+        \\chmod 0755 rootfs/opt
+        \\chmod 0700 rootfs/opt/shut
+        \\printf grouped > rootfs/opt/grouped
+        \\chown 0:50 rootfs/opt/grouped
+        \\chmod 0640 rootfs/opt/grouped
+        \\printf 'root:x:0:\nrunner:x:1001:\nstaff:x:50:runner\n' > rootfs/etc/group
+    , .{root});
+    const made = try std.process.run(arena, std.testing.io, .{ .argv = &.{ "sh", "-c", setup } });
+    try std.testing.expect(made.term == .exited and made.term.exited == 0);
+}
+
+test "native hashFiles: a step's user hashes only what it could read, as Dagger's `sha256sum` did" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    try deniedRootfs(arena, try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena));
+    // The job's upper in its slot's host ids: each step sees it unmapped.
+    const r = try runNativeJob(arena, cfg, try deniedJob(arena), .runner);
+    try expectDenied(arena, r);
+}
+
+test "native hashFiles: a stored layer's ids are the job's, whichever slot left them" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    try deniedRootfs(arena, try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena));
+    // A step that wrote a file only its user may read, kept in the store with the canonical ids,
+    // and a step after it, replayed or not, whose hash of it is the user's.
+    const write = testStep("echo x >> /shared/w; printf mine > mine; chmod 600 mine");
+    var read = testStep("");
+    read.action.script.script = .{ .expr = "format('echo x >> /shared/r; echo got={0}.', hashFiles('mine'))" };
+    const job = testJob(&.{ write, read });
+    const want = try std.fmt.allocPrint(arena, "got={s}.", .{&hashOfFiles(&.{"mine"})});
+    const first = try runCachedAs(arena, c.cfg, job, "j1", .runner);
+    try expectSucceeded(first);
+    try expectLines(first.text, &.{want});
+    const again = try runCachedAs(arena, c.cfg, job, "j2", .runner);
+    try expectSucceeded(again);
+    try expectLines(again.text, &.{want});
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "w"));
+}
+
+test "native hashFiles: a root step's hash does not look at the file's mode" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const plant = testStep("mkdir d; printf r > d/f; chmod 600 d/f; chmod 700 d");
+    var read = testStep("");
+    read.action.script.script = .{ .expr = "format('echo got={0}.', hashFiles('d/f'))" };
+    const r = try runNativeJob(arena, cfg, testJob(&.{ plant, read }), .root);
+    try expectLines(r.text, &.{try std.fmt.allocPrint(arena, "got={s}.", .{&hashOfFiles(&.{"r"})})});
 }
 
 /// Two steps whose text is the same in every job: the first writes the file from its env, the
