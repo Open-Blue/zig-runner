@@ -1652,7 +1652,10 @@ test "native eviction: a slow sync does not eat what a pass may delete" {
     f.s.limits = .{ .volumes_max_bytes = 0, .min_free_pct = 0, .budget_ms = 300 };
     test_sync_ms = 400;
     defer test_sync_ms = 0;
-    for (0..2) |_| run(f.s, testing.io);
+    // Each pass gets its time after the sync, so a busy machine only takes more of them: a sync
+    // that ate the budget would leave the tree whole for good.
+    var passes: usize = 0;
+    while (passes < 30 and try f.deadLeft() > 0) : (passes += 1) run(f.s, testing.io);
     try testing.expectEqual(@as(usize, 0), try f.deadLeft());
 }
 
