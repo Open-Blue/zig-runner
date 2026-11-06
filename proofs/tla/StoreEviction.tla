@@ -12,7 +12,11 @@
 (* published by a rename.  `Outer` and `Inner` are the one case of an      *)
 (* entry inside another's directory (a step user's volume under the same   *)
 (* key as a root's, volumes.plan), whose lock file goes with the outer's   *)
-(* rename.  Each runner process runs `Rounds` jobs of one entry each, then *)
+(* rename; a job holding the outer one can write what is at the inner      *)
+(* lock's name, so anything may be there (`planted`), and could delete a   *)
+(* real lock, which is no worse than the rm -r of the inner volume that   *)
+(* job can do anyway.  Each runner process runs `Rounds` jobs of one entry *)
+(* each, then                                                              *)
 (* a collect.  Any process may die between any two actions, and the        *)
 (* machine may die; the jobs after that find what the crash left.          *)
 (*                                                                         *)
@@ -29,13 +33,18 @@ CONSTANTS
     NoKey,
     MaxCrashes,
     MachineCrashes,
+    MaxPlants,      \* things jobs leave at the inner lock's name
+    MaxStuck,       \* dead trees that cannot be removed
     OpenRechecks,      \* whoever takes a lock checks it is the file the path names (sameFile)
     DowngradeRechecks, \* ensure looks again after it gives up exclusive for shared
     EvictLocks,        \* an eviction takes the lock exclusively, non-blocking
     EvictRechecks,     \* an eviction checks its lock is on the file the path names
     TakesInnerLock,    \* an eviction takes the lock of the entry inside the one it takes
     RenameFirst,       \* the tree goes to a dead name before anything of it is deleted
-    SyncsRename        \* that rename is on disk before anything of it is deleted
+    SyncsRename,       \* that rename is on disk before anything of it is deleted
+    SyncsFilesystem,   \* removeDead syncs the filesystem, as it cannot know a rename's source
+    ClearsPlanted,     \* innerLock removes what is no regular file at the lock's name
+    StuckStopsNothing  \* a dead tree that cannot be removed does not end the pass
 
 Keys == Volumes \cup Trees
 NoFd == <<>>
@@ -49,12 +58,18 @@ VARIABLES
     nextId,   \* the last tree id
     half,     \* ids of trees something was deleted from
     tmp,      \* keys with a tree being made aside (`.tmp-<key>`), by a live or dead maker
-    dead,     \* trees under a dead name: [id, key, synced]
+    dead,     \* trees under a dead name: [id, key, synced, src, stuck]; `synced` its directory,
+              \* `src` the directory it came from, which for a volume is another
     gc,       \* who holds gc.lock
-    crashes, mcrashes
+    planted,  \* something no regular file is at the inner lock's name
+    crashes, mcrashes, plants, stucks,
+    pinned,   \* ghost: what a job planted kept a volume from going
+    stopped   \* ghost: a dead tree that would not go ended a pass
 
-vars == <<st, lockIno, lockGen, locks, dirOf, nextId, half, tmp, dead, gc, crashes, mcrashes>>
-fsVars == <<lockIno, lockGen, locks, dirOf, nextId, half, tmp, dead, gc>>
+vars == <<st, lockIno, lockGen, locks, dirOf, nextId, half, tmp, dead, gc, planted, crashes,
+          mcrashes, plants, stucks, pinned, stopped>>
+fsVars == <<lockIno, lockGen, locks, dirOf, nextId, half, tmp, dead, gc, planted>>
+counts == <<crashes, mcrashes, plants, stucks, pinned, stopped>>
 
 (* `fd` the open lock file; `held` the tree the job's mounts name.        *)
 Idle == [pc |-> "open", round |-> 1, key |-> CHOOSE k \in Keys : TRUE, fd |-> NoFd,
@@ -74,7 +89,9 @@ Init ==
     /\ tmp = {}
     /\ dead = {}
     /\ gc = {}
-    /\ crashes = 0 /\ mcrashes = 0
+    /\ planted = FALSE
+    /\ crashes = 0 /\ mcrashes = 0 /\ plants = 0 /\ stucks = 0
+    /\ pinned = FALSE /\ stopped = FALSE
 
 S(p) == st[p]
 Put(p, r) == st' = [st EXCEPT ![p] = r]
@@ -103,7 +120,9 @@ Open(p) ==
             /\ Put(p, [S(p) EXCEPT !.fd = <<k, lockGen[k] + 1>>, !.pc = "flock_sh"])
        ELSE /\ Put(p, [S(p) EXCEPT !.fd = <<k, lockIno[k]>>, !.pc = "flock_sh"])
             /\ UNCHANGED <<lockIno, lockGen>>
-    /\ UNCHANGED <<locks, dirOf, nextId, half, tmp, dead, gc, crashes, mcrashes>>
+    \* lockBeside removes what is no regular file.
+    /\ planted' = (planted /\ k # Inner)
+    /\ UNCHANGED <<locks, dirOf, nextId, half, tmp, dead, gc, counts>>
 
 (* flock(LOCK_SH), blocking: waits out a maker and an eviction.           *)
 FlockSh(p) ==
@@ -111,7 +130,7 @@ FlockSh(p) ==
     /\ \A l \in Holders(S(p).fd) : l[3] # "ex"
     /\ Add(S(p).fd, p, "sh")
     /\ Goto(p, "same")
-    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, crashes, mcrashes>>
+    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, planted, counts>>
 
 (* sameFile: an eviction removed the file: closed, and again.             *)
 Same(p) ==
@@ -122,7 +141,7 @@ Same(p) ==
             /\ Put(p, [S(p) EXCEPT !.fd = NoFd, !.pc = "open"])
        ELSE /\ Goto(p, "look")
             /\ UNCHANGED locks
-    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, crashes, mcrashes>>
+    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, planted, counts>>
 
 (* The directory, under the lock held shared.  A volume is made here      *)
 (* (mkdir, EEXIST fine); a tree missing is ensure's to make, so the lock  *)
@@ -142,14 +161,14 @@ Look(p) ==
        ELSE /\ Drop(S(p).fd, p)
             /\ Goto(p, "flock_ex")
             /\ UNCHANGED <<dirOf, nextId>>
-    /\ UNCHANGED <<lockIno, lockGen, half, tmp, dead, gc, crashes, mcrashes>>
+    /\ UNCHANGED <<lockIno, lockGen, half, tmp, dead, gc, planted, counts>>
 
 FlockEx(p) ==
     /\ S(p).pc = "flock_ex"
     /\ Holders(S(p).fd) = {}
     /\ Add(S(p).fd, p, "ex")
     /\ Goto(p, "same_ex")
-    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, crashes, mcrashes>>
+    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, planted, counts>>
 
 (* Looked at again under the lock: a maker came first, or the file went.  *)
 SameEx(p) ==
@@ -164,7 +183,7 @@ SameEx(p) ==
        ELSE /\ tmp' = tmp \cup {k}
             /\ Goto(p, "make")
             /\ UNCHANGED locks
-    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, dead, gc, crashes, mcrashes>>
+    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, dead, gc, planted, counts>>
 
 (* The maker's rename, its tree synced first (ensure, adoptSeed).         *)
 Make(p) ==
@@ -174,7 +193,7 @@ Make(p) ==
     /\ dirOf' = [dirOf EXCEPT ![k] = nextId + 1]
     /\ tmp' = tmp \ {k}
     /\ Goto(p, "down")
-    /\ UNCHANGED <<lockIno, lockGen, locks, half, dead, gc, crashes, mcrashes>>
+    /\ UNCHANGED <<lockIno, lockGen, locks, half, dead, gc, planted, counts>>
 
 (* Exclusive given up for shared, for the job: by holdDir again in the     *)
 (* code, as flock's own conversion is no more atomic, so an eviction may  *)
@@ -183,28 +202,42 @@ Down(p) ==
     /\ S(p).pc = "down"
     /\ Drop(S(p).fd, p)
     /\ Goto(p, "flock_sh2")
-    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, crashes, mcrashes>>
+    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, planted, counts>>
 
 FlockSh2(p) ==
     /\ S(p).pc = "flock_sh2"
     /\ \A l \in Holders(S(p).fd) : l[3] # "ex"
     /\ Add(S(p).fd, p, "sh")
     /\ Goto(p, IF DowngradeRechecks THEN "same" ELSE "assume")
-    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, crashes, mcrashes>>
+    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, planted, counts>>
 
 (* The mutant: what it made is taken to be there.                         *)
 Assume(p) ==
     /\ S(p).pc = "assume"
     /\ Put(p, [S(p) EXCEPT !.held = IF dirOf[S(p).key] # 0 THEN dirOf[S(p).key] ELSE nextId,
                            !.pc = "use"])
-    /\ UNCHANGED <<fsVars, crashes, mcrashes>>
+    /\ UNCHANGED <<fsVars, counts>>
+
+(* A job holding the outer volume leaves something at the inner lock's     *)
+(* name: a symlink, a FIFO, anything.  Not over a lock a job holds: that   *)
+(* job's volume is inside this one's, which can rm -r it whatever a lock  *)
+(* says, so that is outside what any protocol here can keep.              *)
+Plant(p) ==
+    /\ S(p).pc = "use" /\ S(p).key = Outer
+    /\ Holders(<<Inner, lockIno[Inner]>>) = {}
+    /\ plants < MaxPlants
+    /\ plants' = plants + 1
+    /\ planted' = TRUE
+    /\ lockIno' = [lockIno EXCEPT ![Inner] = 0]
+    /\ UNCHANGED <<st, lockGen, locks, dirOf, nextId, half, tmp, dead, gc, crashes, mcrashes,
+                   stucks, pinned, stopped>>
 
 (* The job's steps run on the path, then its end lets the lock go.        *)
 Use(p) ==
     /\ S(p).pc = "use"
     /\ Drop(S(p).fd, p)
     /\ Put(p, [S(p) EXCEPT !.fd = NoFd, !.held = 0, !.pc = "gc_lock"])
-    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, crashes, mcrashes>>
+    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, planted, counts>>
 
 -----------------------------------------------------------------------------
 (* evict.run, at the job's end, under gc.lock, non-blocking.              *)
@@ -217,30 +250,50 @@ GcLock(p) ==
        THEN /\ gc' = {p}
             /\ Put(p, [S(p) EXCEPT !.todo = Keys, !.pc = "gc_dead"])
        ELSE Next1(p) /\ UNCHANGED gc
-    /\ UNCHANGED <<lockIno, lockGen, locks, dirOf, nextId, half, tmp, dead, crashes, mcrashes>>
+    /\ UNCHANGED <<lockIno, lockGen, locks, dirOf, nextId, half, tmp, dead, planted, counts>>
 
-(* removeDead: the area's directory synced first, as the runner that      *)
-(* renamed a tree there may have died before its own sync (TLC found the  *)
-(* other order: another runner's pass deleted from a rename a crash then  *)
-(* lost, and the name came back on a tree half gone).  Then one tree at a *)
-(* time, a deadline anywhere.                                             *)
+(* removeDead: the filesystem synced first, as the runner that renamed a   *)
+(* tree there may have died before its own sync (TLC found the other      *)
+(* order: another runner's pass deleted from a rename a crash then lost,  *)
+(* and the name came back on a tree half gone).  The filesystem, not the  *)
+(* area's directory: a volume came from a directory no one here can name  *)
+(* (TLC again, in 25 states).  Then one tree at a time, a deadline         *)
+(* anywhere, and one that will not go is passed over.                     *)
 GcDead(p) ==
+    LET live == {x \in dead : ~x.stuck} IN
     /\ S(p).pc = "gc_dead"
-    /\ IF dead = {}
-       THEN Goto(p, "gc_next") /\ UNCHANGED <<dead, half>>
-       ELSE IF SyncsRename /\ \E x \in dead : ~x.synced
-       THEN /\ dead' = {[x EXCEPT !.synced = TRUE] : x \in dead}
-            /\ UNCHANGED <<st, half>>
-       ELSE LET d == CHOOSE x \in dead : TRUE IN
+    /\ IF live = {}
+       THEN IF dead # {} /\ ~StuckStopsNothing
+            THEN /\ stopped' = TRUE
+                 /\ Goto(p, "gc_end")
+                 /\ UNCHANGED <<dead, half, stucks>>
+            ELSE Goto(p, "gc_next") /\ UNCHANGED <<dead, half, stucks, stopped>>
+       ELSE IF SyncsRename /\ \E x \in dead : ~x.synced \/ (SyncsFilesystem /\ ~x.src)
+       THEN /\ dead' = {[x EXCEPT !.synced = TRUE,
+                                  !.src = SyncsFilesystem \/ x.key \in Trees \/ @] : x \in dead}
+            /\ UNCHANGED <<st, half, stucks, stopped>>
+       ELSE LET d == CHOOSE x \in live : TRUE IN
             \/ /\ IF d.id \in half
                   THEN dead' = dead \ {d} /\ UNCHANGED half
                   ELSE half' = half \cup {d.id} /\ UNCHANGED dead
-               /\ UNCHANGED st
-            \/ Goto(p, "gc_next") /\ UNCHANGED <<dead, half>>
-    /\ UNCHANGED <<lockIno, lockGen, locks, dirOf, nextId, tmp, gc, crashes, mcrashes>>
+               /\ UNCHANGED <<st, stucks, stopped>>
+            \/ /\ stucks < MaxStuck
+               /\ stucks' = stucks + 1
+               /\ dead' = (dead \ {d}) \cup {[d EXCEPT !.stuck = TRUE]}
+               /\ UNCHANGED <<st, half, stopped>>
+            \/ Goto(p, "gc_next") /\ UNCHANGED <<dead, half, stucks, stopped>>
+    /\ UNCHANGED <<lockIno, lockGen, locks, dirOf, nextId, tmp, gc, planted, crashes, mcrashes,
+                   plants, pinned>>
+
+GcEnd(p) ==
+    /\ S(p).pc = "gc_end"
+    /\ gc' = {}
+    /\ Next1(p)
+    /\ UNCHANGED <<lockIno, lockGen, locks, dirOf, nextId, half, tmp, dead, planted, counts>>
 
 (* One key: a stray `.tmp-` under its free lock, a stray lock file, or    *)
-(* the entry evicted, which any entry here may be.                        *)
+(* the entry evicted, which any entry here may be, but the volume inside  *)
+(* a volume: the walk does not look in there, and it goes with the outer. *)
 GcNext(p) ==
     /\ S(p).pc = "gc_next"
     /\ IF S(p).todo = {}
@@ -249,10 +302,11 @@ GcNext(p) ==
        ELSE LET k == CHOOSE x \in S(p).todo : TRUE
                 r == [S(p) EXCEPT !.todo = @ \ {k}]
             IN /\ UNCHANGED gc
-               /\ IF lockIno[k] = 0 /\ dirOf[k] = 0 THEN Put(p, r)
+               /\ IF (lockIno[k] = 0 /\ dirOf[k] = 0) \/ (k = Inner /\ dirOf[Outer] # 0)
+                  THEN Put(p, r)
                   ELSE \/ Put(p, r)
                        \/ Put(p, [r EXCEPT !.evk = k, !.pc = "ev_open"])
-    /\ UNCHANGED <<lockIno, lockGen, locks, dirOf, nextId, half, tmp, dead, crashes, mcrashes>>
+    /\ UNCHANGED <<lockIno, lockGen, locks, dirOf, nextId, half, tmp, dead, planted, counts>>
 
 EvFail(p) == Put(p, [S(p) EXCEPT !.fd = NoFd, !.fd2 = NoFd, !.pc = "gc_next"])
 
@@ -264,7 +318,7 @@ EvOpen(p) ==
        THEN Goto(p, "gc_next")
        ELSE Put(p, [S(p) EXCEPT !.fd = <<k, lockIno[k]>>,
                                 !.pc = IF EvictLocks THEN "ev_flock" ELSE "ev_inner"])
-    /\ UNCHANGED <<fsVars, crashes, mcrashes>>
+    /\ UNCHANGED <<fsVars, counts>>
 
 (* LOCK_EX | LOCK_NB: a job holding it keeps it.                          *)
 EvFlock(p) ==
@@ -272,7 +326,7 @@ EvFlock(p) ==
     /\ IF Holders(S(p).fd) = {}
        THEN Add(S(p).fd, p, "ex") /\ Goto(p, "ev_same")
        ELSE EvFail(p) /\ UNCHANGED locks
-    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, crashes, mcrashes>>
+    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, planted, counts>>
 
 EvSame(p) ==
     LET k == S(p).evk IN
@@ -280,30 +334,38 @@ EvSame(p) ==
     /\ IF EvictRechecks /\ lockIno[k] # S(p).fd[2]
        THEN Drop(S(p).fd, p) /\ EvFail(p)
        ELSE Goto(p, "ev_inner") /\ UNCHANGED locks
-    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, crashes, mcrashes>>
+    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, gc, planted, counts>>
 
 (* A dead maker's tree goes here too: the lock is free, so it is no one's. *)
-(* The lock of the entry that may be inside this one, made if there is    *)
-(* none, so a job starting now waits and then finds its path gone.        *)
+(* innerLock: the lock of the entry that may be inside this one, made if  *)
+(* there is none, so a job starting now waits and then finds its path     *)
+(* gone.  What was planted there is removed first.  The mutant gives up.  *)
 EvInner(p) ==
     LET k == S(p).evk IN
     /\ S(p).pc = "ev_inner"
     /\ tmp' = tmp \ {k}
-    /\ IF k = Outer /\ TakesInnerLock
-       THEN IF lockIno[Inner] = 0
-            THEN /\ Fresh(Inner)
-                 /\ Add(<<Inner, lockGen[Inner] + 1>>, p, "ex")
-                 /\ Put(p, [S(p) EXCEPT !.fd2 = <<Inner, lockGen[Inner] + 1>>, !.pc = "ev_rename"])
-            ELSE IF Holders(<<Inner, lockIno[Inner]>>) = {}
-            THEN /\ Add(<<Inner, lockIno[Inner]>>, p, "ex")
-                 /\ Put(p, [S(p) EXCEPT !.fd2 = <<Inner, lockIno[Inner]>>, !.pc = "ev_rename"])
-                 /\ UNCHANGED <<lockIno, lockGen>>
-            ELSE /\ locks' = locks \ Mine(p)
-                 /\ EvFail(p)
-                 /\ UNCHANGED <<lockIno, lockGen>>
+    /\ IF k = Outer /\ planted /\ ~ClearsPlanted
+       THEN /\ pinned' = TRUE
+            /\ locks' = locks \ Mine(p)
+            /\ EvFail(p)
+            /\ UNCHANGED <<lockIno, lockGen, planted>>
+       ELSE IF k = Outer /\ TakesInnerLock
+       THEN /\ planted' = FALSE
+            /\ UNCHANGED pinned
+            /\ IF lockIno[Inner] = 0
+               THEN /\ Fresh(Inner)
+                    /\ Add(<<Inner, lockGen[Inner] + 1>>, p, "ex")
+                    /\ Put(p, [S(p) EXCEPT !.fd2 = <<Inner, lockGen[Inner] + 1>>, !.pc = "ev_rename"])
+               ELSE IF Holders(<<Inner, lockIno[Inner]>>) = {}
+               THEN /\ Add(<<Inner, lockIno[Inner]>>, p, "ex")
+                    /\ Put(p, [S(p) EXCEPT !.fd2 = <<Inner, lockIno[Inner]>>, !.pc = "ev_rename"])
+                    /\ UNCHANGED <<lockIno, lockGen>>
+               ELSE /\ locks' = locks \ Mine(p)
+                    /\ EvFail(p)
+                    /\ UNCHANGED <<lockIno, lockGen>>
        ELSE /\ Goto(p, "ev_rename")
-            /\ UNCHANGED <<lockIno, lockGen, locks>>
-    /\ UNCHANGED <<dirOf, nextId, half, dead, gc, crashes, mcrashes>>
+            /\ UNCHANGED <<lockIno, lockGen, locks, planted, pinned>>
+    /\ UNCHANGED <<dirOf, nextId, half, dead, gc, crashes, mcrashes, plants, stucks, stopped>>
 
 (* The rename to `.dead-<n>`.  What is inside goes with it: the inner     *)
 (* entry's directory and lock file.  The mutant deletes first.            *)
@@ -322,19 +384,19 @@ EvRename(p) ==
             /\ UNCHANGED <<dirOf, lockIno, dead, st>>
        ELSE /\ dirOf' = [x \in Keys |-> IF x = k \/ x \in inner THEN 0 ELSE dirOf[x]]
             /\ lockIno' = [x \in Keys |-> IF x \in inner THEN 0 ELSE lockIno[x]]
-            /\ dead' = dead \cup {[id |-> i, key |-> k, synced |-> FALSE] : i \in {id} \cup gone}
+            /\ dead' = dead \cup {[id |-> i, key |-> k, synced |-> FALSE, src |-> FALSE, stuck |-> FALSE] : i \in {id} \cup gone}
             /\ Goto(p, "ev_sync")
             /\ UNCHANGED half
-    /\ UNCHANGED <<lockGen, locks, nextId, tmp, gc, crashes, mcrashes>>
+    /\ UNCHANGED <<lockGen, locks, nextId, tmp, gc, planted, counts>>
 
-(* syncDirOf, both directories.                                           *)
+(* syncDirOf, both directories: where it went and where it came from.     *)
 EvSync(p) ==
     /\ S(p).pc = "ev_sync"
     /\ IF SyncsRename
-       THEN dead' = {[d EXCEPT !.synced = TRUE] : d \in dead}
+       THEN dead' = {[d EXCEPT !.synced = TRUE, !.src = TRUE] : d \in dead}
        ELSE UNCHANGED dead
     /\ Goto(p, "ev_unlink")
-    /\ UNCHANGED <<lockIno, lockGen, locks, dirOf, nextId, half, tmp, gc, crashes, mcrashes>>
+    /\ UNCHANGED <<lockIno, lockGen, locks, dirOf, nextId, half, tmp, gc, planted, counts>>
 
 (* `forget`: the lock file's path gone, then every lock let go, so a job  *)
 (* that waited finds no file at that path.                                *)
@@ -344,7 +406,7 @@ EvUnlink(p) ==
     /\ lockIno' = [lockIno EXCEPT ![k] = IF lockIno[k] = S(p).fd[2] THEN 0 ELSE @]
     /\ locks' = locks \ Mine(p)
     /\ Put(p, [S(p) EXCEPT !.fd = NoFd, !.fd2 = NoFd, !.pc = "gc_next"])
-    /\ UNCHANGED <<lockGen, dirOf, nextId, half, tmp, dead, gc, crashes, mcrashes>>
+    /\ UNCHANGED <<lockGen, dirOf, nextId, half, tmp, dead, gc, planted, counts>>
 
 -----------------------------------------------------------------------------
 (* What happens to the processes.                                         *)
@@ -356,7 +418,8 @@ Crash(p) ==
     /\ Put(p, [Idle EXCEPT !.pc = "crashed"])
     /\ locks' = locks \ Mine(p)
     /\ gc' = gc \ {p}
-    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, mcrashes>>
+    /\ UNCHANGED <<lockIno, lockGen, dirOf, nextId, half, tmp, dead, planted, mcrashes, plants,
+                   stucks, pinned, stopped>>
 
 (* The machine dies: every process, and a rename to a dead name no sync   *)
 (* covered, whose tree comes back under its name with whatever was        *)
@@ -368,21 +431,22 @@ Crash(p) ==
 MachineCrash ==
     /\ mcrashes < MachineCrashes
     /\ mcrashes' = mcrashes + 1
-    /\ \E back \in SUBSET {d \in dead : ~d.synced /\ dirOf[d.key] = 0} :
+    /\ \E back \in SUBSET {d \in dead : ~d.src /\ dirOf[d.key] = 0} :
          /\ dirOf' = [k \in Keys |-> IF \E d \in back : d.key = k
                                      THEN (CHOOSE d \in back : d.key = k).id ELSE dirOf[k]]
          /\ dead' = dead \ back
     /\ locks' = {}
     /\ gc' = {}
     /\ st' \in [Procs -> Begin(Rounds)]
-    /\ UNCHANGED <<lockIno, lockGen, nextId, half, tmp, crashes>>
+    /\ UNCHANGED <<lockIno, lockGen, nextId, half, tmp, planted, crashes, plants, stucks, pinned,
+                   stopped>>
 
 Terminated == \A p \in Procs : S(p).pc \in {"done", "crashed"}
 
 Proc(p) ==
     \/ Open(p) \/ FlockSh(p) \/ Same(p) \/ Look(p) \/ FlockEx(p) \/ SameEx(p) \/ Make(p)
-    \/ Down(p) \/ FlockSh2(p) \/ Assume(p) \/ Use(p)
-    \/ GcLock(p) \/ GcDead(p) \/ GcNext(p)
+    \/ Down(p) \/ FlockSh2(p) \/ Assume(p) \/ Use(p) \/ Plant(p)
+    \/ GcLock(p) \/ GcDead(p) \/ GcEnd(p) \/ GcNext(p)
     \/ EvOpen(p) \/ EvFlock(p) \/ EvSame(p) \/ EvInner(p) \/ EvRename(p) \/ EvSync(p) \/ EvUnlink(p)
 
 Next ==
@@ -413,6 +477,12 @@ NamedWhole == \A k \in Keys : dirOf[k] \notin half
 (* Two jobs of one tree do not make it twice.                             *)
 OneMaker == \A p, q \in Procs :
     (p # q /\ S(p).pc = "make" /\ S(q).pc = "make") => S(p).key # S(q).key
+
+(* Nothing a job leaves at the inner lock's name keeps a volume from going. *)
+NotPinned == ~pinned
+
+(* A dead tree that will not go ends no pass: it would end every pass.    *)
+PassGoesOn == ~stopped
 
 (* At most one flock exclusive on an inode, none beside it shared.        *)
 LocksExclude == \A l, m \in locks : (l[1] = m[1] /\ l # m) => l[3] = "sh" /\ m[3] = "sh"

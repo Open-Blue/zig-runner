@@ -833,6 +833,7 @@ pub fn run(
             opts.backend_note = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{
                 w,
             });
+            std.log.warn("native: {s}", .{opts.backend_note.?});
             // The gate took it for a native job (a native pool's): it is an engine job.
             if (cfg.gate) |g| g.backToEngine();
         } else if (try runNative(arena, io, opts, cfg, job, log, &opts.backend_note)) |r| {

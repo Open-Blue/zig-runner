@@ -312,6 +312,7 @@ fn write(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: 
             try hook(io, env, mark_env, "evicted");
             s.limits.budget_ms = 60_000;
             evict.run(s, io);
+            evict.run(s, io);
         },
         9 => {
             const oci: OciStore = .{ .root = s.root };
@@ -360,9 +361,11 @@ fn write(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: 
                 .budget_ms = -1,
             };
             try hook(io, env, mark_env, "before-trees");
+            // Its deadline passed, a pass evicts one and leaves its tree to the next.
             evict.run(s, io);
-            try hook(io, env, mark_env, "trees-evicted");
             s.limits.budget_ms = 60_000;
+            for (trees) |_| evict.run(s, io);
+            try hook(io, env, mark_env, "trees-evicted");
             evict.run(s, io);
         },
         else => return error.BadSpec,

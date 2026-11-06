@@ -744,23 +744,26 @@ proofs/tla/StoreEviction.tla.
 - **An image outlives its rootfs.** A rootfs is its image's files, by hard link, and a job that uses
   a rootfs pulls its image first. So an image counts as used an hour later than it was, and the
   rootfs goes first: an image evicted under a living rootfs would cost the next job a pull for
-  nothing, and the links it drops move the ctimes of the rootfs's files, which
-  `Store.rootfsFingerprint` hashes, so every layer on that rootfs would miss once after the next
-  restart. The rootfs itself loses nothing: an inode lives as long as one name does. Evicting a
-  rootfs still moves the ctimes of a sibling made from the same image, which has that cost, once.
+  nothing. The rootfs itself loses nothing: an inode lives as long as one name does. The links an
+  eviction drops move those files' ctimes, a little at each pass as a tree goes in pieces, so a rootfs
+  in the store is not fingerprinted by walking it: what it holds is in its key, and only making it
+  again changes its root (`Store.rootfsFingerprint`).
 - **What a job sees after.** An evicted image is pulled again, needing the registry; an evicted
-  rootfs is provisioned again, under the same key; a rebuilt one has new inodes, so its fingerprint
-  is new, and every layer on it misses once and ages out under the cap. An evicted seed is built
-  again, needing its tarball, and a job that cannot build it runs unseeded with a note, as it always
-  could. These cost minutes, not results.
+  rootfs is provisioned again, under the same key; a rebuilt one has a new root directory, so a new
+  fingerprint, and every layer on it misses once and ages out under the cap. An evicted seed is
+  built again, needing its tarball, and a job that cannot build it runs unseeded with a note, as it
+  always could. A seed built again is not the same tree, so keys know it by its path and which build
+  it is (`volumes.seedId`), and layers on the old one miss too. These cost minutes, not results.
 - **An entry stays a day.** An entry used in the last 24 hours stays though its area is over its cap,
   with a line in the runner's log. The cap is a target: a working set over it costs disk, where
   evicting it would cost each job its caches or its base image, on a loop.
 - **The disk's floor.** With less than `RUNNER_NATIVE_MIN_FREE_PCT` of the store's filesystem free
-  (10), blobs, then entries of either kind, the longest unused first, go whatever the caps say, until
-  that much is free or all that is left was used in the last hour. This is what bounds the store on
-  a machine smaller than its caps, with no setting: 10 GiB of layers, 16 of volumes and 8 of images
-  fit a 128 GB card, and on a 32 GB one the floor does the work.
+  (10), layers go first, as `Store.collect` runs before this and they are the cheapest to make again,
+  then blobs, then entries of either kind, the longest unused first, whatever the caps say, until
+  that much is free or all that is left was used in the last hour. An entry never measured is
+  measured first, as one counted as 0 would take them all. This is what bounds the store on a
+  machine smaller than its caps, with no setting: 10 GiB of layers, 16 of volumes and 8 of images fit
+  a 128 GB card, and on a 32 GB one the floor does the work.
 - **A job in progress loses nothing.** A job holds each of its volumes' locks shared from
   `volumes.open` to its end. An eviction takes the lock exclusively and non-blocking, so a volume in
   use is skipped, on this runner or any other sharing the store; a `locked` one is in use the same
@@ -773,18 +776,30 @@ proofs/tla/StoreEviction.tla.
   replayed whose script left something else in a volume, and a later step that needs it without
   saying so, would not find it, as on any other runner's first run of that step's successor: that
   rests on a job's own steps, and is the same case as Dagger's own GC of a volume.
-- **A crash at any point.** The entry is renamed to `<area>/.dead-<n>` and the rename synced before
-  anything of it is deleted, by whichever runner finds it, so an entry is what was left there or is
-  gone, on a filesystem that orders its journal or not. A dead maker's `.tmp-<key>` or
-  `<name>.new-<n>` goes under the entry's free lock, which a live maker holds exclusively; a blob's
-  under `oci/blobs.lock`, which an unpack holds shared. The lock file goes last, so whoever takes a lock checks it is the file
-  the path names (`Store.sameFile`), as `lockKey` does. A volume inside another (`<key>` and
-  `<key>/runner`, when one store has had both step users) goes with it, under both locks; a job
-  opening the inner one meanwhile waits, finds the path gone and starts over.
-- **Time and memory.** Deleting has a budget of 1.5 s a job. What is left stays under its dead name,
-  the next job's end goes on with it, and nothing more is evicted until it is gone. A pass holds no
-  entry's lock while it walks or deletes, so a job starting waits at most for one rename's sync.
-  It looks at up to 16,384 volumes, and a walk keeps at most 16 MiB of paths.
+- **A crash at any point.** The entry is renamed to `<area>/.dead-<n>` and both directories synced
+  before anything of it is deleted; a later pass finding a dead name syncs the filesystem first, as
+  the runner that renamed it may have died before it could, and which directory it came from is not
+  known. So an entry is what was left there or is gone, on a filesystem that orders its journal or
+  not. A dead maker's `.tmp-<key>` or `<name>.new-<n>` goes under the entry's free lock, which a live
+  maker holds exclusively; a blob's under `oci/blobs.lock`, which an unpack holds shared. The lock
+  file goes last, so whoever takes a lock checks it is the file the path names
+  (`Store.sameFile`), as `lockKey` does.
+- **A job writes what is in a volume**, so eviction believes nothing in there. The walk never enters
+  a volume, a size and a lock are beside it, where no job reaches, and every file the store looks
+  for is opened through no symlink and without waiting on a FIFO. A volume inside another (`<key>`
+  and `<key>/runner`, when one store has had both step users) is no entry of its own: it goes with
+  the outer one, whose eviction takes the inner lock through a descriptor and removes whatever else
+  is at that name, and a job opening the inner one meanwhile waits, finds the path gone and starts
+  over. A job in the outer volume can delete the inner lock, but it can as well delete the inner
+  volume, which is the same repository's.
+- **What will not go.** Removing a dead tree holds two descriptors and no path, moving what is deep
+  up to the top as it goes, so a chain of directories of any depth loses some of itself each pass.
+  A dead name that still cannot be removed is logged, and stops nothing.
+- **Time and memory.** Deleting has a budget of 1.5 s a job, which evicting counts against too. What
+  is left stays under its dead name, the next job's end goes on with it, and nothing more is evicted
+  until it is gone. A pass holds no entry's lock while it walks or deletes, so a job starting waits
+  at most for one rename's sync. It looks at up to 16,384 volumes, and a walk keeps at most 16 MiB of
+  paths. A `syncfs` for a dead name is not bounded by the budget: it takes what the disk takes.
 - **Costs left.** Deleting and measuring are at a job's end, before its result is reported
   (`Backend.deinit`), so a job can end up to 1.5 s plus a walk later. A size is the runner's own
   estimate, not the filesystem's: a file with several links counts its share per link.

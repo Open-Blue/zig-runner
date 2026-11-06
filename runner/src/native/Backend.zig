@@ -151,6 +151,8 @@ caches: volumes.Options = .{},
 cache_plan: volumes.Plan = .{},
 /// The Zig cache seeds' layers, between the job's layers and the rootfs.
 seed_layers: std.ArrayList([]const u8) = .empty,
+/// What the keys know each seed by (`volumes.seedId`): its path, and which build it is.
+seed_ids: std.ArrayList([]const u8) = .empty,
 /// Tests: the Zig cache seed's build, in place of downloading and running a Zig release.
 test_seed_script: ?[]const u8 = null,
 
@@ -1629,6 +1631,7 @@ fn seeds(b: *Backend, as_runner: bool) !void {
             continue;
         }
         try b.seed_layers.append(arena, s.dir);
+        try b.seed_ids.append(arena, try volumes.seedId(arena, s.dir));
         try seeded.append(arena, s.seed.version);
     }
     if (try volumes.seedNote(arena, b.caches, seeded.items, failure)) |note|
@@ -2057,7 +2060,7 @@ fn keyFor(
 /// slot's job sees as its own (`Store.unshift`, `Spec.canonical`). Null, and the job uncached, when
 /// the rootfs cannot be read.
 fn below(b: *Backend) ?Store.Key {
-    const fp = Store.rootfsFingerprint(b.arena, b.io, b.rootfs) catch |e| {
+    const fp = Store.rootfsFingerprint(b.arena, b.io, b.rootfs, b.store_cfg.root) catch |e| {
         std.log.warn("native: the rootfs's fingerprint: {s}; the job's steps are not cached", .{
             @errorName(e),
         });
@@ -2080,7 +2083,7 @@ fn below(b: *Backend) ?Store.Key {
         .fingerprint = &fp,
         .userns = @tagName(b.how.userns),
         .binds = binds,
-        .seeds = b.seed_layers.items,
+        .seeds = b.seed_ids.items,
     }, null);
 }
 
@@ -2092,8 +2095,9 @@ pub const Below = struct {
     fingerprint: []const u8,
     userns: []const u8,
     binds: []const sandbox.Spec.Bind,
-    /// The Zig cache seeds' layers (`volumes.Seed`), by path, which names the release,
-    /// architecture and step user each was built for, once.
+    /// The Zig cache seeds' layers (`volumes.Seed`), by `volumes.seedId`: the path, which names the
+    /// release, architecture and step user each was built for, and which build it is, as one
+    /// evicted is built again and need not be the same tree.
     seeds: []const []const u8 = &.{},
 };
 
@@ -4544,6 +4548,130 @@ test "native provisioning: a step on the pulled image, flattened and kept under 
     // A failing script fails with its output's last line, and leaves nothing under its key.
     try std.testing.expectError(error.BaseContainerFailed, b.provision(pulled, "echo the reason; exit 7", &err_msg));
     try std.testing.expect(std.mem.indexOf(u8, err_msg, "the reason (exit 7)") != null);
+}
+
+/// A runner's job ends, again and again, while the test's job runs: what it holds must stay.
+const Evictor = struct {
+    s: Store,
+    stop: std.atomic.Value(bool) = .init(false),
+
+    fn hostile(root: []const u8) Evictor {
+        return .{ .s = .{ .root = root, .max_bytes = 1, .limits = .{
+            .volumes_max_bytes = 1,
+            .images_max_bytes = 1,
+            .min_free_pct = 0,
+            .idle_s = 0,
+            .recent_s = 0,
+            .remeasure_s = 0,
+        } } };
+    }
+
+    fn run(e: *Evictor) void {
+        while (!e.stop.load(.acquire)) {
+            var a: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            defer a.deinit();
+            e.s.collect(a.allocator(), std.testing.io);
+            std.testing.io.sleep(.fromMilliseconds(5), .awake) catch {};
+        }
+    }
+
+    fn end(e: *Evictor, t: std.Thread) void {
+        e.stop.store(true, .release);
+        t.join();
+    }
+};
+
+test "native eviction under a real job: its rootfs and image are its overlay's lowers, and stay" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const img = try testregistry.testImage(arena, "test/prov", "1", try testImageLayers(arena), "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    var evictor: Evictor = .hostile(cfg.store);
+    var b = try init(arena, io, std.testing.allocator, cfg);
+    var ended = false;
+    defer if (!ended) b.deinit();
+    var why: []const u8 = "";
+    const pulled = try b.pull(try server.image(arena, "test/prov:1"), null, &why);
+    var err_msg: []const u8 = "";
+    const rootfs = try b.provision(pulled, "mkdir -p /opt/tool && echo new > /opt/tool/f", &err_msg);
+    const t: std.Thread = try .spawn(.{}, Evictor.run, .{&evictor});
+    {
+        defer evictor.end(t);
+        b.rootfs = rootfs;
+        var out: Captured = .{ .arena = arena };
+        const step = try b.exec(
+            \\for i in 1 2 3 4 5 6 7 8 9 10; do
+            \\  [ "$(cat /opt/tool/f)" = new ] && [ "$(cat /etc/marker)" = "from the image" ] || exit 9
+            \\  sleep 0.1
+            \\done
+        , &.{"PATH=" ++ image_path}, &.{}, 0, 0, out.output());
+        try std.testing.expectEqual(@as(i32, 0), step.code);
+    }
+    try std.Io.Dir.cwd().access(io, rootfs, .{});
+    try std.Io.Dir.cwd().access(io, pulled.rootfs, .{});
+    // Let go, both can go: they were kept by the job's locks, and nothing else.
+    b.deinit();
+    ended = true;
+    var after: Evictor = .hostile(cfg.store);
+    for (0..8) |_| after.s.collect(arena, io);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, rootfs, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, pulled.rootfs, .{}));
+}
+
+test "native eviction under a real job: a seed and a volume stay until it ends, and a seed built again is a new key" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    cfg.test_seed_script = "mkdir -p /zig-seed/o/s && echo seeded > /zig-seed/o/s/f";
+    const caches: volumes.Options = .{
+        .package_caches = true,
+        .trusted = true,
+        .zig_seeds = &.{.{ .version = "0.0.1", .sha256 = "00" }},
+    };
+    const job = testJob(&.{testStep(
+        \\echo mine > /root/.npm/f # npm zig build
+        \\for i in 1 2 3 4 5 6 7 8 9 10; do
+        \\  [ "$(cat /root/.cache/zig/o/s/f)" = seeded ] && [ "$(cat /root/.npm/f)" = mine ] || exit 9
+        \\  sleep 0.1
+        \\done
+        \\echo whole-to-the-end
+    )});
+    var evictor: Evictor = .hostile(cfg.store);
+    const t: std.Thread = try .spawn(.{}, Evictor.run, .{&evictor});
+    const first = first: {
+        defer evictor.end(t);
+        break :first try runCachedJob(arena, cfg, job, caches, .{});
+    };
+    try expectLines(first.text, &.{ "whole-to-the-end", "Zig global cache seeded from Zig 0.0.1" });
+    const before = try seedIn(arena, io, try std.fmt.allocPrint(arena, "{s}/seeds", .{cfg.store}));
+    var after: Evictor = .hostile(cfg.store);
+    for (0..8) |_| after.s.collect(arena, io);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, before, .{}));
+    // Built again, the job's layer on the old one is not replayed over it.
+    const second = try runCachedJob(arena, cfg, job, caches, .{});
+    try expectLines(second.text, &.{"whole-to-the-end"});
+}
+
+/// The one seed under `dir`.
+fn seedIn(arena: Allocator, io: std.Io, dir: []const u8) ![]const u8 {
+    var d = try std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
+    defer d.close(io);
+    var it = d.iterate();
+    while (try it.next(io)) |e| if (e.kind == .directory and e.name[0] != '.')
+        return std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, e.name });
+    return error.NoSeed;
 }
 
 test "an image's USER: by name, by uid, with a group, and what a rootless runner cannot map" {

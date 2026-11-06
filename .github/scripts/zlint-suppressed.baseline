@@ -74,11 +74,13 @@ src/loop/upload.zig	addacaa27636b18f	if (s.stopSending()) s.group.await(s.io) ca
 src/main.zig	6248d30ea81a8320	defer err.flush() catch {};
 src/main.zig	79bdabb2a1be65b6	defer out.flush() catch {};
 src/main.zig	cb383b40dafe78f0	s.log.say(line) catch {};
+src/native/Backend.zig	290ff78b6a67238c	std.testing.io.sleep(.fromMilliseconds(5), .awake) catch {};
 src/native/Backend.zig	74206249ad4c0349	errdefer _ = std.process.run(arena, io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch {};
 src/native/Backend.zig	7a6a1cb23d998554	_ = std.process.run(arena, std.testing.io, .{ .argv = &.{ "ip", "netns", "del", ns } }) catch {};
 src/native/Backend.zig	bf37938eff44209b	cwd.deleteFile(b.io, link) catch {};
 src/native/Store.zig	33d1532fa2a72caa	cwd.deleteFile(io, tmp) catch {};
 src/native/Store.zig	7e43621e7c6aab95	cwd.deleteFile(io, full) catch {};
+src/native/Store.zig	b35af56d8a9b5e7d	cwd.deleteFile(io, path) catch {};
 src/native/Store.zig	ec349ee7ec5bdb4e	cwd.rename(tmp, cwd, kept, io) catch cwd.deleteFile(io, tmp) catch {};
 src/native/dockerfile.zig	015b34e4915c7fe7	std.Io.Dir.cwd().deleteTree(io, upper) catch {};
 src/native/dockerfile.zig	0d67919a97bffc0e	errdefer std.Io.Dir.cwd().deleteTree(io, upper) catch {};
@@ -87,7 +89,6 @@ src/native/evict.zig	6093e2da670ffcce	std.Io.Dir.cwd().deleteFile(io, p) catch {
 src/native/evict.zig	7d9fbb2adf0778e3	if (!isDir(arena, full[0 .. full.len - ".size".len])) std.Io.Dir.cwd().deleteFile(io, full) catch {};
 src/native/evict.zig	7d9fbb2adf0778e3	if (!isDir(arena, full[0 .. full.len - ".size".len])) std.Io.Dir.cwd().deleteFile(io, full) catch {};
 src/native/evict.zig	d0802987815275e1	if (!isDir(arena, base) and !isDir(arena, rootless)) std.Io.Dir.cwd().deleteFile(io, p) catch {};
-src/native/evict.zig	e367b9b60b4a6491	std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = text }) catch {};
 src/native/forward.zig	05169a418336f801	child.stdin.?.writeStreamingAll(io, json.written()) catch {};
 src/native/forward.zig	5b7c0fe43b204b21	_ = child.wait(io) catch {};
 src/native/forward.zig	adc27906a9ed0fab	_ = r.child.wait(io) catch {};

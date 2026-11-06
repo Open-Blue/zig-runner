@@ -894,14 +894,20 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
             .used_ns = used_ns,
         }) catch return;
     }
-    if (total > s.max_bytes) {
+    // The disk's floor counts here first: a layer is the cheapest thing the store has to make
+    // again. So under it a layer goes as the rest does (`evict.floor`), sparing recent use, and
+    // only past the cap whatever its use.
+    const keep = @min(s.max_bytes, total -| (Eviction.shortOf(arena, s) orelse 0));
+    if (total > keep) {
         std.mem.sort(Entry, entries.items, {}, struct {
             fn lt(_: void, a: Entry, b: Entry) bool {
                 return a.used_ns < b.used_ns;
             }
         }.lt);
+        const recent = std.Io.Clock.real.now(io).toNanoseconds() - @as(i128, s.limits.recent_s) * std.time.ns_per_s;
         for (entries.items) |e| {
-            if (total <= s.max_bytes) break;
+            if (total <= keep) break;
+            if (total <= s.max_bytes and e.used_ns >= recent) continue;
             if (s.evict(arena, io, e.name)) total -|= e.bytes;
         }
     }
@@ -968,22 +974,54 @@ fn dropKeyLocks(s: Store, arena: Allocator, io: std.Io) void {
     }
 }
 
-/// The lock file `path`, made if it is not there, never through a symlink: a lock beside a volume
-/// may be in a directory a job could write (`evict.nested`). The lock counts only once `sameFile`
-/// says so, as an eviction removes these.
+/// The regular file `path`, read-only, or null: never through a symlink, and with no wait on a
+/// FIFO, as a job may have left anything where one is looked for (`evict.zig`).
+pub fn openPlain(arena: Allocator, path: []const u8) ?std.Io.File {
+    const z = arena.dupeSentinel(u8, path, 0) catch return null;
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true, .CLOEXEC = true };
+    const rc = linux.open(z, flags, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return null;
+    if (isRegular(fd)) return .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    _ = linux.close(fd);
+    return null;
+}
+
+fn isRegular(fd: linux.fd_t) bool {
+    var st: linux.Statx = undefined;
+    return linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &st)) == .SUCCESS and
+        st.mode & linux.S.IFMT == linux.S.IFREG;
+}
+
+/// The lock file `path`, made if it is not there, never through a symlink and with no wait on a
+/// FIFO: a lock beside a volume may be in a directory a job could write (`evict.innerLock`). What is
+/// there and is no regular file is no lock anyone holds, and is removed. The lock counts only once
+/// `sameFile` says so, as an eviction removes these.
 pub fn lockBeside(arena: Allocator, io: std.Io, path: []const u8) !std.Io.File {
-    _ = arena;
     const cwd = std.Io.Dir.cwd();
-    while (true) {
-        if (cwd.openFile(io, path, .{ .follow_symlinks = false })) |f| return f else |e| switch (e) {
-            error.FileNotFound => {},
-            else => return e,
+    const z = try arena.dupeSentinel(u8, path, 0);
+    const flags: linux.O = .{
+        .ACCMODE = .RDONLY,
+        .CREAT = true,
+        .NOFOLLOW = true,
+        .NONBLOCK = true,
+        .CLOEXEC = true,
+    };
+    for (0..8) |_| {
+        const rc = linux.open(z, flags, 0o644);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const fd = std.math.cast(linux.fd_t, rc) orelse return error.Locked;
+                if (isRegular(fd)) return .{ .handle = fd, .flags = .{ .nonblocking = true } };
+                _ = linux.close(fd);
+            },
+            .LOOP => {},
+            .NOENT => return error.FileNotFound,
+            else => return error.Locked,
         }
-        return cwd.createFile(io, path, .{ .exclusive = true, .truncate = false }) catch |e| switch (e) {
-            error.PathAlreadyExists => continue,
-            else => return e,
-        };
+        cwd.deleteFile(io, path) catch {};
     }
+    return error.Locked;
 }
 
 /// Whether `f` is the file `path` names now.
@@ -1131,7 +1169,7 @@ fn listDir(arena: Allocator, io: std.Io, fd: linux.fd_t) ![]Node {
     return out.items;
 }
 
-fn openDirAt(fd: linux.fd_t, name: [*:0]const u8) !linux.fd_t {
+pub fn openDirAt(fd: linux.fd_t, name: [*:0]const u8) !linux.fd_t {
     const flags: linux.O = .{
         .ACCMODE = .RDONLY,
         .DIRECTORY = true,
@@ -1563,7 +1601,20 @@ pub fn layerDigest(s: Store, arena: Allocator, io: std.Io, key: Key, ids: Ids) !
 /// what changes when the rootfs is replaced or touched: the root's inode and ctime, and the
 /// provisioning stamp's (`rootfs_stamp`, which the recipe touches after changing the rootfs in
 /// place). A change the stamp does not show, under a running runner, is found at its restart.
-pub fn rootfsFingerprint(arena: Allocator, io: std.Io, rootfs: []const u8) !Key {
+///
+/// A rootfs in the store (`store`, its root; "" for none) is not walked: no one writes it, what it
+/// holds is in its key, and only making it again gives it a new root. Its files' ctimes say nothing:
+/// they share inodes with its image and siblings (`oci.Store.flatten`), so each file an eviction
+/// removes from any of those would move this digest, a little at each pass.
+pub fn rootfsFingerprint(arena: Allocator, io: std.Io, rootfs: []const u8, store: []const u8) !Key {
+    if (store.len > 0 and rootfs.len > store.len and rootfs[store.len] == '/' and
+        std.mem.startsWith(u8, rootfs, store))
+    {
+        var h: KeyHasher = .plain("a rootfs in the store");
+        h.field(rootfs);
+        h.field(&try rootIdentity(arena, rootfs));
+        return h.final();
+    }
     const seen = try rootfsSeen(arena, rootfs);
     fp_mu.lockUncancelable(io);
     defer fp_mu.unlock(io);
@@ -1585,6 +1636,20 @@ pub fn rootfsFingerprint(arena: Allocator, io: std.Io, rootfs: []const u8) !Key 
 /// The file, in the rootfs, that says it was provisioned again: touched after changing it in place
 /// (docs/native-backend.md, "The rootfs").
 pub const rootfs_stamp = ".zig-runner-provisioned";
+
+/// A rootfs's root directory: which inode, since when.
+fn rootIdentity(arena: Allocator, rootfs: []const u8) !Key {
+    const p = try arena.dupeSentinel(u8, rootfs, 0);
+    var st: linux.Statx = undefined;
+    const mask: linux.STATX = .{ .INO = true, .CTIME = true };
+    if (linux.errno(linux.statx(linux.AT.FDCWD, p, linux.AT.SYMLINK_NOFOLLOW, mask, &st)) != .SUCCESS)
+        return error.RootfsUnreadable;
+    var h: KeyHasher = .plain("rootfs root");
+    h.int(st.ino);
+    h.int(std.math.cast(u64, st.ctime.sec) orelse 0);
+    h.int(st.ctime.nsec);
+    return h.final();
+}
 
 /// What `rootfsFingerprint` checks for every job: the root's and the stamp's identity and ctime.
 fn rootfsSeen(arena: Allocator, rootfs: []const u8) !Key {
@@ -2347,8 +2412,8 @@ test "native store: the rootfs's fingerprint changes when the rootfs is changed 
     try tmp.dir.createDirPath(io, "rootfs/usr/bin");
     try tmp.dir.writeFile(io, .{ .sub_path = "rootfs/usr/bin/tool", .data = "v1" });
     const rootfs = try tmp.dir.realPathFileAlloc(io, "rootfs", arena);
-    const first = try rootfsFingerprint(arena, io, rootfs);
-    try std.testing.expectEqualSlices(u8, &first, &try rootfsFingerprint(arena, io, rootfs));
+    const first = try rootfsFingerprint(arena, io, rootfs, "");
+    try std.testing.expectEqualSlices(u8, &first, &try rootfsFingerprint(arena, io, rootfs, ""));
     // Provisioned again in place, as `tar -x` over it does: same size, mtime set back. The ctime
     // moved, but only a new walk sees it; the stamp, touched after, makes the next job walk.
     try tmp.dir.writeFile(io, .{ .sub_path = "rootfs/usr/bin/tool", .data = "v2" });
@@ -2356,13 +2421,13 @@ test "native store: the rootfs's fingerprint changes when the rootfs is changed 
     const t = [2]linux.timespec{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } };
     _ = linux.utimensat(linux.AT.FDCWD, tool, &t, 0);
     try tmp.dir.writeFile(io, .{ .sub_path = "rootfs/" ++ rootfs_stamp, .data = "" });
-    const second = try rootfsFingerprint(arena, io, rootfs);
+    const second = try rootfsFingerprint(arena, io, rootfs, "");
     try std.testing.expect(!std.mem.eql(u8, &first, &second));
     // A walk sees an in-place change by its ctime even with the stamp untouched, as at a
     // restart, when nothing is kept.
     _ = linux.utimensat(linux.AT.FDCWD, tool, &t, 0);
     fp_len = 0;
-    const third = try rootfsFingerprint(arena, io, rootfs);
+    const third = try rootfsFingerprint(arena, io, rootfs, "");
     try std.testing.expect(!std.mem.eql(u8, &second, &third));
 }
 
@@ -2582,6 +2647,28 @@ test "native store: a layer counts its record and its own files, not only its tr
     s.max_bytes = tree + entry_overhead;
     s.collect(arena, io);
     try std.testing.expect(try s.open(arena, io, k) == null);
+}
+
+test "native store: under the disk's floor a layer goes though the store is under its cap, not one just used" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    const old, const l0 = try testLayer(arena, io, tmp, &s, "up0");
+    const lock = try arena.dupeSentinel(u8, try join(arena, std.fs.path.dirname(l0.fs).?, "lock"), 0);
+    l0.lock.close(io);
+    const new, const l1 = try testLayer(arena, io, tmp, &s, "up1");
+    l1.lock.close(io);
+    const t = [2]linux.timespec{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } };
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.utimensat(linux.AT.FDCWD, lock, &t, 0)));
+    // A floor no disk meets.
+    s.limits.min_free_pct = 100;
+    s.collect(arena, io);
+    try std.testing.expect(try s.open(arena, io, old) == null);
+    (try s.open(arena, io, new)).?.layer.lock.close(io);
 }
 
 test "native store: a key published already stays, and the second upper is put back where it was" {

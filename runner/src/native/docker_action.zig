@@ -297,7 +297,7 @@ fn openContext(arena: Allocator, io: std.Io, bd: Build) !struct { path: []const 
 /// `Backend.below` knows the job's.
 fn baseId(arena: Allocator, io: std.Io, base: images.Image) ![]const u8 {
     if (base.manifest) |m| return m;
-    return arena.dupe(u8, &Store.hex(try Store.rootfsFingerprint(arena, io, base.rootfs)));
+    return arena.dupe(u8, &Store.hex(try Store.rootfsFingerprint(arena, io, base.rootfs, "")));
 }
 
 /// The Dockerfile of `bd` read and planned on its base image from the native store; `digests`:

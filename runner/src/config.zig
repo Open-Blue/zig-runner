@@ -270,6 +270,7 @@ pub const Config = struct {
         InvalidBackend,
         InvalidNativeRootfs,
         InvalidNativeSubnet,
+        InvalidNativeMinFree,
         InvalidNativeSubidBase,
         InvalidNativeCgroup,
         InvalidEngine,
@@ -289,6 +290,7 @@ pub const Config = struct {
                 "(README, \"Environments\").",
             error.InvalidNativeRootfs => "RUNNER_NATIVE_ROOTFS is a directory's absolute path: " ++
                 "overlay takes it as a layer from the job's directory.",
+            error.InvalidNativeMinFree => "RUNNER_NATIVE_MIN_FREE_PCT is a percentage, 0 to 100",
             error.InvalidNativeSubnet => "RUNNER_NATIVE_SUBNET is an IPv4 network a.b.c.d/p " ++
                 "with no host bits set and a prefix of 8 to 23 bits (room for every job's " ++
                 "address), by default " ++ native_net.Subnet.default_text ++ ".",
@@ -429,7 +431,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_STORE_MAX_MB")) |v| c.native_store_max_mb = try num(u64, v);
         if (environ.get("RUNNER_NATIVE_VOLUMES_MAX_MB")) |v| c.native_volumes_max_mb = try num(u64, v);
         if (environ.get("RUNNER_NATIVE_IMAGES_MAX_MB")) |v| c.native_images_max_mb = try num(u64, v);
-        if (environ.get("RUNNER_NATIVE_MIN_FREE_PCT")) |v| c.native_min_free_pct = try num(u8, v);
+        if (environ.get("RUNNER_NATIVE_MIN_FREE_PCT")) |v| c.native_min_free_pct = try minFree(v);
         if (environ.get("RUNNER_NATIVE_CGROUP")) |v| c.native_cgroup = v;
         if (environ.get("RUNNER_NATIVE_MEMORY_MAX_MB")) |v| c.native_memory_max_mb = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_PIDS_MAX")) |v| c.native_pids_max = try num(u32, v);
@@ -511,7 +513,7 @@ pub const Config = struct {
         else if (eq(key, "native-store-max-mb")) c.native_store_max_mb = try num(u64, val) //
         else if (eq(key, "native-volumes-max-mb")) c.native_volumes_max_mb = try num(u64, val) //
         else if (eq(key, "native-images-max-mb")) c.native_images_max_mb = try num(u64, val) //
-        else if (eq(key, "native-min-free-pct")) c.native_min_free_pct = try num(u8, val) //
+        else if (eq(key, "native-min-free-pct")) c.native_min_free_pct = try minFree(val) //
         else if (eq(key, "native-cgroup")) c.native_cgroup = val //
         else if (eq(key, "native-memory-max-mb")) c.native_memory_max_mb = try num(u32, val) //
         else if (eq(key, "native-pids-max")) c.native_pids_max = try num(u32, val) //
@@ -566,6 +568,11 @@ pub const Config = struct {
 
     fn engineMode(s: []const u8) error{InvalidEngine}!EngineMode {
         return std.meta.stringToEnum(EngineMode, s) orelse error.InvalidEngine;
+    }
+
+    fn minFree(s: []const u8) error{InvalidNativeMinFree}!u8 {
+        const n = std.fmt.parseInt(u8, s, 10) catch return error.InvalidNativeMinFree;
+        return if (n <= 100) n else error.InvalidNativeMinFree;
     }
 
     fn stepUser(s: []const u8) error{InvalidStepUser}!StepUser {
@@ -854,6 +861,9 @@ test "the native subnet and ids: defaults, and values that are refused" {
     try std.testing.expectEqual(@as(u64, 2048), limited.native_volumes_max_mb);
     try std.testing.expectEqual(@as(u64, 1024), limited.native_images_max_mb);
     try std.testing.expectEqual(@as(u8, 5), limited.native_min_free_pct);
+    try env.put("RUNNER_NATIVE_MIN_FREE_PCT", "101");
+    try std.testing.expectError(error.InvalidNativeMinFree, Config.load(&env, &.{"runner"}));
+    _ = env.swapRemove("RUNNER_NATIVE_MIN_FREE_PCT");
     try env.put("RUNNER_NATIVE_SUBNET", "10.88.0.0/24");
     try std.testing.expectError(error.InvalidNativeSubnet, Config.load(&env, &.{"runner"}));
     try std.testing.expectEqualStrings("172.30.0.0/20", (try Config.load(&env, &.{

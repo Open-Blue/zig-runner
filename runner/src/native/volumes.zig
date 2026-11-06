@@ -162,7 +162,17 @@ pub fn open(
     _ = linux.utimensat(lock.handle, null, null, 0);
     const at_z = try arena.dupeSentinel(u8, at, 0);
     switch (linux.errno(linux.mkdir(at_z, 0o755))) {
-        .SUCCESS, .EXIST => {},
+        .SUCCESS => {},
+        .EXIST => {
+            // Inside another volume, a job may have left anything at this name.
+            var st: linux.Statx = undefined;
+            const rc = linux.statx(linux.AT.FDCWD, at_z, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &st);
+            if (linux.errno(rc) != .SUCCESS) return error.VolumeNotMade;
+            if (st.mode & linux.S.IFMT != linux.S.IFDIR) {
+                if (linux.errno(linux.unlink(at_z)) != .SUCCESS) return error.VolumeNotMade;
+                if (linux.errno(linux.mkdir(at_z, 0o755)) != .SUCCESS) return error.VolumeNotMade;
+            }
+        },
         else => return error.VolumeNotMade,
     }
     if (owner) |o| if (linux.errno(linux.lchown(at_z, o, o)) != .SUCCESS)
@@ -445,6 +455,19 @@ pub fn adoptSeed(
     };
 }
 
+/// What keys know a seed by: its path, and which build lives there. A seed evicted is built again
+/// under the same path, from the same release, and need not be the same tree, so a layer on the old
+/// one must not be replayed on the new (`Backend.below`). Which directory, since when: no one
+/// changes a seed's root once it is published.
+pub fn seedId(arena: Allocator, dir: []const u8) ![]const u8 {
+    var st: linux.Statx = undefined;
+    const z = try arena.dupeSentinel(u8, dir, 0);
+    const mask: linux.STATX = .{ .INO = true, .CTIME = true };
+    if (linux.errno(linux.statx(linux.AT.FDCWD, z, linux.AT.SYMLINK_NOFOLLOW, mask, &st)) != .SUCCESS)
+        return error.SeedGone;
+    return std.fmt.allocPrint(arena, "{s}@{d}.{d}.{d}", .{ dir, st.ino, st.ctime.sec, st.ctime.nsec });
+}
+
 /// Every file under `path` owned by `user` (none followed through a symlink), and every
 /// setuid and setgid bit cleared.
 fn ownTree(arena: Allocator, io: std.Io, path: []const u8, user: ?u32, depth: u32) !void {
@@ -472,6 +495,26 @@ fn ownTree(arena: Allocator, io: std.Io, path: []const u8, user: ?u32, depth: u3
             },
         }
     }
+}
+
+test "native volumes: a seed built again is another seed to a key" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = std.Io.Dir.cwd();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const dir = try std.fmt.allocPrint(arena, "{s}/seed", .{root});
+    const aside = try std.fmt.allocPrint(arena, "{s}/aside", .{root});
+    try cwd.createDirPath(io, dir);
+    const first = try seedId(arena, dir);
+    try std.testing.expectEqualStrings(first, try seedId(arena, dir));
+    // The old one still there, so no inode can be used again.
+    try cwd.rename(dir, cwd, aside, io);
+    try cwd.createDirPath(io, dir);
+    try std.testing.expect(!std.mem.eql(u8, first, try seedId(arena, dir)));
 }
 
 test "native volumes: a key's parts are names of their own" {
