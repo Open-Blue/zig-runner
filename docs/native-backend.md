@@ -781,7 +781,11 @@ finding it busy goes on; the proof of its locks is proofs/tla/StoreEviction.tla.
   have a budget too: a pass takes one, and more while it has time.
 - **What no budget bounds.** The `syncfs` before deleting from a dead name, once a pass, takes what the
   disk takes; each eviction's two directory fsyncs likewise, and one layer's delete. All of them are
-  at a job's end, before its result is reported.
+  at a job's end, before its result is reported. A dead tree that will not go costs that `syncfs` at
+  every job's end, for as long as it stays. A chain of directories with no files can overrun the
+  budget once a tree: 2.9 s against 1.5 s at a depth of 250,000.
+- **When a sync fails.** A pass stops there: nothing more is evicted until what went is gone, or a
+  disk that fails writes would take entry after entry and free nothing.
 - **Costs left.** Deleting and measuring are at a job's end, before its result is reported
   (`Backend.deinit`), so a job can end up to 1.5 s plus a walk later. A size is the runner's own
   estimate, not the filesystem's: a file with several links counts its share per link.

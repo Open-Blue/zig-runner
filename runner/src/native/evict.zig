@@ -104,11 +104,13 @@ pub fn run(s: Store, io: std.Io) void {
     // and once: a runner that died may not have synced it, and a slow disk must not take what the
     // pass has for deleting, or the worse the disk the less would ever go.
     var synced = syncDead(arena, io, s.root);
+    if (!synced) return;
     var budget: Budget = .init(io, lim.budget_ms);
-    if (synced and !removeDead(arena, io, s.root, "volumes", &budget)) return;
+    if (!removeDead(arena, io, s.root, "volumes", &budget)) return;
     const entries = listVolumes(arena, io, s.root) catch return;
     measureOne(arena, io, entries, lim.remeasure_s);
     var evicted = capped(arena, io, s.root, entries, lim.volumes_max_bytes, lim, &budget, &synced);
+    if (!synced) return;
     if (shortOf(arena, s)) |short| {
         var left = short;
         evicted = floor(arena, io, s.root, entries, &left, lim, &budget, &synced) or evicted;
@@ -130,8 +132,10 @@ fn floor(arena: Allocator, io: std.Io, root: []const u8, entries: []Entry, left:
     std.mem.sort(Entry, entries, {}, olderFirst);
     var evicted = false;
     for (entries) |*e| {
-        if (left.* == 0 or (budget.late() and (evicted or e.measured_s == 0))) break;
+        if (left.* == 0 or !synced.* or (evicted and budget.late())) break;
         if (e.private or lim.recent_s > now(io) - e.used_s) continue;
+        // No time left to walk it: the next may be known.
+        if (e.measured_s == 0 and budget.late()) continue;
         const whole = e.measured_s != 0 or measure(arena, io, e, measure_again_ms);
         if (!evictEntry(arena, io, root, e.*, synced)) continue;
         evicted = true;
@@ -186,7 +190,7 @@ fn capped(arena: Allocator, io: std.Io, root: []const u8, entries: []Entry, max:
     var total: u64 = 0;
     for (entries) |e| total +|= e.bytes;
     var evicted = false;
-    for (entries) |e| if (e.private and evictEntry(arena, io, root, e, synced)) {
+    for (entries) |e| if (synced.* and e.private and evictEntry(arena, io, root, e, synced)) {
         total -|= e.bytes;
         evicted = true;
     };
@@ -194,7 +198,7 @@ fn capped(arena: Allocator, io: std.Io, root: []const u8, entries: []Entry, max:
     std.mem.sort(Entry, entries, {}, olderFirst);
     const t = now(io);
     for (entries) |e| {
-        if (total <= max or (evicted and budget.late())) break;
+        if (total <= max or !synced.* or (evicted and budget.late())) break;
         if (e.private or e.measured_s == 0 or t - e.used_s < lim.idle_s) continue;
         if (!evictEntry(arena, io, root, e, synced)) continue;
         total -|= e.bytes;
@@ -367,7 +371,7 @@ const Inner = union(enum) {
 /// lock was taken, so what is there stays there.
 fn innerLock(dir: linux.fd_t) Inner {
     const name: [:0]const u8 = nested ++ ".lock";
-    const flags: linux.O = .{
+    var flags: linux.O = .{
         .ACCMODE = .RDONLY,
         .CREAT = true,
         .NOFOLLOW = true,
@@ -375,8 +379,9 @@ fn innerLock(dir: linux.fd_t) Inner {
         .CLOEXEC = true,
     };
     for (0..3) |_| {
-        const rc = linux.openat(dir, name, flags, 0o644);
-        switch (linux.errno(rc)) {
+        const refused = test_no_inodes and flags.CREAT;
+        const rc = if (refused) 0 else linux.openat(dir, name, flags, 0o644);
+        switch (if (refused) linux.E.NOSPC else linux.errno(rc)) {
             .SUCCESS => {},
             // A symlink.
             .LOOP => {
@@ -388,6 +393,13 @@ fn innerLock(dir: linux.fd_t) Inner {
                 _ = linux.fchmod(dir, 0o700);
                 continue;
             },
+            // No room to make it, so it is not there, or `O_CREAT` would have opened it: looked
+            // for without. One that cannot be made either, a job cannot have made.
+            .NOSPC, .DQUOT => {
+                flags.CREAT = false;
+                continue;
+            },
+            .NOENT => if (flags.CREAT) return .held else return .none,
             .ISDIR, .NOTDIR => return .none,
             // Whatever else, a job may hold it for all this can tell: out of descriptors, say.
             else => return .held,
@@ -470,7 +482,7 @@ fn evictEntry(arena: Allocator, io: std.Io, root: []const u8, e: Entry, synced: 
     var dead: [32:0]u8 = undefined;
     const dead_name = std.fmt.bufPrintSentinel(&dead, ".dead-{s}", .{&std.fmt.bytesToHex(raw, .lower)}, 0) catch return false;
     if (linux.errno(linux.renameat(from, base, area, dead_name)) != .SUCCESS) return false;
-    for ([_]linux.fd_t{ from, area }) |d| if (linux.errno(linux.fsync(d)) != .SUCCESS) {
+    for ([_]linux.fd_t{ from, area }) |d| if (test_sync_fails or linux.errno(linux.fsync(d)) != .SUCCESS) {
         std.log.warn("native: cannot sync a directory of {s}; what went from there stays until it can be", .{root});
         synced.* = false;
     };
@@ -481,6 +493,10 @@ fn evictEntry(arena: Allocator, io: std.Io, root: []const u8, e: Entry, synced: 
 
 /// How long `syncDead` takes on top of the sync. Tests.
 var test_sync_ms: i64 = 0;
+/// Every sync here fails, as on a disk that fails writes. Tests.
+var test_sync_fails = false;
+/// `innerLock` can make no file, as on a filesystem with no inodes left. Tests.
+var test_no_inodes = false;
 
 /// The filesystem synced if anything is under a dead name, so that a rename it was given by is on
 /// disk before anything of it is deleted: the runner that renamed it may have died before it
@@ -494,7 +510,7 @@ fn syncDead(arena: Allocator, io: std.Io, root: []const u8) bool {
     while (it.next(io) catch null) |e| {
         if (!std.mem.startsWith(u8, e.name, ".dead-")) continue;
         if (test_sync_ms > 0) io.sleep(.fromMilliseconds(test_sync_ms), .awake) catch {};
-        if (linux.errno(linux.syncfs(dir.handle)) == .SUCCESS) return true;
+        if (!test_sync_fails and linux.errno(linux.syncfs(dir.handle)) == .SUCCESS) return true;
         std.log.warn("native: cannot sync {s}; what is dead there stays until it can be", .{dir_path});
         return false;
     }
@@ -1559,4 +1575,112 @@ test "native eviction: past its deadline the floor measures nothing more" {
     var budget: Budget = .init(testing.io, -1);
     try testing.expect(!floor(arena, testing.io, f.s.root, try listVolumes(arena, testing.io, f.s.root), &left, f.s.limits, &budget, &synced));
     for (dirs) |d| try testing.expect(!isFile(arena, Hostile.p(f, "{s}.size", .{d})));
+}
+
+test "native eviction: a sync that fails stops the pass: nothing more goes until what went is gone" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const dirs = [_][]const u8{
+        try f.volume("v0", 6000, 30),
+        try f.volume("v1", 6000, 20),
+        try f.volume("v2", 6000, 10),
+    };
+    f.s.limits = .{ .volumes_max_bytes = 1, .min_free_pct = 0 };
+    test_sync_fails = true;
+    defer test_sync_fails = false;
+    // The rename's own sync fails: it stops at the one, and deletes nothing of it.
+    run(f.s, testing.io);
+    try testing.expectEqual(@as(usize, 1), try f.deadLeft());
+    try testing.expect(!f.there(dirs[0]) and f.there(dirs[1]) and f.there(dirs[2]));
+    // And a pass that cannot sync what is dead does nothing, however often it runs.
+    for (0..4) |_| run(f.s, testing.io);
+    try testing.expectEqual(@as(usize, 1), try f.deadLeft());
+    try testing.expect(f.there(dirs[1]) and f.there(dirs[2]));
+    test_sync_fails = false;
+    run(f.s, testing.io);
+    try testing.expectEqual(@as(usize, 0), try f.deadLeft());
+}
+
+test "native eviction: with no inodes left, a volume with no inner lock can still go" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const dir = try f.volume("v", 6000, 30);
+    f.s.limits = .{ .volumes_max_bytes = 1, .min_free_pct = 0 };
+    test_no_inodes = true;
+    defer test_no_inodes = false;
+    run(f.s, testing.io);
+    try testing.expect(!f.there(dir));
+}
+
+test "native eviction: with no inodes left, a held inner volume still keeps the outer" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const arena = f.arena();
+    const outer = try f.volume("name", 6000, 30);
+    const key = [_][]const u8{ "o", "r", "repo", "name", "runner" };
+    const inner = try volumes.open(arena, testing.io, f.s.root, &key, .shared, null);
+    defer inner.release(testing.io);
+    f.s.limits = .{ .volumes_max_bytes = 1, .min_free_pct = 0 };
+    test_no_inodes = true;
+    defer test_no_inodes = false;
+    run(f.s, testing.io);
+    try testing.expect(f.there(outer) and f.there(inner.dir));
+}
+
+test "native eviction: a late floor passes over a volume never measured for one it knows" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const arena = f.arena();
+    const unknown = try f.volume("unknown", 10, 40);
+    try std.Io.Dir.cwd().deleteFile(testing.io, Hostile.p(f, "{s}.size", .{unknown}));
+    const known = try f.volume("known", 10, 30);
+    var left: u64 = 1 << 40;
+    var synced = true;
+    var budget: Budget = .init(testing.io, -1);
+    try testing.expect(floor(arena, testing.io, f.s.root, try listVolumes(arena, testing.io, f.s.root), &left, f.s.limits, &budget, &synced));
+    try testing.expect(f.there(unknown) and !f.there(known));
+    try testing.expect(!isFile(arena, Hostile.p(f, "{s}.size", .{unknown})));
+}
+
+test "native eviction: repositories whose names were rewritten do not share a volume" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const arena = f.arena();
+    for ([_][2][]const u8{ .{ "x.lock", "x.lock_" }, .{ ".github", "_.github" }, .{ "a.private-b", "a-private-b" } }) |p| {
+        const v = try volumes.open(arena, testing.io, f.s.root, &.{ "o", p[0], "repo", "zig-local" }, .shared, null);
+        defer v.release(testing.io);
+        const w = try volumes.open(arena, testing.io, f.s.root, &.{ "o", p[1], "repo", "zig-local" }, .shared, null);
+        defer w.release(testing.io);
+        try testing.expect(!std.mem.eql(u8, v.dir, w.dir));
+    }
+}
+
+test "native eviction: no two repository names are one directory, and none reads as the store's" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    // A repository's name is letters, digits, `.`, `-` and `_`: every way of putting together what
+    // a rewrite looks for, and what a rewrite could have made.
+    const tokens = [_][]const u8{ ".", "-", "_", "a", ".lock", ".size", ".private-", "private-", ".dead-", "lock", "size" };
+    var seen: std.StringHashMapUnmanaged([]const u8) = .empty;
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.append(arena, "");
+    var from: usize = 0;
+    for (0..4) |_| {
+        const to = names.items.len;
+        for (from..to) |i| for (tokens) |t| try names.append(arena, try std.mem.concat(arena, u8, &.{ names.items[i], t }));
+        from = to;
+    }
+    for (names.items) |n| {
+        const c = try volumes.component(arena, n);
+        try testing.expect(c.len > 0 and c[0] != '.' and std.mem.indexOfScalar(u8, c, '/') == null);
+        try testing.expect(!std.mem.endsWith(u8, c, ".lock") and !std.mem.endsWith(u8, c, ".size"));
+        try testing.expect(std.mem.indexOf(u8, c, ".private-") == null);
+        const got = try seen.getOrPut(arena, c);
+        if (got.found_existing and !std.mem.eql(u8, got.value_ptr.*, n)) {
+            std.debug.print("{s} and {s} are both {s}\n", .{ got.value_ptr.*, n, c });
+            return error.TestUnexpectedResult;
+        }
+        got.value_ptr.* = n;
+    }
 }
