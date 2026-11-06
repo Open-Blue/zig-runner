@@ -801,12 +801,13 @@ and bounded:
   later job's `exec` fail with E2BIG); a tree that does not fit is left out, and so is one that
   would not fit the Dagger path's variable (`set_up.toolTreesVerdict`, the same 64 KiB).
 - Memory: a tree is held in memory while it is checked (a path, an entry and a list line each:
-  about 7 MB for Zig). Every byte is charged to a counter shared by all the checks of the process
-  (`tool_trees.held`, `Limits.memory`, 128 MiB), and a tree that would pass it is left out, so
-  concurrent checks of hostile trees hold 128 MiB between them, not each their own. When #327's
-  process-wide `Budget` (`native/hash_files.zig`) is merged, `held` should become that budget's
-  counter and `Limits.memory` its limit, so the runner has one number for what jobs' checks and
-  `hashFiles()` may hold.
+  about 7 MB for Zig). Every byte is charged to the process's `Budget.held`
+  (`native/hash_files.zig`), the number that `hashFiles()` calls count their memory in as well, against `Limits.memory`
+  (128 MiB), and a tree that would pass it is left out, so concurrent checks of hostile trees hold
+  128 MiB between them, not each their own. A check never waits for the budget and a call is never
+  refused for what checks hold, so neither can fail a job through the other: a check that meets a
+  big call leaves its trees out (the next job checks them), and a call meets checks that are gone
+  in seconds.
 - Order, and what one job can starve. Each tree has a `<tree>.born` file in the lists: when this
   runner first saw it. Trees are checked oldest first (ties in byte order); at each level of the
   walk to them the names that have a `.born` come first, so a level full of planted names does not

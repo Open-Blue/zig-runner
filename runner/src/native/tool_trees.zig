@@ -52,6 +52,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const dagger = @import("../dagger.zig");
 const sandbox = @import("sandbox.zig");
+const hash_files = @import("hash_files.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -85,9 +86,13 @@ pub const Limits = struct {
     time_ms: i64 = 60_000,
     /// See the file's comment.
     racy_s: i64 = 2,
-    /// Bytes of memory that every check running in the process holds at once (`held`): a tree
-    /// that would pass it is given up on. Zig's tree takes about 7 MB.
+    /// Bytes of memory that everything the process holds at once (`Budget.held`: the checks'
+    /// trees and `hashFiles()` calls) may come to when a tree is charged: a tree that would pass
+    /// it is given up on. Zig's tree takes about 7 MB.
     memory: u64 = 128 << 20,
+    /// The process's memory number, shared with `hashFiles()`. A check only takes from it, never
+    /// waits for it, and a call is never refused for what a check holds.
+    budget: *hash_files.Budget = &hash_files.process_budget,
 };
 
 /// What steps are given (`env`, `full`: `DIGEST TREE` lines, `Exec.tool_trees`) and the line
@@ -110,11 +115,6 @@ const max_name = 100;
 const max_env = 64 << 10;
 /// "Set up job"'s line, which lists the trees.
 const max_note = 4 << 10;
-
-/// Memory held by checks in this process now, in bytes, as each charges what it will allocate.
-/// #327's process-wide budget (`native/hash_files.zig`) is the same idea: once both are merged
-/// this counter should be that budget's, and `Limits.memory` its limit.
-var held: std.atomic.Value(u64) = .init(0);
 
 /// Checks the trees under `cache` (the tool cache volume's directory on the host), keeping their
 /// lists in `lists`, and says what steps are given. The trees' paths are `mount`'s (where steps
@@ -257,7 +257,7 @@ const Check = struct {
     tree_read: u64 = 0,
     tree_deadline_ms: i64 = 0,
     tree_why: []const u8 = "",
-    /// Bytes of `held` that this tree took.
+    /// Bytes of `limits.budget.held` that this tree took.
     mine: u64 = 0,
 
     const Error = error{ OutOfMemory, Unreadable, Stopped };
@@ -296,7 +296,7 @@ const Check = struct {
     /// `n` bytes of memory about to be allocated for the tree, against what all checks hold.
     fn charge(c: *Check, n: usize) error{Unreadable}!void {
         c.mine += n;
-        if (held.fetchAdd(n, .acq_rel) + n > c.limits.memory)
+        if (c.limits.budget.held.fetchAdd(n, .acq_rel) + n > c.limits.memory)
             return c.giveUp("too much memory in use");
     }
 
@@ -469,7 +469,7 @@ const Check = struct {
         defer {
             ta.deinit();
             c.in_tree = false;
-            _ = held.fetchSub(c.mine, .acq_rel);
+            _ = c.limits.budget.held.fetchSub(c.mine, .acq_rel);
             c.mine = 0;
         }
         const t = ta.allocator();
@@ -1345,16 +1345,17 @@ test "tool trees: checks together hold what the process allows and give it back"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const f = try fixture(arena, &tmp);
-    try std.testing.expectEqual(@as(u64, 0), held.load(.acquire));
-    // Other checks hold nearly all of it: this tree does not fit.
-    _ = held.fetchAdd(1000, .acq_rel);
-    const v = try checkWith(arena, f, .{ .memory = 2000 }, null);
-    _ = held.fetchSub(1000, .acq_rel);
+    var budget: hash_files.Budget = .{};
+    try std.testing.expectEqual(@as(u64, 0), budget.held.load(.acquire));
+    // Other checks, or a `hashFiles()` call, hold nearly all of it: this tree does not fit.
+    _ = budget.held.fetchAdd(1000, .acq_rel);
+    const v = try checkWith(arena, f, .{ .memory = 2000, .budget = &budget }, null);
+    _ = budget.held.fetchSub(1000, .acq_rel);
     try expectIn(v.note, "too much memory in use");
-    try std.testing.expectEqual(@as(u64, 0), held.load(.acquire));
-    const fits = try checkWith(arena, f, .{}, null);
+    try std.testing.expectEqual(@as(u64, 0), budget.held.load(.acquire));
+    const fits = try checkWith(arena, f, .{ .budget = &budget }, null);
     try expectIn(fits.env, tree_rel);
-    try std.testing.expectEqual(@as(u64, 0), held.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), budget.held.load(.acquire));
 }
 
 test "tool trees: lists are not written past what is read, and leftovers and empty directories go" {
