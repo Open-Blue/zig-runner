@@ -694,8 +694,9 @@ fn bindAll(arena: Allocator, spec: Spec, volume_ns: ?linux.fd_t) void {
 }
 
 /// The directory `host` itself, held. A volume inside another (`<key>/runner`) is a name a job in
-/// the outer one can replace, at any depth below `volume_root`, and a link anywhere there must
-/// fail the step, not bind what it points at. `volume_root` and above are the operator's.
+/// the outer one can replace; that is the one place a job reaches today (`volumes.open`), and a
+/// link there must fail the step. No link is followed below `volume_root` at all, so that holds
+/// if a key ever nests deeper. `volume_root` and above are the operator's.
 fn openVolume(arena: Allocator, volume_root: []const u8, host: []const u8) union(enum) {
     fd: linux.fd_t,
     err: linux.E,
@@ -1636,7 +1637,8 @@ test "a link anywhere below a cache volume's root is refused, and above it is th
     try tmp.dir.createDirPath(io, "elsewhere/runner");
     // The operator's store behind a link, as `/var/lib` on another disk is.
     try tmp.dir.symLink(io, "store", "linked-store", .{});
-    // What a job in the outer volume can plant: at the last name, and on the way to it.
+    // What a job in the outer volume can plant at the last name, and one on the way to it, which
+    // no job reaches today.
     // Out of the root, and more to the point inside it, at another repository's volume, which
     // staying in the root alone would allow.
     try tmp.dir.symLink(io, "../../../elsewhere", "store/volumes/key/last", .{});

@@ -622,6 +622,7 @@ test "native volumes: the job's caches, by scope and step user, as the Dagger ba
     for (trusted.binds.items) |b| {
         try ats.append(arena, b.at);
         try std.testing.expect(b.volume and b.make and !b.read_only);
+        try std.testing.expect(b.volume_root.len > 0);
         try std.testing.expect(std.mem.indexOf(u8, b.host, "/volumes/o/r/repo/") != null);
         try std.testing.expect(std.mem.endsWith(u8, b.host, "/runner"));
     }
