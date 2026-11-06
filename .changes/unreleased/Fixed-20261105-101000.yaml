@@ -1,3 +1,0 @@
-kind: Fixed
-body: A native publish of a checkout no longer waits for everything else being written to the disk. Layers of up to 512 entries sync only their own files, up from 256.
-time: 2026-11-05T10:10:00.000000-05:00

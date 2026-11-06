@@ -1,3 +1,0 @@
-kind: Fixed
-body: The native services test asks for the redis image CI fetches, and a change to those images runs the tests. Renovate moved the images to redis 8 on a change that skipped the tests, which left every later test run failing.
-time: 2026-11-05T13:30:00.000000-05:00

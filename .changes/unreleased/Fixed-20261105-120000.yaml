@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Native Dockerfile actions: a build''s stored layers are keyed on what the base image is, not only its tag, so a tag that moved builds again instead of stacking layers from the old image on the new one. Build keys also keep a root and a rootless runner apart and hash every field length-prefixed. The store format is now 5, so existing layers are rebuilt once.'
-time: 2026-11-05T12:00:00.000000-05:00
