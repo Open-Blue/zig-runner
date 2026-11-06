@@ -5099,7 +5099,8 @@ test "a container job's --user the image does not know fails the job, never runs
     const text = w.written();
     try std.testing.expect(!res.succeeded);
     const reason = "--user typo: not in its /etc/passwd";
-    try std.testing.expect(std.mem.indexOf(u8, text, reason) != null);
+    // The job's failure (`engine_error`), not a step's output.
+    try std.testing.expect(std.mem.indexOf(u8, res.engine_error orelse "", reason) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ran as") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "runs on Dagger") == null);
 }
