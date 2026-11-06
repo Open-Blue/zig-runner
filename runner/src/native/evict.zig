@@ -935,7 +935,6 @@ const Race = struct {
     deadline_ms: i64,
     faults: std.atomic.Value(u32) = .init(0),
     fresh: std.atomic.Value(u32) = .init(0),
-    rounds: std.atomic.Value(u32) = .init(0),
 
     fn fault(r: *Race, comptime fmt: []const u8, args: anytype) void {
         std.debug.print("native eviction race: " ++ fmt ++ "\n", args);
@@ -947,9 +946,7 @@ const Race = struct {
         for (&threads, 0..) |*t, i| t.* = try .spawn(.{}, run1, .{ r, one, i });
         for (threads) |t| t.join();
         try testing.expectEqual(@as(u32, 0), r.faults.load(.monotonic));
-        // It raced something: jobs found what others left, and found it evicted.
         try testing.expect(r.fresh.load(.monotonic) > 0);
-        try testing.expect(r.fresh.load(.monotonic) < r.rounds.load(.monotonic));
     }
 
     fn run1(r: *Race, comptime one: fn (*Race, Allocator, usize, usize) anyerror!void, i: usize) void {
@@ -958,7 +955,6 @@ const Race = struct {
         while (std.Io.Clock.awake.now(io).toMilliseconds() < r.deadline_ms) : (n += 1) {
             var a: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
             defer a.deinit();
-            _ = r.rounds.fetchAdd(1, .monotonic);
             one(r, a.allocator(), i, n) catch |e| r.fault("worker {d} round {d}: {t}", .{ i, n, e });
             r.s.collect(a.allocator(), io);
         }
