@@ -4853,6 +4853,9 @@ test "a container job's options on the native backend: --user and --env, the res
     try server.start();
     defer server.stop();
 
+    // A rootless runner maps only root, so there the user is root; `app` needs a root runner.
+    const as_root = std.os.linux.geteuid() == 0;
+    const user = if (as_root) "app" else "root";
     var job = testJob(&.{testStep("echo uid=$(id -u) gid=$(id -g); echo A=$A BOTH=$BOTH; " ++
         "echo SPACED=$SPACED; pwd")});
     job.container = .{
@@ -4861,8 +4864,9 @@ test "a container job's options on the native backend: --user and --env, the res
         .env = &.{.{ .name = "BOTH", .value = .{ .lit = "container" } }},
         // The image's /etc/passwd has `app` as 1002:1003. `--workdir` and `--health-*` are the
         // runner's, not the steps': `docker exec -w` and the services' health only.
-        .options = .{ .lit = "--user app -e A=1 --env BOTH=options -e \"SPACED=two words\" " ++
-            "--workdir /nowhere --health-cmd true --health-interval 5s" },
+        .options = .{ .lit = try std.fmt.allocPrint(arena, "--user {s} -e A=1 --env " ++
+            "BOTH=options -e \"SPACED=two words\" --workdir /nowhere --health-cmd true " ++
+            "--health-interval 5s", .{user}) },
     };
     var env: std.process.Environ.Map = .init(arena);
     var w: std.Io.Writer.Allocating = .init(arena);
@@ -4878,11 +4882,12 @@ test "a container job's options on the native backend: --user and --env, the res
     const expect = [_][]const u8{
         "Engine: native",
         // `--user` over the image's USER (none here), `--env` over the container's `env:`.
-        "uid=1002 gid=1003",
+        if (as_root) "uid=1002 gid=1003" else "uid=0 gid=0",
         "A=1 BOTH=options",
         "SPACED=two words",
         "/__w/r/r",
-        "Container options: 3 `--env`, `--user` app; 3 understood and without effect natively",
+        try std.fmt.allocPrint(arena, "Container options: 3 `--env`, `--user` {s}; 3 understood " ++
+            "and without effect natively", .{user}),
     };
     for (expect) |e| if (std.mem.indexOf(u8, text, e) == null) {
         std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
