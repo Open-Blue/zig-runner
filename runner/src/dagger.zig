@@ -215,8 +215,8 @@ pub const Resolved = union(enum) {
 /// index. Renovate moves the pin (renovate.json), and CI checks on every pull request that it is
 /// still a pullable index with the applets the runner uses (.github/scripts/busybox-pin.sh). By
 /// hand, `docker buildx imagetools inspect busybox:1.37.0-musl` prints the index digest.
-pub const busybox_image = "busybox:1.37.0-musl" ++
-    "@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478";
+pub const busybox_image = "busybox:1.38.0-musl" ++
+    "@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6";
 /// Where a Docker action's container gets its static busybox, and HOME (shared by the job's Docker
 /// actions, as GitHub mounts one /github/home into each).
 pub const busybox_path = "/github/_runtime/busybox";
