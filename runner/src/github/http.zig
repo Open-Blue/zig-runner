@@ -17,14 +17,24 @@ pub fn client(local: *std.http.Client) *std.http.Client {
     return shared.load(.acquire) orelse local;
 }
 
+/// The least time between two `renew`s, and the awake clock at the last one (0: none yet).
+const renew_every_s = 15 * 60;
+var renewed_at_s: std.atomic.Value(i64) = .init(0);
+
 /// Replaces the shared client with a new one, unless that already happened since `stale` was taken.
 /// A client checks certificates against the time of its first HTTPS request (`Client.now`, which
 /// std never moves and cannot safely move while it is in use), so after a process has run for a
 /// while, a certificate issued since it started is "not yet valid" and every new connection to that
 /// host fails. A new client takes the time again and rescans the system's root certificates. The
 /// old one is never freed: a job's live feed holds one of its connections for as long as the job
-/// runs.
+/// runs. So one every `renew_every_s` at most: `staleClock` cannot tell a stale clock from a TLS
+/// failure with another cause, and an outage that lasts would otherwise leave a client behind on
+/// every try.
 pub fn renew(stale: *std.http.Client) void {
+    const now = std.Io.Clock.awake.now(stale.io).toSeconds();
+    const last = renewed_at_s.load(.acquire);
+    if (last != 0 and now - last < renew_every_s) return;
+    if (renewed_at_s.cmpxchgStrong(last, now, .acq_rel, .acquire) != null) return;
     const gpa = stale.allocator;
     const fresh = gpa.create(std.http.Client) catch return;
     fresh.* = .{ .allocator = gpa, .io = stale.io, .write_buffer_size = stale.write_buffer_size };
@@ -42,9 +52,12 @@ pub fn staleRetries(c: ?*std.http.Client) u32 {
     return @intCast(kept + 1);
 }
 
-/// Whether `err` is a certificate judged by a client's stale clock (see `renew`).
+/// Whether `err` may be a certificate judged by a client's stale clock (see `renew`). std reports
+/// every failed TLS handshake as `TlsInitializationFailed` and drops the reason, so that is all
+/// there is to go on: razorbill's runners spent an hour retrying a certificate issued after they
+/// started (2026-11-06), and a restart was what cured them.
 pub fn staleClock(err: anyerror) bool {
-    return err == error.CertificateNotYetValid or err == error.CertificateExpired;
+    return err == error.TlsInitializationFailed;
 }
 
 /// How long one request to GitHub may take, from connecting to the last byte of its answer, before
@@ -195,6 +208,7 @@ test "renew replaces the shared client once, however many saw it go stale" {
     defer first.deinit();
     shared.store(&first, .release);
     defer shared.store(null, .release);
+    renewed_at_s.store(0, .release);
 
     renew(&first);
     const second = shared.load(.acquire).?;
@@ -205,6 +219,29 @@ test "renew replaces the shared client once, however many saw it go stale" {
     // A second runner that saw the same stale client finds it already replaced.
     renew(&first);
     try std.testing.expectEqual(second, shared.load(.acquire).?);
+}
+
+test "renew leaves one client behind at most in its interval, however long TLS keeps failing" {
+    const gpa = std.testing.allocator;
+    var first: std.http.Client = .{ .allocator = gpa, .io = std.testing.io };
+    defer first.deinit();
+    shared.store(&first, .release);
+    defer shared.store(null, .release);
+    renewed_at_s.store(0, .release);
+
+    renew(&first);
+    const second = shared.load(.acquire).?;
+    defer gpa.destroy(second);
+    defer second.deinit();
+    // The new client fails too: it stays, and no third is made.
+    renew(second);
+    try std.testing.expectEqual(second, shared.load(.acquire).?);
+}
+
+test "what std makes of a handshake's failure counts as a stale clock" {
+    try std.testing.expect(staleClock(error.TlsInitializationFailed));
+    try std.testing.expect(!staleClock(error.ConnectionRefused));
+    try std.testing.expect(!staleClock(error.HttpConnectionClosing));
 }
 
 test "a request can get past every idle connection the pool keeps" {
