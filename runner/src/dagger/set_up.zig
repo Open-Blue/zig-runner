@@ -1697,13 +1697,16 @@ pub const Warmed = struct { image: []const u8, seeded: bool, packages: ?[]const 
 pub fn warm(arena: Allocator, transport: Transport, opts: Options, err_msg: *[]const u8) !Warmed {
     const docs = try warmDocuments(arena, opts);
     _ = gql(arena, transport, docs.base, err_msg) catch return error.BaseContainerFailed;
-    const ref = gql(arena, transport, docs.image_ref, err_msg) catch
-        return error.BaseContainerFailed;
-    const image = jsonFindString(ref, "imageRef") orelse resolveImage(opts.image);
+    // The base is built: what is left is a name for the log, and the engine may refuse `imageRef`
+    // for a container it just pulled, so a failure is the unpinned name, as a missing field is.
+    var ignored: []const u8 = "";
+    const image = if (gql(arena, transport, docs.image_ref, &ignored)) |ref|
+        jsonFindString(ref, "imageRef") orelse resolveImage(opts.image)
+    else |_|
+        resolveImage(opts.image);
     // Only a name for the log: a fingerprint that cannot be read leaves it out.
     var packages: ?[]const u8 = null;
     if (docs.packages) |doc| {
-        var ignored: []const u8 = "";
         if (gql(arena, transport, doc, &ignored)) |r| {
             if (jsonFindString(r, "stdout")) |out| packages = std.mem.trim(u8, out, " \n");
         } else |_| {}
@@ -2566,6 +2569,14 @@ test "the pre-warm sends a Zig job's own seed and base documents, and fails with
     var msg: []const u8 = "";
     try std.testing.expectError(error.BaseContainerFailed, warm(arena, fake.transport(), .{}, &msg));
     try std.testing.expect(std.mem.indexOf(u8, msg, "pull access denied") != null);
+    // The base built, then the engine refusing `imageRef`: the pinned name stands in for the digest.
+    const refused = [_][]const u8{
+        "{\"data\":{\"container\":{\"from\":{\"withExec\":{\"sync\":\"C0\"}}}}}",
+        "{\"errors\":[{\"message\":\"Image reference can only be retrieved immediately\"}]}",
+    };
+    var refusing: FakeSession = .{ .answers = &refused, .arena = arena };
+    const named = try warm(arena, refusing.transport(), .{}, &msg);
+    try std.testing.expectEqualStrings(default_image, named.image);
 }
 
 /// A job run with the tool cache's trees checked, `check` the check exec's answer: what each query
