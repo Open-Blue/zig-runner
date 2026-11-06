@@ -392,7 +392,9 @@ What it covers, as built:
   nor a layer whose size cannot be counted whole (a directory it cannot read). On a root runner the
   layer is first given the canonical ids (`Store.unshift`, below). A commit's checkout
   (a fetch of a full SHA) is a layer like a step's, keyed on its script and never on the token;
-  a branch or tag moves, so its fetch always runs. The upper is moved under `layers/.tmp-<key>-<n>`
+  a branch or tag moves, so its fetch always runs, and with `fetch-tags` the key also holds a digest
+  of the remote's tags (`ls-remote --tags`, one more sandbox before the fetch), which move where a
+  commit does not; if they cannot be listed the fetch runs. The upper is moved under `layers/.tmp-<key>-<n>`
   with its record, held, written to disk (its own files' data, then its meta, then one fsync of
   each file and directory, which ext4 serves with one journal commit; a large layer's `syncfs`
   instead), and published by one `renameat2(RENAME_NOREPLACE)`. An upper that cannot be put back after a failure is left there
