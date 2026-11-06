@@ -24,6 +24,12 @@ engine discharged becomes the runner's obligation, and each one is stated and pr
   (`native_mounts_invisible`, `native_volatile_invisible`, `native_event_invisible`). `Ambiguous`
   is the job where plain concatenation, without the lengths, hands one step another's answer.
 
+* **A key stands on keys.** A layer with no key (a Docker action's, a JavaScript action's mount
+  points, an always-run step's) ends the chain: nothing above it is keyed, replayed or published, so
+  what an image or a mount holds cannot be behind a replay (`Chained`, `ops_keep_chained`). A
+  Dockerfile build's layers are replayed by keys of their own, chained from what the base image is,
+  not only what it is called (`encBuild`, `build_base_matters`, `encBuildLayer_injective`).
+
 * **A hit replays the stored entry, and only successes of unmarked steps are stored.** The store
   never publishes a failure (#69) or a marked step (whose key names the job, and whose log may hold
   a secret: P0's rule), so `SHonest` holds by construction and needs none of `Build`'s
@@ -453,6 +459,223 @@ theorem fork_keys_apart (h : f.Sound) (vol : Volatile) {i j : Input}
     (ne : (f.base (root i.parent)).below.scope ≠ (f.base (root j.parent)).below.scope) :
     encKey f (keyOf vol i) ≠ encKey f (keyOf vol j) :=
   scope_apart h ne
+
+/-! ## The stack: a key stands on keys
+
+A replay is right only if its key says what is below it. A step's key has its parent's in it, so
+that holds of the whole stack as long as no layer sits in it without a key: an image's or a mount's
+content, or what an always-run step left, is in no key. `Backend.keyFor` and `keyFetched` therefore
+key only on a keyed top, or on an empty stack (below a base, `Backend.below`), and everything else
+that adds a layer adds an unkeyed one: a Docker action's step, a JavaScript action's mount points
+(whose binds then stay in every later step, `applyMounts`), a step that always runs or failed. So
+nothing above such a layer is keyed, replayed or published. `Chained` is that invariant and
+`ops_keep_chained` says no order of the stack's operations breaks it. -/
+
+/-- The job's stack, newest first: each layer's key, if it has one (`Layer.key`). -/
+abbrev Stack := List (Option Nat)
+
+/-- Whether the next exec can have a key (`keyFor` not null). -/
+def Stack.keyable : Stack → Bool
+  | [] => true
+  | t :: _ => t.isSome
+
+/-- A keyed layer has only keyed layers below it. -/
+def Chained : Stack → Prop
+  | [] => True
+  | none :: r => Chained r
+  | some _ :: r => (∀ x ∈ r, x.isSome = true) ∧ Chained r
+
+/-- What changes the stack. -/
+inductive StackOp where
+  /-- An exec with no key: its layer joins the stack (`execIn`). -/
+  | exec
+  /-- An exec under key `k` replayed or published (`claimKey`, `publishTop`), whose key `keyFor`
+  gives only on a keyable stack; else it is an `exec`. -/
+  | keyed (k : Nat)
+  /-- A fetched action's layer given key `k`, on what is below it (`keyFetched`). -/
+  | fetched (k : Nat)
+  /-- The top dropped, unless it is keyed (`dropTop`, and `dropLastLayer` for the set-up's own). -/
+  | drop
+  /-- The stack merged into one layer with the top's key (`flatten`). -/
+  | flatten
+
+/-- One operation on the stack. -/
+def StackOp.apply : StackOp → Stack → Stack
+  | .exec, s => none :: s
+  | .keyed k, s => if s.keyable then some k :: s else none :: s
+  | .fetched _, [] => []
+  | .fetched k, t :: r => if Stack.keyable r then some k :: r else t :: r
+  | .drop, [] => []
+  | .drop, none :: r => r
+  | .drop, some k :: r => some k :: r
+  | .flatten, [] => []
+  | .flatten, t :: _ => [t]
+
+theorem Stack.keyable_keyed : ∀ {s : Stack}, Chained s → s.keyable = true →
+    ∀ x ∈ s, x.isSome = true
+  | [], _, _, _, m => nomatch m
+  | none :: _, _, k, _, _ => by simp [Stack.keyable] at k
+  | some _ :: _, c, _, x, m => by
+    cases List.mem_cons.1 m with
+    | inl e => rw [e]; rfl
+    | inr m => exact c.1 x m
+
+/-- Every operation keeps the invariant. -/
+theorem apply_chained (op : StackOp) {s : Stack} (c : Chained s) : Chained (op.apply s) := by
+  cases op with
+  | exec => exact c
+  | keyed k =>
+    simp only [StackOp.apply]
+    split
+    · next k' => exact And.intro (Stack.keyable_keyed c k') c
+    · exact c
+  | fetched k =>
+    cases s with
+    | nil => exact c
+    | cons t r =>
+      have cr : Chained r := by
+        cases t with
+        | none => exact c
+        | some _ => exact c.2
+      simp only [StackOp.apply]
+      split
+      · next k' => exact And.intro (Stack.keyable_keyed cr k') cr
+      · exact c
+  | drop =>
+    cases s with
+    | nil => exact c
+    | cons t r =>
+      cases t with
+      | none => exact c
+      | some _ => exact c
+  | flatten =>
+    cases s with
+    | nil => exact c
+    | cons t r =>
+      cases t with
+      | none => exact trivial
+      | some _ => exact ⟨fun _ m => (nomatch m), trivial⟩
+
+/-- **No order of operations puts a key above an unkeyed layer**, so a stored layer's key says
+everything below it: what a Docker action or a JavaScript action's mounts added is below no key. -/
+theorem ops_keep_chained (ops : List StackOp) {s : Stack} (c : Chained s) :
+    Chained (ops.foldl (fun s op => op.apply s) s) := by
+  induction ops generalizing s with
+  | nil => exact c
+  | cons op ops ih => exact ih (apply_chained op c)
+
+/-! ## A Dockerfile build's keys
+
+A Docker action's build keeps layers under keys of its own (`dockerfile.plan`, `layers.zig`), and
+those replay like a step's: `build` takes a layer by its key and nothing runs. The chain starts from
+the base image: its reference and **what the image is** (`docker_action.baseId`: the platform's
+manifest's digest). Without the second, a tag that moved kept its keys, and the layers built on the
+old image were stacked on the new one. `build_base_matters` says the first key's difference reaches
+every instruction's key. `evaluated` and `reads` are atoms here: an instruction's text or a digest
+of its fields (`dockerfile.listDigest`, `contextDigest`), each one field. -/
+
+/-- A build, as its key names it (`dockerfile.fromKey`, `stepKey`): the base, or an instruction on
+what is before it. -/
+inductive BuildState where
+  | from (reference id : Nat)
+  | step (parent : BuildState) (kind evaluated reads : Nat)
+  deriving DecidableEq, Repr
+
+/-- What the store keeps a build's layer under (`layers.layerKey`): the label, the store's format,
+the trust scope, how ids are mapped, and the builder's key. -/
+structure BuildLayer where
+  label : Nat
+  format : Nat
+  scope : Nat
+  userns : Nat
+  build : BuildState
+  deriving DecidableEq, Repr
+
+section
+variable (f : Format)
+
+/-- An instruction's preimage on a parent's key, as `dockerfile.stepKey` writes it: tag 1, then each
+field length-prefixed. In the store the parent is its key's 64 hex digits. -/
+def buildStepPreimage (parent : Bytes) (kind evaluated reads : Nat) : Bytes :=
+  f.word 1 ++ (lp f parent ++ (lp f (f.str kind) ++ (lp f (f.str evaluated) ++ lp f (f.str reads))))
+
+/-- A build's key as the store spells it before hashing: tag 0, the base's reference and identity,
+or an instruction's preimage on its parent's. -/
+def encBuild : BuildState → Bytes
+  | .from r i => f.word 0 ++ (lp f (f.str r) ++ lp f (f.str i))
+  | .step p k e r => buildStepPreimage f (encBuild p) k e r
+
+/-- `layers.layerKey`'s preimage, given the builder's key as bytes. -/
+def buildLayerPreimage (label format scope userns : Nat) (key : Bytes) : Bytes :=
+  lp f (f.str label) ++ (lp f (f.str format) ++ (lp f (f.str scope) ++
+    (lp f (f.str userns) ++ lp f key)))
+
+/-- What the store hashes for a build's layer, with the parent's preimage where it has the hash. -/
+def encBuildLayer (l : BuildLayer) : Bytes :=
+  buildLayerPreimage f l.label l.format l.scope l.userns (encBuild f l.build)
+
+/-- A Dockerfile's instructions on a base. -/
+def buildChain (base : BuildState) (ins : List (Nat × Nat × Nat)) : BuildState :=
+  ins.foldl (fun p i => .step p i.1 i.2.1 i.2.2) base
+
+end
+
+
+theorem encBuild_injective (h : f.Sound) : ∀ {s s' : BuildState},
+    encBuild f s = encBuild f s' → s = s'
+  | .from r i, .from r' i', e => by
+    simp only [encBuild] at e
+    obtain ⟨_, e⟩ := h.word_split e
+    obtain ⟨hr, e⟩ := lp_split h e
+    have hi := lp_inj h e
+    rw [h.str_inj hr, h.str_inj hi]
+  | .from _ _, .step _ _ _ _, e => by
+    simp only [encBuild, buildStepPreimage] at e
+    have := (h.word_split e).1
+    omega
+  | .step _ _ _ _, .from _ _, e => by
+    simp only [encBuild, buildStepPreimage] at e
+    have := (h.word_split e).1
+    omega
+  | .step p k x r, .step p' k' x' r', e => by
+    simp only [encBuild, buildStepPreimage] at e
+    obtain ⟨_, e⟩ := h.word_split e
+    obtain ⟨hp, e⟩ := lp_split h e
+    obtain ⟨hk, e⟩ := lp_split h e
+    obtain ⟨hx, e⟩ := lp_split h e
+    have hr := lp_inj h e
+    rw [encBuild_injective h hp, h.str_inj hk, h.str_inj hx, h.str_inj hr]
+
+theorem buildChain_injective : ∀ (ins : List (Nat × Nat × Nat)) {s s' : BuildState},
+    buildChain s ins = buildChain s' ins → s = s'
+  | [], _, _, e => e
+  | i :: ins, _, _, e => by
+    have := buildChain_injective ins (s := .step _ i.1 i.2.1 i.2.2)
+      (s' := .step _ i.1 i.2.1 i.2.2) e
+    injection this
+
+/-- **A base image that changed under its reference changes every key of the build**: the same
+Dockerfile on another image shares no layer with the first. -/
+theorem build_base_matters (h : f.Sound) (ins : List (Nat × Nat × Nat)) {r i i' : Nat}
+    (ne : i ≠ i') :
+    encBuild f (buildChain (.from r i) ins) ≠ encBuild f (buildChain (.from r i') ins) := by
+  intro e
+  have := buildChain_injective ins (encBuild_injective h e)
+  injection this with _ hi
+  exact ne hi
+
+/-- The store's key for a build's layer tells every field of it apart. -/
+theorem encBuildLayer_injective (h : f.Sound) {l l' : BuildLayer}
+    (e : encBuildLayer f l = encBuildLayer f l') : l = l' := by
+  cases l
+  cases l'
+  simp only [encBuildLayer, buildLayerPreimage] at e
+  obtain ⟨hl, e⟩ := lp_split h e
+  obtain ⟨hf, e⟩ := lp_split h e
+  obtain ⟨hs, e⟩ := lp_split h e
+  obtain ⟨hu, e⟩ := lp_split h e
+  have hb := encBuild_injective h (lp_inj h e)
+  rw [h.str_inj hl, h.str_inj hf, h.str_inj hs, h.str_inj hu, hb]
 
 /-! ## P2 and P3 for the native key -/
 

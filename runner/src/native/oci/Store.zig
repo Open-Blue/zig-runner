@@ -92,7 +92,7 @@ pub fn ensure(
 /// is whole. Nothing checks such a tree when it is found, so a crash must not leave that name on
 /// files whose contents were lost, and a step's overlay does not sync them at its unmount
 /// (`sandbox.mountVolatile`). The whole filesystem, as these trees are rare and large (a layer's
-/// are often small: `Store.syncTree`).
+/// are often small: `Store.writeBack`).
 pub fn syncFilesystem(arena: Allocator, path: []const u8) !void {
     const rc = linux.open(try arena.dupeSentinel(u8, path, 0), .{
         .ACCMODE = .RDONLY,

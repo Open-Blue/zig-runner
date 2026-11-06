@@ -53,7 +53,10 @@ fi
 export ZIG_RUNNER_TEST_EXE="$scratch/runner"
 (
 	rc=0
+	zig build-exe tools/test_shards.zig -femit-bin="$scratch/test_shards" &
+	shards_exe=$!
 	zig build-exe "${runner[@]}" --name runner -femit-bin="$scratch/runner" || rc=$?
+	wait "$shards_exe" || rc=$?
 	echo "$rc" >"$scratch/runner.rc"
 ) &
 exe=$!
@@ -69,12 +72,14 @@ filter=()
 if [[ ${ZIG_TEST_NATIVE_AS_ROOT:-} == 1 ]]; then
 	filter=(--test-filter native)
 	run+=(--test-cmd sudo
-		--test-cmd '--preserve-env=ZIG_RUNNER_TEST_EXE,ZIG_RUNNER_REQUIRE_NATIVE,ZIG_RUNNER_SERVICE_IMAGES,ZIG_TEST_STORE_STRESS_SECONDS,ZIG_TEST_STORE_STRESS_PROCS,ZIG_TEST_STORE_STRESS_SEED')
+		--test-cmd '--preserve-env=ZIG_RUNNER_TEST_EXE,ZIG_RUNNER_REQUIRE_NATIVE,ZIG_RUNNER_SERVICE_IMAGES,ZIG_TEST_STORE_STRESS_SECONDS,ZIG_TEST_STORE_STRESS_PROCS,ZIG_TEST_STORE_STRESS_SEED,ZIG_TEST_SHARDS')
 fi
 if [[ -n ${ZIG_TEST_FILTER:-} ]]; then
 	filter=(--test-filter "$ZIG_TEST_FILTER")
 fi
-run+=(--test-cmd-bin)
+# The tests run in several processes (tools/test_shards.zig), which this starts; the same program
+# `zig build test` runs. ZIG_TEST_SHARDS=1 runs the test binary itself.
+run+=(--test-cmd "$scratch/test_shards" --test-cmd-bin)
 zig test "${tests[@]}" "${filter[@]}" "${run[@]}"
 wait "$exe"
 exit "$(cat "$scratch/runner.rc")"

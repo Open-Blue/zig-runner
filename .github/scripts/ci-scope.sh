@@ -9,7 +9,7 @@
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)
 #   ci-scope.sh go           Go tools (ci.yml)
 #   ci-scope.sh analysis     Fuzz, Valgrind, ThreadSanitizer, Stress, ZLint (suppressed-errors) (analysis.yml)
-#   ci-scope.sh store        Store stress (analysis.yml)
+#   ci-scope.sh store        Store stress, Store crash (analysis.yml)
 #   ci-scope.sh coverage     Coverage (analysis.yml)
 #
 # Sets `run=true` or `run=false` in GITHUB_OUTPUT, and says why. The jobs still run, and report,
@@ -51,7 +51,8 @@ needed() {
 		runner/* | db/* | .github/workflows/ci.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/install-zig.sh | .github/scripts/ci-database.sh | \
 			.github/scripts/zig-test.sh | .github/scripts/zig-modules.sh | \
-			.github/scripts/expr-conformance.sh | .github/scripts/zlint.sh) return 0 ;;
+			.github/scripts/expr-conformance.sh | .github/scripts/zlint.sh | \
+			.github/scripts/native-service-images.sh) return 0 ;;
 		# Cannot change the runner's build or tests. The Workflows job checks the workflows, scripts
 		# and deployment scripts on every change; proofs and packaging check theirs.
 		*.md | docs/* | .changes/* | .changie.yaml | proofs/* | deploy/* | LICENSE | renovate.json | \
@@ -148,7 +149,9 @@ needed() {
 			runner/src/native/layers.zig | runner/src/native/Backend.zig | \
 			runner/src/native/sandbox.zig | .github/workflows/analysis.yml | \
 			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
-			.github/scripts/zig-test.sh) return 0 ;;
+			.github/scripts/zig-test.sh | runner/src/native/store_crash.zig | \
+			runner/src/native/oci/Store.zig | runner/src/native/volumes.zig | \
+			.github/scripts/store-crash.sh | .github/scripts/zig-modules.sh) return 0 ;;
 		*) return 1 ;;
 		esac
 		;;

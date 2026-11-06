@@ -285,7 +285,7 @@ pub const Admission = struct {
 
     /// A native job near its `memory.high` gets more of it while the host has the memory: the limit
     /// is there for the job's neighbours, and with none to protect it only harms. A build three
-    /// times its limit, on a machine with 4 GB free, was reclaimed into swap on an SD card and
+    /// times its limit, on a machine with 4 GB free, was reclaimed into compressed swap and
     /// took over an hour where the engine took 2 minutes (razorbill, 2026-11-05). What is left
     /// above the step is the floor every job was let in against, and what jobs still ramping up
     /// reserved; runners only polling reserve nothing here, as the gate holds them back itself

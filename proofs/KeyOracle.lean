@@ -24,6 +24,9 @@ Each line is tab-separated, every byte string in lowercase hex, numbers in decim
     below  name equal|differ  A B   with A, B: format scope repository fingerprint userns binds
                                          [seeds=…] preimage
     layer  name root|any  entries preimage    (a tree, and `Native.walkPreimage` of it)
+    buildfrom   name equal|differ  A B   with A, B: reference id preimage
+    buildstep   name equal|differ  A B   with A, B: parent kind evaluated reads preimage
+    buildlayer  name equal|differ  A B   with A, B: label format scope userns key preimage
 
 An environment is `name=value` pairs joined by `,` in the container's order, volatile names
 included (the preimage has the stable ones); files are `path=contents=mode`, binds
@@ -78,6 +81,17 @@ def atomText : Nat → String
   | 38 => "/var/lib/zig-runner/native/seeds/x86_64-0.16.0-root"
   | 39 => "/var/lib/zig-runner/native/volumes/o/r/repo/npm"
   | 43 => "/root/.npm"
+  | 70 => "docker.io/library/alpine:3.22"
+  | 71 => "docker.io/library/alpine:3.23"
+  | 72 => "sha256:0a"
+  | 73 => "sha256:0b"
+  | 74 => "run"
+  | 75 => "copy"
+  | 76 => "apk add curl"
+  | 77 => "apk add jq"
+  | 78 => "digest-of-the-env"
+  | 79 => "digest-of-other-env"
+  | 80 => "a Dockerfile build's layer"
   | 32 => "zig-runner native store 1"
   | 50 => "a.txt"
   | 51 => "bin"
@@ -284,6 +298,48 @@ def belowLine (w : Below) : String :=
     (if w.seeds.isEmpty then [] else ["seeds=" ++ list (fun s => hex (fmt.str s)) w.seeds]) ++
     [hex (belowPreimage fmt w)])
 
+/-! Build vectors: a Dockerfile build's keys (`dockerfile.fromKey`, `stepKey`, `layers.layerKey`).
+`from` sides are the model's `BuildState.from`; a parent is the 64 hex digits the store has, and a
+key the 32 bytes, each of a number, as a step's parent is. -/
+
+def parentHex (n : Nat) : Bytes := utf8 (hex (parentKey n))
+
+def buildFromVectors : List (String × (Nat × Nat) × (Nat × Nat)) :=
+  [ ("build-from-same", (70, 72), (70, 72)),
+    ("build-from-moved-tag", (70, 72), (70, 73)),
+    ("build-from-reference", (70, 72), (71, 72)) ]
+
+def buildStepVectors : List (String × (Nat × Nat × Nat × Nat) × (Nat × Nat × Nat × Nat)) :=
+  [ ("build-step-same", (1, 74, 76, 78), (1, 74, 76, 78)),
+    ("build-step-parent", (1, 74, 76, 78), (2, 74, 76, 78)),
+    ("build-step-kind", (1, 74, 76, 78), (1, 75, 76, 78)),
+    ("build-step-instruction", (1, 74, 76, 78), (1, 74, 77, 78)),
+    ("build-step-reads", (1, 74, 76, 78), (1, 74, 76, 79)) ]
+
+def buildLayerVectors : List (String × (Nat × Nat × Nat × Nat) × (Nat × Nat × Nat × Nat)) :=
+  [ ("build-layer-same", (31, 33, 25, 1), (31, 33, 25, 1)),
+    ("build-layer-format", (31, 33, 25, 1), (32, 33, 25, 1)),
+    ("build-layer-fork", (31, 33, 25, 1), (31, 34, 25, 1)),
+    ("build-layer-userns", (31, 33, 25, 1), (31, 33, 26, 1)),
+    ("build-layer-key", (31, 33, 25, 1), (31, 33, 25, 2)) ]
+
+def buildFromLine (s : Nat × Nat) : String :=
+  "\t".intercalate [hex (fmt.str s.1), hex (fmt.str s.2), hex (encBuild fmt (.from s.1 s.2))]
+
+def buildStepPre (s : Nat × Nat × Nat × Nat) : Bytes :=
+  buildStepPreimage fmt (parentHex s.1) s.2.1 s.2.2.1 s.2.2.2
+
+def buildStepLine (s : Nat × Nat × Nat × Nat) : String :=
+  "\t".intercalate [hex (parentHex s.1), hex (fmt.str s.2.1), hex (fmt.str s.2.2.1),
+    hex (fmt.str s.2.2.2), hex (buildStepPre s)]
+
+def buildLayerPre (s : Nat × Nat × Nat × Nat) : Bytes :=
+  buildLayerPreimage fmt 80 s.1 s.2.1 s.2.2.1 (parentKey s.2.2.2)
+
+def buildLayerLine (s : Nat × Nat × Nat × Nat) : String :=
+  "\t".intercalate [hex (fmt.str 80), hex (fmt.str s.1), hex (fmt.str s.2.1), hex (fmt.str s.2.2.1),
+    hex (parentKey s.2.2.2), hex (buildLayerPre s)]
+
 /-! Layer vectors: small trees as P2's walk sees them, owned by ids outside the job's range (so
 65534 in the preimage, whoever runs the test), children in byte order of names. -/
 
@@ -355,6 +411,24 @@ def main : IO UInt32 := do
       IO.eprintln s!"{name}: the preimages disagree with the model's"
       ok := false
     IO.println ("\t".intercalate ["below", name, verdict same, belowLine v, belowLine w])
+  for (name, v, w) in buildFromVectors do
+    let same := v == w
+    if same != (encBuild fmt (.from v.1 v.2) == encBuild fmt (.from w.1 w.2)) then
+      IO.eprintln s!"{name}: the preimages disagree with the model's"
+      ok := false
+    IO.println ("\t".intercalate ["buildfrom", name, verdict same, buildFromLine v, buildFromLine w])
+  for (name, v, w) in buildStepVectors do
+    let same := v == w
+    if same != (buildStepPre v == buildStepPre w) then
+      IO.eprintln s!"{name}: the preimages disagree with the model's"
+      ok := false
+    IO.println ("\t".intercalate ["buildstep", name, verdict same, buildStepLine v, buildStepLine w])
+  for (name, v, w) in buildLayerVectors do
+    let same := v == w
+    if same != (buildLayerPre v == buildLayerPre w) then
+      IO.eprintln s!"{name}: the preimages disagree with the model's"
+      ok := false
+    IO.println ("\t".intercalate ["buildlayer", name, verdict same, buildLayerLine v, buildLayerLine w])
   for (name, root, tree) in layerVectors do
     IO.println ("\t".intercalate ["layer", name, if root then "root" else "any",
       ";".intercalate (entriesOfList "" tree), hex (walkPreimage fmt (utf8 "tree") tree)])
