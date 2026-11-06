@@ -2274,8 +2274,8 @@ fn aclValue(arena: Allocator, entries: []const [3]u32) ![]u8 {
     std.mem.writeInt(u32, out[0..4], 2, .little);
     for (entries, 0..) |e, i| {
         const at = out[4 + 8 * i ..][0..8];
-        std.mem.writeInt(u16, at[0..2], @intCast(e[0]), .little);
-        std.mem.writeInt(u16, at[2..4], @intCast(e[1]), .little);
+        std.mem.writeInt(u16, at[0..2], std.math.cast(u16, e[0]).?, .little);
+        std.mem.writeInt(u16, at[2..4], std.math.cast(u16, e[1]).?, .little);
         std.mem.writeInt(u32, at[4..8], e[2], .little);
     }
     return out;
