@@ -104,7 +104,8 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   checkout runs).
 - Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a job the runner
   does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
-  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:` or `options:`, `services:`
+  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, `volumes:`, or an `options:` flag the
+  native job does not carry out (all below, "Job container options"), `services:`
   on a rootless runner or with an image given by an expression (native since P6, below, their
   images pulled by P3), JavaScript and local `uses:` actions (P7, `actions.preload`), remote `uses:` actions in an
   image with no git to fetch them with, `docker://` images
@@ -544,9 +545,9 @@ directories and the step's file-command files at a 4 KiB block each.
 - "Set up job" says what the job got: "Image: pulled natively in N ms (L layers, K KB fetched)" or
   "Image: from the native store", and "Provisioned natively in N ms (layer <key>)" or "...made
   before".
-- Falls back to Dagger: a job container's `ports:`, `volumes:` and `options:` (phase 6 brings the
-  network that ports and volumes need), and on a rootless runner without `RUNNER_NATIVE_ROOTFS`
-  the provisioned default image (below).
+- Falls back to Dagger: a job container's `ports:`, `volumes:` and `options:` flags the native job
+  does not carry out ("Job container options", below), and on a rootless runner without
+  `RUNNER_NATIVE_ROOTFS` the provisioned default image (below).
 
 The store, under `RUNNER_NATIVE_STORE`, each directory only the runner's (mode 0700: a rootfs
 holds the image's set-uid files with the image's owners, the host's root's on a root runner):
@@ -1118,6 +1119,58 @@ real one); the sandbox's part is about the 21 ms above. Dagger's side is the tes
 containers against Dagger's", run by hand with a v0.21.10 engine container
 (`ZIG_RUNNER_MEASURE_SERVICES=<images> ZIG_RUNNER_MEASURE_ENGINE=<container>`); the agent that
 built this phase was not allowed to start one on the laptop, so that figure is still to be taken.
+
+### Job container options
+
+What a `container:` job's `ports:`, `volumes:` and `options:` do on GitHub's runner, and what a
+native job does with them. GitHub's runner builds `docker create` for the job container (name,
+network, `--workdir /__w`, `-e` for the container's `env:`, `-p` for `ports:`, `-v` for `volumes:`
+and its own mounts), appends the `options:` string after those, and runs every step with
+`docker exec -w <directory>`. The runner waits for health on service containers only. (That is the
+runner's behaviour as remembered, not re-read for this change.)
+
+`runner/src/native/container_options.zig` reads `options:`. A native job carries out or accepts only
+the flags below; **any other flag, a stray word, or an `options:` with an expression in it sends
+the job to Dagger, naming the flag in "Set up job"**. Nothing is ignored silently.
+
+| Flag | Native job |
+|---|---|
+| `--env`/`-e NAME=value` (also `--env=`, `-eNAME=value`) | Carried out: set in the base environment after the container's `env:` (`docker create` reads `options:` last), before the job's own `env:`, which wins as it does over `docker exec -e`. A bare `-e NAME` is refused: it copies the *runner's* variable. |
+| `--user`/`-u` (`name`, `uid`, `name:group`, `uid:gid`) | Carried out: resolved in the image's own `/etc/passwd` and `/etc/group` as its `USER` is, over it. Refused on the runner's default image, whose step user is `RUNNER_STEP_USER`'s choice (that provisioning is not the container's). A rootless runner maps only root, so there it fails as an image `USER` does. |
+| `--workdir`/`-w` | Understood, no effect: every step is `docker exec -w`, native steps take the same directory. Counted in "Set up job". |
+| `--health-cmd`, `--health-interval`, `--health-timeout`, `--health-start-period`, `--health-start-interval`, `--health-retries`, `--no-healthcheck` | Understood, no effect: nothing waits for a job container's health. Durations and counts are checked as Docker reads them; one it would refuse is refused. |
+| Everything else: `--cpus`, `--memory`, `--privileged`, `--cap-add`, `--security-opt`, `--device`, `--gpus`, `--ulimit`, `--shm-size`, `--network`, `--add-host`, `--dns`, `--hostname`, `--init`, `-t`/`-i`, `--entrypoint`, `--name`, `--label`, `--platform`, `--pull`, `--read-only`, `--tmpfs`, `--sysctl`, `--pid`, `--ipc`, `--userns`, `-v`/`--mount`, `-p`, `--env-file`, `--group-add` | Refused (Dagger). Each changes the container: limits, privileges, devices, networks and mounts are the sandbox's (`sandbox.zig`, `seccomp.zig`, `nft.zig`, the cgroup code), which this does not touch. |
+
+What stays on Dagger, and what carrying it out would need:
+
+- **`ports:`**. On GitHub they publish the container's ports on the *host* (`-p`), so a client
+  outside the container can reach them. The job's own steps run inside it and reach those ports on
+  loopback already; services have no need of them to reach the job. Carrying
+  them out natively means a DNAT from the host's address into the job's network namespace and an
+  `nft` rule that admits it (today's rules admit nothing inbound, `nft.zig`), plus a policy for
+  which host addresses and ports a workflow may take. That is new isolation logic. (`forward.zig`
+  relays a *service's* port into the job's loopback, the other direction.)
+- **`volumes:`**. A bind from a host path, or a named volume, into the container. Needs a bind
+  mount into the job's mount namespace outside the cache volumes' fixed set (`sandbox.Spec.binds`
+  is built by the runner, never from a workflow), a policy for which host paths a job may mount
+  (the runner's own store, `/etc`, the docker socket are all host paths), nosuid/nodev and the id
+  mapping of a root runner's slot (`Bind.volume`'s shifted ids) so files the job writes are not the
+  host's root's, and a lifecycle for named volumes. That is mount and privilege code.
+- **An `options:` that is an expression** (`${{ matrix.options }}`): decided before expressions
+  are evaluated. Reading it after, with the same parser, is possible; not done here.
+- **The Dagger path carries out none of the three on a job container** (`job.container`'s
+  `options`, `ports` and `volumes` are read nowhere under `runner/src/dagger/`), so a job that
+  falls back to Dagger for one of them runs without it, without a warning. Found while reading;
+  this change does not touch it.
+
+Services' `options:` are unchanged: they still log the flags they do not carry out and go on
+(`services.zig`), as the Dagger path does. Making them refuse as the job container's do is a
+separate change.
+
+Tests: the flag table, in every spelling Docker reads, and a refusal for each of 35 flags in three
+spellings (`container_options.zig`); `unsupported`'s reasons for ports, volumes, options and
+expressions (`Backend.zig`); a native job with `--user app -e ... --workdir ... --health-*` that
+runs as the image's `app` user with the options' env over the container's (root runner, in CI).
 
 ### P7: Docker actions
 

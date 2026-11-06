@@ -41,6 +41,7 @@ comptime {
     _ = @import("native/phases.zig");
     _ = @import("native/services.zig");
     _ = @import("native/health.zig");
+    _ = @import("native/container_options.zig");
     _ = @import("native/images.zig");
     _ = @import("native/forward.zig");
     _ = @import("native/docker_action.zig");
