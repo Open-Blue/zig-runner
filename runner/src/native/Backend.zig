@@ -4655,10 +4655,11 @@ test "native eviction under a real job: a seed and a volume stay until it ends, 
         break :first try runCachedJob(arena, cfg, job, caches, .{});
     };
     try expectLines(first.text, &.{ "whole-to-the-end", "Zig global cache seeded from Zig 0.0.1" });
-    const before = try seedIn(arena, io, try std.fmt.allocPrint(arena, "{s}/seeds", .{cfg.store}));
+    // Let go, it can go: the job's lock was what kept it.
     var after: Evictor = .hostile(cfg.store);
     for (0..8) |_| after.s.collect(arena, io);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, before, .{}));
+    const dir = try std.fmt.allocPrint(arena, "{s}/seeds", .{cfg.store});
+    try std.testing.expectError(error.NoSeed, seedIn(arena, io, dir));
     // Built again, the job's layer on the old one is not replayed over it.
     const second = try runCachedJob(arena, cfg, job, caches, .{});
     try expectLines(second.text, &.{"whole-to-the-end"});
