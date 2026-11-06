@@ -54,6 +54,8 @@ pub const Spec = struct {
     /// Who the step runs as inside.
     uid: u32 = 0,
     gid: u32 = 0,
+    /// A non-root step's supplementary groups, as the job sees them.
+    groups: []const u32 = &.{},
     argv: []const []const u8,
     /// What is executed: a path inside the root, or "" for `argv[0]` looked up in the env's PATH
     /// there, as Docker starts an image's entrypoint (a service's, `services.zig`).
@@ -636,7 +638,7 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper) u8 {
         else
             .{ .search = .{ .name = spec.argv[0], .env = env } };
         const in_image = spec.container != null;
-        stepInit(arena, root, workdir, spec.uid, spec.gid, nnp, alive[0], in_image, program, argv, envp);
+        stepInit(arena, root, workdir, spec.uid, spec.gid, spec.groups, nnp, alive[0], in_image, program, argv, envp);
     }
     _ = linux.close(alive[0]);
     const st = if (spec.service) |s|
@@ -1064,6 +1066,7 @@ fn stepInit(
     workdir: [*:0]const u8,
     uid: u32,
     gid: u32,
+    groups: []const u32,
     no_new_privs: bool,
     alive: linux.fd_t,
     in_image: bool,
@@ -1098,7 +1101,7 @@ fn stepInit(
     // the step makes, sudo's root included.
     installSeccomp();
     if (uid != 0 or gid != 0) {
-        check("setgroups", linux.setgroups(0, no_groups));
+        check("setgroups", if (groups.len == 0) linux.setgroups(0, no_groups) else linux.setgroups(groups.len, groups.ptr));
         check("setgid", linux.setgid(gid));
         check("setuid", linux.setuid(uid));
         // The kernel clears the parent-death signal on a change of credentials.
