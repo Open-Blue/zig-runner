@@ -328,11 +328,17 @@ rerun_cache() {
 	record e2e "$1" "$(jobs_settled "$main" "$1" | jq '{jobs: [[.jobs[] | select(.name == "cache")] | max_by(.id)]}')"
 }
 
-# check_replay ATTEMPT: that attempt of `cache` succeeded with its steps replayed.
-check_replay() {
-	local log=$out/logs/$backend-e2e-cache-$1.log state
+# check_attempt ATTEMPT: that attempt of `cache` succeeded.
+check_attempt() {
+	local state
 	state=$(awk -F'\t' -v b="$backend" -v a="$1" '$1 == b && $3 == "cache" && $4 == a { print $5 }' "$out/timings.tsv")
 	[[ $state == success ]] || fail "e2e/cache, attempt $1: ${state:-missing}, not success"
+}
+
+# check_replay ATTEMPT: that attempt of `cache` succeeded with its steps replayed.
+check_replay() {
+	local log=$out/logs/$backend-e2e-cache-$1.log
+	check_attempt "$1"
 	expect "$log" "Reused from" "e2e/cache, attempt $1"
 	echo "rerun (attempt $1): $(grep -cF 'Reused from' "$log" || true) steps replayed"
 }
@@ -432,8 +438,15 @@ check() {
 	# the runner notes each one "Reused from Dagger's cache" or "... the native step store".
 	# Natively in whichever slot the rerun lands: a stored layer has the canonical ids, which every
 	# slot's job sees as its own (docs/native-backend.md, "A layer has the canonical ids").
+	#
+	# Attempt 2 only has to succeed. The run's jobs share one tool cache, and `toolcache` installs
+	# into it while `cache` runs: a tree added between two attempts changes the tree list that
+	# every step's key carries (`ZIG_RUNNER_TOOL_TREES`), so the next attempt runs its steps
+	# again, once. By attempt 3 nothing is changing it.
 	rerun_cache 2
-	check_replay 2
+	check_attempt 2
+	rerun_cache 3
+	check_replay 3
 
 	trap - EXIT
 	echo "timings ($backend):"

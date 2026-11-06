@@ -593,6 +593,7 @@ fn runJobSteps(
         .gpa = c.gpa,
         .nesting = c.cfg.dagger_nesting,
         .package_caches = c.cfg.package_caches,
+        .tool_trees = c.cfg.tool_trees,
         // The same rule as the gate above, without its `*`: a runner that lets every job through
         // vouches for none, so none of its jobs share the trusted jobs' caches (#105).
         .trusted = trust.vouches(cfg.trusted_refs, cfg.trusted_events, job.github),
