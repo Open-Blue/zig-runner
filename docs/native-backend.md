@@ -740,17 +740,29 @@ directory it names. Natively the same check runs in the runner (`native/tool_tre
   replays. A record naming a directory no tree holds (a tree that was removed, an unfinished one,
   `..`) runs again, as before.
 
-Why that is sound is Dagger's argument, kept: the variable is in the key of every step (it is not
-volatile, so `Store.stableEnv` hashes it), hence in the base's key and every layer above it. A tree
-that was modified has another digest, so no record made against the old one is found, and the step
-that installs runs again and repairs it. The cost is also Dagger's: a tree added, removed or
-changed makes every step of every job of the scope new once. Narrowing it (a key of only the trees a
-step puts on PATH) was considered and not done. A step's key is made before it runs, and which trees
-it names is only in its record, so it needs the digests the tree had when the step finished stored
-in the record and compared at replay, which means hashing the tree again after every step that
-names one, and a change to the record's format. A job's first rerun after an install is the one that
-pays: job 1 finds no tree and installs, job 2 sees the tree (new keys) and finds it installed, job 3
-replays.
+**What replay can rely on.** The pinned digest is over regular files, and nothing else: not a
+link, a mode, a pipe, an empty directory. A tree whose link `gcc -> ../../.evil/gcc` was changed,
+or whose `zig` was made set-uid, has the same pinned digest, and `install-zig.sh` (and Dagger's
+check, which is the same) takes it as checked. So the native check makes a second variable,
+`ZIG_RUNNER_TOOL_TREES_FULL` (`FULL TREE` lines), over every entry: type, mode, path, a regular
+file's sha256 and a link's target. Both variables are in the key of every step (neither is
+volatile, so `Store.stableEnv` hashes them), hence in the base's key and every layer above it. A
+tree that changed in any of these ways is a tree no record was made against, so the step that
+installs runs again and repairs it. A tree with a link that can leave it (an absolute target, or
+more `..` than directories above the link) is left out of both: what a link points at outside the
+tree is in no digest, so no record naming such a tree is replayed. This holds for the native
+backend. On Dagger the second variable does not exist and the claim does not hold: a modified link
+or mode in a tree with the same pinned digest is replayed against, and what it would take there is
+the same second digest in `tool_trees.sh` and in `Exec.tool_trees`' parser. `install-zig.sh` itself
+cannot see these changes either way, and that is a script of the workflow's, not the runner's.
+
+The cost is also Dagger's: a tree added, removed or changed makes every step of every job of the
+scope new once. Narrowing it (a key of only the trees a step puts on PATH) was considered and not
+done. A step's key is made before it runs, and which trees it names is only in its record, so it
+needs the digests the tree had when the step finished stored in the record and compared at replay,
+which means hashing the tree again after every step that names one, and a change to the record's
+format. A job's first rerun after an install is the one that pays: job 1 finds no tree and
+installs, job 2 sees the tree (new keys) and finds it installed, job 3 replays.
 
 The check differs from the script where it runs. The script runs as root in the job's image, in a
 container; the port runs in the runner's process, on a directory a job can write, so it is confined
@@ -760,32 +772,60 @@ and bounded:
   `RESOLVE_NO_SYMLINKS` and `RESOLVE_NO_XDEV`, so a link a job planted (a tree that is a link to
   `/`, a file that is one) is never taken and the check cannot be made to read outside the volume.
   Only directories and regular files are opened, the latter `O_NONBLOCK` and checked to be regular
-  after opening, so a pipe or a device cannot hold the check; they are not in the digest, as
-  `find -type f` leaves them out.
-- A tree whose names have a control character or a backslash (`sha256sum` escapes those) is left
-  out, and a step checks it itself. So is a tree the check stopped in, one with unreadable files,
-  and one past a limit.
-- Limits (`tool_trees.Limits`): 65,536 files a tree (Zig 0.17.0 has 19,505), 400,000 entries and
-  4 GiB read in all, 48 directories deep, 512 trees, and 60 s. The job's cancel is seen at every
-  file and every 64 KiB read. A check that stops says so in "Set up job" ("Tool cache: checked ...;
-  stopped: out of time") and keeps the trees it finished. One tree's files are held in memory at a
-  time (a few MB for Zig); there is no budget shared by the jobs of a runner, so many jobs checking
-  at once each hold their tree's, which `Limits.tree_files` bounds at some tens of MB.
-- The lists (below) are in the store beside `volumes/` (`tool-trees/<digest of the volume's
-  path>/`), never in a volume a step mounts. A name a job's volume gives them cannot collide with a
-  volume's.
+  after opening, so a pipe or a device cannot hold the check. A link is read, not followed.
+- A tree whose names have a control character or a backslash (`sha256sum` escapes those), a name
+  over 255 bytes or a path over 4,000, is left out, and a step checks it itself. So is a tree the
+  check gave up on for a limit, one with unreadable files, and one with a link that leaves it.
+  "Set up job" says which and why ("left out: zig/0.17.0/x (too many entries)").
+- Limits (`tool_trees.Limits`). Each tree: 65,536 regular files, 100,000 entries, 8 MiB of paths,
+  1 GiB read, 20 s. The check: 400,000 entries, 4 GiB read, 48 directories deep, 512 trees, 1,024
+  names a level, 60 s. A tree over a limit of its own is left out and the others are checked; the
+  check's own limits and the job's cancel (seen at every file and every 64 KiB read) end it, and
+  what it finished stays. Zig 0.17.0 has 19,505 files and 1.2 MB of paths. Both variables are
+  capped at 64 KiB (one string of an environment may not pass 128 KiB, and one over it made every
+  later job's `exec` fail with E2BIG); a tree that does not fit is left out, and so is one that
+  would not fit the Dagger path's variable (`set_up.toolTreesVerdict`, the same 64 KiB).
+- Memory: a tree is held in memory while it is checked (a path, an entry and a list line each:
+  about 7 MB for Zig). Every byte is charged to a counter shared by all the checks of the process
+  (`tool_trees.held`, `Limits.memory`, 128 MiB), and a tree that would pass it is left out, so
+  concurrent checks of hostile trees hold 128 MiB between them, not each their own. When #327's
+  process-wide `Budget` (`native/hash_files.zig`) is merged, `held` should become that budget's
+  counter and `Limits.memory` its limit, so the runner has one number for what jobs' checks and
+  `hashFiles()` may hold.
+- Order, and what one job can starve. Names are looked at in the order the lists have them first
+  (trees checked once, which the volume still has), then the rest in byte order, so a job that
+  fills a level with 100,000 names, or a tree with 20 GB of holes, costs the trees that are new
+  and no tree that was checked before; the first is bounded by the limits above. A tree that is
+  never checked is a tree a step checks itself, which is the old behaviour. What one job can still
+  do is spend the check's 60 s and 4 GiB on trees that cannot be checked, and so starve a tree
+  that was never listed and sorts after them, in every job of its scope until the volume is
+  cleaned; its steps then run, as before this change. It cannot make a job fail.
+- The lists are in the store beside `volumes/` (`tool-trees/<digest of the volume's path>/`), never
+  in a volume a step mounts. They are a cache of what a check read: store eviction may remove all of
+  `tool-trees/` at any time, and a check without them reads the trees again. A list that would be
+  over 32 MiB (the most that is read) is not written. A list of a tree that is gone, and the
+  directories that leaves empty, are removed by the next complete check; half-written lists
+  (`*.stat.<random>`) older than five minutes by every check.
 
-The cost is the script's lists, kept: one line per file (path, size, inode, mtime, ctime, sha256),
-and only files whose line changed are read again. That is sound as in the script: a write sets the
-file's ctime to now and a step cannot set it back; a file whose ctime is within 2 s of the check is
+The cost is the script's lists, kept: one line per regular file (path, size, inode, mtime, ctime,
+sha256), and only files whose line changed are read again. A write sets the file's ctime to now and
+a step cannot set it back (that takes the clock); a file whose ctime is within 2 s of the check is
 listed as racy and read next time; a list that does not name exactly the tree's files in order is
-not believed. On the laptop, for the real Zig 0.17.0 tree (19,505 files), a check is 0.6 s with no
-list and 0.12 s with one (the script reads the same tree in about 1 s, by its own comment).
+not believed. That is not enough alone: a writable shared mapping, once its page is dirty, writes
+again without changing ctime or mtime, whatever the descriptor (it can be closed). So the check
+takes a read lease (`F_SETLEASE`, `F_RDLCK`) on each file it reads, which the kernel refuses while
+any writer or writable mapping holds the file, and lists a refused file as racy. A lease is broken
+by SIGIO to the process, which ends it unless ignored: the check ignores SIGIO (nothing else in
+the runner uses it), and the writer's open then waits until the check lets go of the file. On the
+laptop, for the real Zig 0.17.0 tree (19,505 files), a check is 0.5 s with no list and 0.1 s with
+one, with 22 MiB of peak memory in the test process; the script reads the same tree in about 1 s,
+by its own comment. A tree of 65,532 hard links of 3.8 KB paths (the case that took 1.5 GB, or 6.1
+GB with four checks at once) is left out in 8 ms with 9 MiB, and 27 MiB with four at once.
 
-Not proven or not done: jobs that write a file through a shared mapping after a check can leave a
-ctime the check does not see change (the script's lists share this); a runner-wide budget for
-checks; removing lists a crash left half written (`*.stat.<random>`); the seed registry's
-discovery.
+Not proven or not done: the lease needs the file's owner to be the runner's user or CAP_LEASE
+(a refused lease only makes the file racy, so the cost is a read, never trust); lists of Dagger's
+check are unchanged; the seed registry's discovery from the trees
+(`zig_release.Registry.discover`) is off natively.
 
 ### P5: isolation for untrusted jobs
 

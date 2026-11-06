@@ -152,6 +152,8 @@ cache_plan: volumes.Plan = .{},
 /// `ZIG_RUNNER_TOOL_TREES`' value, when "Set up job" checked the tool cache's trees
 /// (`checkToolTrees`): a step's key holds it, and `Exec.toolDirNotHeld` reads it.
 tool_trees: ?[]const u8 = null,
+/// `trees_check.full_env`'s value, set with it.
+tool_trees_full: ?[]const u8 = null,
 /// The Zig cache seeds' layers, between the job's layers and the rootfs.
 seed_layers: std.ArrayList([]const u8) = .empty,
 /// Tests: the Zig cache seed's build, in place of downloading and running a Zig release.
@@ -1334,6 +1336,7 @@ fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
     // Last, and set even when no tree was found, so a workflow's own value never stands in for
     // the runner's. Part of every step's key, as on Dagger: see `checkToolTrees`.
     if (b.tool_trees) |v| try b.put(set_up.tool_trees_env, v);
+    if (b.tool_trees_full) |v| try b.put(trees_check.full_env, v);
     b.workdir = ev.workspace;
 }
 
@@ -1564,11 +1567,12 @@ fn setUpCaches(b: *Backend, ev: *Evaluator, plan: anytype) !void {
 /// "Set up job"'s check of the tool cache's trees, as `set_up.verifyToolTrees` does it on Dagger
 /// (`tool_trees.zig`): what steps are given is each tree's digest and path (`tool_trees`), and a
 /// replayed step that names a directory in the volume replays only when a tree holds it
-/// (`Exec.toolDirNotHeld`). The value is in every step's key (the variable is not volatile), so a
-/// tree added, removed or changed makes every step of the job new once, and a tree a job modified
-/// never has another job's record replayed against it. Narrower keys (only the trees a step puts
-/// on PATH) are not possible here: a step's key is made before it runs, and which trees it names
-/// is in its record.
+/// (`Exec.toolDirNotHeld`). The values (the digest `install-zig.sh` pins, and a second over every
+/// entry of the tree, `trees_check.full_env`) are in every step's key (the variables are not
+/// volatile), so a tree added, removed or changed makes every step of the job new once, and no
+/// record made against another state of a tree is replayed. Narrower keys (only the trees a step
+/// puts on PATH) are not possible here: a step's key is made before it runs, and which trees it
+/// names is in its record.
 fn checkToolTrees(b: *Backend) !void {
     const arena = b.arena;
     const volume = b.cache_plan.tool_cache_host orelse return;
@@ -1590,6 +1594,7 @@ fn checkToolTrees(b: *Backend) !void {
         b.caches.cancel,
     );
     b.tool_trees = verdict.env;
+    b.tool_trees_full = verdict.full;
     try b.notes.append(arena, verdict.note);
 }
 
@@ -3531,7 +3536,8 @@ test "native tool trees: an installing step replays while its tree is held, not 
     // What install-zig.sh does: a tree TOOL/VERSION/NAME in the tool cache, on PATH, and the
     // digest it pins read from the variable "Set up job" sets. The step is the same text every job.
     const install = testJob(&.{
-        testStep("echo x >> /shared/install; echo \"trees=[$ZIG_RUNNER_TOOL_TREES]\"; " ++
+        testStep("echo x >> /shared/install; " ++
+            "echo \"trees=[$ZIG_RUNNER_TOOL_TREES] full=[$ZIG_RUNNER_TOOL_TREES_FULL]\"; " ++
             "mkdir -p $RUNNER_TOOL_CACHE/t/1/x64 && echo v1 > $RUNNER_TOOL_CACHE/t/1/x64/bin && " ++
             "echo $RUNNER_TOOL_CACHE/t/1/x64 >> $GITHUB_PATH"),
         testStep("echo y >> /shared/after"),
@@ -3539,11 +3545,11 @@ test "native tool trees: an installing step replays while its tree is held, not 
     // The first job finds no tree, and leaves one. The second sees it in "Set up job", so its
     // steps' keys are new (the variable is part of each), and the step finds the tree installed.
     const j1 = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j1" });
-    try expectLines(j1.text, &.{"trees=[]"});
+    try expectLines(j1.text, &.{"trees=[] full=[]"});
     const j2 = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j2" });
     try expectLines(j2.text, &.{
         "Tool cache: checked t/1/x64 (1 files, ",
-        "/opt/hostedtoolcache/t/1/x64]",
+        "/opt/hostedtoolcache/t/1/x64] full=[",
     });
     try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "install"));
     // The third has the same tree, so the install step replays, though it names a directory in
@@ -3569,11 +3575,19 @@ test "native tool trees: an installing step replays while its tree is held, not 
     try std.testing.expectEqual(@as(usize, 3), runs(arena, c.shared, "after"));
     _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j5" });
     try std.testing.expectEqual(@as(usize, 3), runs(arena, c.shared, "install"));
+    // A link added to the tree is in no digest the install script pins, and in the other one:
+    // the step runs again.
+    const link = try std.fmt.allocPrint(arena, "{s}/{s}/t/1/x64/lnk", .{ tools, image.name });
+    try std.Io.Dir.cwd().symLink(io, "bin", link, .{});
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j5b" });
+    try std.testing.expectEqual(@as(usize, 4), runs(arena, c.shared, "install"));
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j5c" });
+    try std.testing.expectEqual(@as(usize, 4), runs(arena, c.shared, "install"));
     // With the check off, as before: the step runs again every job.
     const off: volumes.Options = .{ .package_caches = true, .trusted = true };
     _ = try runCachedJob(arena, c.cfg, install, off, .{ .ran = "j6" });
     _ = try runCachedJob(arena, c.cfg, install, off, .{ .ran = "j7" });
-    try std.testing.expectEqual(@as(usize, 5), runs(arena, c.shared, "install"));
+    try std.testing.expectEqual(@as(usize, 6), runs(arena, c.shared, "install"));
 }
 
 test "a native step is contained: pivot_root, masked /proc, Docker's capabilities, no_new_privs" {

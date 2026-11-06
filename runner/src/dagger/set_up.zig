@@ -512,6 +512,9 @@ fn toolTreesVerdict(
             std.mem.indexOfNone(u8, tree, path_chars) != null) continue;
         if (std.mem.indexOfNone(u8, files, "0123456789") != null or
             std.mem.indexOfNone(u8, rehashed, "0123456789") != null) continue;
+        // One string of an environment may not pass 128 KiB (`execve`): past this a tree is left
+        // out, as one the script did not print is, rather than every later job failing to start.
+        if (env.items.len + digest.len + tree.len + 2 > max_tool_trees_env) continue;
         try env.print(arena, "{s}{s} {s}", .{ if (env.items.len > 0) "\n" else "", digest, tree });
         try note.print(arena, "{s}{s} ({s} files, {s} read)", .{
             if (note.items.len > 0) ", " else "",
@@ -528,6 +531,8 @@ fn toolTreesVerdict(
             try std.fmt.allocPrint(arena, "Tool cache: checked {s}", .{note.items}),
     };
 }
+
+const max_tool_trees_env = 64 << 10;
 
 /// What tool_trees.sh lets into a tree's path: no spaces, quotes or newlines.
 const path_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-/";
