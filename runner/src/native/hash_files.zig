@@ -560,7 +560,7 @@ const Merged = struct {
         return error.FsFailed;
     }
 
-    /// One unit of work: counted, and the job's cancel seen, and every 1024th the clock read, so
+    /// One unit of work: counted, and the job's cancel seen, and every 1024th the clocks read, so
     /// a call the job made too big, or took too long, or that the job gave up on, ends here.
     /// (The memory is counted by the allocator, which refuses what is over the limit.)
     fn tick(m: *Merged) Error!void {
@@ -569,7 +569,12 @@ const Merged = struct {
             "job's files: its tree is too deep or too tangled to search", .{m.limits.steps});
         if (m.limits.cancel) |c| if (!m.cancelled_before and c.requested.load(.acquire))
             return m.fail("hashFiles() stopped: the job was cancelled", .{});
-        if (m.steps % 1024 != 0) return;
+        if (m.steps % 1024 == 0) try m.clocks();
+    }
+
+    /// Whether the call's time, or the grace period after a cancel, is over. Each block of a file
+    /// reads them too: 1024 blocks are 64 MiB, whose hash takes seconds on a slow machine.
+    fn clocks(m: *Merged) Error!void {
         if (m.limits.timeout_ms != std.math.maxInt(u64) and
             nowMs(m.io, .awake) - m.began_ms - m.waited.* > m.limits.timeout_ms)
             return m.fail("couldn't finish within {d} seconds", .{(m.limits.timeout_ms + 999) / 1000});
@@ -871,6 +876,7 @@ const Merged = struct {
         var block: [64 * 1024]u8 = undefined;
         while (true) {
             try m.tick();
+            try m.clocks();
             const n = linux.read(fd, &block, block.len);
             switch (linux.errno(n)) {
                 .SUCCESS => {},
