@@ -335,7 +335,7 @@ const MountAttr = extern struct {
 const resolve_in_root = 0x10;
 const resolve_no_magiclinks = 0x02;
 /// And no symlink at all: the runner reading a file a step left (`readIn`).
-const resolve_no_symlinks = 0x04;
+pub const resolve_no_symlinks = 0x04;
 
 const OpenHow = extern struct { flags: u64, mode: u64, resolve: u64 };
 

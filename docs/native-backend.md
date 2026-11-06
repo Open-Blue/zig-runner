@@ -109,8 +109,7 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   images pulled by P3), JavaScript and local `uses:` actions (P7, `actions.preload`), remote `uses:` actions in an
   image with no git to fetch them with, `docker://` images
   that cannot be pulled or run as a non-root `USER` (P7), Dagger in steps
-  (`RUNNER_DAGGER_NESTING`), `hashFiles()`
-  anywhere in the job (it reads the container through Dagger), a checkout with submodules, and a
+  (`RUNNER_DAGGER_NESTING`), a checkout with submodules, and a
   machine whose probe fails (no user namespaces, nftables refusing the jobs' rules, no default
   route, the jobs' ids taken on the host, the jobs' subnet overlapping a route of the host's). A
   failed probe is tried again after five minutes, not kept for the process's life. (Until P3
@@ -1289,8 +1288,7 @@ user then pulled the job's ids, its network and the sandbox hardening into P1. W
   links, addresses and routes are rtnetlink already; nftables over netlink is phase 5's), not
   `nft`: the hosted runner has no `nft`, and `iptables` writes into the same tables as Docker's
   own rules, whichever backend the host uses.
-- **Smaller ones.** `hashFiles()` reads the container through Dagger, so it routes a job to Dagger
-  until it is native. `--exec-job` bypassed the trusted refs; it no longer does. Overlay's
+- **Smaller ones.** `--exec-job` bypassed the trusted refs; it no longer does. Overlay's
   work directory and a step's `chmod 000` both defeat a plain recursive delete, so removal gives
   directories their permissions back and logs what still fails, and a sweep at each job's start
   removes the directories of runners that died (each job holds a lock on its own). A step killed
@@ -1763,3 +1761,27 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
 - **Judging a local action needs one blob, not the repository.** A blobless fetch of the job's
   commit and `git cat-file` of one path costs a commit and its trees, and leaves nothing in the
   job but an empty layer; the checkout still does its own fetch.
+
+### hashFiles()
+
+- **The merged view is read without mounting it.** `hashFiles()` is evaluated between steps, in
+  conditions, `env:`, names, `with:` and scripts, and at the job's end for its outputs. The runner
+  merges the layers by lookup (`native/hash_files.zig`): the topmost entry decides, a whiteout
+  deletes, a non-directory hides what is below, an opaque directory stops the ones below it. A
+  mount would need privilege a rootless runner lacks and would cost more than the walk. glob.zig,
+  the search compared with GitHub's script, runs over it as it runs over Dagger's API.
+- **Links are resolved on the merged paths, never on the host's.** Each look at a layer is
+  `sandbox.openIn` with no symlink followed. A link `hashFiles()` finds is hashed as what it leads
+  to, as GitHub's `statSync` does and `sha256sum` does in a Dagger job: with `/` the job's root and
+  `..` taken on the path already resolved, so a link to `/etc/shadow` or to `../../../..` names the
+  job's file, or nothing, and never the host's. A link to a missing file or a loop fails the call.
+- **No new key.** A `hashFiles()` result is a function of the layers below the step, which the
+  step's key already holds through its parent, and wherever it affects the step it is in the
+  script or the env that the key hashes (`env:`, `with:`, the script, the shell and the working
+  directory are all in the script). A condition, a name, a timeout and `continue-on-error` do not
+  change what a step that ran left. The test runs a job, replays it, and runs it with another first
+  file: the replay prints the same hash, and the other file's hash is not served from it.
+- **What is not read.** Mounts (the cache volumes, an action's runtime) are in no layer, as
+  Dagger's `rootfs` leaves them out. A job-level `env:` is evaluated before any container exists, so
+  `hashFiles()` there is an error and the variable stays unset, on both backends (GitHub does not
+  allow it there either).

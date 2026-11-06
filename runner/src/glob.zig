@@ -17,8 +17,8 @@
 //! - **Matching**: minimatch with `dot`, `nobrace`, `noext`, `nonegate`, `nocomment`, case-sensitive:
 //!   `*`, `?`, `[...]` classes (with `!`/`^`, ranges and POSIX classes), `\` escapes and `**`.
 //!
-//! The file system is whatever `Fs` answers, many paths at a time: Dagger's API in a job
-//! (`dagger/hash_files.zig`), the local disk in `tools/hashfilescorpus.zig`, which compares this
+//! The file system is whatever `Fs` answers, many paths at a time: Dagger's API in a Dagger job
+//! (`dagger/hash_files.zig`), the job's layers in a native one (`native/hash_files.zig`), the local disk in `tools/hashfilescorpus.zig`, which compares this
 //! with GitHub's script (`.github/scripts/hashfiles-diff.sh`).
 const std = @import("std");
 
@@ -715,6 +715,38 @@ pub const Walked = union(enum) {
     files: []const []const u8,
     failed: []const u8,
 };
+
+/// What `hashFiles(args)` hashes: the files its patterns find under `ws`, as paths relative to it,
+/// in the order GitHub hashes them; or why the patterns or the search failed. `why` is where
+/// `fs` says what went wrong (`Fs.Error.FsFailed`).
+pub const Found = union(enum) {
+    files: []const []const u8,
+    failed: []const u8,
+};
+
+pub fn find(
+    arena: Allocator,
+    fs: Fs,
+    args: []const []const u8,
+    ws: []const u8,
+    home: []const u8,
+    why: *[]const u8,
+) Allocator.Error!Found {
+    const parsed = switch (try parse(arena, args, ws, home)) {
+        .invalid => |msg| return .{ .failed = msg },
+        .ok => |p| p,
+    };
+    const found = switch (try walk(arena, fs, parsed.patterns, parsed.follow, ws, why)) {
+        .failed => |msg| return .{ .failed = msg },
+        .files => |f| f,
+    };
+    var files: std.ArrayList([]const u8) = .empty;
+    for (found) |path| {
+        if (std.mem.startsWith(u8, path, ws) and path.len > ws.len and path[ws.len] == '/')
+            try files.append(arena, path[ws.len + 1 ..]);
+    }
+    return .{ .files = files.items };
+}
 
 const Node = struct {
     path: []const u8,

@@ -40,22 +40,15 @@ pub fn hashFiles(
 ) Allocator.Error!expr.HashFiles.Result {
     const x: *Exec = @ptrCast(@alignCast(ptr));
     const ws = x.ev.workspace;
-    const parsed = switch (try glob.parse(arena, args, ws, runner_home)) {
-        .invalid => |why| return .{ .failed = why },
-        .ok => |p| p,
-    };
+    // A native job has no Dagger session: its files are in the layers (`native/hash_files.zig`).
+    if (x.native) |b| return b.hashFiles(arena, ws, args);
     var dfs: Fs = .{ .x = x };
-    const found = switch (try glob.walk(arena, dfs.fs(), parsed.patterns, parsed.follow, ws, &dfs.why)) {
+    const files = switch (try glob.find(arena, dfs.fs(), args, ws, runner_home, &dfs.why)) {
         .failed => |msg| return .{ .failed = msg },
         .files => |f| f,
     };
-    var files: std.ArrayList([]const u8) = .empty;
-    for (found) |path| {
-        if (std.mem.startsWith(u8, path, ws) and path.len > ws.len and path[ws.len] == '/')
-            try files.append(arena, path[ws.len + 1 ..]);
-    }
-    if (files.items.len == 0) return .{ .ok = "" };
-    return x.hashListed(arena, ws, files.items);
+    if (files.len == 0) return .{ .ok = "" };
+    return x.hashListed(arena, ws, files);
 }
 
 /// glob.Fs on the job's container, through Dagger's API: `exists` for what a path is (it is

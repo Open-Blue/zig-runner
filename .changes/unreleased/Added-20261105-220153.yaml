@@ -1,0 +1,3 @@
+kind: Added
+body: Jobs that use `hashFiles()` run on the native backend. The runner reads the job's layers itself, as the next step sees them (whiteouts and opaque directories included), with no mount and no Dagger engine; a link is hashed as what it leads to inside the job's tree, never the host's, and the result is the same files, order and hash as on Dagger.
+time: 2026-11-05T22:01:53.567731763-05:00
