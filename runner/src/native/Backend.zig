@@ -1796,8 +1796,8 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     try w.writeAll(" origin ");
     try dagger.shellQuote(w, f.want);
     if (f.tags) try w.writeAll("\ngit fetch -q --tags origin");
-    try w.print("\ngit checkout -q --detach FETCH_HEAD\nrm -f .git/FETCH_HEAD\n" ++
-        "find . -exec touch -h -d @{d} {{}} +\n", .{checkout.mtime});
+    try w.writeAll("\ngit checkout -q --detach FETCH_HEAD\nrm -f .git/FETCH_HEAD\n");
+    try w.print("find . -exec touch -h -d @{d} {{}} +\n", .{checkout.mtime});
 
     // The job's token as GitHub expects it over HTTPS, in git's environment, never on its
     // command line.
@@ -3101,8 +3101,11 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     var co = testStep("");
     co.action = .{ .checkout = &.{} };
     try std.testing.expect(unsupported(io, testJob(&.{co}), root, ok) == null);
-    co.action = .{ .checkout = &.{.{ .name = "submodules", .value = .{ .lit = "true" } }} };
-    try expectReason("submodules", unsupported(io, testJob(&.{co}), root, ok));
+    // Submodules are fetched natively (`fetchCheckout`), whether literal or an expression.
+    for ([_]job_mod.Template{ .{ .lit = "true" }, .{ .lit = "recursive" }, .{ .expr = "inputs.s" } }) |v| {
+        co.action = .{ .checkout = &.{.{ .name = "submodules", .value = v }} };
+        try std.testing.expect(unsupported(io, testJob(&.{co}), root, ok) == null);
+    }
 
     var uses = testStep("");
     uses.action = .{ .uses = .{ .owner = "actions", .name = "setup-node", .ref = "v4" } };
@@ -3375,6 +3378,145 @@ test "the native checkout: the commit, its .git, and the checkout's fixed time" 
         std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
         return error.TestUnexpectedResult;
     };
+}
+
+/// A repository with a submodule that has a submodule: `o/r.git` holds `sub` (file `in-sub`), which
+/// holds `deep` (file `in-deep`), all at file:// URLs under the returned root, which the job's
+/// sandbox sees at the same path (`cfg.binds`). Null when git is missing.
+fn submoduleRepos(arena: Allocator, cfg: *Config, tmp: *std.testing.TmpDir) !?struct {
+    root: []const u8,
+    sha: []const u8,
+} {
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const g = "git -c user.name=t -c user.email=t@t -c protocol.file.allow=always";
+    const make = try std.fmt.allocPrint(arena, "set -e; cd '{[r]s}'; " ++
+        "for n in deep sub r; do git init -q -b main --bare o/$n.git; git init -q -b main src-$n; done; " ++
+        "cd src-deep; echo in-deep > in-deep; git add .; {[g]s} commit -q -m deep; " ++
+        "git push -q ../o/deep.git HEAD:refs/heads/main; cd ../src-sub; echo in-sub > in-sub; " ++
+        "{[g]s} submodule add -q file://{[r]s}/o/deep.git deep; git add .; " ++
+        "{[g]s} commit -q -m sub; git push -q ../o/sub.git HEAD:refs/heads/main; cd ../src-r; " ++
+        "echo in-r > in-r; {[g]s} submodule add -q file://{[r]s}/o/sub.git sub; git add .; " ++
+        "{[g]s} commit -q -m r; git push -q ../o/r.git HEAD:refs/heads/main", .{
+        .r = root,
+        .g = g,
+    });
+    const made = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", make } }) catch return null;
+    if (made.term != .exited or made.term.exited != 0) {
+        std.debug.print("git could not make the repositories: {s}\n", .{made.stderr});
+        return null;
+    }
+    const sha = std.mem.trim(u8, (try std.process.run(arena, io, .{
+        .argv = &.{ "git", "-C", try std.fmt.allocPrint(arena, "{s}/src-r", .{root}), "rev-parse", "HEAD" },
+    })).stdout, "\n");
+    try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "rootfs/{s}", .{root}));
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{
+        cfg.binds,
+        &.{.{ .host = root, .at = root }},
+    });
+    return .{ .root = root, .sha = sha };
+}
+
+/// The job's env for a checkout from those repositories: the owner check off (they are the host's
+/// root's, nobody in the job's namespace) and the file transport on for submodules (git refuses it
+/// by default; GitHub's are HTTPS).
+const file_repos_env = [_]job_mod.Input{.{
+    .name = "GIT_CONFIG_PARAMETERS",
+    .value = .{ .lit = "'safe.directory=*' 'protocol.file.allow=always'" },
+}};
+
+test "the native checkout's submodules: `true` the first level, `recursive` all, `false` none" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const repos = (try submoduleRepos(arena, &cfg, &tmp)) orelse
+        return skip(false, "git is not installed");
+
+    // What actions/checkout leaves for each: the submodule's files and its own submodule's.
+    const cases = [_]struct { input: ?[]const u8, sub: bool, deep: bool }{
+        .{ .input = null, .sub = false, .deep = false },
+        .{ .input = "false", .sub = false, .deep = false },
+        .{ .input = "true", .sub = true, .deep = false },
+        .{ .input = "recursive", .sub = true, .deep = true },
+    };
+    for (cases) |c| {
+        var co = testStep("");
+        co.name = "checkout";
+        co.action = .{ .checkout = if (c.input) |v| &.{
+            .{ .name = "submodules", .value = .{ .lit = v } },
+        } else &.{} };
+        const check = testStep("echo r=$(cat in-r) sub=$(test -f sub/in-sub && echo yes || " ++
+            "echo no) deep=$(test -f sub/deep/in-deep && echo yes || echo no); " ++
+            "echo mtime=$(stat -c %Y in-r)");
+        var job = testJob(&.{ co, check });
+        job.github.server_url = try std.fmt.allocPrint(arena, "file://{s}", .{repos.root});
+        job.github.sha = repos.sha;
+        job.env = &file_repos_env;
+        var env: std.process.Environ.Map = .init(arena);
+        var w: std.Io.Writer.Allocating = .init(arena);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+        const res = try dagger.run(arena, std.testing.io, &env, .{
+            .native = cfg,
+            .step_user = .root,
+            .gpa = std.testing.allocator,
+        }, job, &log);
+        const text = w.written();
+        const want = try std.fmt.allocPrint(arena, "r=in-r sub={s} deep={s}", .{
+            if (c.sub) "yes" else "no",
+            if (c.deep) "yes" else "no",
+        });
+        if (res.steps[0].outcome != .success or res.steps[1].outcome != .success or
+            std.mem.indexOf(u8, text, want) == null)
+        {
+            std.debug.print("submodules {s}: wanted {s}; engine {s}\n{s}\n", .{
+                c.input orelse "(unset)", want, res.engine_error orelse "-", text,
+            });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "native step cache: a checkout with submodules never replays one without, or with fewer" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try cachedConfig(arena, &tmp);
+    const repos = (try submoduleRepos(arena, &c.cfg, &tmp)) orelse
+        return skip(false, "git is not installed");
+
+    // The same commit three ways, each leaving something else: each runs its checkout once and
+    // is replayed after that, never from another's layer.
+    const inputs = [_][]const u8{ "false", "true", "recursive" };
+    const seen = [_][]const u8{ "sub=no deep=no", "sub=yes deep=no", "sub=yes deep=yes" };
+    for (inputs, seen, 0..) |input, want, i| {
+        var co = testStep("");
+        co.name = "checkout";
+        co.action = .{ .checkout = &.{
+            .{ .name = "ref", .value = .{ .lit = repos.sha } },
+            .{ .name = "submodules", .value = .{ .lit = input } },
+        } };
+        const check = testStep("echo sub=$(test -f sub/in-sub && echo yes || echo no) " ++
+            "deep=$(test -f sub/deep/in-deep && echo yes || echo no)");
+        var job = testJob(&.{ co, check });
+        job.github.server_url = try std.fmt.allocPrint(arena, "file://{s}", .{repos.root});
+        job.env = &file_repos_env;
+        const first = try runCached(arena, c.cfg, job, try std.fmt.allocPrint(arena, "a{d}", .{i}));
+        try expectSucceeded(first);
+        if (std.mem.indexOf(u8, first.text, want) == null) {
+            std.debug.print("wanted {s} on the first run:\n{s}\n", .{ want, first.text });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first.text, dagger.native_reused_note));
+        const again = try runCached(arena, c.cfg, job, try std.fmt.allocPrint(arena, "b{d}", .{i}));
+        try expectSucceeded(again);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, again.text, dagger.native_reused_note));
+        try std.testing.expect(std.mem.indexOf(u8, again.text, want) != null);
+    }
 }
 
 test "a native checkout that cannot fetch fails its step with why" {
