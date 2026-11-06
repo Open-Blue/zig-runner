@@ -73,6 +73,9 @@ notes: std.ArrayList([]const u8) = .empty,
 actions: std.StringHashMapUnmanaged(Exec.LoadResult) = .empty,
 /// The JavaScript runtime JavaScript actions run with (`Options.js_runtime`, `actions.preload`).
 js_runtime: config.JsRuntime = .bun,
+/// Set when the job is cancelled, which ends a `hashFiles()` in the middle of a file; the runner's
+/// (`dagger.runNative` hands it over).
+cancel: ?*dagger.Cancel = null,
 /// Local actions read so far before the job (`actions.readOwn`), naming their files.
 preflights: u32 = 0,
 /// Why the last Dockerfile could not be planned or built, for the step's message.
@@ -1807,12 +1810,18 @@ pub fn hashFiles(
 ) Allocator.Error!expr.HashFiles.Result {
     // Topmost first, as `execIn`'s overlay stacks them.
     const n = b.layers.items.len;
-    const layers = try arena.alloc([]const u8, n + b.seed_layers.items.len + 1);
+    const layers = try b.gpa.alloc([]const u8, n + b.seed_layers.items.len + 1);
+    defer b.gpa.free(layers);
     for (b.layers.items, 0..) |l, i| layers[n - 1 - i] = l.path;
     @memcpy(layers[n..][0..b.seed_layers.items.len], b.seed_layers.items);
     layers[layers.len - 1] = b.rootfs;
-    const stack: hash_files.Stack = .{ .layers = layers, .opaque_xattr = b.opaqueXattr() };
-    return hash_files.hashFiles(arena, b.io, stack, ws, dagger.runner_home, args);
+    const stack: hash_files.Stack = .{
+        .layers = layers,
+        .opaque_xattr = b.opaqueXattr(),
+        .limits = .{ .cancel = if (b.cancel) |c| &c.requested else null },
+    };
+    // The call's own memory is freed when it returns; the job's arena gets the result only.
+    return hash_files.hashFiles(b.gpa, arena, b.io, stack, ws, dagger.runner_home, args);
 }
 
 /// Overlay's attribute that marks a directory opaque: `trusted.` when the job's overlay is mounted
@@ -5744,4 +5753,46 @@ test "native hashFiles: a link a step planted out of the job's tree does not rea
     defer dir.close(io);
     var it = dir.iterate();
     while (try it.next(io)) |e| try std.testing.expectEqualStrings("secret.txt", e.name);
+}
+
+/// Two steps whose text is the same in every job: the first writes the file from its env, the
+/// second reads its hash through its own env. Only `content` differs between jobs.
+fn envJob(arena: Allocator, content: []const u8) !job_mod.Job {
+    var write = testStep("echo x >> /shared/w; printf '%s' \"$SEED\" > seed.txt");
+    write.env = try arena.dupe(job_mod.Input, &.{.{ .name = "SEED", .value = .{ .lit = content } }});
+    var read = testStep("echo x >> /shared/r; echo read=$K.");
+    read.env = &.{.{ .name = "K", .value = .{ .expr = "hashFiles('seed.txt')" } }};
+    return testJob(try arena.dupe(job_mod.Step, &.{ write, read }));
+}
+
+test "native hashFiles: a change only in a step's env, or in the file that gives it the hash, is not replayed from the old job" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    const one = hashOfFiles(&.{"one"});
+    const two = hashOfFiles(&.{"two"});
+
+    const first = try runCached(arena, c.cfg, try envJob(arena, "one"), "j1");
+    try expectSucceeded(first);
+    try expectLines(first.text, &.{try std.fmt.allocPrint(arena, "read={s}.", .{&one})});
+    const again = try runCached(arena, c.cfg, try envJob(arena, "one"), "j2");
+    try expectSucceeded(again);
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "w"));
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "r"));
+    // Neither step's text changes, only the writer's env: the writer runs again, the reader's hash
+    // is of the new file, and it runs again too. A replay of either would print `one`'s hash.
+    const other = try runCached(arena, c.cfg, try envJob(arena, "two"), "j3");
+    try expectSucceeded(other);
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "w"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "r"));
+    try expectLines(other.text, &.{try std.fmt.allocPrint(arena, "read={s}.", .{&two})});
+    try std.testing.expect(std.mem.indexOf(u8, other.text, &one) == null);
+    // And the first job's own steps are still kept: `one` replays again.
+    const back = try runCached(arena, c.cfg, try envJob(arena, "one"), "j4");
+    try expectSucceeded(back);
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "w"));
+    try expectLines(back.text, &.{try std.fmt.allocPrint(arena, "read={s}.", .{&one})});
 }

@@ -1785,3 +1785,32 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
   Dagger's `rootfs` leaves them out. A job-level `env:` is evaluated before any container exists, so
   `hashFiles()` there is an error and the variable stays unset, on both backends (GitHub does not
   allow it there either).
+- **The job decides how much work a call is, so a call has limits** (`hash_files.Limits`, the
+  walk's in `glob.zig`). The walk visits at most 1,000,000 files and directories: with
+  `--follow-symbolic-links` two links per directory, twenty-five deep, name one directory by 2^25
+  paths (72 inodes took 4 GB), and @actions/glob only breaks cycles through a directory's own
+  ancestors. A monorepo with its `node_modules` is a few hundred thousand entries (the Linux
+  kernel about 90,000 files), so a million leaves room; the Dagger path shares the walk and the
+  limit. A call takes at most 200 million path components and 2 GiB, in an arena of its own that is
+  freed when it returns (only the result goes to the job's), and each path name is looked up in
+  place and each followed link remembered, so a path 1,000 deep or a chain of 4 KB links costs
+  what it holds, not a copy of the path for every name of it (a 300-deep path with 1,500 files
+  took 387 MB before and 18 MB after; 3,000 links to one chain 497 MB before and 17 MB after).
+  The job's cancel (`dagger.Cancel.requested`, handed to the backend) is polled at every step
+  and every 64 KiB read, so a cancelled or timed-out job stops within a block: `Watch` cannot,
+  as no sandbox runs while expressions are evaluated. A file is read in full however large and
+  sparse, since the hash is GitHub's and has no shortcut for holes (`SEEK_HOLE` would change it);
+  a 16 TiB file takes hours until the job is cancelled, as it does on GitHub.
+- **Overlay's redirects and metacopy fail the call.** `Merged` does not follow them, and a hash
+  of what they hide would be wrong without a word, so a layer entry that has either attribute
+  fails `hashFiles()` with a message. The runner never asks for them, but a host's kernel may
+  default to them: `overlayOptions` in `sandbox.zig` does not pass `redirect_dir=off,metacopy=off`,
+  and `Store.flatten` checks only directories. Both are the owner's to settle.
+- **A file is hashed whatever its mode.** The runner reads as itself (root, or the rootless
+  user), so a non-root `container:` job can hash a file its own user could not read (`ln -s
+  /etc/shadow s`) from within its own tree. Dagger's `sha256sum` ran as the step user and would
+  fail. Matching it needs the layer's ids translated to the step's (a layer's files are the
+  canonical ids, the slot's, or the runner's own, by layer), which is not simple to get right, and
+  the gain is a hash of a file in the job's own container; so it is not done.
+- **A file is looked at before it is opened.** Its type is read from an `O_PATH` descriptor and
+  the file opened through that descriptor, so a pipe is refused and not waited for.

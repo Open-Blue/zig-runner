@@ -730,13 +730,14 @@ pub fn find(
     args: []const []const u8,
     ws: []const u8,
     home: []const u8,
+    max_nodes_: usize,
     why: *[]const u8,
 ) Allocator.Error!Found {
     const parsed = switch (try parse(arena, args, ws, home)) {
         .invalid => |msg| return .{ .failed = msg },
         .ok => |p| p,
     };
-    const found = switch (try walk(arena, fs, parsed.patterns, parsed.follow, ws, why)) {
+    const found = switch (try walkLimited(arena, fs, parsed.patterns, parsed.follow, ws, max_nodes_, why)) {
         .failed => |msg| return .{ .failed = msg },
         .files => |f| f,
     };
@@ -756,6 +757,14 @@ const Node = struct {
     children: []const u32 = &.{},
 };
 
+/// How many files and directories one walk may visit. With `--follow-symbolic-links` a tree of
+/// links can name the same directory by exponentially many paths (a directory whose two links lead
+/// to the next, twenty-five deep), and @actions/glob only breaks cycles through a directory's own
+/// ancestors. A real monorepo with its `node_modules` has a few hundred thousand entries (the
+/// Linux kernel has about 90,000 files), so a million leaves room, and costs a few hundred MB of
+/// the call's memory at most before the walk stops.
+pub const max_nodes: usize = 1_000_000;
+
 /// @actions/glob's walk (`globGenerator`), batched: each level of the tree is matched, looked at
 /// and listed with one call each to `fs`, then the yields are read off depth-first, children in
 /// byte order. Only what can
@@ -766,6 +775,19 @@ pub fn walk(
     patterns_in: []const Pattern,
     follow: bool,
     within: []const u8,
+    why: *[]const u8,
+) Allocator.Error!Walked {
+    return walkLimited(arena, fs, patterns_in, follow, within, max_nodes, why);
+}
+
+/// `walk`, failing when it would visit more than `limit` files and directories.
+pub fn walkLimited(
+    arena: Allocator,
+    fs: Fs,
+    patterns_in: []const Pattern,
+    follow: bool,
+    within: []const u8,
+    limit: usize,
     why: *[]const u8,
 ) Allocator.Error!Walked {
     if (follow and fs.vtable.realpath == null) return .{ .failed = "--follow-symbolic-links is not supported here yet" };
@@ -850,6 +872,9 @@ pub fn walk(
                 const parent = nodes.items[n].path;
                 const child = try std.mem.concat(arena, u8, &.{ parent, if (std.mem.endsWith(u8, parent, "/")) "" else "/", name });
                 if (!relevant(child, within)) continue;
+                if (nodes.items.len >= limit) return .{ .failed = try std.fmt.allocPrint(arena, "the search " ++
+                    "met more than {d} files and directories (links that lead to the same directories " ++
+                    "by many paths, perhaps): narrow the patterns", .{limit}) };
                 try children.append(arena, @intCast(nodes.items.len));
                 try frontier.append(arena, @intCast(nodes.items.len));
                 try nodes.append(arena, .{ .path = child, .parent = n });
