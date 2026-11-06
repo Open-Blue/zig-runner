@@ -741,6 +741,20 @@ proofs/tla/StoreEviction.tla.
   holds its image and its rootfs from the moment it asks for them to its end (`oci.Store.hold`,
   `ensure`, each in `Backend.held`), as it does each seed (`Backend.holdSeed`), and a service's or an
   action's image.
+- **A job of an older runner.** A runner from before these trees had locks holds none of them,
+  touches no mtime, and unpacks without `oci/blobs.lock`, so a tree or blob it is using looks unused,
+  and instances of a unit restart one at a time (`restart_all`), so such a job can share a store
+  with this code. Every job of this code has a mark, `jobs/<id>/holds-trees`, written before the
+  directory gets its name, so no job of this code is seen without it. While any `jobs/<id>` lacks
+  the mark and its `lock` is held, a pass leaves the trees and blobs alone, with what it tidies
+  there and `oci/refs/` (`evict.oldJobRunning`, a scan of at most 4096 directories, under `gc.lock`,
+  logged once a pass at info). Volumes are not affected: older runners hold those. There is no age
+  limit, as a job may run for days: a lock is free only once its runner has let go or died, so a
+  dead runner's directory stops nothing from that moment, and the next job's `sweep` removes it.
+  `jobs/` is out of a job's reach: a step sees the overlay and its binds, after `pivot_root`, and
+  none of them is the job's directory. This narrows the mixed-version window, and does not close
+  it: a job of an older runner that starts after the scan, and takes a tree the same pass evicts,
+  still loses it.
 - **An image outlives its rootfs.** A rootfs is its image's files, by hard link, and a job that uses
   a rootfs pulls its image first. So an image counts as used an hour later than it was, and the
   rootfs goes first: an image evicted under a living rootfs would cost the next job a pull for

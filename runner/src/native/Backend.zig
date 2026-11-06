@@ -731,6 +731,10 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         cwd.writeFile(io, .{ .sub_path = path, .data = "" }) catch |e|
             return failed(why, arena, "writing", path, e);
     }
+    // Before the rename, so no job of this binary is ever seen without it (`evict.oldJobRunning`).
+    const mark = try std.fmt.allocPrint(arena, "{s}/{s}", .{ new, evict.job_mark });
+    cwd.writeFile(io, .{ .sub_path = mark, .data = "" }) catch |e|
+        return failed(why, arena, "writing", mark, e);
     const lock_path = try std.fmt.allocPrint(arena, "{s}/lock", .{new});
     const lock = lockFile(arena, io, lock_path, true) catch |e|
         return failed(why, arena, "locking", lock_path, e);
@@ -1183,7 +1187,8 @@ fn removeJobDir(arena: Allocator, io: std.Io, path: []const u8) void {
     var names: std.ArrayList([]const u8) = .empty;
     var it = dir.iterate();
     while (it.next(io) catch null) |e| {
-        if (std.mem.eql(u8, e.name, "lock")) continue;
+        // The mark too: its job would look like an older runner's while this removes it.
+        if (std.mem.eql(u8, e.name, "lock") or std.mem.eql(u8, e.name, evict.job_mark)) continue;
         names.append(arena, arena.dupe(u8, e.name) catch break) catch break;
     }
     dir.close(io);
@@ -4337,6 +4342,30 @@ test "native sweep: a job's directory its runner is removing is left to it; a de
     // Its runner's removal ends with the lock, while held.
     removeJobDir(arena, io, try std.fmt.allocPrint(arena, "{s}/jobs/live", .{store}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "jobs/live", .{}));
+}
+
+test "native eviction under a real job: its directory has the mark, and no step can see it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var b = try init(arena, io, std.testing.allocator, cfg);
+    defer b.deinit();
+    const mark = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, evict.job_mark });
+    try std.Io.Dir.cwd().access(io, mark, .{});
+    var out: Captured = .{ .arena = arena };
+    const step = try b.exec(
+        try std.fmt.allocPrint(arena, "! test -e {s} && ! find / -xdev -name {s} | grep .", .{ mark, evict.job_mark }),
+        &.{"PATH=/usr/bin:/bin"},
+        &.{},
+        0,
+        0,
+        out.output(),
+    );
+    try std.testing.expectEqual(@as(i32, 0), step.code);
 }
 
 test "a job's directory and lock are let go once, when its set-up fails after the lock is taken" {
