@@ -78,27 +78,65 @@ fn fail(msg: []const u8) u8 {
 /// Makes the rules for `subnet`, the host's `uplinks` and the jobs' nameservers `dns` (see the
 /// file's comment). Null when they were made, else why not. A batch that fails because another
 /// program changed a chain between the rules being read and replaced (Docker starting, ufw
-/// reloading) is tried again.
+/// reloading) is tried again after a pause of a random length that grows with each failure. The
+/// runners of one host take turns (`lock_path`): each removes the rules the others read, and
+/// eight of them starting together lost the rules to each other three times running, which
+/// sent a native job to Dagger.
 pub fn apply(subnet: net.Subnet, uplinks: []const []const u8, dns: []const [4]u8) ?[]const u8 {
     var sock = Socket.open() catch return "cannot open an nftables netlink socket";
     defer sock.close();
+    // Held until `apply` returns. Without one (no /run, say), the retries are what is left.
+    const lock = takeLock();
+    defer if (lock) |fd| {
+        _ = linux.close(fd);
+    };
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         const e = sock.replace(subnet, uplinks, dns) catch |err| return @errorName(err);
         switch (e) {
             .SUCCESS => return null,
             // A rule removed or a chain made under us: read again.
-            .NOENT, .EXIST, .BUSY, .AGAIN => if (attempt < 3) continue,
+            .NOENT, .EXIST, .BUSY, .AGAIN => if (attempt < max_retries) {
+                pause(attempt);
+                continue;
+            },
             else => {},
         }
         return explain(e);
     }
 }
 
+/// `lock_path` opened and locked, or null when it could not be.
+fn takeLock() ?linux.fd_t {
+    const rc = linux.open(lock_path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return null;
+    while (linux.errno(linux.flock(fd, lock_ex)) == .INTR) {}
+    return fd;
+}
+
+/// The file the runners of a host hold while they make the rules. Root's: only a root runner
+/// makes them.
+const lock_path = "/run/zig-runner-nft.lock";
+const lock_ex = 2; // LOCK_EX
+const max_retries = 12;
+
+/// Sleeps up to 2^`attempt` milliseconds (at most 64), at random: makers that failed together
+/// then read the chains one after another instead of together.
+fn pause(attempt: u32) void {
+    var raw: [2]u8 = undefined;
+    _ = linux.getrandom(&raw, raw.len, 0);
+    const shift: u5 = @min(attempt, 6);
+    const span_us = (@as(u32, 1) << shift) * std.time.us_per_ms;
+    const us = std.mem.readInt(u16, &raw, .little) % span_us;
+    const ts: linux.timespec = .{ .sec = 0, .nsec = @as(isize, us) * std.time.ns_per_us };
+    _ = linux.nanosleep(&ts, null);
+}
+
 fn explain(e: linux.E) []const u8 {
     return switch (e) {
         .PERM, .ACCES => "nftables refused the rules (the runner needs CAP_NET_ADMIN)",
-        .NOENT => "nftables lost a rule or chain while the rules were made, three times",
+        .NOENT => "nftables lost a rule or chain while the rules were made, again and again",
         .OPNOTSUPP => "the kernel lacks an nftables feature the rules need " ++
             "(nf_tables, nft_ct, nft_masq, nft_chain_nat)",
         .PROTONOSUPPORT, .AFNOSUPPORT => "the kernel has no nftables (nf_tables)",
@@ -873,4 +911,79 @@ test "the batch: begin, every message acknowledged, end, within its buffer" {
     // nameservers in forward and input, 1 removal, and 2 accepts in each of the host's 2 chains.
     try std.testing.expectEqual(@as(u32, 3 + 4 + 10 + 2 * 2 * 2 + 1 + 4), b.acks);
     try std.testing.expectEqual(@as(usize, b.acks + 2), types.items.len);
+}
+
+/// What `contendedApply` found: how many `apply`s failed, and the first one's reason.
+const Contended = struct {
+    unavailable: bool = false,
+    failures: std.atomic.Value(u32) = .init(0),
+    first: [128]u8 = undefined,
+    first_len: usize = 0,
+    mu: std.atomic.Mutex = .unlocked,
+};
+
+const makers = 8;
+const applies = 25;
+
+/// In a network namespace of its own (this thread's alone, and the threads it starts): the host's
+/// `ip filter FORWARD` chain made, then `applies` of `apply` from each of `makers` threads at
+/// once, as runners starting together on one host make them.
+fn contendedApply(c: *Contended) void {
+    const unshared = linux.unshare(linux.CLONE.NEWNET);
+    if (linux.errno(unshared) != .SUCCESS) {
+        c.unavailable = true;
+        return;
+    }
+    var sock = Socket.open() catch {
+        c.unavailable = true;
+        return;
+    };
+    var buf: [1024]u8 align(4) = undefined;
+    var b: Batch = .init(&buf, sock.seq);
+    b.message(.NEWTABLE, linux.NLM_F_CREATE);
+    b.attrStr(nfta_table_name, "filter");
+    b.endMsg();
+    b.message(.NEWCHAIN, linux.NLM_F_CREATE);
+    b.attrStr(nfta_chain_table, "filter");
+    b.attrStr(nfta_chain_name, "FORWARD");
+    b.endMsg();
+    const bytes = b.finish();
+    const made = sock.send(bytes, b.first_seq, b.seq, b.acks) catch .INVAL;
+    sock.close();
+    if (made != .SUCCESS) {
+        c.unavailable = true;
+        return;
+    }
+    var threads: [makers]?std.Thread = @splat(null);
+    for (&threads) |*t| t.* = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, applyRounds, .{c}) catch null;
+    for (threads) |t| if (t) |th| th.join();
+}
+
+fn applyRounds(c: *Contended) void {
+    for (0..applies) |_| {
+        const why = apply(net.Subnet.default, &.{"eth0"}, &.{}) orelse continue;
+        _ = c.failures.fetchAdd(1, .monotonic);
+        while (!c.mu.tryLock()) std.atomic.spinLoopHint();
+        defer c.mu.unlock();
+        if (c.first_len == 0) {
+            c.first_len = @min(why.len, c.first.len);
+            @memcpy(c.first[0..c.first_len], why[0..c.first_len]);
+        }
+    }
+}
+
+test "native nft: rules made by several makers at once are all made, none lost to the others" {
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var c: Contended = .{};
+    // Its own thread, so only it (and the threads it starts) leaves the host's namespace.
+    const t = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, contendedApply, .{&c});
+    t.join();
+    if (c.unavailable) return error.SkipZigTest;
+    const failed_n = c.failures.load(.monotonic);
+    if (failed_n > 0) {
+        std.debug.print("native nft: {d} of {d} rule batches failed, the first with: {s}\n", .{
+            failed_n, makers * applies, c.first[0..c.first_len],
+        });
+        return error.TestUnexpectedResult;
+    }
 }

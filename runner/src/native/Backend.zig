@@ -15,6 +15,7 @@ const Backend = @This();
 const std = @import("std");
 const job_mod = @import("../job.zig");
 const config = @import("../config.zig");
+const expr = @import("../expr.zig");
 const dagger = @import("../dagger.zig");
 const sandbox = @import("sandbox.zig");
 const net = @import("net.zig");
@@ -27,6 +28,7 @@ const docker = @import("../dagger/docker.zig");
 const cgroup = @import("cgroup.zig");
 const evict = @import("evict.zig");
 const volumes = @import("volumes.zig");
+const trees_check = @import("tool_trees.zig");
 const admission = @import("../admission.zig");
 const services = @import("services.zig");
 const images = @import("images.zig");
@@ -38,6 +40,7 @@ const checkout = @import("../dagger/checkout.zig");
 const scripts = @import("../dagger/scripts.zig");
 const set_up = @import("../dagger/set_up.zig");
 const phases = @import("phases.zig");
+const hash_files = @import("hash_files.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -72,6 +75,11 @@ notes: std.ArrayList([]const u8) = .empty,
 actions: std.StringHashMapUnmanaged(Exec.LoadResult) = .empty,
 /// The JavaScript runtime JavaScript actions run with (`Options.js_runtime`, `actions.preload`).
 js_runtime: config.JsRuntime = .bun,
+/// Set when the job is cancelled, which ends a `hashFiles()` in the middle of a file; the runner's
+/// (`dagger.runNative` hands it over).
+cancel: ?*dagger.Cancel = null,
+/// What a `hashFiles()` may use (`Config.hash_files`).
+hash_settings: hash_files.Settings = .{},
 /// Local actions read so far before the job (`actions.readOwn`), naming their files.
 preflights: u32 = 0,
 /// Why the last Dockerfile could not be planned or built, for the step's message.
@@ -149,6 +157,11 @@ gate: ?*admission.Gate = null,
 /// What the job's options say of caches, and what it got of them (`setUpCaches`).
 caches: volumes.Options = .{},
 cache_plan: volumes.Plan = .{},
+/// `ZIG_RUNNER_TOOL_TREES`' value, when "Set up job" checked the tool cache's trees
+/// (`checkToolTrees`): a step's key holds it, and `Exec.toolDirNotHeld` reads it.
+tool_trees: ?[]const u8 = null,
+/// `trees_check.full_env`'s value, set with it.
+tool_trees_full: ?[]const u8 = null,
 /// The Zig cache seeds' layers, between the job's layers and the rootfs.
 seed_layers: std.ArrayList([]const u8) = .empty,
 /// What the keys know each seed by (`volumes.seedId`): its path, and which build it is.
@@ -212,6 +225,9 @@ pub const Config = struct {
     /// Where the jobs' cgroups go and their limits (`RUNNER_NATIVE_CGROUP`,
     /// `RUNNER_NATIVE_MEMORY_MAX_MB`, `RUNNER_NATIVE_PIDS_MAX`).
     cgroup: cgroup.Config = .{},
+    /// What a `hashFiles()` may use: the memory all of them may hold together, and the time one
+    /// may take (`RUNNER_NATIVE_HASHFILES_MEMORY_MB`, `RUNNER_NATIVE_HASHFILES_TIMEOUT_S`).
+    hash_files: hash_files.Settings = .{},
     /// The runner's place at the memory gate: told of the job's cgroup (`admission.Gate.native`).
     gate: ?*admission.Gate = null,
     /// Tests: see `Backend.test_seed_script`.
@@ -291,6 +307,10 @@ pub fn configFor(
             .min_free_pct = cfg.native_min_free_pct,
         },
         .cgroup = cg,
+        .hash_files = .{
+            .memory_mb = cfg.native_hashfiles_memory_mb,
+            .timeout_s = cfg.native_hashfiles_timeout_s,
+        },
         .job_limits = jobLimits(arena, io, cg),
     };
 }
@@ -374,7 +394,6 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         return "a job container's `ports:`, `volumes:` and `options:` are not native yet (phase 6)";
     if (job.services.len > 0) if (servicesUnsupported(job, cfg)) |why| return why;
     if (opts.nesting) return "steps that use the Dagger engine (RUNNER_DAGGER_NESTING) need Dagger";
-    if (usesHashFiles(job)) return "`hashFiles()` reads the job's container through Dagger";
     // dpkg gives files to other users and groups (`root:adm`), which one mapped id cannot hold.
     if (std.os.linux.geteuid() != 0 and cfg.rootfs.len == 0 and opts.provision and
         std.mem.eql(u8, dagger.resolveImage(if (job.container) |jc| switch (jc.image) {
@@ -428,46 +447,6 @@ fn servicesUnsupported(job: job_mod.Job, cfg: Config) ?[]const u8 {
         .expr => return "a service's image given by an expression is not native yet",
     };
     return null;
-}
-
-/// Whether any expression of the job calls `hashFiles` (function names are not case-sensitive).
-fn usesHashFiles(job: job_mod.Job) bool {
-    const call = "hashfiles(";
-    for (job.env) |e| if (std.ascii.findIgnoreCase(templateText(e.value), call) != null)
-        return true;
-    for (job.outputs) |o| if (std.ascii.findIgnoreCase(templateText(o.value), call) != null)
-        return true;
-    if (job.environment.url) |u| if (std.ascii.findIgnoreCase(templateText(u), call) != null)
-        return true;
-    for (job.steps) |step| {
-        const texts = [_][]const u8{
-            step.condition,
-            step.name_expr orelse "",
-            templateText(step.continue_on_error),
-            if (step.timeout_minutes) |t| templateText(t) else "",
-        };
-        for (texts) |t| if (std.ascii.findIgnoreCase(t, call) != null) return true;
-        for (step.env) |e| if (std.ascii.findIgnoreCase(templateText(e.value), call) != null)
-            return true;
-        switch (step.action) {
-            .script => |sc| {
-                const more = [_]?job_mod.Template{ sc.script, sc.shell, sc.working_directory };
-                for (more) |m| if (m) |t|
-                    if (std.ascii.findIgnoreCase(templateText(t), call) != null) return true;
-            },
-            .checkout => |inputs| for (inputs) |in| {
-                if (std.ascii.findIgnoreCase(templateText(in.value), call) != null) return true;
-            },
-            else => {},
-        }
-    }
-    return false;
-}
-
-fn templateText(t: job_mod.Template) []const u8 {
-    return switch (t) {
-        .lit, .expr => |s| s,
-    };
 }
 
 /// Whether this machine can run native steps, found with one sandbox; null when it can, else
@@ -774,6 +753,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .images_dir = cfg.images,
         .service_binds = cfg.service_binds,
         .self_exe = cfg.self_exe,
+        .hash_settings = cfg.hash_files,
     };
     errdefer b.deinit();
     if (cfg.test_fail_after_lock) return error.TestFailure;
@@ -1343,6 +1323,10 @@ fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
     for (b.cache_plan.env.items) |e| try b.put(e.name, e.value);
     for (try ev.defaultEnv()) |e| try b.put(e.name, e.value);
     for (try ev.withoutReapplied(ev.job_env.items)) |e| try b.put(e.name, e.value);
+    // Last, and set even when no tree was found, so a workflow's own value never stands in for
+    // the runner's. Part of every step's key, as on Dagger: see `checkToolTrees`.
+    if (b.tool_trees) |v| try b.put(set_up.tool_trees_env, v);
+    if (b.tool_trees_full) |v| try b.put(trees_check.full_env, v);
     b.workdir = ev.workspace;
 }
 
@@ -1423,7 +1407,7 @@ pub fn execScript(
         if (claim.hit) |rec| {
             const data = try recordAnswer(arena, rec);
             // A record that points into the tool cache's volume, which is in no layer: the volume
-            // may have lost the tree since, and no tree is checked natively, so the step runs again.
+            // may have lost the tree since, and no checked tree holds it, so the step runs again.
             if (rerun == null) if (try x.toolDirNotHeld(data)) |dir| {
                 rerun = try std.fmt.allocPrint(arena, "its record names {s} in the tool cache, " ++
                     "a volume in no layer", .{dir});
@@ -1567,6 +1551,41 @@ fn setUpCaches(b: *Backend, ev: *Evaluator, plan: anytype) !void {
         b.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ b.binds, &.{v} });
     }
     if (b.cache_plan.zig_local_roll != null) b.rollZigLocal(plan.as_runner);
+    if (b.caches.tool_trees) try b.checkToolTrees();
+}
+
+/// "Set up job"'s check of the tool cache's trees, as `set_up.verifyToolTrees` does it on Dagger
+/// (`tool_trees.zig`): what steps are given is each tree's digest and path (`tool_trees`), and a
+/// replayed step that names a directory in the volume replays only when a tree holds it
+/// (`Exec.toolDirNotHeld`). The values (the digest `install-zig.sh` pins, and a second over every
+/// entry of the tree, `trees_check.full_env`) are in every step's key (the variables are not
+/// volatile), so a tree added, removed or changed makes every step of the job new once, and no
+/// record made against another state of a tree is replayed. Narrower keys (only the trees a step
+/// puts on PATH) are not possible here: a step's key is made before it runs, and which trees it
+/// names is in its record.
+fn checkToolTrees(b: *Backend) !void {
+    const arena = b.arena;
+    const volume = b.cache_plan.tool_cache_host orelse return;
+    const mount = b.cache_plan.tool_cache.?;
+    // In the runner's store beside the volumes, where no step can write: a list a job could
+    // forge would pass a changed file (`tool_trees.zig`).
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(volume, &digest, .{});
+    const root = b.store_cfg.root;
+    const lists = try std.fmt.allocPrint(arena, "{s}/tool-trees/{x}", .{ root, digest[0..16] });
+    const verdict = try trees_check.check(
+        arena,
+        b.gpa,
+        b.io,
+        volume,
+        lists,
+        mount,
+        .{},
+        b.caches.cancel,
+    );
+    b.tool_trees = verdict.env;
+    b.tool_trees_full = verdict.full;
+    try b.notes.append(arena, verdict.note);
 }
 
 /// `set_up.zig_builtin_seed_script` on the `builtin.zig` volume, bound beside the seed's own `b/`
@@ -1803,11 +1822,17 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     try extra.append(arena, .{ .name = "GIT_TERMINAL_PROMPT", .value = "0" });
     // A commit fetched is the same tree every time, as Dagger's `git` keys it, so under step
     // caching it is a layer like a step's, keyed on its script (the URL and the commit), never
-    // on the token in `extra`. A branch or tag moves, so its fetch always runs.
-    const key = if (checkout.isSha(f.want))
-        try b.keyFor(.step, aw.written(), &.{}, b.uid, b.gid)
+    // on the token in `extra`. A branch or tag moves, so its fetch always runs. The tags it reads
+    // move too, with the commit staying: their digest is part of the key (`tagsDigest`).
+    const env = try b.envStrings(extra.items);
+    const tags: ?[]const u8 = if (f.tags and checkout.isSha(f.want))
+        try b.tagsDigest(f.url, env)
     else
-        null;
+        "";
+    const key = if (tags == null or !checkout.isSha(f.want))
+        null
+    else
+        try b.keyFor(.step, try std.fmt.allocPrint(arena, "{s}\n# tags {s}", .{ aw.written(), tags.? }), &.{}, b.uid, b.gid);
     const claim = b.claimKey(key) catch |e| switch (e) {
         error.Stopped => {
             f.result = .{ .failed = "the step was stopped" };
@@ -1823,7 +1848,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     var out: Captured = .{ .arena = arena };
     const ended = try b.exec(
         aw.written(),
-        try b.envStrings(extra.items),
+        env,
         &.{},
         b.uid,
         b.gid,
@@ -1843,6 +1868,23 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
             "the job's own repository; another private one cannot be checked out)" else "",
     }) };
     return f;
+}
+
+/// A digest of the tags `url`'s repository has and where they point, as `git fetch --tags` reads
+/// them: a checkout of a commit is the same tree every time, but its tags are not, so a replay
+/// keyed without them would keep the old ones. Null when they could not be listed: the fetch then
+/// runs, and says why it cannot.
+fn tagsDigest(b: *Backend, url: []const u8, env: []const []const u8) !?[]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(b.arena);
+    try aw.writer.writeAll("tags=$(git ls-remote --tags -- ");
+    try dagger.shellQuote(&aw.writer, try std.fmt.allocPrint(b.arena, "{s}.git", .{url}));
+    try aw.writer.writeAll(") && printf '%s' \"$tags\" | sha256sum");
+    var out: Captured = .{ .arena = b.arena };
+    const ended = try b.exec(aw.written(), env, &.{}, b.uid, b.gid, out.output());
+    defer b.dropLastLayer();
+    if (ended.code != 0 or ended.failure.len > 0 or ended.killed) return null;
+    const digest = std.mem.trim(u8, out.text.items, " \n");
+    return if (digest.len == 0) null else digest;
 }
 
 /// The contents of `path` as the job's last step left it (a problem matcher's file), relative
@@ -1871,6 +1913,35 @@ pub fn readFile(b: *Backend, path: []const u8) ?[]const u8 {
 }
 
 pub const max_read = 16 * 1024 * 1024;
+
+/// `hashFiles(args)` over the job's files as the next step would see them (`native/hash_files.zig`):
+/// the layers as they are now, so what earlier steps wrote is there, read by the runner with no
+/// mount. `ws` is the workspace.
+pub fn hashFiles(
+    b: *Backend,
+    arena: Allocator,
+    ws: []const u8,
+    args: []const []const u8,
+) Allocator.Error!expr.HashFiles.Result {
+    // Topmost first, as `execIn`'s overlay stacks them.
+    const n = b.layers.items.len;
+    const layers = try b.gpa.alloc([]const u8, n + b.seed_layers.items.len + 1);
+    defer b.gpa.free(layers);
+    for (b.layers.items, 0..) |l, i| layers[n - 1 - i] = l.path;
+    @memcpy(layers[n..][0..b.seed_layers.items.len], b.seed_layers.items);
+    layers[layers.len - 1] = b.rootfs;
+    var limits = b.hash_settings.limits(b.io);
+    limits.cancel = b.cancel;
+    const stack: hash_files.Stack = .{ .layers = layers, .opaque_xattr = b.opaqueXattr(), .limits = limits };
+    // The call's own memory is freed when it returns; the job's arena gets the result only.
+    return hash_files.hashFiles(b.gpa, arena, b.io, stack, ws, dagger.runner_home, args);
+}
+
+/// Overlay's attribute that marks a directory opaque: `trusted.` when the job's overlay is mounted
+/// as the host's root, `user.` under `userxattr` (a rootless runner's).
+fn opaqueXattr(b: *const Backend) [:0]const u8 {
+    return if (b.how.userns == .mapped) "trusted.overlay.opaque" else "user.overlay.opaque";
+}
 
 /// Layer `i`'s path (P7's callers; P2's `Layer.path`).
 pub fn layerPath(b: *Backend, i: usize) ![]const u8 {
@@ -2341,12 +2412,7 @@ fn flatten(b: *Backend) !void {
     }
     const name = try b.layerName('F');
     const out = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name });
-    // Overlay's xattrs are `trusted.` when mounted as the host's root, `user.` under `userxattr`.
-    const opaque_xattr = if (b.how.userns == .mapped)
-        "trusted.overlay.opaque"
-    else
-        "user.overlay.opaque";
-    try Store.flatten(arena, b.io, paths, out, opaque_xattr);
+    try Store.flatten(arena, b.io, paths, out, b.opaqueXattr());
     const top_key = b.layers.items[b.layers.items.len - 1].key;
     b.layers.clearRetainingCapacity();
     try b.layers.append(arena, .{
@@ -3089,13 +3155,14 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
         try expectReason("RUNNER_NATIVE_ROOTLESS", unsupported(io, run_only, root, rootless));
     }
 
-    // `hashFiles()` anywhere in the job's expressions, in any case.
+    // `hashFiles()` is native: the runner reads the job's layers (`hash_files.zig`), in any
+    // expression and in any case.
     var hashed = testStep("true");
     hashed.env = &.{.{ .name = "K", .value = .{ .expr = "HASHFILES('**/go.sum')" } }};
-    try expectReason("hashFiles", unsupported(io, testJob(&.{hashed}), root, ok));
+    try std.testing.expect(unsupported(io, testJob(&.{hashed}), root, ok) == null);
     var hashed_if = testStep("true");
     hashed_if.condition = "hashFiles('x') != ''";
-    try expectReason("hashFiles", unsupported(io, testJob(&.{hashed_if}), root, ok));
+    try std.testing.expect(unsupported(io, testJob(&.{hashed_if}), root, ok) == null);
 
     // Without the operator's rootfs the default image is pulled natively; one that is set must
     // be there.
@@ -3145,6 +3212,23 @@ test "a job that cannot be native runs on Dagger, and Set up job says why" {
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "This job runs on Dagger: the " ++
         "native store is not set up") != null);
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "Engine: Dagger") != null);
+}
+
+test "a job sent to Dagger that cannot start it fails with the reason it was sent and what Dagger lacked" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    // No `dagger_cmd` that exists (a test's is /nonexistent/dagger), as in a stress test's workers.
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = .{ .vouched = true, .rootless = true },
+    }, testJob(&.{testStep("echo hi")}), &log);
+    try std.testing.expect(!res.succeeded);
+    const msg = res.engine_error orelse "";
+    try std.testing.expect(std.mem.indexOf(u8, msg, "could not start Dagger (FileNotFound). " ++
+        "This job runs on Dagger: the native store is not set up") != null);
 }
 
 test "parity: a native job's base has the environment of Dagger's base container" {
@@ -3311,6 +3395,66 @@ test "a native checkout that cannot fetch fails its step with why" {
     }, job, &log);
     try std.testing.expectEqual(dagger.Outcome.failure, res.steps[0].outcome);
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "could not fetch o/r@0123456") != null);
+}
+
+test "native step cache: a checkout of a commit with fetch-tags sees the tags as they are now" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try cachedConfig(arena, &tmp);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const git = try std.fmt.allocPrint(arena, "git -c user.name=t -c user.email=t@t -C '{s}/src'", .{root});
+    const make = try std.fmt.allocPrint(arena, "set -e; cd '{s}'; git init -q --bare o/r.git; " ++
+        "git init -q src; cd src; echo one > file; git add file; {s} commit -q -m one; " ++
+        "{s} tag v1; {s} push -q ../o/r.git HEAD:refs/heads/main v1; " ++
+        "echo two > file; {s} commit -qam two; {s} push -q ../o/r.git HEAD:refs/heads/main", .{
+        root, git, git, git, git, git,
+    });
+    const made = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", make } }) catch
+        return skip(false, "git is not installed");
+    if (made.term != .exited or made.term.exited != 0)
+        return skip(false, "git could not make a repository");
+    const sha = std.mem.trim(u8, (try std.process.run(arena, io, .{
+        .argv = &.{ "git", "-C", try std.fmt.allocPrint(arena, "{s}/src", .{root}), "rev-parse", "HEAD" },
+    })).stdout, "\n");
+    try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "rootfs/{s}", .{root}));
+    c.cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{
+        c.cfg.binds,
+        &.{.{ .host = root, .at = root }},
+    });
+
+    var co = testStep("");
+    co.name = "checkout";
+    co.action = .{ .checkout = &.{
+        .{ .name = "ref", .value = .{ .lit = sha } },
+        .{ .name = "fetch-tags", .value = .{ .lit = "true" } },
+    } };
+    const check = testStep("echo tag-v1=$(git rev-parse --short v1)");
+    var job = testJob(&.{ co, check });
+    job.github.server_url = try std.fmt.allocPrint(arena, "file://{s}", .{root});
+    job.env = &.{.{ .name = "GIT_CONFIG_PARAMETERS", .value = .{ .lit = "'safe.directory=*'" } }};
+    const first = try runCached(arena, c.cfg, job, "j1");
+    try expectSucceeded(first);
+
+    // v1 moves to the second commit, as a release tag does, and the job runs again.
+    const moved = try std.process.run(arena, io, .{ .argv = &.{
+        "sh", "-c", try std.fmt.allocPrint(arena, "set -e; {s} tag -f v1 {s}; {s} push -q -f ../o/r.git v1", .{ git, sha, git }),
+    } });
+    try std.testing.expectEqual(@as(u8, 0), moved.term.exited);
+    const second = try runCached(arena, c.cfg, job, "j2");
+    try expectSucceeded(second);
+    const now = try std.fmt.allocPrint(arena, "tag-v1={s}", .{sha[0..7]});
+    if (std.mem.indexOf(u8, second.text, now) == null) {
+        std.debug.print("the second run did not see v1 at {s}:\n{s}\n", .{ sha[0..7], second.text });
+        return error.TestUnexpectedResult;
+    }
+    // With the tags as they were, the checkout and the step after it are replayed.
+    const third = try runCached(arena, c.cfg, job, "j3");
+    try expectSucceeded(third);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, third.text, dagger.native_reused_note));
 }
 
 test "parity: a run-only job gives the same results and step output on Dagger and native" {
@@ -3507,7 +3651,8 @@ test "native tool cache volume: a replayed step that points into it runs again (
     _ = try runCachedJob(arena, c.cfg, plain, caches, .{ .ran = "j2" });
     try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "plain"));
     // One that installs into the tool cache and puts the tree on PATH: its tree is in the
-    // volume, in no layer, and no tree is checked natively, so its record is not trusted.
+    // volume, in no layer, and no checked tree holds it (the check is off here), so its record is
+    // not trusted.
     const install = testJob(&.{testStep("echo x >> /shared/install; " ++
         "mkdir -p $RUNNER_TOOL_CACHE/t/1 && echo $RUNNER_TOOL_CACHE/t/1 >> $GITHUB_PATH")});
     _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j3" });
@@ -3519,6 +3664,76 @@ test "native tool cache volume: a replayed step that points into it runs again (
     _ = try runCachedJob(arena, c.cfg, in_layer, .{}, .{ .ran = "j5" });
     _ = try runCachedJob(arena, c.cfg, in_layer, .{}, .{ .ran = "j6" });
     try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "layer"));
+}
+
+test "native tool trees: an installing step replays while its tree is held, not once changed" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    const caches: volumes.Options = .{
+        .package_caches = true,
+        .trusted = true,
+        .tool_trees = true,
+    };
+    // What install-zig.sh does: a tree TOOL/VERSION/NAME in the tool cache, on PATH, and the
+    // digest it pins read from the variable "Set up job" sets. The step is the same text every job.
+    const install = testJob(&.{
+        testStep("echo x >> /shared/install; " ++
+            "echo \"trees=[$ZIG_RUNNER_TOOL_TREES] full=[$ZIG_RUNNER_TOOL_TREES_FULL]\"; " ++
+            "mkdir -p $RUNNER_TOOL_CACHE/t/1/x64 && echo v1 > $RUNNER_TOOL_CACHE/t/1/x64/bin && " ++
+            "echo $RUNNER_TOOL_CACHE/t/1/x64 >> $GITHUB_PATH"),
+        testStep("echo y >> /shared/after"),
+    });
+    // The first job finds no tree, and leaves one. The second sees it in "Set up job", so its
+    // steps' keys are new (the variable is part of each), and the step finds the tree installed.
+    const j1 = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j1" });
+    try expectLines(j1.text, &.{"trees=[] full=[]"});
+    const j2 = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j2" });
+    try expectLines(j2.text, &.{
+        "Tool cache: checked t/1/x64 (1 files, ",
+        "/opt/hostedtoolcache/t/1/x64] full=[",
+    });
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "install"));
+    // The third has the same tree, so the install step replays, though it names a directory in
+    // a volume that is in no layer (#229), and so does the step after it.
+    const j3 = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j3" });
+    try expectLines(j3.text, &.{"/opt/hostedtoolcache/t/1/x64]"});
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "install"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "after"));
+    // A tree another job changed (the volume's file, from the host) is not replayed against: the
+    // digest, and with it every step's key, is new.
+    const tools = try std.fmt.allocPrint(arena, "{s}/volumes/o/r/repo/toolcache", .{c.cfg.store});
+    var dir = try std.Io.Dir.cwd().openDir(io, tools, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    // Beside the volume's directory is its lock file.
+    const image = while (try it.next(io)) |e| {
+        if (e.kind == .directory) break e;
+    } else return error.TestUnexpectedResult;
+    const bin = try std.fmt.allocPrint(arena, "{s}/{s}/t/1/x64/bin", .{ tools, image.name });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = bin, .data = "v2\n" });
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j4" });
+    try std.testing.expectEqual(@as(usize, 3), runs(arena, c.shared, "install"));
+    try std.testing.expectEqual(@as(usize, 3), runs(arena, c.shared, "after"));
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j5" });
+    try std.testing.expectEqual(@as(usize, 3), runs(arena, c.shared, "install"));
+    // A link added to the tree is in no digest the install script pins, and in the other one:
+    // the step runs again.
+    const link = try std.fmt.allocPrint(arena, "{s}/{s}/t/1/x64/lnk", .{ tools, image.name });
+    try std.Io.Dir.cwd().symLink(io, "bin", link, .{});
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j5b" });
+    try std.testing.expectEqual(@as(usize, 4), runs(arena, c.shared, "install"));
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j5c" });
+    try std.testing.expectEqual(@as(usize, 4), runs(arena, c.shared, "install"));
+    // With the check off, as before: the step runs again every job.
+    const off: volumes.Options = .{ .package_caches = true, .trusted = true };
+    _ = try runCachedJob(arena, c.cfg, install, off, .{ .ran = "j6" });
+    _ = try runCachedJob(arena, c.cfg, install, off, .{ .ran = "j7" });
+    try std.testing.expectEqual(@as(usize, 6), runs(arena, c.shared, "install"));
 }
 
 test "a native step is contained: pivot_root, masked /proc, Docker's capabilities, no_new_privs" {
@@ -5366,6 +5581,7 @@ fn runCachedJob(
         .zig_local_cache_max_mb = caches.zig_local_cache_max_mb,
         .zig_seeds = caches.zig_seeds,
         .zig_seeds_unverified = caches.zig_seeds_unverified,
+        .tool_trees = caches.tool_trees,
     }, job, &log);
     const text = w.written();
     for (res.steps) |s| if (s.outcome != .success) {
@@ -5797,4 +6013,207 @@ test "a native set-up that fails says what it did and on which path" {
         std.debug.print("why: {s}\n", .{why});
         return error.TestUnexpectedResult;
     }
+}
+
+/// GitHub's `hashFiles()` of files with these contents, in this order.
+fn hashOfFiles(contents: []const []const u8) [64]u8 {
+    var all = std.crypto.hash.sha2.Sha256.init(.{});
+    for (contents) |c| {
+        var d: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(c, &d, .{});
+        all.update(&d);
+    }
+    return std.fmt.bytesToHex(all.finalResult(), .lower);
+}
+
+/// The steps of `hashFiles()`'s tests: one writes the files (`lock` is the first one's text), the
+/// others read them where an expression can: a script, `env:`, `if:`, a name, the job's outputs.
+/// Step 4 deletes a file written below it (a whiteout) and makes a link; step 5 reads the tree
+/// again, and hashes it as the step's own overlay sees it (the oracle) as well.
+fn hashingJob(arena: Allocator, lock: []const u8) !job_mod.Job {
+    const s1 = testStep(try std.fmt.allocPrint(arena, "echo x >> /shared/s1; printf '{s}' > lock.txt; " ++
+        "mkdir -p sub; printf two > sub/lock.txt", .{lock}));
+    var s2 = testStep("");
+    s2.action.script.script = .{ .expr = "format('echo x >> /shared/s2; echo key={0}.', hashFiles('**/lock.txt'))" };
+    var s3 = testStep("echo x >> /shared/s3; echo env=$K.");
+    s3.env = &.{.{ .name = "K", .value = .{ .expr = "hashFiles('**/lock.txt', '!sub/**')" } }};
+    s3.condition = "hashFiles('**/lock.txt') != ''";
+    s3.name_expr = "format('named-{0}', hashFiles('sub/lock.txt'))";
+    const s4 = testStep("echo x >> /shared/s4; printf changed > lock.txt; rm sub/lock.txt; " ++
+        "mkdir sub2; printf z > sub2/a; ln -s sub2 dl");
+    var s5 = testStep("echo x >> /shared/s5; echo key2=$KEY2. follow=$FOLLOW. link=$LINK. gone=$GONE. all=$ALL.\n" ++
+        "echo oracle=$(python3 -c \"import hashlib,os\n" ++
+        "h=hashlib.sha256()\n" ++
+        "def walk(d):\n" ++
+        "  for n in sorted(os.listdir(d)):\n" ++
+        "    p=d+'/'+n\n" ++
+        "    if os.path.isdir(p):\n" ++
+        "      if not os.path.islink(p): walk(p)\n" ++
+        "    else: h.update(hashlib.sha256(open(p,'rb').read()).digest())\n" ++
+        "walk('.')\n" ++
+        "print(h.hexdigest())\")");
+    s5.env = &.{
+        .{ .name = "KEY2", .value = .{ .expr = "hashFiles('**/lock.txt')" } },
+        .{ .name = "FOLLOW", .value = .{ .expr = "hashFiles('--follow-symbolic-links', 'dl/**')" } },
+        .{ .name = "LINK", .value = .{ .expr = "hashFiles('dl')" } },
+        .{ .name = "GONE", .value = .{ .expr = "hashFiles('sub/lock.txt')" } },
+        .{ .name = "ALL", .value = .{ .expr = "hashFiles('**')" } },
+    };
+    var s6 = testStep("echo x >> /shared/s6; echo ran-if");
+    s6.condition = "hashFiles('sub/lock.txt') == '' && hashFiles('dl/*') == ''";
+    var job = testJob(try arena.dupe(job_mod.Step, &.{ s1, s2, s3, s4, s5, s6 }));
+    job.outputs = &.{.{ .name = "key", .value = .{ .expr = "hashFiles('**/lock.txt')" } }};
+    return job;
+}
+
+test "native hashFiles: steps read the files the steps before them left, replayed or run, and a changed file is not served a stale replay" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+
+    const one = hashOfFiles(&.{ "one", "two" });
+    const first_only = hashOfFiles(&.{"one"});
+    const sub_only = hashOfFiles(&.{"two"});
+    const upper = hashOfFiles(&.{ "ONE", "two" });
+    const changed = hashOfFiles(&.{"changed"});
+    // What step 5 sees: lock.txt as step 4 wrote it, sub/lock.txt gone, `dl` (to a directory) not
+    // a file, `sub2/a` through it when links are followed, and the whole tree as the oracle walks.
+    const whole = hashOfFiles(&.{ "changed", "z" });
+    const via_link = hashOfFiles(&.{"z"});
+
+    const first = try runCached(arena, c.cfg, try hashingJob(arena, "one"), "j1");
+    try expectSucceeded(first);
+    try expectLines(first.text, &.{
+        try std.fmt.allocPrint(arena, "key={s}.", .{&one}),
+        try std.fmt.allocPrint(arena, "env={s}.", .{&first_only}),
+        try std.fmt.allocPrint(arena, "key2={s}. follow={s}. link=. gone=. all={s}.", .{ &changed, &via_link, &whole }),
+        // The overlay a step sees, walked and hashed in the step: the runner's merge of the layers
+        // gave the same files, in the same order, with the same hash.
+        try std.fmt.allocPrint(arena, "oracle={s}", .{&whole}),
+        "ran-if",
+    });
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "named-{s}", .{&sub_only}), first.res.steps[2].name);
+    // The job's outputs are read once the last step has run.
+    try std.testing.expectEqualStrings(&changed, first.res.outputs[0].value);
+
+    // The same job again: every step replayed, the hash read from the layers the store gave back,
+    // and the replayed log the live one.
+    const second = try runCached(arena, c.cfg, try hashingJob(arena, "one"), "j2");
+    try expectSucceeded(second);
+    for ([_][]const u8{ "s1", "s2", "s3", "s4", "s5", "s6" }) |name|
+        try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, name));
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, second.text, dagger.native_reused_note));
+    try std.testing.expectEqualStrings(&changed, second.res.outputs[0].value);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "named-{s}", .{&sub_only}), second.res.steps[2].name);
+    const live = try replayableLines(arena, first.text);
+    const replayed = try replayableLines(arena, second.text);
+    try std.testing.expectEqual(live.len, replayed.len);
+    for (live, replayed) |l, r| try std.testing.expectEqualStrings(l, r);
+
+    // Another first file: the steps that read it print its hash and run again, none is served the
+    // earlier job's output (whose `key=` has the other hash).
+    const third = try runCached(arena, c.cfg, try hashingJob(arena, "ONE"), "j3");
+    try expectSucceeded(third);
+    for ([_][]const u8{ "s1", "s2", "s3", "s4", "s5", "s6" }) |name|
+        try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, name));
+    try expectLines(third.text, &.{try std.fmt.allocPrint(arena, "key={s}.", .{&upper})});
+    try std.testing.expect(std.mem.indexOf(u8, third.text, &one) == null);
+}
+
+test "native hashFiles: no match is an empty string, a pattern with `..` fails the step, as on Dagger" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var none = testStep("");
+    none.action.script.script = .{ .expr = "format('echo none-{0}. {1}.', hashFiles('**/missing.lock'), hashFiles('/elsewhere/x', '!a'))" };
+    var dots = testStep("echo not-reached");
+    dots.action.script.script = .{ .expr = "format('echo {0}', hashFiles('sub/../lock.txt'))" };
+    const r = try runNativeJob(arena, cfg, testJob(&.{ none, dots }), .root);
+    try std.testing.expectEqual(dagger.Outcome.success, r.res.steps[0].outcome);
+    try expectLines(r.text, &.{"none-. ."});
+    try std.testing.expectEqual(dagger.Outcome.failure, r.res.steps[1].outcome);
+    try expectLines(r.text, &.{"could not evaluate the script: hashFiles(sub/../lock.txt) failed"});
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "not-reached") == null);
+}
+
+test "native hashFiles: a link a step planted out of the job's tree does not read the host's files" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    try tmp.dir.createDirPath(io, "host-dir");
+    try tmp.dir.writeFile(io, .{ .sub_path = "host-dir/secret.txt", .data = "host secret" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const host_dir = try std.fmt.allocPrint(arena, "{s}/host-dir", .{root});
+    // The host's directory under the workspace, by an absolute link and by one of `..` (as many as
+    // reach the host's root, if the job's were it).
+    const plant = try std.fmt.allocPrint(arena, "printf ok > ok.txt; ln -s {s} abs-dir; " ++
+        "ln -s {s}/secret.txt abs-file; ln -s ../../../../../../../../../../../../../../../..{s} rel-dir; " ++
+        "true", .{ host_dir, host_dir, host_dir });
+    var follow = testStep("");
+    follow.action.script.script = .{ .expr = "format('echo follow={0}.', hashFiles('--follow-symbolic-links', '**'))" };
+    var plain = testStep("");
+    plain.action.script.script = .{ .expr = "format('echo plain={0}.', hashFiles('abs-file'))" };
+    const r = try runNativeJob(arena, cfg, testJob(&.{ testStep(plant), follow, plain }), .root);
+    const ok = hashOfFiles(&.{"ok"});
+    // Followed, the links lead to nothing in the job's tree: only `ok.txt` is hashed. Not followed,
+    // a link to a file that is not there fails the call, rather than hash the host's file.
+    try expectLines(r.text, &.{try std.fmt.allocPrint(arena, "follow={s}.", .{&ok})});
+    try std.testing.expectEqual(dagger.Outcome.failure, r.res.steps[2].outcome);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "plain=") == null);
+    var dir = try tmp.dir.openDir(io, "host-dir", .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |e| try std.testing.expectEqualStrings("secret.txt", e.name);
+}
+
+/// Two steps whose text is the same in every job: the first writes the file from its env, the
+/// second reads its hash through its own env. Only `content` differs between jobs.
+fn envJob(arena: Allocator, content: []const u8) !job_mod.Job {
+    var write = testStep("echo x >> /shared/w; printf '%s' \"$SEED\" > seed.txt");
+    write.env = try arena.dupe(job_mod.Input, &.{.{ .name = "SEED", .value = .{ .lit = content } }});
+    var read = testStep("echo x >> /shared/r; echo read=$K.");
+    read.env = &.{.{ .name = "K", .value = .{ .expr = "hashFiles('seed.txt')" } }};
+    return testJob(try arena.dupe(job_mod.Step, &.{ write, read }));
+}
+
+test "native hashFiles: a change only in a step's env, or in the file that gives it the hash, is not replayed from the old job" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    const one = hashOfFiles(&.{"one"});
+    const two = hashOfFiles(&.{"two"});
+
+    const first = try runCached(arena, c.cfg, try envJob(arena, "one"), "j1");
+    try expectSucceeded(first);
+    try expectLines(first.text, &.{try std.fmt.allocPrint(arena, "read={s}.", .{&one})});
+    const again = try runCached(arena, c.cfg, try envJob(arena, "one"), "j2");
+    try expectSucceeded(again);
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "w"));
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "r"));
+    // Neither step's text changes, only the writer's env: the writer runs again, the reader's hash
+    // is of the new file, and it runs again too. A replay of either would print `one`'s hash.
+    const other = try runCached(arena, c.cfg, try envJob(arena, "two"), "j3");
+    try expectSucceeded(other);
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "w"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "r"));
+    try expectLines(other.text, &.{try std.fmt.allocPrint(arena, "read={s}.", .{&two})});
+    try std.testing.expect(std.mem.indexOf(u8, other.text, &one) == null);
+    // And the first job's own steps are still kept: `one` replays again.
+    const back = try runCached(arena, c.cfg, try envJob(arena, "one"), "j4");
+    try expectSucceeded(back);
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "w"));
+    try expectLines(back.text, &.{try std.fmt.allocPrint(arena, "read={s}.", .{&one})});
 }

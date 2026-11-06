@@ -62,6 +62,8 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 		fi
 		grep "passed;" "$log" | tail -1 | sed "s/^/$hook: /" >&2
 		rm -f "$log"
+		say "every test file is compiled"
+		../.github/scripts/test-files.sh >/dev/null || fail "a file's tests are not in the test binary: ../.github/scripts/test-files.sh shows which"
 	)
 	say "unsafe constructs ratchet"
 	(cd "$tree" && .github/scripts/unsafe-ratchet.sh >/dev/null) || fail "more unsafe casts than the baseline: .github/scripts/unsafe-ratchet.sh shows which"

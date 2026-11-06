@@ -61,6 +61,10 @@ pub const Options = struct {
     zig_local_cache_max_mb: u32 = 0,
     zig_seeds: []const config.ZigSeed = &.{},
     zig_seeds_unverified: []const []const u8 = &.{},
+    /// "Set up job" checks the tool cache's trees (`tool_trees.zig`).
+    tool_trees: bool = false,
+    /// The job's cancel, which ends that check.
+    cancel: ?*const dagger.Cancel = null,
 
     pub fn of(opts: dagger.Options) Options {
         return .{
@@ -71,6 +75,8 @@ pub const Options = struct {
             .zig_local_cache_max_mb = opts.zig_local_cache_max_mb,
             .zig_seeds = opts.zig_seeds,
             .zig_seeds_unverified = opts.zig_seeds_unverified,
+            .tool_trees = opts.tool_trees,
+            .cancel = opts.cancel,
         };
     }
 };
@@ -218,6 +224,8 @@ pub const Plan = struct {
     /// Where the `toolcache` volume is bound (RUNNER_TOOL_CACHE), when the job has one: what a
     /// step installs there is in no layer, so a replay is checked against it (`Exec.tool_cache`).
     tool_cache: ?[]const u8 = null,
+    /// The same volume's directory on the host, where `tool_trees.check` reads the trees.
+    tool_cache_host: ?[]const u8 = null,
     /// Zig's local cache volume, when its generations are rolled (`zig_local_cache_max_mb`).
     zig_local_roll: ?[]const u8 = null,
     /// The volume of the `builtin.zig` files the local cache's manifests name, bound once the
@@ -280,7 +288,10 @@ pub fn plan(
         const v = try open(arena, io, store, key.items, .shared, owner);
         try p.held.append(arena, v);
         const path = if (as_runner) try set_up.runnerCachePath(arena, i) else d.path;
-        if (std.mem.eql(u8, d.name, "toolcache")) p.tool_cache = path;
+        if (std.mem.eql(u8, d.name, "toolcache")) {
+            p.tool_cache = path;
+            p.tool_cache_host = v.dir;
+        }
         const zig = std.mem.eql(u8, d.name, set_up.zig_packages);
         // Zig's global cache is the job's own (its layers, over the seed); only its package
         // tarballs, which Zig hashes again when it unpacks them, are in the volume.

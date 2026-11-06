@@ -116,8 +116,14 @@ pub const Admission = struct {
     io: std.Io,
     limits: Limits,
     paths: Paths = .{},
-    /// How often a held runner looks again.
+    /// How often a held runner looks again, at the latest: it looks at once when `changes` moves.
     recheck: std.Io.Duration = .fromSeconds(5),
+    /// Counts what may have lowered a reservation (`Gate.leave`, `assigned`, `native`,
+    /// `backToEngine`, `ended`), so that a held runner looks again when it happens instead of
+    /// at the next `recheck`. A burst of short jobs went through one runner at a time, each
+    /// waiting out the 5 s before it saw the reservation of the one before it drop (razorbill,
+    /// 2026-11-05: seven jobs of 1 to 7 s each waited 4 to 12 s in the queue).
+    epoch: std.atomic.Value(u32) = .init(0),
     /// Runners let through to poll for a job: each may be handed one at any moment.
     polling: u32 = 0,
     /// The pool runs steps natively (`RUNNER_BACKEND=native`): a runner polling reserves a native
@@ -182,6 +188,16 @@ pub const Admission = struct {
     pub fn init(io: std.Io, limits: Limits, slots: []Slot) Admission {
         @memset(slots, .{});
         return .{ .io = io, .limits = limits, .slots = slots };
+    }
+
+    /// The count of events that may have lowered a reservation: a held runner looks again when
+    /// it differs from what it read before its last look.
+    pub fn changes(a: *const Admission) u32 {
+        return a.epoch.load(.acquire);
+    }
+
+    fn changed(a: *Admission) void {
+        _ = a.epoch.fetchAdd(1, .release);
     }
 
     /// What a job whose name is not known yet reserves: the worst case of the pool's backend.
@@ -409,6 +425,7 @@ pub const Gate = struct {
         const a = g.pool;
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
+        defer a.changed();
         if (g.claimed) a.polling -= 1;
         g.claimed = false;
         if (!took_job) return;
@@ -427,6 +444,7 @@ pub const Gate = struct {
         const a = g.pool;
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
+        defer a.changed();
         const s = &a.slots[g.slot];
         std.debug.assert(s.running());
         s.key = key;
@@ -458,6 +476,7 @@ pub const Gate = struct {
         const a = g.pool;
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
+        defer a.changed();
         const s = &a.slots[g.slot];
         if (!s.running()) return null;
         if (!s.native) {
@@ -489,6 +508,7 @@ pub const Gate = struct {
         const a = g.pool;
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
+        defer a.changed();
         const s = &a.slots[g.slot];
         if (!s.running()) return;
         if (s.native) s.overlaps = a.shareEngine(g.slot, true);
@@ -537,6 +557,7 @@ pub const Gate = struct {
         const a = g.pool;
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
+        defer a.changed();
         const s = a.slots[g.slot];
         a.slots[g.slot] = .{};
         if (s.replayed) return null;
@@ -1245,6 +1266,31 @@ test "the pool reserves memory for runners polling and jobs just started" {
     gates[2].leave(false);
     try std.testing.expectEqual(@as(u32, 0), pool.polling);
     try std.testing.expect(gates[3].check() == null);
+}
+
+test "what may lower a reservation moves the count a held runner waits on" {
+    var slots: [2]Admission.Slot = undefined;
+    var pool: Admission = .init(std.testing.io, .{}, &slots);
+    var g: Gate = .{ .pool = &pool };
+    var seen = pool.changes();
+    g.leave(true);
+    try std.testing.expect(pool.changes() != seen);
+    seen = pool.changes();
+    g.assigned(jobKey("o/r", "o/r/.github/workflows/w.yml", "j"));
+    try std.testing.expect(pool.changes() != seen);
+    seen = pool.changes();
+    _ = g.native(null);
+    try std.testing.expect(pool.changes() != seen);
+    seen = pool.changes();
+    g.backToEngine();
+    try std.testing.expect(pool.changes() != seen);
+    seen = pool.changes();
+    _ = g.ended();
+    try std.testing.expect(pool.changes() != seen);
+    // A look moves nothing: held runners do not wake each other.
+    seen = pool.changes();
+    _ = g.check();
+    try std.testing.expectEqual(seen, pool.changes());
 }
 
 test "a job that is over reserves nothing, however soon it ended" {

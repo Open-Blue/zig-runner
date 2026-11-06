@@ -1,0 +1,3 @@
+kind: Fixed
+body: The end-to-end suite says why a job has no log, with what the runner reported of its log uploads, and does not wait for one the runner says failed
+time: 2026-11-06T01:25:34.114343296-05:00

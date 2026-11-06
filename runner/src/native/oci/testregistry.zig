@@ -385,7 +385,9 @@ test "native oci pull: a kept-alive connection the registry closed is replaced; 
         .creds = creds,
         .owners = false,
     }, &why) catch |e| {
-        std.debug.print("pull: {s}\n", .{why});
+        std.debug.print("pull: {s}; the server read {d} requests on {d} connections\n", .{
+            why, server.requests.load(.acquire), server.connections.load(.acquire),
+        });
         return e;
     };
     try testing.expectEqualStrings(img.manifest, got.manifest);

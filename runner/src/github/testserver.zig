@@ -24,6 +24,11 @@
 //!   /app/installations/<id>/access_tokens  201, installation token `ghs_<n>` (n counts them, in
 //!                `Server.app_tokens`) expiring at 2030-01-01T00:00:00Z, for a JWT
 //!   /app-token/<token>  200 "ok" with `Authorization: Bearer <token>`, else 401
+//!   /results/twirp/results.services.receiver.Receiver/<Method>  200, a `logs_url` naming
+//!                /results-blob for the Get...SignedBlobURL methods, "{}" for the rest; /results-blob
+//!                (PUT) 201. Each kind counted in `Server.results`. The first `results_fail`
+//!                requests whose path contains `results_fail_on` answer `results_fail_status`
+//!                instead (a results service having a bad moment).
 //!   anything else 404, with GitHub's `{"message":"Not Found"}`
 //!
 //! Every connection accepted is counted in `Server.accepts`.
@@ -38,6 +43,12 @@ pub const Server = struct {
     polls: std.atomic.Value(u32),
     /// Connections accepted so far.
     accepts: std.atomic.Value(u32),
+    /// Requests to the results service so far: signed URLs asked for, blobs put, metadata made.
+    results: struct { urls: u32 = 0, puts: u32 = 0, metas: u32 = 0, put_bytes: usize = 0 },
+    /// How many requests to a path containing `results_fail_on` answer `results_fail_status`.
+    results_fail: u32,
+    results_fail_on: []const u8,
+    results_fail_status: []const u8,
     /// Installation tokens minted so far (/app/installations/...).
     app_tokens: std.atomic.Value(u32),
     /// Requests to /silent-once/... so far.
@@ -56,6 +67,10 @@ pub const Server = struct {
         s.accepts = .init(0);
         s.app_tokens = .init(0);
         s.silent_once = 0;
+        s.results = .{};
+        s.results_fail = 0;
+        s.results_fail_on = "";
+        s.results_fail_status = "503 Service Unavailable";
         s.held_len = 0;
         s.thread = try std.Thread.spawn(.{}, serve, .{s});
     }
@@ -174,6 +189,28 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
             .{port},
         ) catch return .close;
         respond(out, "200 OK", null, body);
+    } else if (std.mem.startsWith(u8, path, "/results")) {
+        const failing = s.results_fail > 0 and std.mem.indexOf(u8, path, s.results_fail_on) != null;
+        if (failing) s.results_fail -= 1;
+        if (failing) {
+            respond(out, s.results_fail_status, null, "{\"message\":\"try later\"}");
+        } else if (std.mem.eql(u8, path, "/results-blob")) {
+            s.results.puts += 1;
+            s.results.put_bytes = body_len;
+            respond(out, "201 Created", null, "");
+        } else if (std.mem.indexOf(u8, path, "SignedBlobURL") != null) {
+            s.results.urls += 1;
+            var body_buf: [128]u8 = undefined;
+            const body = std.fmt.bufPrint(
+                &body_buf,
+                "{{\"logs_url\":\"http://127.0.0.1:{d}/results-blob\"}}",
+                .{port},
+            ) catch return .close;
+            respond(out, "200 OK", null, body);
+        } else {
+            s.results.metas += 1;
+            respond(out, "200 OK", null, "{}");
+        }
     } else if (std.mem.startsWith(u8, path, "/silent-once/")) {
         respond(out, "200 OK", null, "ok");
     } else if (std.mem.eql(u8, path, "/keep") or std.mem.eql(u8, path, "/keep-close")) {
