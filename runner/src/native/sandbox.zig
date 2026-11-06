@@ -1632,12 +1632,16 @@ test "a link anywhere below a cache volume's root is refused, and above it is th
     defer tmp.cleanup();
     const io = std.testing.io;
     try tmp.dir.createDirPath(io, "store/volumes/key/runner/deeper");
+    try tmp.dir.createDirPath(io, "store/volumes/other-repo/runner");
     try tmp.dir.createDirPath(io, "elsewhere/runner");
     // The operator's store behind a link, as `/var/lib` on another disk is.
     try tmp.dir.symLink(io, "store", "linked-store", .{});
     // What a job in the outer volume can plant: at the last name, and on the way to it.
+    // Out of the root, and more to the point inside it, at another repository's volume, which
+    // staying in the root alone would allow.
     try tmp.dir.symLink(io, "../../../elsewhere", "store/volumes/key/last", .{});
-    try tmp.dir.symLink(io, "../../elsewhere", "store/volumes/middle", .{});
+    try tmp.dir.symLink(io, "other-repo", "store/volumes/middle", .{});
+    try tmp.dir.symLink(io, "../other-repo/runner", "store/volumes/key/neighbour", .{});
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = try tmp.dir.realPathFile(io, ".", &buf);
     const base = buf[0..n];
@@ -1655,6 +1659,8 @@ test "a link anywhere below a cache volume's root is refused, and above it is th
     try std.testing.expect(last == .err);
     const middle = openVolume(arena, root, try std.fmt.allocPrint(arena, "{s}/middle/runner", .{root}));
     try std.testing.expect(middle == .err);
+    const neighbour = openVolume(arena, root, try std.fmt.allocPrint(arena, "{s}/key/neighbour", .{root}));
+    try std.testing.expect(neighbour == .err);
 }
 
 test "homeOf reads the home directory of a uid from /etc/passwd" {
