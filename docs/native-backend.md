@@ -767,14 +767,21 @@ finding it busy goes on; the proof of its locks is proofs/tla/StoreEviction.tla.
   is at that name, and a job opening the inner one meanwhile waits, finds the path gone and starts
   over. A job in the outer volume can delete the inner lock, but it can as well delete the inner
   volume, which is the same repository's.
-- **What will not go.** Removing a dead tree holds two descriptors and no path, moving what is deep
-  up to the top as it goes, so a chain of directories of any depth loses some of itself each pass.
-  A dead name that still cannot be removed is logged, and stops nothing.
-- **Time and memory.** Deleting has a budget of 1.5 s a job, which evicting counts against too. What
-  is left stays under its dead name, the next job's end goes on with it, and nothing more is evicted
-  until it is gone. A pass holds no entry's lock while it walks or deletes, so a job starting waits
-  at most for one rename's sync. It looks at up to 16,384 volumes, and a walk keeps at most 16 MiB of
-  paths. A `syncfs` for a dead name is not bounded by the budget: it takes what the disk takes.
+- **What will not go.** Removing a dead tree goes down by name and back by the descriptors it came
+  through, at most 32, never by `..`, so it cannot reach above the tree whatever moves meanwhile.
+  Deeper than that it moves what is below to the tree's top, as `.cut-<random>` (random, as a job can
+  read its inodes and plant any name it can work out), so a chain of directories of any depth loses
+  some of itself each pass. A dead name that still cannot be removed is logged, and stops nothing.
+- **Time and memory.** Deleting has a budget of 1.5 s a job, which evicting counts against too, and
+  which starts after the sync below. A pass removes at least 64 entries whatever the clock says, so
+  the worse the disk, the less goes, but something does. What is left stays under its dead name, the
+  next job's end goes on with it, and nothing more is evicted until it is gone. A pass holds no
+  entry's lock while it walks or deletes, so a job starting waits at most for one rename's sync. It
+  looks at up to 16,384 volumes, and a walk keeps at most 16 MiB of paths. Under the floor, layers
+  have a budget too: a pass takes one, and more while it has time.
+- **What no budget bounds.** The `syncfs` before deleting from a dead name, once a pass, takes what the
+  disk takes; each eviction's two directory fsyncs likewise, and one layer's delete. All of them are
+  at a job's end, before its result is reported.
 - **Costs left.** Deleting and measuring are at a job's end, before its result is reported
   (`Backend.deinit`), so a job can end up to 1.5 s plus a walk later. A size is the runner's own
   estimate, not the filesystem's: a file with several links counts its share per link.
