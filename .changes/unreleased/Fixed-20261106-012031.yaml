@@ -1,0 +1,3 @@
+kind: Fixed
+body: A runner held at the memory gate looks again as soon as a job starts, is named or ends, instead of at its next 5 s check, so a burst of short jobs no longer waits out the check once per job.
+time: 2026-11-06T01:20:31.754523652-05:00

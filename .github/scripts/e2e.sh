@@ -214,6 +214,10 @@ races() {
 # --- the suite ----------------------------------------------------------------------------------
 
 api() { gh api -H 'X-GitHub-Api-Version: 2022-11-28' "$@"; }
+# gh 2.103 refuses a response with terminal escape sequences (a job's log with colour) unless told
+# to allow them; an older gh has no such flag and does not refuse.
+escapes=()
+if gh api --help 2>&1 | grep -q -- --allow-escape-sequences; then escapes=(--allow-escape-sequences); fi
 failures=0
 fail() {
 	echo "::error::e2e ($backend): $*"
@@ -277,17 +281,27 @@ run_conclusion() {
 	echo "$c"
 }
 
+# uploads_failed JOB_ID: what the runner under test says of the job's log uploads that failed
+# ("job 123: log upload job: FAILED: NameServerFailure"), from its log when `start` started it.
+uploads_failed() {
+	grep -hF -- "job $1: " "$out/runner-$backend.log" 2>/dev/null | grep -E 'upload.*FAILED' |
+		sed -E 's/^job [0-9]+: //' | tr '\n' ';' || true
+}
+
 # job_log JOB_ID [CONCLUSION]: its log, which GitHub may take a few seconds after the job ends to
 # serve. GitHub answers 404 for a log it does not have (a job that never started has none, nor has
-# one still running), so the wait is bounded twice: a skipped job is asked once, and every other
-# job's waits draw on one budget for the whole suite ($log_budget s), so a lagging API costs at
-# most that, not half a minute per job.
+# one still running, nor one whose upload failed: the runner makes one try for the job's whole
+# log, and a DNS failure there left a job that had succeeded with none), so the wait is bounded
+# three times: a skipped job is asked once, so is one whose runner says its upload failed, and
+# every other job's waits draw on one budget for the whole suite ($log_budget s), so a lagging API
+# costs at most that, not half a minute per job. The placeholder says why, and what the runner said.
 log_budget=${E2E_LOG_WAIT:-60}
 job_log() {
-	local log why="" i tries=8
-	[[ ${2:-} == skipped ]] && tries=1
+	local log why="" i tries=8 said
+	said=$(uploads_failed "$1")
+	[[ ${2:-} == skipped || $said == *"log upload job: FAILED"* ]] && tries=1
 	for ((i = 1; i <= tries; i++)); do
-		if log=$(api "repos/$repo/actions/jobs/$1/logs" 2>"$out/log.err") && [[ -n $log ]]; then
+		if log=$(api "${escapes[@]}" "repos/$repo/actions/jobs/$1/logs" 2>"$out/log.err") && [[ -n $log ]]; then
 			printf '%s\n' "$log"
 			return 0
 		fi
@@ -296,7 +310,7 @@ job_log() {
 		sleep 3
 		log_budget=$((log_budget - 3))
 	done
-	echo "(no log: ${why:-empty})"
+	echo "(no log: ${why:-empty}${said:+; the runner: $said})"
 }
 
 # record WORKFLOW ATTEMPT JOBS_JSON: a row of timings.tsv for each job, with its log in $out/logs.
@@ -352,7 +366,14 @@ cancel_runs() {
 }
 
 # expect FILE TEXT [WHAT]: the log has the line.
-expect() { grep -qF -- "$2" "$1" || fail "${3:-$(basename "$1" .log)}: no \"$2\" in its log"; }
+expect() {
+	grep -qF -- "$2" "$1" && return 0
+	if [[ $(head -c 8 "$1") == "(no log:" ]]; then
+		fail "${3:-$(basename "$1" .log)}: no \"$2\", for the log is missing: $(<"$1")"
+	else
+		fail "${3:-$(basename "$1" .log)}: no \"$2\" in its log"
+	fi
+}
 
 check() {
 	label=${2:?}

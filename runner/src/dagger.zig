@@ -215,8 +215,8 @@ pub const Resolved = union(enum) {
 /// index. Renovate moves the pin (renovate.json), and CI checks on every pull request that it is
 /// still a pullable index with the applets the runner uses (.github/scripts/busybox-pin.sh). By
 /// hand, `docker buildx imagetools inspect busybox:1.37.0-musl` prints the index digest.
-pub const busybox_image = "busybox:1.37.0-musl" ++
-    "@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478";
+pub const busybox_image = "busybox:1.38.0-musl" ++
+    "@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6";
 /// Where a Docker action's container gets its static busybox, and HOME (shared by the job's Docker
 /// actions, as GitHub mounts one /github/home into each).
 pub const busybox_path = "/github/_runtime/busybox";
@@ -861,10 +861,16 @@ pub fn run(
 
     const argv: []const []const u8 = opts.test_session_argv orelse
         &.{ opts.dagger_cmd, "run", "--progress=logs", "sh", "-c", session_script };
-    var child = try std.process.spawn(
+    var child = std.process.spawn(
         io,
         .{ .argv = argv, .environ_map = &env, .stdin = .pipe, .stdout = .pipe, .stderr = .pipe },
-    );
+    ) catch |e| {
+        // A job sent here from native (`backend_note`) says why, and what Dagger lacked: a bare
+        // `FileNotFound` out of `spawn` names neither.
+        const note = opts.backend_note orelse return e;
+        return fail(&sh, results, try std.fmt.allocPrint(arena, "could not start Dagger ({s}). " ++
+            "{s}", .{ @errorName(e), note }));
+    };
     // The reader must run while we wait on queries. It owns stderr: `wait` closes the pipes the
     // child still holds, and closing this one under the reader let it read whatever file next got
     // the descriptor (ThreadSanitizer, `zig build test -Dsanitize-thread`).
@@ -958,6 +964,7 @@ fn runNative(
     b.caches = .of(opts_in);
     // The runtime its JavaScript actions get, for the preload in the base (`native/actions.zig`).
     b.js_runtime = opts.js_runtime;
+    b.cancel = opts.cancel;
     // Which ids the job's steps have, as "Set up job" says (`Backend.idsNote`).
     opts.backend_note = try b.idsNote(arena);
     var result = runSteps(arena, io, opts, job, &sh, results, b.transport(), &b) catch |e| switch (e) {
@@ -1896,7 +1903,11 @@ fn runSteps(
             if (e == error.BaseContainerFailed) return fail(sh, results, err_msg);
             return e;
         };
-        break :base .{ .id = "native", .runtime_path = b.runtime_path };
+        break :base .{
+            .id = "native",
+            .runtime_path = b.runtime_path,
+            .tool_trees = b.tool_trees,
+        };
     } else baseContainerId(arena, transport, &ev, job, plan, &secrets, &err_msg) catch |e|
         switch (e) {
             error.BaseContainerFailed => return fail(sh, results, err_msg),
@@ -1907,7 +1918,8 @@ fn runSteps(
     x.native = native;
     x.tool_trees = base.tool_trees;
     // A native job's tool cache is its `toolcache` volume, in no layer, so a replayed step that
-    // points at a tree there runs again (#229): no tree is checked natively (`tool_trees`).
+    // points at a tree there runs again (#229), unless "Set up job" checked a tree that holds it
+    // (`Backend.checkToolTrees`).
     if (native) |b| x.tool_cache = b.cache_plan.tool_cache;
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 

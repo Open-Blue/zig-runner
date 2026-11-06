@@ -156,6 +156,13 @@ pub const Config = struct {
     native_cgroup: []const u8 = "",
     native_memory_max_mb: ?u32 = null,
     native_pids_max: u32 = native_cgroup.default_pids_max,
+    /// What a native job's `hashFiles()` may use: the MiB all of them may hold together in this
+    /// process (`RUNNER_NATIVE_HASHFILES_MEMORY_MB`; null for the smaller of 1 GiB and an eighth of
+    /// the machine's memory, 0 for no limit), and the seconds one may take
+    /// (`RUNNER_NATIVE_HASHFILES_TIMEOUT_S`; GitHub's 120, 0 for no limit). See
+    /// `native/hash_files.zig`.
+    native_hashfiles_memory_mb: ?u32 = null,
+    native_hashfiles_timeout_s: u32 = 120,
 
     /// Experimental: key the steps after one that always runs on what it produced rather than on
     /// the step itself (see `dagger.Options.output_keys`).
@@ -431,6 +438,10 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_CGROUP")) |v| c.native_cgroup = v;
         if (environ.get("RUNNER_NATIVE_MEMORY_MAX_MB")) |v| c.native_memory_max_mb = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_PIDS_MAX")) |v| c.native_pids_max = try num(u32, v);
+        if (environ.get("RUNNER_NATIVE_HASHFILES_MEMORY_MB")) |v|
+            c.native_hashfiles_memory_mb = try num(u32, v);
+        if (environ.get("RUNNER_NATIVE_HASHFILES_TIMEOUT_S")) |v|
+            c.native_hashfiles_timeout_s = try num(u32, v);
 
         if (environ.get("RUNNER_OUTPUT_KEYS")) |v| c.output_keys = try boolean(v);
         if (environ.get("RUNNER_ENFORCE_VOLATILE")) |v| c.enforce_volatile = try boolean(v);
@@ -512,6 +523,8 @@ pub const Config = struct {
         else if (eq(key, "native-cgroup")) c.native_cgroup = val //
         else if (eq(key, "native-memory-max-mb")) c.native_memory_max_mb = try num(u32, val) //
         else if (eq(key, "native-pids-max")) c.native_pids_max = try num(u32, val) //
+        else if (eq(key, "native-hashfiles-memory-mb")) c.native_hashfiles_memory_mb = try num(u32, val) //
+        else if (eq(key, "native-hashfiles-timeout-s")) c.native_hashfiles_timeout_s = try num(u32, val) //
 
         else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache")) c.zig_local_cache = try boolean(val) //
@@ -813,6 +826,23 @@ test "dagger nesting is off by default and can be turned on" {
     try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--dagger-nesting=false" })).dagger_nesting);
     try env.put("RUNNER_DAGGER_NESTING", "maybe");
     try std.testing.expectError(error.InvalidBool, Config.load(&env, &.{"runner"}));
+}
+
+test "the native hashFiles() limits: GitHub's 120 seconds and a share of memory, or what is set" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    const c = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqual(@as(?u32, null), c.native_hashfiles_memory_mb);
+    try std.testing.expectEqual(@as(u32, 120), c.native_hashfiles_timeout_s);
+    try env.put("RUNNER_NATIVE_HASHFILES_MEMORY_MB", "256");
+    try env.put("RUNNER_NATIVE_HASHFILES_TIMEOUT_S", "600");
+    const set = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqual(@as(?u32, 256), set.native_hashfiles_memory_mb);
+    try std.testing.expectEqual(@as(u32, 600), set.native_hashfiles_timeout_s);
+    const flag = try Config.load(&env, &.{ "runner", "--native-hashfiles-timeout-s=0" });
+    try std.testing.expectEqual(@as(u32, 0), flag.native_hashfiles_timeout_s);
 }
 
 test "the native jobs' cgroups and limits: defaults, settings, and parents that are refused" {
