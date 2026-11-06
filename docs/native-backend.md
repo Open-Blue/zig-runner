@@ -981,6 +981,11 @@ proofs/tla/StoreEviction.tla.
   Deeper than that it moves what is below to the tree's top, as `.cut-<random>` (random, as a job can
   read its inodes and plant any name it can work out), so a chain of directories of any depth loses
   some of itself each pass. A dead name that still cannot be removed is logged, and stops nothing.
+  Going down a level counts against a pass's 64 entries like removing one (a chain of directories
+  with no files used to be walked to its end whatever the clock said: 2.9 s against 1.5 s at a
+  depth of 250,000), and a pass the budget stops in the middle of a chain moves the directory it
+  had reached up to the top too, so the next pass does not walk the same levels again. A level
+  costs a descent and a removal, so a pass that is late from the start clears about 32.
 - **Time and memory.** Deleting has a budget of 1.5 s a job, which evicting counts against too, and
   which starts after the sync below. A pass removes at least 64 entries whatever the clock says, so
   the worse the disk, the less goes, but something does. What is left stays under its dead name, the
@@ -991,8 +996,7 @@ proofs/tla/StoreEviction.tla.
 - **What no budget bounds.** The `syncfs` before deleting from a dead name, once a pass, takes what the
   disk takes; each eviction's two directory fsyncs likewise, and one layer's delete. All of them are
   at a job's end, before its result is reported. A dead tree that will not go costs that `syncfs` at
-  every job's end, for as long as it stays. A chain of directories with no files can overrun the
-  budget once a tree: 2.9 s against 1.5 s at a depth of 250,000.
+  every job's end, for as long as it stays.
 - **When a sync fails.** A pass stops there: nothing more is evicted until what went is gone, or a
   disk that fails writes would take entry after entry and free nothing.
 - **Costs left.** Deleting and measuring are at a job's end, before its result is reported
