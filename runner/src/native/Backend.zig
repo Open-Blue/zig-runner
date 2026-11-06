@@ -1766,11 +1766,17 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     try extra.append(arena, .{ .name = "GIT_TERMINAL_PROMPT", .value = "0" });
     // A commit fetched is the same tree every time, as Dagger's `git` keys it, so under step
     // caching it is a layer like a step's, keyed on its script (the URL and the commit), never
-    // on the token in `extra`. A branch or tag moves, so its fetch always runs.
-    const key = if (checkout.isSha(f.want))
-        try b.keyFor(.step, aw.written(), &.{}, b.uid, b.gid)
+    // on the token in `extra`. A branch or tag moves, so its fetch always runs. The tags it reads
+    // move too, with the commit staying: their digest is part of the key (`tagsDigest`).
+    const env = try b.envStrings(extra.items);
+    const tags: ?[]const u8 = if (f.tags and checkout.isSha(f.want))
+        try b.tagsDigest(f.url, env)
     else
-        null;
+        "";
+    const key = if (tags == null or !checkout.isSha(f.want))
+        null
+    else
+        try b.keyFor(.step, try std.fmt.allocPrint(arena, "{s}\n# tags {s}", .{ aw.written(), tags.? }), &.{}, b.uid, b.gid);
     const claim = b.claimKey(key) catch |e| switch (e) {
         error.Stopped => {
             f.result = .{ .failed = "the step was stopped" };
@@ -1786,7 +1792,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     var out: Captured = .{ .arena = arena };
     const ended = try b.exec(
         aw.written(),
-        try b.envStrings(extra.items),
+        env,
         &.{},
         b.uid,
         b.gid,
@@ -1806,6 +1812,23 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
             "the job's own repository; another private one cannot be checked out)" else "",
     }) };
     return f;
+}
+
+/// A digest of the tags `url`'s repository has and where they point, as `git fetch --tags` reads
+/// them: a checkout of a commit is the same tree every time, but its tags are not, so a replay
+/// keyed without them would keep the old ones. Null when they could not be listed: the fetch then
+/// runs, and says why it cannot.
+fn tagsDigest(b: *Backend, url: []const u8, env: []const []const u8) !?[]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(b.arena);
+    try aw.writer.writeAll("tags=$(git ls-remote --tags -- ");
+    try dagger.shellQuote(&aw.writer, try std.fmt.allocPrint(b.arena, "{s}.git", .{url}));
+    try aw.writer.writeAll(") && printf '%s' \"$tags\" | sha256sum");
+    var out: Captured = .{ .arena = b.arena };
+    const ended = try b.exec(aw.written(), env, &.{}, b.uid, b.gid, out.output());
+    defer b.dropLastLayer();
+    if (ended.code != 0 or ended.failure.len > 0 or ended.killed) return null;
+    const digest = std.mem.trim(u8, out.text.items, " \n");
+    return if (digest.len == 0) null else digest;
 }
 
 /// The contents of `path` as the job's last step left it (a problem matcher's file), relative
@@ -3264,6 +3287,66 @@ test "a native checkout that cannot fetch fails its step with why" {
     }, job, &log);
     try std.testing.expectEqual(dagger.Outcome.failure, res.steps[0].outcome);
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "could not fetch o/r@0123456") != null);
+}
+
+test "native step cache: a checkout of a commit with fetch-tags sees the tags as they are now" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try cachedConfig(arena, &tmp);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const git = try std.fmt.allocPrint(arena, "git -c user.name=t -c user.email=t@t -C '{s}/src'", .{root});
+    const make = try std.fmt.allocPrint(arena, "set -e; cd '{s}'; git init -q --bare o/r.git; " ++
+        "git init -q src; cd src; echo one > file; git add file; {s} commit -q -m one; " ++
+        "{s} tag v1; {s} push -q ../o/r.git HEAD:refs/heads/main v1; " ++
+        "echo two > file; {s} commit -qam two; {s} push -q ../o/r.git HEAD:refs/heads/main", .{
+        root, git, git, git, git, git,
+    });
+    const made = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", make } }) catch
+        return skip(false, "git is not installed");
+    if (made.term != .exited or made.term.exited != 0)
+        return skip(false, "git could not make a repository");
+    const sha = std.mem.trim(u8, (try std.process.run(arena, io, .{
+        .argv = &.{ "git", "-C", try std.fmt.allocPrint(arena, "{s}/src", .{root}), "rev-parse", "HEAD" },
+    })).stdout, "\n");
+    try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "rootfs/{s}", .{root}));
+    c.cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{
+        c.cfg.binds,
+        &.{.{ .host = root, .at = root }},
+    });
+
+    var co = testStep("");
+    co.name = "checkout";
+    co.action = .{ .checkout = &.{
+        .{ .name = "ref", .value = .{ .lit = sha } },
+        .{ .name = "fetch-tags", .value = .{ .lit = "true" } },
+    } };
+    const check = testStep("echo tag-v1=$(git rev-parse --short v1)");
+    var job = testJob(&.{ co, check });
+    job.github.server_url = try std.fmt.allocPrint(arena, "file://{s}", .{root});
+    job.env = &.{.{ .name = "GIT_CONFIG_PARAMETERS", .value = .{ .lit = "'safe.directory=*'" } }};
+    const first = try runCached(arena, c.cfg, job, "j1");
+    try expectSucceeded(first);
+
+    // v1 moves to the second commit, as a release tag does, and the job runs again.
+    const moved = try std.process.run(arena, io, .{ .argv = &.{
+        "sh", "-c", try std.fmt.allocPrint(arena, "set -e; {s} tag -f v1 {s}; {s} push -q -f ../o/r.git v1", .{ git, sha, git }),
+    } });
+    try std.testing.expectEqual(@as(u8, 0), moved.term.exited);
+    const second = try runCached(arena, c.cfg, job, "j2");
+    try expectSucceeded(second);
+    const now = try std.fmt.allocPrint(arena, "tag-v1={s}", .{sha[0..7]});
+    if (std.mem.indexOf(u8, second.text, now) == null) {
+        std.debug.print("the second run did not see v1 at {s}:\n{s}\n", .{ sha[0..7], second.text });
+        return error.TestUnexpectedResult;
+    }
+    // With the tags as they were, the checkout and the step after it are replayed.
+    const third = try runCached(arena, c.cfg, job, "j3");
+    try expectSucceeded(third);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, third.text, dagger.native_reused_note));
 }
 
 test "parity: a run-only job gives the same results and step output on Dagger and native" {
