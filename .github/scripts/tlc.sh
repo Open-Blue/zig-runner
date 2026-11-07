@@ -41,9 +41,40 @@ tlc() {
 		-metadir "$dir/states" -config "$cfg" "$module.tla") >"$out" 2>&1
 }
 
+# TLC_PART=K/N checks part K of N, so N jobs share the configurations: each is given to the part
+# with the least expected time so far, the longest first (its `tlc-seconds:` comment, or a few
+# seconds without one). Every configuration is in exactly one part, whatever N.
+mapfile -t all < <(cd "$here" && ls -- *.cfg)
+selected=("${all[@]}")
+if [[ -n ${TLC_PART:-} ]]; then
+	if ! [[ $TLC_PART =~ ^([0-9]+)/([0-9]+)$ ]] || ((BASH_REMATCH[1] < 1 || BASH_REMATCH[1] > BASH_REMATCH[2])); then
+		echo "TLC_PART=$TLC_PART: K/N, with 1 <= K <= N" >&2
+		exit 2
+	fi
+	k=${BASH_REMATCH[1]} n=${BASH_REMATCH[2]}
+	mapfile -t selected < <(
+		for cfg in "${all[@]}"; do
+			sec=$(sed -n 's/^\\\* tlc-seconds: \([0-9]*\).*/\1/p' "$here/$cfg" | head -n 1)
+			printf '%s %s\n' "${sec:-3}" "$cfg"
+		done | sort -k1,1nr -k2,2 | awk -v k="$k" -v n="$n" '{
+			best = 1
+			for (i = 2; i <= n; i++) if (load[i] < load[best]) best = i
+			load[best] += $1
+			if (best == k) print $2
+		}'
+	)
+	echo "part $k of $n: ${#selected[@]} of ${#all[@]} configurations"
+fi
+in_part() {
+	local c
+	for c in "${selected[@]}"; do [[ $c == "$1" ]] && return 0; done
+	return 1
+}
+
 status=0
 for cfg in "$here"/*.cfg; do
 	cfg=$(basename "$cfg")
+	in_part "$cfg" || continue
 	grep -q 'must fail:' "$here/$cfg" && continue
 	echo "== $cfg: must hold"
 	out="$dir/${cfg%.cfg}.out"
@@ -58,6 +89,7 @@ done
 
 for cfg in "$here"/*-*.cfg; do
 	cfg=$(basename "$cfg")
+	in_part "$cfg" || continue
 	grep -q 'must fail:' "$here/$cfg" || continue
 	want=$(sed -n '1s/.*must fail: \([A-Za-z]*\).*/\1/p' "$here/$cfg")
 	echo "== $cfg: must fail with $want"
