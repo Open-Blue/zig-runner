@@ -1,0 +1,44 @@
+name: close linked issues
+
+# GitHub leaves a pull request's `Closes #N` undone when the zig-runner-automerge app merges it: on
+# 2026-11-06 all 7 it merged left their issues open, and both a person merged closed theirs. So a
+# merged pull request's linked issues are closed here. One GitHub did close is left alone.
+#
+# pull_request_target, so the workflow is main's and no pull request can change it; nothing of the
+# pull request is checked out or run, and only its number is used. GITHUB_TOKEN is enough: nothing
+# has to start from a closed issue.
+
+on:
+  # Only main's workflow runs, with nothing of the pull request checked out or run (above).
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
+    types: [closed]
+
+permissions: {}
+
+jobs:
+  close:
+    name: Close linked issues
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Close linked issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        # This repository's issues only: the token can't close another's.
+        run: |
+          gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json closingIssuesReferences \
+            --jq '.closingIssuesReferences[]
+              | select(.repository.owner.login + "/" + .repository.name == env.GITHUB_REPOSITORY)
+              | .number' |
+            while read -r issue; do
+              state=$(gh issue view "$issue" --repo "$GITHUB_REPOSITORY" --json state --jq .state)
+              if [ "$state" = OPEN ]; then
+                gh issue close "$issue" --repo "$GITHUB_REPOSITORY" --reason completed \
+                  --comment "Closed by #$PR."
+              fi
+            done
