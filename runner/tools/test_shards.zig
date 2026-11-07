@@ -19,6 +19,8 @@
 //! test (a `--test-filter`), runs the binary itself, as without this program.
 //! `--names` only prints the binary's test names, one a line, as `.github/scripts/test-files.sh`
 //! compares them with the source's. ZIG_TEST_SHARDS=N sets the number of shards; the default is the cores this process may use.
+//! ZIG_TEST_PART=K/N runs only part K of N: every N-th test, starting at the K-th, so N machines
+//! share a suite (CI's native tests as root, which run one at a time on each).
 //! `zig build test -Dshard-tests=false` runs the tests without it.
 const std = @import("std");
 const Io = std.Io;
@@ -97,6 +99,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
     const wanted = try shardCount(init.environ_map);
+    const part = try partOf(init.environ_map);
     const listening = try std.mem.concat(arena, []const u8, &.{
         args[1..2], &.{"--listen=-"}, args[2..],
     });
@@ -105,7 +108,8 @@ pub fn main(init: std.process.Init) !u8 {
     var first = try Shard.start(arena, io, listening);
     const names = try first.testNames(arena);
     const shards = @min(wanted, names.len);
-    if (shards <= 1) {
+    // A part is chosen here, test by test: the binary itself would run them all.
+    if (shards <= 1 and part == null) {
         first.stop(io);
         const err = std.process.replace(io, .{ .argv = args[1..] });
         std.debug.print("{s}: {t}\n", .{ args[1], err });
@@ -117,6 +121,7 @@ pub fn main(init: std.process.Init) !u8 {
     var alone: std.ArrayList(u32) = .empty;
     for ([_]bool{ true, false }) |slow_first| {
         for (names, 0..) |name, i| {
+            if (part) |p| if (i % p.of != p.index) continue;
             if (slow(name) == slow_first)
                 try (if (serial(name, root)) &alone else &free).append(arena, @intCast(i));
         }
@@ -142,6 +147,27 @@ pub fn main(init: std.process.Init) !u8 {
         run.passed.load(.monotonic), run.skipped.load(.monotonic), failed, shards, seconds,
     });
     return if (failed == 0) 0 else 1;
+}
+
+const Part = struct {
+    /// 0-based: part K of N is index K-1.
+    index: usize,
+    of: usize,
+};
+
+/// ZIG_TEST_PART=K/N (1 <= K <= N), or null to run every test.
+fn partOf(environ_map: *const std.process.Environ.Map) !?Part {
+    const text = environ_map.get("ZIG_TEST_PART") orelse return null;
+    if (text.len == 0) return null;
+    bad: {
+        const slash = std.mem.indexOfScalar(u8, text, '/') orelse break :bad;
+        const k = std.fmt.parseUnsigned(usize, text[0..slash], 10) catch break :bad;
+        const n = std.fmt.parseUnsigned(usize, text[slash + 1 ..], 10) catch break :bad;
+        if (k == 0 or k > n) break :bad;
+        return .{ .index = k - 1, .of = n };
+    }
+    std.debug.print("ZIG_TEST_PART={s}: K/N, with 1 <= K <= N\n", .{text});
+    return error.InvalidPart;
 }
 
 /// ZIG_TEST_SHARDS, or the cores this process may use.

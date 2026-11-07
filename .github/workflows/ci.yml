@@ -258,7 +258,7 @@ jobs:
   # image change moves what the native passes stand on (AppArmor's userns restriction, idmapped
   # mounts, nftables), so upgrade it deliberately, here and in the other workflows together.
   test:
-    name: Format, build and test
+    name: Tests (x86_64)
     runs-on: ${{ fromJSON(github.event_name == 'push' && (vars.PROD_RUNNER || '"ubuntu-26.04"') || (vars.PREPROD_RUNNER || '"ubuntu-26.04"')) }}
     timeout-minutes: 30
     permissions:
@@ -307,16 +307,11 @@ jobs:
         run: |
           if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
             # GitHub's runner can make the native backend's sandboxes, so its tests must run here,
-            # not skip (src/native/Backend.zig, `testConfig`): rootless, then as root, the path
-            # with each job's own ids and network (nft makes its NAT).
+            # not skip (src/native/Backend.zig, `testConfig`): rootless here; as root, the path
+            # with each job's own ids and network (nft makes its NAT), in `native-root`.
             # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
             sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
             ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/zig-test.sh
-            # Real postgres and redis images for the native services test (native/services.zig),
-            # which needs root: their entrypoints change to the images' own users.
-            ../.github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
-            ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 \
-              ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" ../.github/scripts/zig-test.sh
           else
             stop="tests-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
             echo "::stop-commands::$stop" >&2
@@ -364,6 +359,80 @@ jobs:
       - name: Every test file is compiled
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/test-files.sh
+
+  # The native backend's tests as root, on both architectures, in two parts each. As root they run
+  # one at a time (a root job takes the host's first free slot of ids and addresses,
+  # runner/tools/test_shards.zig, `serial`): about 200 s on one runner, which held the whole run
+  # back. ZIG_TEST_PART=K/N gives each part every N-th test, so the parts run side by side and
+  # together are the suite. Not on main: a push runs `zig build test` on prod (`test`).
+  native-root:
+    name: Native tests as root (${{ matrix.arch }}, ${{ matrix.part }}/2)
+    if: github.event_name != 'push'
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+    strategy:
+      # Every part reports: one failing does not hide what the others find.
+      fail-fast: false
+      matrix:
+        arch: [x86_64, arm64]
+        part: [1, 2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether this change can affect the tests
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh tests
+
+      - name: Install Zig
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/install-zig.sh
+
+      # As the tests' output in `test`: only text to this job, never its workflow commands
+      # (zig-test.sh stops them).
+      - name: Test, as root
+        if: steps.scope.outputs.run == 'true'
+        working-directory: runner
+        env:
+          PART: ${{ matrix.part }}/2
+        run: |
+          # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
+          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          # Real postgres and redis images for the native services test (native/services.zig),
+          # which needs root: their entrypoints change to the images' own users.
+          ../.github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
+          ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 ZIG_TEST_PART="$PART" \
+            ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" ../.github/scripts/zig-test.sh
+
+  # The required check "Format, build and test" (the rulesets, version.yml, release.yml): passes
+  # only when the x86_64 tests and every part of the native tests as root passed. A gate, so the
+  # rulesets did not change when the tests split; `if: always()`, so a failed or cancelled job it
+  # needs is a failure here, not a skip (which a required check takes as passed). On main the
+  # native tests as root do not run (`native-root`), and their skip is expected.
+  test-gate:
+    name: Format, build and test
+    needs: [test, native-root]
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every job it needs passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          ON_MAIN: ${{ github.event_name == 'push' }}
+        run: |
+          jq -e 'to_entries | all(.value.result == "success" or
+            (env.ON_MAIN == "true" and .key == "native-root" and .value.result == "skipped"))' \
+            <<<"$NEEDS" >/dev/null || {
+            jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+            exit 1
+          }
 
   # The release's own builds, both targets in ReleaseSafe (build-binaries.sh), which nothing else
   # compiles before the tag: the tests build x86_64 in Debug, and release.yml's checks run only for
@@ -415,8 +484,42 @@ jobs:
   # arm64 as the hosted test job runs them on x86_64: rootless, then the native backend's as root.
   # Skipped, still reporting, on a change that can affect neither the release's builds nor the
   # tests (ci-scope.sh binaries and tests); not on main, as Release builds.
-  arm64:
-    name: Release builds and tests (arm64)
+  arm64-builds:
+    name: Release builds (arm64)
+    if: github.event_name != 'push'
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether this change can affect the release's builds
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh binaries
+
+      - name: Install Zig
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/install-zig.sh
+
+      - name: Build for x86_64 and aarch64
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/build-binaries.sh v0.0.0-ci "$RUNNER_TEMP/dist"
+
+      - name: Hardening, and the aarch64 binary run
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          .github/scripts/checksec.sh "$RUNNER_TEMP/dist/zig-runner-linux-aarch64" "$RUNNER_TEMP/dist/zig-runner-linux-x86_64"
+          "$RUNNER_TEMP/dist/zig-runner-linux-aarch64" --version
+
+  # The tests on arm64, rootless; as root they are `native-root`'s. Apart from the release builds
+  # (`arm64-builds`), which used to run first in the same job and held the tests back.
+  arm64-test:
+    name: Tests (arm64)
     if: github.event_name != 'push'
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 30
@@ -435,32 +538,15 @@ jobs:
           echo "page size: $(getconf PAGESIZE) bytes, kernel $(uname -r)"
           echo "::notice title=arm64 page size::GitHub's arm64 runner has $(getconf PAGESIZE)-byte pages; razorbill has 16384"
 
-      - name: Whether this change can affect the release's builds or the tests
+      - name: Whether this change can affect the tests
         id: scope
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
-        run: |
-          GITHUB_OUTPUT="$RUNNER_TEMP/scope-binaries" .github/scripts/ci-scope.sh binaries
-          GITHUB_OUTPUT="$RUNNER_TEMP/scope-tests" .github/scripts/ci-scope.sh tests
-          if grep -qx run=true "$RUNNER_TEMP/scope-binaries" "$RUNNER_TEMP/scope-tests"; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
+        run: .github/scripts/ci-scope.sh tests
 
       - name: Install Zig
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
-
-      - name: Build for x86_64 and aarch64
-        if: steps.scope.outputs.run == 'true'
-        run: .github/scripts/build-binaries.sh v0.0.0-ci "$RUNNER_TEMP/dist"
-
-      - name: Hardening, and the aarch64 binary run
-        if: steps.scope.outputs.run == 'true'
-        run: |
-          .github/scripts/checksec.sh "$RUNNER_TEMP/dist/zig-runner-linux-aarch64" "$RUNNER_TEMP/dist/zig-runner-linux-x86_64"
-          "$RUNNER_TEMP/dist/zig-runner-linux-aarch64" --version
 
       # As the hosted test job's Test step: the native backend's tests must run here, not skip.
       - name: Test
@@ -470,9 +556,26 @@ jobs:
           # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
           sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
           ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/zig-test.sh
-          ../.github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
-          ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 \
-            ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" ../.github/scripts/zig-test.sh
+
+  # The required check "Release builds and tests (arm64)": passes only when the arm64 release
+  # builds, the arm64 tests and every part of the native tests as root passed (`test-gate` says
+  # why a gate, and why `always()`). Not on main, as before the split.
+  arm64:
+    name: Release builds and tests (arm64)
+    needs: [arm64-builds, arm64-test, native-root]
+    if: always() && github.event_name != 'push'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every job it needs passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -e 'to_entries | all(.value.result == "success")' <<<"$NEEDS" >/dev/null || {
+            jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+            exit 1
+          }
 
   # The end-to-end suite (.github/scripts/e2e.sh): the runner built from this change serves
   # runner-bench's e2e workflows (Open-Blue/runner-bench, e2e.yml and e2e-cancel.yml) on GitHub's
