@@ -1,0 +1,3 @@
+kind: Fixed
+body: The release and the deploy wait for the check names in .github/checks-on-main, read from the commit they check out, and fail at once on one that never ran; CI checks those names and the rulesets' required checks are jobs that run
+time: 2026-11-07T16:06:18.886369163-05:00

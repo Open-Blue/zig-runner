@@ -58,6 +58,15 @@ jobs:
       - name: actionlint
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 
+      # The names the release waits for on main (.github/checks-on-main, release.yml's
+      # EXTRA_CHECKS) and the checks the rulesets require are jobs that run then: a check renamed
+      # in one place and not the others held a release for 30 minutes on 2026-11-07. The rulesets
+      # are read with the job's token (metadata only).
+      - name: Check names the pipeline waits for
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/check-names.sh
+
       # The image is pinned by digest. deploy/zig-runner-deploy runs on prod every minute.
       - name: shellcheck
         run: .github/scripts/shellcheck.sh
