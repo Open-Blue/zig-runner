@@ -548,5 +548,16 @@ deployment guide, measurements and Agda proofs. Releases v0.1.0 and v0.2.0 were 
 repository carries the runner's history from that work and continues it with only what the runner
 needs to build, run and deploy; the rest stays in the original repository.
 
+Comments in `runner/src`, `db` and `proofs` cite three of those documents ("SPEC §3", "DESIGN §6",
+"STUDY.md §3.6"). They are not in this repository; they are at the commit the runner was split
+from, so the section numbers match:
+[SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/SPEC.md) (the
+specification: configuration, the GitHub protocol, the database, what differs from GitHub's
+runner),
+[DESIGN.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/DESIGN.md) (the
+design) and
+[STUDY.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/STUDY.md) (the
+experiments).
+
 Licence: see [LICENSE](LICENSE); the vendored third-party code is listed in
 [THIRD_PARTY.md](THIRD_PARTY.md).
