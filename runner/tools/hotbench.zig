@@ -1,5 +1,5 @@
 //! CPU-bound microbenchmarks of the runner's hot paths, for comparing two builds of the same code
-//! (BENCHMARKS.md, "Position-independent executable"): expression evaluation (src/expr.zig),
+//! (docs/BENCHMARKS.md, "Position-independent executable"): expression evaluation (src/expr.zig),
 //! workflow YAML parsing (src/yaml.zig), the HPACK decoder (src/hpack.zig), the hashFiles() glob's
 //! walk over an in-memory tree (src/glob.zig), and SHA-256 of a 32 MiB buffer (std, which the step
 //! store and hashFiles() use). `.github/scripts/hotbench.sh` builds it twice and runs both in turn.

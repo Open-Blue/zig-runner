@@ -7,7 +7,7 @@
 #
 #   .github/scripts/sbom.sh v0.12.0 dist/SHA256SUMS > zig-runner.spdx.json
 #
-# Licenses are the ones THIRD_PARTY.md gives; a package missing below is NOASSERTION until added.
+# Licenses are the ones docs/THIRD_PARTY.md gives; a package missing below is NOASSERTION until added.
 set -euo pipefail
 
 tag=${1:?usage: sbom.sh TAG SHA256SUMS}

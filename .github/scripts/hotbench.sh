@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The runner's hot paths (runner/tools/hotbench.zig: expressions, YAML, HPACK, the hashFiles() glob,
 # SHA-256) as a position-independent executable against the same code without, in ReleaseSafe for
-# x86_64-linux-musl as the release builds it (BENCHMARKS.md, "Position-independent executable").
+# x86_64-linux-musl as the release builds it (docs/BENCHMARKS.md, "Position-independent executable").
 # The two builds run in turn, RUNS times each, in alternating order, so drift in the machine (heat,
 # other load) falls on both alike; each run times ROUNDS rounds of every benchmark. Prints, per
 # benchmark and build, the median round, its interquartile range and its fastest, then the

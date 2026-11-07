@@ -5,7 +5,7 @@ otherwise:
 
 - a Raspberry Pi 5 with 8 GB of memory and a 117 GB SD card, which also runs other home services
 - the Dagger engine v0.21.10 in Docker, capped at 3 CPUs and 4 GB, with its cache capped at 20 GB
-  ([`deploy/engine.json`](deploy/engine.json))
+  ([`deploy/engine.json`](../deploy/engine.json))
 
 If a fast machine were the yardstick, a slow design could pass. Measuring on a Pi keeps the fixed
 costs visible.
@@ -48,7 +48,7 @@ after asking it to stop, but the engine needs longer to stop.
 | `docker stop -t 300` | clean stop in 21.6 s, no wipe on start; re-run 3 s from cache |
 | Engine recreated with `--stop-timeout 80` | no wipe; re-run 3 s from cache |
 
-The engine now gets 80 s (`stop_grace_period` in [`deploy/compose.yaml`](deploy/compose.yaml)). The
+The engine now gets 80 s (`stop_grace_period` in [`deploy/compose.yaml`](../deploy/compose.yaml)). The
 limit is 90 s, the point at which systemd kills Docker itself during a shutdown. This corrects E4.5
 below: on v0.21.10 the step cache survives a restart, unless the stop was cut short.
 
@@ -56,7 +56,7 @@ below: on v0.21.10 the step cache survives a restart, unless the stop was cut sh
 
 *2026-10-25.* CI used to unpack Zig into each job's temporary directory. It now keeps the unpacked
 tree in the tool cache and checks it against a pinned digest of all its files
-([`.github/scripts/install-zig.sh`](.github/scripts/install-zig.sh)). Times are taken inside the
+([`.github/scripts/install-zig.sh`](../.github/scripts/install-zig.sh)). Times are taken inside the
 script, and the engine's disk I/O is sampled every second.
 
 | | Time | Engine CPU | Read | Written |

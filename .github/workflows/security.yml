@@ -71,13 +71,13 @@ jobs:
       contents: read # to read the dependency graph's diff
     steps:
       # The license list is what can be compiled into, or run beside, an MIT-licensed project
-      # without changing its terms (THIRD_PARTY.md: MIT, Apache-2.0, BSD, ISC, Unicode so far).
+      # without changing its terms (docs/THIRD_PARTY.md: MIT, Apache-2.0, BSD, ISC, Unicode so far).
       # Copyleft (GPL, LGPL, MPL) is not on it: such a dependency needs a decision, not a merge.
       # A dependency whose license the graph does not know is reported, not failed (the actions).
       #
       # golang.org/x/net is BSD-3-Clause with Go's patent grant, which the graph reads as a
       # second license (LicenseRef-scancode-google-patent-license-golang) that no SPDX list names;
-      # the grant only adds rights. hpackdiff's go.mod pins it (THIRD_PARTY.md).
+      # the grant only adds rights. hpackdiff's go.mod pins it (docs/THIRD_PARTY.md).
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: moderate
