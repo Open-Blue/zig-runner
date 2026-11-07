@@ -1,3 +1,0 @@
-kind: Security
-body: 'On a native backend, hashFiles() refuses a file the step''s user could not read, as under Dagger, such as through a link to /etc/shadow. Until #369, a file only a supplementary group of that user may read is still hashed, though the step itself cannot read it'
-time: 2026-11-06T17:19:33.637397653-05:00

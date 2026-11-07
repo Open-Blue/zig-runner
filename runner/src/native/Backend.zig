@@ -6750,7 +6750,8 @@ test "native hashFiles: a job container's --user is whom it reads for, its group
     var read = testStep("");
     read.action.script.script = .{ .expr = "format('echo got={0}.', hashFiles('l'))" };
     // Stored once for the member: the same ids without the group must not replay what it read.
-    const reader = testStep("echo read=$(cat /etc/grouped 2>/dev/null).");
+    var reader = testStep("echo read=$(cat /etc/grouped 2>/dev/null).");
+    reader.condition = "always()";
     const steps = [_]job_mod.Step{ testStep("ln -s /etc/grouped l"), read, reader };
     // By name, the user's groups count; with its ids alone, as BuildKit gives them, they do not.
     for ([_][]const u8{ "--user app", "--user 1002:1003" }, [_]bool{ true, false }) |options, member| {
