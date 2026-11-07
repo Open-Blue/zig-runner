@@ -8,6 +8,7 @@ const auth = @import("github/auth.zig");
 const broker = @import("github/broker.zig");
 const runservice = @import("github/runservice.zig");
 const timefmt = @import("timefmt.zig");
+const jobmsg = @import("job.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -297,18 +298,22 @@ fn probeRunService(
         try out.writeAll("  (non-JSON body)\n");
         return;
     };
+    if (job != .object) {
+        try out.writeAll("  (JSON body is not an object)\n");
+        return;
+    }
     // The job definition holds tokens and secrets: key names, types and lengths only.
     try shape(out, job, 1, false);
     try out.flush();
 
     try dumpWorkflowFacts(out, job);
-    const plan_id = nestedString(job, &.{ "plan", "planId" }) orelse "";
-    const job_id = nestedString(job, &.{"jobId"}) orelse "";
+    const plan_id = jobmsg.path(job, &.{ "plan", "planId" }) orelse "";
+    const job_id = jobmsg.path(job, &.{"jobId"}) orelse "";
     try out.print("  planId {d} chars, jobId {d} chars\n", .{ plan_id.len, job_id.len });
     if (firstStepScript(job)) |sc|
         try out.print("  step[0] script: {s} = {s}\n", .{ sc.key, sc.value });
     // The run service authorizes later calls with the job-scoped token from the job's endpoints.
-    const job_token = jobToken(job) orelse {
+    const job_token = jobmsg.jobToken(job) orelse {
         try out.writeAll("  no job token in resources.endpoints\n");
         return;
     };
@@ -386,29 +391,7 @@ fn tryStepResultShapes(
 fn firstStepId(job: std.json.Value) ?[]const u8 {
     const steps = job.object.get("steps") orelse return null;
     if (steps != .array or steps.array.items.len == 0) return null;
-    return nestedString(steps.array.items[0], &.{"id"});
-}
-
-fn nestedString(v: std.json.Value, path: []const []const u8) ?[]const u8 {
-    var cur = v;
-    for (path) |k| {
-        if (cur != .object) return null;
-        cur = cur.object.get(k) orelse return null;
-    }
-    return if (cur == .string) cur.string else null;
-}
-
-fn jobToken(job: std.json.Value) ?[]const u8 {
-    const eps = (job.object.get("resources") orelse return null).object.get("endpoints") orelse
-        return null;
-    if (eps != .array) return null;
-    for (eps.array.items) |ep| {
-        if (ep != .object) continue;
-        const authz = ep.object.get("authorization") orelse continue;
-        if (authz != .object) continue;
-        if (nestedString(authz, &.{ "parameters", "AccessToken" })) |t| return t;
-    }
-    return null;
+    return jobmsg.path(steps.array.items[0], &.{"id"});
 }
 
 const Script = struct { key: []const u8, value: []const u8 };
@@ -418,14 +401,16 @@ const Script = struct { key: []const u8, value: []const u8 };
 fn firstStepScript(job: std.json.Value) ?Script {
     const steps = job.object.get("steps") orelse return null;
     if (steps != .array or steps.array.items.len == 0) return null;
-    const inputs = steps.array.items[0].object.get("inputs") orelse return null;
+    const step = steps.array.items[0];
+    if (step != .object) return null;
+    const inputs = step.object.get("inputs") orelse return null;
+    if (inputs != .object) return null;
     const map = inputs.object.get("map") orelse return null;
     if (map != .array or map.array.items.len == 0) return null;
     const kv = map.array.items[0];
     return .{
-        .key = nestedString(kv.object.get("Key") orelse return null, &.{"lit"}) orelse return null,
-        .value = nestedString(kv.object.get("Value") orelse return null, &.{"lit"}) orelse
-            return null,
+        .key = jobmsg.path(kv, &.{ "Key", "lit" }) orelse return null,
+        .value = jobmsg.path(kv, &.{ "Value", "lit" }) orelse return null,
     };
 }
 
@@ -438,7 +423,7 @@ fn dumpWorkflowFacts(out: *std.Io.Writer, job: std.json.Value) !void {
         try std.json.Stringify.value(st, .{}, out);
         try out.writeByte('\n');
     };
-    for ([_][]const u8{ "environmentVariables", "defaults", "jobOutputs", "variables_note" }) |k| {
+    for ([_][]const u8{ "environmentVariables", "defaults", "jobOutputs" }) |k| {
         if (job.object.get(k)) |v| {
             try out.print("  job.{s}: ", .{k});
             try std.json.Stringify.value(v, .{}, out);

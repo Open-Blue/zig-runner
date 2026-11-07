@@ -429,7 +429,7 @@ fn parseReference(arena: Allocator, sv: Value, o: std.json.ObjectMap) Error!Step
         return parseImageReference(arena, sv, o);
     const why = try std.fmt.allocPrint(
         arena,
-        "unsupported step reference type '{s}' (v0 supports run: steps)",
+        "unsupported step reference type '{s}' (supported: script, repository, containerRegistry)",
         .{reference_type},
     );
     return .{ .action = .{ .unsupported = why } };
@@ -980,7 +980,8 @@ fn displayName(
     return std.fmt.allocPrint(arena, "Run {s}", .{first});
 }
 
-fn path(v: Value, keys: []const []const u8) ?[]const u8 {
+/// The string at `keys` under `v`; null when a key is missing or the last value is not a string.
+pub fn path(v: Value, keys: []const []const u8) ?[]const u8 {
     var cur = v;
     for (keys) |k| {
         if (cur != .object) return null;
@@ -1078,7 +1079,7 @@ fn runtime(root: Value) Runtime {
     return r;
 }
 
-fn jobToken(root: Value) ?[]const u8 {
+pub fn jobToken(root: Value) ?[]const u8 {
     for (endpoints(root)) |ep| {
         if (path(ep, &.{ "authorization", "parameters", "AccessToken" })) |t| return t;
     }
@@ -1404,6 +1405,19 @@ test "uses: references keep their directory and inputs; local actions; docker://
     try std.testing.expectEqualStrings("alpine:3.22", docker.image);
     try std.testing.expectEqualStrings("args", docker.inputs[0].name);
     try std.testing.expectEqualStrings("Run docker://alpine:3.22", job.steps[4].name);
+}
+
+test "a step reference of an unknown type says what is supported" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const job = try parse(a.allocator(),
+        \\{"plan":{"planId":"p"},"jobId":"j","resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},
+        \\ "steps":[{"type":"action","reference":{"type":"wasm"},"id":"a","name":"__a","condition":"success()"}]}
+    );
+    try std.testing.expectEqualStrings(
+        "unsupported step reference type 'wasm' (supported: script, repository, containerRegistry)",
+        job.steps[0].action.unsupported,
+    );
 }
 
 test "actionsEnvironment: the name, and the url as a token or a plain string" {
