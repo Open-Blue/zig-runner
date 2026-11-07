@@ -18,7 +18,7 @@ cd "$(dirname "$0")/../../runner"
 s=$(mktemp -d)
 trap 'rm -rf "$s"' EXIT
 mkdir "$s/matchers"
-zig build-exe -OReleaseSafe --dep regex -Mroot=tools/regexcorpus.zig -Mregex=src/regex.zig \
+zig build-exe -OReleaseSafe --dep regex --dep corpus -Mroot=tools/regexcorpus.zig -Mregex=src/regex.zig -Mcorpus=tools/corpus.zig \
 	--name regexcorpus -femit-bin="$s/regexcorpus" &
 
 n=0

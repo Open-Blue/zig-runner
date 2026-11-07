@@ -10,7 +10,7 @@ cd "$(dirname "$0")/../../runner"
 
 s=$(mktemp -d)
 trap 'rm -rf "$s"' EXIT
-zig build-exe -OReleaseSafe --dep rsa_sign -Mroot=tools/rsacorpus.zig -Mrsa_sign=src/github/rsa_sign.zig \
+zig build-exe -OReleaseSafe --dep rsa_sign --dep corpus -Mroot=tools/rsacorpus.zig -Mrsa_sign=src/github/rsa_sign.zig -Mcorpus=tools/corpus.zig \
 	--name rsacorpus -femit-bin="$s/rsacorpus" &
 (cd tools/rsadiff && go run . -out "$s/cases.jsonl" -n "${1:-2000}" -seed "${2:-1}")
 wait

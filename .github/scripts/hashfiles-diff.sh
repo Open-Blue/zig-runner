@@ -20,7 +20,7 @@ cd "$(dirname "$0")/../../runner"
 
 s=$(mktemp -d)
 trap 'rm -rf "$s"' EXIT
-zig build-exe --dep runner -Mroot=tools/hashfilescorpus.zig -Mrunner=src/hashfiles_corpus.zig \
+zig build-exe --dep runner --dep corpus -Mroot=tools/hashfilescorpus.zig -Mrunner=src/hashfiles_corpus.zig -Mcorpus=tools/corpus.zig \
 	--name hashfilescorpus -femit-bin="$s/hashfilescorpus" &
 (cd tools/hashfilesdiff && go run . -out "$s" -n "${1:-400}" -seed "${2:-1}")
 wait

@@ -11,6 +11,7 @@
 //! comes from a DebugAllocator, which poisons what is freed and fails the run on a leak.
 const std = @import("std");
 const hpack = @import("hpack");
+const corpus = @import("corpus");
 
 const Io = std.Io;
 
@@ -44,7 +45,7 @@ pub fn main(init: std.process.Init) !u8 {
         var d: hpack.Decoder = .{ .gpa = debug.allocator() };
         defer d.deinit();
         for (c.get("blocks").?.array.items, 0..) |b, n| {
-            const block = try unhex(a, b.object.get("block").?.string);
+            const block = try corpus.unhex(a, b.object.get("block").?.string);
             var got: Got = .{ .gpa = a };
             const err = d.decode(block, &got, Got.on);
             if (got.oom) return error.OutOfMemory;
@@ -58,8 +59,8 @@ pub fn main(init: std.process.Init) !u8 {
             };
             const fields = try a.alloc([2][]const u8, want.len);
             for (want, fields) |w, *f| f.* = .{
-                try unhex(a, w.array.items[0].string),
-                try unhex(a, w.array.items[1].string),
+                try corpus.unhex(a, w.array.items[0].string),
+                try corpus.unhex(a, w.array.items[1].string),
             };
             err catch |e| {
                 if (b.object.get("broken") != null) {
@@ -124,9 +125,4 @@ fn list(out: *Io.Writer, fields: []const [2][]const u8) !void {
 /// The first 80 bytes, for printing.
 fn cut(s: []const u8) []const u8 {
     return s[0..@min(s.len, 80)];
-}
-
-fn unhex(a: std.mem.Allocator, s: []const u8) ![]u8 {
-    const buf = try a.alloc(u8, s.len / 2);
-    return std.fmt.hexToBytes(buf, s);
 }
