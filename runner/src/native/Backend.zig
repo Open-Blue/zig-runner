@@ -3612,6 +3612,8 @@ pub const CancelPlan = struct {
     /// What the job's cancel limit leaves, from the cancel.
     grace_ms: i64 = 60_000,
     why: dagger.Cancel.Why = .github,
+    /// The job uses the layer store, shared with later jobs.
+    step_cache: bool = false,
 };
 
 /// `job` on the native backend, cancelled as `plan` says; `took_ms` runs from the cancel to the
@@ -3635,6 +3637,7 @@ pub fn runCancelled(arena: Allocator, cfg: Config, job: job_mod.Job, plan: Cance
         .step_user = .root,
         .gpa = std.testing.allocator,
         .cancel = &cancel,
+        .step_cache = plan.step_cache,
     }, job, &log);
     return .{
         .res = res,

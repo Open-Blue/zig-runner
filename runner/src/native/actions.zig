@@ -610,7 +610,10 @@ test "a Dockerfile's RUN stopped by a native cancel stores no layer, though its 
     });
     var job = testJob(&.{usesStep("half", "o", "half", "v1", &.{})});
     job.github.server_url = "file:///srv/git";
-    const r = try Backend.runCancelled(arena, cfg, job, .{ .when = "613.78" });
+    const r = try Backend.runCancelled(arena, cfg, job, .{
+        .when = "613.78",
+        .step_cache = true,
+    });
     errdefer std.debug.print("took {d} ms:\n{s}\n", .{ r.took_ms, r.text });
     try std.testing.expectEqual(dagger.Outcome.cancelled, r.res.steps[0].outcome);
     const layers_path = try std.fmt.allocPrint(arena, "{s}/layers", .{cfg.store});
