@@ -9,19 +9,6 @@
 //! Compared to a single query for the whole job this lets the runner decide what to run next from
 //! earlier results (conditions, expressions, step outputs), and `withExec(expect: ANY)` returns the
 //! real exit code and separate stdout/stderr, even for steps served from Dagger's cache.
-//!
-//! Live output comes from `dagger run`'s progress log on stderr, read by a reader task. Each step's
-//! script brackets its output with marker lines so lines can be attributed to the step:
-//!
-//!     <marker>begin N <mark>      <marker>end N <mark>
-//!
-//! `<mark>` is the job's secret (`mark_env`), so a step cannot forge another step's markers by
-//! printing text; see `scan`.
-//!
-//! Dagger's log frontend may repeat a span's header when it switches spans, so lines are attributed
-//! to the step named in the most recent span header (a single line that contains the step's `begin`
-//! marker text), not simply the last `begin`. A step served
-//! from cache prints no log lines at all; its stdout/stderr from the query result are replayed.
 const std = @import("std");
 const builtin = @import("builtin");
 const job_mod = @import("job.zig");

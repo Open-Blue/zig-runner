@@ -1,0 +1,3 @@
+kind: Changed
+body: The part of the dagger.zig overview about markers and reading the log moved to dagger/JobLog.zig, next to the code it describes (#148).
+time: 2026-11-07T12:20:26.248672235-05:00
