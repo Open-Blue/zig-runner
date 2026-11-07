@@ -1,0 +1,3 @@
+kind: Fixed
+body: The README says automerge skips pull requests based on another branch, as automerge.yml does.
+time: 2026-11-07T11:58:39.644969539-05:00

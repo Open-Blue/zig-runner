@@ -2,6 +2,11 @@
 //! (C#) runs a Node script on @actions/glob for it; this is @actions/glob 0.7.0 (the version the
 //! script pins) and the part of minimatch it uses, in Zig.
 //!
+//! Licenses (THIRD_PARTY.md): @actions/glob is MIT. The minimatch ported is the one @actions/glob
+//! 0.7.0 runs (`^10.2.5`; 10.2.6 when this was written), under the Blue Oak Model License 1.0.0,
+//! <https://blueoakcouncil.org/license/1.0.0>, which asks that a copy of any part of it, changed
+//! or not, comes with that text or this link.
+//!
 //! - **Patterns** (`Pattern.init`): one per line, trimmed; `#` lines and blanks skipped; each
 //!   leading `!` flips negation; `.` and `..` segments refused (but a leading `.`); a relative
 //!   pattern is made absolute under the workspace; a trailing `/` matches directories only.

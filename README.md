@@ -91,7 +91,7 @@ read). A path filter would instead leave the check unreported, and the merge que
 it. The GitHub client's tests run over real connections to a local server
 (`src/github/testserver.zig`), so how it handles redirects and tokens is tested, not described. A merge into
 `main` goes through the merge queue, which runs these checks again on top of `main`; `automerge` turns on
-auto-merge for every pull request from a branch of this repository, so it joins the queue once its
+auto-merge for every pull request from a branch of this repository that is based on `main` (not a stack's), so it joins the queue once its
 checks pass (Renovate does the same for its own). Once a day, `version` releases what merged since
 the last release, if anything did: it waits for approval in the `prod` environment, commits and
 tags the release, and the tag runs `release`: the binaries (compiled directly,
