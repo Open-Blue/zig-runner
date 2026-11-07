@@ -78,12 +78,25 @@ default (`direct`) behaves exactly as before. With `none`:
   `usable` give a reason, or the set-up falls back) fails before any step, in "Set up job", with
   "this job needs the Dagger engine, and this runner has none (RUNNER_ENGINE=none). This job runs on
   Dagger: <the reason native gave>." It does not start a `dagger` child or connect to a socket.
-- **Deploy.** `deploy/compose.engineless.yaml` layered over `compose.yaml` drops the engine service,
-  its volumes and the runner's `depends_on`. The native backend needs the privileges
-  the engine service has today (`privileged: true`, or `cap_add: [SYS_ADMIN, ...]`, above): give them
-  to the runner in your override.
+- **Start-up.** The native probe runs before the runner registers (`Backend.reprobe`, which
+  forgets the five minutes of back-off that would otherwise answer from memory). A failure may be
+  transient (nftables busy, a module not loaded, no network yet for the image it pulls), so it is
+  tried five times with pauses doubling from 5 s (about 75 s). A machine that still cannot run
+  native steps exits 4 with "native error: RUNNER_ENGINE=none, and native steps cannot run here:
+  <reason>", a code `zig-runner.service` restarts on (`RestartPreventExitStatus=1 2` does not
+  list it) and compose's `restart: unless-stopped` too, so it starts by itself once the machine
+  can, and until then refuses again, clearly, every 10 s plus the retries. A bad native
+  configuration (a store path that cannot be resolved) is a config error, exit 1. Without the
+  probe, every job in its back-off would fail with the reason. `RUNNER_DAGGER_NESTING=true` with
+  `none` is a configuration error (`EngineNoneNoNesting`): a step could never get its engine.
+- **Deploy.** `deploy/compose.engineless.yaml` layered over `compose.yaml` drops the engine service
+  and its volumes and the runner's `depends_on`, and gives the runner what the native backend needs
+  ("Under `deploy/compose.yaml`", P1): `privileged: true`, `network_mode: host`, `cgroup: private`
+  with `RUNNER_NATIVE_CGROUP=self`, the store on a `native-store` volume
+  (`RUNNER_NATIVE_STORE`) and the host's `/run/zig-runner`. Checked with `docker compose config`
+  only; a job has not been run through it.
 
-What still needs an engine: steps that use the Dagger engine (`RUNNER_DAGGER_NESTING`), and
+What still needs an engine: steps that use the Dagger engine (`RUNNER_DAGGER_NESTING`, which `none` refuses), and
 whatever native lists as unsupported at the time. This is the list the fallbacks are being retired
 from; a job on it fails fast instead of waiting.
 
