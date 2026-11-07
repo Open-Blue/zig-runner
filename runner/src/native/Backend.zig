@@ -90,6 +90,10 @@ build_reason: []const u8 = "",
 /// Why the job runs on Dagger after all, found in `base` (`error.NativeToDagger`): one of its
 /// actions is something native steps cannot run yet (`actions.preload`).
 to_dagger: []const u8 = "",
+/// Set when `base` failed because of the job itself, which Dagger would not mend (a `--user` the
+/// image does not know): the job fails with the reason instead of falling back, where the
+/// option would be dropped and the steps run as root.
+job_fault: bool = false,
 binds: []const sandbox.Spec.Bind,
 /// The host's resolver and hosts file over the image's (`jobBinds`), in `binds` too; services get
 /// these and `service_binds` (`serviceBinds`).
@@ -1309,10 +1313,9 @@ pub fn base(
     t = b.timings.since(arena, .actions, t);
     defer _ = b.timings.since(arena, .base, t);
 
-    // The workspace and RUNNER_TEMP, made as Dagger's base makes them: in the provisioned image by
-    // root, owned by the step user when it is not root; in any other image by its own user, who
-    // may be unable to (its steps then say so). From `/`, as the workspace is not there yet. The
-    // event payload goes in as `withNewFile` does.
+    // The workspace and RUNNER_TEMP, made as Dagger's base makes them: by root, owned by the step
+    // user when it is not root (see `unprivileged` below). From `/`, as the workspace is not there
+    // yet. The event payload goes in as `withNewFile` does.
     //
     // And RUNNER_TOOL_CACHE, which Dagger mounts in every job (`set_up.cachesUsed`) owned by the
     // step user: the job's `toolcache` volume, bound there in every step (`volumes.plan`). A job
@@ -1332,20 +1335,27 @@ pub fn base(
         try std.fmt.allocPrint(arena, " && ln -sfn {s} {s}/.venv", .{ e, ev.workspace })
     else
         "";
-    const mk = if (plan.provision) try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}{s}{s}", .{
-        ev.workspace,
-        ev.temp,
-        tool_dir,
-        link,
-        chown,
-    }) else try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s} 2>/dev/null{s} || true", .{
-        ev.workspace,
-        ev.temp,
-        tool_dir,
-        link,
-    });
-    const mk_uid: u32 = if (plan.provision) 0 else b.uid;
-    const mk_gid: u32 = if (plan.provision) 0 else b.gid;
+    // A user other than root cannot make `/__w` in an image that does not have it writable (GitHub
+    // mounts it from the host, so there it exists): made by root and handed to it, as provisioned
+    // images do. Root's own mkdir stays tolerant of an image that cannot be written.
+    const unprivileged = !plan.provision and (b.uid != 0 or b.gid != 0);
+    const mk = if (plan.provision or unprivileged)
+        try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}{s}{s}", .{
+            ev.workspace,
+            ev.temp,
+            tool_dir,
+            link,
+            if (unprivileged) try ownedBy(arena, b.uid, b.gid, tool_dir, ev.job.container != null) else chown,
+        })
+    else
+        try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s} 2>/dev/null{s} || true", .{
+            ev.workspace,
+            ev.temp,
+            tool_dir,
+            link,
+        });
+    const mk_uid: u32 = 0;
+    const mk_gid: u32 = 0;
     const event_file = [_]sandbox.Spec.File{.{
         .path = dagger.event_path,
         .contents = event,
@@ -1377,6 +1387,21 @@ pub fn base(
     }
 }
 
+/// The shell that gives the job's work root, and the tool cache when it is made in the base
+/// (`tool_dir`, a path with a leading space or empty), to `uid:gid`. The tool cache is only
+/// chowned when it is not theirs already: an image's own `/opt/hostedtoolcache` may be large, and
+/// a recursive chown copies every file of it up into the layer.
+fn ownedBy(arena: Allocator, uid: u32, gid: u32, tool_dir: []const u8, container: bool) ![]const u8 {
+    // A `container:` job's work root is /__w.
+    const work = if (container) dagger.container_work_root else dagger.work_root;
+    const tool = if (tool_dir.len == 0) "" else try std.fmt.allocPrint(
+        arena,
+        " && {{ [ \"$(stat -c %u:%g{s})\" = {d}:{d} ] || chown -R {d}:{d}{s}; }}",
+        .{ tool_dir, uid, gid, uid, gid, tool_dir },
+    );
+    return std.fmt.allocPrint(arena, " && chown -R {d}:{d} {s}{s}", .{ uid, gid, work, tool });
+}
+
 /// The base's environment, user and working directory (`base`), as `set_up.writeImage`,
 /// `writeProvisionAndWorkspace`, `writeRunEnv` and `writeJobEnv` set them on Dagger's container.
 /// What carries a secret is a plain variable here, as a Dagger secret variable is in the
@@ -1390,11 +1415,12 @@ fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
     if (b.envValue("PATH") == null) try b.put("PATH", image_path);
     // Right after the image's own env, as `set_up.writeFrom` sets it.
     for (b.cache_plan.early_env.items) |e| try b.put(e.name, e.value);
-    // A `container:` job's own env, as `docker create -e` sets it; its PATH is the container's
+    // A `container:` job's `options: --env` first, then its own `env:` over them: GitHub's
+    // `DockerCommandManager.DockerCreate` puts the `options:` string on the command line before
+    // the `-e` of the `env:`, and the later `-e` of a name wins. Its PATH is the container's
     // (`Exec.container_path`).
-    for (plan.container_env) |e| try b.put(e.name, e.value);
-    // Then its `options: --env`, which `docker create` reads after the `-e` of its `env:`.
     for (b.container_opts.env) |e| try b.put(e.name, e.value);
+    for (plan.container_env) |e| try b.put(e.name, e.value);
     if (ev.job.container != null) b.runtime_path = b.envValue("PATH");
     b.uid = b.image_uid;
     b.gid = b.image_gid;
@@ -2650,6 +2676,9 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
     const user = b.container_opts.user orelse img.user;
     if (!plan.as_runner and user.len > 0) {
         const user_ids = b.imageUser(user) catch |e| {
+            // `docker create --user typo` fails on GitHub; Dagger would not read the option.
+            b.job_fault = b.container_opts.user != null and
+                (e == error.UnknownUser or e == error.UnknownGroup);
             err_msg.* = try std.fmt.allocPrint(arena, "the {s} {s}: {s}", .{
                 if (b.container_opts.user != null) "container's --user" else "image's USER",
                 user,
@@ -5140,13 +5169,9 @@ test "a container job's options on the native backend: --user and --env, the res
     defer tmp.cleanup();
     const cfg = try testConfig(arena, &tmp);
 
-    // A user other than root cannot make /__w itself, as in any image: this one has it, for `app`.
-    var work: oci_layer.TestTar = .{ .a = arena };
-    try work.add(.{ .path = "__w/", .kind = .directory, .mode = 0o777 });
-    const layers = try std.mem.concat(arena, []const u8, &.{
-        try testImageLayers(arena),
-        &.{try work.finish()},
-    });
+    // No `/__w` in the image, as in most: `app` cannot make it, so the base makes it as root and
+    // hands it over (GitHub mounts it from the host, where it always exists).
+    const layers = try testImageLayers(arena);
     const image_env = "\"PATH=/usr/bin:/bin\",\"BOTH=image\"";
     const img = try testregistry.testImage(arena, "test/opts", "1", layers, image_env, false);
     var server: testregistry.Server = .{ .routes = img.routes };
@@ -5157,7 +5182,7 @@ test "a container job's options on the native backend: --user and --env, the res
     const as_root = std.os.linux.geteuid() == 0;
     const user = if (as_root) "app" else "root";
     var job = testJob(&.{testStep("echo uid=$(id -u) gid=$(id -g); echo A=$A BOTH=$BOTH; " ++
-        "echo SPACED=$SPACED; pwd")});
+        "echo SPACED=$SPACED; echo home-is[$HOME]; pwd; touch /__w/_temp/mine && echo wrote")});
     job.container = .{
         .name = "",
         .image = .{ .lit = try server.image(arena, "test/opts:1") },
@@ -5165,8 +5190,8 @@ test "a container job's options on the native backend: --user and --env, the res
         // The image's /etc/passwd has `app` as 1002:1003. `--workdir` and `--health-*` are the
         // runner's, not the steps': `docker exec -w` and the services' health only.
         .options = .{ .lit = try std.fmt.allocPrint(arena, "--user {s} -e A=1 --env " ++
-            "BOTH=options -e \"SPACED=two words\" --workdir /nowhere --health-cmd true " ++
-            "--health-interval 5s", .{user}) },
+            "BOTH=options -e \"SPACED=two words\" -e HOME=/elsewhere --workdir /nowhere " ++
+            "--health-cmd true --health-interval 5s", .{user}) },
     };
     var env: std.process.Environ.Map = .init(arena);
     var w: std.Io.Writer.Allocating = .init(arena);
@@ -5183,16 +5208,69 @@ test "a container job's options on the native backend: --user and --env, the res
         "Engine: native",
         // `--user` over the image's USER (none here), `--env` over the container's `env:`.
         if (as_root) "uid=1002 gid=1003" else "uid=0 gid=0",
-        "A=1 BOTH=options",
+        // The container's `env:` is after the options on `docker create`: it wins.
+        "A=1 BOTH=container",
         "SPACED=two words",
         "/__w/r/r",
-        try std.fmt.allocPrint(arena, "Container options: 3 `--env`, `--user` {s}; 3 understood " ++
+        "wrote",
+        try std.fmt.allocPrint(arena, "Container options: 3 `--env`, `--user` {s}; 4 understood " ++
             "and without effect natively", .{user}),
     };
     for (expect) |e| if (std.mem.indexOf(u8, text, e) == null) {
         std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
         return error.TestUnexpectedResult;
     };
+    // `-e HOME=` loses to GitHub's `HOME=/github/home`: never the option's value.
+    try std.testing.expect(std.mem.indexOf(u8, text, "home-is[/elsewhere]") == null);
+}
+
+test "the base hands a work root to the user, and the tool cache only when it is not theirs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const none = try ownedBy(arena, 1002, 1003, "", true);
+    try std.testing.expectEqualStrings(" && chown -R 1002:1003 /__w", none);
+    const with = try ownedBy(arena, 1002, 1003, " /opt/hostedtoolcache", false);
+    const head = " && chown -R 1002:1003 /home/runner/work && { [ ";
+    try std.testing.expect(std.mem.startsWith(u8, with, head));
+    const tail = "= 1002:1003 ] || chown -R 1002:1003 /opt/hostedtoolcache; }";
+    try std.testing.expect(std.mem.indexOf(u8, with, tail) != null);
+}
+
+test "a container job's --user the image does not know fails the job, never runs it as root" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const layers = try testImageLayers(arena);
+    const img = try testregistry.testImage(arena, "test/typo", "1", layers, "\"PATH=/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    var job = testJob(&.{testStep("echo ran as $(id -u)")});
+    job.container = .{
+        .name = "",
+        .image = .{ .lit = try server.image(arena, "test/typo:1") },
+        .options = .{ .lit = "--user typo" },
+    };
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const text = w.written();
+    try std.testing.expect(!res.succeeded);
+    const reason = "--user typo: not in its /etc/passwd";
+    // The job's failure (`engine_error`), not a step's output.
+    try std.testing.expect(std.mem.indexOf(u8, res.engine_error orelse "", reason) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ran as") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "runs on Dagger") == null);
 }
 
 test "native provisioning: a step on the pulled image, flattened and kept under its key" {

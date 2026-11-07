@@ -103,7 +103,7 @@ pub fn imageName(image: []const u8) []const u8 {
 pub const docker_workspace = "/github/workspace";
 /// GitHub's runner works under /home/runner/work; a `container:` job sees it as /__w.
 pub const work_root = "/home/runner/work";
-const container_work_root = "/__w";
+pub const container_work_root = "/__w";
 
 /// The job's workspace, where GitHub's runner puts it: `<work>/<repo>/<repo>` (checked next to
 /// `ubuntu-latest`). Scripts and tools that record absolute paths then see the same ones.
@@ -1916,7 +1916,7 @@ fn runSteps(
             // which pulls and sets up on its own and fails the job itself if the job is at fault
             // (`runNative`). Not once the job is cancelled, nor out of memory.
             const why = if (e == error.BaseContainerFailed) err_msg else @errorName(e);
-            if (setUpFallback(opts, e)) {
+            if (setUpFallback(opts, e) and !b.job_fault) {
                 b.to_dagger = try std.fmt.allocPrint(arena, "the native set-up failed ({s})", .{why});
                 return error.NativeToDagger;
             }
