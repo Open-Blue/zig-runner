@@ -412,7 +412,7 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
             .lit => |l| std.mem.eql(u8, dagger.resolveImage(l), dagger.default_image),
             .expr => true,
         };
-        if (container_options.unsupported(jc, opts.provision and default_image)) |why| return why;
+        if (container_options.unsupported(jc, opts.provision and default_image, job.services)) |why| return why;
     }
     if (job.services.len > 0) if (servicesUnsupported(job, cfg)) |why| return why;
     if (opts.nesting) return "steps that use the Dagger engine (RUNNER_DAGGER_NESTING) need Dagger";
@@ -1374,7 +1374,7 @@ pub fn base(
     // mounts it from the host, so there it exists): made by root and handed to it, as provisioned
     // images do. Root's own mkdir stays tolerant of an image that cannot be written.
     const unprivileged = !plan.provision and (b.uid != 0 or b.gid != 0);
-    const mk = if (plan.provision or unprivileged)
+    const mk_work = if (plan.provision or unprivileged)
         try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}{s}{s}", .{
             ev.workspace,
             ev.temp,
@@ -1389,6 +1389,12 @@ pub fn base(
             tool_dir,
             link,
         });
+    // The job container's `volumes:`, made after the work root so that handing that to the step
+    // user does not reach them: Docker's volumes are root's, as an image's directory is.
+    const mk = if (try b.volumeDirs(ev, err_msg)) |vols|
+        try std.fmt.allocPrint(arena, "{{ {s}; }} && {s}", .{ mk_work, vols })
+    else
+        mk_work;
     const mk_uid: u32 = 0;
     const mk_gid: u32 = 0;
     const event_file = [_]sandbox.Spec.File{.{
@@ -2835,6 +2841,48 @@ fn readContainerOptions(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void
     }));
 }
 
+/// The job container's `volumes:` (`container_options.volumes`; `unsupported` has already
+/// refused what it does not carry out) as the shell that makes their mount points in the base:
+/// each is a directory of the job's filesystem, root's as Docker makes a volume's mount point
+/// (what the image has there stays, as a volume starts from it), and it lasts as long as the
+/// job. Null without any. A volume where the runner binds or makes something itself fails the
+/// job, naming both: the bind would hide the volume's files, or the volume the bind's.
+fn volumeDirs(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !?[]const u8 {
+    const arena = b.arena;
+    const jc = ev.job.container orelse return null;
+    if (jc.volumes.len == 0) return null;
+    var why: []const u8 = "";
+    const found = container_options.volumes(arena, jc.volumes, &why) catch |e| {
+        err_msg.* = if (why.len > 0) why else @errorName(e);
+        return error.BaseContainerFailed;
+    };
+    var w: std.Io.Writer.Allocating = .init(arena);
+    try w.writer.writeAll("mkdir -p --");
+    for (found.targets) |target| {
+        const taken = [_][]const u8{ ev.workspace, ev.temp };
+        const mine = for (taken) |at| {
+            if (container_options.under(target, at) or container_options.under(at, target)) break at;
+        } else for (b.binds) |bind| {
+            if (container_options.under(target, bind.at) or container_options.under(bind.at, target))
+                break bind.at;
+        } else null;
+        if (mine) |at| {
+            b.job_fault = true;
+            err_msg.* = try std.fmt.allocPrint(arena, "the job container's volume at {s} overlaps " ++
+                "{s}, which the runner mounts or makes itself", .{ target, at });
+            return error.BaseContainerFailed;
+        }
+        try w.writer.writeByte(' ');
+        try dagger.shellQuote(&w.writer, target);
+    }
+    try b.notes.append(arena, try std.fmt.allocPrint(arena, "Container volumes: {d} made as " ++
+        "directories of the job ({d} named); they last as long as the job", .{
+        found.targets.len,
+        found.named,
+    }));
+    return w.written();
+}
+
 /// Whether the job's image is musl-based: an `ld-musl-*` in its /lib, as the Dagger path asks
 /// (`services.pullJobContainer`), for its JavaScript actions' runtime (`js.zig`). A /lib that is
 /// a symlink (a merged /usr, glibc's) or missing is not musl; nothing is followed.
@@ -3730,8 +3778,16 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     container.container.?.ports = &.{.{ .lit = "8080:80" }};
     try expectReason("`ports:`", unsupported(io, container, root, ok));
     container.container.?.ports = &.{};
+    // Volumes that are directories of the job are native; a path of the host is not.
+    container.container.?.volumes = &.{ .{ .lit = "/data" }, .{ .lit = "cache:/cache" } };
+    try std.testing.expect(unsupported(io, container, root, ok) == null);
     container.container.?.volumes = &.{.{ .lit = "/srv:/srv" }};
-    try expectReason("`volumes:`", unsupported(io, container, root, ok));
+    try expectReason("`/srv:/srv`", unsupported(io, container, root, ok));
+    // A service mounts no volume natively, so it cannot share a named one.
+    container.container.?.volumes = &.{.{ .lit = "shared:/shared" }};
+    var with_volumes = container;
+    with_volumes.services = &.{.{ .name = "db", .image = .{ .lit = "postgres:17" }, .volumes = &.{.{ .lit = "shared:/s" }} }};
+    try expectReason("service", unsupported(io, with_volumes, root, ok));
     container.container.?.volumes = &.{};
     // An option the sandbox does not carry out is named, never dropped; the others are native.
     container.container.?.options = .{ .lit = "--cpus 1" };
@@ -5619,6 +5675,95 @@ test "a container job's options on the native backend: --user and --env, the res
     };
     // `-e HOME=` loses to GitHub's `HOME=/github/home`: never the option's value.
     try std.testing.expect(std.mem.indexOf(u8, text, "home-is[/elsewhere]") == null);
+}
+
+test "a container job's volumes on the native backend: directories of the job, there for every step" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const layers = try testImageLayers(arena);
+    const img = try testregistry.testImage(arena, "test/vols", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    // None of these paths is in the image: Docker makes each volume's mount point, as root's, and
+    // it is there from the first step on. What a step writes in one is there in the next.
+    var job = testJob(&.{
+        testStep("test -d /data && test -d /cache && test -d /var/lib/deep/er && " ++
+            "echo made[$(ls -ldn /data | cut -d' ' -f3)] && echo hello > /cache/f && " ++
+            "echo kept > /data/g"),
+        testStep("echo cache=$(cat /cache/f) data=$(cat /data/g); ls /var/lib/deep"),
+    });
+    job.container = .{
+        .name = "",
+        .image = .{ .lit = try server.image(arena, "test/vols:1") },
+        .volumes = &.{
+            .{ .lit = "/data" },
+            .{ .lit = "cache:/cache" },
+            .{ .lit = "deep:/var/lib//deep/er:rw" },
+        },
+    };
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const text = w.written();
+    if (!res.succeeded) std.debug.print("{s}\n", .{text});
+    try std.testing.expect(res.succeeded);
+    const expect = [_][]const u8{
+        "Engine: native",
+        "made[0]",
+        "cache=hello data=kept",
+        "Container volumes: 3 made as directories of the job (2 named); they last as long as the job",
+    };
+    for (expect) |e| if (std.mem.indexOf(u8, text, e) == null) {
+        std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(std.mem.indexOf(u8, text, "runs on Dagger") == null);
+}
+
+test "a container job's volume where the runner mounts something fails the job, naming both" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const layers = try testImageLayers(arena);
+    const img = try testregistry.testImage(arena, "test/volclash", "1", layers, "\"PATH=/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    // /__w/r holds the workspace, /__w/r/r: a directory there would be the workspace's parent.
+    var job = testJob(&.{testStep("echo ran")});
+    job.container = .{
+        .name = "",
+        .image = .{ .lit = try server.image(arena, "test/volclash:1") },
+        .volumes = &.{.{ .lit = "/__w/r" }},
+    };
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const text = w.written();
+    try std.testing.expect(!res.succeeded);
+    const why = res.engine_error orelse text;
+    try std.testing.expect(std.mem.indexOf(u8, why, "volume at /__w/r overlaps /__w/r/r") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ran\n") == null);
 }
 
 test "the base hands a work root to the user, and the tool cache only when it is not theirs" {
