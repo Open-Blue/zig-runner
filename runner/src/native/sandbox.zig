@@ -324,9 +324,9 @@ pub const Running = struct {
         defer r.mu.unlock(io);
         const f = r.lifeline orelse return false;
         r.killed = true;
-        // Fails only when the helper has gone, and the step with it.
+        // Fails when the helper has gone, and the step with it.
         const stage = [1]u8{@intCast(@backingInt(sig))};
-        f.writeStreamingAll(io, &stage) catch {};
+        f.writeStreamingAll(io, &stage) catch return false;
         return true;
     }
 

@@ -3577,7 +3577,7 @@ pub fn runCancelled(arena: Allocator, cfg: Config, job: job_mod.Job, plan: Cance
 
 fn cancelOnce(cancel: *dagger.Cancel, plan: CancelPlan, at: *std.atomic.Value(i64)) void {
     const io = std.testing.io;
-    waitForProcess(plan.when) catch {};
+    waitForProcess(plan.when) catch return;
     at.store(std.Io.Clock.awake.now(io).toMilliseconds(), .release);
     cancel.requestBecause(std.Io.Clock.real.now(io).toMilliseconds() + plan.grace_ms, plan.why);
 }
