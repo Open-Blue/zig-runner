@@ -30,7 +30,7 @@ pub const Port = struct { host: u16, container: u16 };
 /// `5432`, `5432:5432`, `127.0.0.1:15432:5432`, `5432/tcp`. On GitHub a bare container port is
 /// published on a random host port (read back as `job.services.<name>.ports[...]`); here it keeps
 /// its own number. Null for UDP and what is not a port.
-pub fn parsePort(text: []const u8) ?Port {
+fn parsePort(text: []const u8) ?Port {
     var t = std.mem.trim(u8, text, " ");
     if (std.mem.indexOfScalar(u8, t, '/')) |slash| {
         if (!std.ascii.eqlIgnoreCase(t[slash + 1 ..], "tcp")) return null;
@@ -260,6 +260,8 @@ const Spec = struct {
     ports: []const Port,
 };
 
+/// What a service container needs to start (its image, env and ports) with expressions evaluated,
+/// or null with the failure logged.
 pub fn serviceSpec(x: *Exec, ls: u32, sc: expr.Scope, svc: job_mod.Service) !?Spec {
     const arena = x.arena;
     const ev = x.ev;
@@ -323,6 +325,8 @@ const ImageHead = struct {
     }
 };
 
+/// Looks the service's image up, logging in to its registry if the service has a login; null with
+/// the failure logged.
 pub fn serviceHead(
     x: *Exec,
     ls: u32,
@@ -380,6 +384,7 @@ const ServiceConfig = struct {
     cmd: []const []const u8,
 };
 
+/// Pulls the service's image and reads its entrypoint and command; null with the failure logged.
 pub fn pullServiceConfig(
     x: *Exec,
     ls: u32,

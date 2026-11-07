@@ -1320,7 +1320,7 @@ pub fn logGroup(
 pub const ContainerEnv = @import("docker.zig").ContainerEnv;
 pub const runDocker = @import("docker.zig").runDocker;
 pub const dockerEnv = @import("docker.zig").dockerEnv;
-pub const dockerRunFor = @import("docker.zig").dockerRunFor;
+pub const dockerRunFor = @import("docker.zig").runFor;
 pub const runImageStep = @import("docker.zig").runImageStep;
 pub const logContainerStart = @import("docker.zig").logContainerStart;
 pub const containerScriptFor = @import("docker.zig").containerScriptFor;

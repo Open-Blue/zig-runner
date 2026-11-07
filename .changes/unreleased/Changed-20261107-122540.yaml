@@ -1,0 +1,3 @@
+kind: Changed
+body: Declarations in dagger.zig and dagger/ that other files use got doc comments, ten that no other file uses are private again, and docker.dockerRunFor is now docker.runFor (#148).
+time: 2026-11-07T12:25:40.662415742-05:00

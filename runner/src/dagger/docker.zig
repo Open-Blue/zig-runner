@@ -66,7 +66,7 @@ const Allocator = std.mem.Allocator;
 /// An argument of a Docker action's command: its text, or the alias of the Dagger secret that
 /// holds it (`secretAlias`), which the script expands as one word whatever it holds, so the
 /// arguments are the same either way.
-pub const Arg = union(enum) { text: []const u8, alias: []const u8 };
+const Arg = union(enum) { text: []const u8, alias: []const u8 };
 
 /// The busybox `sh -c` script that runs a Docker action's command `argv` as step `n`: as
 /// `stepScriptFc`, with the image's command in place of a shell script, and busybox's own `mkdir`,
@@ -301,7 +301,10 @@ pub fn dockerEnv(
     return env.items;
 }
 
-pub fn dockerRunFor(
+/// The `DockerRun` of the `runs: docker` action `act`: its args evaluated against `inputs`, its
+/// env, and its image pulled (`docker://`) or built from the action's Dockerfile. Null, with the
+/// step failed, when an expression does not evaluate. `Exec.dockerRunFor`.
+pub fn runFor(
     x: *Exec,
     num: u32,
     act: Loaded,
@@ -459,6 +462,9 @@ pub fn containerScriptFor(
     );
 }
 
+/// Runs one phase of a Docker action in its container, natively when the job is, and returns its
+/// exit code, outputs and state (`Exec.Out`); null when the container could not be set up (the step
+/// is already failed).
 pub fn runContainer(
     x: *Exec,
     num: u32,

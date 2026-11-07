@@ -20,10 +20,12 @@ const readsRunSpecific = @import("../dagger.zig").readsRunSpecific;
 
 const Allocator = std.mem.Allocator;
 
+/// Where a job's file command files live, in the container, as `<fc_dir>/<kind>_<step>`.
 pub const fc_dir = "/github/file_commands";
 /// GITHUB_STATE is written by JavaScript actions (`core.saveState`) for their post scripts.
 pub const fc_kinds = [_][]const u8{ "output", "env", "path", "step_summary", "state" };
 
+/// The path of step `n`'s file for the file command `kind` (one of `fc_kinds`).
 pub fn fcPath(arena: Allocator, kind: []const u8, n: u32) ![]const u8 {
     return std.fmt.allocPrint(arena, "{s}/{s}_{d}", .{ fc_dir, kind, n });
 }
@@ -224,7 +226,7 @@ pub fn writeCombinedFileCommands(
     try w.print("}} > {s}\n", .{try fcPath(arena, "all", fc)});
 }
 
-pub const fc_marker = "::zig-file-command::";
+const fc_marker = "::zig-file-command::";
 
 /// `parts` (a kind and its file's text each) and then `ran`, as `writeCombinedFileCommands`'s
 /// script writes them.

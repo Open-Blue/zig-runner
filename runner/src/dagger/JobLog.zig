@@ -100,6 +100,8 @@ masks: ?*redact.Set = null,
 /// `scratchAllocator`.
 scratch: ?std.heap.ArenaAllocator = null,
 
+/// What a step's workflow commands (`::set-output`, `::add-mask`, `::stop-commands`...) asked for,
+/// until the runner takes it.
 pub const StepCommands = struct {
     stop_token: ?[]const u8 = null,
     /// From the deprecated `::set-output` and `::save-state`.
@@ -122,7 +124,7 @@ pub const StepCommands = struct {
 };
 
 /// What the unsecure commands of a step's exec left (`takeUnsecure`).
-pub const Unsecure = struct {
+const Unsecure = struct {
     env: []const job_mod.EnvVar,
     paths: []const []const u8,
     failed: bool,
@@ -411,6 +413,7 @@ pub fn takePendingMatchers(sh: *JobLog) []const []const u8 {
     return out;
 }
 
+/// Adds problem matchers, which the log's lines are then checked against.
 pub fn addMatchers(sh: *JobLog, matchers: []const matcher.Matcher) void {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
@@ -536,6 +539,7 @@ fn annotateLocked(sh: *JobLog, step: u32, an: commands_mod.Annotation) void {
     sh.annotations.append(sh.arena, .{ .step = step, .an = copy }) catch {};
 }
 
+/// Appends one formatted line to `step`'s log, taking the lock `appendLocked` needs.
 pub fn appendFmt(sh: *JobLog, step: u32, comptime fmt: []const u8, args: anytype) void {
     const text = std.fmt.allocPrint(sh.arena, fmt, args) catch return;
     sh.appendLocked(step, text);
@@ -619,6 +623,7 @@ pub fn takeOutputs(sh: *JobLog, step: u32) []const job_mod.EnvVar {
     return out;
 }
 
+/// Writes out what the log sink still holds.
 pub fn flush(sh: *JobLog) void {
     sh.mu.lockUncancelable(sh.io);
     defer sh.mu.unlock(sh.io);
@@ -741,6 +746,7 @@ const max_annotations = 10;
 
 // --- the log reader ---
 
+/// What a marker line says: a step begins or ends, or a service printed its first line.
 pub const Marker = union(enum) {
     begin: u32,
     end: u32,
@@ -748,6 +754,7 @@ pub const Marker = union(enum) {
     service: u32,
 };
 
+/// What `scan` finds in a line: the output before the marker, the marker and its `mark`.
 pub const Scan = struct {
     /// Step output that preceded the marker on the same line (output without a trailing newline).
     before: []const u8,
@@ -833,6 +840,8 @@ const Demux = struct {
     }
 };
 
+/// Reads `dagger run`'s progress log from `file` to its end, handing each line to the step it
+/// belongs to, then tells `awaitLive` that no more arrive.
 pub fn readLogs(io: std.Io, sh: *JobLog, file: std.Io.File) void {
     defer {
         sh.stream_ended.store(true, .release);

@@ -195,6 +195,8 @@ pub fn loadUses(x: *Exec, num: u32, u: job_mod.Uses, nested: bool) !LoadResult {
     return if (u.local) x.loadLocal(u) else x.loadAction(u);
 }
 
+/// Gives the evaluator the action's view of the contexts: its inputs, `github.action_*`, and a
+/// fresh job status, for the steps of a composite action.
 pub fn enterAction(x: *Exec, act: Loaded, inputs: []const expr.Value.Entry) !void {
     const ev = x.ev;
     ev.steps = .empty;

@@ -72,7 +72,7 @@ pub const default_image = "ubuntu:24.04" ++
     "@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852";
 /// The default image's name, which a workflow's `container:` or the config's image may give:
 /// `resolveImage` makes it the pinned image, so it is provisioned and keyed as the default is.
-pub const default_image_name = default_image[0..std.mem.indexOfScalar(u8, default_image, '@').?];
+const default_image_name = default_image[0..std.mem.indexOfScalar(u8, default_image, '@').?];
 
 /// `default_image` for its bare name, any other image as given (a custom tag or digest is the
 /// user's choice, used as is and not provisioned).
@@ -112,6 +112,7 @@ pub fn jobTemp(arena: Allocator, job: job_mod.Job) ![]const u8 {
 fn jobWorkRoot(job: job_mod.Job) []const u8 {
     return if (job.container != null) container_work_root else work_root;
 }
+/// What every step marker line starts with (`JobLog.scan` reads them).
 pub const marker = "::zig-step::";
 
 /// The user steps run as in the default image with `Options.step_user = .runner`, as on GitHub's
@@ -121,6 +122,7 @@ pub const marker = "::zig-step::";
 pub const runner_user = "runner";
 pub const runner_home = "/home/runner";
 
+/// Writes `s` as one single-quoted shell word.
 pub fn shellQuote(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('\'');
     for (s) |c| {
@@ -244,8 +246,10 @@ pub fn jsonStrings(arena: Allocator, v: ?std.json.Value) ![]const []const u8 {
     return out.items;
 }
 
+/// What a step ended as; `not_run` is a step that never started (an earlier one stopped the job).
 pub const Outcome = enum { not_run, success, failure, skipped, cancelled };
 
+/// How one step went, as `Result.steps` lists them.
 pub const StepResult = struct {
     /// The step's display name with expressions evaluated; empty when it was never evaluated.
     name: []const u8 = "",
@@ -257,6 +261,7 @@ pub const StepResult = struct {
     completed_ms: i64 = 0,
 };
 
+/// How a job went: every step, the engine's error if it had one, and the annotations.
 pub const Result = struct {
     steps: []StepResult,
     /// Set when the engine itself failed (pull error, session lost): what Dagger said.
@@ -312,6 +317,7 @@ pub const max_recorded_bytes = 4 * 1024 * 1024;
 /// (0 is "Set up job", 1..n the job's steps).
 pub const ExtraKind = enum { pre, post, initialize, stop };
 
+/// A step the runner adds to the job's own (see `ExtraKind`), shown to GitHub like any other.
 pub const ExtraStep = struct {
     /// `initialize` and `stop` are "Initialize containers" and "Stop containers", which GitHub
     /// lists with the pre and post steps but numbers apart from them (see `upload.shownSteps`).
@@ -638,6 +644,8 @@ pub const Observer = struct {
     }
 };
 
+/// How `run` runs a job: its engine, image, user, native backend and the observer told of each
+/// step.
 pub const Options = struct {
     observer: ?Observer = null,
     /// The `dagger` command. In the tests, one that is never there: a job they did not mean for
@@ -807,6 +815,7 @@ const HttpTransport = struct {
     }
 };
 
+/// The first value under `key` anywhere in `v` (searched depth first), or null.
 pub fn jsonFind(v: std.json.Value, key: []const u8) ?std.json.Value {
     if (v != .object) return null;
     var it = v.object.iterator();
@@ -817,6 +826,7 @@ pub fn jsonFind(v: std.json.Value, key: []const u8) ?std.json.Value {
     return null;
 }
 
+/// `jsonFind`, when what it finds is a string.
 pub fn jsonFindString(v: std.json.Value, key: []const u8) ?[]const u8 {
     const f = jsonFind(v, key) orelse return null;
     return if (f == .string) f.string else null;
@@ -883,7 +893,7 @@ pub fn containsSecret(job: job_mod.Job, value: []const u8) bool {
 
 /// The shortest secret or mask that a value is checked for: a shorter one would match unrelated
 /// text.
-pub const min_secret_len = 3;
+const min_secret_len = 3;
 
 /// Whether a value contains a secret (`containsSecret`) or a value the job's steps masked so far
 /// (`::add-mask::`, through `sh`; none before the first step). A step can pass a masked value on
@@ -894,6 +904,7 @@ pub fn holdsSecret(job: job_mod.Job, sh: ?*JobLog, value: []const u8) bool {
     return log.holdsSecret(value, min_secret_len);
 }
 
+/// A Dagger secret by its name and id.
 pub const SecretRef = struct { name: []const u8, id: []const u8 };
 
 /// The Dagger secrets this job's session holds, by plaintext. A value is registered once per job,
@@ -1023,6 +1034,8 @@ fn base64Encode(arena: Allocator, s: []const u8) ![]const u8 {
     return enc.encode(buf, s);
 }
 
+/// Runs `job` to its end and returns how each step went: on the native backend when `opts.native`
+/// is set and the job and machine allow it, else through Dagger.
 pub fn run(
     arena: Allocator,
     io: std.Io,
@@ -2091,6 +2104,7 @@ pub fn scriptRun(script: []const u8, env: []const job_mod.EnvVar) Resolved {
     return .{ .run = .{ .script = script, .shell = null, .working_directory = null, .env = env } };
 }
 
+/// The `steps` context entry of a step that did not run, so later conditions see it as skipped.
 pub fn skippedStep(id: []const u8) StepCtx {
     return .{ .id = id, .outcome = "skipped", .conclusion = "skipped", .outputs = &.{} };
 }
@@ -2452,6 +2466,8 @@ pub fn readsRunSpecific(script: []const u8) bool {
         std.mem.indexOf(u8, script, event_path) != null;
 }
 
+/// Whether `name` is an environment variable whose value differs between jobs, so it is kept out of
+/// exec cache keys.
 pub fn isVolatile(name: []const u8) bool {
     for (volatile_env) |v| if (std.mem.eql(u8, v, name)) return true;
     return false;
@@ -2492,6 +2508,7 @@ fn stepDebug(arena: Allocator, job: job_mod.Job) bool {
     return false;
 }
 
+/// Whether the object `v` has `key`, compared as GitHub does, ignoring case.
 pub fn hasKey(v: expr.Value, key: []const u8) bool {
     if (v != .object) return false;
     for (v.object) |e| if (std.ascii.eqlIgnoreCase(e.key, key)) return true;
@@ -2512,6 +2529,7 @@ pub fn withEntries(arena: Allocator, base: expr.Value, extra: []const expr.Value
     return .{ .object = list.items };
 }
 
+/// The first line of `s` once its surrounding whitespace is trimmed.
 pub fn firstLine(s: []const u8) []const u8 {
     const t = std.mem.trim(u8, s, " \n\r\t");
     return t[0 .. std.mem.indexOfScalar(u8, t, '\n') orelse t.len];
@@ -2598,6 +2616,9 @@ fn fail(sh: *JobLog, results: []StepResult, msg: []const u8) !Result {
     return .{ .steps = results, .engine_error = msg, .succeeded = false };
 }
 
+/// Builds the job's `Result` from its steps' results: flushes the log, and keeps the engine's
+/// message with the log's last lines as `engine_error` when the engine said something or a step did
+/// not run though none failed.
 pub fn finish(arena: Allocator, sh: *JobLog, results: []StepResult, engine_msg: []const u8) !Result {
     sh.flush();
     var any_failed = false;

@@ -194,7 +194,7 @@ fn newFileMount(path: []const u8, contents: []const u8) Mount {
     return .{ .new_file = .{ .path = path, .contents = contents, .permissions = 0o755 } };
 }
 
-pub const RuntimeSource = struct {
+const RuntimeSource = struct {
     image: []const u8,
     binary: []const u8,
     npm_dir: ?[]const u8 = null,
