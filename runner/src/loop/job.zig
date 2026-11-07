@@ -23,14 +23,14 @@ const Cycle = @import("../loop.zig").Cycle;
 const Registering = @import("../loop.zig").Registering;
 const stopRequested = @import("../loop.zig").stopRequested;
 const stop_signals = &@import("../loop.zig").stop_signals;
-const say = @import("../loop.zig").say;
+const say = @import("exchange.zig").say;
 const sayUnallocated = @import("../loop.zig").sayUnallocated;
 const token_refresh_secs = @import("../loop.zig").token_refresh_secs;
 const poll_timeout = @import("../loop.zig").poll_timeout;
-const mintToken = @import("../loop.zig").mintToken;
-const jsonString = @import("../loop.zig").jsonString;
-const fail = @import("../loop.zig").fail;
-const failBody = @import("../loop.zig").failBody;
+const mintToken = @import("exchange.zig").mintToken;
+const jsonString = @import("exchange.zig").jsonString;
+const fail = @import("exchange.zig").fail;
+const failBody = @import("exchange.zig").failBody;
 const testRunner = @import("../loop.zig").testRunner;
 
 const Allocator = std.mem.Allocator;
@@ -230,6 +230,8 @@ fn acquire(
     }
 }
 
+/// One job from its broker message `body` to completejob: acquire it, run it, upload what GitHub
+/// shows, and say how the cycle ended.
 pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     const runner_token = session.token;
     const jr = runservice.parseJobRequest(c.arena, body) catch |e| return fail(c, "job request", e);

@@ -716,6 +716,7 @@ test "annotations are masked as the log is, and cut where GitHub cuts them" {
     try std.testing.expectEqual(@as(usize, 4095), parsed.array.items[1].object.get("message").?.string.len);
 }
 
+/// The `stepResults` array completejob sends: each shown step's result (see `Shown`).
 pub fn stepResultsJson(arena: Allocator, shown: []const Shown) ![]const u8 {
     const Item = struct {
         external_id: []const u8,

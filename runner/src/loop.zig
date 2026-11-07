@@ -14,6 +14,12 @@ const redact = @import("redact.zig");
 const admission = @import("admission.zig");
 const handleJob = @import("loop/job.zig").handleJob;
 const SpoolDir = @import("loop/job.zig").SpoolDir;
+const say = @import("loop/exchange.zig").say;
+const fail = @import("loop/exchange.zig").fail;
+const failHttp = @import("loop/exchange.zig").failHttp;
+const failBody = @import("loop/exchange.zig").failBody;
+const mintToken = @import("loop/exchange.zig").mintToken;
+const jsonString = @import("loop/exchange.zig").jsonString;
 const trust = @import("trust.zig");
 
 const Allocator = std.mem.Allocator;
@@ -29,10 +35,13 @@ pub const Exit = enum(u8) { done = 0, config = 1, github = 2, db = 3, native = 4
 /// then cancelled (`StopDeadline`). The second exits immediately.
 pub var stop_signals: std.atomic.Value(u32) = .init(0);
 
+/// Whether a stop signal arrived (`stop_signals`).
 pub fn stopRequested() bool {
     return stop_signals.load(.acquire) > 0;
 }
 
+/// What one cycle of a runner works with: its allocators, io, config, log, error output and the
+/// pool's shared state.
 pub const Runner = struct {
     /// Lives for one cycle (`serve` frees it after each job).
     arena: Allocator,
@@ -98,11 +107,6 @@ pub const SlowOutputs = struct {
         return true;
     }
 };
-
-pub fn say(c: Runner, comptime fmt: []const u8, args: anytype) !void {
-    const text = try std.fmt.allocPrint(c.arena, fmt, args);
-    try c.log.say(text);
-}
 
 /// Poll responses are 202 when idle. A fresh token is minted before the old one can expire.
 pub const token_refresh_secs = 10 * 60;
@@ -873,7 +877,7 @@ fn copyJit(arena: Allocator, jit: jitconfig.Jit) !jitconfig.Jit {
 }
 
 /// Seconds to wait after `failures` failed cycles in a row: 5, 10, 20, ... up to 5 minutes.
-pub fn backoffSecs(failures: u32) u32 {
+fn backoffSecs(failures: u32) u32 {
     if (failures == 0) return 0;
     const shift: u5 = @intCast(@min(failures - 1, 6));
     return @min(@as(u32, 5) << shift, 300);
@@ -1181,57 +1185,6 @@ fn withSlash(arena: Allocator, url: []const u8) ![]const u8 {
 fn deleteSession(c: Runner, base: []const u8, sid: []const u8, token: []const u8) void {
     const url = std.fmt.allocPrint(c.arena, "{s}session?sessionId={s}", .{ base, sid }) catch "";
     _ = broker.call(c.arena, c.io, .DELETE, url, token, null) catch {};
-}
-
-pub fn mintToken(c: Runner, creds: auth.Credentials, status: *std.http.Status) !([]const u8) {
-    var jti: [8]u8 = undefined;
-    c.io.random(&jti);
-    const now = std.Io.Clock.real.now(c.io).toSeconds();
-    const jwt = try auth.buildJwt(
-        c.arena,
-        creds,
-        now,
-        try std.fmt.allocPrint(c.arena, "{x}", .{jti}),
-    );
-    return auth.fetchAccessToken(c.arena, c.io, creds, jwt, status);
-}
-
-/// The string at `key` in the JSON object `body`, or null when it is not one. Running out of memory
-/// is an error, not a missing key: read as one, a job request was ignored as a message of type ''.
-pub fn jsonString(arena: Allocator, body: []const u8, key: []const u8) Allocator.Error!?[]const u8 {
-    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
-    };
-    if (v != .object) return null;
-    const s = v.object.get(key) orelse return null;
-    return if (s == .string) s.string else null;
-}
-
-const github_failure: Cycle = .{ .failed = .{ .exit = .github } };
-
-pub fn fail(c: Runner, what: []const u8, e: anyerror) !Cycle {
-    try c.err.print("error during {s}: ", .{what});
-    try redact.write(c.err, @errorName(e), c.secrets);
-    try c.err.writeByte('\n');
-    return github_failure;
-}
-
-fn failHttp(c: Runner, what: []const u8, e: anyerror, status: std.http.Status) !Cycle {
-    try c.err.print(
-        "error during {s}: {s} (HTTP {d})\n",
-        .{ what, @errorName(e), @backingInt(status) },
-    );
-    return github_failure;
-}
-
-pub fn failBody(c: Runner, what: []const u8, r: broker.Response) !Cycle {
-    // Error bodies are short JSON documents without credentials.
-    try c.err.print(
-        "error during {s}: HTTP {d}: {s}\n",
-        .{ what, @backingInt(r.status), r.body[0..@min(r.body.len, 400)] },
-    );
-    return github_failure;
 }
 
 test "backoffSecs doubles from 5s up to 5 minutes" {

@@ -1,0 +1,3 @@
+kind: Changed
+body: The helpers loop.zig and loop/job.zig share (say, fail, failBody, mintToken, jsonString) moved to loop/exchange.zig, so the two files share little more than Runner, Cycle, Registering and handleJob (#148).
+time: 2026-11-07T12:19:17.863275912-05:00
