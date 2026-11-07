@@ -13,16 +13,21 @@
 (* and .github/scripts/wait-for-checks.sh, which both waits run: the names *)
 (* in .github/checks-on-main read from the commit the job checked out, a   *)
 (* failed check failing the wait at once, a check that never started      *)
-(* failing it once every workflow run on the commit has finished and the   *)
-(* grace has passed, anything else at the end of the wait.                 *)
+(* failing it once every workflow run on the commit but the waiting        *)
+(* workflows' (version.yml's and release.yml's, since 85dc4e8) has         *)
+(* finished and the grace has passed, anything else at the end of the      *)
+(* wait.                                                                   *)
 (*                                                                         *)
 (* main is a line of commits: merges (the merge queue's; each may rename   *)
 (* or add a check, as #405 renamed one) and release commits.  A commit     *)
-(* pushed to main starts two workflow runs, ci.yml's and proofs.yml's push *)
-(* runs ("A" and "B"), whose jobs are the checks: "t" one no merge renames *)
-(* (Tests (x86_64), Database tests, Workflows), "old" and "new" the one a  *)
-(* merge renames or adds.  A run's jobs end together, passing or failing:  *)
-(* a run with one failed job is the same to the wait as one with several.  *)
+(* pushed to main starts ci.yml's and proofs.yml's push runs ("A" and      *)
+(* "B"), whose jobs are the checks: "t" one no merge renames (Tests        *)
+(* (x86_64), Database tests, Workflows), "old" and "new" the one a merge   *)
+(* renames or adds; with OtherWf, also a run that reports none of them     *)
+(* ("C": codeql.yml's, scorecard.yml's, or a scheduled run made at the     *)
+(* commit, as analysis.yml's).  A run's jobs end together, passing or      *)
+(* failing: a run with one failed job is the same to the wait as one with  *)
+(* several.                                                                *)
 (* check-names.sh holds in the merge queue, so the names in checks-on-main *)
 (* at a commit are the jobs that commit runs on a push: one function,      *)
 (* `jobsOf`.  GitHub may never create a run (`lost`): then its checks      *)
@@ -55,13 +60,17 @@ CONSTANTS
     Grace,              \* GRACE_SECONDS, in polls
     ListFromCommit,     \* #408: the names from the commit checked out; FALSE: the run's own file
     FastFails,          \* #408: a check that never started fails the wait once the runs finished
-    RunsCounted,        \* "all": every workflow run on the commit, as #408's query has it;
-                        \* "ci": only the runs of the workflows that report the checks
+    RunsCounted,        \* "others": every workflow run on the commit but the waiting workflows'
+                        \* (version.yml's, release.yml's), as #408 has it since 85dc4e8;
+                        \* "all": every run, the waiting job's own among them, as before it
+    OtherWf,            \* a third push run on every commit, reporting none of the checks
+                        \* (codeql.yml's, scorecard.yml's), which the fast fail waits for too
     DeployIfExplicit,   \* release.yml's deploy `if:` names its needs' results; FALSE: success()
     AtomicPush,         \* `git push --atomic HEAD:main refs/tags/$TAG`
     ApprovalHoldsGroup  \* a run waiting for approval is in progress in the group
 
-Wfs == {"A", "B"}
+Wfs == IF OtherWf THEN {"A", "B", "C"} ELSE {"A", "B"}
+Producers == {"A", "B"}
 Names == {"t", "old", "new"}
 Configs == {{"t", "old"}, {"t", "new"}, {"t", "old", "new"}}
 MaxCommits == 1 + MaxMerges + MaxRuns
@@ -76,18 +85,19 @@ VARIABLES
     vr,       \* the version runs
     rel,      \* rel[i]: the release run of the tag vr[i] pushed
     merges, renames, lost, fails, nruns,
-    lateAll,  \* ghost: a wait went on, a check missing, once all the commit's runs had finished
-    lateCI    \* ghost: ... once the commit's ci and proofs runs had finished
+    lateOthers, \* ghost: a wait went on, a check missing, once every run on the commit but the
+                \* waiting workflows' had finished
+    lateChecks  \* ghost: ... once the runs that report the checks (ci's, proofs') had finished
 
 vars == <<main, ncommits, parent, isRel, jobsOf, wf, vr, rel, merges, renames, lost, fails, nruns,
-          lateAll, lateCI>>
+          lateOthers, lateChecks>>
 
 Tip == main[Len(main)]
 OnMain == {main[k] : k \in 1..Len(main)}
 
 (* The jobs a push run on c defines: ci.yml's do not change, the renamed  *)
 (* one is proofs.yml's.                                                   *)
-WfJobs(c, w) == IF w = "A" THEN {"t"} ELSE jobsOf[c] \ {"t"}
+WfJobs(c, w) == CASE w = "A" -> {"t"} [] w = "B" -> jobsOf[c] \ {"t"} [] OTHER -> {}
 
 (* A check's latest run on c: "none" when it never started.               *)
 Chk(c, n) ==
@@ -120,7 +130,7 @@ Init ==
     /\ vr = [i \in Runs |-> NoRun]
     /\ rel = [i \in Runs |-> NoRel]
     /\ merges = 0 /\ renames = 0 /\ lost = 0 /\ fails = 0 /\ nruns = 0
-    /\ lateAll = FALSE /\ lateCI = FALSE
+    /\ lateOthers = FALSE /\ lateChecks = FALSE
 
 -----------------------------------------------------------------------------
 (* What wait-for-checks.sh sees of a commit.                              *)
@@ -139,14 +149,19 @@ ROpen(c) == {i \in RRuns(c) : ~RelEnded(i)}
 Total(c) == Cardinality(CIRuns(c)) + Cardinality(VRuns(c)) + Cardinality(RRuns(c))
 Open(c) == Cardinality(CIOpen(c)) + Cardinality(VOpen(c)) + Cardinality(ROpen(c))
 
-(* `open == 0 && total > 0`, over what the query counts.                  *)
+(* `open == 0 && total > 0`, over what the query counts: since 85dc4e8,   *)
+(* every run but version.yml's and release.yml's, the push runs here;     *)
+(* before it, every run, the waiting job's own among them.                *)
 ScriptSeesDone(c) ==
     IF RunsCounted = "all" THEN Open(c) = 0 /\ Total(c) > 0
     ELSE CIOpen(c) = {} /\ CIRuns(c) # {}
-(* The commit's runs have all finished: every one, the waiter's own among *)
-(* them (AllRunsDone), or those that report checks (CIDone).              *)
-AllRunsDone(c) == Open(c) = 0 /\ Total(c) > 0 /\ ~Creating(c)
-CIDone(c) == CIOpen(c) = {} /\ CIRuns(c) # {} /\ ~Creating(c)
+(* What a wait could be waiting on has finished: every run but the        *)
+(* waiting workflows' (OthersDone), or the runs that report the checks    *)
+(* (ChecksDone).                                                          *)
+OthersDone(c) == CIOpen(c) = {} /\ CIRuns(c) # {} /\ ~Creating(c)
+ChecksDone(c) ==
+    /\ CIOpen(c) \cap Producers = {} /\ CIRuns(c) \cap Producers # {}
+    /\ \A w \in Producers : wf[c][w] # "creating"
 
 Missing(c, L) == {n \in L : Chk(c, n) = "none"}
 
@@ -165,8 +180,8 @@ CanPoll(c, el) == el < Grace \/ ~Creating(c)
 
 Late(c, L, el, out) == Missing(c, L) # {} /\ el >= Grace /\ out \in {"wait", "timed out"}
 Ghosts(c, L, el, out) ==
-    /\ lateAll' = (lateAll \/ (Late(c, L, el, out) /\ AllRunsDone(c)))
-    /\ lateCI' = (lateCI \/ (Late(c, L, el, out) /\ CIDone(c)))
+    /\ lateOthers' = (lateOthers \/ (Late(c, L, el, out) /\ OthersDone(c)))
+    /\ lateChecks' = (lateChecks \/ (Late(c, L, el, out) /\ ChecksDone(c)))
 
 -----------------------------------------------------------------------------
 (* main and its push runs.                                                *)
@@ -188,7 +203,7 @@ Merge ==
         /\ NewCommit(ncommits + 1, Tip, jobs, FALSE)
     /\ main' = Append(main, ncommits + 1)
     /\ merges' = merges + 1
-    /\ UNCHANGED <<vr, rel, lost, fails, nruns, lateAll, lateCI>>
+    /\ UNCHANGED <<vr, rel, lost, fails, nruns, lateOthers, lateChecks>>
 
 (* GitHub creates a push run, its jobs queued, or never does.             *)
 CreateWf(c, w) ==
@@ -196,14 +211,15 @@ CreateWf(c, w) ==
     /\ \/ wf' = [wf EXCEPT ![c][w] = "queued"] /\ UNCHANGED lost
        \/ lost < MaxLost /\ wf' = [wf EXCEPT ![c][w] = "lost"] /\ lost' = lost + 1
     /\ UNCHANGED <<main, ncommits, parent, isRel, jobsOf, vr, rel, merges, renames, fails, nruns,
-                   lateAll, lateCI>>
+                   lateOthers, lateChecks>>
 
 FinishWf(c, w) ==
     /\ wf[c][w] = "queued"
     /\ \/ wf' = [wf EXCEPT ![c][w] = "pass"] /\ UNCHANGED fails
-       \/ fails < MaxFails /\ wf' = [wf EXCEPT ![c][w] = "fail"] /\ fails' = fails + 1
+       \/ /\ w \in Producers   \* how the others end does not matter to the wait
+          /\ fails < MaxFails /\ wf' = [wf EXCEPT ![c][w] = "fail"] /\ fails' = fails + 1
     /\ UNCHANGED <<main, ncommits, parent, isRel, jobsOf, vr, rel, merges, renames, lost, nruns,
-                   lateAll, lateCI>>
+                   lateOthers, lateChecks>>
 
 -----------------------------------------------------------------------------
 (* version.yml.                                                           *)
@@ -211,7 +227,7 @@ FinishWf(c, w) ==
 SetRun(i, r) == vr' = [vr EXCEPT ![i] = r]
 Fail(r, why) == [r EXCEPT !.st = "failed", !.why = why]
 UnchangedButRuns == UNCHANGED <<main, ncommits, parent, isRel, jobsOf, wf, merges, renames, lost,
-                                fails, lateAll, lateCI>>
+                                fails, lateOthers, lateChecks>>
 
 InProgress == {i \in Runs : vr[i].st \in InGroup}
 Pending == {i \in Runs : vr[i].st = "pending"}
@@ -285,14 +301,14 @@ Push(i) ==
             /\ main' = IF moved THEN main ELSE Append(main, c)
             /\ SetRun(i, IF moved THEN Fail(r, "main moved") ELSE [r EXCEPT !.st = "done"])
             /\ rel' = [rel EXCEPT ![i] = [NoRel EXCEPT !.on = TRUE, !.c = c]]
-    /\ UNCHANGED <<merges, renames, lost, fails, nruns, lateAll, lateCI>>
+    /\ UNCHANGED <<merges, renames, lost, fails, nruns, lateOthers, lateChecks>>
 
 -----------------------------------------------------------------------------
 (* release.yml, on the tag.                                               *)
 
 SetRel(i, r) == rel' = [rel EXCEPT ![i] = r]
 UnchangedButRel == UNCHANGED <<main, ncommits, parent, isRel, jobsOf, wf, vr, merges, renames,
-                               lost, nruns, lateAll, lateCI>>
+                               lost, nruns, lateOthers, lateChecks>>
 
 (* Binaries, Image (`!contains(needs.*.result, 'failure')`) and Image      *)
 (* (publish), one step: a failure of any is the same to the deploy job.    *)
@@ -394,14 +410,16 @@ WaitBounded == \A i \in Runs :
     /\ vr[i].st = "failed" => vr[i].why # ""
     /\ rel[i].dep = "failed" => rel[i].why # ""
 
-(* The fast fail as the script states it: once every workflow run on the  *)
-(* commit has finished, its own among them, a check that never started    *)
-(* ends the wait at the first poll past the grace, not at the timeout.    *)
-FastFailAllRuns == ~lateAll
+(* The fast fail: once every workflow run on the commit but the waiting   *)
+(* workflows' (version.yml's, release.yml's) has finished, a check that   *)
+(* never started ends the wait at the first poll past the grace, not at   *)
+(* the deadline.                                                          *)
+FastFail == ~lateOthers
 
-(* The fast fail as it is meant: once the commit's ci and proofs runs, the *)
-(* ones that report checks, have finished.                                 *)
-FastFail == ~lateCI
+(* Sooner: once the runs that report the checks have finished, whatever   *)
+(* else runs on the commit (codeql, scorecard).  The script waits for     *)
+(* those too, so this fails with OtherWf: ReleasePipeline-other-wf.cfg.   *)
+FastFailOnChecks == ~lateChecks
 
 -----------------------------------------------------------------------------
 (* Liveness, under Spec's fairness.                                       *)
