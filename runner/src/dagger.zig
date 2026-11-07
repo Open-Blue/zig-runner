@@ -355,6 +355,10 @@ pub const Transport = struct {
     /// Ends the document being sent, from another task, so `send` fails; false when none was in
     /// flight. Null when the transport cannot (the `dagger run` CLI): steps then run to their end.
     abortFn: ?*const fn (ptr: *anyopaque) bool = null,
+    /// Sends `sig` to every process of the running step, which goes on until it ends or `abort`
+    /// ends it; false when none is running. Null when the transport has no way to (Dagger:
+    /// BuildKit's cancel is a SIGKILL, and a step gets no warning): `Watch` then aborts at once.
+    warnFn: ?*const fn (ptr: *anyopaque, sig: std.os.linux.SIG) bool = null,
 
     fn send(t: Transport, arena: Allocator, doc: []const u8, limit: usize) ![]const u8 {
         return t.sendFn(t.ptr, arena, doc, limit);
@@ -362,6 +366,10 @@ pub const Transport = struct {
 
     fn abort(t: Transport) bool {
         return if (t.abortFn) |f| f(t.ptr) else false;
+    }
+
+    fn warn(t: Transport, sig: std.os.linux.SIG) bool {
+        return t.warnFn.?(t.ptr, sig);
     }
 };
 
@@ -372,11 +380,34 @@ pub const Cancel = struct {
     /// When whatever still runs is stopped too (the grace period GitHub gives after a cancel), in
     /// ms since the epoch; 0 for none.
     hard_deadline_ms: std.atomic.Value(i64) = .init(0),
+    /// Why, for the job's log: the first reason given.
+    why: std.atomic.Value(Why) = .init(.none),
+
+    pub const Why = enum(u8) {
+        none,
+        github,
+        runner_stopping,
+        job_lost,
+
+        fn text(why: Why) []const u8 {
+            return switch (why) {
+                .none, .github => "The job was cancelled",
+                .runner_stopping => "The runner is stopping",
+                .job_lost => "GitHub no longer has the job",
+            };
+        }
+    };
 
     /// Cancels the job, with whatever still runs after it stopped at `hard_deadline_ms`. Called
     /// from the runner's tasks, possibly more than once (GitHub cancels, then the runner stops):
     /// the earliest deadline holds, so a later, longer grace period never extends a shorter one.
     pub fn request(c: *Cancel, hard_deadline_ms: i64) void {
+        c.requestBecause(hard_deadline_ms, .github);
+    }
+
+    /// `request`, saying why when it was not GitHub's cancel.
+    pub fn requestBecause(c: *Cancel, hard_deadline_ms: i64, why: Why) void {
+        _ = c.why.cmpxchgStrong(.none, why, .acq_rel, .acquire);
         var cur = c.hard_deadline_ms.load(.acquire);
         while (cur == 0 or hard_deadline_ms < cur) {
             cur = c.hard_deadline_ms.cmpxchgWeak(cur, hard_deadline_ms, .acq_rel, .acquire) orelse
@@ -390,12 +421,24 @@ pub const Cancel = struct {
 /// and whose condition no longer holds (`survivesCancel`), by aborting the step's query (the
 /// engine then cancels the exec). A task of its own checks every 200 ms; `begin` and `end` bracket
 /// each step, so an interrupt meant for one step never reaches the next.
+///
+/// A transport that can warn a step (`Transport.warnFn`, the native backend) gets GitHub's ladder
+/// first, whatever the reason for the stop (actions/runner `ProcessInvoker.cs`,
+/// `CancelAndKillProcessTree`): SIGINT, SIGTERM `sigint_ms` later, the kill `sigterm_ms` after
+/// that, each only if the step has not ended. The whole of it fits inside the job's cancel limit
+/// (`ladderEnd`), and a step that outlives the ladder is killed by `abort`, which nothing here can
+/// skip or put off. The timing lives here and not in the helper so that a second cancel, which can
+/// only bring `Cancel.hard_deadline_ms` forward, shortens a ladder under way.
 const Watch = struct {
     io: std.Io,
     transport: Transport,
     cancel: ?*Cancel,
+    /// Where a step is told why it was stopped; the log's step is `step`.
+    log: ?*JobLog = null,
     mu: std.Io.Mutex = .init,
     in_step: bool = false,
+    /// The running step's log step, 0 when `begin` was not told one.
+    step: u32 = 0,
     deadline_ms: i64 = 0,
     /// The running step keeps running through a cancel, until the grace period ends
     /// (`survivesCancel`).
@@ -404,14 +447,28 @@ const Watch = struct {
     cancel_pending: bool = false,
     cancel_seen: bool = false,
     interrupt: Interrupt = .none,
+    /// The ladder under way; null when no step is being stopped.
+    ladder: ?Ladder = null,
     done: std.atomic.Value(bool) = .init(false),
 
     const Interrupt = enum { none, timed_out, cancelled };
 
-    fn begin(w: *Watch, deadline_ms: i64, survives_cancel: bool) void {
+    /// `_sigintTimeout` and `_sigtermTimeout` in `ProcessInvoker.cs`, which are fixed there too.
+    const sigint_ms = 7_500;
+    const sigterm_ms = 2_500;
+    const ladder_ms = sigint_ms + sigterm_ms;
+
+    const Ladder = struct {
+        started_ms: i64,
+        terminated: bool = false,
+    };
+
+    fn begin(w: *Watch, step: u32, deadline_ms: i64, survives_cancel: bool) void {
         w.mu.lockUncancelable(w.io);
         defer w.mu.unlock(w.io);
         w.in_step = true;
+        w.step = step;
+        w.ladder = null;
         w.deadline_ms = deadline_ms;
         w.survives_cancel = survives_cancel;
         w.interrupt = .none;
@@ -423,6 +480,8 @@ const Watch = struct {
         w.mu.lockUncancelable(w.io);
         defer w.mu.unlock(w.io);
         w.in_step = false;
+        w.step = 0;
+        w.ladder = null;
         w.deadline_ms = 0;
         w.survives_cancel = false;
         w.cancel_pending = false;
@@ -446,18 +505,83 @@ const Watch = struct {
                 w.cancel_pending = w.in_step and !w.survives_cancel;
             }
             const hard = c.hard_deadline_ms.load(.acquire);
-            // Past the grace period nothing runs on: whatever is in flight is ended.
-            if (w.cancel_seen and hard > 0 and now > hard) w.cancel_pending = true;
+            // Past the grace period nothing runs on: whatever is in flight is ended. A ladder
+            // starts in time to end with it.
+            if (w.cancel_seen and hard > 0 and now > hard - w.graceMs()) w.cancel_pending = true;
         }
-        if (w.cancel_pending and w.transport.abort()) {
-            w.interrupt = .cancelled;
+        if (w.ladder) |*l| return w.climb(l, now);
+        if (w.cancel_pending and w.stop(now, .cancelled)) {
             w.cancel_pending = false;
             return;
         }
-        if (w.in_step and w.deadline_ms > 0 and now > w.deadline_ms and w.transport.abort()) {
-            w.interrupt = .timed_out;
+        if (w.in_step and w.deadline_ms > 0 and now > w.deadline_ms and w.stop(now, .timed_out))
             w.deadline_ms = 0;
+    }
+
+    /// What the transport needs of the job's cancel limit to stop a step.
+    fn graceMs(w: *const Watch) i64 {
+        return if (w.transport.warnFn != null) ladder_ms else 0;
+    }
+
+    /// When a ladder begun at `started_ms` kills the step: at its full length, or sooner to end
+    /// by the job's cancel limit. `Cancel.request` only ever brings the limit forward, so this
+    /// never moves later, and a second cancel shortens the ladder but cannot lengthen it.
+    fn ladderEnd(w: *const Watch, started_ms: i64) i64 {
+        const full = started_ms + ladder_ms;
+        const c = w.cancel orelse return full;
+        const hard = c.hard_deadline_ms.load(.acquire);
+        return if (hard > 0) @min(full, hard) else full;
+    }
+
+    /// The ladder's last stage, in ms: its share of the whole when the job's limit cut it short.
+    fn ladderTail(w: *const Watch, started_ms: i64) i64 {
+        return @divTrunc((w.ladderEnd(started_ms) - started_ms) * sigterm_ms, ladder_ms);
+    }
+
+    /// Starts stopping what is running: its ladder, or at once when the transport has none or the
+    /// job's limit is already here. False when nothing was running.
+    fn stop(w: *Watch, now: i64, why: Interrupt) bool {
+        const kill_in = w.ladderEnd(now) - now;
+        if (w.transport.warnFn != null and kill_in > 0) {
+            if (!w.transport.warn(.INT)) return false;
+            w.ladder = .{ .started_ms = now };
+            w.say("{s}: stopping the step. Its processes get SIGINT now, SIGTERM in {d} ms and " ++
+                "SIGKILL in {d} ms.", .{ w.reason(why), kill_in - w.ladderTail(now), kill_in });
+        } else {
+            if (!w.transport.abort()) return false;
+            w.say("{s}: the step is stopped.", .{w.reason(why)});
         }
+        w.interrupt = why;
+        return true;
+    }
+
+    /// The ladder's next stage, once it is due.
+    fn climb(w: *Watch, l: *Ladder, now: i64) void {
+        if (now >= w.ladderEnd(l.started_ms)) {
+            w.ladder = null;
+            if (w.transport.abort()) w.say("The step did not stop: killing it.", .{});
+            return;
+        }
+        if (l.terminated or now < w.ladderEnd(l.started_ms) - w.ladderTail(l.started_ms)) return;
+        l.terminated = true;
+        if (w.transport.warn(.TERM)) w.say("The step is still running: SIGTERM sent.", .{});
+    }
+
+    /// Why the step is being stopped, for its log.
+    fn reason(w: *const Watch, why: Interrupt) []const u8 {
+        if (why == .timed_out) return "The step ran past its timeout-minutes";
+        if (w.survives_cancel) return "The job's cancel limit is near";
+        const c = w.cancel orelse return Cancel.Why.github.text();
+        return c.why.load(.acquire).text();
+    }
+
+    /// A line in the step's own log. Between steps (a post script at the job's limit) there is
+    /// none to write to.
+    fn say(w: *const Watch, comptime fmt: []const u8, args: anytype) void {
+        const log = w.log orelse return;
+        if (w.step == 0) return;
+        var buf: [256]u8 = undefined;
+        log.append(w.step, std.fmt.bufPrint(&buf, fmt, args) catch return);
     }
 };
 
@@ -1179,7 +1303,7 @@ pub fn warm(
     };
     // A stop aborts the query, and the engine cancels the exec, as for a step.
     var watch: Watch = .{ .io = io, .transport = transport, .cancel = opts.cancel };
-    watch.begin(0, false);
+    watch.begin(0, 0, false);
     var watching = io.concurrent(Watch.run, .{&watch}) catch null;
     defer if (watching) |*f| {
         watch.done.store(true, .release);
@@ -1731,7 +1855,7 @@ fn runActionStep(
     res.started_ms = std.Io.Clock.real.now(x.io).toMilliseconds();
     if (x.observer) |o| o.started(num, res.name, res.started_ms);
     const deadline_ms = if (how.timeout_ms > 0) res.started_ms + how.timeout_ms else 0;
-    watch.begin(deadline_ms, how.survives_cancel);
+    watch.begin(num, deadline_ms, how.survives_cancel);
     const ran = switch (step.action) {
         .uses => |u| x.runAction(num, u, how.scope, plain, secret, false),
         .docker => |d| x.runImageStep(num, d, how.scope, plain, secret),
@@ -1785,7 +1909,7 @@ fn runResolvedStep(
     res.started_ms = std.Io.Clock.real.now(x.io).toMilliseconds();
     if (x.observer) |o| o.started(num, res.name, res.started_ms);
     const deadline_ms = if (how.timeout_ms > 0) res.started_ms + how.timeout_ms else 0;
-    watch.begin(deadline_ms, how.survives_cancel);
+    watch.begin(num, deadline_ms, how.survives_cancel);
     const name = if (step.context_name.len > 0) step.context_name else step.id;
     const ran = x.execScript(num, num, resolved, name, secret, mounts);
     const intr = watch.end();
@@ -1943,7 +2067,7 @@ fn runSteps(
     if (native) |b| x.tool_cache = b.cache_plan.tool_cache;
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 
-    var watch: Watch = .{ .io = io, .transport = transport, .cancel = opts.cancel };
+    var watch: Watch = .{ .io = io, .transport = transport, .cancel = opts.cancel, .log = sh };
     var watching: ?std.Io.Future(void) = null;
     if (transport.abortFn != null) watching = io.concurrent(Watch.run, .{&watch}) catch null;
     defer if (watching) |*f| {
@@ -2390,7 +2514,7 @@ const FakeAbort = struct {
 test "a step past its timeout is stopped, and only that step" {
     var f: FakeAbort = .{};
     var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = null };
-    w.begin(1_000, false);
+    w.begin(0, 1_000, false);
     f.in_flight = true;
     w.tick(999);
     try std.testing.expectEqual(@as(u32, 0), f.aborted);
@@ -2398,7 +2522,7 @@ test "a step past its timeout is stopped, and only that step" {
     try std.testing.expectEqual(@as(u32, 1), f.aborted);
     try std.testing.expectEqual(Watch.Interrupt.timed_out, w.end());
     // The next step has no timeout: nothing reaches it.
-    w.begin(0, false);
+    w.begin(0, 0, false);
     f.in_flight = true;
     w.tick(5_000);
     try std.testing.expectEqual(@as(u32, 1), f.aborted);
@@ -2408,7 +2532,7 @@ test "a step past its timeout is stopped, and only that step" {
 test "a deadline passed between a step's queries stops its next query" {
     var f: FakeAbort = .{};
     var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = null };
-    w.begin(1_000, false);
+    w.begin(0, 1_000, false);
     w.tick(2_000); // no query in flight
     f.in_flight = true;
     w.tick(2_200);
@@ -2419,20 +2543,20 @@ test "a cancel stops the running step, not the always() steps after it, until th
     var f: FakeAbort = .{};
     var c: Cancel = .{};
     var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = &c };
-    w.begin(0, false);
+    w.begin(0, 0, false);
     f.in_flight = true;
     c.hard_deadline_ms.store(10_000, .release);
     c.requested.store(true, .release);
     w.tick(1_000);
     try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
     // An `if: always()` step after it runs.
-    w.begin(0, false);
+    w.begin(0, 0, false);
     f.in_flight = true;
     w.tick(2_000);
     try std.testing.expectEqual(@as(u32, 1), f.aborted);
     try std.testing.expectEqual(Watch.Interrupt.none, w.end());
     // Past the grace period, whatever runs is stopped.
-    w.begin(0, false);
+    w.begin(0, 0, false);
     f.in_flight = true;
     w.tick(10_001);
     try std.testing.expectEqual(@as(u32, 2), f.aborted);
@@ -2443,7 +2567,7 @@ test "an if: always() step runs on through a cancel, until the grace period ends
     var f: FakeAbort = .{};
     var c: Cancel = .{};
     var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = &c };
-    w.begin(0, true);
+    w.begin(0, 0, true);
     f.in_flight = true;
     c.hard_deadline_ms.store(10_000, .release);
     c.requested.store(true, .release);
@@ -2452,6 +2576,167 @@ test "an if: always() step runs on through a cancel, until the grace period ends
     w.tick(10_001);
     try std.testing.expectEqual(@as(u32, 1), f.aborted);
     try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
+}
+
+/// A transport with a ladder, as the native backend's: the signals it was asked to send.
+const FakeWarn = struct {
+    fake: FakeAbort = .{},
+    sent: [4]std.os.linux.SIG = undefined,
+    n: usize = 0,
+
+    fn warn(ptr: *anyopaque, sig: std.os.linux.SIG) bool {
+        const f: *FakeWarn = @ptrCast(@alignCast(ptr));
+        if (!f.fake.in_flight) return false;
+        f.sent[f.n] = sig;
+        f.n += 1;
+        return true;
+    }
+    fn abort(ptr: *anyopaque) bool {
+        const f: *FakeWarn = @ptrCast(@alignCast(ptr));
+        return FakeAbort.abort(&f.fake);
+    }
+    fn transport(f: *FakeWarn) Transport {
+        return .{ .ptr = f, .sendFn = FakeAbort.send, .abortFn = abort, .warnFn = warn };
+    }
+    fn signals(f: *const FakeWarn) []const std.os.linux.SIG {
+        return f.sent[0..f.n];
+    }
+};
+
+test "a cancel climbs GitHub's ladder: SIGINT, SIGTERM 7500 ms on, the kill 2500 ms after that" {
+    var f: FakeWarn = .{};
+    var c: Cancel = .{};
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = &c };
+    w.begin(0, 0, false);
+    f.fake.in_flight = true;
+    c.request(1_000_000);
+    w.tick(1_000);
+    try std.testing.expectEqualSlices(std.os.linux.SIG, &.{.INT}, f.signals());
+    try std.testing.expectEqual(@as(u32, 0), f.fake.aborted);
+    w.tick(8_499);
+    try std.testing.expectEqualSlices(std.os.linux.SIG, &.{.INT}, f.signals());
+    w.tick(8_500);
+    w.tick(8_700);
+    try std.testing.expectEqualSlices(std.os.linux.SIG, &.{ .INT, .TERM }, f.signals());
+    w.tick(10_999);
+    try std.testing.expectEqual(@as(u32, 0), f.fake.aborted);
+    w.tick(11_000);
+    try std.testing.expectEqual(@as(u32, 1), f.fake.aborted);
+    try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
+}
+
+test "a step past its timeout takes the same ladder, and no limit cuts it short" {
+    var f: FakeWarn = .{};
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = null };
+    w.begin(0, 1_000, false);
+    f.fake.in_flight = true;
+    w.tick(1_001);
+    w.tick(8_501);
+    try std.testing.expectEqualSlices(std.os.linux.SIG, &.{ .INT, .TERM }, f.signals());
+    try std.testing.expectEqual(@as(u32, 0), f.fake.aborted);
+    w.tick(11_001);
+    try std.testing.expectEqual(@as(u32, 1), f.fake.aborted);
+    try std.testing.expectEqual(Watch.Interrupt.timed_out, w.end());
+}
+
+test "a ladder ends by the job's cancel limit, in proportion, and a second cancel only shortens" {
+    var f: FakeWarn = .{};
+    var c: Cancel = .{};
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = &c };
+    w.begin(0, 0, false);
+    f.fake.in_flight = true;
+    // 4 s left of the limit: SIGTERM three quarters of the way, the kill at the limit.
+    c.request(5_000);
+    w.tick(1_000);
+    w.tick(3_999);
+    try std.testing.expectEqualSlices(std.os.linux.SIG, &.{.INT}, f.signals());
+    // A later cancel with more time changes nothing.
+    c.request(60_000);
+    w.tick(4_000);
+    try std.testing.expectEqualSlices(std.os.linux.SIG, &.{ .INT, .TERM }, f.signals());
+    // A second cancel with less brings the kill forward.
+    c.request(4_500);
+    w.tick(4_400);
+    try std.testing.expectEqual(@as(u32, 0), f.fake.aborted);
+    w.tick(4_500);
+    try std.testing.expectEqual(@as(u32, 1), f.fake.aborted);
+    try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
+}
+
+test "a second cancel at once skips what is left of a ladder" {
+    var f: FakeWarn = .{};
+    var c: Cancel = .{};
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = &c };
+    w.begin(0, 0, false);
+    f.fake.in_flight = true;
+    c.request(100_000);
+    w.tick(1_000);
+    c.request(1_500);
+    w.tick(1_600);
+    try std.testing.expectEqualSlices(std.os.linux.SIG, &.{.INT}, f.signals());
+    try std.testing.expectEqual(@as(u32, 1), f.fake.aborted);
+}
+
+test "a job already past its limit is stopped with no ladder" {
+    var f: FakeWarn = .{};
+    var c: Cancel = .{};
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = &c };
+    w.begin(0, 0, false);
+    f.fake.in_flight = true;
+    c.request(900);
+    w.tick(1_000);
+    try std.testing.expectEqual(@as(usize, 0), f.n);
+    try std.testing.expectEqual(@as(u32, 1), f.fake.aborted);
+    try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
+}
+
+test "an if: always() step's ladder ends with the job's limit, not after it" {
+    var f: FakeWarn = .{};
+    var c: Cancel = .{};
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = &c };
+    w.begin(0, 0, true);
+    f.fake.in_flight = true;
+    c.request(100_000);
+    w.tick(1_000);
+    w.tick(90_000);
+    try std.testing.expectEqual(@as(usize, 0), f.n);
+    w.tick(90_001);
+    w.tick(97_501);
+    try std.testing.expectEqualSlices(std.os.linux.SIG, &.{ .INT, .TERM }, f.signals());
+    w.tick(99_999);
+    try std.testing.expectEqual(@as(u32, 0), f.fake.aborted);
+    w.tick(100_000);
+    try std.testing.expectEqual(@as(u32, 1), f.fake.aborted);
+    try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
+}
+
+test "a step that ended during its ladder takes none of it to the next step" {
+    var f: FakeWarn = .{};
+    var c: Cancel = .{};
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = &c };
+    w.begin(0, 0, false);
+    f.fake.in_flight = true;
+    c.request(100_000);
+    w.tick(1_000);
+    f.fake.in_flight = false;
+    try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
+    // An `if: always()` step after it hears nothing, and is not killed when the ladder would have
+    // ended.
+    w.begin(0, 0, true);
+    f.fake.in_flight = true;
+    w.tick(8_600);
+    w.tick(11_100);
+    try std.testing.expectEqualSlices(std.os.linux.SIG, &.{.INT}, f.signals());
+    try std.testing.expectEqual(@as(u32, 0), f.fake.aborted);
+    try std.testing.expectEqual(Watch.Interrupt.none, w.end());
+}
+
+test "a cancel's first reason is the one the job is told" {
+    var c: Cancel = .{};
+    c.requestBecause(5_000, .runner_stopping);
+    c.request(4_000);
+    try std.testing.expectEqual(Cancel.Why.runner_stopping, c.why.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 4_000), c.hard_deadline_ms.load(.acquire));
 }
 
 test "survivesCancel: the step's condition, evaluated with the job cancelled" {
@@ -2491,7 +2776,7 @@ test "a cancel between steps does not stop the next step" {
     var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = &c };
     c.requested.store(true, .release);
     w.tick(1_000);
-    w.begin(0, false);
+    w.begin(0, 0, false);
     f.in_flight = true;
     w.tick(1_200);
     try std.testing.expectEqual(@as(u32, 0), f.aborted);

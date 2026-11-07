@@ -8,9 +8,11 @@
 //! `run` is the runner's side, `main` the helper's. The helper's stdin carries the step's `Spec`
 //! as one line of JSON and then stays open as its lifeline: when it closes, because the runner
 //! stops the step (`Running.kill`) or the runner itself is gone, the helper kills the step's PID 1,
-//! and with it every process in the step's PID namespace. The helper's stdout is the step's stdout
-//! and stderr, streamed into the job's log as it is read; its stderr carries only its own failures,
-//! so anything there means the sandbox, not the step, failed.
+//! and with it every process in the step's PID namespace. Before that the runner can warn the step
+//! through it (`Running.warn`), a byte each, and the helper signals the step's processes
+//! (`Warning`). The helper's stdout is the step's stdout and stderr, streamed into the job's log
+//! as it is read; its stderr carries only its own failures, so anything there means the sandbox,
+//! not the step, failed.
 //!
 //! What it replaces in Dagger: BuildKit's runc executor. runc did implicitly several things a
 //! step relies on, each now explicit here: HOME from the image's /etc/passwd when the env has
@@ -226,10 +228,24 @@ fn finish(
     out: Output,
 ) !Ended {
     var buf: [64 * 1024]u8 = undefined;
+    var canceled = false;
     while (true) {
-        const n = child.stdout.?.readStreaming(io, &.{&buf}) catch break;
+        const n = child.stdout.?.readStreaming(io, &.{&buf}) catch |e| {
+            if (e != error.Canceled) break;
+            // The task's own cancel, not the job's (`dagger.Cancel`): it stops the step, whose
+            // output and end are still to come. It is delivered once, so `run`'s caller sees it
+            // only if it is delivered again, which waits until the helper is gone.
+            canceled = true;
+            _ = running.kill(io);
+            continue;
+        };
         if (n == 0) break;
         out.chunk(buf[0..n]);
+    }
+    const protection = io.swapCancelProtection(.blocked);
+    defer {
+        _ = io.swapCancelProtection(protection);
+        if (canceled) io.recancel();
     }
     var failure: std.ArrayList(u8) = .empty;
     while (failure.items.len < max_failure_bytes) {
@@ -266,8 +282,8 @@ pub const Output = struct {
     }
 };
 
-/// The helper running now, if any, for `kill` from another task (a timeout or a cancel, through
-/// `dagger.Watch`): its lifeline, the write end of its stdin.
+/// The helper running now, if any, for `warn` and `kill` from another task (a timeout or a cancel,
+/// through `dagger.Watch`): its lifeline, the write end of its stdin.
 pub const Running = struct {
     mu: std.Io.Mutex = .init,
     lifeline: ?std.Io.File = null,
@@ -298,6 +314,20 @@ pub const Running = struct {
         defer r.mu.unlock(io);
         if (r.lifeline) |f| f.close(io);
         r.lifeline = null;
+    }
+
+    /// Sends `sig` to the step's processes, through its lifeline (`Warning`). The step goes on,
+    /// but its end is taken for a stop, as after `kill`: what it does now is not its own. False
+    /// when none was running.
+    pub fn warn(r: *Running, io: std.Io, sig: linux.SIG) bool {
+        r.mu.lockUncancelable(io);
+        defer r.mu.unlock(io);
+        const f = r.lifeline orelse return false;
+        r.killed = true;
+        // Fails only when the helper has gone, and the step with it.
+        const stage = [1]u8{@intCast(@backingInt(sig))};
+        f.writeStreamingAll(io, &stage) catch {};
+        return true;
     }
 
     /// Stops the running step: its lifeline closes, and the helper kills the step's PID 1, and
@@ -486,9 +516,11 @@ fn dirIn(arena: Allocator, root: linux.fd_t, path: []const u8) ?linux.fd_t {
 /// The helper's entry: reads the spec from stdin, runs the step, and exits with its code. Uses
 /// only raw system calls once it has the spec, so nothing starts a thread before `unshare`.
 pub fn main(arena: Allocator) u8 {
-    const spec = readSpec(arena) catch |e| fatal("cannot read the step's spec", @intFromError(e));
+    var early: std.ArrayList(u8) = .empty;
+    const spec = readJsonLine(Spec, arena, &early) catch |e|
+        fatal("cannot read the step's spec", @intFromError(e));
     var marks: phases.Helper = .{ .start = phases.now() };
-    const code = runStep(arena, spec, &marks);
+    const code = runStep(arena, spec, &marks, early.items);
     // Its phases, for the runner (`phases.Helper.take`): once the step has ended, so never
     // mixed with a failure, which ends the helper before this (`fatal`).
     marks.end = phases.now();
@@ -498,17 +530,11 @@ pub fn main(arena: Allocator) u8 {
     return code;
 }
 
-/// The spec's one line from stdin, read a byte at a time so nothing after it is taken: what
-/// follows on the pipe is the lifeline's end.
-fn readSpec(arena: Allocator) !Spec {
-    return readJsonLine(Spec, arena);
-}
-
-/// A helper's spec: one line of JSON on stdin (`readSpec`; `forward.zig`'s too). Read as it comes,
+/// A helper's spec: one line of JSON on stdin (`main`; `forward.zig`'s too). Read as it comes,
 /// not a byte at a time (a step's spec, its env and files, is tens of KB: as many reads, the
-/// larger part of a helper's start): its writer writes the line and nothing after it, keeping
-/// the pipe open only as the lifeline, so no read takes anything past the line's end.
-pub fn readJsonLine(comptime T: type, arena: Allocator) !T {
+/// larger part of a helper's start). What came after the line on the same read goes to `rest`:
+/// the runner may warn a step that is still starting (`Running.warn`).
+pub fn readJsonLine(comptime T: type, arena: Allocator, rest: *std.ArrayList(u8)) !T {
     var data: std.ArrayList(u8) = .empty;
     var buf: [64 * 1024]u8 = undefined;
     const line = while (true) {
@@ -522,6 +548,7 @@ pub fn readJsonLine(comptime T: type, arena: Allocator) !T {
         const got = buf[0..rc];
         if (std.mem.indexOfScalar(u8, got, '\n')) |end| {
             try data.appendSlice(arena, got[0..end]);
+            try rest.appendSlice(arena, got[end + 1 ..]);
             break data.items;
         }
         try data.appendSlice(arena, got);
@@ -529,7 +556,7 @@ pub fn readJsonLine(comptime T: type, arena: Allocator) !T {
     return std.json.parseFromSliceLeaky(T, arena, line, .{ .allocate = .alloc_always });
 }
 
-fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper) u8 {
+fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper, early: []const u8) u8 {
     // First, so every process the step makes, and this helper, is held to the job's limits.
     if (spec.cgroup) |dir| joinCgroup(arena, dir);
     // Files a step creates get the modes they get under runc.
@@ -671,7 +698,7 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper) u8 {
     const st = if (spec.service) |s|
         health.supervise(arena, spec, s, @intCast(pid), root, status, env)
     else
-        superviseStep(@intCast(pid));
+        superviseStep(@intCast(pid), spec.container != null, early);
     for (spec.files) |f| if (!f.keep) {
         // Its bind first: a mount point cannot be removed in the namespace it is mounted in.
         if (targetIn(arena, root, f.path, false)) |fd| {
@@ -1062,24 +1089,34 @@ fn makeDirsOpen(arena: Allocator, root: linux.fd_t, path: []const u8) linux.fd_t
     return dirIn(arena, root, rel) orelse fatal(about(arena, "make", path), @as(u32, 2));
 }
 
-/// Waits for the step's PID 1, killing it when the lifeline (stdin) closes or says anything: the
-/// runner stopped the step, or is gone. Killing PID 1 kills every process of the step's PID
-/// namespace. The wait status.
-fn superviseStep(pid: linux.pid_t) u32 {
+/// Waits for the step's PID 1, killing it when the lifeline (stdin) closes or says anything but a
+/// warning (`Warning.take`): the runner stopped the step, or is gone. Killing PID 1 kills every
+/// process of the step's PID namespace: the kernel stops the namespace's forks first, so nothing
+/// outruns it, and a process that left its group or its parent goes too. `own_program`: PID 1 is
+/// the step's own, not the `sh -c` around it (`Warning.pid1`). The wait status.
+fn superviseStep(pid: linux.pid_t, own_program: bool, early: []const u8) u32 {
     const pidfd_rc = linux.pidfd_open(pid, 0);
     const pidfd: ?linux.fd_t = if (linux.errno(pidfd_rc) == .SUCCESS) @intCast(pidfd_rc) else null;
-    while (true) {
+    var warning: Warning = .{ .pid1 = if (own_program) pid else null };
+    var stopped = false;
+    for (early) |byte| stopped = stopped or !warning.take(byte);
+    while (!stopped) {
+        warning.tend();
         var fds = [_]linux.pollfd{
             .{ .fd = 0, .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = pidfd orelse -1, .events = linux.POLL.IN, .revents = 0 },
         };
         // Without a pidfd (Linux before 5.3), the step's end is polled for.
-        const rc = linux.poll(&fds, fds.len, if (pidfd == null) 100 else -1);
+        const wait_ms: i32 = if (warning.busy()) 20 else if (pidfd == null) 100 else -1;
+        const rc = linux.poll(&fds, fds.len, wait_ms);
         if (linux.errno(rc) == .INTR) continue;
         check("wait for the step or its stop", rc);
         if (fds[0].revents != 0) {
-            _ = linux.kill(pid, .KILL);
-            break;
+            var byte: [1]u8 = undefined;
+            const n = linux.read(0, &byte, 1);
+            if (linux.errno(n) == .INTR) continue;
+            stopped = n != 1 or !warning.take(byte[0]);
+            continue;
         }
         if (fds[1].revents != 0) break;
         if (pidfd == null) {
@@ -1089,6 +1126,8 @@ fn superviseStep(pid: linux.pid_t) u32 {
                 return @bitCast(status);
         }
     }
+    if (stopped) _ = linux.kill(pid, .KILL);
+    warning.drop();
     var status: i32 = 0;
     while (true) {
         const rc = linux.waitpid(pid, &status, 0);
@@ -1098,6 +1137,81 @@ fn superviseStep(pid: linux.pid_t) u32 {
     }
     return @bitCast(status);
 }
+
+/// One stage of a stop in the helper (`Running.warn`): a signal to every process of the step, so a
+/// step's foreground child, a background job and a process in a session of its own all hear it,
+/// where GitHub's runner signals only the step's entry process (`ProcessInvoker.cs`, `SendSignal`).
+///
+/// From outside its PID namespace no call reaches all of a namespace, and a signal to PID 1 is
+/// dropped unless PID 1 has a handler for it. `kill(-1)` from inside does reach all but PID 1, as
+/// one act the kernel holds forks off from, so a process in a fork cannot slip past it. So a
+/// process is forked for that one call (the helper's forks land in the step's namespace, as
+/// `unshare` left them): it can be nothing the step's own could become, since it lasts one system
+/// call, is not dumpable, and has capabilities the step's bounding set has not, which is what
+/// keeps a step's root from tracing it. A step that stops it only loses its warning.
+///
+/// Its fork can fail, with a fork bomb at `pids.max`: it is tried again while the stage lasts, and
+/// the ladder's last stage needs no fork.
+const Warning = struct {
+    /// PID 1, for a Docker action's container, whose first process is the action's own: it is
+    /// signalled as `docker stop` would. A `run:` step's PID 1 is the `sh -c` around the step's
+    /// shell (`scripts.stepScriptFc`), which is left alone: it reports the step's end, and where
+    /// `sh` is bash it would act on a signal and end the namespace under a step still cleaning up.
+    pid1: ?linux.pid_t,
+    /// A signal no process could be forked for yet.
+    pending: ?linux.SIG = null,
+    /// The process sending it. Its zombie must be reaped: PID 1 cannot finish exiting while one
+    /// of its namespace is left (`zap_pid_ns_processes`), and the step would never end.
+    sender: ?linux.pid_t = null,
+
+    /// A byte from the lifeline: false when it is no warning, which stops the step.
+    fn take(w: *Warning, byte: u8) bool {
+        const sig: linux.SIG = switch (byte) {
+            @backingInt(linux.SIG.INT) => .INT,
+            @backingInt(linux.SIG.TERM) => .TERM,
+            else => return false,
+        };
+        if (w.pid1) |p| _ = linux.kill(p, sig);
+        w.drop();
+        w.pending = sig;
+        w.tend();
+        return true;
+    }
+
+    fn busy(w: *const Warning) bool {
+        return w.pending != null or w.sender != null;
+    }
+
+    /// Forks for the signal waiting for it, and reaps a sender that is done.
+    fn tend(w: *Warning) void {
+        if (w.sender) |p| {
+            var status: i32 = 0;
+            const rc = linux.waitpid(p, &status, linux.W.NOHANG);
+            if (rc == 0 and linux.errno(rc) == .SUCCESS) return;
+            w.sender = null;
+        }
+        const sig = w.pending orelse return;
+        const pid = linux.fork();
+        if (linux.errno(pid) != .SUCCESS) return;
+        if (pid == 0) {
+            _ = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
+            _ = linux.kill(-1, sig);
+            linux.exit_group(0);
+        }
+        w.pending = null;
+        w.sender = @intCast(pid);
+    }
+
+    /// Whatever is still being sent, given up on: the next stage, or the end of the step.
+    fn drop(w: *Warning) void {
+        w.pending = null;
+        const p = w.sender orelse return;
+        w.sender = null;
+        _ = linux.kill(p, .KILL);
+        var status: i32 = 0;
+        while (linux.errno(linux.waitpid(p, &status, 0)) == .INTR) {}
+    }
+};
 
 /// PID 1 of the step: its /dev, /proc and /sys, the overlay as its root (`pivot_root`, the host's
 /// root detached), its working directory, capabilities, user, no_new_privs and seccomp filter,

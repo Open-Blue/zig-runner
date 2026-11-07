@@ -43,7 +43,8 @@ const buf_len = 16 * 1024;
 /// The helper's entry. Exits 0 when its lifeline closes, 1 with why on stderr when it cannot
 /// listen.
 pub fn main(arena: Allocator) u8 {
-    const spec = sandbox.readJsonLine(Spec, arena) catch
+    var rest: std.ArrayList(u8) = .empty;
+    const spec = sandbox.readJsonLine(Spec, arena, &rest) catch
         sandbox.fatal("read the relay's spec", @as(u32, 22));
     if (spec.cgroup) |dir| sandbox.joinCgroup(arena, dir);
     if (spec.netns) |p| {
