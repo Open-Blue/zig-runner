@@ -167,7 +167,7 @@ pub const Volumes = struct {
     /// Every volume's mount point, in order.
     targets: []const []const u8 = &.{},
     /// How many of them are named.
-    named: u32 = 0,
+    named: usize = 0,
 };
 
 fn refuseVolume(arena: Allocator, why: *[]const u8, raw: []const u8, reason: []const u8) Error {
@@ -288,7 +288,7 @@ pub fn volumes(arena: Allocator, list: []const job_mod.Template, why: *[]const u
         }
         try targets.append(arena, v.target);
     }
-    return .{ .targets = targets.items, .named = @intCast(names.items.len) };
+    return .{ .targets = targets.items, .named = names.items.len };
 }
 
 /// Why a job container cannot be native, or null: its `ports:`, any of its `volumes:` that
@@ -532,7 +532,7 @@ test "unsupported: a list of volumes is carried out whole, or the job falls back
     defer a.deinit();
     var why: []const u8 = "";
     const v = try volumes(a.allocator(), jc.volumes, &why);
-    try std.testing.expectEqual(@as(u32, 2), v.named);
+    try std.testing.expectEqual(@as(usize, 2), v.named);
     try std.testing.expectEqual(@as(usize, 3), v.targets.len);
     try std.testing.expectEqualStrings("/other", v.targets[2]);
 
