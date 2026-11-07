@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
     // A position-independent executable, static still: the kernel loads it at a random address, so
     // its code is not where an exploit of the runner (root on prod, reading untrusted input) knows
     // to find it. On by default, so the release (build-binaries.sh, zig-modules.sh's -fPIE), the
-    // image and a developer's build are the same binary; it costs 0-3% on the hot paths (BENCHMARKS.md).
+    // image and a developer's build are the same binary; it costs 0-3% on the hot paths (docs/BENCHMARKS.md).
     const pie = b.option(bool, "pie", "Build a position-independent executable (default: true)") orelse true;
 
     // The build's own version, in every job's "Set up job" and in `--version`. Answering "which

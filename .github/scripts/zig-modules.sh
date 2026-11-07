@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # The runner's module graph as runner/build.zig makes it, for compiling with the compiler directly
 # instead of `zig build`, whose first step on a machine with an empty cache is compiling Zig's own
-# build system, about 100 s on one core (BENCHMARKS.md). Sourced by zig-test.sh (CI's tests) and
+# build system, about 100 s on one core (docs/BENCHMARKS.md). Sourced by zig-test.sh (CI's tests) and
 # build-binaries.sh (the release's binaries), from runner/.
 #
 # The graph must match build.zig's: src/main.zig as the root; build_version, a file holding the

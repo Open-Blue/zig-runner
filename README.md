@@ -120,7 +120,7 @@ BSD, ISC, Zlib, Unicode; the list and its one exception are in `security.yml`). 
 dependency graph, which sees the Go tools' modules under `runner/tools/` (indirect ones included)
 and the actions the workflows use. It does not see `runner/build.zig.zon` (no Zig support:
 tls.zig, the one dependency compiled into the runner, is followed by Renovate and listed in
-[THIRD_PARTY.md](THIRD_PARTY.md) by hand), the images `runner/Dockerfile`, `deploy/compose.yaml`
+[docs/THIRD_PARTY.md](docs/THIRD_PARTY.md) by hand), the images `runner/Dockerfile`, `deploy/compose.yaml`
 and the scripts pin (Trivy scans the release's image), or the .NET reference program, which has no
 packages.
 "End to end" (`ci`, `.github/scripts/e2e.sh`) runs the runner built from the pull request for
@@ -254,7 +254,7 @@ repository:
   same binary): the kernel loads each at a random address, where before they sat at the fixed
   0x1000000. They have full RELRO (what is relocated at startup is read-only before the runner's
   code runs), a non-executable stack, and no segment both writable and executable (W^X). PIE costs
-  0-3% on the hot paths ([BENCHMARKS.md](BENCHMARKS.md), "Position-independent executable").
+  0-3% on the hot paths ([docs/BENCHMARKS.md](docs/BENCHMARKS.md), "Position-independent executable").
   Intel CET (IBT and shadow stacks) is not available: Zig 0.17 has no `-fcf-protection` for Zig
   code, so the binaries carry no CET note. [checksec](https://github.com/slimm609/checksec) 3.2
   (`.github/scripts/checksec.sh`, pinned by version and checksum) fails the release, and on pull
@@ -471,7 +471,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now zig-runner-deploy.ti
 ### Rebooting the machine
 
 The engine keeps its cache across a restart only if it is allowed to mark it clean first (see
-[BENCHMARKS.md](BENCHMARKS.md)), and Docker gives a container 10 s at shutdown. So stop the runner
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md)), and Docker gives a container 10 s at shutdown. So stop the runner
 instances (each finishes its running jobs), then the engine with time to spare, then reboot:
 
 ```sh
@@ -527,13 +527,13 @@ it off.
 
 ## Benchmarks
 
-[BENCHMARKS.md](BENCHMARKS.md) has what was measured on the reference machine, a Raspberry Pi 5:
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) has what was measured on the reference machine, a Raspberry Pi 5:
 where a job's time goes (the engine, not the runner), what an engine restart does to its cache, what
 installing Zig costs, and the earlier study's results with their verdicts.
 
 ## Changelog
 
-[CHANGELOG.md](CHANGELOG.md) is kept with [changie](https://changie.dev): each change is a file
+[docs/CHANGELOG.md](docs/CHANGELOG.md) is kept with [changie](https://changie.dev): each change is a file
 under `.changes/unreleased/`, written with `changie new` in the pull request that makes it. The
 release batches them into the version's notes (`changie batch <version> && changie merge`), which
 are also its GitHub release's notes.
@@ -560,4 +560,4 @@ design) and
 experiments).
 
 Licence: see [LICENSE](LICENSE); the vendored third-party code is listed in
-[THIRD_PARTY.md](THIRD_PARTY.md).
+[docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).

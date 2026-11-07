@@ -1,7 +1,7 @@
 # Third-party code and sources
 
 What this project includes from others, what it follows without copying, and what it uses at run
-time. The project's own license is in [LICENSE](LICENSE).
+time. The project's own license is in [LICENSE](../LICENSE).
 
 ## Included in this repository
 

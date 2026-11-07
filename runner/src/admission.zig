@@ -1017,7 +1017,7 @@ pub fn read(io: std.Io, paths: Paths, engine_dir: ?[]const u8) Sample {
 /// and cheaply as the cgroup nears its cap, `inactive_file` and `slab_reclaimable`. The engine's
 /// cache is file-backed and large (image layers, the step and package caches), and the reclaimable
 /// slab is the dentries and inodes of the files it hashes and reads: the Zig tool cache's 19,505
-/// files every job (BENCHMARKS.md), 180-270 MB on razorbill at idle, where the gate charged 1.3 GB
+/// files every job (docs/BENCHMARKS.md), 180-270 MB on razorbill at idle, where the gate charged 1.3 GB
 /// for an engine whose own heap was about 650 MB. Counting either would hold runners, and raise a
 /// job's learned size (#144), for memory the engine gives up the moment a job needs it (#126).
 /// Active file pages stay counted: they are being read, dropping them turns into reads from the SD
