@@ -19,7 +19,10 @@ const trust = @import("trust.zig");
 const Allocator = std.mem.Allocator;
 
 /// SPEC §2 exit codes.
-pub const Exit = enum(u8) { done = 0, config = 1, github = 2, db = 3 };
+/// `native` is a runner with no engine whose machine could not run native steps just now, which
+/// may pass (nftables busy, no network yet): unlike `config` and `github`, systemd restarts it
+/// (`RestartPreventExitStatus=1 2`).
+pub const Exit = enum(u8) { done = 0, config = 1, github = 2, db = 3, native = 4 };
 
 /// SIGTERM / SIGINT received so far (`main` installs the handlers). The first asks the runners to
 /// stop: waiting ones stop at once, running jobs get `Config.stop_grace_secs` to finish and are

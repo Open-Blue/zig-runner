@@ -2,13 +2,16 @@
 //! options"): the `docker create` flags a native job can honour, and a refusal for every other.
 //!
 //! GitHub's runner appends the string to `docker create` for the job container, after the flags
-//! it builds itself, and runs every step with `docker exec -w <directory>`. So a flag is honoured
+//! it builds itself but before the `-e` of the container's `env:` (so that wins over an `-e` here,
+//! and its `HOME=/github/home` over `-e HOME`), and runs every step with `docker exec -w
+//! <directory>`. So a flag is honoured
 //! when the native sandbox already has what it asks for (the step user, the container's env), is
 //! meaningless when `docker exec` or the runner overrides it (`--workdir`, `--health-*`: the
 //! runner waits for the health of service containers only), and is refused otherwise. Refused,
 //! never ignored: `--cpus`, `--privileged`, `--device`, `--add-host` and the rest change the
 //! container, and the sandbox does not carry them out, so a job that silently lost one would run
-//! differently from its workflow. The job goes to Dagger with the flag named instead.
+//! differently from its workflow. The job goes to Dagger with the flag named instead, and Dagger
+//! reads none of `options:`: there the flag is dropped, which the note says (`dropped`).
 //!
 //! Only literal text is read here. An `options:` with an expression in it is decided when the job
 //! is, before any expression can be evaluated, so it falls back too.
@@ -21,7 +24,8 @@ const Allocator = std.mem.Allocator;
 
 /// What a job container's `options:` ask for that the native job carries out.
 pub const Options = struct {
-    /// `--env`/`-e` as `docker create` sets them, in order, over the container's `env:`.
+    /// `--env`/`-e` as `docker create` sets them, in order, under the container's `env:` (the
+    /// runner puts the options first, so the `env:` wins). Not `HOME`: see `parse`.
     env: []const job_mod.EnvVar = &.{},
     /// `--user`/`-u`, as an image's `USER` is written: `name`, `uid`, `name:group`, `uid:gid`.
     user: ?[]const u8 = null,
@@ -74,6 +78,11 @@ pub fn parse(arena: Allocator, text: []const u8, why: *[]const u8) Error!Options
             const eq = std.mem.indexOfScalar(u8, value, '=') orelse
                 return refuse(arena, why, w, "copies a variable from the runner's environment");
             if (eq == 0) return refuse(arena, why, w, "has no variable name");
+            // GitHub sets `HOME=/github/home` after the options, so the flag never wins there.
+            if (std.mem.eql(u8, value[0..eq], "HOME")) {
+                out.no_effect += 1;
+                continue;
+            }
             try env.append(arena, .{ .name = value[0..eq], .value = value[eq + 1 ..] });
         } else if (std.mem.eql(u8, name, "--user")) {
             if (!userIsPlain(value)) return refuse(arena, why, w, "is not a user, a uid, or " ++
@@ -124,8 +133,12 @@ fn userIsPlain(user: []const u8) bool {
     return true;
 }
 
+/// Said wherever a flag sends the job to Dagger: Dagger reads none of `options:`, so the flag is
+/// dropped there, not carried out (a reader of "Set up job" must not take it for supported).
+const dropped = "; Dagger drops a container's `options:`, so it is not applied there either";
+
 fn refuse(arena: Allocator, why: *[]const u8, word: []const u8, reason: []const u8) Error {
-    const fmt = "the job container's option `{s}` {s}";
+    const fmt = "the job container's option `{s}` {s}" ++ dropped;
     why.* = std.fmt.allocPrint(arena, fmt, .{ word, reason }) catch
         "a job container option is not carried out natively";
     return error.Refused;
@@ -147,7 +160,8 @@ pub fn unsupported(jc: job_mod.Service, provisioned: bool) ?[]const u8 {
     const t = jc.options orelse return null;
     const text = switch (t) {
         .lit => |l| l,
-        .expr => return "a job container's `options:` given by an expression are not native yet",
+        .expr => return "a job container's `options:` given by an expression are not native " ++
+            "yet" ++ dropped,
     };
     var fba: std.heap.FixedBufferAllocator = .init(&scratch);
     var why: []const u8 = "";
@@ -156,7 +170,7 @@ pub fn unsupported(jc: job_mod.Service, provisioned: bool) ?[]const u8 {
         error.OutOfMemory => "a job container's `options:` are too long to read natively",
     };
     if (o.user != null and provisioned) return "a job container's `--user` on the default " ++
-        "image, whose steps run as RUNNER_STEP_USER's user, is not native";
+        "image, whose steps run as RUNNER_STEP_USER's user, is not native" ++ dropped;
     return null;
 }
 
@@ -194,6 +208,12 @@ test "options honoured: --env and --user in every form docker reads, the others 
     try std.testing.expectEqualStrings("nobody", u.user.?);
     try std.testing.expectEqualStrings("URL", u.env[0].name);
     try std.testing.expectEqualStrings("http://h/?a=b", u.env[0].value);
+
+    // GitHub's `HOME=/github/home` comes after the options, so `-e HOME` never takes effect.
+    const h = try parse(arena, "-e HOME=/x --env=HOME=/y -e B=1", &why);
+    try std.testing.expectEqual(@as(usize, 1), h.env.len);
+    try std.testing.expectEqualStrings("B", h.env[0].name);
+    try std.testing.expectEqual(@as(u32, 2), h.no_effect);
 
     // Understood, and with no effect natively: counted so "Set up job" can say so.
     const n = try parse(arena, "--workdir /w -w/x --health-cmd \"pg_isready\" " ++
@@ -253,8 +273,11 @@ test "unsupported: ports and volumes fall back, options by what they hold" {
 
     jc.options = .{ .lit = "--privileged" };
     try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false).?, "--privileged") != null);
+    // Dagger reads none of `options:`: the note says the flag is dropped there, not carried out.
+    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false).?, "drops") != null);
     jc.options = .{ .expr = "matrix.options" };
     try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false).?, "expression") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false).?, "drops") != null);
 
     jc = base;
     jc.ports = &.{.{ .lit = "8080:80" }};

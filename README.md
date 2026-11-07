@@ -130,7 +130,8 @@ that changes them, and govulncheck for information).
 CodeQL and Semgrep read no Zig, so the runner's own code has analysis of its own. "Lint (ZLint)"
 (`ci`, `.github/scripts/zlint.sh`) runs [ZLint](https://github.com/DonIsaac/zlint) on every pull
 request, pinned and checked against its release's checksum, with the rules that find bugs
-(`runner/zlint.json`; the script says why each other rule is off). `analysis` runs nightly: "Fuzz"
+(`runner/zlint.json`; the script says why each other rule is off), and its suppressed-errors rule
+against the baseline of `catch {}` sites that were read and meant. `analysis` runs nightly: "Fuzz"
 runs each of `runner/src/fuzz.zig`'s targets (an image layer's tar, PAX and paths applied beside a
 directory it must not reach; image references, registry challenges and manifests; expressions,
 YAML, regular expressions, HPACK, `hashFiles()` patterns, minisign signatures, workflow commands
@@ -141,7 +142,9 @@ artifact; `zig build test` runs the same targets over their seed corpus every ti
 `zig build test -Dllvm --fuzz` (add `-Dtest-filter='fuzz: YAML'` for one target). "Valgrind" runs
 every test under memcheck (`.github/scripts/zig-valgrind.sh`), for reads of memory never written
 and accesses outside an allocation, which Debug's safety checks miss; known-benign reports are
-suppressed in `.github/valgrind.supp`, each with why. "ThreadSanitizer, native" runs the native
+suppressed in `.github/valgrind.supp`, each with why (a pull request that adds or edits a test
+runs just those, `.github/scripts/changed-tests.sh`; a run that does not finish is stopped, naming
+the test it was in). "ThreadSanitizer, native" runs the native
 backend's tests under ThreadSanitizer on x86_64 and arm64, rootless and as root, with the runner
 binary they start for each step built with it too (`ZIG_TEST_SANITIZE_THREAD=1`, which ci's
 Database tests job sets where those tests skip); "ThreadSanitizer, end to end" runs ci's end-to-end
@@ -482,9 +485,11 @@ the machine thrashed for hours (#126). Two things keep that from happening again
   learns from it what each job (by repository, workflow and name) takes, so that a light job
   reserves less than a heavy one once it has run (#144). A native job (`RUNNER_BACKEND=native`)
   is measured in a cgroup of its own and learned apart from Dagger's, reserves 256 MB until it
-  has run (`RUNNER_NATIVE_MEM_PER_JOB_MB`), and gets a `memory.high` from its estimate, so one that
-  outgrows it is slowed in its own cgroup rather than taking its neighbours' memory
-  (docs/native-backend.md, P4). The limits and why they are what they
+  has run (`RUNNER_NATIVE_MEM_PER_JOB_MB`), and, where jobs may swap, gets a `memory.high` from its
+  estimate, so one that outgrows it is slowed in its own cgroup rather than taking its neighbours'
+  memory (docs/native-backend.md, P4). All native jobs together stay under the machine's memory less a
+  third, with no swap, each under two thirds of that, and a job that cannot be held to it does not
+  run natively (docs/native-backend.md, "Bounded jobs"). The limits and why they are what they
   are are in `deploy/runner.env.example` (`RUNNER_MIN_MEM_AVAILABLE_MB` and the rest;
   `RUNNER_ADMISSION=false` turns it off). The gate sees only its own process's runners: run one
   pool per machine.

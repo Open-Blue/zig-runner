@@ -26,6 +26,7 @@ const build_version = @import("version.zig");
 comptime {
     _ = @import("sink.zig");
     _ = @import("native/Backend.zig");
+    _ = @import("native/cgroup.zig");
     _ = @import("native/Store.zig");
     _ = @import("native/evict.zig");
     _ = @import("native/sandbox.zig");
@@ -162,6 +163,24 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (cfg.inspect) return inspect.run(arena, io, &cfg, name, &stdout.interface);
 
+    // With no engine a job native cannot run fails, so a machine that cannot run native steps
+    // would fail every job: found now, before registering, not per job.
+    if (cfg.engineless()) {
+        const native = dagger.Backend.configFor(arena, io, init.environ_map, &cfg, true) catch |e| {
+            try err.print("config error: RUNNER_ENGINE=none, and the native backend is not " ++
+                "configured: {s}\n", .{@errorName(e)});
+            return @backingInt(Exit.config);
+        };
+        if (nativeRefusal(&cfg, arena, io, init.gpa, native, dagger.Backend.reprobe, .{})) |why| {
+            // May pass later (nftables busy, no network yet for the image): a code systemd and
+            // compose restart on, after the retries.
+            try err.print("native error: RUNNER_ENGINE=none, and native steps cannot run here: " ++
+                "{s}\n  (exiting {d}: systemd restarts the runner, which refuses again until " ++
+                "the machine can)\n", .{ why, @backingInt(Exit.native) });
+            return @backingInt(Exit.native);
+        }
+    }
+
     // One HTTP client for every runner (see `github/http.zig`).
     var client: std.http.Client = .{
         .allocator = init.gpa,
@@ -189,6 +208,77 @@ pub fn main(init: std.process.Init) !u8 {
     sweep.start(stale);
     defer sweep.stop();
     return runPool(init, &cfg, log, err, secrets, name, if (store) |*st| st else null);
+}
+
+/// How `nativeRefusal` retries: a failure may be transient (nftables busy, a module not loaded,
+/// the network or registry not up for the default image), so it is tried again after a pause
+/// that doubles, `attempts` times in all (about 75 s with the defaults).
+const Retry = struct { attempts: u32 = 5, first_wait_ms: u32 = 5000 };
+
+/// Why a runner with no engine (`RUNNER_ENGINE=none`) cannot start: the native backend's probe
+/// (`Backend.reprobe`, passed as `probe`) found the machine unable to run native steps on each
+/// of the attempts. Null when the runner has an engine, which has the fallback, or when an
+/// attempt passed. (`Backend.usable` remembers a failure for five minutes, so the same answer
+/// would burn every job in that time.)
+fn nativeRefusal(
+    cfg: *const Config,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    native: ?dagger.Backend.Config,
+    probe: anytype,
+    retry: Retry,
+) ?[]const u8 {
+    if (!cfg.engineless()) return null;
+    const n = native orelse return "the native backend is not configured";
+    var why: ?[]const u8 = null;
+    var wait_ms = retry.first_wait_ms;
+    var attempt: u32 = 0;
+    while (attempt < retry.attempts) : (attempt += 1) {
+        why = probe(arena, io, gpa, n) orelse return null;
+        if (loop.stopRequested() or attempt + 1 == retry.attempts) break;
+        std.log.warn("native: not usable yet ({s}); trying again in {d} ms", .{ why.?, wait_ms });
+        io.sleep(.fromMilliseconds(wait_ms), .awake) catch break;
+        wait_ms *|= 2;
+    }
+    return why;
+}
+
+test "a runner with no engine refuses to start when the native probe fails" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try env.put("RUNNER_BACKEND", "native");
+    const stub = struct {
+        var calls: u32 = 0;
+        var fail_first: u32 = 100;
+        fn probe(_: std.mem.Allocator, _: std.Io, _: std.mem.Allocator, _: dagger.Backend.Config) ?[]const u8 {
+            calls += 1;
+            if (calls > fail_first) return null;
+            return "nftables is busy";
+        }
+    };
+    const arena = std.testing.allocator;
+    const io = std.testing.io;
+    const native: dagger.Backend.Config = .{};
+    // With an engine, jobs fall back to it: nothing is probed.
+    const with_engine = try Config.load(&env, &.{"runner"});
+    try std.testing.expect(nativeRefusal(&with_engine, arena, io, arena, native, stub.probe, .{}) == null);
+    try std.testing.expectEqual(@as(u32, 0), stub.calls);
+    // With none, the probe's reason is the refusal.
+    try env.put("RUNNER_ENGINE", "none");
+    const none = try Config.load(&env, &.{"runner"});
+    const retry: Retry = .{ .attempts = 3, .first_wait_ms = 0 };
+    const why = nativeRefusal(&none, arena, io, arena, native, stub.probe, retry).?;
+    try std.testing.expectEqualStrings("nftables is busy", why);
+    // Tried again before giving up, since a failure may pass.
+    try std.testing.expectEqual(@as(u32, 3), stub.calls);
+    // And a failure that passes on the way lets the runner start.
+    stub.calls = 0;
+    stub.fail_first = 2;
+    try std.testing.expect(nativeRefusal(&none, arena, io, arena, native, stub.probe, retry) == null);
+    try std.testing.expectEqual(@as(u32, 3), stub.calls);
 }
 
 /// The GitHub App's installation tokens, with the first one minted now: a key GitHub does not

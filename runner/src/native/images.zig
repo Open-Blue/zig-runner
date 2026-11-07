@@ -207,7 +207,7 @@ pub const Ids = struct { uid: u32, gid: u32 };
 
 /// The fields of the line of an /etc/passwd or /etc/group naming `name` or id `id` (its third
 /// field).
-fn entryOf(text: []const u8, name: ?[]const u8, id: ?u32) ?[4][]const u8 {
+pub fn entryOf(text: []const u8, name: ?[]const u8, id: ?u32) ?[4][]const u8 {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         var it = std.mem.splitScalar(u8, line, ':');
@@ -222,6 +222,67 @@ fn entryOf(text: []const u8, name: ?[]const u8, id: ?u32) ?[4][]const u8 {
         if (id) |want| if ((std.fmt.parseInt(u32, f[2], 10) catch continue) == want) return f;
     }
     return null;
+}
+
+/// The most groups a process may have (`NGROUPS_MAX`).
+pub const max_groups = 65536;
+
+/// The supplementary groups of an image's `USER` as the engine gave them (BuildKit's `GetUser`,
+/// moby's `GetExecUser`): those whose member list names it, for a name or a uid `passwd` has, and
+/// none with an explicit group (`app:staff`, `1000:1000`) or for a uid not there. Sorted, each
+/// once, the first `max_groups`: a job's image writes these files, and a list past what the kernel
+/// takes would fail the step where leaving some out can only refuse more.
+pub fn supplementaryGroups(arena: Allocator, passwd: []const u8, group: []const u8, user: []const u8) Allocator.Error![]const u32 {
+    if (std.mem.indexOfScalar(u8, user, ':') != null) return &.{};
+    const line = if (std.fmt.parseInt(u32, user, 10)) |uid| entryOf(passwd, null, uid) else |_| entryOf(passwd, user, null);
+    const name = (line orelse return &.{})[0];
+    if (name.len == 0) return &.{};
+    var groups: std.ArrayList(u32) = .empty;
+    var lines = std.mem.splitScalar(u8, group, '\n');
+    while (lines.next()) |raw| {
+        const text = std.mem.trim(u8, raw, " \t\r");
+        if (text.len == 0 or text[0] == '#') continue;
+        var fields = std.mem.splitScalar(u8, text, ':');
+        _ = fields.next();
+        _ = fields.next();
+        const gid = std.fmt.parseInt(u32, fields.next() orelse continue, 10) catch continue;
+        var members = std.mem.splitScalar(u8, fields.next() orelse continue, ',');
+        while (members.next()) |member| if (std.mem.eql(u8, member, name)) {
+            try groups.append(arena, gid);
+            break;
+        };
+    }
+    return distinctGroups(groups.items);
+}
+
+/// `groups` sorted, each once, the first `max_groups` of them.
+pub fn distinctGroups(groups: []u32) []const u32 {
+    std.mem.sort(u32, groups, {}, std.sort.asc(u32));
+    var n: usize = 0;
+    for (groups) |g| {
+        if (n > 0 and groups[n - 1] == g) continue;
+        if (n == max_groups) break;
+        groups[n] = g;
+        n += 1;
+    }
+    return groups[0..n];
+}
+
+test "an image user's supplementary groups: by name or known uid, none with an explicit group" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const passwd = "root:x:0:0::/root:/bin/sh\napp:x:1000:1000::/home/app:/bin/sh\n";
+    const group = "root:x:0:\n# app is a member\n  staff:x:50:other,app\nbad:x:nan:app\nadm:x:4:app\n" ++
+        "again:x:50:app\nnot-app:x:7:application\n";
+    const both = [_]u32{ 4, 50 };
+    try std.testing.expectEqualSlices(u32, &both, try supplementaryGroups(arena, passwd, group, "app"));
+    try std.testing.expectEqualSlices(u32, &both, try supplementaryGroups(arena, passwd, group, "1000"));
+    const none = [_]u32{};
+    try std.testing.expectEqualSlices(u32, &none, try supplementaryGroups(arena, passwd, group, "app:app"));
+    try std.testing.expectEqualSlices(u32, &none, try supplementaryGroups(arena, passwd, group, "1000:1000"));
+    try std.testing.expectEqualSlices(u32, &none, try supplementaryGroups(arena, passwd, group, "1001"));
+    try std.testing.expectEqualSlices(u32, &none, try supplementaryGroups(arena, passwd, group, "ap"));
 }
 
 /// The reference as Docker resolves it: a registry host first (`docker.io` when the first part

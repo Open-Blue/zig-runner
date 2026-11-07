@@ -1,0 +1,3 @@
+kind: Fixed
+body: RUNNER_ENGINE=none now checks at start-up that native steps can run and refuses to start with the reason, instead of failing every job; it rejects RUNNER_DAGGER_NESTING; and deploy/compose.engineless.yaml gives the runner the privileges, host network, private cgroup, store volume and /run/zig-runner the native backend needs
+time: 2026-11-06T17:29:12.024763028-05:00

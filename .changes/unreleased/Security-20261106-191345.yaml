@@ -1,0 +1,3 @@
+kind: Security
+body: On a native backend, hashFiles() refuses a file the step's user could not read, as under Dagger, such as through a link to /etc/shadow
+time: 2026-11-06T19:13:45.999289876-05:00

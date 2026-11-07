@@ -103,7 +103,7 @@ pub fn imageName(image: []const u8) []const u8 {
 pub const docker_workspace = "/github/workspace";
 /// GitHub's runner works under /home/runner/work; a `container:` job sees it as /__w.
 pub const work_root = "/home/runner/work";
-const container_work_root = "/__w";
+pub const container_work_root = "/__w";
 
 /// The job's workspace, where GitHub's runner puts it: `<work>/<repo>/<repo>` (checked next to
 /// `ubuntu-latest`). Scripts and tools that record absolute paths then see the same ones.
@@ -1014,12 +1014,10 @@ fn runNative(
     var why: []const u8 = "";
     var b = Backend.initWhy(arena, io, opts.gpa, cfg, &why) catch |e| {
         const what = if (why.len > 0) why else @errorName(e);
-        // A job the runner does not vouch for whose cgroup could not be made with its limits
-        // after all (P4, P5's `job_limits`): not native, and not failed either.
+        // A job that would have no limits (P4, P5's `job_limits`, #367): not native, and not
+        // failed either, where there is an engine to hold it (`Backend.jobCgroup` says why).
         if (e == error.NoJobLimits) {
-            dagger_note.* = "This job runs on Dagger: native steps run a job this runner does " ++
-                "not vouch for only within a cgroup of its own with memory and process limits, " ++
-                "which could not be made for it.";
+            dagger_note.* = try std.fmt.allocPrint(arena, "This job runs on Dagger: {s}.", .{what});
             return null;
         }
         // Its store, cgroup, slot, resolver or network could not be made: to Dagger as well,
@@ -1973,7 +1971,7 @@ fn runSteps(
             // which pulls and sets up on its own and fails the job itself if the job is at fault
             // (`runNative`). Not once the job is cancelled, nor out of memory.
             const why = if (e == error.BaseContainerFailed) err_msg else @errorName(e);
-            if (setUpFallback(opts, e)) {
+            if (setUpFallback(opts, e) and !b.job_fault) {
                 b.to_dagger = try std.fmt.allocPrint(arena, "the native set-up failed ({s})", .{why});
                 return error.NativeToDagger;
             }
@@ -5234,4 +5232,66 @@ test "with an engine, a job native cannot run still goes to Dagger and runs ther
     try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "This job runs on Dagger: the " ++
         "native store is not set up") != null);
+}
+
+/// The job's whole log after a run of `job` on the fake session; the job must succeed.
+fn logAfterRun(arena: Allocator, job: job_mod.Job) ![]const u8 {
+    var env: std.process.Environ.Map = .init(arena);
+    const buf = try arena.alloc(u8, 1 << 16);
+    var w: std.Io.Writer = .fixed(buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w, .secrets = job.secrets } };
+    var auto: AutoSession = .{ .arena = arena };
+    const res = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = auto.transport(),
+    }, job, &log);
+    try std.testing.expect(res.succeeded);
+    return w.buffered();
+}
+
+test "a job container's options, ports and volumes are each warned about, and the job runs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var job = testJob(&.{testStep("true")});
+    job.container = .{
+        .name = "job",
+        .image = .{ .lit = "node:20" },
+        .options = .{ .lit = "--cpus 2 --privileged" },
+        .ports = &.{ .{ .lit = "8080:80" }, .{ .lit = "9000" } },
+        .volumes = &.{.{ .lit = "/data:/data:ro" }},
+    };
+    const text = try logAfterRun(arena, job);
+    try std.testing.expect(std.mem.indexOf(u8, text, "##[warning]Job container options not " ++
+        "supported here and ignored: --cpus 2 --privileged") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "##[warning]Job container ports not " ++
+        "supported here and ignored: 8080:80, 9000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "##[warning]Job container volumes not " ++
+        "supported here and ignored: /data:/data:ro") != null);
+}
+
+test "a job container's ignored volume that holds a secret is masked in the warning" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var job = testJob(&.{testStep("true")});
+    job.secrets = &.{"vol_s3cr3t"};
+    job.container = .{
+        .name = "job",
+        .image = .{ .lit = "node:20" },
+        .volumes = &.{.{ .lit = "vol_s3cr3t:/data" }},
+    };
+    const text = try logAfterRun(arena, job);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Job container volumes not supported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "vol_s3cr3t") == null);
+}
+
+test "a job container without options, ports or volumes gets no warning" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var job = testJob(&.{testStep("true")});
+    job.container = .{ .name = "job", .image = .{ .lit = "node:20" } };
+    const text = try logAfterRun(arena, job);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Job container") == null);
 }
