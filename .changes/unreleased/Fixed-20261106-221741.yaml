@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A native exec stopped during a cancel never counts as exiting 0, so a Dockerfile `RUN` cut short stores no layer, however its script ended. A step stopped is reported cancelled, or failed on a timeout, whatever it exited with. GitHub''s cancel limit is taken as its runner takes it: at least 60 s, less 15 s.'
-time: 2026-11-06T22:17:41.593357295-05:00

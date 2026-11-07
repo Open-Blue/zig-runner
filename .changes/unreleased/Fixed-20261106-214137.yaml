@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A native step that is cancelled, times out or is stopped with the runner now gets GitHub''s warning before it is killed: SIGINT to every process of the step, SIGTERM 7.5 s later, the kill 2.5 s after that, all inside the job''s cancel limit, and the step''s log says why it was stopped. A second cancel from GitHub can now shorten the limit.'
-time: 2026-11-06T21:41:37.990943232-05:00

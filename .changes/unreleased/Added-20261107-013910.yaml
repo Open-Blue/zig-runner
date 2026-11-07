@@ -1,3 +1,0 @@
-kind: Added
-body: 'A `container:` job''s `volumes:` that are directories of the job (an anonymous `/data`, a named `cache:/cache`) run on the native backend: each is made in the base, root''s, there for every step and gone with the job. Host paths, read-only volumes, a named volume a service also lists and odd targets still go to Dagger with the volume named, as does `ports:` (publishing to the host needs a network rule the runner does not have); the reasons say Dagger ignores them too.'
-time: 2026-11-07T01:39:10.324977004-05:00

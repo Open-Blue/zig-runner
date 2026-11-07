@@ -1,3 +1,0 @@
-kind: Fixed
-body: The tests of loop/job.zig (the job's log spool, the cancel watch, the stop deadline) were never part of the test build; they run now.
-time: 2026-11-07T01:33:57.02950066-05:00

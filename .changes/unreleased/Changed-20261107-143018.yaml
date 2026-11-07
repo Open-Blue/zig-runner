@@ -1,3 +1,0 @@
-kind: Changed
-body: The required checks are the test jobs themselves (Tests on both architectures, Release builds (arm64) and the four parts of the native tests as root) instead of two gate jobs, which waited up to 14 minutes for a runner in a busy merge queue
-time: 2026-11-07T14:30:18.592773225-05:00

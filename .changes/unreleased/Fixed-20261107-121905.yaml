@@ -1,3 +1,0 @@
-kind: Fixed
-body: The unsupported-step-reference message names the types the runner supports, and `inspect` no longer crashes on an unexpected job message.
-time: 2026-11-07T12:19:05.396775283-05:00

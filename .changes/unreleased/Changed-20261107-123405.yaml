@@ -1,3 +1,0 @@
-kind: Changed
-body: The job message and results-service code share one reader for a mapping's Key/Value entries and one wrapper that turns a failed try into a Result.
-time: 2026-11-07T12:34:05.057048757-05:00

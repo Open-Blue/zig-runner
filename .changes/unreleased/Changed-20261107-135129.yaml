@@ -1,3 +1,0 @@
-kind: Changed
-body: CI runs the native tests as root in two parts per architecture, side by side, and the arm64 release builds apart from its tests; the required checks are now gates over those jobs
-time: 2026-11-07T13:51:29.547868302-05:00

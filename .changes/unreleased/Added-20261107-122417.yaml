@@ -1,3 +1,0 @@
-kind: Added
-body: The engine container can be set with `--engine-container`, as `RUNNER_ENGINE_CONTAINER` does.
-time: 2026-11-07T12:24:17.316388387-05:00

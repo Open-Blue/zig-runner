@@ -1,3 +1,0 @@
-kind: Fixed
-body: A pull request based on another branch no longer turns on auto-merge, which merged a stacked pull request as it opened, before CI ran.
-time: 2026-11-07T01:28:09.64469373-05:00

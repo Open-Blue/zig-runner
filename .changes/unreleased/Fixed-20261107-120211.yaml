@@ -1,3 +1,0 @@
-kind: Fixed
-body: Native eviction's floor is now tested on a really full disk (a tmpfs filled until writes fail with ENOSPC, in a bubblewrap mount namespace) as well as on simulated shortages.
-time: 2026-11-07T12:02:11.063176759-05:00
