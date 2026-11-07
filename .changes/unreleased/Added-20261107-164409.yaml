@@ -1,0 +1,3 @@
+kind: Added
+body: 'A TLA+ model of the release pipeline as #408 has it (proofs/tla/ReleasePipeline.tla), checked by TLC in CI with its mutants: tags only checked commits, deploys only checked releases, waits for the current check names, and ends every wait'
+time: 2026-11-07T16:44:09.291543035-05:00

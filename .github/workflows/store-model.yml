@@ -1,11 +1,13 @@
 name: store model
 
-# The native store's locking protocols, model-checked with TLC (proofs/tla/StoreLocking.tla and
-# StoreEviction.tla, proofs/README.md "The store's locking, in TLA+"): its safety and liveness must hold, and each
-# mutant (the code with one guard taken away) must fail. tla2tools.jar is pinned with its sha256 in
-# tlc.sh. On pull requests and pushes to main that touch the store, its callers or the model, and
-# weekly with the proofs. Not a required check, so a path filter is enough (proofs.yml needs
-# ci-scope.sh because it is one), and the merge queue does not run it.
+# The TLA+ models, checked with TLC: the native store's locking protocols (proofs/tla/StoreLocking.tla
+# and StoreEviction.tla, proofs/README.md "The store's locking, in TLA+") and the release pipeline
+# (ReleasePipeline.tla, "The release pipeline, in TLA+"). Their safety and liveness must hold, and
+# each mutant (the code with one guard taken away) and finding must fail. tla2tools.jar is pinned
+# with its sha256 in tlc.sh. On pull requests and pushes to main that touch the store, its callers,
+# the release's workflows and scripts, or the models, and weekly with the proofs. Not a required
+# check, so a path filter is enough (proofs.yml needs ci-scope.sh because it is one), and the merge
+# queue does not run it.
 
 on:
   push:
@@ -18,6 +20,12 @@ on:
       - runner/src/native/evict.zig
       - runner/src/native/volumes.zig
       - runner/src/native/oci/Store.zig
+      - .github/workflows/version.yml
+      - .github/workflows/release.yml
+      - .github/scripts/next-version.sh
+      - .github/scripts/wait-for-checks.sh
+      - .github/scripts/check-names.sh
+      - .github/checks-on-main
       - .github/workflows/store-model.yml
       - .github/scripts/tlc.sh
   pull_request:
@@ -29,6 +37,12 @@ on:
       - runner/src/native/evict.zig
       - runner/src/native/volumes.zig
       - runner/src/native/oci/Store.zig
+      - .github/workflows/version.yml
+      - .github/workflows/release.yml
+      - .github/scripts/next-version.sh
+      - .github/scripts/wait-for-checks.sh
+      - .github/scripts/check-names.sh
+      - .github/checks-on-main
       - .github/workflows/store-model.yml
       - .github/scripts/tlc.sh
   schedule:
@@ -58,5 +72,5 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Check the store's locking protocol
+      - name: Check the store's locking and the release pipeline
         run: .github/scripts/tlc.sh

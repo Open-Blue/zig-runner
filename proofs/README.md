@@ -594,6 +594,123 @@ as a layer's is, which `StoreLocking.tla` models for layers and the store's cras
 The bounds are small: three runners, one job each and a process crash, and two runners with a
 machine's crash. It is not a proof beyond them.
 
+## The release pipeline, in TLA+
+
+`tla/ReleasePipeline.tla` models how a merge into `main` becomes a tag and a deployment, at the
+level of GitHub's runs and jobs, **as #408 has it**: `.github/checks-on-main` read from the commit
+the job checked out, and `wait-for-checks.sh` failing at once on a check that never started once
+every workflow run on the commit has finished. Until #408 merges, `main`'s own pipeline is the
+mutant `ReleasePipeline-inline-list.cfg` (and has no fast fail at all, `-no-fast-fail.cfg`). It is
+checked by the same `.github/scripts/tlc.sh`, in `store-model.yml`, which also runs on changes to
+`version.yml`, `release.yml`, `next-version.sh`, `wait-for-checks.sh`, `check-names.sh` and
+`.github/checks-on-main`. As for the store, TLC explores every state of a bounded instance; it is
+not a proof for every size.
+
+**What is modelled**, and what it is in the workflows:
+
+| In the model | In the workflows |
+|---|---|
+| `main`, a line of commits; `Merge` | the merge queue's merges; each may rename or add a check (as #405 renamed one), and `checks-on-main` changes with it (`check-names.sh` holds in the queue, so the names at a commit are the jobs it runs on a push: one function, `jobsOf`) |
+| `wf[c]["A"]`, `wf[c]["B"]`; `CreateWf`, `FinishWf` | `ci.yml`'s and `proofs.yml`'s push runs on a commit: created, or never (`lost`: GitHub did not start it), then passing or failing. A run's jobs end together; "t" stands for the checks no merge renames, "old"/"new" for the one renamed |
+| `Create`, `StartPending`, `InGroup` | a scheduled or dispatched `version` run, made from `main` as it is (its `head_sha` and the `version.yml` it runs), entering `concurrency: group: version`, `cancel-in-progress: false` |
+| `Check` | the `check` job, `next-version.sh` on `main`: nothing merged since the last tag, nothing to do |
+| `Approve`, `ApprovalTimeout` | the `tag` job's `environment: prod`: approved late or never (unfair); with no approval the run fails when the environment's wait runs out |
+| `Approve`'s read of `main`; `list` | the tag job's checkout of `main` and `next-version.sh` again; the names it will wait for: `checks-on-main` at that commit (#408), or the run's own `version.yml` (before #408, `ListFromCommit = FALSE`) |
+| `Poll`, `Outcome`, `CanPoll` | one poll of `wait-for-checks.sh`: a failed check fails at once, all passed goes on, a check that never started fails once `open == 0 && total > 0` over `actions/runs?head_sha=` and the grace has passed, the deadline fails the rest. `el` counts polls (`WaitTicks` is `WAIT_MINUTES`, `Grace` is `GRACE_SECONDS`) |
+| `Push` | `Commit and tag` and `Push`: the release commit on the commit checked out, `git push --atomic HEAD:main refs/tags/$TAG`, refused whole when `main` moved |
+| `rel[i]`, `Build` | `release.yml` on the tag: Binaries, Image and Image (publish), one step (a failure of any is the same to the deploy job); Binaries (check) is skipped on a tag |
+| `DeployStart`, `DeployPoll` | the deploy job's `if:` (explicit results; `DeployIfExplicit = FALSE` is v0.14.0's implicit `success()`), then `wait-for-checks.sh` on the tag commit with `checks-on-main` read from the tag, then the deployment recorded |
+
+GitHub's concurrency is taken from [Control the concurrency of workflows and
+jobs](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency):
+at most one run in progress in the group and, with the default `queue: single`, at most one
+pending; a run queued while one is in progress is pending, and a pending one already there is
+cancelled; with `cancel-in-progress: false` the one in progress is kept. The page does not say
+whether a run whose job waits for an environment's approval is in progress. The model takes it
+so (it has started; `ApprovalHoldsGroup = TRUE`), and checks the weaker reading too
+(`ReleasePipeline-approval-outside.cfg`: a newer run starts beside it).
+
+**What is checked**:
+
+| Property | Says |
+|---|---|
+| `TagChecked` | no tag unless every check in `checks-on-main` succeeded on the commit the release commit goes on (the release commit adds only the version and the changelog; its own checks are the deploy's) |
+| `DeployChecked` | no deployment unless the tag commit's checks and the release's own jobs passed |
+| `OneTagJob` | never two tag jobs (approved, waiting or pushing) at once |
+| `TagOnMain` | a tag is always on `main`'s history |
+| `FreshList` | the tag job waits for the names current at the commit it checked out, never a stale list |
+| `Includes` | the release includes every merge on `main` when its tag job read it |
+| `WaitBounded` | a wait ends within `WAIT_MINUTES`, and a failure names its reason |
+| `FastFailAllRuns` | the fast fail as the script states it: once every run on the commit has finished, the waiter's own among them, a check that never started ends the wait at the first poll past the grace, not at the deadline |
+| `FastFail` | the fast fail as it is meant: once the commit's `ci` and `proofs` runs, the ones that report checks, have finished. **#408 does not have it** (below) |
+| `TagJobEnds` | an approved tag job ends: it tags, or fails naming a reason (weak fairness of GitHub's and the jobs' steps) |
+| `DeployEnds` | a release that tagged deploys, or fails where it shows (a job failed) |
+
+**Bounds and results** (cowbird, `-workers auto`, `-Xmx4g`, 2026-11-07): `WaitTicks = 2`,
+`Grace = 1`, `MaxRenames = 1` everywhere.
+
+| Configuration | Merges | Version runs | Lost push runs | Failures | Checks | Distinct states | Depth | Time |
+|---|---|---|---|---|---|---|---|---|
+| `ReleasePipeline.cfg` | 1 | 3 (one in progress, one pending, one replacing it) | 1 | 1 | safety | 236,886 | 35 | 4 s |
+| `ReleasePipeline-merges.cfg` | 2 (one may come while a tag job waits) | 2 | 0 | 0 | safety | 1,474,773 | 44 | 19 s |
+| `ReleasePipeline-liveness.cfg` | 1 | 2 | 1 | 1 | safety, `TagJobEnds`, `DeployEnds` | 44,245 | 29 | 8 s |
+| `ReleasePipeline-ci-runs.cfg` | 1 | 3 | 1 | 1 | safety and `FastFail`, the fast fail counting only `ci`'s and `proofs`' runs | 237,036 | 35 | 3 s |
+| `ReleasePipeline-approval-outside.cfg` | 1 | 2 | 1 | 1 | safety but `OneTagJob`, under the weaker reading of the concurrency docs | 165,850 | 30 | 4 s |
+| the mutants and the finding | | | | | to the first violation | under 30,000 each | | a second or two each |
+
+A merge before the first run is needed for it to have anything to release, so the one-merge
+configurations cover a rename between a run's creation and its wait, and `-merges` one while a tag
+job waits (`main` moved: the push refused). Two merges with two runs, a lost run and a failure
+were stopped unfinished at 9 million states (3 minutes, no error) and are left out of CI; a third version run is what gives the
+cancellation of a pending run, and two runs what gives two releases.
+
+**Mutants and findings**, each of which TLC must reject with the property its first line names
+(`tlc.sh` fails if it does not; a temporal property, which TLC does not name, is checked alone):
+
+- `ReleasePipeline-inline-list.cfg`, the names inline in `version.yml` as before #408 (the run's own
+  file, from `main` when the run was made): a rename merged before the approval is waited for under
+  its old name. `FreshList`, in 7 states.
+- `ReleasePipeline-no-fast-fail.cfg`, `wait-for-checks.sh` as before #408: a check that never
+  started holds the wait to its deadline after every run on the commit has finished.
+  `FastFailAllRuns`.
+- `ReleasePipeline-v0.14.0.cfg`, the deploy job's `if:` as v0.14.0 had it, the implicit
+  `success()`: Binaries (check) is skipped on a tag, so the deploy is skipped and the release ends
+  green, never deployed and failing nowhere. `DeployEnds`.
+- `ReleasePipeline-non-atomic.cfg`, the push without `--atomic`: when `main` moved since the
+  checkout, its update is refused and the tag goes, on a commit off `main`. `TagOnMain`.
+- `ReleasePipeline-own-run.cfg`, a finding rather than a mutant: #408 as it is fails `FastFail`
+  (below). It fails CI once `wait-for-checks.sh` is fixed, and then goes, with `FastFail` added to
+  `ReleasePipeline.cfg`.
+
+**What it found**: with #408 as it is, the fast fail does not fire where it is most needed.
+`wait-for-checks.sh` counts every workflow run on the commit (`actions/runs?head_sha=$sha`), and the
+job that waits is in one of them: `release.yml`'s run is on the tag commit, so the deploy job's
+wait never sees all runs finished and a check that never started holds every deploy for the whole
+40 minutes, as before #408; and a `version` run's `head_sha` is `main` when GitHub made the run,
+so a tag job on that same commit (nothing merged between the run's creation and the approval,
+the usual case) waits the whole 30 minutes too. A pending `version` run made at the commit blocks
+it the same way. On 2026-11-07 a merge came between, so the fast fail would have fired then.
+TLC's trace (`ReleasePipeline-own-run.cfg`, 10 states): a merge; a scheduled run made at it; the
+commit's `ci` run created and passed, its `proofs` run never created; the check job finds something
+to release; the approval; the tag job checks out the same commit; the first poll (inside the grace);
+the second poll finds that run's check missing and `ci` finished, but its own run open, and goes on to the
+deadline. Counting only the runs of the workflows that report the checks (`ci.yml`,
+`proofs.yml`) would give `FastFail` (`ReleasePipeline-ci-runs.cfg` holds); that change is not made
+here. Under the weaker reading of the concurrency docs, two tag jobs can run at once, and
+everything else still holds: the atomic push, not the group, keeps a tag on `main` and checked
+(the second push is refused, or the second tag job finds nothing to release).
+
+**Not modelled**: GitHub's own bugs (a check run reported wrong, a lost approval, an API that
+lies rather than fails: a failed request counts as a poll with nothing found, which the model's
+"not yet" covers); runner availability and queueing (a job that never gets a runner is a check
+still queued, which the deadline covers); `skip_main_checks` (a dispatch that tags without the
+wait, on purpose); re-runs of a failed check (the wait has failed by then; the README says run
+`version` again); the bump `next-version.sh` computes (only whether there is one); the deploy
+agent on razorbill and its report; `release.yml` by hand (a rebuild); jobs' own `timeout-minutes`
+beyond the wait's (45 against 30 and 40); and real time: the grace is an assumption that GitHub
+creates a push's runs within `GRACE_SECONDS` (`CanPoll`), and a run that is created later than
+that is a lost one to the model.
+
 ## Why the regex matcher terminates
 
 `Runner/Regex.lean` is about a different part of the runner: the backtracking matcher that problem

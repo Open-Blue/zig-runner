@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Model-checks the native store's locking protocols (proofs/tla/StoreLocking.tla and
-# StoreEviction.tla, proofs/README.md "The store's locking, in TLA+") with TLC. tla2tools.jar is the TLA+ project's v1.7.4 release,
+# StoreEviction.tla, proofs/README.md "The store's locking, in TLA+") and the release pipeline
+# (proofs/tla/ReleasePipeline.tla, "The release pipeline, in TLA+") with TLC. tla2tools.jar is the TLA+ project's v1.7.4 release,
 # checked against the sha256 pinned here, so a changed or replaced jar fails the job instead of
 # checking the model. A new version means a new checksum from that release's asset.
 #
 # The configurations under proofs/tla are of two kinds: the protocol as the code has it
 # (<Module>.cfg, -crash, -liveness and the like) must hold; a mutant, the code with one guard taken away,
 # says "must fail: <invariant>" in its first line and must fail with that invariant, so a model
-# that could no longer see a broken protocol fails the job too.
+# that could no longer see a broken protocol fails the job too. A temporal property TLC does not
+# name when it fails, so a configuration that must fail one checks that property alone.
+# A finding (the code as it is, failing a property it should have) is a configuration of the same
+# kind, so it fails the job once the code is fixed, and the configuration with it.
 #
 # Locally: .github/scripts/tlc.sh (Java 11 or later on the PATH; the jar is kept in $TLC_DIR).
 set -euo pipefail
@@ -38,7 +42,7 @@ tlc() {
 }
 
 status=0
-for cfg in "$here"/Store*.cfg; do
+for cfg in "$here"/*.cfg; do
 	cfg=$(basename "$cfg")
 	grep -q 'must fail:' "$here/$cfg" && continue
 	echo "== $cfg: must hold"
@@ -52,7 +56,7 @@ for cfg in "$here"/Store*.cfg; do
 	fi
 done
 
-for cfg in "$here"/Store*-*.cfg; do
+for cfg in "$here"/*-*.cfg; do
 	cfg=$(basename "$cfg")
 	grep -q 'must fail:' "$here/$cfg" || continue
 	want=$(sed -n '1s/.*must fail: \([A-Za-z]*\).*/\1/p' "$here/$cfg")
@@ -62,12 +66,14 @@ for cfg in "$here"/Store*-*.cfg; do
 		cat "$out"
 		echo "$cfg: TLC found no error in a mutant" >&2
 		status=1
-	elif [[ -z $want ]] || ! grep -q "^Error: Invariant $want is violated" "$out"; then
+	elif [[ -z $want ]] || ! { grep -q "^Error: Invariant $want is violated" "$out" ||
+		{ [[ $(sed -n 's/^PROPERT\(Y\|IES\)[[:space:]]*//p' "$here/$cfg") == "$want" ]] &&
+			grep -q "^Error: Temporal properties were violated" "$out"; }; }; then
 		cat "$out"
 		echo "$cfg: TLC did not fail with $want" >&2
 		status=1
 	else
-		grep -E "^Error: Invariant|^[0-9,]+ states generated" "$out"
+		grep -E "^Error: (Invariant|Temporal)|^[0-9,]+ states generated" "$out"
 	fi
 done
 exit "$status"
