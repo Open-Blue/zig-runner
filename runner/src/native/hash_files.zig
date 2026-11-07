@@ -231,9 +231,9 @@ pub const Stack = struct {
 pub const Step = struct {
     uid: u32,
     gid: u32,
-    /// As the engine was given it: the image's `USER`, or `dagger.runner_user`. Its form decides
-    /// the supplementary groups (`Merged.supplementary`), which `uid` and `gid` cannot say.
-    user: []const u8,
+    /// The step's supplementary groups, the list its own processes have (`Backend.groups`), as
+    /// `images.supplementaryGroups` leaves them, so a call says yes only where the step could.
+    groups: []const u32,
     /// How each layer's ids look from the job, by position in `Stack.layers`: a layer holds
     /// the canonical ids, the slot's or the runner's own (`Backend.hashStep`).
     ids: []const Store.Ids,
@@ -496,7 +496,7 @@ fn runWaited(
     defer m.close();
     if (stack.step) |s| {
         std.debug.assert(s.ids.len == stack.layers.len);
-        m.groups = m.supplementary(s.user) catch |e| return failed(&m, e);
+        m.groups = s.groups;
     }
     return hashAll(&m, ws, home, args) catch |e| failed(&m, e);
 }
@@ -688,55 +688,6 @@ const Merged = struct {
     }
 
     // --- the step's user ---
-
-    /// The supplementary groups the engine gave the step's user at each exec (BuildKit's
-    /// `oci.GetUser`, moby's `user.GetExecUser`), though not a native step's own processes, which
-    /// `setgroups(0)` leaves with none until #369 (`sandbox.zig`): hashFiles() answers as Dagger
-    /// did. Those of a user named by a name or uid that is in /etc/passwd, by the first line that
-    /// matches, and none with an explicit group (`app:staff`, `1000:1000`) or for a uid not there.
-    /// Read through the job's root like any file, so no link in them leaves the tree, and from the
-    /// view the next step has, as the engine read the container's. Not there, or not a file, they
-    /// give no group. As `distinctGroups` leaves them.
-    fn supplementary(m: *Merged, user: []const u8) Error![]const u32 {
-        if (std.mem.indexOfScalar(u8, user, ':') != null) return &.{};
-        const passwd = (try m.userFile("/etc/passwd")) orelse return &.{};
-        const line = if (std.fmt.parseInt(u32, user, 10)) |uid|
-            images.entryOf(passwd, null, uid)
-        else |_|
-            images.entryOf(passwd, user, null);
-        const name = (line orelse return &.{})[0];
-        if (name.len == 0) return &.{};
-        const group = (try m.userFile("/etc/group")) orelse return &.{};
-        var groups: std.ArrayList(u32) = .empty;
-        var lines = std.mem.splitScalar(u8, group, '\n');
-        while (lines.next()) |raw| {
-            try m.tick();
-            const text = std.mem.trim(u8, raw, " \t\r");
-            if (text.len == 0 or text[0] == '#') continue;
-            var fields = std.mem.splitScalar(u8, text, ':');
-            _ = fields.next();
-            _ = fields.next();
-            const gid = std.fmt.parseInt(u32, fields.next() orelse continue, 10) catch continue;
-            var members = std.mem.splitScalar(u8, fields.next() orelse continue, ',');
-            while (members.next()) |member| if (std.mem.eql(u8, member, name)) {
-                try groups.append(m.arena, gid);
-                break;
-            };
-        }
-        return distinctGroups(groups.items);
-    }
-
-    /// `path`'s contents in the job's view, up to the engine's limit: resolved as `resolve` does,
-    /// then read from the one layer with no link taken.
-    fn userFile(m: *Merged, path: []const u8) Error!?[]const u8 {
-        const at = (try m.resolve(path, true)) orelse return null;
-        if (at.node.kind != .file) return null;
-        const max_bytes = 10 << 20;
-        return switch (try sandbox.readIn(m.arena, m.layers[at.node.layer], at.path, max_bytes)) {
-            .text => |t| t,
-            .missing, .whiteout => null,
-        };
-    }
 
     /// Whether the step's user may search the real directory `dir`. The step's `/` is the top of
     /// its own upper, which `Backend.execIn` leaves 0755.
@@ -1231,7 +1182,7 @@ const may_search: u16 = 0o1;
 const Who = struct {
     uid: u32,
     gid: u32,
-    /// As `distinctGroups` leaves them: sorted.
+    /// As `images.supplementaryGroups` leaves them: sorted.
     groups: []const u32,
     ids: Store.Ids,
 
@@ -1246,24 +1197,6 @@ const Who = struct {
         return id == w.gid or std.sort.binarySearch(u32, w.groups, id, order) != null;
     }
 };
-
-/// The most groups a process can have (Linux's `NGROUPS_MAX`).
-const max_groups = 65536;
-
-/// `groups` sorted, each once, the first `max_groups` of them: the job writes /etc/group, and each
-/// ACL entry asks whether a group is here. Where the kernel would have refused the engine that
-/// many, this leaves the last ones out, which can only refuse more.
-fn distinctGroups(groups: []u32) []const u32 {
-    std.mem.sort(u32, groups, {}, std.sort.asc(u32));
-    var n: usize = 0;
-    for (groups) |g| {
-        if (n > 0 and groups[n - 1] == g) continue;
-        if (n == max_groups) break;
-        groups[n] = g;
-        n += 1;
-    }
-    return groups[0..n];
-}
 
 /// The size of an entry of an ACL (`aclGives`).
 const acl_entry_size = 8;
@@ -2094,7 +2027,7 @@ test "native hashFiles: the file's owner has the owner's bits, whatever the othe
     defer f.cleanup();
     try f.put("l0/ws/a", "a");
     const o = try ownerOf(f, "l0/ws/a");
-    const owner: Step = .{ .uid = o.uid, .gid = o.gid +% 1, .user = "app", .ids = &.{} };
+    const owner: Step = .{ .uid = o.uid, .gid = o.gid +% 1, .groups = &.{}, .ids = &.{} };
     try setMode(f, "l0/ws/a", 0o400);
     try expectHash(&hashOf(&.{"a"}), try hashAs(f, &.{"l0"}, owner, &.{"a"}));
     // Everyone else may read it; its owner, by the owner's bits, may not.
@@ -2109,7 +2042,7 @@ test "native hashFiles: the file's group has the group's bits, whatever the othe
     defer f.cleanup();
     try f.put("l0/ws/a", "a");
     const o = try ownerOf(f, "l0/ws/a");
-    const member: Step = .{ .uid = o.uid +% 1, .gid = o.gid, .user = "app", .ids = &.{} };
+    const member: Step = .{ .uid = o.uid +% 1, .gid = o.gid, .groups = &.{}, .ids = &.{} };
     try setMode(f, "l0/ws/a", 0o640);
     try expectHash(&hashOf(&.{"a"}), try hashAs(f, &.{"l0"}, member, &.{"a"}));
     try setMode(f, "l0/ws/a", 0o604);
@@ -2125,7 +2058,7 @@ test "native hashFiles: anyone else has the others' bits, also through a link to
     try f.put("l0/etc/shadow", "root:secret");
     try f.link("l0/ws/s", "/etc/shadow");
     const o = try ownerOf(f, "l0/ws/a");
-    const other: Step = .{ .uid = o.uid +% 1, .gid = o.gid +% 1, .user = "app", .ids = &.{} };
+    const other: Step = .{ .uid = o.uid +% 1, .gid = o.gid +% 1, .groups = &.{}, .ids = &.{} };
     try setMode(f, "l0/ws/a", 0o604);
     try expectHash(&hashOf(&.{"a"}), try hashAs(f, &.{"l0"}, other, &.{"a"}));
     try setMode(f, "l0/ws/a", 0o640);
@@ -2138,7 +2071,7 @@ test "native hashFiles: anyone else has the others' bits, also through a link to
     try expectFailed("sha256sum: s: " ++ denied, try hashAs(f, &.{"l0"}, other, &.{"**"}));
 }
 
-test "native hashFiles: supplementary groups are the engine's, from the job's own /etc" {
+test "native hashFiles: a supplementary group is the step's own list, not what /etc says now" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     var f = try Fixture.init(a.allocator());
@@ -2148,53 +2081,15 @@ test "native hashFiles: supplementary groups are the engine's, from the job's ow
     const o = try ownerOf(f, "l0/ws/a");
     const uid = o.uid +% 1;
     const primary = o.gid +% 1;
-    try f.put("l0/etc/passwd", try std.fmt.allocPrint(
-        f.arena,
-        "root:x:0:0::/root:/bin/sh\napp:x:{d}:{d}::/home/app:/bin/sh\n",
-        .{ uid, primary },
-    ));
-    try f.put("l0/etc/group", try std.fmt.allocPrint(
-        f.arena,
-        "root:x:0:\n# app is a member\n  staff:x:{d}:other,app\nbad:x:nan:app\n",
-        .{o.gid},
-    ));
-    const as = struct {
-        fn user(name: []const u8, id: u32, gid: u32) Step {
-            return .{ .uid = id, .gid = gid, .user = name, .ids = &.{} };
-        }
-    };
-    const numeric = try std.fmt.allocPrint(f.arena, "{d}", .{uid});
-    const both = try std.fmt.allocPrint(f.arena, "{d}:{d}", .{ uid, primary });
-    const absent = try std.fmt.allocPrint(f.arena, "{d}", .{uid +% 1});
     const stack = [_][]const u8{"l0"};
-    // A name, or a uid /etc/passwd has: the member's groups.
-    try expectHash(&hashOf(&.{"a"}), try hashAs(f, &stack, as.user("app", uid, primary), &.{"a"}));
-    try expectHash(&hashOf(&.{"a"}), try hashAs(f, &stack, as.user(numeric, uid, primary), &.{"a"}));
-    // An explicit group leaves them out (`GetExecUser`), and `uid:gid` looks nothing up.
-    try expectFailed(denied, try hashAs(f, &stack, as.user("app:app", uid, primary), &.{"a"}));
-    try expectFailed(denied, try hashAs(f, &stack, as.user(both, uid, primary), &.{"a"}));
-    // A uid /etc/passwd has not got has no name to be a member by.
-    try expectFailed(denied, try hashAs(f, &stack, as.user(absent, uid +% 1, primary), &.{"a"}));
-    // Membership is by the whole name.
-    try expectFailed(denied, try hashAs(f, &stack, as.user("ap", uid, primary), &.{"a"}));
-
-    // What the next step has decides: a layer above takes the user out of the group...
-    try f.put("l1/etc/group", try std.fmt.allocPrint(f.arena, "staff:x:{d}:other\n", .{o.gid}));
-    try expectFailed(denied, try hashAs(f, &.{ "l1", "l0" }, as.user("app", uid, primary), &.{"a"}));
-    // ...a link stays in the job's tree...
-    try f.put("l2/etc/members", try std.fmt.allocPrint(f.arena, "staff:x:{d}:app\n", .{o.gid}));
-    try f.link("l2/etc/group", "members");
-    try expectHash(
-        &hashOf(&.{"a"}),
-        try hashAs(f, &.{ "l2", "l1", "l0" }, as.user("app", uid, primary), &.{"a"}),
-    );
-    // ...and one out of it is not taken, so the host's file makes no one a member.
-    try f.put("host/group", try std.fmt.allocPrint(f.arena, "staff:x:{d}:app\n", .{o.gid}));
-    try f.link("l3/etc/group", try f.abs("host/group"));
-    try expectFailed(
-        denied,
-        try hashAs(f, &.{ "l3", "l1", "l0" }, as.user("app", uid, primary), &.{"a"}),
-    );
+    const member: Step = .{ .uid = uid, .gid = primary, .groups = &.{o.gid}, .ids = &.{} };
+    const outsider: Step = .{ .uid = uid, .gid = primary, .groups = &.{}, .ids = &.{} };
+    try expectHash(&hashOf(&.{"a"}), try hashAs(f, &stack, member, &.{"a"}));
+    try expectFailed(denied, try hashAs(f, &stack, outsider, &.{"a"}));
+    // A step that writes itself into /etc/group gains no read through hashFiles: its processes
+    // have what they were given when the job began.
+    try f.put("l0/etc/group", try std.fmt.allocPrint(f.arena, "staff:x:{d}:app\n", .{o.gid}));
+    try expectFailed(denied, try hashAs(f, &stack, outsider, &.{"a"}));
 }
 
 test "native hashFiles: a directory without search permission refuses what is in it, found or not" {
@@ -2212,7 +2107,7 @@ test "native hashFiles: a directory without search permission refuses what is in
     try f.link("l0/ws/through", "d/../ok");
     try f.link("l0/ws/to-open", "open");
     const o = try ownerOf(f, "l0/ws/d");
-    const other: Step = .{ .uid = o.uid +% 1, .gid = o.gid +% 1, .user = "app", .ids = &.{} };
+    const other: Step = .{ .uid = o.uid +% 1, .gid = o.gid +% 1, .groups = &.{}, .ids = &.{} };
     const stack = [_][]const u8{"l0"};
     defer setMode(f, "l0/ws/d", 0o755) catch {};
 
@@ -2253,7 +2148,7 @@ test "native hashFiles: links followed are walked as the step's user, as `realpa
     try f.link("l0/ws/to-d", "d");
     try f.link("l0/ws/to-plain", "../plain");
     const o = try ownerOf(f, "l0/ws/d");
-    const other: Step = .{ .uid = o.uid +% 1, .gid = o.gid +% 1, .user = "app", .ids = &.{} };
+    const other: Step = .{ .uid = o.uid +% 1, .gid = o.gid +% 1, .groups = &.{}, .ids = &.{} };
     const stack = [_][]const u8{"l0"};
     const follow = "--follow-symbolic-links";
     try setMode(f, "l0/ws/d", 0o700);
@@ -2300,15 +2195,15 @@ test "native hashFiles: a file's ids are read as its layer holds them" {
     const far: Store.Ids = .{ .base = @max(o.uid, o.gid) + 1, .count = 65536 };
     const ids = [_]Store.Ids{ slot, far };
     const layers = [_][]const u8{ "slot", "seen" };
-    const step: Step = .{ .uid = o.uid - base, .gid = o.gid - base +% 1, .user = "app", .ids = &ids };
+    const step: Step = .{ .uid = o.uid - base, .gid = o.gid - base +% 1, .groups = &.{}, .ids = &ids };
     // The user owns `a` in the slot's ids, and the same on-disk id elsewhere is no one's.
     try expectHash(&hashOf(&.{"a"}), try hashAs(f, &layers, step, &.{"a"}));
     try expectFailed("sha256sum: b: " ++ denied, try hashAs(f, &layers, step, &.{"b"}));
     // Groups too: `g` is the user's group's, with the step's id for it.
-    const member: Step = .{ .uid = o.uid - base +% 1, .gid = o.gid - base, .user = "app", .ids = &ids };
+    const member: Step = .{ .uid = o.uid - base +% 1, .gid = o.gid - base, .groups = &.{}, .ids = &ids };
     try expectHash(&hashOf(&.{"g"}), try hashAs(f, &layers, member, &.{"g"}));
     // An id the job does not reach is `nobody` to `stat`, but not to the kernel's check.
-    const nobody: Step = .{ .uid = 65534, .gid = 65534, .user = "nobody", .ids = &ids };
+    const nobody: Step = .{ .uid = 65534, .gid = 65534, .groups = &.{}, .ids = &ids };
     try expectFailed("sha256sum: b: " ++ denied, try hashAs(f, &layers, nobody, &.{"b"}));
 }
 
@@ -2372,16 +2267,16 @@ test "native hashFiles: groups are kept sorted and once each, up to the kernel's
     defer a.deinit();
     const arena = a.allocator();
     var few = [_]u32{ 9, 3, 9, 3, 7 };
-    try std.testing.expectEqualSlices(u32, &.{ 3, 7, 9 }, distinctGroups(&few));
+    try std.testing.expectEqualSlices(u32, &.{ 3, 7, 9 }, images.distinctGroups(&few));
     // Many times the same group is one, and many more than the kernel's most are held to it.
-    const many_ids = try arena.alloc(u32, 3 * max_groups);
+    const many_ids = try arena.alloc(u32, 3 * images.max_groups);
     for (many_ids, 0..) |*g, i| g.* = @truncate(i / 2);
-    const kept = distinctGroups(many_ids);
-    try std.testing.expectEqual(@as(usize, max_groups), kept.len);
+    const kept = images.distinctGroups(many_ids);
+    try std.testing.expectEqual(@as(usize, images.max_groups), kept.len);
     const who: Who = .{ .uid = 1, .gid = 1 << 30, .groups = kept, .ids = .{} };
     try std.testing.expect(who.inGroup(0));
-    try std.testing.expect(who.inGroup(max_groups - 1));
-    try std.testing.expect(!who.inGroup(max_groups));
+    try std.testing.expect(who.inGroup(images.max_groups - 1));
+    try std.testing.expect(!who.inGroup(images.max_groups));
     try std.testing.expect(who.inGroup(1 << 30));
     try std.testing.expect(!who.inGroup(null));
     const none: Who = .{ .uid = 1, .gid = 2, .groups = &.{}, .ids = .{} };
@@ -2395,7 +2290,7 @@ test "native hashFiles: an ACL's entries are work the call's limits count" {
     defer f.cleanup();
     try f.put("l0/ws/a", "a");
     const o = try ownerOf(f, "l0/ws/a");
-    const step: Step = .{ .uid = o.uid +% 1, .gid = o.gid +% 1, .user = "app", .ids = &.{} };
+    const step: Step = .{ .uid = o.uid +% 1, .gid = o.gid +% 1, .groups = &.{}, .ids = &.{} };
     const none = 0xffffffff;
     // Named users, in the kernel's order, none of them the step's.
     var entries: std.ArrayList([3]u32) = .empty;
@@ -2423,8 +2318,8 @@ test "native hashFiles: an ACL on the file and on a directory counts, past the m
     try f.put("l0/ws/d/a", "a");
     const o = try ownerOf(f, "l0/ws/d/a");
     const named = o.uid +% 1;
-    const step: Step = .{ .uid = named, .gid = o.gid +% 1, .user = "app", .ids = &.{} };
-    const other: Step = .{ .uid = named +% 1, .gid = o.gid +% 1, .user = "app", .ids = &.{} };
+    const step: Step = .{ .uid = named, .gid = o.gid +% 1, .groups = &.{}, .ids = &.{} };
+    const other: Step = .{ .uid = named +% 1, .gid = o.gid +% 1, .groups = &.{}, .ids = &.{} };
     const none = 0xffffffff;
     const acl = try aclValue(f.arena, &.{
         .{ 0x01, 7, none },

@@ -54,6 +54,8 @@ pub const Spec = struct {
     /// Who the step runs as inside.
     uid: u32 = 0,
     gid: u32 = 0,
+    /// A non-root step's supplementary groups, as the job sees them.
+    groups: []const u32 = &.{},
     argv: []const []const u8,
     /// What is executed: a path inside the root, or "" for `argv[0]` looked up in the env's PATH
     /// there, as Docker starts an image's entrypoint (a service's, `services.zig`).
@@ -378,6 +380,9 @@ pub fn openIn(
     return .{ .err = .AGAIN };
 }
 
+/// What `readIn` finds.
+pub const LayerFile = union(enum) { text: []const u8, missing, whiteout };
+
 /// The contents of `path` in a layer, read by the runner: resolved inside the layer and through no
 /// symlink. `missing` when it is not a regular file there; `whiteout` when the layer deletes it (an
 /// overlay whiteout, a character device), so lower layers must not be looked in.
@@ -386,7 +391,28 @@ pub fn readIn(
     layer: []const u8,
     path: []const u8,
     limit: usize,
-) !union(enum) { text: []const u8, missing, whiteout } {
+) !LayerFile {
+    return readResolved(arena, layer, path, limit, resolve_no_symlinks);
+}
+
+/// `readIn` for a tree no job wrote, an image's own, whose links are the image's: they are
+/// followed, staying inside it.
+pub fn readFollowingIn(
+    arena: Allocator,
+    layer: []const u8,
+    path: []const u8,
+    limit: usize,
+) !LayerFile {
+    return readResolved(arena, layer, path, limit, 0);
+}
+
+fn readResolved(
+    arena: Allocator,
+    layer: []const u8,
+    path: []const u8,
+    limit: usize,
+    resolve: u64,
+) !LayerFile {
     const dir = linux.open(try arena.dupeSentinel(u8, layer, 0), .{
         .ACCMODE = .RDONLY,
         .DIRECTORY = true,
@@ -399,7 +425,7 @@ pub fn readIn(
         .ACCMODE = .RDONLY,
         .NONBLOCK = true,
         .NOCTTY = true,
-    }, 0, resolve_no_symlinks)) {
+    }, 0, resolve)) {
         .fd => |f| f,
         .err => return .missing,
     };
@@ -639,7 +665,7 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper) u8 {
         else
             .{ .search = .{ .name = spec.argv[0], .env = env } };
         const in_image = spec.container != null;
-        stepInit(arena, root, workdir, spec.uid, spec.gid, nnp, alive[0], in_image, program, argv, envp);
+        stepInit(arena, root, workdir, spec.uid, spec.gid, spec.groups, nnp, alive[0], in_image, program, argv, envp);
     }
     _ = linux.close(alive[0]);
     const st = if (spec.service) |s|
@@ -1082,6 +1108,7 @@ fn stepInit(
     workdir: [*:0]const u8,
     uid: u32,
     gid: u32,
+    groups: []const u32,
     no_new_privs: bool,
     alive: linux.fd_t,
     in_image: bool,
@@ -1116,7 +1143,7 @@ fn stepInit(
     // the step makes, sudo's root included.
     installSeccomp();
     if (uid != 0 or gid != 0) {
-        check("setgroups", linux.setgroups(0, no_groups));
+        check("setgroups", if (groups.len == 0) linux.setgroups(0, no_groups) else linux.setgroups(groups.len, groups.ptr));
         check("setgid", linux.setgid(gid));
         check("setuid", linux.setuid(uid));
         // The kernel clears the parent-death signal on a change of credentials.

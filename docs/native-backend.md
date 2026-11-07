@@ -2335,14 +2335,13 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
     on a root runner has `CAP_DAC_OVERRIDE`, and a rootless runner's steps are all root, so
     neither is checked.
   - *Groups.* The primary group, and the supplementary groups BuildKit's `GetUser` gave: those of
-    a name or uid that /etc/passwd has, and none with an explicit group. They come from
-    /etc/passwd and /etc/group as the next step has them, resolved like any file of the job, so
-    a link in them stays in its tree. A native step's own processes have no supplementary group
-    (`setgroups(0)` in `sandbox.zig`), so until #369 a file only such a group may read is hashed
-    though the step itself cannot read it. That is Dagger's answer; the difference is the
-    sandbox's. A user's groups are held to the kernel's 65536, and each ACL's entries count
-    against the call's steps, with its clocks read, so that a job's /etc/group or ACLs cannot
-    outlast its limits.
+    `/etc/group` that name the user, for a name or a uid `/etc/passwd` has, and none with an
+    explicit group or a uid not there. They are read once, from the image, when the job starts
+    (`Backend.stepGroups`), and that one list is what the step's processes have and what the call
+    counts, so `hashFiles()` says yes only where the step could read. The engine read them at each
+    exec; here a step that edits `/etc/group`, or `usermod -aG`, changes nothing for the steps after
+    it, and a gid past the job's 65,536 ids is left out. A link in them stays in the image. The list
+    is in a step's key when it has one, so the same ids without a group never replay what it read.
   - *ACLs and capabilities.* An ACL decides as the kernel's `posix_acl_permission` does, on the
     file and on each directory, with its ids shifted like the owner's. `sha256sum` as a non-root
     user had no capability to use, so none is modelled.

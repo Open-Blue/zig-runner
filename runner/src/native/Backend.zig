@@ -66,6 +66,8 @@ image_env: []const []const u8 = &.{"PATH=" ++ image_path},
 /// Who the image's `USER` is, for steps that do not run as the runner user.
 image_uid: u32 = 0,
 image_gid: u32 = 0,
+/// The steps' supplementary groups (`stepGroups`).
+groups: []const u32 = &.{},
 /// What a `container:` job's `options:` ask for (`container_options.zig`), read by `base`.
 container_opts: container_options.Options = .{},
 /// A `container:` job's PATH once its env is set (`dagger.Base.runtime_path`).
@@ -1431,6 +1433,7 @@ fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
         b.user = dagger.runner_user;
         try b.put("HOME", dagger.runner_home);
     }
+    b.groups = try b.stepGroups();
     try b.put(dagger.mark_env, plan.mark);
     for (b.cache_plan.env.items) |e| try b.put(e.name, e.value);
     for (try ev.defaultEnv()) |e| try b.put(e.name, e.value);
@@ -2129,6 +2132,43 @@ pub fn hashFiles(
     return hash_files.hashFiles(b.gpa, arena, b.io, stack, ws, dagger.runner_home, args);
 }
 
+/// The supplementary groups of the steps' user, read once from the image, so hashFiles and the
+/// steps' own processes have the one list. The engine read them at each exec; here a step that
+/// edits /etc/group changes nothing for the steps after it. Only a job's own ids can be set, so a
+/// gid past them is left out; a rootless runner's steps are root, and need none.
+fn stepGroups(b: *const Backend) ![]const u32 {
+    if (b.uid == 0 or b.how.userns != .mapped) return &.{};
+    const arena = b.arena;
+    const max_bytes = 10 << 20;
+    const passwd = switch (try sandbox.readFollowingIn(arena, b.rootfs, "/etc/passwd", max_bytes)) {
+        .text => |t| t,
+        else => return &.{},
+    };
+    const group = switch (try sandbox.readFollowingIn(arena, b.rootfs, "/etc/group", max_bytes)) {
+        .text => |t| t,
+        else => return &.{},
+    };
+    return mappedGroups(arena, try images.supplementaryGroups(arena, passwd, group, b.user));
+}
+
+/// `groups` the job's ids reach, in order: `setgroups` fails a step for any other.
+fn mappedGroups(arena: Allocator, groups: []const u32) ![]const u32 {
+    const mapped = try arena.dupe(u32, groups);
+    var n: usize = 0;
+    for (groups) |g| if (g < ids_per_slot) {
+        mapped[n] = g;
+        n += 1;
+    };
+    return mapped[0..n];
+}
+
+test "a step's groups are those the job's ids reach, in order" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const kept = try mappedGroups(a.allocator(), &.{ 4, 50, ids_per_slot - 1, ids_per_slot, 70000 });
+    try std.testing.expectEqualSlices(u32, &.{ 4, 50, ids_per_slot - 1 }, kept);
+}
+
 /// The steps' user for `hashFiles`, with `layer_ids` filled for its layers, topmost first; null
 /// when they run as root, which is every step of a rootless runner. A job's own upper has its
 /// slot's host ids and is seen as it is; what is seen through the job's ids (`canonical`: stored
@@ -2143,7 +2183,7 @@ fn hashStep(b: *const Backend, layer_ids: []Store.Ids) ?hash_files.Step {
             if (!l.canonical) layer_ids[n - 1 - i] = b.slotIds();
         }
     }
-    return .{ .uid = b.uid, .gid = b.gid, .user = b.user, .ids = layer_ids };
+    return .{ .uid = b.uid, .gid = b.gid, .groups = b.groups, .ids = layer_ids };
 }
 
 /// Overlay's attribute that marks a directory opaque: `trusted.` when the job's overlay is mounted
@@ -2269,6 +2309,7 @@ fn execIn(
         .workdir = b.workdir,
         .uid = uid,
         .gid = gid,
+        .groups = if (uid == b.uid and gid == b.gid) b.groups else &.{},
         .argv = argv,
         .env = env,
         .files = files,
@@ -2331,6 +2372,12 @@ fn keyFor(
         h.field(f.path);
         h.field(f.contents);
         h.int(f.mode);
+    }
+    // What a step may read is in its groups too. Hashed only if it has some, which leaves every
+    // other key as it was; a layer stored before steps had them was made without, and misses.
+    if (uid == b.uid and gid == b.gid and b.groups.len > 0) {
+        h.int(b.groups.len);
+        for (b.groups) |g| h.int(g);
     }
     return h.final();
 }
@@ -7116,7 +7163,6 @@ test "hashFiles reads for the steps' user, by each layer's ids, and for root che
     b.user = dagger.runner_user;
     const step = b.hashStep(&seen).?;
     try std.testing.expectEqual(@as(u32, 1001), step.uid);
-    try std.testing.expectEqualStrings(dagger.runner_user, step.user);
     try std.testing.expectEqual(b.slotIds(), seen[0]);
     for (seen[1..]) |lower| try std.testing.expectEqual(b.ids(), lower);
 
@@ -7145,9 +7191,11 @@ fn deniedJob(arena: Allocator) !job_mod.Job {
         "'mine'",
         "'grouped'",
     };
-    const steps = try arena.alloc(job_mod.Step, asks.len + 1);
+    const steps = try arena.alloc(job_mod.Step, asks.len + 2);
     steps[0] = plant;
-    for (asks, steps[1..], 0..) |ask, *st, i| {
+    steps[asks.len + 1] = testStep("echo read-by-group=$(cat grouped).");
+    steps[asks.len + 1].condition = "always()";
+    for (asks, steps[1 .. asks.len + 1], 0..) |ask, *st, i| {
         st.* = testStep("");
         st.condition = "always()";
         st.action.script.script = .{ .expr = try std.fmt.allocPrint(
@@ -7175,8 +7223,9 @@ fn expectDenied(arena: Allocator, r: anytype) !void {
         // A link to a directory the user can reach is skipped.
         "got6=.",
         try std.fmt.allocPrint(arena, "got7={s}.", .{&hashOfFiles(&.{"mine"})}),
-        // By a supplementary group of /etc/group, which a step's own processes have not got.
+        // By a supplementary group of /etc/group, which the step has too.
         try std.fmt.allocPrint(arena, "got8={s}.", .{&hashOfFiles(&.{"grouped"})}),
+        "read-by-group=grouped.",
     });
     const steps = r.res.steps;
     for (steps[1..7]) |st| try std.testing.expectEqual(dagger.Outcome.failure, st.outcome);
@@ -7273,7 +7322,10 @@ test "native hashFiles: a job container's --user is whom it reads for, its group
 
     var read = testStep("");
     read.action.script.script = .{ .expr = "format('echo got={0}.', hashFiles('l'))" };
-    const steps = [_]job_mod.Step{ testStep("ln -s /etc/grouped l"), read };
+    // Stored once for the member: the same ids without the group must not replay what it read.
+    var reader = testStep("echo read=$(cat /etc/grouped 2>/dev/null).");
+    reader.condition = "always()";
+    const steps = [_]job_mod.Step{ testStep("ln -s /etc/grouped l"), read, reader };
     // By name, the user's groups count; with its ids alone, as BuildKit gives them, they do not.
     for ([_][]const u8{ "--user app", "--user 1002:1003" }, [_]bool{ true, false }) |options, member| {
         var job = testJob(&steps);
@@ -7287,6 +7339,7 @@ test "native hashFiles: a job container's --user is whom it reads for, its group
             try std.fmt.allocPrint(arena, "got={s}.", .{&hashOfFiles(&.{"grouped"})})
         else
             "hashFiles(l) failed: sha256sum: l: Permission denied"});
+        try expectLines(r.text, &.{if (member) "read=grouped." else "read=."});
     }
 }
 
