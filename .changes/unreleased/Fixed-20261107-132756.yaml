@@ -1,0 +1,3 @@
+kind: Fixed
+body: The test of an abort that comes as the answer does no longer races a 10 ms timer, which a busy CI machine could pause past and fail
+time: 2026-11-07T13:27:56.262345664-05:00

@@ -2663,9 +2663,13 @@ const FakeAbort = struct {
 };
 
 /// A stand-in for the `dagger run` session's HTTP endpoint: takes one query, then either answers
-/// it `answer_after_ms` later or never, and notes when the client goes.
+/// it `answer_after_ms` later (after `answer_when` is set, when there is one) or never, and notes
+/// when the client goes.
 const FakeQueryServer = struct {
     answer_after_ms: ?i64 = null,
+    /// Answer only once this is set: a test orders its own step before the answer instead of
+    /// racing a timer, which a loaded machine can pause past.
+    answer_when: ?*const std.atomic.Value(bool) = null,
     got_query: std.atomic.Value(bool) = .init(false),
     client_gone: std.atomic.Value(bool) = .init(false),
 
@@ -2684,6 +2688,7 @@ const FakeQueryServer = struct {
         }
         f.got_query.store(true, .release);
         if (f.answer_after_ms) |ms| {
+            if (f.answer_when) |when| waitFor(when) catch return;
             io.sleep(.fromMilliseconds(ms), .awake) catch return;
             var wbuf: [256]u8 = undefined;
             var w = s.writer(io, &wbuf);
@@ -2697,7 +2702,7 @@ const FakeQueryServer = struct {
     }
 
     /// Waits for `flag`, at most about five seconds, so a failure is a failed test, not a hang.
-    fn waitFor(flag: *std.atomic.Value(bool)) !void {
+    fn waitFor(flag: *const std.atomic.Value(bool)) !void {
         for (0..500) |_| {
             if (flag.load(.acquire)) return;
             try std.testing.io.sleep(.fromMilliseconds(10), .awake);
@@ -2762,9 +2767,12 @@ test "an abort that came as the answer did is not lost: the send fails" {
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
-    // Answers 10 ms after the query arrives, well inside `waitAborted`'s 50 ms poll, so the
-    // answer is what `send` sees first.
-    var fake: FakeQueryServer = .{ .answer_after_ms = 10 };
+    // Answers as soon as the abort is in, well inside `waitAborted`'s 50 ms poll, so the answer is
+    // what `send` sees first. Answering on a timer instead (10 ms after the query) failed on a
+    // hosted runner: paused past it, the test found the query already answered and nothing to
+    // abort.
+    var abort_in: std.atomic.Value(bool) = .init(false);
+    var fake: FakeQueryServer = .{ .answer_after_ms = 0, .answer_when = &abort_in };
     const t = try std.Thread.spawn(.{}, FakeQueryServer.run, .{ &fake, &listener });
     defer t.join();
     defer fake.release(port);
@@ -2785,12 +2793,14 @@ test "an abort that came as the answer did is not lost: the send fails" {
     var sending = try io.concurrent(Transport.send, .{ transport, arena.allocator(), "{ a }", 1024 });
     defer _ = sending.cancel(io) catch {};
     try FakeQueryServer.waitFor(&fake.got_query);
+    // Nothing answers before `abort_in`, so the query is in flight however long this takes.
     var aborted = false;
-    for (0..5) |_| {
+    for (0..500) |_| {
         aborted = transport.abort();
         if (aborted) break;
-        try io.sleep(.fromMilliseconds(1), .awake);
+        try io.sleep(.fromMilliseconds(10), .awake);
     }
+    abort_in.store(true, .release);
     // `Watch` takes true to mean the query ended and does not ask again, so it must have ended.
     try std.testing.expect(aborted);
     try std.testing.expectError(error.QueryAborted, sending.await(io));
