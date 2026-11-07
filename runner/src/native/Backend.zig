@@ -2253,9 +2253,10 @@ fn abort(ptr: *anyopaque) bool {
 
 /// A stage of `dagger.Watch`'s ladder: `sig` to the running step. An exec only waiting for its
 /// key's lock has nothing to warn, and stops as `abort` stops it.
-fn warn(ptr: *anyopaque, sig: std.os.linux.SIG) bool {
+fn warn(ptr: *anyopaque, sig: std.os.linux.SIG) dagger.Transport.Warned {
     const b: *Backend = @ptrCast(@alignCast(ptr));
-    return b.running.warn(b.io, sig) or abort(ptr);
+    if (b.running.warn(b.io, sig)) return .warned;
+    return if (abort(ptr)) .ended else .nothing;
 }
 
 /// Runs one script on a new layer over the others, which it joins when it ends.
@@ -3421,8 +3422,7 @@ test "a cancel's SIGINT reaches a native step's foreground child, and the step's
     try std.testing.expectEqual(dagger.Outcome.cancelled, r.res.steps[0].outcome);
     try std.testing.expectEqual(dagger.Outcome.success, r.res.steps[1].outcome);
     try expectLines(r.text, &.{
-        "The job was cancelled: stopping the step. Its processes get SIGINT now, SIGTERM in " ++
-            "7500 ms and SIGKILL in 10000 ms.",
+        "The job was cancelled: stopping the step with SIGINT, then SIGTERM in ",
         "cleaned-up",
         // The step's own log, as GitHub's runner ends it.
         "##[error]The operation was canceled.",
@@ -3478,7 +3478,7 @@ test "a native step that ignores every signal is dead at the ladder's end, whate
     try std.testing.expectEqual(dagger.Outcome.cancelled, r.res.steps[0].outcome);
     try expectLines(r.text, &.{
         // Less than the limit by when the watch saw the cancel.
-        "The runner is stopping: stopping the step. Its processes get SIGINT now, SIGTERM in ",
+        "The runner is stopping: stopping the step with SIGINT, then SIGTERM in ",
         "The step is still running: SIGTERM sent.",
         "The step did not stop: killing it.",
     });
@@ -3550,6 +3550,51 @@ test "a task's cancel stops a native step at once, and the job's own end still r
     defer jobs.close(io);
     var it = jobs.iterate();
     try std.testing.expect(try it.next(io) == null);
+}
+
+test "a task's cancel that lands in a sink's write of a native step's output is not lost" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const io = std.testing.io;
+
+    const Slow = struct {
+        reached: std.atomic.Value(bool) = .init(false),
+
+        /// A sink that waits, and sees nothing wrong in a cancel.
+        fn chunk(ptr: *anyopaque, _: []const u8) void {
+            const s: *@This() = @ptrCast(@alignCast(ptr));
+            s.reached.store(true, .release);
+            io.sleep(.fromSeconds(1), .awake) catch {};
+        }
+
+        fn run(s: *@This(), b: *Backend) anyerror!sandbox.Ended {
+            // It ends by itself if the cancel is lost, and the check below then fails.
+            return b.exec("echo first; sleep 12.79", &.{"PATH=/usr/bin:/bin"}, &.{}, 0, 0, .{
+                .ptr = s,
+                .chunkFn = chunk,
+            });
+        }
+    };
+    var b = try init(arena, io, std.testing.allocator, cfg);
+    defer b.deinit();
+    var slow: Slow = .{};
+    var running = try io.concurrent(Slow.run, .{ &slow, &b });
+    var cancelled = false;
+    defer if (!cancelled) {
+        _ = running.cancel(io) catch {};
+    };
+    for (0..3000) |_| {
+        if (slow.reached.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    const started = std.Io.Clock.awake.now(io).toMilliseconds();
+    cancelled = true;
+    _ = running.cancel(io) catch {};
+    try std.testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - started < 8_000);
 }
 
 /// `dagger.Watch`'s first stage, for the tests that wait it out.

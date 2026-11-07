@@ -460,6 +460,8 @@ const BuildRunner = struct {
             r.failure = ended.failure;
             return 125;
         }
+        // Stopped, it may be half done whatever it exited with: never a layer for the store.
+        if (ended.killed) return ended.code;
         // The layer gets the canonical ids, as P2 gives a step's before it is stored
         // (`Store.unshift`, #276), so it serves every slot. Half shifted, it must not be stored.
         if (mapped) Store.unshift(b.arena, b.io, upper, b.slotIds()) catch |e| {

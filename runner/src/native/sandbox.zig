@@ -170,8 +170,10 @@ pub const Spec = struct {
 pub const Userns = enum { mapped, self, inherited };
 
 /// What a step ended with: its exit code (128 + n for signal n, as a shell reports it), and the
-/// helper's own failure, when the sandbox could not be made. `killed`: it was stopped by
-/// `Running.kill`, so its end is not the step's own.
+/// helper's own failure, when the sandbox could not be made. `killed`: it was stopped
+/// (`Running.warn`, `Running.kill`), so its end is not the step's own. Never code 0 then: a script
+/// can go on past a program a warning killed and exit 0 with its work half done, and a caller that
+/// keeps what an exec made on its code (a Dockerfile's `RUN`, a seed) must not keep that.
 pub const Ended = struct {
     code: i32,
     failure: []const u8,
@@ -210,7 +212,12 @@ pub fn run(
     var json: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(spec, .{}, &json.writer);
     try json.writer.writeByte('\n');
-    child.stdin.?.writeStreamingAll(io, json.written()) catch {};
+    {
+        // A task's cancel waits for `finish`'s read: taken here, it would end nothing.
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        child.stdin.?.writeStreamingAll(io, json.written()) catch {};
+    }
     running.begin(io, child.stdin.?);
     child.stdin = null;
     defer running.end(io);
@@ -240,6 +247,9 @@ fn finish(
             continue;
         };
         if (n == 0) break;
+        // The sink's writes may wait, and do not report a cancel: the next read gets it.
+        const sink_protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(sink_protection);
         out.chunk(buf[0..n]);
     }
     const protection = io.swapCancelProtection(.blocked);
@@ -261,16 +271,20 @@ fn finish(
         .signal => |s| 128 + @as(i32, @intCast(@backingInt(s))),
         else => 128,
     };
+    const killed = running.wasKilled(io);
     return .{
-        .code = code,
+        .code = if (killed and code == 0) stopped_code else code,
         .failure = std.mem.trimEnd(u8, said.rest, "\n"),
-        .killed = running.wasKilled(io),
+        .killed = killed,
         .helper = said.helper,
         .ended = waited,
     };
 }
 
 const max_failure_bytes = 16 * 1024;
+
+/// The code of a step stopped that exited 0 (`Ended`): what the kill gives, 128 + SIGKILL.
+const stopped_code = 137;
 
 /// Where `run` hands the step's output, in pieces as read (not lines).
 pub const Output = struct {

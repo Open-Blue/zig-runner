@@ -1692,27 +1692,36 @@ What Dagger (BuildKit and runc under it) did implicitly, now explicit in `native
     failed instead (`StepsRunner.cs` 322-337).
   - `always()` steps do not run on a cancelled token: each step has a token of its own, which the
     job's cancel cancels only when the condition, evaluated again, no longer holds
-    (`StepsRunner.cs` 149-185). The worker itself is killed 15 s before the job's cancel limit
-    (`JobDispatcher.cs:1285`).
+    (`StepsRunner.cs` 149-185). The worker itself is killed 15 s before the job's cancel limit,
+    which is raised to 60 s first (`JobDispatcher.cs` 1280-1285).
 
   What this runner does:
   - **The ladder and its timing** are `Watch`'s (`sigint_ms`, `sigterm_ms`), on its 200 ms tick:
     SIGINT, SIGTERM 7500 ms on, the kill 2500 ms after that, each only while the step runs. The
-    whole fits inside the job's cancel limit (`ladderEnd`): with less time left it shrinks in
+    whole fits inside the job's cancel limit (`ladderMs`): with less time left it shrinks in
     proportion, a job past its limit gets the kill alone, an `if: always()` step at the limit
     starts its ladder early enough to end by it, and a second cancel, which can only bring
     `Cancel.hard_deadline_ms` forward, shortens a ladder under way and cannot lengthen it. The
-    runner holds the time and not the helper for that reason. If the runner dies the lifeline
-    closes, which is the kill. Nothing here is configurable, as on GitHub.
+    runner holds the time and not the helper for that reason. A kill that finds nothing, between
+    two execs of a step, stays due. The ladder runs on the awake clock, so a wall clock stepped
+    back cannot put it off. If the runner dies the lifeline closes, which is the kill. Nothing here
+    is configurable, as on GitHub. GitHub's limit is taken as its runner takes it
+    (`CancelWatch.cancelLimitMs`): 60 s at the least, less 15 s. One difference: there a later
+    cancel can move the limit out (`CancelAfter`), and here it cannot.
   - **Who hears it** differs from GitHub on purpose: every process of the step, not one. A signal
     from outside to PID 1 is dropped unless PID 1 has a handler (`SIGNAL_UNKILLABLE`), and no call
     from outside reaches a namespace, so the helper forks one process, which lands in the step's
     PID namespace, for `kill(-1, sig)`: all but PID 1, sessions and process groups of their own
     included, in one act the kernel holds forks off from (`sandbox.Warning`). It lasts one system
     call, is not dumpable, and holds capabilities the step's bounding set does not, so a root step
-    cannot trace it. Its zombie is reaped at once, because PID 1 cannot finish exiting while one is
+    cannot trace it (no job can add one: `--cap-add` and `--privileged` are refused,
+    `container_options.zig`). Its zombie is reaped at once, because PID 1 cannot finish exiting while one is
     left. A `bash` step's foreground child therefore dies of SIGINT, and the shell's trap runs
-    straight away, where on GitHub it waits for that child.
+    straight away, where on GitHub it waits for that child. The cost: a wrapper that passes
+    signals on (`timeout`, `npm`, `make`) has its child hear SIGINT twice, once from each, as
+    Ctrl-C in a terminal does to a foreground group. A program that counts them, as Terraform's
+    second interrupt means "exit now", then skips its clean exit. No choice of who to signal avoids
+    it without losing the foreground child under a shell, which is the point of signalling all.
   - **PID 1** of a `run:` step is the `sh -c` around the step's shell, which is left alone: it
     reports the step's end, and where `sh` is bash it would act on the signal and end the namespace
     under a step still cleaning up. A Docker action's PID 1 is the action's own and is signalled as
@@ -1726,13 +1735,21 @@ What Dagger (BuildKit and runc under it) did implicitly, now explicit in `native
     step's cgroup of its own would hide `memory.max` from what a step reads there, for no process
     the namespace's end does not already reach.
   - **Once the step's shell has ended** the namespace goes, so a background process still cleaning
-    up is killed then. On GitHub it would be left until the end of the job. A step that exits 0
-    during the ladder is still cancelled, or failed on a timeout, as on GitHub, and its file
-    commands are not read. Its layer stays, so what a trap wrote is there for `always()` steps.
+    up is killed then. On GitHub it would be left until the end of the job. A step that ends
+    during the ladder is still cancelled, or failed on a timeout, whatever it exited with, as on
+    GitHub, and its file commands are not read. Its layer stays, so what a trap wrote is there for
+    `always()` steps. Every exec stopped ends with a code other than 0 (`sandbox.Ended`), whatever
+    its script exited with, so nothing that keeps an exec's work on its code keeps a stopped one's:
+    a `RUN` whose script went on past a killed `apt-get` and exited 0 stores no layer, and a Zig
+    seed or an action's fetch fails as a killed one did.
   - **The log** says why, in the step's own log, before `##[error]The operation was canceled.`:
     the reason (`Cancel.Why`: GitHub's cancel, the runner stopping, GitHub no longer having the
-    job, or `Watch.reason` for a timeout or the job's limit), then each stage reached. A post
-    script stopped at the job's limit has no step of `Watch`'s to log in.
+    job, or `Watch.reason` for a timeout or the job's limit), then each stage reached. It names
+    the plan, not delivery: a warning the helper cannot fork for at `pids.max` is not sent. A job
+    cancelled during a timeout's ladder reports the step cancelled, as GitHub does. Written once
+    `Watch` has let go of its lock, so a stuck sink does not hold up the next stage. Pre scripts
+    have no log step of `Watch`'s. Each pre and post script gets a ladder of its own, and one
+    stopped near the limit fails as a post script does, so the next still runs.
   - **After a cancel** nothing runs on a cancelled context: `dagger.Cancel` is a flag, read where
     work should stop (`Watch`, `hashFiles`, the tool tree check), and a call begun after it is not
     cut short. A job's cancel never cancels the job's task, so `if: always()` steps, post scripts,
@@ -1740,8 +1757,9 @@ What Dagger (BuildKit and runc under it) did implicitly, now explicit in `native
     another matter, and only a pool failing to start its runners sends one to a job: `std.Io`
     delivers it once, and two places lost it. `sandbox.finish` took it for the end of the step's
     output, then waited for the step, however long it ran; it now stops the step and delivers it
-    again once the helper has gone. `Backend.deinit` could lose its cgroup or its directory to it,
-    and now runs protected from it.
+    again once the helper has gone. A sink's write and the spec's run protected from it, so the
+    read gets it. `Backend.deinit` could lose its cgroup or its directory to it, and now runs
+    protected from it.
   - **A second cancel from GitHub** is read: `CancelWatch` used to stop at the first, so a shorter
     limit in a second message never reached `Cancel.request`.
   - **Dagger and `RUNNER_ENGINE=cli` cannot do this.** A step there is a BuildKit exec: cancelling

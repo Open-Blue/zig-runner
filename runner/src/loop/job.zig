@@ -1009,17 +1009,26 @@ const CancelWatch = struct {
             if (!std.mem.eql(u8, id, w.job_id)) continue;
             const grace_ms = timeSpanMs((jsonString(cc.arena, inner, "timeout") catch null) orelse "") orelse
                 default_grace_ms;
-            w.cancel.request(std.Io.Clock.real.now(cc.io).toMilliseconds() + grace_ms);
+            const limit_ms = cancelLimitMs(grace_ms);
+            w.cancel.request(std.Io.Clock.real.now(cc.io).toMilliseconds() + limit_ms);
             const text = std.fmt.allocPrint(
                 cc.arena,
                 "job {d}: cancelled by GitHub; stopping the running step ({d} s for what still " ++
                     "runs)",
-                .{ w.log_job, @divTrunc(grace_ms, 1000) },
+                .{ w.log_job, @divTrunc(limit_ms, 1000) },
             ) catch return;
             w.c.log.say(text) catch {};
-            // On, as GitHub's runner hears each one (`JobDispatcher.Cancel`): a second cancel can
-            // bring the limit forward, which `Cancel.request` keeps, and never put it back.
+            // On, as GitHub's runner hears each one (`JobDispatcher.Cancel`). A second cancel can
+            // bring the limit forward, which `Cancel.request` keeps. It cannot put it back, which
+            // GitHub's `CancelAfter` would: the ladder's promise is that it never grows.
         }
+    }
+
+    /// What of GitHub's `timeout` this runner uses, as its `WorkerDispatcher.Cancel` does
+    /// (`JobDispatcher.cs`, 1280-1285): at least 60 s, so a small one still gets a full ladder,
+    /// less 15 s, in which the job's end reports before GitHub closes the job.
+    fn cancelLimitMs(grace_ms: i64) i64 {
+        return @max(grace_ms, 60 * std.time.ms_per_s) - 15 * std.time.ms_per_s;
     }
 
     /// GitHub's default `cancel-timeout-minutes`.
@@ -1396,14 +1405,15 @@ test "a second cancel from GitHub shortens the job's limit, and a later longer o
     // Five seconds at the most: the check below then fails, and the test ends.
     for (0..500) |_| {
         if (cancel.hard_deadline_ms.load(.acquire) != 0 and
-            cancel.hard_deadline_ms.load(.acquire) < before + 60_000) break;
+            cancel.hard_deadline_ms.load(.acquire) < before + 100_000) break;
         try io.sleep(.fromMilliseconds(10), .awake);
     }
     // Time for the third, longer one to do its harm, had it any.
     try io.sleep(.fromMilliseconds(200), .awake);
     const hard = cancel.hard_deadline_ms.load(.acquire);
-    try std.testing.expect(hard >= before + 30_000);
-    try std.testing.expect(hard <= before + 40_000);
+    // The smallest limit GitHub's runner keeps: 60 s, less its 15.
+    try std.testing.expect(hard >= before + 45_000);
+    try std.testing.expect(hard <= before + 55_000);
 }
 
 test "a stop cancels a running job once its grace has passed, and not a job that ended first" {

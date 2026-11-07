@@ -1,6 +1,6 @@
 # How many times each construct appears in runner/src's code (.github/scripts/unsafe-ratchet.sh).
 @bitCast	17
-@ptrCast	80
-@alignCast	66
+@ptrCast	81
+@alignCast	67
 @intCast	209
 catch unreachable	14
