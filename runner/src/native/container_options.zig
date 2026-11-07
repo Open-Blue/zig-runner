@@ -148,15 +148,173 @@ fn refuse(arena: Allocator, why: *[]const u8, word: []const u8, reason: []const 
 /// same thread, which is long enough for the caller to print it.
 threadlocal var scratch: [8192]u8 = undefined;
 
-/// Why a job container cannot be native, or null: its `ports:` and `volumes:` (not native yet,
-/// docs/native-backend.md, "Job container options") and any of its `options:` that `parse` does
-/// not carry out. `provisioned` is whether its image is the one the runner provisions, whose step
-/// user is `RUNNER_STEP_USER`'s choice, not the container's.
-pub fn unsupported(jc: job_mod.Service, provisioned: bool) ?[]const u8 {
-    if (jc.ports.len > 0) return "a job container's `ports:` are not native yet (publishing a " ++
-        "port to the host needs the job's network, phase 6's isolation)";
-    if (jc.volumes.len > 0) return "a job container's `volumes:` are not native yet (a bind " ++
-        "from the host needs a mount policy and id mapping of its own)";
+/// Said wherever `ports:` or `volumes:` send the job to Dagger, which reads neither: it warns
+/// "Job container ports/volumes not supported here and ignored" (`set_up.warnDroppedContainerSettings`,
+/// #368), so they are not applied there either.
+const dropped_ports = "; Dagger ignores a job container's `ports:`, so they are not published there either";
+const dropped_volumes = "; Dagger ignores a job container's `volumes:`, so they are not mounted there either";
+
+/// One `volumes:` entry the native job carries out.
+pub const Volume = struct {
+    /// A named volume's name; null for an anonymous one.
+    name: ?[]const u8,
+    /// Absolute, with no `.`, `..` or empty part.
+    target: []const u8,
+};
+
+/// The job container's `volumes:`, all carried out.
+pub const Volumes = struct {
+    /// Every volume's mount point, in order.
+    targets: []const []const u8 = &.{},
+    /// How many of them are named.
+    named: usize = 0,
+};
+
+fn refuseVolume(arena: Allocator, why: *[]const u8, raw: []const u8, reason: []const u8) Error {
+    why.* = std.fmt.allocPrint(arena, "a job container's volume `{s}` {s}" ++ dropped_volumes, .{
+        raw,
+        reason,
+    }) catch "a job container's volume is not carried out natively" ++ dropped_volumes;
+    return error.Refused;
+}
+
+/// What GitHub's runner mounts itself in a job container (`ContainerInfo`, `ContainerOperationProvider`),
+/// which Docker would refuse a second mount of.
+const runner_mounts = [_][]const u8{
+    "/__w", "/__t", "/__e", "/github/home", "/github/workflow", "/var/run/docker.sock",
+};
+/// Directories the sandbox mounts itself, and everything below them.
+const sandbox_trees = [_][]const u8{ "/proc", "/sys", "/dev" };
+
+/// `raw` as GitHub's runner reads a job container's `volumes:` entry (`MountVolume.ParseVolumeString`):
+/// `target`, `source:target` or `source:target:ro` (and `target:ro`), which it passes on as
+/// `docker create -v`. Carried out: an anonymous volume and a named one, which are directories of
+/// the job's filesystem (a volume is new and empty, or holds what the image has there, as the
+/// job's own overlay does) that live as long as the job. Refused, with why: a path of the host as
+/// the source (a bind needs a policy for which paths a job may take, and the ids of its files),
+/// a read-only volume (that needs a mount), and a target that is not a plain directory of the
+/// container.
+pub fn parseVolume(arena: Allocator, raw: []const u8, why: *[]const u8) Error!Volume {
+    var parts: [3][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, raw, ':');
+    while (it.next()) |p| {
+        if (n == parts.len) return refuseVolume(arena, why, raw, "has more than three parts");
+        if (p.len == 0) return refuseVolume(arena, why, raw, "has an empty part");
+        parts[n] = p;
+        n += 1;
+    }
+    var name: ?[]const u8 = null;
+    var target = parts[0];
+    var read_only = false;
+    if (n == 2 and std.ascii.eqlIgnoreCase(parts[1], "ro")) {
+        read_only = true;
+    } else if (n >= 2) {
+        name = parts[0];
+        target = parts[1];
+        read_only = n == 3 and std.ascii.eqlIgnoreCase(parts[2], "ro");
+    }
+    if (name) |s| {
+        if (s[0] == '/') return refuseVolume(arena, why, raw, "binds a path of the host, which " ++
+            "needs a mount policy (which host paths a job may take) and an id mapping of its own");
+        if (!volumeName(s)) return refuseVolume(arena, why, raw, "has a source that is not a " ++
+            "volume name Docker takes");
+    }
+    if (read_only) return refuseVolume(arena, why, raw, "is read-only, which needs a mount of its own");
+    const clean = cleanTarget(arena, target) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NotPlain => return refuseVolume(arena, why, raw, "has a target that is not an " ++
+            "absolute path without `.` or `..`"),
+    };
+    if (clean.len <= 1) return refuseVolume(arena, why, raw, "mounts the root directory");
+    for (runner_mounts) |m| if (std.mem.eql(u8, clean, m)) return refuseVolume(arena, why, raw, "mounts " ++
+        "where the runner mounts its own directory");
+    for (sandbox_trees) |t| if (under(clean, t)) return refuseVolume(arena, why, raw, "mounts " ++
+        "inside a directory the sandbox mounts itself");
+    return .{ .name = name, .target = clean };
+}
+
+/// Whether `path` is `tree` or below it.
+pub fn under(path: []const u8, tree: []const u8) bool {
+    return std.mem.startsWith(u8, path, tree) and
+        (path.len == tree.len or path[tree.len] == '/');
+}
+
+/// Docker's rule for a volume name: `[a-zA-Z0-9][a-zA-Z0-9_.-]+`.
+fn volumeName(s: []const u8) bool {
+    if (s.len < 2 or !std.ascii.isAlphanumeric(s[0])) return false;
+    for (s[1..]) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '.' and c != '-') return false;
+    return true;
+}
+
+/// `path` with its empty and `.` parts dropped; `error.NotPlain` for a relative path or a `..`.
+fn cleanTarget(arena: Allocator, path: []const u8) error{ OutOfMemory, NotPlain }![]const u8 {
+    if (path.len == 0 or path[0] != '/') return error.NotPlain;
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.mem.tokenizeScalar(u8, path, '/');
+    while (it.next()) |part| {
+        if (std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) return error.NotPlain;
+        try out.append(arena, '/');
+        try out.appendSlice(arena, part);
+    }
+    if (out.items.len == 0) try out.append(arena, '/');
+    return out.items;
+}
+
+/// A job container's `volumes:`, each read by `parseVolume`; a literal list only (one with an
+/// expression in it is decided before expressions are evaluated). Refused too: two volumes at
+/// one path or one named volume at two (Docker refuses the first, and the second would need a
+/// bind to be one directory in two places).
+pub fn volumes(arena: Allocator, list: []const job_mod.Template, why: *[]const u8) Error!Volumes {
+    var targets: std.ArrayList([]const u8) = .empty;
+    var names: std.ArrayList([]const u8) = .empty;
+    for (list) |t| {
+        const raw = switch (t) {
+            .lit => |l| l,
+            .expr => {
+                why.* = "a job container's `volumes:` given by an expression are not native yet" ++
+                    dropped_volumes;
+                return error.Refused;
+            },
+        };
+        const v = try parseVolume(arena, raw, why);
+        for (targets.items) |earlier| if (std.mem.eql(u8, earlier, v.target))
+            return refuseVolume(arena, why, raw, "mounts a path an earlier volume mounts");
+        if (v.name) |name| {
+            for (names.items) |earlier| if (std.mem.eql(u8, earlier, name))
+                return refuseVolume(arena, why, raw, "is a named volume mounted at two paths");
+            try names.append(arena, name);
+        }
+        try targets.append(arena, v.target);
+    }
+    return .{ .targets = targets.items, .named = names.items.len };
+}
+
+/// Why a job container cannot be native, or null: its `ports:`, any of its `volumes:` that
+/// `volumes` does not carry out, and any of its `options:` that `parse` does not carry out
+/// (docs/native-backend.md, "Job container options"). `provisioned` is whether its image is the
+/// one the runner provisions, whose step user is `RUNNER_STEP_USER`'s choice, not the
+/// container's. `services` are the job's: a native service mounts no volume, so a named volume
+/// of the job container could not be shared with one.
+pub fn unsupported(jc: job_mod.Service, provisioned: bool, services: []const job_mod.Service) ?[]const u8 {
+    if (jc.ports.len > 0) return "a job container's `ports:` are not native: publishing a port " ++
+        "to the host needs a rule that admits the host to the job's network (the runner's table " ++
+        "drops that by design) and a policy for the host addresses a workflow may take; the " ++
+        "relay of `forward.zig` goes the other way, from the job's loopback to a service" ++
+        dropped_ports;
+    if (jc.volumes.len > 0) {
+        var fba: std.heap.FixedBufferAllocator = .init(&scratch);
+        var why: []const u8 = "";
+        const found = volumes(fba.allocator(), jc.volumes, &why) catch |e| return switch (e) {
+            error.Refused => why,
+            error.OutOfMemory => "a job container's `volumes:` are too long to read natively" ++
+                dropped_volumes,
+        };
+        if (found.named > 0) for (services) |svc| if (svc.volumes.len > 0) return "a job " ++
+            "container's named volume could be one a service mounts too, and native services " ++
+            "mount no volume" ++ dropped_volumes;
+    }
     const t = jc.options orelse return null;
     const text = switch (t) {
         .lit => |l| l,
@@ -261,28 +419,148 @@ test "options refused, never ignored: what the sandbox does not carry out" {
 
 test "unsupported: ports and volumes fall back, options by what they hold" {
     const base: job_mod.Service = .{ .name = "", .image = .{ .lit = "node:22" } };
-    try std.testing.expect(unsupported(base, false) == null);
+    try std.testing.expect(unsupported(base, false, &.{}) == null);
 
     var jc = base;
     jc.options = .{ .lit = "--user 1001 -e A=1 --workdir /x --health-cmd true" };
-    try std.testing.expect(unsupported(jc, false) == null);
+    try std.testing.expect(unsupported(jc, false, &.{}) == null);
     // The default image's user is the runner's choice, not the container's.
-    try std.testing.expect(unsupported(jc, true) != null);
+    try std.testing.expect(unsupported(jc, true, &.{}) != null);
     jc.options = .{ .lit = "-e A=1" };
-    try std.testing.expect(unsupported(jc, true) == null);
+    try std.testing.expect(unsupported(jc, true, &.{}) == null);
 
     jc.options = .{ .lit = "--privileged" };
-    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false).?, "--privileged") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false, &.{}).?, "--privileged") != null);
     // Dagger reads none of `options:`: the note says the flag is dropped there, not carried out.
-    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false).?, "drops") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false, &.{}).?, "drops") != null);
     jc.options = .{ .expr = "matrix.options" };
-    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false).?, "expression") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false).?, "drops") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false, &.{}).?, "expression") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false, &.{}).?, "drops") != null);
 
+    // Ports publish on the host, which the job's network does not admit; Dagger warns and
+    // ignores them, and the reason says so.
     jc = base;
-    jc.ports = &.{.{ .lit = "8080:80" }};
-    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false).?, "`ports:`") != null);
-    jc = base;
-    jc.volumes = &.{.{ .lit = "/data:/data" }};
-    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false).?, "`volumes:`") != null);
+    for ([_][]const u8{ "8080:80", "80", "127.0.0.1:8080:80/tcp" }) |p| {
+        jc.ports = &.{.{ .lit = p }};
+        const why = unsupported(jc, false, &.{}).?;
+        try std.testing.expect(std.mem.indexOf(u8, why, "`ports:`") != null);
+        try std.testing.expect(std.mem.indexOf(u8, why, "Dagger ignores") != null);
+    }
+}
+
+fn expectVolume(arena: Allocator, raw: []const u8, name: ?[]const u8, target: []const u8) !void {
+    var why: []const u8 = "";
+    const v = parseVolume(arena, raw, &why) catch |e| {
+        std.debug.print("{s} is refused ({s}): {s}\n", .{ raw, @errorName(e), why });
+        return e;
+    };
+    try std.testing.expectEqualStrings(target, v.target);
+    if (name) |n| try std.testing.expectEqualStrings(n, v.name.?) else try std.testing.expect(v.name == null);
+}
+
+fn expectVolumeRefused(arena: Allocator, raw: []const u8, mentions: []const u8) !void {
+    var why: []const u8 = "";
+    if (parseVolume(arena, raw, &why)) |v| {
+        std.debug.print("{s} is carried out as {?s}:{s}\n", .{ raw, v.name, v.target });
+        return error.TestUnexpectedResult;
+    } else |e| try std.testing.expectEqual(error.Refused, e);
+    if (std.mem.indexOf(u8, why, mentions) == null or std.mem.indexOf(u8, why, raw) == null or
+        std.mem.indexOf(u8, why, "Dagger ignores") == null)
+    {
+        std.debug.print("{s} is refused as: {s}\n", .{ raw, why });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "volumes carried out: an anonymous or a named volume, read as GitHub's runner reads it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    // `ParseVolumeString`: `target`, `source:target`, `source:target:mode`; only `ro` is a mode.
+    try expectVolume(arena, "/data", null, "/data");
+    try expectVolume(arena, "cache:/cache", "cache", "/cache");
+    try expectVolume(arena, "my_vol-1.x:/var/lib/data:rw", "my_vol-1.x", "/var/lib/data");
+    // `z` and the like are not read by the runner: not passed on.
+    try expectVolume(arena, "cache:/cache:z", "cache", "/cache");
+    // Docker cleans the target.
+    try expectVolume(arena, "/a//b/./c/", null, "/a/b/c");
+    try expectVolume(arena, "v2:/opt//x", "v2", "/opt/x");
+}
+
+test "volumes refused, never ignored: the host, read-only, and targets that are not plain" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    // A path of the host needs a mount policy and an id mapping.
+    try expectVolumeRefused(arena, "/srv:/srv", "host");
+    try expectVolumeRefused(arena, "/var/run/docker.sock:/var/run/docker.sock", "host");
+    try expectVolumeRefused(arena, "/:/host:rw", "host");
+    // A read-only volume needs a mount, in either spelling.
+    try expectVolumeRefused(arena, "cache:/cache:ro", "read-only");
+    try expectVolumeRefused(arena, "cache:/cache:RO", "read-only");
+    try expectVolumeRefused(arena, "/data:ro", "read-only");
+    // What Docker itself refuses: a relative or `..` target, a bad name, extra parts, empty parts.
+    try expectVolumeRefused(arena, "cache:data", "absolute");
+    try expectVolumeRefused(arena, "cache:/a/../b", "absolute");
+    try expectVolumeRefused(arena, "data", "absolute");
+    try expectVolumeRefused(arena, "./rel:/x", "volume name");
+    try expectVolumeRefused(arena, "a:/x", "volume name");
+    try expectVolumeRefused(arena, "my vol:/x", "volume name");
+    try expectVolumeRefused(arena, "-v:/x", "volume name");
+    try expectVolumeRefused(arena, "a:/b:c:d", "more than three");
+    try expectVolumeRefused(arena, "cache:", "empty part");
+    try expectVolumeRefused(arena, ":/x", "empty part");
+    try expectVolumeRefused(arena, "", "empty part");
+    // The root, the sandbox's own mounts and the runner's own.
+    try expectVolumeRefused(arena, "v1:/", "root");
+    try expectVolumeRefused(arena, "/", "root");
+    for ([_][]const u8{ "/proc", "/proc/1", "/sys/fs", "/dev", "/dev/shm", "/__w", "/__t", "/__e", "/github/home", "/github/workflow", "/var/run/docker.sock" }) |t| {
+        const raw = try std.fmt.allocPrint(arena, "vol:{s}", .{t});
+        try expectVolumeRefused(arena, raw, "mounts");
+    }
+    // Below the runner's directories is a directory like any other.
+    try expectVolume(arena, "/__w/data", null, "/__w/data");
+    try expectVolume(arena, "/devices", null, "/devices");
+}
+
+test "unsupported: a list of volumes is carried out whole, or the job falls back" {
+    const base: job_mod.Service = .{ .name = "", .image = .{ .lit = "node:22" } };
+    var jc = base;
+    jc.volumes = &.{ .{ .lit = "/data" }, .{ .lit = "cache:/cache" }, .{ .lit = "other:/other:rw" } };
+    try std.testing.expect(unsupported(jc, false, &.{}) == null);
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var why: []const u8 = "";
+    const v = try volumes(a.allocator(), jc.volumes, &why);
+    try std.testing.expectEqual(@as(usize, 2), v.named);
+    try std.testing.expectEqual(@as(usize, 3), v.targets.len);
+    try std.testing.expectEqualStrings("/other", v.targets[2]);
+
+    // One that is not carried out takes the whole list to Dagger, and the reason names it.
+    jc.volumes = &.{ .{ .lit = "/data" }, .{ .lit = "/srv:/srv" } };
+    const host = unsupported(jc, false, &.{}).?;
+    try std.testing.expect(std.mem.indexOf(u8, host, "`/srv:/srv`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, host, "Dagger ignores a job container's `volumes:`") != null);
+    // An expression is read after this is decided.
+    jc.volumes = &.{.{ .expr = "matrix.volume" }};
+    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false, &.{}).?, "expression") != null);
+    // Two volumes at one path, and one name at two paths.
+    jc.volumes = &.{ .{ .lit = "a1:/x" }, .{ .lit = "b1:/x" } };
+    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false, &.{}).?, "earlier volume") != null);
+    jc.volumes = &.{ .{ .lit = "/x/" }, .{ .lit = "/x" } };
+    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false, &.{}).?, "earlier volume") != null);
+    jc.volumes = &.{ .{ .lit = "a1:/x" }, .{ .lit = "a1:/y" } };
+    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false, &.{}).?, "two paths") != null);
+
+    // A native service mounts no volume, so a named volume the service lists could not be shared;
+    // an anonymous one is the job container's alone.
+    var svc: job_mod.Service = .{ .name = "db", .image = .{ .lit = "postgres:17" } };
+    svc.volumes = &.{.{ .lit = "cache:/var/lib/postgresql" }};
+    jc.volumes = &.{.{ .lit = "cache:/cache" }};
+    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false, &.{svc}).?, "service") != null);
+    jc.volumes = &.{.{ .lit = "/cache" }};
+    try std.testing.expect(unsupported(jc, false, &.{svc}) == null);
+    svc.volumes = &.{};
+    jc.volumes = &.{.{ .lit = "cache:/cache" }};
+    try std.testing.expect(unsupported(jc, false, &.{svc}) == null);
 }
