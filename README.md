@@ -482,9 +482,11 @@ the machine thrashed for hours (#126). Two things keep that from happening again
   learns from it what each job (by repository, workflow and name) takes, so that a light job
   reserves less than a heavy one once it has run (#144). A native job (`RUNNER_BACKEND=native`)
   is measured in a cgroup of its own and learned apart from Dagger's, reserves 256 MB until it
-  has run (`RUNNER_NATIVE_MEM_PER_JOB_MB`), and gets a `memory.high` from its estimate, so one that
-  outgrows it is slowed in its own cgroup rather than taking its neighbours' memory
-  (docs/native-backend.md, P4). The limits and why they are what they
+  has run (`RUNNER_NATIVE_MEM_PER_JOB_MB`), and, where jobs may swap, gets a `memory.high` from its
+  estimate, so one that outgrows it is slowed in its own cgroup rather than taking its neighbours'
+  memory (docs/native-backend.md, P4). All native jobs together stay under the machine's memory less a
+  third, with no swap, each under two thirds of that, and a job that cannot be held to it does not
+  run natively (docs/native-backend.md, "Bounded jobs"). The limits and why they are what they
   are are in `deploy/runner.env.example` (`RUNNER_MIN_MEM_AVAILABLE_MB` and the rest;
   `RUNNER_ADMISSION=false` turns it off). The gate sees only its own process's runners: run one
   pool per machine.

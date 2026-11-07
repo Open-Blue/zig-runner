@@ -155,11 +155,14 @@ pub const Config = struct {
     /// whatever the caps say (`RUNNER_NATIVE_MIN_FREE_PCT`, 0 for no floor, `native/evict.zig`).
     native_min_free_pct: u8 = native_evict.default_min_free_pct,
     /// Where native jobs' cgroups go (`RUNNER_NATIVE_CGROUP`: "", `self`, `none` or a cgroup's
-    /// path), and each job's limits (`RUNNER_NATIVE_MEMORY_MAX_MB`, null for three quarters of
-    /// the machine's memory and 0 for none; `RUNNER_NATIVE_PIDS_MAX`, 0 for none). See
-    /// `native/cgroup.zig`.
+    /// path), each job's limits (`RUNNER_NATIVE_MEMORY_MAX_MB`, null for two thirds of the
+    /// total and 0 for none; `RUNNER_NATIVE_PIDS_MAX`, 0 for none), all jobs' memory together
+    /// (`RUNNER_NATIVE_MEMORY_TOTAL_MB`, null for what `cgroup.totalOf` leaves the machine and 0
+    /// for none), and whether jobs may swap (`RUNNER_NATIVE_SWAP`). See `native/cgroup.zig`.
     native_cgroup: []const u8 = "",
     native_memory_max_mb: ?u32 = null,
+    native_memory_total_mb: ?u32 = null,
+    native_swap: bool = false,
     native_pids_max: u32 = native_cgroup.default_pids_max,
     /// What a native job's `hashFiles()` may use: the MiB all of them may hold together in this
     /// process (`RUNNER_NATIVE_HASHFILES_MEMORY_MB`; null for the smaller of 1 GiB and an eighth of
@@ -446,6 +449,9 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_MIN_FREE_PCT")) |v| c.native_min_free_pct = try minFree(v);
         if (environ.get("RUNNER_NATIVE_CGROUP")) |v| c.native_cgroup = v;
         if (environ.get("RUNNER_NATIVE_MEMORY_MAX_MB")) |v| c.native_memory_max_mb = try num(u32, v);
+        if (environ.get("RUNNER_NATIVE_MEMORY_TOTAL_MB")) |v|
+            c.native_memory_total_mb = try num(u32, v);
+        if (environ.get("RUNNER_NATIVE_SWAP")) |v| c.native_swap = try boolean(v);
         if (environ.get("RUNNER_NATIVE_PIDS_MAX")) |v| c.native_pids_max = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_HASHFILES_MEMORY_MB")) |v|
             c.native_hashfiles_memory_mb = try num(u32, v);
@@ -532,6 +538,8 @@ pub const Config = struct {
         else if (eq(key, "native-min-free-pct")) c.native_min_free_pct = try minFree(val) //
         else if (eq(key, "native-cgroup")) c.native_cgroup = val //
         else if (eq(key, "native-memory-max-mb")) c.native_memory_max_mb = try num(u32, val) //
+        else if (eq(key, "native-memory-total-mb")) c.native_memory_total_mb = try num(u32, val) //
+        else if (eq(key, "native-swap")) c.native_swap = try boolean(val) //
         else if (eq(key, "native-pids-max")) c.native_pids_max = try num(u32, val) //
         else if (eq(key, "native-hashfiles-memory-mb")) c.native_hashfiles_memory_mb = try num(u32, val) //
         else if (eq(key, "native-hashfiles-timeout-s")) c.native_hashfiles_timeout_s = try num(u32, val) //
@@ -885,13 +893,19 @@ test "the native jobs' cgroups and limits: defaults, settings, and parents that 
     const c = try Config.load(&env, &.{"runner"});
     try std.testing.expectEqualStrings("", c.native_cgroup);
     try std.testing.expectEqual(@as(?u32, null), c.native_memory_max_mb);
+    try std.testing.expectEqual(@as(?u32, null), c.native_memory_total_mb);
+    try std.testing.expect(!c.native_swap);
     try std.testing.expectEqual(native_cgroup.default_pids_max, c.native_pids_max);
     try env.put("RUNNER_NATIVE_CGROUP", "self");
     try env.put("RUNNER_NATIVE_MEMORY_MAX_MB", "0");
+    try env.put("RUNNER_NATIVE_MEMORY_TOTAL_MB", "2048");
+    try env.put("RUNNER_NATIVE_SWAP", "true");
     try env.put("RUNNER_NATIVE_PIDS_MAX", "512");
     const set = try Config.load(&env, &.{"runner"});
     try std.testing.expectEqualStrings("self", set.native_cgroup);
     try std.testing.expectEqual(@as(?u32, 0), set.native_memory_max_mb);
+    try std.testing.expectEqual(@as(?u32, 2048), set.native_memory_total_mb);
+    try std.testing.expect(set.native_swap);
     try std.testing.expectEqual(@as(u32, 512), set.native_pids_max);
     try std.testing.expectEqualStrings("/sys/fs/cgroup/zr.slice", (try Config.load(&env, &.{
         "runner",

@@ -5,8 +5,8 @@
 #
 # Jobs the native backend cannot run fail at once, saying why, instead of waiting for an engine.
 # The native backend needs privileges to make its sandboxes: the engine service has `privileged:
-# true` in compose.yaml, and the runner needs the same or `cap_add` (docs/native-backend.md, P1),
-# which this file does not grant.
+# true` in compose.yaml, and the runner needs the same, or `cap_add` with writable cgroups, without
+# which every native job is refused (docs/native-backend.md, P1). This file grants neither.
 services:
   engine:
     # Not started: only a service in a profile that is not enabled is left out of `up`.
