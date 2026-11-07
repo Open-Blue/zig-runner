@@ -84,7 +84,9 @@ jobs:
       # version GitHub's hashFiles runs, needs minimatch ^10.2.5, and overriding it would make the
       # reference something other than GitHub's. It runs weekly (hashfiles-diff.sh, compare.yml)
       # on patterns the corpus generates, never a workflow's. Remove it when @actions/glob moves
-      # to minimatch 11 (Renovate's npm manager proposes that).
+      # to minimatch 11 (Renovate's npm manager proposes that). minimatch moved to BlueOak-1.0.0
+      # within 10.x (permissive, OSI approved): allowed by name, for the same lockfile, so another
+      # dependency under that license is still flagged (THIRD_PARTY.md).
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: moderate
@@ -92,4 +94,4 @@ jobs:
           allow-licenses: >-
             MIT, MIT-0, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, 0BSD, Zlib, Unicode-3.0,
             Unicode-DFS-2016
-          allow-dependencies-licenses: pkg:golang/golang.org/x/net
+          allow-dependencies-licenses: pkg:golang/golang.org/x/net, pkg:npm/minimatch
