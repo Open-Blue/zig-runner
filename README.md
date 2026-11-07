@@ -63,7 +63,7 @@ pull request carries the `breaking` label. In a stack, each pull request merged 
 counts toward the next release; one merged into another's branch instead counts toward that one's
 bump when it reaches `main`. The release commits the version to `runner/build.zig.zon`
 and the changelog on `main`, and tags that commit. It does so only once `main`'s own checks have
-passed on the commit it releases ("Format, build and test", "Database tests", "Workflows" and
+passed on the commit it releases ("Tests (x86_64)", "Database tests", "Workflows" and
 "Proofs" on the push to `main`), waiting up to 30 minutes for them. When they cannot pass because of
 what the release fixes (prod's runner, broken by the release before), run `version` by hand with
 `skip_main_checks`; it still waits for approval.
@@ -80,8 +80,10 @@ decide the version, write the changelog and tag the release alongside this, disa
 [zizmor](https://docs.zizmor.sh) for security), the format, build and tests, the database tests
 against TimescaleDB, and the release's own builds, for both targets in ReleaseSafe ("Release
 builds"), so code that does not compile for aarch64 fails here rather than after the tag, and
-the same builds on GitHub's arm64 runner, where the aarch64 binary is run and the tests run
-natively on arm64, as on razorbill ("Release builds and tests (arm64)");
+the same builds on GitHub's arm64 runner, where the aarch64 binary is run ("Release builds
+(arm64)"), and the tests on both architectures ("Tests (x86_64)", "Tests (arm64)", and the native
+backend's tests as root in two parts each, "Native tests as root (…)"), natively on arm64 as on
+razorbill;
 `proofs` checks the Lean proofs and `release` the packaging (below). Every one of these is a
 required check, and reports on every pull request and in the merge queue: on a change that cannot
 affect what a job checks, it reports without running its steps
@@ -258,7 +260,7 @@ repository:
   Intel CET (IBT and shadow stacks) is not available: Zig 0.17 has no `-fcf-protection` for Zig
   code, so the binaries carry no CET note. [checksec](https://github.com/slimm609/checksec) 3.2
   (`.github/scripts/checksec.sh`, pinned by version and checksum) fails the release, and on pull
-  requests "Release builds", "Release builds and tests (arm64)" and "Binaries (check)", on any
+  requests "Release builds", "Release builds (arm64)" and "Binaries (check)", on any
   binary without PIE, full RELRO, NX or W^X:
 
   ```sh
@@ -417,7 +419,7 @@ A release deploys itself to razorbill. Once its binaries and image are built, an
 the tagged commit, `release` records a GitHub deployment of the version to the `razorbill`
 environment. The tagged commit is the release commit `version` pushes to `main`, which the merge
 queue never checked; the push starts `ci` on it, on prod, at the same time as `release`. So the
-deploy job waits, up to 40 minutes, until "Format, build and test", "Database tests", "Workflows",
+deploy job waits, up to 40 minutes, until "Tests (x86_64)", "Database tests", "Workflows",
 "Binaries", "Image" and "Image (publish)" have each completed on that commit, and fails, naming the check, as soon as
 one has not succeeded or once the wait runs out. (The deployment cannot list them as
 `required_contexts`: GitHub matches those against commit statuses only, not Actions check runs.)

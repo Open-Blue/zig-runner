@@ -3,7 +3,7 @@
 # checked out in a temporary worktree, so uncommitted changes neither help nor hurt):
 #
 #   - the branch name's prefix (CI's "Branch name"; it decides the release, README "Versioning");
-#   - zig fmt, GitHub's expression cases, and the build and tests ("Format, build and test");
+#   - zig fmt, GitHub's expression cases, and the build and tests ("Tests (x86_64)");
 #     the database tests run too when PG* or ZIG_TEST_PG_URL point at a database;
 #   - actionlint and zizmor, when workflows changed, shellcheck and shfmt, when shell scripts did,
 #     and hadolint, when the Dockerfile did ("Workflows"), and the unsafe constructs ratchet, always;
