@@ -14,6 +14,7 @@
 //! SHA-256 digests, "" for none.
 const std = @import("std");
 const runner = @import("runner");
+const corpus = @import("corpus");
 
 const glob = runner.glob;
 const native = runner.native;
@@ -38,14 +39,7 @@ pub fn main(init: std.process.Init) !u8 {
     const layer = args[3];
     var disk: Disk = .{ .io = io, .ws = ws, .tree = try std.mem.concat(arena, u8, &.{ layer, ws }) };
     const cases = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try cwd.readFileAlloc(io, args[1], arena, .limited(1 << 28)), .{})).array.items;
-    var reference: std.AutoHashMapUnmanaged(i64, std.json.ObjectMap) = .empty;
-    var lines = std.mem.splitScalar(u8, try cwd.readFileAlloc(io, args[4], arena, .limited(1 << 28)), '\n');
-    while (lines.next()) |l| {
-        // @actions/glob prints `::debug::` lines of its own on stdout.
-        if (!std.mem.startsWith(u8, l, "{\"id\"")) continue;
-        const o = (try std.json.parseFromSliceLeaky(std.json.Value, arena, l, .{})).object;
-        try reference.put(arena, o.get("id").?.integer, o);
-    }
+    const reference = try corpus.loadReference(arena, io, args[4]);
 
     var same: usize = 0;
     var differ: usize = 0;

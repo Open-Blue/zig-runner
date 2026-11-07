@@ -11,7 +11,7 @@ cd "$(dirname "$0")/../../runner"
 
 s=$(mktemp -d)
 trap 'rm -rf "$s"' EXIT
-zig build-exe -OReleaseSafe --dep hpack -Mroot=tools/hpackcorpus.zig -Mhpack=src/hpack.zig \
+zig build-exe -OReleaseSafe --dep hpack --dep corpus -Mroot=tools/hpackcorpus.zig -Mhpack=src/hpack.zig -Mcorpus=tools/corpus.zig \
 	--name hpackcorpus -femit-bin="$s/hpackcorpus" &
 (cd tools/hpackdiff && go run . -out "$s/cases.jsonl" -n "${1:-2000}" -seed "${2:-1}")
 wait

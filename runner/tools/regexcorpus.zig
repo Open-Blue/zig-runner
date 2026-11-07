@@ -11,6 +11,7 @@
 //! out of the comparison.
 const std = @import("std");
 const regex = @import("regex");
+const corpus = @import("corpus");
 
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
@@ -28,13 +29,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     const cwd = std.Io.Dir.cwd();
     const cases = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try cwd.readFileAlloc(io, args[1], arena, .limited(1 << 28)), .{})).array.items;
-    var reference: std.AutoHashMapUnmanaged(i64, std.json.ObjectMap) = .empty;
-    var lines = std.mem.splitScalar(u8, try cwd.readFileAlloc(io, args[2], arena, .limited(1 << 28)), '\n');
-    while (lines.next()) |l| {
-        if (!std.mem.startsWith(u8, l, "{\"id\"")) continue;
-        const o = (try std.json.parseFromSliceLeaky(std.json.Value, arena, l, .{})).object;
-        try reference.put(arena, o.get("id").?.integer, o);
-    }
+    const reference = try corpus.loadReference(arena, io, args[2]);
 
     const Count = struct { n: usize = 0, shown: usize = 0 };
     var agree_patterns: usize = 0;

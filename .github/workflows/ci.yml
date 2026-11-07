@@ -359,7 +359,7 @@ jobs:
       - name: The hashFiles comparison tool compiles
         if: steps.scope.outputs.run == 'true'
         working-directory: runner
-        run: zig build-exe --dep runner -Mroot=tools/hashfilescorpus.zig -Mrunner=src/hashfiles_corpus.zig --name hashfilescorpus -fno-emit-bin
+        run: zig build-exe --dep runner --dep corpus -Mroot=tools/hashfilescorpus.zig -Mrunner=src/hashfiles_corpus.zig -Mcorpus=tools/corpus.zig --name hashfilescorpus -fno-emit-bin
 
       - name: Every test file is compiled
         if: steps.scope.outputs.run == 'true'

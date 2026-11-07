@@ -8,6 +8,7 @@
 //! new each run), then counts.
 const std = @import("std");
 const rsa_sign = @import("rsa_sign");
+const corpus = @import("corpus");
 
 const Io = std.Io;
 
@@ -34,10 +35,10 @@ pub fn main(init: std.process.Init) !u8 {
         defer case_arena.deinit();
         const a = case_arena.allocator();
         const c = (try std.json.parseFromSliceLeaky(std.json.Value, a, l, .{})).object;
-        const n = try unhex(a, c.get("n").?.string);
-        const d = try unhex(a, c.get("d").?.string);
-        const msg = try unhex(a, c.get("msg").?.string);
-        const want = try unhex(a, c.get("sig").?.string);
+        const n = try corpus.unhex(a, c.get("n").?.string);
+        const d = try corpus.unhex(a, c.get("d").?.string);
+        const msg = try corpus.unhex(a, c.get("msg").?.string);
+        const want = try corpus.unhex(a, c.get("sig").?.string);
         var buf: [512]u8 = undefined;
         if (rsa_sign.signSha256(&buf, n, d, msg)) |sig| {
             if (std.mem.eql(u8, sig, want)) {
@@ -54,9 +55,4 @@ pub fn main(init: std.process.Init) !u8 {
     }
     try out.print("\n{d} signatures the same, {d} differ\n", .{ same, differ });
     return if (differ == 0) 0 else 1;
-}
-
-fn unhex(a: std.mem.Allocator, s: []const u8) ![]u8 {
-    const buf = try a.alloc(u8, s.len / 2);
-    return std.fmt.hexToBytes(buf, s);
 }

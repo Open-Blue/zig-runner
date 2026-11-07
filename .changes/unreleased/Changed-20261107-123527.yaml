@@ -1,0 +1,3 @@
+kind: Changed
+body: The corpus comparison tools share `unhex` and the reference loader in `runner/tools/corpus.zig`.
+time: 2026-11-07T12:35:27.739184351-05:00
