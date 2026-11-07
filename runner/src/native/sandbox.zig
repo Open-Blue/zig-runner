@@ -841,17 +841,15 @@ fn pickOomScoreAdj(env: []const []const u8, current: i32) i32 {
 fn setOomScoreAdj(env: []const []const u8) void {
     const path = "/proc/self/oom_score_adj";
     var buf: [16]u8 = undefined;
-    const rfd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(rfd) != .SUCCESS) return;
-    const n = linux.read(@intCast(rfd), &buf, buf.len);
-    _ = linux.close(@intCast(rfd));
+    const rc = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    const n = linux.pread(fd, &buf, buf.len, 0);
     if (linux.errno(n) != .SUCCESS) return;
     const current = std.fmt.parseInt(i32, std.mem.trim(u8, buf[0..n], " \n"), 10) catch return;
     const text = std.fmt.bufPrint(&buf, "{d}", .{pickOomScoreAdj(env, current)}) catch return;
-    const wfd = linux.open(path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(wfd) != .SUCCESS) return;
-    _ = linux.write(@intCast(wfd), text.ptr, text.len);
-    _ = linux.close(@intCast(wfd));
+    _ = linux.pwrite(fd, text.ptr, text.len, 0);
 }
 
 /// Moves the helper into the job's cgroup: `0` written to its `cgroup.procs`.
