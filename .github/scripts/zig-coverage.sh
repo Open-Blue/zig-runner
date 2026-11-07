@@ -94,21 +94,28 @@ EOF
 	chmod +x "$scratch/runner-kcov"
 
 	# The tests go through tools/test_shards.zig, as zig-test.sh's do, for ZIG_TEST_PART (K/N: every
-	# N-th test from the K-th, in each pass). One shard, as the one process kcov followed before;
-	# with no part, test_shards runs the test binary itself.
+	# N-th test from the K-th, in each pass). It starts the test binary as a child, which kcov does
+	# not follow from outside (a run under kcov of test_shards itself measured the helpers only), so
+	# each test process runs under kcov itself, as a helper does, into a report of its own. One
+	# shard: with no part, test_shards runs the test binary itself.
 	export ZIG_TEST_SHARDS=1
 
-	# pass NAME [PREFIX...] TEST: TEST under kcov into raw/NAME, then TEST with each helper under
-	# kcov. The output is only text to the job (zig-test.sh), and failed tests a warning.
+	# pass NAME [PREFIX...] TEST: TEST under kcov into raw/NAME-PID (one for each process
+	# test_shards starts), then TEST with each helper under kcov. The output is only text to the
+	# job (zig-test.sh), and failed tests a warning.
 	pass() {
-		local name=$1 stop status=0
+		local name=$1 test stop status=0
 		shift
+		test=${*: -1}
+		cat >"$scratch/test-kcov" <<EOF
+#!/bin/sh
+exec "$kcov" --include-path="$src" "$raw/$name-\$\$" "$test" "\$@"
+EOF
+		chmod +x "$scratch/test-kcov"
 		stop="coverage-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 		echo "::stop-commands::$stop"
-		ZIG_RUNNER_TEST_EXE="$scratch/runner" "${@:1:$#-1}" \
-			"$kcov" --include-path="$src" "$raw/$name" "$scratch/test_shards" "${@: -1}" 2>&1 || status=$?
-		ZIG_RUNNER_TEST_EXE="$scratch/runner-kcov" "${@:1:$#-1}" \
-			"$scratch/test_shards" "${@: -1}" 2>&1 || status=$?
+		ZIG_RUNNER_TEST_EXE="$scratch/runner" "${@:1:$#-1}" "$scratch/test_shards" "$scratch/test-kcov" 2>&1 || status=$?
+		ZIG_RUNNER_TEST_EXE="$scratch/runner-kcov" "${@:1:$#-1}" "$scratch/test_shards" "$test" 2>&1 || status=$?
 		echo "::$stop::"
 		if ((status != 0)); then
 			echo "::warning title=Coverage::tests failed in the $name pass under kcov (exit $status; the tests' own job judges them): its coverage still counts"
