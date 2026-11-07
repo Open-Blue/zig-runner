@@ -600,13 +600,11 @@ test "a Dockerfile's RUN stopped by a native cancel stores no layer, though its 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cfg = try testActions(arena, &tmp);
-    // `sh`'s PID 1 has no handler, so hears nothing: the program in it ends on SIGINT, with an
-    // exit code of its own as apt-get's is, and the script goes on to its end and exits 0, as
-    // `RUN apt-get install x; rm -rf /tmp/foo` does.
+    // A script that ends 0 during the stop, with its work half done.
     try testRepo(arena, &tmp, "half", &.{
         .{ "action.yml", "runs:\n  using: docker\n  image: Dockerfile\n" },
-        .{ "Dockerfile", "FROM zr-test/base:1\nRUN sh -c 'trap \"exit 1\" INT; sleep 613.78 & wait'; " ++
-            "echo half-done > /half-done\n" },
+        .{ "Dockerfile", "FROM zr-test/base:1\nRUN trap 'echo half-done > /half-done; exit 0' INT; " ++
+            "sleep 613.78 & wait\n" },
     });
     var job = testJob(&.{usesStep("half", "o", "half", "v1", &.{})});
     job.github.server_url = "file:///srv/git";

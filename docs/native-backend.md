@@ -1762,8 +1762,8 @@ What Dagger (BuildKit and runc under it) did implicitly, now explicit in `native
     GitHub, and its file commands are not read. Its layer stays, so what a trap wrote is there for
     `always()` steps. Every exec stopped ends with a code other than 0 (`sandbox.Ended`), whatever
     its script exited with, so nothing that keeps an exec's work on its code keeps a stopped one's:
-    a `RUN` whose script went on past a killed `apt-get` and exited 0 stores no layer, and a Zig
-    seed or an action's fetch fails as a killed one did.
+    a `RUN` whose script exits 0 during a stop stores no layer, and a Zig seed or an action's
+    fetch fails as a killed one did.
   - **The log** says why, in the step's own log, before `##[error]The operation was canceled.`:
     the reason (`Cancel.Why`: GitHub's cancel, the runner stopping, GitHub no longer having the
     job, or `Watch.reason` for a timeout or the job's limit), then each stage reached. It names
