@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Runners starting together on one host no longer send a native job to Dagger: they take turns making the NAT rules, and a rule batch that another runner overtook is tried again after a pause, up to twelve times. A job sent to Dagger that cannot start it now fails saying why it was sent.'
-time: 2026-11-06T01:42:15.263539006-05:00

@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A job container''s `options: -e` no longer beats the container''s own `env:` (GitHub puts `env:` last), `-e HOME` has no effect, a `--user` on an image without a writable `/__w` works because the base makes the workspace as root and hands it over, a `--user` the image does not know fails the job instead of falling back to Dagger as root, and the note for a refused flag says Dagger drops it'
-time: 2026-11-06T17:24:46.220333185-05:00

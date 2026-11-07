@@ -1,3 +1,0 @@
-kind: Fixed
-body: A native job's OOM kill now takes every process of its steps together (`memory.oom.group` on a `steps` child of the job's cgroup), not only the largest one, so a step no longer carries on in a damaged state; services and the ports' relay run in a sibling cgroup without it and survive a step's OOM for the cleanup steps. Job processes also get `oom_score_adj` 500, as GitHub's runner does (`PIPELINE_JOB_OOMSCOREADJ` overrides it, never below the runner's own), so a machine-wide OOM prefers a job to the runner. Both are best effort.
-time: 2026-11-06T21:33:42.000868275-05:00

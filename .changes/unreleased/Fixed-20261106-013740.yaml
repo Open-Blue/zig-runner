@@ -1,3 +1,0 @@
-kind: Fixed
-body: A rerun of a job that installs a tool into the tool cache (`Install Zig`) replays that step on the native backend, as on Dagger. "Set up job" checks the tool cache's trees in the runner itself, bounded and confined to the volume, and a step whose record names a tree that is still the same is no longer run again.
-time: 2026-11-06T01:37:40.020684432-05:00

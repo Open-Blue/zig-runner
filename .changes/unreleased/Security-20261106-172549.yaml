@@ -1,3 +1,0 @@
-kind: Security
-body: Native steps have their user's supplementary groups, as on Dagger, and hashFiles counts that same list, so editing /etc/group gains a step nothing
-time: 2026-11-06T17:25:49.921010312-05:00

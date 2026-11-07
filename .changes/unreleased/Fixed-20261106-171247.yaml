@@ -1,3 +1,0 @@
-kind: Fixed
-body: With `RUNNER_ENGINE=cli`, a GitHub cancel, a stop or a step timeout ends the running step (#135). The query to the `dagger run` session is dropped and its connection closed, as the direct session does, so the session stays up for the `always()` steps that follow; before, the step ran to its end. An abort that lands as the answer arrives is not lost.
-time: 2026-11-06T17:12:47.016899467-05:00

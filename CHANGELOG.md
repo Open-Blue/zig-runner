@@ -10,6 +10,52 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.26.0 - 2026-11-07
+### Added
+* Jobs that use `hashFiles()` run on the native backend. The runner reads the job's layers itself, as the next step sees them (whiteouts and opaque directories included), with no mount and no Dagger engine; a link is hashed as what it leads to inside the job's tree, never the host's, and the result is the same files, order and hash as on Dagger. A call is bounded (files visited, steps, memory shared by all jobs, GitHub's 120 seconds; RUNNER_NATIVE_HASHFILES_MEMORY_MB and RUNNER_NATIVE_HASHFILES_TIMEOUT_S) and stops when the job is cancelled.
+* The systemd unit sets `MemoryMax=90%`, so a runner that runs away stops its own pool, which systemd restarts, rather than leaving the kernel to pick what to kill on the host. Existing installs need the setting added by hand: deploys do not replace the unit.
+* Native cache volumes are evicted: past `RUNNER_NATIVE_VOLUMES_MAX_MB` (16 GiB), or with under `RUNNER_NATIVE_MIN_FREE_PCT` (10) of the disk free, those no job holds go, the longest unused first. A volume used today stays over the cap; one evicted is an empty directory to the next job.
+* Native images, provisioned rootfs, Zig cache seeds and blobs are evicted: past `RUNNER_NATIVE_IMAGES_MAX_MB` (8 GiB) together, or under the disk floor, the blobs go first, then what no job holds, the longest unused first, a rootfs before its image. A job holds each until it ends. Something used today stays, so the base image is not evicted on a loop.
+* RUNNER_ENGINE=none (with RUNNER_BACKEND=native) runs the runner with no Dagger engine: no pre-warm, no engine look in the memory gate, and a job native cannot run fails at once in Set up job, naming why, instead of waiting for an engine. deploy/compose.engineless.yaml drops the engine service. The default is unchanged.
+* The native backend fetches a checkout `submodules:` (`true` the first level, `recursive` all, as GitHub does) in the job image, so these jobs no longer fall back to Dagger. The flags are part of the step key, so a checkout with other flags is never replayed.
+* A `container:` job's `options:` run natively when they are `--env`, `--user`, `--workdir` or `--health-*`; any other flag is refused by name and the job runs on Dagger. `ports:` and `volumes:` still run on Dagger.
+* An optional AppArmor profile (`deploy/apparmor/`) for Ubuntu 23.10 and later, which grants the runner binary `userns` so rootless native sandboxes work without lifting `kernel.apparmor_restrict_unprivileged_userns`; the refusal names it when that restriction stops the sandbox (#380)
+### Fixed
+* A check fails CI and the pre-push hook when a file's tests are not in the test binary, so a file left off main.zig's test block cannot pass with its tests never run
+* A runner held at the memory gate looks again as soon as a job starts, is named or ends, instead of at its next 5 s check, so a burst of short jobs no longer waits out the check once per job.
+* The end-to-end suite says why a job has no log, with what the runner reported of its log uploads, and does not wait for one the runner says failed
+* A rerun of a job that installs a tool into the tool cache (`Install Zig`) replays that step on the native backend, as on Dagger. "Set up job" checks the tool cache's trees in the runner itself, bounded and confined to the volume, and a step whose record names a tree that is still the same is no longer run again.
+* Runners starting together on one host no longer send a native job to Dagger: they take turns making the NAT rules, and a rule batch that another runner overtook is tried again after a pause, up to twelve times. A job sent to Dagger that cannot start it now fails saying why it was sent.
+* A native image pull whose token request fails after its resets says how many times it sent it, and the stale-connection test says how many requests the registry read.
+* A native checkout of a commit with fetch-tags is no longer replayed with tags that have since moved: the remote's tags are part of its key
+* A job's log and its steps' logs are uploaded again after a transient failure (DNS, connection, timeout, 5xx, 429), with a bounded backoff, instead of being lost to one network blip
+* The native store's TLA+ model follows the publish as #309 left it, the machine's crash loses renames no `syncLayers` covered, and the jobs after one run through `checkOncePerBoot`; every configuration holds, with three new mutants.
+* A native layer counts its record and its own files against `RUNNER_NATIVE_STORE_MAX_MB`, not only its tree, so steps that change nothing no longer grow the store for ever under a cap that saw 0 bytes.
+* Three tests that failed with nothing wrong: a rename race that never ended under Valgrind, an output keys check tripped by a random name, and a fuzz check tripped by a repeated JSON key
+* Under the native disk floor layers go first, and every native job sent to Dagger logs why.
+* A native Zig cache seed built again is a new key, and a rootfs in the store keeps its fingerprint while a sibling sharing its files is evicted. Layers on such a rootfs miss once at the upgrade.
+* The nightly suppressed-errors check accepts the best-effort sites hashFiles and the tool trees added
+* A task's cancel that lands in hashFiles' wait for its turn, or in the tool trees' upkeep of their lists, is no longer lost
+* A job no longer fails when the Dagger engine refuses to give an image's digest after a pull that worked ("Image reference can only be retrieved immediately after the Container.From call"): the digest is only a log line, so it is asked for on its own and its Digest line is left out when refused. A pull that fails still fails the job or service, and the pre-warm falls back to the pinned image name.
+* On a filesystem where a read lease does not see a writable mapping, such as overlayfs, the tool trees' check reads every file again instead of trusting its list
+* Tool-tree checks and hashFiles() now count their memory in one number, so the runner has a single limit for what a job's checks and hashFiles() hold at once
+* The weekly hashFiles() comparison with @actions/glob now covers the native backend's hashFiles() too, not only glob.zig
+* Native eviction's removal of a dead tree counts going down a directory against its budget, so a chain of directories with no files no longer overruns it
+* CI tests on overlayfs and checks ZLint's suppressed errors on every pull request that changes runner code, and runs Valgrind on the tests a pull request adds or edits, stopping a Valgrind run that does not finish and naming its test
+* The Dagger path warns in "Set up job" about a job container's `options:`, `ports:` and `volumes:`, which it does not apply, naming each value, instead of dropping them silently (#368).
+* Native jobs are bounded together: a limit on their parent cgroup leaves the machine a third of its memory, jobs do not swap, and a job that cannot be limited does not run natively unless RUNNER_NATIVE_CGROUP=none accepts the risk
+* With `RUNNER_ENGINE=cli`, a GitHub cancel, a stop or a step timeout ends the running step (#135). The query to the `dagger run` session is dropped and its connection closed, as the direct session does, so the session stays up for the `always()` steps that follow; before, the step ran to its end. An abort that lands as the answer arrives is not lost.
+* A job container's `options: -e` no longer beats the container's own `env:` (GitHub puts `env:` last), `-e HOME` has no effect, a `--user` on an image without a writable `/__w` works because the base makes the workspace as root and hands it over, a `--user` the image does not know fails the job instead of falling back to Dagger as root, and the note for a refused flag says Dagger drops it
+* RUNNER_ENGINE=none now checks at start-up that native steps can run and refuses to start with the reason, instead of failing every job; it rejects RUNNER_DAGGER_NESTING; and deploy/compose.engineless.yaml gives the runner the privileges, host network, private cgroup, store volume and /run/zig-runner the native backend needs
+* Tool-tree checks are limited by what checks hold (128 MiB together), not by what hashFiles() calls hold too, so two or three large hashFiles() calls no longer leave every other job's trees out; the two still share one visible number (the earlier note's single limit was wrong). The eviction descents counter wraps instead of panicking a ReleaseSafe runner after 2^32 descents. A native checkout with submodules and tags is not replayed, as a submodule's tags can move
+* A native job's OOM kill now takes every process of its steps together (`memory.oom.group` on a `steps` child of the job's cgroup), not only the largest one, so a step no longer carries on in a damaged state; services and the ports' relay run in a sibling cgroup without it and survive a step's OOM for the cleanup steps. Job processes also get `oom_score_adj` 500, as GitHub's runner does (`PIPELINE_JOB_OOMSCOREADJ` overrides it, never below the runner's own), so a machine-wide OOM prefers a job to the runner. Both are best effort.
+* A pull request merged by the automerge app now closes the issues it links with `Closes #N`, which GitHub left open.
+### Security
+* A symlink a job swaps in at a nested cache volume is refused rather than bound, and a root runner's overlays turn off redirects and metacopy whatever the kernel defaults to
+* A symlink a job plants anywhere below the volumes root, not only at a nested volume's last name, is refused rather than bound
+* Native steps have their user's supplementary groups, as on Dagger, and hashFiles counts that same list, so editing /etc/group gains a step nothing
+* On a native backend, hashFiles() refuses a file the step's user could not read, as under Dagger, such as through a link to /etc/shadow
+
 ## v0.25.0 - 2026-11-06
 ### Added
 * The native layer store is crash-tested. In CI, `Store.publish`, the once-per-boot check, `oci.Store.ensure` and `volumes.adoptSeed` run on ext4 over dm-log-writes, the disk is put back to every flush, FUA and mark of the log and mounted, and no layer `open` accepts differs from what was published; and a publish on a disk that fails writes (dm-flakey) must fail, in `syncTree`, in `syncfs` and through the job's descriptor, rather than publish.

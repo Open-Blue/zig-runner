@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A job no longer fails when the Dagger engine refuses to give an image''s digest after a pull that worked ("Image reference can only be retrieved immediately after the Container.From call"): the digest is only a log line, so it is asked for on its own and its Digest line is left out when refused. A pull that fails still fails the job or service, and the pre-warm falls back to the pinned image name.'
-time: 2026-11-06T12:05:46.406049734-05:00

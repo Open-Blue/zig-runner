@@ -1,3 +1,0 @@
-kind: Fixed
-body: A native layer counts its record and its own files against `RUNNER_NATIVE_STORE_MAX_MB`, not only its tree, so steps that change nothing no longer grow the store for ever under a cap that saw 0 bytes.
-time: 2026-11-06T02:41:19.638792824-05:00

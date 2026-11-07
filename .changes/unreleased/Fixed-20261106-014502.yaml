@@ -1,3 +1,0 @@
-kind: Fixed
-body: A native image pull whose token request fails after its resets says how many times it sent it, and the stale-connection test says how many requests the registry read.
-time: 2026-11-06T01:45:02.927090213-05:00

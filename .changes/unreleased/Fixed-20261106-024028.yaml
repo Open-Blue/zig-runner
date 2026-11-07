@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The native store''s TLA+ model follows the publish as #309 left it, the machine''s crash loses renames no `syncLayers` covered, and the jobs after one run through `checkOncePerBoot`; every configuration holds, with three new mutants.'
-time: 2026-11-06T02:40:28.260081643-05:00

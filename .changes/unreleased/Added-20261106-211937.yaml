@@ -1,3 +1,0 @@
-kind: Added
-body: An optional AppArmor profile (`deploy/apparmor/`) for Ubuntu 23.10 and later, which grants the runner binary `userns` so rootless native sandboxes work without lifting `kernel.apparmor_restrict_unprivileged_userns`; the refusal names it when that restriction stops the sandbox (#380)
-time: 2026-11-06T21:19:37.865683615-05:00

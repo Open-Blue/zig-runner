@@ -1,3 +1,0 @@
-kind: Added
-body: The native backend fetches a checkout `submodules:` (`true` the first level, `recursive` all, as GitHub does) in the job image, so these jobs no longer fall back to Dagger. The flags are part of the step key, so a checkout with other flags is never replayed.
-time: 2026-11-06T15:40:46.077235142-05:00

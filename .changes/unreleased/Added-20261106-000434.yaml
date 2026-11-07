@@ -1,3 +1,0 @@
-kind: Added
-body: 'The systemd unit sets `MemoryMax=90%`, so a runner that runs away stops its own pool, which systemd restarts, rather than leaving the kernel to pick what to kill on the host. Existing installs need the setting added by hand: deploys do not replace the unit.'
-time: 2026-11-06T00:04:34.029453547-05:00

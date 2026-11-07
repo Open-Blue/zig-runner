@@ -1,3 +1,0 @@
-kind: Added
-body: A `container:` job's `options:` run natively when they are `--env`, `--user`, `--workdir` or `--health-*`; any other flag is refused by name and the job runs on Dagger. `ports:` and `volumes:` still run on Dagger.
-time: 2026-11-06T15:40:57.848716338-05:00

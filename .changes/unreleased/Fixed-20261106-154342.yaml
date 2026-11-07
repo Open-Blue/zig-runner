@@ -1,3 +1,0 @@
-kind: Fixed
-body: Native eviction's removal of a dead tree counts going down a directory against its budget, so a chain of directories with no files no longer overruns it
-time: 2026-11-06T15:43:42.078233564-05:00

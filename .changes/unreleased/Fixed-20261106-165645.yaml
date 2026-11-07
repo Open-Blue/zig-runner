@@ -1,3 +1,0 @@
-kind: Fixed
-body: The Dagger path warns in "Set up job" about a job container's `options:`, `ports:` and `volumes:`, which it does not apply, naming each value, instead of dropping them silently (#368).
-time: 2026-11-06T16:56:45.337826801-05:00

@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Native jobs are bounded together: a limit on their parent cgroup leaves the machine a third of its memory, jobs do not swap, and a job that cannot be limited does not run natively unless RUNNER_NATIVE_CGROUP=none accepts the risk'
-time: 2026-11-06T17:09:00.205722011-05:00
