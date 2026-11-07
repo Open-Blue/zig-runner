@@ -1169,6 +1169,66 @@ test "native eviction: the disk's floor spares only what was used in the last ho
     try testing.expect(!f.there(yesterday));
 }
 
+/// Writes zeros into `path` until the filesystem says it is full; the bytes written.
+fn fillDisk(path: [:0]const u8) !u64 {
+    const rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o644);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const fd = std.math.cast(linux.fd_t, rc) orelse return error.Unexpected;
+    defer _ = linux.close(fd);
+    var chunk: [64 * 1024]u8 = @splat(0);
+    var total: u64 = 0;
+    while (true) {
+        const w = linux.write(fd, &chunk, chunk.len);
+        switch (linux.errno(w)) {
+            .SUCCESS => total += w,
+            .NOSPC => return total,
+            else => |e| {
+                std.debug.print("unexpected {t} while filling the disk\n", .{e});
+                return error.Unexpected;
+            },
+        }
+    }
+}
+
+// Needs a small filesystem that really fills, which no test can make without privilege: run in a
+// mount namespace of its own, as `.github/scripts/full-disk-test.sh` does, which sets
+// ZIG_RUNNER_FULL_DISK to a directory on it. Skipped everywhere else.
+test "native eviction: the disk's floor frees room on a disk that is really full" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    var env = try testing.environ.createMap(f.arena());
+    const dir = env.get("ZIG_RUNNER_FULL_DISK") orelse return error.SkipZigTest;
+    const arena = f.arena();
+    f.s.root = try std.fmt.allocPrint(arena, "{s}/store-{d}", .{ dir, now(testing.io) });
+    try std.Io.Dir.cwd().createDirPath(testing.io, f.s.root);
+    // Four volumes of 12 MiB, the newest used today, the others days ago; the second never
+    // measured (its size file is written when the disk has no room, and may not be).
+    const mib = 1024 * 1024;
+    const day3 = try f.volume("d3", 12 * mib, 3);
+    const day2 = try f.volume("d2", 12 * mib, 2);
+    const day1 = try f.volume("d1", 12 * mib, 1);
+    const today = try f.volume("today", 12 * mib, 0);
+    try std.Io.Dir.cwd().deleteFile(testing.io, try std.fmt.allocPrint(arena, "{s}.size", .{day2}));
+    const ballast = try std.fmt.allocPrintSentinel(arena, "{s}/ballast", .{f.s.root}, 0);
+    const wrote = try fillDisk(ballast);
+    var st: linux.Statx = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, ballast, 0, .{ .SIZE = true }, &st)));
+    try testing.expectEqual(wrote, st.size);
+    // Really full: a file cannot grow, and the floor sees the shortage.
+    try testing.expect(shortBy(arena, f.s.root, 20) != null);
+    // No cap: only the floor asks for room, a fifth of the disk.
+    f.s.limits = .{ .volumes_max_bytes = 0, .min_free_pct = 20 };
+    run(f.s, testing.io);
+    try testing.expect(shortBy(arena, f.s.root, 20) == null);
+    // One volume is a little short of a fifth of the disk: the two longest unused go, the one never
+    // measured among them (a walk finds its size, though its file could not be written).
+    try testing.expect(!f.there(day3) and !f.there(day2));
+    try testing.expect(f.there(day1) and f.there(today));
+    // Room again: the store takes writes.
+    f.s.limits.min_free_pct = 0;
+    try f.fill(day1, 1000);
+}
+
 test "native eviction: a dead runner's private copy goes, a running job's stays" {
     const f = try Fixture.init();
     defer f.deinit();
