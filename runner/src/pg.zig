@@ -413,34 +413,20 @@ pub const Client = struct {
     /// std's own connect timeout is not implemented yet, and `SO_RCVTIMEO` would make a read end
     /// in `EAGAIN`, which std treats as a bug.
     pub fn connect(gpa: Allocator, io: Io, cfg: Config) anyerror!*Client {
-        const Ended = union(enum) { done: anyerror!*Client, timeout: void };
-        var buf: [2]Ended = undefined;
-        var sel: Io.Select(Ended) = .init(io, &buf);
-        sel.concurrent(.done, connectUnbounded, .{ gpa, io, cfg }) catch
-            return connectUnbounded(gpa, io, cfg);
-        // Without a timer it is only waited for.
-        sel.concurrent(.timeout, sleep, .{ io, cfg.connect_timeout }) catch {};
-        const first = sel.await() catch |e| {
-            drain(&sel);
-            return e;
-        };
-        drain(&sel);
-        return switch (first) {
-            .done => |r| r,
-            .timeout => error.Timeout,
-        };
+        const r = try http.withinClosing(
+            io,
+            cfg.connect_timeout,
+            connectUnbounded,
+            .{ gpa, io, cfg },
+            {},
+            closeLate,
+        ) orelse return error.Timeout;
+        return r;
     }
 
-    /// Ends what `connect` still runs, closing a connection made just as the time ran out.
-    fn drain(sel: anytype) void {
-        while (sel.cancel()) |ended| switch (ended) {
-            .done => |r| if (r) |c| c.close() else |_| {},
-            .timeout => {},
-        };
-    }
-
-    fn sleep(io: Io, d: Io.Duration) void {
-        io.sleep(d, .awake) catch {};
+    /// A connection made just as the time ran out is closed.
+    fn closeLate(_: void, made: anyerror!*Client) void {
+        if (made) |c| c.close() else |_| {}
     }
 
     fn connectUnbounded(gpa: Allocator, io: Io, cfg: Config) anyerror!*Client {
