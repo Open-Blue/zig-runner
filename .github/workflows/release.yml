@@ -472,17 +472,14 @@ jobs:
     permissions:
       contents: read # to check out the script that waits
       checks: read # to wait for the tagged commit's checks
+      actions: read # to see whether the commit's workflow runs have all finished
       deployments: write # to record the deployment
     env:
-      # What must have passed on the tagged commit, one per line: ci.yml's jobs that run on a push
-      # to main (not "Branch name", pull requests' only, which is skipped here), and this run's
-      # Binaries, Image and Image (publish), which this job waits for, so they are done before it
-      # starts. A name that never runs on a push to main would hold every deploy for the whole
-      # wait, then fail it.
-      REQUIRED_CHECKS: |-
-        Tests (x86_64)
-        Database tests
-        Workflows
+      # What must have passed on the tagged commit: .github/checks-on-main, read from the tag
+      # (wait-for-checks.sh), and this run's own Binaries, Image and Image (publish), which this job
+      # waits for, so they are done before it starts. One per line. check-names.sh fails CI on a
+      # name here that is not a job run on a push.
+      EXTRA_CHECKS: |-
         Binaries
         Image
         Image (publish)

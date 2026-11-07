@@ -5,7 +5,8 @@
 #   - the branch name's prefix (CI's "Branch name"; it decides the release, README "Versioning");
 #   - zig fmt, GitHub's expression cases, and the build and tests ("Tests (x86_64)");
 #     the database tests run too when PG* or ZIG_TEST_PG_URL point at a database;
-#   - actionlint and zizmor, when workflows changed, shellcheck and shfmt, when shell scripts did,
+#   - actionlint and zizmor, and the check names the release waits for (check-names.sh), when
+#     workflows changed, shellcheck and shfmt, when shell scripts did,
 #     and hadolint, when the Dockerfile did ("Workflows"), and the unsafe constructs ratchet, always;
 #   - gofmt and go vet for the Go tools under runner/tools, when they changed;
 #   - the Lean proofs, and the hashFiles model against glob.zig, when either changed ("Proofs").
@@ -83,6 +84,10 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 		command -v python3 >/dev/null ||
 			fail "workflows changed, and zizmor needs python3 with venv to run (.github/scripts/zizmor.sh)"
 		(cd "$tree" && .github/scripts/zizmor.sh .github/workflows) || fail "zizmor found problems"
+	fi
+	if grep -q -e '^\.github/workflows/' -e '^\.github/checks-on-main$' <<<"$changed"; then
+		say "the check names the pipeline waits for"
+		(cd "$tree" && .github/scripts/check-names.sh) || fail "a check name the pipeline waits for is not a job that runs then (.github/scripts/check-names.sh)"
 	fi
 	while read -r mod; do
 		[[ -n $mod && -f $tree/$mod/go.mod ]] || continue

@@ -1,0 +1,10 @@
+# The checks that must pass on a commit on main before it is released (version.yml's tag job) or
+# deployed (release.yml's deploy job, which adds its own run's Binaries and Image jobs). One name
+# per line, as GitHub shows the job; `#` starts a comment. Both jobs read this file from the commit
+# they check out, not from their own workflow file: a run that waited for approval through a change
+# to these names still waits for the current ones. check-names.sh fails CI on a name here that is
+# not a job run on a push to main.
+Tests (x86_64)
+Database tests
+Workflows
+Proofs

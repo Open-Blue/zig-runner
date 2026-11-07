@@ -76,6 +76,7 @@ jobs:
       contents: read # to check out main and its tags
       pull-requests: read # to read the merged pull requests' branches and labels
       checks: read # to wait for main's checks
+      actions: read # to see whether the commit's workflow runs have all finished
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -98,11 +99,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.next.outputs.tag }}
           WAIT_MINUTES: "30"
-          REQUIRED_CHECKS: |-
-            Tests (x86_64)
-            Database tests
-            Workflows
-            Proofs
         run: |
           .github/scripts/wait-for-checks.sh "$(git rev-parse HEAD)" \
             "$TAG is not released; once they pass, run version again (README, \"Versioning\")"

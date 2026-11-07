@@ -64,7 +64,8 @@ counts toward the next release; one merged into another's branch instead counts 
 bump when it reaches `main`. The release commits the version to `runner/build.zig.zon`
 and the changelog on `main`, and tags that commit. It does so only once `main`'s own checks have
 passed on the commit it releases ("Tests (x86_64)", "Database tests", "Workflows" and
-"Proofs" on the push to `main`), waiting up to 30 minutes for them. When they cannot pass because of
+"Proofs" on the push to `main`, listed in `.github/checks-on-main`), waiting up to 30 minutes for them;
+a check that never runs there fails the wait as soon as the commit's runs have finished. When they cannot pass because of
 what the release fixes (prod's runner, broken by the release before), run `version` by hand with
 `skip_main_checks`; it still waits for approval.
 
@@ -419,8 +420,9 @@ A release deploys itself to razorbill. Once its binaries and image are built, an
 the tagged commit, `release` records a GitHub deployment of the version to the `razorbill`
 environment. The tagged commit is the release commit `version` pushes to `main`, which the merge
 queue never checked; the push starts `ci` on it, on prod, at the same time as `release`. So the
-deploy job waits, up to 40 minutes, until "Tests (x86_64)", "Database tests", "Workflows",
-"Binaries", "Image" and "Image (publish)" have each completed on that commit, and fails, naming the check, as soon as
+deploy job waits, up to 40 minutes, until the checks in `.github/checks-on-main` ("Tests (x86_64)",
+"Database tests", "Workflows", "Proofs"), "Binaries", "Image" and "Image (publish)" have each
+completed on that commit, and fails, naming the check, as soon as
 one has not succeeded or once the wait runs out. (The deployment cannot list them as
 `required_contexts`: GitHub matches those against commit statuses only, not Actions check runs.)
 Once the check passes (re-run it), re-run the release's failed jobs: that is the deploy job alone.
