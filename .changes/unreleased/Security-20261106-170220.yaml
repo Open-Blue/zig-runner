@@ -1,0 +1,3 @@
+kind: Security
+body: A symlink a job plants anywhere below the volumes root, not only at a nested volume's last name, is refused rather than bound
+time: 2026-11-06T17:02:20.153235383-05:00
