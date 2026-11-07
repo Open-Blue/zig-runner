@@ -1195,6 +1195,10 @@ fn lockFile(arena: Allocator, io: std.Io, path: []const u8, wait: bool) !std.Io.
 
 /// The job's network taken down, its layers removed, its volumes, cgroup, slot and lock let go.
 pub fn deinit(b: *Backend) void {
+    // The job's own teardown, whatever ended the job: a task's cancel, delivered here once, would
+    // leave its cgroup, its directory or its locks behind (`cgroup.Job.remove` gives up on it).
+    const protection = b.io.swapCancelProtection(.blocked);
+    defer _ = b.io.swapCancelProtection(protection);
     const arena = b.arena;
     var t = phases.now();
     // First: their helpers hold the job's directory and network, and are in its cgroup.
@@ -2234,7 +2238,7 @@ pub fn layerPath(b: *Backend, i: usize) ![]const u8 {
 /// `dagger.Transport` for the shared code: the native backend has no Dagger session, so a query
 /// is a bug in what decided the job could run here (`unsupported`).
 pub fn transport(b: *Backend) dagger.Transport {
-    return .{ .ptr = b, .sendFn = send, .abortFn = abort };
+    return .{ .ptr = b, .sendFn = send, .abortFn = abort, .warnFn = warn };
 }
 
 fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8, limit: usize) anyerror![]const u8 {
@@ -2250,6 +2254,14 @@ fn abort(ptr: *anyopaque) bool {
     if (!b.waiting.load(.acquire)) return false;
     b.stop_wait.store(true, .release);
     return true;
+}
+
+/// A stage of `dagger.Watch`'s ladder: `sig` to the running step. An exec only waiting for its
+/// key's lock has nothing to warn, and stops as `abort` stops it.
+fn warn(ptr: *anyopaque, sig: std.os.linux.SIG) dagger.Transport.Warned {
+    const b: *Backend = @ptrCast(@alignCast(ptr));
+    if (b.running.warn(b.io, sig)) return .warned;
+    return if (abort(ptr)) .ended else .nothing;
 }
 
 /// Runs one script on a new layer over the others, which it joins when it ends.
@@ -3373,7 +3385,7 @@ test "a run-only job on the native backend: file commands, masks, exit codes and
     try std.testing.expect(try it.next(std.testing.io) == null);
 }
 
-test "a cancel stops a native step at once, and every process it started" {
+test "a cancel stops a native step, and every process it started, well inside the ladder" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -3381,36 +3393,293 @@ test "a cancel stops a native step at once, and every process it started" {
     defer tmp.cleanup();
     const cfg = try testConfig(arena, &tmp);
 
-    var s1 = testStep("sleep 60 & sleep 60");
+    var s1 = testStep("sleep 613.70 & sleep 613.70");
     s1.name = "long";
     var s2 = testStep("echo after");
     s2.condition = "always()";
-    const job = testJob(&.{ s1, s2 });
+    const r = try runCancelled(arena, cfg, testJob(&.{ s1, s2 }), .{ .when = "613.70" });
+    try std.testing.expectEqual(dagger.Outcome.cancelled, r.res.steps[0].outcome);
+    try std.testing.expectEqual(dagger.Outcome.success, r.res.steps[1].outcome);
+    try std.testing.expect(r.res.cancelled);
+    // The foreground `sleep` took SIGINT with it, the shell went too, and the backgrounded one,
+    // which ignores SIGINT as a shell's background job does, went with the step's namespace: its
+    // pipe closed, so the job went on.
+    try std.testing.expect(r.took_ms < 5_000);
+    try std.testing.expect(!processRuns("613.70"));
+}
+
+test "a cancel's SIGINT reaches a native step's foreground child, and the step's trap then runs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+
+    // A signal to the shell alone would wait for its `sleep`, as on GitHub, whose runner signals
+    // only the step's entry process.
+    const s1 = testStep("trap 'echo cleaned-up; echo int > got-int' INT\nsleep 613.71\n" ++
+        "echo not\"\"-this");
+    var s2 = testStep("cat got-int");
+    s2.condition = "always()";
+    const r = try runCancelled(arena, cfg, testJob(&.{ s1, s2 }), .{ .when = "613.71" });
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expectEqual(dagger.Outcome.cancelled, r.res.steps[0].outcome);
+    try std.testing.expectEqual(dagger.Outcome.success, r.res.steps[1].outcome);
+    try expectLines(r.text, &.{
+        "The job was cancelled: stopping the step with SIGINT, then SIGTERM in ",
+        "cleaned-up",
+        // The step's own log, as GitHub's runner ends it.
+        "##[error]The operation was canceled.",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "not-this") == null);
+    // It ended when it was done, not when the ladder was.
+    try std.testing.expect(r.took_ms < 5_000);
+    try std.testing.expect(!processRuns("613.71"));
+}
+
+test "a native step that takes no SIGINT hears SIGTERM 7500 ms on, and its end counts as cancelled" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+
+    const s1 = testStep("trap '' INT\ntrap 'echo cleaned-up; echo term > got-term; exit 0' TERM\n" ++
+        "sleep 613.72 &\nwait");
+    var s2 = testStep("cat got-term");
+    s2.condition = "always()";
+    const r = try runCancelled(arena, cfg, testJob(&.{ s1, s2 }), .{ .when = "613.72" });
+    errdefer std.debug.print("took {d} ms:\n{s}\n", .{ r.took_ms, r.text });
+    // It exited 0, and is cancelled still (`ProcessInvoker.cs`: `ThrowIfCancellationRequested`).
+    try std.testing.expectEqual(dagger.Outcome.cancelled, r.res.steps[0].outcome);
+    try std.testing.expectEqual(dagger.Outcome.success, r.res.steps[1].outcome);
+    try expectLines(r.text, &.{ "The step is still running: SIGTERM sent.", "cleaned-up" });
+    try std.testing.expect(r.took_ms >= sigint_ms - 300);
+    try std.testing.expect(r.took_ms < sigint_ms + 2_000);
+    try std.testing.expect(!processRuns("613.72"));
+}
+
+test "a native step that ignores every signal is dead at the ladder's end, whatever it started" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+
+    // A session of its own, a subshell, a plain background job: all ignoring what the shell does.
+    // Each ends by itself if the kill fails, and the checks below then fail.
+    const job = testJob(&.{testStep("trap '' INT TERM HUP\nsetsid sleep 613.73 &\n" ++
+        "( sleep 613.73; : ) &\nsleep 613.73 &\nsleep 0.2\nfor i in $(seq 1 300); do sleep 0.1; " ++
+        "done\necho out\"\"lived-the-ladder")});
+    const r = try runCancelled(arena, cfg, job, .{
+        .when = "613.73",
+        .grace_ms = 3_000,
+        .why = .runner_stopping,
+    });
+    errdefer std.debug.print("took {d} ms:\n{s}\n", .{ r.took_ms, r.text });
+    try std.testing.expectEqual(dagger.Outcome.cancelled, r.res.steps[0].outcome);
+    try expectLines(r.text, &.{
+        // Less than the limit by when the watch saw the cancel.
+        "The runner is stopping: stopping the step with SIGINT, then SIGTERM in ",
+        "The step is still running: SIGTERM sent.",
+        "The step did not stop: killing it.",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "outlived-the-ladder") == null);
+    // The whole limit, and the ladder ended with it: a tick (200 ms) and the job's own end late.
+    try std.testing.expect(r.took_ms >= 2_800);
+    try std.testing.expect(r.took_ms < 6_000);
+    try std.testing.expect(!processRuns("613.73"));
+}
+
+test "a native step that forks all through the ladder leaves nothing at its end" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+
+    // Slowly enough to need no limit of its own: this test also runs with no cgroup.
+    const job = testJob(&.{testStep("trap '' INT TERM\n" ++
+        "for i in $(seq 1 300); do sleep 613.74 & sleep 0.1; done\necho out\"\"lived-the-ladder")});
+    // No cancel limit near: only the ladder's own last stage can end it.
+    const r = try runCancelled(arena, cfg, job, .{ .when = "613.74" });
+    errdefer std.debug.print("took {d} ms:\n{s}\n", .{ r.took_ms, r.text });
+    try std.testing.expectEqual(dagger.Outcome.cancelled, r.res.steps[0].outcome);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "outlived-the-ladder") == null);
+    try expectLines(r.text, &.{"The step did not stop: killing it."});
+    try std.testing.expect(r.took_ms >= 9_800);
+    try std.testing.expect(r.took_ms < 12_500);
+    try std.testing.expect(!processRuns("613.74"));
+}
+
+test "a task's cancel stops a native step at once, and the job's own end still runs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const io = std.testing.io;
+
+    const Job = struct {
+        fn run(arena_: Allocator, cfg_: Config) anyerror!dagger.Result {
+            var env: std.process.Environ.Map = .init(arena_);
+            var w: std.Io.Writer.Allocating = .init(arena_);
+            var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+            // It ends by itself if the cancel does nothing, and the check below then fails.
+            return dagger.run(arena_, io, &env, .{
+                .native = cfg_,
+                .step_user = .root,
+                .gpa = std.testing.allocator,
+            }, testJob(&.{testStep("sleep 12.75")}), &log);
+        }
+    };
+    var job = try io.concurrent(Job.run, .{ arena, cfg });
+    var cancelled = false;
+    defer if (!cancelled) {
+        _ = job.cancel(io) catch {};
+    };
+    try waitForProcess("12.75");
+    const started = std.Io.Clock.awake.now(io).toMilliseconds();
+    cancelled = true;
+    _ = job.cancel(io) catch {};
+    try std.testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - started < 8_000);
+    try std.testing.expect(!processRuns("12.75"));
+    // The job's layers went with it, its directory and locks (`deinit`).
+    const jobs_path = try std.fmt.allocPrint(arena, "{s}/jobs", .{cfg.store});
+    var jobs = try std.Io.Dir.cwd().openDir(io, jobs_path, .{ .iterate = true });
+    defer jobs.close(io);
+    var it = jobs.iterate();
+    try std.testing.expect(try it.next(io) == null);
+}
+
+test "a task's cancel that lands in a sink's write of a native step's output is not lost" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const io = std.testing.io;
+
+    const Slow = struct {
+        reached: std.atomic.Value(bool) = .init(false),
+
+        /// A sink that waits, and sees nothing wrong in a cancel.
+        fn chunk(ptr: *anyopaque, _: []const u8) void {
+            const s: *@This() = @ptrCast(@alignCast(ptr));
+            s.reached.store(true, .release);
+            io.sleep(.fromSeconds(1), .awake) catch {};
+        }
+
+        fn run(s: *@This(), b: *Backend) anyerror!sandbox.Ended {
+            // It ends by itself if the cancel is lost, and the check below then fails.
+            return b.exec("echo first; sleep 12.79", &.{"PATH=/usr/bin:/bin"}, &.{}, 0, 0, .{
+                .ptr = s,
+                .chunkFn = chunk,
+            });
+        }
+    };
+    var b = try init(arena, io, std.testing.allocator, cfg);
+    defer b.deinit();
+    var slow: Slow = .{};
+    var running = try io.concurrent(Slow.run, .{ &slow, &b });
+    var cancelled = false;
+    defer if (!cancelled) {
+        _ = running.cancel(io) catch {};
+    };
+    for (0..3000) |_| {
+        if (slow.reached.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    const started = std.Io.Clock.awake.now(io).toMilliseconds();
+    cancelled = true;
+    _ = running.cancel(io) catch {};
+    try std.testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - started < 8_000);
+}
+
+/// `dagger.Watch`'s first stage, for the tests that wait it out.
+const sigint_ms = 7_500;
+
+/// How `runCancelled` cancels a job.
+pub const CancelPlan = struct {
+    /// A number on a `sleep` the job runs (`processRuns`): the cancel comes once it is running.
+    when: []const u8,
+    /// What the job's cancel limit leaves, from the cancel.
+    grace_ms: i64 = 60_000,
+    why: dagger.Cancel.Why = .github,
+    /// The job uses the layer store, shared with later jobs.
+    step_cache: bool = false,
+};
+
+/// `job` on the native backend, cancelled as `plan` says; `took_ms` runs from the cancel to the
+/// job's end. Its `sleep`s are what the cancel waits for, so a slow machine still cancels a step
+/// that has set its traps.
+pub fn runCancelled(arena: Allocator, cfg: Config, job: job_mod.Job, plan: CancelPlan) !struct {
+    res: dagger.Result,
+    text: []const u8,
+    took_ms: i64,
+} {
+    const io = std.testing.io;
     var cancel: dagger.Cancel = .{};
+    var cancelled_at: std.atomic.Value(i64) = .init(0);
     var env: std.process.Environ.Map = .init(arena);
     var w: std.Io.Writer.Allocating = .init(arena);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
-    const io = std.testing.io;
-    var canceller = try io.concurrent(cancelSoon, .{ io, &cancel });
+    var canceller = try io.concurrent(cancelOnce, .{ &cancel, plan, &cancelled_at });
     defer canceller.cancel(io);
-    const started = std.Io.Clock.awake.now(io).toMilliseconds();
     const res = try dagger.run(arena, io, &env, .{
         .native = cfg,
         .step_user = .root,
         .gpa = std.testing.allocator,
         .cancel = &cancel,
+        .step_cache = plan.step_cache,
     }, job, &log);
-    const took = std.Io.Clock.awake.now(io).toMilliseconds() - started;
-    try std.testing.expectEqual(dagger.Outcome.cancelled, res.steps[0].outcome);
-    try std.testing.expectEqual(dagger.Outcome.success, res.steps[1].outcome);
-    try std.testing.expect(res.cancelled);
-    // The backgrounded `sleep 60` went with the step: its pipe closed, so the job went on.
-    try std.testing.expect(took < 10_000);
+    return .{
+        .res = res,
+        .text = w.written(),
+        .took_ms = std.Io.Clock.awake.now(io).toMilliseconds() - cancelled_at.load(.acquire),
+    };
 }
 
-fn cancelSoon(io: std.Io, cancel: *dagger.Cancel) void {
-    io.sleep(.fromMilliseconds(500), .awake) catch return;
-    cancel.request(std.Io.Clock.real.now(io).toMilliseconds() + 60_000);
+fn cancelOnce(cancel: *dagger.Cancel, plan: CancelPlan, at: *std.atomic.Value(i64)) void {
+    const io = std.testing.io;
+    waitForProcess(plan.when) catch return;
+    at.store(std.Io.Clock.awake.now(io).toMilliseconds(), .release);
+    cancel.requestBecause(std.Io.Clock.real.now(io).toMilliseconds() + plan.grace_ms, plan.why);
+}
+
+/// Waits until `processRuns(number)`, for a minute at the most: whoever waits then fails on what
+/// it expected, and does not hang.
+fn waitForProcess(number: []const u8) !void {
+    for (0..600) |_| {
+        if (processRuns(number)) return;
+        try std.testing.io.sleep(.fromMilliseconds(100), .awake);
+    }
+}
+
+/// Whether a `sleep <number>` runs on this machine, seen from outside any namespace. The numbers
+/// are the tests' own. Exactly that command line: a step's `sh -c` holds its script's text too.
+fn processRuns(number: []const u8) bool {
+    const io = std.testing.io;
+    var name_buf: [64]u8 = undefined;
+    const want = std.fmt.bufPrint(&name_buf, "sleep\x00{s}\x00", .{number}) catch return false;
+    var proc = std.Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch return false;
+    defer proc.close(io);
+    var it = proc.iterate();
+    while (it.next(io) catch null) |e| {
+        _ = std.fmt.parseInt(u32, e.name, 10) catch continue;
+        var path_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/cmdline", .{e.name}) catch continue;
+        var buf: [128]u8 = undefined;
+        const line = proc.readFile(io, path, &buf) catch continue;
+        if (std.mem.eql(u8, line, want)) return true;
+    }
+    return false;
 }
 
 test "unsupported: what sends a job to Dagger, and the first reason given" {
@@ -6410,6 +6679,36 @@ fn bombStep(comptime depth: u32) job_mod.Step {
         "kill -9 -- -$pg\n" ++
         "while kill -0 -- -$pg 2>/dev/null; do :; done\n" ++
         "echo after-the-bomb");
+}
+
+test "root runner: a native step's fork bomb that ignores signals goes at the ladder's end" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    // It fills the job's limit, so no process can be forked to warn the step: the warnings go
+    // unsent, the ladder goes on, and its end needs no fork.
+    cfg.cgroup.memory_max_mb = 256;
+    cfg.cgroup.pids_max = 64;
+    // Of builtins, as `bombStep`, and with an end of its own, should the kill fail.
+    const job = testJob(&.{testStep("trap '' INT TERM\nsleep 613.75 &\n" ++
+        "bomb() {\n" ++
+        "  if [ \"$1\" -gt 0 ]; then bomb $(($1 - 1)) & bomb $(($1 - 1)) & fi\n" ++
+        "  until [ $SECONDS -ge 20 ]; do :; done\n" ++
+        "}\n" ++
+        "bomb 9\n" ++
+        "echo out\"\"lived-the-ladder")});
+    const r = try runCancelled(arena, cfg, job, .{ .when = "613.75", .grace_ms = 2_000 });
+    errdefer std.debug.print("took {d} ms:\n{s}\n", .{ r.took_ms, r.text });
+    try std.testing.expectEqual(dagger.Outcome.cancelled, r.res.steps[0].outcome);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "outlived-the-ladder") == null);
+    try std.testing.expect(r.took_ms >= 1_800);
+    try std.testing.expect(r.took_ms < 6_000);
+    try std.testing.expect(!processRuns("613.75"));
 }
 
 test "the tests' runaway and fork bomb end by themselves, with no limit on them" {

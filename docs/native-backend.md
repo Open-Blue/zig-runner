@@ -135,8 +135,8 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   `Exec.execScript` hands each exec to `Backend.execScript`. The Dagger path is unchanged, and so
   are its tests.
 - Covered: `run:` steps with any shell, `defaults.run`, step and job `env:`, expressions, `if:`,
-  `continue-on-error`, `timeout-minutes` and cancellation (the same `Watch`; the helper kills the
-  step's PID 1 when told), every file command, `::add-mask::` and the other workflow commands,
+  `continue-on-error`, `timeout-minutes` and cancellation (the same `Watch`, with GitHub's
+  SIGINT, SIGTERM and kill: see "Stopping a step"), every file command, `::add-mask::` and the other workflow commands,
   problem matchers (read from the layers, relative to the working directory), step summaries,
   `id-token: write`, secrets in env, in scripts and in working directories, and the built-in
   checkout, submodules included (git in the job's image, then the same step script Dagger's
@@ -1694,7 +1694,105 @@ What Dagger (BuildKit and runc under it) did implicitly, now explicit in `native
   first process being PID 1 of its own PID namespace, with `PR_SET_PDEATHSIG` tying it to the
   helper: killing the helper (through a pidfd, so a reused pid is never hit) takes everything the
   step started with it, background processes included, and closes the output pipe. The cancel test
-  checks this with a backgrounded `sleep 60`.
+  checks this with a backgrounded `sleep 60`. That kill is now the end of a ladder: see "Stopping a
+  step".
+- **Stopping a step.** A cancel, a `timeout-minutes` and a runner's stop all take one route,
+  `dagger.Watch`, and on this backend it warns the step before it kills it (#379). What GitHub's
+  runner does, read from actions/runner at 5ba5044:
+  - `src/Runner.Sdk/ProcessInvoker.cs`: `_sigintTimeout` 7500 ms and `_sigtermTimeout` 2500 ms
+    (lines 32-33), fixed: no setting or environment variable changes them.
+    `CancelAndKillProcessTree` (443-465) sends SIGINT, waits for the process to exit or the
+    timeout, sends SIGTERM, waits, and kills; it stops as soon as the process has exited.
+    `SendSignal` (829-853) is `kill(_proc.Id, signal)`: the entry process alone, not its
+    group. `NixKillProcessTree` (855-869) despite its name is `_proc.Kill()`, one process again:
+    the tree goes only at the job's end ("Cleaning up orphan processes", `JobExtension.cs` 891-935,
+    by `RUNNER_TRACKING_ID`). So `bash -e` waiting on a foreground child holds its SIGINT until the
+    child ends, and the child never hears anything.
+  - `ScriptHandler.cs:346` and `NodeScriptActionHandler.cs:173` pass `killProcessOnCancel: false`,
+    so steps get the ladder. After it `cancellationToken.ThrowIfCancellationRequested()`
+    (`ProcessInvoker.cs:369`) makes the step cancelled whatever the exit code; on a timeout it
+    failed instead (`StepsRunner.cs` 322-337).
+  - `always()` steps do not run on a cancelled token: each step has a token of its own, which the
+    job's cancel cancels only when the condition, evaluated again, no longer holds
+    (`StepsRunner.cs` 149-185). The worker itself is killed 15 s before the job's cancel limit,
+    which is raised to 60 s first (`JobDispatcher.cs` 1280-1285).
+
+  What this runner does:
+  - **The ladder and its timing** are `Watch`'s (`sigint_ms`, `sigterm_ms`), on its 200 ms tick:
+    SIGINT, SIGTERM 7500 ms on, the kill 2500 ms after that, each only while the step runs. The
+    whole fits inside the job's cancel limit (`ladderMs`): with less time left it shrinks in
+    proportion, a job past its limit gets the kill alone, an `if: always()` step at the limit
+    starts its ladder early enough to end by it, and a second cancel, which can only bring
+    `Cancel.hard_deadline_ms` forward, shortens a ladder under way and cannot lengthen it. The
+    runner holds the time and not the helper for that reason. A SIGTERM or a kill that finds nothing,
+    between two execs of a step, stays due. The ladder runs on the awake clock, so a wall clock stepped
+    back cannot put it off. If the runner dies the lifeline closes, which is the kill. Nothing here
+    is configurable, as on GitHub. GitHub's limit is taken as its runner takes it
+    (`CancelWatch.cancelLimitMs`): 60 s at the least, less 15 s. One difference: there a later
+    cancel can move the limit out (`CancelAfter`), and here it cannot.
+  - **Who hears it** differs from GitHub on purpose: every process of the step, not one. A signal
+    from outside to PID 1 is dropped unless PID 1 has a handler (`SIGNAL_UNKILLABLE`), and no call
+    from outside reaches a namespace, so the helper forks one process, which lands in the step's
+    PID namespace, for `kill(-1, sig)`: all but PID 1, sessions and process groups of their own
+    included, in one act the kernel holds forks off from (`sandbox.Warning`). It lasts one system
+    call, is not dumpable, and holds capabilities the step's bounding set does not, so a root step
+    cannot trace it (no job can add one: `--cap-add` and `--privileged` are refused,
+    `container_options.zig`). Its zombie is reaped at once, because PID 1 cannot finish exiting while one is
+    left. A `bash` step's foreground child therefore dies of SIGINT, and the shell's trap runs
+    straight away, where on GitHub it waits for that child. The cost: a wrapper that passes
+    signals on (`timeout`, `npm`, `make`) has its child hear SIGINT twice, once from each, as
+    Ctrl-C in a terminal does to a foreground group. A program that counts them, as Terraform's
+    second interrupt means "exit now", then skips its clean exit. No choice of who to signal avoids
+    it without losing the foreground child under a shell, which is the point of signalling all.
+  - **PID 1** of a `run:` step is the `sh -c` around the step's shell, which is left alone: it
+    reports the step's end, and where `sh` is bash it would act on the signal and end the namespace
+    under a step still cleaning up. A Docker action's PID 1 is the action's own and is signalled as
+    well, which is what `docker stop` does, including its being ignored without a handler.
+  - **The end** is the kill that was always there: the lifeline closes and the helper SIGKILLs PID
+    1. The kernel then stops the namespace's forks and kills all of it (`zap_pid_ns_processes`), so
+    neither a process that forked away nor a fork bomb outlives it. A fork bomb at `pids.max` may
+    leave the helper no process to warn with: it tries again every 20 ms and the kill needs no
+    fork. `cgroup.kill` remains what it was, the job's end (`cgroup.Job.remove`): the cgroup is the
+    job's, shared with its service containers and the next steps, so it cannot stop one step, and a
+    step's cgroup of its own would hide `memory.max` from what a step reads there, for no process
+    the namespace's end does not already reach.
+  - **Once the step's shell has ended** the namespace goes, so a background process still cleaning
+    up is killed then. On GitHub it would be left until the end of the job. A step that ends
+    during the ladder is still cancelled, or failed on a timeout, whatever it exited with, as on
+    GitHub, and its file commands are not read. Its layer stays, so what a trap wrote is there for
+    `always()` steps. Every exec stopped ends with a code other than 0 (`sandbox.Ended`), whatever
+    its script exited with, so nothing that keeps an exec's work on its code keeps a stopped one's:
+    a `RUN` whose script exits 0 during a stop stores no layer, and a Zig seed or an action's
+    fetch fails as a killed one did.
+  - **The log** says why, in the step's own log, before `##[error]The operation was canceled.`:
+    the reason (`Cancel.Why`: GitHub's cancel, the runner stopping, GitHub no longer having the
+    job, or `Watch.reason` for a timeout or the job's limit), then each stage reached. It names
+    the plan, not delivery: a warning the helper cannot fork for at `pids.max` is not sent. A job
+    cancelled during a timeout's ladder reports the step cancelled, as GitHub does. Written once
+    `Watch` has let go of its lock, so a stuck sink does not hold up a step's end, though the next
+    stage waits behind it. Pre scripts
+    have no log step of `Watch`'s. Each pre and post script gets a ladder of its own, and one
+    stopped near the limit fails as a post script does, so the next still runs.
+  - **After a cancel** nothing runs on a cancelled context: `dagger.Cancel` is a flag, read where
+    work should stop (`Watch`, `hashFiles`, the tool tree check), and a call begun after it is not
+    cut short. A job's cancel never cancels the job's task, so `if: always()` steps, post scripts,
+    the log's flush, `completejob` and the uploads run on as they would. A task's cancel is
+    another matter, and only a pool failing to start its runners sends one to a job: `std.Io`
+    delivers it once, and two places lost it. `sandbox.finish` took it for the end of the step's
+    output, then waited for the step, however long it ran; it now stops the step and delivers it
+    again once the helper has gone. A sink's write and the spec's run protected from it, so the
+    read gets it. `Backend.deinit` could lose its cgroup or its directory to it, and now runs
+    protected from it.
+  - **A second cancel from GitHub** is read: `CancelWatch` used to stop at the first, so a shorter
+    limit in a second message never reached `Cancel.request`.
+  - **Dagger and `RUNNER_ENGINE=cli` cannot do this.** A step there is a BuildKit exec: cancelling
+    its context SIGKILLs the container's process (`runcProcessHandle` and `doKillProc` in
+    `executor/runcexecutor/executor.go`, moby/buildkit at cedaeca), and `process.Signal`, the one
+    way to send another signal, is the gateway API's: a Dagger `withExec` has no way to reach it.
+    The script cannot stand in, since the step's text is its cache key and nothing reaches a running
+    exec from the runner. `Transport.warnFn` is null there, so `Watch` aborts at once as before,
+    and with `RUNNER_ENGINE=cli` (#315) the same, by dropping the query. A step on those backends
+    still gets no warning; its `always()` steps run as they did.
 - **Secrets out of command lines.** Under Dagger the reason for `withSecretVariable` and secret
   mounts was the engine's cache metadata. Natively the same discipline matters for another reason:
   `/proc/<pid>/cmdline` is readable by every user on the host. Keeping the identical script

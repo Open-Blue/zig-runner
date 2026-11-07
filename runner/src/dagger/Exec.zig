@@ -180,6 +180,9 @@ forward_prelude: []const u8 = "",
 /// the job's own `run:` steps use them, not a composite action's.
 default_shell: ?[]const u8 = null,
 default_working_directory: ?[]const u8 = null,
+/// Watches each step for a stop; post and pre scripts are bracketed too, so a stop of one does not
+/// run over the next.
+watch: ?*@import("../dagger.zig").Watch = null,
 /// The job runs on the native backend: each exec goes there instead of to Dagger
 /// (`Backend.execScript`), and so do reads of the container's files.
 native: ?*Backend = null,

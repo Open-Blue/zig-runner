@@ -592,6 +592,80 @@ test "a Dockerfile action whose base image changed under its tag is built again,
     try std.testing.expect(std.mem.indexOf(u8, again, "moved under its tag") != null);
 }
 
+test "a Dockerfile's RUN stopped by a native cancel stores no layer, though its script exits 0" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testActions(arena, &tmp);
+    // A script that ends 0 during the stop, with its work half done.
+    try testRepo(arena, &tmp, "half", &.{
+        .{ "action.yml", "runs:\n  using: docker\n  image: Dockerfile\n" },
+        .{ "Dockerfile", "FROM zr-test/base:1\nRUN trap 'echo half-done > /half-done; exit 0' INT; " ++
+            "sleep 613.78 & wait\n" },
+    });
+    var job = testJob(&.{usesStep("half", "o", "half", "v1", &.{})});
+    job.github.server_url = "file:///srv/git";
+    const r = try Backend.runCancelled(arena, cfg, job, .{
+        .when = "613.78",
+        .step_cache = true,
+    });
+    errdefer std.debug.print("took {d} ms:\n{s}\n", .{ r.took_ms, r.text });
+    try std.testing.expectEqual(dagger.Outcome.cancelled, r.res.steps[0].outcome);
+    const layers_path = try std.fmt.allocPrint(arena, "{s}/layers", .{cfg.store});
+    var stored = try std.Io.Dir.cwd().openDir(io, layers_path, .{ .iterate = true });
+    defer stored.close(io);
+    var it = stored.iterate();
+    while (try it.next(io)) |e| {
+        const built = try std.fmt.allocPrint(arena, "{s}/fs/half-done", .{e.name});
+        try std.testing.expectError(error.FileNotFound, stored.access(io, built, .{}));
+    }
+}
+
+test "each post script of a native job hears its own SIGINT at the job's limit" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testActions(arena, &tmp);
+    // Each action's main run leaves a file; its post script finds it, and waits to be told.
+    for ([_][]const u8{ "1", "2" }) |n| try testRepo(arena, &tmp, try std.fmt.allocPrint(
+        arena,
+        "post{s}",
+        .{n},
+    ), &.{.{
+        "action.yml",
+        try std.fmt.allocPrint(arena,
+            \\runs:
+            \\  using: docker
+            \\  image: docker://zr-test/base:1
+            \\  entrypoint: sh
+            \\  post-entrypoint: sh
+            \\  args:
+            \\    - -c
+            \\    - if [ -e seen{0s} ]; then trap 'echo heard-int-{0s}; exit 0' INT; sleep 613.8{0s} & wait; else touch seen{0s}; fi
+        , .{n}),
+    }});
+    var job = testJob(&.{
+        usesStep("post1", "o", "post1", "v1", &.{}),
+        usesStep("post2", "o", "post2", "v1", &.{}),
+        testStep("sleep 613.79"),
+    });
+    job.github.server_url = "file:///srv/git";
+    // The ladder's window opens 3 s in: the first post script hears SIGINT then, and the second
+    // must hear one of its own, not the rest of the first's ladder.
+    const r = try Backend.runCancelled(arena, cfg, job, .{ .when = "613.79", .grace_ms = 13_000 });
+    errdefer std.debug.print("took {d} ms:\n{s}\n", .{ r.took_ms, r.text });
+    try Backend.expectLines(r.text, &.{
+        "heard-int-2",
+        "heard-int-1",
+        "The job's cancel limit is near",
+    });
+}
+
 test "preload: a JavaScript action, a local one, or an image not in the store sends the job to Dagger" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();

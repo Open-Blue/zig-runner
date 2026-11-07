@@ -460,6 +460,8 @@ const BuildRunner = struct {
             r.failure = ended.failure;
             return 125;
         }
+        // Stopped, it may be half done whatever it exited with: never a layer for the store.
+        if (ended.killed) return ended.code;
         // The layer gets the canonical ids, as P2 gives a step's before it is stored
         // (`Store.unshift`, #276), so it serves every slot. Half shifted, it must not be stored.
         if (mapped) Store.unshift(b.arena, b.io, upper, b.slotIds()) catch |e| {
@@ -657,6 +659,31 @@ test "a docker:// step runs natively in its image, with the workspace and file c
         std.debug.print("missing {s}\n", .{e});
         return error.TestUnexpectedResult;
     };
+}
+
+test "a Docker action's own PID 1 hears a native cancel, as `docker stop` tells it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    cfg.images = try testImage(arena, &tmp, "zr-test/tool:1",
+        \\{"config":{"Env":["PATH=/usr/bin:/bin"],"Entrypoint":["/bin/sh","-c"],"Cmd":["true"]}}
+    );
+    var s1 = dockerStep("zr-test/tool:1", &.{
+        .{ .name = "entrypoint", .value = .{ .lit = "sh" } },
+        .{ .name = "args", .value = .{ .lit = "-c \"trap 'echo int > got-int; exit 0' INT; " ++
+            "sleep 613.77 & wait\"" } },
+    });
+    s1.name = "action";
+    var s2 = testStep("cat got-int");
+    s2.condition = "always()";
+    const r = try Backend.runCancelled(arena, cfg, testJob(&.{ s1, s2 }), .{ .when = "613.77" });
+    errdefer std.debug.print("took {d} ms:\n{s}\n", .{ r.took_ms, r.text });
+    try std.testing.expectEqual(dagger.Outcome.cancelled, r.res.steps[0].outcome);
+    try std.testing.expectEqual(dagger.Outcome.success, r.res.steps[1].outcome);
+    try std.testing.expect(r.took_ms < 5_000);
 }
 
 test "unsupported: a docker:// step needs its image in the native store, run as root" {
