@@ -473,6 +473,14 @@ What it changes on the host, which is shared by every runner on it:
   (`kernel.apparmor_restrict_unprivileged_userns=1`), the sandbox is started under util-linux's
   `unshare` where its profile allows it (the laptop), and needs the restriction lifted where it
   does not (GitHub's hosted runner).
+  Ubuntu's narrow alternative to lifting it is a profile for the runner binary granting `userns`
+  (`deploy/apparmor/usr.local.bin.zig-runner`, installed by the operator with `apparmor_parser -r`;
+  README; optional). It attaches by path, so it covers the runner and its
+  self-exec helpers (`--exec-job`, the sandbox helper: one binary at one path), not `unshare` or
+  anything else, and it is `flags=(unconfined)`: it grants `userns` and no other rule. When
+  the restriction is what stops the probe's sandbox, `Backend.usable`'s reason names the profile.
+  Whether the runner using it directly, instead of through `unshare`, works is not yet
+  measured; `launch` still starts under `unshare` while the sysctl is 1.
 
 #### Measured (laptop "cowbird", balanced profile, 2026-10-31, another agent benchmarking)
 
