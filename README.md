@@ -22,6 +22,21 @@ zig-out/bin/runner
 
 Or install `deploy/zig-runner.service` and run it under systemd, or `docker compose -f deploy/compose.yaml up`.
 
+Optional, for a rootless native runner on Ubuntu 23.10 and later (24.04 by default), where AppArmor
+lets only programs with a `userns` rule make user namespaces
+(`kernel.apparmor_restrict_unprivileged_userns=1`): `deploy/apparmor/usr.local.bin.zig-runner`
+grants that to `/usr/local/bin/zig-runner` alone, and nothing else (the runner is not confined any
+further or less; it is not a root runner's need, nor the Dagger backend's). Instead of lifting the
+sysctl for the whole machine, the operator installs it:
+
+```sh
+sudo install -m 0644 deploy/apparmor/usr.local.bin.zig-runner /etc/apparmor.d/
+sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.zig-runner
+```
+
+A profile attaches by path: edit the path in the file if the runner is installed elsewhere. The
+runner never installs it; when the restriction stops its sandbox, the refusal says so and names it.
+
 Instead of `GH_TOKEN`, the runner can manage its registrations as a GitHub App, which reaches only
 the repositories it is installed on: `GH_APP_ID` (the App's ID or Client ID) and
 `GH_APP_PRIVATE_KEY_FILE` (or `GH_APP_PRIVATE_KEY`), with the permission "Administration: read and
