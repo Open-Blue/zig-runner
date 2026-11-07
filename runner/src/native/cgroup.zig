@@ -9,7 +9,10 @@
 //!
 //! Each step's helper joins the job's cgroup before it does anything else (`sandbox.zig`), so
 //! every process of the step is born in it; the runner never is. Between steps the cgroup is
-//! empty and kept: its peak and events are the job's, across its steps.
+//! empty and kept: its peak and events are the job's, across its steps. The steps run in a
+//! `steps` child with `memory.oom.group`, so an OOM kill takes all of them and not one process
+//! (#378); services and the ports' relay run in a `services` child without it (`Job.split`).
+//! Limits, usage and events are the job's cgroup's, which counts its children.
 //!
 //! All jobs together are bounded on their parent (`Limits`, `Job.make`): a job's own limit cannot
 //! stop two jobs at once from taking the machine. Page cache counts towards these limits and is
@@ -516,11 +519,32 @@ fn hasJobs(io: std.Io, dir: []const u8) bool {
     return (admission.parseStat(text, "nr_descendants") orelse 0) > 0;
 }
 
+/// The job's children where steps and services run, when the kernel can group-kill (`Job.split`).
+const steps_name = "steps";
+const services_name = "services";
+
 /// One job's cgroup.
 pub const Job = struct {
     dir: []const u8,
     /// All jobs' limits as they stand (`limitAll`).
     all: All = .{},
+    /// `<dir>/steps`, with `memory.oom.group` 1: an OOM kill in a step takes every process of the
+    /// steps together, not the largest one with the rest left running in a damaged state (#378).
+    /// Null where the kernel lacks it (Linux 4.19): the steps then run in `dir`.
+    steps_dir: ?[]const u8 = null,
+    /// `<dir>/services`, without it: a step's OOM must not take a service container or the ports'
+    /// relay, which the job's later steps (an `always()` cleanup reading a database) still use.
+    services_dir: ?[]const u8 = null,
+
+    /// Where a step's helper joins.
+    pub fn stepsDir(j: Job) []const u8 {
+        return j.steps_dir orelse j.dir;
+    }
+
+    /// Where a service's helper, and the relay, join.
+    pub fn servicesDir(j: Job) []const u8 {
+        return j.services_dir orelse j.dir;
+    }
 
     /// `<parent>/<name>`, with the job's limits, and all jobs' on the parent. One left by a runner
     /// that died is taken over.
@@ -534,7 +558,7 @@ pub const Job = struct {
         const all = try limitAll(arena, io, parent_dir, limits);
         const dir = try std.fmt.allocPrint(arena, "{s}/{s}", .{ parent_dir, name });
         try mkdir(arena, dir);
-        const j: Job = .{ .dir = dir, .all = all };
+        var j: Job = .{ .dir = dir, .all = all };
         errdefer j.remove(arena, null);
         const memory = if (limits.memory_max) |m|
             try std.fmt.allocPrint(arena, "{d}", .{m})
@@ -543,6 +567,39 @@ pub const Job = struct {
         if (write(arena, dir, "memory.max", memory) != .SUCCESS) return error.MemoryLimitFailed;
         const pids = if (limits.pids_max) |p| try std.fmt.allocPrint(arena, "{d}", .{p}) else "max";
         if (write(arena, dir, "pids.max", pids) != .SUCCESS) return error.PidsLimitFailed;
+        j = try j.split(arena);
+        return j;
+    }
+
+    /// The `steps` child with `memory.oom.group`, and a `services` one without. The kernel's flag
+    /// kills the victim's whole group (the highest cgroup with it, below the one whose limit ran
+    /// out), so it goes where only steps are: set on the job it would take a service and the
+    /// relay with them, and any service's OOM would take the steps. Best effort: without the
+    /// flag (older kernels) or the controller, the job stays one cgroup with its limits, which
+    /// are what bound it. A cgroup that gives its children the controller holds no process, so
+    /// it is given back when the flag cannot be set.
+    fn split(j: Job, arena: Allocator) !Job {
+        const steps = try std.fmt.allocPrint(arena, "{s}/{s}", .{ j.dir, steps_name });
+        const services = try std.fmt.allocPrint(arena, "{s}/{s}", .{ j.dir, services_name });
+        mkdir(arena, steps) catch return j;
+        mkdir(arena, services) catch return j.unsplit(arena, false);
+        if (write(arena, j.dir, "cgroup.subtree_control", "+memory") != .SUCCESS)
+            return j.unsplit(arena, false);
+        if (write(arena, steps, "memory.oom.group", "1") != .SUCCESS)
+            return j.unsplit(arena, true);
+        var split_job = j;
+        split_job.steps_dir = steps;
+        split_job.services_dir = services;
+        return split_job;
+    }
+
+    /// The children removed again (empty: no process was ever put in them), the controller given
+    /// back if `enabled`, and the job as it was.
+    fn unsplit(j: Job, arena: Allocator, enabled: bool) !Job {
+        removeEmpty(arena, j.dir, steps_name);
+        removeEmpty(arena, j.dir, services_name);
+        if (enabled and write(arena, j.dir, "cgroup.subtree_control", "-memory") != .SUCCESS)
+            return error.MemoryLimitFailed;
         return j;
     }
 
@@ -586,18 +643,24 @@ pub const Job = struct {
     /// cgroup removed once they are gone. `io` null: not waited for (a failed `make`, where none
     /// ran).
     pub fn remove(j: Job, arena: Allocator, io: ?std.Io) void {
+        // The children by name, so a sweep's `Job{ .dir = ... }` removes a dead runner's too.
         if (write(arena, j.dir, "cgroup.kill", "1") != .SUCCESS) if (io) |i| {
-            var buf: [64 * 1024]u8 = undefined;
-            const procs = readIn(i, j.dir, "cgroup.procs", &buf) catch "";
-            var pids = std.mem.tokenizeScalar(u8, procs, '\n');
-            while (pids.next()) |p| {
-                const pid = std.fmt.parseInt(linux.pid_t, p, 10) catch continue;
-                _ = linux.kill(pid, .KILL);
+            for ([_][]const u8{ "", "/" ++ steps_name, "/" ++ services_name }) |child| {
+                const at = std.fmt.allocPrint(arena, "{s}{s}", .{ j.dir, child }) catch continue;
+                var buf: [64 * 1024]u8 = undefined;
+                const procs = readIn(i, at, "cgroup.procs", &buf) catch "";
+                var pids = std.mem.tokenizeScalar(u8, procs, '\n');
+                while (pids.next()) |p| {
+                    const pid = std.fmt.parseInt(linux.pid_t, p, 10) catch continue;
+                    _ = linux.kill(pid, .KILL);
+                }
             }
         };
         const p = arena.dupeSentinel(u8, j.dir, 0) catch return;
         // The killed processes leave the cgroup as they exit, which takes a moment.
         for (0..200) |_| {
+            removeEmpty(arena, j.dir, steps_name);
+            removeEmpty(arena, j.dir, services_name);
             switch (linux.errno(linux.rmdir(p))) {
                 .SUCCESS, .NOENT => return,
                 .BUSY => {},
@@ -609,6 +672,12 @@ pub const Job = struct {
         std.log.warn("native: cannot remove the job's cgroup {s}", .{j.dir});
     }
 };
+
+/// `dir/name` removed if it is there and empty; the kernel refuses any other.
+fn removeEmpty(arena: Allocator, dir: []const u8, name: []const u8) void {
+    const p = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ dir, name }, 0) catch return;
+    _ = linux.rmdir(p);
+}
 
 /// A job's use of its cgroup.
 pub const Usage = struct {
@@ -867,6 +936,43 @@ test "native cgroup: under jobs, all jobs' limits only tighten, and only as far 
     ), "\n"));
     const swap = try tmp.dir.readFile(io, "memory.swap.max", &buf);
     try std.testing.expectEqualStrings("0", swap[0..1]);
+}
+
+test "native cgroup: a job without children has its steps and services in its own cgroup" {
+    const j: Job = .{ .dir = "/sys/fs/cgroup/x/jobs/j" };
+    try std.testing.expectEqualStrings(j.dir, j.stepsDir());
+    try std.testing.expectEqualStrings(j.dir, j.servicesDir());
+    const split_job: Job = .{ .dir = j.dir, .steps_dir = "a/steps", .services_dir = "a/services" };
+    try std.testing.expectEqualStrings("a/steps", split_job.stepsDir());
+    try std.testing.expectEqualStrings("a/services", split_job.servicesDir());
+}
+
+test "native cgroup: the steps' cgroup kills as a group, the services' does not, and both go" {
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    const top = try std.fmt.allocPrint(arena, "{s}/zig-runner-test-{s}", .{ mount_point, &hex });
+    defer (Job{ .dir = top }).remove(arena, io);
+    ensure(arena, top) catch return error.SkipZigTest;
+    const set: Limits = .{ .memory_max = 1 << 30, .pids_max = 64, .memory_total = 1 << 30 };
+    const job = try Job.make(arena, io, top, "oom-group", set);
+    var buf: [64]u8 = undefined;
+    // Best effort in `Job.make`, but every kernel the tests run on (4.19 and later) has the flag.
+    const steps = job.steps_dir orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("1\n", try readIn(io, steps, "memory.oom.group", &buf));
+    const services = job.services_dir orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("0\n", try readIn(io, services, "memory.oom.group", &buf));
+    // Only the job's own limits, which both children count towards.
+    const held = admission.readCgroupBytes(io, job.dir, "memory.max");
+    try std.testing.expectEqual(@as(?u64, 1 << 30), held);
+    job.remove(arena, io);
+    for ([_][]const u8{ steps, services, job.dir }) |gone|
+        try std.testing.expectError(error.FileNotFound, readIn(io, gone, "cgroup.procs", &buf));
 }
 
 test "native cgroup: a job between steps has nothing in its cgroup, and still counts" {

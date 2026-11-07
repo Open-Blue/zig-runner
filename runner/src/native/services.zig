@@ -268,7 +268,7 @@ fn startOne(
         .mount_points = Backend.mount_points,
         // P4: the service's helper and everything it starts are in the job's cgroup, held to
         // the job's limits and measured with it.
-        .cgroup = if (b.job_cgroup) |j| j.dir else null,
+        .cgroup = if (b.job_cgroup) |j| j.servicesDir() else null,
         .service = .{ .status = dirs.status, .health = check, .ports = ports.items },
     };
     try b.service_set.list.append(arena, s);
@@ -369,7 +369,7 @@ fn startRelay(b: *Backend, x: *Exec, ls: u32) !bool {
         .netns = b.netns,
         // The job's nobody: an id of its range, nothing on the host.
         .id = if (b.how.userns == .mapped) b.idBase() + nobody else null,
-        .cgroup = if (b.job_cgroup) |j| j.dir else null,
+        .cgroup = if (b.job_cgroup) |j| j.servicesDir() else null,
         .ports = maps.items,
     }, &why) catch {
         x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to publish the services' " ++
