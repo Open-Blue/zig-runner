@@ -553,13 +553,37 @@ fn probe(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !?[]const u8
     }
     var out: Captured = .{ .arena = arena };
     const ended = try b.exec("true", &.{"PATH=/usr/bin:/bin"}, &.{}, 0, 0, out.output());
-    if (ended.failure.len > 0 or ended.code != 0) return try std.fmt.allocPrint(
-        arena,
-        "this machine cannot make a native step's sandbox ({s}, exit {d})",
-        .{ ended.failure, ended.code },
-    );
+    if (ended.failure.len > 0 or ended.code != 0) {
+        const root = std.os.linux.geteuid() == 0;
+        const hint = try usernsHint(arena, restrictSysctl(io), root, cfg.self_exe);
+        return try std.fmt.allocPrint(
+            arena,
+            "this machine cannot make a native step's sandbox ({s}, exit {d}){s}",
+            .{ ended.failure, ended.code, hint },
+        );
+    }
     return null;
 }
+
+/// The profile that lets this runner make user namespaces where Ubuntu restricts them
+/// (`deploy/apparmor/`), named in the refusal when the restriction is what stops the sandbox: a
+/// bare errno does not say so. "" for a root runner or a machine without the restriction.
+/// `sysctl` is `restrict_userns_path`'s text.
+fn usernsHint(arena: Allocator, sysctl: []const u8, root: bool, exe: []const u8) ![]const u8 {
+    if (root or !std.mem.startsWith(u8, sysctl, "1")) return "";
+    return try std.fmt.allocPrint(arena, "; Ubuntu restricts user namespaces " ++
+        "(kernel.apparmor_restrict_unprivileged_userns=1) and this runner may have no AppArmor " ++
+        "profile allowing them: as root, install deploy/apparmor/usr.local.bin.zig-runner into " ++
+        "/etc/apparmor.d/ (edited if the runner is not at its path, {s}) and load it with " ++
+        "`apparmor_parser -r`, or run the runner as root", .{exe});
+}
+
+fn restrictSysctl(io: std.Io) []const u8 {
+    var buf: [8]u8 = undefined;
+    return std.Io.Dir.cwd().readFile(io, restrict_userns_path, &buf) catch "0";
+}
+
+const restrict_userns_path = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
 
 /// The NAT rules for the host's uplinks and the jobs' nameservers (`dns`) now, remembered so a
 /// job finds out cheaply whether either changed since (a laptop moving from cable to Wi-Fi,
@@ -679,13 +703,7 @@ pub fn launch(arena: Allocator, io: std.Io, cfg: Config) !Launch {
 
 fn usernsHere(io: std.Io) sandbox.Userns {
     if (std.os.linux.geteuid() == 0) return .mapped;
-    var buf: [8]u8 = undefined;
-    const restricted = std.Io.Dir.cwd().readFile(
-        io,
-        "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
-        &buf,
-    ) catch "0";
-    return if (std.mem.startsWith(u8, restricted, "1")) .inherited else .self;
+    return if (std.mem.startsWith(u8, restrictSysctl(io), "1")) .inherited else .self;
 }
 
 /// A job's directory in the store, locked, and on a root runner its slot and network. Stale
@@ -7408,4 +7426,20 @@ test "native hashFiles: a change only in a step's env, or in the file that gives
     try expectSucceeded(back);
     try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "w"));
     try expectLines(back.text, &.{try std.fmt.allocPrint(arena, "read={s}.", .{&one})});
+}
+
+test "a refused sandbox names the AppArmor profile when Ubuntu's restriction is on" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const exe = "/usr/local/bin/zig-runner";
+    const hint = try usernsHint(arena, "1\n", false, exe);
+    try std.testing.expect(std.mem.indexOf(u8, hint, "apparmor_restrict_unprivileged_userns") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hint, "deploy/apparmor/usr.local.bin.zig-runner") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hint, "apparmor_parser -r") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hint, exe) != null);
+    // Not the cause: sysctl off, unreadable (not Ubuntu), or a root runner, which needs no profile.
+    try std.testing.expectEqualStrings("", try usernsHint(arena, "0\n", false, exe));
+    try std.testing.expectEqualStrings("", try usernsHint(arena, "", false, exe));
+    try std.testing.expectEqualStrings("", try usernsHint(arena, "1\n", true, exe));
 }

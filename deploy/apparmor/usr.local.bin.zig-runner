@@ -1,0 +1,34 @@
+# AppArmor profile that lets the runner make user namespaces on Ubuntu 23.10 and later.
+#
+# Those releases (24.04 by default, `kernel.apparmor_restrict_unprivileged_userns=1`) let an
+# unprivileged process make a user namespace only when an AppArmor profile with a `userns` rule
+# confines it. The rootless native backend needs one (docs/native-backend.md, "Rootless"); this is
+# Ubuntu's documented narrow fix, a profile for the one binary instead of lifting the sysctl for
+# the whole machine (https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces).
+# It is optional: a runner as root, or on a host without the restriction, does not need it.
+#
+# What it grants: `userns`, so /usr/local/bin/zig-runner, and the helpers it starts from that same
+# path (`--exec-job` and the sandbox helper are the one binary), may create user namespaces.
+# What it does not: `flags=(unconfined)` means no other rule applies, so the runner is confined no
+# more and no less than without a profile. It does not grant capabilities, mount or network
+# access beyond what the runner already has, and it covers no other binary: a profile attaches by
+# path, so a runner installed elsewhere needs the path below changed, and a copy of the runner
+# under another name gets nothing.
+#
+# Install (as root, by the operator; the runner never does this), after
+# `sudo install -m 0755 runner /usr/local/bin/zig-runner`:
+#
+#   sudo install -m 0644 deploy/apparmor/usr.local.bin.zig-runner /etc/apparmor.d/
+#   sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.zig-runner
+#
+# Check without root and without loading: `apparmor_parser -QK <this file>` (parse only).
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile zig-runner /usr/local/bin/zig-runner flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/usr.local.bin.zig-runner>
+}
