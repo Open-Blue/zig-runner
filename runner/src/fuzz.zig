@@ -35,7 +35,7 @@ const JobLog = @import("dagger/JobLog.zig");
 const scripts = @import("dagger/scripts.zig");
 const engine = @import("engine.zig");
 const job_mod = @import("job.zig");
-const loop = @import("loop.zig");
+const exchange = @import("loop/exchange.zig");
 const loop_job = @import("loop/job.zig");
 const runservice = @import("github/runservice.zig");
 
@@ -1217,7 +1217,7 @@ const job_base =
 ;
 
 /// The messages the broker and the run service send, as the runner reads them: a poll's message
-/// (`loop.jsonString`), the job request in its body (`runservice.parseJobRequest`), the job
+/// (`exchange.jsonString`), the job request in its body (`runservice.parseJobRequest`), the job
 /// (`job.parse`), a cancellation's timeout (`timeSpanMs`), and the engine's log records
 /// (`engine.eachLogRecord`). Each returns, an answer or an error, within a heap of a fixed size
 /// (no panic, and memory in proportion to the message); and a field the runner does not know is
@@ -1235,8 +1235,8 @@ fn jobMessages(_: void, smith: *Smith) !void {
     var fba: std.heap.FixedBufferAllocator = .init(&capped_heap);
     const ar = fba.allocator();
 
-    if (try loop.jsonString(ar, msg, "messageType")) |t| _ = t;
-    if (try loop.jsonString(ar, msg, "body")) |body| {
+    if (try exchange.jsonString(ar, msg, "messageType")) |t| _ = t;
+    if (try exchange.jsonString(ar, msg, "body")) |body| {
         _ = runservice.parseJobRequest(ar, body) catch |e| if (e == error.OutOfMemory) return e;
     }
     _ = runservice.parseJobRequest(ar, msg) catch |e| if (e == error.OutOfMemory) return e;

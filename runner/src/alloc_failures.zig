@@ -16,7 +16,7 @@ const std = @import("std");
 const expr = @import("expr.zig");
 const glob = @import("glob.zig");
 const hpack = @import("hpack.zig");
-const loop = @import("loop.zig");
+const exchange = @import("loop/exchange.zig");
 const regex = @import("regex.zig");
 const runservice = @import("github/runservice.zig");
 const yaml = @import("yaml.zig");
@@ -437,9 +437,9 @@ test "allocation failures: the broker's messages" {
             var arena: Scratch = .init(a);
             defer arena.deinit();
             const ar = arena.allocator();
-            const mtype = (try loop.jsonString(ar, message, "messageType")) orelse return error.TestUnexpectedResult;
+            const mtype = (try exchange.jsonString(ar, message, "messageType")) orelse return error.TestUnexpectedResult;
             try std.testing.expectEqualStrings("RunnerJobRequest", mtype);
-            const body = (try loop.jsonString(ar, message, "body")) orelse return error.TestUnexpectedResult;
+            const body = (try exchange.jsonString(ar, message, "body")) orelse return error.TestUnexpectedResult;
             const req = try runservice.parseJobRequest(ar, body);
             try std.testing.expectEqualStrings("https://run.test/", req.run_service_url);
         }

@@ -77,6 +77,7 @@ comptime {
     _ = @import("hpack.zig");
     _ = @import("loop.zig");
     _ = @import("loop/job.zig");
+    _ = @import("loop/exchange.zig");
     _ = @import("loop/upload.zig");
     _ = @import("timefmt.zig");
     _ = @import("expr.zig");
