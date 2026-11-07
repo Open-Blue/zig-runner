@@ -312,15 +312,11 @@ fn jobDefaults(arena: Allocator, root: Value) Allocator.Error!JobDefaults {
     var out: JobDefaults = .{};
     for (list.array.items) |token| {
         if (tokenType(token) != Token.mapping) return unreadable;
-        const map = token.object.get("map") orelse continue;
-        if (map != .array) return unreadable;
-        for (map.array.items) |pair| {
-            if (pair != .object) return unreadable;
-            const key = literal(pair.object.get("Key") orelse return unreadable) orelse
-                return unreadable;
-            if (!std.ascii.eqlIgnoreCase(key, "run")) continue;
-            const value = pair.object.get("Value") orelse return unreadable;
-            const settings = mappingInputs(arena, value) catch |e| switch (e) {
+        const pairs = mappingPairs(token) catch return unreadable;
+        for (pairs) |entry| {
+            const pair = pairOf(entry) catch return unreadable;
+            if (!std.ascii.eqlIgnoreCase(pair.key, "run")) continue;
+            const settings = mappingInputs(arena, pair.value) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Unsupported => return unreadable,
             };
@@ -813,34 +809,40 @@ fn githubContext(arena: Allocator, root: Value) Allocator.Error!Github {
 
 /// A mapping token as inputs: keys must be literal; values are literals or expressions.
 fn mappingInputs(arena: Allocator, v: Value) error{ OutOfMemory, Unsupported }![]const Input {
-    if (tokenType(v) != Token.mapping) return error.Unsupported;
     var out: std.ArrayList(Input) = .empty;
-    const map = v.object.get("map") orelse return out.items;
-    if (map != .array) return error.Unsupported;
-    for (map.array.items) |pair| {
-        if (pair != .object) return error.Unsupported;
-        const k = literal(pair.object.get("Key") orelse return error.Unsupported) orelse
-            return error.Unsupported;
-        const val = tokenTemplate(pair.object.get("Value") orelse return error.Unsupported) orelse
-            return error.Unsupported;
-        try out.append(arena, .{ .name = k, .value = val });
+    for (try mappingPairs(v)) |entry| {
+        const pair = try pairOf(entry);
+        const val = tokenTemplate(pair.value) orelse return error.Unsupported;
+        try out.append(arena, .{ .name = pair.key, .value = val });
     }
     return out.items;
+}
+
+/// A mapping token's `{Key, Value}` entries (none when it has no `map`).
+fn mappingPairs(v: Value) error{Unsupported}![]const Value {
+    if (tokenType(v) != Token.mapping) return error.Unsupported;
+    const map = v.object.get("map") orelse return &.{};
+    if (map != .array) return error.Unsupported;
+    return map.array.items;
+}
+
+/// One entry of `mappingPairs`; the key must be a literal.
+fn pairOf(entry: Value) error{Unsupported}!struct { key: []const u8, value: Value } {
+    if (entry != .object) return error.Unsupported;
+    return .{
+        .key = literal(entry.object.get("Key") orelse return error.Unsupported) orelse
+            return error.Unsupported,
+        .value = entry.object.get("Value") orelse return error.Unsupported,
+    };
 }
 
 /// `jobServiceContainers`: a mapping of name to a mapping (`image`, `env`, `ports`, `options`,
 /// `credentials`, `volumes`), or to just the image.
 fn parseServices(arena: Allocator, v: Value) error{ OutOfMemory, Unsupported }![]const Service {
-    if (tokenType(v) != Token.mapping) return error.Unsupported;
     var out: std.ArrayList(Service) = .empty;
-    const map = v.object.get("map") orelse return out.items;
-    if (map != .array) return error.Unsupported;
-    for (map.array.items) |pair| {
-        if (pair != .object) return error.Unsupported;
-        const name = literal(pair.object.get("Key") orelse return error.Unsupported) orelse
-            return error.Unsupported;
-        try out.append(arena, try parseService(arena, name, pair.object.get("Value") orelse
-            return error.Unsupported));
+    for (try mappingPairs(v)) |entry| {
+        const pair = try pairOf(entry);
+        try out.append(arena, try parseService(arena, pair.key, pair.value));
     }
     return out.items;
 }
@@ -852,15 +854,14 @@ fn parseService(
     body: Value,
 ) error{ OutOfMemory, Unsupported }!Service {
     if (tokenTemplate(body)) |image| return .{ .name = name, .image = image };
-    if (tokenType(body) != Token.mapping) return error.Unsupported;
     var svc: Service = .{ .name = name, .image = .{ .lit = "" } };
-    const fields = body.object.get("map") orelse return error.Unsupported;
-    if (fields != .array) return error.Unsupported;
-    for (fields.array.items) |f| {
-        if (f != .object) return error.Unsupported;
-        const key = literal(f.object.get("Key") orelse return error.Unsupported) orelse
-            return error.Unsupported;
-        const val = f.object.get("Value") orelse return error.Unsupported;
+    // Unlike the mapping of services, one service with no `map` is not an empty set of fields.
+    if (tokenType(body) != Token.mapping or body.object.get("map") == null)
+        return error.Unsupported;
+    for (try mappingPairs(body)) |entry| {
+        const field = try pairOf(entry);
+        const key = field.key;
+        const val = field.value;
         if (std.mem.eql(u8, key, "image")) {
             svc.image = tokenTemplate(val) orelse return error.Unsupported;
         } else if (std.mem.eql(u8, key, "env")) {
