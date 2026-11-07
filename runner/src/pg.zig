@@ -556,11 +556,6 @@ pub const Client = struct {
         ) catch c.error_buf[0..0];
     }
 
-    /// A readable form of the last server error ("ERROR 42P01: relation ... does not exist").
-    pub fn lastErrorText(c: *const Client) []const u8 {
-        return c.last_error;
-    }
-
     fn startup(c: *Client, cfg: Config) !void {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
@@ -944,7 +939,7 @@ test "integration: connect, query, error recovery, COPY (needs a database)" {
 
     // A failing statement reports the server's message and leaves the connection usable.
     try std.testing.expectError(error.ServerError, c.exec("select * from zig_pg_no_such_table"));
-    try std.testing.expect(std.mem.indexOf(u8, c.lastErrorText(), "zig_pg_no_such_table") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.last_error, "zig_pg_no_such_table") != null);
     try std.testing.expectEqualStrings("2", (try c.query(arena, "select 2"))[0][0].?);
 
     // Quoting round-trips hostile strings, and COPY stores what was sent.

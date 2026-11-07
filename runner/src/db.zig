@@ -144,6 +144,47 @@ pub fn setSchema(gpa: Allocator, c: *pg.Client, schema: []const u8) !void {
     try c.exec(aw.written());
 }
 
+/// What a connection to the database remembers of its failures, for `Store` and `PgSink`: the most
+/// recent one, for the job's end to report, and when to dial again. The caller locks, as each
+/// has its own rules for which mutex guards which.
+pub const Outage = struct {
+    /// Not dialled again before this, so a database that is down costs one attempt every two
+    /// seconds instead of one per row.
+    retry_after_ms: i64 = 0,
+    last_error: [256]u8 = undefined,
+    last_error_len: usize = 0,
+
+    pub const retry_ms = 2000;
+
+    pub fn remember(o: *Outage, what: []const u8, detail: []const u8) void {
+        const t = std.fmt.bufPrint(&o.last_error, "{s}: {s}", .{ what, detail }) catch
+            o.last_error[0..0];
+        o.last_error_len = t.len;
+    }
+
+    pub fn lastError(o: *const Outage) []const u8 {
+        return o.last_error[0..o.last_error_len];
+    }
+
+    /// Waits `retry_ms` from now, not from when the failed attempt began: one that took its whole
+    /// time (a database that accepts and never answers) was followed at once by the next (#100).
+    pub fn backOff(o: *Outage, io: Io) void {
+        o.retry_after_ms = Io.Clock.real.now(io).toMilliseconds() + retry_ms;
+    }
+
+    pub fn backingOff(o: *const Outage, io: Io) bool {
+        return Io.Clock.real.now(io).toMilliseconds() < o.retry_after_ms;
+    }
+};
+
+/// Waits for `flag` to be set by a task that is stopping, at most `max_ms`, for a `close` that
+/// gives the task time to write what is left.
+pub fn waitFor(io: Io, flag: *const std.atomic.Value(bool), max_ms: u32) void {
+    var waited: u32 = 0;
+    while (!flag.load(.acquire) and waited < max_ms) : (waited += 50)
+        io.sleep(.fromMilliseconds(50), .awake) catch return;
+}
+
 pub const Store = struct {
     gpa: Allocator,
     io: Io,
@@ -154,14 +195,11 @@ pub const Store = struct {
     client: ?*pg.Client = null,
     /// One connection, shared by the process's runners: one query at a time.
     mu: Io.Mutex = .init,
-    /// Not dialled again before this, so a database that is down costs one attempt every two
-    /// seconds instead of one per row. `PgSink` backs off the same way, for the same reason.
-    retry_after_ms: i64 = 0,
-    /// The most recent failure, for `Reporter` to report when the job ends. Under `error_mu`, not
-    /// `mu`: the writer holds `mu` through a connect or a statement, and the job's end waited
-    /// behind one that the database never answered, before completejob (#100).
-    last_error: [256]u8 = undefined,
-    last_error_len: usize = 0,
+    /// The back-off (under `mu`) and the most recent failure, for `Reporter` to report when the job
+    /// ends. The failure is under `error_mu`, not `mu`: the writer holds `mu` through a connect or
+    /// a statement, and the job's end waited behind one that the database never answered, before
+    /// completejob (#100).
+    outage: Outage = .{},
     error_mu: Io.Mutex = .init,
     /// Writes that failed, for the life of the process. `Reporter` reports those made while its
     /// job ran: with a writer, a row's failure comes after the call that queued it has returned.
@@ -188,8 +226,6 @@ pub const Store = struct {
     /// What `close` gives the writer to write what is left before cutting it short.
     close_wait_ms: u32 = 5000,
 
-    const retry_ms = 2000;
-
     /// Describes the connection without making it. The first write dials, and a write that finds
     /// the connection gone dials again, so a database that is down or restarted costs run-state
     /// rows and nothing else: it never fails a job (SPEC §5.2) and never stops the runner starting.
@@ -208,9 +244,7 @@ pub const Store = struct {
     pub fn close(s: *Store) void {
         s.stop.store(true, .release);
         if (s.writer) |*f| {
-            var waited: u32 = 0;
-            while (!s.writer_stopped.load(.acquire) and waited < s.close_wait_ms) : (waited += 50)
-                s.io.sleep(.fromMilliseconds(50), .awake) catch break;
+            waitFor(s.io, &s.writer_stopped, s.close_wait_ms);
             s.abandon.store(true, .release);
             f.cancel(s.io);
             s.writer = null;
@@ -272,15 +306,13 @@ pub const Store = struct {
     pub fn lastError(s: *Store, arena: Allocator) []const u8 {
         s.error_mu.lockUncancelable(s.io);
         defer s.error_mu.unlock(s.io);
-        return arena.dupe(u8, s.last_error[0..s.last_error_len]) catch "";
+        return arena.dupe(u8, s.outage.lastError()) catch "";
     }
 
     fn remember(s: *Store, what: []const u8, detail: []const u8) void {
         s.error_mu.lockUncancelable(s.io);
         defer s.error_mu.unlock(s.io);
-        const t = std.fmt.bufPrint(&s.last_error, "{s}: {s}", .{ what, detail }) catch
-            s.last_error[0..0];
-        s.last_error_len = t.len;
+        s.outage.remember(what, detail);
     }
 
     fn dial(s: *Store) !void {
@@ -293,12 +325,10 @@ pub const Store = struct {
     /// The connection, dialled if there is none. Called with `mu` held.
     fn ensure(s: *Store) pg.Error!*pg.Client {
         if (s.client) |c| return c;
-        const t = Io.Clock.real.now(s.io).toMilliseconds();
-        if (t < s.retry_after_ms) return error.ConnectionClosed;
+        if (s.outage.backingOff(s.io)) return error.ConnectionClosed;
         s.dial() catch |e| {
-            // From when the attempt ended: one that took its whole time (a database that accepts
-            // and never answers) was followed at once by the next, and `mu` was hardly ever free.
-            s.retry_after_ms = Io.Clock.real.now(s.io).toMilliseconds() + retry_ms;
+            // Without the wait, `mu` was hardly ever free: the next attempt followed at once.
+            s.outage.backOff(s.io);
             s.remember("connect failed", @errorName(e));
             return error.ConnectionClosed;
         };
@@ -343,7 +373,7 @@ pub const Store = struct {
             _ = s.failed.fetchAdd(1, .monotonic);
             s.remember(
                 "write failed",
-                if (c.lastErrorText().len > 0) c.lastErrorText() else @errorName(e),
+                if (c.last_error.len > 0) c.last_error else @errorName(e),
             );
             // A connection the server has dropped is let go, so the next row dials again instead
             // of failing for the life of the process. A `ServerError` is the statement's problem,
@@ -388,9 +418,9 @@ test "a store whose database is down describes itself, writes nothing, and never
 
     // The second write inside the backoff window does not dial again — a job of forty steps must
     // not cost forty connection attempts to a database that is down.
-    const first_deadline = store.retry_after_ms;
+    const first_deadline = store.outage.retry_after_ms;
     try std.testing.expectError(error.ConnectionClosed, store.upsertStep(.{ .job_id = 1, .number = 1, .name = "s", .status = "in_progress" }));
-    try std.testing.expectEqual(first_deadline, store.retry_after_ms);
+    try std.testing.expectEqual(first_deadline, store.outage.retry_after_ms);
 }
 
 test "upsert statements quote values, keep created_at, and use NULL for absent fields" {
@@ -540,8 +570,8 @@ test "a database that accepts and never answers holds up neither the job's end n
     try std.testing.expectEqualStrings("connect failed: Timeout", last);
     // The next dial waits `retry_ms` from when this one ended, not from when it began.
     store.mu.lockUncancelable(io);
-    const retry_after = store.retry_after_ms;
+    const retry_after = store.outage.retry_after_ms;
     store.mu.unlock(io);
-    try std.testing.expect(retry_after >= started + connect_ms + Store.retry_ms);
+    try std.testing.expect(retry_after >= started + connect_ms + Outage.retry_ms);
     try queued.await(io);
 }
