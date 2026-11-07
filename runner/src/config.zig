@@ -524,6 +524,7 @@ pub const Config = struct {
         else if (eq(key, "log-flush-ms")) c.log_flush_ms = try num(u32, val) //
         else if (eq(key, "js-runtime")) c.js_runtime = try jsRuntime(val) //
         else if (eq(key, "engine")) c.engine = try engineMode(val) //
+        else if (eq(key, "engine-container")) c.engine_container = val //
         else if (eq(key, "engine-host")) c.engine_host = val //
         else if (eq(key, "engine-silence-timeout")) c.engine_silence_timeout_secs = try secs(val) //
         else if (eq(key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
@@ -754,6 +755,8 @@ test "RUNNER_ENGINE, RUNNER_ENGINE_CONTAINER and DOCKER_HOST" {
     try std.testing.expectEqual(EngineMode.cli, c.engine);
     try std.testing.expectEqualStrings("/run/user/1000/docker.sock", c.docker_socket);
     try std.testing.expectEqualStrings("dagger-engine-custom", c.engine_container);
+    const flagged = try Config.load(&env, &.{ "runner", "--engine-container=from-flag" });
+    try std.testing.expectEqualStrings("from-flag", flagged.engine_container);
     try std.testing.expectError(error.InvalidEngine, Config.load(&env, &.{ "runner", "--engine=go" }));
     try env.put("RUNNER_ENGINE_HOST", "tcp://dagger-engine:1234");
     try std.testing.expectEqualStrings("tcp://dagger-engine:1234", (try Config.load(&env, &.{"runner"})).engineEndpoint().?.host);
@@ -813,7 +816,7 @@ test "JavaScript actions run on Bun unless Node is asked for" {
     try std.testing.expectError(error.InvalidJsRuntime, Config.load(&env, &.{"runner"}));
 }
 
-test "the output-keys limit: milliseconds, and 0 turns it off" {
+test "enforce_volatile: on by default, the variable turns it off, the flag overrides" {
     var env: std.process.Environ.Map = .init(std.testing.allocator);
     defer env.deinit();
     try env.put("GH_TOKEN", "t");
@@ -822,6 +825,13 @@ test "the output-keys limit: milliseconds, and 0 turns it off" {
     try env.put("RUNNER_ENFORCE_VOLATILE", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).enforce_volatile);
     try std.testing.expect((try Config.load(&env, &.{ "runner", "--enforce-volatile=true" })).enforce_volatile);
+}
+
+test "the output-keys limit: milliseconds, and 0 turns it off" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
     try std.testing.expectEqual(@as(u32, 10_000), (try Config.load(&env, &.{"runner"})).output_keys_max_ms);
     try env.put("RUNNER_OUTPUT_KEYS_MAX_MS", "0");
     try std.testing.expectEqual(@as(u32, 0), (try Config.load(&env, &.{"runner"})).output_keys_max_ms);
