@@ -68,6 +68,7 @@ temp: []const u8 = "",
 
 // --- expression evaluation ---
 
+/// One entry of the `steps` context: a finished step's outcome, conclusion and outputs, by its id.
 pub const StepCtx = struct {
     id: []const u8,
     outcome: []const u8,
@@ -75,6 +76,7 @@ pub const StepCtx = struct {
     outputs: []const job_mod.EnvVar,
 };
 
+/// An evaluator for `job`, its contexts as the job sent them.
 pub fn init(arena: Allocator, job: *const job_mod.Job) !Evaluator {
     var ev: Evaluator = .{
         .arena = arena,
@@ -127,6 +129,7 @@ pub fn init(arena: Allocator, job: *const job_mod.Job) !Evaluator {
     return ev;
 }
 
+/// Sets `name` in `list`, replacing a value already there.
 pub fn putEnv(
     arena: Allocator,
     list: *std.ArrayList(job_mod.EnvVar),
@@ -242,6 +245,7 @@ pub fn scope(ev: *Evaluator, step_env: []const job_mod.EnvVar) !expr.Scope {
     };
 }
 
+/// A template's text: a literal as it is, an expression evaluated in `sc`.
 pub fn render(ev: *Evaluator, t: job_mod.Template, sc: expr.Scope) ![]const u8 {
     return switch (t) {
         .lit => |l| l,
@@ -249,6 +253,7 @@ pub fn render(ev: *Evaluator, t: job_mod.Template, sc: expr.Scope) ![]const u8 {
     };
 }
 
+/// The environment (or `with:` inputs) a step is given, each value rendered in `sc`.
 pub fn renderEnv(
     ev: *Evaluator,
     inputs: []const job_mod.Input,
@@ -308,6 +313,8 @@ fn stableId(arena: Allocator, dagger_id: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "{x}", .{&digest});
 }
 
+/// Adds a finished step to the `steps` context. A failure the step continued past concludes as a
+/// success, as in GitHub.
 pub fn record(
     ev: *Evaluator,
     step: job_mod.Step,
@@ -330,7 +337,6 @@ pub fn record(
     });
 }
 
-/// A string from the `github` context ("" when absent).
 /// A `github` context value as GitHub's runner puts it in the environment: strings as they
 /// are, numbers and booleans as text; null when the context has no such key.
 fn githubText(ev: *const Evaluator, key: []const u8) !?[]const u8 {
@@ -343,6 +349,7 @@ fn githubText(ev: *const Evaluator, key: []const u8) !?[]const u8 {
     return null;
 }
 
+/// A string from the `github` context ("" when absent).
 pub fn githubString(ev: *const Evaluator, key: []const u8) []const u8 {
     if (ev.github != .object) return "";
     for (ev.github.object) |e|

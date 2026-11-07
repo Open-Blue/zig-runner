@@ -26,6 +26,7 @@ const Allocator = std.mem.Allocator;
 /// Argument text written as it is, for the values that are not JSON: GraphQL enum literals.
 pub const Raw = struct { text: []const u8 };
 
+/// A GraphQL document under construction; see the file's example.
 pub const Query = struct {
     out: std.Io.Writer.Allocating,
     /// Braces opened and not yet closed; `finish` closes them all.

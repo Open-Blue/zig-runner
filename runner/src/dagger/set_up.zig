@@ -83,7 +83,7 @@ pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteracti
     " >/dev/null && rm -rf /var/lib/apt/lists/*";
 
 /// Every installed package and version, hashed: the pre-warm's line names the provisioned seed by it.
-pub const package_fingerprint_script =
+const package_fingerprint_script =
     "dpkg-query -W -f '${Package}=${Version}\\n' | sha256sum | cut -c1-12";
 
 const chown_runner = " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " " ++ work_root;
@@ -431,6 +431,8 @@ pub const tool_trees_env = "ZIG_RUNNER_TOOL_TREES";
 const tool_cache_index = for (package_cache_dirs, 0..) |d, i| {
     if (std.mem.eql(u8, d.name, "toolcache")) break i;
 } else unreachable;
+/// Where the tool cache volume (`toolcache` in `package_cache_dirs`) is mounted in the job's
+/// container.
 pub const tool_cache_dir = package_cache_dirs[tool_cache_index].path;
 /// The check runs with the image's bash and none of the job's environment (a workflow's
 /// `BASH_ENV` or `PATH` must not run in it).
@@ -1439,6 +1441,7 @@ pub const package_cache_dirs = [_]struct {
     },
     .{ .name = "go-telemetry", .path = "/root/.config/go/telemetry", .tools = &go_tools },
 };
+/// The name of the `package_cache_dirs` entry that holds Zig's package cache.
 pub const zig_packages = "zig-packages";
 const node_tools = [_][]const u8{ "npm", "npx", "node", "nodejs" };
 const go_tools = [_][]const u8{ "go", "golang", "gofmt" };
@@ -1674,14 +1677,14 @@ pub fn usesZig(job: job_mod.Job) bool {
 /// cache volumes, evaluated (`sync`); what its image resolves to; and the Zig seed when a Zig job
 /// would get one (one per verified seed); and the provisioned packages' fingerprint, on top of
 /// the base, when provisioned.
-pub const WarmDocuments = struct {
+const WarmDocuments = struct {
     base: []const u8,
     image_ref: []const u8,
     seeds: []const []const u8,
     packages: ?[]const u8,
 };
 
-pub fn warmDocuments(arena: Allocator, opts: Options) !WarmDocuments {
+fn warmDocuments(arena: Allocator, opts: Options) !WarmDocuments {
     const image = resolveImage(opts.image);
     const provision = opts.provision and std.mem.eql(u8, image, default_image);
     const as_runner = provision and opts.step_user == .runner;

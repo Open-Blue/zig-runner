@@ -26,18 +26,19 @@ const Allocator = std.mem.Allocator;
 
 // --- checkout resolution ---
 
+/// Whether `s` is a full 40-digit hexadecimal commit id.
 pub fn isSha(s: []const u8) bool {
     if (s.len != 40) return false;
     for (s) |c| if (!std.ascii.isHex(c)) return false;
     return true;
 }
 
-/// The query that resolves a checkout to a Directory id, or null with a reason. `auth`: a Dagger
-/// secret holding the job's GITHUB_TOKEN, sent as GitHub expects a token over HTTPS (user
-/// `x-access-token`), so private repositories can be checked out, as actions/checkout does. The
-/// time checked-out files get: 2000-01-01 00:00 UTC (see `query`).
+/// The time checked-out files get: 2000-01-01 00:00 UTC (see `query`).
 pub const mtime: i64 = 946684800;
 
+/// The query that resolves a checkout to a Directory id, or null with a reason. `auth`: a Dagger
+/// secret holding the job's GITHUB_TOKEN, sent as GitHub expects a token over HTTPS (user
+/// `x-access-token`), so private repositories can be checked out, as actions/checkout does.
 pub fn query(
     arena: Allocator,
     job: job_mod.Job,
@@ -237,6 +238,8 @@ pub fn refCommands(arena: Allocator, mount: []const u8, ref: []const u8) ![]cons
     return aw.written();
 }
 
+/// Whether git's message reads like a refused or missing credential, which the checkout then
+/// explains.
 pub fn looksLikeAuthFailure(text: []const u8) bool {
     const needles = [_][]const u8{
         "not found",
