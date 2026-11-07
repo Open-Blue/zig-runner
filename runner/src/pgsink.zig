@@ -57,12 +57,10 @@ pub const PgSink = struct {
     rows: std.ArrayList(Row) = .empty,
     next_seq: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     last_flush_ms: i64 = 0,
-    retry_after_ms: i64 = 0,
     written: u64 = 0,
     dropped: u64 = 0,
-    /// Most recent failure, for reporting once the job is done.
-    last_error: [256]u8 = undefined,
-    last_error_len: usize = 0,
+    /// The most recent failure, for reporting once the job is done, and the back-off after one.
+    outage: db.Outage = .{},
 
     stop: std.atomic.Value(bool) = .init(false),
     flusher: ?Io.Future(void) = null,
@@ -80,9 +78,6 @@ pub const PgSink = struct {
     flusher_stopped: std.atomic.Value(bool) = .init(false),
     /// What `close` gives the flusher to write what is left before cutting it short.
     close_wait_ms: u32 = 5000,
-
-    /// How long a failed write keeps the next one from dialling again.
-    const retry_ms = 2000;
 
     pub fn append(
         s: *PgSink,
@@ -156,9 +151,7 @@ pub const PgSink = struct {
         if (s.flusher) |*f| {
             // The flusher writes what is left as it stops. A database that does not answer gets
             // `close_wait_ms`; then the write is cancelled, and what it held is dropped below.
-            var waited: u32 = 0;
-            while (!s.flusher_stopped.load(.acquire) and waited < s.close_wait_ms) : (waited += 50)
-                s.io.sleep(.fromMilliseconds(50), .awake) catch break;
+            db.waitFor(s.io, &s.flusher_stopped, s.close_wait_ms);
             f.cancel(s.io);
         }
         s.flusher = null;
@@ -217,7 +210,7 @@ pub const PgSink = struct {
         {
             s.mu.lockUncancelable(s.io);
             defer s.mu.unlock(s.io);
-            if (s.rows.items.len == 0 or now(s.io) < s.retry_after_ms) return;
+            if (s.rows.items.len == 0 or s.outage.backingOff(s.io)) return;
             batch = s.rows;
             s.rows = .empty;
         }
@@ -250,17 +243,11 @@ pub const PgSink = struct {
     }
 
     pub fn errorText(s: *const PgSink) []const u8 {
-        return s.last_error[0..s.last_error_len];
+        return s.outage.lastError();
     }
 
     fn now(io: Io) i64 {
         return Io.Clock.real.now(io).toMilliseconds();
-    }
-
-    fn remember(s: *PgSink, what: []const u8, detail: []const u8) void {
-        const t = std.fmt.bufPrint(&s.last_error, "{s}: {s}", .{ what, detail }) catch
-            s.last_error[0..0];
-        s.last_error_len = t.len;
     }
 
     /// After a write failed: says why, lets the connection go (the next write dials again) and
@@ -268,11 +255,11 @@ pub const PgSink = struct {
     /// otherwise be followed at once by the next (#100). Called with `mu` held, by the only writer
     /// there is.
     fn writeFailed(s: *PgSink, e: anyerror) void {
-        const detail = if (s.client) |c| c.lastErrorText() else "";
-        s.remember("log write failed", if (detail.len > 0) detail else @errorName(e));
+        const detail = if (s.client) |c| c.last_error else "";
+        s.outage.remember("log write failed", if (detail.len > 0) detail else @errorName(e));
         if (s.client) |c| c.close();
         s.client = null;
-        s.retry_after_ms = now(s.io) + retry_ms;
+        s.outage.backOff(s.io);
     }
 
     /// Writes the buffered rows; on failure keeps them and backs off. Called with `mu` held, and
@@ -280,7 +267,7 @@ pub const PgSink = struct {
     fn flushLocked(s: *PgSink) void {
         if (s.rows.items.len == 0) return;
         const t = now(s.io);
-        if (t < s.retry_after_ms) return;
+        if (s.outage.backingOff(s.io)) return;
         const n = s.writeRows(s.rows.items) catch |e| {
             s.writeFailed(e);
             return;
@@ -423,7 +410,7 @@ test "integration: a database outage never fails the caller; lines are kept and 
     try std.testing.expectEqual(@as(u64, 0), try countLogs(&sc));
 
     pgs.cfg = sc.cfg; // the database is back
-    pgs.retry_after_ms = 0;
+    pgs.outage.retry_after_ms = 0;
     try pgs.append(8, 0, .stdout, "line after recovery");
     try pgs.flush();
     try std.testing.expectEqual(@as(u64, 2), try countLogs(&sc));

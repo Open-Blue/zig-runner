@@ -1,0 +1,3 @@
+kind: Changed
+body: The database store and the log sink share one record of their last failure and back-off, and one close-wait, instead of two copies.
+time: 2026-11-07T12:32:38.838793161-05:00
