@@ -106,7 +106,10 @@ pub const Decoder = struct {
         d.size += size;
     }
 
-    /// Drops the oldest entries until `extra` more bytes fit.
+    /// Drops the oldest entries until `extra` more bytes fit. `orderedRemove(0)` shifts the rest
+    /// down, which a ring buffer would avoid, but the table is capped at 4096 bytes and an entry
+    /// costs at least 32, so there are at most 128 entries: each eviction moves under 4 KiB, next
+    /// to the decoding of a block, and a ring would make every index lookup do modular arithmetic.
     fn evict(d: *Decoder, extra: usize) void {
         while (d.entries.items.len > 0 and d.size + extra > d.max_size) {
             const e = d.entries.orderedRemove(0);
