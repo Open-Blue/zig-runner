@@ -32,6 +32,16 @@
 //! job is known (`Gate.assigned`), the job reserves what jobs of its name were seen to take
 //! (`Learned`), measured from the engine's working set while they ran (`Admission.sample`).
 //!
+//! On a native pool the order is the other way round (#361). A native job is bounded by its own
+//! cgroup and its parent's `memory.max`, and nothing of it runs until the runner has set it up, so
+//! the room for it can be looked for after GitHub has handed it out and named it. A runner polling
+//! reserves `native_per_job_mb`, not the heaviest job there was: with one `zig build test` learned
+//! at 2.6 GB, six pollers reserved 15.8 GB on razorbill and held every small job behind a heavy
+//! one that was not there. The job, once named, waits for room for its own estimate (`Gate.start`)
+//! with the job's hold renewed, one job at a time under the lock so that a burst of heavy ones is
+//! let through only as far as there is room. Nothing of this on the engine, where a job starts
+//! the moment it is handed out and the poll is the only gate.
+//!
 //! A native job (`Gate.native`, docs/native-backend.md P4) is measured in a cgroup of its own, and
 //! learned in a table of its own (`Admission.learned_native`): the engine's reading of a job is the
 //! job plus whatever the engine grew by for it, so the two are not the same quantity, and a job
@@ -63,8 +73,9 @@ pub const Limits = struct {
     /// `per_job_mb` (`Engine`).
     min_engine_headroom_mb: u32 = 256,
     /// `per_job_mb` for native jobs (`RUNNER_NATIVE_MEM_PER_JOB_MB`): what one whose name has not
-    /// run natively yet reserves, and what a runner of a native pool reserves while it polls (or
-    /// the most any native job took, if that is more). A native job is measured in its own cgroup
+    /// run natively yet reserves while it sets up (more where jobs cannot swap, below), and what a
+    /// runner of a native pool reserves while it polls: the job it is handed is checked again once
+    /// it is named, against its own estimate (`Gate.start`). A native job is measured in its own cgroup
     /// with nothing of the engine's in it. Where jobs can swap it is slowed at its `memory.high`
     /// (`nativeHighMb`) if it outgrows what it reserved; where they cannot, the default, one not
     /// learned yet reserves the most any native job took (`Gate.noHigh`). Either way this need not
@@ -129,9 +140,12 @@ pub const Admission = struct {
     epoch: std.atomic.Value(u32) = .init(0),
     /// Runners let through to poll for a job: each may be handed one at any moment.
     polling: u32 = 0,
-    /// The pool runs steps natively (`RUNNER_BACKEND=native`): a runner polling reserves a native
-    /// job's worst case, and a job, once named, what it took natively.
+    /// The pool runs steps natively (`RUNNER_BACKEND=native`): a runner polling reserves
+    /// `native_per_job_mb`, and a job, once named, waits for room for what it took natively.
     native: bool = false,
+    /// Counts the jobs that came to wait (`Slot.wait_seq`): the oldest is let through when
+    /// nothing else runs, however little room there is.
+    waits: u64 = 0,
     /// Each runner's job, one entry per runner (`Gate.slot`): a runner runs one job at a time.
     slots: []Slot,
     /// What jobs took, by name: on the engine, and natively. In memory only: a restart forgets
@@ -172,6 +186,12 @@ pub const Admission = struct {
         /// cgroup goes.
         high_mb: ?u32 = null,
         over_high: bool = false,
+        /// The job is handed out and named but does not run yet: on a native pool it waits for
+        /// room (`Gate.start`), holding the job GitHub gave it. Counts in the reservations of
+        /// runners polling, at its estimate; not in those of the jobs waiting beside it, which
+        /// would hold each other for ever; the order they came in is `wait_seq`.
+        waiting: bool = false,
+        wait_seq: u64 = 0,
 
         fn cgroup(s: *const Slot) ?[]const u8 {
             return if (s.cgroup_len > 0) s.cgroup_buf[0..s.cgroup_len] else null;
@@ -203,9 +223,62 @@ pub const Admission = struct {
         _ = a.epoch.fetchAdd(1, .release);
     }
 
-    /// What a job whose name is not known yet reserves: the worst case of the pool's backend.
+    /// What the gate reads now: the machine's and the engine's memory, pressure and swap growth.
+    /// With the lock held.
+    fn signals(a: *Admission, now_ms: i64) Signals {
+        if (a.engine.dir == null) a.engine.find(a.io, a.paths, now_ms);
+        const reading = read(a.io, a.paths, a.engine.dir);
+        // Its files are gone: the engine's container was recreated, under a new cgroup. The jobs
+        // running are not measured further: the new engine's working set is not theirs.
+        if (a.engine.dir != null and reading.engine == null) {
+            a.engine.lost();
+            for (a.slots) |*s| if (!s.native) {
+                s.base_mb = null;
+            };
+        }
+        const swap_rate = if (reading.swap_used_mb) |u| a.swap.update(u, now_ms) else null;
+        const engine_swap_rate = if (reading.engine_swap_mb) |u|
+            a.engine.swap.update(u, now_ms)
+        else
+            null;
+        return .{
+            .available_mb = reading.available_mb,
+            .pressure = reading.pressure,
+            .swap_growth_mb = swap_rate,
+            .engine = reading.engine,
+            .engine_swap_growth_mb = engine_swap_rate,
+        };
+    }
+
+    /// The waiting job `s` runs from `now_ms`: its estimate is reserved for the ramp from here,
+    /// not from when it was handed out.
+    fn admit(s: *Slot, now_ms: i64) void {
+        s.waiting = false;
+        s.started_ms = now_ms;
+    }
+
+    /// Whether the job in `slot` is the one waiting longest and no other job runs: the one that
+    /// may start whatever the room (`Gate.start`). A job handed out and not named yet counts as
+    /// running, for it may be a job that fits, or end at once.
+    fn firstAlone(a: *const Admission, slot: usize) bool {
+        const mine = a.slots[slot].wait_seq;
+        for (a.slots, 0..) |s, i| {
+            if (i == slot) continue;
+            if (s.waiting) {
+                if (s.wait_seq < mine) return false;
+            } else if (s.running()) return false;
+        }
+        return true;
+    }
+
+    /// What a runner polling, or a job handed out and not named yet, reserves. On the engine,
+    /// the worst case: it cannot be told apart from the job it may be handed, which is then
+    /// started at once. On a native pool, `native_per_job_mb`: a job there is checked again once
+    /// it is named, and waits for room for its own estimate (`Gate.start`), so reserving the
+    /// heaviest job for every runner that polls only held small jobs behind a heavy one that was
+    /// not there (#361).
     fn unknown(a: *const Admission) u32 {
-        return a.worstCase(a.native);
+        return if (a.native) a.limits.native_per_job_mb else a.worstCase(false);
     }
 
     /// A job's worst case on the engine, or natively: the configured `per_job_mb` (or
@@ -228,20 +301,25 @@ pub const Admission = struct {
         return a.learned_native.estimate(k) orelse a.limits.native_per_job_mb;
     }
 
-    /// What may start without showing in the machine's or the engine's memory yet: a worst case
-    /// for each of `polling` runners that may be handed a job, and each job started less than
-    /// `ramp_ms` ago with its own estimate. A job without one reserves the pool's worst case while
-    /// its name is not known, and its own backend's once it is.
-    fn reserved(a: *const Admission, now_ms: i64, polling: u32) Reservation {
+    /// What may start without showing in the machine's or the engine's memory yet: what a runner
+    /// polling reserves (`unknown`) for each of `polling` that may be handed a job, and each job
+    /// started less than `ramp_ms` ago with its own estimate. A job without one reserves what
+    /// a runner polling does while its name is not known, and its own backend's worst case once
+    /// it is. A job waiting for room (`Slot.waiting`) reserves its estimate for as long as it
+    /// waits, unless `waiters` is false: the jobs waiting do not count each other.
+    fn reserved(a: *const Admission, now_ms: i64, polling: u32, waiters: bool) Reservation {
         const unknown_mb = a.unknown();
         var r: Reservation = .{ .jobs = polling };
         r.mb = @as(u64, r.jobs) * unknown_mb;
-        for (a.slots) |s| if (s.started_ms > now_ms - ramp_ms) {
+        for (a.slots) |s| {
+            if (s.waiting) {
+                if (!waiters) continue;
+            } else if (s.started_ms <= now_ms - ramp_ms) continue;
             const mb: u64 = s.est_mb orelse if (s.key == null) unknown_mb else a.worstCase(s.native);
             r.jobs += 1;
             r.mb += mb;
-            if (s.native) r.native_mb += mb;
-        };
+            if (s.native or s.waiting) r.native_mb += mb;
+        }
         return r;
     }
 
@@ -316,7 +394,7 @@ pub const Admission = struct {
         if (working_mb +| high_grow_margin_mb < high) return;
         const available = read(a.io, a.paths, null).available_mb orelse return;
         const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
-        const others = a.reserved(now_ms, 0).mb;
+        const others = a.reserved(now_ms, 0, true).mb;
         if (available < @as(u64, a.limits.min_available_mb) + others + high_step_mb) return;
         const next = high +| high_step_mb;
         var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -390,36 +468,74 @@ pub const Gate = struct {
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
         const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
-        if (a.engine.dir == null) a.engine.find(a.io, a.paths, now_ms);
-        const sample = read(a.io, a.paths, a.engine.dir);
-        // Its files are gone: the engine's container was recreated, under a new cgroup. The jobs
-        // running are not measured further: the new engine's working set is not theirs.
-        if (a.engine.dir != null and sample.engine == null) {
-            a.engine.lost();
-            for (a.slots) |*s| if (!s.native) {
-                s.base_mb = null;
-            };
-        }
-        const swap_rate = if (sample.swap_used_mb) |u| a.swap.update(u, now_ms) else null;
-        const engine_swap_rate = if (sample.engine_swap_mb) |u|
-            a.engine.swap.update(u, now_ms)
-        else
-            null;
+        const signal = a.signals(now_ms);
         // A runner asks beside every runner polling; the warm asks for itself alone.
         const asking = if (g.warm) 1 else a.polling + @intFromBool(!g.claimed);
-        const hold = decide(a.limits, .{
-            .available_mb = sample.available_mb,
-            .pressure = sample.pressure,
-            .swap_growth_mb = swap_rate,
-            .engine = sample.engine,
-            .engine_swap_growth_mb = engine_swap_rate,
-        }, a.reserved(now_ms, asking), g.holding);
+        const hold = decide(a.limits, signal, a.reserved(now_ms, asking, true), g.holding);
         g.holding = hold != null;
         if (g.warm) return hold;
         if (hold == null and !g.claimed) a.polling += 1;
         if (hold != null and g.claimed) a.polling -= 1;
         g.claimed = hold == null;
         return hold;
+    }
+
+    /// How a job named on a native pool fares at the gate (`Gate.start`).
+    pub const Start = union(enum) {
+        /// It may run: it reserves its estimate from now, for `ramp_ms` or until it ends.
+        started,
+        /// No room, and the job waits.
+        wait: Hold,
+        /// No room either, but nothing else runs, so none will come of waiting: the machine is
+        /// as free as it gets. It runs, under its cgroup's `memory.max`, and the reason it would
+        /// have waited is told.
+        forced: Hold,
+    };
+
+    /// Whether the runner's job, handed out and named (`assigned`), runs now. A runner cannot
+    /// know its job before GitHub hands it one, so a native pool's pollers reserve little
+    /// (`Admission.unknown`) and the room is looked for here, for this job's estimate: what
+    /// jobs of its name took, or the worst case for a name not seen. Decided under the lock, so
+    /// that jobs named in the same moment pass one at a time, each counting the ones before it:
+    /// a burst of heavy jobs gets as far as there is room for, and the rest wait, holding the
+    /// jobs GitHub gave them (`Renewer`). Waiting jobs do not reserve against each other, which
+    /// would hold them all for ever. When none else runs, the one that came first is let through
+    /// however little room there is: the machine cannot get freer, and a job over `memory.max`
+    /// is the kernel's to end. Always `started` for a job that does not wait: on the engine, or
+    /// the pre-warm.
+    pub fn start(g: *Gate) Start {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const s = &a.slots[g.slot];
+        if (!s.waiting) return .started;
+        const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
+        const signal = a.signals(now_ms);
+        const est: u64 = s.est_mb orelse a.unknown();
+        var r = a.reserved(now_ms, a.polling, false);
+        r.jobs += 1;
+        r.mb += est;
+        r.native_mb += est;
+        const hold = decide(a.limits, signal, r, g.holding);
+        g.holding = hold != null;
+        const h = hold orelse {
+            Admission.admit(s, now_ms);
+            return .started;
+        };
+        if (!a.firstAlone(g.slot)) return .{ .wait = h };
+        Admission.admit(s, now_ms);
+        g.holding = false;
+        return .{ .forced = h };
+    }
+
+    /// The job runs whatever the room: GitHub cancelled it while it waited, and what is left to
+    /// run is the steps that survive a cancel.
+    pub fn startNow(g: *Gate) void {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const s = &a.slots[g.slot];
+        if (s.waiting) Admission.admit(s, std.Io.Clock.awake.now(a.io).toMilliseconds());
     }
 
     /// The runner stops polling; `took_job` when because it was handed a job, whose memory is then
@@ -442,8 +558,9 @@ pub const Gate = struct {
     /// The runner's job is known as `key` (`jobKey`): it reserves what jobs of that name took, or
     /// the worst case for a name not seen yet, and is measured from here (`Admission.sample`). On
     /// a native pool it reserves what it took natively, or else on the engine (it went there
-    /// last time, and likely will again), or else `native_per_job_mb`, until it is known to run
-    /// natively (`native`) or on the engine (`backToEngine`).
+    /// last time, and likely will again), or else the native worst case, until it is known to run
+    /// natively (`native`) or on the engine (`backToEngine`). It waits for room to start
+    /// (`start`) from here; on the engine it does not wait.
     pub fn assigned(g: *Gate, key: u64) void {
         const a = g.pool;
         a.mu.lockUncancelable(a.io);
@@ -454,11 +571,17 @@ pub const Gate = struct {
         s.key = key;
         // The pre-warm is the engine's whatever the pool's backend.
         if (a.native and !g.warm) {
-            const floor = a.limits.native_per_job_mb;
-            s.est_mb = if (floor == 0)
+            // Unlearned, the worst case, as `noHigh` has it where jobs cannot swap: until it is
+            // native, and its estimate is what it is.
+            s.est_mb = if (a.limits.native_per_job_mb == 0)
                 0
             else
-                a.learned_native.estimate(key) orelse a.learned.estimate(key) orelse floor;
+                a.learned_native.estimate(key) orelse a.learned.estimate(key) orelse
+                    a.worstCase(true);
+            // It waits for room (`start`) before anything of it runs.
+            s.waiting = true;
+            a.waits += 1;
+            s.wait_seq = a.waits;
         } else if (a.limits.per_job_mb > 0) s.est_mb = a.learned.estimate(key);
         // Measured on the engine until it goes native, so a job a native pool sends to Dagger is
         // learned there. Without the engine's cgroup (another OS, `RUNNER_ENGINE_CGROUP=none`)
@@ -483,6 +606,7 @@ pub const Gate = struct {
         defer a.changed();
         const s = &a.slots[g.slot];
         if (!s.running()) return null;
+        s.waiting = false;
         if (!s.native) {
             _ = a.shareEngine(g.slot, false);
             s.overlaps = 0;
@@ -509,7 +633,8 @@ pub const Gate = struct {
     /// to its estimate, a job not learned yet may be as heavy as any before it, so it reserves
     /// that while it ramps up, no more than it may take: `native_per_job_mb` would let in a burst
     /// of new heavy names at 256 MB each. It holds the jobs after it for `ramp_ms` at the most,
-    /// and no job before it: what runners reserve to start is `worstCase` as it was.
+    /// and no job before it. The same worst case is what a job not learned yet asks for to start
+    /// (`assigned`, `start`), so a burst of new names is let through one at a time.
     pub fn noHigh(g: *Gate, limit_mb: ?u64) void {
         const a = g.pool;
         a.mu.lockUncancelable(a.io);
@@ -535,6 +660,7 @@ pub const Gate = struct {
         defer a.changed();
         const s = &a.slots[g.slot];
         if (!s.running()) return;
+        s.waiting = false;
         if (s.native) s.overlaps = a.shareEngine(g.slot, true);
         s.native = false;
         s.cgroup_len = 0;
@@ -1754,10 +1880,10 @@ test "a job heavier than configured raises what an unknown job reserves" {
     gates[1].assigned(jobKey("o/r", workflow, "lint"));
     try std.testing.expectEqual(@as(?u32, null), slots[1].est_mb);
     const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
-    try std.testing.expectEqual(Reservation{ .jobs = 2, .mb = 3200 }, pool.reserved(now_ms, pool.polling + 1));
+    try std.testing.expectEqual(Reservation{ .jobs = 2, .mb = 3200 }, pool.reserved(now_ms, pool.polling + 1, true));
     // `per_job_mb` off reserves nothing, whatever was learned.
     pool.limits.per_job_mb = 0;
-    try std.testing.expectEqual(@as(u64, 0), pool.reserved(now_ms, pool.polling + 1).mb);
+    try std.testing.expectEqual(@as(u64, 0), pool.reserved(now_ms, pool.polling + 1, true).mb);
 }
 
 test "a name reserves the most it took in its last five runs; a full table forgets the oldest" {
@@ -1856,7 +1982,7 @@ test "a native job is measured in its own cgroup, alone, and not against the eng
     // the unknown Dagger job (1024 MB) and its headroom (256 MB) fit, the native one's 256 MB
     // (`native_per_job_mb`) beside.
     const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
-    const r = pool.reserved(now_ms, 0);
+    const r = pool.reserved(now_ms, 0, true);
     try std.testing.expectEqual(@as(u64, 1024 + 256), r.mb);
     try std.testing.expectEqual(@as(u64, 256), r.native_mb);
     try std.testing.expect(decide(.{}, .{ .engine = .{ .cap_mb = 4096, .used_mb = 2800 } }, r, false) == null);
@@ -1919,7 +2045,7 @@ test "a native job not learned yet reserves native_per_job_mb, and a native pool
     const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
     try std.testing.expectEqual(
         Reservation{ .jobs = 6, .mb = 6 * 256, .native_mb = 256 },
-        pool.reserved(now_ms, pool.polling),
+        pool.reserved(now_ms, pool.polling, true),
     );
     _ = gates[0].ended();
 
@@ -1930,7 +2056,143 @@ test "a native job not learned yet reserves native_per_job_mb, and a native pool
     gates[0].assigned(jobKey("o/r", "o/r/.github/workflows/e2e.yml", "e2e (1)"));
     try std.testing.expectEqual(@as(?u32, 0), slots[0].est_mb);
     try std.testing.expectEqual(@as(?u32, null), gates[0].native(null));
-    try std.testing.expectEqual(@as(u64, 0), pool.reserved(now_ms, 0).mb);
+    try std.testing.expectEqual(@as(u64, 0), pool.reserved(now_ms, 0, true).mb);
+}
+
+/// A native pool of `slots.len` runners and `available_mb` of memory (floor 1536 MB), with one
+/// heavy name (2600 MB, razorbill's `zig build test`) and one light (200 MB) learned.
+fn burstPool(tmp: std.Io.Dir, sub_path: []const u8, slots: []Admission.Slot, available_mb: u64) !Admission {
+    var text: [64]u8 = undefined;
+    try tmp.writeFile(std.testing.io, .{
+        .sub_path = "meminfo",
+        .data = try std.fmt.bufPrint(&text, "MemAvailable: {d} kB\n", .{available_mb * 1024}),
+    });
+    const Paths_ = struct {
+        var buf: [256]u8 = undefined;
+    };
+    const meminfo = try std.fmt.bufPrint(&Paths_.buf, ".zig-cache/tmp/{s}/meminfo", .{sub_path});
+    var pool: Admission = .init(std.testing.io, .{}, slots);
+    pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
+    pool.native = true;
+    _ = pool.learned_native.record(burst_heavy, 2600, true);
+    _ = pool.learned_native.record(burst_light, 200, true);
+    return pool;
+}
+
+const burst_heavy = jobKey("o/r", "o/r/.github/workflows/ci.yml", "test (zig)");
+const burst_light = jobKey("o/r", "o/r/.github/workflows/ci.yml", "lint");
+const StartTag = std.meta.Tag(Gate.Start);
+
+test "a native pool's runners reserve native_per_job_mb while they poll, however heavy a job was learned (#361)" {
+    var slots: [6]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 5400);
+    const now_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    // razorbill: six pollers beside a learned 2.6 GB job reserved 15.8 GB, now 1.5 GB.
+    try std.testing.expectEqual(Reservation{ .jobs = 6, .mb = 6 * 256 }, pool.reserved(now_ms, 6, true));
+    var gates: [6]Gate = undefined;
+    for (&gates, 0..) |*g, i| {
+        g.* = .{ .pool = &pool, .slot = i };
+        try std.testing.expect(g.check() == null);
+    }
+    // The engine's pool keeps its worst case: a job there starts the moment it is handed out.
+    var dagger_pool: Admission = .init(std.testing.io, .{}, &slots);
+    _ = dagger_pool.learned.record(burst_heavy, 1600, true);
+    try std.testing.expectEqual(@as(u32, 1600), dagger_pool.unknown());
+}
+
+test "heavy jobs handed out together start as far as there is room, and the rest wait (#361)" {
+    var slots: [7]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Room for two heavy jobs above the floor: 7400 - 1536 = 5864 of 2 x 2600 = 5200.
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 7400);
+    var gates: [7]Gate = undefined;
+    for (&gates, 0..) |*g, i| {
+        g.* = .{ .pool = &pool, .slot = i };
+        try std.testing.expect(g.check() == null);
+    }
+    // Six heavy jobs in the same moment, each named: they used to start, all six, because the
+    // gate looked only when the runner polled.
+    for (gates[0..6]) |*g| {
+        g.leave(true);
+        g.assigned(burst_heavy);
+    }
+    var started: usize = 0;
+    for (gates[0..6]) |*g| {
+        if (g.start() == .started) started += 1;
+        const now_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+        // Whatever has started, the floor holds: nothing runs that would take the machine under it.
+        try std.testing.expect(1536 + pool.reserved(now_ms, 0, false).mb <= 7400);
+    }
+    try std.testing.expectEqual(@as(usize, 2), started);
+    try std.testing.expect(!slots[0].waiting and !slots[1].waiting and slots[2].waiting);
+    // A light job named meanwhile passes beside them (the heavy jobs waiting do not hold it):
+    // 1536 + 5200 + 200 fit.
+    gates[6].leave(true);
+    gates[6].assigned(burst_light);
+    try std.testing.expectEqual(@as(StartTag, .started), std.meta.activeTag(gates[6].start()));
+    // The waiting jobs reserve for runners polling, not against each other.
+    const now_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    try std.testing.expectEqual(@as(u64, 2 * 2600 + 200 + 4 * 2600), pool.reserved(now_ms, 0, true).mb);
+    // One heavy job ends, and the next in line starts; the others still wait.
+    const epoch = pool.changes();
+    _ = gates[0].ended();
+    try std.testing.expect(pool.changes() != epoch);
+    try std.testing.expectEqual(@as(StartTag, .started), std.meta.activeTag(gates[2].start()));
+    try std.testing.expectEqual(@as(StartTag, .wait), std.meta.activeTag(gates[3].start()));
+    try std.testing.expectEqual(@as(StartTag, .wait), std.meta.activeTag(gates[4].start()));
+    // Cancelled while it waits, a job runs what survives a cancel, and is then reserved.
+    gates[3].startNow();
+    try std.testing.expect(!slots[3].waiting);
+}
+
+test "every runner holding a job that has no room starts them one at a time, oldest first (#361)" {
+    var slots: [3]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Under the floor: nothing fits, and nothing is running to free anything.
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 1000);
+    var gates: [3]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    // Handed out in the order 1, 2, 0.
+    for ([_]usize{ 1, 2, 0 }) |i| {
+        gates[i].leave(true);
+        gates[i].assigned(burst_heavy);
+    }
+    // None runs: the oldest starts, with what it would have waited for told.
+    try std.testing.expectEqual(@as(StartTag, .wait), std.meta.activeTag(gates[2].start()));
+    try std.testing.expectEqual(@as(StartTag, .wait), std.meta.activeTag(gates[0].start()));
+    try std.testing.expectEqual(@as(StartTag, .forced), std.meta.activeTag(gates[1].start()));
+    try std.testing.expect(gates[1].start() == .started);
+    // It runs, so the others wait for it, and are not all let through at once.
+    try std.testing.expectEqual(@as(StartTag, .wait), std.meta.activeTag(gates[2].start()));
+    try std.testing.expectEqual(@as(StartTag, .wait), std.meta.activeTag(gates[0].start()));
+    _ = gates[1].ended();
+    try std.testing.expectEqual(@as(StartTag, .wait), std.meta.activeTag(gates[0].start()));
+    try std.testing.expectEqual(@as(StartTag, .forced), std.meta.activeTag(gates[2].start()));
+    _ = gates[2].ended();
+    try std.testing.expectEqual(@as(StartTag, .forced), std.meta.activeTag(gates[0].start()));
+}
+
+test "on the engine a job is never held after it is named, and a native pool's job unlearned asks for the worst case (#361)" {
+    var slots: [2]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 1000);
+    var gates: [2]Gate = .{ .{ .pool = &pool, .slot = 0 }, .{ .pool = &pool, .slot = 1 } };
+    // A name not seen yet cannot be told from the heaviest, as `noHigh` has it where jobs
+    // cannot swap.
+    gates[0].leave(true);
+    gates[0].assigned(jobKey("o/r", "o/r/.github/workflows/ci.yml", "new"));
+    try std.testing.expectEqual(@as(?u32, 2600), slots[0].est_mb);
+    // The Dagger pool: no waiting, whatever the memory.
+    pool.native = false;
+    gates[1].leave(true);
+    gates[1].assigned(burst_heavy);
+    try std.testing.expect(!slots[1].waiting);
+    try std.testing.expect(gates[1].start() == .started);
 }
 
 test "a native job is learned from its own cgroup under its name, apart from the same name on the engine" {
@@ -1989,9 +2251,10 @@ test "a native job is learned from its own cgroup under its name, apart from the
     try std.testing.expectEqual(@as(?u32, 600), slots[0].est_mb);
     try std.testing.expectEqual(@as(?u32, 2 * 600 + high_headroom_mb), gate.native(job));
     _ = gate.ended();
-    // A native pool's poller reserves the most any native job took; the engine's own worst
-    // case is the engine's.
-    try std.testing.expectEqual(@as(u32, 600), pool.unknown());
+    // A native pool's poller reserves the native default however heavy a job was (#361), the
+    // job itself what it took; the engine's own worst case is the engine's.
+    try std.testing.expectEqual(@as(u32, 256), pool.unknown());
+    try std.testing.expectEqual(@as(u32, 600), pool.worstCase(true));
     try std.testing.expectEqual(@as(u32, 1600), pool.worstCase(false));
 }
 
@@ -2098,13 +2361,13 @@ test "a native job not learned yet, with no memory.high, reserves the most any n
     gate.noHigh(3400);
     try std.testing.expectEqual(@as(?u32, 3000), pool.slots[0].est_mb);
     const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
-    try std.testing.expectEqual(@as(u64, 3000), pool.reserved(now_ms, 0).mb);
+    try std.testing.expectEqual(@as(u64, 3000), pool.reserved(now_ms, 0, true).mb);
     // On a machine where a job may take less, it reserves no more than that.
     gate.noHigh(2000);
     try std.testing.expectEqual(@as(?u32, 2000), pool.slots[0].est_mb);
     // Once ramped up it reserves nothing: what it took shows in `MemAvailable`, and nothing after
     // it waits on this for good.
-    try std.testing.expectEqual(@as(u64, 0), pool.reserved(now_ms + ramp_ms + 1, 0).mb);
+    try std.testing.expectEqual(@as(u64, 0), pool.reserved(now_ms + ramp_ms + 1, 0, true).mb);
     pool.slots[0] = .{};
     // A name that has run keeps what it took.
     start.native(&gate, light);
@@ -2200,7 +2463,7 @@ test "without the engine's cgroup nothing is learned, and every job reserves per
     gate.assigned(jobKey("o/r", "o/r/.github/workflows/ci.yml", "build"));
     pool.samplePeaks();
     const now_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
-    try std.testing.expectEqual(Reservation{ .jobs = 2, .mb = 2048 }, pool.reserved(now_ms, pool.polling + 1));
+    try std.testing.expectEqual(Reservation{ .jobs = 2, .mb = 2048 }, pool.reserved(now_ms, pool.polling + 1, true));
     try std.testing.expectEqual(@as(?Learned.Change, null), gate.ended());
     try std.testing.expectEqual(@as(usize, 0), pool.learned.len);
 }
@@ -2235,7 +2498,7 @@ test "a pre-warm is let through on an idle machine whose pollers fill the gate, 
     gates[0].leave(true);
     try std.testing.expect(slots[16].overlapped() and slots[0].overlapped());
     const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
-    try std.testing.expectEqual(Reservation{ .jobs = 17, .mb = 17 * 1024 }, pool.reserved(now_ms, pool.polling));
+    try std.testing.expectEqual(Reservation{ .jobs = 17, .mb = 17 * 1024 }, pool.reserved(now_ms, pool.polling, true));
     // So a poller that asks again is held, the warm counted: 14 polling, itself, 2 running.
     gates[1].leave(false);
     try std.testing.expect(gates[1].check() != null);

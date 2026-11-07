@@ -874,13 +874,51 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   engine, whose reading is the job plus what the engine grew by for it. A job a native pool sends
   to Dagger, unsupported or after a native set-up (`Gate.backToEngine`), is measured on the engine
   from then and learned there. A native job not learned yet reserves `RUNNER_NATIVE_MEM_PER_JOB_MB`
-  (256 MB), and a native pool's runner polling reserves the most of that and any native job's
-  estimate, where both used `RUNNER_MEM_PER_JOB_MB`'s 1.5 GB, sized for `zig build test` on the
+  (256 MB), and a native pool's runner polling reserves the same 256 MB (since #361; it reserved
+  the most of that and any native job's estimate, so one `zig build test` learned at 2.6 GB made
+  six pollers reserve 15.8 GB and hold small jobs behind a heavy one that was not there), where both used `RUNNER_MEM_PER_JOB_MB`'s 1.5 GB, sized for `zig build test` on the
   engine: razorbill's six native bench runners held e2e jobs of a few MB for 87-150 s ("3 job(s)
   needing 4.5 GB would leave under 1536 MB" with 5533 MB available). A native job is always
   learned as alone, and a job on the engine is no longer taken as beside a native one: the overlap
   mark a native job sets as it starts is taken back once it is known to be native
   (`Admission.shareEngine`).
+- **A native job waits for room once it is named, not before it is handed out** (#361, after the
+  v0.26.0 measurement on razorbill: queue median 4.5 s, largest 12 s, 32 s in the first pass after
+  a learned build, `holding back` 69 times in 25 minutes; about 1 s before the gate). A runner
+  cannot know its job before it asks for one, and on the engine that decided everything: the job
+  started the moment it was handed out, so every runner polling had to have room for the heaviest.
+  A native job has a cgroup of its own under a parent with `memory.max` (#372), and nothing of it
+  runs before its set-up, so the gate can look after the acquire, when the name is known. A
+  polling runner reserves `RUNNER_NATIVE_MEM_PER_JOB_MB`; the named job (`Gate.assigned`) waits
+  in `Gate.start` for `MemAvailable` above the floor, less what the jobs started in the last two
+  minutes and the runners polling reserve, less its own estimate (what its name took natively,
+  or on the engine, or for a name not seen the most any native job took, which is what
+  `Gate.noHigh` reserves where jobs cannot swap). The decision and the job's reservation are one
+  step under the pool's lock, so jobs named in the same moment pass one at a time, each counting
+  the ones before it: of six `zig build test` jobs learned at 2.6 GB with 7.4 GB available, two
+  start (1.5 GB floor + 5.2 GB) and four wait. Jobs waiting do not count each other, which would
+  hold them all for ever; the runners polling do count them, so no new job is taken while a heavy
+  one waits unless there is room for both. A small job named meanwhile starts beside the waiting
+  heavy ones. The wait is in the job's own log ("Waiting for room in memory before starting")
+  and ends when a reservation drops (`Admission.changes`, within 50 ms) or at the next recheck.
+  - *No deadlock.* When every runner holds a job and none has room, nothing is running to free
+    any: the job that came first starts regardless (said in its log), the others wait for it, and
+    the next oldest follows as each ends. The machine cannot get freer, and a job over
+    `memory.max` is the kernel's to end, not the machine's. A job handed out and not named yet
+    counts as running, so the escape waits for the acquire to finish.
+  - *GitHub keeps the job.* The runner renews the job's lock every 60 s from the acquire
+    (`Renewer`), as GitHub's runner does from its first moment and for as long as the job runs
+    (`JobDispatcher.RenewJobRequestAsync`, 60 s). The lock lasts 10 minutes without a renewal. So
+    a wait holds the job for as long as it takes, and no timeout is added to it; a job that waits
+    for hours behind a hung one is ended by its own `timeout-minutes`, which GitHub enforces by
+    cancelling it.
+  - *A cancel ends the wait.* GitHub's cancel, the job's timeout or a 404 from the renewal sets
+    the same flag as during the steps; the job then starts (and is reserved) to run what survives
+    a cancel, `if: always()` steps and post scripts. A runner told to stop keeps waiting for
+    `StopDeadline` to cancel the job once its grace has passed.
+  - *The engine is unchanged.* A pool on Dagger, and the pre-warm, are never marked waiting; the
+    poll's worst case is theirs as before. A native pool's job that goes to the engine after its
+    set-up (`Gate.backToEngine`) was let in as a native job and is not checked again.
 - **`memory.high` per native job** (`Job.setHigh`, `admission.nativeHighMb`): twice the job's
   estimate (learned, or the native default) plus 512 MB, so 1 GB for a job not learned yet; "Set
   up job" says it, as the kernel holds it. Past it the kernel reclaims the job's page cache, then

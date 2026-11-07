@@ -309,6 +309,9 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     }
     // For the runner's own console and database only: the job's log starts as GitHub's does.
     try sayJob(c.log, c.arena, job, "job acquired: {d} steps", .{job.steps.len});
+    // Named, the job asks the gate for its own room: a native pool's runners reserved little to
+    // be handed it.
+    if (c.gate) |gate| try awaitRoom(c, gate, log, job, &cancel);
 
     const job_started_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
     var reporter = try startReporter(c, job, job_started_ms);
@@ -349,6 +352,67 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     if (try completeJobWithRetry(c, jr, job, conclusion, shown, result, log.currentSecrets())) |failed| return failed;
     try sayJob(log, c.arena, job, "job {s}", .{@tagName(conclusion)});
     return .{ .job = result.succeeded };
+}
+
+/// How often a job waiting for room looks for a cancel, or a reservation that dropped.
+const room_step_ms = 50;
+
+/// Holds the job, GitHub's and renewed (`Renewer`), until the memory gate has room for it
+/// (`admission.Gate.start`): on a native pool the gate is checked once the job is named, not when
+/// the runner polls. Looks again when a reservation drops (`Admission.changes`), and every
+/// `Admission.recheck` otherwise. GitHub cancelling the job ends the wait: what runs then is the
+/// steps that survive a cancel. A runner told to stop keeps waiting, for `StopDeadline` to cancel
+/// the job once its grace has passed. Said in the job's own log when it waits and when it stops.
+fn awaitRoom(
+    c: Runner,
+    gate: *admission.Gate,
+    log: *sink.LogSink,
+    job: job_mod.Job,
+    cancel: *dagger.Cancel,
+) !void {
+    var since_ms: ?i64 = null;
+    while (true) {
+        // Read before the look, so that a change between the look and the wait is not missed.
+        const seen = gate.pool.changes();
+        switch (gate.start()) {
+            .started => break,
+            .forced => |hold| {
+                try sayJob(log, c.arena, job, "Nothing else runs, so the job starts without " ++
+                    "the room it asked for: {f}", .{hold});
+                break;
+            },
+            .wait => |hold| {
+                if (since_ms == null) {
+                    since_ms = std.Io.Clock.awake.now(c.io).toMilliseconds();
+                    try sayJob(log, c.arena, job, "Waiting for room in memory before " ++
+                        "starting (the job is kept): {f}", .{hold});
+                    sayUnallocated(c, "job {d} waits for room in memory: {f}", .{
+                        job.check_run_id,
+                        hold,
+                    });
+                }
+                var left = gate.pool.recheck.toMilliseconds();
+                while (left > 0 and gate.pool.changes() == seen and
+                    !cancel.requested.load(.acquire)) : (left -= @min(left, room_step_ms))
+                {
+                    try c.io.sleep(.fromMilliseconds(@min(left, room_step_ms)), .awake);
+                }
+                if (cancel.requested.load(.acquire)) {
+                    gate.startNow();
+                    try sayJob(log, c.arena, job, "Cancelled while waiting for room in memory", .{});
+                    break;
+                }
+            },
+        }
+    }
+    if (since_ms) |t| {
+        const waited_ms = std.Io.Clock.awake.now(c.io).toMilliseconds() - t;
+        try sayJob(log, c.arena, job, "Waited {d}.{d} s for room in memory", .{
+            @divTrunc(waited_ms, 1000),
+            @divTrunc(@mod(waited_ms, 1000), 100),
+        });
+        sayUnallocated(c, "job {d} waited {d} ms for room in memory", .{ job.check_run_id, waited_ms });
+    }
 }
 
 /// A line in the job's log, under its "Set up job" step, as `std.fmt` writes it.
@@ -1414,6 +1478,96 @@ test "a second cancel from GitHub shortens the job's limit, and a later longer o
     // The smallest limit GitHub's runner keeps: 60 s, less its 15.
     try std.testing.expect(hard >= before + 45_000);
     try std.testing.expect(hard <= before + 55_000);
+}
+
+test "a job with no room waits kept, starts when a reservation drops, and a cancel ends the wait (#361)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    // 4.3 GB available: room for one 2.6 GB job above the 1.5 GB floor, not two.
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 4403200 kB\n" });
+    var slots: [3]admission.Admission.Slot = undefined;
+    // A job not seen yet asks for 2.6 GB, razorbill's `zig build test`.
+    var memory: admission.Admission = .init(io, .{ .native_per_job_mb = 2600 }, &slots);
+    memory.paths = .{
+        .meminfo = try std.fs.path.join(arena, &.{ dir, "meminfo" }),
+        .pressure = "/nonexistent",
+    };
+    memory.native = true;
+    // A minute: far beyond the test, so that only a change or a cancel can end the wait.
+    memory.recheck = .fromSeconds(60);
+    const heavy = admission.jobKey("o/r", "o/r/.github/workflows/w.yml", "zig");
+    var gates: [3]admission.Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &memory, .slot = i };
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var stdout_log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var log: sink.LogSink = .{ .collect = .{ .arena = arena, .io = io, .inner = &stdout_log } };
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+    const c = testRunner(arena, &stdout_log, &err, &cfg);
+    const job: job_mod.Job = .{
+        .plan_id = "p",
+        .job_id = "j",
+        .job_token = "t",
+        .check_run_id = 7,
+        .secrets = &.{},
+        .steps = &.{},
+    };
+
+    // One heavy job runs; two more are handed out and named.
+    for (&gates) |*g| {
+        g.leave(true);
+        g.assigned(heavy);
+    }
+    try std.testing.expect(gates[0].start() == .started);
+
+    const Wait = struct {
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(w: *@This(), cc: Runner, g: *admission.Gate, l: *sink.LogSink, j: job_mod.Job, cn: *dagger.Cancel) anyerror!void {
+            defer w.done.store(true, .release);
+            try awaitRoom(cc, g, l, j, cn);
+        }
+    };
+    var cancel_a: dagger.Cancel = .{};
+    var cancel_b: dagger.Cancel = .{};
+    var wait_a: Wait = .{};
+    var wait_b: Wait = .{};
+    var waiting_a = try io.concurrent(Wait.run, .{ &wait_a, c, &gates[1], &log, job, &cancel_a });
+    var waiting_b = try io.concurrent(Wait.run, .{ &wait_b, c, &gates[2], &log, job, &cancel_b });
+    io.sleep(.fromMilliseconds(300), .awake) catch {};
+    // No room: both wait, and neither has started.
+    try std.testing.expect(!wait_a.done.load(.acquire) and !wait_b.done.load(.acquire));
+    try std.testing.expect(slots[1].waiting and slots[2].waiting);
+
+    // The second is cancelled (GitHub's cancel, or the job's timeout): it stops waiting at once.
+    cancel_b.request(0);
+    io.sleep(.fromMilliseconds(300), .awake) catch {};
+    try std.testing.expect(wait_b.done.load(.acquire));
+    try std.testing.expect(!wait_a.done.load(.acquire));
+    try waiting_b.await(io);
+    try std.testing.expect(!slots[2].waiting);
+
+    // The first job running ends, and the cancelled one, which runs what survives a cancel,
+    // with it. The job still waiting looks again at once, not a minute later.
+    _ = gates[2].ended();
+    io.sleep(.fromMilliseconds(100), .awake) catch {};
+    try std.testing.expect(!wait_a.done.load(.acquire));
+    const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
+    _ = gates[0].ended();
+    io.sleep(.fromMilliseconds(300), .awake) catch {};
+    const started_in = std.Io.Clock.awake.now(io).toMilliseconds() - t0;
+    try std.testing.expect(wait_a.done.load(.acquire));
+    try std.testing.expect(started_in < 10 * std.time.ms_per_s);
+    try waiting_a.await(io);
+    try std.testing.expect(!slots[1].waiting);
 }
 
 test "a stop cancels a running job once its grace has passed, and not a job that ended first" {

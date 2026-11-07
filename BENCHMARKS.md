@@ -145,6 +145,17 @@ one, so every runner that asks must have room for the heaviest. Light jobs wait 
 in the 30 days before, all `zig build test`. The runner itself stayed between 24 and 38 MB over the
 hour-long soak, and flat after the first 20 minutes.
 
+**That holds for a pool on Dagger, where a job starts the moment it is handed out. A native pool
+no longer asks it** (#361). Its jobs have a cgroup each under a parent with `memory.max`, so the gate
+looks for room after the acquire, when the job's name is known: a runner polling reserves 256 MB, and
+a heavy job handed out with no room waits, kept, for room for its own estimate. On v0.26.0 the native
+bench pool on razorbill had a queue median of 4.5 s, a largest of 12 s and 32 s in the first pass
+after a learned build, with `holding back` logged 69 times in 25 minutes, against about 1 s before the
+gate: one `zig build test` learned at 2.6 GB made six pollers reserve 15.8 GB, so small jobs waited
+behind a heavy one that was not there. Not measured since: the numbers to take after the release that
+carries this are the queue median and largest, the `holding back` count, the lowest `MemAvailable`
+and any OOM kill in a burst of `zig build test` jobs.
+
 ## Against GitHub's hosted runner
 
 *2026-10-31, zig-runner at main (after v0.19.0).* The same job, this repository's CI test steps

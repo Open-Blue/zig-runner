@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A native pool no longer holds small jobs behind a heavy one that is not there (#361): a runner polling reserves RUNNER_NATIVE_MEM_PER_JOB_MB instead of the heaviest job learned, and a job waits for room for its own estimate once GitHub has handed it out and named it, kept by the renewed lock, one at a time under the gate so a burst of heavy jobs starts only as far as there is room.'
+time: 2026-11-07T01:33:51.878823677-05:00
