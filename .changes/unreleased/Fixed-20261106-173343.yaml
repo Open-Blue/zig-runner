@@ -1,0 +1,3 @@
+kind: Fixed
+body: Tool-tree checks are limited by what checks hold (128 MiB together), not by what hashFiles() calls hold too, so two or three large hashFiles() calls no longer leave every other job's trees out; the two still share one visible number (the earlier note's single limit was wrong). The eviction descents counter wraps instead of panicking a ReleaseSafe runner after 2^32 descents. A native checkout with submodules and tags is not replayed, as a submodule's tags can move
+time: 2026-11-06T17:33:43.961906817-05:00

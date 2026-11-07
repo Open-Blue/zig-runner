@@ -88,9 +88,10 @@ pub const Limits = struct {
     time_ms: i64 = 60_000,
     /// See the file's comment.
     racy_s: i64 = 2,
-    /// Bytes of memory that everything the process holds at once (`Budget.held`: the checks'
-    /// trees and `hashFiles()` calls) may come to when a tree is charged: a tree that would pass
-    /// it is given up on. Zig's tree takes about 7 MB.
+    /// Bytes of memory that all the checks of the process hold at once (`Budget.checks`, part of
+    /// `Budget.held` with the `hashFiles()` calls') may come to when a tree is charged: a tree
+    /// that would pass it is given up on. What the calls hold does not count, so a few large
+    /// `hashFiles()` cannot leave every check's trees out. Zig's tree takes about 7 MB.
     memory: u64 = 128 << 20,
     /// The process's memory number, shared with `hashFiles()`. A check only takes from it, never
     /// waits for it, and a call is never refused for what a check holds.
@@ -298,7 +299,8 @@ const Check = struct {
     /// `n` bytes of memory about to be allocated for the tree, against what all checks hold.
     fn charge(c: *Check, n: usize) error{Unreadable}!void {
         c.mine += n;
-        if (c.limits.budget.held.fetchAdd(n, .acq_rel) + n > c.limits.memory)
+        _ = c.limits.budget.held.fetchAdd(n, .acq_rel);
+        if (c.limits.budget.checks.fetchAdd(n, .acq_rel) + n > c.limits.memory)
             return c.giveUp("too much memory in use");
     }
 
@@ -472,6 +474,7 @@ const Check = struct {
             ta.deinit();
             c.in_tree = false;
             _ = c.limits.budget.held.fetchSub(c.mine, .acq_rel);
+            _ = c.limits.budget.checks.fetchSub(c.mine, .acq_rel);
             c.mine = 0;
         }
         const t = ta.allocator();
@@ -1380,15 +1383,25 @@ test "tool trees: checks together hold what the process allows and give it back"
     const f = try fixture(arena, &tmp);
     var budget: hash_files.Budget = .{};
     try std.testing.expectEqual(@as(u64, 0), budget.held.load(.acquire));
-    // Other checks, or a `hashFiles()` call, hold nearly all of it: this tree does not fit.
+    // Other checks hold nearly all of it: this tree does not fit.
     _ = budget.held.fetchAdd(1000, .acq_rel);
+    _ = budget.checks.fetchAdd(1000, .acq_rel);
     const v = try checkWith(arena, f, .{ .memory = 2000, .budget = &budget }, null);
     _ = budget.held.fetchSub(1000, .acq_rel);
+    _ = budget.checks.fetchSub(1000, .acq_rel);
     try expectIn(v.note, "too much memory in use");
     try std.testing.expectEqual(@as(u64, 0), budget.held.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), budget.checks.load(.acquire));
+    // `hashFiles()` calls hold far past the checks' limit: they take nothing from the checks.
+    _ = budget.held.fetchAdd(1 << 30, .acq_rel);
+    const calls = try checkWith(arena, f, .{ .budget = &budget }, null);
+    _ = budget.held.fetchSub(1 << 30, .acq_rel);
+    try expectIn(calls.env, tree_rel);
+    try std.testing.expect(std.mem.indexOf(u8, calls.note, "too much memory") == null);
     const fits = try checkWith(arena, f, .{ .budget = &budget }, null);
     try expectIn(fits.env, tree_rel);
     try std.testing.expectEqual(@as(u64, 0), budget.held.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), budget.checks.load(.acquire));
 }
 
 test "tool trees: lists are not written past what is read, and leftovers and empty directories go" {
