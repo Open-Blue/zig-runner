@@ -1434,7 +1434,7 @@ pub fn warmNative(
     b.cancel = opts.cancel;
     // A stop kills the sandbox that is building, as it does a step.
     var watch: Watch = .{ .io = io, .transport = b.transport(), .cancel = opts.cancel };
-    watch.begin(0, false);
+    watch.begin(0, 0, false);
     var watching = io.concurrent(Watch.run, .{&watch}) catch null;
     defer if (watching) |*f| {
         watch.done.store(true, .release);
