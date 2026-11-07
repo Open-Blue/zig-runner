@@ -915,7 +915,7 @@ const Renewer = struct {
             if (resp.status == .not_found) {
                 // Seen when a cancelled job's grace period ran out: GitHub closed the job itself.
                 r.say(arena, "GitHub no longer has the job (renewjob: HTTP 404); stopping it", .{});
-                r.cancel.request(std.Io.Clock.real.now(r.c.io).toMilliseconds());
+                r.cancel.requestBecause(std.Io.Clock.real.now(r.c.io).toMilliseconds(), .job_lost);
                 return;
             }
             if (resp.status.class() != .success) {
@@ -1009,16 +1009,26 @@ const CancelWatch = struct {
             if (!std.mem.eql(u8, id, w.job_id)) continue;
             const grace_ms = timeSpanMs((jsonString(cc.arena, inner, "timeout") catch null) orelse "") orelse
                 default_grace_ms;
-            w.cancel.request(std.Io.Clock.real.now(cc.io).toMilliseconds() + grace_ms);
+            const limit_ms = cancelLimitMs(grace_ms);
+            w.cancel.request(std.Io.Clock.real.now(cc.io).toMilliseconds() + limit_ms);
             const text = std.fmt.allocPrint(
                 cc.arena,
                 "job {d}: cancelled by GitHub; stopping the running step ({d} s for what still " ++
                     "runs)",
-                .{ w.log_job, @divTrunc(grace_ms, 1000) },
+                .{ w.log_job, @divTrunc(limit_ms, 1000) },
             ) catch return;
             w.c.log.say(text) catch {};
-            return;
+            // On, as GitHub's runner hears each one (`JobDispatcher.Cancel`). A second cancel can
+            // bring the limit forward, which `Cancel.request` keeps. It cannot put it back, which
+            // GitHub's `CancelAfter` would: the ladder's promise is that it never grows.
         }
+    }
+
+    /// What of GitHub's `timeout` this runner uses, as its `WorkerDispatcher.Cancel` does
+    /// (`JobDispatcher.cs`, 1280-1285): at least 60 s, so a small one still gets a full ladder,
+    /// less 15 s, in which the job's end reports before GitHub closes the job.
+    fn cancelLimitMs(grace_ms: i64) i64 {
+        return @max(grace_ms, 60 * std.time.ms_per_s) - 15 * std.time.ms_per_s;
     }
 
     /// GitHub's default `cancel-timeout-minutes`.
@@ -1050,7 +1060,10 @@ const StopDeadline = struct {
             s.c.io.sleep(.fromMilliseconds(200), .awake) catch return;
         }
         if (s.stop.load(.acquire)) return;
-        s.cancel.request(std.Io.Clock.real.now(s.c.io).toMilliseconds() + stop_cancel_ms);
+        s.cancel.requestBecause(
+            std.Io.Clock.real.now(s.c.io).toMilliseconds() + stop_cancel_ms,
+            .runner_stopping,
+        );
         sayUnallocated(
             s.c,
             "job {d}: the runner is stopping and the job did not finish within {d} s; " ++
@@ -1299,6 +1312,108 @@ test "a job's cancel watch stops at once when the job ends, mid-poll" {
     const took = std.Io.Clock.awake.now(io).toMilliseconds() - started;
     try std.testing.expect(took < 1000);
     try std.testing.expect(!cancel.requested.load(.acquire));
+}
+
+test "a second cancel from GitHub shortens the job's limit, and a later longer one does not" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const url = try std.fmt.allocPrint(
+        arena,
+        "http://127.0.0.1:{d}/message",
+        .{listener.socket.address.getPort()},
+    );
+
+    const Session = struct {
+        /// Answers one poll for each of `limits`, then leaves the next unanswered.
+        fn serve(l: *std.Io.net.Server, limits: []const []const u8) void {
+            for (limits) |limit| answer(l, limit) catch return;
+        }
+
+        fn answer(l: *std.Io.net.Server, limit: []const u8) !void {
+            const server_io = std.testing.io;
+            const conn = try l.accept(server_io);
+            defer conn.close(server_io);
+            var in_buf: [4096]u8 = undefined;
+            var reader = conn.reader(server_io, &in_buf);
+            while (true) {
+                const line = try reader.interface.takeDelimiterInclusive('\n');
+                if (line.len <= 2) break;
+            }
+            var body_buf: [256]u8 = undefined;
+            const body = try std.fmt.bufPrint(
+                &body_buf,
+                "{{\"messageType\":\"JobCancellation\",\"body\":" ++
+                    "\"{{\\\"jobId\\\":\\\"j\\\",\\\"timeout\\\":\\\"{s}\\\"}}\"}}",
+                .{limit},
+            );
+            var out_buf: [512]u8 = undefined;
+            var writer = conn.writer(server_io, &out_buf);
+            try writer.interface.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n" ++
+                "Connection: close\r\n\r\n{s}", .{ body.len, body });
+            try writer.interface.flush();
+        }
+    };
+    var server = try io.concurrent(Session.serve, .{
+        &listener,
+        &[_][]const u8{ "0.00:05:00", "0.00:00:30", "0.00:05:00" },
+    });
+    defer server.cancel(io);
+
+    var out_buf: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+    const c: Runner = .{
+        .arena = arena,
+        .gpa = std.testing.allocator,
+        .io = io,
+        .environ = undefined,
+        .cfg = &cfg,
+        .log = &log,
+        .err = &err,
+        .secrets = &.{},
+        .name = "t",
+    };
+    const job: job_mod.Job = .{
+        .plan_id = "p",
+        .job_id = "j",
+        .job_token = "t",
+        .check_run_id = 7,
+        .secrets = &.{},
+        .steps = &.{},
+    };
+    var cancel: dagger.Cancel = .{};
+    var watcher = CancelWatch.init(c, .{
+        .creds = undefined,
+        .token = "token",
+        .token_at = std.Io.Clock.real.now(io).toSeconds(),
+        .url = url,
+    }, job, &cancel);
+    const before = std.Io.Clock.real.now(io).toMilliseconds();
+    var watching = try io.concurrent(CancelWatch.run, .{&watcher});
+    defer {
+        watcher.stop.store(true, .release);
+        watching.cancel(io);
+    }
+    // Five seconds at the most: the check below then fails, and the test ends.
+    for (0..500) |_| {
+        if (cancel.hard_deadline_ms.load(.acquire) != 0 and
+            cancel.hard_deadline_ms.load(.acquire) < before + 100_000) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    // Time for the third, longer one to do its harm, had it any.
+    try io.sleep(.fromMilliseconds(200), .awake);
+    const hard = cancel.hard_deadline_ms.load(.acquire);
+    // The smallest limit GitHub's runner keeps: 60 s, less its 15.
+    try std.testing.expect(hard >= before + 45_000);
+    try std.testing.expect(hard <= before + 55_000);
 }
 
 test "a stop cancels a running job once its grace has passed, and not a job that ended first" {

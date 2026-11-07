@@ -1009,10 +1009,11 @@ pub fn runPosts(x: *Exec) !void {
             });
             continue;
         }
-        const post_out = if (p.docker) |dr|
-            try x.runContainer(ls, .post, dr, p.state)
+        if (x.watch) |w| w.begin(ls, 0, true);
+        const ran = if (p.docker) |dr|
+            x.runContainer(ls, .post, dr, p.state)
         else
-            try x.runJsScript(
+            x.runJsScript(
                 ls,
                 .post,
                 p.act,
@@ -1023,6 +1024,9 @@ pub fn runPosts(x: *Exec) !void {
                 p.step_secret,
                 p.state,
             );
+        const stopped = if (x.watch) |w| w.end() != .none else false;
+        // Stopped near the job's limit, it fails as a post script, and the next one still runs.
+        const post_out = ran catch |e| if (e == error.EngineFailed and stopped) null else return e;
         const ok = if (post_out) |out| out.code == 0 else false;
         try x.addExtra(.{
             .kind = .post,
