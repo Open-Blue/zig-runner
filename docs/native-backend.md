@@ -1220,6 +1220,11 @@ proofs/tla/StoreEviction.tla.
 - **Costs left.** Deleting and measuring are at a job's end, before its result is reported
   (`Backend.deinit`), so a job can end up to 1.5 s plus a walk later. A size is the runner's own
   estimate, not the filesystem's: a file with several links counts its share per link.
+- **A really full disk.** The floor is tested on a 64 MiB tmpfs filled until a write fails with
+  `ENOSPC`, in a mount namespace of bubblewrap's (`.github/scripts/full-disk-test.sh`; no root, and
+  skipped where bubblewrap or user namespaces are not allowed): with a volume never measured among
+  them, the pass frees a fifth of the disk and the store takes writes again. A plain
+  `unshare -rm` is refused on hosts that restrict unprivileged user namespaces (Ubuntu's AppArmor).
 
 ### P5: isolation for untrusted jobs
 
