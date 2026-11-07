@@ -230,6 +230,8 @@ fn acquire(
     }
 }
 
+/// One job from its broker message `body` to completejob: acquire it, run it, upload what GitHub
+/// shows, and say how the cycle ended.
 pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     const runner_token = session.token;
     const jr = runservice.parseJobRequest(c.arena, body) catch |e| return fail(c, "job request", e);

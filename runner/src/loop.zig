@@ -35,10 +35,13 @@ pub const Exit = enum(u8) { done = 0, config = 1, github = 2, db = 3, native = 4
 /// then cancelled (`StopDeadline`). The second exits immediately.
 pub var stop_signals: std.atomic.Value(u32) = .init(0);
 
+/// Whether a stop signal arrived (`stop_signals`).
 pub fn stopRequested() bool {
     return stop_signals.load(.acquire) > 0;
 }
 
+/// What one cycle of a runner works with: its allocators, io, config, log, error output and the
+/// pool's shared state.
 pub const Runner = struct {
     /// Lives for one cycle (`serve` frees it after each job).
     arena: Allocator,
@@ -874,7 +877,7 @@ fn copyJit(arena: Allocator, jit: jitconfig.Jit) !jitconfig.Jit {
 }
 
 /// Seconds to wait after `failures` failed cycles in a row: 5, 10, 20, ... up to 5 minutes.
-pub fn backoffSecs(failures: u32) u32 {
+fn backoffSecs(failures: u32) u32 {
     if (failures == 0) return 0;
     const shift: u5 = @intCast(@min(failures - 1, 6));
     return @min(@as(u32, 5) << shift, 300);
