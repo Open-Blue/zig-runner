@@ -354,6 +354,27 @@ parent, with no setting and no host tuning, and each job under a limit of its ow
   then kills the largest process under it.
 - **An OOM kill says which limit it came from** in the step's log: the job's, all jobs', or the
   machine's or one above the parent, told apart by where `memory.events` counts `oom`.
+- **An OOM kill takes every process of the steps, not one** (#378). The steps run in a `steps` child
+  of the job's cgroup with `memory.oom.group` 1, so when the job's `memory.max` runs out the kernel
+  kills the whole group (the step's shell, its helper and the hog, not only the largest process,
+  which left the rest of the step running in a damaged state), and the step ends 137. The flag is
+  on the child, not the job, because services and the ports' relay run in a `services` child
+  without it: on the job it would take a database with the step that overran, and an `always()`
+  cleanup step would find it gone. A service that is the victim is killed alone, as before. The
+  job's `memory.max`, `memory.high`, `memory.peak` and `memory.events` are the job's, counting both
+  children, so the limits, the gate's reading and the "reached its memory limit" line (whose count
+  is now the whole group) are unchanged. The flag is best effort: a kernel without it (before
+  Linux 4.19) leaves the job in one cgroup, bounded by the same limits. GitHub's runner has no
+  equivalent.
+- **Job processes prefer to die before the runner** (#378). Each step's helper sets
+  `oom_score_adj` to 500 before it forks, which its children inherit, so a machine-wide OOM picks
+  a job's process over the runner's. GitHub's runner does the same (`ProcessInvoker.cs`,
+  `WriteProcessOomScoreAdj`: 500, or `PIPELINE_JOB_OOMSCOREADJ` when it is -1000 to 1000). Here
+  the override is read from the step's environment (workflow or step `env:`), and it is never
+  below the runner's own value: lowering needs CAP_SYS_RESOURCE, which a root runner's helper
+  has, and a workflow must not make its processes the last the kernel kills. Raising needs no
+  privilege, and neither seccomp (installed later, in the step's init) nor no_new_privs stops a
+  write to /proc. It is best effort and never fails a step. The ports' relay is not set.
 - **A job that cannot be bounded is refused**, by default: a rootless runner without delegation, or
   a parent that cannot be made or limited. It goes to Dagger, whose engine holds it, or fails saying
   why with `RUNNER_ENGINE=none`. `RUNNER_NATIVE_CGROUP=none` is the operator accepting the risk, and
@@ -833,7 +854,8 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   `memory.peak`, `memory.events` and `pids.events` read back. Each step's helper joins it before
   anything else (`sandbox.joinCgroup`), so every process of the step is born in it and the runner
   never is. It is kept, empty, between steps, and killed (`cgroup.kill`) and removed when the job
-  ends, or by the sweep after a crash. When a step's processes were OOM-killed or refused a fork,
+  ends, or by the sweep after a crash. Its `steps` and `services` children are described under
+  "Bounded jobs". When a step's processes were OOM-killed or refused a fork,
   its log says so in an error line. Where it goes: `/sys/fs/cgroup/zig-runner` as root; the
   runner's own delegated cgroup with `self` (the runner moves its processes into a `runner` leaf and
   makes the jobs' under `jobs`, systemd's rule for delegation); a path; or none, with

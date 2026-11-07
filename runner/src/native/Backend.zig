@@ -1529,7 +1529,12 @@ pub fn execScript(
             .run => |r| r.env,
             .checkout => &.{},
         };
-        x.sh.beginCommands(num, try dagger.envContext(arena, x.ev.job_env.items, step_env));
+        const env_context = try dagger.envContext(arena, x.ev.job_env.items, step_env);
+        x.sh.beginCommands(num, env_context);
+        // GitHub's runner reads the oom_score_adj override from the step's environment. Here the
+        // script exports the step's env, after the helper has set it, so the helper is told.
+        for (env_context) |e| if (std.mem.eql(u8, e.name, sandbox.oom_score_adj_env))
+            try extra.append(arena, e);
         x.beginExec(num);
         const always_run = switch (resolved) {
             .run => |r| r.always_run != null,
@@ -2348,7 +2353,7 @@ fn execIn(
         .id_count = ids_per_slot,
         .netns = b.netns,
         .mount_points = mount_points,
-        .cgroup = if (b.job_cgroup) |j| j.dir else null,
+        .cgroup = if (b.job_cgroup) |j| j.stepsDir() else null,
         .image_layers = @intCast(b.seed_layers.items.len + 1),
         .canonical = canonical,
         .volume_id_base = volumeIdBase(b.subid_base),
@@ -6549,6 +6554,94 @@ test "root runner: a native job's runaway is OOM-killed in its own cgroup, a for
     try expectLines(texts[1], &.{"neighbour held 200"});
     try std.testing.expect(std.mem.indexOf(u8, texts[1], "reached its") == null);
     try std.testing.expect(took < 60_000);
+}
+
+test "root runner: an OOM kill takes every process of a step's cgroup, and the job goes on" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    // Room for the step's shell and the helper, as the runaway test's.
+    cfg.cgroup.memory_max_mb = 256;
+
+    // Where the steps run, as the step sees it: the cgroup file is the host's, read-only.
+    var which = testStep("cg=$(cut -d: -f3 /proc/self/cgroup)\necho \"cgroup=$cg\"\n" ++
+        "echo \"oom.group=$(cat /sys/fs/cgroup$cg/memory.oom.group)\"");
+    which.name = "which";
+    // Without the group kill the kernel ends the hog, the largest, and the shell carries on
+    // after it (`survived`); with it the shell and the sleep beside it go too. It ends by itself
+    // if the limit fails: `no limit stopped it`.
+    var oom = testStep("command -v python3 >/dev/null || { echo no\"\"-python; exit 0; }\n" ++
+        "sleep 60 &\npython3 -c 'x = []\nfor _ in range(128): x.append(b\"x\" * (8 << 20))\n" ++
+        "print(\"no limit\", \"stopped it\")\nraise SystemExit(3)' || echo exit=$?\n" ++
+        "echo survived\"\"-the-oom");
+    oom.name = "oom";
+    var after = testStep("echo after-the-oom");
+    after.name = "after";
+    after.condition = "always()";
+    const r = try runNativeJob(arena, cfg, testJob(&.{ which, oom, after }), .root);
+    std.debug.print("oom group job:\n{s}\n", .{r.text});
+    try expectLines(r.text, &.{
+        "The job reached its memory limit (256 MB, RUNNER_NATIVE_MEMORY_MAX_MB): the kernel " ++
+            "killed ",
+        "after-the-oom",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "survived-the-oom") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "no limit stopped it") == null);
+    try std.testing.expect(r.res.steps[1].outcome != .success);
+    try std.testing.expectEqual(dagger.Outcome.success, r.res.steps[2].outcome);
+    // The steps' cgroup is the one with the flag; services get another (`cgroup.Job.split`).
+    try expectLines(r.text, &.{ "oom.group=1", "/steps" });
+}
+
+test "root runner: a step's processes, and their children, get oom_score_adj 500 or the env's" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    // The runner's own, which a step is never given less than.
+    var buf: [16]u8 = undefined;
+    const own = std.fmt.parseInt(i32, std.mem.trim(u8, try std.Io.Dir.cwd().readFile(
+        io,
+        "/proc/self/oom_score_adj",
+        &buf,
+    ), "\n"), 10) catch return error.TestUnexpectedResult;
+
+    // `cat` is a child of the shell, and `sh -c` a grandchild's parent: all inherit it.
+    const show = "echo \"adj=$(cat /proc/self/oom_score_adj)\"\n" ++
+        "sh -c 'echo \"child=$(cat /proc/self/oom_score_adj)\"'";
+    const adj_env = "PIPELINE_JOB_OOMSCOREADJ";
+    var plain = testStep(show);
+    plain.name = "plain";
+    var set = testStep(show);
+    set.name = "set";
+    set.env = &.{.{ .name = adj_env, .value = .{ .lit = "700" } }};
+    var invalid = testStep(show);
+    invalid.name = "invalid";
+    invalid.env = &.{.{ .name = adj_env, .value = .{ .lit = "lots" } }};
+    var low = testStep(show);
+    low.name = "low";
+    low.env = &.{.{ .name = adj_env, .value = .{ .lit = "-1000" } }};
+    const r = try runNativeJob(arena, cfg, testJob(&.{ plain, set, invalid, low }), .root);
+    std.debug.print("oom_score_adj job:\n{s}\n", .{r.text});
+    try std.testing.expect(r.res.succeeded);
+    const want = [_]i32{ @max(500, own), @max(700, own), @max(500, own), own };
+    var at: usize = 0;
+    for (want) |w| for ([_][]const u8{ "adj=", "child=" }) |key| {
+        const line = try std.fmt.allocPrint(arena, "{s}{d}\n", .{ key, w });
+        const found = std.mem.indexOfPos(u8, r.text, at, line) orelse {
+            std.debug.print("missing {s} after {d} in:\n{s}\n", .{ line, at, r.text });
+            return error.TestUnexpectedResult;
+        };
+        at = found + line.len;
+    };
 }
 
 test "root runner: native gate accuracy, each job's own cgroup against the engine-wide reading" {
