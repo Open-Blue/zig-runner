@@ -11,7 +11,9 @@ name: automerge
 # does nothing. Renovate turns on auto-merge for its own pull requests (renovate.json).
 #
 # pull_request_target, so the workflow and the key are main's and no pull request can change them;
-# nothing of the pull request is checked out or run. Pull requests from forks are left alone.
+# nothing of the pull request is checked out or run. Pull requests from forks are left alone, and
+# so are those based on another branch: a stack's has no required checks, so auto-merge would merge
+# it the moment it opened, before any CI ran.
 
 on:
   # Only main's workflow runs, with nothing of the pull request checked out or run (above).
@@ -25,6 +27,7 @@ jobs:
     name: Turn on auto-merge
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == github.event.repository.default_branch &&
       !github.event.pull_request.draft &&
       vars.AUTOMERGE_APP_ID != ''
     runs-on: ubuntu-26.04
