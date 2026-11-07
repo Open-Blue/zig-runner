@@ -1,0 +1,3 @@
+kind: Changed
+body: The pre-push hook also runs the tests on overlayfs and ZLint when the runner changed, and TLC when the models or the release pipeline changed, so failures CI found first are found before a push
+time: 2026-11-07T18:52:36.957177369-05:00
