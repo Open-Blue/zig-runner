@@ -99,7 +99,7 @@ jobs:
           TAG: ${{ steps.next.outputs.tag }}
           WAIT_MINUTES: "30"
           REQUIRED_CHECKS: |-
-            Format, build and test
+            Tests (x86_64)
             Database tests
             Workflows
             Proofs

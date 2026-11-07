@@ -480,7 +480,7 @@ jobs:
       # starts. A name that never runs on a push to main would hold every deploy for the whole
       # wait, then fail it.
       REQUIRED_CHECKS: |-
-        Format, build and test
+        Tests (x86_64)
         Database tests
         Workflows
         Binaries

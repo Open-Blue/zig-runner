@@ -364,7 +364,8 @@ jobs:
   # one at a time (a root job takes the host's first free slot of ids and addresses,
   # runner/tools/test_shards.zig, `serial`): about 200 s on one runner, which held the whole run
   # back. ZIG_TEST_PART=K/N gives each part every N-th test, so the parts run side by side and
-  # together are the suite. Not on main: a push runs `zig build test` on prod (`test`).
+  # together are the suite. Each part is a required check of its own (the "main and release
+  # branches" ruleset). Not on main: a push runs `zig build test` on prod (`test`).
   native-root:
     name: Native tests as root (${{ matrix.arch }}, ${{ matrix.part }}/2)
     if: github.event_name != 'push'
@@ -408,31 +409,6 @@ jobs:
           ../.github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
           ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 ZIG_TEST_PART="$PART" \
             ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" ../.github/scripts/zig-test.sh
-
-  # The required check "Format, build and test" (the rulesets, version.yml, release.yml): passes
-  # only when the x86_64 tests and every part of the native tests as root passed. A gate, so the
-  # rulesets did not change when the tests split; `if: always()`, so a failed or cancelled job it
-  # needs is a failure here, not a skip (which a required check takes as passed). On main the
-  # native tests as root do not run (`native-root`), and their skip is expected.
-  test-gate:
-    name: Format, build and test
-    needs: [test, native-root]
-    if: always()
-    runs-on: ubuntu-26.04
-    timeout-minutes: 5
-    permissions: {}
-    steps:
-      - name: Every job it needs passed
-        env:
-          NEEDS: ${{ toJSON(needs) }}
-          ON_MAIN: ${{ github.event_name == 'push' }}
-        run: |
-          jq -e 'to_entries | all(.value.result == "success" or
-            (env.ON_MAIN == "true" and .key == "native-root" and .value.result == "skipped"))' \
-            <<<"$NEEDS" >/dev/null || {
-            jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
-            exit 1
-          }
 
   # The release's own builds, both targets in ReleaseSafe (build-binaries.sh), which nothing else
   # compiles before the tag: the tests build x86_64 in Debug, and release.yml's checks run only for
@@ -556,26 +532,6 @@ jobs:
           # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
           sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
           ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/zig-test.sh
-
-  # The required check "Release builds and tests (arm64)": passes only when the arm64 release
-  # builds, the arm64 tests and every part of the native tests as root passed (`test-gate` says
-  # why a gate, and why `always()`). Not on main, as before the split.
-  arm64:
-    name: Release builds and tests (arm64)
-    needs: [arm64-builds, arm64-test, native-root]
-    if: always() && github.event_name != 'push'
-    runs-on: ubuntu-26.04
-    timeout-minutes: 5
-    permissions: {}
-    steps:
-      - name: Every job it needs passed
-        env:
-          NEEDS: ${{ toJSON(needs) }}
-        run: |
-          jq -e 'to_entries | all(.value.result == "success")' <<<"$NEEDS" >/dev/null || {
-            jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
-            exit 1
-          }
 
   # The end-to-end suite (.github/scripts/e2e.sh): the runner built from this change serves
   # runner-bench's e2e workflows (Open-Blue/runner-bench, e2e.yml and e2e-cancel.yml) on GitHub's
