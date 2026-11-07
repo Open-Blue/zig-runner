@@ -1243,6 +1243,50 @@ pub fn warm(
     return warmBase(arena, transport, opts, err_msg);
 }
 
+/// The native pre-warm (`Backend.warm`): the image's pull and provisioning and the Zig cache
+/// seeds, made in a sandbox's job directory and cgroup of their own with no job, as a job makes
+/// them, so the first job on an empty store finds them. `ready` is told first (the memory gate,
+/// as for `warm`) and false gives up; `opts.cancel` stops a build under way. No engine is
+/// involved, so it works with `RUNNER_ENGINE=none`. On failure the message is in `err_msg`.
+pub fn warmNative(
+    arena: Allocator,
+    io: std.Io,
+    opts: Options,
+    ready: Ready,
+    err_msg: *[]const u8,
+) anyerror!Backend.Warmed {
+    const cfg = opts.native orelse return error.NeedsNative;
+    // What a job asks first: a machine that cannot run native steps has nothing to warm.
+    if (Backend.usable(arena, io, opts.gpa, cfg)) |no| {
+        err_msg.* = no;
+        return error.NativeUnusable;
+    }
+    if (!ready.readyFn(ready.ptr)) return error.Cancelled;
+    var why: []const u8 = "";
+    var b = Backend.initWhy(arena, io, opts.gpa, cfg, &why) catch |e| {
+        err_msg.* = if (why.len > 0) why else @errorName(e);
+        return e;
+    };
+    defer b.deinit();
+    b.cancel = opts.cancel;
+    // A stop kills the sandbox that is building, as it does a step.
+    var watch: Watch = .{ .io = io, .transport = b.transport(), .cancel = opts.cancel };
+    watch.begin(0, false);
+    var watching = io.concurrent(Watch.run, .{&watch}) catch null;
+    defer if (watching) |*f| {
+        watch.done.store(true, .release);
+        f.cancel(io);
+    };
+    const image = resolveImage(opts.image);
+    const provision = opts.provision and std.mem.eql(u8, image, default_image);
+    return b.warm(.{
+        .image = image,
+        .provision = provision,
+        .as_runner = provision and opts.step_user == .runner,
+        .seeds = if (opts.package_caches) opts.zig_seeds else &.{},
+    }, err_msg);
+}
+
 /// `openSession`, waiting for an engine that is starting (just restarted, or updated) and refuses
 /// connections, or has no socket yet, for up to a minute or so, as GitHub's runner waits for
 /// Docker, rather than fail. Gives up after `engine_wait_ms` counted from `started`, or when

@@ -69,9 +69,20 @@ setting, not a detection: a runner that noticed the engine's absence and changed
 turn a stopped engine, which today makes a job wait, into failed jobs nobody asked for, so the
 default (`direct`) behaves exactly as before. With `none`:
 
-- **Start-up.** No engine is looked for. The pre-warm is skipped ("pre-warm skipped:
-  RUNNER_ENGINE=none"), so there is no socket to poll every 5 s and no lock on the engine's
-  directory. The memory gate has no engine source (as `RUNNER_ENGINE_CGROUP=none`): it holds on the
+- **Start-up.** No engine is looked for. The engine's pre-warm is not run, so there is no socket
+  to poll every 5 s and no lock on the engine's directory ("pre-warm: RUNNER_ENGINE=none, there
+  is no engine to warm; warming the native store"). The native store is warmed instead, in the
+  background, once, after the runners start listening (`loop.Warmer.onceNative`,
+  `dagger.warmNative`, `Backend.warm`; `RUNNER_PREWARM=false` turns it off): the default image's
+  provisioning (about 25 s on the laptop, which the first job on an empty store otherwise pays
+  while the others wait for it) and the Zig cache seeds (127 s on the laptop, paid by the first
+  job that runs Zig), by the code and under the locks a job uses, so a job that comes while it
+  runs waits for the piece being made and one that comes later finds all of it. (The image's
+  pull is already done before start-up, by the probe below.) It runs in a job directory and
+  cgroup of its own, so `memory.max` and `pids.max` hold it, and through the memory gate as a job
+  of its own (the pool's extra slot); a failure is said ("pre-warm failed ...") and the first
+  job makes what it needs, as it always did. A native pool with an engine warms the native
+  store too, before the engine's. The memory gate has no engine source (as `RUNNER_ENGINE_CGROUP=none`): it holds on the
   machine and on each job's cgroup, and logs nothing about an engine cgroup. The silence-timeout
   line is not printed.
 - **Jobs.** A job native can run runs natively as always. One it cannot (`Backend.unsupported` or

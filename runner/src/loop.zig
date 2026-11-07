@@ -392,6 +392,14 @@ fn engineSource(cfg: *const Config) admission.Engine.Source {
 /// again (a wipe happens only then), and after a job that had to wait for the engine. A failed
 /// warm is said and nothing else: the first job builds what it needs, as before.
 ///
+/// On the native backend (`RUNNER_BACKEND=native`, with or without an engine) the same is done to
+/// the native store, once when the pool starts (`onceNative`, `dagger.warmNative`): the image's
+/// pull and provisioning and the Zig seeds, which an empty store otherwise makes inside the first
+/// jobs' "Set up job" (32 s of pull and provisioning, and 130 to 165 s for the seed, on the
+/// laptop). It runs in a job directory and cgroup of its own, through the memory gate as a job
+/// of its own, and a job that comes while it runs waits on the store's locks for the piece being
+/// made, as two jobs always did, instead of making it too.
+///
 /// An engine start is the memory gate's to see where it sees the engine's cgroup (it is found
 /// again after it was not, `Admission.engineReturns`); otherwise, as under deploy/compose.yaml,
 /// it is the engine's socket appearing or being replaced (`engine.SocketIdentity`). The warm is a
@@ -417,9 +425,14 @@ pub const Warmer = struct {
     failed: ?anyerror = null,
     future: ?std.Io.Future(void) = null,
     calls: Calls = .{},
+    /// The native backend's settings, when the pool has the native store to warm.
+    native: ?dagger.Backend.Config = null,
+    /// There is an engine to warm (`engineWarm`).
+    engine_warm: bool = true,
 
     const Calls = struct {
         warm: *const @TypeOf(dagger.warm) = dagger.warm,
+        warm_native: *const @TypeOf(dagger.warmNative) = dagger.warmNative,
         socket: *const @TypeOf(engine.SocketIdentity.of) = engine.SocketIdentity.of,
     };
 
@@ -440,12 +453,21 @@ pub const Warmer = struct {
     /// have nothing to do.
     pub fn init(c: Runner, memory: ?*admission.Admission, slot: usize) !?*Warmer {
         if (!c.cfg.prewarm) return null;
-        if (c.cfg.engineless()) {
-            try c.log.say("pre-warm skipped: RUNNER_ENGINE=none, there is no engine to warm");
-            return null;
-        }
-        if (c.cfg.engineEndpoint() == null) {
-            try c.log.say("pre-warm skipped: RUNNER_ENGINE=cli opens no session of its own");
+        // The native store has an engine-free warm of its own: what a pool with no engine has to
+        // warm, and what a native pool with one warms beside the engine's.
+        const native = dagger.Backend.configFor(c.arena, c.io, c.environ, c.cfg, true) catch |e| n: {
+            try c.log.say("pre-warm: the native backend is not configured, so its store is not warmed");
+            std.log.warn("native pre-warm: {s}", .{@errorName(e)});
+            break :n null;
+        };
+        const engine_why: ?[]const u8 = if (c.cfg.engineless())
+            "RUNNER_ENGINE=none, there is no engine to warm"
+        else if (c.cfg.engineEndpoint() == null)
+            "RUNNER_ENGINE=cli opens no session of its own"
+        else
+            null;
+        if (engine_why != null and native == null) {
+            try c.log.say(try std.fmt.allocPrint(c.arena, "pre-warm skipped: {s}", .{engine_why.?}));
             return null;
         }
         if (trust.none(c.cfg.trusted_refs)) {
@@ -453,11 +475,23 @@ pub const Warmer = struct {
             return null;
         }
         const w = try c.arena.create(Warmer);
-        w.* = .{ .c = c, .arena = .init(c.gpa), .memory = memory };
+        w.* = .{ .c = c, .arena = .init(c.gpa), .memory = memory, .native = native };
+        w.engine_warm = engine_why == null;
         if (memory) |m| w.gate = .{ .pool = m, .slot = slot, .warm = true };
+        if (memory != null) if (w.native) |*n| {
+            n.gate = &w.gate;
+        };
         // What is there now is what the first warm warms.
-        w.socket = w.calls.socket(c.io, c.cfg.engine_host);
-        if (memory) |m| w.returns = m.engineReturns();
+        if (w.engine_warm) {
+            w.socket = w.calls.socket(c.io, c.cfg.engine_host);
+            if (memory) |m| w.returns = m.engineReturns();
+        } else {
+            try c.log.say(try std.fmt.allocPrint(
+                c.arena,
+                "pre-warm: {s}; warming the native store",
+                .{engine_why.?},
+            ));
+        }
         return w;
     }
 
@@ -481,6 +515,9 @@ pub const Warmer = struct {
     }
 
     fn run(w: *Warmer) void {
+        // First: the native store is what the pool's first jobs run on.
+        if (w.native != null and !stopRequested() and !w.cancel.requested.load(.acquire)) w.onceNative();
+        if (!w.engine_warm) return;
         var since_look: i64 = 0;
         while (!stopRequested() and !w.cancel.requested.load(.acquire)) {
             if (since_look >= look_ms) {
@@ -503,6 +540,64 @@ pub const Warmer = struct {
         const now = w.calls.socket(w.c.io, w.c.cfg.engine_host);
         defer w.socket = now;
         return engine.SocketIdentity.changed(w.socket, now);
+    }
+
+    /// The native store's warm (`dagger.warmNative`), said in one line. Once for the pool: nothing
+    /// wipes the store while the runner is up, and an eviction is made good by the job that
+    /// needs what it took.
+    fn onceNative(w: *Warmer) void {
+        _ = w.arena.reset(.retain_capacity);
+        const arena = w.arena.allocator();
+        const cfg = w.c.cfg;
+        w.admitted = false;
+        var msg: []const u8 = "";
+        const result = w.calls.warm_native(arena, w.c.io, .{
+            .image = cfg.image,
+            .gpa = w.c.gpa,
+            .package_caches = cfg.package_caches,
+            .zig_seeds = cfg.zig_seeds,
+            .step_user = cfg.step_user,
+            .cancel = &w.cancel,
+            .native = w.native,
+        }, .{ .ptr = w, .readyFn = ready }, &msg);
+        const ms = std.Io.Clock.awake.now(w.c.io).toMilliseconds() - w.admitted_ms;
+        // A warm that found it all made takes no memory worth learning (`cached_ms`).
+        if (w.admitted and w.memory != null and ms < cached_ms) w.gate.replayed();
+        if (w.admitted) if (w.memory != null) if (w.gate.ended()) |learned| sayUnallocated(
+            w.c,
+            "the native pre-warm took {f} of memory at most ({s}); reserving {f} for it",
+            .{
+                admission.gb(learned.seen_mb),
+                if (learned.alone) "alone" else "beside jobs",
+                admission.gb(learned.estimate_mb),
+            },
+        );
+        const warmed = result catch |e| {
+            if (e == error.Cancelled or w.cancel.requested.load(.acquire)) return;
+            sayUnallocated(w.c, "pre-warm failed ({s}): {s}; the first job makes what it needs", .{
+                @errorName(e),
+                if (msg.len > 0) msg else "no message",
+            });
+            return;
+        };
+        // A stop killed the build under way: what it made is not what it says.
+        if (w.cancel.requested.load(.acquire) or stopRequested()) return;
+        sayUnallocated(w.c, "pre-warm: native store ready in {d}.{d} s (image {s} in {d} ms, " ++
+            "provisioned in {d} ms, Zig seeds: {d} built, {d} found in {d} ms)", .{
+            @divTrunc(ms, 1000),
+            @divTrunc(@mod(ms, 1000), 100),
+            if (warmed.pulled) "pulled" else "found",
+            warmed.image_ms,
+            warmed.provision_ms,
+            warmed.seeds_built,
+            warmed.seeds_found,
+            warmed.seed_ms,
+        });
+        if (warmed.seed_failure) |why| sayUnallocated(
+            w.c,
+            "pre-warm: a Zig seed was not made ({s}); the first Zig job makes it",
+            .{why},
+        );
     }
 
     /// One warm, said in one line.
@@ -1868,6 +1963,118 @@ test "no pre-warm when it is off, with RUNNER_ENGINE=cli, or when the runner tru
     cfg.trusted_refs = "";
     try std.testing.expect(try Warmer.init(c, null, 1) == null);
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "trusts no ref") != null);
+}
+
+/// `dagger.warmNative` for the Warmer's tests: what it was asked, and the gate as it found it.
+const FakeNative = struct {
+    var calls: std.atomic.Value(u32) = .init(0);
+    var opts: dagger.Options = .{};
+    var memory: ?*admission.Admission = null;
+    var during: ?admission.Admission.Slot = null;
+    var failure: ?anyerror = null;
+    /// A stop comes while it builds: the seed's build was killed, and the warm returns as made.
+    var stopped_during = false;
+
+    fn warm(_: Allocator, _: std.Io, o: dagger.Options, ready: dagger.Ready, msg: *[]const u8) anyerror!dagger.Backend.Warmed {
+        _ = calls.fetchAdd(1, .acq_rel);
+        opts = o;
+        if (!ready.readyFn(ready.ptr)) return error.Cancelled;
+        if (memory) |m| during = m.slots[m.slots.len - 1];
+        if (stopped_during) {
+            o.cancel.?.request(1);
+            return .{ .seed_failure = "its build exited 137" };
+        }
+        if (failure) |e| {
+            msg.* = "the store is not safe";
+            return e;
+        }
+        return .{ .image_ms = 1200, .provision_ms = 300, .seed_ms = 4000, .pulled = true, .seeds_built = 1 };
+    }
+};
+
+test "the native pre-warm runs with no engine, through the gate, for what a job gets, and a failure is only said" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 8388608 kB\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pressure", .data = "some avg10=0.00 avg60=0.00 avg300=0.00 total=900\n" });
+    var slots: [2]admission.Admission.Slot = undefined;
+    var memory: admission.Admission = .init(io, .{}, &slots);
+    memory.paths = .{
+        .meminfo = try std.fs.path.join(arena, &.{ dir, "meminfo" }),
+        .pressure = try std.fs.path.join(arena, &.{ dir, "pressure" }),
+    };
+    memory.recheck = .fromMilliseconds(10);
+
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var cfg: Config = .{
+        .gh_token = "",
+        .scope = undefined,
+        .trusted_refs = "refs/heads/main",
+        .backend = .native,
+        .engine = .none,
+        .native_store = "/nonexistent/native",
+        .zig_seeds = &.{.{ .version = "0.17.0", .sha256 = "00" }},
+    };
+    const c = testRunner(arena, &log, &out, &cfg);
+    const w = (try Warmer.init(c, &memory, 1)).?;
+    defer w.arena.deinit();
+    // No engine to warm; the native store is.
+    try std.testing.expect(!w.engine_warm);
+    try std.testing.expect(w.native != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "RUNNER_ENGINE=none, there is no engine to warm; warming the native store") != null);
+    w.calls.warm_native = FakeNative.warm;
+    w.calls.warm = FakeWarm.warm;
+    FakeWarm.calls.store(0, .release);
+    FakeNative.calls.store(0, .release);
+    FakeNative.memory = &memory;
+    FakeNative.during = null;
+    FakeNative.failure = null;
+
+    // What `run` does for a pool with no engine: the native warm, then nothing more to wait for.
+    w.run();
+    try std.testing.expectEqual(@as(u32, 1), FakeNative.calls.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), FakeWarm.calls.load(.acquire));
+    // What a job is given: the runner's image and seeds, the native settings, and the warm's gate,
+    // whose slot is held under the warm's own name while it runs.
+    try std.testing.expectEqualStrings(cfg.image, FakeNative.opts.image);
+    try std.testing.expectEqual(@as(usize, 1), FakeNative.opts.zig_seeds.len);
+    try std.testing.expectEqualStrings("/nonexistent/native", FakeNative.opts.native.?.store);
+    try std.testing.expect(FakeNative.opts.native.?.gate == &w.gate);
+    try std.testing.expectEqual(admission.jobKey("", "", Warmer.job_name), FakeNative.during.?.key.?);
+    try std.testing.expectEqual(@as(u32, 0), memory.polling);
+    const said = "pre-warm: native store ready in ";
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), said) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "image pulled in 1200 ms, provisioned in 300 ms, Zig seeds: 1 built, 0 found in 4000 ms") != null);
+
+    // A warm that fails takes nothing down: it is said, and the first job makes what it needs.
+    out.end = 0;
+    FakeNative.failure = error.StoreUnsafe;
+    w.run();
+    try std.testing.expectEqual(@as(u32, 2), FakeNative.calls.load(.acquire));
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "pre-warm failed (StoreUnsafe): the store is not safe; the first job makes what it needs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), said) == null);
+
+    // A stop while it builds kills the build: that is not said as a warm that finished.
+    out.end = 0;
+    FakeNative.failure = null;
+    FakeNative.stopped_during = true;
+    w.run();
+    try std.testing.expectEqual(@as(u32, 3), FakeNative.calls.load(.acquire));
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "pre-warm: native store ready") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "was not made") == null);
+
+    // A stop before the gate lets it through: it gives up, and says nothing of a failure.
+    out.end = 0;
+    FakeNative.stopped_during = false;
+    w.run();
+    try std.testing.expectEqual(@as(u32, 3), FakeNative.calls.load(.acquire));
 }
 
 test "the gate looks for the engine's cgroup only where there is an engine" {
