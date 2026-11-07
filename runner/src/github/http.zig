@@ -123,6 +123,22 @@ pub fn within(
     function: anytype,
     args: std.meta.ArgsTuple(@TypeOf(function)),
 ) std.Io.Cancelable!?@typeInfo(@TypeOf(function)).@"fn".return_type.? {
+    return withinClosing(io, limit, function, args, {}, discardLate);
+}
+
+fn discardLate(_: void, _: anytype) void {}
+
+/// `within` for a function whose result owns something (a connection): `closeLate(ctx, result)`
+/// releases a result that arrives after the time ran out, or after the caller was cancelled, which
+/// nobody would otherwise take. A connect that finished just as the limit passed is such a result.
+pub fn withinClosing(
+    io: std.Io,
+    limit: std.Io.Duration,
+    function: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(function)),
+    ctx: anytype,
+    comptime closeLate: anytype,
+) std.Io.Cancelable!?@typeInfo(@TypeOf(function)).@"fn".return_type.? {
     const Ended = union(enum) {
         done: @typeInfo(@TypeOf(function)).@"fn".return_type.?,
         timeout: void,
@@ -133,13 +149,21 @@ pub fn within(
     // Without a timer it is only waited for.
     sel.concurrent(.timeout, sleep, .{ io, limit }) catch {};
     const first = sel.await() catch |e| {
-        while (sel.cancel()) |_| {}
+        drain(&sel, ctx, closeLate);
         return e;
     };
-    while (sel.cancel()) |_| {}
+    drain(&sel, ctx, closeLate);
     return switch (first) {
         .done => |r| r,
         .timeout => null,
+    };
+}
+
+/// Ends what `withinClosing` still runs, handing a result that came in late to `closeLate`.
+fn drain(sel: anytype, ctx: anytype, comptime closeLate: anytype) void {
+    while (sel.cancel()) |ended| switch (ended) {
+        .done => |r| closeLate(ctx, r),
+        .timeout => {},
     };
 }
 

@@ -1,0 +1,3 @@
+kind: Changed
+body: The select that runs a function next to a timer and closes a result that arrives late, repeated in pg.Client.connect and feed.Socket.openWithin, is one helper, http.withinClosing, beside http.within (#148).
+time: 2026-11-07T12:29:39.093616003-05:00

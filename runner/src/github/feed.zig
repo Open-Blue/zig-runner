@@ -30,10 +30,9 @@ pub const Socket = struct {
         s.* = try openWithin(gpa, io, url, token, http.request_deadline);
     }
 
-    /// `connect`, given up at `limit` (`error.Timeout`): it runs next to a timer and whichever ends
-    /// first cancels the other, as `http.within` does. A feed endpoint that accepted and never
-    /// answered the handshake or the upgrade held the job's start, or, opened again from
-    /// `Live.run`, its end, for good (#100).
+    /// `connect`, given up at `limit` (`error.Timeout`), as `http.within` does. A feed endpoint that
+    /// accepted and never answered the handshake or the upgrade held the job's start, or, opened
+    /// again from `Live.run`, its end, for good (#100).
     fn openWithin(
         gpa: Allocator,
         io: std.Io,
@@ -41,37 +40,15 @@ pub const Socket = struct {
         token: []const u8,
         limit: std.Io.Duration,
     ) !Socket {
-        const Ended = union(enum) { done: anyerror!Socket, timeout: void };
-        var buf: [2]Ended = undefined;
-        var sel: std.Io.Select(Ended) = .init(io, &buf);
-        sel.concurrent(.done, connect, .{ gpa, io, url, token }) catch
-            return connect(gpa, io, url, token);
-        // Without a timer it is only waited for.
-        sel.concurrent(.timeout, sleep, .{ io, limit }) catch {};
-        const first = sel.await() catch |e| {
-            drain(&sel, gpa);
-            return e;
-        };
-        drain(&sel, gpa);
-        return switch (first) {
-            .done => |r| r,
-            .timeout => error.Timeout,
-        };
+        const r = try http.withinClosing(io, limit, connect, .{ gpa, io, url, token }, gpa, closeLate) orelse
+            return error.Timeout;
+        return r;
     }
 
-    /// Ends what `openWithin` still runs, closing a feed opened just as the time ran out.
-    fn drain(sel: anytype, gpa: Allocator) void {
-        while (sel.cancel()) |ended| switch (ended) {
-            .done => |r| if (r) |sock| {
-                var s = sock;
-                s.close(gpa);
-            } else |_| {},
-            .timeout => {},
-        };
-    }
-
-    fn sleep(io: std.Io, d: std.Io.Duration) void {
-        io.sleep(d, .awake) catch {};
+    /// A feed opened just as the time ran out is closed.
+    fn closeLate(gpa: Allocator, opened: anyerror!Socket) void {
+        var s = opened catch return;
+        s.close(gpa);
     }
 
     fn connect(gpa: Allocator, io: std.Io, url: []const u8, token: []const u8) anyerror!Socket {
