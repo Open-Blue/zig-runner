@@ -91,7 +91,7 @@ read). A path filter would instead leave the check unreported, and the merge que
 it. The GitHub client's tests run over real connections to a local server
 (`src/github/testserver.zig`), so how it handles redirects and tokens is tested, not described. A merge into
 `main` goes through the merge queue, which runs these checks again on top of `main`; `automerge` turns on
-auto-merge for every pull request from a branch of this repository, so it joins the queue once its
+auto-merge for every pull request from a branch of this repository that is based on `main` (not a stack's), so it joins the queue once its
 checks pass (Renovate does the same for its own). Once a day, `version` releases what merged since
 the last release, if anything did: it waits for approval in the `prod` environment, commits and
 tags the release, and the tag runs `release`: the binaries (compiled directly,
@@ -547,6 +547,17 @@ schema by [@rafayet-git](https://github.com/rafayet-git), and the design documen
 deployment guide, measurements and Agda proofs. Releases v0.1.0 and v0.2.0 were made there. This
 repository carries the runner's history from that work and continues it with only what the runner
 needs to build, run and deploy; the rest stays in the original repository.
+
+Comments in `runner/src`, `db` and `proofs` cite three of those documents ("SPEC §3", "DESIGN §6",
+"STUDY.md §3.6"). They are not in this repository; they are at the commit the runner was split
+from, so the section numbers match:
+[SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/SPEC.md) (the
+specification: configuration, the GitHub protocol, the database, what differs from GitHub's
+runner),
+[DESIGN.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/DESIGN.md) (the
+design) and
+[STUDY.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/STUDY.md) (the
+experiments).
 
 Licence: see [LICENSE](LICENSE); the vendored third-party code is listed in
 [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).

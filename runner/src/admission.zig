@@ -569,7 +569,9 @@ pub const Gate = struct {
         const s = &a.slots[g.slot];
         std.debug.assert(s.running());
         s.key = key;
-        // The pre-warm is the engine's whatever the pool's backend.
+        // The pre-warm never waits here: `ready` let it through already. It reserves as on the
+        // engine until the native store's warm makes its cgroup (`native`), and stays on the
+        // engine for the engine's warm.
         if (a.native and !g.warm) {
             // Unlearned, the worst case, as `noHigh` has it where jobs cannot swap: until it is
             // native, and its estimate is what it is.

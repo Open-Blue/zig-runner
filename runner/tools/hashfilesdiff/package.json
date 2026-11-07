@@ -1,0 +1,8 @@
+{
+  "name": "hashfilesdiff-reference",
+  "private": true,
+  "description": "The reference hashFiles() for hashfiles-diff.sh: actions/runner's script on @actions/glob",
+  "dependencies": {
+    "@actions/glob": "0.7.0"
+  }
+}

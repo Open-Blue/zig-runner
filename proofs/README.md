@@ -1,10 +1,10 @@
 # The proofs, in Lean
 
 Audience: whoever changes the caching, the regex matcher or `hashFiles()`, or doubts them ·
-Companion: [MEASURE.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/MEASURE.md),
-[CLAIMS.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/CLAIMS.md),
-[RELATED.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/RELATED.md),
-[SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/SPEC.md) §6
+Companion: [MEASURE.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/MEASURE.md),
+[CLAIMS.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/CLAIMS.md),
+[RELATED.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/RELATED.md),
+[SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/SPEC.md) §6
 
 ```
 cd proofs
@@ -61,7 +61,7 @@ operations as whole entries.
 
 ## The step cache
 
-[MEASURE.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/MEASURE.md) §4 lists
+[MEASURE.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/MEASURE.md) §4 lists
 six properties the caching must *have* rather than merely measure. No benchmark can establish one of
 them: a measurement says a step was replayed quickly, not that replaying it was right. These modules
 state them and prove them, and for each hypothesis a proof needs, they give a concrete job where
@@ -155,7 +155,7 @@ same constant, as a JSON string, at `$GITHUB_EVENT_PATH` in place of the event p
 then the payload was written to every step, and a script reading it from a file was replayed with
 an earlier run's). One way around it is left: the parent shell's environment still holds the real
 values, so a step that reads `/proc/$PPID/environ` can see them (see "Against today's code"). See
-[SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/SPEC.md) §9, the first
+[SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/SPEC.md) §9, the first
 entry in "Where this runner differs from GitHub's". Early cutoff turns out to need it too, and that
 is new: what a step exports through `$GITHUB_ENV` is in the next step's container, so an unmarked
 step that exported different variables in two jobs would part the keys after it
@@ -210,10 +210,10 @@ wrongly, as 8 has it. 3 and 4 have no 8 of their own — they are open.
   determinism from the hypothesis P1 needs, so the step cache is sound only for jobs with no flaky
   unmarked step — a replayed step gives the result it recorded, a pass staying a pass. (A failure
   is not replayed: the runner runs a step again when the cache answers with one, #69.)
-  [RELATED.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/RELATED.md) noted we
+  [RELATED.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/RELATED.md) noted we
   had never measured flakiness; this says measuring it needs the cache off.
 - **The documented gap is a correctness gap.**
-  [SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/SPEC.md) §6 already
+  [SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/SPEC.md) §6 already
   says a script that reads run-specific values from a file in the repository is "not detected".
   Counterexample 1 shows what that costs: not a slower job, a wrong one.
 
@@ -221,7 +221,7 @@ wrongly, as 8 has it. 3 and 4 have no 8 of their own — they are open.
 
 What a proof of a property buys is a *test that is worth generating*: the model says which cases
 matter and what must hold in each, so
-[MEASURE.md](https://github.com/Lementknight/zig-actions-runner/blob/main/docs/MEASURE.md) stage 3
+[MEASURE.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/MEASURE.md) stage 3
 does not have to guess. Each row is one generated family, against a real engine rather than the fake
 session.
 
