@@ -1853,6 +1853,63 @@ fn seeds(b: *Backend, as_runner: bool) !void {
         try b.notes.append(arena, note);
 }
 
+/// What `warm` makes: what a job with no `container:` starts from, and the seeds a Zig job gets.
+pub const Warm = struct {
+    /// The job's image (`dagger.resolveImage`).
+    image: []const u8,
+    /// Provisioned, as the default image is (`set_up.provision_script`).
+    provision: bool,
+    /// The step user is the runner user, not root (`Options.step_user`).
+    as_runner: bool,
+    seeds: []const config.ZigSeed = &.{},
+};
+
+/// What `warm` found and what it made, in milliseconds each.
+pub const Warmed = struct {
+    image_ms: u64 = 0,
+    provision_ms: u64 = 0,
+    seed_ms: u64 = 0,
+    /// The image was fetched from its registry now, not found in the store.
+    pulled: bool = false,
+    seeds_built: u32 = 0,
+    seeds_found: u32 = 0,
+    /// Why the last seed that was not made was not, for the log; the job would build it itself.
+    seed_failure: ?[]const u8 = null,
+};
+
+/// The pull, the provisioning and the Zig cache seeds that every job with no `container:` makes
+/// before its first step, made with no job, so the first job finds them (`Warmer` in loop.zig).
+/// Each is made as `base` makes it, by the same code, under the same locks: a job that comes
+/// while this runs waits for the piece being made instead of making it too, and one that comes
+/// after finds all of it. A seed that cannot be made is left to the job, as it is there
+/// (`Warmed.seed_failure`); the image failing is an error.
+pub fn warm(b: *Backend, w: Warm, err_msg: *[]const u8) !Warmed {
+    const arena = b.arena;
+    var out: Warmed = .{};
+    if (b.operator_rootfs.len > 0 and w.provision) {
+        b.rootfs = b.operator_rootfs;
+    } else {
+        const img = try b.fetchRootfs(w.image, null, w.provision, w.as_runner, err_msg);
+        out.pulled = img.pulled != null;
+    }
+    out.image_ms = b.timings.lastMs(.image);
+    out.provision_ms = b.timings.lastMs(.provision);
+    const started = std.Io.Clock.awake.now(b.io).toMilliseconds();
+    for (w.seeds) |sd| {
+        const s = try volumes.seedFor(arena, b.store_cfg.root, sd, w.as_runner);
+        const there = if (std.Io.Dir.cwd().access(b.io, s.dir, .{})) |_| true else |_| false;
+        if (b.seed(s, w.as_runner)) |why| {
+            out.seed_failure = why;
+        } else if (there) {
+            out.seeds_found += 1;
+        } else {
+            out.seeds_built += 1;
+        }
+    }
+    out.seed_ms = std.math.cast(u64, std.Io.Clock.awake.now(b.io).toMilliseconds() - started) orelse 0;
+    return out;
+}
+
 /// Builds `seed` unless it is there; null when it is, else why not.
 fn seed(b: *Backend, s: volumes.Seed, as_runner: bool) ?[]const u8 {
     const arena = b.arena;
@@ -2762,33 +2819,7 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
     if (ev.job.container) |jc| if (try docker.registryCredentials(ev, jc)) |c| {
         creds = .{ .username = c.user, .password = c.pass };
     };
-    var why: []const u8 = "";
-    var t = phases.now();
-    const img = b.pull(plan.job_image, creds, &why) catch |e| {
-        err_msg.* = try std.fmt.allocPrint(arena, "could not pull {s} natively: {s}", .{
-            plan.job_image,
-            if (why.len > 0) why else @errorName(e),
-        });
-        return error.BaseContainerFailed;
-    };
-    b.image = img;
-    b.image_env = img.env;
-    try b.notes.append(arena, if (img.pulled) |p| try std.fmt.allocPrint(
-        arena,
-        "Image: pulled natively in {d} ms ({d} layers, {d} KB fetched){s}",
-        .{
-            p.ms,                                                                                                  p.layers, p.bytes / 1024,
-            if (p.devices > 0) try std.fmt.allocPrint(arena, "; {d} device nodes left out", .{p.devices}) else "",
-        },
-    ) else "Image: from the native store");
-    b.rootfs = img.rootfs;
-    t = b.timings.since(arena, .image, t);
-    if (plan.provision) b.rootfs = try b.provision(
-        img,
-        if (plan.as_runner) set_up.provision_runner_script else set_up.provision_script,
-        err_msg,
-    );
-    _ = b.timings.since(arena, .provision, t);
+    const img = try b.fetchRootfs(plan.job_image, creds, plan.provision, plan.as_runner, err_msg);
     // `options: --user` over the image's `USER`, as `docker create` has it. (Never with the
     // provisioned image: `container_options.unsupported` sends that job to Dagger.)
     const user = b.container_opts.user orelse img.user;
@@ -2812,6 +2843,48 @@ fn prepareRootfs(b: *Backend, ev: *Evaluator, plan: anytype, err_msg: *[]const u
         b.image_uid = user_ids[0];
         b.image_gid = user_ids[1];
     }
+}
+
+/// `image` pulled into the store or found there, and provisioned when `provision_it` (the default
+/// image): `b.rootfs` is then what the job's steps start from. The part of `prepareRootfs` that
+/// depends on nothing of a job, so `warm` makes it with no job.
+fn fetchRootfs(
+    b: *Backend,
+    image: []const u8,
+    creds: ?registry.Credentials,
+    provision_it: bool,
+    as_runner: bool,
+    err_msg: *[]const u8,
+) !oci.Image {
+    const arena = b.arena;
+    var why: []const u8 = "";
+    var t = phases.now();
+    const img = b.pull(image, creds, &why) catch |e| {
+        err_msg.* = try std.fmt.allocPrint(arena, "could not pull {s} natively: {s}", .{
+            image,
+            if (why.len > 0) why else @errorName(e),
+        });
+        return error.BaseContainerFailed;
+    };
+    b.image = img;
+    b.image_env = img.env;
+    try b.notes.append(arena, if (img.pulled) |p| try std.fmt.allocPrint(
+        arena,
+        "Image: pulled natively in {d} ms ({d} layers, {d} KB fetched){s}",
+        .{
+            p.ms,                                                                                                  p.layers, p.bytes / 1024,
+            if (p.devices > 0) try std.fmt.allocPrint(arena, "; {d} device nodes left out", .{p.devices}) else "",
+        },
+    ) else "Image: from the native store");
+    b.rootfs = img.rootfs;
+    t = b.timings.since(arena, .image, t);
+    if (provision_it) b.rootfs = try b.provision(
+        img,
+        if (as_runner) set_up.provision_runner_script else set_up.provision_script,
+        err_msg,
+    );
+    _ = b.timings.since(arena, .provision, t);
+    return img;
 }
 
 /// The job container's `options:`, read (`container_options.parse`; `unsupported` has already
@@ -5975,6 +6048,62 @@ test "native eviction under a real job: a seed and a volume stay until it ends, 
     // Built again, the job's layer on the old one is not replayed over it.
     const second = try runCachedJob(arena, cfg, job, caches, .{});
     try expectLines(second.text, &.{"whole-to-the-end"});
+}
+
+test "the native pre-warm makes the Zig seed a job then finds, and a second warm finds it made" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    cfg.test_seed_script = "mkdir -p /zig-seed/o/s && echo seeded > /zig-seed/o/s/f";
+    const zig_seeds: []const config.ZigSeed = &.{.{ .version = "0.0.1", .sha256 = "00" }};
+    const plan: Warm = .{ .image = dagger.default_image, .provision = true, .as_runner = false, .seeds = zig_seeds };
+
+    var err_msg: []const u8 = "";
+    {
+        var b = try init(arena, io, std.testing.allocator, cfg);
+        defer b.deinit();
+        const first = try b.warm(plan, &err_msg);
+        try std.testing.expectEqual(@as(u32, 1), first.seeds_built);
+        try std.testing.expectEqual(@as(u32, 0), first.seeds_found);
+        try std.testing.expect(first.seed_failure == null);
+    }
+    {
+        var b = try init(arena, io, std.testing.allocator, cfg);
+        defer b.deinit();
+        const second = try b.warm(plan, &err_msg);
+        try std.testing.expectEqual(@as(u32, 0), second.seeds_built);
+        try std.testing.expectEqual(@as(u32, 1), second.seeds_found);
+    }
+
+    // The job's own build would fail: what it runs on is the pre-warm's seed.
+    var job_cfg = cfg;
+    job_cfg.test_seed_script = "exit 1";
+    const caches: volumes.Options = .{ .package_caches = true, .trusted = true, .zig_seeds = zig_seeds };
+    const job = testJob(&.{testStep(
+        \\[ "$(cat /root/.cache/zig/o/s/f)" = seeded ] || exit 9 # zig build
+        \\echo found-the-warm-seed
+    )});
+    const ran = try runCachedJob(arena, job_cfg, job, caches, .{});
+    try expectLines(ran.text, &.{ "found-the-warm-seed", "Zig global cache seeded from Zig 0.0.1" });
+
+    // A seed that cannot be made is said and left to the job; the image is still warm.
+    var broken = cfg;
+    broken.test_seed_script = "exit 1";
+    var b = try init(arena, io, std.testing.allocator, broken);
+    defer b.deinit();
+    const other: Warm = .{
+        .image = dagger.default_image,
+        .provision = true,
+        .as_runner = false,
+        .seeds = &.{.{ .version = "0.0.2", .sha256 = "00" }},
+    };
+    const failed_warm = try b.warm(other, &err_msg);
+    try std.testing.expectEqual(@as(u32, 0), failed_warm.seeds_built);
+    try std.testing.expect(failed_warm.seed_failure != null);
 }
 
 /// The one seed under `dir`.

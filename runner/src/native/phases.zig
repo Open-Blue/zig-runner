@@ -136,6 +136,12 @@ pub const Phases = struct {
         }
     }
 
+    /// The latest sample of `p`, in milliseconds; 0 when it has none.
+    pub fn lastMs(ps: *const Phases, p: Phase) u64 {
+        const s = ps.samples[@backingInt(p)].getLastOrNull() orelse return 0;
+        return s / 1000;
+    }
+
     /// The set-up phases' total, in milliseconds.
     pub fn setUpMs(ps: *const Phases) u64 {
         var us: u64 = 0;

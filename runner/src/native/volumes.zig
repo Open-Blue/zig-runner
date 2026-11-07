@@ -371,20 +371,27 @@ pub fn plan(
                 .{unverified},
             ));
         }
-        const zig_dir = set_up.package_cache_dirs[zig_index].path;
-        const cache = if (as_runner) try set_up.runnerCachePath(arena, zig_index) else zig_dir;
-        for (opts.zig_seeds) |seed| try p.seeds.append(arena, .{
-            .seed = seed,
-            .dir = try std.fmt.allocPrint(arena, "{s}/seeds/{s}-{s}-{s}", .{
-                store,
-                @tagName(builtin.cpu.arch),
-                try component(arena, seed.version),
-                if (as_runner) dagger.runner_user else "root",
-            }),
-            .cache = std.mem.trimStart(u8, cache, "/"),
-        });
+        for (opts.zig_seeds) |seed| try p.seeds.append(arena, try seedFor(arena, store, seed, as_runner));
     }
     return p;
+}
+
+/// Where `seed` lives in the store, and where its cache is in the layer, for the step user: the
+/// one place a job (`plan`) and the pre-warm (`Backend.warm`) both name it, so the seed the
+/// pre-warm built is the one a job finds.
+pub fn seedFor(arena: Allocator, store: []const u8, seed: config.ZigSeed, as_runner: bool) !Seed {
+    const zig_dir = set_up.package_cache_dirs[zig_index].path;
+    const cache = if (as_runner) try set_up.runnerCachePath(arena, zig_index) else zig_dir;
+    return .{
+        .seed = seed,
+        .dir = try std.fmt.allocPrint(arena, "{s}/seeds/{s}-{s}-{s}", .{
+            store,
+            @tagName(builtin.cpu.arch),
+            try component(arena, seed.version),
+            if (as_runner) dagger.runner_user else "root",
+        }),
+        .cache = std.mem.trimStart(u8, cache, "/"),
+    };
 }
 
 const zig_index = for (set_up.package_cache_dirs, 0..) |d, i| {
@@ -678,4 +685,31 @@ test "native volumes: the job's caches, by scope and step user, as the Dagger ba
     var cached = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, true, null);
     defer cached.release(io);
     try std.testing.expect(cached.uv_env == null);
+}
+
+test "native volumes: the pre-warm names a seed where a job's plan does, for each step user" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const testing = @import("../dagger/testing.zig");
+    var job = testing.testJob(&.{testing.testStep("zig build test")});
+    job.github.repository = "o/r";
+    const seed: config.ZigSeed = .{ .version = "0.17.0", .sha256 = "ab" };
+    const opts: Options = .{ .package_caches = true, .trusted = true, .zig_seeds = &.{seed} };
+    for ([_]bool{ false, true }) |as_runner| {
+        var p = try plan(arena, io, store, opts, "repo", job, dagger.default_image, as_runner, false, null);
+        defer p.release(io);
+        const named = try seedFor(arena, store, seed, as_runner);
+        try std.testing.expectEqual(@as(usize, 1), p.seeds.items.len);
+        try std.testing.expectEqualStrings(p.seeds.items[0].dir, named.dir);
+        try std.testing.expectEqualStrings(p.seeds.items[0].cache, named.cache);
+    }
+    // The two users' seeds are apart: root's cache is not the runner user's.
+    const root = try seedFor(arena, store, seed, false);
+    const runner = try seedFor(arena, store, seed, true);
+    try std.testing.expect(!std.mem.eql(u8, root.dir, runner.dir));
 }

@@ -1,0 +1,3 @@
+kind: Added
+body: 'A native pool warms its store when it starts: the default image is provisioned and the Zig cache seeds are built in the background, with or without an engine (`RUNNER_ENGINE=none`), so the first jobs on an empty store no longer wait for them. A failed warm is only said.'
+time: 2026-11-07T01:33:09.723975485-05:00
