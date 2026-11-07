@@ -532,6 +532,8 @@ pub fn readJsonLine(comptime T: type, arena: Allocator) !T {
 fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper) u8 {
     // First, so every process the step makes, and this helper, is held to the job's limits.
     if (spec.cgroup) |dir| joinCgroup(arena, dir);
+    // Before anything is forked, so the step's processes and its children inherit it.
+    setOomScoreAdj(spec.env);
     // Files a step creates get the modes they get under runc.
     _ = linux.syscall1(.umask, 0o022);
     check("chdir to the job directory", linux.chdir(z(arena, spec.root)));
@@ -811,6 +813,45 @@ fn makeDirsIn(arena: Allocator, root: linux.fd_t, path: []const u8, owner: ?u32)
         };
         i = end + 1;
     }
+}
+
+/// What GitHub's runner gives a job's processes (`ProcessInvoker.cs`, `WriteProcessOomScoreAdj`),
+/// and the env name that sets another (-1000 to 1000, else this): a machine-wide OOM then
+/// prefers the job's processes to the runner's.
+const default_oom_score_adj: i32 = 500;
+pub const oom_score_adj_env = "PIPELINE_JOB_OOMSCOREADJ";
+
+/// The `oom_score_adj` for a step with `env`, never below `current`: lowering one needs
+/// CAP_SYS_RESOURCE, which a root runner's helper has and a workflow must not borrow to make its
+/// processes the last the kernel kills.
+fn pickOomScoreAdj(env: []const []const u8, current: i32) i32 {
+    var want = default_oom_score_adj;
+    for (env) |e| if (std.mem.startsWith(u8, e, oom_score_adj_env ++ "=")) {
+        const text = std.mem.trim(u8, e[oom_score_adj_env.len + 1 ..], " ");
+        const v = std.fmt.parseInt(i32, text, 10) catch default_oom_score_adj;
+        want = if (v >= -1000 and v <= 1000) v else default_oom_score_adj;
+    };
+    return @max(want, current);
+}
+
+/// Sets this process's `oom_score_adj`, which its children inherit across fork and exec, in or
+/// out of a namespace. Raising a value needs no privilege, and neither seccomp (installed later,
+/// in the step's init) nor no_new_privs touches a write to /proc. Best effort: it never fails a
+/// step.
+fn setOomScoreAdj(env: []const []const u8) void {
+    const path = "/proc/self/oom_score_adj";
+    var buf: [16]u8 = undefined;
+    const rfd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rfd) != .SUCCESS) return;
+    const n = linux.read(@intCast(rfd), &buf, buf.len);
+    _ = linux.close(@intCast(rfd));
+    if (linux.errno(n) != .SUCCESS) return;
+    const current = std.fmt.parseInt(i32, std.mem.trim(u8, buf[0..n], " \n"), 10) catch return;
+    const text = std.fmt.bufPrint(&buf, "{d}", .{pickOomScoreAdj(env, current)}) catch return;
+    const wfd = linux.open(path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(wfd) != .SUCCESS) return;
+    _ = linux.write(@intCast(wfd), text.ptr, text.len);
+    _ = linux.close(@intCast(wfd));
 }
 
 /// Moves the helper into the job's cgroup: `0` written to its `cgroup.procs`.
@@ -1760,4 +1801,18 @@ test "readIn reads inside a layer: no symlink is followed, and a whiteout is tol
     for ([_][]const u8{ "/github/abs", "/github/rel", "/github/dir/outside", "/../outside" }) |p|
         try std.testing.expect(try readIn(arena, layer, p, 1024) == .missing);
     try std.testing.expect(try readIn(arena, layer, "/github/ok", 2) == .missing);
+}
+
+test "a step's oom_score_adj is GitHub's 500, or the env's within -1000 to 1000, never lowered" {
+    const name = "PIPELINE_JOB_OOMSCOREADJ=";
+    try std.testing.expectEqual(@as(i32, 500), pickOomScoreAdj(&.{"A=b"}, 0));
+    try std.testing.expectEqual(@as(i32, 300), pickOomScoreAdj(&.{name ++ "300"}, 0));
+    try std.testing.expectEqual(@as(i32, 1000), pickOomScoreAdj(&.{name ++ "1000"}, 0));
+    // Out of range or not a number: 500, as upstream.
+    for ([_][]const u8{ name ++ "1001", name ++ "-1001", name ++ "lots", name }) |bad|
+        try std.testing.expectEqual(@as(i32, 500), pickOomScoreAdj(&.{bad}, 0));
+    // Not below the runner's own: a negative or low value from a workflow is only a request.
+    try std.testing.expectEqual(@as(i32, 0), pickOomScoreAdj(&.{name ++ "-1000"}, 0));
+    try std.testing.expectEqual(@as(i32, 200), pickOomScoreAdj(&.{name ++ "100"}, 200));
+    try std.testing.expectEqual(@as(i32, 500), pickOomScoreAdj(&.{}, -500));
 }
