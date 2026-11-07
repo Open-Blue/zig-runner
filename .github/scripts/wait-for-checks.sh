@@ -4,7 +4,8 @@
 # the commit the job checked out, not from the workflow that runs this: a run that waited for
 # approval through a rename waits for the current names. A check that completed without success
 # fails at once. One that never started fails as soon as every workflow run on the commit has
-# finished (after a short grace for runs not created yet), naming it; one still queued or running
+# finished, other than the runs that wait (version.yml's and release.yml's, this one among them),
+# after a short grace for runs not created yet, naming it; one still queued or running
 # fails at the end of the wait. Each is named, followed by what its
 # failure means (the second argument). Only GitHub Actions' check runs count (another app could
 # name one the same), from every page, and for each name the latest (the highest id): a re-run is a
@@ -63,10 +64,15 @@ while :; do
 	((${#waiting[@]} > 0)) || break
 	# A check that never started, on a commit whose runs have all finished, will not start now.
 	if ((${#missing[@]} > 0)) && ((SECONDS >= grace_seconds)); then
-		open=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$sha&per_page=100" \
-			--jq '[.workflow_runs[] | select(.status != "completed")] | length' 2>/dev/null) || open=1
-		total=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$sha&per_page=100" \
-			--jq '.total_count' 2>/dev/null) || total=0
+		# Not the runs that wait (version.yml's, release.yml's): the job running this is one, open
+		# while it waits, and on the commit whenever nothing merged since its run was created, the
+		# usual case; a version run waiting for approval is another. What they wait for comes from
+		# the other workflows. (Found by proofs/tla/ReleasePipeline.tla, `-own-run`.)
+		runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$sha&per_page=100" \
+			--jq '[.workflow_runs[] | select(.path | test("^\\.github/workflows/(version|release)\\.yml") | not)
+				| .status]' 2>/dev/null) || runs='["unknown"]'
+		open=$(jq '[.[] | select(. != "completed")] | length' <<<"$runs")
+		total=$(jq 'length' <<<"$runs")
 		if ((open == 0 && total > 0)); then
 			echo "::error::never ran on $sha, whose workflow runs have all finished: ${missing[*]}; $consequence (a name in .github/checks-on-main or EXTRA_CHECKS that is not a job run on a push to main?)"
 			exit 1
