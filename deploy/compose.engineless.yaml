@@ -10,7 +10,8 @@
 # deploy/compose.yaml") is below: privileges for its sandboxes, the host's network for its bridge,
 # a store on a volume (overlayfs cannot take an upper directory on overlayfs), the host's
 # /run/zig-runner for the slots' locks, and a private cgroup that it moves itself into. A host
-# that wants less than `privileged` can use the `cap_add` and `security_opt` lines there instead.
+# that wants less than `privileged` can use the `cap_add` and `security_opt` lines there, which
+# need writable cgroups too.
 services:
   engine:
     # Not started: only a service in a profile that is not enabled is left out of `up`.

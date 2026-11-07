@@ -207,7 +207,7 @@ pub const Ids = struct { uid: u32, gid: u32 };
 
 /// The fields of the line of an /etc/passwd or /etc/group naming `name` or id `id` (its third
 /// field).
-fn entryOf(text: []const u8, name: ?[]const u8, id: ?u32) ?[4][]const u8 {
+pub fn entryOf(text: []const u8, name: ?[]const u8, id: ?u32) ?[4][]const u8 {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         var it = std.mem.splitScalar(u8, line, ':');

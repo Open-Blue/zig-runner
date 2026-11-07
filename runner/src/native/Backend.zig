@@ -135,6 +135,9 @@ env: std.ArrayList(job_mod.EnvVar) = .empty,
 /// Who steps run as, and where they start.
 uid: u32 = 0,
 gid: u32 = 0,
+/// `uid` as it was given (the image's `USER`, or `dagger.runner_user`): `hashFiles()` needs its
+/// form, which `uid` and `gid` have lost (`hash_files.Step.user`).
+user: []const u8 = "",
 workdir: []const u8 = "/",
 how: Launch,
 /// On a root runner: the job's slot (its range of ids and its address), held by a lock, and its
@@ -154,6 +157,8 @@ running: sandbox.Running = .{},
 job_cgroup: ?cgroup.Job = null,
 limits: cgroup.Limits = .{ .memory_max = null, .pids_max = null },
 oom_kills: u64 = 0,
+ooms: u64 = 0,
+parent_ooms: u64 = 0,
 pids_max_hits: u64 = 0,
 /// `Config.gate`: told of the job's cgroup, which it measures the job in.
 gate: ?*admission.Gate = null,
@@ -225,7 +230,7 @@ pub const Config = struct {
     test_rootless_services: bool = false,
     /// Tests: `init` fails once the job's lock is the Backend's, as a failed network does.
     test_fail_after_lock: bool = false,
-    /// Where the jobs' cgroups go and their limits (`RUNNER_NATIVE_CGROUP`,
+    /// Where the jobs' cgroups go, their limits and all jobs' (`RUNNER_NATIVE_CGROUP`,
     /// `RUNNER_NATIVE_MEMORY_MAX_MB`, `RUNNER_NATIVE_PIDS_MAX`).
     cgroup: cgroup.Config = .{},
     /// What a `hashFiles()` may use: the memory all of them may hold together, and the time one
@@ -291,6 +296,8 @@ pub fn configFor(
     const cg: cgroup.Config = .{
         .parent = cfg.native_cgroup,
         .memory_max_mb = cfg.native_memory_max_mb,
+        .memory_total_mb = cfg.native_memory_total_mb,
+        .swap = cfg.native_swap,
         .pids_max = cfg.native_pids_max,
     };
     const exe = exeOf(arena, io, std.os.linux.getpid());
@@ -348,12 +355,13 @@ pub fn exeOf(arena: Allocator, io: std.Io, pid: std.os.linux.pid_t) Exe {
 }
 
 /// Whether each job gets a cgroup of its own with `memory.max` and `pids.max` (P5's
-/// `Config.job_limits`): a parent to make it under, and neither limit configured away. `init`
-/// fails a job the runner does not vouch for when its cgroup could not be made after all
-/// (`jobCgroup`), so this never lets one run unlimited.
+/// `Config.job_limits`): a parent to make it under, and no limit configured away, of the job's or
+/// of all jobs'. `init` fails a job the runner does not vouch for when its cgroup could not be
+/// made after all (`jobCgroup`), so this never lets one run unlimited.
 fn jobLimits(arena: Allocator, io: std.Io, cg: cgroup.Config) bool {
-    const l = cgroup.Limits.of(io, cg);
+    const l = cgroup.Limits.compute(cg, null);
     if (l.memory_max == null or l.pids_max == null) return false;
+    if (l.memory_total == null or l.pids_total == null) return false;
     return cgroup.parent(arena, io, cg.parent) == .dir;
 }
 
@@ -523,9 +531,10 @@ fn probe(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !?[]const u8
     // Not a job: the gate measures none in it.
     var probing = cfg;
     probing.gate = null;
-    // What the machine can do, whoever's job asked: an untrusted job's need of limits is
-    // `init`'s to enforce for that job, not the probe's for every job.
+    // What the machine can do, whoever's job asked: a job's need of limits is `init`'s to enforce
+    // for that job, saying why, not the probe's for every job. The probe's `true` needs none.
     probing.vouched = true;
+    probing.cgroup.parent = "none";
     var b = try init(arena, io, gpa, probing);
     defer b.deinit();
     // Without the operator's rootfs, the default image as pulled: the probe then also says
@@ -774,7 +783,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         cfg.self_exe,
     }));
     t = phases.now();
-    try b.jobCgroup(cfg, cg_parent, &id);
+    try b.jobCgroup(cfg, cg_parent, &id, why);
     t = b.timings.since(arena, .cgroup, t);
     b.binds = try b.jobBinds(cfg, why);
     _ = b.timings.since(arena, .resolver, t);
@@ -790,28 +799,87 @@ fn failed(why: *[]const u8, arena: Allocator, what: []const u8, path: []const u8
     return e;
 }
 
-/// The job's cgroup under `parent`, named as its directory is, with its limits; or none, and
-/// "Set up job" says why. The gate measures the job in it, or not at all.
-fn jobCgroup(b: *Backend, cfg: Config, parent: cgroup.Parent, name: []const u8) !void {
+/// The job's cgroup under `parent`, named as its directory is, with its limits, and all jobs'
+/// limits on the parent. A job never runs without them unless the operator said so with
+/// `RUNNER_NATIVE_CGROUP=none`: on 2026-11-06 a test's job whose cgroup could not be made went on
+/// regardless, in a container with no limit, and took a laptop's desktop with it (#367).
+/// `error.NoJobLimits` sends it to Dagger, with `why_out`, where the engine holds it, or fails it
+/// saying so where there is none. No per-process limit (`RLIMIT_AS`) stands in for the cgroup:
+/// each of a job's processes would get the whole of it, so it bounds no job, and the incident's
+/// were several `python3` at once.
+fn jobCgroup(
+    b: *Backend,
+    cfg: Config,
+    parent: cgroup.Parent,
+    name: []const u8,
+    why_out: *[]const u8,
+) !void {
     const arena = b.arena;
-    b.limits = cgroup.Limits.of(b.io, cfg.cgroup);
+    b.limits = cgroup.Limits.of(b.io, cfg.cgroup, switch (parent) {
+        .dir => |d| d,
+        .none => null,
+    });
+    const untrusted_why = "native steps run a job this runner does not vouch for only within a " ++
+        "cgroup of its own with memory and process limits, which could not be made for it";
     // A job the runner does not vouch for runs natively only within limits of its own
     // (`untrustedRefusal`, decided on `Config.job_limits`): without them it does not run.
     const limited = b.limits.memory_max != null and b.limits.pids_max != null;
-    if (!cfg.vouched and !limited) return error.NoJobLimits;
+    if (!cfg.vouched and !limited) {
+        why_out.* = untrusted_why;
+        return error.NoJobLimits;
+    }
     const why: []const u8 = switch (parent) {
         .none => |w| w,
-        .dir => |dir| if (cgroup.Job.make(arena, dir, name, b.limits)) |j| {
+        .dir => |dir| if (cgroup.Job.make(arena, b.io, dir, name, b.limits)) |j| {
+            // No total that could be put on, as beside an older runner's jobs holding more: as
+            // a job with no cgroup, for one the runner does not vouch for.
+            if (!cfg.vouched and (j.all.memory == null or j.all.pids == null)) {
+                j.remove(arena, b.io);
+                why_out.* = untrusted_why;
+                return error.NoJobLimits;
+            }
             b.job_cgroup = j;
+            b.parent_ooms = j.usage(b.io).parent_ooms;
+            // What holds is what the log says, and what a kill is put down to.
+            b.limits.memory_total = j.all.memory;
+            b.limits.pids_total = j.all.pids;
             try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: the job's " ++
                 "cgroup is {s}, with memory.max {f} and pids.max {f}.", .{
                 j.dir,
                 Limit.memory(b.limits.memory_max),
                 Limit.count(b.limits.pids_max),
             }));
+            try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: all native " ++
+                "jobs under {s} share memory.max {f} and pids.max {f}, and {s}.", .{
+                dir,
+                Limit.memory(b.limits.memory_total),
+                Limit.count(b.limits.pids_total),
+                if (!j.all.accounted)
+                    "may swap: this kernel does not account for swap"
+                else if (j.all.swap)
+                    "may swap (RUNNER_NATIVE_SWAP)"
+                else
+                    "may not swap",
+            }));
+            if (j.all.kept) {
+                const said = try std.fmt.allocPrint(arena, "Native steps: these are not this " ++
+                    "runner's limits for all jobs: another runner's jobs are running under {s} " ++
+                    "with these, and changing them could kill those jobs or leave them " ++
+                    "unbounded. Runners on one parent must use the same settings.", .{dir});
+                try b.notes.append(arena, said);
+                std.log.warn("native: {s}", .{said});
+            }
             // memory.high from what the gate reserves for the job; under memory.max, which stays
-            // the hard cap.
-            const high_mb = if (b.gate) |g| g.native(j.dir) orelse return else return;
+            // the hard cap. Only where it can slow a job, not stop it (`cgroup.canSwap`).
+            const g = b.gate orelse return;
+            const high_mb = g.native(j.dir) orelse return;
+            if (!cgroup.canSwap(j.all, b.io)) {
+                g.noHigh(if (b.limits.memory_max) |m| m >> 20 else null);
+                try b.notes.append(arena, "Native steps: no memory.high: with no swap it would " ++
+                    "stop a job past it instead of slowing it. memory.max ends one that takes " ++
+                    "too much.");
+                return;
+            }
             const high = j.setHigh(arena, b.io, @as(u64, high_mb) << 20) catch |e| {
                 try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: the " ++
                     "job's memory.high could not be set ({s}).", .{@errorName(e)}));
@@ -828,10 +896,21 @@ fn jobCgroup(b: *Backend, cfg: Config, parent: cgroup.Parent, name: []const u8) 
             @errorName(e),
         }),
     };
-    if (!cfg.vouched) return error.NoJobLimits;
-    try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: the job has no " ++
-        "cgroup of its own ({s}), so no memory or process limit of its own, and the memory " ++
-        "gate does not measure it.", .{why}));
+    if (!cfg.vouched) {
+        why_out.* = untrusted_why;
+        return error.NoJobLimits;
+    }
+    if (!std.mem.eql(u8, cfg.cgroup.parent, "none")) {
+        why_out.* = try std.fmt.allocPrint(arena, "native steps do not run a job with no limits " ++
+            "unless told to, and this job would have no cgroup ({s}). " ++
+            "RUNNER_NATIVE_CGROUP=none accepts that a runaway job can take the whole machine", .{
+            why,
+        });
+        return error.NoJobLimits;
+    }
+    try b.notes.append(arena, "Native steps: this job runs UNBOUNDED " ++
+        "(RUNNER_NATIVE_CGROUP=none): it has no memory or process limit, a runaway step can " ++
+        "exhaust the whole machine, and the memory gate does not measure it.");
     if (b.gate) |g| _ = g.native(null);
 }
 
@@ -1330,9 +1409,11 @@ fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
     if (ev.job.container != null) b.runtime_path = b.envValue("PATH");
     b.uid = b.image_uid;
     b.gid = b.image_gid;
+    b.user = b.container_opts.user orelse if (b.image) |img| img.user else "";
     if (plan.as_runner) {
         b.uid = runner_uid;
         b.gid = runner_uid;
+        b.user = dagger.runner_user;
         try b.put("HOME", dagger.runner_home);
     }
     try b.put(dagger.mark_env, plan.mark);
@@ -1520,20 +1601,52 @@ fn limitsReached(b: *Backend, x: *Exec, num: u32) !void {
     const u = j.usage(b.io);
     defer {
         b.oom_kills = u.oom_kills;
+        b.ooms = u.ooms;
+        b.parent_ooms = u.parent_ooms;
         b.pids_max_hits = u.pids_max_hits;
     }
-    if (u.oom_kills > b.oom_kills) x.sh.errorLine(num, try std.fmt.allocPrint(
-        b.arena,
-        "The job reached its memory limit ({f}, RUNNER_NATIVE_MEMORY_MAX_MB): the kernel " ++
-            "killed {d} process(es) of this step to stay within it.",
-        .{ Limit.memory(b.limits.memory_max), u.oom_kills - b.oom_kills },
-    ));
+    if (u.oom_kills > b.oom_kills) {
+        const before: cgroup.Usage = .{
+            .working_set_mb = null,
+            .peak_mb = null,
+            .oom_kills = b.oom_kills,
+            .ooms = b.ooms,
+            .parent_ooms = b.parent_ooms,
+            .pids_max_hits = 0,
+        };
+        x.sh.errorLine(num, try oomLine(
+            b.arena,
+            cgroup.Killer.of(before, u),
+            b.limits,
+            u.oom_kills - b.oom_kills,
+        ));
+    }
     if (u.pids_max_hits > b.pids_max_hits) x.sh.errorLine(num, try std.fmt.allocPrint(
         b.arena,
         "The job reached its process limit ({f}, RUNNER_NATIVE_PIDS_MAX): this step was " ++
             "refused {d} new process(es) or thread(s).",
         .{ Limit.count(b.limits.pids_max), u.pids_max_hits - b.pids_max_hits },
     ));
+}
+
+/// The error line for `killed` processes OOM-killed in a step, by the limit they were killed for.
+fn oomLine(
+    arena: Allocator,
+    killer: cgroup.Killer,
+    limits: cgroup.Limits,
+    killed: u64,
+) ![]const u8 {
+    return switch (killer) {
+        .job => std.fmt.allocPrint(arena, "The job reached its memory limit ({f}, " ++
+            "RUNNER_NATIVE_MEMORY_MAX_MB): the kernel killed {d} process(es) of this step to " ++
+            "stay within it.", .{ Limit.memory(limits.memory_max), killed }),
+        .all => std.fmt.allocPrint(arena, "All native jobs together reached their memory limit " ++
+            "({f}, RUNNER_NATIVE_MEMORY_TOTAL_MB): the kernel killed {d} process(es) of this " ++
+            "step to stay within it.", .{ Limit.memory(limits.memory_total), killed }),
+        .above => std.fmt.allocPrint(arena, "The machine ran out of memory, or a limit above " ++
+            "the native jobs' reached its own: the kernel killed {d} process(es) of this step. " ++
+            "This job was within its limits.", .{killed}),
+    };
 }
 
 /// The job's cache volumes, as the Dagger backend gives them (`volumes.plan`): held for the job
@@ -1954,7 +2067,7 @@ pub const max_read = 16 * 1024 * 1024;
 
 /// `hashFiles(args)` over the job's files as the next step would see them (`native/hash_files.zig`):
 /// the layers as they are now, so what earlier steps wrote is there, read by the runner with no
-/// mount. `ws` is the workspace.
+/// mount, for the steps' user (`hashStep`). `ws` is the workspace.
 pub fn hashFiles(
     b: *Backend,
     arena: Allocator,
@@ -1970,9 +2083,33 @@ pub fn hashFiles(
     layers[layers.len - 1] = b.rootfs;
     var limits = b.hash_settings.limits(b.io);
     limits.cancel = b.cancel;
-    const stack: hash_files.Stack = .{ .layers = layers, .opaque_xattr = b.opaqueXattr(), .limits = limits };
+    const layer_ids = try b.gpa.alloc(Store.Ids, layers.len);
+    defer b.gpa.free(layer_ids);
+    const stack: hash_files.Stack = .{
+        .layers = layers,
+        .opaque_xattr = b.opaqueXattr(),
+        .step = b.hashStep(layer_ids),
+        .limits = limits,
+    };
     // The call's own memory is freed when it returns; the job's arena gets the result only.
     return hash_files.hashFiles(b.gpa, arena, b.io, stack, ws, dagger.runner_home, args);
+}
+
+/// The steps' user for `hashFiles`, with `layer_ids` filled for its layers, topmost first; null
+/// when they run as root, which is every step of a rootless runner. A job's own upper has its
+/// slot's host ids and is seen as it is; what is seen through the job's ids (`canonical`: stored
+/// layers, a flattened one, then the seeds and the rootfs, the image's own) has the job's ids
+/// (`sandbox.idmapLowers`). Rootless, no layer has any ids but the runner's own user's.
+fn hashStep(b: *const Backend, layer_ids: []Store.Ids) ?hash_files.Step {
+    if (b.uid == 0) return null;
+    @memset(layer_ids, b.ids());
+    if (b.how.userns == .mapped) {
+        const n = b.layers.items.len;
+        for (b.layers.items, 0..) |l, i| {
+            if (!l.canonical) layer_ids[n - 1 - i] = b.slotIds();
+        }
+    }
+    return .{ .uid = b.uid, .gid = b.gid, .user = b.user, .ids = layer_ids };
 }
 
 /// Overlay's attribute that marks a directory opaque: `trusted.` when the job's overlay is mounted
@@ -2990,7 +3127,12 @@ pub fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
         .sub_path = try std.fmt.allocPrint(arena, "rootfs/etc/{s}", .{f}),
         .data = "",
     });
-    const cfg = try testConfigAt(arena, try d.realPathFileAlloc(io, ".", arena), exe);
+    var cfg = try testConfigAt(arena, try d.realPathFileAlloc(io, ".", arena), exe);
+    // As root, the root runner's path where this machine has it: under limits, in a tree of the
+    // tests' own. They do not depend on it: nothing here takes more than it asks for by itself,
+    // and the tests that reach limits have parents of their own (`testCgroup`).
+    if (std.os.linux.geteuid() == 0 and cgroup.parent(arena, io, test_parent) == .dir)
+        cfg.cgroup.parent = test_parent;
     // One sandbox, to see whether this machine lets us make them at all.
     var b = try init(arena, io, std.testing.allocator, cfg);
     defer b.deinit();
@@ -3015,6 +3157,8 @@ pub fn testConfigAt(arena: Allocator, root: []const u8, exe: []const u8) !Config
         .vouched = true,
         .rootless = true,
         .check_store_parents = false,
+        // Rootless tests have no cgroup to run in, and most machines none to delegate.
+        .cgroup = .{ .parent = "none" },
         .binds = &.{
             .{ .host = "/usr", .at = "/usr" },
             .{ .host = "/etc/ld.so.cache", .at = "/etc/ld.so.cache" },
@@ -4850,6 +4994,7 @@ test "a job's directory and lock are let go once, when its set-up fails after th
         .vouched = true,
         .test_fail_after_lock = true,
         .check_store_parents = false,
+        .cgroup = .{ .parent = "none" },
     };
     // Closing an fd twice would panic here (Zig's own check for a file closed twice).
     try std.testing.expectError(error.TestFailure, init(arena, io, std.testing.allocator, cfg));
@@ -5989,13 +6134,36 @@ test "native cache volumes: kept between jobs, apart by scope, Zig's local cache
     try std.testing.expect(std.mem.indexOf(u8, third.text, "stdout] leaked") == null);
 }
 
-/// The cgroup parent the cgroup tests use: a tree of the tests' own as root (its memory.max is
-/// set by the gate's test), or `ZIG_RUNNER_TEST_CGROUP` (`self` under `systemd-run --user
-/// --scope -p Delegate=yes`) rootless; else the test is skipped.
-fn testCgroup(arena: Allocator, cfg: *Config) !void {
+/// The tests' tree as root, for the tests that reach no limit (`testConfig`).
+const test_parent = cgroup.mount_point ++ "/zig-runner-test";
+
+/// A test's own cgroup parent: a new one as root, since all jobs' limits are on the parent and
+/// tests of them give it different numbers, or `ZIG_RUNNER_TEST_CGROUP` (`self` under `systemd-run
+/// --user --scope -p Delegate=yes`) rootless. Without one the test is skipped (failed where
+/// `ZIG_RUNNER_REQUIRE_NATIVE=1`) before it can run anything: in a container whose root holds
+/// processes no parent can be made (#367).
+const TestCgroup = struct {
+    /// Where the jobs' cgroups go.
+    dir: []const u8,
+    /// What was made for this test, and `remove` removes; null for a delegated `self`.
+    top: ?[]const u8,
+
+    fn remove(t: TestCgroup, arena: Allocator) void {
+        const top = t.top orelse return;
+        (cgroup.Job{ .dir = t.dir }).remove(arena, std.testing.io);
+        (cgroup.Job{ .dir = top }).remove(arena, std.testing.io);
+    }
+};
+
+fn testCgroup(arena: Allocator, cfg: *Config) !TestCgroup {
+    const io = std.testing.io;
     var env = try std.testing.environ.createMap(arena);
-    if (std.os.linux.geteuid() == 0) {
-        cfg.cgroup.parent = cgroup.mount_point ++ "/zig-runner-test";
+    const own = std.os.linux.geteuid() == 0;
+    if (own) {
+        var raw: [8]u8 = undefined;
+        io.random(&raw);
+        const name = std.fmt.bytesToHex(raw, .lower);
+        cfg.cgroup.parent = try std.fmt.allocPrint(arena, "{s}-{s}", .{ test_parent, &name });
     } else if (env.get("ZIG_RUNNER_TEST_CGROUP")) |p| {
         cfg.cgroup.parent = p;
     } else {
@@ -6003,6 +6171,117 @@ fn testCgroup(arena: Allocator, cfg: *Config) !void {
             "(ZIG_RUNNER_TEST_CGROUP=self)\n", .{});
         return error.SkipZigTest;
     }
+    switch (cgroup.parent(arena, io, cfg.cgroup.parent)) {
+        .dir => |d| return .{
+            .dir = try arena.dupe(u8, d),
+            .top = if (own) cfg.cgroup.parent else null,
+        },
+        .none => |why| {
+            if (own) (cgroup.Job{ .dir = cfg.cgroup.parent }).remove(arena, io);
+            const required = std.mem.eql(u8, env.get("ZIG_RUNNER_REQUIRE_NATIVE") orelse "", "1");
+            return skip(required, why);
+        },
+    }
+}
+
+/// A step that takes `mb` of memory, 8 MiB at a time, and then ends by itself, saying so: the
+/// tests' runaway, which never relies on a limit to protect the host. Its exit status follows
+/// `exit=`, since bash's `-e` would end the step at it; without python3 it says `no-python`. Both
+/// sayings are put together as they run, as a step's log shows its script too.
+fn hogStep(comptime mb: u32) job_mod.Step {
+    return testStep("command -v python3 >/dev/null || { echo no\"\"-python; exit 0; }\n" ++
+        "python3 -c 'x = []\nfor _ in range(" ++ std.fmt.comptimePrint("{d}", .{mb / 8}) ++
+        "): x.append(b\"x\" * (8 << 20))\nprint(\"no limit\", \"stopped it\")\n" ++
+        "raise SystemExit(3)' || echo exit=$?");
+}
+
+/// A step that forks a binary tree of `depth` levels of processes, 2^(`depth` + 1) - 1 at the most
+/// and each spinning for 20 s at the most, and ends it after 2 s: a fork bomb with an end of its
+/// own. In a process group of its own (`set -m`), of builtins only (nothing else can fork while
+/// it holds every process), then killed, and waited out until no process of the group is left,
+/// so the step's own end (`scripts.stepScriptFc`'s epilogue, whose `sh` must fork) finds its
+/// processes free again. Left running, the bomb still held them there: the wrapper's `sh` could
+/// not fork, and the step failed with exit 2 (#265's CI, once).
+fn bombStep(comptime depth: u32) job_mod.Step {
+    return testStep("set -m\n" ++
+        "( set +m\n" ++
+        "bomb() {\n" ++
+        "  if [ \"$1\" -gt 0 ]; then bomb $(($1 - 1)) & bomb $(($1 - 1)) & fi\n" ++
+        "  until [ $SECONDS -ge 20 ]; do :; done\n" ++
+        "}\n" ++
+        "bomb " ++ std.fmt.comptimePrint("{d}", .{depth}) ++ " ) &\n" ++
+        "pg=$!\nset +m\n" ++
+        "end=$((SECONDS + 2)); while [ $SECONDS -lt $end ]; do :; done\n" ++
+        "kill -9 -- -$pg\n" ++
+        "while kill -0 -- -$pg 2>/dev/null; do :; done\n" ++
+        "echo after-the-bomb");
+}
+
+test "the tests' runaway and fork bomb end by themselves, with no limit on them" {
+    // Small, as nothing here holds them but themselves: #367's `while True` under a cgroup that
+    // could not be made ran until the machine's global OOM.
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    cfg.cgroup.parent = "none";
+    const r = try runNativeJob(arena, cfg, testJob(&.{ hogStep(64), bombStep(3) }), .root);
+    if (std.mem.indexOf(u8, r.text, "no-python") != null) return error.SkipZigTest;
+    try expectLines(r.text, &.{ "no limit stopped it", "exit=3", "after-the-bomb" });
+    try std.testing.expect(r.res.succeeded);
+}
+
+test "a native job that cannot be bounded is refused, unless the operator accepts it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "refused/store");
+    try tmp.dir.createDirPath(io, "refused/rootfs");
+    const root = try tmp.dir.realPathFileAlloc(io, "refused", arena);
+    // No parent, on any machine, as a rootless runner without delegation has none. Refused before
+    // any sandbox, so this part needs none.
+    const no_parent = cgroup.mount_point ++ "/../not-a-cgroup";
+    const refused: Config = .{
+        .rootfs = try std.fmt.allocPrint(arena, "{s}/rootfs", .{root}),
+        .store = try std.fmt.allocPrint(arena, "{s}/store", .{root}),
+        .self_exe = "/bin/true",
+        .vouched = true,
+        .check_store_parents = false,
+        .cgroup = .{ .parent = no_parent },
+    };
+    var why: []const u8 = "";
+    try std.testing.expectError(
+        error.NoJobLimits,
+        initWhy(arena, io, std.testing.allocator, refused, &why),
+    );
+    // It says why not, and what accepts the risk.
+    for ([_][]const u8{
+        "would have no cgroup",
+        "is not a cgroup's path",
+        "RUNNER_NATIVE_CGROUP=none",
+    }) |w| try std.testing.expect(std.mem.indexOf(u8, why, w) != null);
+
+    // Said by the operator, it runs, saying plainly what that means.
+    var cfg = try testConfig(arena, &tmp);
+    cfg.cgroup.parent = "none";
+    const accepted = try runNativeJob(arena, cfg, testJob(&.{testStep("echo ran")}), .root);
+    try std.testing.expect(accepted.res.succeeded);
+    try expectLines(accepted.text, &.{
+        "ran",
+        "this job runs UNBOUNDED (RUNNER_NATIVE_CGROUP=none): it has no memory or process limit",
+    });
+
+    // A machine that cannot make a job's cgroup can still run the probe: the refusal is the
+    // job's, with its reason, not a probe's error for every job.
+    probe_cache = .{};
+    defer probe_cache = .{};
+    cfg.cgroup.parent = no_parent;
+    try std.testing.expect(usable(arena, io, std.testing.allocator, cfg) == null);
 }
 
 test "root runner: a native job's runaway is OOM-killed in its own cgroup, a fork bomb stops at pids.max" {
@@ -6013,7 +6292,8 @@ test "root runner: a native job's runaway is OOM-killed in its own cgroup, a for
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var cfg = try testConfig(arena, &tmp);
-    try testCgroup(arena, &cfg);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
     var runaway = cfg;
     // Room for the step's shell and the helper: the kernel kills the largest process first, but
     // a limit near their own size takes them too (seen on the root pass at 64 MB).
@@ -6022,20 +6302,9 @@ test "root runner: a native job's runaway is OOM-killed in its own cgroup, a for
 
     // The runaway job holds more and more memory, and a fork bomb after it; its neighbour, at
     // the same time, holds 200 MB under the default limit and must not notice.
-    const hog = testStep("python3 -c 'x = []\nwhile True: x.append(b\"x\" * (8 << 20))' || " ++
-        "echo exit=$?");
-    // The bomb in a process group of its own (`set -m`), for 2 s of builtins only (nothing else
-    // can fork while it holds every process), then killed, and waited out until no process of
-    // the group is left, so the step's own end (`scripts.stepScriptFc`'s epilogue, whose `sh`
-    // must fork) finds its processes free again. Left running, the bomb still held them there:
-    // the wrapper's `sh` could not fork, and the step failed with exit 2 (#265's CI, once).
-    var bomb = testStep("set -m\n" ++
-        "( set +m; bomb() { bomb | bomb & }; bomb; while :; do :; done ) &\n" ++
-        "pg=$!\nset +m\n" ++
-        "end=$((SECONDS + 2)); while [ $SECONDS -lt $end ]; do :; done\n" ++
-        "kill -9 -- -$pg\n" ++
-        "while kill -0 -- -$pg 2>/dev/null; do :; done\n" ++
-        "echo after-the-bomb");
+    // Each ends by itself if its limit fails, and the checks below then fail.
+    const hog = hogStep(1024);
+    var bomb = bombStep(9);
     bomb.condition = "always()";
     var near = testStep("python3 -c 'import time; x = b\"x\" * (200 << 20); time.sleep(6); " ++
         "print(\"neighbour held\", len(x) >> 20)'");
@@ -6079,6 +6348,7 @@ test "root runner: a native job's runaway is OOM-killed in its own cgroup, a for
     // stopped at the limit and the job went on.
     try std.testing.expect(std.mem.indexOf(u8, texts[0], "exit=137") != null or
         r.steps[0].exit_code == 137);
+    try std.testing.expect(std.mem.indexOf(u8, texts[0], "no limit stopped it") == null);
     // The bomb's step succeeded: once it ended the bomb, its end could fork again.
     if (r.steps[1].outcome != .success) std.debug.print("bomb step: exit {d}\n", .{r.steps[1].exit_code});
     try std.testing.expectEqual(dagger.Outcome.success, r.steps[1].outcome);
@@ -6099,13 +6369,12 @@ test "root runner: native gate accuracy, each job's own cgroup against the engin
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var cfg = try testConfig(arena, &tmp);
-    try testCgroup(arena, &cfg);
-    const parent = switch (cgroup.parent(arena, io, cfg.cgroup.parent)) {
-        .dir => |d| d,
-        .none => |why| return skip(true, why),
-    };
+    const test_cgroup = try testCgroup(arena, &cfg);
+    defer test_cgroup.remove(arena);
+    const parent = test_cgroup.dir;
     // The jobs' parent stands for the engine's cgroup: one cgroup for every job, as the engine
-    // is, read as the gate reads the engine's (which needs a cap to be read at all).
+    // is, read as the gate reads the engine's (which needs a cap to be read at all). The first
+    // job replaces this cap with all jobs' limit, which serves as well.
     const cap = try std.fmt.allocPrintSentinel(arena, "{s}/memory.max", .{parent}, 0);
     const fd = std.os.linux.open(cap, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
     if (std.os.linux.errno(fd) != .SUCCESS) return skip(true, "the cgroup parent's memory.max");
@@ -6177,11 +6446,12 @@ test "root runner: a native job's cgroup gets memory.high from what the gate res
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var cfg = try testConfig(arena, &tmp);
-    try testCgroup(arena, &cfg);
-    switch (cgroup.parent(arena, io, cfg.cgroup.parent)) {
-        .dir => {},
-        .none => |why| return skip(true, why),
-    }
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    // On a machine with no swap at all it has no use (`cgroup.canSwap`), and the test below has it.
+    const can = cgroup.canSwap(.{ .swap = true }, io);
+    if (!can) return error.SkipZigTest;
+    cfg.cgroup.swap = true;
     var slots: [1]admission.Admission.Slot = undefined;
     var pool: admission.Admission = .init(io, .{}, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
@@ -6202,8 +6472,22 @@ test "root runner: a native job's cgroup gets memory.high from what the gate res
     try std.testing.expectEqual(@as(?u32, 1024), slots[0].high_mb);
     try expectLines(first.text, &.{
         "with memory.max ",
+        "Native steps: all native jobs under ",
         "Native steps: memory.high 1.0 GB, from what the memory gate reserves for the job",
     });
+    // All jobs' limits are on the parent.
+    const all = cgroup.Limits.of(io, cfg.cgroup, parent.dir);
+    // The kernel rounds it down to a page.
+    const held = admission.readCgroupBytes(io, parent.dir, "memory.max").?;
+    try std.testing.expect(held <= all.memory_total.? and all.memory_total.? - held < 1 << 16);
+    var pids_buf: [32]u8 = undefined;
+    const pids = try std.Io.Dir.cwd().readFile(
+        io,
+        try std.fmt.allocPrint(arena, "{s}/pids.max", .{parent.dir}),
+        &pids_buf,
+    );
+    const pids_held = try std.fmt.parseInt(u32, std.mem.trim(u8, pids, "\n"), 10);
+    try std.testing.expectEqual(all.pids_total.?, pids_held);
     const learned = gate.ended() orelse return error.TestUnexpectedResult;
     try std.testing.expect(learned.native and learned.alone);
     // The job's own few MB (its shell and helper), or the 64 MB floor.
@@ -6220,6 +6504,199 @@ test "root runner: a native job's cgroup gets memory.high from what the gate res
         try std.fmt.allocPrint(arena, "Native steps: memory.high {d} MB, from ", .{high}),
     });
     _ = gate.ended();
+}
+
+test "root runner: with no swap a job past what the gate reserves is not held there" {
+    // It stops dead at a `memory.high` it cannot reclaim: nothing kills it, and it holds its runner
+    // until the job's timeout. `timeout` ends it here if it comes to that.
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    cfg.cgroup.memory_max_mb = 1536;
+    var slots: [1]admission.Admission.Slot = undefined;
+    var pool: admission.Admission = .init(io, .{}, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    pool.native = true;
+    var gate: admission.Gate = .{ .pool = &pool };
+    cfg.gate = &gate;
+    var sampling = try io.concurrent(admission.Admission.sample, .{&pool});
+    defer sampling.cancel(io);
+    gate.leave(true);
+    gate.assigned(admission.jobKey("o/r", "ci.yml", "past its high"));
+    // 1.1 GiB, over the 1 GB a job not learned yet would get, under its `memory.max`, and held for
+    // the gate to see.
+    const step = testStep("timeout 60 python3 -c 'import time; x = b\"x\" * (1100 << 20); " ++
+        "print(\"held\", len(x) >> 20, flush=True); time.sleep(4)' || echo exit=$?");
+    const r = try runNativeJob(arena, cfg, testJob(&.{step}), .root);
+    if (!r.res.succeeded) std.debug.print("{s}\n", .{r.text});
+    try expectLines(r.text, &.{ "held 1100", "Native steps: no memory.high: with no swap" });
+    try std.testing.expectEqual(@as(?u32, null), slots[0].high_mb);
+    // Seen at what it took, with nothing held down.
+    const learned = gate.ended() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(learned.seen_mb >= 1100);
+}
+
+test "the error line says which limit an OOM kill came from" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const limits: cgroup.Limits = .{
+        .memory_max = 256 << 20,
+        .pids_max = 64,
+        .memory_total = 512 << 20,
+    };
+    const job = try oomLine(arena, .job, limits, 1);
+    try std.testing.expect(std.mem.startsWith(u8, job, "The job reached its memory limit (256 "));
+    const all = try oomLine(arena, .all, limits, 2);
+    try std.testing.expect(std.mem.startsWith(u8, all, "All native jobs together reached their " ++
+        "memory limit (512 MB, "));
+    const above = try oomLine(arena, .above, limits, 1);
+    try std.testing.expect(std.mem.startsWith(u8, above, "The machine ran out of memory"));
+    try std.testing.expect(std.mem.indexOf(u8, above, "RUNNER_NATIVE") == null);
+}
+
+test "root runner: a named parent keeps the operator's limit, and a job's limits go below it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    if (parent.top == null) return error.SkipZigTest;
+    // The operator's: a slice's `MemoryMax=4G`.
+    const cap = try std.fmt.allocPrint(arena, "{s}/memory.max", .{parent.top.?});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cap, .data = "4294967296" });
+    const r = try runNativeJob(arena, cfg, testJob(&.{testStep("echo small job")}), .root);
+    try std.testing.expect(r.res.succeeded);
+    // Its limit and its swap are as they were, ours in the `jobs` child, figured from its 4 GiB.
+    const top = parent.top.?;
+    try std.testing.expectEqual(@as(?u64, 4 << 30), admission.readCgroupBytes(io, top, "memory.max"));
+    try std.testing.expectEqual(null, admission.readCgroupBytes(io, top, "memory.swap.max"));
+    try std.testing.expect(std.mem.endsWith(u8, parent.dir, "/jobs"));
+    try std.testing.expect(admission.readCgroupBytes(io, parent.dir, "memory.max").? <= 2 << 30);
+}
+
+test "root runner: a job the runner does not vouch for does not run where no total can hold" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    // A pool set to no limit, whose job holds 50 MB, so that a total of 1 MB would end it.
+    var open = cfg;
+    open.cgroup.memory_total_mb = 0;
+    open.cgroup.memory_max_mb = 0;
+    const Run = struct {
+        fn one(arena_: Allocator, cfg_: Config, out: *?dagger.Result) void {
+            const script = "python3 -c 'import time; x = b\"x\" * (50 << 20); time.sleep(6)'";
+            const r = runNativeJob(arena_, cfg_, testJob(&.{testStep(script)}), .root) catch return;
+            out.* = r.res;
+        }
+    };
+    var ran: ?dagger.Result = null;
+    var other_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer other_arena.deinit();
+    var holding = try io.concurrent(Run.one, .{ other_arena.allocator(), open, &ran });
+    try io.sleep(.fromSeconds(3), .awake);
+    var strict = cfg;
+    strict.vouched = false;
+    strict.cgroup.memory_total_mb = 1;
+    var why: []const u8 = "";
+    const refused = initWhy(arena, io, std.testing.allocator, strict, &why);
+    holding.await(io);
+    try std.testing.expectError(error.NoJobLimits, refused);
+    try std.testing.expect(std.mem.indexOf(u8, why, "does not vouch for") != null);
+    // And the job it would have put at risk ran through.
+    try std.testing.expect(ran != null and ran.?.succeeded);
+}
+
+test "root runner: all native jobs together stay under the limit on their parent" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    // Each job within its own limit, two of them not within all jobs': 600 MB of 400 at the
+    // most, and neither asks for more whatever the limit does.
+    cfg.cgroup.memory_max_mb = 350;
+    cfg.cgroup.memory_total_mb = 400;
+    const Run = struct {
+        fn one(arena_: Allocator, cfg_: Config, out: *[]const u8) void {
+            const r = runNativeJob(arena_, cfg_, testJob(&.{testStep("python3 -c 'import time; " ++
+                "x = b\"x\" * (300 << 20); print(\"held\", flush=True); time.sleep(8)' || " ++
+                "echo exit=$?")}), .root) catch return;
+            out.* = r.text;
+        }
+    };
+    var texts: [2][]const u8 = .{ "", "" };
+    var arenas: [2]std.heap.ArenaAllocator = .{
+        .init(std.testing.allocator),
+        .init(std.testing.allocator),
+    };
+    defer for (&arenas) |*x| x.deinit();
+    var first = try io.concurrent(Run.one, .{ arenas[0].allocator(), cfg, &texts[0] });
+    try io.sleep(.fromSeconds(3), .awake);
+    Run.one(arenas[1].allocator(), cfg, &texts[1]);
+    first.await(io);
+    for (texts) |t| try expectLines(t, &.{
+        "with memory.max 350 MB",
+        "share memory.max 400 MB and pids.max 32768",
+    });
+    // The kernel kills the larger of the two, either one, and the log says which limit it was.
+    const said = "All native jobs together reached their memory limit (400 MB, " ++
+        "RUNNER_NATIVE_MEMORY_TOTAL_MB)";
+    try std.testing.expect(std.mem.indexOf(u8, texts[0], said) != null or
+        std.mem.indexOf(u8, texts[1], said) != null);
+    if (admission.readCgroupBytes(io, parent.dir, "memory.peak")) |peak|
+        try std.testing.expect(peak <= 400 << 20);
+}
+
+test "root runner: a test's cgroup parent is its own, so runs side by side keep their limits" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var one = try testConfig(arena, &tmp);
+    var other = one;
+    if (std.os.linux.geteuid() != 0) return error.SkipZigTest;
+    const p1 = try testCgroup(arena, &one);
+    defer p1.remove(arena);
+    const p2 = try testCgroup(arena, &other);
+    defer p2.remove(arena);
+    try std.testing.expect(!std.mem.eql(u8, p1.dir, p2.dir));
+    one.cgroup.memory_total_mb = 256;
+    other.cgroup.memory_total_mb = 512;
+    const io = std.testing.io;
+    const l1 = cgroup.Limits.compute(one.cgroup, null);
+    const j1 = try cgroup.Job.make(arena, io, p1.dir, "one", l1);
+    defer j1.remove(arena, io);
+    const l2 = cgroup.Limits.compute(other.cgroup, null);
+    const j2 = try cgroup.Job.make(arena, io, p2.dir, "two", l2);
+    defer j2.remove(arena, io);
+    const held = [_]?u64{
+        admission.readCgroupBytes(io, p1.dir, "memory.max"),
+        admission.readCgroupBytes(io, p2.dir, "memory.max"),
+    };
+    try std.testing.expectEqual(@as(?u64, 256 << 20), held[0]);
+    try std.testing.expectEqual(@as(?u64, 512 << 20), held[1]);
 }
 
 test "a runner whose binary a deployment replaced runs native jobs on the binary it started from" {
@@ -6488,6 +6965,229 @@ test "native hashFiles: a link a step planted out of the job's tree does not rea
     defer dir.close(io);
     var it = dir.iterate();
     while (try it.next(io)) |e| try std.testing.expectEqualStrings("secret.txt", e.name);
+}
+
+test "hashFiles reads for the steps' user, by each layer's ids, and for root checks nothing" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var b: Backend = .{
+        .arena = arena,
+        .io = std.testing.io,
+        .gpa = std.testing.allocator,
+        .dir = "",
+        .rootfs = "",
+        .binds = &.{},
+        .lock = undefined,
+        .how = .{ .argv_prefix = &.{}, .userns = .mapped },
+    };
+    try b.layers.append(arena, .{ .name = "old", .path = "old", .canonical = true });
+    try b.layers.append(arena, .{ .name = "new", .path = "new" });
+    var seen: [4]Store.Ids = undefined;
+
+    // Root sees all of it, on a root runner...
+    try std.testing.expect(b.hashStep(&seen) == null);
+    // ...as a rootless one's steps, which can be no one else, do, in a namespace of their own or
+    // in one they were started in.
+    for ([_]sandbox.Userns{ .self, .inherited }) |rootless| {
+        b.how.userns = rootless;
+        try std.testing.expect(b.hashStep(&seen) == null);
+    }
+
+    // The runner user on a root runner: the job's upper in the slot's ids, the stored layer and
+    // the image's below it in the job's.
+    b.how.userns = .mapped;
+    b.uid = 1001;
+    b.gid = 1001;
+    b.user = dagger.runner_user;
+    const step = b.hashStep(&seen).?;
+    try std.testing.expectEqual(@as(u32, 1001), step.uid);
+    try std.testing.expectEqualStrings(dagger.runner_user, step.user);
+    try std.testing.expectEqual(b.slotIds(), seen[0]);
+    for (seen[1..]) |lower| try std.testing.expectEqual(b.ids(), lower);
+
+    // No layer of a rootless runner has a slot's ids, whoever it were asked for.
+    for ([_]sandbox.Userns{ .self, .inherited }) |rootless| {
+        b.how.userns = rootless;
+        _ = b.hashStep(&seen).?;
+        for (seen) |any| try std.testing.expectEqual(b.ids(), any);
+    }
+}
+
+/// A job that plants links to what its user may not read, in a rootfs that has such files, then
+/// asks for each in a step of its own. `hashFiles()` failing fails a step, and these run anyway.
+fn deniedJob(arena: Allocator) !job_mod.Job {
+    const plant = testStep("ln -s /etc/shadow s; ln -s /opt/shut/f behind; ln -s /opt/shut/none absent; " ++
+        "ln -s /opt/shut/sub dir-behind; ln -s /opt/grouped grouped; ln -s /opt opt-dir; " ++
+        "printf mine > mine; chmod 600 mine; mkdir own; printf x > own/f; chmod 000 own");
+    const asks = [_][]const u8{
+        "'s'",
+        "'behind'",
+        "'absent'",
+        "'dir-behind'",
+        "'own/f'",
+        "'--follow-symbolic-links', 'dir-behind/**'",
+        "'opt-dir'",
+        "'mine'",
+        "'grouped'",
+    };
+    const steps = try arena.alloc(job_mod.Step, asks.len + 1);
+    steps[0] = plant;
+    for (asks, steps[1..], 0..) |ask, *st, i| {
+        st.* = testStep("");
+        st.condition = "always()";
+        st.action.script.script = .{ .expr = try std.fmt.allocPrint(
+            arena,
+            "format('echo got{d}={{0}}.', hashFiles({s}))",
+            .{ i, ask },
+        ) };
+    }
+    return testJob(steps);
+}
+
+/// What `deniedJob` must leave: a step's failure for each file its user may not reach, in the words
+/// of Dagger's `sha256sum` and `realpath`, and the hashes of those it may.
+fn expectDenied(arena: Allocator, r: anytype) !void {
+    const ws = "/home/runner/work/r/r";
+    try expectLines(r.text, &.{
+        "hashFiles(s) failed: sha256sum: s: Permission denied",
+        "hashFiles(behind) failed: sha256sum: behind: Permission denied",
+        // What is not there behind the directory reads as what is.
+        "hashFiles(absent) failed: sha256sum: absent: Permission denied",
+        "failed: sha256sum: dir-behind: Permission denied",
+        // The user's own file, in the user's own directory, whose search it took away.
+        "hashFiles(own/f) failed: sha256sum: own/f: Permission denied",
+        "failed: realpath: " ++ ws ++ "/dir-behind: Permission denied",
+        // A link to a directory the user can reach is skipped.
+        "got6=.",
+        try std.fmt.allocPrint(arena, "got7={s}.", .{&hashOfFiles(&.{"mine"})}),
+        // By a supplementary group of /etc/group, which a step's own processes have not got.
+        try std.fmt.allocPrint(arena, "got8={s}.", .{&hashOfFiles(&.{"grouped"})}),
+    });
+    const steps = r.res.steps;
+    for (steps[1..7]) |st| try std.testing.expectEqual(dagger.Outcome.failure, st.outcome);
+    // The content of nothing refused reached the job.
+    for ([_][]const u8{ "root:secret", "behind the door", "x" }) |content| {
+        const hash = hashOfFiles(&.{content});
+        try std.testing.expect(std.mem.indexOf(u8, r.text, &hash) == null);
+    }
+}
+
+/// `deniedJob`'s rootfs, under `root`: what a provisioned image gives the runner user, and files
+/// of the job's root that it may not read.
+fn deniedRootfs(arena: Allocator, root: []const u8) !void {
+    const setup = try std.fmt.allocPrint(arena,
+        \\set -e
+        \\cd '{s}'
+        \\mkdir -p rootfs/opt/shut/sub rootfs/github rootfs/home/runner
+        \\chown 1001:1001 rootfs/github rootfs/home/runner
+        \\chmod 1777 rootfs/tmp
+        \\printf 'root:secret' > rootfs/etc/shadow
+        \\chmod 0640 rootfs/etc/shadow
+        \\printf 'behind the door' > rootfs/opt/shut/f
+        \\chmod 0755 rootfs/opt
+        \\chmod 0700 rootfs/opt/shut
+        \\printf grouped > rootfs/opt/grouped
+        \\chown 0:50 rootfs/opt/grouped
+        \\chmod 0640 rootfs/opt/grouped
+        \\printf 'root:x:0:\nrunner:x:1001:\nstaff:x:50:runner\n' > rootfs/etc/group
+    , .{root});
+    const made = try std.process.run(arena, std.testing.io, .{ .argv = &.{ "sh", "-c", setup } });
+    try std.testing.expect(made.term == .exited and made.term.exited == 0);
+}
+
+test "native hashFiles: a step's user hashes only what it could read, as Dagger's `sha256sum` did" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    try deniedRootfs(arena, try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena));
+    // The job's upper in its slot's host ids: each step sees it unmapped.
+    const r = try runNativeJob(arena, cfg, try deniedJob(arena), .runner);
+    try expectDenied(arena, r);
+}
+
+test "native hashFiles: a stored layer's ids are the job's, whichever slot left them" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    try deniedRootfs(arena, try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena));
+    // A step that wrote a file only its user may read, kept in the store with the canonical ids,
+    // and a step after it, replayed or not, whose hash of it is the user's.
+    const write = testStep("echo x >> /shared/w; printf mine > mine; chmod 600 mine");
+    var read = testStep("");
+    read.action.script.script = .{ .expr = "format('echo x >> /shared/r; echo got={0}.', hashFiles('mine'))" };
+    const job = testJob(&.{ write, read });
+    const want = try std.fmt.allocPrint(arena, "got={s}.", .{&hashOfFiles(&.{"mine"})});
+    const first = try runCachedAs(arena, c.cfg, job, "j1", .runner);
+    try expectSucceeded(first);
+    try expectLines(first.text, &.{want});
+    const again = try runCachedAs(arena, c.cfg, job, "j2", .runner);
+    try expectSucceeded(again);
+    try expectLines(again.text, &.{want});
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "w"));
+}
+
+test "native hashFiles: a job container's --user is whom it reads for, its groups by its form" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    // `app` (1002:1003 in the image) is in `staff` here, and only `staff` may read the file.
+    var extra: oci_layer.TestTar = .{ .a = arena };
+    try extra.add(.{ .path = "__w/", .kind = .directory, .mode = 0o777 });
+    try extra.add(.{ .path = "etc/group", .body = "root:x:0:\napp:x:1003:\nstaff:x:50:app\n" });
+    try extra.add(.{ .path = "etc/grouped", .body = "grouped", .mode = 0o640, .gid = 50 });
+    const layers = try std.mem.concat(arena, []const u8, &.{
+        try testImageLayers(arena),
+        &.{try extra.finish()},
+    });
+    const img = try testregistry.testImage(arena, "test/user", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    var read = testStep("");
+    read.action.script.script = .{ .expr = "format('echo got={0}.', hashFiles('l'))" };
+    const steps = [_]job_mod.Step{ testStep("ln -s /etc/grouped l"), read };
+    // By name, the user's groups count; with its ids alone, as BuildKit gives them, they do not.
+    for ([_][]const u8{ "--user app", "--user 1002:1003" }, [_]bool{ true, false }) |options, member| {
+        var job = testJob(&steps);
+        job.container = .{
+            .name = "",
+            .image = .{ .lit = try server.image(arena, "test/user:1") },
+            .options = .{ .lit = options },
+        };
+        const r = try runNativeJob(arena, cfg, job, .root);
+        try expectLines(r.text, &.{if (member)
+            try std.fmt.allocPrint(arena, "got={s}.", .{&hashOfFiles(&.{"grouped"})})
+        else
+            "hashFiles(l) failed: sha256sum: l: Permission denied"});
+    }
+}
+
+test "native hashFiles: a root step's hash does not look at the file's mode" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const plant = testStep("mkdir d; printf r > d/f; chmod 600 d/f; chmod 700 d");
+    var read = testStep("");
+    read.action.script.script = .{ .expr = "format('echo got={0}.', hashFiles('d/f'))" };
+    const r = try runNativeJob(arena, cfg, testJob(&.{ plant, read }), .root);
+    try expectLines(r.text, &.{try std.fmt.allocPrint(arena, "got={s}.", .{&hashOfFiles(&.{"r"})})});
 }
 
 /// Two steps whose text is the same in every job: the first writes the file from its env, the

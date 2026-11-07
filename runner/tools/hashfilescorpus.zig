@@ -66,7 +66,7 @@ pub fn main(init: std.process.Init) !u8 {
             init.gpa,
             arena,
             io,
-            .{ .layers = &.{layer}, .opaque_xattr = "user.overlay.opaque" },
+            .{ .layers = &.{layer}, .opaque_xattr = "user.overlay.opaque", .step = null },
             ws,
             "/root",
             pattern_args,
