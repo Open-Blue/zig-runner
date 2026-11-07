@@ -4,7 +4,10 @@
 # checks miss (they check bounds of slices and `undefined` they can see, not raw pointers, C's
 # allocations or the kernel's buffers).
 #
-#   zig-valgrind.sh [TEST_FILTER]
+#   zig-valgrind.sh [TEST_FILTER...]
+#
+# With filters, only the tests whose names contain one: a pull request's own new tests
+# (changed-tests.sh), where the whole run is the nightly's.
 #
 # The tests compile as zig-test.sh compiles them (the compiler directly, the module graph
 # zig-modules.sh gives), in Debug, where Zig tells Valgrind which memory is `undefined`
@@ -28,6 +31,10 @@
 # at a time, and the tests of deadlines (a silent connection dropped, a server that never answers)
 # then see their deadlines pass; the tests' own job runs them at full speed. The tests' output,
 # Valgrind's included, is only text to the job (zig-test.sh).
+#
+# A test that does not finish would hold the job to its time limit with nothing said. ZIG_VALGRIND_TIMEOUT
+# (`timeout`'s duration, 35m by default: the whole suite takes about 25, with the build before it)
+# ends the run instead, and names the test that was running, the last the log started.
 set -euo pipefail
 cd "$(dirname "$0")/../../runner"
 
@@ -43,7 +50,7 @@ flags=(-mcpu=x86_64_v3)
 [[ ${ZIG_VALGRIND_LLVM:-} == 1 ]] && flags+=(-fllvm)
 zig_modules "$scratch" "$scratch/version" "${flags[@]}"
 filter=()
-[[ -n ${1:-} ]] && filter=(--test-filter "$1")
+for name in "$@"; do filter+=(--test-filter "$name"); done
 
 # The native backend's tests run steps through the runner binary (zig-test.sh); it is not what is
 # checked here, so it runs as compiled, outside Valgrind (--trace-children=no, the default).
@@ -54,22 +61,42 @@ export ZIG_RUNNER_TEST_EXE="$scratch/runner"
 stop="valgrind-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 echo "::stop-commands::$stop"
 set +e
-"$valgrind" -q --tool=memcheck --error-exitcode=99 --track-origins=yes --num-callers=40 \
+# Valgrind writes to a file and the log is read from it (`tail --pid` ends with Valgrind), not
+# through a pipe: a process the tests left running (a setsid child) would hold a pipe open past
+# the timeout, and the job would wait on it to its own limit with nothing said.
+: >"$scratch/raw"
+timeout --kill-after=30s "${ZIG_VALGRIND_TIMEOUT:-35m}" "$valgrind" -q --tool=memcheck --error-exitcode=99 --track-origins=yes --num-callers=40 \
 	--aspace-minaddr=0x200000000 --suppressions=../.github/valgrind.supp --gen-suppressions=all \
-	"$scratch/test" 2>&1 | grep --line-buffered -v 'Warning: DWARF2 reader: Badly formed extended line op' |
-	tee "$scratch/log"
-status=${PIPESTATUS[0]}
+	"$scratch/test" >"$scratch/raw" 2>&1 &
+checking=$!
+tail -n +1 -f --pid="$checking" "$scratch/raw" 2>/dev/null |
+	grep --line-buffered -v 'Warning: DWARF2 reader: Badly formed extended line op' >"$scratch/log" &
+reading=$!
+# The log as it grows, so a long run shows its progress.
+tail -n +1 -f --pid="$reading" "$scratch/log" 2>/dev/null &
+showing=$!
+wait "$checking"
+status=$?
+wait "$reading" "$showing"
 set -e
 echo "::$stop::"
 case $status in
 0) echo "Valgrind: no reports, every test passed" ;;
 1)
 	echo "Valgrind: no reports"
+	# Also for a filtered run (a pull request's own tests): ci ran them at full speed and passed
+	# them, so what fails here is Valgrind's slowdown on a deadline, not the test; the warning
+	# names each. Memcheck's own reports are the failure (99).
 	# The test each `FAIL (...)` belongs to: the last `N/M name...` line before it (a test's own
 	# output can come between the two).
 	failed=$(awk '/^[0-9]+\/[0-9]+ /{t=$0; sub(/\.\.\..*/, "", t)} /FAIL \(/{print t}' "$scratch/log" | paste -sd ';' -)
 	echo "::warning title=Valgrind::memcheck reported nothing, but tests failed under it (timing, most likely: see the script): ${failed:-see the log}"
 	status=0
+	;;
+124 | 137)
+	# The last `N/M name...` the log started, with no result after it.
+	running=$(awk '/^[0-9]+\/[0-9]+ /{t=$0} END{print t}' "$scratch/log")
+	echo "::error title=Valgrind::still running after ${ZIG_VALGRIND_TIMEOUT:-35m}, stopped: a test that does not finish, or a run too slow for its limit. The last test started: ${running:-none}"
 	;;
 99) echo "::error title=Valgrind::memcheck reported errors in the tests (above; each with a suppression to copy if it is benign)" ;;
 *) echo "::error title=Valgrind::the tests crashed under Valgrind (exit $status), before all were checked" ;;

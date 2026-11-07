@@ -146,7 +146,10 @@ jobs:
   # ZLint over the runner's Zig (.github/scripts/zlint.sh, its rules in runner/zlint.json): CodeQL
   # and Semgrep read no Zig, so this is the only static analysis of the runner's own code besides
   # the compiler. A few seconds, with no Zig to install. Skipped, still reporting, on a change that
-  # cannot affect it (ci-scope.sh tests).
+  # cannot affect it (ci-scope.sh tests). Its suppressed-errors rule runs here too, against the
+  # baseline of the sites read and meant: the rule cannot be on in runner/zlint.json (zlint.sh says
+  # why), and run only by analysis.yml's nightly it let two `catch {}` sites (#327, #332) merge
+  # and fail that night. The same binary, so about two seconds more.
   lint:
     name: Lint (ZLint)
     runs-on: ubuntu-26.04
@@ -167,6 +170,10 @@ jobs:
       - name: ZLint
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/zlint.sh
+
+      - name: ZLint (suppressed-errors)
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/zlint.sh suppressed-errors
 
   # The comparison tools' Go (runner/tools/*diff), with go vet, staticcheck and the race detector
   # (go-lint.sh): they are test oracles, so a bug in one hides one in the runner. Skipped, still
@@ -323,9 +330,37 @@ jobs:
             exit "$status"
           fi
 
+      # The same tests in a Docker container, where the working directory is overlayfs, as on the
+      # project's own runner (a push to main): pull requests and the merge queue otherwise test on
+      # the VM's ext4, which agrees with overlayfs on nearly everything and not on all (#332's test
+      # passed on every pull request and failed on every push to main, as overlayfs grants a read
+      # lease over a writable mapping). The native backend's tests skip in it, as there: Docker's
+      # seccomp refuses their namespaces, and the passes above ran them. The compile is the tests'
+      # above, cached (zig-test.sh, ZIG_TEST_IN_CONTAINER). Over 700 tests pass in it (a floor of
+      # 500 is held, ZIG_TEST_MIN_PASSED), so a mistake that skips them cannot stay green. The two
+      # chains of directories tens of thousands deep skip there at once (evict.zig,
+      # `needsDeepDirs`): overlayfs refuses them, after nine minutes of building them.
+      - name: Test, on overlayfs
+        if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        # Several times the step's time, so a test that does not finish fails here, not at the
+        # job's limit.
+        timeout-minutes: 5
+        working-directory: runner
+        env:
+          ZIG_TEST_IN_CONTAINER: "1"
+          ZIG_TEST_MIN_PASSED: "500"
+        run: ../.github/scripts/zig-test.sh
+
       # Every test in runner/src is one the test binary has: a file that nothing reached compiled
       # and passed with its tests never run (github/http.zig's, until #326). Its compile is the
       # tests' on a runner that ran them with zig-test.sh, cached.
+      # Built by the weekly comparison (`hashfiles-diff.sh`), which pull requests do not run: #366
+      # would have broken it unseen.
+      - name: The hashFiles comparison tool compiles
+        if: steps.scope.outputs.run == 'true'
+        working-directory: runner
+        run: zig build-exe --dep runner -Mroot=tools/hashfilescorpus.zig -Mrunner=src/hashfiles_corpus.zig --name hashfilescorpus -fno-emit-bin
+
       - name: Every test file is compiled
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/test-files.sh
@@ -391,6 +426,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Razorbill (a Pi) runs 16 KiB pages; GitHub's arm64 runner does not, so a test that depends
+      # on the page size passes here on 4 KiB and is not seen at 16: said in the log, so a runner
+      # image that changes it is noticed.
+      - name: Page size
+        run: |
+          echo "page size: $(getconf PAGESIZE) bytes, kernel $(uname -r)"
+          echo "::notice title=arm64 page size::GitHub's arm64 runner has $(getconf PAGESIZE)-byte pages; razorbill has 16384"
 
       - name: Whether this change can affect the release's builds or the tests
         id: scope

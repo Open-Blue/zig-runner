@@ -1522,7 +1522,36 @@ test "native eviction: a dead name that is no directory goes, and one that will 
     try testing.expect(!f.there(old));
 }
 
+/// One level more of a chain, or the test skipped where the filesystem will not make one so deep
+/// (overlayfs): a job on it cannot plant the chain either.
+/// The tests below build chains of directories tens of thousands deep. Overlayfs refuses them
+/// (NAMETOOLONG once the path inside it is too long), and only after building most of the chain: a
+/// run in a container spent over nine minutes on the two longest before they were skipped by
+/// `goDown`. So they skip at the start there, and say why.
+fn needsDeepDirs(f: *Fixture, depth: usize) !void {
+    // Valgrind takes half an hour over the cleanup of a tree this deep, past its job's limit.
+    if (depth > 8000 and std.valgrind.runningOnValgrind() != 0) {
+        std.debug.print("test skipped: a chain this deep outlasts Valgrind's limit\n", .{});
+        return error.SkipZigTest;
+    }
+    const overlayfs = 0x794c7630;
+    var st: [120]u8 align(8) = undefined;
+    const fd = std.math.cast(usize, f.tmp.dir.handle) orelse return;
+    if (linux.errno(linux.syscall2(.fstatfs, fd, @intFromPtr(&st))) != .SUCCESS) return;
+    if (std.mem.readInt(u64, st[0..8], .little) == overlayfs) {
+        std.debug.print("test skipped: overlayfs refuses a chain of directories this deep\n", .{});
+        return error.SkipZigTest;
+    }
+}
+
+fn goDown(fd: linux.fd_t) !void {
+    const e = linux.errno(linux.mkdirat(fd, "a", 0o755));
+    if (e == .NAMETOOLONG) return error.SkipZigTest;
+    try testing.expectEqual(linux.E.SUCCESS, e);
+}
+
 fn deepChain(f: *Fixture, depth: usize) !void {
+    try needsDeepDirs(f, depth);
     const io = testing.io;
     try std.Io.Dir.cwd().createDirPath(io, Hostile.p(f, "{s}/volumes", .{f.s.root}));
     const vz = try f.arena().dupeSentinel(u8, Hostile.p(f, "{s}/volumes", .{f.s.root}), 0);
@@ -1532,7 +1561,7 @@ fn deepChain(f: *Fixture, depth: usize) !void {
     var fd = try Store.openDirAt(vfd, ".dead-chain");
     defer _ = linux.close(fd);
     for (0..depth) |_| {
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdirat(fd, "a", 0o755)));
+        try goDown(fd);
         const n = try Store.openDirAt(fd, "a");
         _ = linux.close(fd);
         fd = n;
@@ -1752,6 +1781,7 @@ test "native eviction: names a job planted under a dead tree do not stop the rem
     defer f.deinit();
     const arena = f.arena();
     const cwd = std.Io.Dir.cwd();
+    try needsDeepDirs(f, 20_000);
     const depth: usize = 20_000;
     const dead = Hostile.p(f, "{s}/volumes/.dead-9", .{f.s.root});
     const build = Hostile.p(f, "{s}/build", .{f.s.root});
@@ -1761,7 +1791,7 @@ test "native eviction: names a job planted under a dead tree do not stop the rem
     const df = try Store.openRoot(arena, dead);
     defer _ = linux.close(df);
     for (0..depth) |_| {
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdirat(fd, "a", 0o755)));
+        try goDown(fd);
         const n = try Store.openDirAt(fd, "a");
         _ = linux.close(fd);
         fd = n;

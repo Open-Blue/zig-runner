@@ -77,6 +77,49 @@ fi
 if [[ -n ${ZIG_TEST_FILTER:-} ]]; then
 	filter=(--test-filter "$ZIG_TEST_FILTER")
 fi
+# ZIG_TEST_IN_CONTAINER=1: the tests run in a Docker container of the default job image
+# (runner/src/dagger.zig), as the project's own runner runs them on a push to main, where the
+# working directory is the container's overlayfs: not the host's ext4 or tmpfs, which pull
+# requests test on. Overlayfs differs where tests can notice (it grants a read lease over a
+# writable mapping, #332's test relied on the opposite). The user is the host's, not root; Docker's default seccomp refuses the namespaces
+# the native backend needs, so its tests skip, as on that runner. The tests write into the
+# container's /tmp (their `.zig-cache/tmp` is relative to it); the scratch directory and the test
+# binary's are mounted read-only at their own paths.
+if [[ ${ZIG_TEST_IN_CONTAINER:-} == 1 ]]; then
+	image=$(tr -d '\n' <../runner/src/dagger.zig | grep -oE '"ubuntu:[A-Za-z0-9._-]+" *\+\+ *"@sha256:[a-f0-9]{64}"' | tr -d '" +')
+	[[ -n $image ]] || {
+		echo "zig-test.sh: no default_image in runner/src/dagger.zig" >&2
+		exit 1
+	}
+	for attempt in 1 2 3; do
+		docker pull -q "$image" >/dev/null && break
+		((attempt < 3)) || exit 1
+		sleep $((attempt * 10))
+	done
+	# The test binary's path is the compiler's, relative; the container needs it whole.
+	cat >"$scratch/in-container" <<'SCRIPT'
+#!/usr/bin/env bash
+set -uo pipefail
+image=$1 scratch=$2 shards=$3 bin=$(realpath "$4")
+# ZIG_TEST_CONTAINER_ARGS: more arguments for `docker run`, such as memory limits.
+read -ra extra <<<"${ZIG_TEST_CONTAINER_ARGS:-}"
+# --init: a step's timeout sends SIGTERM, which a container's PID 1 would otherwise ignore.
+docker run --rm --init --user "$(id -u):$(id -g)" -w /tmp "${extra[@]}" \
+	-v "$scratch:$scratch:ro" -v "$(dirname "$bin"):$(dirname "$bin"):ro" \
+	-e ZIG_RUNNER_TEST_EXE -e ZIG_TEST_SHARDS "$image" "$shards" "$bin" 2>&1 | tee "$scratch/container.log"
+status=${PIPESTATUS[0]}
+# ZIG_TEST_MIN_PASSED: a floor on the tests that passed, so a mistake that skips nearly all of
+# them (the container's directory, the runner binary) cannot stay green.
+passed=$(sed -n 's/^\([0-9][0-9]*\) passed;.*/\1/p' "$scratch/container.log" | tail -n 1)
+if ((status == 0)) && ((${passed:-0} < ${ZIG_TEST_MIN_PASSED:-1})); then
+	echo "zig-test.sh: ${passed:-0} tests passed in the container, fewer than the ${ZIG_TEST_MIN_PASSED:-1} expected" >&2
+	exit 1
+fi
+exit "$status"
+SCRIPT
+	chmod +x "$scratch/in-container"
+	run+=(--test-cmd "$scratch/in-container" --test-cmd "$image" --test-cmd "$scratch")
+fi
 # The tests run in several processes (tools/test_shards.zig), which this starts; the same program
 # `zig build test` runs. ZIG_TEST_SHARDS=1 runs the test binary itself.
 run+=(--test-cmd "$scratch/test_shards" --test-cmd-bin)

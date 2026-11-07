@@ -130,7 +130,8 @@ that changes them, and govulncheck for information).
 CodeQL and Semgrep read no Zig, so the runner's own code has analysis of its own. "Lint (ZLint)"
 (`ci`, `.github/scripts/zlint.sh`) runs [ZLint](https://github.com/DonIsaac/zlint) on every pull
 request, pinned and checked against its release's checksum, with the rules that find bugs
-(`runner/zlint.json`; the script says why each other rule is off). `analysis` runs nightly: "Fuzz"
+(`runner/zlint.json`; the script says why each other rule is off), and its suppressed-errors rule
+against the baseline of `catch {}` sites that were read and meant. `analysis` runs nightly: "Fuzz"
 runs each of `runner/src/fuzz.zig`'s targets (an image layer's tar, PAX and paths applied beside a
 directory it must not reach; image references, registry challenges and manifests; expressions,
 YAML, regular expressions, HPACK, `hashFiles()` patterns, minisign signatures, workflow commands
@@ -141,7 +142,9 @@ artifact; `zig build test` runs the same targets over their seed corpus every ti
 `zig build test -Dllvm --fuzz` (add `-Dtest-filter='fuzz: YAML'` for one target). "Valgrind" runs
 every test under memcheck (`.github/scripts/zig-valgrind.sh`), for reads of memory never written
 and accesses outside an allocation, which Debug's safety checks miss; known-benign reports are
-suppressed in `.github/valgrind.supp`, each with why. "ThreadSanitizer, native" runs the native
+suppressed in `.github/valgrind.supp`, each with why (a pull request that adds or edits a test
+runs just those, `.github/scripts/changed-tests.sh`; a run that does not finish is stopped, naming
+the test it was in). "ThreadSanitizer, native" runs the native
 backend's tests under ThreadSanitizer on x86_64 and arm64, rootless and as root, with the runner
 binary they start for each step built with it too (`ZIG_TEST_SANITIZE_THREAD=1`, which ci's
 Database tests job sets where those tests skip); "ThreadSanitizer, end to end" runs ci's end-to-end

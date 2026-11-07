@@ -12,7 +12,8 @@ name: analysis
 #                  leak or a hang fails the job, named after its target, with the input as an
 #                  artifact (fuzz-TARGET).
 #   Valgrind       every test under Valgrind's memcheck (.github/scripts/zig-valgrind.sh): reads
-#                  of memory never written, and accesses outside what was allocated.
+#                  of memory never written, and accesses outside what was allocated. A pull
+#                  request runs the tests it adds or edits.
 #   ZLint (suppressed-errors)
 #                  ZLint's `catch {}` and `catch unreachable` rule, which ci's Lint job cannot run
 #                  (ZLint does not yet apply line-level disables), against the sites read and
@@ -60,7 +61,9 @@ name: analysis
 # ThreadSanitizer, here and in ci, sees those locks.
 #
 # Each search costs more than a pull request should wait for, so they run here and not in ci; a
-# failure is a case for an issue (or a fix), not a broken main. Coverage also runs on a pull
+# failure is a case for an issue (or a fix), not a broken main. Valgrind on the tests a pull request
+# adds or edits, and ZLint's suppressed-errors rule (ci's Lint job), are cheap enough to run on
+# every pull request that could change what they find. Coverage also runs on a pull
 # request that changes the runner's code, so its numbers can be compared with main's nightly ones;
 # it reports only, failing on nothing but a report that did not come out. To hold the total above
 # a floor later, set COVERAGE_MIN (a percentage) on its Coverage step, and make "Coverage" a
@@ -85,6 +88,7 @@ on:
       - .github/scripts/ci-scope.sh
       - .github/scripts/zig-fuzz.sh
       - .github/scripts/zig-valgrind.sh
+      - .github/scripts/changed-tests.sh
       - .github/scripts/zig-coverage.sh
       - .github/valgrind.supp
       - .github/scripts/zig-race-tests.sh
@@ -218,11 +222,17 @@ jobs:
           path: ${{ runner.temp }}/fuzz
           if-no-files-found: ignore
 
-  # About ten minutes on GitHub's runner.
+  # Every test, about 21 minutes on GitHub's runner (the 11-03 night: 20 minutes 54 seconds), nightly
+  # and when a pull request changes what runs them. On any other pull request that adds or edits a
+  # test in runner/src, only those tests (changed-tests.sh): the build and the install, then
+  # seconds a test, about 5 minutes in all; a pull request that changes no test skips the steps and
+  # costs the checkout. A new test is where a hang or a bad read arrives (#324's hung the nightly
+  # until its 45 minute limit, unseen), and the rest of the suite is what the nightly keeps.
+  # Either run ends at its own time limit, with the test it was in named (zig-valgrind.sh), well
+  # before the job's.
   valgrind:
     name: Valgrind
     needs: scope
-    if: needs.scope.outputs.analysis == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     permissions:
@@ -232,18 +242,57 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Which tests to run
+        id: tests
+        env:
+          ANALYSIS: ${{ needs.scope.outputs.analysis }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          : >"$RUNNER_TEMP/valgrind-tests"
+          if [ -n "$BASE" ]; then
+            .github/scripts/changed-tests.sh "$BASE" >"$RUNNER_TEMP/valgrind-tests"
+          fi
+          if [ "$ANALYSIS" = true ]; then
+            echo "mode=all" >>"$GITHUB_OUTPUT"
+            echo "Valgrind: every test"
+          elif [ -s "$RUNNER_TEMP/valgrind-tests" ]; then
+            echo "mode=changed" >>"$GITHUB_OUTPUT"
+            echo "Valgrind: the tests this change adds or edits"
+          else
+            echo "mode=none" >>"$GITHUB_OUTPUT"
+            echo "Valgrind: this change adds or edits no test: skipped"
+          fi
+          # Test names are the author's text: a `::error::x` in one must not be read as a command.
+          stop="tests-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+          echo "::stop-commands::$stop"
+          cat "$RUNNER_TEMP/valgrind-tests"
+          echo "::$stop::"
+
       - name: Install Zig
+        if: steps.tests.outputs.mode != 'none'
         run: .github/scripts/install-zig.sh
 
       # Ubuntu's own package, checked by apt against the archive's signed index.
       - name: Install Valgrind
+        if: steps.tests.outputs.mode != 'none'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends valgrind
           valgrind --version
 
-      - name: Tests under memcheck
+      - name: Every test under memcheck
+        if: steps.tests.outputs.mode == 'all'
         run: .github/scripts/zig-valgrind.sh
+
+      # Fifteen minutes is far past the tests it is given, with Valgrind's slowdown (a test that
+      # takes a second takes a minute); a hang is named by then, not at the job's limit.
+      - name: The changed tests under memcheck
+        if: steps.tests.outputs.mode == 'changed'
+        env:
+          ZIG_VALGRIND_TIMEOUT: 15m
+        run: |
+          mapfile -t tests <"$RUNNER_TEMP/valgrind-tests"
+          .github/scripts/zig-valgrind.sh "${tests[@]}"
 
   # The native backend's tests under ThreadSanitizer, as ci's hosted Test step runs them (rootless,
   # then as root with the service images) with ZIG_TEST_SANITIZE_THREAD=1 (zig-test.sh): the tests
