@@ -211,17 +211,21 @@ pub fn uploadRetrying(
     };
 }
 
-/// `try_fn(args)` until it succeeds, fails for good or `retry` runs out; the last outcome. A try
-/// that returns an error is a failed Result, transient or not by the error.
+/// `try_fn(args)` once; an error it returns is a failed Result, transient or not by the error.
+fn tryOnce(comptime try_fn: anytype, args: anytype) Result {
+    return @call(.auto, try_fn, args) catch |e| .{
+        .ok = false,
+        .detail = @errorName(e),
+        .transient = transientError(e),
+    };
+}
+
+/// `try_fn(args)` until it succeeds, fails for good or `retry` runs out; the last outcome.
 fn retrying(io: std.Io, retry: Retry, comptime try_fn: anytype, args: anytype) Result {
     const started = std.Io.Clock.awake.now(io).toNanoseconds();
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        const r: Result = @call(.auto, try_fn, args) catch |e| .{
-            .ok = false,
-            .detail = @errorName(e),
-            .transient = transientError(e),
-        };
+        const r = tryOnce(try_fn, args);
         if (r.ok or !r.transient or attempt == retry.delays_ms.len) return r;
         const delay_ns = retry.delays_ms[attempt] * std.time.ns_per_ms;
         const elapsed = std.Io.Clock.awake.now(io).toNanoseconds() - started;
@@ -379,13 +383,7 @@ pub fn updateSteps(
     steps: []const u8,
     change_order: u64,
 ) Result {
-    return updateStepsInner(
-        arena,
-        io,
-        job,
-        steps,
-        change_order,
-    ) catch |e| .{ .ok = false, .detail = @errorName(e) };
+    return tryOnce(updateStepsInner, .{ arena, io, job, steps, change_order });
 }
 
 fn updateStepsInner(
