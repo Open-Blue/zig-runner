@@ -1724,8 +1724,8 @@ What Dagger (BuildKit and runc under it) did implicitly, now explicit in `native
     proportion, a job past its limit gets the kill alone, an `if: always()` step at the limit
     starts its ladder early enough to end by it, and a second cancel, which can only bring
     `Cancel.hard_deadline_ms` forward, shortens a ladder under way and cannot lengthen it. The
-    runner holds the time and not the helper for that reason. A kill that finds nothing, between
-    two execs of a step, stays due. The ladder runs on the awake clock, so a wall clock stepped
+    runner holds the time and not the helper for that reason. A SIGTERM or a kill that finds nothing,
+    between two execs of a step, stays due. The ladder runs on the awake clock, so a wall clock stepped
     back cannot put it off. If the runner dies the lifeline closes, which is the kill. Nothing here
     is configurable, as on GitHub. GitHub's limit is taken as its runner takes it
     (`CancelWatch.cancelLimitMs`): 60 s at the least, less 15 s. One difference: there a later
@@ -1769,7 +1769,8 @@ What Dagger (BuildKit and runc under it) did implicitly, now explicit in `native
     job, or `Watch.reason` for a timeout or the job's limit), then each stage reached. It names
     the plan, not delivery: a warning the helper cannot fork for at `pids.max` is not sent. A job
     cancelled during a timeout's ladder reports the step cancelled, as GitHub does. Written once
-    `Watch` has let go of its lock, so a stuck sink does not hold up the next stage. Pre scripts
+    `Watch` has let go of its lock, so a stuck sink does not hold up a step's end, though the next
+    stage waits behind it. Pre scripts
     have no log step of `Watch`'s. Each pre and post script gets a ladder of its own, and one
     stopped near the limit fails as a post script does, so the next still runs.
   - **After a cancel** nothing runs on a cancelled context: `dagger.Cancel` is a flag, read where

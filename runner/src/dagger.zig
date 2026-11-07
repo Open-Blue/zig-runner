@@ -472,8 +472,8 @@ pub const Watch = struct {
         terminated: bool = false,
     };
 
-    /// A line for the step's log, written once `mu` is let go: a sink that blocks must not hold up
-    /// the next stage, or `end`.
+    /// A line for the step's log, written once `mu` is let go: a sink that blocks holds up this
+    /// task, and so the next stage, but not `begin` or `end`.
     const Note = struct {
         step: u32 = 0,
         len: usize = 0,
@@ -598,9 +598,13 @@ pub const Watch = struct {
             return;
         }
         if (l.terminated or elapsed < length - ladderTail(length)) return;
+        // Between two execs there is no one to tell: the next exec is, as with SIGINT.
+        switch (w.transport.warn(.TERM)) {
+            .nothing => return,
+            .ended => {},
+            .warned => w.say(note, "The step is still running: SIGTERM sent.", .{}),
+        }
         l.terminated = true;
-        if (w.transport.warn(.TERM) == .warned) w.say(note, "The step is still running: SIGTERM " ++
-            "sent.", .{});
     }
 
     /// Why the step is being stopped, for its log.
@@ -3013,6 +3017,24 @@ test "a ladder keeps the awake clock's time when the wall clock is stepped back"
     try std.testing.expectEqual(@as(u32, 1), f.fake.aborted);
 }
 
+test "a ladder's SIGTERM that finds nothing between two execs reaches the next exec" {
+    var f: FakeWarn = .{};
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = null };
+    w.begin(0, 1_000, false);
+    f.fake.in_flight = true;
+    w.tick(1_001, 1_001);
+    f.fake.in_flight = false;
+    w.tick(8_501, 8_501);
+    try std.testing.expectEqualSlices(std.os.linux.SIG, &.{.INT}, f.signals());
+    f.fake.in_flight = true;
+    w.tick(8_701, 8_701);
+    try std.testing.expectEqualSlices(std.os.linux.SIG, &.{ .INT, .TERM }, f.signals());
+    // Once.
+    w.tick(8_901, 8_901);
+    try std.testing.expectEqualSlices(std.os.linux.SIG, &.{ .INT, .TERM }, f.signals());
+    try std.testing.expectEqual(@as(u32, 0), f.fake.aborted);
+}
+
 test "a job cancelled during a timeout's ladder reports the step cancelled, as GitHub does" {
     var f: FakeWarn = .{};
     var c: Cancel = .{};
@@ -3045,7 +3067,7 @@ test "a wait with no process to warn starts no ladder" {
     try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
 }
 
-test "a stuck log holds up neither the ladder nor the step's end" {
+test "a stuck log does not hold the watch's lock, so the step's end is not held up" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
