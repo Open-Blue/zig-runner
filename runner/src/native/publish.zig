@@ -63,13 +63,19 @@ pub fn parseRange(text: []const u8) ?Range {
 }
 
 /// The ports of the runner's own endpoints that a job must never publish on the host: the
-/// database's (`port`), and those of `urls` given as `tcp://host:port` (the engine's, Docker's).
-/// A unix socket has none.
+/// database's (`port`), and those of `urls` given as `tcp://host:port` or `host:port` (the
+/// engine's, Docker's). A unix socket (a path, or another scheme's URL) has none.
 pub fn reservedPorts(arena: Allocator, db_port: ?u16, urls: []const []const u8) ![]const u16 {
     var out: std.ArrayList(u16) = .empty;
     if (db_port) |p| try out.append(arena, p);
-    for (urls) |u| {
-        const rest = if (std.mem.startsWith(u8, u, "tcp://")) u["tcp://".len..] else continue;
+    for (urls) |url| {
+        const u = std.mem.trim(u8, url, " \t");
+        const rest = if (std.mem.startsWith(u8, u, "tcp://"))
+            u["tcp://".len..]
+        else if (std.mem.indexOf(u8, u, "://") == null and !std.mem.startsWith(u8, u, "/"))
+            u
+        else
+            continue;
         const host_end = std.mem.indexOfAny(u8, rest, "/?") orelse rest.len;
         const hostport = rest[0..host_end];
         const colon = std.mem.lastIndexOfScalar(u8, hostport, ':') orelse continue;
@@ -157,7 +163,8 @@ pub fn plan(
         if (p.host != 0 and !operator.range.has(p.host)) {
             why.* = try std.fmt.allocPrint(arena, "the job container's port {f} publishes host " ++
                 "port {d}, outside {d}-{d}, the host ports " ++ range_setting ++ " lets a job " ++
-                "name (a bare port, `{d}`, gets one the kernel picks)", .{
+                "name (a bare port, `{d}`, gets one the kernel picks; " ++ range_setting ++
+                "=1024-65535 lets a job name any, as Docker does)", .{
                 Shown{ .p = p, .address = address },
                 p.host,
                 operator.range.lo,
@@ -256,7 +263,7 @@ test "publish: what the operator allows, by address, port and trust" {
         .{ .port = .{ .address = .{ 10, 0, 0, 1 }, .container = 80 }, .trusted = true, .says = &.{ "10.0.0.1::80/tcp", setting } },
         .{ .port = .{ .host = 80, .container = 80 }, .trusted = true, .says = &.{ "127.0.0.1:80:80/tcp", "port 80, below 1024" } },
         .{ .port = .{ .host = 1023, .container = 80, .udp = true }, .trusted = true, .says = &.{"port 1023, below 1024"} },
-        .{ .port = .{ .host = 8080, .container = 80 }, .trusted = true, .says = &.{ "port 8080, outside 49152-65535", range_setting, "`80`" } },
+        .{ .port = .{ .host = 8080, .container = 80 }, .trusted = true, .says = &.{ "port 8080, outside 49152-65535", range_setting, "`80`", range_setting ++ "=1024-65535" } },
         .{ .port = .{ .host = 5432, .container = 5432 }, .trusted = true, .says = &.{"runner's own endpoints"} },
         .{ .port = .{ .host = 50432, .container = 5432 }, .trusted = true, .says = &.{"runner's own endpoints"} },
         .{ .port = .{ .host = 50080, .container = 80 }, .trusted = false, .says = &.{"does not vouch for"} },
@@ -285,6 +292,8 @@ test "publish: the operator's range, and the runner's own endpoints' ports" {
     defer a.deinit();
     const got = try reservedPorts(a.allocator(), 5432, &.{
         "tcp://127.0.0.1:1234", "unix:///run/buildkit.sock", "tcp://[::1]:2375/", "docker-container://engine",
+        // Written without its scheme, as Docker takes it; a path and another scheme have no port.
+        "127.0.0.1:2376",       "/var/run/docker.sock",      "ssh://ci@build:22", "localhost",
     });
-    try std.testing.expectEqualSlices(u16, &.{ 5432, 1234, 2375 }, got);
+    try std.testing.expectEqualSlices(u16, &.{ 5432, 1234, 2375, 2376 }, got);
 }

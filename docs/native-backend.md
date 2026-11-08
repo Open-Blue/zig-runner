@@ -1575,9 +1575,13 @@ volume's mount) fails the job in "Set up job", naming both, as it would hide one
   runner's `input` chain drops all but replies and DNS. **Beyond loopback, the relay also refuses
   local containers**: a peer in the runner's job subnet (`RUNNER_NATIVE_SUBNET`), or on the
   directly connected subnet of any bridge of the host's (Docker's `docker0` and its compose
-  networks, the Dagger engine's, so a Dagger-fallback job's container too; read from the host's
-  `/proc/net/route` and `/sys/class/net/<if>/bridge` on each such peer, so a bridge made after the
-  job started counts too), is closed as soon as it is accepted, before a byte goes to the job.
+  networks, the Dagger engine's, so a Dagger-fallback job's container too), or reached directly
+  out of a veth into another namespace (`iflink` not its `ifindex`, and no `lower_*` device:
+  Calico's routed /32 pods) or a tun or tap device (`tun_flags`: Firecracker's VMs, and a VPN's
+  tun too), is closed as soon as it is accepted, before a byte goes to the job. Read from the
+  host's `/proc/net/route` and `/sys/class/net/<if>` on each such peer, so a link made after the
+  job started counts too; a UDP client's verdict is kept for a second (64 at most), so its
+  datagrams are not each a read of the routes.
   Those containers are not the host's to let in through a trusted job's port. A host whose LAN NIC
   is itself enslaved to a bridge (`br0` for VMs) has its LAN treated so too; publish on a specific
   address and let the firewall decide, or keep 127.0.0.1. Routes that cannot be read refuse every
@@ -1589,10 +1593,11 @@ volume's mount) fails the job in "Set up job", naming both, as it would hide one
   here a job could otherwise take 5432 or 6379 while the host's PostgreSQL or Redis is down (a
   restart, an upgrade) and collect the credentials and data its clients send. Workflows written
   for Docker with `8080:80` either name a port in the range, use a bare port, or the operator widens
-  the range (`RUNNER_NATIVE_PORT_RANGE=8000-8999`). None below 1024 ever (the host's privileged
+  the range (`RUNNER_NATIVE_PORT_RANGE=8000-8999`, or `1024-65535` for Docker's any). None below 1024 ever (the host's privileged
   ports). **The runner's own endpoints' ports are always refused**, inside the range or not: its
   database's (`DATABASE_URL` / `PGPORT`, 5432 by default when one is set), and a `tcp://` engine
-  host (`RUNNER_ENGINE_HOST`) or Docker host (`DOCKER_HOST`); a bare port never lands on one (the
+  host (`RUNNER_ENGINE_HOST`) or Docker host (`DOCKER_HOST`), written with `tcp://` or without
+  (`127.0.0.1:2375`); a bare port never lands on one (the
   relay picks again). A bare `80` or `ip::80` gets one the kernel picks, from the host's ephemeral
   range as Docker's does, and "Set up job" says where each went as `docker port` does:
   `Container ports: 80/tcp -> 127.0.0.1:50080, 9090/tcp -> 127.0.0.1:41234`. A port another process
@@ -1612,8 +1617,9 @@ volume's mount) fails the job in "Set up job", naming both, as it would hide one
 Tests: the `-p` grammar and its refusals, a host port twice (`container_options.zig`); the
 operator's addresses, the default, 0.0.0.0, a privileged port, a port outside the range, the
 runner's own endpoints' ports, the range's grammar and an untrusted job (`publish.zig`); the
-guard's reading of the routes (the runner's subnet and a bridge's refused, loopback and the LAN
-not, unreadable routes refusing all), a full backlog on one published port stalling no other, a
+guard's reading of the routes (the runner's subnet, a bridge's, a routed veth's and a tap's
+refused, loopback and the LAN and a VLAN of it not, unreadable routes refusing all), its UDP
+verdicts kept a second, a kernel pick on a reserved port picked again, a full backlog on one published port stalling no other, a
 newcomer taking the place of the quietest of 64 silent connections and idle ones closed, UDP new
 clients capped per second, and 127.0.0.1 published on `::1` too (`forward.zig`, non-root); the relay listening in the host's namespace on a port the kernel picks, said in
 its ready line, carrying TCP both ways and gone once stopped, UDP for two clients each answered on
