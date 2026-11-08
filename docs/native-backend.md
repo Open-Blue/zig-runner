@@ -162,8 +162,8 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   gating every submodule checkout would cost its replay.
 - Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a job the runner
   does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
-  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, a `volumes:` entry that is a host path or
-  otherwise not a directory of the job, or an `options:` flag the native job does not carry out (all below, "Job container options"), `services:`
+  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, a `volumes:` entry the native job does not carry out
+  (a host path it does not allow fails instead), or an `options:` flag the native job does not carry out (all below, "Job container options"), `services:`
   on a rootless runner or with an image given by an expression (native since P6, below, their
   images pulled by P3), JavaScript and local `uses:` actions (P7, `actions.preload`), remote `uses:` actions in an
   image with no git to fetch them with, `docker://` images
@@ -745,7 +745,7 @@ directories and the step's file-command files at a 4 KiB block each.
 - "Set up job" says what the job got: "Image: pulled natively in N ms (L layers, K KB fetched)" or
   "Image: from the native store", and "Provisioned natively in N ms (layer <key>)" or "...made
   before".
-- Falls back to Dagger: a job container's `ports:`, `volumes:` that are not directories of the job
+- Falls back to Dagger: a job container's `ports:`, `volumes:` the native job does not carry out
   and `options:` flags the native job does not carry out ("Job container options", below), and on a rootless runner without
   `RUNNER_NATIVE_ROOTFS` the provisioned default image (below).
 
@@ -1426,12 +1426,58 @@ self-hosted runner one could. Making them last would reuse the cache volumes' st
 (`volumes.zig`: a name under the repository and its trust scope, the shared lock, the id mapping)
 and its eviction would then lose the data a Docker volume keeps, so it is not done here.
 
+**`volumes:` carried out: host paths, off by default** (`/srv/data:/data`, `/srv/data:/data:ro`;
+`runner/src/native/host_paths.zig`, `Backend.hostVolumes`, `sandbox.bindHostIn`). A job may bind a
+host directory only when the operator allows it:
+
+- **`RUNNER_NATIVE_HOST_PATHS`** (`--native-host-paths`): colon- or comma-separated absolute
+  directories; empty, the default, allows none. A job may bind one of them or a directory below
+  one. Each is canonicalised with `realpath` when the runner starts, and **the runner refuses to
+  start** (`config error: RUNNER_NATIVE_HOST_PATHS: ...`, naming the entry) when one does not
+  exist, is not a directory, is `/`, resolves under `/proc`, `/sys`, `/dev` or `/run` (the Docker
+  and systemd sockets live there), or is, holds or lies inside one of the runner's own directories
+  (`RUNNER_NATIVE_STORE`, which holds every job's layers and volumes, `RUNNER_NATIVE_ROOTFS`, the
+  log spool `RUNNER_LOG_SPOOL_DIR/zig-runner-<uid>`). A job reading or writing those could read or
+  change other jobs. Each job resolves the list again; an entry gone since leaves it closed.
+- **Untrusted jobs never get one**, whatever the list says: a job the runner does not vouch for
+  (`trust.vouches` false), and a fork's pull request on a runner that vouches for pull requests
+  (scope `untrusted`, `set_up.packageCacheScope`), fail.
+- **Symlinks**: the job's source is resolved with `realpath` when the job starts and checked
+  against the list again, so a link inside an allowed directory that points out of it is refused.
+  The step's helper then opens that canonical path from `/` with `openat2(RESOLVE_NO_SYMLINKS)`, so
+  a link swapped in after the check fails the step instead of escaping.
+- **The mount**: an `open_tree(OPEN_TREE_CLONE)` of that directory alone (no mount below it comes
+  along), `nosuid` and `nodev` always, `ro` for `:ro`, set in one `mount_setattr` and moved into the
+  step's mount namespace only (the host's mount table never has it). Directories only: a file (a
+  socket) is refused. On a root runner it is made before the job's user namespace is entered, so
+  the job cannot remount it writable or suid.
+- **Ids** (the decision): on a root runner the mount is **idmapped as a cache volume's**, through
+  the volumes' range (`Backend.volumeIdBase`, `RUNNER_NATIVE_SUBID_BASE + 250 * 65536`, by default
+  1916384000): a file owned on disk by that id plus *n* is the job's id *n*, the same in every slot,
+  and **every other id, host root's and the host users' included, is `nobody` (65534) to the job**.
+  So a job reads what the modes let others read, and writes only where the operator gave a
+  directory to that range (`chown -R 1916384000:1916384000 /srv/data` makes it the jobs' root's);
+  what it writes is owned by the range, never by a host user, so it can never leave a file (or a
+  setuid one) a host user owns. Not Docker's default, where the container's root is the host's
+  root; that is not given to a job here. Where the filesystem cannot be idmapped (the kernel refuses
+  with `EINVAL`, NFS for one; ext4, xfs, btrfs and tmpfs can on the Ubuntu 24.04+ and Raspberry Pi
+  kernels this supports) the mount keeps the host's ids as they are: host ids are still `nobody`,
+  and what a job writes is owned by its slot's ids (`RUNNER_NATIVE_SUBID_BASE + slot * 65536 + n`),
+  so another slot's job sees it as `nobody` too. A rootless runner maps only its own user, as the
+  job's root, with no idmapping.
+- **Refused natively, not sent to Dagger**: a host path the list does not allow fails the job in
+  "Set up job" with the reason, naming `RUNNER_NATIVE_HOST_PATHS`. This follows the convention of
+  this section for what the native job understands and will not do (an unknown `--user`, a volume
+  over the workspace: both fail the job), not the one for what it does not carry out (those go to
+  Dagger). Sent to Dagger, the volume would be ignored with a warning and the job would run without
+  the directory it asked for.
+- **Step caching is off** for a job with a host path: its contents are in no key and no layer.
+
 **Refused (the job goes to Dagger, with the volume named in "Set up job", as an `options:` flag is).**
 
 | `volumes:` entry | Why |
 |---|---|
-| `/host/path:/target` (a source starting with `/`, including `/var/run/docker.sock`) | A bind from the host. Needs a mount outside the cache volumes' fixed set (`sandbox.Spec.binds` is built by the runner, never from a workflow), a policy for which host paths a job may mount (the runner's store, `/etc` and the Docker socket are host paths), nosuid/nodev and the id mapping of a root runner's slot (`Bind.volume`) so files the job writes are not the host's root's. Mount and privilege code. |
-| `:ro` in either spelling | Read-only needs a mount of its own. |
+| `:ro` on an anonymous or named volume, in either spelling | Read-only needs a mount of its own; a host path's has one (above). |
 | A named volume the job's `services:` list a volume for | A native service mounts no volume (it logs "Service volumes are not supported and were ignored"), so the volume would not be shared as it is on GitHub. An anonymous volume is the job container's alone, and is native whatever the services list. |
 | One name at two targets, or two volumes at one target | Docker refuses the second; the first would need a bind to be one directory in two places. |
 | A target that is relative, has a `..`, is `/`, is under `/proc`, `/sys` or `/dev`, or is a directory the runner mounts itself (`/__w`, `/__t`, `/__e`, `/github/home`, `/github/workflow`, `/var/run/docker.sock`) | Docker refuses them or they are the sandbox's. |
@@ -1472,7 +1518,15 @@ each entry above, and `unsupported`'s reasons for ports, volumes (with and witho
 options and expressions (`container_options.zig`, `Backend.zig`); a native job with `--user app -e
 ... --workdir ... --health-*` that runs as the image's `app` user with the options' env over the
 container's, a native job whose anonymous and named volumes are there for every step, and one whose
-volume clashes with the workspace fails in "Set up job" (root runner, in CI).
+volume clashes with the workspace fails in "Set up job" (root runner, in CI). Host paths
+(`host_paths.zig`, `Backend.zig`): the setting's separators, symlinks resolved, and each refusal
+(relative, missing, a file, `/`, `/proc`, `/sys`, `/dev`, `/run`, the store, inside it, above it);
+a job's source allowed in the list and below it, through a link that stays inside, refused through
+one that leaves, outside it, and with none allowed; and as root, real jobs: an allowed directory
+read and written (the host's file `nobody`'s to the job, the job's file the volumes' range's on the
+host), a second bind `:ro` refusing writes, both `nosuid,nodev` in `/proc/self/mountinfo`, and
+failures naming the setting for a path outside the list, a link out of it, an untrusted job, and
+an empty list.
 
 ### P7: Docker actions
 

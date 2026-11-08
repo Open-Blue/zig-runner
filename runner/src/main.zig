@@ -165,6 +165,20 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (cfg.inspect) return inspect.run(arena, io, &cfg, name, &stdout.interface);
 
+    // The host paths jobs may bind are checked once, now: a bad entry is the operator's to fix,
+    // never a list quietly narrower or wider than the one they wrote.
+    if (cfg.backend == .native and cfg.native_host_paths.len > 0) {
+        var refusal: dagger.Backend.HostPathRefusal = .{};
+        _ = dagger.Backend.hostPathsOf(arena, io, init.environ_map, &cfg, &refusal) catch |e| {
+            try err.print("config error: RUNNER_NATIVE_HOST_PATHS: `{s}` {s} ({s})\n", .{
+                refusal.entry,
+                refusal.why,
+                @errorName(e),
+            });
+            return @backingInt(Exit.config);
+        };
+    }
+
     // With no engine a job native cannot run fails, so a machine that cannot run native steps
     // would fail every job: found now, before registering, not per job.
     if (cfg.engineless()) {

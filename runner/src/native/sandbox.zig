@@ -127,6 +127,12 @@ pub const Spec = struct {
         /// nosuid and nodev (a JavaScript runtime's files from the store, `Backend.applyMounts`):
         /// a setuid file or a device node there is never one for the step.
         nosuid: bool = false,
+        /// A job container's host-path volume (`host_paths.zig`): `host` is canonical and was
+        /// checked against the operator's list, and is opened with no symlink followed, so one
+        /// swapped in since fails the step. Not recursive, nosuid and nodev, read-only when
+        /// `read_only`, and on a root runner idmapped as a cache volume is where its filesystem
+        /// can be (`bindHostIn`).
+        host_path: bool = false,
     };
 
     /// The job's overlay (`lowers`, `upper`) is still mounted, and this step's layer is where
@@ -601,7 +607,7 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper, early: []const u
             const userns = mappedUserns(0, spec.id_base, spec.id_count);
             // The cache volumes' on-disk ids, seen as the job's.
             var volumes = false;
-            for (spec.binds) |bd| volumes = volumes or bd.volume;
+            for (spec.binds) |bd| volumes = volumes or bd.volume or bd.host_path;
             const volume_ns: ?linux.fd_t = if (volumes)
                 mappedUserns(spec.volume_id_base, spec.id_base, spec.id_count)
             else
@@ -747,10 +753,14 @@ fn bindAll(arena: Allocator, spec: Spec, volume_ns: ?linux.fd_t) void {
         // A Docker action's image gets a bind only where it has the path: the job's binds are
         // made for the job's image, and nothing is made in the image for them. Nor the job's
         // cache volumes (P4): Dagger gives a Docker action's container none either.
-        if (spec.container != null and bd.volume) continue;
+        if (spec.container != null and (bd.volume or bd.host_path)) continue;
         if (bd.make and spec.container == null) makeDirsIn(arena, root, bd.at, owner);
         if (bd.volume) {
             bindVolumeIn(arena, root, bd.volume_root, bd.host, bd.at, volume_ns);
+            continue;
+        }
+        if (bd.host_path) {
+            bindHostIn(arena, root, bd.host, bd.at, bd.read_only, volume_ns);
             continue;
         }
         const required = !bd.optional and spec.container == null;
@@ -833,6 +843,75 @@ fn bindVolumeIn(
         @as(usize, @intCast(tree)),
         @intFromPtr(""),
         @as(usize, @intCast(target)),
+        @intFromPtr(""),
+        move_mount_f_empty_path | move_mount_t_empty_path,
+    ));
+}
+
+/// A host directory at `at` (`Bind.host_path`): `host`, canonical and allowed by the operator
+/// (`host_paths.zig`), opened from `/` with no symlink followed at all, so a link put in its path
+/// since the runner checked it fails the step instead of reaching outside the allowed directory.
+/// Cloned alone (no mount below it comes along), nosuid and nodev, read-only when `read_only`,
+/// set in one `mount_setattr` and moved into place in the step's mount namespace only. On a root
+/// runner it is idmapped through `userns` as a cache volume is: files owned on disk by the
+/// volumes' range are the job's own ids, any other id (the host's users, root included) is nobody
+/// to the job, so a job can never make a file a host user owns. A filesystem that cannot be
+/// idmapped (the kernel refuses with EINVAL, as for NFS) is mounted with the host's ids as they
+/// are: then what the job writes is owned by its slot's ids, and host ids are nobody all the same.
+fn bindHostIn(
+    arena: Allocator,
+    root: linux.fd_t,
+    host: []const u8,
+    at: []const u8,
+    read_only: bool,
+    userns: ?linux.fd_t,
+) void {
+    std.debug.assert(host.len > 1 and host[0] == '/');
+    const slash_rc = linux.open("/", .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    check("open /", slash_rc);
+    const slash = std.math.cast(linux.fd_t, slash_rc) orelse fatal("open /", @as(u32, 9));
+    defer _ = linux.close(slash);
+    const dir = switch (openIn(slash, z(arena, host[1..]), .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = true }, 0, resolve_no_symlinks)) {
+        .fd => |fd| fd,
+        .err => |e| fatal(about(arena, "open the host path (no symlink followed) for", at), @backingInt(e)),
+    };
+    defer _ = linux.close(dir);
+    const open_tree_clone = 1;
+    const tree = linux.syscall3(
+        .open_tree,
+        std.math.cast(usize, dir) orelse unreachable,
+        @intFromPtr(""),
+        open_tree_clone | linux.AT.EMPTY_PATH | linux.SOCK.CLOEXEC,
+    );
+    check(about(arena, "clone the host path for", at), tree);
+    const tree_fd = std.math.cast(linux.fd_t, tree) orelse fatal(about(arena, "clone the host path for", at), @as(u32, 9));
+    defer _ = linux.close(tree_fd);
+    const rdonly = 0x1;
+    const nosuid = 0x2;
+    const nodev = 0x4;
+    const idmap = 0x00100000;
+    var attr: MountAttr = .{ .set = nosuid | nodev };
+    if (read_only) attr.set |= rdonly;
+    var set_rc: usize = 0;
+    if (userns) |ns| {
+        var mapped = attr;
+        mapped.set |= idmap;
+        mapped.userns_fd = std.math.cast(u64, ns) orelse 0;
+        set_rc = linux.syscall5(.mount_setattr, tree, @intFromPtr(""), linux.AT.EMPTY_PATH, @intFromPtr(&mapped), @sizeOf(MountAttr));
+    }
+    if (userns == null or linux.errno(set_rc) == .INVAL)
+        set_rc = linux.syscall5(.mount_setattr, tree, @intFromPtr(""), linux.AT.EMPTY_PATH, @intFromPtr(&attr), @sizeOf(MountAttr));
+    check(about(arena, "set up the host path for", at), set_rc);
+    const target = targetIn(arena, root, at, true) orelse
+        fatal(about(arena, "find", at), @as(u32, 2));
+    defer _ = linux.close(target);
+    const move_mount_f_empty_path = 0x4;
+    const move_mount_t_empty_path = 0x40;
+    check(about(arena, "mount the host path at", at), linux.syscall5(
+        .move_mount,
+        tree,
+        @intFromPtr(""),
+        std.math.cast(usize, target) orelse unreachable,
         @intFromPtr(""),
         move_mount_f_empty_path | move_mount_t_empty_path,
     ));
