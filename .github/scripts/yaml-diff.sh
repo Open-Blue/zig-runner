@@ -22,6 +22,7 @@ mkdir "$scratch/real" "$scratch/random"
 zig build-exe -OReleaseSafe --dep yaml -Mroot=tools/yamlcorpus.zig -Myaml=src/yaml.zig \
 	--name yamlcorpus -femit-bin="$scratch/yamlcorpus" &
 
+echo "== fetching the action.yml files"
 fetch() {
 	local name=${1//\//__}
 	for f in action.yml action.yaml; do
@@ -37,6 +38,7 @@ done <tools/yamldiff/repos.txt
 wait
 
 cd tools/yamldiff
+echo "== parsing with Go"
 go run . -gen "${1:-2000}" -seed "${2:-1}" -out "$scratch/random"
 go run . "$scratch"/real/*.yml >"$scratch/real.jsonl"
 go run . "$scratch"/random/*.yml >"$scratch/random.jsonl"

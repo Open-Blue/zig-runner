@@ -183,6 +183,9 @@ crash() {
 	while read -r limit mark kind; do
 		count=$((count + 1))
 		if ! point "$limit" "$mark" "$kind"; then bad=$((bad + 1)); fi
+		if ((count % 25 == 0)); then
+			echo "$count of $points crash points checked in $((SECONDS - started)) s, $bad failed"
+		fi
 	done <"$w/points.txt"
 	echo "$count crash points in $((SECONDS - started)) s, $bad failed"
 	echo "disks seen, by layers a hit found, directories published whole, volumes and dead trees (points):"
