@@ -921,8 +921,25 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   (#415: counting all of them held small jobs at GitHub for 182-266 s behind heavy jobs waiting
   for room), so no new job is taken while the first in line waits unless there is room for both.
   A job named meanwhile that is not first in line must leave that room too (`Admission.withHead`),
-  so the first in line is never delayed by a job that began waiting after it did. The runners
-  polling on a native pool count natively for the engine's cap: a busy engine does not hold
+  so the first in line is never delayed by a job that began waiting after it did.
+  - *Short jobs go ahead* (#415). Counting the first in line still held small jobs at GitHub while
+    it waited for a heavy job to end. The pool now learns how long each name runs (the longest of
+    its last five runs, kept with its memory: a job that is sometimes long is not taken for a
+    short one). A job named while another waits, that does not fit beside it but fits without it,
+    starts anyway when its name ran at most 60 s (`short_run_ms`) in each of those runs; a name not
+    learned, or learned longer, waits behind the first in line as before. A runner polling cannot
+    know its job, so it passes on the same room test (it fits without the first in line) and the
+    job it is handed is then told at start; the cost of a wrong guess is a runner holding a job,
+    so no poller passes once half the pool's runners hold waiting jobs. The first in line is
+    protected by when this is allowed: only while it would not fit even with every job that went
+    ahead gone (it waits for jobs not expected to end soon), and while some job that did not go
+    ahead runs (when only those do, it is the one forced when they end, #386). Once it would fit
+    without them no more go ahead, so a stream of short jobs delays it only by the ones in flight,
+    each for as long as it was learned to run: 60 s at most, and nothing like the 182-266 s the
+    e2e burst waited. A job learned short that runs long (a `short_run_ms` guess gone wrong) delays
+    it by that run, once: after 120 s (`overdue_ms`) no more go ahead on the word of a learned time
+    while it runs, and when it ends its run is learned, so its name is long for its next five runs.
+  - The runners polling on a native pool count natively for the engine's cap: a busy engine does not hold
   runners whose jobs never run in it (#414). The wait is in the job's own log ("Waiting for room in memory before starting")
   and ends when a reservation drops (`Admission.changes`, within 50 ms) or at the next recheck.
   - *A machine that cannot fit one job* (#406). At start the runner compares one job's reservation
@@ -936,12 +953,12 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   - *The estimates survive a restart* (#407). `Admission.learned` and `learned_native` are kept in
     `memory-gate` in the native store's directory (`RUNNER_NATIVE_STORE`, `Config.nativeStore`;
     written there for a Dagger pool too), one text line a name, versioned (`zig-runner memory gate
-    v1`), with the machine id, `MemTotal` and the backend they were measured on. It is written
+    v2`), with the machine id, `MemTotal` and the backend they were measured on. It is written
     atomically (temp file, fsync, rename, fsync of the directory) when something was learned, at
     most every 10 s and when the pool ends, and read at start, where the log says how many were
     loaded. A file from another machine, another amount of memory (more than 1/16 apart), another
     backend or format version, or a damaged one, is not used and is warned of; the next write
-    replaces it. The table keeps the last five runs of a name and the 64 used most recently, as
+    replaces it (v1 had no run times: it is not used). The table keeps the last five runs of a name, and how long each ran (#415), and the 64 used most recently, as
     before: a name's estimate is the most of those runs, so one learned low (a warm `zig build
     test` at 64 MB) still reserves little for a cold one until a heavy run has been seen, restart
     or not.
