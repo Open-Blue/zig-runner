@@ -1,3 +1,0 @@
-kind: Changed
-body: StoreLocking's safety is model-checked with SPIN, on a Promela port of the TLA+ model that reaches exactly TLC's states, in a fifth of the time; its liveness stays TLC's
-time: 2026-11-07T23:06:29.72601345-05:00

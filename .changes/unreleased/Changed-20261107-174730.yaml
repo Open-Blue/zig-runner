@@ -1,3 +1,0 @@
-kind: Changed
-body: The analysis workflow splits its Coverage job into four parts of a quarter of the tests each, merged by a final Coverage job, and its Stress job into four jobs of 25 rounds, so each finishes in about a quarter of the time.
-time: 2026-11-07T17:47:30.249814778-05:00

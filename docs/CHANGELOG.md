@@ -10,6 +10,22 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.28.0 - 2026-11-08
+### Added
+* A TLA+ model of the release pipeline as #408 has it (proofs/tla/ReleasePipeline.tla), checked by TLC in CI with its mutants: tags only checked commits, deploys only checked releases, waits for the current check names, and ends every wait
+* RUNNER_PREWARM=before-listen (or --prewarm=before-listen) finishes the native store pre-warm before any runner registers or polls, so a machine added to a pool takes jobs only once warm; a failed warm, or one over 15 minutes, still lets the runners listen, and a stop ends the wait
+### Changed
+* TLC runs in four parts side by side, each configuration given to a part by its expected time, so the model check takes about three minutes instead of twelve
+* The analysis workflow splits its Coverage job into four parts of a quarter of the tests each, merged by a final Coverage job, and its Stress job into four jobs of 25 rounds, so each finishes in about a quarter of the time.
+* The pre-push hook also runs the tests on overlayfs and ZLint when the runner changed, and TLC when the models or the release pipeline changed, so failures CI found first are found before a push
+* TLC checks what its configurations claim, a little faster than it did: the store's locking model ordered a directory listing by the runners' names, which the runners' symmetry does not allow, so TLC left part of the model unexplored (StoreLocking-crash.cfg 6.5 million states where every orbit is 7.3 million); the order is now the lister's own and every orbit is explored. The release pipeline's safety is checked under a view that leaves out what no action reads again (2.0 million states to 156,000, the same violations found), and its liveness as two configurations of one property each
+* StoreLocking's safety is model-checked with SPIN, on a Promela port of the TLA+ model that reaches exactly TLC's states, in a fifth of the time; its liveness stays TLC's
+### Fixed
+* The release and the deploy wait for the check names in .github/checks-on-main, read from the commit they check out, and fail at once on one that never ran; CI checks those names and the rulesets' required checks are jobs that run
+* The memory gate no longer charges a native pool's idle runners to the engine's cap (#414), counts only the job that has waited longest against small jobs (#415), keeps what jobs took across restarts (#407), and refuses to start, or lets one runner poll, when a single job could never fit (#406).
+* The memory gate learns how long each job runs, and lets a job whose name ran 60 s at most each time start beside a heavy one waiting for room, so a burst of small jobs no longer queues at GitHub behind it (#415); the memory-gate file is now format v2 and a v1 file is ignored with a warning
+* A stop during RUNNER_PREWARM=before-listen is no longer said as a finished warm with the runners about to register, when the stopped warm was done before the wait first looked
+
 ## v0.27.0 - 2026-11-07
 ### Added
 * A native pool warms its store when it starts: the default image is provisioned and the Zig cache seeds are built in the background, with or without an engine (`RUNNER_ENGINE=none`), so the first jobs on an empty store no longer wait for them. A failed warm is only said.

@@ -1,3 +1,0 @@
-kind: Fixed
-body: The memory gate no longer charges a native pool's idle runners to the engine's cap (#414), counts only the job that has waited longest against small jobs (#415), keeps what jobs took across restarts (#407), and refuses to start, or lets one runner poll, when a single job could never fit (#406).
-time: 2026-11-07T21:14:57.43595793-05:00

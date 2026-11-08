@@ -1,3 +1,0 @@
-kind: Fixed
-body: The memory gate learns how long each job runs, and lets a job whose name ran 60 s at most each time start beside a heavy one waiting for room, so a burst of small jobs no longer queues at GitHub behind it (#415); the memory-gate file is now format v2 and a v1 file is ignored with a warning
-time: 2026-11-07T21:55:09.464091427-05:00
