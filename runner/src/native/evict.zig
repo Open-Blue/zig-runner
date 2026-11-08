@@ -1157,6 +1157,30 @@ test "native eviction: a volume evicted is a new, empty one to the next job" {
     try testing.expect(try it.next(testing.io) == null);
 }
 
+test "native eviction: a job container's named volume goes as a cache volume does, unless in use" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const arena = f.arena();
+    const key = try volumes.namedKey(arena, "o/r", "repo", "data");
+    var v = try volumes.openNamed(arena, testing.io, f.s.root, key, null);
+    v.share();
+    try f.fill(v.dir, 6000);
+    try f.age(v.dir, 30);
+    f.s.limits = .{ .volumes_max_bytes = 1, .min_free_pct = 0 };
+    // In use: it stays, whatever the cap says.
+    run(f.s, testing.io);
+    try testing.expect(f.there(v.dir));
+    v.release(testing.io);
+    // Unused for long, it goes, and the next job gets it new, to fill from its image again.
+    run(f.s, testing.io);
+    try testing.expect(!f.there(v.dir));
+    try testing.expectEqual(@as(usize, 0), try f.deadLeft());
+    var again = try volumes.openNamed(arena, testing.io, f.s.root, key, null);
+    defer again.release(testing.io);
+    try testing.expect(again.new);
+    again.share();
+}
+
 test "native eviction: the disk's floor spares only what was used in the last hour" {
     const f = try Fixture.init();
     defer f.deinit();

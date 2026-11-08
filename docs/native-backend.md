@@ -1462,27 +1462,72 @@ is handed to it as `-p`. The runner always adds `/var/run/docker.sock`, the work
 actions and externals directories and `/github/home` and `/github/workflow` itself. A volume at
 `/` only gets a warning from the runner.
 
-**`volumes:` carried out.** An anonymous volume (`- /data`) and a named one (`- cache:/cache`,
-`- cache:/cache:rw`) are directories of the job's filesystem: the base makes each mount point
-(`Backend.volumeDirs`, one `mkdir -p` after the work root is made and handed to the step user, in
-the base's key), root's as Docker makes a new volume's mount point, and what the image has there
-stays, which is where a Docker volume starts. Every step sees it, so a file one step writes is
-there for the next, and it goes with the job (the job's layers are removed when it ends). No mount
-is made, so the sandbox and the network are untouched. "Set up job" says how many were made and how
-many were named.
+**`volumes:` carried out: anonymous.** An anonymous volume (`- /data`) is a directory of the job's
+filesystem: the base makes its mount point (`Backend.containerVolumes`, one `mkdir -p` after the
+work root is made and handed to the step user, in the base's key), root's as Docker makes a new
+volume's mount point, and what the image has there stays, which is where a Docker volume starts.
+Every step sees it, so a file one step writes is there for the next, and it goes with the job (the
+job's layers are removed when it ends). No mount is made.
 
-Docker's named volumes outlive the job; a native one does not. On a GitHub-hosted runner every job
-is a fresh machine and none does, so a workflow written for it cannot depend on that; on a
-self-hosted runner one could. Making them last would reuse the cache volumes' store
-(`volumes.zig`: a name under the repository and its trust scope, the shared lock, the id mapping)
-and its eviction would then lose the data a Docker volume keeps, so it is not done here.
+**`volumes:` carried out: named, kept between jobs as Docker's are** (decided 2026-11-08). A named
+volume (`- cache:/cache`, `- cache:/cache:rw`, `- cache:/cache:ro`) is a directory of the native
+store beside the cache volumes, `volumes/<owner>/<repository>/<scope>/named/<name>`
+(`volumes.namedKey`, `openNamed`), bound at its target in every step:
+
+- **Trusted jobs only, scoped by repository.** Docker's volumes are one namespace for the whole
+  host. Here a name is its repository's, and only a job the runner vouches for, in scope `repo`
+  (`set_up.packageCacheScope`), gets one, because a volume holds what one job left for the next,
+  which reads it as its own. **A job the runner does not vouch for, and a fork's pull request on a
+  runner that vouches for pull requests (scope `untrusted`), fail** in "Set up job", naming the
+  volume and saying that an anonymous volume (`- /path`) lasts as long as the job: kept per
+  repository in an `untrusted` scope, one fork's pull request could plant files the next fork's runs,
+  and each would hold store space no review let in (refused rather than keyed per fork and pull
+  request number, as #420 refuses host paths and #423 ports to those jobs). A workflow that shares
+  a volume between repositories on Docker gets one per repository.
+- **Filled from the image when new**, as Docker copies the image's files into a volume
+  (moby `daemon/create_unix.go`, `populateVolume`, and `daemon/container/container_unix.go`,
+  `copyExistingContents`): what the image has at the target (its files, owner and mode, by `cp -a`
+  in a sandbox of the job's image, as the job's root, whose layer is dropped) goes into a volume
+  this job made, and never into one that exists, so what an earlier job left is never written over.
+  Docker copies into any *empty* volume; here only a new one is filled, so a volume a job emptied
+  stays empty. An image without `cp` and with files at the target fails the job in "Set up job",
+  and the volume is removed again so the next job fills it.
+- **Shared by jobs at once, as Docker's are.** Each job holds the volume's lock shared to its end,
+  as a cache volume's (an eviction takes only one no job holds). A new volume is held exclusively
+  while it is filled, so a second job opening it meanwhile waits for it whole; an open never waits
+  for a job that holds it shared, and never for good: it polls the lock (`LOCK_NB`) for at most the
+  filling's limit plus a minute, and gives up at once when the job is cancelled (`volumes.Wait`),
+  failing the job saying why. The filling itself is stopped after 10 minutes, or at the job's
+  cancel (`Backend.SeedWatch`), the volume removed so the next job fills it. Two jobs writing the
+  same files at once race as two containers on one Docker volume do.
+- **Ids**: a cache volume's (`Bind.volume`): owned on disk by the volumes' range on a root runner
+  and seen through an idmapped mount as the job's own ids, the same in every slot, never the host's;
+  nosuid and nodev. `:ro` binds it read-only (`MOUNT_ATTR_RDONLY` with the rest, in one
+  `mount_setattr`), checked in `/proc/self/mountinfo` by the tests.
+- **Evicted as a cache volume is: unlike Docker's, a named volume can disappear.** It counts
+  toward `RUNNER_NATIVE_VOLUMES_MAX_MB`, and goes, least recently used first, when the volumes are
+  over that cap and it has not been used for a day, or when the disk is under its floor
+  (`RUNNER_NATIVE_MIN_FREE_PCT`) and it has not been used for an hour ("Eviction", above). The next
+  job then gets it new, filled from its image again. What a workflow keeps in one must be something
+  it can make again; anything that must last belongs in an artifact, a cache action or a host path
+  an operator allows. **No cap of its own**, on purpose: a job that fills a named volume can evict
+  only volumes no job holds that were not used for a day (over the cap) or an hour (under the
+  disk's floor), never one in use, exactly as it could by filling one of its cache volumes (`pip`,
+  `npm`, a tool cache), which every trusted job already has. A separate cap would not stop that,
+  and only untrusted jobs could make the difference, which now get no named volume.
+- **Step caching is off** for a job with a named volume: what a step read from it or wrote to it
+  is in no key and no layer, so a replay would stand for a run against other contents and leave the
+  volume as it was. "Set up job" says so.
+
+"Set up job" says how many volumes were made as directories, how many are named, in which scope,
+and how many were new.
 
 **Refused (the job goes to Dagger, with the volume named in "Set up job", as an `options:` flag is).**
 
 | `volumes:` entry | Why |
 |---|---|
 | `/host/path:/target` (a source starting with `/`, including `/var/run/docker.sock`) | A bind from the host. Needs a mount outside the cache volumes' fixed set (`sandbox.Spec.binds` is built by the runner, never from a workflow), a policy for which host paths a job may mount (the runner's store, `/etc` and the Docker socket are host paths), nosuid/nodev and the id mapping of a root runner's slot (`Bind.volume`) so files the job writes are not the host's root's. Mount and privilege code. |
-| `:ro` in either spelling | Read-only needs a mount of its own. |
+| `:ro` on an anonymous volume (`/data:ro`), in either spelling | An anonymous volume is a directory of the job's overlay, not a mount, so it cannot be read-only on its own. A named one can (above). |
 | A named volume the job's `services:` list a volume for | A native service mounts no volume (it logs "Service volumes are not supported and were ignored"), so the volume would not be shared as it is on GitHub. An anonymous volume is the job container's alone, and is native whatever the services list. |
 | One name at two targets, or two volumes at one target | Docker refuses the second; the first would need a bind to be one directory in two places. |
 | A target that is relative, has a `..`, is `/`, is under `/proc`, `/sys` or `/dev`, or is a directory the runner mounts itself (`/__w`, `/__t`, `/__e`, `/github/home`, `/github/workflow`, `/var/run/docker.sock`) | Docker refuses them or they are the sandbox's. |
@@ -1523,7 +1568,17 @@ each entry above, and `unsupported`'s reasons for ports, volumes (with and witho
 options and expressions (`container_options.zig`, `Backend.zig`); a native job with `--user app -e
 ... --workdir ... --health-*` that runs as the image's `app` user with the options' env over the
 container's, a native job whose anonymous and named volumes are there for every step, and one whose
-volume clashes with the workspace fails in "Set up job" (root runner, in CI).
+volume clashes with the workspace fails in "Set up job" (root runner, in CI). Named volumes
+(`volumes.zig`, `evict.zig`, `Backend.zig`): kept between opens and new only the first time, apart
+for another scope or repository; a second open waits while a new one is filled and then shares it,
+but only so long and not past a cancel,
+and one whose filling failed is made again; one in use survives an eviction and an unused one goes;
+and as root, across real jobs: kept between jobs, filled from the image (owner and mode too) only
+when new, apart for another repository, refused for a fork's pull request and for a job whose ref
+the runner does not vouch for (`Config.vouched` false) with nothing left in the store, `:ro`
+refusing writes, remounts (`ro` to `rw`, to `suid,dev`) refused, both mounts nosuid and nodev in
+`/proc/self/mountinfo`, and a filling that does not end stopped at its limit and the volume filled
+by the next job.
 
 ### P7: Docker actions
 
