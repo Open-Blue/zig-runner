@@ -148,7 +148,8 @@ fn applyPiped(
     // Closed whatever came before: a producer blocked on a full queue (the tar ended early, or
     // failed) is let go.
     pipe.queue.close(io);
-    group.await(io) catch {};
+    // Canceled means the pull is being abandoned; the group has ended all the same.
+    group.await(io) catch return error.ReadFailed;
     // The producer's failure first: the tar reader sees it only as an archive that ends.
     if (pipe.failed) return error.ReadFailed;
     try result;
