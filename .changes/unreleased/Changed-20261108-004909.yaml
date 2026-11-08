@@ -1,0 +1,3 @@
+kind: Changed
+body: 'Native image pulls unpack several times faster: zstd layers use a decoder of the runner''s own (std''s took 19 s for a 500 MB layer, now 1 s), a layer''s inflating and hashing run on a thread of their own beside the unpacking, the layers'' blobs are fetched ahead while the earlier ones unpack, and large files start their writeback as they are written so the store''s syncfs has little left to wait for'
+time: 2026-11-08T00:49:09.599075485-05:00

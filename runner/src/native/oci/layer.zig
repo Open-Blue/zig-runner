@@ -23,6 +23,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const sandbox = @import("../sandbox.zig");
+const zstd = @import("zstd.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -35,6 +36,8 @@ pub const Options = struct {
     /// Caps over every layer of an image (`Totals`).
     max_bytes: u64 = 32 << 30,
     max_entries: u64 = 4_000_000,
+    /// Inflate on a thread of its own (`applyDecompressed`); off for the tests that want one.
+    pipeline: bool = true,
 };
 
 /// What the layers of one image added up to, so far.
@@ -83,39 +86,161 @@ pub fn apply(
         error.EndOfStream => in.buffered(),
         error.ReadFailed => return error.ReadFailed,
     };
-    var hash_buf: [64 * 1024]u8 = undefined;
     if (std.mem.startsWith(u8, magic, "\x1f\x8b")) {
         const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
         defer gpa.free(window);
         var d: std.compress.flate.Decompress = .init(in, .gzip, window);
-        var h = d.reader.hashed(Sha256.init(.{}), &hash_buf);
-        try applyTar(gpa, io, root, &h.reader, opts, totals);
-        try checkDiffId(&h, diff_id);
+        try applyDecompressed(gpa, io, root, &d.reader, diff_id, opts, totals);
     } else if (std.mem.startsWith(u8, magic, "\x28\xb5\x2f\xfd")) {
-        const window = try gpa.alloc(u8, std.compress.zstd.default_window_len +
-            std.compress.zstd.block_size_max);
-        defer gpa.free(window);
-        // Not its frame checksum (std's zstd cannot check it while streaming yet): the blob's
-        // digest is checked before, and the diff id after.
-        var d: std.compress.zstd.Decompress = .init(in, window, .{});
-        var h = d.reader.hashed(Sha256.init(.{}), &hash_buf);
-        try applyTar(gpa, io, root, &h.reader, opts, totals);
-        try checkDiffId(&h, diff_id);
+        // Not its frame checksum: the blob's digest is checked before, and the diff id after.
+        const d = try zstd.Decompress.create(gpa, in);
+        defer d.destroy();
+        try applyDecompressed(gpa, io, root, &d.reader, diff_id, opts, totals);
     } else {
+        var hash_buf: [64 * 1024]u8 = undefined;
         var h = in.hashed(Sha256.init(.{}), &hash_buf);
         try applyTar(gpa, io, root, &h.reader, opts, totals);
         try checkDiffId(&h, diff_id);
     }
 }
 
+/// The tar `src` yields (a decompressor's output) applied, and its digest checked. Inflating and
+/// hashing are a thread's work and writing the files another's (`Pipe`), so a layer takes the
+/// longer of the two rather than their sum; on a machine that cannot run the second, one thread
+/// does both.
+fn applyDecompressed(
+    gpa: Allocator,
+    io: std.Io,
+    root: linux.fd_t,
+    src: *std.Io.Reader,
+    diff_id: []const u8,
+    opts: Options,
+    totals: *Totals,
+) Error!void {
+    if (opts.pipeline and try applyPiped(gpa, io, root, src, diff_id, opts, totals)) return;
+    var hash_buf: [64 * 1024]u8 = undefined;
+    var h = src.hashed(Sha256.init(.{}), &hash_buf);
+    try applyTar(gpa, io, root, &h.reader, opts, totals);
+    try checkDiffId(&h, diff_id);
+}
+
+/// `applyDecompressed` through a `Pipe`; false, with nothing done, when there is no thread to
+/// inflate on.
+fn applyPiped(
+    gpa: Allocator,
+    io: std.Io,
+    root: linux.fd_t,
+    src: *std.Io.Reader,
+    diff_id: []const u8,
+    opts: Options,
+    totals: *Totals,
+) Error!bool {
+    const pipe = Pipe.create(gpa, io, src) catch return error.OutOfMemory;
+    defer pipe.destroy(gpa);
+    var group: std.Io.Group = .init;
+    group.concurrent(io, Pipe.produce, .{ pipe, io }) catch return false;
+    var result: Error!void = applyTar(gpa, io, root, &pipe.reader, opts, totals);
+    if (result) |_| {
+        _ = pipe.reader.discardRemaining() catch {
+            result = error.ReadFailed;
+        };
+    } else |_| {}
+    // Closed whatever came before: a producer blocked on a full queue (the tar ended early, or
+    // failed) is let go.
+    pipe.queue.close(io);
+    group.await(io) catch {};
+    // The producer's failure first: the tar reader sees it only as an archive that ends.
+    if (pipe.failed) return error.ReadFailed;
+    try result;
+    try checkSum(&pipe.hasher, diff_id);
+    return true;
+}
+
+/// A decompressed tar handed from the thread that inflates it to the one that unpacks it, in
+/// `chunk` pieces through a queue of `queue_bytes`. The unpacking side hashes what it takes (the
+/// image config's diff id).
+const Pipe = struct {
+    src: *std.Io.Reader,
+    queue: std.Io.Queue(u8),
+    hasher: Sha256 = .init(.{}),
+    /// Set by the producer before it closes the queue, read after the group is awaited.
+    failed: bool = false,
+    reader: std.Io.Reader,
+    io: std.Io,
+    /// The producer's chunk, then the queue's storage, then the consumer's buffer.
+    memory: []u8,
+
+    const chunk = 256 * 1024;
+    const queue_bytes = 4 << 20;
+    const reader_bytes = 64 * 1024;
+
+    fn create(gpa: Allocator, io: std.Io, src: *std.Io.Reader) Allocator.Error!*Pipe {
+        const p = try gpa.create(Pipe);
+        errdefer gpa.destroy(p);
+        const memory = try gpa.alloc(u8, chunk + queue_bytes + reader_bytes);
+        p.* = .{
+            .src = src,
+            .io = io,
+            .queue = .init(memory[chunk..][0..queue_bytes]),
+            .reader = .{
+                .vtable = &.{ .stream = stream },
+                .buffer = memory[chunk + queue_bytes ..],
+                .seek = 0,
+                .end = 0,
+            },
+            .memory = memory,
+        };
+        return p;
+    }
+
+    fn destroy(p: *Pipe, gpa: Allocator) void {
+        gpa.free(p.memory);
+        gpa.destroy(p);
+    }
+
+    fn produce(p: *Pipe, io: std.Io) void {
+        const buf = p.memory[0..chunk];
+        while (true) {
+            const n = p.src.readSliceShort(buf) catch {
+                p.failed = true;
+                break;
+            };
+            if (n > 0) p.queue.putAll(io, buf[0..n]) catch break;
+            if (n < buf.len) break;
+        }
+        p.queue.close(io);
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const p: *Pipe = @alignCast(@fieldParentPtr("reader", r));
+        // Through a buffer of its own, as `w` may have none (a discarding writer).
+        var buf: [16 * 1024]u8 = undefined;
+        const dest = limit.slice(&buf);
+        const n = p.queue.get(p.io, dest, 1) catch |e| switch (e) {
+            error.Closed => return error.EndOfStream,
+            error.Canceled => return error.ReadFailed,
+        };
+        // Hashed here, not by the producer: inflating is the slower of the two, and this thread
+        // waits for it.
+        p.hasher.update(dest[0..n]);
+        try w.writeAll(dest[0..n]);
+        return n;
+    }
+};
+
+/// `hasher`'s digest compared with the image config's.
+fn checkSum(hasher: *Sha256, diff_id: []const u8) Error!void {
+    if (diff_id.len == 0) return;
+    var sum: [32]u8 = undefined;
+    hasher.final(&sum);
+    const want = std.mem.cutPrefix(u8, diff_id, "sha256:") orelse return error.DiffIdMismatch;
+    if (!std.mem.eql(u8, &std.fmt.bytesToHex(sum, .lower), want)) return error.DiffIdMismatch;
+}
+
 /// The rest of the stream (the archive's end blocks) read, and its digest compared.
 fn checkDiffId(h: anytype, diff_id: []const u8) Error!void {
     _ = h.reader.discardRemaining() catch return error.ReadFailed;
-    if (diff_id.len == 0) return;
-    var sum: [32]u8 = undefined;
-    h.hasher.final(&sum);
-    const want = std.mem.cutPrefix(u8, diff_id, "sha256:") orelse return error.DiffIdMismatch;
-    if (!std.mem.eql(u8, &std.fmt.bytesToHex(sum, .lower), want)) return error.DiffIdMismatch;
+    return checkSum(&h.hasher, diff_id);
 }
 
 // --- the tar format ---
@@ -411,6 +536,7 @@ fn applyTar(
                     if (n == 0) break;
                     try writeAll(fd, buf[0..n]);
                 }
+                if (e.size >= start_writeback_at) startWriteback(fd);
                 try setXattrs(fd, e.xattrs, opts);
                 try own(fd, e, opts);
             },
@@ -670,6 +796,20 @@ fn setTime(dir: linux.fd_t, name: ?[*:0]const u8, mtime: i64) void {
     _ = linux.utimensat(dir, name, &times, if (name != null) linux.AT.SYMLINK_NOFOLLOW else 0);
 }
 
+/// Files at least this big have their writeback started when they are written (`startWriteback`).
+const start_writeback_at = 128 * 1024;
+
+/// `SYNC_FILE_RANGE_WRITE` over the whole file: the kernel starts writing its pages out and this
+/// returns at once, waiting for nothing and promising nothing. An image unpacks into the page
+/// cache, and the store's `syncfs` before the rename (`Store.syncFilesystem`) then had a gigabyte
+/// or more to write on its own (9.5 s of a 22 s pull of a 1.2 GB image on a laptop's NVMe); this
+/// overlaps that with the unpacking. Durability is still `syncfs`'s alone, so a failure or a
+/// filesystem without the call is ignored.
+fn startWriteback(fd: linux.fd_t) void {
+    const write = 2;
+    _ = linux.syscall4(.sync_file_range, @abs(fd), 0, 0, write);
+}
+
 fn writeAll(fd: linux.fd_t, bytes: []const u8) FsError!void {
     var rest = bytes;
     while (rest.len > 0) {
@@ -772,6 +912,12 @@ fn applyBytes(root: linux.fd_t, bytes: []const u8, diff_id: []const u8) !void {
     var r: std.Io.Reader = .fixed(bytes);
     var totals: Totals = .{};
     try apply(testing.allocator, testing.io, root, &r, diff_id, .{ .owners = false }, &totals);
+}
+
+fn applyWith(root: linux.fd_t, bytes: []const u8, diff_id: []const u8, pipeline: bool) !void {
+    var r: std.Io.Reader = .fixed(bytes);
+    var totals: Totals = .{};
+    try apply(testing.allocator, testing.io, root, &r, diff_id, .{ .owners = false, .pipeline = pipeline }, &totals);
 }
 
 fn readTmp(tmp: *testing.TmpDir, arena: Allocator, path: []const u8) ![]const u8 {
@@ -883,6 +1029,33 @@ test "native oci layer: no entry, link or symlink reaches outside the rootfs" {
     try t4.add(.{ .path = "d/", .kind = .directory });
     try t4.add(.{ .path = "dl", .kind = .hard_link, .link = "d" });
     try testing.expectError(error.HardLinkTarget, applyBytes(root, try t4.finish(), ""));
+}
+
+test "native oci layer: the diff id is checked with the decompressor on its own thread and without, and a cut stream fails" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try openRoot(testing.io, &tmp, arena);
+    defer _ = linux.close(root);
+
+    // The tar inside the gzip fixture, and its digest as an image config names it.
+    var in: std.Io.Reader = .fixed(&test_gzip);
+    const window = try arena.alloc(u8, std.compress.flate.max_window_len);
+    var d: std.compress.flate.Decompress = .init(&in, .gzip, window);
+    const tar = try d.reader.allocRemaining(arena, .unlimited);
+    var sum: [32]u8 = undefined;
+    Sha256.hash(tar, &sum, .{});
+    const diff_id = try std.fmt.allocPrint(arena, "sha256:{s}", .{&std.fmt.bytesToHex(sum, .lower)});
+
+    for ([_]bool{ true, false }) |pipeline| {
+        try applyWith(root, &test_gzip, diff_id, pipeline);
+        try applyWith(root, &test_zstd, "", pipeline);
+        try testing.expectError(error.DiffIdMismatch, applyWith(root, &test_gzip, "sha256:" ++ repeat('0', 64), pipeline));
+        try testing.expectError(error.ReadFailed, applyWith(root, test_gzip[0 .. test_gzip.len / 2], "", pipeline));
+        try testing.expectError(error.ReadFailed, applyWith(root, test_zstd[0 .. test_zstd.len / 2], "", pipeline));
+    }
 }
 
 test "native oci layer: gzip and zstd layers, and a diff id that does not match" {

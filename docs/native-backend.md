@@ -778,10 +778,17 @@ What it does not do yet (debt, with the phase that pays it):
 
 - **Each image is flattened whole.** Two images that share layers share their blobs on disk but
   not their unpacked files. P2's stacked layers could keep layers apart.
-- **Layers are fetched one at a time**, and a broken download starts over. Parallel fetches are a
-  measured optimisation for later (P9's real workloads); ubuntu has one layer.
-- **zstd frame checksums are not checked** (std's streaming zstd cannot yet); the blob's digest is
-  checked before and the diff id after, which covers it.
+- **Layers are fetched three at a time, in order, while the earlier ones unpack**, and a broken
+  download starts over. A blob still goes into the store whole and synced, as before
+  (`image.zig`, `Prefetch`).
+- **A layer's inflating and hashing run on a thread beside its unpacking** (`layer.zig`, `Pipe`),
+  and a large file's writeback is started as it is written (`sync_file_range`, advisory) so the
+  `syncfs` before the rename has little left to write. The publish order is unchanged: nothing is
+  durable by the early writeback, only by that `syncfs`.
+- **zstd is the runner's own decoder** (`oci/zstd.zig`), because std's took 19 s for a 500 MB layer
+  (one bit at a time through the Huffman tree) and this one 1 s; std's decoder is its test
+  oracle. Frame checksums are not checked; the blob's digest is checked before and the diff id
+  after, which covers it. Dictionaries are refused, and so is a window over 128 MiB.
 - **Rootless** (tests, the laptop): only root is mapped, so every file is the runner's,
   directories keep their owner's write bit, an image whose `USER` is not root cannot run, and the
   default image cannot be provisioned (dpkg gives files to other ids, `root:adm`, which fails with
