@@ -13,7 +13,10 @@
 #
 # The search is exhaustive: no bitstate or hash compaction, which may miss states, and no partial
 # order reduction, which reduces nothing here (every step touches the shared store) and costs time.
-# The configurations run side by side, one a core, each in its own directory under $SPIN_DIR.
+# The configurations run side by side, one a core, each in its own directory under $SPIN_DIR. Their
+# output is not interleaved: pan prints its report once, at the end, so each configuration says when
+# it starts and, with its verdict, when it ends (a line naming it, in the order they finish), and a
+# heartbeat line says every minute which are still running. The ordered verdicts follow at the end.
 #
 # Locally: .github/scripts/spin.sh (spin 6.5.2, gcc and python3 on the PATH).
 set -euo pipefail
@@ -30,10 +33,11 @@ python3 -I "$here/cfg.py" --check
 
 # check <name>: compiles and runs one configuration in $dir/<name>; the verdict is in result.
 check() {
-	local name=$1 w="$dir/$1"
+	local name=$1 w="$dir/$1" started=$SECONDS
 	rm -rf "${w:?}"
 	mkdir -p "$w"
 	cp "$here"/*.pml "$w"/
+	echo "[$name] spin, gcc and pan started"
 	(
 		cd "$w"
 		spin -a "$name.pml" >spin.out 2>&1 &&
@@ -41,6 +45,8 @@ check() {
 			{ ./pan -m100000 -w26 >pan.out 2>&1 || true; }
 	) || {
 		echo "$name: spin -a or gcc failed" >"$w/result"
+		echo "[$name] $(cat "$w/result")"
+		echo "$name" >>"$dir/finished"
 		return
 	}
 	local first want stored
@@ -63,6 +69,8 @@ check() {
 			echo "ok: holds, $stored states, $(sed -n 's/^pan: elapsed time \(.*\)/\1/p' "$w/pan.out")" >"$w/result"
 		fi
 	fi
+	echo "[$name] ended after $((SECONDS - started)) s: $(cat "$w/result")"
+	echo "$name" >>"$dir/finished"
 }
 
 names=()
@@ -76,15 +84,30 @@ mapfile -t names < <(for n in "${names[@]}"; do
 done | sort -k1,1nr | cut -d' ' -f2)
 jobs=$(nproc)
 running=0
+mkdir -p "$dir"
+: >"$dir/finished"
+(
+	trap 'kill "$nap" 2>/dev/null; exit 0' TERM
+	while :; do
+		sleep 60 &
+		nap=$!
+		wait "$nap"
+		echo "spin: $SECONDS s, $(wc -l <"$dir/finished") of ${#names[@]} configurations finished"
+	done
+) &
+heartbeat=$!
+pids=()
 for n in "${names[@]}"; do
 	if ((running >= jobs)); then
 		wait -n
 		running=$((running - 1))
 	fi
 	check "$n" &
+	pids+=($!)
 	running=$((running + 1))
 done
-wait
+wait "${pids[@]}" || true
+kill "$heartbeat" 2>/dev/null || true
 
 status=0
 for n in "${names[@]}"; do

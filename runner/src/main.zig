@@ -125,6 +125,28 @@ pub fn main(init: std.process.Init) !u8 {
         try err.print("config error: {s}\n", .{Config.explain(e) orelse @errorName(e)});
         return @backingInt(Exit.config);
     };
+    // The host paths jobs may bind are checked once, now: a bad entry is the operator's to fix,
+    // never a list quietly narrower or wider than the one they wrote.
+    // The list every job is then held to (`Backend.configFor`), never read from the setting again.
+    if (cfg.backend == .native and cfg.native_host_paths.len > 0) {
+        // A rootless runner's job root is the runner's own user on the host, with no idmapping:
+        // what it wrote there would be the runner's, and it could change the runner's files.
+        if (std.os.linux.geteuid() != 0) {
+            try err.print("config error: RUNNER_NATIVE_HOST_PATHS: host paths need a root " ++
+                "runner (a rootless runner's jobs are its own user on the host); unset it\n", .{});
+            return @backingInt(Exit.config);
+        }
+        var refusal: dagger.Backend.HostPathRefusal = .{};
+        cfg.native_host_allowed = dagger.Backend.hostPathsOf(arena, io, init.environ_map, &cfg, &refusal) catch |e| {
+            try err.print("config error: RUNNER_NATIVE_HOST_PATHS: `{s}` {s} ({s})\n", .{
+                refusal.entry,
+                refusal.why,
+                @errorName(e),
+            });
+            return @backingInt(Exit.config);
+        };
+    }
+
     // Where logs and run state go: DATABASE_URL / PG* when set, else stdout only.
     const pg_cfg = cfg.pgConfig(arena, init.environ_map) catch |e| {
         try err.print("config error: invalid database settings ({s})\n", .{@errorName(e)});

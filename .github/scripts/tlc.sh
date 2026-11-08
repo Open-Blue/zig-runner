@@ -34,12 +34,18 @@ if ! echo "$sum  $jar" | sha256sum --check --quiet --status; then
 	exit 1
 fi
 
-# A configuration's module is its name up to the first `-` or `.`.
+# A configuration's module is its name up to the first `-` or `.`. TLC's output goes to the job's
+# log as it comes (its progress lines, and a counterexample), in a group of its own, and to $out for
+# the checks below; TLC's exit status is the function's (pipefail), not tee's.
 tlc() {
-	local cfg=$1 out=$2 module=${1%%[-.]*}
+	local cfg=$1 out=$2 module=${1%%[-.]*} rc=0 started=$SECONDS
 	rm -rf "$dir/states"
+	echo "::group::TLC $cfg"
 	(cd "$here" && java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -cleanup \
-		-metadir "$dir/states" -config "$cfg" "$module.tla") >"$out" 2>&1
+		-metadir "$dir/states" -config "$cfg" "$module.tla") 2>&1 | tee "$out" || rc=$?
+	echo "::endgroup::"
+	echo "== $cfg: TLC ended (exit $rc) after $((SECONDS - started)) s"
+	return "$rc"
 }
 
 # A configuration that SPIN checks (proofs/spin/<name>.pml, written from the .cfg: StoreLocking's
@@ -87,7 +93,7 @@ for cfg in "${all[@]}"; do
 	if tlc "$cfg" "$out" && grep -q '^Model checking completed. No error has been found.' "$out"; then
 		grep -E '^[0-9,]+ states generated|^The depth|^Finished in' "$out"
 	else
-		cat "$out"
+		tail -n 60 "$out"
 		echo "$cfg: TLC found an error, or did not finish" >&2
 		status=1
 	fi
@@ -101,13 +107,13 @@ for cfg in "${all[@]}"; do
 	echo "== $cfg: must fail with $want"
 	out="$dir/${cfg%.cfg}.out"
 	if tlc "$cfg" "$out"; then
-		cat "$out"
+		tail -n 60 "$out"
 		echo "$cfg: TLC found no error in a mutant" >&2
 		status=1
 	elif [[ -z $want ]] || ! { grep -q "^Error: Invariant $want is violated" "$out" ||
 		{ [[ $(sed -n 's/^PROPERT\(Y\|IES\)[[:space:]]*//p' "$here/$cfg") == "$want" ]] &&
 			grep -q "^Error: Temporal properties were violated" "$out"; }; }; then
-		cat "$out"
+		tail -n 60 "$out"
 		echo "$cfg: TLC did not fail with $want" >&2
 		status=1
 	else

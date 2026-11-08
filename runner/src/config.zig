@@ -153,6 +153,17 @@ pub const Config = struct {
     /// The ports of the runner's own endpoints, which no job publishes (`publish.reservedPorts`),
     /// as `main.zig` found them: its database's, and a `tcp://` engine or Docker host's.
     native_reserved_ports: ?[]const u16 = null,
+    /// The host directories a native job container's `volumes:` may bind, colon- or
+    /// comma-separated (`RUNNER_NATIVE_HOST_PATHS`, `native/host_paths.zig`); empty, the default,
+    /// allows none. Checked when the runner starts (`Backend.hostPathsOf`).
+    native_host_paths: []const u8 = "",
+    /// That list as `main.zig` checked it when the runner started (canonical, each entry's
+    /// device and inode): what every job holds its list to (`Backend.configFor`). Null when it
+    /// was not checked, which allows none.
+    native_host_allowed: ?[]const NativeBackend.HostPathEntry = null,
+    /// Host paths mounted with the host's ids where the kernel cannot idmap their filesystem
+    /// (`RUNNER_NATIVE_HOST_PATHS_UNMAPPED`, `sandbox.bindHostIn`); off, such a step fails.
+    native_host_paths_unmapped: bool = false,
     /// Past this many MiB, the native step store's least recently used layers go
     /// (`RUNNER_NATIVE_STORE_MAX_MB`, `native/Store.zig`).
     native_store_max_mb: u64 = NativeStore.default_max_bytes / (1024 * 1024),
@@ -475,6 +486,8 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_SUBNET")) |v| c.native_subnet = v;
         if (environ.get("RUNNER_NATIVE_PORT_ADDRESSES")) |v| c.native_port_addresses = v;
         if (environ.get("RUNNER_NATIVE_PORT_RANGE")) |v| c.native_port_range = v;
+        if (environ.get("RUNNER_NATIVE_HOST_PATHS")) |v| c.native_host_paths = v;
+        if (environ.get("RUNNER_NATIVE_HOST_PATHS_UNMAPPED")) |v| c.native_host_paths_unmapped = try boolean(v);
         if (environ.get("RUNNER_NATIVE_STORE_MAX_MB")) |v| c.native_store_max_mb = try num(u64, v);
         if (environ.get("RUNNER_NATIVE_VOLUMES_MAX_MB")) |v| c.native_volumes_max_mb = try num(u64, v);
         if (environ.get("RUNNER_NATIVE_IMAGES_MAX_MB")) |v| c.native_images_max_mb = try num(u64, v);
@@ -567,6 +580,8 @@ pub const Config = struct {
         else if (eq(key, "native-subnet")) c.native_subnet = val //
         else if (eq(key, "native-port-addresses")) c.native_port_addresses = val //
         else if (eq(key, "native-port-range")) c.native_port_range = val //
+        else if (eq(key, "native-host-paths")) c.native_host_paths = val //
+        else if (eq(key, "native-host-paths-unmapped")) c.native_host_paths_unmapped = try boolean(val) //
         else if (eq(key, "native-store-max-mb")) c.native_store_max_mb = try num(u64, val) //
         else if (eq(key, "native-volumes-max-mb")) c.native_volumes_max_mb = try num(u64, val) //
         else if (eq(key, "native-images-max-mb")) c.native_images_max_mb = try num(u64, val) //

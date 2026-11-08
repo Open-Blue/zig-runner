@@ -25,10 +25,12 @@ zig build-exe --dep runner --dep corpus -Mroot=tools/hashfilescorpus.zig -Mrunne
 (cd tools/hashfilesdiff && go run . -out "$s" -n "${1:-400}" -seed "${2:-1}")
 wait
 
+echo "== the reference: GitHub's hashFiles in node"
 mkdir "$s/node"
 cp tools/hashfilesdiff/reference.mjs tools/hashfilesdiff/package.json tools/hashfilesdiff/package-lock.json "$s/node/"
 docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$s/node:/app" -v "$s/tree:/tree:ro" \
 	-v "$s/cases.json:/cases.json:ro" -w /app node:22-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914 sh -c 'npm ci --silent --ignore-scripts &&
 		node reference.mjs /cases.json /tree' >"$s/reference.jsonl"
 
+echo "== the runner's hashFiles against it"
 "$s/hashfilescorpus" "$s/cases.json" /tree "$s" "$s/reference.jsonl"
