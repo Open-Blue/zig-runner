@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Model-checks the native store's locking protocols (proofs/tla/StoreLocking.tla and
-# StoreEviction.tla, proofs/README.md "The store's locking, in TLA+") and the release pipeline
+# Model-checks the native store's locking protocols (proofs/tla/StoreLocking.tla, whose safety
+# configurations are SPIN's (spin.sh) and its liveness TLC's, and StoreEviction.tla, proofs/README.md
+# "The store's locking, in TLA+") and the release pipeline
 # (proofs/tla/ReleasePipeline.tla, "The release pipeline, in TLA+") with TLC. tla2tools.jar is the TLA+ project's v1.7.4 release,
 # checked against the sha256 pinned here, so a changed or replaced jar fails the job instead of
 # checking the model. A new version means a new checksum from that release's asset.
@@ -33,18 +34,30 @@ if ! echo "$sum  $jar" | sha256sum --check --quiet --status; then
 	exit 1
 fi
 
-# A configuration's module is its name up to the first `-` or `.`.
+# A configuration's module is its name up to the first `-` or `.`. TLC's output goes to the job's
+# log as it comes (its progress lines, and a counterexample), in a group of its own, and to $out for
+# the checks below; TLC's exit status is the function's (pipefail), not tee's.
 tlc() {
-	local cfg=$1 out=$2 module=${1%%[-.]*}
+	local cfg=$1 out=$2 module=${1%%[-.]*} rc=0 started=$SECONDS
 	rm -rf "$dir/states"
+	echo "::group::TLC $cfg"
 	(cd "$here" && java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -cleanup \
-		-metadir "$dir/states" -config "$cfg" "$module.tla") >"$out" 2>&1
+		-metadir "$dir/states" -config "$cfg" "$module.tla") 2>&1 | tee "$out" || rc=$?
+	echo "::endgroup::"
+	echo "== $cfg: TLC ended (exit $rc) after $((SECONDS - started)) s"
+	return "$rc"
 }
 
+# A configuration that SPIN checks (proofs/spin/<name>.pml, written from the .cfg: StoreLocking's
+# safety and its mutants, .github/scripts/spin.sh) is left to SPIN, unless TLC_ALL=1 (TLC then
+# checks it too, in minutes; the .cfg's `states without symmetry:` is TLC's count without SYMMETRY).
+#
 # TLC_PART=K/N checks part K of N, so N jobs share the configurations: each is given to the part
 # with the least expected time so far, the longest first (its `tlc-seconds:` comment, or a few
 # seconds without one). Every configuration is in exactly one part, whatever N.
-mapfile -t all < <(cd "$here" && ls -- *.cfg)
+mapfile -t all < <(cd "$here" && for cfg in *.cfg; do
+	[[ ${TLC_ALL:-} != 1 && -f ../spin/${cfg%.cfg}.pml ]] || echo "$cfg"
+done)
 selected=("${all[@]}")
 if [[ -n ${TLC_PART:-} ]]; then
 	if ! [[ $TLC_PART =~ ^([0-9]+)/([0-9]+)$ ]] || ((BASH_REMATCH[1] < 1 || BASH_REMATCH[1] > BASH_REMATCH[2])); then
@@ -72,8 +85,7 @@ in_part() {
 }
 
 status=0
-for cfg in "$here"/*.cfg; do
-	cfg=$(basename "$cfg")
+for cfg in "${all[@]}"; do
 	in_part "$cfg" || continue
 	grep -q 'must fail:' "$here/$cfg" && continue
 	echo "== $cfg: must hold"
@@ -81,27 +93,27 @@ for cfg in "$here"/*.cfg; do
 	if tlc "$cfg" "$out" && grep -q '^Model checking completed. No error has been found.' "$out"; then
 		grep -E '^[0-9,]+ states generated|^The depth|^Finished in' "$out"
 	else
-		cat "$out"
+		tail -n 60 "$out"
 		echo "$cfg: TLC found an error, or did not finish" >&2
 		status=1
 	fi
 done
 
-for cfg in "$here"/*-*.cfg; do
-	cfg=$(basename "$cfg")
+for cfg in "${all[@]}"; do
+	[[ $cfg == *-* ]] || continue
 	in_part "$cfg" || continue
 	grep -q 'must fail:' "$here/$cfg" || continue
 	want=$(sed -n '1s/.*must fail: \([A-Za-z]*\).*/\1/p' "$here/$cfg")
 	echo "== $cfg: must fail with $want"
 	out="$dir/${cfg%.cfg}.out"
 	if tlc "$cfg" "$out"; then
-		cat "$out"
+		tail -n 60 "$out"
 		echo "$cfg: TLC found no error in a mutant" >&2
 		status=1
 	elif [[ -z $want ]] || ! { grep -q "^Error: Invariant $want is violated" "$out" ||
 		{ [[ $(sed -n 's/^PROPERT\(Y\|IES\)[[:space:]]*//p' "$here/$cfg") == "$want" ]] &&
 			grep -q "^Error: Temporal properties were violated" "$out"; }; }; then
-		cat "$out"
+		tail -n 60 "$out"
 		echo "$cfg: TLC did not fail with $want" >&2
 		status=1
 	else

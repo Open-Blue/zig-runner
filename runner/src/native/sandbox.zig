@@ -29,6 +29,7 @@ const linux = std.os.linux;
 const seccomp = @import("seccomp.zig");
 const health = @import("health.zig");
 const phases = @import("phases.zig");
+const host_paths = @import("host_paths.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -114,9 +115,10 @@ pub const Spec = struct {
         read_only: bool = true,
         /// Only over a file or directory the image has: making one would put it in the layer.
         optional: bool = false,
-        /// A cache volume (`volumes.zig`): nosuid and nodev, and on a root runner its files'
-        /// on-disk ids are the volumes' range (`Spec.volume_id_base`), seen as the job's own
-        /// through an idmapped mount, so a volume filled in one slot is the next slot's too.
+        /// A cache volume or a job container's named one (`volumes.zig`): nosuid and nodev,
+        /// read-only only when `read_only` is (a named `:ro` one), and on a root runner its
+        /// files' on-disk ids are the volumes' range (`Spec.volume_id_base`), seen as the job's
+        /// own through an idmapped mount, so a volume filled in one slot is the next slot's too.
         volume: bool = false,
         /// A cache volume's root, `<store>/volumes`: `host` is below it. Reached as the operator
         /// set it up, links and all; from there on no link is followed (`openVolume`).
@@ -127,6 +129,15 @@ pub const Spec = struct {
         /// nosuid and nodev (a JavaScript runtime's files from the store, `Backend.applyMounts`):
         /// a setuid file or a device node there is never one for the step.
         nosuid: bool = false,
+        /// A job container's host-path volume (`host_paths.zig`): `host` is canonical and was
+        /// checked against the operator's list, and is opened with no symlink followed, so one
+        /// swapped in since fails the step. Not recursive, nosuid and nodev, read-only when
+        /// `read_only`, and on a root runner idmapped as a cache volume is where its filesystem
+        /// can be (`bindHostIn`).
+        host_path: bool = false,
+        /// A host path whose filesystem the kernel cannot idmap is bound with the host's ids
+        /// (`RUNNER_NATIVE_HOST_PATHS_UNMAPPED`); otherwise the step fails.
+        unmapped_ok: bool = false,
     };
 
     /// The job's overlay (`lowers`, `upper`) is still mounted, and this step's layer is where
@@ -385,6 +396,8 @@ const resolve_in_root = 0x10;
 const resolve_no_magiclinks = 0x02;
 /// And no symlink at all: the runner reading a file a step left (`readIn`).
 pub const resolve_no_symlinks = 0x04;
+/// And no mount crossed: a path below another mount (a bind made before it) is refused, EXDEV.
+const resolve_no_xdev = 0x01;
 
 const OpenHow = extern struct { flags: u64, mode: u64, resolve: u64 };
 
@@ -516,10 +529,14 @@ fn unlinkAt(arena: Allocator, root: linux.fd_t, path: []const u8) void {
 
 /// A directory under `root`, resolved inside it, for the `*at` calls; null when it is not there.
 fn dirIn(arena: Allocator, root: linux.fd_t, path: []const u8) ?linux.fd_t {
+    return dirResolved(arena, root, path, 0);
+}
+
+fn dirResolved(arena: Allocator, root: linux.fd_t, path: []const u8, resolve: u64) ?linux.fd_t {
     const rel = std.mem.trim(u8, path, "/");
     const p = arena.dupeSentinel(u8, if (rel.len == 0) "." else rel, 0) catch return null;
     const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .PATH = true };
-    return switch (openIn(root, p, flags, 0, 0)) {
+    return switch (openIn(root, p, flags, 0, resolve)) {
         .fd => |f| f,
         .err => null,
     };
@@ -601,7 +618,7 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper, early: []const u
             const userns = mappedUserns(0, spec.id_base, spec.id_count);
             // The cache volumes' on-disk ids, seen as the job's.
             var volumes = false;
-            for (spec.binds) |bd| volumes = volumes or bd.volume;
+            for (spec.binds) |bd| volumes = volumes or bd.volume or bd.host_path;
             const volume_ns: ?linux.fd_t = if (volumes)
                 mappedUserns(spec.volume_id_base, spec.id_base, spec.id_count)
             else
@@ -735,7 +752,12 @@ fn topOf(spec: Spec) []const u8 {
 
 /// `spec.binds`, at their places in the step's root, read-only where asked. On a root runner a
 /// cache volume is seen through `volume_ns` (`Bind.volume`), and a mount point made here is the
-/// job's root's.
+/// job's root's. Every mount point is made before the first bind, and through no mount: on a root
+/// runner the helper is still the host's root here, and a mount point made through a bind (a
+/// target below another volume, or reached through an image's symlink into one) would be a
+/// directory it made, and gave the job, on the host. A cache volume's or a host path's target is
+/// then found through no mount either: one that lies inside another bind (`/x/y` with `/x` a
+/// host path, or `/y/z` with the image's `/y` a link to `/x`) fails the step.
 fn bindAll(arena: Allocator, spec: Spec, volume_ns: ?linux.fd_t) void {
     const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
     const rc = linux.open(z(arena, topOf(spec)), flags, 0);
@@ -743,14 +765,20 @@ fn bindAll(arena: Allocator, spec: Spec, volume_ns: ?linux.fd_t) void {
     const root: linux.fd_t = @intCast(rc);
     defer _ = linux.close(root);
     const owner: ?u32 = if (spec.userns == .mapped) spec.id_base else null;
+    // A Docker action's image gets a bind only where it has the path: the job's binds are made
+    // for the job's image, and nothing is made in the image for them.
+    if (spec.container == null) for (spec.binds) |bd| {
+        if (bd.make) makeDirsIn(arena, root, bd.at, owner);
+    };
     for (spec.binds) |bd| {
-        // A Docker action's image gets a bind only where it has the path: the job's binds are
-        // made for the job's image, and nothing is made in the image for them. Nor the job's
-        // cache volumes (P4): Dagger gives a Docker action's container none either.
-        if (spec.container != null and bd.volume) continue;
-        if (bd.make and spec.container == null) makeDirsIn(arena, root, bd.at, owner);
+        // Nor the job's cache volumes (P4): Dagger gives a Docker action's container none either.
+        if (spec.container != null and (bd.volume or bd.host_path)) continue;
         if (bd.volume) {
-            bindVolumeIn(arena, root, bd.volume_root, bd.host, bd.at, volume_ns);
+            bindVolumeIn(arena, root, bd.volume_root, bd.host, bd.at, bd.read_only, volume_ns);
+            continue;
+        }
+        if (bd.host_path) {
+            bindHostIn(arena, root, bd, volume_ns);
             continue;
         }
         const required = !bd.optional and spec.container == null;
@@ -782,15 +810,16 @@ fn openVolume(arena: Allocator, volume_root: []const u8, host: []const u8) union
     };
 }
 
-/// A cache volume at `at`, writable, nosuid and nodev, and idmapped through `userns` when given:
-/// a detached clone of the host's directory, its attributes set in one `mount_setattr`, then
-/// moved into place. Fails the step when it cannot.
+/// A volume at `at`, writable unless `read_only` (a job container's `name:/path:ro`), nosuid and
+/// nodev, and idmapped through `userns` when given: a detached clone of the host's directory, its
+/// attributes set in one `mount_setattr`, then moved into place. Fails the step when it cannot.
 fn bindVolumeIn(
     arena: Allocator,
     root: linux.fd_t,
     volume_root: []const u8,
     host: []const u8,
     at: []const u8,
+    read_only: bool,
     userns: ?linux.fd_t,
 ) void {
     const volume = switch (openVolume(arena, volume_root, host)) {
@@ -807,10 +836,12 @@ fn bindVolumeIn(
     );
     check(about(arena, "clone the cache volume for", at), tree);
     defer _ = linux.close(@intCast(tree));
+    const rdonly = 0x1;
     const nosuid = 0x2;
     const nodev = 0x4;
     const idmap = 0x00100000;
     var attr: MountAttr = .{ .set = nosuid | nodev };
+    if (read_only) attr.set |= rdonly;
     if (userns) |ns| {
         attr.set |= idmap;
         attr.userns_fd = @intCast(ns);
@@ -823,8 +854,7 @@ fn bindVolumeIn(
         @intFromPtr(&attr),
         @sizeOf(MountAttr),
     ));
-    const target = targetIn(arena, root, at, true) orelse
-        fatal(about(arena, "find", at), @as(u32, 2));
+    const target = ownTarget(arena, root, at);
     defer _ = linux.close(target);
     const move_mount_f_empty_path = 0x4;
     const move_mount_t_empty_path = 0x40;
@@ -838,15 +868,118 @@ fn bindVolumeIn(
     ));
 }
 
+/// A host directory at `bd.at` (`Bind.host_path`): `bd.host`, canonical and allowed by the
+/// operator (`host_paths.zig`), opened from `/` with no symlink followed at all (`openHostPath`),
+/// so a link put in its path since the runner checked it fails the step instead of reaching
+/// outside the allowed directory, and on a mount that is `nosuid` and `nodev` on the host (else a
+/// setuid file the job left there would be one for the host's users). Cloned alone (no mount below
+/// it comes along), nosuid and nodev, read-only when `read_only`, set in one `mount_setattr` and
+/// moved into place in the step's mount namespace only, at a target found through no other mount
+/// (`ownTarget`). On a root runner it is idmapped through `userns` as a cache volume is: files
+/// owned on disk by the volumes' range are the job's own ids, any other id (the host's users, root
+/// included) is nobody to the job, so a job can never make a file a host user owns. A filesystem
+/// that cannot be idmapped (the kernel refuses with EINVAL, as for NFS) fails the step, unless the
+/// operator allowed it (`unmapped_ok`): then it is mounted with the host's ids as they are, what
+/// the job writes is owned by its slot's ids, and host ids are nobody all the same.
+fn bindHostIn(arena: Allocator, root: linux.fd_t, bd: Spec.Bind, userns: ?linux.fd_t) void {
+    const at = bd.at;
+    const dir = switch (openHostPath(arena, bd.host)) {
+        .fd => |fd| fd,
+        .err => |e| fatal(about(arena, "open the host path (no symlink followed) for", at), @backingInt(e)),
+    };
+    defer _ = linux.close(dir);
+    if (!host_paths.safeMountFd(dir)) refused(arena, "the host path for {s} is on a mount without " ++
+        "nosuid and nodev on the host; the operator must mount it so ({s})", .{ at, host_paths.setting });
+    const open_tree_clone = 1;
+    const tree = linux.syscall3(
+        .open_tree,
+        std.math.cast(usize, dir) orelse unreachable,
+        @intFromPtr(""),
+        open_tree_clone | linux.AT.EMPTY_PATH | linux.SOCK.CLOEXEC,
+    );
+    check(about(arena, "clone the host path for", at), tree);
+    const tree_fd = std.math.cast(linux.fd_t, tree) orelse fatal(about(arena, "clone the host path for", at), @as(u32, 9));
+    defer _ = linux.close(tree_fd);
+    const rdonly = 0x1;
+    const nosuid = 0x2;
+    const nodev = 0x4;
+    const idmap = 0x00100000;
+    var attr: MountAttr = .{ .set = nosuid | nodev };
+    if (bd.read_only) attr.set |= rdonly;
+    var set_rc: usize = 0;
+    if (userns) |ns| {
+        var mapped = attr;
+        mapped.set |= idmap;
+        mapped.userns_fd = std.math.cast(u64, ns) orelse 0;
+        set_rc = linux.syscall5(.mount_setattr, tree, @intFromPtr(""), linux.AT.EMPTY_PATH, @intFromPtr(&mapped), @sizeOf(MountAttr));
+        if (linux.errno(set_rc) == .INVAL and !bd.unmapped_ok) refused(arena, "the host path for " ++
+            "{s} is on a filesystem the kernel cannot idmap, so the job's ids would be its " ++
+            "slot's on the host; {s}=true allows that", .{ at, host_paths.unmapped_setting });
+    }
+    if (userns == null or linux.errno(set_rc) == .INVAL)
+        set_rc = linux.syscall5(.mount_setattr, tree, @intFromPtr(""), linux.AT.EMPTY_PATH, @intFromPtr(&attr), @sizeOf(MountAttr));
+    check(about(arena, "set up the host path for", at), set_rc);
+    const target = ownTarget(arena, root, at);
+    defer _ = linux.close(target);
+    const move_mount_f_empty_path = 0x4;
+    const move_mount_t_empty_path = 0x40;
+    check(about(arena, "mount the host path at", at), linux.syscall5(
+        .move_mount,
+        tree,
+        @intFromPtr(""),
+        std.math.cast(usize, target) orelse unreachable,
+        @intFromPtr(""),
+        move_mount_f_empty_path | move_mount_t_empty_path,
+    ));
+}
+
+/// The host directory `host` (canonical), opened from `/` with no symlink followed: a link put
+/// anywhere in its path since it was checked fails the open (ELOOP).
+pub fn openHostPath(arena: Allocator, host: []const u8) union(enum) { fd: linux.fd_t, err: linux.E } {
+    std.debug.assert(host.len > 1 and host[0] == '/');
+    const slash_rc = linux.open("/", .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(slash_rc) != .SUCCESS) return .{ .err = linux.errno(slash_rc) };
+    const slash = std.math.cast(linux.fd_t, slash_rc) orelse return .{ .err = .BADF };
+    defer _ = linux.close(slash);
+    return switch (openIn(slash, z(arena, host[1..]), .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = true }, 0, resolve_no_symlinks)) {
+        .fd => |fd| .{ .fd = fd },
+        .err => |e| .{ .err = e },
+    };
+}
+
+/// The mount point `at` of a cache volume or a host path, found through no other mount: one that
+/// lies inside another bind, as written or through a symlink of the image's, fails the step
+/// (a volume inside another is refused when the job starts, `container_options.volumes`; this
+/// catches what a link makes of a path).
+fn ownTarget(arena: Allocator, root: linux.fd_t, at: []const u8) linux.fd_t {
+    const rel = z(arena, std.mem.trimStart(u8, at, "/"));
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = true };
+    return switch (openIn(root, rel, flags, 0, resolve_no_xdev)) {
+        .fd => |f| f,
+        .err => |e| if (e == .XDEV) refused(arena, "the volume at {s} lies inside another " ++
+            "mount of the job (a volume, a host path or the runner's, perhaps through a symlink " ++
+            "of the image's); a volume may not be inside another", .{at}) else fatal(about(arena, "find", at), @backingInt(e)),
+    };
+}
+
+/// Ends the helper with `fmt`, a refusal the step's log shows as it is (not an errno).
+fn refused(arena: Allocator, comptime fmt: []const u8, args: anytype) noreturn {
+    const msg = std.fmt.allocPrint(arena, "native step: " ++ fmt ++ "\n", args) catch "native step: refused\n";
+    _ = linux.write(2, msg.ptr, msg.len);
+    linux.exit_group(125);
+}
+
 /// The directory `path` in the overlay, its missing parts made (mode 0755) inside it, each one
 /// made owned by host id `owner` when given (the job's root on a root runner, which the helper,
 /// still the host's root here, is not).
+/// No mount is crossed on the way (`bindAll` makes them all before the first bind, so none is
+/// there to cross), and none could take the helper to a host directory.
 fn makeDirsIn(arena: Allocator, root: linux.fd_t, path: []const u8, owner: ?u32) void {
     const rel = std.mem.trim(u8, path, "/");
     var i: usize = 0;
     while (i <= rel.len) {
         const end = std.mem.indexOfScalarPos(u8, rel, i, '/') orelse rel.len;
-        const parent = dirIn(arena, root, rel[0..i]) orelse return;
+        const parent = dirResolved(arena, root, rel[0..i], resolve_no_xdev) orelse return;
         defer _ = linux.close(parent);
         const name = z(arena, rel[i..end]);
         if (linux.errno(linux.mkdirat(parent, name, 0o755)) == .SUCCESS) if (owner) |o| {
@@ -1941,4 +2074,32 @@ test "a step's oom_score_adj is GitHub's 500, or the env's within -1000 to 1000,
     try std.testing.expectEqual(@as(i32, 0), pickOomScoreAdj(&.{name ++ "-1000"}, 0));
     try std.testing.expectEqual(@as(i32, 200), pickOomScoreAdj(&.{name ++ "100"}, 200));
     try std.testing.expectEqual(@as(i32, 500), pickOomScoreAdj(&.{}, -500));
+}
+
+test "a host path swapped for a symlink after its check fails to open, wherever on its way" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    for ([_][]const u8{ "allowed/mid/sub", "outside/sub" }) |d| try tmp.dir.createDirPath(io, d);
+    const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const sub = try std.fmt.allocPrint(arena, "{s}/allowed/mid/sub", .{base});
+    // Checked: the canonical path `host_paths.resolve` gave the runner opens.
+    const ok = openHostPath(arena, sub);
+    try std.testing.expect(ok == .fd);
+    _ = linux.close(ok.fd);
+    // Then the last name swapped for a link out of the allowed directory: the open fails.
+    try tmp.dir.rename("allowed/mid/sub", tmp.dir, "allowed/mid/was-sub", io);
+    try tmp.dir.symLink(io, "../../outside/sub", "allowed/mid/sub", .{});
+    const last = openHostPath(arena, sub);
+    try std.testing.expect(last == .err and last.err == .LOOP);
+    // And a name on the way.
+    try tmp.dir.deleteFile(io, "allowed/mid/sub");
+    try tmp.dir.rename("allowed/mid/was-sub", tmp.dir, "allowed/mid/sub", io);
+    try tmp.dir.rename("allowed/mid", tmp.dir, "allowed/was-mid", io);
+    try tmp.dir.symLink(io, "../outside", "allowed/mid", .{});
+    const middle = openHostPath(arena, sub);
+    try std.testing.expect(middle == .err and middle.err == .LOOP);
 }

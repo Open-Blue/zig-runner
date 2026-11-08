@@ -24,6 +24,7 @@ lean_build=$!
 wait "$zig_build"
 wait "$lean_build"
 
+echo "== running glob.zig and the Lean model"
 "$s/globleancorpus" gen "${1:-20000}" "${2:-1}" >"$s/cases.jsonl"
 "$s/globleancorpus" run "$s/cases.jsonl" | jq -cS . >"$s/zig.jsonl"
 proofs/.lake/build/bin/globoracle <"$s/cases.jsonl" | jq -cS . >"$s/lean.jsonl"

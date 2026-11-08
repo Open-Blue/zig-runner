@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Named volumes: a fork''s cache growth no longer evicts a repository''s named volume ahead of untrusted ones; repository-scope volumes rank a week later, as images rank an hour later (#428)'
+time: 2026-11-08T02:29:07.661509234-05:00

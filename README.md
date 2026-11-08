@@ -153,7 +153,7 @@ against the baseline of `catch {}` sites that were read and meant. `analysis` ru
 runs each of `runner/src/fuzz.zig`'s targets (an image layer's tar, PAX and paths applied beside a
 directory it must not reach; image references, registry challenges and manifests; expressions,
 YAML, regular expressions, HPACK, `hashFiles()` patterns, minisign signatures, workflow commands
-and problem matchers) with Zig's coverage-guided fuzzer (`.github/scripts/zig-fuzz.sh`, LLVM-built,
+and problem matchers; the runner's zstd decoder against std's, input for input) with Zig's coverage-guided fuzzer (`.github/scripts/zig-fuzz.sh`, LLVM-built,
 for a bounded number of runs), keeping each target's corpus in the Actions cache and failing,
 named after the target, on a crash, a failed check, a leak or a hang, with the input as an
 artifact; `zig build test` runs the same targets over their seed corpus every time. Locally:
@@ -515,7 +515,12 @@ the machine thrashed for hours (#126). Two things keep that from happening again
   is measured in a cgroup of its own and learned apart from Dagger's, reserves 256 MB until it
   has run (`RUNNER_NATIVE_MEM_PER_JOB_MB`), and so does a runner polling: the job it is handed
   waits, kept, for room for its own estimate once it is named, instead of every runner reserving
-  the heaviest job there was (#361). Where jobs may swap, gets a `memory.high` from its
+  the heaviest job there was (#361), and the runners polling count only the job that has waited
+  longest, so small jobs are not held behind a queue of heavy ones, and a job whose name has run
+  for 60 s at most each time starts beside the one waiting if it fits without it (#415). What
+  jobs took, and how long they ran, is kept
+  across restarts in the native store's directory (#407). A pool whose one job could never fit
+  the machine does not start and names the setting (#406). Where jobs may swap, gets a `memory.high` from its
   estimate, so one that outgrows it is slowed in its own cgroup rather than taking its neighbours'
   memory (docs/native-backend.md, P4). All native jobs together stay under the machine's memory less a
   third, with no swap, each under two thirds of that, and a job that cannot be held to it does not

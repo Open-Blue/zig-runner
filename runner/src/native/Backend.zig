@@ -33,6 +33,7 @@ const admission = @import("../admission.zig");
 const services = @import("services.zig");
 const images = @import("images.zig");
 const container_options = @import("container_options.zig");
+const host_paths = @import("host_paths.zig");
 const native_actions = @import("actions.zig");
 const Exec = @import("../dagger/Exec.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
@@ -74,6 +75,16 @@ image_gid: u32 = 0,
 groups: []const u32 = &.{},
 /// What a `container:` job's `options:` ask for (`container_options.zig`), read by `base`.
 container_opts: container_options.Options = .{},
+/// `Config.host_paths`: where a job container's host-path volumes may be (`hostVolumes`).
+allowed_host_paths: []const host_paths.Entry = &.{},
+/// `Config.host_paths_unmapped`.
+host_paths_unmapped: bool = false,
+/// `Config.host_paths_closed`, said in "Set up job" when the job binds a host path.
+host_paths_closed: []const []const u8 = &.{},
+/// The shell that makes the job container's anonymous volumes in the base (`containerVolumes`),
+/// and how many named ones it binds from the store.
+volume_dirs: ?[]const u8 = null,
+named_volumes: usize = 0,
 /// A `container:` job's PATH once its env is set (`dagger.Base.runtime_path`).
 runtime_path: ?[]const u8 = null,
 /// Where the job's time went (`phases.zig`): its set-up, each sandbox and publish, its teardown.
@@ -186,6 +197,10 @@ seed_layers: std.ArrayList([]const u8) = .empty,
 seed_ids: std.ArrayList([]const u8) = .empty,
 /// Tests: the Zig cache seed's build, in place of downloading and running a Zig release.
 test_seed_script: ?[]const u8 = null,
+/// How long a new named volume's filling from the image may take (`seedVolume`); tests shorten it.
+volume_seed_limit_ms: u64 = volumes.seed_limit_ms,
+/// Tests: the filling's script, in place of `cp -a`.
+test_volume_seed: ?[]const u8 = null,
 
 /// What the runner configures (`RUNNER_BACKEND=native`).
 pub const Config = struct {
@@ -228,6 +243,15 @@ pub const Config = struct {
     /// Host paths mounted into every step. Tests bind the host's /usr into a rootfs of a few
     /// directories; phase 4's cache volumes will be these.
     binds: []const sandbox.Spec.Bind = &.{},
+    /// The directories a job container's host-path volume may be in (`RUNNER_NATIVE_HOST_PATHS`,
+    /// `hostPathsOf`), canonical; none by default.
+    host_paths: []const host_paths.Entry = &.{},
+    /// Entries of the operator's list left out for this job: changed since the runner started
+    /// (`host_paths.recheck`).
+    host_paths_closed: []const []const u8 = &.{},
+    /// `RUNNER_NATIVE_HOST_PATHS_UNMAPPED`: a host path on a filesystem the kernel cannot idmap
+    /// is mounted with the host's ids, instead of failing the step (`sandbox.bindHostIn`).
+    host_paths_unmapped: bool = false,
     /// Past this many bytes, the store's least recently used layers go
     /// (`RUNNER_NATIVE_STORE_MAX_MB`, `Store.collect`).
     store_max_bytes: u64 = Store.default_max_bytes,
@@ -255,6 +279,9 @@ pub const Config = struct {
     gate: ?*admission.Gate = null,
     /// Tests: see `Backend.test_seed_script`.
     test_seed_script: ?[]const u8 = null,
+    /// Tests: see `Backend.volume_seed_limit_ms` and `Backend.test_volume_seed`.
+    test_volume_seed_limit_ms: ?u64 = null,
+    test_volume_seed: ?[]const u8 = null,
     /// Tests: off, as their stores are under a checkout a non-root user owns
     /// (`Store.Prepare.check_parents`).
     check_store_parents: bool = true,
@@ -316,7 +343,23 @@ pub fn configFor(
         .pids_max = cfg.native_pids_max,
     };
     const exe = exeOf(arena, io, std.os.linux.getpid());
+    // The list `main.zig` checked when the runner started (it refuses to start on a bad one),
+    // never parsed from the setting again: an entry whose path resolves elsewhere now, or is
+    // another directory, is closed for this job (`host_paths.recheck`). Never checked (a caller
+    // that is not `main`), none is allowed.
+    var closed: std.ArrayList([]const u8) = .empty;
+    const allowed: []const host_paths.Entry = if (cfg.native_host_allowed) |list|
+        try host_paths.recheck(arena, io, list, .{}, &closed)
+    else
+        &.{};
+    if (cfg.native_host_allowed == null and cfg.native_host_paths.len > 0)
+        try closed.append(arena, cfg.native_host_paths);
+    for (closed.items) |e| std.log.warn("native: {s}: `{s}` is not the directory checked when " ++
+        "the runner started (moved, replaced or remounted since); closed for this job", .{ host_paths.setting, e });
     return .{
+        .host_paths = allowed,
+        .host_paths_closed = closed.items,
+        .host_paths_unmapped = cfg.native_host_paths_unmapped,
         .rootfs = cfg.native_rootfs,
         .provisioned_image = cfg.provisioned_image,
         .store = try cfg.nativeStore(arena, environ),
@@ -339,6 +382,45 @@ pub fn configFor(
         },
         .job_limits = jobLimits(arena, io, cg),
     };
+}
+
+pub const HostPathRefusal = host_paths.Refusal;
+pub const HostPathEntry = host_paths.Entry;
+
+/// The env files the deploy files give the runner and its deploy timer (`deploy/*.service`):
+/// they hold its token or App key.
+const runner_env_files = [_][]const u8{ "/etc/zig-runner.env", "/etc/zig-runner-deploy.env" };
+
+/// `RUNNER_NATIVE_HOST_PATHS` canonicalised (`host_paths.parse`), refusing the runner's own
+/// paths: its store, its rootfs, its log spool, its executable, its GitHub App key's directory,
+/// systemd's credentials directory for it, and its env files.
+pub fn hostPathsOf(
+    arena: Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    cfg: *const config.Config,
+    refusal: *host_paths.Refusal,
+) ![]const host_paths.Entry {
+    if (cfg.native_host_paths.len == 0) return &.{};
+    const spool = if (cfg.log_spool_dir.len > 0) try std.fmt.allocPrint(arena, "{s}/zig-runner-{d}", .{
+        cfg.log_spool_dir,
+        std.os.linux.geteuid(),
+    }) else "";
+    const key_dir: []const u8 = if (cfg.gh_app) |a| switch (a.key) {
+        .file => |f| std.fs.path.dirname(f) orelse f,
+        .pem => "",
+    } else "";
+    const exe = exeOf(arena, io, std.os.linux.getpid());
+    const mine = [_][]const u8{
+        try cfg.nativeStore(arena, environ),
+        cfg.native_rootfs,
+        spool,
+        exe.path,
+        exe.replaced,
+        key_dir,
+        environ.get("CREDENTIALS_DIRECTORY") orelse "",
+    } ++ runner_env_files;
+    return host_paths.parse(arena, io, cfg.native_host_paths, &mine, refusal, .{});
 }
 
 /// A process's executable, for the helpers it starts (`Config.self_exe`).
@@ -802,9 +884,14 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
             .sync_fd = Store.syncCursor(arena, cfg.store),
         },
         .vouched = cfg.vouched,
+        .allowed_host_paths = cfg.host_paths,
+        .host_paths_unmapped = cfg.host_paths_unmapped,
+        .host_paths_closed = cfg.host_paths_closed,
         .flatten_at = @max(2, cfg.flatten_at),
         .gate = cfg.gate,
         .test_seed_script = cfg.test_seed_script,
+        .volume_seed_limit_ms = cfg.test_volume_seed_limit_ms orelse volumes.seed_limit_ms,
+        .test_volume_seed = cfg.test_volume_seed,
         .images_dir = cfg.images,
         .service_binds = cfg.service_binds,
         .self_exe = cfg.self_exe,
@@ -1331,11 +1418,19 @@ pub fn base(
     var t = phases.now();
     // On the job's image (the seed's build and the roll run on `b.rootfs`).
     try b.setUpCaches(ev, plan);
+    try b.containerVolumes(ev, err_msg);
     t = b.timings.since(arena, .caches, t);
     try b.baseEnv(ev, plan);
     // Not with services (P6): what a step got from a service (its image, its env, its data) is
-    // in no key, so a replay could stand for a run against another service.
-    if (plan.step_cache and ev.job.services.len == 0) b.store = b.store_cfg;
+    // in no key, so a replay could stand for a run against another service. Nor with a named
+    // volume or a host path: what a step read from it or wrote to it is in no key and no layer,
+    // so a replay would stand for a run against other contents and leave the volume as it was.
+    if (plan.step_cache and ev.job.services.len == 0) {
+        const has_host = hasHostVolume(arena, ev.job.*);
+        if (b.named_volumes == 0 and !has_host) b.store = b.store_cfg else try b.notes.append(arena, "Step " ++
+            "cache: off for this job, as it mounts named volumes or binds host paths, whose " ++
+            "contents no key holds");
+    }
     b.repository = ev.job.github.repository;
     b.scope = try set_up.packageCacheScope(arena, ev, b.repository, b.vouched);
     const event = try ev.eventJson();
@@ -1403,7 +1498,7 @@ pub fn base(
         });
     // The job container's `volumes:`, made after the work root so that handing that to the step
     // user does not reach them: Docker's volumes are root's, as an image's directory is.
-    const mk = if (try b.volumeDirs(ev, err_msg)) |vols|
+    const mk = if (b.volume_dirs) |vols|
         try std.fmt.allocPrint(arena, "{{ {s}; }} && {s}", .{ mk_work, vols })
     else
         mk_work;
@@ -1436,6 +1531,10 @@ pub fn base(
             ended.failure,
             out.tail(),
         });
+        // A host path the step's helper refused (a link swapped in, a mount without nosuid, a
+        // filesystem it cannot idmap, a target inside another mount) is the job's to fail: on
+        // Dagger, which ignores a job container's `volumes:`, it would run without it.
+        if (hasHostVolume(arena, ev.job.*)) b.job_fault = true;
         return error.BaseContainerFailed;
     }
 }
@@ -2961,23 +3060,27 @@ fn readContainerOptions(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void
 }
 
 /// The job container's `volumes:` (`container_options.volumes`; `unsupported` has already
-/// refused what it does not carry out) as the shell that makes their mount points in the base:
-/// each is a directory of the job's filesystem, root's as Docker makes a volume's mount point
-/// (what the image has there stays, as a volume starts from it), and it lasts as long as the
-/// job. Null without any. A volume where the runner binds or makes something itself fails the
-/// job, naming both: the bind would hide the volume's files, or the volume the bind's.
-fn volumeDirs(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !?[]const u8 {
+/// refused what it does not carry out). An anonymous one is a directory of the job's filesystem,
+/// made in the base (`volume_dirs`, the shell that makes them after the work root): root's as
+/// Docker makes a volume's mount point, what the image has there kept, and it lasts as long as
+/// the job. A named one outlives the job as Docker's does: a directory of the store
+/// (`volumes.openNamed`, scoped by the job's trust scope and repository), held shared for the
+/// job and bound at its target in every step, read-only for `:ro`, with the cache volumes' ids,
+/// nosuid and nodev. One the job made is seeded first from what the image has at its target, as
+/// Docker copies it into a new volume (moby `daemon/create_unix.go`, `populateVolume`); one that
+/// exists is never written over. A volume where the runner binds or makes something itself fails
+/// the job, naming both: the bind would hide the volume's files, or the volume the bind's.
+fn containerVolumes(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void {
     const arena = b.arena;
-    const jc = ev.job.container orelse return null;
-    if (jc.volumes.len == 0) return null;
+    const jc = ev.job.container orelse return;
+    if (jc.volumes.len == 0) return;
     var why: []const u8 = "";
     const found = container_options.volumes(arena, jc.volumes, &why) catch |e| {
         err_msg.* = if (why.len > 0) why else @errorName(e);
         return error.BaseContainerFailed;
     };
-    var w: std.Io.Writer.Allocating = .init(arena);
-    try w.writer.writeAll("mkdir -p --");
-    for (found.targets) |target| {
+    for (found.list, 0..) |v, i| {
+        const target = v.target;
         const taken = [_][]const u8{ ev.workspace, ev.temp };
         const mine = for (taken) |at| {
             if (container_options.under(target, at) or container_options.under(at, target)) break at;
@@ -2991,15 +3094,278 @@ fn volumeDirs(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !?[]const u8 {
                 "{s}, which the runner mounts or makes itself", .{ target, at });
             return error.BaseContainerFailed;
         }
-        try w.writer.writeByte(' ');
-        try dagger.shellQuote(&w.writer, target);
+        // Nested volumes, where one of them is a mount that the other's mount point would be
+        // made through: a host path inside any other volume or holding one, or a named volume
+        // inside another named one. Such a mount point would be made, by the host's root,
+        // through a bind of a directory a job can write (`sandbox.bindAll` makes them all first,
+        // and finds every bind's target through no mount, so a link cannot do it either). An
+        // anonymous volume with any but a host path nests as Docker's do: it is a directory of the
+        // job's filesystem, or made in the base through the named volume's bind as the job would.
+        for (found.list[0..i]) |other| {
+            const has_host = v.host != null or other.host != null;
+            const both_named = v.name != null and other.name != null;
+            if (!has_host and !both_named) continue;
+            if (!container_options.under(v.target, other.target) and
+                !container_options.under(other.target, v.target)) continue;
+            b.job_fault = true;
+            err_msg.* = try std.fmt.allocPrint(arena, "the job container's volume at {s} is " ++
+                "nested with the one at {s}: a host path may not be inside another volume, nor " ++
+                "hold one, and a named volume may not be inside another named volume", .{ v.target, other.target });
+            return error.BaseContainerFailed;
+        }
     }
-    try b.notes.append(arena, try std.fmt.allocPrint(arena, "Container volumes: {d} made as " ++
-        "directories of the job ({d} named); they last as long as the job", .{
-        found.targets.len,
-        found.named,
-    }));
-    return w.written();
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var anonymous: usize = 0;
+    var new: usize = 0;
+    const scope = try set_up.packageCacheScope(arena, ev, ev.job.github.repository, b.caches.trusted);
+    const owner: ?u32 = if (b.how.userns == .mapped) volumeIdBase(b.subid_base) else null;
+    for (found.list) |v| {
+        // Bound after the named ones (`hostVolumes`), so that no filling runs with them.
+        if (v.host != null) continue;
+        const name = v.name orelse {
+            if (anonymous == 0) try w.writer.writeAll("mkdir -p --");
+            anonymous += 1;
+            try w.writer.writeByte(' ');
+            try dagger.shellQuote(&w.writer, v.target);
+            continue;
+        };
+        // Kept between jobs, so what one job left is the next one's: never for a job the runner
+        // does not vouch for, nor a fork's pull request on one that vouches for pull requests
+        // (scope `untrusted`), whose volumes every other such job would share.
+        if (!b.vouched or !std.mem.eql(u8, scope, "repo")) {
+            b.job_fault = true;
+            err_msg.* = try std.fmt.allocPrint(arena, "the job container's named volume `{s}` " ++
+                "is kept between jobs, which a job the runner does not vouch for (a fork's pull " ++
+                "request included) never gets: an anonymous volume (`- {s}`) lasts as long as " ++
+                "the job", .{ name, v.target });
+            return error.BaseContainerFailed;
+        }
+        const key = volumes.namedKey(arena, ev.job.github.repository, scope, name) catch |e| {
+            err_msg.* = try std.fmt.allocPrint(arena, "the job container's volume `{s}` is kept " ++
+                "per repository, and the job names none ({s})", .{ name, @errorName(e) });
+            return error.BaseContainerFailed;
+        };
+        // Waiting for another job's filling of it no longer than a filling may take, and not
+        // past the job's cancel.
+        var vol = volumes.openNamedWaiting(arena, b.io, b.store_cfg.root, key, owner, .{
+            .ms = b.volume_seed_limit_ms + 60 * 1000,
+            .cancel = if (b.cancel) |c| &c.requested else null,
+        }) catch |e| {
+            err_msg.* = try std.fmt.allocPrint(arena, "could not open the job container's " ++
+                "volume `{s}`: {s}", .{ name, switch (e) {
+                error.VolumeBusy => "another job has been filling it for longer than a filling may take",
+                error.Canceled => "the job was cancelled while another job filled it",
+                else => @errorName(e),
+            } });
+            return error.BaseContainerFailed;
+        };
+        const bind: sandbox.Spec.Bind = .{
+            .host = vol.dir,
+            .volume_root = vol.root,
+            .at = v.target,
+            .read_only = v.read_only,
+            .volume = true,
+            .make = true,
+        };
+        if (vol.new) {
+            if (b.seedVolume(bind)) |failure| {
+                vol.discard(b.io);
+                b.job_fault = true;
+                err_msg.* = try std.fmt.allocPrint(arena, "could not fill the new volume `{s}` " ++
+                    "from the image's {s}: {s}", .{ name, v.target, failure });
+                return error.BaseContainerFailed;
+            }
+            vol.share();
+            new += 1;
+        }
+        try b.cache_plan.held.append(arena, vol);
+        b.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ b.binds, &.{bind} });
+        b.named_volumes += 1;
+    }
+    if (anonymous > 0) b.volume_dirs = w.written();
+    if (anonymous + b.named_volumes > 0)
+        try b.notes.append(arena, try std.fmt.allocPrint(arena, "Container volumes: {d} made as " ++
+            "directories of the job, which last as long as it; {d} named, kept between jobs in the " ++
+            "native store ({s} scope, {d} new and filled from the image), which evicts one unused " ++
+            "for long when it needs the room", .{ anonymous, b.named_volumes, scope, new }));
+    try b.hostVolumes(ev, found.list, err_msg);
+}
+
+/// Stops a new named volume's filling (`seedVolume`) past `limit_ms` or at the job's cancel: it
+/// holds the volume's lock alone, which every other job opening it waits for.
+const SeedWatch = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    fired: std.atomic.Value(bool) = .init(false),
+
+    fn run(w: *SeedWatch, b: *Backend, limit_ms: u64) void {
+        var waited: u64 = 0;
+        while (!w.done.load(.acquire)) {
+            const cancelled = if (b.cancel) |c| c.requested.load(.acquire) else false;
+            if (waited >= limit_ms or cancelled) {
+                w.fired.store(true, .release);
+                // Again each turn until it ends: the helper may not have started yet.
+                _ = b.running.kill(b.io);
+            }
+            b.io.sleep(.fromMilliseconds(100), .awake) catch return;
+            waited += 100;
+        }
+    }
+};
+
+test "a volume's filling is stopped at the job's cancel, well before its time limit" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const io = std.testing.io;
+    var cancel: dagger.Cancel = .{};
+    var b: Backend = .{
+        .arena = a.allocator(),
+        .io = io,
+        .gpa = std.testing.allocator,
+        .dir = "",
+        .rootfs = "",
+        .binds = &.{},
+        .lock = undefined,
+        .how = .{ .argv_prefix = &.{}, .userns = .mapped },
+        .cancel = &cancel,
+    };
+    var dog: SeedWatch = .{};
+    // An hour: only the cancel can be what stops it.
+    var watch = try io.concurrent(SeedWatch.run, .{ &dog, &b, 60 * 60 * 1000 });
+    defer {
+        dog.done.store(true, .release);
+        watch.await(io);
+    }
+    // Quiet while nothing is cancelled.
+    try io.sleep(.fromMilliseconds(250), .awake);
+    try std.testing.expect(!dog.fired.load(.acquire));
+    cancel.requested.store(true, .release);
+    for (0..300) |_| {
+        if (dog.fired.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expect(dog.fired.load(.acquire));
+}
+
+/// What the image has at `volume.at` copied into the new volume, as Docker fills one: the
+/// directory's files, and its owner and mode (`cp -a`, run in the job's image as its root, so the
+/// ids are the job's as every step sees them), in a sandbox whose layer is dropped. Nothing there,
+/// or no directory (a symlink is not followed), leaves it empty. Null, or why it failed.
+fn seedVolume(b: *Backend, volume: sandbox.Spec.Bind) ?[]const u8 {
+    const arena = b.arena;
+    const saved = b.binds;
+    const workdir = b.workdir;
+    defer {
+        b.binds = saved;
+        b.workdir = workdir;
+    }
+    const at = "/zig-runner-volume";
+    var beside = volume;
+    beside.at = at;
+    beside.read_only = false;
+    b.binds = std.mem.concat(arena, sandbox.Spec.Bind, &.{ saved, &.{beside} }) catch return "out of memory";
+    b.workdir = "/";
+    var w: std.Io.Writer.Allocating = .init(arena);
+    w.writer.writeAll("t=") catch return "out of memory";
+    dagger.shellQuote(&w.writer, volume.at) catch return "out of memory";
+    w.writer.writeAll("\nif [ -d \"$t\" ] && [ ! -L \"$t\" ]; then cp -a -- \"$t\"/. " ++ at ++ "/; fi\n") catch
+        return "out of memory";
+    var out: Captured = .{ .arena = arena };
+    // Bounded: the volume's lock is held alone meanwhile, and every other job that opens it
+    // waits (`volumes.Wait`). Stopped past its time or at the job's cancel.
+    var dog: SeedWatch = .{};
+    var watch = b.io.concurrent(SeedWatch.run, .{ &dog, b, b.volume_seed_limit_ms }) catch
+        return "cannot watch the filling's time on this machine";
+    const ended = b.exec(b.test_volume_seed orelse w.written(), &.{"PATH=" ++ image_path}, &.{}, 0, 0, out.output()) catch |e| {
+        dog.done.store(true, .release);
+        watch.await(b.io);
+        return @errorName(e);
+    };
+    dog.done.store(true, .release);
+    watch.await(b.io);
+    b.dropLastLayer();
+    if (dog.fired.load(.acquire)) return std.fmt.allocPrint(arena, "stopped after {d} s{s}", .{
+        b.volume_seed_limit_ms / 1000,
+        if (b.cancel) |c| if (c.requested.load(.acquire)) " (the job was cancelled)" else "" else "",
+    }) catch "stopped";
+    if (ended.failure.len > 0) return ended.failure;
+    if (ended.code != 0) return std.fmt.allocPrint(arena, "`cp -a` exited {d}{s}", .{
+        ended.code,
+        out.tail(),
+    }) catch "`cp -a` failed";
+    return null;
+}
+
+/// Whether the job container lists a host-path volume.
+fn hasHostVolume(arena: Allocator, job: job_mod.Job) bool {
+    const jc = job.container orelse return false;
+    var why: []const u8 = "";
+    const found = container_options.volumes(arena, jc.volumes, &why) catch return false;
+    for (found.list) |v| if (v.host != null) return true;
+    return false;
+}
+
+/// The job container's host-path volumes (`host_paths.zig`), each bound at its target in every
+/// step (`Bind.host_path`: not recursive, nosuid, nodev, read-only for `:ro`, idmapped as a
+/// cache volume where the filesystem can be), after the overlap check every volume had. Off by
+/// default: a source the operator's `RUNNER_NATIVE_HOST_PATHS` does not allow, once its symlinks
+/// are resolved now, fails the job naming the setting, as does any host path in a job the runner
+/// does not vouch for, or a fork's pull request on one that does (scope `untrusted`): the host's
+/// directories are the operator's, and a job they do not trust gets none. Failed, not sent to
+/// Dagger: Dagger ignores a job container's `volumes:`, so the job would run without the
+/// directory it asked for and the refusal would be a warning in "Set up job".
+fn hostVolumes(b: *Backend, ev: *Evaluator, list: []const container_options.Volume, err_msg: *[]const u8) !void {
+    const arena = b.arena;
+    var n: usize = 0;
+    var read_only: usize = 0;
+    for (list) |v| {
+        const source = v.host orelse continue;
+        const raw = try std.fmt.allocPrint(arena, "{s}:{s}{s}", .{ source, v.target, if (v.read_only) ":ro" else "" });
+        const scope = try set_up.packageCacheScope(arena, ev, ev.job.github.repository, b.caches.trusted);
+        if (!b.vouched or !std.mem.eql(u8, scope, "repo")) {
+            b.job_fault = true;
+            err_msg.* = try std.fmt.allocPrint(arena, "the job container's volume `{s}` binds a " ++
+                "host path, which a job the runner does not vouch for (a fork's pull request " ++
+                "included) never gets, whatever " ++ host_paths.setting ++ " allows", .{raw});
+            return error.BaseContainerFailed;
+        }
+        // A rootless runner's job root is the runner's own user on the host, unmapped: what it
+        // wrote would be the runner's, and its own files would be the job's to change.
+        if (b.how.userns != .mapped) {
+            b.job_fault = true;
+            err_msg.* = try std.fmt.allocPrint(arena, "the job container's volume `{s}` binds a " ++
+                "host path, which needs a root runner (a rootless runner's jobs are its own " ++
+                "user on the host), whatever " ++ host_paths.setting ++ " allows", .{raw});
+            return error.BaseContainerFailed;
+        }
+        var why: []const u8 = "";
+        const ok = try host_paths.resolve(arena, b.io, b.allowed_host_paths, source, &why, .{}) orelse {
+            b.job_fault = true;
+            err_msg.* = try std.fmt.allocPrint(arena, "the job container's volume `{s}` binds a " ++
+                "host path that is not allowed: {s}", .{ raw, why });
+            return error.BaseContainerFailed;
+        };
+        b.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ b.binds, &.{.{
+            .host = ok.path,
+            .at = v.target,
+            .read_only = v.read_only,
+            .host_path = true,
+            .unmapped_ok = b.host_paths_unmapped,
+            .make = true,
+        }} });
+        n += 1;
+        read_only += @intFromBool(v.read_only);
+    }
+    if (n == 0) return;
+    try b.notes.append(arena, try std.fmt.allocPrint(arena, "Container volumes: {d} host " ++
+        "path(s) bound ({d} read-only), nosuid and nodev, allowed by " ++ host_paths.setting, .{ n, read_only }));
+    try b.notes.append(arena, if (b.host_paths_unmapped) "Container volumes: a host path whose " ++
+        "filesystem cannot be idmapped is bound with the host's ids (" ++ host_paths.unmapped_setting ++
+        "=true): what the job writes there is its slot's ids" else "Container volumes: a host " ++
+        "path whose filesystem cannot be idmapped fails the step (" ++ host_paths.unmapped_setting ++
+        "=true binds it with the host's ids)");
+    for (b.host_paths_closed) |e| try b.notes.append(arena, try std.fmt.allocPrint(arena, "Container " ++
+        "volumes: {s} entry `{s}` is closed for this job: it is not the directory checked when " ++
+        "the runner started", .{ host_paths.setting, e }));
 }
 
 /// Whether the job's image is musl-based: an `ld-musl-*` in its /lib, as the Dagger path asks
@@ -3922,11 +4288,14 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     container.container.?.ports = &.{.{ .lit = "8080:80" }};
     try expectReason("`ports:`", unsupported(io, container, root, ok));
     container.container.?.ports = &.{};
-    // Volumes that are directories of the job are native; a path of the host is not.
-    container.container.?.volumes = &.{ .{ .lit = "/data" }, .{ .lit = "cache:/cache" } };
+    // Volumes that are directories of the job are native, and so is a path of the host (allowed
+    // or failed when the job starts, `hostVolumes`); a read-only anonymous one is not.
+    container.container.?.volumes = &.{ .{ .lit = "/data" }, .{ .lit = "cache:/cache:ro" } };
     try std.testing.expect(unsupported(io, container, root, ok) == null);
     container.container.?.volumes = &.{.{ .lit = "/srv:/srv" }};
-    try expectReason("`/srv:/srv`", unsupported(io, container, root, ok));
+    try std.testing.expect(unsupported(io, container, root, ok) == null);
+    container.container.?.volumes = &.{.{ .lit = "/data:ro" }};
+    try expectReason("`/data:ro`", unsupported(io, container, root, ok));
     // A service mounts no volume natively, so it cannot share a named one.
     container.container.?.volumes = &.{.{ .lit = "shared:/shared" }};
     var with_volumes = container;
@@ -5857,6 +6226,8 @@ test "a container job's volumes on the native backend: directories of the job, t
     const res = try dagger.run(arena, std.testing.io, &env, .{
         .native = cfg,
         .step_user = .root,
+        // Named volumes are kept between jobs, which only trusted jobs get.
+        .trusted = true,
         .gpa = std.testing.allocator,
     }, job, &log);
     const text = w.written();
@@ -5866,7 +6237,8 @@ test "a container job's volumes on the native backend: directories of the job, t
         "Engine: native",
         "made[0]",
         "cache=hello data=kept",
-        "Container volumes: 3 made as directories of the job (2 named); they last as long as the job",
+        "Container volumes: 1 made as directories of the job, which last as long as it; 2 named, " ++
+            "kept between jobs in the native store (repo scope, 2 new and filled from the image)",
     };
     for (expect) |e| if (std.mem.indexOf(u8, text, e) == null) {
         std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
@@ -5908,6 +6280,526 @@ test "a container job's volume where the runner mounts something fails the job, 
     const why = res.engine_error orelse text;
     try std.testing.expect(std.mem.indexOf(u8, why, "volume at /__w/r overlaps /__w/r/r") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ran\n") == null);
+}
+
+/// One job of `job` on `cfg`, trusted or not: whether it passed, what it printed, and why it
+/// failed (its engine error, else its log).
+fn runVolumeJob(arena: Allocator, cfg: Config, job: job_mod.Job, trusted: bool) !struct { ok: bool, text: []const u8, why: []const u8 } {
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .trusted = trusted,
+        // On, as a runner has it: a job with a named volume or a host path turns it off.
+        .step_cache = true,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const why = if (res.engine_error) |e| try std.mem.concat(arena, u8, &.{ e, "\n", w.written() }) else w.written();
+    return .{ .ok = res.succeeded, .text = w.written(), .why = why };
+}
+
+fn expectAll(text: []const u8, want: []const []const u8) !void {
+    for (want) |e| if (std.mem.indexOf(u8, text, e) == null) {
+        std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
+        return error.TestUnexpectedResult;
+    };
+}
+
+/// Mounts a filesystem of `fstype` at `path` (made first) with `flags`, for the root tests of host
+/// paths: an allowed directory must be on a `nosuid,nodev` mount, and the work directory is not.
+fn testMount(arena: Allocator, path: []const u8, fstype: [*:0]const u8, flags: u32) !void {
+    const z = try arena.dupeSentinel(u8, path, 0);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.mount(fstype, z, fstype, flags, 0)));
+}
+
+fn testUnmount(arena: Allocator, path: []const u8) void {
+    const z = arena.dupeSentinel(u8, path, 0) catch return;
+    _ = std.os.linux.umount2(z, std.os.linux.MNT.DETACH);
+}
+
+fn testHostPaths(arena: Allocator, raw: []const u8) ![]const host_paths.Entry {
+    var r: host_paths.Refusal = .{};
+    return host_paths.parse(arena, std.testing.io, raw, &.{}, &r, .{}) catch |e| {
+        std.debug.print("{s}: {s}\n", .{ r.entry, r.why });
+        return e;
+    };
+}
+
+fn testExists(arena: Allocator, path: []const u8) bool {
+    const z = arena.dupeSentinel(u8, path, 0) catch return false;
+    var st: std.os.linux.Statx = undefined;
+    return std.os.linux.errno(std.os.linux.statx(std.os.linux.AT.FDCWD, z, std.os.linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &st)) == .SUCCESS;
+}
+
+test "a container job's host-path volumes: only where the operator allows, nosuid and nodev, :ro read-only" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const layers = try testImageLayers(arena);
+    const img = try testregistry.testImage(arena, "test/hostvol", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+    const image = try server.image(arena, "test/hostvol:1");
+    const host = try std.fmt.allocPrint(arena, "{s}/host", .{root});
+    try tmp.dir.createDirPath(io, "host");
+
+    if (std.os.linux.geteuid() != 0) {
+        // Rootless: the job's root is the runner's own user on the host, so no host path,
+        // whatever the list says.
+        var r: host_paths.Refusal = .{};
+        cfg.host_paths = try host_paths.parse(arena, io, host, &.{}, &r, .{ .mount_flags = false });
+        var job = testJob(&.{testStep("echo ran-$((1+1))")});
+        job.container = .{ .name = "", .image = .{ .lit = image }, .volumes = &.{.{ .lit = try std.fmt.allocPrint(arena, "{s}:/x", .{host}) }} };
+        const refused = try runVolumeJob(arena, cfg, job, true);
+        try std.testing.expect(!refused.ok);
+        try expectAll(refused.why, &.{ "needs a root runner", "RUNNER_NATIVE_HOST_PATHS" });
+        try std.testing.expect(std.mem.indexOf(u8, refused.text, "ran-2") == null);
+        return;
+    }
+
+    // What an operator does: the allowed tree on a nosuid,nodev mount.
+    try testMount(arena, host, "tmpfs", std.os.linux.MS.NOSUID | std.os.linux.MS.NODEV);
+    defer testUnmount(arena, host);
+    for ([_][]const u8{ "host/allowed/data/sub", "host/allowed/plain", "host/outside" }) |d| try tmp.dir.createDirPath(io, d);
+    try tmp.dir.writeFile(io, .{ .sub_path = "host/allowed/data/from-host", .data = "host file\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "host/outside/secret", .data = "not yours\n" });
+    // A link inside the allowed directory to one outside it.
+    try tmp.dir.symLink(io, "../outside", "host/allowed/escape", .{});
+    const allowed = try std.fmt.allocPrint(arena, "{s}/allowed", .{host});
+    cfg.host_paths = try testHostPaths(arena, allowed);
+    const data = try std.fmt.allocPrint(arena, "{s}/data", .{allowed});
+    // A directory below the allowed one on a mount of its own without nosuid and nodev.
+    const plain = try std.fmt.allocPrint(arena, "{s}/plain", .{allowed});
+    try testMount(arena, plain, "tmpfs", 0);
+    defer testUnmount(arena, plain);
+    // What an operator does for a directory jobs write to: give it to the volumes' range, which a
+    // root runner's jobs see as their root (its files stay root's, so nobody's to the job).
+    const base_id = volumeIdBase(cfg.subid_base);
+    const data_z = try arena.dupeSentinel(u8, data, 0);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.lchown(data_z, base_id, base_id)));
+
+    // Allowed: the host's files there, what the job writes on the host, a second bind of it
+    // read-only, both nosuid and nodev, and neither remounted otherwise by the job. Nothing
+    // expected is in the script's text (the log echoes it).
+    const mounts = "while read -r _ _ _ _ at opts _; do case $at in /data) echo data-opts:$opts;; " ++
+        "/ro) echo ro-opts:$opts;; esac; done < /proc/self/mountinfo";
+    var job = testJob(&.{testStep("sed 's/^/seen:/' /data/from-host; echo owner[$(stat -c %u /data/from-host)]; " ++
+        "echo job > /data/from-job && echo wrote-$((2+3)); r=wrote; touch /ro/x 2>/dev/null || " ++
+        "r=refused; echo ro-$r; sed 's/^/ro-seen:/' /ro/from-job; " ++
+        "for m in 'remount,rw /ro' 'remount,bind,rw /ro' 'remount,bind,suid,dev /data'; do " ++
+        "mount -o $m 2>&1 && echo remount-yes-$((6*7)):$m || echo remount-no-$((40+2)); done; " ++ mounts)});
+    job.container = .{
+        .name = "",
+        .image = .{ .lit = image },
+        .volumes = &.{
+            .{ .lit = try std.fmt.allocPrint(arena, "{s}:/data", .{data}) },
+            .{ .lit = try std.fmt.allocPrint(arena, "{s}/:/ro:ro", .{data}) },
+        },
+    };
+    const ok = try runVolumeJob(arena, cfg, job, true);
+    if (!ok.ok) std.debug.print("{s}\n", .{ok.text});
+    try std.testing.expect(ok.ok);
+    try expectAll(ok.text, &.{
+        "Engine: native",
+        "seen:host file",
+        // Host ids are nobody to a root runner's job.
+        "owner[65534]",
+        "wrote-5",
+        "ro-refused",
+        "ro-seen:job",
+        "data-opts:rw,nosuid,nodev",
+        "ro-opts:ro,nosuid,nodev",
+        "2 host path(s) bound (1 read-only), nosuid and nodev, allowed by RUNNER_NATIVE_HOST_PATHS",
+        "cannot be idmapped fails the step (RUNNER_NATIVE_HOST_PATHS_UNMAPPED=true",
+        "Step cache: off for this job, as it mounts named volumes or binds host paths",
+    });
+    // Each remount was refused, and the mounts are as they were.
+    try std.testing.expect(std.mem.indexOf(u8, ok.text, "remount-yes-42") == null);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, ok.text, "remount-no-42"));
+    // On the host: written, owned by the volumes' range (the job's root seen through the
+    // idmapped mount), no host user's.
+    const from_job = try std.fmt.allocPrintSentinel(arena, "{s}/from-job", .{data}, 0);
+    var st: std.os.linux.Statx = undefined;
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.statx(
+        std.os.linux.AT.FDCWD,
+        from_job,
+        0,
+        .{ .UID = true },
+        &st,
+    )));
+    try std.testing.expectEqual(base_id, st.uid);
+
+    // Refused, failing the job and naming the setting: outside the list, a link out of it (both
+    // saying the same, nothing of where the link points), a mount below the list without nosuid
+    // and nodev, a host path nested with another volume, and any host path in a job the runner
+    // does not vouch for: a fork's pull request (scope `untrusted`), and one whose ref the
+    // runner's trusted refs do not vouch for (`Config.vouched` false, as `configFor` makes it).
+    job.steps = &.{testStep("echo ran-$((1+1))")};
+    const not_allowed = "is not a directory under one RUNNER_NATIVE_HOST_PATHS allows";
+    const Case = struct {
+        volumes: []const []const u8,
+        trusted: bool = true,
+        vouched: bool = true,
+        says: []const u8,
+        setting: bool = true,
+        /// What the refusal must not tell the job.
+        hides: ?[]const u8 = null,
+    };
+    const outside = try std.fmt.allocPrint(arena, "{s}/outside:/x", .{host});
+    const escape = try std.fmt.allocPrint(arena, "{s}/escape:/x", .{allowed});
+    const at_x = try std.fmt.allocPrint(arena, "{s}:/x", .{data});
+    const cases = [_]Case{
+        .{ .volumes = &.{outside}, .says = not_allowed },
+        .{ .volumes = &.{escape}, .says = not_allowed, .hides = "outside" },
+        .{ .volumes = &.{try std.fmt.allocPrint(arena, "{s}:/x", .{plain})}, .says = "without nosuid and nodev" },
+        .{ .volumes = &.{ at_x, try std.fmt.allocPrint(arena, "{s}/sub:/x/y", .{data}) }, .says = "nested", .setting = false },
+        .{ .volumes = &.{ "/x/y", at_x }, .says = "nested", .setting = false },
+        .{ .volumes = &.{at_x}, .trusted = false, .says = "does not vouch for" },
+        .{ .volumes = &.{at_x}, .vouched = false, .says = "does not vouch for" },
+    };
+    for (cases) |c| {
+        var vols: std.ArrayList(job_mod.Template) = .empty;
+        for (c.volumes) |v| try vols.append(arena, .{ .lit = v });
+        job.container.?.volumes = vols.items;
+        var case_cfg = cfg;
+        case_cfg.vouched = c.vouched;
+        if (!c.vouched) {
+            // As `configFor` decides it: a job the runner does not vouch for runs natively only
+            // under per-job limits (else on Dagger, which binds no host path either).
+            case_cfg.job_limits = jobLimits(arena, io, case_cfg.cgroup);
+            if (!case_cfg.job_limits) {
+                std.debug.print("skipped the unvouched case: no cgroup for per-job limits\n", .{});
+                continue;
+            }
+        }
+        const refused = try runVolumeJob(arena, case_cfg, job, c.trusted);
+        try std.testing.expect(!refused.ok);
+        try expectAll(refused.why, &.{c.says});
+        if (c.setting) try expectAll(refused.why, &.{"RUNNER_NATIVE_HOST_PATHS"});
+        try std.testing.expect(std.mem.indexOf(u8, refused.why, "ran-2") == null);
+        try std.testing.expect(std.mem.indexOf(u8, refused.why, "runs on Dagger") == null);
+        if (c.hides) |h| try std.testing.expect(std.mem.indexOf(u8, refused.why, h) == null);
+    }
+    // None allowed: off, saying so.
+    var off_cfg = cfg;
+    off_cfg.host_paths = &.{};
+    job.container.?.volumes = &.{.{ .lit = at_x }};
+    const off = try runVolumeJob(arena, off_cfg, job, true);
+    try std.testing.expect(!off.ok);
+    try expectAll(off.why, &.{"host paths are off: RUNNER_NATIVE_HOST_PATHS allows none"});
+}
+
+test "a container job's host path inside another bind through the image's symlink fails, making nothing on the host" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    if (std.os.linux.geteuid() != 0) return error.SkipZigTest;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const host = try std.fmt.allocPrint(arena, "{s}/host", .{root});
+    try tmp.dir.createDirPath(io, "host");
+    try testMount(arena, host, "tmpfs", std.os.linux.MS.NOSUID | std.os.linux.MS.NODEV);
+    defer testUnmount(arena, host);
+    for ([_][]const u8{ "host/one", "host/two" }) |d| try tmp.dir.createDirPath(io, d);
+    cfg.host_paths = try testHostPaths(arena, host);
+    // The image's /y is a link to /x: `/y/z` is not below `/x` as written, and is once resolved.
+    var t: oci_layer.TestTar = .{ .a = arena };
+    try t.add(.{ .path = "x/", .kind = .directory, .mode = 0o755 });
+    try t.add(.{ .path = "y", .kind = .symlink, .link = "/x" });
+    const layers = try std.mem.concat(arena, []const u8, &.{ try testImageLayers(arena), &.{try t.finish()} });
+    const img = try testregistry.testImage(arena, "test/hostlink", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+    var job = testJob(&.{testStep("echo ran-$((1+1))")});
+    job.container = .{
+        .name = "",
+        .image = .{ .lit = try server.image(arena, "test/hostlink:1") },
+        .volumes = &.{
+            .{ .lit = try std.fmt.allocPrint(arena, "{s}/one:/x", .{host}) },
+            .{ .lit = try std.fmt.allocPrint(arena, "{s}/two:/y/z", .{host}) },
+        },
+    };
+    const refused = try runVolumeJob(arena, cfg, job, true);
+    try std.testing.expect(!refused.ok);
+    try expectAll(refused.why, &.{"the volume at /y/z lies inside another mount of the job"});
+    try std.testing.expect(std.mem.indexOf(u8, refused.why, "ran-2") == null);
+    // Failed, not sent to Dagger, which would run the job without its volumes.
+    try std.testing.expect(std.mem.indexOf(u8, refused.why, "runs on Dagger") == null);
+    // And the host's root made no mount point in the first host path on the job's behalf.
+    try std.testing.expect(!testExists(arena, try std.fmt.allocPrint(arena, "{s}/one/z", .{host})));
+}
+
+test "a container job's host path on a filesystem that cannot be idmapped: refused unless the operator allows it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    if (std.os.linux.geteuid() != 0) return error.SkipZigTest;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    // ramfs takes no idmapping (no FS_ALLOW_IDMAP): the kernel refuses with EINVAL, as for NFS.
+    const host = try std.fmt.allocPrint(arena, "{s}/ramfs", .{root});
+    try tmp.dir.createDirPath(io, "ramfs");
+    try testMount(arena, host, "ramfs", std.os.linux.MS.NOSUID | std.os.linux.MS.NODEV);
+    defer testUnmount(arena, host);
+    // Writable by every slot's ids: unmapped, the job's root is its slot's host id.
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.chmod(try arena.dupeSentinel(u8, host, 0), 0o1777)));
+    cfg.host_paths = try testHostPaths(arena, host);
+    const img = try testregistry.testImage(arena, "test/hostram", "1", try testImageLayers(arena), "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+    var job = testJob(&.{testStep("echo job > /r/from-job && echo wrote-$((2+3))")});
+    job.container = .{
+        .name = "",
+        .image = .{ .lit = try server.image(arena, "test/hostram:1") },
+        .volumes = &.{.{ .lit = try std.fmt.allocPrint(arena, "{s}:/r", .{host}) }},
+    };
+    const refused = try runVolumeJob(arena, cfg, job, true);
+    try std.testing.expect(!refused.ok);
+    try expectAll(refused.why, &.{ "cannot idmap", "RUNNER_NATIVE_HOST_PATHS_UNMAPPED=true" });
+    try std.testing.expect(std.mem.indexOf(u8, refused.why, "runs on Dagger") == null);
+    try std.testing.expect(std.mem.indexOf(u8, refused.why, "wrote-5") == null);
+    try std.testing.expect(!testExists(arena, try std.fmt.allocPrint(arena, "{s}/from-job", .{host})));
+
+    cfg.host_paths_unmapped = true;
+    const ok = try runVolumeJob(arena, cfg, job, true);
+    if (!ok.ok) std.debug.print("{s}\n", .{ok.why});
+    try std.testing.expect(ok.ok);
+    try expectAll(ok.text, &.{ "wrote-5", "bound with the host's ids (RUNNER_NATIVE_HOST_PATHS_UNMAPPED=true)" });
+    // Owned by the job's slot's ids, never a host user's (nor the volumes' range: not mapped).
+    const from_job = try std.fmt.allocPrintSentinel(arena, "{s}/from-job", .{host}, 0);
+    var st: std.os.linux.Statx = undefined;
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.statx(std.os.linux.AT.FDCWD, from_job, 0, .{ .UID = true }, &st)));
+    try std.testing.expect(st.uid >= cfg.subid_base and st.uid < volumeIdBase(cfg.subid_base));
+}
+
+test "a container job's named volumes: kept between jobs, filled from the image once, apart by scope and repository, :ro read-only" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var extra: oci_layer.TestTar = .{ .a = arena };
+    try extra.add(.{ .path = "srv/", .kind = .directory, .mode = 0o755 });
+    try extra.add(.{ .path = "srv/seed/", .kind = .directory, .mode = 0o750, .uid = 1002, .gid = 1003 });
+    try extra.add(.{ .path = "srv/seed/from-image", .body = "image\n" });
+    try extra.add(.{ .path = "srv/ro/", .kind = .directory, .mode = 0o755 });
+    try extra.add(.{ .path = "srv/ro/readme", .body = "read me\n" });
+    const layers = try std.mem.concat(arena, []const u8, &.{ try testImageLayers(arena), &.{try extra.finish()} });
+    const img = try testregistry.testImage(arena, "test/named", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+    const image = try server.image(arena, "test/named:1");
+    const as_root = std.os.linux.geteuid() == 0;
+
+    const mounts = "while read -r _ _ _ _ at opts _; do case $at in /srv/seed) echo seed-opts:$opts;; " ++
+        "/srv/ro) echo ro-opts:$opts;; esac; done < /proc/self/mountinfo";
+    var job = testJob(&.{
+        // Nothing expected below is in the script's text, which the log echoes.
+        testStep("sed 's/^/seeded:/' /srv/seed/from-image /srv/ro/readme; " ++
+            "echo owner[$(stat -c %u:%g:%a /srv/seed)]; " ++
+            "echo one > /srv/seed/kept && rm /srv/seed/from-image && echo wrote-$((2+3)); " ++
+            "r=wrote; touch /srv/ro/x 2>/dev/null || r=refused; echo ro-$r; " ++
+            // Nor can the job remount either otherwise.
+            "for m in 'remount,rw /srv/ro' 'remount,bind,rw /srv/ro' 'remount,bind,suid,dev /srv/seed'; do " ++
+            "mount -o $m 2>&1 && echo remount-yes-$((6*7)):$m || echo remount-no-$((40+2)); done; " ++ mounts),
+        testStep("echo next-step[$(cat /srv/seed/kept)]"),
+    });
+    job.container = .{
+        .name = "",
+        .image = .{ .lit = image },
+        .volumes = &.{ .{ .lit = "data:/srv/seed" }, .{ .lit = "docs:/srv/ro:ro" } },
+    };
+    const first = try runVolumeJob(arena, cfg, job, true);
+    if (!first.ok) std.debug.print("{s}\n", .{first.text});
+    try std.testing.expect(first.ok);
+    try expectAll(first.text, &.{
+        "Engine: native",
+        // A new volume holds what the image has at its target, its owner and mode too.
+        "seeded:image",
+        "seeded:read me",
+        if (as_root) "owner[1002:1003:750]" else "Engine: native",
+        "wrote-5",
+        "ro-refused",
+        "seed-opts:rw,nosuid,nodev",
+        "ro-opts:ro,nosuid,nodev",
+        "next-step[one]",
+        "2 named, kept between jobs in the native store (repo scope, 2 new and filled from the image)",
+        "Step cache: off for this job",
+    });
+    // Each remount refused, and the mounts (read after) as they were.
+    try std.testing.expect(std.mem.indexOf(u8, first.text, "remount-yes-42") == null);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, first.text, "remount-no-42"));
+
+    // The next job of the repository finds the volume as the last left it: not filled again.
+    job.steps = &.{testStep("echo kept[$(cat /srv/seed/kept)]; f=no; test -e /srv/seed/from-image && " ++
+        "f=yes; echo filled-again=$f; ls /srv/ro")};
+    const second = try runVolumeJob(arena, cfg, job, true);
+    if (!second.ok) std.debug.print("{s}\n", .{second.text});
+    try std.testing.expect(second.ok);
+    try expectAll(second.text, &.{ "kept[one]", "filled-again=no", "readme", "(repo scope, 0 new" });
+
+    // An untrusted job gets no named volume at all, failing and saying so: a fork's pull request
+    // (scope `untrusted`), and a job whose ref the runner's trusted refs do not vouch for
+    // (`Config.vouched` false, as `configFor` makes it; native only under per-job limits).
+    job.steps = &.{testStep("k=apart; test -e /srv/seed/kept && k=leaked; echo kept-$k; " ++
+        "sed 's/^/seeded:/' /srv/seed/from-image")};
+    const untrusted = try runVolumeJob(arena, cfg, job, false);
+    try std.testing.expect(!untrusted.ok);
+    try expectAll(untrusted.why, &.{ "named volume `data` is kept between jobs, which a job the runner does not vouch for", "anonymous volume (`- /srv/seed`)" });
+    try std.testing.expect(std.mem.indexOf(u8, untrusted.why, "kept-") == null);
+    try std.testing.expect(std.mem.indexOf(u8, untrusted.why, "runs on Dagger") == null);
+    var unvouched = cfg;
+    unvouched.vouched = false;
+    unvouched.job_limits = jobLimits(arena, std.testing.io, unvouched.cgroup);
+    if (unvouched.job_limits) {
+        const refused = try runVolumeJob(arena, unvouched, job, true);
+        try std.testing.expect(!refused.ok);
+        try expectAll(refused.why, &.{"which a job the runner does not vouch for"});
+        try std.testing.expect(std.mem.indexOf(u8, refused.why, "kept-") == null);
+    } else std.debug.print("skipped the unvouched case: no cgroup for per-job limits\n", .{});
+    // Neither left a volume of its own in the store.
+    const store_named = try std.fmt.allocPrint(arena, "{s}/volumes/o/r/untrusted", .{cfg.store});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, store_named, .{}));
+    // A trusted job of another repository never sees it: a new volume, filled from its image.
+    job.github.repository = "o/other";
+    const other = try runVolumeJob(arena, cfg, job, true);
+    if (!other.ok) std.debug.print("{s}\n", .{other.text});
+    try std.testing.expect(other.ok);
+    try expectAll(other.text, &.{ "kept-apart", "seeded:image", "(repo scope, 2 new" });
+
+    // A filling that does not end (an image's `cp` that hangs) is stopped at its limit, failing
+    // the job, and the volume is removed so the next job fills it: no other job waits on it for
+    // good.
+    var slow = cfg;
+    slow.test_volume_seed = "sleep 60";
+    slow.test_volume_seed_limit_ms = 1000;
+    job.github.repository = "o/slow";
+    job.steps = &.{testStep("echo ran-$((1+1))")};
+    const started = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    const stuck = try runVolumeJob(arena, slow, job, true);
+    const took_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds() - started;
+    try std.testing.expect(!stuck.ok);
+    try expectAll(stuck.why, &.{ "could not fill the new volume `data`", "stopped after 1 s" });
+    try std.testing.expect(std.mem.indexOf(u8, stuck.why, "ran-2") == null);
+    try std.testing.expect(took_ms < 30_000);
+    const after = try runVolumeJob(arena, cfg, job, true);
+    if (!after.ok) std.debug.print("{s}\n", .{after.text});
+    try std.testing.expect(after.ok);
+    try expectAll(after.text, &.{"(repo scope, 2 new"});
+}
+
+test "a container job's named volume and host path together: both bound, nesting across kinds refused" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    // Host paths need a root runner (a rootless one refuses them, tested above).
+    if (std.os.linux.geteuid() != 0) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    var extra: oci_layer.TestTar = .{ .a = arena };
+    try extra.add(.{ .path = "srv/", .kind = .directory, .mode = 0o755 });
+    try extra.add(.{ .path = "srv/seed/", .kind = .directory, .mode = 0o755 });
+    try extra.add(.{ .path = "srv/seed/from-image", .body = "image\n" });
+    const layers = try std.mem.concat(arena, []const u8, &.{ try testImageLayers(arena), &.{try extra.finish()} });
+    const img = try testregistry.testImage(arena, "test/bothvol", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+    const image = try server.image(arena, "test/bothvol:1");
+    const host = try std.fmt.allocPrint(arena, "{s}/host", .{root});
+    try tmp.dir.createDirPath(io, "host");
+    try testMount(arena, host, "tmpfs", std.os.linux.MS.NOSUID | std.os.linux.MS.NODEV);
+    defer testUnmount(arena, host);
+    try tmp.dir.createDirPath(io, "host/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "host/data/from-host", .data = "host file\n" });
+    cfg.host_paths = try testHostPaths(arena, host);
+    const data = try std.fmt.allocPrint(arena, "{s}/data", .{host});
+    const base_id = volumeIdBase(cfg.subid_base);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.lchown(try arena.dupeSentinel(u8, data, 0), base_id, base_id)));
+
+    // Side by side: the named volume filled from the image and kept, the host path the host's,
+    // both nosuid and nodev, and the job's step cache off. Nothing expected is in the script.
+    const mounts = "while read -r _ _ _ _ at opts _; do case $at in /srv/seed) echo named-opts:$opts;; " ++
+        "/h) echo host-opts:$opts;; esac; done < /proc/self/mountinfo";
+    var job = testJob(&.{testStep("sed 's/^/named:/' /srv/seed/from-image; sed 's/^/host:/' /h/from-host; " ++
+        "echo one > /srv/seed/kept && echo job > /h/from-job && echo wrote-$((2+3)); " ++
+        "k=no; test -e /h/kept && k=yes; echo crossed-$k; " ++ mounts)});
+    const both = [_]job_mod.Template{ .{ .lit = "data:/srv/seed" }, .{ .lit = try std.fmt.allocPrint(arena, "{s}:/h", .{data}) } };
+    job.container = .{ .name = "", .image = .{ .lit = image }, .volumes = &both };
+    const ok = try runVolumeJob(arena, cfg, job, true);
+    if (!ok.ok) std.debug.print("{s}\n", .{ok.why});
+    try std.testing.expect(ok.ok);
+    try expectAll(ok.text, &.{
+        "Engine: native",
+        "named:image",
+        "host:host file",
+        "wrote-5",
+        "crossed-no",
+        "named-opts:rw,nosuid,nodev",
+        "host-opts:rw,nosuid,nodev",
+        "1 named, kept between jobs in the native store (repo scope, 1 new and filled from the image)",
+        "1 host path(s) bound (0 read-only), nosuid and nodev, allowed by RUNNER_NATIVE_HOST_PATHS",
+        "Step cache: off for this job, as it mounts named volumes or binds host paths",
+    });
+    const from_job = try std.fmt.allocPrintSentinel(arena, "{s}/from-job", .{data}, 0);
+    var st: std.os.linux.Statx = undefined;
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.statx(std.os.linux.AT.FDCWD, from_job, 0, .{ .UID = true }, &st)));
+    try std.testing.expectEqual(base_id, st.uid);
+    job.steps = &.{testStep("echo kept[$(cat /srv/seed/kept)]")};
+    const again = try runVolumeJob(arena, cfg, job, true);
+    if (!again.ok) std.debug.print("{s}\n", .{again.why});
+    try std.testing.expect(again.ok);
+    try expectAll(again.text, &.{ "kept[one]", "(repo scope, 0 new" });
+
+    // Nested across kinds, as written: a host path inside a named volume, a named volume inside a
+    // host path, and a named volume inside another; each fails before any named volume is opened.
+    job.steps = &.{testStep("echo ran-$((1+1))")};
+    job.github.repository = "o/nest";
+    const host_in_named = try std.fmt.allocPrint(arena, "{s}:/srv/seed/h", .{data});
+    const at_h = try std.fmt.allocPrint(arena, "{s}:/h", .{data});
+    const nested = [_][2][]const u8{
+        .{ "data:/srv/seed", host_in_named },
+        .{ host_in_named, "data:/srv/seed" },
+        .{ at_h, "data:/h/n" },
+        .{ "data:/n", "more:/n/m" },
+    };
+    for (nested) |pair| {
+        job.container.?.volumes = &.{ .{ .lit = pair[0] }, .{ .lit = pair[1] } };
+        const refused = try runVolumeJob(arena, cfg, job, true);
+        try std.testing.expect(!refused.ok);
+        try expectAll(refused.why, &.{"is nested with the one at"});
+        try std.testing.expect(std.mem.indexOf(u8, refused.why, "ran-2") == null);
+        try std.testing.expect(std.mem.indexOf(u8, refused.why, "runs on Dagger") == null);
+    }
+    const store_nest = try std.fmt.allocPrint(arena, "{s}/volumes/o/nest", .{cfg.store});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, store_nest, .{}));
+    // An anonymous volume holding a named one nests as Docker's do.
+    job.container.?.volumes = &.{ .{ .lit = "/anon" }, .{ .lit = "inner:/anon/n" } };
+    const anon = try runVolumeJob(arena, cfg, job, true);
+    if (!anon.ok) std.debug.print("{s}\n", .{anon.why});
+    try std.testing.expect(anon.ok);
+    try expectAll(anon.text, &.{"ran-2"});
 }
 
 test "the base hands a work root to the user, and the tool cache only when it is not theirs" {
@@ -8256,4 +9148,49 @@ test "a refused sandbox names the AppArmor profile when Ubuntu's restriction is 
     try std.testing.expectEqualStrings("", try usernsHint(arena, "0\n", false, exe));
     try std.testing.expectEqualStrings("", try usernsHint(arena, "", false, exe));
     try std.testing.expectEqualStrings("", try usernsHint(arena, "1\n", true, exe));
+}
+
+test "host paths: the runner's own files refused, and each job held to the list checked at the start" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    for ([_][]const u8{ "keys", "store", "data" }) |d| try tmp.dir.createDirPath(io, d);
+    try tmp.dir.writeFile(io, .{ .sub_path = "keys/app.pem", .data = "" });
+    var env: std.process.Environ.Map = .init(arena);
+    try env.put("GH_SCOPE", "o/r");
+    try env.put("GH_APP_ID", "1");
+    try env.put("GH_APP_PRIVATE_KEY_FILE", try std.fmt.allocPrint(arena, "{s}/keys/app.pem", .{root}));
+    try env.put("RUNNER_BACKEND", "native");
+    try env.put("RUNNER_NATIVE_STORE", try std.fmt.allocPrint(arena, "{s}/store", .{root}));
+    var cfg = try config.Config.load(&env, &.{"runner"});
+    // The App key's directory, and the one holding the runner's own executable.
+    const exe = exeOf(arena, io, std.os.linux.getpid()).path;
+    for ([_][]const u8{ try std.fmt.allocPrint(arena, "{s}/keys", .{root}), std.fs.path.dirname(exe).? }) |entry| {
+        cfg.native_host_paths = entry;
+        var r: host_paths.Refusal = .{};
+        try std.testing.expectError(error.Refused, hostPathsOf(arena, io, &env, &cfg, &r));
+        if (std.mem.indexOf(u8, r.why, "runner's own") == null) {
+            std.debug.print("{s}: {s}\n", .{ entry, r.why });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // A job is held to the list `main` checked: none when it was never checked, and an entry
+    // whose directory changed since is closed, not resolved again to where it points now.
+    const data = try std.fmt.allocPrint(arena, "{s}/data", .{root});
+    cfg.native_host_paths = data;
+    cfg.native_host_allowed = null;
+    const unchecked = (try configFor(arena, io, &env, &cfg, true)).?;
+    try std.testing.expectEqual(@as(usize, 0), unchecked.host_paths.len);
+    var r: host_paths.Refusal = .{};
+    cfg.native_host_allowed = try host_paths.parse(arena, io, data, &.{}, &r, .{ .mount_flags = false });
+    try tmp.dir.rename("data", tmp.dir, "data-was", io);
+    try tmp.dir.createDirPath(io, "data");
+    const replaced = (try configFor(arena, io, &env, &cfg, true)).?;
+    try std.testing.expectEqual(@as(usize, 0), replaced.host_paths.len);
+    try std.testing.expectEqual(@as(usize, 1), replaced.host_paths_closed.len);
 }

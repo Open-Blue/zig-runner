@@ -1,8 +1,8 @@
 //! Fuzz tests for the parsers that read what jobs, workflows and servers hand the runner: workflow
 //! commands, problem matchers and their regular expressions, YAML, expressions, hashFiles()
 //! patterns, HPACK, an image's layers (tar, PAX, paths), references, registry challenges and
-//! manifests, and minisign signatures; and property tests of the text paths that guard secrets
-//! and a job's environment: masking (secret masking), file commands and their heredocs (file
+//! manifests, minisign signatures and zstd streams (the runner's decoder, held to std's); and
+//! property tests of the text paths that guard secrets and a job's environment: masking (secret masking), file commands and their heredocs (file
 //! commands), the broker's and run service's messages (job messages) and HTTP/2's framing
 //! (HTTP2 frames). A crash in any of them takes the whole runner down, every job on it included,
 //! so each test holds the parser to returning, with an answer or an error, whatever the input,
@@ -27,6 +27,7 @@ const regex = @import("regex.zig");
 const yaml = @import("yaml.zig");
 const image = @import("native/oci/image.zig");
 const layer = @import("native/oci/layer.zig");
+const zstd = @import("native/oci/zstd.zig");
 const registry = @import("native/oci/registry.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
@@ -680,6 +681,229 @@ fn ociManifests(_: void, smith: *Smith) !void {
     }
     // The same bytes as an image's config.
     _ = std.json.parseFromSliceLeaky(image.Config, arena, json, .{ .ignore_unknown_fields = true }) catch {};
+}
+
+// --- zstd ---
+
+/// "fuzz: zstd" holds the runner's decoder (`oci/zstd.zig`, which reads every zstd layer a
+/// registry sends) to what std's `std.compress.zstd`, the slow oracle, makes of the same bytes,
+/// and to its own limits. The input is a stream of frames. Both decoders read it, to the same
+/// window limit and to the same output cap (a bomb is cut off, not waited for), and then:
+///
+///  - both fail, or both give the same bytes (or the same first `zstd_output` of them);
+///  - the runner's decoder takes nothing std refuses, and refuses nothing std takes, except where
+///    std is the one that is lenient or does not do it: a dictionary id of 0 and std's own
+///    limits (it refuses the flag, not the id), and an offset beyond the frame's window or its
+///    start, which std checks only against its buffer, not the frame;
+///  - a failure has a reason (`Decompress.err`), and the heap stays within `zstd_heap` live bytes,
+///    which window, blocks and tables fit in with room to spare: nothing the stream says
+///    allocates more;
+///  - no more than 128 KiB comes out of 4 bytes of input (a block's header and its one byte), so
+///    the work is in proportion to the input; and an input takes under `zstd_seconds`.
+const zstd_input = 80 * 1024;
+const zstd_window = 1 << 20;
+const zstd_output = 1 << 20;
+const zstd_heap = 4 << 20;
+const zstd_seconds = 10;
+
+var zstd_oracle_window: [zstd_window + std.compress.zstd.block_size_max]u8 = undefined;
+var zstd_ours_out: [zstd_output]u8 = undefined;
+var zstd_oracle_out: [zstd_output]u8 = undefined;
+
+/// The heap a run of "fuzz: zstd" gets: an allocator that fails past `limit` live bytes. One run at
+/// a time (the fuzzer is one thread), so it is a global, which needs no cast from the allocator's
+/// pointer.
+var zstd_budget: struct { limit: usize = zstd_heap, live: usize = 0 } = .{};
+
+const zstd_budget_vtable: std.mem.Allocator.VTable = .{
+    .alloc = struct {
+        fn f(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            if (len > zstd_budget.limit - zstd_budget.live) return null;
+            const p = std.testing.allocator.rawAlloc(len, alignment, ret) orelse return null;
+            zstd_budget.live += len;
+            return p;
+        }
+    }.f,
+    .resize = struct {
+        fn f(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) bool {
+            if (new_len > memory.len and new_len - memory.len > zstd_budget.limit - zstd_budget.live) return false;
+            if (!std.testing.allocator.rawResize(memory, alignment, new_len, ret)) return false;
+            zstd_budget.live = zstd_budget.live - memory.len + new_len;
+            return true;
+        }
+    }.f,
+    .remap = struct {
+        fn f(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
+            if (new_len > memory.len and new_len - memory.len > zstd_budget.limit - zstd_budget.live) return null;
+            const p = std.testing.allocator.rawRemap(memory, alignment, new_len, ret) orelse return null;
+            zstd_budget.live = zstd_budget.live - memory.len + new_len;
+            return p;
+        }
+    }.f,
+    .free = struct {
+        fn f(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            std.testing.allocator.rawFree(memory, alignment, ret);
+            zstd_budget.live -= memory.len;
+        }
+    }.f,
+};
+
+const zstd_files = [_][]const u8{
+    "bin6k-l19",            "bin6k",                      "empty",                  "hand-dictid0",           "hand-raw",
+    "hand-rle-window",      "hand-rle",                   "period-l19",             "period",                 "random3k",
+    "skew4k-l19",           "skew4k",                     "skippable-only",         "skippable-then-frame",   "text12k-checksum",
+    "text12k-fast",         "text12k-l1",                 "text12k-l19",            "text12k-l22",            "text12k-l3",
+    "text12k-stdin-nosize", "text12k-wlog17",             "text300",                "text3k-l9",              "text3k-stdin",
+    "text40",               "two-frames",                 "zeros20k-l19",           "zeros20k",               "blocks-l3",
+    "blocks-l9",            "blocks-l19",                 "blocks-l1",              "blocks-bin",             "blocks-bin-l19",
+    "blocks-w10",           "hand-huffman-direct-f0",     "hand-huffman-direct-f1", "hand-huffman-direct-f2", "hand-huffman-direct-f3",
+    "hand-literals-rle",    "hand-sequences-rle-refused", "hand-sequences-rle",     "hand-window-slides",
+};
+
+/// The seed corpus (`fuzz_corpus/zstd`), 1.5.7's `zstd` and libzstd's frames of text, a binary,
+/// random bytes (raw blocks), runs (RLE blocks, repeated offsets) and a skewed alphabet, at levels
+/// from `--fast` to `--ultra -22` and in blocks of 1.3 KB (`targetCBlockSize`, so a short input
+/// has many that reuse the last one's tree and tables), with and without a checksum, a content size
+/// or a window descriptor, behind and between skippable frames and concatenated; and frames made
+/// by hand for what zstd does not write at this size: a dictionary id of 0, a window that slides
+/// (a match across 150 KB), Huffman trees of direct weights in all four literals headers, RLE
+/// literals, RLE sequence tables, and a repeat offset out of reach. Together the seeds reach every
+/// literals type and size format, every sequences table mode, and all four repeat offsets.
+const zstd_seeds = zstd_seeds: {
+    var out: [zstd_files.len][]const u8 = undefined;
+    for (zstd_files, 0..) |name, i| out[i] = seed(&.{@embedFile("fuzz_corpus/zstd/" ++ name ++ ".zst")});
+    const final = out;
+    break :zstd_seeds &final;
+};
+
+test "fuzz: zstd" {
+    try std.testing.fuzz({}, zstdFrames, .{ .corpus = zstd_seeds });
+}
+
+/// What a decoder made of the input: `done` (all of it), `capped` (the output buffer full, with
+/// more perhaps to come) or `failed`.
+const ZstdRun = enum { done, capped, failed };
+
+fn zstdRead(r: *std.Io.Reader, out: []u8) struct { ZstdRun, usize } {
+    const n = r.readSliceShort(out) catch return .{ .failed, 0 };
+    return .{ if (n == out.len) .capped else .done, n };
+}
+
+/// Why std refuses a stream the runner's decoder takes, when std is the one that does not do it:
+/// a dictionary id flag (with an id of 0, which is no dictionary) and the limits of its buffers.
+fn zstdOracleDeclines(why: ?std.compress.zstd.Decompress.Error) bool {
+    const e = why orelse return false;
+    return switch (e) {
+        error.DictionaryIdFlagUnsupported,
+        error.WindowOversize,
+        error.OutputBufferUndersize,
+        error.SequenceBufferUndersize,
+        error.InputBufferUndersize,
+        => true,
+        else => false,
+    };
+}
+
+fn zstdOracleLenient(why: zstd.Error) bool {
+    return switch (why) {
+        error.BadOffset, error.IncompleteHuffmanTree, error.BadLiteralStream => true,
+        else => false,
+    };
+}
+
+fn zstdFrames(_: void, smith: *Smith) !void {
+    var buf: [zstd_input]u8 = undefined;
+    try zstdAgrees(take(smith, &buf));
+}
+
+// The fuzzer's byte mutations rarely make the exact change that tells two decoders apart (the
+// marker bit of a stream's last byte moved, one bit of a header), so every bit of each small
+// seed is flipped, one at a time, as a test.
+test "zstd decoders: every bit of the small seeds flipped" {
+    var buf: [400]u8 = undefined;
+    // Under Valgrind (many times slower, two decoders a run) every 37th bit: it looks for memory
+    // errors, which any input shows, not for disagreements.
+    const stride: usize = if (std.valgrind.runningOnValgrind() != 0) 37 else 1;
+    inline for (zstd_files) |name| {
+        const frame = @embedFile("fuzz_corpus/zstd/" ++ name ++ ".zst");
+        if (comptime frame.len <= buf.len) {
+            var bit: usize = 0;
+            while (bit < frame.len * 8) : (bit += stride) {
+                @memcpy(buf[0..frame.len], frame);
+                buf[bit / 8] ^= std.math.shl(u8, 1, bit % 8);
+                zstdAgrees(buf[0..frame.len]) catch |e| {
+                    std.debug.print("SEED {s} bit {d} {x}\n", .{ name, bit, buf[0..frame.len] });
+                    return e;
+                };
+            }
+        }
+    }
+}
+
+/// `input` read by the runner's decoder and by std's, and held to the target's properties.
+fn zstdAgrees(input: []const u8) !void {
+    const io = std.testing.io;
+    const started = std.Io.Timestamp.now(io, .awake);
+
+    zstd_budget.live = 0;
+    const heap: std.mem.Allocator = .{ .ptr = &zstd_budget, .vtable = &zstd_budget_vtable };
+    var in: std.Io.Reader = .fixed(input);
+    const d = try zstd.Decompress.create(heap, &in);
+    defer d.destroy();
+    d.window_limit = zstd_window;
+    const mine, const mine_len = zstdRead(&d.reader, &zstd_ours_out);
+    const ours = zstd_ours_out[0..mine_len];
+
+    var oracle_in: std.Io.Reader = .fixed(input);
+    var oracle: std.compress.zstd.Decompress = .init(&oracle_in, &zstd_oracle_window, .{ .window_len = zstd_window });
+    const theirs, const theirs_len = zstdRead(&oracle.reader, &zstd_oracle_out);
+    const want = zstd_oracle_out[0..theirs_len];
+
+    // A failure has a reason, and none is for want of memory.
+    if (mine == .failed) {
+        try std.testing.expect(d.err != null);
+        try std.testing.expect(d.err.? != error.OutOfMemory);
+    }
+    // Reading on after a failure fails again, or ends, and never reads out of bounds.
+    var more: [64]u8 = undefined;
+    if (d.reader.readSliceShort(&more)) |_| {} else |_| {}
+
+    switch (mine) {
+        .done => switch (theirs) {
+            .done => try std.testing.expectEqualSlices(u8, want, ours),
+            .capped => return zstdDisagree(input, "the runner's decoder ends, std's gives more", d.err, oracle.err),
+            .failed => if (!zstdOracleDeclines(oracle.err)) return zstdDisagree(input, "std refuses what the runner's takes", d.err, oracle.err),
+        },
+        .capped => switch (theirs) {
+            .capped => try std.testing.expectEqualSlices(u8, want, ours),
+            .done => return zstdDisagree(input, "std's decoder ends, the runner's gives more", d.err, oracle.err),
+            .failed => if (!zstdOracleDeclines(oracle.err)) return zstdDisagree(input, "std refuses what the runner's takes", d.err, oracle.err),
+        },
+        .failed => switch (theirs) {
+            .failed => {},
+            // What std does not look at, and libzstd refuses (each found by this target, and
+            // checked against `zstd -d`): an offset beyond the frame's window or start (std checks
+            // its buffer), a Huffman tree whose weights leave no power of two for the last symbol,
+            // and a literal stream that holds more or fewer bits than its symbols take (std moves
+            // on to the next of the four streams).
+            .done, .capped => if (!zstdOracleLenient(d.err.?)) return zstdDisagree(input, "the runner's refuses what std takes", d.err, oracle.err),
+        },
+    }
+
+    // Work in proportion to the input: a block is 4 bytes at the least and holds 128 KiB at the most.
+    if (mine != .capped) try std.testing.expect(mine_len <= (input.len / 4 + 1) * std.compress.zstd.block_size_max);
+    const took = started.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+    try std.testing.expect(took < zstd_seconds * std.time.ns_per_s);
+}
+
+fn zstdDisagree(input: []const u8, what: []const u8, ours: ?zstd.Error, theirs: ?std.compress.zstd.Decompress.Error) error{ZstdDisagreement} {
+    std.debug.print("zstd: {s} (runner's: {?s}, std's: {?s}), {d} input bytes\n", .{
+        what,
+        if (ours) |e| @errorName(e) else null,
+        if (theirs) |e| @errorName(e) else null,
+        input.len,
+    });
+    return error.ZstdDisagreement;
 }
 
 // --- minisign ---

@@ -82,7 +82,16 @@ default (`direct`) behaves exactly as before. With `none`:
   cgroup of its own, so `memory.max` and `pids.max` hold it, and through the memory gate as a job
   of its own (the pool's extra slot); a failure is said ("pre-warm failed ...") and the first
   job makes what it needs, as it always did. A native pool with an engine warms the native
-  store too, before the engine's. The memory gate has no engine source (as `RUNNER_ENGINE_CGROUP=none`): it holds on the
+  store too, before the engine's.
+  `RUNNER_PREWARM=before-listen` (`--prewarm=before-listen`) makes the native warm finish
+  before any runner registers or polls (`loop.Warmer.beforeListen`, called by `pool`), so a
+  machine added for scaling takes jobs only once warm: on razorbill (Pi 5, empty store) the
+  warm takes 209 s, a Zig job sent during it took 284 s and one after it 6-13 s. Nothing registers
+  before the pool's runners start, so no runner is held online and idle meanwhile. A failed warm is
+  said and the runners listen; a warm over 15 minutes (`before_listen_max_ms_default`) is
+  cancelled, said, and the runners listen; a stop ends the wait with no "ready". The engine's warm
+  (Dagger) keeps its background behaviour. No systemd or compose readiness signal is involved
+  (no `Type=notify` or healthcheck exists), so "started" still means the process is up. The memory gate has no engine source (as `RUNNER_ENGINE_CGROUP=none`): it holds on the
   machine and on each job's cgroup, and logs nothing about an engine cgroup. The silence-timeout
   line is not printed.
 - **Jobs.** A job native can run runs natively as always. One it cannot (`Backend.unsupported` or
@@ -162,8 +171,8 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   gating every submodule checkout would cost its replay.
 - Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a job the runner
   does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
-  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, a `volumes:` entry that is a host path or
-  otherwise not a directory of the job, or an `options:` flag the native job does not carry out (all below, "Job container options"), `services:`
+  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, a `volumes:` entry the native job does not carry out
+  (a host path it does not allow fails instead), or an `options:` flag the native job does not carry out (all below, "Job container options"), `services:`
   on a rootless runner or with an image given by an expression (native since P6, below, their
   images pulled by P3), JavaScript and local `uses:` actions (P7, `actions.preload`), remote `uses:` actions in an
   image with no git to fetch them with, `docker://` images
@@ -767,7 +776,7 @@ directories and the step's file-command files at a 4 KiB block each.
 - "Set up job" says what the job got: "Image: pulled natively in N ms (L layers, K KB fetched)" or
   "Image: from the native store", and "Provisioned natively in N ms (layer <key>)" or "...made
   before".
-- Falls back to Dagger: a job container's `ports:`, `volumes:` that are not directories of the job
+- Falls back to Dagger: a job container's `ports:`, `volumes:` the native job does not carry out
   and `options:` flags the native job does not carry out ("Job container options", below), and on a rootless runner without
   `RUNNER_NATIVE_ROOTFS` the provisioned default image (below).
 
@@ -800,10 +809,17 @@ What it does not do yet (debt, with the phase that pays it):
 
 - **Each image is flattened whole.** Two images that share layers share their blobs on disk but
   not their unpacked files. P2's stacked layers could keep layers apart.
-- **Layers are fetched one at a time**, and a broken download starts over. Parallel fetches are a
-  measured optimisation for later (P9's real workloads); ubuntu has one layer.
-- **zstd frame checksums are not checked** (std's streaming zstd cannot yet); the blob's digest is
-  checked before and the diff id after, which covers it.
+- **Layers are fetched three at a time, in order, while the earlier ones unpack**, and a broken
+  download starts over. A blob still goes into the store whole and synced, as before
+  (`image.zig`, `Prefetch`).
+- **A layer's inflating and hashing run on a thread beside its unpacking** (`layer.zig`, `Pipe`),
+  and a large file's writeback is started as it is written (`sync_file_range`, advisory) so the
+  `syncfs` before the rename has little left to write. The publish order is unchanged: nothing is
+  durable by the early writeback, only by that `syncfs`.
+- **zstd is the runner's own decoder** (`oci/zstd.zig`), because std's took 19 s for a 500 MB layer
+  (one bit at a time through the Huffman tree) and this one 1 s; std's decoder is its test
+  oracle. Frame checksums are not checked; the blob's digest is checked before and the diff id
+  after, which covers it. Dictionaries are refused, and so is a window over 128 MiB.
 - **Rootless** (tests, the laptop): only root is mapped, so every file is the runner's,
   directories keep their owner's write bit, an image whose `USER` is not root cannot run, and the
   default image cannot be provisioned (dpkg gives files to other ids, `root:adm`, which fails with
@@ -930,10 +946,52 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   step under the pool's lock, so jobs named in the same moment pass one at a time, each counting
   the ones before it: of six `zig build test` jobs learned at 2.6 GB with 7.4 GB available, two
   start (1.5 GB floor + 5.2 GB) and four wait. Jobs waiting do not count each other, which would
-  hold them all for ever; the runners polling do count them, so no new job is taken while a heavy
-  one waits unless there is room for both. A small job named meanwhile starts beside the waiting
-  heavy ones. The wait is in the job's own log ("Waiting for room in memory before starting")
+  hold them all for ever; the runners polling count the one that has waited longest, not the rest
+  (#415: counting all of them held small jobs at GitHub for 182-266 s behind heavy jobs waiting
+  for room), so no new job is taken while the first in line waits unless there is room for both.
+  A job named meanwhile that is not first in line must leave that room too (`Admission.withHead`),
+  so the first in line is never delayed by a job that began waiting after it did.
+  - *Short jobs go ahead* (#415). Counting the first in line still held small jobs at GitHub while
+    it waited for a heavy job to end. The pool now learns how long each name runs (the longest of
+    its last five runs, kept with its memory: a job that is sometimes long is not taken for a
+    short one). A job named while another waits, that does not fit beside it but fits without it,
+    starts anyway when its name ran at most 60 s (`short_run_ms`) in each of those runs; a name not
+    learned, or learned longer, waits behind the first in line as before. A runner polling cannot
+    know its job, so it passes on the same room test (it fits without the first in line) and the
+    job it is handed is then told at start; the cost of a wrong guess is a runner holding a job,
+    so no poller passes once half the pool's runners hold waiting jobs. The first in line is
+    protected by when this is allowed: only while it would not fit even with every job that went
+    ahead gone (it waits for jobs not expected to end soon), and while some job that did not go
+    ahead runs (when only those do, it is the one forced when they end, #386). Once it would fit
+    without them no more go ahead, so a stream of short jobs delays it only by the ones in flight,
+    each for as long as it was learned to run: 60 s at most, and nothing like the 182-266 s the
+    e2e burst waited. A job learned short that runs long (a `short_run_ms` guess gone wrong) delays
+    it by that run, once: after 120 s (`overdue_ms`) no more go ahead on the word of a learned time
+    while it runs, and when it ends its run is learned, so its name is long for its next five runs.
+  - The runners polling on a native pool count natively for the engine's cap: a busy engine does not hold
+  runners whose jobs never run in it (#414). The wait is in the job's own log ("Waiting for room in memory before starting")
   and ends when a reservation drops (`Admission.changes`, within 50 ms) or at the next recheck.
+  - *A machine that cannot fit one job* (#406). At start the runner compares one job's reservation
+    plus the floor (`RUNNER_NATIVE_MEM_PER_JOB_MB` or `RUNNER_MEM_PER_JOB_MB`, and
+    `RUNNER_MIN_MEM_AVAILABLE_MB`) with the machine's memory, or the memory limit of the cgroup it
+    runs under if that is less, and on the engine with the engine's cap less
+    `RUNNER_MIN_ENGINE_HEADROOM_MB`; if no job could ever start it exits with a message naming the
+    settings and the numbers (`Admission.misfit`). While running, when nothing runs, no job waits
+    and no other runner polls, one runner polls whatever the room (said in the log): a machine
+    that has less memory than at start does not idle in silence.
+  - *The estimates survive a restart* (#407). `Admission.learned` and `learned_native` are kept in
+    `memory-gate-<RUNNER_NAME_PREFIX>` in the native store's directory (`RUNNER_NATIVE_STORE`,
+    `Config.nativeStore`; written there for a Dagger pool too; one file for each pool, as pools on
+    one machine share the directory), one text line a name, versioned (`zig-runner memory gate
+    v2`), with the machine id, `MemTotal` and the backend they were measured on. It is written
+    atomically (temp file, fsync, rename, fsync of the directory) when something was learned, at
+    most every 10 s and when the pool ends, and read at start, where the log says how many were
+    loaded. A file from another machine, another amount of memory (more than 1/16 apart), another
+    backend or format version, or a damaged one, is not used and is warned of; the next write
+    replaces it (v1 had no run times: it is not used). The table keeps the last five runs of a name, and how long each ran (#415), and the 64 used most recently, as
+    before: a name's estimate is the most of those runs, so one learned low (a warm `zig build
+    test` at 64 MB) still reserves little for a cold one until a heavy run has been seen, restart
+    or not.
   - *No deadlock.* When every runner holds a job and none has room, nothing is running to free
     any: the job that came first starts regardless (said in its log), the others wait for it, and
     the next oldest follows as each ends. The machine cannot get freer, and a job over
@@ -1433,27 +1491,155 @@ is handed to it as `-p`. The runner always adds `/var/run/docker.sock`, the work
 actions and externals directories and `/github/home` and `/github/workflow` itself. A volume at
 `/` only gets a warning from the runner.
 
-**`volumes:` carried out.** An anonymous volume (`- /data`) and a named one (`- cache:/cache`,
-`- cache:/cache:rw`) are directories of the job's filesystem: the base makes each mount point
-(`Backend.volumeDirs`, one `mkdir -p` after the work root is made and handed to the step user, in
-the base's key), root's as Docker makes a new volume's mount point, and what the image has there
-stays, which is where a Docker volume starts. Every step sees it, so a file one step writes is
-there for the next, and it goes with the job (the job's layers are removed when it ends). No mount
-is made, so the sandbox and the network are untouched. "Set up job" says how many were made and how
-many were named.
+**`volumes:` carried out: anonymous.** An anonymous volume (`- /data`) is a directory of the job's
+filesystem: the base makes its mount point (`Backend.containerVolumes`, one `mkdir -p` after the
+work root is made and handed to the step user, in the base's key), root's as Docker makes a new
+volume's mount point, and what the image has there stays, which is where a Docker volume starts.
+Every step sees it, so a file one step writes is there for the next, and it goes with the job (the
+job's layers are removed when it ends). No mount is made.
 
-Docker's named volumes outlive the job; a native one does not. On a GitHub-hosted runner every job
-is a fresh machine and none does, so a workflow written for it cannot depend on that; on a
-self-hosted runner one could. Making them last would reuse the cache volumes' store
-(`volumes.zig`: a name under the repository and its trust scope, the shared lock, the id mapping)
-and its eviction would then lose the data a Docker volume keeps, so it is not done here.
+**`volumes:` carried out: named, kept between jobs as Docker's are** (decided 2026-11-08). A named
+volume (`- cache:/cache`, `- cache:/cache:rw`, `- cache:/cache:ro`) is a directory of the native
+store beside the cache volumes, `volumes/<owner>/<repository>/<scope>/named/<name>`
+(`volumes.namedKey`, `openNamed`), bound at its target in every step:
+
+- **Trusted jobs only, scoped by repository.** Docker's volumes are one namespace for the whole
+  host. Here a name is its repository's, and only a job the runner vouches for, in scope `repo`
+  (`set_up.packageCacheScope`), gets one, because a volume holds what one job left for the next,
+  which reads it as its own. **A job the runner does not vouch for, and a fork's pull request on a
+  runner that vouches for pull requests (scope `untrusted`), fail** in "Set up job", naming the
+  volume and saying that an anonymous volume (`- /path`) lasts as long as the job: kept per
+  repository in an `untrusted` scope, one fork's pull request could plant files the next fork's runs,
+  and each would hold store space no review let in (refused rather than keyed per fork and pull
+  request number, as #420 refuses host paths and #423 ports to those jobs). A workflow that shares
+  a volume between repositories on Docker gets one per repository.
+- **Filled from the image when new**, as Docker copies the image's files into a volume
+  (moby `daemon/create_unix.go`, `populateVolume`, and `daemon/container/container_unix.go`,
+  `copyExistingContents`): what the image has at the target (its files, owner and mode, by `cp -a`
+  in a sandbox of the job's image, as the job's root, whose layer is dropped) goes into a volume
+  this job made, and never into one that exists, so what an earlier job left is never written over.
+  Docker copies into any *empty* volume; here only a new one is filled, so a volume a job emptied
+  stays empty. An image without `cp` and with files at the target fails the job in "Set up job",
+  and the volume is removed again so the next job fills it.
+- **Shared by jobs at once, as Docker's are.** Each job holds the volume's lock shared to its end,
+  as a cache volume's (an eviction takes only one no job holds). A new volume is held exclusively
+  while it is filled, so a second job opening it meanwhile waits for it whole; an open never waits
+  for a job that holds it shared, and never for good: it polls the lock (`LOCK_NB`) for at most the
+  filling's limit plus a minute, and gives up at once when the job is cancelled (`volumes.Wait`),
+  failing the job saying why. The filling itself is stopped after 10 minutes, or at the job's
+  cancel (`Backend.SeedWatch`), the volume removed so the next job fills it. Two jobs writing the
+  same files at once race as two containers on one Docker volume do.
+- **Ids**: a cache volume's (`Bind.volume`): owned on disk by the volumes' range on a root runner
+  and seen through an idmapped mount as the job's own ids, the same in every slot, never the host's;
+  nosuid and nodev. `:ro` binds it read-only (`MOUNT_ATTR_RDONLY` with the rest, in one
+  `mount_setattr`), checked in `/proc/self/mountinfo` by the tests.
+- **Evicted as a cache volume is: unlike Docker's, a named volume can disappear.** It counts
+  toward `RUNNER_NATIVE_VOLUMES_MAX_MB`, and goes, least recently used first, when the volumes are
+  over that cap and it has not been used for a day, or when the disk is under its floor
+  (`RUNNER_NATIVE_MIN_FREE_PCT`) and it has not been used for an hour ("Eviction", above). The next
+  job then gets it new, filled from its image again. What a workflow keeps in one must be something
+  it can make again; anything that must last belongs in an artifact, a cache action or a host path
+  an operator allows. **No cap of its own**, on purpose: a job that fills a named volume can evict
+  only volumes no job holds that were not used for a day (over the cap) or an hour (under the
+  disk's floor), never one in use, exactly as it could by filling one of its cache volumes (`pip`,
+  `npm`, a tool cache), which every trusted job already has. A separate cap would not stop that,
+  and only untrusted jobs could make the difference, which now get no named volume.
+- **Nesting**: a named volume may not be inside another named volume, nor be nested with a host
+  path (the job fails in "Set up job", naming both): the inner one's mount point would be made by
+  the step's helper through the outer bind, in a directory jobs write (with `RESOLVE_NO_XDEV` it
+  would fail the step anyway). An anonymous volume inside a named one, or a named one inside an
+  anonymous one, nests as Docker's do.
+- **Step caching is off** for a job with a named volume: what a step read from it or wrote to it
+  is in no key and no layer, so a replay would stand for a run against other contents and leave the
+  volume as it was. "Set up job" says so.
+
+"Set up job" says how many volumes were made as directories, how many are named, in which scope,
+and how many were new.
+
+**`volumes:` carried out: host paths, off by default** (`/srv/data:/data`, `/srv/data:/data:ro`;
+`runner/src/native/host_paths.zig`, `Backend.hostVolumes`, `sandbox.bindHostIn`). A job may bind a
+host directory only when the operator allows it, and only on a root runner:
+
+- **`RUNNER_NATIVE_HOST_PATHS`** (`--native-host-paths`): colon- or comma-separated absolute
+  directories; empty, the default, allows none. A job may bind one of them or a directory below
+  one. Each is canonicalised with `realpath` when the runner starts, and **the runner refuses to
+  start** (`config error: RUNNER_NATIVE_HOST_PATHS: ...`, naming the entry) when one does not
+  exist, is not a directory, is `/`, resolves under `/proc`, `/sys`, `/dev` or `/run` (the Docker
+  and systemd sockets live there), is, holds or lies inside one of the runner's own paths
+  (`RUNNER_NATIVE_STORE`, which holds every job's layers and volumes, `RUNNER_NATIVE_ROOTFS`, the
+  log spool `RUNNER_LOG_SPOOL_DIR/zig-runner-<uid>`, the runner's own executable, the directory of
+  `GH_APP_PRIVATE_KEY_FILE`, systemd's `$CREDENTIALS_DIRECTORY`, and the env files the deploy files
+  use, `/etc/zig-runner.env` and `/etc/zig-runner-deploy.env`), or **is on a mount without
+  `nosuid` and `nodev`**. A job reading or writing the runner's paths could read its secrets or
+  change other jobs. The mount must be `nosuid,nodev` on the host, not only in the job: the job's
+  root can make a setuid file in a directory it writes, and a host user running it from the host's
+  mount would get the volumes' ids (which own every job's cache volumes). Mount the filesystem
+  with `-o nosuid,nodev`, or bind the directory onto itself so (`mount --bind /srv/data /srv/data
+  && mount -o remount,bind,nosuid,nodev /srv/data`, or `Options=bind,nosuid,nodev` in a systemd
+  mount unit). A **rootless runner refuses to start** with the setting, and fails a job that asks
+  for one: its jobs' root is the runner's own user on the host, with no idmapping, so a job would
+  write as the runner and could change its files.
+- **The list is the one checked at start.** Each job holds it to what the runner checked then
+  (`host_paths.recheck`): an entry whose path now resolves elsewhere (a symlink repointed), or is
+  another directory (its device and inode changed: moved, replaced, remounted), or whose mount
+  lost `nosuid`/`nodev`, is closed for that job, and "Set up job" names it. The setting is never
+  read again, so a list can never become wider than the one the runner started with.
+- **Untrusted jobs never get one**, whatever the list says: a job the runner does not vouch for
+  (`trust.vouches` false), and a fork's pull request on a runner that vouches for pull requests
+  (scope `untrusted`, `set_up.packageCacheScope`), fail.
+- **What a refusal says.** The job's source is checked as written, lexically (`.` and `..` taken
+  out), against the list before anything of it is looked at on the host, and every refusal of a
+  source (outside the list, through a link out of it, missing, not a directory) is the same
+  sentence naming the source and the allowed list only, so a job cannot use it to learn what
+  exists on the host or where a link points.
+- **Symlinks**: the job's source is then resolved with `realpath` and checked against the list
+  again, so a link inside an allowed directory that points out of it is refused. The step's helper
+  then opens that canonical path from `/` with `openat2(RESOLVE_NO_SYMLINKS)`, so a link swapped in
+  after the check fails the step instead of escaping, and checks with `fstatfs` that what it
+  opened is on a `nosuid,nodev` mount.
+- **Targets**: a host path may not be nested with another volume of the job, anonymous, named or
+  another host path (one inside the other, as written: the job fails, naming both), nor overlap
+  the runner's own mounts (as every volume). A job may list host paths and named volumes side by
+  side. The helper, still the host's root on a root runner, makes every bind's mount point in
+  the job's overlay before the first bind, through no mount (`RESOLVE_NO_XDEV`), and then finds
+  each cache volume's and host path's target through no mount either: one that resolves into
+  another bind, through a symlink of the image's (`/y -> /x`, with `/x` a host path and `/y/z`
+  another), fails the step. Otherwise it would make and `chown` a directory inside the host
+  directory on the job's behalf.
+- **The mount**: an `open_tree(OPEN_TREE_CLONE)` of that directory alone (no mount below it comes
+  along), `nosuid` and `nodev` always, `ro` for `:ro`, set in one `mount_setattr` and moved into the
+  step's mount namespace only (the host's mount table never has it). Directories only: a file (a
+  socket) is refused. On a root runner it is made before the job's user namespace is entered, so
+  the job cannot remount it writable, suid or dev (the kernel locks those flags; the tests try).
+- **Ids** (the decision): on a root runner the mount is **idmapped as a cache volume's**, through
+  the volumes' range (`Backend.volumeIdBase`, `RUNNER_NATIVE_SUBID_BASE + 250 * 65536`, by default
+  1916384000): a file owned on disk by that id plus *n* is the job's id *n*, the same in every slot,
+  and **every other id, host root's and the host users' included, is `nobody` (65534) to the job**.
+  So a job reads what the modes let others read, and writes only where the operator gave a
+  directory to that range (`chown -R 1916384000:1916384000 /srv/data` makes it the jobs' root's);
+  what it writes is owned by the range, never by a host user, so it can never leave a file a host
+  user owns. Not Docker's default, where the container's root is the host's root; that is not
+  given to a job here. Where the filesystem cannot be idmapped (the kernel refuses with `EINVAL`:
+  NFS, ramfs; ext4, xfs, btrfs and tmpfs can on the Ubuntu 24.04+ and Raspberry Pi kernels this
+  supports) **the step fails**, naming `RUNNER_NATIVE_HOST_PATHS_UNMAPPED`, and is not sent to
+  Dagger. **`RUNNER_NATIVE_HOST_PATHS_UNMAPPED=true`** (`--native-host-paths-unmapped`; off by
+  default, said in "Set up job" either way) binds such a filesystem with the host's ids as they
+  are instead: host ids are still `nobody`, and what a job writes is owned by its slot's ids
+  (`RUNNER_NATIVE_SUBID_BASE + slot * 65536 + n`), which the next job in that slot has too.
+- **Refused natively, not sent to Dagger**: a host path the list does not allow fails the job in
+  "Set up job" with the reason, naming `RUNNER_NATIVE_HOST_PATHS`, and so does a refusal of the
+  step's helper while it binds one. This follows the convention of this section for what the
+  native job understands and will not do (an unknown `--user`, a volume over the workspace: both
+  fail the job), not the one for what it does not carry out (those go to Dagger). Sent to Dagger,
+  the volume would be ignored with a warning and the job would run without the directory it asked
+  for.
+- **Step caching is off** for a job with a host path: its contents are in no key and no layer.
 
 **Refused (the job goes to Dagger, with the volume named in "Set up job", as an `options:` flag is).**
 
 | `volumes:` entry | Why |
 |---|---|
-| `/host/path:/target` (a source starting with `/`, including `/var/run/docker.sock`) | A bind from the host. Needs a mount outside the cache volumes' fixed set (`sandbox.Spec.binds` is built by the runner, never from a workflow), a policy for which host paths a job may mount (the runner's store, `/etc` and the Docker socket are host paths), nosuid/nodev and the id mapping of a root runner's slot (`Bind.volume`) so files the job writes are not the host's root's. Mount and privilege code. |
-| `:ro` in either spelling | Read-only needs a mount of its own. |
+| `:ro` on an anonymous volume (`/data:ro`), in either spelling | An anonymous volume is a directory of the job's overlay, not a mount, so it cannot be read-only on its own. A named one and a host path's can (above). |
 | A named volume the job's `services:` list a volume for | A native service mounts no volume (it logs "Service volumes are not supported and were ignored"), so the volume would not be shared as it is on GitHub. An anonymous volume is the job container's alone, and is native whatever the services list. |
 | One name at two targets, or two volumes at one target | Docker refuses the second; the first would need a bind to be one directory in two places. |
 | A target that is relative, has a `..`, is `/`, is under `/proc`, `/sys` or `/dev`, or is a directory the runner mounts itself (`/__w`, `/__t`, `/__e`, `/github/home`, `/github/workflow`, `/var/run/docker.sock`) | Docker refuses them or they are the sandbox's. |
@@ -1494,7 +1680,36 @@ each entry above, and `unsupported`'s reasons for ports, volumes (with and witho
 options and expressions (`container_options.zig`, `Backend.zig`); a native job with `--user app -e
 ... --workdir ... --health-*` that runs as the image's `app` user with the options' env over the
 container's, a native job whose anonymous and named volumes are there for every step, and one whose
-volume clashes with the workspace fails in "Set up job" (root runner, in CI).
+volume clashes with the workspace fails in "Set up job" (root runner, in CI). Named volumes
+(`volumes.zig`, `evict.zig`, `Backend.zig`): kept between opens and new only the first time, apart
+for another scope or repository; a second open waits while a new one is filled and then shares it,
+but only so long and not past a cancel,
+and one whose filling failed is made again; one in use survives an eviction and an unused one goes;
+and as root, across real jobs: kept between jobs, filled from the image (owner and mode too) only
+when new, apart for another repository, refused for a fork's pull request and for a job whose ref
+the runner does not vouch for (`Config.vouched` false) with nothing left in the store, `:ro`
+refusing writes, remounts (`ro` to `rw`, to `suid,dev`) refused, both mounts nosuid and nodev in
+`/proc/self/mountinfo`, and a filling that does not end stopped at its limit and the volume filled
+by the next job. Host paths
+(`host_paths.zig`, `Backend.zig`): the setting's separators, symlinks resolved, and each refusal
+(relative, missing, a file, `/`, `/proc`, `/sys`, `/dev`, `/run`, the store, inside it, above it);
+a job's source allowed in the list and below it, through a link that stays inside, refused through
+one that leaves, outside it, and with none allowed; and as root, real jobs: an allowed directory
+read and written (the host's file `nobody`'s to the job, the job's file the volumes' range's on the
+host), a second bind `:ro` refusing writes, both `nosuid,nodev` in `/proc/self/mountinfo`, and
+remount attempts (`ro` to `rw`, `nosuid,nodev` to `suid,dev`) refused and the mounts unchanged, and
+failures naming the setting for a path outside the list, a link out of it (saying the same, naming
+not where it points), a mount below the list without `nosuid`/`nodev`, a host path nested with
+another volume, a fork's pull request and a job whose ref the runner does not vouch for
+(`Config.vouched` false, as `configFor` makes it), and an empty list; a host path reached through
+the image's symlink into another one fails, and nothing is made in the first; a ramfs (no
+idmapping) refused without `RUNNER_NATIVE_HOST_PATHS_UNMAPPED`, and written as the slot's ids with
+it; and rootless, any host path refused. Unprivileged: a symlink swapped in after the check fails
+the helper's open, an entry on a mount without `nosuid,nodev` is refused at start, an entry
+repointed or replaced since the start is closed for the job, and the runner's App key directory
+and executable directory are refused. Both kinds in one job (root): a named volume and a host path
+side by side, each with its own contents, and a host path inside the named volume refused, naming
+both.
 
 ### P7: Docker actions
 

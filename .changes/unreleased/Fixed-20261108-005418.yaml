@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Native backend: a job container''s named volumes are refused for a job the runner does not vouch for and for a fork''s pull request, an open waits for another job''s filling of one only so long and not past a cancel, and the filling is stopped after 10 minutes or at the job''s cancel'
+time: 2026-11-08T00:54:18.373085429-05:00
