@@ -82,16 +82,39 @@ pub fn resolveUser(arena: Allocator, lowers: []const []const u8, user: []const u
     } };
 }
 
-/// Why an image run as `user` cannot be run natively, or null: root always can; another user
-/// only on a root runner (the shares are idmapped, `sandbox.Spec.Container.owner`), and one the
-/// image has.
-pub fn userReason(arena: Allocator, lowers: []const []const u8, ref: []const u8, user: []const u8) !?[]const u8 {
-    if (images.runsAsRoot(user)) return null;
-    if (std.os.linux.geteuid() != 0) return try std.fmt.allocPrint(arena, "the image {s} runs as " ++
-        "USER {s}, and a rootless runner's Docker actions run as root only", .{ ref, user });
+/// Who an image run as `user` runs as, or why it cannot be run natively: root always can; another
+/// user only on a root runner (the shares are idmapped, `sandbox.Spec.Container.owner`), and one
+/// the image has. Resolved once, so what is checked is what is used.
+pub fn userCheck(arena: Allocator, lowers: []const []const u8, ref: []const u8, user: []const u8) !union(enum) {
+    root,
+    ok: ImageUser,
+    refused: []const u8,
+} {
+    if (images.runsAsRoot(user)) return .root;
+    if (std.os.linux.geteuid() != 0) return .{ .refused = try std.fmt.allocPrint(arena, "the image " ++
+        "{s} runs as USER {s}, and a rootless runner's Docker actions run as root only", .{ ref, user }) };
     return switch (try resolveUser(arena, lowers, user)) {
-        .ok => null,
-        .refused => |why| try std.fmt.allocPrint(arena, "{s}: {s}", .{ ref, why }),
+        .ok => |u| .{ .ok = u },
+        .refused => |why| .{ .refused = try std.fmt.allocPrint(arena, "{s}: {s}", .{ ref, why }) },
+    };
+}
+
+test "userCheck resolves the user once: root is root, and a name the image lacks is refused" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    try std.testing.expect((try userCheck(arena, &.{}, "img", "")) == .root);
+    try std.testing.expect((try userCheck(arena, &.{}, "img", "root")) == .root);
+    // Rootless: refused for the runner; as root: for the image having no such user. Never `.ok`.
+    try std.testing.expect((try userCheck(arena, &.{}, "img", "nobody-here")) == .refused);
+    try std.testing.expect((try userReason(arena, &.{}, "img", "nobody-here")) != null);
+}
+
+/// Why an image run as `user` cannot be run natively, or null (`userCheck`).
+pub fn userReason(arena: Allocator, lowers: []const []const u8, ref: []const u8, user: []const u8) !?[]const u8 {
+    return switch (try userCheck(arena, lowers, ref, user)) {
+        .root, .ok => null,
+        .refused => |why| why,
     };
 }
 
@@ -188,17 +211,19 @@ pub fn run(
     var step_user: ImageUser = .{ .uid = 0, .gid = 0, .groups = &.{} };
     var owner: ?sandbox.Spec.Container.Owner = null;
     if (!images.runsAsRoot(img.user)) {
-        const why = try userReason(arena, img_lowers, ref, img.user);
-        if (why) |w| {
-            _ = try x.actionFailed(num, "{s}: {s}", .{ dr.label, w });
-            return null;
+        switch (try userCheck(arena, img_lowers, ref, img.user)) {
+            .refused => |w| {
+                _ = try x.actionFailed(num, "{s}: {s}", .{ dr.label, w });
+                return null;
+            },
+            .ok => |u| step_user = u,
+            .root => {},
         }
         if (b.how.userns != .mapped) {
             _ = try x.actionFailed(num, "{s}: a rootless runner's Docker actions run as root " ++
                 "only", .{dr.label});
             return null;
         }
-        step_user = (try resolveUser(arena, img_lowers, img.user)).ok;
         owner = .{
             .uid = step_user.uid,
             .gid = step_user.gid,

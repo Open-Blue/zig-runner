@@ -1191,6 +1191,11 @@ fn mappedRanges(uids: []const Range, gids: []const Range) linux.fd_t {
 const swap_ranges = 6;
 
 /// An id on disk that nothing owns (the last valid one): where `swapRanges` has the host's root.
+///
+/// Files owned by it show as the host's root through the slot's view (`X`), the mount `swapRanges`
+/// builds with `host_root`. That stays harmless only while `X` is mounted `nosuid` and `nodev`
+/// (`idmapMount` does): a setuid file there would be root's, and only `nosuid` has the kernel
+/// ignore the bit. Never mount `X` without them.
 const no_owner: u32 = std.math.maxInt(u32) - 1;
 
 /// The ranges that map ids `inside + n` to `outside + n` for `n` below `count`, but `a` to `b`
@@ -1270,6 +1275,39 @@ const job_view_work = "VW";
 
 const JobView = struct { canonical: linux.fd_t, slot: linux.fd_t };
 
+/// The directory `name` in `dir`, made if missing and given to `id` (user and group): never by
+/// path, which a link in its place would send to its target as host root would chown it. Made
+/// with `mkdirat` (it may exist: `EEXIST`), opened `O_NOFOLLOW | O_DIRECTORY` (a link or a file
+/// there fails) and given by its descriptor. Errno zero (`SUCCESS`) when it is done.
+fn ownedDirAt(dir: linux.fd_t, name: [*:0]const u8, id: u32) linux.E {
+    const made = linux.errno(linux.mkdirat(dir, name, 0o755));
+    if (made != .SUCCESS and made != .EXIST) return made;
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true };
+    const rc = linux.openat(dir, name, flags, 0);
+    if (linux.errno(rc) != .SUCCESS) return linux.errno(rc);
+    const fd = std.math.cast(linux.fd_t, rc) orelse return .BADF;
+    defer _ = linux.close(fd);
+    return linux.errno(linux.fchown(fd, id, id));
+}
+
+test "ownedDirAt makes a directory and refuses a link or a file in its place" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir: linux.fd_t = tmp.dir.handle;
+    const me = linux.getuid();
+    try std.testing.expectEqual(linux.E.SUCCESS, ownedDirAt(dir, "VW", me));
+    // Again: it exists.
+    try std.testing.expectEqual(linux.E.SUCCESS, ownedDirAt(dir, "VW", me));
+    // A link, to a directory that is there or to none: not followed.
+    try tmp.dir.createDir(std.testing.io, "target", .default_dir);
+    try tmp.dir.symLink(std.testing.io, "target", "LINK", .{});
+    try std.testing.expect(ownedDirAt(dir, "LINK", me) != .SUCCESS);
+    try tmp.dir.symLink(std.testing.io, "/nonexistent/elsewhere", "DANGLING", .{});
+    try std.testing.expect(ownedDirAt(dir, "DANGLING", me) != .SUCCESS);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "FILE", .data = "x" });
+    try std.testing.expect(ownedDirAt(dir, "FILE", me) != .SUCCESS);
+}
+
 /// The job's directory seen with the job's user's ids and the step's user's exchanged
 /// (`Container.Owner`), at `job_view_dir`, writable: the job's overlay is mounted from it (its
 /// upper and work directory, and the layers with the slot's host ids), and a Docker action's
@@ -1291,9 +1329,8 @@ fn jobView(arena: Allocator, spec: Spec, o: Spec.Container.Owner) JobView {
         swapRanges(spec.id_base, spec.id_base, count, o.job_uid, o.uid, true, &u),
         swapRanges(spec.id_base, spec.id_base, count, o.job_gid, o.gid, true, &g),
     );
-    const work = z(arena, job_view_work);
-    _ = linux.mkdir(work, 0o755);
-    check("give the job's root the work directory", linux.chown(work, spec.id_base, spec.id_base));
+    const owned = ownedDirAt(linux.AT.FDCWD, z(arena, job_view_work), spec.id_base);
+    if (owned != .SUCCESS) fatal("give the job's root the work directory", @backingInt(owned));
     idmapMount(arena, ".", job_view_dir, slot, false, false);
     return .{ .canonical = canonical, .slot = slot };
 }
