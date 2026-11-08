@@ -1,0 +1,3 @@
+kind: Added
+body: 'A Docker action whose image runs as a non-root USER runs on the native backend on a root runner: the workspace, home, file commands and event are the image''s user''s through an idmap of the job''s layers that swaps it with the job''s user, so what the action writes is the job''s user''s afterwards (#351)'
+time: 2026-11-08T10:25:14.478121436-05:00

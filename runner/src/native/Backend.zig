@@ -2407,7 +2407,7 @@ fn stepGroups(b: *const Backend) ![]const u32 {
 }
 
 /// `groups` the job's ids reach, in order: `setgroups` fails a step for any other.
-fn mappedGroups(arena: Allocator, groups: []const u32) ![]const u32 {
+pub fn mappedGroups(arena: Allocator, groups: []const u32) ![]const u32 {
     const mapped = try arena.dupe(u32, groups);
     var n: usize = 0;
     for (groups) |g| if (g < ids_per_slot) {
@@ -2572,7 +2572,9 @@ fn execIn(
         .workdir = b.workdir,
         .uid = uid,
         .gid = gid,
-        .groups = if (uid == b.uid and gid == b.gid) b.groups else &.{},
+        .groups = if (container != null and container.?.owner != null)
+            container.?.owner.?.groups
+        else if (uid == b.uid and gid == b.gid) b.groups else &.{},
         .argv = argv,
         .env = env,
         .files = files,

@@ -176,7 +176,8 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   on a rootless runner or with an image given by an expression (native since P6, below, their
   images pulled by P3), JavaScript and local `uses:` actions (P7, `actions.preload`), remote `uses:` actions in an
   image with no git to fetch them with, `docker://` images
-  that cannot be pulled or run as a non-root `USER` (P7), Dagger in steps
+  that cannot be pulled, or whose non-root `USER` the image does not have, is past the job's
+  ids, or runs on a rootless runner (P7), Dagger in steps
   (`RUNNER_DAGGER_NESTING`), and a
   machine whose probe fails (no user namespaces, nftables refusing the jobs' rules, no default
   route, the jobs' ids taken on the host, the jobs' subnet overlapping a route of the host's). A
@@ -821,7 +822,7 @@ What it does not do yet (debt, with the phase that pays it):
   oracle. Frame checksums are not checked; the blob's digest is checked before and the diff id
   after, which covers it. Dictionaries are refused, and so is a window over 128 MiB.
 - **Rootless** (tests, the laptop): only root is mapped, so every file is the runner's,
-  directories keep their owner's write bit, an image whose `USER` is not root cannot run, and the
+  directories keep their owner's write bit, an image whose `USER` is not root cannot run a Docker action, and the
   default image cannot be provisioned (dpkg gives files to other ids, `root:adm`, which fails with
   `EINVAL`): such a job goes to Dagger unless `RUNNER_NATIVE_ROOTFS` is set. Phase 5's
   subordinate ids pay this.
@@ -1842,10 +1843,23 @@ Dagger.** What it covers, as built:
   ```
 
 - Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a `docker://` image
-  that is not in the store (or no store), and an image whose `USER` is not root (GitHub's
-  documentation requires root for Docker actions; Dagger's path gives another user the
-  directories it writes, which here needs an idmapped share, below). For `uses:` actions, see
-  "The action loader" below.
+  that is not in the store (or no store), and, on a rootless runner, an image whose `USER` is not
+  root (GitHub's documentation requires root for Docker actions; a root runner gives another user
+  the shares through an idmap, below), or on a root runner a `USER` that is not in the image's
+  /etc/passwd or /etc/group (`docker run` refuses it too) or is past the job's ids (65536 a job).
+  For `uses:` actions, see "The action loader" below.
+- A non-root `USER` (`name`, `uid`, `name:group`, `uid:gid`, resolved in the image's own files as
+  Docker does, its supplementary groups from /etc/group) owns the shares for the step:
+  `/github/workspace`, `/github/home`, `/github/file_commands` and `/github/workflow`. An overlay
+  cannot be idmapped, so the job's overlay is mounted for such a step from idmapped layers
+  (`sandbox.jobView`): the layers, the step's upper and a work directory of its own, seen through
+  ids that swap the job's user (the runner user, or root) with the image's user. What the job's
+  user owns, the action's user owns; what the action makes lands on disk as the job's user's, so
+  the next step needs no walk of the layer, no copy and no `chown` of the workspace, and the
+  shares keep the mount flags they have. No id outside the job's range appears on either side
+  (the host's root, which overlay needs to make its work directory, is mapped to an id nothing
+  owns). The file commands and the event are given to the user, and the shares' roots too (a
+  directory the helper made, `/github/home` the first time).
 - Parity kept explicitly: on a root runner with steps as the runner user, what the action made or
   changed in the workspace is given to the runner user afterwards (the files in the step's layer
   under the workspace, through no symlink), as Dagger copies the workspace back owned by it; a
@@ -1861,8 +1875,8 @@ What it does not do yet, and who pays:
   pre-flight judged the commit's. With every kind of action native, the only way that bites is an
   image the commit's version did not need and the store lacks: the step fails saying so, where
   Dagger would have pulled it. Gone with P3's pull.
-- **Images with a non-root `USER`, and a `RUN` as one.** They need the shares idmapped so the
-  image's user owns them, as Dagger's `owner:` does. Debt of P7.
+- **A `RUN` as a non-root user in a Dockerfile.** It needs the builder's own filesystem owned by
+  that user; the final `USER` of a built image runs natively on a root runner (#351).
 - **The pull.** Images come from the operator's directory until P3's store replaces
   `images.lookup`.
 - **Small differences from Dagger's path**, none visible to an action that follows GitHub's
@@ -1956,8 +1970,8 @@ as on Dagger (`actions.loadLocal`, through `Backend.readFile`).
   `js.runtimes`' images; with the pull it gets them on a miss, and `preload`'s runtime check goes.
 - P3's image store replaces `images.lookup(arena, io, dir, ref)`: return `Image{ rootfs, entrypoint,
   cmd, env, user }` for the reference, pulled when missing. `docker_action.unsupported` then needs
-  no store check (an image is pulled, not refused) but keeps the `USER` check until the idmapped
-  shares; `Config.images` and `RUNNER_NATIVE_IMAGES` go.
+  no store check (an image is pulled, not refused) but keeps the `USER` check
+  (`docker_action.userReason`); `Config.images` and `RUNNER_NATIVE_IMAGES` go.
 - P2's per-job helper: `sandbox.Spec.Container` is a field of the step's spec; the per-job helper
   takes it with the step and mounts the container's overlay in the step's own namespace (the
   job's overlay and its layer as for any step). Its layer store: the action's step always runs
@@ -2745,6 +2759,20 @@ Surprises:
   `GITHUB_ACTION` to the step's label (`docker://alpine:3.22`) and logs no "Process completed with
   exit code" for a Docker action; the native path does the same, so a job's results do not depend
   on the backend.
+
+- **A non-root `USER` is an idmap of the layers, not of the share (#351).** The shares are bound out
+  of the job's overlay, and the kernel does not idmap an overlay (`mount_setattr` gives `EINVAL`,
+  tried on 7.0); it takes idmapped layers, the upper and the work directory among them (5.19).
+  The job's overlay is therefore mounted again for such a step from the layers seen through a
+  swap of two ids, and mounting it rejects what is easy to miss: the work directory must be new
+  (`VW`; the job's own is the host root's, which the swap does not map, and overlay then mounts
+  read-only with `errno 75` in the log, so the first write is `EROFS`), and the host's root must
+  be in the map too, as the mounter that makes `work/work` (any id will do that nothing owns). The
+  mount must be made after the helper's `unshare(CLONE_NEWNS)`: before it, it lands in the runner's
+  own namespace and the job's directory cannot then be removed (`EOVERFLOW`). A swap, not a shift,
+  because both users keep their files: the image's `/home/app` is in the layers the swap does
+  not touch (the rootfs under the container is mounted as before). The cost over a root action
+  is the second `mount_setattr` per layer, not a walk of the workspace as Dagger's copy is.
 
 Measured: 11.3 ms a `docker://` step natively on the laptop (rootless), against a cold `run:` step
 at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
