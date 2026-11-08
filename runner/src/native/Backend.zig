@@ -33,6 +33,7 @@ const admission = @import("../admission.zig");
 const services = @import("services.zig");
 const images = @import("images.zig");
 const container_options = @import("container_options.zig");
+const publish = @import("publish.zig");
 const native_actions = @import("actions.zig");
 const Exec = @import("../dagger/Exec.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
@@ -70,6 +71,8 @@ image_gid: u32 = 0,
 groups: []const u32 = &.{},
 /// What a `container:` job's `options:` ask for (`container_options.zig`), read by `base`.
 container_opts: container_options.Options = .{},
+/// `Config.port_addresses`: the host addresses a job container may publish on (`publishPorts`).
+port_addresses: []const [4]u8 = &publish.default_addresses,
 /// A `container:` job's PATH once its env is set (`dagger.Base.runtime_path`).
 runtime_path: ?[]const u8 = null,
 /// Where the job's time went (`phases.zig`): its set-up, each sandbox and publish, its teardown.
@@ -107,6 +110,8 @@ images_dir: []const u8 = "",
 self_exe: []const u8 = "",
 /// The job's running services (`services.zig`), stopped however the job ends (`deinit`).
 service_set: services.Set = .{},
+/// The relay that publishes a job container's `ports:` (`publishPorts`), stopped first.
+publisher: ?forward.Running = null,
 /// Held while the job runs (`lock`): a directory whose lock is free is stale (`sweep`).
 lock: std.Io.File,
 /// The overlay's layers above the rootfs, oldest first.
@@ -219,6 +224,10 @@ pub const Config = struct {
     /// Host paths mounted into every step. Tests bind the host's /usr into a rootfs of a few
     /// directories; phase 4's cache volumes will be these.
     binds: []const sandbox.Spec.Bind = &.{},
+    /// The host addresses a job container's `ports:` may be published on, the first for an
+    /// entry that names none (`RUNNER_NATIVE_PORT_ADDRESSES`, `publish.zig`): 127.0.0.1 alone
+    /// by default.
+    port_addresses: []const [4]u8 = &publish.default_addresses,
     /// Past this many bytes, the store's least recently used layers go
     /// (`RUNNER_NATIVE_STORE_MAX_MB`, `Store.collect`).
     store_max_bytes: u64 = Store.default_max_bytes,
@@ -308,6 +317,8 @@ pub fn configFor(
     };
     const exe = exeOf(arena, io, std.os.linux.getpid());
     return .{
+        // Checked when the configuration is loaded (`Config.load`).
+        .port_addresses = publish.parseAddresses(arena, cfg.native_port_addresses) catch &publish.default_addresses,
         .rootfs = cfg.native_rootfs,
         .store = try cfg.nativeStore(arena, environ),
         .self_exe = exe.path,
@@ -415,6 +426,9 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         if (container_options.unsupported(jc, opts.provision and default_image, job.services)) |why| return why;
     }
     if (job.services.len > 0) if (servicesUnsupported(job, cfg)) |why| return why;
+    if (job.container) |jc| if (jc.ports.len > 0 and std.os.linux.geteuid() != 0)
+        return "a job container's `ports:` need the job's own network, which a rootless " ++
+            "runner does not give: its steps already share the host's (phase 5)";
     if (opts.nesting) return "steps that use the Dagger engine (RUNNER_DAGGER_NESTING) need Dagger";
     // dpkg gives files to other users and groups (`root:adm`), which one mapped id cannot hold.
     if (std.os.linux.geteuid() != 0 and cfg.rootfs.len == 0 and opts.provision and
@@ -790,6 +804,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
             .sync_fd = Store.syncCursor(arena, cfg.store),
         },
         .vouched = cfg.vouched,
+        .port_addresses = cfg.port_addresses,
         .flatten_at = @max(2, cfg.flatten_at),
         .gate = cfg.gate,
         .test_seed_script = cfg.test_seed_script,
@@ -1201,7 +1216,10 @@ pub fn deinit(b: *Backend) void {
     defer _ = b.io.swapCancelProtection(protection);
     const arena = b.arena;
     var t = phases.now();
-    // First: their helpers hold the job's directory and network, and are in its cgroup.
+    // First: their helpers hold the job's directory and network, and are in its cgroup. The
+    // published ports go with their relay.
+    if (b.publisher) |*p| p.stop(b.io);
+    b.publisher = null;
     b.service_set.stopAll(b.io);
     b.cache_plan.release(b.io);
     t = b.timings.since(arena, .services, t);
@@ -1395,6 +1413,7 @@ pub fn base(
         try std.fmt.allocPrint(arena, "{{ {s}; }} && {s}", .{ mk_work, vols })
     else
         mk_work;
+    try b.publishPorts(ev, err_msg);
     const mk_uid: u32 = 0;
     const mk_gid: u32 = 0;
     const event_file = [_]sandbox.Spec.File{.{
@@ -2914,6 +2933,47 @@ fn readContainerOptions(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void
     }));
 }
 
+/// The job container's `ports:` published from the host (`publish.zig`): what the operator
+/// allows (`RUNNER_NATIVE_PORT_ADDRESSES`, no host port below 1024, none for a job the runner
+/// does not vouch for or a fork's pull request), each listened on by the relay in the host's
+/// network and carried to the job's port on its loopback (`forward.zig`, `Spec.publish`), for
+/// the job's life. "Set up job" says where each went, as `docker port` does. Anything refused, or
+/// a port another process holds, fails the job naming it: on Dagger it would be ignored.
+fn publishPorts(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void {
+    const arena = b.arena;
+    const jc = ev.job.container orelse return;
+    if (jc.ports.len == 0) return;
+    var why: []const u8 = "";
+    const ports = container_options.ports(arena, jc.ports, &why) catch |e| {
+        err_msg.* = if (why.len > 0) why else @errorName(e);
+        return error.BaseContainerFailed;
+    };
+    const scope = try set_up.packageCacheScope(arena, ev, ev.job.github.repository, b.caches.trusted);
+    const trusted = b.vouched and std.mem.eql(u8, scope, "repo");
+    const maps = publish.plan(arena, ports, b.port_addresses, trusted, &why) catch |e| {
+        b.job_fault = true;
+        err_msg.* = if (why.len > 0) why else @errorName(e);
+        return error.BaseContainerFailed;
+    };
+    b.publisher = forward.start(arena, b.io, b.self_exe, .{
+        .netns = b.netns,
+        // The job's nobody: an id of its range, nothing on the host.
+        .id = if (b.how.userns == .mapped) b.idBase() + 65534 else null,
+        .cgroup = if (b.job_cgroup) |j| j.servicesDir() else null,
+        .ports = maps,
+        .publish = true,
+    }, &why) catch |e| {
+        b.job_fault = true;
+        err_msg.* = try std.fmt.allocPrint(arena, "the job container's ports could not be " ++
+            "published: {s}", .{if (why.len > 0) why else @errorName(e)});
+        return error.BaseContainerFailed;
+    };
+    const lines = try publish.report(arena, maps, b.publisher.?.ports);
+    try b.notes.append(arena, try std.fmt.allocPrint(arena, "Container ports: {s}", .{
+        try std.mem.join(arena, ", ", lines),
+    }));
+}
+
 /// The job container's `volumes:` (`container_options.volumes`; `unsupported` has already
 /// refused what it does not carry out) as the shell that makes their mount points in the base:
 /// each is a directory of the job's filesystem, root's as Docker makes a volume's mount point
@@ -3848,8 +3908,15 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     var container = run_only;
     container.container = .{ .name = "", .image = .{ .lit = "node:22" } };
     try std.testing.expect(unsupported(io, container, root, ok) == null);
+    // Ports are published natively by a root runner (`publishPorts`); a rootless runner's steps
+    // share the host's network, and a range is not native anywhere.
     container.container.?.ports = &.{.{ .lit = "8080:80" }};
-    try expectReason("`ports:`", unsupported(io, container, root, ok));
+    if (std.os.linux.geteuid() == 0)
+        try std.testing.expect(unsupported(io, container, root, ok) == null)
+    else
+        try expectReason("rootless", unsupported(io, container, root, ok));
+    container.container.?.ports = &.{.{ .lit = "8000-8010:8000-8010" }};
+    try expectReason("`8000-8010:8000-8010`", unsupported(io, container, root, ok));
     container.container.?.ports = &.{};
     // Volumes that are directories of the job are native; a path of the host is not.
     container.container.?.volumes = &.{ .{ .lit = "/data" }, .{ .lit = "cache:/cache" } };
@@ -5837,6 +5904,204 @@ test "a container job's volume where the runner mounts something fails the job, 
     const why = res.engine_error orelse text;
     try std.testing.expect(std.mem.indexOf(u8, why, "volume at /__w/r overlaps /__w/r/r") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ran\n") == null);
+}
+
+const PortJob = struct {
+    cfg: Config,
+    job: job_mod.Job,
+    ok: bool = false,
+    text: []const u8 = "",
+    why: []const u8 = "",
+    arena: std.heap.ArenaAllocator = .init(std.testing.allocator),
+
+    fn run(p: *PortJob) void {
+        p.runOrFail() catch |e| {
+            p.why = @errorName(e);
+        };
+    }
+
+    fn runOrFail(p: *PortJob) !void {
+        const arena = p.arena.allocator();
+        var env: std.process.Environ.Map = .init(arena);
+        var w: std.Io.Writer.Allocating = .init(arena);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+        const res = try dagger.run(arena, std.testing.io, &env, .{
+            .native = p.cfg,
+            .step_user = .root,
+            .trusted = true,
+            .gpa = std.testing.allocator,
+        }, p.job, &log);
+        p.ok = res.succeeded;
+        p.text = w.written();
+        p.why = res.engine_error orelse p.text;
+    }
+};
+
+fn expectSaid(text: []const u8, want: []const []const u8) !void {
+    for (want) |e| if (std.mem.indexOf(u8, text, e) == null) {
+        std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
+        return error.TestUnexpectedResult;
+    };
+}
+
+/// A TCP connection to `127.0.0.1:port` from the host, or null when refused.
+fn connectLoopback(port: u16) ?std.os.linux.fd_t {
+    const linux = std.os.linux;
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    const fd = std.math.cast(linux.fd_t, rc) orelse return null;
+    var sa: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    if (linux.errno(linux.connect(fd, forward.asSockaddr(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+        _ = linux.close(fd);
+        return null;
+    }
+    return fd;
+}
+
+/// A port of the host's loopback no one listens on now.
+fn freePort() !u16 {
+    const linux = std.os.linux;
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    const fd = std.math.cast(linux.fd_t, rc) orelse return error.SkipZigTest;
+    defer _ = linux.close(fd);
+    var sa: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    if (linux.errno(linux.bind(fd, forward.asSockaddr(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    _ = linux.getsockname(fd, forward.asSockaddr(&sa), &len);
+    return std.mem.bigToNative(u16, sa.port);
+}
+
+test "a container job's ports: published on the host's 127.0.0.1 only, never another job's, gone with the job; a taken port fails it; a bare one is the kernel's pick" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    const linux = std.os.linux;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    // Rootless, a job has no network of its own to publish into: those go to Dagger.
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    const img = try testregistry.testImage(arena, "test/ports", "1", try testImageLayers(arena), "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+    const image = try server.image(arena, "test/ports:1");
+    const hp = try freePort();
+
+    // The job's server, on its own 8080: "hello" to each connection, until one says "quit".
+    const serve =
+        \\python3 -c '
+        \\import socket
+        \\s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        \\s.bind(("0.0.0.0", 8080)); s.listen(8); s.settimeout(120)
+        \\while True:
+        \\    c, _ = s.accept(); c.settimeout(10)
+        \\    try:
+        \\        c.sendall(b"hello\n"); d = c.recv(16)
+        \\    except Exception:
+        \\        d = b""
+        \\    c.close()
+        \\    if d.startswith(b"quit"): break
+        \\print("served-" + str(2 + 3))
+        \\'
+    ;
+    var serving: PortJob = .{ .cfg = cfg, .job = testJob(&.{testStep(serve)}) };
+    defer serving.arena.deinit();
+    serving.job.container = .{
+        .name = "",
+        .image = .{ .lit = image },
+        .ports = &.{ .{ .lit = try std.fmt.allocPrint(arena, "{d}:8080", .{hp}) }, .{ .lit = "9090" } },
+    };
+    const t = try std.Thread.spawn(.{}, PortJob.run, .{&serving});
+    var joined = false;
+    defer if (!joined) t.join();
+    // Published once the relay listens: a connection is taken (and closed while the job's
+    // server is not up yet).
+    var tries: u32 = 0;
+    while (connectLoopback(hp) == null) : (tries += 1) {
+        if (tries > 1200) return error.TestUnexpectedResult;
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+
+    // Another job reaches it neither at its own 127.0.0.1 nor at the host's address on the bridge.
+    const gw = cfg.subnet.gateway();
+    const probe_script = try std.fmt.allocPrint(arena,
+        \\python3 -c '
+        \\import socket
+        \\for name, host in (("gw", "{d}.{d}.{d}.{d}"), ("lo", "127.0.0.1")):
+        \\    s = socket.socket(); s.settimeout(3)
+        \\    try:
+        \\        s.connect((host, {d})); r = "connected"
+        \\    except Exception:
+        \\        r = "refused"
+        \\    print("other-" + name + "=" + r)
+        \\'
+    , .{ gw[0], gw[1], gw[2], gw[3], hp });
+    var other: PortJob = .{ .cfg = cfg, .job = testJob(&.{testStep(probe_script)}) };
+    defer other.arena.deinit();
+    other.job.container = .{ .name = "", .image = .{ .lit = image } };
+    other.run();
+    if (!other.ok) std.debug.print("{s}\n", .{other.text});
+    try std.testing.expect(other.ok);
+    try expectSaid(other.text, &.{ "other-gw=refused", "other-lo=refused" });
+
+    // The host reaches the job's server through it.
+    var hello = false;
+    tries = 0;
+    while (!hello and tries < 600) : (tries += 1) {
+        const fd = connectLoopback(hp) orelse break;
+        defer _ = linux.close(fd);
+        var buf: [16]u8 = undefined;
+        var fds = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+        if (linux.poll(&fds, 1, 2000) == 1) {
+            const n = linux.read(fd, &buf, buf.len);
+            if (linux.errno(n) == .SUCCESS and std.mem.startsWith(u8, buf[0..n], "hello")) {
+                hello = true;
+                _ = linux.write(fd, "quit\n", 5);
+                break;
+            }
+        }
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+    try std.testing.expect(hello);
+    t.join();
+    joined = true;
+    if (!serving.ok) std.debug.print("{s}\n", .{serving.text});
+    try std.testing.expect(serving.ok);
+    try expectSaid(serving.text, &.{
+        "served-5",
+        try std.fmt.allocPrint(arena, "Container ports: 8080/tcp -> 127.0.0.1:{d}, 9090/tcp -> 127.0.0.1:", .{hp}),
+    });
+    // The bare port got a port of its own, said as Docker says it.
+    const said = "9090/tcp -> 127.0.0.1:";
+    const at = std.mem.indexOf(u8, serving.text, said).? + said.len;
+    var end = at;
+    while (end < serving.text.len and std.ascii.isDigit(serving.text[end])) end += 1;
+    const picked = try std.fmt.parseInt(u16, serving.text[at..end], 10);
+    try std.testing.expect(picked != 0 and picked != 9090);
+    // Gone with the job.
+    try std.testing.expect(connectLoopback(hp) == null);
+
+    // A port another process holds fails the job, naming it; nothing runs.
+    const holder = std.math.cast(linux.fd_t, linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0)).?;
+    defer _ = linux.close(holder);
+    var sa: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, hp), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    // The connections above may leave the port in TIME_WAIT; a listener still refuses a second.
+    const one: i32 = 1;
+    _ = linux.setsockopt(holder, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&one), 4);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.bind(holder, forward.asSockaddr(&sa), @sizeOf(linux.sockaddr.in))));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.listen(holder, 1)));
+    var taken: PortJob = .{ .cfg = cfg, .job = testJob(&.{testStep("echo ran-$((1+1))")}) };
+    defer taken.arena.deinit();
+    taken.job.container = .{
+        .name = "",
+        .image = .{ .lit = image },
+        .ports = &.{.{ .lit = try std.fmt.allocPrint(arena, "{d}:8080", .{hp}) }},
+    };
+    taken.run();
+    try std.testing.expect(!taken.ok);
+    try expectSaid(taken.why, &.{try std.fmt.allocPrint(arena, "publish 127.0.0.1:{d}/tcp", .{hp})});
+    try std.testing.expect(std.mem.indexOf(u8, taken.text, "ran-2") == null);
 }
 
 test "the base hands a work root to the user, and the tool cache only when it is not theirs" {

@@ -32,12 +32,27 @@ pub const Spec = struct {
     /// with it.
     cgroup: ?[]const u8 = null,
     ports: []const Map,
+    /// A job container's `ports:` (`publish.zig`): each listener is made in the runner's own
+    /// network namespace on `Map.address` before the helper joins the job's, where it connects to
+    /// the job's port on its loopback. Otherwise (a service's published port) the listeners are on
+    /// the job's loopback.
+    publish: bool = false,
 
-    pub const Map = struct { host: u16, container: u16 };
+    pub const Map = struct {
+        /// 0 when published: the kernel picks one, which the ready line says.
+        host: u16,
+        container: u16,
+        /// Where a published port listens on the host.
+        address: [4]u8 = .{ 127, 0, 0, 1 },
+        /// A published UDP port: datagrams relayed per client (`Assoc`).
+        udp: bool = false,
+    };
 };
 
 /// Connections relayed at once; more wait in the listen queue.
 const max_conns = 64;
+/// The most ports one helper publishes (`publish.zig` refuses more).
+pub const max_published = 64;
 const buf_len = 16 * 1024;
 
 /// The helper's entry. Exits 0 when its lifeline closes, 1 with why on stderr when it cannot
@@ -47,15 +62,26 @@ pub fn main(arena: Allocator) u8 {
     const spec = sandbox.readJsonLine(Spec, arena, &rest) catch
         sandbox.fatal("read the relay's spec", @as(u32, 22));
     if (spec.cgroup) |dir| sandbox.joinCgroup(arena, dir);
-    if (spec.netns) |p| {
-        const fd = linux.open(sandbox.z(arena, p), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-        sandbox.check("open the job's network namespace", fd);
-        const joined = linux.setns(@intCast(fd), linux.CLONE.NEWNET);
-        sandbox.check("enter the job's network namespace", joined);
-        _ = linux.close(@intCast(fd));
-    }
+    // Published from the host: listening in the runner's network namespace, then into the job's,
+    // where every connection to the job's port is made. A socket stays in the namespace it was
+    // made in, so the listeners are the host's and the connections the job's.
+    if (!spec.publish) joinNetns(arena, spec.netns);
     var listeners: std.ArrayList(Listener) = .empty;
+    var ready: std.ArrayList(u8) = .empty;
+    ready.appendSlice(arena, "ready") catch sandbox.oom();
     for (spec.ports) |m| {
+        if (spec.publish) {
+            const fd = listenOn(m.address, m.host, m.udp) orelse {
+                const what = std.fmt.allocPrint(arena, "publish {d}.{d}.{d}.{d}:{d}/{s}", .{
+                    m.address[0],                m.address[1], m.address[2], m.address[3], m.host,
+                    if (m.udp) "udp" else "tcp",
+                }) catch "publish a port";
+                sandbox.fatal(what, @as(u32, 98));
+            };
+            listeners.append(arena, .{ .fd = fd, .to = m.container, .udp = m.udp }) catch sandbox.oom();
+            ready.print(arena, " {d}", .{boundPort(fd)}) catch sandbox.oom();
+            continue;
+        }
         const v4 = listen(m.host, false) orelse {
             const what = sandbox.about(arena, "listen on 127.0.0.1 port", portText(arena, m.host));
             sandbox.fatal(what, @as(u32, 98));
@@ -65,6 +91,8 @@ pub fn main(arena: Allocator) u8 {
         const v6 = listen(m.host, true) orelse continue;
         listeners.append(arena, .{ .fd = v6, .to = m.container }) catch sandbox.oom();
     }
+    if (spec.publish) joinNetns(arena, spec.netns);
+    ready.append(arena, '\n') catch sandbox.oom();
     if (spec.id) |id| {
         sandbox.check("setgroups", linux.setgroups(0, sandbox.no_groups));
         sandbox.check("setresgid", linux.setresgid(id, id, id));
@@ -74,16 +102,65 @@ pub fn main(arena: Allocator) u8 {
     // Docker's allow list, as each step has it: after no_new_privs, which an unprivileged
     // filter needs, and before any of the job's traffic.
     sandbox.installSeccomp();
-    _ = linux.write(1, "ready\n", 6);
+    _ = linux.write(1, ready.items.ptr, ready.items.len);
     relay(arena, listeners.items);
     return 0;
+}
+
+/// Into the job's network namespace, when it has one (a rootless job has none).
+fn joinNetns(arena: Allocator, netns: ?[]const u8) void {
+    const p = netns orelse return;
+    const rc = linux.open(sandbox.z(arena, p), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    sandbox.check("open the job's network namespace", rc);
+    const fd = std.math.cast(linux.fd_t, rc) orelse sandbox.fatal("open the job's network namespace", @as(u32, 9));
+    sandbox.check("enter the job's network namespace", linux.setns(fd, linux.CLONE.NEWNET));
+    _ = linux.close(fd);
 }
 
 fn portText(arena: Allocator, port: u16) []const u8 {
     return std.fmt.allocPrint(arena, "{d}", .{port}) catch "?";
 }
 
-const Listener = struct { fd: linux.fd_t, to: u16 };
+const Listener = struct { fd: linux.fd_t, to: u16, udp: bool = false };
+
+/// A socket of the host's on `address:port` (0: one the kernel picks), listening for TCP or
+/// bound for UDP, or null when it cannot be (the port is taken, the address is not the host's).
+fn listenOn(address: [4]u8, port: u16, udp: bool) ?linux.fd_t {
+    const sock: u32 = if (udp) linux.SOCK.DGRAM else linux.SOCK.STREAM;
+    const kind = sock | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
+    const rc = linux.socket(linux.AF.INET, kind, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return null;
+    const one: i32 = 1;
+    if (!udp) _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&one), 4);
+    var sa = inet4(address, port);
+    const bound = linux.errno(linux.bind(fd, asSockaddr(&sa), @sizeOf(linux.sockaddr.in))) == .SUCCESS;
+    if (!bound or (!udp and linux.errno(linux.listen(fd, 128)) != .SUCCESS)) {
+        _ = linux.close(fd);
+        return null;
+    }
+    return fd;
+}
+
+/// An IPv4 address as the socket calls take it: the one cast this file's sockets need.
+pub fn asSockaddr(sa: *linux.sockaddr.in) *linux.sockaddr {
+    return @ptrCast(sa);
+}
+
+fn inet4(address: [4]u8, port: u16) linux.sockaddr.in {
+    return .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, std.mem.readInt(u32, &address, .big)),
+    };
+}
+
+/// The port `fd` is bound to: the kernel's pick for port 0.
+fn boundPort(fd: linux.fd_t) u16 {
+    var sa: linux.sockaddr.in = undefined;
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    if (linux.errno(linux.getsockname(fd, asSockaddr(&sa), &len)) != .SUCCESS) return 0;
+    return std.mem.bigToNative(u16, sa.port);
+}
 
 /// A listening socket on the loopback (`::1` for `v6`, which may be missing: null then).
 fn listen(port: u16, v6: bool) ?linux.fd_t {
@@ -102,7 +179,7 @@ fn listen(port: u16, v6: bool) ?linux.fd_t {
         break :ok linux.errno(rc6) == .SUCCESS;
     } else ok: {
         var sa = loopback4(port);
-        const rc4 = linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in));
+        const rc4 = linux.bind(fd, asSockaddr(&sa), @sizeOf(linux.sockaddr.in));
         break :ok linux.errno(rc4) == .SUCCESS;
     };
     if (!ok or linux.errno(linux.listen(fd, 128)) != .SUCCESS) {
@@ -168,13 +245,18 @@ const Conn = struct {
 fn relay(arena: Allocator, listeners: []const Listener) void {
     const conns = arena.alloc(Conn, max_conns) catch sandbox.oom();
     for (conns) |*c| c.* = .{};
-    const nfds = 1 + listeners.len + 2 * max_conns;
+    var udp: Udp = .{ .assocs = arena.alloc(Assoc, max_assocs) catch sandbox.oom() };
+    for (udp.assocs) |*s| s.* = .{};
+    const nfds = 1 + listeners.len + 2 * max_conns + max_assocs;
     const fds = arena.alloc(linux.pollfd, nfds) catch sandbox.oom();
     while (true) {
         fds[0] = .{ .fd = 0, .events = linux.POLL.IN, .revents = 0 };
         for (listeners, fds[1..][0..listeners.len]) |l, *p|
             p.* = .{ .fd = l.fd, .events = linux.POLL.IN, .revents = 0 };
-        const conn_fds = fds[1 + listeners.len ..];
+        const assoc_fds = fds[nfds - max_assocs ..];
+        for (udp.assocs, assoc_fds) |s, *p|
+            p.* = .{ .fd = if (s.used) s.fd else -1, .events = linux.POLL.IN, .revents = 0 };
+        const conn_fds = fds[1 + listeners.len .. nfds - max_assocs];
         for (conns, 0..) |*c, i| for (0..2) |side| {
             var ev: i16 = 0;
             if (c.used) {
@@ -188,11 +270,101 @@ fn relay(arena: Allocator, listeners: []const Listener) void {
         if (linux.errno(rc) == .INTR) continue;
         sandbox.check("wait for the relay's connections", rc);
         if (fds[0].revents != 0) return;
-        for (listeners, fds[1..][0..listeners.len]) |l, p| if (p.revents != 0) accept(conns, l);
+        for (listeners, fds[1..][0..listeners.len], 0..) |l, p, i| if (p.revents != 0) {
+            if (l.udp) udp.fromClients(listeners, i) else accept(conns, l);
+        };
         for (conns, 0..) |*c, i| if (c.used) {
             if (!step(c, conn_fds[2 * i ..][0..2])) c.close();
         };
+        for (udp.assocs, assoc_fds) |*s, p| if (s.used and p.revents != 0) udp.toClient(listeners, s);
     }
+}
+
+/// UDP clients relayed at once; past it, the one quiet longest is dropped for the newcomer.
+const max_assocs = 64;
+
+/// One UDP client of a published port: its address on the host, and the socket of the job's
+/// that carries its datagrams to the job's port and the answers back.
+const Assoc = struct {
+    used: bool = false,
+    listener: usize = 0,
+    client: linux.sockaddr.in = undefined,
+    fd: linux.fd_t = -1,
+    /// When it was last heard from or answered, in the relay's own count.
+    seen: u64 = 0,
+};
+
+const Udp = struct {
+    assocs: []Assoc,
+    clock: u64 = 0,
+    buf: [64 * 1024]u8 = undefined,
+
+    /// Every datagram waiting on listener `i`, each sent on by its client's socket in the job's
+    /// network (made on its first datagram, connected to the job's port on the loopback).
+    fn fromClients(u: *Udp, listeners: []const Listener, i: usize) void {
+        const l = listeners[i];
+        while (true) {
+            var from: linux.sockaddr.in = undefined;
+            var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+            const n = linux.recvfrom(l.fd, &u.buf, u.buf.len, 0, asSockaddr(&from), &len);
+            if (linux.errno(n) != .SUCCESS) return;
+            u.clock += 1;
+            const s = u.assocOf(i, from, l.to) orelse continue;
+            s.seen = u.clock;
+            _ = linux.sendto(s.fd, &u.buf, n, 0, null, 0);
+        }
+    }
+
+    /// The client's association, made when it has none (the quietest dropped when all are in use).
+    fn assocOf(u: *Udp, listener: usize, client: linux.sockaddr.in, to: u16) ?*Assoc {
+        var free: ?*Assoc = null;
+        var oldest: *Assoc = &u.assocs[0];
+        for (u.assocs) |*s| {
+            if (!s.used) {
+                if (free == null) free = s;
+                continue;
+            }
+            if (s.listener == listener and s.client.port == client.port and s.client.addr == client.addr) return s;
+            if (s.seen < oldest.seen) oldest = s;
+        }
+        const s = free orelse s: {
+            _ = linux.close(oldest.fd);
+            oldest.* = .{};
+            break :s oldest;
+        };
+        const fd = dialUdp(to) orelse return null;
+        s.* = .{ .used = true, .listener = listener, .client = client, .fd = fd, .seen = u.clock };
+        return s;
+    }
+
+    /// The job's answers on `s`, sent to its client from the published port.
+    fn toClient(u: *Udp, listeners: []const Listener, s: *Assoc) void {
+        while (true) {
+            const n = linux.recvfrom(s.fd, &u.buf, u.buf.len, 0, null, null);
+            switch (linux.errno(n)) {
+                .SUCCESS => {},
+                // The job's port answered with an ICMP error: nothing listens there yet.
+                .CONNREFUSED => continue,
+                else => return,
+            }
+            u.clock += 1;
+            s.seen = u.clock;
+            _ = linux.sendto(listeners[s.listener].fd, &u.buf, n, 0, asSockaddr(&s.client), @sizeOf(linux.sockaddr.in));
+        }
+    }
+};
+
+/// A UDP socket of the job's network connected to its `port` on 127.0.0.1, non-blocking.
+fn dialUdp(port: u16) ?linux.fd_t {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return null;
+    var sa = loopback4(port);
+    if (linux.errno(linux.connect(fd, asSockaddr(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+        _ = linux.close(fd);
+        return null;
+    }
+    return fd;
 }
 
 fn accept(conns: []Conn, l: Listener) void {
@@ -225,7 +397,7 @@ fn dial(port: u16) ?linux.fd_t {
             break :done linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in6));
         } else done: {
             var sa = loopback4(port);
-            break :done linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in));
+            break :done linux.connect(fd, asSockaddr(&sa), @sizeOf(linux.sockaddr.in));
         };
         if (linux.errno(done) != .SUCCESS) {
             _ = linux.close(fd);
@@ -288,6 +460,8 @@ fn step(c: *Conn, polled: []const linux.pollfd) bool {
 pub const Running = struct {
     child: std.process.Child,
     lifeline: std.Io.File,
+    /// Published: the host port each `Spec.ports` entry got, in order (the kernel's pick for 0).
+    ports: []const u16 = &.{},
 
     /// Closes its lifeline and waits for it.
     pub fn stop(r: *Running, io: std.Io) void {
@@ -318,10 +492,21 @@ pub fn start(
     child.stdin.?.writeStreamingAll(io, json.written()) catch {};
     const lifeline = child.stdin.?;
     child.stdin = null;
-    var buf: [16]u8 = undefined;
-    const n = child.stdout.?.readStreaming(io, &.{&buf}) catch 0;
-    if (n > 0 and std.mem.startsWith(u8, buf[0..n], "ready"))
-        return .{ .child = child, .lifeline = lifeline };
+    // "ready", then each published port: one line, written at once.
+    var buf: [8 * max_published]u8 = undefined;
+    var n: usize = 0;
+    while (n < buf.len) {
+        const got = child.stdout.?.readStreaming(io, &.{buf[n..]}) catch 0;
+        if (got == 0) break;
+        n += got;
+        if (std.mem.indexOfScalar(u8, buf[0..n], '\n') != null) break;
+    }
+    if (n > 0 and std.mem.startsWith(u8, buf[0..n], "ready")) {
+        var bound: std.ArrayList(u16) = .empty;
+        var words = std.mem.tokenizeAny(u8, buf["ready".len..n], " \n");
+        while (words.next()) |w| try bound.append(arena, std.fmt.parseInt(u16, w, 10) catch 0);
+        return .{ .child = child, .lifeline = lifeline, .ports = bound.items };
+    }
     lifeline.close(io);
     var err: std.ArrayList(u8) = .empty;
     var ebuf: [1024]u8 = undefined;
@@ -351,11 +536,11 @@ test "a published port reaches the service's own port, both ways, until the rela
     defer _ = linux.close(server);
     var sa: linux.sockaddr.in = undefined;
     var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
-    _ = linux.getsockname(server, @ptrCast(&sa), &len);
+    _ = linux.getsockname(server, asSockaddr(&sa), &len);
     const to = std.mem.bigToNative(u16, sa.port);
     // A free port to publish it on.
     const probe = listen(0, false) orelse return error.SkipZigTest;
-    _ = linux.getsockname(probe, @ptrCast(&sa), &len);
+    _ = linux.getsockname(probe, asSockaddr(&sa), &len);
     const from = std.mem.bigToNative(u16, sa.port);
     _ = linux.close(probe);
     var why: []const u8 = "";
@@ -364,7 +549,7 @@ test "a published port reaches the service's own port, both ways, until the rela
     const client = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     defer _ = linux.close(@intCast(client));
     var dest = loopback4(from);
-    const connected = linux.connect(@intCast(client), @ptrCast(&dest), @sizeOf(linux.sockaddr.in));
+    const connected = linux.connect(@intCast(client), asSockaddr(&dest), @sizeOf(linux.sockaddr.in));
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(connected));
     // The server's side: accept, read what came, answer, and close.
     var fds = [_]linux.pollfd{.{ .fd = server, .events = linux.POLL.IN, .revents = 0 }};
@@ -406,11 +591,134 @@ test "a relay that cannot listen says why" {
     defer _ = linux.close(taken);
     var sa: linux.sockaddr.in = undefined;
     var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
-    _ = linux.getsockname(taken, @ptrCast(&sa), &len);
+    _ = linux.getsockname(taken, asSockaddr(&sa), &len);
     const port = std.mem.bigToNative(u16, sa.port);
     var why: []const u8 = "";
     try std.testing.expectError(error.ForwardFailed, start(arena, io, exe, .{
         .ports = &.{.{ .host = port, .container = 1 }},
     }, &why));
     try std.testing.expect(std.mem.indexOf(u8, why, "listen on 127.0.0.1 port") != null);
+    // Published: the port another process holds is named, with its address and protocol.
+    why = "";
+    try std.testing.expectError(error.ForwardFailed, start(arena, io, exe, .{
+        .ports = &.{.{ .host = port, .container = 1 }},
+        .publish = true,
+    }, &why));
+    const named = try std.fmt.allocPrint(arena, "publish 127.0.0.1:{d}/tcp", .{port});
+    if (std.mem.indexOf(u8, why, named) == null) {
+        std.debug.print("{s} is not in: {s}\n", .{ named, why });
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn testExe(arena: Allocator) ![]const u8 {
+    var env = try std.testing.environ.createMap(arena);
+    const exe_rel = env.get("ZIG_RUNNER_TEST_EXE") orelse return error.SkipZigTest;
+    return std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, exe_rel, arena) catch error.SkipZigTest;
+}
+
+/// `fd`'s data, read until it ends or `want` bytes came, waiting at most 5 s for each read.
+fn readAll(fd: linux.fd_t, buf: []u8) []const u8 {
+    var have: usize = 0;
+    while (have < buf.len) {
+        var p = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+        if (linux.poll(&p, 1, 5000) != 1) break;
+        const n = linux.read(fd, buf[have..].ptr, buf.len - have);
+        if (linux.errno(n) != .SUCCESS or n == 0) break;
+        have += n;
+    }
+    return buf[0..have];
+}
+
+test "a published port: listened on in the host's network on a port the kernel picks, said in the ready line, gone with the relay" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    const exe = try testExe(arena);
+    // The job's port: a server of the test's (the relay has no job network to join here, so it
+    // connects in the host's, as for a rootless job).
+    const server = listen(0, false) orelse return error.SkipZigTest;
+    defer _ = linux.close(server);
+    const to = boundPort(server);
+    var why: []const u8 = "";
+    var r = try start(arena, io, exe, .{
+        .ports = &.{.{ .host = 0, .container = to }},
+        .publish = true,
+    }, &why);
+    var stopped = false;
+    defer if (!stopped) r.stop(io);
+    try std.testing.expectEqual(@as(usize, 1), r.ports.len);
+    const published = r.ports[0];
+    try std.testing.expect(published != 0 and published != to);
+    const client_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    const client: linux.fd_t = std.math.cast(linux.fd_t, client_rc) orelse return error.TestUnexpectedResult;
+    defer _ = linux.close(client);
+    var dest = loopback4(published);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.connect(client, asSockaddr(&dest), @sizeOf(linux.sockaddr.in))));
+    _ = linux.write(client, "ping", 4);
+    _ = linux.shutdown(client, linux.SHUT.WR);
+    var p = [_]linux.pollfd{.{ .fd = server, .events = linux.POLL.IN, .revents = 0 }};
+    _ = linux.poll(&p, 1, 5000);
+    const conn_rc = linux.accept4(server, null, null, linux.SOCK.CLOEXEC);
+    const conn: linux.fd_t = std.math.cast(linux.fd_t, conn_rc) orelse return error.TestUnexpectedResult;
+    var got: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("ping", readAll(conn, &got));
+    _ = linux.write(conn, "pong", 4);
+    _ = linux.close(conn);
+    try std.testing.expectEqualStrings("pong", readAll(client, &got));
+    // Stopped, the port is no one's: nothing is left to remove.
+    r.stop(io);
+    stopped = true;
+    const again_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    const again: linux.fd_t = std.math.cast(linux.fd_t, again_rc) orelse return error.TestUnexpectedResult;
+    defer _ = linux.close(again);
+    try std.testing.expectEqual(linux.E.CONNREFUSED, linux.errno(linux.connect(again, asSockaddr(&dest), @sizeOf(linux.sockaddr.in))));
+}
+
+test "a published UDP port relays each client's datagrams and the answers back" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    const exe = try testExe(arena);
+    const server = listenOn(.{ 127, 0, 0, 1 }, 0, true) orelse return error.SkipZigTest;
+    defer _ = linux.close(server);
+    var why: []const u8 = "";
+    var r = try start(arena, io, exe, .{
+        .ports = &.{.{ .host = 0, .container = boundPort(server), .udp = true }},
+        .publish = true,
+    }, &why);
+    defer r.stop(io);
+    const published = r.ports[0];
+    try std.testing.expect(published != 0);
+    // Two clients, each answered on its own.
+    var clients: [2]linux.fd_t = undefined;
+    for (&clients, 0..) |*c, i| {
+        c.* = listenOn(.{ 127, 0, 0, 1 }, 0, true) orelse return error.TestUnexpectedResult;
+        var dest = loopback4(published);
+        const msg = if (i == 0) "one" else "two";
+        _ = linux.sendto(c.*, msg.ptr, msg.len, 0, asSockaddr(&dest), @sizeOf(linux.sockaddr.in));
+    }
+    defer for (clients) |c| {
+        _ = linux.close(c);
+    };
+    var buf: [64]u8 = undefined;
+    for (0..2) |_| {
+        var p = [_]linux.pollfd{.{ .fd = server, .events = linux.POLL.IN, .revents = 0 }};
+        try std.testing.expectEqual(@as(usize, 1), linux.poll(&p, 1, 5000));
+        var from: linux.sockaddr.in = undefined;
+        var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+        const n = linux.recvfrom(server, &buf, buf.len, 0, asSockaddr(&from), &len);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(n));
+        const answer = try std.fmt.allocPrint(arena, "re:{s}", .{buf[0..n]});
+        _ = linux.sendto(server, answer.ptr, answer.len, 0, asSockaddr(&from), len);
+    }
+    for (clients, 0..) |c, i| {
+        var p = [_]linux.pollfd{.{ .fd = c, .events = linux.POLL.IN, .revents = 0 }};
+        try std.testing.expectEqual(@as(usize, 1), linux.poll(&p, 1, 5000));
+        const n = linux.recvfrom(c, &buf, buf.len, 0, null, null);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(n));
+        try std.testing.expectEqualStrings(if (i == 0) "re:one" else "re:two", buf[0..n]);
+    }
 }

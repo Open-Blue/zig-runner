@@ -154,6 +154,113 @@ threadlocal var scratch: [8192]u8 = undefined;
 const dropped_ports = "; Dagger ignores a job container's `ports:`, so they are not published there either";
 const dropped_volumes = "; Dagger ignores a job container's `volumes:`, so they are not mounted there either";
 
+/// One `ports:` entry the native job carries out: published from the host into the job's
+/// network (`publish.zig`).
+pub const Port = struct {
+    /// The host address, when the entry names one; null for the operator's default
+    /// (`RUNNER_NATIVE_PORT_ADDRESSES`' first, 127.0.0.1 unless set).
+    address: ?[4]u8 = null,
+    /// The host port; 0 for one the kernel picks, as Docker picks one for `80` or `ip::80`.
+    host: u16 = 0,
+    container: u16,
+    udp: bool = false,
+};
+
+fn refusePort(arena: Allocator, why: *[]const u8, raw: []const u8, reason: []const u8) Error {
+    why.* = std.fmt.allocPrint(arena, "a job container's port `{s}` {s}" ++ dropped_ports, .{
+        raw,
+        reason,
+    }) catch "a job container's port is not carried out natively" ++ dropped_ports;
+    return error.Refused;
+}
+
+/// `raw` as `docker create -p` reads it (GitHub's runner passes each `ports:` entry on as one,
+/// `DockerCommandManager.DockerCreate`; Docker's grammar is `nat.ParsePortSpec`):
+/// `[ip:][hostPort:]containerPort[/proto]`. Carried out: an IPv4 address or none, a host port or
+/// none (`80`, `ip::80`: one the kernel picks), `tcp` (the default) and `udp`. Refused, with why
+/// (the job goes to Dagger, which ignores it): ranges (`8000-8010:8000-8010`), IPv6 addresses,
+/// `sctp`, port 0 and what is not a port.
+pub fn parsePort(arena: Allocator, raw: []const u8, why: *[]const u8) Error!Port {
+    var t = std.mem.trim(u8, raw, " ");
+    var udp = false;
+    if (std.mem.indexOfScalar(u8, t, '/')) |slash| {
+        const proto = t[slash + 1 ..];
+        if (std.ascii.eqlIgnoreCase(proto, "udp")) {
+            udp = true;
+        } else if (!std.ascii.eqlIgnoreCase(proto, "tcp"))
+            return refusePort(arena, why, raw, "is not TCP or UDP");
+        t = t[0..slash];
+    }
+    if (std.mem.indexOfScalar(u8, t, '[') != null) return refusePort(arena, why, raw, "names an " ++
+        "IPv6 address, which is not native (the jobs' network is IPv4)");
+    var parts: [3][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, t, ':');
+    while (it.next()) |p| {
+        if (n == parts.len) return refusePort(arena, why, raw, "is not [ip:][hostPort:]containerPort");
+        parts[n] = p;
+        n += 1;
+    }
+    for (parts[0..n]) |p| if (std.mem.indexOfScalar(u8, p, '-') != null)
+        return refusePort(arena, why, raw, "is a range of ports, which is not native");
+    const container = portNumber(parts[n - 1]) orelse
+        return refusePort(arena, why, raw, "has a container port that is not 1 to 65535");
+    var out: Port = .{ .container = container, .udp = udp };
+    if (n >= 2 and parts[n - 2].len > 0) out.host = portNumber(parts[n - 2]) orelse
+        return refusePort(arena, why, raw, "has a host port that is not 1 to 65535");
+    if (n == 3) out.address = parseIp4(parts[0]) orelse
+        return refusePort(arena, why, raw, "has a host address that is not an IPv4 address");
+    return out;
+}
+
+fn portNumber(s: []const u8) ?u16 {
+    if (s.len == 0 or s.len > 5) return null;
+    for (s) |c| if (!std.ascii.isDigit(c)) return null;
+    const p = std.fmt.parseInt(u16, s, 10) catch return null;
+    return if (p == 0) null else p;
+}
+
+/// `a.b.c.d`, each part 0 to 255 in decimal.
+pub fn parseIp4(s: []const u8) ?[4]u8 {
+    var out: [4]u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, s, '.');
+    while (it.next()) |p| {
+        if (n == 4 or p.len == 0 or p.len > 3) return null;
+        for (p) |c| if (!std.ascii.isDigit(c)) return null;
+        out[n] = std.fmt.parseInt(u8, p, 10) catch return null;
+        n += 1;
+    }
+    return if (n == 4) out else null;
+}
+
+/// A job container's `ports:`, each read by `parsePort`; a literal list only. Two entries with
+/// one host address, port and protocol are refused, as Docker refuses the second bind.
+pub fn ports(arena: Allocator, list: []const job_mod.Template, why: *[]const u8) Error![]const Port {
+    var out: std.ArrayList(Port) = .empty;
+    for (list) |t| {
+        const raw = switch (t) {
+            .lit => |l| l,
+            .expr => {
+                why.* = "a job container's `ports:` given by an expression are not native yet" ++
+                    dropped_ports;
+                return error.Refused;
+            },
+        };
+        const p = try parsePort(arena, raw, why);
+        if (p.host != 0) for (out.items) |q| {
+            const same_address = if (p.address == null or q.address == null)
+                p.address == null and q.address == null
+            else
+                std.mem.eql(u8, &p.address.?, &q.address.?);
+            if (q.host == p.host and q.udp == p.udp and same_address)
+                return refusePort(arena, why, raw, "publishes a host port an earlier entry publishes");
+        };
+        try out.append(arena, p);
+    }
+    return out.items;
+}
+
 /// One `volumes:` entry the native job carries out.
 pub const Volume = struct {
     /// A named volume's name; null for an anonymous one.
@@ -298,11 +405,15 @@ pub fn volumes(arena: Allocator, list: []const job_mod.Template, why: *[]const u
 /// container's. `services` are the job's: a native service mounts no volume, so a named volume
 /// of the job container could not be shared with one.
 pub fn unsupported(jc: job_mod.Service, provisioned: bool, services: []const job_mod.Service) ?[]const u8 {
-    if (jc.ports.len > 0) return "a job container's `ports:` are not native: publishing a port " ++
-        "to the host needs a rule that admits the host to the job's network (the runner's table " ++
-        "drops that by design) and a policy for the host addresses a workflow may take; the " ++
-        "relay of `forward.zig` goes the other way, from the job's loopback to a service" ++
-        dropped_ports;
+    if (jc.ports.len > 0) {
+        var fba: std.heap.FixedBufferAllocator = .init(&scratch);
+        var why: []const u8 = "";
+        _ = ports(fba.allocator(), jc.ports, &why) catch |e| return switch (e) {
+            error.Refused => why,
+            error.OutOfMemory => "a job container's `ports:` are too long to read natively" ++
+                dropped_ports,
+        };
+    }
     if (jc.volumes.len > 0) {
         var fba: std.heap.FixedBufferAllocator = .init(&scratch);
         var why: []const u8 = "";
@@ -437,15 +548,71 @@ test "unsupported: ports and volumes fall back, options by what they hold" {
     try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false, &.{}).?, "expression") != null);
     try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false, &.{}).?, "drops") != null);
 
-    // Ports publish on the host, which the job's network does not admit; Dagger warns and
-    // ignores them, and the reason says so.
+    // Ports Docker publishes are native (`publish.zig` decides at the job's start what the
+    // operator allows); the forms that are not go to Dagger, which warns and ignores them, and the
+    // reason says so.
     jc = base;
-    for ([_][]const u8{ "8080:80", "80", "127.0.0.1:8080:80/tcp" }) |p| {
+    for ([_][]const u8{ "8080:80", "80", "127.0.0.1:8080:80/tcp", "0.0.0.0::53/udp" }) |p| {
+        jc.ports = &.{.{ .lit = p }};
+        try std.testing.expect(unsupported(jc, false, &.{}) == null);
+    }
+    for ([_][]const u8{ "8000-8010:8000-8010", "[::1]:8080:80", "80/sctp" }) |p| {
         jc.ports = &.{.{ .lit = p }};
         const why = unsupported(jc, false, &.{}).?;
-        try std.testing.expect(std.mem.indexOf(u8, why, "`ports:`") != null);
+        try std.testing.expect(std.mem.indexOf(u8, why, p) != null);
         try std.testing.expect(std.mem.indexOf(u8, why, "Dagger ignores") != null);
     }
+    jc.ports = &.{.{ .expr = "matrix.ports" }};
+    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false, &.{}).?, "expression") != null);
+}
+
+test "ports read as docker create -p reads them" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var why: []const u8 = "";
+    const Case = struct { raw: []const u8, want: Port };
+    for ([_]Case{
+        .{ .raw = "80", .want = .{ .container = 80 } },
+        .{ .raw = "8080:80", .want = .{ .host = 8080, .container = 80 } },
+        .{ .raw = "127.0.0.1:8080:80/tcp", .want = .{ .address = .{ 127, 0, 0, 1 }, .host = 8080, .container = 80 } },
+        .{ .raw = "0.0.0.0::53/UDP", .want = .{ .address = .{ 0, 0, 0, 0 }, .container = 53, .udp = true } },
+        .{ .raw = "5353:53/udp", .want = .{ .host = 5353, .container = 53, .udp = true } },
+        .{ .raw = " 9000 ", .want = .{ .container = 9000 } },
+    }) |c| {
+        const p = try parsePort(arena, c.raw, &why);
+        try std.testing.expectEqual(c.want.host, p.host);
+        try std.testing.expectEqual(c.want.container, p.container);
+        try std.testing.expectEqual(c.want.udp, p.udp);
+        try std.testing.expectEqual(c.want.address == null, p.address == null);
+        if (p.address) |ad| try std.testing.expectEqualSlices(u8, &c.want.address.?, &ad);
+    }
+    for ([_][2][]const u8{
+        .{ "8000-8010:8000-8010", "range" },
+        .{ "[::1]:8080:80", "IPv6" },
+        .{ "80/sctp", "TCP or UDP" },
+        .{ "0", "container port" },
+        .{ "8080:70000", "container port" },
+        .{ "x:80", "host port" },
+        .{ "localhost:8080:80", "IPv4" },
+        .{ "1.2.3:8080:80", "IPv4" },
+        .{ "1:2:3:4", "[ip:][hostPort:]containerPort" },
+        .{ "", "container port" },
+    }) |c| {
+        why = "";
+        try std.testing.expectError(error.Refused, parsePort(arena, c[0], &why));
+        if (std.mem.indexOf(u8, why, c[1]) == null or std.mem.indexOf(u8, why, "Dagger ignores") == null) {
+            std.debug.print("{s} refused as: {s}\n", .{ c[0], why });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // One host port twice: Docker's second bind would fail. Another address or protocol is
+    // another socket, and kernel-picked ports never clash.
+    const twice = [_]job_mod.Template{ .{ .lit = "8080:80" }, .{ .lit = "8080:81" } };
+    try std.testing.expectError(error.Refused, ports(arena, &twice, &why));
+    try std.testing.expect(std.mem.indexOf(u8, why, "earlier entry") != null);
+    const apart = [_]job_mod.Template{ .{ .lit = "8080:80" }, .{ .lit = "8080:80/udp" }, .{ .lit = "127.0.0.2:8080:80" }, .{ .lit = "80" }, .{ .lit = "80" } };
+    try std.testing.expectEqual(@as(usize, 5), (try ports(arena, &apart, &why)).len);
 }
 
 fn expectVolume(arena: Allocator, raw: []const u8, name: ?[]const u8, target: []const u8) !void {

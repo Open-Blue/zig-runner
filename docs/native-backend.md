@@ -162,7 +162,7 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   gating every submodule checkout would cost its replay.
 - Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a job the runner
   does not vouch for (`trust.vouches`, for `--exec-job` too), a rootless runner unless
-  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:`, a `volumes:` entry that is a host path or
+  `RUNNER_NATIVE_ROOTLESS=1`, a job container's `ports:` it does not publish, a `volumes:` entry that is a host path or
   otherwise not a directory of the job, or an `options:` flag the native job does not carry out (all below, "Job container options"), `services:`
   on a rootless runner or with an image given by an expression (native since P6, below, their
   images pulled by P3), JavaScript and local `uses:` actions (P7, `actions.preload`), remote `uses:` actions in an
@@ -745,7 +745,7 @@ directories and the step's file-command files at a 4 KiB block each.
 - "Set up job" says what the job got: "Image: pulled natively in N ms (L layers, K KB fetched)" or
   "Image: from the native store", and "Provisioned natively in N ms (layer <key>)" or "...made
   before".
-- Falls back to Dagger: a job container's `ports:`, `volumes:` that are not directories of the job
+- Falls back to Dagger: a job container's `ports:` the native job does not publish, `volumes:` that are not directories of the job
   and `options:` flags the native job does not carry out ("Job container options", below), and on a rootless runner without
   `RUNNER_NATIVE_ROOTFS` the provisioned default image (below).
 
@@ -1440,17 +1440,58 @@ and its eviction would then lose the data a Docker volume keeps, so it is not do
 A volume where the runner binds or makes something itself (the workspace, `RUNNER_TEMP`, a cache
 volume's mount) fails the job in "Set up job", naming both, as it would hide one or the other.
 
-**`ports:` stay on Dagger.** On GitHub they publish the container's ports on the *host* (`-p`), so a
-client outside the container can reach them. Checked whether they can reuse what services use
-(`startRelay`, `forward.zig`): they cannot. The relay listens *inside* the job's network namespace
-and forwards to a service's port, which is how a non-container job on GitHub reaches a service
-published on the host; for a job container the steps run inside the container and reach their own
-ports on loopback already, and what `-p` adds is a way in from outside the job. The runner's table
-refuses that by design (`nft.zig`: `output` is "to the bridge, replies only. No process of the
-host's reaches a job"), so carrying it out means a DNAT or a listener in the host's network
-namespace, an `nft` rule that admits it, and a policy for which host addresses and ports a
-workflow may take. That is new isolation and network logic, and is not done here: the job goes to
-Dagger, with the reason in "Set up job".
+**`ports:` carried out on a root runner** (`runner/src/native/publish.zig`, `Backend.publishPorts`,
+`forward.zig` with `Spec.publish`). On GitHub they publish the container's ports on the *host*
+(`docker create -p`), so a client outside the container can reach them. Read as Docker reads `-p`
+(`nat.ParsePortSpec`): `[ip:][hostPort:]containerPort[/tcp|/udp]`, so `8080:80`, `80`,
+`127.0.0.1:8080:80/tcp`, `0.0.0.0::53/udp`.
+
+- **How: a relay of the runner's, not nftables.** The relay (the services' `forward.zig`, in a mode
+  of its own) makes its listening sockets in the runner's network namespace, on the host's address
+  and port, *then* joins the job's namespace, where it connects each client to the job's port on
+  the job's loopback; a socket stays in the namespace it was made in. Before it reads a byte it
+  becomes the job's `nobody` (an id of the job's range), with no capabilities, `no_new_privs` and
+  the steps' seccomp filter, and it runs in the job's cgroup. The runner's table is untouched:
+  `output` still drops every packet of the host's to the bridge ("no process of the host's reaches
+  a job"), so the job's address is never reachable and nothing that is not published is either. A
+  DNAT in the runner's table would have needed an accept beside that drop, a rule per job to remove
+  at its end and, after a crash, at the next start, and `route_localnet` to reach a job from the
+  host's 127.0.0.1. With the relay there is nothing to clean up: its sockets are a process's, and
+  it exits when its lifeline (its stdin, a pipe of the runner's) closes, at the job's end
+  (`Backend.deinit`, first) or when the runner dies, so a crash leaves no stale port or rule.
+  UDP is relayed per client (64 at once, the quietest dropped for a newcomer).
+- **Where: 127.0.0.1 by default.** `RUNNER_NATIVE_PORT_ADDRESSES` (`--native-port-addresses`,
+  IPv4 addresses separated by commas or colons, `0.0.0.0` for every address of the host) says
+  which host addresses a job may publish on; an entry with no address takes the first. Unset, it
+  is 127.0.0.1 alone: reached only by the host's own processes. An entry naming another address
+  fails the job naming the setting. Not Docker's default (0.0.0.0); an operator who wants that
+  sets `RUNNER_NATIVE_PORT_ADDRESSES=0.0.0.0`, and the host's own firewall then decides who reaches
+  it. A published port is never reachable from another job: other jobs reach the host only at the
+  bridge's address, where the runner's `input` chain drops all but replies and DNS.
+- **Which ports**: none below 1024 (the host's privileged ports; the job fails naming the port).
+  A bare `80` or `ip::80` gets one the kernel picks, from the host's ephemeral range as Docker's
+  does, and "Set up job" says where each went as `docker port` does:
+  `Container ports: 80/tcp -> 127.0.0.1:8080, 9090/tcp -> 127.0.0.1:41234`. A port another process
+  holds fails the job in "Set up job" naming it (`publish 127.0.0.1:8080/tcp`), as Docker's bind does.
+  At most 64.
+- **Untrusted jobs publish nothing**: a job the runner does not vouch for, and a fork's pull
+  request on a runner that does (scope `untrusted`), fail: a published port would be a way in to
+  code no one reviewed, on the host's address.
+- **Refused natively, not sent to Dagger**, for the reason host paths are (above): Dagger ignores a
+  job container's `ports:`, so the job would run with nothing published. What the native job does
+  not carry out goes to Dagger with the reason, as before: a range (`8000-8010:8000-8010`), an IPv6
+  address, `sctp`, an expression, and any `ports:` on a rootless runner (its steps share the host's
+  network already; phase 5).
+- Only IPv4: the listener is on the address given, not also on `[::]` as Docker's 0.0.0.0 is.
+
+Tests: the `-p` grammar and its refusals, a host port twice (`container_options.zig`); the
+operator's addresses, the default, 0.0.0.0, a privileged port and an untrusted job
+(`publish.zig`); the relay listening in the host's namespace on a port the kernel picks, said in
+its ready line, carrying TCP both ways and gone once stopped, UDP for two clients each answered on
+its own, and a taken port named (`forward.zig`, non-root); and as root, real jobs: a job's server
+reached from the host through its published 127.0.0.1 port, never from another job (neither its
+own 127.0.0.1 nor the host's bridge address), gone after the job, a bare port reported with the
+kernel's pick, and a taken port failing the job before any step runs.
 
 - **An `options:` that is an expression** (`${{ matrix.options }}`): decided before expressions
   are evaluated. Reading it after, with the same parser, is possible; not done here. The same for a
