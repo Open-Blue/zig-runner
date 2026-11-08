@@ -188,9 +188,10 @@ jobs:
             exit 0
           fi
           cd "$RUNNER_TEMP/digests"
-          [[ $(ls | wc -l) == 2 ]] || { echo "expected one image per architecture, found: $(ls)" >&2; exit 1; }
+          digests=(*)
+          ((${#digests[@]} == 2)) || { echo "expected one image per architecture, found: ${digests[*]}" >&2; exit 1; }
           images=()
-          for digest in *; do images+=("$image@sha256:$digest"); done
+          for digest in "${digests[@]}"; do images+=("$image@sha256:$digest"); done
           docker buildx imagetools create -t "$image:$tag" "${images[@]}"
           echo "digest=$(docker buildx imagetools inspect "$image:$tag" --format '{{.Manifest.Digest}}')" >> "$GITHUB_OUTPUT"
       # The packages that went in, for whoever pins this: the runner's logs name the same.
