@@ -1,0 +1,3 @@
+kind: Added
+body: RUNNER_PREWARM=before-listen (or --prewarm=before-listen) finishes the native store pre-warm before any runner registers or polls, so a machine added to a pool takes jobs only once warm; a failed warm, or one over 15 minutes, still lets the runners listen, and a stop ends the wait
+time: 2026-11-07T21:23:48.509908235-05:00

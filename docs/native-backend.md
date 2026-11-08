@@ -82,7 +82,16 @@ default (`direct`) behaves exactly as before. With `none`:
   cgroup of its own, so `memory.max` and `pids.max` hold it, and through the memory gate as a job
   of its own (the pool's extra slot); a failure is said ("pre-warm failed ...") and the first
   job makes what it needs, as it always did. A native pool with an engine warms the native
-  store too, before the engine's. The memory gate has no engine source (as `RUNNER_ENGINE_CGROUP=none`): it holds on the
+  store too, before the engine's.
+  `RUNNER_PREWARM=before-listen` (`--prewarm=before-listen`) makes the native warm finish
+  before any runner registers or polls (`loop.Warmer.beforeListen`, called by `pool`), so a
+  machine added for scaling takes jobs only once warm: on razorbill (Pi 5, empty store) the
+  warm takes 209 s, a Zig job sent during it took 284 s and one after it 6-13 s. Nothing registers
+  before the pool's runners start, so no runner is held online and idle meanwhile. A failed warm is
+  said and the runners listen; a warm over 15 minutes (`before_listen_max_ms_default`) is
+  cancelled, said, and the runners listen; a stop ends the wait with no "ready". The engine's warm
+  (Dagger) keeps its background behaviour. No systemd or compose readiness signal is involved
+  (no `Type=notify` or healthcheck exists), so "started" still means the process is up. The memory gate has no engine source (as `RUNNER_ENGINE_CGROUP=none`): it holds on the
   machine and on each job's cgroup, and logs nothing about an engine cgroup. The silence-timeout
   line is not printed.
 - **Jobs.** A job native can run runs natively as always. One it cannot (`Backend.unsupported` or
