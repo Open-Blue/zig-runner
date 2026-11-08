@@ -1,0 +1,3 @@
+kind: Changed
+body: TLC runs in four parts side by side, each configuration given to a part by its expected time, so the model check takes about three minutes instead of twelve
+time: 2026-11-07T17:41:25.603845203-05:00

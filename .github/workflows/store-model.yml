@@ -56,12 +56,19 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # In four parts side by side (tlc.sh, TLC_PART): one after another the configurations took 12
+  # minutes; each part has about three of them, by the times the configurations note.
   tlc:
-    name: TLC
+    name: TLC (${{ matrix.part }}/4)
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
       contents: read # to check out the code
+    strategy:
+      # Every part reports: one failing does not hide what the others find.
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -73,4 +80,6 @@ jobs:
           java-version: "21"
 
       - name: Check the store's locking and the release pipeline
+        env:
+          TLC_PART: ${{ matrix.part }}/4
         run: .github/scripts/tlc.sh
