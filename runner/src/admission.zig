@@ -581,7 +581,10 @@ pub const Admission = struct {
             const persist = &(a.persist orelse return);
             if (!persist.dirty) return;
             const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
-            if (!force and now_ms - persist.written_ms < Persist.min_interval_ms) return;
+            // Saturating: `written_ms` starts at the least i64, so the first write after a start
+            // goes ahead (v0.28.0 subtracted plainly, which overflowed and aborted the runner at
+            // its first job's end on razorbill).
+            if (!force and now_ms -| persist.written_ms < Persist.min_interval_ms) return;
             if (persist.path.len > path_buf.len) return;
             persist.dirty = false;
             persist.written_ms = now_ms;
@@ -3660,6 +3663,11 @@ test "a restart keeps what jobs took, natively and on the engine, in the order t
     try std.testing.expect(!third.persist.?.dirty);
     _ = gate.ended();
     try std.testing.expect(third.persist.?.dirty);
+    // The first write after a start goes ahead: `written_ms` is still its start value (v0.28.0
+    // overflowed here and the runner panicked at its first job's end).
+    third.persistNow(false);
+    try std.testing.expect(!third.persist.?.dirty);
+    third.persist.?.dirty = true;
     // Written at most every `min_interval_ms`; the pool's end writes the rest.
     third.persist.?.written_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
     third.persistNow(false);

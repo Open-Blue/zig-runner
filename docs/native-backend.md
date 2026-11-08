@@ -951,8 +951,9 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
     and no other runner polls, one runner polls whatever the room (said in the log): a machine
     that has less memory than at start does not idle in silence.
   - *The estimates survive a restart* (#407). `Admission.learned` and `learned_native` are kept in
-    `memory-gate` in the native store's directory (`RUNNER_NATIVE_STORE`, `Config.nativeStore`;
-    written there for a Dagger pool too), one text line a name, versioned (`zig-runner memory gate
+    `memory-gate-<RUNNER_NAME_PREFIX>` in the native store's directory (`RUNNER_NATIVE_STORE`,
+    `Config.nativeStore`; written there for a Dagger pool too; one file for each pool, as pools on
+    one machine share the directory), one text line a name, versioned (`zig-runner memory gate
     v2`), with the machine id, `MemTotal` and the backend they were measured on. It is written
     atomically (temp file, fsync, rename, fsync of the directory) when something was learned, at
     most every 10 s and when the pool ends, and read at start, where the log says how many were
