@@ -3166,6 +3166,40 @@ const SeedWatch = struct {
     }
 };
 
+test "a volume's filling is stopped at the job's cancel, well before its time limit" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const io = std.testing.io;
+    var cancel: dagger.Cancel = .{};
+    var b: Backend = .{
+        .arena = a.allocator(),
+        .io = io,
+        .gpa = std.testing.allocator,
+        .dir = "",
+        .rootfs = "",
+        .binds = &.{},
+        .lock = undefined,
+        .how = .{ .argv_prefix = &.{}, .userns = .mapped },
+        .cancel = &cancel,
+    };
+    var dog: SeedWatch = .{};
+    // An hour: only the cancel can be what stops it.
+    var watch = try io.concurrent(SeedWatch.run, .{ &dog, &b, 60 * 60 * 1000 });
+    defer {
+        dog.done.store(true, .release);
+        watch.await(io);
+    }
+    // Quiet while nothing is cancelled.
+    try io.sleep(.fromMilliseconds(250), .awake);
+    try std.testing.expect(!dog.fired.load(.acquire));
+    cancel.requested.store(true, .release);
+    for (0..300) |_| {
+        if (dog.fired.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expect(dog.fired.load(.acquire));
+}
+
 /// What the image has at `volume.at` copied into the new volume, as Docker fills one: the
 /// directory's files, and its owner and mode (`cp -a`, run in the job's image as its root, so the
 /// ids are the job's as every step sees them), in a sandbox whose layer is dropped. Nothing there,

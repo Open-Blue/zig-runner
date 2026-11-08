@@ -96,6 +96,13 @@ const all_areas = tree_areas ++ [_][]const u8{"volumes"};
 /// (so `Store.rootfsFingerprint`, and every layer's key on it, at the next restart) and cost the
 /// next job a pull it would not otherwise need.
 const image_grace_s = 60 * 60;
+/// How much later a repository-scope volume goes than an untrusted one used as long ago: the
+/// untrusted scope is what a fork's pull request fills (`set_up.packageCacheScope`), and its
+/// growth must not take the room of a volume the repository's own jobs rely on. Past it, the
+/// longest unused goes first as ever.
+const trusted_grace_s = 7 * 24 * 60 * 60;
+/// The scope of the key (`<owner>/<repository>/<scope>/...`) whose volumes are untrusted jobs'.
+const untrusted_scope = "untrusted";
 
 const Entry = struct {
     /// The directory's path. A `.lock` and a `.size` are beside it.
@@ -106,7 +113,8 @@ const Entry = struct {
     volume: bool,
     /// Its last use, in seconds: the lock file's mtime.
     used_s: i64,
-    /// What the order of eviction goes by: its last use, and `image_grace_s` for an image.
+    /// What the order of eviction goes by: its last use, and `image_grace_s` for an image,
+    /// `trusted_grace_s` for a volume outside the untrusted scope.
     rank_s: i64,
     /// When it was last measured, 0 when it never was: the size file's mtime.
     measured_s: i64 = 0,
@@ -472,7 +480,7 @@ fn dropRefs(arena: Allocator, io: std.Io, root: []const u8) void {
 /// The volumes, stray lock files removed on the way.
 fn listVolumes(arena: Allocator, io: std.Io, root: []const u8) ![]Entry {
     var out: std.ArrayList(Entry) = .empty;
-    try walkKeys(arena, io, try std.fmt.allocPrint(arena, "{s}/volumes", .{root}), &out, 0);
+    try walkKeys(arena, io, try std.fmt.allocPrint(arena, "{s}/volumes", .{root}), &out, 0, false);
     return out.items;
 }
 
@@ -480,7 +488,7 @@ fn listVolumes(arena: Allocator, io: std.Io, root: []const u8) ![]Entry {
 /// is a volume, a job's own content, which is never looked into: a volume inside it goes with it
 /// (`innerLock`). One without is a part of a key, which no job can reach, so it must look like one:
 /// the runner's own, and where a key has parts. Below the name, only an image's and the step user's.
-fn walkKeys(arena: Allocator, io: std.Io, dir: []const u8, out: *std.ArrayList(Entry), depth: u32) !void {
+fn walkKeys(arena: Allocator, io: std.Io, dir: []const u8, out: *std.ArrayList(Entry), depth: u32, untrusted: bool) !void {
     if (depth > max_key_depth) return;
     var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true, .follow_symlinks = false }) catch return;
     defer d.close(io);
@@ -505,11 +513,17 @@ fn walkKeys(arena: Allocator, io: std.Io, dir: []const u8, out: *std.ArrayList(E
             continue;
         }
         if (!isFile(arena, try std.fmt.allocPrint(arena, "{s}.lock", .{full}))) {
-            if (runners(arena, full)) try walkKeys(arena, io, full, out, depth + 1);
+            if (runners(arena, full)) {
+                // The scope is the key's third part: the directory listed at depth 2.
+                const in_untrusted = untrusted or (depth == 2 and std.mem.eql(u8, n, untrusted_scope));
+                try walkKeys(arena, io, full, out, depth + 1, in_untrusted);
+            }
             continue;
         }
         if (out.items.len >= max_entries) return;
-        try out.append(arena, try entryOf(arena, io, full, "volumes", true, std.mem.indexOf(u8, n, ".private-") != null));
+        var e = try entryOf(arena, io, full, "volumes", true, std.mem.indexOf(u8, n, ".private-") != null);
+        if (!untrusted) e.rank_s += trusted_grace_s;
+        try out.append(arena, e);
     }
 }
 
@@ -1068,8 +1082,21 @@ const Fixture = struct {
         return v.dir;
     }
 
+    /// As `volume`, in `scope` of the repository.
+    fn scoped(f: *Fixture, scope: []const u8, name: []const u8, bytes: usize, days: i64) ![]const u8 {
+        const v = try f.holdIn(scope, name);
+        defer v.release(testing.io);
+        try f.fill(v.dir, bytes);
+        try f.age(v.dir, days);
+        return v.dir;
+    }
+
     fn hold(f: *Fixture, name: []const u8) !volumes.Volume {
-        const key = [_][]const u8{ "o", "r", "repo", name };
+        return f.holdIn("repo", name);
+    }
+
+    fn holdIn(f: *Fixture, scope: []const u8, name: []const u8) !volumes.Volume {
+        const key = [_][]const u8{ "o", "r", scope, name };
         return volumes.open(f.arena(), testing.io, f.s.root, &key, .shared, null);
     }
 
@@ -1120,6 +1147,41 @@ test "native eviction: the volumes unused longest go, down to the cap, and leave
     // Its lock and size went with it: a key no job uses again leaves no trace.
     try testing.expect(mtime(f.arena(), try std.fmt.allocPrint(f.arena(), "{s}.lock", .{oldest})) == null);
     try testing.expect(mtime(f.arena(), try std.fmt.allocPrint(f.arena(), "{s}.size", .{oldest})) == null);
+}
+
+test "native eviction: untrusted volumes go before a repository's, however long that one has been idle" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    // The repository's volume is the longest unused, by two days.
+    const trusted = try f.scoped("repo", "cargo", 6000, 5);
+    const fork_old = try f.scoped("untrusted", "a", 6000, 3);
+    const fork_new = try f.scoped("untrusted", "b", 6000, 2);
+    // Over the cap by one volume: the longer unused of the forks' goes, not the repository's.
+    f.s.limits = .{ .volumes_max_bytes = 13_000, .min_free_pct = 0 };
+    run(f.s, testing.io);
+    try testing.expect(f.there(trusted));
+    try testing.expect(!f.there(fork_old));
+    try testing.expect(f.there(fork_new));
+    // Past the grace it is the longest unused as ever.
+    const stale = try f.scoped("repo", "stale", 6000, 30);
+    run(f.s, testing.io);
+    try testing.expect(!f.there(stale));
+    try testing.expect(f.there(trusted));
+}
+
+test "native eviction: untrusted growth leaves a repository's volume alone within its grace" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const trusted = try f.scoped("repo", "npm", 6000, 2);
+    const fork_names = [_][]const u8{ "a", "b", "c" };
+    var forks: [3][]const u8 = undefined;
+    for (&forks, fork_names, [_]i64{ 10, 11, 12 }) |*d, name, days| d.* = try f.scoped("untrusted", name, 6000, days);
+    f.s.limits = .{ .volumes_max_bytes = 13_000, .min_free_pct = 0 };
+    run(f.s, testing.io);
+    try testing.expect(f.there(trusted));
+    // The cap is met by the forks' alone: the longest unused two.
+    try testing.expect(!f.there(forks[2]) and !f.there(forks[1]));
+    try testing.expect(f.there(forks[0]));
 }
 
 test "native eviction: a volume a job holds stays, and one used today stays over the cap" {
