@@ -28,6 +28,13 @@
 //! root's files as the job's root's, 1001's as its runner user's. Never host ids: a setuid file a
 //! job left in a volume is then nobody's on the host, and the mount is nosuid anyway.
 //!
+//! A job container's named volumes (`volumes: - name:/path`, `openNamed`) live here too, beside
+//! the caches of their repository and scope (`namedKey`), and outlive the job as Docker's do. Their
+//! files are owned and seen as the cache volumes' are. Unlike Docker's, they are evicted as the
+//! cache volumes are (least recently used, past `RUNNER_NATIVE_VOLUMES_MAX_MB` or under the disk's
+//! floor), so one a job has not used for a day can be gone: what a workflow keeps in one must be
+//! something it can make again.
+//!
 //! The Zig cache seed (`Options.zig_seeds`, minisign-verified releases) is a layer, not a volume:
 //! the global cache `zig build --help` leaves, built once per release, architecture and step user
 //! in a sandbox from the release's tarball checked against its pinned sha256, as the Dagger
@@ -81,6 +88,10 @@ pub const Options = struct {
     }
 };
 
+const lock_sh: i32 = 1;
+const lock_ex: i32 = 2;
+const lock_nb: i32 = 4;
+
 /// Dagger's cache sharing modes (`CacheSharingMode`).
 pub const Sharing = enum { shared, locked, private };
 
@@ -92,6 +103,25 @@ pub const Volume = struct {
     lock: std.Io.File,
     /// A `private` volume's copy of the job's own, removed when it is let go.
     private: bool = false,
+    /// Made by this open (`openNamed`): it is held exclusively until `share`, so the job can
+    /// seed it from its image before any other job sees it.
+    new: bool = false,
+
+    /// A new named volume, seeded, given to the jobs that wait for it: its lock taken shared.
+    pub fn share(v: *Volume) void {
+        std.debug.assert(v.new);
+        _ = linux.flock(v.lock.handle, lock_sh);
+        v.new = false;
+    }
+
+    /// A new named volume that could not be seeded, removed, so the next job makes it again
+    /// and seeds it. Its lock is still held exclusively here: no job is in it.
+    pub fn discard(v: Volume, io: std.Io) void {
+        std.debug.assert(v.new);
+        std.Io.Dir.cwd().deleteTree(io, v.dir) catch |e|
+            std.log.warn("native: cannot remove {s}: {s}", .{ v.dir, @errorName(e) });
+        v.lock.close(io);
+    }
 
     /// Lets the volume go; a private copy is removed, and its lock with it.
     pub fn release(v: Volume, io: std.Io) void {
@@ -129,9 +159,6 @@ pub fn open(
     }
     const dir = path.items;
     const lock_path = try std.fmt.allocPrint(arena, "{s}.lock", .{dir});
-    const lock_sh: i32 = 1;
-    const lock_ex: i32 = 2;
-    const lock_nb: i32 = 4;
     var private = false;
     // Until the lock is on the file the path names: an eviction removes the file once it has the
     // volume away, and can take the directory it is in (`evict.nested`).
@@ -208,6 +235,101 @@ pub fn component(arena: Allocator, part: []const u8) ![]const u8 {
     if (std.mem.endsWith(u8, out, ".lock") or std.mem.endsWith(u8, out, ".size"))
         out = try std.mem.concat(arena, u8, &.{ out, "~" });
     return out;
+}
+
+/// The part of a key under a scope that holds the job containers' named volumes: no cache volume
+/// is called so (`set_up.package_cache_dirs`, `zig-local`, `zig-builtin`).
+pub const named_part = "named";
+
+/// The key of a job container's named volume `name` (`volumes: - name:/path`):
+/// `<owner>/<repository>/<scope>/named/<name>`. Docker's volumes are the host's, one namespace for
+/// every container; here a name is the repository's, in its trust scope, because a volume holds
+/// what one job left for the next, which reads it as its own: a job of another repository, or an
+/// untrusted job of this one (a fork's pull request, `set_up.packageCacheScope`), could otherwise
+/// plant files in it that a trusted job runs or ships. A workflow that shares a volume across
+/// repositories on Docker gets one per repository here.
+pub fn namedKey(arena: Allocator, repository: []const u8, scope: []const u8, name: []const u8) ![]const []const u8 {
+    if (repository.len == 0) return error.NoRepository;
+    var parts = std.mem.splitScalar(u8, repository, '/');
+    const repo_owner = parts.next().?;
+    return arena.dupe([]const u8, &.{ repo_owner, parts.rest(), scope, named_part, name });
+}
+
+/// A job container's named volume (`namedKey`), made if missing, held for the job as a cache
+/// volume is (its lock shared, so jobs use it at once as Docker's containers do, and an eviction
+/// takes none in use). One this open made is `new`, its root owned by `owner` (a host id; null
+/// leaves it the runner's) and its lock held exclusively until the job has seeded it from its
+/// image (`Volume.share`), so a job that opens it meanwhile waits for it whole: Docker copies the
+/// image's files into a volume once, before the first container that mounts it starts. An open
+/// that finds it in use waits only for such a seeding, never for a job that holds it shared.
+pub fn openNamed(
+    arena: Allocator,
+    io: std.Io,
+    store: []const u8,
+    key: []const []const u8,
+    owner: ?u32,
+) !Volume {
+    const root = try std.fmt.allocPrint(arena, "{s}/volumes", .{store});
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    _ = linux.chmod(try arena.dupeSentinel(u8, root, 0), 0o700);
+    var path: std.ArrayList(u8) = .empty;
+    try path.appendSlice(arena, root);
+    for (key) |part| {
+        try path.append(arena, '/');
+        try path.appendSlice(arena, try component(arena, part));
+    }
+    const dir = path.items;
+    const dir_z = try arena.dupeSentinel(u8, dir, 0);
+    const lock_path = try std.fmt.allocPrint(arena, "{s}.lock", .{dir});
+    // Each turn ends with the lock on the file the path names, or starts again: an eviction
+    // removes the file once it has taken the volume away, and a seeding that failed removes the
+    // volume (`Volume.discard`).
+    var turns: u32 = 0;
+    while (turns < 64) : (turns += 1) {
+        try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(dir).?);
+        const f = Store.lockBeside(arena, io, lock_path) catch |e| switch (e) {
+            error.FileNotFound => continue,
+            else => return e,
+        };
+        errdefer f.close(io);
+        // Free: this job may make it. Not free: it is in use, so it is there, or being seeded,
+        // which a shared lock waits for.
+        const alone = linux.errno(linux.flock(f.handle, lock_ex | lock_nb)) == .SUCCESS;
+        if (!alone and linux.errno(linux.flock(f.handle, lock_sh)) != .SUCCESS) return error.Locked;
+        if (!Store.sameFile(arena, f, lock_path)) {
+            f.close(io);
+            continue;
+        }
+        _ = linux.utimensat(f.handle, null, null, 0);
+        const made = switch (linux.errno(linux.mkdir(dir_z, 0o755))) {
+            .SUCCESS => true,
+            .EXIST => false,
+            else => return error.VolumeNotMade,
+        };
+        if (made and !alone) {
+            // Gone since it was in use (evicted, or its seeding failed): made again by an open
+            // that holds it alone, so it is seeded.
+            _ = linux.rmdir(dir_z);
+            f.close(io);
+            continue;
+        }
+        if (!made) {
+            // Only the runner writes here, never a job: what is not a directory is the store's
+            // fault.
+            var st: linux.Statx = undefined;
+            const rc = linux.statx(linux.AT.FDCWD, dir_z, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &st);
+            if (linux.errno(rc) != .SUCCESS or st.mode & linux.S.IFMT != linux.S.IFDIR)
+                return error.VolumeNotMade;
+            if (alone) _ = linux.flock(f.handle, lock_sh);
+            return .{ .dir = dir, .root = root, .lock = f };
+        }
+        if (owner) |o| if (linux.errno(linux.lchown(dir_z, o, o)) != .SUCCESS) {
+            _ = linux.rmdir(dir_z);
+            return error.VolumeNotOwned;
+        };
+        return .{ .dir = dir, .root = root, .lock = f, .new = true };
+    }
+    return error.Locked;
 }
 
 /// What a job gets of the caches (`plan`).
@@ -592,8 +714,6 @@ test "native volumes: shared ones are used at once, locked ones in turn, private
     const alone = try open(arena, io, store, &key, .private, null);
     try std.testing.expect(!alone.private);
     try std.testing.expectEqualStrings(one.dir, alone.dir);
-    const lock_ex: i32 = 2;
-    const lock_nb: i32 = 4;
     const probe = try std.Io.Dir.cwd().openFile(io, try std.fmt.allocPrint(arena, "{s}.lock", .{
         alone.dir,
     }), .{});
@@ -712,4 +832,112 @@ test "native volumes: the pre-warm names a seed where a job's plan does, for eac
     const root = try seedFor(arena, store, seed, false);
     const runner = try seedFor(arena, store, seed, true);
     try std.testing.expect(!std.mem.eql(u8, root.dir, runner.dir));
+}
+
+test "native named volumes: kept between opens, new only the first time, apart by scope and repository" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cwd = std.Io.Dir.cwd();
+
+    const key = try namedKey(arena, "o/r", "repo", "data");
+    var first = try openNamed(arena, io, store, key, null);
+    try std.testing.expect(first.new);
+    try std.testing.expect(std.mem.endsWith(u8, first.dir, "/volumes/o/r/repo/named/data"));
+    try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/f", .{first.dir}), .data = "kept" });
+    first.share();
+    first.release(io);
+    // The next job finds it as the last left it, and seeds nothing.
+    const again = try openNamed(arena, io, store, key, null);
+    defer again.release(io);
+    try std.testing.expect(!again.new);
+    try std.testing.expectEqualStrings(first.dir, again.dir);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("kept", try cwd.readFile(io, try std.fmt.allocPrint(arena, "{s}/f", .{again.dir}), &buf));
+
+    // An untrusted job of the repository, and a job of another, each get a volume of their own.
+    for ([_][2][]const u8{ .{ "o/r", "untrusted" }, .{ "o/other", "repo" }, .{ "x/r", "repo" } }) |other| {
+        var v = try openNamed(arena, io, store, try namedKey(arena, other[0], other[1], "data"), null);
+        defer v.release(io);
+        try std.testing.expect(v.new);
+        try std.testing.expect(!std.mem.eql(u8, v.dir, again.dir));
+        try std.testing.expectError(error.FileNotFound, cwd.access(io, try std.fmt.allocPrint(arena, "{s}/f", .{v.dir}), .{}));
+        v.share();
+    }
+    // A name is a directory of its own, whatever Docker lets it hold, and never a cache's.
+    const odd = try namedKey(arena, "o/r", "repo", "x.lock");
+    try std.testing.expectEqualStrings(named_part, odd[3]);
+    var v = try openNamed(arena, io, store, odd, null);
+    defer v.release(io);
+    try std.testing.expect(std.mem.endsWith(u8, v.dir, "/named/x.lock~"));
+    v.share();
+    try std.testing.expectError(error.NoRepository, namedKey(arena, "", "repo", "data"));
+}
+
+test "native named volumes: jobs use one at once, waiting only while a new one is filled" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cwd = std.Io.Dir.cwd();
+    const key = try namedKey(arena, "o/r", "repo", "data");
+    const lock_path = try std.fmt.allocPrint(arena, "{s}/volumes/o/r/repo/named/data.lock", .{store});
+
+    // New: held alone while the job fills it, so no other job sees it half filled.
+    var seeding = try openNamed(arena, io, store, key, null);
+    try std.testing.expect(seeding.new);
+    const probe = try cwd.openFile(io, lock_path, .{});
+    defer probe.close(io);
+    try std.testing.expect(linux.errno(linux.flock(probe.handle, lock_sh | lock_nb)) != .SUCCESS);
+
+    // A second job opening it meanwhile waits for the filling, then shares it.
+    const Opener = struct {
+        arena: Allocator,
+        store: []const u8,
+        key: []const []const u8,
+        out: ?Volume = null,
+        done: std.atomic.Value(bool) = .init(false),
+        fn go(o: *@This()) void {
+            o.out = openNamed(o.arena, std.testing.io, o.store, o.key, null) catch null;
+            o.done.store(true, .release);
+        }
+    };
+    var thread_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer thread_arena.deinit();
+    var opener: Opener = .{ .arena = thread_arena.allocator(), .store = store, .key = key };
+    const t = try std.Thread.spawn(.{}, Opener.go, .{&opener});
+    for (0..20) |_| {
+        try std.testing.expect(!opener.done.load(.acquire));
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/seeded", .{seeding.dir}), .data = "" });
+    seeding.share();
+    t.join();
+    const second = opener.out orelse return error.TestUnexpectedResult;
+    defer second.release(io);
+    try std.testing.expect(!second.new);
+    try cwd.access(io, try std.fmt.allocPrint(arena, "{s}/seeded", .{second.dir}), .{});
+    // Both hold it shared: a third opens it at once, and only an eviction is kept out.
+    const third = try openNamed(arena, io, store, key, null);
+    defer third.release(io);
+    try std.testing.expect(!third.new);
+    try std.testing.expect(linux.errno(linux.flock(probe.handle, lock_ex | lock_nb)) != .SUCCESS);
+    seeding.release(io);
+
+    // A new one whose filling failed is gone: the next job makes it again, and fills it.
+    const fresh_key = try namedKey(arena, "o/r", "repo", "fresh");
+    const failed = try openNamed(arena, io, store, fresh_key, null);
+    try std.testing.expect(failed.new);
+    failed.discard(io);
+    var retry = try openNamed(arena, io, store, fresh_key, null);
+    defer retry.release(io);
+    try std.testing.expect(retry.new);
+    retry.share();
 }
