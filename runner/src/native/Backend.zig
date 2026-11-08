@@ -2018,18 +2018,23 @@ fn seed(b: *Backend, s: volumes.Seed, as_runner: bool) ?[]const u8 {
     // Only the runner's user may look in, as in the volumes'.
     const seeds_z = arena.dupeSentinel(u8, seeds_dir, 0) catch return "out of memory";
     _ = std.os.linux.chmod(seeds_z, 0o700);
-    if (b.holdSeed(s.dir)) |held| {
-        if (held) return null;
-    } else |e| return @errorName(e);
-    {
+    // Built under the seed's lock, then held as any job holds it, past the lock let go
+    // (`ImageStore.ensure`): an eviction can come between, and a seed evicted at once is built
+    // again. A few times at most, so an eviction that takes each one cannot keep the job here.
+    for (0..seed_builds_max) |_| {
+        if (b.holdSeed(s.dir)) |held| {
+            if (held) return null;
+        } else |e| return @errorName(e);
         const lock = ImageStore.lockDir(arena, b.io, s.dir, 2) catch |e| return @errorName(e);
         defer lock.close(b.io);
         if (cwd.access(b.io, s.dir, .{})) |_| {} else |_| if (b.buildSeed(s, as_runner)) |why| return why;
     }
-    // Held as any job holds it, past the lock let go. Evicted in that moment, the job runs unseeded.
     const held = b.holdSeed(s.dir) catch |e| return @errorName(e);
-    return if (held) null else "it was evicted as it was built";
+    return if (held) null else "it was evicted as it was built, each time";
 }
+
+/// How many times `seed` builds a seed that an eviction takes as soon as it is built.
+const seed_builds_max = 3;
 
 /// Whether the seed `dir` is there, then held for the job (`ImageStore.holdDir`).
 fn holdSeed(b: *Backend, dir: []const u8) !bool {
