@@ -233,8 +233,12 @@ repository:
   digests too. zizmor is installed from PyPI by hash (`.github/zizmor-requirements.txt`,
   `.github/scripts/zizmor.sh`). The job base image `ubuntu:24.04` (`RUNNER_IMAGE`) is pinned by its multi-arch index digest
   (`runner/src/dagger.zig`, checked by `.github/scripts/ubuntu-pin.sh`); the packages provisioning
-  installs into it come from the Ubuntu archive on the day the engine builds them, and the pre-warm
-  logs their fingerprint. tls.zig and GitHub's expression
+  installs into it come from the Ubuntu archive on the day they are installed, and the pre-warm
+  logs their fingerprint. Where one is pinned (`runner/src/dagger/provisioned_pin.zig`, checked by
+  `.github/scripts/provisioned-pin.sh`), the runner pulls the default image already provisioned, built
+  by the "provisioned image" workflow from the runner's own script, signed and by digest, instead of
+  installing the packages (22-45 s, and Ubuntu's mirrors) on every new machine and empty store; a
+  pull that fails provisions as before, and `RUNNER_PROVISIONED_IMAGE=false` never pulls it. tls.zig and GitHub's expression
   test cases are pinned by commit. Zig, changie, checksec and gitleaks are checked against pinned checksums
   before they run, tls.zig against its `.hash` as well; a Renovate pull request for a new Zig, tls.zig or
   changie fails until its checksums are updated (changie's by the Workflows job, which downloads

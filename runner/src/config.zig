@@ -120,6 +120,11 @@ pub const Config = struct {
     /// razorbill's Install Zig under load. Only in jobs without `dagger_nesting`, whose steps
     /// cannot reach the lists' volume (`set_up.verifyToolTrees`).
     tool_trees: bool = true,
+    /// Pull the default image already provisioned (`dagger/provisioned.zig`, from ghcr.io) instead
+    /// of running `apt-get install` in it, when this build pins one; any failure to pull provisions
+    /// with apt as before (`RUNNER_PROVISIONED_IMAGE`). Off for a host that must pull from nowhere
+    /// but the Ubuntu mirrors.
+    provisioned_image: bool = true,
     /// Reuse a step's result from an earlier run when its inputs are unchanged (steps that use
     /// secrets always run). A workflow can opt out with `ZIG_RUNNER_STEP_CACHE: false` in its env.
     step_cache: bool = true,
@@ -476,6 +481,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_DAGGER_NESTING")) |v| c.dagger_nesting = try boolean(v);
         if (environ.get("RUNNER_PACKAGE_CACHES")) |v| c.package_caches = try boolean(v);
         if (environ.get("RUNNER_TOOL_TREES")) |v| c.tool_trees = try boolean(v);
+        if (environ.get("RUNNER_PROVISIONED_IMAGE")) |v| c.provisioned_image = try boolean(v);
         if (environ.get("RUNNER_STEP_CACHE")) |v| c.step_cache = try boolean(v);
         if (environ.get("RUNNER_STEP_USER")) |v| c.step_user = try stepUser(v);
         if (environ.get("RUNNER_BACKEND")) |v| c.backend = try stepBackend(v);
@@ -570,6 +576,7 @@ pub const Config = struct {
         else if (eq(key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
         else if (eq(key, "package-caches")) c.package_caches = try boolean(val) //
         else if (eq(key, "tool-trees")) c.tool_trees = try boolean(val) //
+        else if (eq(key, "provisioned-image")) c.provisioned_image = try boolean(val) //
         else if (eq(key, "step-cache")) c.step_cache = try boolean(val) //
         else if (eq(key, "step-user")) c.step_user = try stepUser(val) //
         else if (eq(key, "backend")) c.backend = try stepBackend(val) //
@@ -1127,6 +1134,17 @@ test "the tool cache's trees are checked in Set up job unless turned off" {
     try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--tool-trees=false" })).tool_trees);
     try env.put("RUNNER_TOOL_TREES", "0");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).tool_trees);
+}
+
+test "the provisioned image is on by default and can be turned off" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expect((try Config.load(&env, &.{"runner"})).provisioned_image);
+    try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--provisioned-image=false" })).provisioned_image);
+    try env.put("RUNNER_PROVISIONED_IMAGE", "false");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).provisioned_image);
 }
 
 test "step caching is on by default and can be turned off" {

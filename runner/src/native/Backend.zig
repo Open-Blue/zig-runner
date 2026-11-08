@@ -43,6 +43,7 @@ const SpanDemux = @import("../dagger/JobLog.zig").SpanDemux;
 const checkout = @import("../dagger/checkout.zig");
 const scripts = @import("../dagger/scripts.zig");
 const set_up = @import("../dagger/set_up.zig");
+const provisioned = @import("../dagger/provisioned.zig");
 const phases = @import("phases.zig");
 const hash_files = @import("hash_files.zig");
 
@@ -62,6 +63,9 @@ rootfs: []const u8,
 /// `Config.rootfs`: the operator's provisioned default image, used instead of a native pull of
 /// it; "" for none.
 operator_rootfs: []const u8 = "",
+/// `Config.provisioned_image` and `Config.provisioned_pins`.
+provisioned_image: bool = true,
+provisioned_pins: provisioned.Pins = provisioned.pinned,
 /// The job's image, once pulled (`prepareRootfs`); null with the operator's rootfs.
 image: ?oci.Image = null,
 /// The image's own env (`NAME=value`), which every step starts from.
@@ -213,6 +217,11 @@ pub const Config = struct {
     /// or `provision_runner_script` for the runner user), used instead of pulling and provisioning
     /// it natively; "" to pull it (`RUNNER_NATIVE_ROOTFS`).
     rootfs: []const u8 = "",
+    /// Pull the pre-provisioned default image (`provisioned.zig`) instead of pulling Ubuntu and
+    /// provisioning it, where `provisioned_pins` pins one (`RUNNER_PROVISIONED_IMAGE`). Failing to
+    /// pull it provisions, as without.
+    provisioned_image: bool = true,
+    provisioned_pins: provisioned.Pins = provisioned.pinned,
     /// Where jobs' layers live while they run, and pulled images and provisioned rootfs
     /// (`RUNNER_NATIVE_STORE`).
     store: []const u8 = "",
@@ -380,6 +389,7 @@ pub fn configFor(
         .host_paths_closed = closed.items,
         .host_paths_unmapped = cfg.native_host_paths_unmapped,
         .rootfs = cfg.native_rootfs,
+        .provisioned_image = cfg.provisioned_image,
         .store = try cfg.nativeStore(arena, environ),
         .self_exe = exe.path,
         .self_exe_replaced = exe.replaced,
@@ -891,6 +901,8 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .dir = dir,
         .rootfs = cfg.rootfs,
         .operator_rootfs = cfg.rootfs,
+        .provisioned_image = cfg.provisioned_image,
+        .provisioned_pins = cfg.provisioned_pins,
         .binds = cfg.binds,
         .lock = lock,
         .how = how,
@@ -3001,6 +3013,10 @@ fn fetchRootfs(
     const arena = b.arena;
     var why: []const u8 = "";
     var t = phases.now();
+    if (provision_it) if (try b.pullProvisioned(as_runner)) |img| {
+        _ = b.timings.since(arena, .image, t);
+        return img;
+    };
     const img = b.pull(image, creds, &why) catch |e| {
         err_msg.* = try std.fmt.allocPrint(arena, "could not pull {s} natively: {s}", .{
             image,
@@ -3026,6 +3042,36 @@ fn fetchRootfs(
         err_msg,
     );
     _ = b.timings.since(arena, .provision, t);
+    return img;
+}
+
+/// How long the pre-provisioned image may take to pull before apt provisions instead: far less
+/// than `pull_deadline`, since provisioning is the alternative and takes under a minute.
+const provisioned_pull_deadline: std.Io.Duration = .fromSeconds(5 * 60);
+
+/// The pre-provisioned default image (`provisioned.zig`) pulled into the store, or found there, as
+/// what the job's steps start from: `b.rootfs` is then the image's own tree, under the store's
+/// `oci/images/<key>/rootfs`, a path no locally provisioned rootfs (`provision`, under
+/// `rootfs/<key>/rootfs`) shares, so `Store.rootfsFingerprint` and the step cache's keys never
+/// take one for the other. Null when none is pinned or the operator turned it off, and when the
+/// pull fails (the note says why): the caller pulls Ubuntu and provisions it with apt.
+fn pullProvisioned(b: *Backend, as_runner: bool) !?oci.Image {
+    const arena = b.arena;
+    const ref = try provisioned.reference(arena, b.provisioned_image, b.provisioned_pins, .of(as_runner)) orelse
+        return null;
+    var why: []const u8 = "";
+    const img = b.pullBefore(ref, null, provisioned_pull_deadline, &why) catch |e| {
+        try b.notes.append(arena, try provisioned.fallbackNote(arena, ref, if (why.len > 0) why else @errorName(e)));
+        return null;
+    };
+    b.image = img;
+    b.image_env = img.env;
+    b.rootfs = img.rootfs;
+    try b.notes.append(arena, if (img.pulled) |p| try std.fmt.allocPrint(
+        arena,
+        "{s}, pulled natively in {d} ms ({d} KB fetched)",
+        .{ try provisioned.usedNote(arena, ref), p.ms, p.bytes / 1024 },
+    ) else try std.fmt.allocPrint(arena, "{s}, from the native store", .{try provisioned.usedNote(arena, ref)}));
     return img;
 }
 
@@ -3462,7 +3508,18 @@ test "a musl image is told by its /lib, never through a symlink" {
 
 /// `image` pulled into the store, or found there (`oci/image.zig`), within `pull_deadline`.
 fn pull(b: *Backend, image: []const u8, creds: ?registry.Credentials, why: *[]const u8) !oci.Image {
-    const img = try pullAt(b.arena, b.gpa, b.io, b.store_cfg.root, b.how.userns == .mapped, image, creds, why);
+    return b.pullBefore(image, creds, pull_deadline, why);
+}
+
+/// `pull` within `deadline`.
+fn pullBefore(
+    b: *Backend,
+    image: []const u8,
+    creds: ?registry.Credentials,
+    deadline: std.Io.Duration,
+    why: *[]const u8,
+) !oci.Image {
+    const img = try pullWithin(b.arena, b.gpa, b.io, b.store_cfg.root, b.how.userns == .mapped, image, creds, deadline, why);
     errdefer img.lock.close(b.io);
     // Held to the job's end, as its layers are: eviction leaves it alone (`evict.zig`).
     try b.held.append(b.arena, img.lock);
@@ -3482,6 +3539,20 @@ pub fn pullAt(
     creds: ?registry.Credentials,
     why: *[]const u8,
 ) !oci.Image {
+    return pullWithin(arena, gpa, io, root, owners, image, creds, pull_deadline, why);
+}
+
+fn pullWithin(
+    arena: Allocator,
+    gpa: Allocator,
+    io: std.Io,
+    root: []const u8,
+    owners: bool,
+    image: []const u8,
+    creds: ?registry.Credentials,
+    deadline: std.Io.Duration,
+    why: *[]const u8,
+) !oci.Image {
     var local: std.http.Client = .{
         .allocator = gpa,
         .io = io,
@@ -3490,11 +3561,11 @@ pub fn pullAt(
     defer local.deinit();
     const store: ImageStore = .{ .root = root };
     const req: oci.Request = .{ .image = image, .creds = creds, .owners = owners };
-    const r = try http.within(io, pull_deadline, pullWithin, .{
+    const r = try http.within(io, deadline, pullInto, .{
         arena, gpa, io, http.client(&local), store, req, why,
     });
     return (r orelse {
-        why.* = "it took longer than 30 minutes";
+        why.* = try std.fmt.allocPrint(arena, "it took longer than {d} minutes", .{@divTrunc(deadline.toSeconds(), 60)});
         return error.Timeout;
     });
 }
@@ -3519,7 +3590,7 @@ pub fn pullImage(
     };
 }
 
-fn pullWithin(
+fn pullInto(
     arena: Allocator,
     gpa: Allocator,
     io: std.Io,
@@ -7245,6 +7316,83 @@ test "native provisioning: a step on the pulled image, flattened and kept under 
     // A failing script fails with its output's last line, and leaves nothing under its key.
     try std.testing.expectError(error.BaseContainerFailed, b.provision(pulled, "echo the reason; exit 7", &err_msg));
     try std.testing.expect(std.mem.indexOf(u8, err_msg, "the reason (exit 7)") != null);
+}
+
+test "native pre-provisioned image: pulled as the rootfs; nothing pinned, a stale pin or the setting leaves it to apt; a failed pull says why" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const fp = try arena.dupe(u8, &provisioned.fingerprint(.root));
+    const tag = try std.fmt.allocPrint(arena, "{s}-root", .{fp});
+    const img = try testregistry.testImage(arena, "test/base", tag, try testImageLayers(arena), "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+    const repository = try server.image(arena, "test/base");
+    const pins: provisioned.Pins = .{
+        .root = .{ .fingerprint = fp, .digest = img.index },
+        .runner = .{ .fingerprint = "", .digest = "" },
+        .repository = repository,
+    };
+
+    // Pinned and current: its own tree is the rootfs, in the store's image area, a path no
+    // locally provisioned rootfs has, so the step cache's keys cannot take one for the other.
+    cfg.provisioned_pins = pins;
+    {
+        var b = try init(arena, std.testing.io, std.testing.allocator, cfg);
+        defer b.deinit();
+        var err_msg: []const u8 = "";
+        const got = try b.fetchRootfs(dagger.default_image, null, true, false, &err_msg);
+        try std.testing.expect(std.mem.indexOf(u8, b.rootfs, "/oci/images/") != null);
+        try std.testing.expectEqualStrings(got.rootfs, b.rootfs);
+        try std.testing.expectEqualStrings("from the image\n", try std.Io.Dir.cwd().readFileAlloc(std.testing.io, try std.fmt.allocPrint(arena, "{s}/etc/marker", .{b.rootfs}), arena, .limited(64)));
+        const note = b.notes.getLast();
+        try std.testing.expect(std.mem.indexOf(u8, note, "Provisioned image: ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, note, "@" ++ "sha256:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, note, "Provisioned natively") == null);
+    }
+
+    // Not pinned for the runner variant, a pin made for another script, and the setting off:
+    // nothing is pulled, and nothing is said.
+    const stale: provisioned.Pins = .{
+        .root = .{ .fingerprint = "000000000000", .digest = img.index },
+        .runner = pins.runner,
+        .repository = repository,
+    };
+    const before = server.requests.load(.acquire);
+    for ([_]struct { pins: provisioned.Pins, on: bool, as_runner: bool }{
+        .{ .pins = pins, .on = true, .as_runner = true },
+        .{ .pins = stale, .on = true, .as_runner = false },
+        .{ .pins = pins, .on = false, .as_runner = false },
+    }) |case| {
+        cfg.provisioned_pins = case.pins;
+        cfg.provisioned_image = case.on;
+        var b = try init(arena, std.testing.io, std.testing.allocator, cfg);
+        defer b.deinit();
+        try std.testing.expect(try b.pullProvisioned(case.as_runner) == null);
+        for (b.notes.items) |n| try std.testing.expect(std.mem.indexOf(u8, n, "Provisioned image") == null);
+    }
+    try std.testing.expectEqual(before, server.requests.load(.acquire));
+
+    // A registry that cannot be reached: no image, and the note says what could not be pulled,
+    // for the caller to provision with apt.
+    // (Not the digest the store has: an image it holds is found without asking the registry.)
+    const unseen = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    cfg.provisioned_pins = .{
+        .root = .{ .fingerprint = fp, .digest = unseen },
+        .runner = pins.runner,
+        .repository = "127.0.0.1:1/test/base",
+    };
+    cfg.provisioned_image = true;
+    var gone = try init(arena, std.testing.io, std.testing.allocator, cfg);
+    defer gone.deinit();
+    try std.testing.expect(try gone.pullProvisioned(false) == null);
+    const said = gone.notes.getLast();
+    try std.testing.expect(std.mem.indexOf(u8, said, "Provisioned image: could not pull 127.0.0.1:1/test/base:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "provisioning with apt-get instead") != null);
 }
 
 /// A runner's job ends, again and again, while the test's job runs: what it holds must stay.

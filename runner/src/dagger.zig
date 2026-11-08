@@ -656,6 +656,10 @@ pub const Options = struct {
     /// Installed into the image before the job (one cached exec). Used for the default image only,
     /// which has no git; a custom image is expected to bring what it needs.
     provision: bool = true,
+    /// Pull the pre-provisioned default image where this build pins one, instead of provisioning
+    /// (`RUNNER_PROVISIONED_IMAGE`); `provisioned_pins` is what it pins (tests give their own).
+    provisioned_image: bool = true,
+    provisioned_pins: @import("dagger/provisioned.zig").Pins = @import("dagger/provisioned.zig").pinned,
     /// Key under which output lines are written to the sink.
     sink_job_id: u64 = 0,
     /// The name the runner registered under (`runner.name`, RUNNER_NAME).
@@ -2224,6 +2228,7 @@ fn runSteps(
     };
 
     if (try setUpJob(&x, opts, results)) |failed| return failed;
+    if (plan.pulled_note) |note| x.setUpLine(note);
     if (plan.zig_seed_note) |note| x.setUpLine(note);
     if (plan.zig_local_note) |note| x.setUpLine(note);
     if (base.tool_trees_note) |note| x.setUpLine(note);

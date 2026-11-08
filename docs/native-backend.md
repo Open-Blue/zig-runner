@@ -443,6 +443,28 @@ were made over the old rootfs: every job checks the rootfs's root and that stamp
 the fingerprint it found once (`Store.rootfsFingerprint`), and a change neither shows (an
 in-place change, the stamp not touched) is found when the runner restarts, by the walk's ctimes.
 
+**The pre-provisioned image.** Provisioning (`apt-get install` of the runner's packages into
+`ubuntu:24.04`) took 22 to 28 s on the laptop and 35 s on razorbill's Pi, 26 to 45 s with the
+mirrors, and needs them reachable. Where the build pins one (`runner/src/dagger/provisioned_pin.zig`),
+a job in the default image pulls the image the "provisioned image" workflow built instead
+(`ghcr.io/open-blue/zig-runner-base:<fingerprint>-<root|runner>@<index digest>`, one per way steps
+run, for linux/amd64 and linux/arm64): `Backend.fetchRootfs` pulls it as any image
+(`pullProvisioned`), its tree is the rootfs (`oci/images/<key>/rootfs`, so it shares no path, and so
+no `Store.rootfsFingerprint`, with a locally provisioned `rootfs/<key>/rootfs`), and Ubuntu is not
+pulled at all. "Set up job" says `Provisioned image: <reference> ...`. A pull that fails (no route to
+ghcr.io, a registry error, no image for the architecture, or one slower than 5 minutes) is said in
+"Set up job" too, and the base is pulled and provisioned with apt as before.
+`RUNNER_PROVISIONED_IMAGE=false` never pulls it, for a host that may reach nothing but the Ubuntu
+mirrors. `RUNNER_NATIVE_ROOTFS` still wins over both.
+
+The image is the script's: the workflow gets the base image, the script and a fingerprint,
+`sha256(default_image, "\n", script)[:12]`, from the runner binary itself (`--provisioned-image=root`,
+`--provision-script=root`), so `set_up.zig` is the only copy. A changed script or a new Ubuntu digest
+is a new fingerprint, hence a new tag; the pin carries the fingerprint it was published for, the
+runner uses it only while that is the current one, and a unit test fails until the pin is. The
+packages are the archive's on the day the image was built (as provisioning's are on the day it ran);
+the workflow logs their fingerprint.
+
 **What the runner needs.** As root (the supported mode): `CAP_SYS_ADMIN` (namespaces, mounts,
 idmapped mounts, `pivot_root`), `CAP_NET_ADMIN` (the bridge, veths, addresses, routes, NAT),
 `CAP_SETUID`/`CAP_SETGID` (writing the job's id maps), Linux 5.19 or later (idmapped overlay

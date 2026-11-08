@@ -17,6 +17,7 @@ const Transport = @import("../dagger.zig").Transport;
 const SecretRef = @import("../dagger.zig").SecretRef;
 const Secrets = @import("../dagger.zig").Secrets;
 const Options = @import("../dagger.zig").Options;
+const provisioned = @import("provisioned.zig");
 const Outcome = @import("../dagger.zig").Outcome;
 const StepResult = @import("../dagger.zig").StepResult;
 const Result = @import("../dagger.zig").Result;
@@ -194,12 +195,13 @@ fn rollZigLocal(
     volume: []const u8,
     max_mb: u32,
     as_runner: bool,
+    pulled: ?[]const u8,
     nonce: []const u8,
 ) !void {
     var q: Query = .init(arena);
     try q.open("container");
-    try q.call("from", .{ .address = default_image });
-    if (as_runner) try writeProvision(&q, true);
+    try q.call("from", .{ .address = pulled orelse default_image });
+    if (as_runner and pulled == null) try writeProvision(&q, true);
     try writeZigLocalMount(&q, volume, as_runner);
     try q.call("withEnvVariable", .{ .name = "ZIG_RUNNER_ROLL", .value = nonce });
     const limit_kb = try std.fmt.allocPrint(arena, "{d}", .{@as(u64, max_mb) * 1024});
@@ -239,13 +241,14 @@ fn seedBuiltin(
     volume: []const u8,
     seed: []const u8,
     as_runner: bool,
+    pulled: ?[]const u8,
     nonce: []const u8,
 ) !void {
     const dir = try zigBuiltinDir(arena, as_runner);
     var q: Query = .init(arena);
     try q.open("container");
-    try q.call("from", .{ .address = default_image });
-    if (as_runner) try writeProvision(&q, true);
+    try q.call("from", .{ .address = pulled orelse default_image });
+    if (as_runner and pulled == null) try writeProvision(&q, true);
     try q.call("withMountedDirectory", .{ .path = zig_seed_dir, .source = seed });
     try q.call("withMountedCache", .{
         .path = dir,
@@ -330,6 +333,11 @@ fn writeEnvNodes(q: *Query, plain: []const job_mod.EnvVar, secret: []const Secre
 const BasePlan = struct {
     job_image: []const u8,
     provision: bool,
+    /// The pre-provisioned image the base starts from instead of `job_image` and the provisioning
+    /// exec (`pulledBase`); null provisions with apt.
+    pulled: ?[]const u8 = null,
+    /// What "Set up job" says of it: pulled, or why provisioning ran.
+    pulled_note: ?[]const u8 = null,
     as_runner: bool,
     step_cache: bool,
     uv_env: ?[]const u8,
@@ -565,7 +573,7 @@ fn writeImage(
             try q.call("withRegistryAuth", auth);
         } else if (err_msg.len > 0) return error.BaseContainerFailed;
     }
-    try writeFrom(q, plan.job_image, plan.zig_local_env);
+    try writeFrom(q, plan.pulled orelse plan.job_image, plan.zig_local_env);
     if (job.container != null) for (plan.cache_ids, 0..) |_, i| {
         // Before the container's env, so its own value wins.
         if (package_cache_dirs[i].env.len == 0 or !plan.cache_used[i]) continue;
@@ -624,10 +632,37 @@ fn containerEnv(arena: Allocator, ev: *Evaluator, job: job_mod.Job) !?[]const jo
     return out.items;
 }
 
+/// The pre-provisioned image for the default image's job (`provisioned.zig`), when this build pins
+/// one that is current and the operator has not turned it off: `sync`ed, so a registry that cannot
+/// be reached, or an image that cannot be pulled, is found here and not in the middle of the job's
+/// base container. Null provisions with apt (`writeProvision`); `note` says why when a pull failed,
+/// and which image when it did not.
+fn pulledBase(
+    arena: Allocator,
+    transport: Transport,
+    opts: Options,
+    as_runner: bool,
+    note: *?[]const u8,
+) !?[]const u8 {
+    const ref = try provisioned.reference(arena, opts.provisioned_image, opts.provisioned_pins, .of(as_runner)) orelse
+        return null;
+    var q: Query = .init(arena);
+    try q.open("container");
+    try q.call("from", .{ .address = ref });
+    try q.leaf("sync");
+    var why: []const u8 = "";
+    _ = gql(arena, transport, try q.finish(), &why) catch |e| {
+        note.* = try provisioned.fallbackNote(arena, ref, if (why.len > 0) why else @errorName(e));
+        return null;
+    };
+    note.* = try provisioned.usedNote(arena, ref);
+    return ref;
+}
+
 /// Provisioning in the default image, the workspace and RUNNER_TEMP, the step user, and the
 /// workdir.
 fn writeProvisionAndWorkspace(q: *Query, arena: Allocator, ev: *Evaluator, plan: BasePlan) !void {
-    if (plan.provision) try writeProvision(q, plan.as_runner);
+    if (plan.provision and plan.pulled == null) try writeProvision(q, plan.as_runner);
     // The job's workspace and RUNNER_TEMP, the step user's in the default image (cached per
     // repository). A job container's user may be unable to make them; its steps then report
     // that themselves.
@@ -804,8 +839,10 @@ pub fn basePlan(
         io.random(&raw);
         break :ran try arena.dupe(u8, &std.fmt.bytesToHex(raw, .lower));
     };
+    var pulled_note: ?[]const u8 = null;
+    const pulled = if (provision) try pulledBase(arena, transport, opts, as_runner, &pulled_note) else null;
     var zig_seed_note: ?[]const u8 = null;
-    const zig_seed = try zigSeedFor(arena, transport, job, opts, &zig_seed_note);
+    const zig_seed = try zigSeedFor(arena, transport, job, opts, pulled, &zig_seed_note);
     const volumes = try cacheVolumeIds(
         arena,
         transport,
@@ -820,13 +857,15 @@ pub fn basePlan(
         err_msg,
     );
     if (volumes.zig_local) |id| if (opts.zig_local_cache_max_mb > 0)
-        try rollZigLocal(arena, transport, id, opts.zig_local_cache_max_mb, as_runner, ran_marker);
+        try rollZigLocal(arena, transport, id, opts.zig_local_cache_max_mb, as_runner, pulled, ran_marker);
     if (volumes.zig_builtin) |id| if (zig_seed) |seed|
-        try seedBuiltin(arena, transport, id, seed, as_runner, ran_marker);
+        try seedBuiltin(arena, transport, id, seed, as_runner, pulled, ran_marker);
     return .{
         .container_env = container_env,
         .job_image = job_image,
         .provision = provision,
+        .pulled = pulled,
+        .pulled_note = pulled_note,
         .as_runner = as_runner,
         .step_cache = step_cache,
         .uv_env = try uvEnvFor(arena, opts, job, as_runner, step_cache),
@@ -1550,6 +1589,7 @@ fn zigSeedFor(
     transport: Transport,
     job: job_mod.Job,
     opts: Options,
+    pulled: ?[]const u8,
     note: *?[]const u8,
 ) !?[]const u8 {
     if (!opts.package_caches or job.github.repository.len == 0 or !usesZig(job)) return null;
@@ -1570,7 +1610,7 @@ fn zigSeedFor(
     var seeded: std.ArrayList(u8) = .empty;
     var msg: []const u8 = "";
     for (opts.zig_seeds) |seed| {
-        const doc = try zigSeedDocument(arena, seed, opts.step_user == .runner);
+        const doc = try zigSeedDocument(arena, seed, opts.step_user == .runner, pulled);
         const data = gql(arena, transport, doc, &msg) catch continue;
         const id = jsonFindString(data, "sync") orelse continue;
         try ids.append(arena, id);
@@ -1607,12 +1647,12 @@ fn zigSeedFor(
 /// The seed's query, evaluated (`sync`) where a failure leaves the job unseeded, not in the base
 /// container. One writer for the job (`zigSeedFor`) and the pre-warm (`warmDocuments`), so both
 /// send the same document and the seed the pre-warm built is the one the job finds.
-fn zigSeedDocument(arena: Allocator, seed: config.ZigSeed, as_runner: bool) ![]const u8 {
+fn zigSeedDocument(arena: Allocator, seed: config.ZigSeed, as_runner: bool, pulled: ?[]const u8) ![]const u8 {
     var q: Query = .init(arena);
     try q.open("container");
-    try q.call("from", .{ .address = default_image });
+    try q.call("from", .{ .address = pulled orelse default_image });
     // The base container's own provisioning (curl and xz), which the engine has cached.
-    try writeProvision(&q, as_runner);
+    if (pulled == null) try writeProvision(&q, as_runner);
     try q.call("withNewFile", .{
         .path = zig_seed_project ++ "/build.zig",
         .contents = zig_seed_build_zig,
@@ -1684,7 +1724,7 @@ const WarmDocuments = struct {
     packages: ?[]const u8,
 };
 
-fn warmDocuments(arena: Allocator, opts: Options) !WarmDocuments {
+fn warmDocuments(arena: Allocator, opts: Options, pulled: ?[]const u8) !WarmDocuments {
     const image = resolveImage(opts.image);
     const provision = opts.provision and std.mem.eql(u8, image, default_image);
     const as_runner = provision and opts.step_user == .runner;
@@ -1694,13 +1734,13 @@ fn warmDocuments(arena: Allocator, opts: Options) !WarmDocuments {
         try q.open("container");
         try writeFrom(
             &q,
-            image,
+            pulled orelse image,
             if (opts.package_caches and opts.zig_local_cache)
                 zigLocalCacheEnv(as_runner, opts.zig_local_cache_max_mb)
             else
                 null,
         );
-        if (provision) try writeProvision(&q, as_runner);
+        if (provision and pulled == null) try writeProvision(&q, as_runner);
         if (std.mem.eql(u8, leaf, "stdout")) try q.call("withExec", .{
             .args = &[_][]const u8{ "sh", "-c", package_fingerprint_script },
         });
@@ -1709,11 +1749,11 @@ fn warmDocuments(arena: Allocator, opts: Options) !WarmDocuments {
     }
     var ref: Query = .init(arena);
     try ref.open("container");
-    try ref.call("from", .{ .address = image });
+    try ref.call("from", .{ .address = pulled orelse image });
     try ref.leaf("imageRef");
     const seeds = try arena.alloc([]const u8, if (opts.package_caches) opts.zig_seeds.len else 0);
     for (seeds, opts.zig_seeds[0..seeds.len]) |*doc, z|
-        doc.* = try zigSeedDocument(arena, z, opts.step_user == .runner);
+        doc.* = try zigSeedDocument(arena, z, opts.step_user == .runner, pulled);
     return .{
         .base = docs[0],
         .image_ref = try ref.finish(),
@@ -1725,13 +1765,36 @@ fn warmDocuments(arena: Allocator, opts: Options) !WarmDocuments {
 /// What the pre-warm built: the image as the engine resolved it (with its digest when the
 /// registry gave one, as services do for a job's images), whether the seed was built too, and the
 /// provisioned packages' fingerprint (`package_fingerprint_script`) when there is one.
-pub const Warmed = struct { image: []const u8, seeded: bool, packages: ?[]const u8 = null };
+pub const Warmed = struct {
+    image: []const u8,
+    seeded: bool,
+    packages: ?[]const u8 = null,
+    /// Set when the pre-provisioned image could not be pulled and apt provisioned instead
+    /// (`provisioned.fallbackNote`).
+    pulled_note: ?[]const u8 = null,
+};
 
 /// Sends the pre-warm's documents, the base container first. On failure the message is in
 /// `err_msg`.
 pub fn warm(arena: Allocator, transport: Transport, opts: Options, err_msg: *[]const u8) !Warmed {
-    const docs = try warmDocuments(arena, opts);
-    _ = gql(arena, transport, docs.base, err_msg) catch return error.BaseContainerFailed;
+    const image_name = resolveImage(opts.image);
+    const provision = opts.provision and std.mem.eql(u8, image_name, default_image);
+    const pulled = if (provision) try provisioned.reference(
+        arena,
+        opts.provisioned_image,
+        opts.provisioned_pins,
+        .of(opts.step_user == .runner),
+    ) else null;
+    var pulled_note: ?[]const u8 = null;
+    var docs = try warmDocuments(arena, opts, pulled);
+    _ = gql(arena, transport, docs.base, err_msg) catch |e| {
+        // The pre-provisioned image could not be pulled: provision with apt, as before it.
+        const ref = pulled orelse return error.BaseContainerFailed;
+        pulled_note = try provisioned.fallbackNote(arena, ref, if (err_msg.len > 0) err_msg.* else @errorName(e));
+        err_msg.* = "";
+        docs = try warmDocuments(arena, opts, null);
+        _ = gql(arena, transport, docs.base, err_msg) catch return error.BaseContainerFailed;
+    };
     // The base is built: what is left is a name for the log, and the engine may refuse `imageRef`
     // for a container it just pulled, so a failure is the unpinned name, as a missing field is.
     var ignored: []const u8 = "";
@@ -1748,7 +1811,7 @@ pub fn warm(arena: Allocator, transport: Transport, opts: Options, err_msg: *[]c
     }
     for (docs.seeds) |seed| _ = gql(arena, transport, seed, err_msg) catch
         return error.ZigSeedFailed;
-    return .{ .image = image, .seeded = docs.seeds.len > 0, .packages = packages };
+    return .{ .image = image, .seeded = docs.seeds.len > 0, .packages = packages, .pulled_note = pulled_note };
 }
 
 test "the default image is provisioned with git; a custom image is left alone" {
@@ -1772,6 +1835,128 @@ test "the default image is provisioned with git; a custom image is left alone" {
         try std.testing.expectEqual(case.expect_provision, std.mem.indexOf(u8, base, "apt-get install") != null);
         try std.testing.expect(std.mem.indexOf(u8, base, case.image) != null);
     }
+}
+
+/// The pins of a pre-provisioned image published for the scripts this build has.
+fn currentPins(arena: Allocator) !provisioned.Pins {
+    const digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    return .{
+        .root = .{ .fingerprint = try arena.dupe(u8, &provisioned.fingerprint(.root)), .digest = digest },
+        .runner = .{ .fingerprint = try arena.dupe(u8, &provisioned.fingerprint(.runner)), .digest = digest },
+    };
+}
+
+/// A default-image job through the fake session, `answers` first: the documents sent and the log.
+fn pulledRun(arena: Allocator, opts: Options, answers: []const []const u8) !SeedRun {
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("true")};
+    const fake = try arena.create(FakeSession);
+    fake.* = .{ .answers = answers, .arena = arena };
+    const w = try arena.create(std.Io.Writer);
+    w.* = .fixed(try arena.alloc(u8, 8192));
+    var log: sink.LogSink = .{ .stdout = .{ .writer = w } };
+    var o = opts;
+    o.test_session_argv = &.{ "sh", "-c", fake_child };
+    o.test_transport = fake.transport();
+    _ = try run(arena, std.testing.io, &env, o, testJob(&steps), &log);
+    return .{ .seen = fake.seen.items, .log = w.buffered() };
+}
+
+test "a pinned provisioned image is pulled instead of provisioning; a failed pull, or the setting, provisions" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const pins = try currentPins(arena);
+    const ref = (try provisioned.reference(arena, true, pins, .root)).?;
+    const synced = "{\"data\":{\"container\":{\"from\":{\"sync\":\"C\"}}}}";
+    const pulled_answers = [_][]const u8{ synced, base_answer, try exec(arena, "C1", 0, "") };
+
+    // Pulled: the probe, then a base that starts from the image and runs no apt-get.
+    const used = try pulledRun(arena, .{ .provisioned_pins = pins }, &pulled_answers);
+    try std.testing.expect(std.mem.indexOf(u8, used.seen[0], ref) != null);
+    try std.testing.expect(std.mem.indexOf(u8, used.seen[0], "sync") != null);
+    try std.testing.expect(std.mem.indexOf(u8, used.seen[1], ref) != null);
+    try std.testing.expect(std.mem.indexOf(u8, used.seen[1], "apt-get") == null);
+    try std.testing.expect(std.mem.indexOf(u8, used.seen[1], "from(address:\"" ++ default_image) == null);
+    try std.testing.expect(std.mem.indexOf(u8, used.log, "Provisioned image: ghcr.io/open-blue/zig-runner-base:") != null);
+
+    // The registry cannot be reached: the base is provisioned as before, and "Set up job" says why.
+    const refused = [_][]const u8{
+        "{\"errors\":[{\"message\":\"failed to resolve source metadata: no route to host\"}]}",
+        base_answer,
+        try exec(arena, "C1", 0, ""),
+    };
+    const fell = try pulledRun(arena, .{ .provisioned_pins = pins }, &refused);
+    try std.testing.expect(std.mem.indexOf(u8, fell.seen[1], "apt-get install") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fell.seen[1], ref) == null);
+    try std.testing.expect(std.mem.indexOf(u8, fell.log, "could not pull ghcr.io/open-blue/zig-runner-base:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fell.log, "no route to host") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fell.log, "provisioning with apt-get instead") != null);
+
+    // RUNNER_PROVISIONED_IMAGE=false, a pin of another script and no pin: no probe, apt.
+    const plain = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "") };
+    const stale: provisioned.Pins = .{
+        .root = .{ .fingerprint = "000000000000", .digest = pins.root.digest },
+        .runner = pins.runner,
+    };
+    for ([_]Options{
+        .{ .provisioned_pins = pins, .provisioned_image = false },
+        .{ .provisioned_pins = stale },
+        .{},
+    }) |o| {
+        const r = try pulledRun(arena, o, &plain);
+        try std.testing.expect(std.mem.indexOf(u8, r.seen[0], "apt-get install") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.seen[0], provisioned.repository) == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.log, "Provisioned image") == null);
+    }
+
+    // The runner variant: its own image, which the step user's setup is already in.
+    const runner_ref = (try provisioned.reference(arena, true, pins, .runner)).?;
+    const as_runner = try pulledRun(arena, .{ .provisioned_pins = pins, .step_user = .runner }, &pulled_answers);
+    try std.testing.expect(std.mem.indexOf(u8, as_runner.seen[1], runner_ref) != null);
+    try std.testing.expect(std.mem.indexOf(u8, as_runner.seen[1], "useradd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, as_runner.seen[1], "withUser") != null);
+
+    // A custom image is never swapped for it.
+    const custom = try pulledRun(arena, .{ .provisioned_pins = pins, .image = "custom/image:1" }, &plain);
+    try std.testing.expect(std.mem.indexOf(u8, custom.seen[0], provisioned.repository) == null);
+}
+
+test "the pre-warm builds the pulled image's base, and provisions when it cannot be pulled" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const pins = try currentPins(arena);
+    const ref = (try provisioned.reference(arena, true, pins, .root)).?;
+    var msg: []const u8 = "";
+    const built = "{\"data\":{\"container\":{\"from\":{\"sync\":\"C0\"}}}}";
+    const named = "{\"data\":{\"container\":{\"from\":{\"imageRef\":\"" ++ "ghcr.io/x@sha256:1" ++ "\"}}}}";
+    const stdout = "{\"data\":{\"container\":{\"from\":{\"withExec\":{\"stdout\":\"6980617ef435\\n\"}}}}}";
+
+    const ok = [_][]const u8{ built, named, stdout };
+    var fake: FakeSession = .{ .answers = &ok, .arena = arena };
+    const pulled = try warm(arena, fake.transport(), .{ .provisioned_pins = pins }, &msg);
+    try std.testing.expect(pulled.pulled_note == null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], ref) != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "apt-get") == null);
+
+    const failing = [_][]const u8{
+        "{\"errors\":[{\"message\":\"denied: not found\"}]}",
+        built,
+        named,
+        stdout,
+    };
+    var refusing: FakeSession = .{ .answers = &failing, .arena = arena };
+    const fell = try warm(arena, refusing.transport(), .{ .provisioned_pins = pins }, &msg);
+    try std.testing.expect(std.mem.indexOf(u8, fell.pulled_note.?, "denied: not found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refusing.seen.items[1], "apt-get install") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refusing.seen.items[1], ref) == null);
+    try std.testing.expectEqualStrings("6980617ef435", fell.packages.?);
+
+    // Off, or nothing pinned: one attempt, with apt, and a failure is the job's as before.
+    var off: FakeSession = .{ .answers = &failing, .arena = arena };
+    try std.testing.expectError(error.BaseContainerFailed, warm(arena, off.transport(), .{ .provisioned_pins = pins, .provisioned_image = false }, &msg));
+    try std.testing.expectEqual(@as(usize, 1), off.seen.items.len);
 }
 
 test "a job without container:, or with the default's bare name, gets the pinned, provisioned default" {
@@ -1860,7 +2045,7 @@ test "the from and provisioning nodes are a byte prefix of every job's base docu
                     .package_caches = true,
                     .zig_local_cache = zig_local,
                     .step_user = step_user,
-                });
+                }, null);
                 try std.testing.expect(std.mem.startsWith(u8, warm_docs.base, prefix));
                 try std.testing.expectEqualStrings("sync } } }", warm_docs.base[prefix.len..][0..10]);
                 try std.testing.expect(warm_docs.seeds.len == 0);
@@ -2182,7 +2367,7 @@ test "with a limit, Zig's local cache rolls before the base container, under one
         try writeProvision(&q, true);
         const prefix = q.fragment().text;
         try std.testing.expect(std.mem.startsWith(u8, base.*, prefix));
-        try std.testing.expect(std.mem.startsWith(u8, (try warmDocuments(arena, opts)).base, prefix));
+        try std.testing.expect(std.mem.startsWith(u8, (try warmDocuments(arena, opts, null)).base, prefix));
     }
     // Up to the job's mark, two jobs' base containers are one: the generation is in neither, so it
     // reaches no step's key.
@@ -2564,7 +2749,7 @@ test "the pre-warm sends a Zig job's own seed and base documents, and fails with
     for ([_]config.StepUser{ .runner, .root }) |user| {
         const opts: Options = .{ .package_caches = true, .step_user = user, .zig_seeds = &.{test_zig_seed} };
         const r = try seedRun(arena, opts, testJob(&steps), &.{seed_answer});
-        const docs = try warmDocuments(arena, opts);
+        const docs = try warmDocuments(arena, opts, null);
         // Byte for byte the job's seed query, so the engine answers the job from its cache.
         try std.testing.expectEqualStrings(r.seen[0], docs.seeds[0]);
         const prefix = docs.base[0..std.mem.indexOf(u8, docs.base, "sync ").?];
@@ -2592,12 +2777,12 @@ test "the pre-warm sends a Zig job's own seed and base documents, and fails with
         try std.testing.expectEqualStrings(docs.seeds[0], fake.seen.items[3]);
     }
     // No seed without package caches, as a job gets none; a pull that fails says why.
-    const off = try warmDocuments(arena, .{ .zig_seeds = &.{test_zig_seed} });
+    const off = try warmDocuments(arena, .{ .zig_seeds = &.{test_zig_seed} }, null);
     try std.testing.expect(off.seeds.len == 0);
     // A custom image is not provisioned, so it has no fingerprint; the bare default name is the pin.
-    try std.testing.expect((try warmDocuments(arena, .{ .image = "custom/image:1" })).packages == null);
-    const bare = try warmDocuments(arena, .{ .image = "ubuntu:24.04" });
-    try std.testing.expectEqualStrings((try warmDocuments(arena, .{})).base, bare.base);
+    try std.testing.expect((try warmDocuments(arena, .{ .image = "custom/image:1" }, null)).packages == null);
+    const bare = try warmDocuments(arena, .{ .image = "ubuntu:24.04" }, null);
+    try std.testing.expectEqualStrings((try warmDocuments(arena, .{}, null)).base, bare.base);
     try std.testing.expect(std.mem.indexOf(u8, bare.base, default_image) != null);
     const denied = [_][]const u8{"{\"errors\":[{\"message\":\"pull access denied\"}]}"};
     var fake: FakeSession = .{ .answers = &denied, .arena = arena };
