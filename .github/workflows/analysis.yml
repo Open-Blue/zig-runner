@@ -298,6 +298,7 @@ jobs:
         if: steps.tests.outputs.mode == 'changed'
         env:
           ZIG_VALGRIND_TIMEOUT: 15m
+          ZIG_VALGRIND_STALL: "480"
         run: |
           mapfile -t tests <"$RUNNER_TEMP/valgrind-tests"
           .github/scripts/zig-valgrind.sh "${tests[@]}"
