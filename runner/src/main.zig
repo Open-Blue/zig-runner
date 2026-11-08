@@ -9,6 +9,7 @@ const net = @import("native/net.zig");
 const nft = @import("native/nft.zig");
 
 const forward = @import("native/forward.zig");
+const native_publish = @import("native/publish.zig");
 const trust = @import("trust.zig");
 const job_mod = @import("job.zig");
 const db = @import("db.zig");
@@ -46,6 +47,7 @@ comptime {
     _ = @import("native/container_options.zig");
     _ = @import("native/images.zig");
     _ = @import("native/forward.zig");
+    _ = @import("native/publish.zig");
     _ = @import("native/volumes.zig");
     _ = @import("native/docker_action.zig");
     _ = @import("native/dockerfile.zig");
@@ -152,6 +154,12 @@ pub fn main(init: std.process.Init) !u8 {
         return @backingInt(Exit.config);
     };
     const secrets = try allSecrets(arena, &cfg, pg_cfg);
+    // The ports a job container must never publish on the host (`native/publish.zig`).
+    cfg.native_reserved_ports = try native_publish.reservedPorts(arena, if (pg_cfg) |p| p.port else null, &.{
+        cfg.engine_host,
+        cfg.docker_socket,
+        init.environ_map.get("DOCKER_HOST") orelse "",
+    });
 
     var out_buf: [4096]u8 = undefined;
     var stdout: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);

@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Published ports (#428): the relay also refuses peers reached through a veth into another namespace or a tun/tap device (routed pods, VMs), keeps a UDP client''s verdict for a second instead of reading the routes per datagram, and counts an engine or Docker host written without tcp:// as reserved; the range refusal names RUNNER_NATIVE_PORT_RANGE=1024-65535 for Docker''s behaviour.'
+time: 2026-11-08T03:06:02.218349818-05:00
