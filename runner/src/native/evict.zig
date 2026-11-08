@@ -1173,8 +1173,9 @@ test "native eviction: untrusted growth leaves a repository's volume alone withi
     const f = try Fixture.init();
     defer f.deinit();
     const trusted = try f.scoped("repo", "npm", 6000, 2);
+    const fork_names = [_][]const u8{ "a", "b", "c" };
     var forks: [3][]const u8 = undefined;
-    for (&forks, 0..) |*d, i| d.* = try f.scoped("untrusted", &.{'a' + @as(u8, @intCast(i))}, 6000, 10 + @as(i64, @intCast(i)));
+    for (&forks, fork_names, [_]i64{ 10, 11, 12 }) |*d, name, days| d.* = try f.scoped("untrusted", name, 6000, days);
     f.s.limits = .{ .volumes_max_bytes = 13_000, .min_free_pct = 0 };
     run(f.s, testing.io);
     try testing.expect(f.there(trusted));
