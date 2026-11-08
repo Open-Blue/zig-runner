@@ -862,7 +862,7 @@ fn zstdAgrees(input: []const u8) !void {
     }
     // Reading on after a failure fails again, or ends, and never reads out of bounds.
     var more: [64]u8 = undefined;
-    _ = d.reader.readSliceShort(&more) catch {};
+    if (d.reader.readSliceShort(&more)) |_| {} else |_| {}
 
     switch (mine) {
         .done => switch (theirs) {
