@@ -8,7 +8,8 @@
 //! or `/run`, is, holds or lies inside one of the runner's own paths (its store, where every job's
 //! layers and volumes are, its rootfs, its log spool, its executable, its GitHub App key's
 //! directory, its env file), or is on a mount without `nosuid` and `nodev`: a job could otherwise
-//! leave a setuid file there that a host user runs as the volumes' ids. Each job checks that list
+//! leave a setuid file there that a host user runs as the volumes' ids (and it must not be shown
+//! at another path on such a mount, `exposedElsewhere`). Each job checks that list
 //! again (`recheck`): an entry whose path now resolves elsewhere, or is another directory (device
 //! and inode), is closed for the job, never followed to where it points now.
 //!
@@ -108,10 +109,26 @@ pub fn parse(
         if (opts.mount_flags and !safeMount(arena, real)) return refuse(refusal, try std.fmt.allocPrint(
             arena,
             "resolves to {s}, on a mount without nosuid and nodev: a job could leave a setuid " ++
-                "file or a device node there for the host (mount it with -o nosuid,nodev, or " ++
-                "bind it so: mount --bind {s} {s} && mount -o remount,bind,nosuid,nodev {s})",
-            .{ real, real, real, real },
+                "file or a device node there for the host (mount its filesystem with " ++
+                "-o nosuid,nodev, in /etc/fstab so it lasts)",
+            .{real},
         ));
+        if (opts.mount_flags) if (exposedElsewhere(arena, io, real)) |elsewhere| {
+            if (elsewhere) |at| return refuse(refusal, try std.fmt.allocPrint(
+                arena,
+                "resolves to {s}, which is also reachable at {s}, on a mount without nosuid and " ++
+                    "nodev: a setuid file a job left would run there (mount the whole filesystem " ++
+                    "with -o nosuid,nodev, not only this directory)",
+                .{ real, at },
+            ));
+        } else |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unknown => return refuse(refusal, try std.fmt.allocPrint(
+                arena,
+                "resolves to {s}, whose mounts cannot be read from /proc/self/mountinfo",
+                .{real},
+            )),
+        };
         try out.append(arena, .{
             .written = try std.fs.path.resolveAllocPosix(arena, &.{entry}),
             .real = real,
@@ -147,7 +164,13 @@ pub fn recheck(
             const id = dirId(arena, real) orelse break :still false;
             if (id.dev_major != e.dev_major or id.dev_minor != e.dev_minor or id.ino != e.ino)
                 break :still false;
-            break :still !opts.mount_flags or safeMount(arena, real);
+            if (!opts.mount_flags) break :still true;
+            if (!safeMount(arena, real)) break :still false;
+            const elsewhere = exposedElsewhere(arena, io, real) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Unknown => break :still false,
+            };
+            break :still elsewhere == null;
         };
         if (still) try out.append(arena, e) else try closed.append(arena, e.written);
     }
@@ -197,6 +220,128 @@ pub fn safeMountFd(fd: linux.fd_t) bool {
 fn safeFlags(flags: u64) bool {
     return flags & st_nosuid != 0 and flags & st_nodev != 0;
 }
+
+/// The most of `/proc/self/mountinfo` read: a machine's mount table is far smaller.
+const mountinfo_max = 4 << 20;
+
+/// Where else, in the runner's mount namespace, `path`'s directory is reachable on a mount without
+/// `nosuid` or `nodev`, or null when nowhere. The mount at `path` passing (`safeMount`) is not
+/// enough: the same filesystem may show the directory at another path too (`/srv` bound at
+/// `/mnt/srv`), where a setuid file a job left runs. Other namespaces' mounts are not seen.
+/// `error.Unknown` when the table cannot be read or has no mount for `path`.
+fn exposedElsewhere(arena: Allocator, io: std.Io, path: []const u8) error{ Unknown, OutOfMemory }!?[]const u8 {
+    // Read to its end, not by its size: procfs gives it as 0. Cut short, it could leave out the
+    // very mount that shows the directory, so a table past the limit is not read at all.
+    const f = std.Io.Dir.cwd().openFile(io, "/proc/self/mountinfo", .{}) catch return error.Unknown;
+    defer f.close(io);
+    var table: std.ArrayList(u8) = .empty;
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = f.readStreaming(io, &.{&buf}) catch |e| switch (e) {
+            error.EndOfStream => break,
+            else => return error.Unknown,
+        };
+        if (n == 0) break;
+        if (table.items.len + n > mountinfo_max) return error.Unknown;
+        try table.appendSlice(arena, buf[0..n]);
+    }
+    return exposedIn(arena, table.items, path);
+}
+
+/// `exposedElsewhere` on the mount table `table`, as `/proc/self/mountinfo` writes it.
+fn exposedIn(arena: Allocator, table: []const u8, path: []const u8) error{ Unknown, OutOfMemory }!?[]const u8 {
+    // The mount `path` is on: the longest mount point it is under, the last of equals (the one on
+    // top). Its device names the filesystem, and its root joined to the rest of `path` is the
+    // directory within that filesystem.
+    var mounts: std.ArrayList(Mount) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, table, '\n');
+    while (lines.next()) |line| if (try Mount.parse(arena, line)) |m| try mounts.append(arena, m);
+    const mine = visible(mounts.items, path) orelse return error.Unknown;
+    const within = try join(arena, mounts.items[mine].root, below(path, mounts.items[mine].point));
+    // Every other mount of that filesystem whose root holds the directory shows it at a path of
+    // its own, unless a mount on top hides that path (a directory bound onto itself hides the
+    // filesystem's own mount there).
+    for (mounts.items, 0..) |m, i| {
+        if (m.safe or !std.mem.eql(u8, m.dev, mounts.items[mine].dev) or !under(within, m.root)) continue;
+        const at = try join(arena, m.point, below(within, m.root));
+        if (visible(mounts.items, at) == i) return at;
+    }
+    return null;
+}
+
+/// Which of `mounts` (in the table's order) `path` is on: the longest mount point it is under,
+/// the last of equals (the one on top).
+fn visible(mounts: []const Mount, path: []const u8) ?usize {
+    var on: ?usize = null;
+    for (mounts, 0..) |m, i| {
+        if (!under(path, m.point)) continue;
+        if (on == null or m.point.len >= mounts[on.?].point.len) on = i;
+    }
+    return on;
+}
+
+/// What of `path` is below `tree` (`under(path, tree)`): empty, or starting with `/`.
+fn below(path: []const u8, tree: []const u8) []const u8 {
+    if (!std.mem.eql(u8, tree, "/")) return path[tree.len..];
+    return if (std.mem.eql(u8, path, "/")) "" else path;
+}
+
+/// `base` and `rest` (empty, or starting with `/`) as one path.
+fn join(arena: Allocator, base: []const u8, rest: []const u8) ![]const u8 {
+    if (rest.len == 0) return base;
+    if (std.mem.eql(u8, base, "/")) return rest;
+    return std.mem.concat(arena, u8, &.{ base, rest });
+}
+
+/// One line of `/proc/self/mountinfo`: `id parent major:minor root point options [tags] - ...`.
+const Mount = struct {
+    dev: []const u8,
+    root: []const u8,
+    point: []const u8,
+    /// Its own options name both `nosuid` and `nodev`.
+    safe: bool,
+
+    fn parse(arena: Allocator, line: []const u8) !?Mount {
+        var f = std.mem.tokenizeScalar(u8, line, ' ');
+        _ = f.next() orelse return null;
+        _ = f.next() orelse return null;
+        const dev = f.next() orelse return null;
+        const root = f.next() orelse return null;
+        const point = f.next() orelse return null;
+        const options = f.next() orelse return null;
+        var nosuid = false;
+        var nodev = false;
+        var opts = std.mem.tokenizeScalar(u8, options, ',');
+        while (opts.next()) |o| {
+            if (std.mem.eql(u8, o, "nosuid")) nosuid = true;
+            if (std.mem.eql(u8, o, "nodev")) nodev = true;
+        }
+        return .{
+            .dev = dev,
+            .root = try unescape(arena, root),
+            .point = try unescape(arena, point),
+            .safe = nosuid and nodev,
+        };
+    }
+
+    /// The kernel writes a space, tab, newline or backslash in a path as `\ooo`.
+    fn unescape(arena: Allocator, s: []const u8) ![]const u8 {
+        if (std.mem.indexOfScalar(u8, s, '\\') == null) return s;
+        var out: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) {
+            if (s[i] == '\\' and s.len - i > 3) {
+                if (std.fmt.parseInt(u8, s[i + 1 ..][0..3], 8)) |c| {
+                    try out.append(arena, c);
+                    i += 3;
+                    continue;
+                } else |_| {}
+            }
+            try out.append(arena, s[i]);
+        }
+        return out.items;
+    }
+};
 
 /// A job's host source, allowed: the allowed directory it is under and its own canonical path.
 pub const Allowed = struct { root: []const u8, path: []const u8 };
@@ -339,6 +484,69 @@ test "host paths: an entry on a mount without nosuid and nodev is refused, namin
     try std.testing.expect(safeMount(arena, "/proc"));
     try std.testing.expect(safeFlags(st_nosuid | st_nodev));
     try std.testing.expect(!safeFlags(st_nosuid) and !safeFlags(st_nodev));
+}
+
+test "host paths: a directory also shown on a mount without nosuid and nodev is found there" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const root = "22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n";
+    const srv = "30 22 8:3 / /srv rw,nosuid,nodev,relatime - ext4 /dev/sda3 rw\n";
+    // Its own filesystem nosuid,nodev, and shown nowhere else.
+    try std.testing.expectEqual(@as(?[]const u8, null), try exposedIn(arena, root ++ srv, "/srv/data"));
+    // Bound onto itself on the root filesystem: the bind hides the root's mount at that path.
+    const self_bind = "40 22 8:2 /srv/data /srv/data rw,nosuid,nodev - ext4 /dev/sda2 rw\n";
+    try std.testing.expectEqual(@as(?[]const u8, null), try exposedIn(arena, root ++ self_bind, "/srv/data"));
+    // The filesystem shown again, without them, at another path: the directory is there too.
+    const again = "41 22 8:3 / /mnt/srv rw,relatime - ext4 /dev/sda3 rw\n";
+    try std.testing.expectEqualStrings("/mnt/srv/data", (try exposedIn(arena, root ++ srv ++ again, "/srv/data")).?);
+    // A bind of a directory above it, and one of a sibling, which does not show it.
+    const above = "42 22 8:3 /data /opt/d rw - ext4 /dev/sda3 rw\n";
+    try std.testing.expectEqualStrings("/opt/d/x", (try exposedIn(arena, root ++ srv ++ above, "/srv/data/x")).?);
+    const sibling = "43 22 8:3 /other /opt/o rw - ext4 /dev/sda3 rw\n";
+    try std.testing.expectEqual(@as(?[]const u8, null), try exposedIn(arena, root ++ srv ++ sibling, "/srv/data"));
+    // Hidden by a mount on top of the second view: not reachable there.
+    const hidden = again ++ "44 41 0:50 / /mnt/srv rw,nosuid,nodev - tmpfs tmpfs rw\n";
+    try std.testing.expectEqual(@as(?[]const u8, null), try exposedIn(arena, root ++ srv ++ hidden, "/srv/data"));
+    // The kernel's escapes in a mount point.
+    const spaced = "45 22 8:3 / /mnt/a\\040b rw - ext4 /dev/sda3 rw\n";
+    try std.testing.expectEqualStrings("/mnt/a b/data", (try exposedIn(arena, root ++ srv ++ spaced, "/srv/data")).?);
+    // No mount for the path at all.
+    try std.testing.expectError(error.Unknown, exposedIn(arena, srv, "/elsewhere"));
+}
+
+test "host paths, as root: an entry also bound elsewhere without nosuid is refused, at start and for each job" {
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try tmp.dir.createDirPath(io, "fs");
+    try tmp.dir.createDirPath(io, "view");
+    const fs = try std.fmt.allocPrintSentinel(arena, "{s}/fs", .{root}, 0);
+    const view = try std.fmt.allocPrintSentinel(arena, "{s}/view", .{root}, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mount("tmpfs", fs, "tmpfs", linux.MS.NOSUID | linux.MS.NODEV, 0)));
+    defer _ = linux.umount2(fs, linux.MNT.DETACH);
+    try tmp.dir.createDirPath(io, "fs/data");
+    const data = try std.fmt.allocPrint(arena, "{s}/data", .{fs});
+    var r: Refusal = .{};
+    // Shown only where it is mounted nosuid,nodev: allowed.
+    const entries = try parse(arena, io, data, &.{}, &r, .{});
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    // The same filesystem bound at a second path without them: refused, naming that path, and a
+    // runner that started before the bind closes it for the next job.
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mount(fs, view, null, linux.MS.BIND, 0)));
+    defer _ = linux.umount2(view, linux.MNT.DETACH);
+    // A bind keeps its source's flags: taken off again, as an operator's remount would.
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mount(null, view, null, linux.MS.REMOUNT | linux.MS.BIND, 0)));
+    try std.testing.expectError(error.Refused, parse(arena, io, data, &.{}, &r, .{}));
+    try std.testing.expect(std.mem.indexOf(u8, r.why, try std.fmt.allocPrint(arena, "{s}/data", .{view})) != null);
+    var closed: std.ArrayList([]const u8) = .empty;
+    try std.testing.expectEqual(@as(usize, 0), (try recheck(arena, io, entries, .{}, &closed)).len);
+    try std.testing.expectEqual(@as(usize, 1), closed.items.len);
 }
 
 test "host paths: an entry moved or replaced since the start is closed for the job, not followed" {
