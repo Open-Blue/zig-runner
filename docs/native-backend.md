@@ -1459,19 +1459,47 @@ volume's mount) fails the job in "Set up job", naming both, as it would hide one
   host's 127.0.0.1. With the relay there is nothing to clean up: its sockets are a process's, and
   it exits when its lifeline (its stdin, a pipe of the runner's) closes, at the job's end
   (`Backend.deinit`, first) or when the runner dies, so a crash leaves no stale port or rule.
-  UDP is relayed per client (64 at once, the quietest dropped for a newcomer).
+  UDP is relayed per client (64 at once, the quietest dropped for a newcomer, and at most 32 new
+  clients a second: datagrams from more are dropped, so a flood of sources cannot churn the relay's
+  sockets).
+- **The relay does not stall.** Its connect to the job's port is non-blocking (given up after 10 s),
+  so a job port whose backlog is full holds up no other connection or port. A connection with no
+  byte either way for 5 minutes is closed, and when all 64 places are taken a newcomer takes the
+  place of the connection quiet longest once that one has been quiet 10 s, so connections held open
+  and silent cannot lock the port out.
 - **Where: 127.0.0.1 by default.** `RUNNER_NATIVE_PORT_ADDRESSES` (`--native-port-addresses`,
   IPv4 addresses separated by commas or colons, `0.0.0.0` for every address of the host) says
   which host addresses a job may publish on; an entry with no address takes the first. Unset, it
-  is 127.0.0.1 alone: reached only by the host's own processes. An entry naming another address
-  fails the job naming the setting. Not Docker's default (0.0.0.0); an operator who wants that
-  sets `RUNNER_NATIVE_PORT_ADDRESSES=0.0.0.0`, and the host's own firewall then decides who reaches
-  it. A published port is never reachable from another job: other jobs reach the host only at the
-  bridge's address, where the runner's `input` chain drops all but replies and DNS.
-- **Which ports**: none below 1024 (the host's privileged ports; the job fails naming the port).
-  A bare `80` or `ip::80` gets one the kernel picks, from the host's ephemeral range as Docker's
-  does, and "Set up job" says where each went as `docker port` does:
-  `Container ports: 80/tcp -> 127.0.0.1:8080, 9090/tcp -> 127.0.0.1:41234`. A port another process
+  is 127.0.0.1 alone: reached only by the host's own processes (on `::1` too, where the host has
+  IPv6, so a client that resolves `localhost` to `::1` reaches it as on Docker; skipped where IPv6
+  is off). An entry naming another address fails the job naming the setting. Not Docker's default
+  (0.0.0.0); an operator who wants that sets `RUNNER_NATIVE_PORT_ADDRESSES=0.0.0.0`, and the host's
+  own firewall then decides who reaches it from the network. A published port is never reachable
+  from another native job: other jobs reach the host only at the bridge's address, where the
+  runner's `input` chain drops all but replies and DNS. **Beyond loopback, the relay also refuses
+  local containers**: a peer in the runner's job subnet (`RUNNER_NATIVE_SUBNET`), or on the
+  directly connected subnet of any bridge of the host's (Docker's `docker0` and its compose
+  networks, the Dagger engine's, so a Dagger-fallback job's container too; read from the host's
+  `/proc/net/route` and `/sys/class/net/<if>/bridge` on each such peer, so a bridge made after the
+  job started counts too), is closed as soon as it is accepted, before a byte goes to the job.
+  Those containers are not the host's to let in through a trusted job's port. A host whose LAN NIC
+  is itself enslaved to a bridge (`br0` for VMs) has its LAN treated so too; publish on a specific
+  address and let the firewall decide, or keep 127.0.0.1. Routes that cannot be read refuse every
+  peer beyond loopback.
+- **Which ports**: a host port a job names (`50080:80`) must be inside
+  **`RUNNER_NATIVE_PORT_RANGE`** (`--native-port-range`, `lo-hi`, 1024 <= lo <= hi), by default
+  **49152-65535**, IANA's dynamic and private ports (RFC 6335), which no service is registered on.
+  Outside it the job fails naming the setting. **Docker lets a container take any free host port**;
+  here a job could otherwise take 5432 or 6379 while the host's PostgreSQL or Redis is down (a
+  restart, an upgrade) and collect the credentials and data its clients send. Workflows written
+  for Docker with `8080:80` either name a port in the range, use a bare port, or the operator widens
+  the range (`RUNNER_NATIVE_PORT_RANGE=8000-8999`). None below 1024 ever (the host's privileged
+  ports). **The runner's own endpoints' ports are always refused**, inside the range or not: its
+  database's (`DATABASE_URL` / `PGPORT`, 5432 by default when one is set), and a `tcp://` engine
+  host (`RUNNER_ENGINE_HOST`) or Docker host (`DOCKER_HOST`); a bare port never lands on one (the
+  relay picks again). A bare `80` or `ip::80` gets one the kernel picks, from the host's ephemeral
+  range as Docker's does, and "Set up job" says where each went as `docker port` does:
+  `Container ports: 80/tcp -> 127.0.0.1:50080, 9090/tcp -> 127.0.0.1:41234`. A port another process
   holds fails the job in "Set up job" naming it (`publish 127.0.0.1:8080/tcp`), as Docker's bind does.
   At most 64.
 - **Untrusted jobs publish nothing**: a job the runner does not vouch for, and a fork's pull
@@ -1482,15 +1510,21 @@ volume's mount) fails the job in "Set up job", naming both, as it would hide one
   not carry out goes to Dagger with the reason, as before: a range (`8000-8010:8000-8010`), an IPv6
   address, `sctp`, an expression, and any `ports:` on a rootless runner (its steps share the host's
   network already; phase 5).
-- Only IPv4: the listener is on the address given, not also on `[::]` as Docker's 0.0.0.0 is.
+- IPv4 addresses only: the listener is on the address given (and `::1` beside 127.0.0.1), not also
+  on `[::]` as Docker's 0.0.0.0 is.
 
 Tests: the `-p` grammar and its refusals, a host port twice (`container_options.zig`); the
-operator's addresses, the default, 0.0.0.0, a privileged port and an untrusted job
-(`publish.zig`); the relay listening in the host's namespace on a port the kernel picks, said in
+operator's addresses, the default, 0.0.0.0, a privileged port, a port outside the range, the
+runner's own endpoints' ports, the range's grammar and an untrusted job (`publish.zig`); the
+guard's reading of the routes (the runner's subnet and a bridge's refused, loopback and the LAN
+not, unreadable routes refusing all), a full backlog on one published port stalling no other, a
+newcomer taking the place of the quietest of 64 silent connections and idle ones closed, UDP new
+clients capped per second, and 127.0.0.1 published on `::1` too (`forward.zig`, non-root); the relay listening in the host's namespace on a port the kernel picks, said in
 its ready line, carrying TCP both ways and gone once stopped, UDP for two clients each answered on
 its own, and a taken port named (`forward.zig`, non-root); and as root, real jobs: a job's server
-reached from the host through its published 127.0.0.1 port, never from another job (neither its
-own 127.0.0.1 nor the host's bridge address), gone after the job, a bare port reported with the
+reached from the host through its port published on 0.0.0.0, never from another job (neither its
+own 127.0.0.1 nor the host's bridge address, which the runner's `input` chain drops) nor from a
+peer on another bridge of the host's (refused by the relay), gone after the job, a bare port reported with the
 kernel's pick, and a taken port failing the job before any step runs.
 
 - **An `options:` that is an expression** (`${{ matrix.options }}`): decided before expressions

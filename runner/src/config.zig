@@ -147,6 +147,12 @@ pub const Config = struct {
     /// comma-separated IPv4 (`RUNNER_NATIVE_PORT_ADDRESSES`, `native/publish.zig`); the first is
     /// where an entry with no address goes. Empty, the default: 127.0.0.1 alone.
     native_port_addresses: []const u8 = "",
+    /// The host ports a native job container may name in its `ports:` (`8080:80`), `lo-hi`
+    /// (`RUNNER_NATIVE_PORT_RANGE`, `native/publish.zig`). Empty, the default: 49152-65535.
+    native_port_range: []const u8 = "",
+    /// The ports of the runner's own endpoints, which no job publishes (`publish.reservedPorts`),
+    /// as `main.zig` found them: its database's, and a `tcp://` engine or Docker host's.
+    native_reserved_ports: ?[]const u16 = null,
     /// Past this many MiB, the native step store's least recently used layers go
     /// (`RUNNER_NATIVE_STORE_MAX_MB`, `native/Store.zig`).
     native_store_max_mb: u64 = NativeStore.default_max_bytes / (1024 * 1024),
@@ -288,6 +294,7 @@ pub const Config = struct {
         InvalidNativeRootfs,
         InvalidNativeSubnet,
         InvalidNativePortAddresses,
+        InvalidNativePortRange,
         InvalidNativeMinFree,
         InvalidNativeSubidBase,
         InvalidNativeCgroup,
@@ -315,6 +322,8 @@ pub const Config = struct {
             error.InvalidNativePortAddresses => "RUNNER_NATIVE_PORT_ADDRESSES is a list of IPv4 " ++
                 "addresses (0.0.0.0 for every address of the host), separated by commas or " ++
                 "colons; empty is 127.0.0.1 alone.",
+            error.InvalidNativePortRange => "RUNNER_NATIVE_PORT_RANGE is the host ports a job " ++
+                "container may name, lo-hi with 1024 <= lo <= hi <= 65535; empty is 49152-65535.",
             error.InvalidNativeMinFree => "RUNNER_NATIVE_MIN_FREE_PCT is a percentage, 0 to 100",
             error.InvalidNativeSubnet => "RUNNER_NATIVE_SUBNET is an IPv4 network a.b.c.d/p " ++
                 "with no host bits set and a prefix of 8 to 23 bits (room for every job's " ++
@@ -377,6 +386,7 @@ pub const Config = struct {
             return error.InvalidNativeRootfs;
         _ = try native_net.Subnet.parse(c.native_subnet);
         if (!native_publish.validAddresses(c.native_port_addresses)) return error.InvalidNativePortAddresses;
+        if (native_publish.parseRange(c.native_port_range) == null) return error.InvalidNativePortRange;
         if (c.native_subid_base < NativeBackend.min_subid_base) return error.InvalidNativeSubidBase;
         if (c.native_cgroup.len > 0 and !std.mem.eql(u8, c.native_cgroup, "self") and
             !std.mem.eql(u8, c.native_cgroup, "none") and !native_cgroup.within(c.native_cgroup))
@@ -459,6 +469,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_SUBID_BASE")) |v| c.native_subid_base = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_SUBNET")) |v| c.native_subnet = v;
         if (environ.get("RUNNER_NATIVE_PORT_ADDRESSES")) |v| c.native_port_addresses = v;
+        if (environ.get("RUNNER_NATIVE_PORT_RANGE")) |v| c.native_port_range = v;
         if (environ.get("RUNNER_NATIVE_STORE_MAX_MB")) |v| c.native_store_max_mb = try num(u64, v);
         if (environ.get("RUNNER_NATIVE_VOLUMES_MAX_MB")) |v| c.native_volumes_max_mb = try num(u64, v);
         if (environ.get("RUNNER_NATIVE_IMAGES_MAX_MB")) |v| c.native_images_max_mb = try num(u64, v);
@@ -550,6 +561,7 @@ pub const Config = struct {
         else if (eq(key, "native-subid-base")) c.native_subid_base = try num(u32, val) //
         else if (eq(key, "native-subnet")) c.native_subnet = val //
         else if (eq(key, "native-port-addresses")) c.native_port_addresses = val //
+        else if (eq(key, "native-port-range")) c.native_port_range = val //
         else if (eq(key, "native-store-max-mb")) c.native_store_max_mb = try num(u64, val) //
         else if (eq(key, "native-volumes-max-mb")) c.native_volumes_max_mb = try num(u64, val) //
         else if (eq(key, "native-images-max-mb")) c.native_images_max_mb = try num(u64, val) //
@@ -983,6 +995,14 @@ test "the native subnet and ids: defaults, and values that are refused" {
         "--native-port-addresses=::1",
     }));
     _ = env.swapRemove("RUNNER_NATIVE_PORT_ADDRESSES");
+    // The host ports a job may name: lo-hi, checked at load.
+    try env.put("RUNNER_NATIVE_PORT_RANGE", "30000-39999");
+    try std.testing.expectEqualStrings("30000-39999", (try Config.load(&env, &.{"runner"})).native_port_range);
+    for ([_][]const u8{ "80-90", "8080", "9000-8000" }) |bad| {
+        try env.put("RUNNER_NATIVE_PORT_RANGE", bad);
+        try std.testing.expectError(error.InvalidNativePortRange, Config.load(&env, &.{"runner"}));
+    }
+    _ = env.swapRemove("RUNNER_NATIVE_PORT_RANGE");
     try env.put("RUNNER_NATIVE_SUBID_BASE", "99999");
     try std.testing.expectError(error.InvalidNativeSubidBase, Config.load(&env, &.{"runner"}));
     try env.put("RUNNER_NATIVE_SUBID_BASE", "100000");

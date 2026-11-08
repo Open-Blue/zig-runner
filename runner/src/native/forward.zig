@@ -37,6 +37,14 @@ pub const Spec = struct {
     /// the job's port on its loopback. Otherwise (a service's published port) the listeners are on
     /// the job's loopback.
     publish: bool = false,
+    /// Published: the host ports a kernel pick must not land on (the runner's own endpoints).
+    reserved: []const u16 = &.{},
+    /// Published beyond the host's loopback: the runner's jobs' subnet, whose peers are refused,
+    /// as are those on the host's bridges (`Guard`).
+    guard: ?GuardSpec = null,
+
+    /// The relay's timeouts; tests shorten them.
+    limits: Limits = .{},
 
     pub const Map = struct {
         /// 0 when published: the kernel picks one, which the ready line says.
@@ -47,13 +55,30 @@ pub const Spec = struct {
         /// A published UDP port: datagrams relayed per client (`Assoc`).
         udp: bool = false,
     };
+
+    pub const GuardSpec = struct { subnet: [4]u8, prefix: u8 };
+
+    pub const Limits = struct {
+        /// A connection to the job's port that has not completed in this long is given up: the
+        /// connect is non-blocking, so one the job's full backlog holds never stalls the others.
+        connect_ms: u64 = 10_000,
+        /// A connection with no byte either way for this long is closed.
+        idle_ms: u64 = 300_000,
+        /// How long a connection must have been quiet before a newcomer may take its place.
+        evict_idle_ms: u64 = 10_000,
+    };
 };
 
-/// Connections relayed at once; more wait in the listen queue.
+/// Connections relayed at once. A newcomer past it takes the place of the one quiet longest, once
+/// that one has been quiet `Limits.evict_idle_ms`; until then it is closed. So connections held open and
+/// silent cannot lock out the rest.
 const max_conns = 64;
 /// The most ports one helper publishes (`publish.zig` refuses more).
 pub const max_published = 64;
 const buf_len = 16 * 1024;
+/// New UDP clients taken per second; datagrams from more new ones in that second are dropped, so
+/// a flood of sources cannot churn the relay's sockets.
+const max_new_assocs_per_s = 32;
 
 /// The helper's entry. Exits 0 when its lifeline closes, 1 with why on stderr when it cannot
 /// listen.
@@ -66,20 +91,36 @@ pub fn main(arena: Allocator) u8 {
     // where every connection to the job's port is made. A socket stays in the namespace it was
     // made in, so the listeners are the host's and the connections the job's.
     if (!spec.publish) joinNetns(arena, spec.netns);
+    // The host's routes, opened while the helper is in the host's network: a file of /proc/net
+    // stays its namespace's, so `Guard` reads the host's bridges from it later.
+    var guard: ?Guard = if (spec.publish) if (spec.guard) |g| .{
+        .route = openRoute(),
+        .subnet = g.subnet,
+        .prefix = g.prefix,
+    } else null else null;
     var listeners: std.ArrayList(Listener) = .empty;
     var ready: std.ArrayList(u8) = .empty;
     ready.appendSlice(arena, "ready") catch sandbox.oom();
     for (spec.ports) |m| {
         if (spec.publish) {
-            const fd = listenOn(m.address, m.host, m.udp) orelse {
-                const what = std.fmt.allocPrint(arena, "publish {d}.{d}.{d}.{d}:{d}/{s}", .{
-                    m.address[0],                m.address[1], m.address[2], m.address[3], m.host,
-                    if (m.udp) "udp" else "tcp",
-                }) catch "publish a port";
-                sandbox.fatal(what, @as(u32, 98));
+            const got = publishOne(m, spec.reserved);
+            const pair = switch (got) {
+                .ok => |p| p,
+                .taken => |v6| {
+                    const what = if (v6)
+                        std.fmt.allocPrint(arena, "publish [::1]:{d}/{s}", .{ m.host, if (m.udp) "udp" else "tcp" }) catch "publish a port"
+                    else
+                        std.fmt.allocPrint(arena, "publish {d}.{d}.{d}.{d}:{d}/{s}", .{
+                            m.address[0],                m.address[1], m.address[2], m.address[3], m.host,
+                            if (m.udp) "udp" else "tcp",
+                        }) catch "publish a port";
+                    sandbox.fatal(what, @as(u32, 98));
+                },
             };
-            listeners.append(arena, .{ .fd = fd, .to = m.container, .udp = m.udp }) catch sandbox.oom();
-            ready.print(arena, " {d}", .{boundPort(fd)}) catch sandbox.oom();
+            const guarded = guard != null and m.address[0] != 127;
+            listeners.append(arena, .{ .fd = pair.v4, .to = m.container, .udp = m.udp, .guarded = guarded }) catch sandbox.oom();
+            if (pair.v6) |fd| listeners.append(arena, .{ .fd = fd, .to = m.container, .udp = m.udp, .v6 = true }) catch sandbox.oom();
+            ready.print(arena, " {d}", .{boundPort(pair.v4)}) catch sandbox.oom();
             continue;
         }
         const v4 = listen(m.host, false) orelse {
@@ -89,7 +130,7 @@ pub fn main(arena: Allocator) u8 {
         listeners.append(arena, .{ .fd = v4, .to = m.container }) catch sandbox.oom();
         // ::1 too, as the Dagger path forwards it, where the namespace has IPv6.
         const v6 = listen(m.host, true) orelse continue;
-        listeners.append(arena, .{ .fd = v6, .to = m.container }) catch sandbox.oom();
+        listeners.append(arena, .{ .fd = v6, .to = m.container, .v6 = true }) catch sandbox.oom();
     }
     if (spec.publish) joinNetns(arena, spec.netns);
     ready.append(arena, '\n') catch sandbox.oom();
@@ -103,7 +144,7 @@ pub fn main(arena: Allocator) u8 {
     // filter needs, and before any of the job's traffic.
     sandbox.installSeccomp();
     _ = linux.write(1, ready.items.ptr, ready.items.len);
-    relay(arena, listeners.items);
+    relay(arena, listeners.items, if (guard) |*g| g else null, spec.limits);
     return 0;
 }
 
@@ -121,7 +162,60 @@ fn portText(arena: Allocator, port: u16) []const u8 {
     return std.fmt.allocPrint(arena, "{d}", .{port}) catch "?";
 }
 
-const Listener = struct { fd: linux.fd_t, to: u16, udp: bool = false };
+const Listener = struct {
+    fd: linux.fd_t,
+    to: u16,
+    udp: bool = false,
+    /// Its peers are IPv6 (it is on `::1`).
+    v6: bool = false,
+    /// Published beyond the host's loopback: each peer is checked (`Guard`).
+    guarded: bool = false,
+};
+
+/// A published port's sockets: IPv4 on its address, and on `::1` too when that is 127.0.0.1 and
+/// the host has IPv6, so a client that resolves `localhost` to `::1` reaches it as on Docker.
+const Pair = struct { v4: linux.fd_t, v6: ?linux.fd_t = null };
+
+/// `m` listened on, or which of its sockets was taken (true: `::1`'s). A port the kernel picks is
+/// picked again when it lands on one of `reserved` (the runner's own) or its `::1` is taken.
+fn publishOne(m: Spec.Map, reserved: []const u16) union(enum) { ok: Pair, taken: bool } {
+    for (0..16) |_| {
+        const v4 = listenOn(m.address, m.host, m.udp) orelse return .{ .taken = false };
+        const port = boundPort(v4);
+        if (m.host == 0 and std.mem.indexOfScalar(u16, reserved, port) != null) {
+            _ = linux.close(v4);
+            continue;
+        }
+        if (m.address[0] != 127) return .{ .ok = .{ .v4 = v4 } };
+        switch (listenLoopback6(port, m.udp)) {
+            .fd => |fd| return .{ .ok = .{ .v4 = v4, .v6 = fd } },
+            .off => return .{ .ok = .{ .v4 = v4 } },
+            .taken => {
+                _ = linux.close(v4);
+                if (m.host != 0) return .{ .taken = true };
+            },
+        }
+    }
+    return .{ .taken = false };
+}
+
+/// A socket on `[::1]:port`, listening for TCP or bound for UDP; `off` where the host has no
+/// IPv6 (no AF_INET6, or no `::1`), `taken` when another process holds it.
+fn listenLoopback6(port: u16, udp: bool) union(enum) { fd: linux.fd_t, off, taken } {
+    const sock: u32 = if (udp) linux.SOCK.DGRAM else linux.SOCK.STREAM;
+    const rc = linux.socket(linux.AF.INET6, sock | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
+    if (linux.errno(rc) != .SUCCESS) return .off;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return .off;
+    const one: i32 = 1;
+    const ipv6_v6only = 26;
+    _ = linux.setsockopt(fd, linux.IPPROTO.IPV6, ipv6_v6only, std.mem.asBytes(&one), 4);
+    if (!udp) _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&one), 4);
+    var sa = loopback6(port);
+    const bound = linux.errno(linux.bind(fd, asSockaddr6(&sa), @sizeOf(linux.sockaddr.in6)));
+    if (bound == .SUCCESS and (udp or linux.errno(linux.listen(fd, 128)) == .SUCCESS)) return .{ .fd = fd };
+    _ = linux.close(fd);
+    return if (bound == .ADDRINUSE) .taken else .off;
+}
 
 /// A socket of the host's on `address:port` (0: one the kernel picks), listening for TCP or
 /// bound for UDP, or null when it cannot be (the port is taken, the address is not the host's).
@@ -144,6 +238,10 @@ fn listenOn(address: [4]u8, port: u16, udp: bool) ?linux.fd_t {
 
 /// An IPv4 address as the socket calls take it: the one cast this file's sockets need.
 pub fn asSockaddr(sa: *linux.sockaddr.in) *linux.sockaddr {
+    return @ptrCast(sa);
+}
+
+fn asSockaddr6(sa: *linux.sockaddr.in6) *linux.sockaddr {
     return @ptrCast(sa);
 }
 
@@ -175,7 +273,7 @@ fn listen(port: u16, v6: bool) ?linux.fd_t {
         const ipv6_v6only = 26;
         _ = linux.setsockopt(fd, linux.IPPROTO.IPV6, ipv6_v6only, std.mem.asBytes(&one), 4);
         var sa = loopback6(port);
-        const rc6 = linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in6));
+        const rc6 = linux.bind(fd, asSockaddr6(&sa), @sizeOf(linux.sockaddr.in6));
         break :ok linux.errno(rc6) == .SUCCESS;
     } else ok: {
         var sa = loopback4(port);
@@ -203,6 +301,83 @@ fn loopback6(port: u16) linux.sockaddr.in6 {
         .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
         .scope_id = 0,
     };
+}
+
+/// The host's IPv4 routes, `/proc/self/net/route` of the namespace the helper is in now; -1
+/// when it cannot be read, which refuses every peer beyond loopback (`Guard.allows`).
+fn openRoute() linux.fd_t {
+    const rc = linux.open("/proc/self/net/route", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    return std.math.cast(linux.fd_t, rc) orelse -1;
+}
+
+/// Who may reach a port published beyond the host's loopback: not the runner's own jobs (their
+/// subnet; the runner's table drops them at the bridge already) and not a container on another
+/// bridge of the host's (Docker's, the Dagger engine's, a Dagger-fallback job's): those are
+/// local, and not the host's to let in through a trusted job's port. The host's bridges are read
+/// from its routes on each such peer, so one made since the job started is refused too.
+pub const Guard = struct {
+    route: linux.fd_t,
+    subnet: [4]u8,
+    prefix: u8,
+    /// Whether an interface is a bridge (tests give their own).
+    bridge: *const fn ([]const u8) bool = isBridge,
+    buf: [32 * 1024]u8 = undefined,
+
+    pub fn allows(g: *Guard, peer: [4]u8) bool {
+        if (peer[0] == 127) return true;
+        if (inSubnet(peer, g.subnet, g.prefix)) return false;
+        if (g.route < 0) return false;
+        const n = linux.pread(g.route, &g.buf, g.buf.len, 0);
+        if (linux.errno(n) != .SUCCESS or n == g.buf.len) return false;
+        return !onBridge(g.buf[0..n], peer, g.bridge);
+    }
+};
+
+fn inSubnet(a: [4]u8, base: [4]u8, prefix: u8) bool {
+    if (prefix == 0) return true;
+    const shift: u5 = @truncate(32 - @as(u32, @min(prefix, 32)));
+    const mask: u32 = if (prefix >= 32) 0xffff_ffff else ~@as(u32, 0) << shift;
+    return std.mem.readInt(u32, &a, .big) & mask == std.mem.readInt(u32, &base, .big) & mask;
+}
+
+/// Whether `peer` is on the subnet a bridge of `route`'s (`/proc/net/route`'s text) is directly
+/// connected to. Lines that cannot be read count as no bridge's.
+pub fn onBridge(route: []const u8, peer: [4]u8, bridge: *const fn ([]const u8) bool) bool {
+    var lines = std.mem.splitScalar(u8, route, '\n');
+    _ = lines.next();
+    const want = std.mem.readInt(u32, &peer, .little);
+    while (lines.next()) |line| {
+        var f = std.mem.tokenizeAny(u8, line, " \t");
+        const iface = f.next() orelse continue;
+        const dest = std.fmt.parseInt(u32, f.next() orelse continue, 16) catch continue;
+        const gw = std.fmt.parseInt(u32, f.next() orelse continue, 16) catch continue;
+        const flags = std.fmt.parseInt(u32, f.next() orelse continue, 16) catch continue;
+        for (0..3) |_| _ = f.next();
+        const mask = std.fmt.parseInt(u32, f.next() orelse continue, 16) catch continue;
+        // Up, no gateway (directly connected), and not the default route.
+        if (flags & 1 == 0 or gw != 0 or mask == 0) continue;
+        if (want & mask != dest & mask) continue;
+        if (bridge(iface)) return true;
+    }
+    return false;
+}
+
+/// Whether the host's interface `name` is a bridge (`/sys/class/net/<name>/bridge`; sysfs is the
+/// host's network's, as the helper stays in the host's mount namespace).
+fn isBridge(name: []const u8) bool {
+    if (name.len == 0 or name.len > 15 or std.mem.indexOfAny(u8, name, "/.") != null) return true;
+    var buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&buf, "/sys/class/net/{s}/bridge", .{name}, 0) catch return true;
+    return linux.errno(linux.faccessat(linux.AT.FDCWD, path, linux.F_OK, 0)) == .SUCCESS;
+}
+
+/// The monotonic clock, in milliseconds.
+fn nowMs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    const sec = std.math.cast(u64, ts.sec) orelse 0;
+    const nsec = std.math.cast(u64, ts.nsec) orelse 0;
+    return sec * 1000 + nsec / 1_000_000;
 }
 
 /// One direction of a connection: bytes read from one end, not yet written to the other.
@@ -233,19 +408,33 @@ const Conn = struct {
     used: bool = false,
     fds: [2]linux.fd_t = .{ -1, -1 },
     pipes: [2]Pipe = .{ .{}, .{} },
+    /// Its connect to the job's port is under way (non-blocking).
+    connecting: bool = false,
+    /// That connect is to `::1` (IPv4's was refused).
+    v6: bool = false,
+    to: u16 = 0,
+    /// When a byte last went either way (or it was accepted), `nowMs`.
+    last: u64 = 0,
 
     fn close(c: *Conn) void {
-        for (c.fds) |fd| _ = linux.close(fd);
+        for (c.fds) |fd| if (fd >= 0) {
+            _ = linux.close(fd);
+        };
         c.* = .{};
+    }
+
+    /// When it is given up: its connect's timeout, or its idle one.
+    fn deadline(c: *const Conn, l: Spec.Limits) u64 {
+        return c.last + if (c.connecting) l.connect_ms else l.idle_ms;
     }
 };
 
 /// Until the lifeline closes: accepts, connects each to the service's port, and copies both
 /// ways, each direction shut once its sender is done.
-fn relay(arena: Allocator, listeners: []const Listener) void {
+fn relay(arena: Allocator, listeners: []const Listener, guard: ?*Guard, limits: Spec.Limits) void {
     const conns = arena.alloc(Conn, max_conns) catch sandbox.oom();
     for (conns) |*c| c.* = .{};
-    var udp: Udp = .{ .assocs = arena.alloc(Assoc, max_assocs) catch sandbox.oom() };
+    var udp: Udp = .{ .assocs = arena.alloc(Assoc, max_assocs) catch sandbox.oom(), .guard = guard };
     for (udp.assocs) |*s| s.* = .{};
     const nfds = 1 + listeners.len + 2 * max_conns + max_assocs;
     const fds = arena.alloc(linux.pollfd, nfds) catch sandbox.oom();
@@ -257,24 +446,34 @@ fn relay(arena: Allocator, listeners: []const Listener) void {
         for (udp.assocs, assoc_fds) |s, *p|
             p.* = .{ .fd = if (s.used) s.fd else -1, .events = linux.POLL.IN, .revents = 0 };
         const conn_fds = fds[1 + listeners.len .. nfds - max_assocs];
-        for (conns, 0..) |*c, i| for (0..2) |side| {
-            var ev: i16 = 0;
-            if (c.used) {
-                if (!c.pipes[side].eof and c.pipes[side].room().len > 0) ev |= linux.POLL.IN;
-                if (c.pipes[1 - side].pending()) ev |= linux.POLL.OUT;
+        var next: ?u64 = null;
+        for (conns, 0..) |*c, i| {
+            if (c.used) next = @min(next orelse c.deadline(limits), c.deadline(limits));
+            for (0..2) |side| {
+                var ev: i16 = 0;
+                var fd: linux.fd_t = if (c.used) c.fds[side] else -1;
+                if (c.used and c.connecting) {
+                    // Only the connect is waited on: the client's bytes wait in its socket.
+                    if (side == 1) ev = linux.POLL.OUT else fd = -1;
+                } else if (c.used) {
+                    if (!c.pipes[side].eof and c.pipes[side].room().len > 0) ev |= linux.POLL.IN;
+                    if (c.pipes[1 - side].pending()) ev |= linux.POLL.OUT;
+                }
+                conn_fds[2 * i + side] = .{ .fd = fd, .events = ev, .revents = 0 };
             }
-            const fd = if (c.used) c.fds[side] else -1;
-            conn_fds[2 * i + side] = .{ .fd = fd, .events = ev, .revents = 0 };
-        };
-        const rc = linux.poll(fds.ptr, nfds, -1);
+        }
+        const now = nowMs();
+        const wait: i32 = if (next) |d| std.math.cast(i32, d -| now) orelse std.math.maxInt(i32) else -1;
+        const rc = linux.poll(fds.ptr, nfds, wait);
         if (linux.errno(rc) == .INTR) continue;
         sandbox.check("wait for the relay's connections", rc);
         if (fds[0].revents != 0) return;
+        const t = nowMs();
         for (listeners, fds[1..][0..listeners.len], 0..) |l, p, i| if (p.revents != 0) {
-            if (l.udp) udp.fromClients(listeners, i) else accept(conns, l);
+            if (l.udp) udp.fromClients(listeners, i, t) else accept(conns, l, guard, t, limits);
         };
         for (conns, 0..) |*c, i| if (c.used) {
-            if (!step(c, conn_fds[2 * i ..][0..2])) c.close();
+            if (!step(c, conn_fds[2 * i ..][0..2], t, limits)) c.close();
         };
         for (udp.assocs, assoc_fds) |*s, p| if (s.used and p.revents != 0) udp.toClient(listeners, s);
     }
@@ -289,6 +488,9 @@ const Assoc = struct {
     used: bool = false,
     listener: usize = 0,
     client: linux.sockaddr.in = undefined,
+    /// A `::1` listener's client.
+    client6: linux.sockaddr.in6 = undefined,
+    is_v6: bool = false,
     fd: linux.fd_t = -1,
     /// When it was last heard from or answered, in the relay's own count.
     seen: u64 = 0,
@@ -296,27 +498,51 @@ const Assoc = struct {
 
 const Udp = struct {
     assocs: []Assoc,
+    guard: ?*Guard = null,
     clock: u64 = 0,
+    /// The second (`nowMs` / 1000) new clients are being counted in, and how many came in it.
+    second: u64 = 0,
+    new_in_second: u32 = 0,
     buf: [64 * 1024]u8 = undefined,
 
     /// Every datagram waiting on listener `i`, each sent on by its client's socket in the job's
     /// network (made on its first datagram, connected to the job's port on the loopback).
-    fn fromClients(u: *Udp, listeners: []const Listener, i: usize) void {
+    fn fromClients(u: *Udp, listeners: []const Listener, i: usize, now: u64) void {
         const l = listeners[i];
+        // A `::1` listener's clients have IPv6 addresses.
+        if (l.v6) return u.fromClients6(listeners, i, now);
         while (true) {
             var from: linux.sockaddr.in = undefined;
             var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
             const n = linux.recvfrom(l.fd, &u.buf, u.buf.len, 0, asSockaddr(&from), &len);
             if (linux.errno(n) != .SUCCESS) return;
+            if (l.guarded) if (u.guard) |g| if (!g.allows(peerOf(from))) continue;
             u.clock += 1;
-            const s = u.assocOf(i, from, l.to) orelse continue;
+            const s = u.assocOf(i, .{ .v4 = from }, l.to, now) orelse continue;
             s.seen = u.clock;
             _ = linux.sendto(s.fd, &u.buf, n, 0, null, 0);
         }
     }
 
-    /// The client's association, made when it has none (the quietest dropped when all are in use).
-    fn assocOf(u: *Udp, listener: usize, client: linux.sockaddr.in, to: u16) ?*Assoc {
+    fn fromClients6(u: *Udp, listeners: []const Listener, i: usize, now: u64) void {
+        const l = listeners[i];
+        while (true) {
+            var from: linux.sockaddr.in6 = undefined;
+            var len: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
+            const n = linux.recvfrom(l.fd, &u.buf, u.buf.len, 0, asSockaddr6(&from), &len);
+            if (linux.errno(n) != .SUCCESS) return;
+            u.clock += 1;
+            const s = u.assocOf(i, .{ .v6 = from }, l.to, now) orelse continue;
+            s.seen = u.clock;
+            _ = linux.sendto(s.fd, &u.buf, n, 0, null, 0);
+        }
+    }
+
+    const Client = union(enum) { v4: linux.sockaddr.in, v6: linux.sockaddr.in6 };
+
+    /// The client's association, made when it has none (the quietest dropped when all are in
+    /// use), or null when this second's new clients are spent.
+    fn assocOf(u: *Udp, listener: usize, client: Client, to: u16, now: u64) ?*Assoc {
         var free: ?*Assoc = null;
         var oldest: *Assoc = &u.assocs[0];
         for (u.assocs) |*s| {
@@ -324,17 +550,35 @@ const Udp = struct {
                 if (free == null) free = s;
                 continue;
             }
-            if (s.listener == listener and s.client.port == client.port and s.client.addr == client.addr) return s;
+            if (s.listener == listener and sameClient(s, client)) return s;
             if (s.seen < oldest.seen) oldest = s;
         }
+        if (now / 1000 != u.second) {
+            u.second = now / 1000;
+            u.new_in_second = 0;
+        }
+        if (u.new_in_second >= max_new_assocs_per_s) return null;
+        u.new_in_second += 1;
         const s = free orelse s: {
             _ = linux.close(oldest.fd);
             oldest.* = .{};
             break :s oldest;
         };
         const fd = dialUdp(to) orelse return null;
-        s.* = .{ .used = true, .listener = listener, .client = client, .fd = fd, .seen = u.clock };
+        s.* = .{ .used = true, .listener = listener, .fd = fd, .seen = u.clock };
+        switch (client) {
+            .v4 => |c| s.client = c,
+            .v6 => |c| s.client6 = c,
+        }
+        s.is_v6 = client == .v6;
         return s;
+    }
+
+    fn sameClient(s: *const Assoc, client: Client) bool {
+        return switch (client) {
+            .v4 => |c| !s.is_v6 and s.client.port == c.port and s.client.addr == c.addr,
+            .v6 => |c| s.is_v6 and s.client6.port == c.port and std.mem.eql(u8, &s.client6.addr, &c.addr),
+        };
     }
 
     /// The job's answers on `s`, sent to its client from the published port.
@@ -349,10 +593,20 @@ const Udp = struct {
             }
             u.clock += 1;
             s.seen = u.clock;
-            _ = linux.sendto(listeners[s.listener].fd, &u.buf, n, 0, asSockaddr(&s.client), @sizeOf(linux.sockaddr.in));
+            const out = listeners[s.listener].fd;
+            if (s.is_v6)
+                _ = linux.sendto(out, &u.buf, n, 0, asSockaddr6(&s.client6), @sizeOf(linux.sockaddr.in6))
+            else
+                _ = linux.sendto(out, &u.buf, n, 0, asSockaddr(&s.client), @sizeOf(linux.sockaddr.in));
         }
     }
 };
+
+fn peerOf(sa: linux.sockaddr.in) [4]u8 {
+    var a: [4]u8 = undefined;
+    std.mem.writeInt(u32, &a, std.mem.bigToNative(u32, sa.addr), .big);
+    return a;
+}
 
 /// A UDP socket of the job's network connected to its `port` on 127.0.0.1, non-blocking.
 fn dialUdp(port: u16) ?linux.fd_t {
@@ -367,54 +621,90 @@ fn dialUdp(port: u16) ?linux.fd_t {
     return fd;
 }
 
-fn accept(conns: []Conn, l: Listener) void {
-    const rc = linux.accept4(l.fd, null, null, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK);
+fn accept(conns: []Conn, l: Listener, guard: ?*Guard, now: u64, limits: Spec.Limits) void {
+    var peer: linux.sockaddr.in6 = undefined;
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
+    const rc = linux.accept4(l.fd, asSockaddr6(&peer), &len, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK);
     if (linux.errno(rc) != .SUCCESS) return;
-    const client: linux.fd_t = @intCast(rc);
+    const client = std.math.cast(linux.fd_t, rc) orelse return;
+    // An IPv4 peer's address is at bytes 4 to 8 of the storage (`sockaddr_in`'s `sin_addr`).
+    if (l.guarded) if (guard) |g| if (!g.allows(std.mem.asBytes(&peer)[4..8].*)) {
+        _ = linux.close(client);
+        return;
+    };
+    var oldest: ?*Conn = null;
     const slot = for (conns) |*c| {
         if (!c.used) break c;
-    } else {
+        if (!c.connecting and (oldest == null or c.last < oldest.?.last)) oldest = c;
+    } else s: {
+        // All in use: the one quiet longest makes way, once it has been quiet a while.
+        const o = oldest orelse break :s null;
+        if (now -| o.last < limits.evict_idle_ms) break :s null;
+        o.close();
+        break :s o;
+    };
+    const s = slot orelse {
         _ = linux.close(client);
         return;
     };
-    const upstream = dial(l.to) orelse {
+    const up = dial(l.to, false) orelse dial(l.to, true) orelse {
         _ = linux.close(client);
         return;
     };
-    slot.* = .{ .used = true, .fds = .{ client, upstream } };
+    s.* = .{ .used = true, .fds = .{ client, up.fd }, .connecting = !up.done, .v6 = up.v6, .to = l.to, .last = now };
 }
 
-/// A connection to the service's `port` on the loopback (127.0.0.1, else ::1), made non-blocking
-/// once connected; a connection on the loopback is made or refused at once.
-fn dial(port: u16) ?linux.fd_t {
-    for ([_]bool{ false, true }) |v6| {
-        const family: u32 = if (v6) linux.AF.INET6 else linux.AF.INET;
-        const rc = linux.socket(family, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-        if (linux.errno(rc) != .SUCCESS) continue;
-        const fd: linux.fd_t = @intCast(rc);
-        const done = if (v6) done: {
-            var sa = loopback6(port);
-            break :done linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in6));
-        } else done: {
-            var sa = loopback4(port);
-            break :done linux.connect(fd, asSockaddr(&sa), @sizeOf(linux.sockaddr.in));
-        };
-        if (linux.errno(done) != .SUCCESS) {
+/// A non-blocking connection to the service's `port` on the loopback (`::1` for `v6`): made
+/// (`done`), under way, or null when it was refused at once.
+fn dial(port: u16, v6: bool) ?struct { fd: linux.fd_t, done: bool, v6: bool } {
+    const family: u32 = if (v6) linux.AF.INET6 else linux.AF.INET;
+    const rc = linux.socket(family, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return null;
+    const done = if (v6) done: {
+        var sa = loopback6(port);
+        break :done linux.connect(fd, asSockaddr6(&sa), @sizeOf(linux.sockaddr.in6));
+    } else done: {
+        var sa = loopback4(port);
+        break :done linux.connect(fd, asSockaddr(&sa), @sizeOf(linux.sockaddr.in));
+    };
+    switch (linux.errno(done)) {
+        .SUCCESS => return .{ .fd = fd, .done = true, .v6 = v6 },
+        .INPROGRESS => return .{ .fd = fd, .done = false, .v6 = v6 },
+        else => {
             _ = linux.close(fd);
-            continue;
-        }
-        const nonblock: usize = 0o4000;
-        const fl = linux.fcntl(fd, linux.F.GETFL, 0);
-        _ = linux.fcntl(fd, linux.F.SETFL, fl | nonblock);
-        return fd;
+            return null;
+        },
     }
-    return null;
 }
 
-/// One round for a connection: what can be read, read; what can be written, written; a drained
-/// direction whose sender is done, shut. False when it is over (both directions shut, or an
-/// error).
-fn step(c: *Conn, polled: []const linux.pollfd) bool {
+/// One round for a connection: its connect finished, or what can be read, read; what can be
+/// written, written; a drained direction whose sender is done, shut. False when it is over (both
+/// directions shut, an error, its connect refused or too slow, or idle too long).
+fn step(c: *Conn, polled: []const linux.pollfd, now: u64, limits: Spec.Limits) bool {
+    if (c.connecting) {
+        if (polled[1].revents == 0) return now < c.deadline(limits);
+        var err: i32 = 0;
+        var len: linux.socklen_t = @sizeOf(i32);
+        const so_error = 4;
+        const rc = linux.getsockopt(c.fds[1], linux.SOL.SOCKET, so_error, std.mem.asBytes(&err), &len);
+        if (linux.errno(rc) == .SUCCESS and err == 0) {
+            c.connecting = false;
+            c.last = now;
+            return true;
+        }
+        // Refused on IPv4: the job's port may be on `::1` alone.
+        _ = linux.close(c.fds[1]);
+        c.fds[1] = -1;
+        if (c.v6) return false;
+        const up = dial(c.to, true) orelse return false;
+        c.fds[1] = up.fd;
+        c.connecting = !up.done;
+        c.v6 = true;
+        c.last = now;
+        return true;
+    }
+    var moved = false;
     for (0..2) |side| {
         const re = polled[side].revents;
         if (re & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) != 0 and !c.pipes[side].eof) {
@@ -426,6 +716,7 @@ fn step(c: *Conn, polled: []const linux.pollfd) bool {
                         c.pipes[side].eof = true;
                     } else {
                         c.pipes[side].end += n;
+                        moved = true;
                     },
                     .AGAIN, .INTR => {},
                     else => return false,
@@ -437,13 +728,17 @@ fn step(c: *Conn, polled: []const linux.pollfd) bool {
             if (p.pending()) {
                 const n = linux.write(c.fds[side], p.buf[p.start..p.end].ptr, p.end - p.start);
                 switch (linux.errno(n)) {
-                    .SUCCESS => p.start += n,
+                    .SUCCESS => {
+                        p.start += n;
+                        moved = true;
+                    },
                     .AGAIN, .INTR => {},
                     else => return false,
                 }
             }
         }
     }
+    if (moved) c.last = now;
     for (0..2) |side| {
         const p = &c.pipes[side];
         if (p.eof and !p.pending() and !p.shut) {
@@ -451,6 +746,7 @@ fn step(c: *Conn, polled: []const linux.pollfd) bool {
             p.shut = true;
         }
     }
+    if (now >= c.deadline(limits)) return false;
     return !(c.pipes[0].shut and c.pipes[1].shut);
 }
 
@@ -721,4 +1017,219 @@ test "a published UDP port relays each client's datagrams and the answers back" 
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(n));
         try std.testing.expectEqualStrings(if (i == 0) "re:one" else "re:two", buf[0..n]);
     }
+}
+
+fn testBridge(name: []const u8) bool {
+    return std.mem.eql(u8, name, "docker0") or std.mem.eql(u8, name, "zr0");
+}
+
+test "the guard: a peer of the runner's jobs or on a bridge of the host's is refused; loopback and the LAN are not" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    // As /proc/net/route has them: a default route via the LAN's NIC, the LAN, Docker's bridge
+    // and the runner's (10.211.0.0/16), in the kernel's byte order.
+    try tmp.dir.writeFile(io, .{ .sub_path = "route", .data = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n" ++
+        "eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n" ++
+        "eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n" ++
+        "docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n" ++
+        "down0\t00001EAC\t00000000\t0000\t0\t0\t0\t0000FFFF\t0\t0\t0\n" });
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const path = try tmp.dir.realPathFileAlloc(io, "route", a.allocator());
+    const rc = linux.open(try a.allocator().dupeSentinel(u8, path, 0), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    const fd = std.math.cast(linux.fd_t, rc) orelse return error.TestUnexpectedResult;
+    defer _ = linux.close(fd);
+    var g: Guard = .{ .route = fd, .subnet = .{ 10, 211, 0, 0 }, .prefix = 16, .bridge = testBridge };
+    try std.testing.expect(g.allows(.{ 127, 0, 0, 1 }));
+    try std.testing.expect(g.allows(.{ 192, 168, 1, 50 }));
+    try std.testing.expect(g.allows(.{ 8, 8, 8, 8 }));
+    // A route that is down is no bridge's.
+    try std.testing.expect(g.allows(.{ 172, 30, 0, 2 }));
+    try std.testing.expect(!g.allows(.{ 10, 211, 1, 2 }));
+    try std.testing.expect(!g.allows(.{ 172, 17, 0, 2 }));
+    // Routes that cannot be read refuse every peer beyond loopback.
+    g.route = -1;
+    try std.testing.expect(!g.allows(.{ 192, 168, 1, 50 }));
+    try std.testing.expect(g.allows(.{ 127, 0, 0, 1 }));
+}
+
+/// A TCP client of `127.0.0.1:port` (or `[::1]:port`), connected, or null.
+fn testConnect(port: u16, v6: bool) ?linux.fd_t {
+    const family: u32 = if (v6) linux.AF.INET6 else linux.AF.INET;
+    const fd = std.math.cast(linux.fd_t, linux.socket(family, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0)) orelse return null;
+    const rc = if (v6) rc: {
+        var sa = loopback6(port);
+        break :rc linux.connect(fd, asSockaddr6(&sa), @sizeOf(linux.sockaddr.in6));
+    } else rc: {
+        var sa = loopback4(port);
+        break :rc linux.connect(fd, asSockaddr(&sa), @sizeOf(linux.sockaddr.in));
+    };
+    if (linux.errno(rc) != .SUCCESS) {
+        _ = linux.close(fd);
+        return null;
+    }
+    return fd;
+}
+
+/// One round on `server`: accept within `ms`, read what came, answer "pong", close. Whether it did.
+fn testServeOnce(server: linux.fd_t, ms: i32) bool {
+    var p = [_]linux.pollfd{.{ .fd = server, .events = linux.POLL.IN, .revents = 0 }};
+    if (linux.poll(&p, 1, ms) != 1) return false;
+    const conn = std.math.cast(linux.fd_t, linux.accept4(server, null, null, linux.SOCK.CLOEXEC)) orelse return false;
+    defer _ = linux.close(conn);
+    var got: [16]u8 = undefined;
+    _ = readAll(conn, got[0..4]);
+    _ = linux.write(conn, "pong", 4);
+    return true;
+}
+
+/// Whether `fd` is still open after `ms`: no end of file came on it.
+fn testStillOpen(fd: linux.fd_t, ms: i32) bool {
+    var p = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+    if (linux.poll(&p, 1, ms) == 0) return true;
+    var b: [1]u8 = undefined;
+    const n = linux.read(fd, &b, 1);
+    return linux.errno(n) == .SUCCESS and n > 0;
+}
+
+test "a published port's connect to the job is not waited on: a job port whose backlog is full stalls no other" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    const exe = try testExe(arena);
+    // The stuck port: a backlog of none, never accepted, filled by two clients of the test's, so
+    // the next SYN is dropped and a blocking connect would wait for minutes.
+    const stuck = std.math.cast(linux.fd_t, linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0)).?;
+    defer _ = linux.close(stuck);
+    var sa = loopback4(0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.bind(stuck, asSockaddr(&sa), @sizeOf(linux.sockaddr.in))));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.listen(stuck, 0)));
+    var fillers: [2]linux.fd_t = undefined;
+    for (&fillers) |*f| {
+        f.* = std.math.cast(linux.fd_t, linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0)).?;
+        var to = loopback4(boundPort(stuck));
+        _ = linux.connect(f.*, asSockaddr(&to), @sizeOf(linux.sockaddr.in));
+    }
+    defer for (fillers) |f| {
+        _ = linux.close(f);
+    };
+    const server = listen(0, false) orelse return error.SkipZigTest;
+    defer _ = linux.close(server);
+    var why: []const u8 = "";
+    var r = try start(arena, io, exe, .{
+        .ports = &.{ .{ .host = 0, .container = boundPort(stuck) }, .{ .host = 0, .container = boundPort(server) } },
+        .publish = true,
+    }, &why);
+    defer r.stop(io);
+    // A client of the stuck port, whose connect the relay starts and cannot finish.
+    const waiting = testConnect(r.ports[0], false) orelse return error.TestUnexpectedResult;
+    defer _ = linux.close(waiting);
+    _ = linux.write(waiting, "ping", 4);
+    io.sleep(.fromMilliseconds(200), .awake) catch {};
+    // The other port is served meanwhile.
+    const client = testConnect(r.ports[1], false) orelse return error.TestUnexpectedResult;
+    defer _ = linux.close(client);
+    _ = linux.write(client, "ping", 4);
+    try std.testing.expect(testServeOnce(server, 3000));
+    var got: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("pong", readAll(client, &got));
+}
+
+test "a published port's quiet connections make way for a newcomer, and idle ones are closed" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    const exe = try testExe(arena);
+    // The job's port: its connections complete in its backlog, never read.
+    const server = std.math.cast(linux.fd_t, linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0)).?;
+    defer _ = linux.close(server);
+    var sa = loopback4(0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.bind(server, asSockaddr(&sa), @sizeOf(linux.sockaddr.in))));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.listen(server, 512)));
+    var why: []const u8 = "";
+    var r = try start(arena, io, exe, .{
+        .ports = &.{.{ .host = 0, .container = boundPort(server) }},
+        .publish = true,
+        .limits = .{ .evict_idle_ms = 200, .idle_ms = 1500 },
+    }, &why);
+    defer r.stop(io);
+    // Every place taken by a connection that says nothing.
+    var held: [max_conns]linux.fd_t = undefined;
+    for (&held) |*h| h.* = testConnect(r.ports[0], false) orelse return error.TestUnexpectedResult;
+    defer for (held) |h| {
+        _ = linux.close(h);
+    };
+    io.sleep(.fromMilliseconds(400), .awake) catch {};
+    // A newcomer is relayed, in the place of the one quiet longest, which is closed.
+    const newcomer = testConnect(r.ports[0], false) orelse return error.TestUnexpectedResult;
+    defer _ = linux.close(newcomer);
+    try std.testing.expect(testStillOpen(newcomer, 300));
+    var closed: usize = 0;
+    for (held) |h| closed += @intFromBool(!testStillOpen(h, 0));
+    try std.testing.expectEqual(@as(usize, 1), closed);
+    // Past the idle timeout, every connection that said nothing is closed.
+    io.sleep(.fromMilliseconds(1800), .awake) catch {};
+    try std.testing.expect(!testStillOpen(newcomer, 500));
+}
+
+test "a published UDP port takes only so many new clients a second" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    const exe = try testExe(arena);
+    const server = listenOn(.{ 127, 0, 0, 1 }, 0, true) orelse return error.SkipZigTest;
+    defer _ = linux.close(server);
+    var why: []const u8 = "";
+    var r = try start(arena, io, exe, .{
+        .ports = &.{.{ .host = 0, .container = boundPort(server), .udp = true }},
+        .publish = true,
+    }, &why);
+    defer r.stop(io);
+    // A hundred sources at once: past the cap their datagrams are dropped, not given sockets.
+    var clients: [100]linux.fd_t = undefined;
+    for (&clients) |*c| {
+        c.* = listenOn(.{ 127, 0, 0, 1 }, 0, true) orelse return error.TestUnexpectedResult;
+        var dest = loopback4(r.ports[0]);
+        _ = linux.sendto(c.*, "x", 1, 0, asSockaddr(&dest), @sizeOf(linux.sockaddr.in));
+    }
+    defer for (clients) |c| {
+        _ = linux.close(c);
+    };
+    var got: usize = 0;
+    var buf: [16]u8 = undefined;
+    while (true) {
+        var p = [_]linux.pollfd{.{ .fd = server, .events = linux.POLL.IN, .revents = 0 }};
+        if (linux.poll(&p, 1, 1000) != 1) break;
+        if (linux.errno(linux.recvfrom(server, &buf, buf.len, 0, null, null)) == .SUCCESS) got += 1;
+    }
+    // At most two seconds' worth, should the hundred straddle one.
+    try std.testing.expect(got > 0 and got <= 2 * max_new_assocs_per_s);
+}
+
+test "a port published on 127.0.0.1 is on ::1 too, where the host has IPv6" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    const exe = try testExe(arena);
+    const probe = listen(0, true) orelse return error.SkipZigTest;
+    _ = linux.close(probe);
+    const server = listen(0, false) orelse return error.SkipZigTest;
+    defer _ = linux.close(server);
+    var why: []const u8 = "";
+    var r = try start(arena, io, exe, .{
+        .ports = &.{.{ .host = 0, .container = boundPort(server) }},
+        .publish = true,
+    }, &why);
+    defer r.stop(io);
+    const client = testConnect(r.ports[0], true) orelse return error.TestUnexpectedResult;
+    defer _ = linux.close(client);
+    _ = linux.write(client, "ping", 4);
+    try std.testing.expect(testServeOnce(server, 3000));
+    var got: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("pong", readAll(client, &got));
 }

@@ -15,6 +15,7 @@ const Backend = @This();
 const std = @import("std");
 const job_mod = @import("../job.zig");
 const config = @import("../config.zig");
+const pg = @import("../pg.zig");
 const expr = @import("../expr.zig");
 const dagger = @import("../dagger.zig");
 const sandbox = @import("sandbox.zig");
@@ -73,6 +74,9 @@ groups: []const u32 = &.{},
 container_opts: container_options.Options = .{},
 /// `Config.port_addresses`: the host addresses a job container may publish on (`publishPorts`).
 port_addresses: []const [4]u8 = &publish.default_addresses,
+/// `Config.port_range` and `Config.reserved_ports`.
+port_range: publish.Range = publish.default_range,
+reserved_ports: []const u16 = &.{},
 /// A `container:` job's PATH once its env is set (`dagger.Base.runtime_path`).
 runtime_path: ?[]const u8 = null,
 /// Where the job's time went (`phases.zig`): its set-up, each sandbox and publish, its teardown.
@@ -228,6 +232,12 @@ pub const Config = struct {
     /// entry that names none (`RUNNER_NATIVE_PORT_ADDRESSES`, `publish.zig`): 127.0.0.1 alone
     /// by default.
     port_addresses: []const [4]u8 = &publish.default_addresses,
+    /// The host ports a job container may name (`RUNNER_NATIVE_PORT_RANGE`): 49152-65535 by
+    /// default.
+    port_range: publish.Range = publish.default_range,
+    /// The ports of the runner's own endpoints (its database, the engine, Docker), never
+    /// published (`publish.reservedPorts`).
+    reserved_ports: []const u16 = &.{},
     /// Past this many bytes, the store's least recently used layers go
     /// (`RUNNER_NATIVE_STORE_MAX_MB`, `Store.collect`).
     store_max_bytes: u64 = Store.default_max_bytes,
@@ -319,6 +329,13 @@ pub fn configFor(
     return .{
         // Checked when the configuration is loaded (`Config.load`).
         .port_addresses = publish.parseAddresses(arena, cfg.native_port_addresses) catch &publish.default_addresses,
+        .port_range = publish.parseRange(cfg.native_port_range) orelse publish.default_range,
+        // As `main.zig` found them (the database's from `PG*` too); else from the settings.
+        .reserved_ports = cfg.native_reserved_ports orelse try publish.reservedPorts(
+            arena,
+            if (cfg.database_url) |u| if (pg.parseUrl(arena, u)) |c| c.port else |_| null else null,
+            &.{ cfg.engine_host, cfg.docker_socket },
+        ),
         .rootfs = cfg.native_rootfs,
         .store = try cfg.nativeStore(arena, environ),
         .self_exe = exe.path,
@@ -805,6 +822,8 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         },
         .vouched = cfg.vouched,
         .port_addresses = cfg.port_addresses,
+        .port_range = cfg.port_range,
+        .reserved_ports = cfg.reserved_ports,
         .flatten_at = @max(2, cfg.flatten_at),
         .gate = cfg.gate,
         .test_seed_script = cfg.test_seed_script,
@@ -2950,7 +2969,11 @@ fn publishPorts(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void {
     };
     const scope = try set_up.packageCacheScope(arena, ev, ev.job.github.repository, b.caches.trusted);
     const trusted = b.vouched and std.mem.eql(u8, scope, "repo");
-    const maps = publish.plan(arena, ports, b.port_addresses, trusted, &why) catch |e| {
+    const maps = publish.plan(arena, ports, .{
+        .addresses = b.port_addresses,
+        .range = b.port_range,
+        .reserved = b.reserved_ports,
+    }, trusted, &why) catch |e| {
         b.job_fault = true;
         err_msg.* = if (why.len > 0) why else @errorName(e);
         return error.BaseContainerFailed;
@@ -2962,6 +2985,11 @@ fn publishPorts(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void {
         .cgroup = if (b.job_cgroup) |j| j.servicesDir() else null,
         .ports = maps,
         .publish = true,
+        .reserved = b.reserved_ports,
+        // Published beyond the host's loopback: no peer of the runner's jobs, nor of a bridge's.
+        .guard = for (maps) |m| {
+            if (m.address[0] != 127) break .{ .subnet = b.subnet.base, .prefix = b.subnet.prefix };
+        } else null,
     }, &why) catch |e| {
         b.job_fault = true;
         err_msg.* = try std.fmt.allocPrint(arena, "the job container's ports could not be " ++
@@ -5970,7 +5998,7 @@ fn freePort() !u16 {
     return std.mem.bigToNative(u16, sa.port);
 }
 
-test "a container job's ports: published on the host's 127.0.0.1 only, never another job's, gone with the job; a taken port fails it; a bare one is the kernel's pick" {
+test "a container job's ports: published on the host, never another job's nor a bridge's, gone with the job; a taken port fails it; a bare one is the kernel's pick" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -6009,6 +6037,11 @@ test "a container job's ports: published on the host's 127.0.0.1 only, never ano
     // relay's stop alone.
     var lone = cfg;
     lone.cgroup = .{ .parent = "none" };
+    // On every address of the host, so what keeps other jobs out is the runner's table (`input`
+    // drops their packets to the bridge's address) and the relay's guard, not the address.
+    lone.port_addresses = &.{.{ 0, 0, 0, 0 }};
+    // `hp` is the kernel's pick, from its ephemeral range.
+    lone.port_range = .{ .lo = 1024, .hi = 65535 };
     var serving: PortJob = .{ .cfg = lone, .job = testJob(&.{testStep(serve)}) };
     defer serving.arena.deinit();
     serving.job.container = .{
@@ -6049,6 +6082,34 @@ test "a container job's ports: published on the host's 127.0.0.1 only, never ano
     try std.testing.expect(other.ok);
     try expectSaid(other.text, &.{ "other-gw=refused", "other-lo=refused" });
 
+    // A container on another bridge of the host's (Docker's, the engine's), which the runner's
+    // table does not see: the relay refuses it by its address.
+    const bridge_script = try std.fmt.allocPrint(arena,
+        \\set -e
+        \\ip link add zrtbr0 type bridge; ip addr add 172.31.250.1/24 dev zrtbr0; ip link set zrtbr0 up
+        \\ip netns add zrtpeer; ip link add zrtv0 type veth peer name zrtv1 netns zrtpeer
+        \\ip link set zrtv0 master zrtbr0 up
+        \\ip -n zrtpeer addr add 172.31.250.2/24 dev zrtv1; ip -n zrtpeer link set zrtv1 up; ip -n zrtpeer link set lo up
+        \\ip netns exec zrtpeer python3 -c '
+        \\import socket
+        \\s = socket.socket(); s.settimeout(3)
+        \\try:
+        \\    s.connect(("172.31.250.1", {d})); d = s.recv(16); r = "hello" if d.startswith(b"hello") else "closed"
+        \\except Exception as e:
+        \\    r = "refused"
+        \\print("bridge=" + r)
+        \\'
+    , .{hp});
+    const bridged = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", bridge_script } }) catch |e| {
+        std.debug.print("the bridge peer could not be made: {s}\n", .{@errorName(e)});
+        return e;
+    };
+    _ = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", "ip netns del zrtpeer; ip link del zrtbr0" } }) catch {};
+    if (std.mem.indexOf(u8, bridged.stdout, "bridge=") == null) std.debug.print("{s}{s}\n", .{ bridged.stdout, bridged.stderr });
+    // Accepted by the host's socket and closed by the relay at once, or not let in at all.
+    try std.testing.expect(std.mem.indexOf(u8, bridged.stdout, "bridge=hello") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bridged.stdout, "bridge=") != null);
+
     // The host reaches the job's server through it.
     var hello = false;
     tries = 0;
@@ -6074,10 +6135,10 @@ test "a container job's ports: published on the host's 127.0.0.1 only, never ano
     try std.testing.expect(serving.ok);
     try expectSaid(serving.text, &.{
         "served-5",
-        try std.fmt.allocPrint(arena, "Container ports: 8080/tcp -> 127.0.0.1:{d}, 9090/tcp -> 127.0.0.1:", .{hp}),
+        try std.fmt.allocPrint(arena, "Container ports: 8080/tcp -> 0.0.0.0:{d}, 9090/tcp -> 0.0.0.0:", .{hp}),
     });
     // The bare port got a port of its own, said as Docker says it.
-    const said = "9090/tcp -> 127.0.0.1:";
+    const said = "9090/tcp -> 0.0.0.0:";
     const at = std.mem.indexOf(u8, serving.text, said).? + said.len;
     var end = at;
     while (end < serving.text.len and std.ascii.isDigit(serving.text[end])) end += 1;
@@ -6095,7 +6156,9 @@ test "a container job's ports: published on the host's 127.0.0.1 only, never ano
     _ = linux.setsockopt(holder, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&one), 4);
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.bind(holder, forward.asSockaddr(&sa), @sizeOf(linux.sockaddr.in))));
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.listen(holder, 1)));
-    var taken: PortJob = .{ .cfg = cfg, .job = testJob(&.{testStep("echo ran-$((1+1))")}) };
+    var taken_cfg = cfg;
+    taken_cfg.port_range = lone.port_range;
+    var taken: PortJob = .{ .cfg = taken_cfg, .job = testJob(&.{testStep("echo ran-$((1+1))")}) };
     defer taken.arena.deinit();
     taken.job.container = .{
         .name = "",
