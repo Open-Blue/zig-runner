@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Mutation testing of the runner's own code: changes one thing at a time in a module's source and
-runs the tests that cover it, to find what the tests let through (README, "Mutation testing").
+runs the tests that cover it, to find what the tests let through (docs/CI.md, "Mutation testing").
 
 A mutant the tests fail on is killed; one they pass is a survivor, and points at a missing test (or,
 sometimes, at a change that means the same thing). Each mutant is one of:

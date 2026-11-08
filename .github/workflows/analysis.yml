@@ -1,6 +1,6 @@
 name: analysis
 
-# Zig-specific analysis of the runner's own code, nightly (README, "Pipeline"). CodeQL and Semgrep
+# Zig-specific analysis of the runner's own code, nightly (docs/CI.md). CodeQL and Semgrep
 # read no Zig, so these search where the tests and ci's ThreadSanitizer pass do not look:
 #
 #   Fuzz (TARGET)  runner/src/fuzz.zig's targets, each with Zig's coverage-guided fuzzer for a

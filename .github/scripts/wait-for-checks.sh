@@ -15,7 +15,7 @@
 # GITHUB_REPOSITORY.
 #
 #   wait-for-checks.sh <commit> <consequence>
-#   e.g. wait-for-checks.sh "$GITHUB_SHA" "v1.2.3 is not deployed (README, \"Deploying releases\")"
+#   e.g. wait-for-checks.sh "$GITHUB_SHA" "v1.2.3 is not deployed (docs/OPERATIONS.md, \"Deploying releases\")"
 set -euo pipefail
 
 sha=${1:?usage: wait-for-checks.sh COMMIT CONSEQUENCE}

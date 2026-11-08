@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # zig-runner-deploy: installs the release GitHub last recorded as a deployment to this machine's
-# environment, restarts the runner instances here, and reports back (README, "Deploying releases").
+# environment, restarts the runner instances here, and reports back (docs/OPERATIONS.md, "Deploying releases").
 # zig-runner-deploy.timer runs it every minute; with nothing new to deploy it only asks GitHub.
 #
 # A release is installed only once its binary matches SHA256SUMS and its build provenance says

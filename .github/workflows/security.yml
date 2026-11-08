@@ -1,6 +1,6 @@
 name: security
 
-# Secrets and dependencies (README, "Pipeline"):
+# Secrets and dependencies (docs/CI.md):
 #
 #   Secrets             gitleaks over a pull request's own commits, and weekly over main's whole
 #                       history (with the rules a newer gitleaks brings). Any finding fails the job;

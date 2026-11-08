@@ -1,5 +1,5 @@
 # Installs the zig-runner release deployed to this machine, run by zig-runner-deploy.timer
-# (README, "Deploying releases"). Install:
+# (docs/OPERATIONS.md, "Deploying releases"). Install:
 #
 #   sudo install -m 0755 zig-runner-deploy /usr/local/bin/
 #   sudo install -m 0600 zig-runner-deploy.env /etc/zig-runner-deploy.env

@@ -13,7 +13,7 @@ best-effort basis; a fix is released as soon as it is ready, and the advisory pu
 The runner runs other people's workflows, so these matter most:
 
 - **Trust enforcement** (`runner/src/trust.zig`): a job from an untrusted ref or event that runs
-  on a runner configured to refuse it (README, "Environments").
+  on a runner configured to refuse it (docs/OPERATIONS.md, "Environments").
 - **Secrets**: a secret, token or credential that reaches a log, an annotation, the database or a
   step that should not see it (`runner/src/redact.zig`, `runner/src/sink.zig`).
 - **Escaping a job**: a step that reaches the runner's own process, its credentials, its Dagger

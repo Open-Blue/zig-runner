@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Shared by the hooks (README, "Git hooks"): what they print, and finding the Zig the project
+# Shared by the hooks (CONTRIBUTING.md, "Git hooks"): what they print, and finding the Zig the project
 # builds with. The hook that sources this sets `hook` to its own name first.
 : "${hook:?set by the hook that sources this}"
 

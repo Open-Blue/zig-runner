@@ -1,6 +1,6 @@
 name: mutation
 
-# Mutation testing of one module, by hand (README, "Mutation testing"): runner/tools/mutate.py
+# Mutation testing of one module, by hand (docs/CI.md, "Mutation testing"): runner/tools/mutate.py
 # changes the module's code one thing at a time (a comparison flipped, `and` for `or`, a
 # `return error.X` guard taken away, a constant off by one, a statement deleted) and runs the
 # module's tests on each change. A change the tests pass is a survivor, listed with its file and
