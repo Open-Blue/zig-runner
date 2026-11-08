@@ -1,0 +1,3 @@
+kind: Fixed
+body: A stop during RUNNER_PREWARM=before-listen is no longer said as a finished warm with the runners about to register, when the stopped warm was done before the wait first looked
+time: 2026-11-08T00:17:58.137279652-05:00

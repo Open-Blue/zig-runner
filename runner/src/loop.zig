@@ -560,7 +560,7 @@ pub const Warmer = struct {
         var done: std.atomic.Value(bool) = .init(false);
         var future = w.c.io.concurrent(nativeThenDone, .{ w, &done }) catch {
             w.onceNative();
-            return w.listenSoon(t0, "ended");
+            return w.listenSoon(t0, if (stopRequested()) "stopped" else "ended");
         };
         var outcome: []const u8 = "ended";
         while (!done.load(.acquire)) {
@@ -582,8 +582,12 @@ pub const Warmer = struct {
             };
         }
         future.await(w.c.io);
+        // A stop decides after the wait, not only inside it: a warm that a stop ended at once (its
+        // gate gives up on a stop) can be done before the loop first looks, and that stop would
+        // then be said as a warm that ended, and the runners as about to register.
+        if (stopRequested()) outcome = "stopped";
         // Only a stop of the whole pool keeps the cancel; one made here was for the native warm.
-        if (!stopRequested() and !std.mem.eql(u8, outcome, "stopped")) w.cancel = .{};
+        if (!std.mem.eql(u8, outcome, "stopped")) w.cancel = .{};
         w.listenSoon(t0, outcome);
     }
 
@@ -2221,6 +2225,16 @@ test "before-listen: the pool waits for the native warm, and a failure, a stop o
     try std.testing.expect(std.Io.Clock.awake.now(std.testing.io).toMilliseconds() - t0 < 2000);
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), ready) == null);
     try std.testing.expect(std.mem.indexOf(u8, out.buffered(), register) == null);
+
+    // The same when the stopped warm is done before the wait first looks (razorbill, 2026-11-08:
+    // the loop was skipped and the stop was said as "ended ...; the runners register now").
+    // Which of the two looks first is the scheduler's, so the case runs many times.
+    FakeNative.block = false;
+    for (0..200) |_| {
+        out.end = 0;
+        w.beforeListen();
+        try std.testing.expect(std.mem.indexOf(u8, out.buffered(), register) == null);
+    }
 }
 
 test "the gate looks for the engine's cgroup only where there is an engine" {
