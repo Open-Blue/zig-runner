@@ -456,7 +456,7 @@ minutes, with a build key and two steps a job beside a machine's crash), so `-cr
 machine's crash with one key and one step, and `-faults` the two steps, the build key, a sync error
 and an older format's entry without it: no run has two steps a job and a machine's crash together.
 Each configuration is two minutes or less on a laptop ("cowbird", 12 threads, `-workers auto`,
-`-Xmx8g`, 2026-11-07), and on GitHub's 4-core runner about 1.7 times that:
+`-Xmx8g`, 2026-11-07), and on GitHub's 4-core runner about 1.5 times that:
 
 | Configuration | Distinct states | Depth | Time | Without the symmetry |
 |---|---|---|---|---|

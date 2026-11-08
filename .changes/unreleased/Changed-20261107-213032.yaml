@@ -1,0 +1,3 @@
+kind: Changed
+body: 'TLC checks what its configurations claim, a little faster than it did: the store''s locking model ordered a directory listing by the runners'' names, which the runners'' symmetry does not allow, so TLC left part of the model unexplored (StoreLocking-crash.cfg 6.5 million states where every orbit is 7.3 million); the order is now the lister''s own and every orbit is explored. The release pipeline''s safety is checked under a view that leaves out what no action reads again (2.0 million states to 156,000, the same violations found), and its liveness as two configurations of one property each'
+time: 2026-11-07T21:30:32.269190574-05:00
