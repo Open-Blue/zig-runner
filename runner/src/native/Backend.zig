@@ -6005,7 +6005,11 @@ test "a container job's ports: published on the host's 127.0.0.1 only, never ano
         \\print("served-" + str(2 + 3))
         \\'
     ;
-    var serving: PortJob = .{ .cfg = cfg, .job = testJob(&.{testStep(serve)}) };
+    // With no cgroup of its own, whose removal would end the relay too: the ports go with the
+    // relay's stop alone.
+    var lone = cfg;
+    lone.cgroup = .{ .parent = "none" };
+    var serving: PortJob = .{ .cfg = lone, .job = testJob(&.{testStep(serve)}) };
     defer serving.arena.deinit();
     serving.job.container = .{
         .name = "",
