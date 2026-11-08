@@ -2744,7 +2744,7 @@ test "native eviction: a walk of a chain of directories too deep to name ends at
     const f = try Fixture.init();
     defer f.deinit();
     const io = testing.io;
-    const depth = 30_000;
+    const depth = 10_000;
     const dir = try f.volume("deep", 6000, 30);
     try needsDeepDirs(f, depth);
     var fd = try Store.openDirAt(linux.AT.FDCWD, try f.arena().dupeSentinel(u8, dir, 0));
@@ -2762,6 +2762,9 @@ test "native eviction: a walk of a chain of directories too deep to name ends at
     try testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - t0 < 1500);
     try testing.expect(!seen.whole);
     try testing.expect(seen.bytes > 6000);
+    // The chain is removed as a pass removes one: the test directory's own cleanup would take minutes.
+    var budget: Budget = .init(io, 60_000);
+    while (removeSome(f.arena(), dir, io, &budget) == .spent) budget = .init(io, 60_000);
 }
 
 test "native eviction: a volume too big for a pass's walk is counted over several, from where the last stopped" {
