@@ -33,29 +33,32 @@ pin_of() {
 		inside && /^};/ { inside = 0 }' "$pin_file"
 }
 
+# runner_bin: sets `bin` to a runner binary (ZIG_RUNNER_BIN, or one compiled here, removed when this
+# script ends). Not in a command substitution: its cleanup would run before the binary is used.
+bin=''
+build_dir=''
+cleanup() { [[ -z $build_dir ]] || rm -rf "$build_dir"; }
+trap cleanup EXIT
 runner_bin() {
+	[[ -z $bin ]] || return 0
 	if [[ -n ${ZIG_RUNNER_BIN:-} ]]; then
-		echo "$ZIG_RUNNER_BIN"
+		bin=$ZIG_RUNNER_BIN
 		return
 	fi
-	local scratch
-	scratch=$(mktemp -d)
-	trap 'rm -rf "$scratch"' EXIT
+	build_dir=$(mktemp -d)
 	# The module graph is zig-modules.sh's, as for every build here; the version is no matter.
-	(
-		cd runner
-		# shellcheck source=.github/scripts/zig-modules.sh
-		. ../.github/scripts/zig-modules.sh
-		printf 'provisioned-pin' >"$scratch/version"
-		zig_modules "$scratch" "$scratch/version" -OReleaseSafe
-		zig build-exe "${modules[@]}" --name runner -femit-bin="$scratch/runner" >&2
-	)
-	echo "$scratch/runner"
+	printf 'provisioned-pin' >"$build_dir/version"
+	pushd runner >/dev/null
+	# shellcheck source=.github/scripts/zig-modules.sh
+	. ../.github/scripts/zig-modules.sh
+	zig_modules "$build_dir" "$build_dir/version" -OReleaseSafe
+	zig build-exe "${modules[@]}" --name runner -femit-bin="$build_dir/runner" >&2
+	popd >/dev/null
+	bin=$build_dir/runner
 }
 
 fingerprints() {
-	local bin
-	bin=$(runner_bin)
+	runner_bin
 	local out='{}' v base fp script
 	for v in "${variants[@]}"; do
 		read -r base fp < <("$bin" "--provisioned-image=$v")
@@ -134,6 +137,7 @@ update() {
 		echo "provisioned-pin: could not get an anonymous token from ghcr.io" >&2
 		return 75
 	}
+	runner_bin
 	plan=$(fingerprints)
 	for v in "${variants[@]}"; do
 		fp=$(jq -r --arg v "$v" '.[$v].fingerprint' <<<"$plan")
