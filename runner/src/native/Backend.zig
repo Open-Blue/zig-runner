@@ -3956,11 +3956,14 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     container.container.?.ports = &.{.{ .lit = "8080:80" }};
     try expectReason("`ports:`", unsupported(io, container, root, ok));
     container.container.?.ports = &.{};
-    // Volumes that are directories of the job are native; a path of the host is not.
+    // Volumes that are directories of the job are native, and so is a path of the host (allowed
+    // or failed when the job starts, `hostVolumes`); a read-only named one is not.
     container.container.?.volumes = &.{ .{ .lit = "/data" }, .{ .lit = "cache:/cache" } };
     try std.testing.expect(unsupported(io, container, root, ok) == null);
     container.container.?.volumes = &.{.{ .lit = "/srv:/srv" }};
-    try expectReason("`/srv:/srv`", unsupported(io, container, root, ok));
+    try std.testing.expect(unsupported(io, container, root, ok) == null);
+    container.container.?.volumes = &.{.{ .lit = "cache:/cache:ro" }};
+    try expectReason("`cache:/cache:ro`", unsupported(io, container, root, ok));
     // A service mounts no volume natively, so it cannot share a named one.
     container.container.?.volumes = &.{.{ .lit = "shared:/shared" }};
     var with_volumes = container;
