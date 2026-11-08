@@ -153,7 +153,7 @@ against the baseline of `catch {}` sites that were read and meant. `analysis` ru
 runs each of `runner/src/fuzz.zig`'s targets (an image layer's tar, PAX and paths applied beside a
 directory it must not reach; image references, registry challenges and manifests; expressions,
 YAML, regular expressions, HPACK, `hashFiles()` patterns, minisign signatures, workflow commands
-and problem matchers) with Zig's coverage-guided fuzzer (`.github/scripts/zig-fuzz.sh`, LLVM-built,
+and problem matchers; the runner's zstd decoder against std's, input for input) with Zig's coverage-guided fuzzer (`.github/scripts/zig-fuzz.sh`, LLVM-built,
 for a bounded number of runs), keeping each target's corpus in the Actions cache and failing,
 named after the target, on a crash, a failed check, a leak or a hang, with the input as an
 artifact; `zig build test` runs the same targets over their seed corpus every time. Locally:

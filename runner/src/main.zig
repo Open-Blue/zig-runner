@@ -35,6 +35,7 @@ comptime {
     _ = @import("native/seccomp.zig");
     _ = @import("native/nft.zig");
     _ = @import("native/oci/layer.zig");
+    _ = @import("native/oci/zstd.zig");
     _ = @import("native/oci/registry.zig");
     _ = @import("native/oci/Store.zig");
     _ = @import("native/oci/image.zig");

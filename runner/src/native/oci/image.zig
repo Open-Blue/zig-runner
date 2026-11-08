@@ -352,12 +352,15 @@ const Unpack = struct {
         if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
         const root: linux.fd_t = @intCast(rc);
         defer _ = linux.close(root);
-        for (layers, diff_ids, 1..) |l, diff_id, n| {
+        const ahead = try Prefetch.start(u, layers);
+        defer ahead.stop(io);
+        for (layers, diff_ids, 0..) |l, diff_id, i| {
+            const n = i + 1;
             if (!layerType(l.mediaType)) {
                 u.why = try std.fmt.allocPrint(arena, "{s}: layer {d} is a {s}, not a tar layer", .{ u.image, n, l.mediaType });
                 return error.UnsupportedLayer;
             }
-            const path = try u.blob(l);
+            const path = try ahead.wait(i);
             const f = try cwd.openFile(io, path, .{});
             defer f.close(io);
             var buf: [64 * 1024]u8 = undefined;
@@ -374,31 +377,116 @@ const Unpack = struct {
         }
         try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/config.json", .{dir}), .data = raw });
     }
+};
 
-    /// The layer's blob in the store, fetched when it is not there yet.
-    fn blob(u: *Unpack, l: Descriptor) ![]const u8 {
-        const arena = u.arena;
-        const io = u.io;
-        const path = try u.store.blobPath(arena, l.digest);
+/// The layers' blobs fetched while the earlier ones unpack, `fetchers` at a time, in order. A
+/// blob goes into the store (renamed into place once it is whole and on disk) as it did when each
+/// was fetched just before its turn; what changes is that the wait for the registry overlaps the
+/// unpacking, which on a real network was most of a pull.
+const Prefetch = struct {
+    u: *Unpack,
+    layers: []const Descriptor,
+    slots: []Slot,
+    next: std.atomic.Value(usize) = .init(0),
+    group: std.Io.Group = .init,
+    /// How many fetch tasks run. Without any, `wait` fetches in the caller.
+    running: usize = 0,
+
+    const fetchers = 3;
+
+    const Slot = struct {
+        done: std.Io.Event = .unset,
+        path: []const u8,
+        /// Bytes fetched (0 when the store had the blob).
+        bytes: u64 = 0,
+        err: ?anyerror = null,
+        /// Why `err`, owned by `Unpack.gpa`.
+        why: []const u8 = "",
+    };
+
+    fn start(u: *Unpack, layers: []const Descriptor) !*Prefetch {
+        const p = try u.arena.create(Prefetch);
+        const slots = try u.arena.alloc(Slot, layers.len);
+        for (slots, layers) |*s, l| s.* = .{ .path = try u.store.blobPath(u.arena, l.digest) };
+        p.* = .{ .u = u, .layers = layers, .slots = slots };
+        for (0..@min(fetchers, layers.len)) |_| {
+            p.group.concurrent(u.io, run, .{p}) catch break;
+            p.running += 1;
+        }
+        return p;
+    }
+
+    /// Lets the tasks go, whatever they are doing.
+    fn stop(p: *Prefetch, io: std.Io) void {
+        p.next.store(p.slots.len, .monotonic);
+        p.group.cancel(io);
+        for (p.slots) |s| if (s.why.len > 0) p.u.gpa.free(s.why);
+    }
+
+    /// Layer `i`'s blob in the store, once it is there.
+    fn wait(p: *Prefetch, i: usize) ![]const u8 {
+        const s = &p.slots[i];
+        if (p.running == 0) {
+            var client = p.u.client.*;
+            p.fetch(&client, p.u.arena, i);
+        } else s.done.waitUncancelable(p.u.io);
+        p.u.bytes += s.bytes;
+        if (s.err) |e| {
+            if (s.why.len > 0) p.u.client.why = try p.u.arena.dupe(u8, s.why);
+            return e;
+        }
+        return s.path;
+    }
+
+    /// A fetch task: layers taken in turn until there are none, with a client and a memory of its
+    /// own (the registry's conversation, `registry.Client`, is not for two threads).
+    fn run(p: *Prefetch) void {
+        var arena_state: std.heap.ArenaAllocator = .init(p.u.gpa);
+        defer arena_state.deinit();
+        var client = p.u.client.*;
+        client.why = "";
+        while (true) {
+            const i = p.next.fetchAdd(1, .monotonic);
+            if (i >= p.slots.len) return;
+            _ = arena_state.reset(.retain_capacity);
+            client.arena = arena_state.allocator();
+            p.fetch(&client, arena_state.allocator(), i);
+        }
+    }
+
+    /// Layer `i`'s blob made sure of, the slot set and its event raised.
+    fn fetch(p: *Prefetch, client: *registry.Client, arena: Allocator, i: usize) void {
+        const s = &p.slots[i];
+        defer s.done.set(p.u.io);
+        if (!layerType(p.layers[i].mediaType)) return;
+        s.bytes = p.blob(client, arena, p.layers[i], s.path) catch |e| {
+            s.err = e;
+            if (client.why.len > 0) s.why = p.u.gpa.dupe(u8, client.why) catch "";
+            return;
+        };
+    }
+
+    /// The layer's blob in the store, fetched when it is not there yet: the bytes fetched.
+    fn blob(p: *Prefetch, c: *registry.Client, arena: Allocator, l: Descriptor, path: []const u8) !u64 {
+        const io = p.u.io;
         const cwd = std.Io.Dir.cwd();
         if (cwd.access(io, path, .{})) |_| {
             // Its last use, which an eviction goes by, on the file's own mtime.
             _ = linux.utimensat(linux.AT.FDCWD, try arena.dupeSentinel(u8, path, 0), null, 0);
-            return path;
+            return 0;
         } else |_| {}
-        const tmp = try u.store.blobTemp(arena, io, l.digest);
+        const tmp = try p.u.store.blobTemp(arena, io, l.digest);
         const f = try cwd.createFile(io, tmp, .{ .exclusive = true });
         {
             defer f.close(io);
             errdefer cwd.deleteFile(io, tmp) catch {};
-            try u.client.blob(l.digest, l.size, f);
+            try c.blob(l.digest, l.size, f);
             // On disk before its name is: a blob is trusted by its path, and an unpacked one is
             // not fetched again.
             if (linux.errno(linux.fsync(f.handle)) != .SUCCESS) return error.Sync;
         }
-        u.bytes += l.size;
         try cwd.rename(tmp, cwd, path, io);
-        return path;
+        return l.size;
     }
 };
 
