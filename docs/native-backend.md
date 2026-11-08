@@ -1428,49 +1428,80 @@ and its eviction would then lose the data a Docker volume keeps, so it is not do
 
 **`volumes:` carried out: host paths, off by default** (`/srv/data:/data`, `/srv/data:/data:ro`;
 `runner/src/native/host_paths.zig`, `Backend.hostVolumes`, `sandbox.bindHostIn`). A job may bind a
-host directory only when the operator allows it:
+host directory only when the operator allows it, and only on a root runner:
 
 - **`RUNNER_NATIVE_HOST_PATHS`** (`--native-host-paths`): colon- or comma-separated absolute
   directories; empty, the default, allows none. A job may bind one of them or a directory below
   one. Each is canonicalised with `realpath` when the runner starts, and **the runner refuses to
   start** (`config error: RUNNER_NATIVE_HOST_PATHS: ...`, naming the entry) when one does not
   exist, is not a directory, is `/`, resolves under `/proc`, `/sys`, `/dev` or `/run` (the Docker
-  and systemd sockets live there), or is, holds or lies inside one of the runner's own directories
+  and systemd sockets live there), is, holds or lies inside one of the runner's own paths
   (`RUNNER_NATIVE_STORE`, which holds every job's layers and volumes, `RUNNER_NATIVE_ROOTFS`, the
-  log spool `RUNNER_LOG_SPOOL_DIR/zig-runner-<uid>`). A job reading or writing those could read or
-  change other jobs. Each job resolves the list again; an entry gone since leaves it closed.
+  log spool `RUNNER_LOG_SPOOL_DIR/zig-runner-<uid>`, the runner's own executable, the directory of
+  `GH_APP_PRIVATE_KEY_FILE`, systemd's `$CREDENTIALS_DIRECTORY`, and the env files the deploy files
+  use, `/etc/zig-runner.env` and `/etc/zig-runner-deploy.env`), or **is on a mount without
+  `nosuid` and `nodev`**. A job reading or writing the runner's paths could read its secrets or
+  change other jobs. The mount must be `nosuid,nodev` on the host, not only in the job: the job's
+  root can make a setuid file in a directory it writes, and a host user running it from the host's
+  mount would get the volumes' ids (which own every job's cache volumes). Mount the filesystem
+  with `-o nosuid,nodev`, or bind the directory onto itself so (`mount --bind /srv/data /srv/data
+  && mount -o remount,bind,nosuid,nodev /srv/data`, or `Options=bind,nosuid,nodev` in a systemd
+  mount unit). A **rootless runner refuses to start** with the setting, and fails a job that asks
+  for one: its jobs' root is the runner's own user on the host, with no idmapping, so a job would
+  write as the runner and could change its files.
+- **The list is the one checked at start.** Each job holds it to what the runner checked then
+  (`host_paths.recheck`): an entry whose path now resolves elsewhere (a symlink repointed), or is
+  another directory (its device and inode changed: moved, replaced, remounted), or whose mount
+  lost `nosuid`/`nodev`, is closed for that job, and "Set up job" names it. The setting is never
+  read again, so a list can never become wider than the one the runner started with.
 - **Untrusted jobs never get one**, whatever the list says: a job the runner does not vouch for
   (`trust.vouches` false), and a fork's pull request on a runner that vouches for pull requests
   (scope `untrusted`, `set_up.packageCacheScope`), fail.
-- **Symlinks**: the job's source is resolved with `realpath` when the job starts and checked
-  against the list again, so a link inside an allowed directory that points out of it is refused.
-  The step's helper then opens that canonical path from `/` with `openat2(RESOLVE_NO_SYMLINKS)`, so
-  a link swapped in after the check fails the step instead of escaping.
+- **What a refusal says.** The job's source is checked as written, lexically (`.` and `..` taken
+  out), against the list before anything of it is looked at on the host, and every refusal of a
+  source (outside the list, through a link out of it, missing, not a directory) is the same
+  sentence naming the source and the allowed list only, so a job cannot use it to learn what
+  exists on the host or where a link points.
+- **Symlinks**: the job's source is then resolved with `realpath` and checked against the list
+  again, so a link inside an allowed directory that points out of it is refused. The step's helper
+  then opens that canonical path from `/` with `openat2(RESOLVE_NO_SYMLINKS)`, so a link swapped in
+  after the check fails the step instead of escaping, and checks with `fstatfs` that what it
+  opened is on a `nosuid,nodev` mount.
+- **Targets**: a host path may not be nested with another volume of the job (one inside the
+  other, as written: the job fails, naming both), nor overlap the runner's own mounts (as every
+  volume). The helper, still the host's root on a root runner, makes every bind's mount point in
+  the job's overlay before the first bind, through no mount (`RESOLVE_NO_XDEV`), and then finds
+  each cache volume's and host path's target through no mount either: one that resolves into
+  another bind, through a symlink of the image's (`/y -> /x`, with `/x` a host path and `/y/z`
+  another), fails the step. Otherwise it would make and `chown` a directory inside the host
+  directory on the job's behalf.
 - **The mount**: an `open_tree(OPEN_TREE_CLONE)` of that directory alone (no mount below it comes
   along), `nosuid` and `nodev` always, `ro` for `:ro`, set in one `mount_setattr` and moved into the
   step's mount namespace only (the host's mount table never has it). Directories only: a file (a
   socket) is refused. On a root runner it is made before the job's user namespace is entered, so
-  the job cannot remount it writable or suid.
+  the job cannot remount it writable, suid or dev (the kernel locks those flags; the tests try).
 - **Ids** (the decision): on a root runner the mount is **idmapped as a cache volume's**, through
   the volumes' range (`Backend.volumeIdBase`, `RUNNER_NATIVE_SUBID_BASE + 250 * 65536`, by default
   1916384000): a file owned on disk by that id plus *n* is the job's id *n*, the same in every slot,
   and **every other id, host root's and the host users' included, is `nobody` (65534) to the job**.
   So a job reads what the modes let others read, and writes only where the operator gave a
   directory to that range (`chown -R 1916384000:1916384000 /srv/data` makes it the jobs' root's);
-  what it writes is owned by the range, never by a host user, so it can never leave a file (or a
-  setuid one) a host user owns. Not Docker's default, where the container's root is the host's
-  root; that is not given to a job here. Where the filesystem cannot be idmapped (the kernel refuses
-  with `EINVAL`, NFS for one; ext4, xfs, btrfs and tmpfs can on the Ubuntu 24.04+ and Raspberry Pi
-  kernels this supports) the mount keeps the host's ids as they are: host ids are still `nobody`,
-  and what a job writes is owned by its slot's ids (`RUNNER_NATIVE_SUBID_BASE + slot * 65536 + n`),
-  so another slot's job sees it as `nobody` too. A rootless runner maps only its own user, as the
-  job's root, with no idmapping.
+  what it writes is owned by the range, never by a host user, so it can never leave a file a host
+  user owns. Not Docker's default, where the container's root is the host's root; that is not
+  given to a job here. Where the filesystem cannot be idmapped (the kernel refuses with `EINVAL`:
+  NFS, ramfs; ext4, xfs, btrfs and tmpfs can on the Ubuntu 24.04+ and Raspberry Pi kernels this
+  supports) **the step fails**, naming `RUNNER_NATIVE_HOST_PATHS_UNMAPPED`, and is not sent to
+  Dagger. **`RUNNER_NATIVE_HOST_PATHS_UNMAPPED=true`** (`--native-host-paths-unmapped`; off by
+  default, said in "Set up job" either way) binds such a filesystem with the host's ids as they
+  are instead: host ids are still `nobody`, and what a job writes is owned by its slot's ids
+  (`RUNNER_NATIVE_SUBID_BASE + slot * 65536 + n`), which the next job in that slot has too.
 - **Refused natively, not sent to Dagger**: a host path the list does not allow fails the job in
-  "Set up job" with the reason, naming `RUNNER_NATIVE_HOST_PATHS`. This follows the convention of
-  this section for what the native job understands and will not do (an unknown `--user`, a volume
-  over the workspace: both fail the job), not the one for what it does not carry out (those go to
-  Dagger). Sent to Dagger, the volume would be ignored with a warning and the job would run without
-  the directory it asked for.
+  "Set up job" with the reason, naming `RUNNER_NATIVE_HOST_PATHS`, and so does a refusal of the
+  step's helper while it binds one. This follows the convention of this section for what the
+  native job understands and will not do (an unknown `--user`, a volume over the workspace: both
+  fail the job), not the one for what it does not carry out (those go to Dagger). Sent to Dagger,
+  the volume would be ignored with a warning and the job would run without the directory it asked
+  for.
 - **Step caching is off** for a job with a host path: its contents are in no key and no layer.
 
 **Refused (the job goes to Dagger, with the volume named in "Set up job", as an `options:` flag is).**
@@ -1525,8 +1556,17 @@ a job's source allowed in the list and below it, through a link that stays insid
 one that leaves, outside it, and with none allowed; and as root, real jobs: an allowed directory
 read and written (the host's file `nobody`'s to the job, the job's file the volumes' range's on the
 host), a second bind `:ro` refusing writes, both `nosuid,nodev` in `/proc/self/mountinfo`, and
-failures naming the setting for a path outside the list, a link out of it, an untrusted job, and
-an empty list.
+remount attempts (`ro` to `rw`, `nosuid,nodev` to `suid,dev`) refused and the mounts unchanged, and
+failures naming the setting for a path outside the list, a link out of it (saying the same, naming
+not where it points), a mount below the list without `nosuid`/`nodev`, a host path nested with
+another volume, a fork's pull request and a job whose ref the runner does not vouch for
+(`Config.vouched` false, as `configFor` makes it), and an empty list; a host path reached through
+the image's symlink into another one fails, and nothing is made in the first; a ramfs (no
+idmapping) refused without `RUNNER_NATIVE_HOST_PATHS_UNMAPPED`, and written as the slot's ids with
+it; and rootless, any host path refused. Unprivileged: a symlink swapped in after the check fails
+the helper's open, an entry on a mount without `nosuid,nodev` is refused at start, an entry
+repointed or replaced since the start is closed for the job, and the runner's App key directory
+and executable directory are refused.
 
 ### P7: Docker actions
 
