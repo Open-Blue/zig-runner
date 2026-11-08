@@ -230,9 +230,18 @@ const mountinfo_max = 4 << 20;
 /// `/mnt/srv`), where a setuid file a job left runs. Other namespaces' mounts are not seen.
 /// `error.Unknown` when the table cannot be read or has no mount for `path`.
 fn exposedElsewhere(arena: Allocator, io: std.Io, path: []const u8) error{ Unknown, OutOfMemory }!?[]const u8 {
-    // Read to its end, not by its size: procfs gives it as 0. Cut short, it could leave out the
-    // very mount that shows the directory, so a table past the limit is not read at all.
-    const f = std.Io.Dir.cwd().openFile(io, "/proc/self/mountinfo", .{}) catch return error.Unknown;
+    const own = try readTable(arena, io, "/proc/self/mountinfo");
+    // And the host's own view, pid 1's: a service manager may give the runner a mount namespace of
+    // its own (deploy/zig-runner.service's ProtectSystem and PrivateTmp), which is not what host
+    // users see.
+    const host = try readTable(arena, io, "/proc/1/mountinfo");
+    return exposedIn(arena, own, host, path);
+}
+
+/// A mount table, read to its end, not by its size: procfs gives it as 0. Cut short, it could
+/// leave out the very mount that shows the directory, so a table past the limit is not read at all.
+fn readTable(arena: Allocator, io: std.Io, path: []const u8) error{ Unknown, OutOfMemory }![]const u8 {
+    const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.Unknown;
     defer f.close(io);
     var table: std.ArrayList(u8) = .empty;
     var buf: [4096]u8 = undefined;
@@ -245,39 +254,73 @@ fn exposedElsewhere(arena: Allocator, io: std.Io, path: []const u8) error{ Unkno
         if (table.items.len + n > mountinfo_max) return error.Unknown;
         try table.appendSlice(arena, buf[0..n]);
     }
-    return exposedIn(arena, table.items, path);
+    return table.items;
 }
 
-/// `exposedElsewhere` on the mount table `table`, as `/proc/self/mountinfo` writes it.
-fn exposedIn(arena: Allocator, table: []const u8, path: []const u8) error{ Unknown, OutOfMemory }!?[]const u8 {
-    // The mount `path` is on: the longest mount point it is under, the last of equals (the one on
-    // top). Its device names the filesystem, and its root joined to the rest of `path` is the
-    // directory within that filesystem.
-    var mounts: std.ArrayList(Mount) = .empty;
-    var lines = std.mem.tokenizeScalar(u8, table, '\n');
-    while (lines.next()) |line| if (try Mount.parse(arena, line)) |m| try mounts.append(arena, m);
-    const mine = visible(mounts.items, path) orelse return error.Unknown;
-    const within = try join(arena, mounts.items[mine].root, below(path, mounts.items[mine].point));
-    // Every other mount of that filesystem whose root holds the directory shows it at a path of
-    // its own, unless a mount on top hides that path (a directory bound onto itself hides the
-    // filesystem's own mount there).
-    for (mounts.items, 0..) |m, i| {
-        if (m.safe or !std.mem.eql(u8, m.dev, mounts.items[mine].dev) or !under(within, m.root)) continue;
+/// `exposedElsewhere` on the runner's mount table `own` and the host's `host`, as
+/// `/proc/<pid>/mountinfo` writes them.
+fn exposedIn(arena: Allocator, own: []const u8, host: []const u8, path: []const u8) error{ Unknown, OutOfMemory }!?[]const u8 {
+    // The mount `path` is on names the filesystem (its device), and its root joined to the rest of
+    // `path` is the directory within that filesystem.
+    const mounts = try parseTable(arena, own);
+    const mine = visible(mounts, path) orelse return error.Unknown;
+    const dev = mounts[mine].dev;
+    const within = try join(arena, mounts[mine].root, below(path, mounts[mine].point));
+    if (try shownIn(arena, mounts, dev, within)) |at| return at;
+    return shownIn(arena, try parseTable(arena, host), dev, within);
+}
+
+/// Where a mount of `mounts` without `nosuid` and `nodev` shows the directory `within` of the
+/// filesystem `dev`, or null: every mount of that filesystem whose root holds it shows it at a
+/// path of its own, unless a mount on top hides that path (a directory bound onto itself hides
+/// the filesystem's own mount there).
+fn shownIn(arena: Allocator, mounts: []const Mount, dev: []const u8, within: []const u8) !?[]const u8 {
+    for (mounts, 0..) |m, i| {
+        if (m.safe or !std.mem.eql(u8, m.dev, dev) or !under(within, m.root)) continue;
         const at = try join(arena, m.point, below(within, m.root));
-        if (visible(mounts.items, at) == i) return at;
+        if (visible(mounts, at) == i) return at;
     }
     return null;
 }
 
-/// Which of `mounts` (in the table's order) `path` is on: the longest mount point it is under,
-/// the last of equals (the one on top).
+fn parseTable(arena: Allocator, table: []const u8) ![]const Mount {
+    var mounts: std.ArrayList(Mount) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, table, '\n');
+    while (lines.next()) |line| if (try Mount.parse(arena, line)) |m| try mounts.append(arena, m);
+    return mounts.items;
+}
+
+/// Which of `mounts` `path` (canonical) is on, as the kernel's path walk finds it: from the root
+/// mount, at each of `path`'s prefixes, shortest first, down to a mount there whose parent is the
+/// mount reached so far (one mounted on top of another has that one as its parent). So a mount
+/// that a later one hides, mounted below where the later one sits, is never reached. Null when the
+/// table has no root.
 fn visible(mounts: []const Mount, path: []const u8) ?usize {
-    var on: ?usize = null;
-    for (mounts, 0..) |m, i| {
-        if (!under(path, m.point)) continue;
-        if (on == null or m.point.len >= mounts[on.?].point.len) on = i;
+    var on: usize = for (mounts, 0..) |m, i| {
+        if (std.mem.eql(u8, m.point, "/") and !hasId(mounts, m.parent)) break i;
+    } else return null;
+    var end: usize = 0;
+    var steps: usize = 0;
+    while (true) {
+        const prefix = if (end == 0) "/" else path[0..end];
+        down: while (steps <= mounts.len) : (steps += 1) {
+            for (mounts, 0..) |m, i| {
+                if (i == on or !std.mem.eql(u8, m.parent, mounts[on].id)) continue;
+                if (!std.mem.eql(u8, m.point, prefix)) continue;
+                on = i;
+                continue :down;
+            }
+            break;
+        } else return null;
+        if (end == path.len or path.len <= 1) return on;
+        end += 1;
+        while (end < path.len and path[end] != '/') end += 1;
     }
-    return on;
+}
+
+fn hasId(mounts: []const Mount, id: []const u8) bool {
+    for (mounts) |m| if (std.mem.eql(u8, m.id, id)) return true;
+    return false;
 }
 
 /// What of `path` is below `tree` (`under(path, tree)`): empty, or starting with `/`.
@@ -295,6 +338,8 @@ fn join(arena: Allocator, base: []const u8, rest: []const u8) ![]const u8 {
 
 /// One line of `/proc/self/mountinfo`: `id parent major:minor root point options [tags] - ...`.
 const Mount = struct {
+    id: []const u8,
+    parent: []const u8,
     dev: []const u8,
     root: []const u8,
     point: []const u8,
@@ -303,8 +348,8 @@ const Mount = struct {
 
     fn parse(arena: Allocator, line: []const u8) !?Mount {
         var f = std.mem.tokenizeScalar(u8, line, ' ');
-        _ = f.next() orelse return null;
-        _ = f.next() orelse return null;
+        const id = f.next() orelse return null;
+        const parent = f.next() orelse return null;
         const dev = f.next() orelse return null;
         const root = f.next() orelse return null;
         const point = f.next() orelse return null;
@@ -317,6 +362,8 @@ const Mount = struct {
             if (std.mem.eql(u8, o, "nodev")) nodev = true;
         }
         return .{
+            .id = id,
+            .parent = parent,
             .dev = dev,
             .root = try unescape(arena, root),
             .point = try unescape(arena, point),
@@ -493,26 +540,35 @@ test "host paths: a directory also shown on a mount without nosuid and nodev is 
     const root = "22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n";
     const srv = "30 22 8:3 / /srv rw,nosuid,nodev,relatime - ext4 /dev/sda3 rw\n";
     // Its own filesystem nosuid,nodev, and shown nowhere else.
-    try std.testing.expectEqual(@as(?[]const u8, null), try exposedIn(arena, root ++ srv, "/srv/data"));
+    try std.testing.expectEqual(@as(?[]const u8, null), try exposedIn(arena, root ++ srv, "", "/srv/data"));
     // Bound onto itself on the root filesystem: the bind hides the root's mount at that path.
     const self_bind = "40 22 8:2 /srv/data /srv/data rw,nosuid,nodev - ext4 /dev/sda2 rw\n";
-    try std.testing.expectEqual(@as(?[]const u8, null), try exposedIn(arena, root ++ self_bind, "/srv/data"));
+    try std.testing.expectEqual(@as(?[]const u8, null), try exposedIn(arena, root ++ self_bind, "", "/srv/data"));
     // The filesystem shown again, without them, at another path: the directory is there too.
     const again = "41 22 8:3 / /mnt/srv rw,relatime - ext4 /dev/sda3 rw\n";
-    try std.testing.expectEqualStrings("/mnt/srv/data", (try exposedIn(arena, root ++ srv ++ again, "/srv/data")).?);
+    try std.testing.expectEqualStrings("/mnt/srv/data", (try exposedIn(arena, root ++ srv ++ again, "", "/srv/data")).?);
     // A bind of a directory above it, and one of a sibling, which does not show it.
     const above = "42 22 8:3 /data /opt/d rw - ext4 /dev/sda3 rw\n";
-    try std.testing.expectEqualStrings("/opt/d/x", (try exposedIn(arena, root ++ srv ++ above, "/srv/data/x")).?);
+    try std.testing.expectEqualStrings("/opt/d/x", (try exposedIn(arena, root ++ srv ++ above, "", "/srv/data/x")).?);
     const sibling = "43 22 8:3 /other /opt/o rw - ext4 /dev/sda3 rw\n";
-    try std.testing.expectEqual(@as(?[]const u8, null), try exposedIn(arena, root ++ srv ++ sibling, "/srv/data"));
+    try std.testing.expectEqual(@as(?[]const u8, null), try exposedIn(arena, root ++ srv ++ sibling, "", "/srv/data"));
     // Hidden by a mount on top of the second view: not reachable there.
     const hidden = again ++ "44 41 0:50 / /mnt/srv rw,nosuid,nodev - tmpfs tmpfs rw\n";
-    try std.testing.expectEqual(@as(?[]const u8, null), try exposedIn(arena, root ++ srv ++ hidden, "/srv/data"));
+    try std.testing.expectEqual(@as(?[]const u8, null), try exposedIn(arena, root ++ srv ++ hidden, "", "/srv/data"));
     // The kernel's escapes in a mount point.
     const spaced = "45 22 8:3 / /mnt/a\\040b rw - ext4 /dev/sda3 rw\n";
-    try std.testing.expectEqualStrings("/mnt/a b/data", (try exposedIn(arena, root ++ srv ++ spaced, "/srv/data")).?);
+    try std.testing.expectEqualStrings("/mnt/a b/data", (try exposedIn(arena, root ++ srv ++ spaced, "", "/srv/data")).?);
     // No mount for the path at all.
-    try std.testing.expectError(error.Unknown, exposedIn(arena, srv, "/elsewhere"));
+    try std.testing.expectError(error.Unknown, exposedIn(arena, srv, "", "/elsewhere"));
+    // A mount hidden under a later one is not where the path goes: a tmpfs at /mnt/srv/data,
+    // then the filesystem bound at /mnt/srv over it, without nosuid. The walk goes through the
+    // bind, and finds the directory there, not the tmpfs below.
+    const under_bind = "50 22 0:60 / /mnt/srv/data rw,nosuid,nodev - tmpfs tmpfs rw\n" ++
+        "51 22 8:3 / /mnt/srv rw - ext4 /dev/sda3 rw\n";
+    try std.testing.expectEqualStrings("/mnt/srv/data", (try exposedIn(arena, root ++ srv ++ under_bind, "", "/srv/data")).?);
+    // The host's own view counts too: shown there and not in the runner's namespace.
+    const host = root ++ srv ++ "60 22 8:3 / /export rw - ext4 /dev/sda3 rw\n";
+    try std.testing.expectEqualStrings("/export/data", (try exposedIn(arena, root ++ srv, host, "/srv/data")).?);
 }
 
 test "host paths, as root: an entry also bound elsewhere without nosuid is refused, at start and for each job" {

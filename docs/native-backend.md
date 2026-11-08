@@ -1558,8 +1558,10 @@ host directory only when the operator allows it, and only on a root runner:
   mount namespace, so a container or service with mounts of its own that show the filesystem
   still runs a setuid file a job left there, and one made by hand is gone after a reboot (the
   runner then refuses to start, naming the entry). The runner also refuses an entry its own mount
-  table shows at another path without `nosuid` and `nodev` (`/srv` bound at `/mnt/srv`), at start
-  and for each job (`host_paths.exposedElsewhere`). A **rootless runner refuses to start** with
+  table, or the host's (pid 1's: a service manager may give the runner a mount namespace of its
+  own), shows at another path without `nosuid` and `nodev` (`/srv` bound at `/mnt/srv`), at start
+  and for each job (`host_paths.exposedElsewhere`, which follows the mount tree as the kernel's
+  path walk does). Exports over NFS or SMB, and other namespaces' mounts, are beyond what it sees. A **rootless runner refuses to start** with
   the setting, and fails a job that asks for one: its jobs' root is the runner's own user on the host, with no idmapping, so a job would
   write as the runner and could change its files.
 - **The list is the one checked at start.** Each job holds it to what the runner checked then
