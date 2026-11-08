@@ -6139,6 +6139,40 @@ test "a container job's named volumes: kept between jobs, filled from the image 
     try expectAll(after.text, &.{"(repo scope, 2 new"});
 }
 
+test "a volume's filling is stopped at the job's cancel, well before its time limit" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const io = std.testing.io;
+    var cancel: dagger.Cancel = .{};
+    var b: Backend = .{
+        .arena = a.allocator(),
+        .io = io,
+        .gpa = std.testing.allocator,
+        .dir = "",
+        .rootfs = "",
+        .binds = &.{},
+        .lock = undefined,
+        .how = .{ .argv_prefix = &.{}, .userns = .mapped },
+        .cancel = &cancel,
+    };
+    var dog: SeedWatch = .{};
+    // An hour: only the cancel can be what stops it.
+    var watch = try io.concurrent(SeedWatch.run, .{ &dog, &b, 60 * 60 * 1000 });
+    defer {
+        dog.done.store(true, .release);
+        watch.await(io);
+    }
+    // Quiet while nothing is cancelled.
+    try io.sleep(.fromMilliseconds(250), .awake);
+    try std.testing.expect(!dog.fired.load(.acquire));
+    cancel.requested.store(true, .release);
+    for (0..300) |_| {
+        if (dog.fired.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expect(dog.fired.load(.acquire));
+}
+
 test "the base hands a work root to the user, and the tool cache only when it is not theirs" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
