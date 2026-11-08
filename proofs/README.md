@@ -353,17 +353,20 @@ one rename of a complete entry, an eviction one entry removed, a reader takes an
 misses (`Native.Op`, `ops_keep_honest`, `Torn`), and `race_irrelevant` shows which of two racing
 writers wins does not matter. Those are hypotheses about the system calls under it, with several
 runners sharing one store and any of them dying between any two calls. `tla/StoreLocking.tla` is a
-TLA+ model of that layer, checked with TLC, and what it shows is what lets the Lean model have whole
-entries:
+TLA+ model of that layer, and what it shows is what lets the Lean model have whole entries. Its
+safety configurations are checked with SPIN, on a Promela port of the module that reaches exactly
+the same states ("The store's locking, in SPIN", below), and its liveness with TLC:
 
 ```
-.github/scripts/tlc.sh    # fetches tla2tools.jar v1.7.4, checks its sha256, runs every configuration
+.github/scripts/spin.sh   # SPIN 6.5.2: StoreLocking's safety configurations and its mutants
+.github/scripts/tlc.sh    # fetches tla2tools.jar v1.7.4, checks its sha256, runs the rest
+TLC_ALL=1 .github/scripts/tlc.sh   # ... and StoreLocking's safety with TLC too
 ```
 
-CI runs it (`store-model.yml`) on pull requests and pushes that touch `runner/src/native/Store.zig`,
+CI runs them (`store-model.yml`) on pull requests and pushes that touch `runner/src/native/Store.zig`,
 `Backend.zig`, `layers.zig`, `evict.zig`, `volumes.zig`, `oci/Store.zig` or the model, and weekly with
-the proofs. It is not a proof: TLC
-explores every state of a bounded instance, and the bounds are below.
+the proofs. It is not a proof: SPIN and TLC
+explore every state of a bounded instance, and the bounds are below.
 
 **What is modelled**, each action citing the code it stands for (file:line, in the module):
 
@@ -425,8 +428,8 @@ explores every state of a bounded instance, and the bounds are below.
 | `WaitEnds` | a claim waiting on its key's lock gets it, is cancelled, or its process dies: a holder that finishes or crashes lets it go on (weak fairness of each process) |
 | `AllEnd` | every job ends, so no blocking flock waits for ever |
 
-And seven mutants, each the code with one guard taken away, which TLC must reject with the
-invariant the configuration's first line names (`tlc.sh` fails if it does not, so a model that
+And seven mutants, each the code with one guard taken away, which SPIN (and TLC) must reject with the
+invariant the configuration's first line names (`spin.sh` fails if it does not, so a model that
 could no longer see a broken protocol fails CI): `StoreLocking-unlocked-build.cfg` (`layers.zig`'s
 publish without the key's lock, as it was: `NoWrongValid`), `StoreLocking-unchecked-evict.cfg`
 (`Store.evict` without `sameFile` after its exclusive lock, as it was: `HeldIntact`),
@@ -566,6 +569,72 @@ read by `open`); the rootfs, the provisioning store (`oci/Store.zig`) and flatte
 into the job's own directory; a hand deleting an entry's lock file (`evict` would then remove an
 entry a job holds: the store is the runner's alone, `Store.prepare`); readdir returning an entry
 twice; and more runners, keys or steps than the bounds.
+
+### The store's locking, in SPIN
+
+CI checks `StoreLocking`'s safety with SPIN 6.5.2, not TLC: `proofs/spin/StoreLockingModel.pml`
+is the module in Promela, action for action, and `.github/scripts/spin.sh` checks every safety
+configuration and every mutant with it, side by side on the machine's cores. TLC still checks
+`StoreLocking-liveness.cfg` (SPIN's weak fairness is per process, and would force the crashes and
+the hand's changes, which the module never forces). `StoreLocking.tla` stays the documented model:
+the actions above, their comments and the code they cite are the module's, and the port says only
+how it encodes them.
+
+**Kept in step.** A change to one is a change to the other, in the same pull request:
+
+- The configurations are the `.cfg` files. `proofs/spin/cfg.py` writes each
+  `proofs/spin/StoreLocking*.pml` from the `.cfg` of the same name (constants as `#define`s, the
+  invariants it lists, the "must fail" line), and `spin.sh` fails when one is stale, missing or left
+  over, so the two have the same configurations and mutants. A new mutant is a new `.cfg`, then
+  `cfg.py`.
+- Each configuration that must hold says how many states it has without the symmetry
+  (`states without symmetry:`, TLC's count), and SPIN must find exactly that many and one more
+  (SPIN's first state, before `init` sets the variables): a change to the Promela that the TLA+
+  does not have, or the other way round, changes one count and not the other. After a change to
+  the module, run `TLC_ALL=1 .github/scripts/tlc.sh` with `SYMMETRY` taken out of the
+  configurations for the new counts, change the Promela, and the counts must agree.
+
+**Faithful, by the counts.** With partial order reduction off and no symmetry (SPIN has none),
+SPIN's states are TLC's without the symmetry, plus one, in every configuration, including each
+mutant run to the end with its invariant off:
+
+| Configuration | TLC, no symmetry | SPIN |
+|---|---|---|
+| `StoreLocking.cfg` | 16,495,442 | 16,495,443 |
+| `StoreLocking-crash.cfg` | 14,674,008 | 14,674,009 |
+| `StoreLocking-faults.cfg` | 10,758,378 | 10,758,379 |
+| `StoreLocking-boot-check.cfg` | 382,279 | 382,280 |
+| the seven mutants, no invariant | 521,379, 1,593, 1,034, 6,683, 3,814, 46,604, 8,040 | each one more |
+
+And every mutant fails with the assertion of the invariant its first line names. What makes the
+counts equal: each variable of the module is a variable here, its sets bit masks over the same
+elements and its strings numbers (the encoding is in the port's header), nothing else is in SPIN's
+state (the runners' and the environment's program counters stay at their loops' heads between
+steps, and the temporaries a step uses are `hidden` or set back to 0), and each action is one
+step: a `d_step`, or for a choice the module makes with `\E` over directories or subsets, an
+`atomic` that chooses and then does the rest in one `d_step`. A deadlock is the same to both: the
+runners are never at an end label, and the module's step of a terminated system is the
+environment's. Where the module's `CHOOSE` picks among more than one value (`dropKeyLocks`' next
+key, with two keys), SPIN takes the least; the counts for `StoreLocking.cfg` and `-faults` show
+that TLC's choice gives the same graph.
+
+**Time**, `StoreLocking-crash.cfg` on the laptop (cowbird, 12 threads, 2026-11-07, load under 4):
+
+| | laptop | 4 cores (`taskset -c 0-3`) |
+|---|---|---|
+| TLC, with the symmetry (7,337,252 states), `-workers auto`/`4`, `-Xmx8g` | 111 s | 217 s |
+| SPIN, one core, exhaustive (14,674,009 states) | 22 s | 22 s |
+| SPIN, `-DNCORE=4` (`spin -DNOHIDDEN`) | 11 s | 12 s |
+| SPIN, `-DNCORE=8` | 8 s | |
+| compiling `pan.c` (gcc 15.2, `-O2`) | 10 to 14 s | |
+
+The whole of `spin.sh`, the four configurations that must hold and the seven mutants, compiles
+included, takes 61 s on the laptop and 75 s on 4 cores; TLC took 4 min 22 s for the four
+configurations alone, one after another on the laptop. `spin.sh` runs the configurations side by
+side, one a core, rather than SPIN's multi-core search, which is faster for one configuration but
+needs every temporary in the state. Partial order reduction is off: it reduces nothing (every step
+reads or writes the shared store) and costs a quarter of the time. Bitstate and hash compaction
+(`-DBITSTATE`, `-DHC4`) are not used: on `-crash` they missed 470 and 134,163 states.
 
 
 ### Eviction beside the layers

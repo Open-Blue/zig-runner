@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Model-checks the native store's locking protocols (proofs/tla/StoreLocking.tla and
-# StoreEviction.tla, proofs/README.md "The store's locking, in TLA+") and the release pipeline
+# Model-checks the native store's locking protocols (proofs/tla/StoreLocking.tla, whose safety
+# configurations are SPIN's (spin.sh) and its liveness TLC's, and StoreEviction.tla, proofs/README.md
+# "The store's locking, in TLA+") and the release pipeline
 # (proofs/tla/ReleasePipeline.tla, "The release pipeline, in TLA+") with TLC. tla2tools.jar is the TLA+ project's v1.7.4 release,
 # checked against the sha256 pinned here, so a changed or replaced jar fails the job instead of
 # checking the model. A new version means a new checksum from that release's asset.
@@ -41,10 +42,16 @@ tlc() {
 		-metadir "$dir/states" -config "$cfg" "$module.tla") >"$out" 2>&1
 }
 
+# A configuration that SPIN checks (proofs/spin/<name>.pml, written from the .cfg: StoreLocking's
+# safety and its mutants, .github/scripts/spin.sh) is left to SPIN, unless TLC_ALL=1 (TLC then
+# checks it too, in minutes; the .cfg's `states without symmetry:` is TLC's count without SYMMETRY).
+#
 # TLC_PART=K/N checks part K of N, so N jobs share the configurations: each is given to the part
 # with the least expected time so far, the longest first (its `tlc-seconds:` comment, or a few
 # seconds without one). Every configuration is in exactly one part, whatever N.
-mapfile -t all < <(cd "$here" && ls -- *.cfg)
+mapfile -t all < <(cd "$here" && for cfg in *.cfg; do
+	[[ ${TLC_ALL:-} != 1 && -f ../spin/${cfg%.cfg}.pml ]] || echo "$cfg"
+done)
 selected=("${all[@]}")
 if [[ -n ${TLC_PART:-} ]]; then
 	if ! [[ $TLC_PART =~ ^([0-9]+)/([0-9]+)$ ]] || ((BASH_REMATCH[1] < 1 || BASH_REMATCH[1] > BASH_REMATCH[2])); then
@@ -72,8 +79,7 @@ in_part() {
 }
 
 status=0
-for cfg in "$here"/*.cfg; do
-	cfg=$(basename "$cfg")
+for cfg in "${all[@]}"; do
 	in_part "$cfg" || continue
 	grep -q 'must fail:' "$here/$cfg" && continue
 	echo "== $cfg: must hold"
@@ -87,8 +93,8 @@ for cfg in "$here"/*.cfg; do
 	fi
 done
 
-for cfg in "$here"/*-*.cfg; do
-	cfg=$(basename "$cfg")
+for cfg in "${all[@]}"; do
+	[[ $cfg == *-* ]] || continue
 	in_part "$cfg" || continue
 	grep -q 'must fail:' "$here/$cfg" || continue
 	want=$(sed -n '1s/.*must fail: \([A-Za-z]*\).*/\1/p' "$here/$cfg")

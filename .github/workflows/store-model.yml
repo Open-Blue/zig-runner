@@ -2,9 +2,10 @@ name: store model
 
 # The TLA+ models, checked with TLC: the native store's locking protocols (proofs/tla/StoreLocking.tla
 # and StoreEviction.tla, proofs/README.md "The store's locking, in TLA+") and the release pipeline
-# (ReleasePipeline.tla, "The release pipeline, in TLA+"). Their safety and liveness must hold, and
-# each mutant (the code with one guard taken away) and finding must fail. tla2tools.jar is pinned
-# with its sha256 in tlc.sh. On pull requests and pushes to main that touch the store, its callers,
+# (ReleasePipeline.tla, "The release pipeline, in TLA+"); StoreLocking's safety is checked with
+# SPIN instead, on its Promela port (proofs/spin, "The store's locking, in SPIN"). Their safety and
+# liveness must hold, and each mutant (the code with one guard taken away) and finding must fail.
+# tla2tools.jar is pinned with its sha256 in tlc.sh, SPIN as Ubuntu's package below. On pull requests and pushes to main that touch the store, its callers,
 # the release's workflows and scripts, or the models, and weekly with the proofs. Not a required
 # check, so a path filter is enough (proofs.yml needs ci-scope.sh because it is one), and the merge
 # queue does not run it.
@@ -14,6 +15,7 @@ on:
     branches: [main]
     paths:
       - proofs/tla/**
+      - proofs/spin/**
       - runner/src/native/Store.zig
       - runner/src/native/Backend.zig
       - runner/src/native/layers.zig
@@ -28,9 +30,11 @@ on:
       - .github/checks-on-main
       - .github/workflows/store-model.yml
       - .github/scripts/tlc.sh
+      - .github/scripts/spin.sh
   pull_request:
     paths:
       - proofs/tla/**
+      - proofs/spin/**
       - runner/src/native/Store.zig
       - runner/src/native/Backend.zig
       - runner/src/native/layers.zig
@@ -45,6 +49,7 @@ on:
       - .github/checks-on-main
       - .github/workflows/store-model.yml
       - .github/scripts/tlc.sh
+      - .github/scripts/spin.sh
   schedule:
     - cron: "41 5 * * 1" # Mondays, 05:41 UTC, with proofs.yml
   workflow_dispatch:
@@ -56,11 +61,11 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # In four parts side by side (tlc.sh, TLC_PART), by the times the configurations note: one after
-  # another they take 10 minutes, and the longest, StoreLocking-crash.cfg (under 3 minutes), has a part
-  # to itself, so a fifth part would not finish sooner.
+  # In three parts side by side (tlc.sh, TLC_PART), by the times the configurations note: one after
+  # another they take under 4 minutes now that StoreLocking's safety is SPIN's, the longest
+  # (ReleasePipeline-liveness-deploy.cfg) under a minute, so each part takes about 70 s.
   tlc:
-    name: TLC (${{ matrix.part }}/4)
+    name: TLC (${{ matrix.part }}/3)
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
@@ -69,7 +74,7 @@ jobs:
       # Every part reports: one failing does not hide what the others find.
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4]
+        part: [1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,5 +87,32 @@ jobs:
 
       - name: Check the store's locking and the release pipeline
         env:
-          TLC_PART: ${{ matrix.part }}/4
+          TLC_PART: ${{ matrix.part }}/3
         run: .github/scripts/tlc.sh
+
+  # StoreLocking's safety configurations and mutants (proofs/spin, the Promela port of
+  # StoreLocking.tla), side by side on the runner's cores.
+  spin:
+    name: SPIN
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Ubuntu's own package, checked by apt against the archive's signed index, at the version
+      # pinned here (spin.sh checks `spin -V` too): a new one fails here until it is checked and
+      # bumped.
+      - name: Install SPIN
+        env:
+          SPIN_VERSION: 6.5.2+dfsg-2build1
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends "spin=$SPIN_VERSION"
+          spin -V
+
+      - name: Check the store's locking
+        run: .github/scripts/spin.sh
