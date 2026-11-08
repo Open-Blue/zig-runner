@@ -184,9 +184,10 @@ jobs:
           - { target: file commands, runs: 1M }
           - { target: job messages, runs: 2M }
           - { target: HTTP2 frames, runs: 800K }
-          # Two decoders per input, std's slow one (a Debug build) among them: about 300 runs a
-          # second on a laptop with the cores busy, so about eleven minutes.
-          - { target: zstd, runs: 200K }
+          # Two decoders per input, std's slow one among them: about 500 runs a second on a laptop
+          # and 1,000 on GitHub's runner (the first run, pull request #426: 200K in 3 minutes after
+          # a 2 minute build), so about ten minutes, with room for a corpus that grows.
+          - { target: zstd, runs: 500K }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
