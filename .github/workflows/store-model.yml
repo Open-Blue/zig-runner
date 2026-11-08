@@ -56,8 +56,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # In four parts side by side (tlc.sh, TLC_PART): one after another the configurations took 12
-  # minutes; each part has about three of them, by the times the configurations note.
+  # In four parts side by side (tlc.sh, TLC_PART), by the times the configurations note: one after
+  # another they take 10 minutes, and the longest, StoreLocking-crash.cfg (under 3 minutes), has a part
+  # to itself, so a fifth part would not finish sooner.
   tlc:
     name: TLC (${{ matrix.part }}/4)
     runs-on: ubuntu-26.04

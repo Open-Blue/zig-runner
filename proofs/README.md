@@ -455,17 +455,41 @@ Everything at once would be too large to check in CI (over 30 million states, un
 minutes, with a build key and two steps a job beside a machine's crash), so `-crash` has the
 machine's crash with one key and one step, and `-faults` the two steps, the build key, a sync error
 and an older format's entry without it: no run has two steps a job and a machine's crash together.
-Each configuration is a few minutes or less on a laptop ("cowbird", 12 threads, under load,
-`-workers auto`, 2026-11-06):
+Each configuration is two minutes or less on a laptop ("cowbird", 12 threads, `-workers auto`,
+`-Xmx8g`, 2026-11-07), and on GitHub's 4-core runner about 1.5 times that:
 
-| Configuration | Distinct states | Depth | Time |
-|---|---|---|---|
-| `StoreLocking.cfg` | 2,117,662 | 112 | 47 s |
-| `StoreLocking-crash.cfg` | 6,545,285 | 140 | 1 min 46 s |
-| `StoreLocking-faults.cfg` | 4,582,934 | 138 | 1 min 20 s |
-| `StoreLocking-boot-check.cfg` | 205,674 | 136 | 4 s |
-| `StoreLocking-liveness.cfg` | 159,488 | 74 | 23 s |
-| the seven mutants | under 50,000 each, to the first violation | | seconds |
+| Configuration | Distinct states | Depth | Time | Without the symmetry |
+|---|---|---|---|---|
+| `StoreLocking.cfg` | 2,754,585 | 112 | 56 s | 16,495,442 (5.99 times: 3 runners, 6 orders) |
+| `StoreLocking-crash.cfg` | 7,337,252 | 140 | 1 min 53 s | 14,674,008 (2.00 times) |
+| `StoreLocking-faults.cfg` | 5,379,277 | 142 | 1 min 28 s | 10,758,378 (2.00 times) |
+| `StoreLocking-boot-check.cfg` | 191,178 | 136 | 5 s | 382,279 (2.00 times) |
+| `StoreLocking-liveness.cfg` | 167,362 | 74 | 23 s | (no symmetry) |
+| the seven mutants | under 50,000 each, to the first violation | | seconds | |
+
+**The runners' symmetry** (`ProcSymmetry`, safety only): TLC keeps one state of each set of states
+that differ only in which runner is which, which is sound only if nothing in the model tells the
+runners apart. Before the times above it did not hold: `collect` and the check after a
+boot took the next directory of their listing with a `CHOOSE` over its ids, which name the runner
+that made it, so readdir's order was by the runners' names. `StoreLocking-boot-check.cfg` then had
+536,011 states without the symmetry and 205,674 with it, fewer than the 268,006 sets of at most two
+that two runners leave: TLC left behaviours of the model unexplored, and `-crash` (19,218,025
+states without it, 6,545,285 with) and `-faults` the same way; their counts even varied from run to
+run (`-crash` 6,543,505 to 6,547,430, `-faults` 4,582,934 to 4,610,311), as which state of a set TLC
+kept depended on which its workers found first. The order is now the lister's
+(`First`): by the step that made a directory, its epoch, and the lister's own before the other
+runners', with two other runners' directories alike in all three in either order. Nothing else names a
+runner: the `CHOOSE`s left are over keys, or over `Pub(k)`, which has one entry at most (`OnePub`). The
+counts above show it: without the symmetry, every configuration has twice its states with it (two
+runners), less the few hundred states that swapping the runners leaves as they are (77 to 496), or
+six times (three). Two
+other fixed orders were measured and left: by step and epoch alone, ties in either order (9,206,560
+states for `-crash`), and each runner's directories in order but the runners' interleaved
+(15,031,366, more than the model without the symmetry takes). Each is as arbitrary as readdir's, and
+the one taken is the cheapest that is sound. The mutants have no symmetry, and each still fails with
+its invariant. A bug only the runner `p1` has (`evict` without its `sameFile`, in
+`StoreLocking-unchecked-evict.cfg`'s bounds with the check on for the others) is found with the
+symmetry too (`HeldIntact`, 19,826 states; 39,506 without).
 
 Two larger runs were made while the model was written and are left out of CI for its time: three
 runners with a hand's change (6.7 million states, 3 minutes, no error), and three runners with two
@@ -594,6 +618,11 @@ as a layer's is, which `StoreLocking.tla` models for layers and the store's cras
 The bounds are small: three runners, one job each and a process crash, and two runners with a
 machine's crash. It is not a proof beyond them.
 
+Its runners' symmetry is sound: no expression names a runner (its `CHOOSE`s are over keys and dead
+trees, which name none), and the counts agree. Without the symmetry `StoreEviction.cfg` has 3,109,886
+states (5.58 times its 557,195; three runners, at most six), `-nested` 955,704 (5.57 times 171,460) and
+`-crash` 7,379,839 (1.98 times 3,727,288; two runners).
+
 ## The release pipeline, in TLA+
 
 `tla/ReleasePipeline.tla` models how a merge into `main` becomes a tag and a deployment, at the
@@ -658,16 +687,40 @@ so (it has started; `ApprovalHoldsGroup = TRUE`), and checks the weaker reading 
 | `TagJobEnds` | an approved tag job ends: it tags, or fails naming a reason (weak fairness of GitHub's and the jobs' steps) |
 | `DeployEnds` | a release that tagged deploys, or fails where it shows (a job failed) |
 
-**Bounds and results** (cowbird, `-Xmx4g`, 2026-11-07): `WaitTicks = 2`, `Grace = 1`,
-`MaxRenames = 1` everywhere.
+**Bounds and results** (cowbird, 12 threads, `-Xmx8g`, 2026-11-07): `WaitTicks = 2`, `Grace = 1`,
+`MaxRenames = 1` everywhere. The safety configurations are checked under `LiveView` (below); the
+states without it are the model's own.
 
-| Configuration | Merges | Version runs | Push runs | Lost runs | Failures | Checks | Distinct states | Depth | Time |
-|---|---|---|---|---|---|---|---|---|---|
-| `ReleasePipeline.cfg` | 1 | 3 (one in progress, one pending, one replacing it) | ci, proofs, other | 1 | 1 | safety, `FastFail` | 2,002,482 | 39 | 28 s |
-| `ReleasePipeline-merges.cfg` | 2 (one may come while a tag job waits) | 2 | ci, proofs | 0 | 0 | safety (`FastFail` trivially: no check goes missing) | 1,474,773 | 44 | 24 s |
-| `ReleasePipeline-liveness.cfg` | 1 | 2 | ci, proofs, other | 1 | 1 | safety, `FastFail`, `TagJobEnds`, `DeployEnds` | 373,471 | 33 | 1 min 25 s |
-| `ReleasePipeline-approval-outside.cfg` | 1 | 2 | ci, proofs, other | 1 | 1 | safety but `OneTagJob`, under the weaker reading of the concurrency docs | 1,445,110 | 34 | 19 s |
-| the mutants and the finding | | | | | | to the first violation | under 30,000 each, `-v0.14.0` 234,337 (a liveness search) | | seconds, `-v0.14.0` 21 s |
+| Configuration | Merges | Version runs | Push runs | Lost runs | Failures | Checks | Distinct states | Without the view | Depth | Time |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `ReleasePipeline.cfg` | 1 | 3 (one in progress, one pending, one replacing it) | ci, proofs, other | 1 | 1 | safety, `FastFail` | 156,279 | 2,002,482 | 30 | 6 s |
+| `ReleasePipeline-merges.cfg` | 2 (one may come while a tag job waits) | 2 | ci, proofs | 0 | 0 | safety (`FastFail` trivially: no check goes missing) | 59,935 | 1,474,773 | 39 | 4 s |
+| `ReleasePipeline-liveness.cfg` | 1 | 2 | ci, proofs, other | 1 | 1 | safety, `FastFail`, `TagJobEnds` | 373,471 | (no view) | 33 | 37 s |
+| `ReleasePipeline-liveness-deploy.cfg` | the same | | | | | safety, `FastFail`, `DeployEnds` | 373,471 | (no view) | 33 | 41 s |
+| `ReleasePipeline-approval-outside.cfg` | 1 | 2 | ci, proofs, other | 1 | 1 | safety but `OneTagJob`, under the weaker reading of the concurrency docs | 105,604 | 1,445,110 | 29 | 4 s |
+| the mutants and the finding | | | | | | to the first violation | under 20,000 each, `-v0.14.0` 234,337 (a liveness search, no view) | | | seconds, `-v0.14.0` 24 s |
+
+**The view** (`VIEW LiveView`, in every configuration without a temporal property): TLC takes two
+states as one when their views are equal, so a view is sound when it keeps everything any action or
+property will still read. `LiveView` is the state without what no action and no invariant reads
+again: a run's `at` (its `head_sha`, read only by `Approve` without `ListFromCommit` and by the count
+of `RunsCounted = "all"`, so kept in those mutants); a wait's `el` once it has ended (a run never
+waits again, and only `WaitBounded`'s `el <= WaitTicks` is kept); a failure's `why` but for whether
+it is empty (all `WaitBounded` reads); and the checkout, the list and the `main` seen by a run that
+is not in its tag job and has no tag (`Approve` writes them before they are read again;
+`TagChecked`, `Includes` and `FreshList` read them only while it waits, pushes or has tagged). The
+module says which action reads each. Every state the model reaches has one view in the run, the
+invariants are functions of the view, and two states with one view have successors with one view
+each, so the run sees what the model has; it has 8 to 25 times fewer states. Every action TLC
+takes without the view it takes with it, and every expression it evaluates without it it evaluates
+with it (`-coverage`, in the three configurations); in `-merges` a pending run's start
+(`StartPending`) finds no state of its own any more, as the run it starts is one created when the
+group was free, but for its `at`. Every mutant still fails with its property under the view. A bug in a field the view leaves out is still found: `Approve` reading the list
+from `at` whatever `ListFromCommit` says, in `ReleasePipeline.cfg`, fails `FreshList` with the view
+(5,907 states) as without it (1,048). Liveness has no view (TLC's reduction of it is unsound for
+temporal properties), and is in two configurations, one property each: `TagJobEnds` and
+`DeployEnds` together took 1 min 8 s, each alone half of it, as TLC checks each property's tableau
+branches (two each, four together) beside every state, and the two run in different CI parts.
 
 A merge before the first run is needed for it to have anything to release, so the one-merge
 configurations cover a rename between a run's creation and its wait, and `-merges` one while a tag
