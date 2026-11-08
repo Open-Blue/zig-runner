@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # The runner's line coverage under its tests, with kcov (the `analysis` workflow's Coverage job):
 #
-#   zig-coverage.sh OUT
+#   zig-coverage.sh OUT              every pass, then the report below
+#   zig-coverage.sh --part OUT       the passes only, into OUT/raw.tar.gz; with ZIG_TEST_PART=K/N,
+#                                    part K of N of each pass's tests
+#   zig-coverage.sh --merge OUT DIR  the report from the parts' DIR/*/raw.tar.gz (one directory a
+#                                    part, as actions/download-artifact leaves them)
+#
+# The job runs four parts on four machines, and merges them on a fifth. A part is a subset of the
+# tests, and kcov --merge adds each line's hits, so the merge counts the lines one run does. The
+# parts must run at the same path (kcov records a source file by its absolute path), as the
+# runners' checkouts do.
 #
 # Leaves in OUT:
 #
@@ -42,61 +51,112 @@
 # (what a traced step can see), cancel's timing, and the replaced binary (the helper here is a
 # script). What fails is a report that did not come out.
 set -euo pipefail
-out=$(realpath -m "${1:?usage: zig-coverage.sh OUT}")
+mode=all
+case ${1:-} in
+--part | --merge)
+	mode=${1#--}
+	shift
+	;;
+esac
+out=$(realpath -m "${1:?usage: zig-coverage.sh [--part|--merge] OUT [DIR]}")
 cd "$(dirname "$0")/../../runner"
-
-# shellcheck source=.github/scripts/zig-modules.sh
-. ../.github/scripts/zig-modules.sh
 
 kcov=$(command -v "${KCOV:-kcov}")
 src=$PWD/src
-scratch=$(mktemp -d)
-trap 'rm -rf "$scratch"' EXIT
-git describe --tags --always --dirty --abbrev=8 >"$scratch/version"
 raw=$out/raw
 rm -rf "$out"
 mkdir -p "$raw"
 
-zig_modules "$scratch" "$scratch/version" -fllvm
-build=("${modules[@]}" -fno-PIE)
-zig build-exe "${build[@]}" --name runner -femit-bin="$scratch/runner"
-zig test "${build[@]}" --test-no-exec -femit-bin="$scratch/test"
-if [[ ${ZIG_COVERAGE_ROOT:-} == 1 ]]; then
-	zig test "${build[@]}" --test-filter native --test-no-exec -femit-bin="$scratch/test-native"
-fi
+# run_passes: every pass, into $raw.
+run_passes() {
+	# shellcheck source=.github/scripts/zig-modules.sh
+	. ../.github/scripts/zig-modules.sh
 
-# The helpers: each run of the runner binary under kcov, into a report of its own (two at once
-# would race on one), merged with the rest below.
-cat >"$scratch/runner-kcov" <<EOF
+	scratch=$(mktemp -d)
+	trap 'rm -rf "$scratch"' EXIT
+	git describe --tags --always --dirty --abbrev=8 >"$scratch/version"
+
+	zig_modules "$scratch" "$scratch/version" -fllvm
+	build=("${modules[@]}" -fno-PIE)
+	zig build-exe "${build[@]}" --name runner -femit-bin="$scratch/runner"
+	zig build-exe tools/test_shards.zig -femit-bin="$scratch/test_shards"
+	zig test "${build[@]}" --test-no-exec -femit-bin="$scratch/test"
+	if [[ ${ZIG_COVERAGE_ROOT:-} == 1 ]]; then
+		zig test "${build[@]}" --test-filter native --test-no-exec -femit-bin="$scratch/test-native"
+	fi
+
+	# The helpers: each run of the runner binary under kcov, into a report of its own (two at once
+	# would race on one), merged with the rest below.
+	cat >"$scratch/runner-kcov" <<EOF
 #!/bin/sh
 exec "$kcov" --include-path="$src" "$raw/helper-\$\$" "$scratch/runner" "\$@"
 EOF
-chmod +x "$scratch/runner-kcov"
+	chmod +x "$scratch/runner-kcov"
 
-# pass NAME [PREFIX...] TEST: TEST under kcov into raw/NAME, then TEST with each helper under kcov.
-# The output is only text to the job (zig-test.sh), and failed tests a warning.
-pass() {
-	local name=$1 stop status=0
-	shift
-	stop="coverage-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
-	echo "::stop-commands::$stop"
-	ZIG_RUNNER_TEST_EXE="$scratch/runner" "${@:1:$#-1}" \
-		"$kcov" --include-path="$src" "$raw/$name" "${@: -1}" 2>&1 || status=$?
-	ZIG_RUNNER_TEST_EXE="$scratch/runner-kcov" "$@" 2>&1 || status=$?
-	echo "::$stop::"
-	if ((status != 0)); then
-		echo "::warning title=Coverage::tests failed in the $name pass under kcov (exit $status; the tests' own job judges them): its coverage still counts"
+	# The tests go through tools/test_shards.zig, as zig-test.sh's do, for ZIG_TEST_PART (K/N: every
+	# N-th test from the K-th, in each pass). It starts the test binary as a child, which kcov does
+	# not follow from outside (a run under kcov of test_shards itself measured the helpers only), so
+	# each test process runs under kcov itself, as a helper does, into a report of its own. One
+	# shard: with no part, test_shards runs the test binary itself.
+	export ZIG_TEST_SHARDS=1
+
+	# pass NAME [PREFIX...] TEST: TEST under kcov into raw/NAME-PID (one for each process
+	# test_shards starts), then TEST with each helper under kcov. The output is only text to the
+	# job (zig-test.sh), and failed tests a warning.
+	pass() {
+		local name=$1 test stop status=0
+		shift
+		test=${*: -1}
+		cat >"$scratch/test-kcov" <<EOF
+#!/bin/sh
+exec "$kcov" --include-path="$src" "$raw/$name-\$\$" "$test" "\$@"
+EOF
+		chmod +x "$scratch/test-kcov"
+		stop="coverage-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+		echo "::stop-commands::$stop"
+		ZIG_RUNNER_TEST_EXE="$scratch/runner" "${@:1:$#-1}" "$scratch/test_shards" "$scratch/test-kcov" 2>&1 || status=$?
+		ZIG_RUNNER_TEST_EXE="$scratch/runner-kcov" "${@:1:$#-1}" "$scratch/test_shards" "$test" 2>&1 || status=$?
+		echo "::$stop::"
+		if ((status != 0)); then
+			echo "::warning title=Coverage::tests failed in the $name pass under kcov (exit $status; the tests' own job judges them): its coverage still counts"
+		fi
+	}
+
+	pass rootless "$scratch/test"
+	if [[ ${ZIG_COVERAGE_ROOT:-} == 1 ]]; then
+		pass root sudo --preserve-env=ZIG_RUNNER_TEST_EXE,ZIG_RUNNER_REQUIRE_NATIVE,ZIG_RUNNER_SERVICE_IMAGES,ZIG_TEST_SHARDS,ZIG_TEST_PART \
+			"$scratch/test-native"
+		sudo chown -R "$(id -u):$(id -g)" "$raw"
 	fi
 }
 
-pass rootless "$scratch/test"
-if [[ ${ZIG_COVERAGE_ROOT:-} == 1 ]]; then
-	pass root sudo --preserve-env=ZIG_RUNNER_TEST_EXE,ZIG_RUNNER_REQUIRE_NATIVE,ZIG_RUNNER_SERVICE_IMAGES \
-		"$scratch/test-native"
-	sudo chown -R "$(id -u):$(id -g)" "$raw"
-fi
+case $mode in
+all) run_passes ;;
+part)
+	run_passes
+	tar -czf "$out/raw.tar.gz" -C "$raw" .
+	rm -rf "$raw"
+	exit 0
+	;;
+merge)
+	# Each part's passes keep their names (rootless, root, helper-PID) under the part's number.
+	parts=0
+	for tarball in "${2:?usage: zig-coverage.sh --merge OUT DIR}"/*/raw.tar.gz; do
+		parts=$((parts + 1))
+		mkdir "$raw/part-$parts"
+		tar -xzf "$tarball" -C "$raw/part-$parts"
+		for pass in "$raw/part-$parts"/*; do mv "$pass" "$raw/$parts-${pass##*/}"; done
+		rmdir "$raw/part-$parts"
+	done
+	((parts > 0)) || {
+		echo "::error title=Coverage::no raw.tar.gz in $2/*/"
+		exit 1
+	}
+	echo "Coverage: $parts parts merged"
+	;;
+esac
 
-helpers=$(find "$raw" -maxdepth 1 -name 'helper-*' | wc -l)
+helpers=$(find "$raw" -maxdepth 1 -name '*helper-*' | wc -l)
 echo "Coverage: $helpers helper runs measured"
 "$kcov" --merge "$out/html" "$raw"/*
 merged=$out/html/kcov-merged

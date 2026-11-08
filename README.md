@@ -173,7 +173,9 @@ these builds are dynamically linked PIEs, not the release's static PIE.
 store's locks, the database, the broker's long-poll, log uploads;
 `.github/scripts/zig-race-tests.sh` names them) 100 times over under stress-ng's CPU and memory
 load, with the database, and fails on the first round that fails, its output an artifact
-(`.github/scripts/zig-stress.sh`).
+(`.github/scripts/zig-stress.sh`). It is four jobs of 25 rounds each, "Stress (1/4)" to "(4/4)",
+each loaded as its own runner's cores size it; the rounds are independent runs, so 100 in all
+reach what 100 on one runner do, on four machines. A failing part's output is `stress-output-K`.
 **Mutation testing** asks whether the tests would notice the code being wrong:
 `runner/tools/mutate.py` changes a module's code one thing at a time (a comparison flipped, `and`
 for `or`, `true` for `false`, a `return error.X` guard taken away, an integer constant off by one,
@@ -196,6 +198,9 @@ plugin, which Zig has no way to load.
 measures which lines the tests reach with [kcov](https://github.com/SimonKagstrom/kcov) (Ubuntu's
 package, pinned to the version checked): the rootless tests, the native backend's tests as root,
 and the runner binary those tests start for their sandboxes and networks, merged into one report.
+Four jobs, "Coverage (1/4)" to "(4/4)", each run every fourth test of both passes
+(`ZIG_TEST_PART`), and "Coverage" merges their kcov output (`zig-coverage.sh --merge`) into the
+report, which counts the lines one whole run does.
 The `coverage` artifact holds kcov's HTML report, Cobertura XML and JSON, with the total, each
 directory's and every file's line coverage in `summary.json`; the job summary lists the
 security-relevant files (masking in `dagger/JobLog.zig`, workflow commands, expressions, YAML, the

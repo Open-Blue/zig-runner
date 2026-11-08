@@ -32,8 +32,9 @@ name: analysis
 #   Stress         the concurrency-sensitive tests (.github/scripts/zig-race-tests.sh: cancels,
 #                  deadlines, the memory gate, the native store's locks, the database, the
 #                  broker's long-poll, log uploads) 100 times over under CPU and memory load
-#                  (.github/scripts/zig-stress.sh), with the database; the first failing round
-#                  fails the job, its output an artifact (stress-output).
+#                  (.github/scripts/zig-stress.sh), with the database, as four jobs of 25 rounds;
+#                  the first failing round fails its job, its output an artifact
+#                  (stress-output-K).
 #   Store stress   the native layer store under load (runner/src/native/store_stress.zig): eight
 #                  processes sharing one store under a small cap, ten minutes rootless and ten as
 #                  root, on x86_64 and arm64, where ci runs it for 30 s each. A failure prints the
@@ -49,7 +50,8 @@ name: analysis
 #   Coverage       the lines the tests reach, with kcov (.github/scripts/zig-coverage.sh): the
 #                  rootless tests and the native backend's root pass merged, as an HTML report and
 #                  Cobertura and JSON (the coverage artifact), with the total, each area and the
-#                  least-covered security-relevant files in the job summary. Nothing leaves
+#                  least-covered security-relevant files in the job summary. Four parts (Coverage
+#                  (K/4)) each run a quarter of the tests; Coverage merges them. Nothing leaves
 #                  GitHub: no coverage service is sent anything.
 #
 # Not here, as they cannot work on these tests (measured 2026-11-02): rr, which needs the CPU's
@@ -465,13 +467,20 @@ jobs:
           .github/scripts/e2e.sh stop || true
           rm -f "$RUNNER_TEMP/e2e-app.pem"
 
-  # The concurrency-sensitive tests under load. About 11 s a round on an idle runner.
+  # The concurrency-sensitive tests under load. About 11 s a round on an idle runner: 25 rounds a
+  # job, on four runners, 100 in all. The rounds are independent runs, each loaded as the
+  # runner's own cores size it (stress-ng takes one worker a CPU), so what a round reaches is the
+  # same on four runners as on one; what differs is which machines the 100 land on.
   stress:
-    name: Stress
+    name: Stress (${{ matrix.part }}/4)
     needs: scope
     if: needs.scope.outputs.analysis == 'true'
     runs-on: ubuntu-26.04
-    timeout-minutes: 75
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
     permissions:
       contents: read # to check out the code
     # The database's tests run too (ci.yml's Database tests job, whose database this is), and fail
@@ -507,12 +516,12 @@ jobs:
         run: .github/scripts/ci-database.sh wait
 
       - name: Tests under load
-        run: .github/scripts/zig-stress.sh 100 "$RUNNER_TEMP/stress"
+        run: .github/scripts/zig-stress.sh 25 "$RUNNER_TEMP/stress"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
-          name: stress-output
+          name: stress-output-${{ matrix.part }}
           path: ${{ runner.temp }}/stress
           if-no-files-found: ignore
 
@@ -534,14 +543,20 @@ jobs:
         run: .github/scripts/zlint.sh suppressed-errors
 
   # kcov over the tests on GitHub's runner, which can make the native backend's sandboxes (as ci's
-  # hosted test job): rootless, then the native tests as root, merged (zig-coverage.sh). About 18
-  # minutes: each pass runs twice, and the helpers start some 570 times under kcov.
-  coverage:
-    name: Coverage
+  # hosted test job): rootless, then the native tests as root (zig-coverage.sh). Each pass runs
+  # twice, and the helpers start some 570 times under kcov; the native tests as root run one at a
+  # time, so the whole took 40 minutes on one runner. Four parts share it, every fourth test each
+  # (ZIG_TEST_PART, as ci's native tests as root do), and the Coverage job merges what they leave.
+  coverage-part:
+    name: Coverage (${{ matrix.part }}/4)
     needs: scope
     if: needs.scope.outputs.coverage == 'true'
     runs-on: ubuntu-26.04
-    timeout-minutes: 45
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
     permissions:
       contents: read # to check out the code
     steps:
@@ -562,7 +577,9 @@ jobs:
           sudo apt-get install -y -q --no-install-recommends "kcov=$KCOV_VERSION"
           kcov --version
 
-      - name: Coverage
+      - name: Coverage, part ${{ matrix.part }} of 4
+        env:
+          ZIG_TEST_PART: ${{ matrix.part }}/4
         run: |
           # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
           sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -570,7 +587,54 @@ jobs:
           .github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
           ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_COVERAGE_ROOT=1 \
             ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" \
-            .github/scripts/zig-coverage.sh "$RUNNER_TEMP/coverage"
+            .github/scripts/zig-coverage.sh --part "$RUNNER_TEMP/coverage"
+
+      # One tarball: the kcov reports are thousands of small files (a run of each helper).
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-raw-${{ matrix.part }}
+          path: ${{ runner.temp }}/coverage/raw.tar.gz
+          compression-level: 0
+          retention-days: 1
+
+  # The parts' reports merged into the one report (zig-coverage.sh --merge): the html, Cobertura
+  # and JSON (the coverage artifact), and the summary. The check others read as "Coverage".
+  coverage:
+    name: Coverage
+    needs: [scope, coverage-part]
+    if: always() && needs.scope.outputs.coverage == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - name: Every part ran
+        if: needs.coverage-part.result != 'success'
+        run: |
+          echo "::error title=Coverage::the parts ended as ${{ needs.coverage-part.result }}: no report"
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: coverage-raw-*
+          path: ${{ runner.temp }}/parts
+
+      # The version zig-coverage.sh was checked with, as in the parts.
+      - name: Install kcov
+        env:
+          KCOV_VERSION: 43+dfsg-2
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends "kcov=$KCOV_VERSION"
+          kcov --version
+
+      - name: Merge
+        run: |
+          .github/scripts/zig-coverage.sh --merge "$RUNNER_TEMP/coverage" "$RUNNER_TEMP/parts"
           cat "$RUNNER_TEMP/coverage/summary.md" >>"$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
