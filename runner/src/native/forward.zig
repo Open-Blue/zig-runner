@@ -103,7 +103,7 @@ pub fn main(arena: Allocator) u8 {
     ready.appendSlice(arena, "ready") catch sandbox.oom();
     for (spec.ports) |m| {
         if (spec.publish) {
-            const got = publishOne(m, spec.reserved);
+            const got = publishOne(m, spec.reserved, HostSockets{});
             const pair = switch (got) {
                 .ok => |p| p,
                 .taken => |v6| {
@@ -178,20 +178,21 @@ const Pair = struct { v4: linux.fd_t, v6: ?linux.fd_t = null };
 
 /// `m` listened on, or which of its sockets was taken (true: `::1`'s). A port the kernel picks is
 /// picked again when it lands on one of `reserved` (the runner's own) or its `::1` is taken.
-fn publishOne(m: Spec.Map, reserved: []const u16) union(enum) { ok: Pair, taken: bool } {
+/// `sockets` makes them (`HostSockets`; a test fakes the binds).
+fn publishOne(m: Spec.Map, reserved: []const u16, sockets: anytype) union(enum) { ok: Pair, taken: bool } {
     for (0..16) |_| {
-        const v4 = listenOn(m.address, m.host, m.udp) orelse return .{ .taken = false };
-        const port = boundPort(v4);
+        const v4 = sockets.listen4(m.address, m.host, m.udp) orelse return .{ .taken = false };
+        const port = sockets.boundTo(v4);
         if (m.host == 0 and std.mem.indexOfScalar(u16, reserved, port) != null) {
-            _ = linux.close(v4);
+            sockets.close(v4);
             continue;
         }
         if (m.address[0] != 127) return .{ .ok = .{ .v4 = v4 } };
-        switch (listenLoopback6(port, m.udp)) {
+        switch (sockets.listen6(port, m.udp)) {
             .fd => |fd| return .{ .ok = .{ .v4 = v4, .v6 = fd } },
             .off => return .{ .ok = .{ .v4 = v4 } },
             .taken => {
-                _ = linux.close(v4);
+                sockets.close(v4);
                 if (m.host != 0) return .{ .taken = true };
             },
         }
@@ -199,9 +200,27 @@ fn publishOne(m: Spec.Map, reserved: []const u16) union(enum) { ok: Pair, taken:
     return .{ .taken = false };
 }
 
+/// The host's sockets, as `publishOne` makes them.
+const HostSockets = struct {
+    fn listen4(_: HostSockets, address: [4]u8, port: u16, udp: bool) ?linux.fd_t {
+        return listenOn(address, port, udp);
+    }
+    fn boundTo(_: HostSockets, fd: linux.fd_t) u16 {
+        return boundPort(fd);
+    }
+    fn listen6(_: HostSockets, port: u16, udp: bool) Loopback6 {
+        return listenLoopback6(port, udp);
+    }
+    fn close(_: HostSockets, fd: linux.fd_t) void {
+        _ = linux.close(fd);
+    }
+};
+
+const Loopback6 = union(enum) { fd: linux.fd_t, off, taken };
+
 /// A socket on `[::1]:port`, listening for TCP or bound for UDP; `off` where the host has no
 /// IPv6 (no AF_INET6, or no `::1`), `taken` when another process holds it.
-fn listenLoopback6(port: u16, udp: bool) union(enum) { fd: linux.fd_t, off, taken } {
+fn listenLoopback6(port: u16, udp: bool) Loopback6 {
     const sock: u32 = if (udp) linux.SOCK.DGRAM else linux.SOCK.STREAM;
     const rc = linux.socket(linux.AF.INET6, sock | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
     if (linux.errno(rc) != .SUCCESS) return .off;
@@ -311,17 +330,22 @@ fn openRoute() linux.fd_t {
 }
 
 /// Who may reach a port published beyond the host's loopback: not the runner's own jobs (their
-/// subnet; the runner's table drops them at the bridge already) and not a container on another
-/// bridge of the host's (Docker's, the Dagger engine's, a Dagger-fallback job's): those are
-/// local, and not the host's to let in through a trusted job's port. The host's bridges are read
-/// from its routes on each such peer, so one made since the job started is refused too.
+/// subnet; the runner's table drops them at the bridge already) and not a container or VM of the
+/// host's (on Docker's bridge, the Dagger engine's, a Dagger-fallback job's, a veth routed to as
+/// Calico's are, a tap as Firecracker's): those are local, and not the host's to let in through a
+/// trusted job's port. The host's links are read from its routes on each such peer, so one made
+/// since the job started is refused too.
 pub const Guard = struct {
     route: linux.fd_t,
     subnet: [4]u8,
     prefix: u8,
-    /// Whether an interface is a bridge (tests give their own).
-    bridge: *const fn ([]const u8) bool = isBridge,
+    /// Whether an interface leads to the host's own containers or VMs (tests give their own).
+    local: *const fn ([]const u8) bool = isLocal,
     buf: [32 * 1024]u8 = undefined,
+    /// UDP peers' verdicts (`allowsCached`).
+    verdicts: [max_verdicts]Verdict = @splat(.{}),
+
+    const Verdict = struct { peer: [4]u8 = @splat(0), port: u16 = 0, ok: bool = false, until: u64 = 0 };
 
     pub fn allows(g: *Guard, peer: [4]u8) bool {
         if (peer[0] == 127) return true;
@@ -329,9 +353,27 @@ pub const Guard = struct {
         if (g.route < 0) return false;
         const n = linux.pread(g.route, &g.buf, g.buf.len, 0);
         if (linux.errno(n) != .SUCCESS or n == g.buf.len) return false;
-        return !onBridge(g.buf[0..n], peer, g.bridge);
+        return !onLocal(g.buf[0..n], peer, g.local);
+    }
+
+    /// `allows`, its verdict on `peer:port` kept `verdict_ms`: a UDP client's datagrams are not
+    /// each a read of the routes, and a route changed still counts within the second. The verdict
+    /// that expires first makes way when all are in use.
+    pub fn allowsCached(g: *Guard, peer: [4]u8, port: u16, now: u64) bool {
+        var slot = &g.verdicts[0];
+        for (&g.verdicts) |*v| {
+            if (v.until > now and v.port == port and std.mem.eql(u8, &v.peer, &peer)) return v.ok;
+            if (v.until < slot.until) slot = v;
+        }
+        const ok = g.allows(peer);
+        slot.* = .{ .peer = peer, .port = port, .ok = ok, .until = now + verdict_ms };
+        return ok;
     }
 };
+
+/// The UDP peers whose verdict the guard keeps (`Guard.allowsCached`), and for how long.
+const max_verdicts = max_assocs;
+const verdict_ms = 1000;
 
 fn inSubnet(a: [4]u8, base: [4]u8, prefix: u8) bool {
     if (prefix == 0) return true;
@@ -340,9 +382,10 @@ fn inSubnet(a: [4]u8, base: [4]u8, prefix: u8) bool {
     return std.mem.readInt(u32, &a, .big) & mask == std.mem.readInt(u32, &base, .big) & mask;
 }
 
-/// Whether `peer` is on the subnet a bridge of `route`'s (`/proc/net/route`'s text) is directly
-/// connected to. Lines that cannot be read count as no bridge's.
-pub fn onBridge(route: []const u8, peer: [4]u8, bridge: *const fn ([]const u8) bool) bool {
+/// Whether `peer` is reached directly (no gateway) through a link of `route`'s
+/// (`/proc/net/route`'s text) that `local` says is the host's own containers' or VMs'. Lines that
+/// cannot be read count as no link's.
+pub fn onLocal(route: []const u8, peer: [4]u8, local: *const fn ([]const u8) bool) bool {
     var lines = std.mem.splitScalar(u8, route, '\n');
     _ = lines.next();
     const want = std.mem.readInt(u32, &peer, .little);
@@ -357,18 +400,80 @@ pub fn onBridge(route: []const u8, peer: [4]u8, bridge: *const fn ([]const u8) b
         // Up, no gateway (directly connected), and not the default route.
         if (flags & 1 == 0 or gw != 0 or mask == 0) continue;
         if (want & mask != dest & mask) continue;
-        if (bridge(iface)) return true;
+        if (local(iface)) return true;
     }
     return false;
 }
 
-/// Whether the host's interface `name` is a bridge (`/sys/class/net/<name>/bridge`; sysfs is the
-/// host's network's, as the helper stays in the host's mount namespace).
-fn isBridge(name: []const u8) bool {
-    if (name.len == 0 or name.len > 15 or std.mem.indexOfAny(u8, name, "/.") != null) return true;
-    var buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&buf, "/sys/class/net/{s}/bridge", .{name}, 0) catch return true;
-    return linux.errno(linux.faccessat(linux.AT.FDCWD, path, linux.F_OK, 0)) == .SUCCESS;
+/// The host's interfaces: sysfs is the host's network's, as the helper stays in the host's mount
+/// namespace.
+fn isLocal(name: []const u8) bool {
+    return isLocalAt("/sys/class/net", name);
+}
+
+/// Whether the interface `name` of `sys` (a `/sys/class/net`) leads to the host's own containers
+/// or VMs rather than its LAN: a bridge; a tun or tap (a VM's, Firecracker's, and a VPN's too);
+/// or a link into another namespace, as a veth is (Calico routes each pod's /32 out of one): its
+/// `iflink` is not its own `ifindex`, and it has no `lower_*` device (a VLAN or macvlan of the
+/// LAN's NIC has one). A name or file that cannot be read counts as local.
+pub fn isLocalAt(sys: []const u8, name: []const u8) bool {
+    // Not a name the kernel gives an interface, nor one that leaves `sys`.
+    if (name.len == 0 or name.len > 15 or std.mem.indexOfScalar(u8, name, '/') != null) return true;
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return true;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (sysExists(&buf, sys, name, "bridge") orelse return true) return true;
+    if (sysExists(&buf, sys, name, "tun_flags") orelse return true) return true;
+    const index = sysNumber(&buf, sys, name, "ifindex") orelse return true;
+    const link = sysNumber(&buf, sys, name, "iflink") orelse return true;
+    if (index == link) return false;
+    return !(hasLower(&buf, sys, name) orelse false);
+}
+
+/// Whether `sys/name/file` exists; null when that cannot be told.
+fn sysExists(buf: []u8, sys: []const u8, name: []const u8, file: []const u8) ?bool {
+    const path = std.fmt.bufPrintSentinel(buf, "{s}/{s}/{s}", .{ sys, name, file }, 0) catch return null;
+    return switch (linux.errno(linux.faccessat(linux.AT.FDCWD, path, linux.F_OK, 0))) {
+        .SUCCESS => true,
+        .NOENT => false,
+        else => null,
+    };
+}
+
+/// `sys/name/file`'s number (`ifindex`, `iflink`), or null.
+fn sysNumber(buf: []u8, sys: []const u8, name: []const u8, file: []const u8) ?u32 {
+    const path = std.fmt.bufPrintSentinel(buf, "{s}/{s}/{s}", .{ sys, name, file }, 0) catch return null;
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    const fd = std.math.cast(linux.fd_t, rc) orelse return null;
+    defer _ = linux.close(fd);
+    var text: [32]u8 = undefined;
+    const n = linux.read(fd, &text, text.len);
+    if (linux.errno(n) != .SUCCESS) return null;
+    return std.fmt.parseInt(u32, std.mem.trim(u8, text[0..n], " \t\n"), 10) catch null;
+}
+
+/// Whether `sys/name` has a `lower_*` entry (a device of the host's it is stacked on); null when
+/// its directory cannot be read.
+fn hasLower(buf: []u8, sys: []const u8, name: []const u8) ?bool {
+    const path = std.fmt.bufPrintSentinel(buf, "{s}/{s}", .{ sys, name }, 0) catch return null;
+    const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    const fd = std.math.cast(linux.fd_t, rc) orelse return null;
+    defer _ = linux.close(fd);
+    var ents: [4096]u8 = undefined;
+    while (true) {
+        const n = linux.getdents64(fd, &ents, ents.len);
+        if (linux.errno(n) != .SUCCESS) return null;
+        if (n == 0) return false;
+        // Each a `dirent64`: its length at `reclen`, its name from `name` to a NUL.
+        const reclen = @offsetOf(linux.dirent64, "reclen");
+        const name_at = @offsetOf(linux.dirent64, "name");
+        var at: usize = 0;
+        while (at + name_at < n) {
+            const len = std.mem.readInt(u16, ents[at + reclen ..][0..2], .native);
+            if (len <= name_at or at + len > n) return null;
+            if (std.mem.startsWith(u8, std.mem.sliceTo(ents[at + name_at .. at + len], 0), "lower_")) return true;
+            at += len;
+        }
+    }
 }
 
 /// The monotonic clock, in milliseconds.
@@ -516,7 +621,7 @@ const Udp = struct {
             var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
             const n = linux.recvfrom(l.fd, &u.buf, u.buf.len, 0, asSockaddr(&from), &len);
             if (linux.errno(n) != .SUCCESS) return;
-            if (l.guarded) if (u.guard) |g| if (!g.allows(peerOf(from))) continue;
+            if (l.guarded) if (u.guard) |g| if (!g.allowsCached(peerOf(from), from.port, now)) continue;
             u.clock += 1;
             const s = u.assocOf(i, .{ .v4 = from }, l.to, now) orelse continue;
             s.seen = u.clock;
@@ -1019,39 +1124,200 @@ test "a published UDP port relays each client's datagrams and the answers back" 
     }
 }
 
-fn testBridge(name: []const u8) bool {
-    return std.mem.eql(u8, name, "docker0") or std.mem.eql(u8, name, "zr0");
+/// The local links of `testRoutes`: Docker's bridge, the runner's, a Calico pod's veth and a
+/// Firecracker VM's tap. Counted, for the guard's kept verdicts.
+fn testLocal(name: []const u8) bool {
+    test_local_calls += 1;
+    for ([_][]const u8{ "docker0", "zr0", "cali1a2b", "tap0" }) |l| if (std.mem.eql(u8, name, l)) return true;
+    return false;
+}
+var test_local_calls: usize = 0;
+
+/// As /proc/net/route has them: a default route via the LAN's NIC, the LAN, Docker's bridge, a
+/// route that is down, a Calico pod's /32 (172.16.0.5) and a VM's tap (172.31.0.0/30), in the
+/// kernel's byte order.
+const test_routes = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n" ++
+    "eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n" ++
+    "eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n" ++
+    "docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n" ++
+    "down0\t00001EAC\t00000000\t0000\t0\t0\t0\t0000FFFF\t0\t0\t0\n" ++
+    "cali1a2b\t050010AC\t00000000\t0005\t0\t0\t0\tFFFFFFFF\t0\t0\t0\n" ++
+    "tap0\t00001FAC\t00000000\t0001\t0\t0\t0\tFCFFFFFF\t0\t0\t0\n";
+
+/// `test_routes` opened as the guard opens the host's.
+fn testRoutes(tmp: *std.testing.TmpDir, arena: Allocator) !linux.fd_t {
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "route", .data = test_routes });
+    const path = try tmp.dir.realPathFileAlloc(io, "route", arena);
+    const rc = linux.open(try arena.dupeSentinel(u8, path, 0), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    return std.math.cast(linux.fd_t, rc) orelse error.TestUnexpectedResult;
 }
 
-test "the guard: a peer of the runner's jobs or on a bridge of the host's is refused; loopback and the LAN are not" {
+test "the guard: a peer of the runner's jobs or of the host's own containers and VMs is refused; loopback and the LAN are not" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const io = std.testing.io;
-    // As /proc/net/route has them: a default route via the LAN's NIC, the LAN, Docker's bridge
-    // and the runner's (10.211.0.0/16), in the kernel's byte order.
-    try tmp.dir.writeFile(io, .{ .sub_path = "route", .data = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n" ++
-        "eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n" ++
-        "eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n" ++
-        "docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n" ++
-        "down0\t00001EAC\t00000000\t0000\t0\t0\t0\t0000FFFF\t0\t0\t0\n" });
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
-    const path = try tmp.dir.realPathFileAlloc(io, "route", a.allocator());
-    const rc = linux.open(try a.allocator().dupeSentinel(u8, path, 0), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    const fd = std.math.cast(linux.fd_t, rc) orelse return error.TestUnexpectedResult;
+    const fd = try testRoutes(&tmp, a.allocator());
     defer _ = linux.close(fd);
-    var g: Guard = .{ .route = fd, .subnet = .{ 10, 211, 0, 0 }, .prefix = 16, .bridge = testBridge };
+    var g: Guard = .{ .route = fd, .subnet = .{ 10, 211, 0, 0 }, .prefix = 16, .local = testLocal };
     try std.testing.expect(g.allows(.{ 127, 0, 0, 1 }));
     try std.testing.expect(g.allows(.{ 192, 168, 1, 50 }));
     try std.testing.expect(g.allows(.{ 8, 8, 8, 8 }));
-    // A route that is down is no bridge's.
+    // A route that is down is no link's.
     try std.testing.expect(g.allows(.{ 172, 30, 0, 2 }));
     try std.testing.expect(!g.allows(.{ 10, 211, 1, 2 }));
     try std.testing.expect(!g.allows(.{ 172, 17, 0, 2 }));
+    // Routed, not bridged: a pod's /32 out of its veth, a VM out of its tap. The pod's neighbour
+    // has no route of its own, so it is reached by the default one, through the LAN.
+    try std.testing.expect(!g.allows(.{ 172, 16, 0, 5 }));
+    try std.testing.expect(g.allows(.{ 172, 16, 0, 6 }));
+    try std.testing.expect(!g.allows(.{ 172, 31, 0, 2 }));
+    try std.testing.expect(g.allows(.{ 172, 31, 0, 4 }));
     // Routes that cannot be read refuse every peer beyond loopback.
     g.route = -1;
     try std.testing.expect(!g.allows(.{ 192, 168, 1, 50 }));
     try std.testing.expect(g.allows(.{ 127, 0, 0, 1 }));
+}
+
+test "the guard keeps a UDP peer's verdict for a second, for so many peers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const fd = try testRoutes(&tmp, a.allocator());
+    defer _ = linux.close(fd);
+    var g: Guard = .{ .route = fd, .subnet = .{ 10, 211, 0, 0 }, .prefix = 16, .local = testLocal };
+    const pod: [4]u8 = .{ 172, 16, 0, 5 };
+    const lan: [4]u8 = .{ 192, 168, 1, 50 };
+    const t0: u64 = 50_000;
+    test_local_calls = 0;
+    try std.testing.expect(!g.allowsCached(pod, 4000, t0));
+    const once = test_local_calls;
+    try std.testing.expect(once > 0);
+    // The same peer within the second: kept, the routes not read again.
+    try std.testing.expect(!g.allowsCached(pod, 4000, t0 + 1));
+    try std.testing.expect(!g.allowsCached(pod, 4000, t0 + verdict_ms - 1));
+    try std.testing.expectEqual(once, test_local_calls);
+    // Another port of the same address is another client, and an allowed verdict is kept too.
+    try std.testing.expect(!g.allowsCached(pod, 4001, t0));
+    try std.testing.expect(g.allowsCached(lan, 4000, t0));
+    const three = test_local_calls;
+    try std.testing.expect(g.allowsCached(lan, 4000, t0 + 2));
+    try std.testing.expectEqual(three, test_local_calls);
+    // A second on, the routes are read again: a link made or gone since counts.
+    try std.testing.expect(!g.allowsCached(pod, 4000, t0 + verdict_ms));
+    try std.testing.expect(test_local_calls > three);
+    // Past `max_verdicts` peers, the one that expires first makes way; the verdicts stay right.
+    for (0..max_verdicts + 8) |i| {
+        const port = std.math.cast(u16, 10_000 + i).?;
+        try std.testing.expect(g.allowsCached(lan, port, t0 + 10 + i));
+        try std.testing.expect(!g.allowsCached(pod, port, t0 + 10 + i));
+    }
+    const full = test_local_calls;
+    try std.testing.expect(g.allowsCached(lan, 10_000, t0 + 200));
+    try std.testing.expect(test_local_calls > full);
+    // Loopback is never refused, and the runner's jobs always are, kept or not.
+    try std.testing.expect(g.allowsCached(.{ 127, 0, 0, 1 }, 1, t0));
+    try std.testing.expect(!g.allowsCached(.{ 10, 211, 0, 9 }, 1, t0));
+}
+
+test "the guard's links: a bridge, a tun or tap, and a veth into another namespace are local; a NIC and a VLAN of it are not" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    // A /sys/class/net as the host's has them: `ifindex`, `iflink`, and the files that tell.
+    const Link = struct { name: []const u8, index: []const u8, link: []const u8, extra: []const u8 = "" };
+    for ([_]Link{
+        .{ .name = "eth0", .index = "2", .link = "2" },
+        .{ .name = "docker0", .index = "3", .link = "3", .extra = "bridge/bridge_id" },
+        .{ .name = "tap0", .index = "11", .link = "11", .extra = "tun_flags" },
+        .{ .name = "tun0", .index = "12", .link = "12", .extra = "tun_flags" },
+        // A veth's `iflink` is its peer's index, in the pod's namespace.
+        .{ .name = "cali1a2b", .index = "9", .link = "4" },
+        // A VLAN's is its NIC's, which it is stacked on (`lower_eth0`).
+        .{ .name = "eth0.10", .index = "10", .link = "2", .extra = "lower_eth0" },
+        .{ .name = "vlan10", .index = "13", .link = "2", .extra = "lower_eth0" },
+        // No `iflink`: cannot be told, so local.
+        .{ .name = "odd0", .index = "14", .link = "" },
+    }) |l| {
+        try tmp.dir.createDirPath(io, l.name);
+        const index = try std.fmt.allocPrint(a.allocator(), "{s}/ifindex", .{l.name});
+        try tmp.dir.writeFile(io, .{ .sub_path = index, .data = try std.fmt.allocPrint(a.allocator(), "{s}\n", .{l.index}) });
+        if (l.link.len > 0) {
+            const link = try std.fmt.allocPrint(a.allocator(), "{s}/iflink", .{l.name});
+            try tmp.dir.writeFile(io, .{ .sub_path = link, .data = try std.fmt.allocPrint(a.allocator(), "{s}\n", .{l.link}) });
+        }
+        if (l.extra.len > 0) {
+            const extra = try std.fmt.allocPrint(a.allocator(), "{s}/{s}", .{ l.name, l.extra });
+            if (std.fs.path.dirname(extra)) |d| try tmp.dir.createDirPath(io, d);
+            try tmp.dir.writeFile(io, .{ .sub_path = extra, .data = "" });
+        }
+    }
+    const sys = try tmp.dir.realPathFileAlloc(io, ".", a.allocator());
+    try std.testing.expect(!isLocalAt(sys, "eth0"));
+    try std.testing.expect(!isLocalAt(sys, "vlan10"));
+    try std.testing.expect(!isLocalAt(sys, "eth0.10"));
+    try std.testing.expect(isLocalAt(sys, "docker0"));
+    try std.testing.expect(isLocalAt(sys, "tap0"));
+    try std.testing.expect(isLocalAt(sys, "tun0"));
+    try std.testing.expect(isLocalAt(sys, "cali1a2b"));
+    try std.testing.expect(isLocalAt(sys, "odd0"));
+    // A name that is no interface, or no name sysfs could have, is local too.
+    try std.testing.expect(isLocalAt(sys, "gone0"));
+    try std.testing.expect(isLocalAt(sys, ".."));
+    try std.testing.expect(isLocalAt(sys, "../eth0"));
+    try std.testing.expect(isLocalAt(sys, ""));
+    // The host's own loopback is its own link.
+    try std.testing.expect(!isLocal("lo"));
+}
+
+/// Sockets `publishOne` makes, faked: the kernel's picks are `picks`, in turn; fds are their
+/// indexes. Counts what it closed.
+const TestSockets = struct {
+    picks: []const u16,
+    next: usize = 0,
+    closed: usize = 0,
+    v6: Loopback6 = .off,
+
+    fn listen4(s: *TestSockets, _: [4]u8, port: u16, _: bool) ?linux.fd_t {
+        if (port != 0) return 100;
+        if (s.next == s.picks.len) return null;
+        s.next += 1;
+        return std.math.cast(linux.fd_t, s.next - 1);
+    }
+    fn boundTo(s: *TestSockets, fd: linux.fd_t) u16 {
+        return if (fd == 100) 50080 else s.picks[std.math.cast(usize, fd).?];
+    }
+    fn listen6(s: *TestSockets, _: u16, _: bool) Loopback6 {
+        return s.v6;
+    }
+    fn close(s: *TestSockets, _: linux.fd_t) void {
+        s.closed += 1;
+    }
+};
+
+test "a published port the kernel picks is picked again when it lands on one of the runner's own" {
+    const reserved = [_]u16{ 5432, 2375 };
+    const picked: Spec.Map = .{ .host = 0, .container = 80, .address = .{ 0, 0, 0, 0 } };
+    var s: TestSockets = .{ .picks = &.{ 5432, 2375, 41234 } };
+    const got = publishOne(picked, &reserved, &s);
+    try std.testing.expectEqual(@as(linux.fd_t, 2), got.ok.v4);
+    try std.testing.expectEqual(@as(usize, 2), s.closed);
+    // Every pick reserved: given up, as a port taken.
+    const all_reserved: [20]u16 = @splat(5432);
+    s = .{ .picks = &all_reserved };
+    try std.testing.expect(publishOne(picked, &reserved, &s) == .taken);
+    // A port the job names is the operator's to allow (`publish.plan`), never picked again.
+    s = .{ .picks = &.{} };
+    const named = publishOne(.{ .host = 50080, .container = 80, .address = .{ 0, 0, 0, 0 } }, &.{50080}, &s);
+    try std.testing.expectEqual(@as(linux.fd_t, 100), named.ok.v4);
+    // On 127.0.0.1, a pick whose ::1 is taken is picked again too.
+    s = .{ .picks = &.{ 2375, 41234 }, .v6 = .taken };
+    try std.testing.expect(publishOne(.{ .host = 0, .container = 80 }, &reserved, &s) == .taken);
+    try std.testing.expectEqual(@as(usize, 2), s.closed);
 }
 
 /// A TCP client of `127.0.0.1:port` (or `[::1]:port`), connected, or null.
