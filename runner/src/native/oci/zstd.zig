@@ -13,7 +13,10 @@
 //!
 //! Every length, offset and count in the stream is checked before it is used: the archive is a
 //! registry's, so a corrupt or hostile stream gets `error.ReadFailed` from the reader (the reason
-//! in `Decompress.err`) and never an out-of-bounds access.
+//! in `Decompress.err`) and never an out-of-bounds access. It is as strict as libzstd where std's
+//! decoder is not: a block over its window, a frame that is not the size its header says, an offset
+//! past the window, a Huffman tree that is not complete, a literal stream not used up. "fuzz:
+//! zstd" (`fuzz.zig`) holds it to std's decoder on every input, and says where they differ.
 
 const std = @import("std");
 const zstd = std.compress.zstd;
@@ -33,10 +36,13 @@ pub const Error = error{
     BlockTooLarge,
     ReservedBlockType,
     BadLiterals,
+    BadLiteralStream,
     BadHuffmanTree,
+    IncompleteHuffmanTree,
     BadFseTable,
     BadSequences,
     BadOffset,
+    BadContentSize,
     TruncatedStream,
     ReservedBit,
     OutOfMemory,
@@ -52,8 +58,8 @@ const Fse = struct {
 
     /// `norm`'s counts (-1 for a probability below one) spread over a table of `1 << log`.
     fn build(t: *Fse, norm: []const i16, log: u8) Error!void {
-        const size: usize = @as(usize, 1) << @intCast(log);
         if (log > 9) return error.BadFseTable;
+        const size: usize = @as(usize, 1) << @intCast(log);
         var next: [256]u16 = undefined;
         var high = size - 1;
         for (norm, 0..) |n, s| {
@@ -77,7 +83,7 @@ const Fse = struct {
         for (t.entries[0..size]) |*e| {
             const n = next[e.symbol];
             next[e.symbol] = n + 1;
-            const bits: u8 = log - @as(u8, @intCast(std.math.log2_int(u16, n)));
+            const bits: u8 = log - std.math.log2_int(u16, n);
             e.bits = bits;
             e.base = (n << @intCast(bits)) -% @as(u16, @intCast(size));
         }
@@ -95,7 +101,7 @@ const Fse = struct {
     /// The table `bytes` starts with (the normalized counts, packed), and how many bytes it took.
     fn read(t: *Fse, bytes: []const u8, max_symbols: usize, max_log: u8) Error!usize {
         var bits: Forward = .{ .bytes = bytes };
-        const log: u8 = @as(u8, @intCast(bits.take(4))) + 5;
+        const log: u8 = @as(u8, @truncate(bits.take(4))) + 5; // 4 bits: 0 to 15
         if (log > max_log) return error.BadFseTable;
         var norm: [256]i16 = undefined;
         var remaining: i32 = (@as(i32, 1) << @intCast(log)) + 1;
@@ -233,7 +239,9 @@ const Huffman = struct {
         const max_bits: u8 = @intCast(std.math.log2_int(u32, total) + 1);
         if (max_bits > 11) return error.BadHuffmanTree;
         const rest = (@as(u32, 1) << @intCast(max_bits)) - total;
-        if (!std.math.isPowerOfTwo(rest)) return error.BadHuffmanTree;
+        // What is left for the last symbol is a power of two, or the tree is not complete (libzstd
+        // refuses it too; std's decoder does not look).
+        if (!std.math.isPowerOfTwo(rest)) return error.IncompleteHuffmanTree;
         weights[count - 1] = @intCast(std.math.log2_int(u32, rest) + 1);
 
         var in_rank: [13]u32 = @splat(0);
@@ -314,11 +322,12 @@ const Huffman = struct {
         const bits: u6 = @intCast(h.max_bits);
         for (out) |*o| {
             const e = h.table[@intCast(rev.peek(bits))];
-            if (e.bits > rev.left) return error.BadLiterals;
+            if (e.bits > rev.left) return error.BadLiteralStream;
             rev.left -= e.bits;
             o.* = e.symbol;
         }
-        if (rev.left != 0) return error.BadLiterals;
+        // Used up, as libzstd wants of each of the four streams (std's decoder looks at the last).
+        if (rev.left != 0) return error.BadLiteralStream;
     }
 };
 
@@ -336,6 +345,12 @@ pub const Decompress = struct {
     phase: Phase = .frame,
     checksum: bool = false,
     window_size: usize = 0,
+    /// The largest window a frame may declare.
+    window_limit: u64 = max_window,
+    /// The frame's content size, when it says, and the most a block may hold: the window, or 128
+    /// KiB when that is less (RFC 8878, "Blocks").
+    content: ?u64 = null,
+    block_limit: usize = block_max,
     /// The frame's decoded bytes: the last `window_size` of them, then room for a block. `pos` is
     /// the end of what is decoded and `sent` how much of it `reader` has handed out.
     win: []u8 = &.{},
@@ -402,6 +417,7 @@ pub const Decompress = struct {
 
     fn stream(r: *Reader, w: *std.Io.Writer, limit: std.Io.Limit) Reader.StreamError!usize {
         const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
+        if (d.err != null) return error.ReadFailed;
         while (d.sent == d.pos) {
             if (d.phase == .end) return error.EndOfStream;
             d.advance() catch |e| switch (e) {
@@ -488,10 +504,12 @@ pub const Decompress = struct {
             content = v;
         }
         if (single) window = content.?;
-        if (window > max_window) return error.WindowTooLarge;
+        if (window > d.window_limit) return error.WindowTooLarge;
+        d.content = content;
+        d.block_limit = @min(block_max, std.math.lossyCast(usize, window));
         // No more than the frame holds, when it says.
         if (content) |c| window = @min(window, c);
-        d.window_size = @intCast(window);
+        d.window_size = std.math.cast(usize, window) orelse return error.WindowTooLarge;
         // Room beyond the window to decode into before sliding it forward again: the slide copies
         // the whole window, so with only a block of room it would copy it for every block.
         const want = d.window_size + std.math.clamp(d.window_size, block_max, max_slack);
@@ -515,7 +533,7 @@ pub const Decompress = struct {
         const last = head & 1 != 0;
         const kind = (head >> 1) & 3;
         const size: usize = head >> 3;
-        if (size > block_max) return error.BlockTooLarge;
+        if (size > d.block_limit) return error.BlockTooLarge;
         // Room for a block: the window's worth kept, the rest slid out (all of it was sent).
         if (d.pos + block_max > d.win.len) {
             const keep = @min(d.pos, d.window_size);
@@ -539,6 +557,11 @@ pub const Decompress = struct {
                 try d.compressed(d.block[0..size]);
             },
             else => return error.ReservedBlockType,
+        }
+        // A frame holds as many bytes as its header says, no more (and at the end, no fewer).
+        if (d.content) |c| {
+            const total = d.history + d.pos;
+            if (total > c or (last and total != c)) return error.BadContentSize;
         }
         if (last) {
             if (d.checksum) try in.discardAll(4);
@@ -682,7 +705,7 @@ pub const Decompress = struct {
     }
 
     fn appendLiterals(d: *Decompress, lits: []const u8) Error!void {
-        if (d.pos + lits.len > d.win.len) return error.BadSequences;
+        if (lits.len > d.block_limit) return error.BadSequences;
         @memcpy(d.win[d.pos..][0..lits.len], lits);
         d.pos += lits.len;
     }
@@ -716,7 +739,7 @@ pub const Decompress = struct {
             const offset = d.resolveOffset(offset_value, lit_len);
             if (offset == 0) return error.BadOffset;
 
-            if (lit_len > lits.len - lit_at or pos + lit_len + match_len > start + block_max) return error.BadSequences;
+            if (lit_len > lits.len - lit_at or pos + lit_len + match_len > start + d.block_limit) return error.BadSequences;
             @memcpy(win[pos..][0..lit_len], lits[lit_at..][0..lit_len]);
             pos += lit_len;
             lit_at += lit_len;
@@ -736,7 +759,7 @@ pub const Decompress = struct {
         }
         if (rev.left != 0) return error.BadSequences;
         const rest = lits.len - lit_at;
-        if (pos + rest > start + block_max) return error.BadSequences;
+        if (pos + rest > start + d.block_limit) return error.BadSequences;
         @memcpy(win[pos..][0..rest], lits[lit_at..]);
         d.pos = pos + rest;
     }
@@ -871,4 +894,131 @@ test "native oci zstd: random streams behind a valid header never crash it" {
         defer a.free(stream);
         if (decompressAll(a, stream)) |ok| a.free(ok) else |_| {}
     }
+}
+
+/// A frame by hand: the magic, a descriptor, the fields the descriptor names, and RLE blocks of
+/// `byte`, one of `sizes` bytes each (the last one marked so).
+fn rleFrame(a: Allocator, descriptor: u8, fields: []const u8, byte: u8, sizes: []const u24) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, &.{ 0x28, 0xb5, 0x2f, 0xfd, descriptor });
+    try out.appendSlice(a, fields);
+    for (sizes, 0..) |size, i| {
+        const head: u24 = (size << 3) | 2 | @intFromBool(i + 1 == sizes.len);
+        var h: [3]u8 = undefined;
+        std.mem.writeInt(u24, &h, head, .little);
+        try out.appendSlice(a, &h);
+        try out.append(a, byte);
+    }
+    return out.toOwnedSlice(a);
+}
+
+test "native oci zstd: a frame holds as many bytes as its header says, and no block is over its window" {
+    const a = testing.allocator;
+    // Single segment, content size 200 in one byte (so a window of 200): 200 bytes are right, 199
+    // are fewer than it says, and a block of 201 is over the window.
+    for ([_]struct { u24, ?Error }{ .{ 200, null }, .{ 199, error.BadContentSize }, .{ 201, error.BlockTooLarge } }) |c| {
+        const frame = try rleFrame(a, 0x20, &.{200}, 'x', &.{c[0]});
+        defer a.free(frame);
+        if (c[1]) |want| {
+            try testing.expectError(want, decompressAll(a, frame));
+        } else {
+            const got = try decompressAll(a, frame);
+            defer a.free(got);
+            try testing.expectEqual(200, got.len);
+        }
+    }
+    // More than the size by the second block, which is refused before its bytes are handed out.
+    const over = try rleFrame(a, 0x20, &.{10}, 'x', &.{ 6, 6 });
+    defer a.free(over);
+    try testing.expectError(error.BadContentSize, decompressAll(a, over));
+    // A window of 1 KiB (descriptor 0, no content size): a block of 1 KiB, not one of 1 KiB + 1.
+    const fits = try rleFrame(a, 0x00, &.{0x00}, 'x', &.{1024});
+    defer a.free(fits);
+    const got = try decompressAll(a, fits);
+    defer a.free(got);
+    try testing.expectEqual(1024, got.len);
+    const big = try rleFrame(a, 0x00, &.{0x00}, 'x', &.{1025});
+    defer a.free(big);
+    try testing.expectError(error.BlockTooLarge, decompressAll(a, big));
+}
+
+/// A frame with a window of 1 KiB and no content size: two RLE blocks of 1000 bytes ('a', 'b'),
+/// then a compressed block of five literals and one sequence that takes the offset code `code`,
+/// with `extra` for its bits (the tables are RLE: literal length code 5, match length code 2, so
+/// five literals and a match of five).
+fn matchFrame(a: Allocator, code: u8, extra: u16) ![]u8 {
+    const bits = code; // an offset code reads that many bits
+    const stream: u32 = std.math.shl(u32, 1, bits) | extra;
+    var block: std.ArrayList(u8) = .empty;
+    errdefer block.deinit(a);
+    try block.appendSlice(a, &.{ 5 << 3, 'h', 'e', 'l', 'l', 'o', 1, 0b01_01_01_00, 5, code, 2 });
+    var rest = stream;
+    for (0..(bits + 1 + 7) / 8) |_| {
+        try block.append(a, @truncate(rest));
+        rest >>= 8;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, &.{ 0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00 });
+    for ("ab") |byte| try out.appendSlice(a, &.{ 0x42, 0x1f, 0x00, byte }); // (1000 << 3) | RLE
+    var head: [3]u8 = undefined;
+    std.mem.writeInt(u24, &head, @as(u24, @truncate(block.items.len)) << 3 | 4 | 1, .little);
+    try out.appendSlice(a, &head);
+    try out.appendSlice(a, block.items);
+    block.deinit(a);
+    return out.toOwnedSlice(a);
+}
+
+test "native oci zstd: a match reaches back within the window and no further, as libzstd reads it" {
+    const a = testing.allocator;
+    // Offset code 9 and 491: the value 512 + 491 = 1003, an offset of 1000, which the window holds.
+    const near = try matchFrame(a, 9, 491);
+    defer a.free(near);
+    const got = try decompressAll(a, near);
+    defer a.free(got);
+    try testing.expectEqual(2000 + 5 + 5, got.len);
+    try testing.expectEqualStrings("hello" ++ "bbbbb", got[2000..]);
+    // Code 10 and 4: 1024 + 4 = 1028, an offset of 1025, past a window of 1024 though not past the
+    // 2000 bytes before it (std's decoder takes it: it checks its buffer, not the window).
+    const far = try matchFrame(a, 10, 4);
+    defer a.free(far);
+    try testing.expectError(error.BadOffset, decompressAll(a, far));
+}
+
+test "native oci zstd: what libzstd refuses and std's decoder takes: a tree that is not complete, a literal stream not used up" {
+    const a = testing.allocator;
+    // A tree of weights 2, 1, 2 (the last symbol takes what is left: 8 - 5 = 3, not a power of two).
+    const tree = @embedFile("../../fuzz_corpus/zstd/hand-huffman-direct-f0.zst");
+    const copy = try a.dupe(u8, tree);
+    defer a.free(copy);
+    try testing.expectEqual(0x11, copy[62]);
+    copy[62] = 0x12;
+    try testing.expectError(error.IncompleteHuffmanTree, decompressAll(a, copy));
+    // One bit of the first of four streams, the last read, changed: the symbols no longer use the stream up.
+    const streams = @embedFile("../../fuzz_corpus/zstd/hand-huffman-direct-f1.zst");
+    const flipped = try a.dupe(u8, streams);
+    defer a.free(flipped);
+    flipped[69] ^= 1;
+    try testing.expectError(error.BadLiteralStream, decompressAll(a, flipped));
+    // Unchanged, both decode.
+    const ok = try decompressAll(a, streams);
+    a.free(ok);
+}
+
+test "native oci zstd: a window over the limit is refused, and a failed stream stays failed" {
+    const a = testing.allocator;
+    // Window 2 KiB (descriptor 0x08), a limit of 1 KiB.
+    const frame = try rleFrame(a, 0x00, &.{0x08}, 'x', &.{16});
+    defer a.free(frame);
+    var in: Reader = .fixed(frame);
+    const d = try Decompress.create(a, &in);
+    defer d.destroy();
+    d.window_limit = 1024;
+    var out: [64]u8 = undefined;
+    try testing.expectError(error.ReadFailed, d.reader.readSliceAll(&out));
+    try testing.expectEqual(error.WindowTooLarge, d.err.?);
+    // Reading on does not decode what follows the refused header.
+    try testing.expectError(error.ReadFailed, d.reader.readSliceAll(&out));
+    try testing.expectEqual(error.WindowTooLarge, d.err.?);
 }

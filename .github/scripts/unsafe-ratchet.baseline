@@ -2,5 +2,5 @@
 @bitCast	17
 @ptrCast	82
 @alignCast	70
-@intCast	276
+@intCast	273
 catch unreachable	14
