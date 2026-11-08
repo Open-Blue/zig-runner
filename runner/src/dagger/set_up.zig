@@ -1283,8 +1283,10 @@ fn failSetUp(x: *Exec, results: []StepResult, why: []const u8) !Result {
 /// A `container:` job's `options`, `ports` and `volumes` are not read on this path: the job runs
 /// without them, and the log says which (#368). A warning, not a failure, so jobs that fell back
 /// to Dagger with these set keep running. Values are rendered and logged through the job's log,
-/// which masks secrets; one that cannot be evaluated is named without its value.
+/// which masks secrets; one that cannot be evaluated is named without its value. Not on the native
+/// backend, which takes a job only when it carries all of them out (`container_options.unsupported`).
 fn warnDroppedContainerSettings(x: *Exec) !void {
+    if (x.native != null) return;
     const jc = x.job.container orelse return;
     const sc = try x.ev.scope(&.{});
     if (jc.options) |t| {

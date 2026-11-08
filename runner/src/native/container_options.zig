@@ -7,11 +7,15 @@
 //! <directory>`. So a flag is honoured
 //! when the native sandbox already has what it asks for (the step user, the container's env), is
 //! meaningless when `docker exec` or the runner overrides it (`--workdir`, `--health-*`: the
-//! runner waits for the health of service containers only), and is refused otherwise. Refused,
-//! never ignored: `--cpus`, `--privileged`, `--device`, `--add-host` and the rest change the
-//! container, and the sandbox does not carry them out, so a job that silently lost one would run
-//! differently from its workflow. The job goes to Dagger with the flag named instead, and Dagger
-//! reads none of `options:`: there the flag is dropped, which the note says (`dropped`).
+//! runner waits for the health of service containers only), and is refused otherwise. Honoured
+//! too, because the job's own sandbox can carry them out without more power than it has:
+//! `--hostname`, `--add-host` (the job's own hosts file), `--shm-size`, `--tmpfs` (a tmpfs is
+//! nosuid and nodev, as Docker's) and `--memory` (within the job's cgroup limit, never above it).
+//! Refused, never ignored: `--cpus`, `--privileged`, `--cap-add`, `--security-opt`, `--device`,
+//! `--network`, `--pid`, `--ipc`, `--userns` and the rest change the container beyond what the
+//! sandbox grants, so a job that silently lost one would run differently from its workflow. The
+//! job goes to Dagger with the flag named instead, and Dagger reads none of `options:`: there the
+//! flag is dropped, which the note says (`dropped`).
 //!
 //! Only literal text is read here. An `options:` with an expression in it is decided when the job
 //! is, before any expression can be evaluated, so it falls back too.
@@ -29,9 +33,34 @@ pub const Options = struct {
     env: []const job_mod.EnvVar = &.{},
     /// `--user`/`-u`, as an image's `USER` is written: `name`, `uid`, `name:group`, `uid:gid`.
     user: ?[]const u8 = null,
-    /// How many flags were understood and have no effect natively (`--workdir`, `--health-*`),
-    /// for "Set up job" to say so.
+    /// `--hostname`/`-h`: the steps' UTS hostname.
+    hostname: ?[]const u8 = null,
+    /// `--add-host name:ip`, in order: lines added to the job's hosts file.
+    add_hosts: []const AddHost = &.{},
+    /// `--shm-size`, in bytes: the size of `/dev/shm`.
+    shm_size: ?u64 = null,
+    /// `--tmpfs`, in order.
+    tmpfs: []const Tmpfs = &.{},
+    /// `--memory`/`-m`, in bytes: a limit for the job's cgroup, when it is lower than the
+    /// runner's own (`Backend.limitMemory`).
+    memory: ?u64 = null,
+    /// How many flags were understood and have no effect natively (`--workdir`, `--health-*`,
+    /// `--init`), for "Set up job" to say so.
     no_effect: u32 = 0,
+};
+
+pub const AddHost = struct { name: []const u8, ip: []const u8 };
+
+/// One `--tmpfs path[:options]`, the options Docker takes that stay within the sandbox.
+pub const Tmpfs = struct {
+    /// Clean and absolute (`cleanTarget`).
+    target: []const u8,
+    /// Bytes; 0 for the kernel's default.
+    size: u64 = 0,
+    mode: u32 = 0o1777,
+    /// `exec`: Docker's default is `noexec`.
+    exec: bool = false,
+    read_only: bool = false,
 };
 
 pub const Error = error{ Refused, OutOfMemory };
@@ -43,6 +72,11 @@ const valued = [_]Flag{
     .{ .long = "--env", .short = 'e' },
     .{ .long = "--user", .short = 'u' },
     .{ .long = "--workdir", .short = 'w' },
+    .{ .long = "--hostname", .short = 'h' },
+    .{ .long = "--add-host" },
+    .{ .long = "--shm-size" },
+    .{ .long = "--tmpfs" },
+    .{ .long = "--memory", .short = 'm' },
     .{ .long = "--health-cmd" },
     .{ .long = "--health-interval" },
     .{ .long = "--health-timeout" },
@@ -55,11 +89,13 @@ const valued = [_]Flag{
 pub fn parse(arena: Allocator, text: []const u8, why: *[]const u8) Error!Options {
     const words = try health.splitOptions(arena, text);
     var env: std.ArrayList(job_mod.EnvVar) = .empty;
+    var add_hosts: std.ArrayList(AddHost) = .empty;
+    var tmpfs_list: std.ArrayList(Tmpfs) = .empty;
     var out: Options = .{};
     var i: usize = 0;
     while (i < words.len) : (i += 1) {
         const w = words[i];
-        if (std.mem.eql(u8, w, "--no-healthcheck")) {
+        if (std.mem.eql(u8, w, "--no-healthcheck") or std.mem.eql(u8, w, "--init")) {
             out.no_effect += 1;
             continue;
         }
@@ -88,6 +124,24 @@ pub fn parse(arena: Allocator, text: []const u8, why: *[]const u8) Error!Options
             if (!userIsPlain(value)) return refuse(arena, why, w, "is not a user, a uid, or " ++
                 "user:group");
             out.user = value;
+        } else if (std.mem.eql(u8, name, "--hostname")) {
+            if (!hostnameIsPlain(value)) return refuse(arena, why, w, "is not a hostname " ++
+                "(letters, digits, `-` and `.`, at most 64 characters)");
+            out.hostname = value;
+        } else if (std.mem.eql(u8, name, "--add-host")) {
+            try add_hosts.append(arena, try parseAddHost(arena, w, value, why));
+        } else if (std.mem.eql(u8, name, "--shm-size")) {
+            const n = parseSize(value) orelse return refuse(arena, why, w, "is not a size " ++
+                "Docker reads (a number of bytes, or with b, k, m, g or t)");
+            if (n == 0) return refuse(arena, why, w, "is zero");
+            out.shm_size = n;
+        } else if (std.mem.eql(u8, name, "--memory")) {
+            const n = parseSize(value) orelse return refuse(arena, why, w, "is not a size " ++
+                "Docker reads (a number of bytes, or with b, k, m, g or t)");
+            if (n < min_memory) return refuse(arena, why, w, "is below the 6 MiB Docker takes");
+            out.memory = n;
+        } else if (std.mem.eql(u8, name, "--tmpfs")) {
+            try tmpfs_list.append(arena, try parseTmpfs(arena, w, value, why));
         } else if (std.mem.eql(u8, name, "--workdir") or std.mem.eql(u8, name, "--health-cmd")) {
             out.no_effect += 1;
         } else {
@@ -101,6 +155,108 @@ pub fn parse(arena: Allocator, text: []const u8, why: *[]const u8) Error!Options
         }
     }
     out.env = env.items;
+    out.add_hosts = add_hosts.items;
+    out.tmpfs = tmpfs_list.items;
+    for (out.tmpfs, 0..) |t, n| for (out.tmpfs[0..n]) |earlier| if (std.mem.eql(u8, earlier.target, t.target))
+        return refuse(arena, why, "--tmpfs", "mounts a path an earlier `--tmpfs` mounts");
+    return out;
+}
+
+/// Docker takes no `--memory` below this (`MinMemoryLimit`).
+const min_memory: u64 = 6 << 20;
+
+/// A size as `units.RAMInBytes` reads one, whole numbers only: bytes, or a number with `b`, `k`,
+/// `m`, `g` or `t` (and `kb`... `tb`), in any case, as powers of 1024.
+fn parseSize(text: []const u8) ?u64 {
+    var end: usize = 0;
+    while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+    if (end == 0 or end > 15) return null;
+    const n = std.fmt.parseInt(u64, text[0..end], 10) catch return null;
+    const unit = text[end..];
+    const shift: u6 = if (unit.len == 0 or std.ascii.eqlIgnoreCase(unit, "b"))
+        0
+    else if (std.ascii.eqlIgnoreCase(unit, "k") or std.ascii.eqlIgnoreCase(unit, "kb"))
+        10
+    else if (std.ascii.eqlIgnoreCase(unit, "m") or std.ascii.eqlIgnoreCase(unit, "mb"))
+        20
+    else if (std.ascii.eqlIgnoreCase(unit, "g") or std.ascii.eqlIgnoreCase(unit, "gb"))
+        30
+    else if (std.ascii.eqlIgnoreCase(unit, "t") or std.ascii.eqlIgnoreCase(unit, "tb"))
+        40
+    else
+        return null;
+    return std.math.shlExact(u64, n, shift) catch null;
+}
+
+/// A hostname Docker takes (RFC 1123, at most 64 characters, as `sethostname` does).
+fn hostnameIsPlain(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    if (name[0] == '-' or name[0] == '.' or name[name.len - 1] == '-' or name[name.len - 1] == '.')
+        return false;
+    for (name) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '.') return false;
+    return true;
+}
+
+/// `--add-host name:ip` (or `name=ip`, which newer Docker reads too). The address is IPv4, as the
+/// jobs' network is; `host-gateway` stands for the host's address, which a job has no business
+/// with, and is refused.
+fn parseAddHost(arena: Allocator, flag: []const u8, value: []const u8, why: *[]const u8) Error!AddHost {
+    const sep = std.mem.indexOfAny(u8, value, ":=") orelse
+        return refuse(arena, why, flag, "is not name:ip");
+    const name = value[0..sep];
+    const ip = value[sep + 1 ..];
+    if (!hostnameIsPlain(name)) return refuse(arena, why, flag, "has a name that is not a hostname");
+    if (std.mem.eql(u8, ip, "host-gateway")) return refuse(arena, why, flag, "names " ++
+        "`host-gateway`, the host's address, which a job does not get");
+    if (parseIp4(ip) == null) return refuse(arena, why, flag, "has an address that is not an " ++
+        "IPv4 address");
+    return .{ .name = name, .ip = ip };
+}
+
+/// `--tmpfs path[:options]`: `rw`, `ro`, `exec`, `noexec`, `nosuid`, `nodev` (a tmpfs is always
+/// nosuid and nodev here), `size=` and `mode=`. `suid` and `dev` are refused, as are the options
+/// that name ids (`uid=`, `gid=`: they would be ids of the host's namespace) and any other.
+fn parseTmpfs(arena: Allocator, flag: []const u8, value: []const u8, why: *[]const u8) Error!Tmpfs {
+    const colon = std.mem.indexOfScalar(u8, value, ':');
+    const path = if (colon) |c| value[0..c] else value;
+    var out: Tmpfs = .{ .target = undefined };
+    out.target = cleanTarget(arena, path) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NotPlain => return refuse(arena, why, flag, "has a path that is not an absolute " ++
+            "path without `.` or `..`"),
+    };
+    if (out.target.len <= 1) return refuse(arena, why, flag, "mounts the root directory");
+    for (runner_mounts) |m| if (under(out.target, m)) return refuse(arena, why, flag, "mounts " ++
+        "where the runner mounts its own directory");
+    for (sandbox_trees) |t| if (under(out.target, t)) return refuse(arena, why, flag, "mounts " ++
+        "inside a directory the sandbox mounts itself");
+    const options = if (colon) |c| value[c + 1 ..] else "";
+    var it = std.mem.splitScalar(u8, options, ',');
+    while (it.next()) |o| {
+        if (o.len == 0 or std.mem.eql(u8, o, "rw") or std.mem.eql(u8, o, "nosuid") or
+            std.mem.eql(u8, o, "nodev") or std.mem.eql(u8, o, "noexec"))
+        {
+            if (std.mem.eql(u8, o, "noexec")) out.exec = false;
+            continue;
+        }
+        if (std.mem.eql(u8, o, "ro")) {
+            out.read_only = true;
+        } else if (std.mem.eql(u8, o, "exec")) {
+            out.exec = true;
+        } else if (std.mem.startsWith(u8, o, "size=")) {
+            out.size = parseSize(o[5..]) orelse return refuse(arena, why, flag, "has a size " ++
+                "that Docker does not read");
+            if (out.size == 0) return refuse(arena, why, flag, "has a size of zero");
+        } else if (std.mem.startsWith(u8, o, "mode=")) {
+            out.mode = std.fmt.parseInt(u32, o[5..], 8) catch 0o10000;
+            if (out.mode > 0o7777) return refuse(arena, why, flag, "has a mode that is not octal " ++
+                "permissions");
+        } else if (std.mem.eql(u8, o, "suid") or std.mem.eql(u8, o, "dev")) {
+            return refuse(arena, why, flag, "asks for `suid` or `dev`, which the sandbox never " ++
+                "gives a mount");
+        } else return refuse(arena, why, flag, "has a mount option the sandbox does not carry " ++
+            "out (only rw, ro, exec, noexec, nosuid, nodev, size and mode)");
+    }
     return out;
 }
 
@@ -458,6 +614,11 @@ pub fn unsupported(jc: job_mod.Service, provisioned: bool, services: []const job
     };
     if (o.user != null and provisioned) return "a job container's `--user` on the default " ++
         "image, whose steps run as RUNNER_STEP_USER's user, is not native" ++ dropped;
+    if (o.tmpfs.len > 0 and jc.volumes.len > 0) {
+        const found = volumes(fba.allocator(), jc.volumes, &why) catch return null;
+        for (o.tmpfs) |fs| for (found.targets) |v| if (under(fs.target, v) or under(v, fs.target))
+            return "a job container's `--tmpfs` is at or beside a path a volume mounts" ++ dropped;
+    }
     return null;
 }
 
@@ -510,18 +671,90 @@ test "options honoured: --env and --user in every form docker reads, the others 
     try std.testing.expectEqual(@as(usize, 0), n.env.len);
 }
 
+test "options honoured: hostname, add-host, shm-size, tmpfs, memory and init in every spelling" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var why: []const u8 = "";
+
+    const o = try parse(arena, "--hostname build-1.local --add-host db:10.0.0.5 " ++
+        "--add-host=cache=10.0.0.6 --shm-size 1g --memory 512m --init " ++
+        "--tmpfs /run:rw,noexec,size=64m --tmpfs /scratch --tmpfs=/fast:exec,mode=0755,ro", &why);
+    try std.testing.expectEqualStrings("build-1.local", o.hostname.?);
+    try std.testing.expectEqual(@as(usize, 2), o.add_hosts.len);
+    try std.testing.expectEqualStrings("db", o.add_hosts[0].name);
+    try std.testing.expectEqualStrings("10.0.0.5", o.add_hosts[0].ip);
+    try std.testing.expectEqualStrings("cache", o.add_hosts[1].name);
+    try std.testing.expectEqual(@as(?u64, 1 << 30), o.shm_size);
+    try std.testing.expectEqual(@as(?u64, 512 << 20), o.memory);
+    try std.testing.expectEqual(@as(u32, 1), o.no_effect);
+    try std.testing.expectEqual(@as(usize, 3), o.tmpfs.len);
+    try std.testing.expectEqualStrings("/run", o.tmpfs[0].target);
+    try std.testing.expectEqual(@as(u64, 64 << 20), o.tmpfs[0].size);
+    try std.testing.expect(!o.tmpfs[0].exec and !o.tmpfs[0].read_only);
+    try std.testing.expectEqual(@as(u32, 0o1777), o.tmpfs[1].mode);
+    try std.testing.expect(o.tmpfs[2].exec and o.tmpfs[2].read_only);
+    try std.testing.expectEqual(@as(u32, 0o755), o.tmpfs[2].mode);
+
+    // The short forms, and sizes as Docker writes them.
+    const s = try parse(arena, "-h box -m2G --shm-size=128MB --tmpfs //var//tmp/./x:size=1k", &why);
+    try std.testing.expectEqualStrings("box", s.hostname.?);
+    try std.testing.expectEqual(@as(?u64, 2 << 30), s.memory);
+    try std.testing.expectEqual(@as(?u64, 128 << 20), s.shm_size);
+    try std.testing.expectEqualStrings("/var/tmp/x", s.tmpfs[0].target);
+    try std.testing.expectEqual(@as(u64, 1024), s.tmpfs[0].size);
+    try std.testing.expectEqual(@as(?u64, 1 << 20), (try parse(arena, "--shm-size 1048576", &why)).shm_size);
+}
+
+test "options refused: unsafe or unreadable values of the honoured flags" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    // `host-gateway` is the host's address; IPv6 and non-addresses are not the jobs' network.
+    try expectRefused(arena, "--add-host db:host-gateway", "--add-host");
+    try expectRefused(arena, "--add-host db:::1", "--add-host");
+    try expectRefused(arena, "--add-host db", "--add-host");
+    try expectRefused(arena, "--add-host bad_name:10.0.0.1", "--add-host");
+    try expectRefused(arena, "--add-host db:300.0.0.1", "--add-host");
+    try expectRefused(arena, "--hostname -x", "--hostname");
+    try expectRefused(arena, "--hostname \"a b\"", "--hostname");
+    try expectRefused(arena, "--hostname aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--hostname");
+    try expectRefused(arena, "--shm-size 0", "--shm-size");
+    try expectRefused(arena, "--shm-size 1.5g", "--shm-size");
+    try expectRefused(arena, "--shm-size 10x", "--shm-size");
+    try expectRefused(arena, "--shm-size 99999999999t", "--shm-size");
+    try expectRefused(arena, "--memory 1m", "--memory");
+    try expectRefused(arena, "--memory lots", "--memory");
+    // A tmpfs stays inside the job's filesystem and the sandbox's own mounts.
+    try expectRefused(arena, "--tmpfs relative", "--tmpfs");
+    try expectRefused(arena, "--tmpfs /a/../etc", "--tmpfs");
+    try expectRefused(arena, "--tmpfs /", "--tmpfs");
+    try expectRefused(arena, "--tmpfs /proc/sys", "--tmpfs");
+    try expectRefused(arena, "--tmpfs /dev", "--tmpfs");
+    try expectRefused(arena, "--tmpfs /__w/r", "--tmpfs");
+    try expectRefused(arena, "--tmpfs /github/home", "--tmpfs");
+    try expectRefused(arena, "--tmpfs /t:suid", "--tmpfs");
+    try expectRefused(arena, "--tmpfs /t:dev", "--tmpfs");
+    try expectRefused(arena, "--tmpfs /t:uid=0", "--tmpfs");
+    try expectRefused(arena, "--tmpfs /t:size=big", "--tmpfs");
+    try expectRefused(arena, "--tmpfs /t:mode=9999", "--tmpfs");
+    try expectRefused(arena, "--tmpfs /t:mode=17777", "--tmpfs");
+    try expectRefused(arena, "--tmpfs /t --tmpfs /t/", "--tmpfs");
+}
+
 test "options refused, never ignored: what the sandbox does not carry out" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
     for ([_][]const u8{
-        "--cpus",         "--memory",   "--privileged", "--cap-add",   "--device",
-        "--security-opt", "--shm-size", "--ulimit",     "--network",   "--add-host",
-        "--hostname",     "--init",     "--tty",        "-t",          "-i",
-        "--volume",       "-v",         "--publish",    "-p",          "--entrypoint",
-        "--name",         "--env-file", "--label",      "--group-add", "--pid",
-        "--ipc",          "--gpus",     "--platform",   "--read-only", "--tmpfs",
-        "--sysctl",       "--dns",      "--mount",      "--pull",      "--userns",
+        "--cpus",         "--memory-swap",      "--privileged", "--cap-add",   "--device",
+        "--security-opt", "--cap-drop",         "--ulimit",     "--network",   "--net",
+        "--uts",          "--cpuset-cpus",      "--tty",        "-t",          "-i",
+        "--volume",       "-v",                 "--publish",    "-p",          "--entrypoint",
+        "--name",         "--env-file",         "--label",      "--group-add", "--pid",
+        "--ipc",          "--gpus",             "--platform",   "--read-only", "--dns",
+        "--sysctl",       "--oom-kill-disable", "--mount",      "--pull",      "--userns",
+        "--cgroupns",     "--cgroup-parent",    "--pids-limit", "--restart",   "--runtime",
     }) |flag| {
         // With a value and without, and among honoured flags: the flag is what is named.
         try expectRefused(arena, try std.fmt.allocPrint(arena, "{s} 1", .{flag}), flag);
@@ -558,6 +791,27 @@ test "unsupported: ports and volumes fall back, options by what they hold" {
     jc.options = .{ .lit = "-e A=1" };
     try std.testing.expect(unsupported(jc, true, &.{}) == null);
 
+    jc.options = .{ .lit = "--hostname h --add-host a:10.0.0.1 --shm-size 1g --tmpfs /x --init" };
+    try std.testing.expect(unsupported(jc, false, &.{}) == null);
+    // A tmpfs over, or under, a volume would hide it: not native.
+    jc.volumes = &.{.{ .lit = "/x/data" }};
+    try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false, &.{}).?, "--tmpfs") != null);
+    jc.volumes = &.{.{ .lit = "/y" }};
+    try std.testing.expect(unsupported(jc, false, &.{}) == null);
+    jc.volumes = &.{};
+
+    // The sandbox's own powers are not for a workflow to ask for: each goes to Dagger by name.
+    for ([_][]const u8{
+        "--privileged",   "--cap-add SYS_ADMIN", "--security-opt seccomp=unconfined", "--device /dev/kvm",
+        "--network host", "--net=host",          "--pid=host",                        "--ipc host",
+        "--userns host",  "--cpus 2",
+    }) |flag| {
+        jc.options = .{ .lit = flag };
+        const why = unsupported(jc, false, &.{}).?;
+        const name = flag[0 .. std.mem.indexOfAny(u8, flag, " =") orelse flag.len];
+        try std.testing.expect(std.mem.indexOf(u8, why, name) != null);
+        try std.testing.expect(std.mem.indexOf(u8, why, "drops") != null);
+    }
     jc.options = .{ .lit = "--privileged" };
     try std.testing.expect(std.mem.indexOf(u8, unsupported(jc, false, &.{}).?, "--privileged") != null);
     // Dagger reads none of `options:`: the note says the flag is dropped there, not carried out.

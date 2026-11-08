@@ -1449,7 +1449,8 @@ runner's behaviour as remembered, not re-read for this change.)
 `runner/src/native/container_options.zig` reads `options:`. A native job carries out or accepts only
 the flags below; **any other flag, a stray word, or an `options:` with an expression in it sends
 the job to Dagger, naming the flag in "Set up job"**. Dagger reads none of `options:`, so a flag
-sent there is dropped, not carried out, and the note says so (it also logs a warning, #368). A
+sent there is dropped, not carried out, and the note says so (it also logs a warning, #368, which
+a native job, that carries everything out, no longer logs). A
 `--user` the image does not know (a name or group missing from its `/etc/passwd` or `/etc/group`)
 fails the job, as `docker create` does, instead of falling back to run as root.
 
@@ -1459,7 +1460,41 @@ fails the job, as `docker create` does, instead of falling back to run as root.
 | `--user`/`-u` (`name`, `uid`, `name:group`, `uid:gid`) | Carried out: resolved in the image's own `/etc/passwd` and `/etc/group` as its `USER` is, over it. Refused on the runner's default image, whose step user is `RUNNER_STEP_USER`'s choice (that provisioning is not the container's). A rootless runner maps only root, so there it fails as an image `USER` does. The base makes `/__w` (workspace, `_temp`, the tool cache) as root and gives it to that user (the tool cache only when it is not that user's already, so an image's large `/opt/hostedtoolcache` is not copied up): GitHub mounts `/__w` from the host, so an image never has to carry a writable one. |
 | `--workdir`/`-w` | Understood, no effect: every step is `docker exec -w`, native steps take the same directory. Counted in "Set up job". |
 | `--health-cmd`, `--health-interval`, `--health-timeout`, `--health-start-period`, `--health-start-interval`, `--health-retries`, `--no-healthcheck` | Understood, no effect: nothing waits for a job container's health. Durations and counts are checked as Docker reads them; one it would refuse is refused. |
-| Everything else: `--cpus`, `--memory`, `--privileged`, `--cap-add`, `--security-opt`, `--device`, `--gpus`, `--ulimit`, `--shm-size`, `--network`, `--add-host`, `--dns`, `--hostname`, `--init`, `-t`/`-i`, `--entrypoint`, `--name`, `--label`, `--platform`, `--pull`, `--read-only`, `--tmpfs`, `--sysctl`, `--pid`, `--ipc`, `--userns`, `-v`/`--mount`, `-p`, `--env-file`, `--group-add` | Refused (Dagger). Each changes the container: limits, privileges, devices, networks and mounts are the sandbox's (`sandbox.zig`, `seccomp.zig`, `nft.zig`, the cgroup code), which this does not touch. |
+| `--hostname`/`-h` | Carried out: the steps' UTS hostname (`sethostname` in the step's own UTS namespace), and a line `127.0.0.1 <hostname>` in the job's hosts file, as Docker names the container in its own. A name Docker would refuse (RFC 1123, at most 64 characters) is refused. |
+| `--add-host name:ip` (also `name=ip`) | Carried out: a line in the job's hosts file (`Backend.writeHosts`), which the job's services share. An IPv4 address only; `host-gateway` (the host's address) and IPv6 are refused. The hosts file is the job's own, so a key of the job's layers differs per job (step caching does not replay across jobs that use it). |
+| `--shm-size` | Carried out: the size of the step's `/dev/shm` (a tmpfs, so memory the job's cgroup is charged for), over Docker's 64 MiB. A number of bytes or with `b`, `k`, `m`, `g`, `t`, whole numbers only; zero is refused. |
+| `--tmpfs path[:options]` | Carried out: a new tmpfs in each of the job's own steps (not a Docker action's container), the directory made if the image has none, **nosuid and nodev always** and noexec unless `exec` is given, as Docker mounts one; `size=` and `mode=` (default 1777), `rw`, `ro`. Refused: `suid`, `dev`, `uid=`, `gid=` and any other mount option, the root, a path under the runner's own mounts (`/__w`, `/__t`, `/__e`, `/github/...`) or the sandbox's (`/proc`, `/sys`, `/dev`), the same path twice, and a path at or beside a `volumes:` target (a tmpfs would hide the volume). |
+| `--memory`/`-m` | Carried out within the job's own cgroup: it lowers the job's `memory.max` to the value when that is below the runner's limit for a job (`RUNNER_NATIVE_MEMORY_MAX_MB`), and never raises it: above that limit the runner's holds, and "Set up job" says so. A job with no cgroup (`RUNNER_NATIVE_CGROUP=none`) fails instead of running without it. Below 6 MiB is refused, as Docker does. `--memory-swap` is not read (refused): a job may not swap anyway. |
+| `--init` | Understood, no effect: a step's first process is its shell, which does not reap other processes' orphans or forward signals as `tini` does; orphans are reaped when the step ends. Counted in "Set up job". |
+| **Security-sensitive, never native:** `--privileged`, `--cap-add`, `--cap-drop`, `--security-opt`, `--device`, `--device-cgroup-rule`, `--userns`, `--network`/`--net` (including `host`), `--pid`, `--ipc`, `--uts`, `--cgroup-parent`, `--cgroupns`, `--sysctl`, `--runtime`, `--gpus` | Refused, never honoured natively: each asks for more than the sandbox grants (capabilities and the seccomp filter, the user namespace, the job's own network, PID and IPC namespaces, the cgroup the runner makes) and the sandbox has no flag to widen them. The job goes to Dagger, with the flag named in "Set up job" and the fact that Dagger drops it (a job that needs one runs on Docker's runner instead). |
+| Everything else: `--cpus` (a cpu controller the job's cgroup does not have), `--cpuset-cpus`, `--ulimit`, `--pids-limit`, `--network-alias`, `-t`/`-i`, `--entrypoint` (it changes how the job container itself starts, which a native job does not have: its steps are the only processes), `--name`, `--label`, `--platform`, `--pull`, `--read-only`, `--dns`, `-v`/`--volume`/`--mount` (use `volumes:`), `-p`/`--publish` (use `ports:`), `--env-file`, `--group-add`, `--oom-kill-disable`, `--restart` | Refused (Dagger, which drops them): each changes the container beyond the options above, in a way the sandbox does not carry out. |
+
+**Which flags are in use (#352, 2026-11-08).** GitHub code search over public workflows
+(`.github/workflows`), `container:` and `services:` `options:` strings together. Files whose
+`options:` starts with the flag, by the search's own count (a loose count, in the order of
+magnitude): `--health-cmd` 19.9k, `--user` 8.2k, `--privileged` 7.7k, `-v` 1.5k, `--gpus` 1.5k,
+`--ipc` 1.4k, `--entrypoint` 0.9k, `--security-opt` 0.9k, `-e` 0.65k, `--shm-size` 0.6k,
+`--init` 0.56k, `--cap-add` 0.5k, `--cpus` 0.46k, `--name` 0.43k, `--device` 0.33k, `-u` 0.30k,
+`--platform` 0.29k, `--tmpfs` 0.25k, `--network` 0.14k, `--env` 0.1k, `--memory` 90, `--sysctl` 86,
+`--workdir` 80, `--hostname` 55, `--add-host` 46, `--ulimit` 37. And a sample of 3,495 files
+(300 per seed flag at most, so the ranks are the seeds' in part): of 1,611 job container
+`options:` strings whose key could be told, 193 carried only flags the native job honoured
+before this change, 427 carry only flags it honours now, and 865 hold a security flag
+(`--privileged`, `--cap-add`, `--security-opt`, `--device`, `--ipc`, `--gpus`...), which stay
+refused. Most-used in the sample's job containers: `--user` 295, `--security-opt` 307,
+`--privileged` 280, `--cap-add` 235, `--shm-size` 185, `--cpus` 167, `--ipc` 161, `--init` 155,
+`--device` 150, `--memory` 127, `--volume` 116, `--tmpfs` 56, `--entrypoint` 45. Services use
+`--health-*` far above the rest (`services.zig` honours them), then `--entrypoint` and `--volume`.
+That is what chose `--shm-size`, `--init`, `--tmpfs`, `--memory`, `--hostname` and
+`--add-host` for this change; `--cpus` (167) needs the cpu controller in the job's cgroup and is
+left for a change that can give the job one.
+
+**Never native, whatever the use.** `--privileged`, `--cap-add`, `--security-opt`, `--device`,
+`--userns`, `--network`, `--pid`, `--ipc` and `--uts` ask the container for more than the sandbox
+has, and the sandbox is what makes a job from a fork or a pull request safe to run on the
+host. They are refused with the flag named (`container_options.zig` knows no flag it does not
+carry out), the job goes to Dagger, which drops them, and with `RUNNER_ENGINE=none` it fails
+with the reason. A workflow that needs one belongs on a runner that is allowed to give it.
 
 `volumes:` and `ports:` are read from GitHub's runner (`ContainerInfo.cs`, `DockerCommandManager.DockerCreate`
 and `ContainerOperationProvider.cs` at actions/runner 5ba50443, read with `gh api` for #352): a
@@ -1733,8 +1768,12 @@ Services' `options:` are unchanged: they still log the flags they do not carry o
 (`services.zig`), as the Dagger path does. Making them refuse as the job container's do is a
 separate change.
 
-Tests: the flag table, in every spelling Docker reads, and a refusal for each of 35 flags in three
-spellings (`container_options.zig`); the volume grammar as GitHub's runner reads it, a refusal for
+Tests: the flag table, in every spelling Docker reads, a refusal for each of 40 flags in three
+spellings, and for the values of the honoured flags that are unsafe or unreadable, a security flag
+among them (`container_options.zig`); a job with `--hostname`, `--add-host`, `--shm-size`, `--tmpfs` and
+`--init` whose steps see them (hostname, hosts, `/proc/mounts` with nosuid, nodev and noexec, a
+tmpfs that executes only when asked), and one whose `--memory` lowers the job's `memory.max` and
+is capped at the runner's (`Backend.zig`, the second as root); the volume grammar as GitHub's runner reads it, a refusal for
 each entry above, and `unsupported`'s reasons for ports, volumes (with and without services),
 options and expressions (`container_options.zig`, `Backend.zig`); a native job with `--user app -e
 ... --workdir ... --health-*` that runs as the image's `app` user with the options' env over the

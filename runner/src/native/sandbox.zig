@@ -108,6 +108,29 @@ pub const Spec = struct {
     /// command, its first word found through the env's PATH as `docker run` finds it; otherwise
     /// `argv` runs under `/bin/sh`.
     container: ?Container = null,
+    /// A job container's `options:` the sandbox carries out (`container_options.zig`), for the
+    /// job's own steps: a Docker action's container has none of them, as on GitHub.
+    container_opts: ContainerOpts = .{},
+
+    /// `--hostname`, `--shm-size` and `--tmpfs`, as `docker create` sets them on the job container.
+    pub const ContainerOpts = struct {
+        /// The step's UTS hostname; empty keeps the host's.
+        hostname: []const u8 = "",
+        /// `/dev/shm`'s size in bytes; 0 for the default (`default_shm_size`).
+        shm_size: u64 = 0,
+        tmpfs: []const Tmpfs = &.{},
+    };
+
+    /// One `--tmpfs`: a new tmpfs at `path`, made if missing, mounted nosuid and nodev, and
+    /// noexec unless asked otherwise, as Docker mounts one.
+    pub const Tmpfs = struct {
+        path: []const u8,
+        /// Bytes; 0 for the kernel's default (half the memory, charged to the job's cgroup).
+        size: u64 = 0,
+        mode: u32 = 0o1777,
+        exec: bool = false,
+        read_only: bool = false,
+    };
 
     pub const Bind = struct {
         host: []const u8,
@@ -667,6 +690,10 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper, early: []const u
     // 2. The step's own namespaces, owned by the user namespace; its first process is PID 1.
     check("unshare(mount, pid, uts, ipc)", linux.unshare(linux.CLONE.NEWNS | linux.CLONE.NEWPID |
         linux.CLONE.NEWUTS | linux.CLONE.NEWIPC));
+    if (spec.container == null and spec.container_opts.hostname.len > 0) {
+        const name = spec.container_opts.hostname;
+        check("set the hostname", linux.syscall2(.sethostname, @intFromPtr(name.ptr), name.len));
+    }
     makePrivate();
     const merged = z(arena, topOf(spec));
     // The overlay bound onto itself, a mount of this namespace's own: on a root runner it was
@@ -688,6 +715,7 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper, early: []const u
         bindAll(arena, spec, null);
         marks.binds = phases.now();
     }
+    if (spec.container == null) for (spec.container_opts.tmpfs) |t| mountTmpfs(arena, root, t);
     var secrets = false;
     for (spec.files) |f| secrets = secrets or !f.keep;
     if (secrets) check("mount the tmpfs for secret files", linux.mount(
@@ -725,7 +753,7 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper, early: []const u
         else
             .{ .search = .{ .name = spec.argv[0], .env = env } };
         const in_image = spec.container != null;
-        stepInit(arena, root, workdir, spec.uid, spec.gid, spec.groups, nnp, alive[0], in_image, program, argv, envp);
+        stepInit(arena, root, shmSize(spec), workdir, spec.uid, spec.gid, spec.groups, nnp, alive[0], in_image, program, argv, envp);
     }
     _ = linux.close(alive[0]);
     const st = if (spec.service) |s|
@@ -1405,6 +1433,7 @@ const Warning = struct {
 fn stepInit(
     arena: Allocator,
     root: linux.fd_t,
+    shm_size: u64,
     workdir: [*:0]const u8,
     uid: u32,
     gid: u32,
@@ -1417,7 +1446,7 @@ fn stepInit(
     envp: [*:null]const ?[*:0]const u8,
 ) noreturn {
     armParentDeath(alive);
-    makeDev(arena, root);
+    makeDev(arena, root, shm_size);
     mountIn(arena, root, "/proc", "proc", "proc", linux.MS.NOSUID | linux.MS.NODEV |
         linux.MS.NOEXEC, null);
     // The host's /sys, read-only with every mount under it, as BuildKit mounts sysfs read-only.
@@ -1623,9 +1652,32 @@ pub fn installSeccomp() void {
     check("install the seccomp filter", seccomp.install());
 }
 
+/// Docker's default `/dev/shm`, which `--shm-size` replaces.
+pub const default_shm_size: u64 = 64 << 20;
+
+/// `/dev/shm`'s size for the step: `--shm-size` of the job container's options, for its own steps.
+fn shmSize(spec: Spec) u64 {
+    const asked = spec.container_opts.shm_size;
+    return if (spec.container == null and asked > 0) asked else default_shm_size;
+}
+
+/// One `--tmpfs` of the job container: its mount point made when the overlay has none, then a
+/// tmpfs there, nosuid and nodev as Docker's always is (`Tmpfs.exec`, `Tmpfs.read_only`).
+fn mountTmpfs(arena: Allocator, root: linux.fd_t, t: Spec.Tmpfs) void {
+    makeDirsIn(arena, root, t.path, null);
+    var flags: u32 = linux.MS.NOSUID | linux.MS.NODEV;
+    if (!t.exec) flags |= linux.MS.NOEXEC;
+    if (t.read_only) flags |= linux.MS.RDONLY;
+    const data = if (t.size > 0)
+        std.fmt.allocPrintSentinel(arena, "mode={o},size={d}", .{ t.mode, t.size }, 0) catch oom()
+    else
+        std.fmt.allocPrintSentinel(arena, "mode={o}", .{t.mode}, 0) catch oom();
+    mountIn(arena, root, t.path, "tmpfs", "tmpfs", flags, data);
+}
+
 /// A /dev of the nodes a step needs, bound from the host's, as runc builds one: not the host's
 /// whole /dev, which would hand a step its disks.
-fn makeDev(arena: Allocator, root: linux.fd_t) void {
+fn makeDev(arena: Allocator, root: linux.fd_t, shm_size: u64) void {
     const ms = linux.MS;
     mountIn(arena, root, "/dev", "tmpfs", "tmpfs", ms.NOSUID | ms.NOEXEC, "mode=755,size=65536k");
     for ([_][]const u8{ "null", "zero", "full", "random", "urandom", "tty" }) |name| {
@@ -1643,7 +1695,8 @@ fn makeDev(arena: Allocator, root: linux.fd_t) void {
     mountIn(arena, root, "/dev/pts", "devpts", "devpts", ms.NOSUID | ms.NOEXEC, "newinstance," ++
         "ptmxmode=0666,mode=0620");
     const shm_flags = ms.NOSUID | ms.NODEV | ms.NOEXEC;
-    mountIn(arena, root, "/dev/shm", "shm", "tmpfs", shm_flags, "mode=1777,size=65536k");
+    const shm_data = std.fmt.allocPrintSentinel(arena, "mode=1777,size={d}", .{shm_size}, 0) catch oom();
+    mountIn(arena, root, "/dev/shm", "shm", "tmpfs", shm_flags, shm_data);
     const links = [_][2][*:0]const u8{
         .{ "pts/ptmx", "ptmx" },
         .{ "/proc/self/fd", "fd" },
