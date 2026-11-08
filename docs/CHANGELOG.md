@@ -10,6 +10,10 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.28.1 - 2026-11-08
+### Fixed
+* The runner no longer aborts with "integer overflow" at the first job end after a start, when the memory gate first writes what it learned (v0.28.0); each pool on a machine keeps its learned sizes in a file of its own, memory-gate-<RUNNER_NAME_PREFIX>
+
 ## v0.28.0 - 2026-11-08
 ### Added
 * A TLA+ model of the release pipeline as #408 has it (proofs/tla/ReleasePipeline.tla), checked by TLC in CI with its mutants: tags only checked commits, deploys only checked releases, waits for the current check names, and ends every wait

@@ -1,3 +1,0 @@
-kind: Fixed
-body: The runner no longer aborts with "integer overflow" at the first job end after a start, when the memory gate first writes what it learned (v0.28.0); each pool on a machine keeps its learned sizes in a file of its own, memory-gate-<RUNNER_NAME_PREFIX>
-time: 2026-11-08T01:12:13.830193576-05:00
