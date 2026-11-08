@@ -185,8 +185,11 @@ pub fn pool(c: Runner, n: u32) !Exit {
             return .config;
         }
         // What jobs took on earlier runs, so a restart does not reserve the worst case again (#407).
-        const path = try std.fmt.allocPrint(c.arena, "{s}/memory-gate", .{
+        // One file per pool: pools on one machine share the store's directory (razorbill's prod,
+        // ci and bench), and each learns its own jobs, on its own backend.
+        const path = try std.fmt.allocPrint(c.arena, "{s}/memory-gate-{s}", .{
             try c.cfg.nativeStore(c.arena, c.environ),
+            try poolFileName(c.arena, c.cfg.name_prefix),
         });
         switch (m.restore(path)) {
             .absent => try say(c, "memory gate: no learned job sizes in {s} yet", .{path}),
@@ -1290,6 +1293,29 @@ fn withSlash(arena: Allocator, url: []const u8) ![]const u8 {
 fn deleteSession(c: Runner, base: []const u8, sid: []const u8, token: []const u8) void {
     const url = std.fmt.allocPrint(c.arena, "{s}session?sessionId={s}", .{ base, sid }) catch "";
     _ = broker.call(c.arena, c.io, .DELETE, url, token, null) catch {};
+}
+
+/// `prefix` (`RUNNER_NAME_PREFIX`) as a file name: letters, digits, `_`, `-` and `.` as they are,
+/// anything else as `_`, and "zig" for an empty one, so no prefix can name a path elsewhere.
+fn poolFileName(arena: Allocator, prefix: []const u8) ![]const u8 {
+    if (prefix.len == 0) return "zig";
+    const out = try arena.dupe(u8, prefix);
+    for (out) |*ch| {
+        if (!std.ascii.isAlphanumeric(ch.*) and ch.* != '_' and ch.* != '-' and ch.* != '.') ch.* = '_';
+    }
+    if (out[0] == '.') out[0] = '_';
+    return out;
+}
+
+test "the memory gate's file is the pool's own, and its name cannot leave the directory" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    try std.testing.expectEqualStrings("zig-ci", try poolFileName(arena, "zig-ci"));
+    try std.testing.expectEqualStrings("pibench", try poolFileName(arena, "pibench"));
+    try std.testing.expectEqualStrings("_._x_y", try poolFileName(arena, "../x/y"));
+    try std.testing.expectEqualStrings("_hidden", try poolFileName(arena, ".hidden"));
+    try std.testing.expectEqualStrings("zig", try poolFileName(arena, ""));
 }
 
 test "backoffSecs doubles from 5s up to 5 minutes" {
