@@ -20,6 +20,7 @@
 const std = @import("std");
 const job_mod = @import("../job.zig");
 const action = @import("../action.zig");
+const expr = @import("../expr.zig");
 const dagger = @import("../dagger.zig");
 const Backend = @import("Backend.zig");
 const sandbox = @import("sandbox.zig");
@@ -42,7 +43,10 @@ pub fn key(arena: Allocator, u: job_mod.Uses) ![]const u8 {
 pub fn preload(b: *Backend, job: job_mod.Job, js_runtime: config.JsRuntime) !?[]const u8 {
     b.js_runtime = js_runtime;
     for (job.steps) |step| switch (step.action) {
-        .uses => |u| if (try reasonFor(b, job, u, 0)) |why| return why,
+        // A step that never runs (`if: false`) fetches and pulls nothing (#351).
+        .uses => |u| if (!try expr.neverTrue(b.arena, step.condition)) {
+            if (try reasonFor(b, job, u, 0)) |why| return why;
+        },
         else => {},
     };
     return null;
@@ -115,6 +119,7 @@ fn judge(
             }, label);
         },
         .composite => |steps| for (steps) |st| {
+            if (st.condition) |c| if (try expr.neverTrue(arena, c)) continue;
             const text = st.uses orelse continue;
             const parsed = action.parseUses(text) orelse continue;
             switch (parsed) {
@@ -682,7 +687,11 @@ test "preload: a JavaScript action, a local one, or an image not in the store se
     const Case = struct { step: job_mod.Step, why: ?[]const u8 };
     var local = testStep("");
     local.action = .{ .uses = .{ .owner = "", .name = "", .path = "act", .ref = "", .local = true } };
+    // The same action in a step that never runs is not looked at (#351).
+    var never = usesStep("f", "o", "far", "v1", &.{});
+    never.condition = "false";
     for ([_]Case{
+        .{ .step = never, .why = null },
         .{ .step = usesStep("j", "o", "js", "v1", &.{}), .why = "o/js@v1 is a JavaScript action" },
         .{ .step = local, .why = "is not in o/r at" },
         .{ .step = usesStep("f", "o", "far", "v1", &.{}), .why = "zr-test/other:1 is not in the tests' images directory" },

@@ -2767,6 +2767,20 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
   the sandbox, with the test's bare repositories bound there, so the loader's tests run the real
   git fetch in both native passes and never reach Dagger.
 
+- **Only what can run decides the fallback (#351).** The pre-check pulled the image of every
+  `docker://` step, so one whose `if: false` never ran could still send the whole job to Dagger
+  when its image could not be pulled. It now leaves out a step whose condition has one value,
+  false: no context, no status function (`failure()` is true once a step failed), no `hashFiles`
+  (`expr.neverTrue`, which looks at the parsed expression: a condition on a context has a value
+  at run time that no check before the job knows). The same goes for the
+  `uses:` steps `actions.preload` fetches and judges, and for a composite action's steps. The
+  pull stays in the pre-check for a step that may run, and is not made lazy at the step: the
+  decision between the backends is made before the job starts, and a step that fails to pull
+  half-way through would have run the steps before it natively, with no way back to Dagger; a
+  failed pull is a reason for Dagger, which the engine's own mirror or login may still pull.
+  What a condition on a context decides (`github.event_name == 'push'` on a pull request) is not
+  known before the job: that step's image is still pulled.
+
 ### P7: JavaScript and local actions
 
 - **Mounts were the whole difference.** Dagger's JavaScript path is a script plus mounts: the

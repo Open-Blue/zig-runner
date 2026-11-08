@@ -19,6 +19,7 @@ const dagger = @import("../dagger.zig");
 const Backend = @import("Backend.zig");
 const sandbox = @import("sandbox.zig");
 const images = @import("images.zig");
+const expr = @import("../expr.zig");
 const Exec = @import("../dagger/Exec.zig");
 const SpanDemux = @import("../dagger/JobLog.zig").SpanDemux;
 const scripts = @import("../dagger/scripts.zig");
@@ -52,8 +53,16 @@ pub fn unsupported(
     job: job_mod.Job,
     cfg: Backend.Config,
 ) !?[]const u8 {
-    for (job.steps) |step| switch (step.action) {
-        .docker => |d| switch (try find(arena, gpa, io, cfg.images, cfg.store, d.image, null)) {
+    for (job.steps) |step| {
+        const d = switch (step.action) {
+            .docker => |d| d,
+            else => continue,
+        };
+        // A step that never runs (`if: false`) pulls nothing: a failed pull would send the whole
+        // job to Dagger for an image no step uses (#351). A step that may run is pulled, as a
+        // pull that fails is Dagger's to try, and the job cannot start natively without it.
+        if (try expr.neverTrue(arena, step.condition)) continue;
+        switch (try find(arena, gpa, io, cfg.images, cfg.store, d.image, null)) {
             .missing => |why| return why,
             // GitHub's documentation asks for root ("Docker actions must be run by the default
             // Docker user"); Dagger's path gives another USER the directories it writes, which
@@ -64,9 +73,8 @@ pub fn unsupported(
                     "yet",
                 .{ d.image, img.user },
             ),
-        },
-        else => {},
-    };
+        }
+    }
     return null;
 }
 
@@ -781,4 +789,69 @@ test "on a root runner, what a Docker action writes in the workspace is the runn
     errdefer std.debug.print("{s}\n", .{w2.written()});
     for (res2.steps) |st| try std.testing.expectEqual(dagger.Outcome.success, st.outcome);
     try std.testing.expect(std.mem.indexOf(u8, w2.written(), "wrote its output") != null);
+}
+
+test "unsupported: a docker:// step that never runs pulls nothing and decides nothing" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try testImage(arena, &tmp, "zr-test/root:1", "{\"config\":{\"User\":\"0:0\"}}");
+    _ = try testImage(arena, &tmp, "zr-test/user:1", "{\"config\":{\"User\":\"actionuser\"}}");
+    const missing = "zr-test/missing:1 is not in";
+    const Case = struct { condition: []const u8, image: []const u8, why: ?[]const u8 };
+    for ([_]Case{
+        // Never true: not looked at, whether the image is missing or a user's.
+        .{ .condition = "false", .image = "zr-test/missing:1", .why = null },
+        .{ .condition = "${{ 1 == 2 }}", .image = "zr-test/missing:1", .why = null },
+        .{ .condition = "false", .image = "zr-test/user:1", .why = null },
+        // It may run, whatever the job's state or contexts say: judged as before.
+        .{ .condition = "success()", .image = "zr-test/missing:1", .why = missing },
+        .{ .condition = "failure()", .image = "zr-test/missing:1", .why = missing },
+        .{ .condition = "github.event_name == 'push'", .image = "zr-test/missing:1", .why = missing },
+        .{ .condition = "hashFiles('x') == 'y'", .image = "zr-test/missing:1", .why = missing },
+        .{ .condition = "true", .image = "zr-test/root:1", .why = null },
+    }) |c| {
+        var s = dockerStep(c.image, &.{});
+        s.condition = c.condition;
+        // A step after it, which runs: the one that decides.
+        const job = testJob(&.{ s, dockerStep("zr-test/root:1", &.{}) });
+        const why = try unsupported(arena, std.testing.allocator, std.testing.io, job, .{ .images = dir });
+        errdefer std.debug.print("{s}: {?s}\n", .{ c.condition, why });
+        if (c.why) |want| {
+            try std.testing.expect(std.mem.indexOf(u8, why.?, want) != null);
+        } else try std.testing.expect(why == null);
+    }
+}
+
+test "a job whose docker:// step never runs stays native, though its image cannot be pulled" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    cfg.images = try testImage(arena, &tmp, "zr-test/tool:1",
+        \\{"config":{"Env":["PATH=/usr/bin:/bin"],"Entrypoint":["/bin/sh","-c"],"Cmd":["echo ran in image"]}}
+    );
+    var dead = dockerStep("zr-test/missing:1", &.{});
+    dead.condition = "false";
+    // The step that runs follows, so a job the pre-check leaves to the native backend runs it.
+    const job = testJob(&.{ dead, dockerStep("zr-test/tool:1", &.{}) });
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const text = w.written();
+    errdefer std.debug.print("{s}\n", .{text});
+    try std.testing.expectEqual(dagger.Outcome.skipped, res.steps[0].outcome);
+    try std.testing.expectEqual(dagger.Outcome.success, res.steps[1].outcome);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Engine: native") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "This job runs on Dagger") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ran in image") != null);
 }
