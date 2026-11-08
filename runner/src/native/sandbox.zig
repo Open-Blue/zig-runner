@@ -114,9 +114,10 @@ pub const Spec = struct {
         read_only: bool = true,
         /// Only over a file or directory the image has: making one would put it in the layer.
         optional: bool = false,
-        /// A cache volume (`volumes.zig`): nosuid and nodev, and on a root runner its files'
-        /// on-disk ids are the volumes' range (`Spec.volume_id_base`), seen as the job's own
-        /// through an idmapped mount, so a volume filled in one slot is the next slot's too.
+        /// A cache volume or a job container's named one (`volumes.zig`): nosuid and nodev,
+        /// read-only only when `read_only` is (a named `:ro` one), and on a root runner its
+        /// files' on-disk ids are the volumes' range (`Spec.volume_id_base`), seen as the job's
+        /// own through an idmapped mount, so a volume filled in one slot is the next slot's too.
         volume: bool = false,
         /// A cache volume's root, `<store>/volumes`: `host` is below it. Reached as the operator
         /// set it up, links and all; from there on no link is followed (`openVolume`).
@@ -750,7 +751,7 @@ fn bindAll(arena: Allocator, spec: Spec, volume_ns: ?linux.fd_t) void {
         if (spec.container != null and bd.volume) continue;
         if (bd.make and spec.container == null) makeDirsIn(arena, root, bd.at, owner);
         if (bd.volume) {
-            bindVolumeIn(arena, root, bd.volume_root, bd.host, bd.at, volume_ns);
+            bindVolumeIn(arena, root, bd.volume_root, bd.host, bd.at, bd.read_only, volume_ns);
             continue;
         }
         const required = !bd.optional and spec.container == null;
@@ -782,15 +783,16 @@ fn openVolume(arena: Allocator, volume_root: []const u8, host: []const u8) union
     };
 }
 
-/// A cache volume at `at`, writable, nosuid and nodev, and idmapped through `userns` when given:
-/// a detached clone of the host's directory, its attributes set in one `mount_setattr`, then
-/// moved into place. Fails the step when it cannot.
+/// A volume at `at`, writable unless `read_only` (a job container's `name:/path:ro`), nosuid and
+/// nodev, and idmapped through `userns` when given: a detached clone of the host's directory, its
+/// attributes set in one `mount_setattr`, then moved into place. Fails the step when it cannot.
 fn bindVolumeIn(
     arena: Allocator,
     root: linux.fd_t,
     volume_root: []const u8,
     host: []const u8,
     at: []const u8,
+    read_only: bool,
     userns: ?linux.fd_t,
 ) void {
     const volume = switch (openVolume(arena, volume_root, host)) {
@@ -807,10 +809,12 @@ fn bindVolumeIn(
     );
     check(about(arena, "clone the cache volume for", at), tree);
     defer _ = linux.close(@intCast(tree));
+    const rdonly = 0x1;
     const nosuid = 0x2;
     const nodev = 0x4;
     const idmap = 0x00100000;
     var attr: MountAttr = .{ .set = nosuid | nodev };
+    if (read_only) attr.set |= rdonly;
     if (userns) |ns| {
         attr.set |= idmap;
         attr.userns_fd = @intCast(ns);

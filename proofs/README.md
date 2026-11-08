@@ -353,17 +353,20 @@ one rename of a complete entry, an eviction one entry removed, a reader takes an
 misses (`Native.Op`, `ops_keep_honest`, `Torn`), and `race_irrelevant` shows which of two racing
 writers wins does not matter. Those are hypotheses about the system calls under it, with several
 runners sharing one store and any of them dying between any two calls. `tla/StoreLocking.tla` is a
-TLA+ model of that layer, checked with TLC, and what it shows is what lets the Lean model have whole
-entries:
+TLA+ model of that layer, and what it shows is what lets the Lean model have whole entries. Its
+safety configurations are checked with SPIN, on a Promela port of the module that reaches exactly
+the same states ("The store's locking, in SPIN", below), and its liveness with TLC:
 
 ```
-.github/scripts/tlc.sh    # fetches tla2tools.jar v1.7.4, checks its sha256, runs every configuration
+.github/scripts/spin.sh   # SPIN 6.5.2: StoreLocking's safety configurations and its mutants
+.github/scripts/tlc.sh    # fetches tla2tools.jar v1.7.4, checks its sha256, runs the rest
+TLC_ALL=1 .github/scripts/tlc.sh   # ... and StoreLocking's safety with TLC too
 ```
 
-CI runs it (`store-model.yml`) on pull requests and pushes that touch `runner/src/native/Store.zig`,
+CI runs them (`store-model.yml`) on pull requests and pushes that touch `runner/src/native/Store.zig`,
 `Backend.zig`, `layers.zig`, `evict.zig`, `volumes.zig`, `oci/Store.zig` or the model, and weekly with
-the proofs. It is not a proof: TLC
-explores every state of a bounded instance, and the bounds are below.
+the proofs. It is not a proof: SPIN and TLC
+explore every state of a bounded instance, and the bounds are below.
 
 **What is modelled**, each action citing the code it stands for (file:line, in the module):
 
@@ -425,8 +428,8 @@ explores every state of a bounded instance, and the bounds are below.
 | `WaitEnds` | a claim waiting on its key's lock gets it, is cancelled, or its process dies: a holder that finishes or crashes lets it go on (weak fairness of each process) |
 | `AllEnd` | every job ends, so no blocking flock waits for ever |
 
-And seven mutants, each the code with one guard taken away, which TLC must reject with the
-invariant the configuration's first line names (`tlc.sh` fails if it does not, so a model that
+And seven mutants, each the code with one guard taken away, which SPIN (and TLC) must reject with the
+invariant the configuration's first line names (`spin.sh` fails if it does not, so a model that
 could no longer see a broken protocol fails CI): `StoreLocking-unlocked-build.cfg` (`layers.zig`'s
 publish without the key's lock, as it was: `NoWrongValid`), `StoreLocking-unchecked-evict.cfg`
 (`Store.evict` without `sameFile` after its exclusive lock, as it was: `HeldIntact`),
@@ -455,17 +458,41 @@ Everything at once would be too large to check in CI (over 30 million states, un
 minutes, with a build key and two steps a job beside a machine's crash), so `-crash` has the
 machine's crash with one key and one step, and `-faults` the two steps, the build key, a sync error
 and an older format's entry without it: no run has two steps a job and a machine's crash together.
-Each configuration is a few minutes or less on a laptop ("cowbird", 12 threads, under load,
-`-workers auto`, 2026-11-06):
+Each configuration is two minutes or less on a laptop ("cowbird", 12 threads, `-workers auto`,
+`-Xmx8g`, 2026-11-07), and on GitHub's 4-core runner about 1.5 times that:
 
-| Configuration | Distinct states | Depth | Time |
-|---|---|---|---|
-| `StoreLocking.cfg` | 2,117,662 | 112 | 47 s |
-| `StoreLocking-crash.cfg` | 6,545,285 | 140 | 1 min 46 s |
-| `StoreLocking-faults.cfg` | 4,582,934 | 138 | 1 min 20 s |
-| `StoreLocking-boot-check.cfg` | 205,674 | 136 | 4 s |
-| `StoreLocking-liveness.cfg` | 159,488 | 74 | 23 s |
-| the seven mutants | under 50,000 each, to the first violation | | seconds |
+| Configuration | Distinct states | Depth | Time | Without the symmetry |
+|---|---|---|---|---|
+| `StoreLocking.cfg` | 2,754,585 | 112 | 56 s | 16,495,442 (5.99 times: 3 runners, 6 orders) |
+| `StoreLocking-crash.cfg` | 7,337,252 | 140 | 1 min 53 s | 14,674,008 (2.00 times) |
+| `StoreLocking-faults.cfg` | 5,379,277 | 142 | 1 min 28 s | 10,758,378 (2.00 times) |
+| `StoreLocking-boot-check.cfg` | 191,178 | 136 | 5 s | 382,279 (2.00 times) |
+| `StoreLocking-liveness.cfg` | 167,362 | 74 | 23 s | (no symmetry) |
+| the seven mutants | under 50,000 each, to the first violation | | seconds | |
+
+**The runners' symmetry** (`ProcSymmetry`, safety only): TLC keeps one state of each set of states
+that differ only in which runner is which, which is sound only if nothing in the model tells the
+runners apart. Before the times above it did not hold: `collect` and the check after a
+boot took the next directory of their listing with a `CHOOSE` over its ids, which name the runner
+that made it, so readdir's order was by the runners' names. `StoreLocking-boot-check.cfg` then had
+536,011 states without the symmetry and 205,674 with it, fewer than the 268,006 sets of at most two
+that two runners leave: TLC left behaviours of the model unexplored, and `-crash` (19,218,025
+states without it, 6,545,285 with) and `-faults` the same way; their counts even varied from run to
+run (`-crash` 6,543,505 to 6,547,430, `-faults` 4,582,934 to 4,610,311), as which state of a set TLC
+kept depended on which its workers found first. The order is now the lister's
+(`First`): by the step that made a directory, its epoch, and the lister's own before the other
+runners', with two other runners' directories alike in all three in either order. Nothing else names a
+runner: the `CHOOSE`s left are over keys, or over `Pub(k)`, which has one entry at most (`OnePub`). The
+counts above show it: without the symmetry, every configuration has twice its states with it (two
+runners), less the few hundred states that swapping the runners leaves as they are (77 to 496), or
+six times (three). Two
+other fixed orders were measured and left: by step and epoch alone, ties in either order (9,206,560
+states for `-crash`), and each runner's directories in order but the runners' interleaved
+(15,031,366, more than the model without the symmetry takes). Each is as arbitrary as readdir's, and
+the one taken is the cheapest that is sound. The mutants have no symmetry, and each still fails with
+its invariant. A bug only the runner `p1` has (`evict` without its `sameFile`, in
+`StoreLocking-unchecked-evict.cfg`'s bounds with the check on for the others) is found with the
+symmetry too (`HeldIntact`, 19,826 states; 39,506 without).
 
 Two larger runs were made while the model was written and are left out of CI for its time: three
 runners with a hand's change (6.7 million states, 3 minutes, no error), and three runners with two
@@ -543,6 +570,72 @@ into the job's own directory; a hand deleting an entry's lock file (`evict` woul
 entry a job holds: the store is the runner's alone, `Store.prepare`); readdir returning an entry
 twice; and more runners, keys or steps than the bounds.
 
+### The store's locking, in SPIN
+
+CI checks `StoreLocking`'s safety with SPIN 6.5.2, not TLC: `proofs/spin/StoreLockingModel.pml`
+is the module in Promela, action for action, and `.github/scripts/spin.sh` checks every safety
+configuration and every mutant with it, side by side on the machine's cores. TLC still checks
+`StoreLocking-liveness.cfg` (SPIN's weak fairness is per process, and would force the crashes and
+the hand's changes, which the module never forces). `StoreLocking.tla` stays the documented model:
+the actions above, their comments and the code they cite are the module's, and the port says only
+how it encodes them.
+
+**Kept in step.** A change to one is a change to the other, in the same pull request:
+
+- The configurations are the `.cfg` files. `proofs/spin/cfg.py` writes each
+  `proofs/spin/StoreLocking*.pml` from the `.cfg` of the same name (constants as `#define`s, the
+  invariants it lists, the "must fail" line), and `spin.sh` fails when one is stale, missing or left
+  over, so the two have the same configurations and mutants. A new mutant is a new `.cfg`, then
+  `cfg.py`.
+- Each configuration that must hold says how many states it has without the symmetry
+  (`states without symmetry:`, TLC's count), and SPIN must find exactly that many and one more
+  (SPIN's first state, before `init` sets the variables): a change to the Promela that the TLA+
+  does not have, or the other way round, changes one count and not the other. After a change to
+  the module, run `TLC_ALL=1 .github/scripts/tlc.sh` with `SYMMETRY` taken out of the
+  configurations for the new counts, change the Promela, and the counts must agree.
+
+**Faithful, by the counts.** With partial order reduction off and no symmetry (SPIN has none),
+SPIN's states are TLC's without the symmetry, plus one, in every configuration, including each
+mutant run to the end with its invariant off:
+
+| Configuration | TLC, no symmetry | SPIN |
+|---|---|---|
+| `StoreLocking.cfg` | 16,495,442 | 16,495,443 |
+| `StoreLocking-crash.cfg` | 14,674,008 | 14,674,009 |
+| `StoreLocking-faults.cfg` | 10,758,378 | 10,758,379 |
+| `StoreLocking-boot-check.cfg` | 382,279 | 382,280 |
+| the seven mutants, no invariant | 521,379, 1,593, 1,034, 6,683, 3,814, 46,604, 8,040 | each one more |
+
+And every mutant fails with the assertion of the invariant its first line names. What makes the
+counts equal: each variable of the module is a variable here, its sets bit masks over the same
+elements and its strings numbers (the encoding is in the port's header), nothing else is in SPIN's
+state (the runners' and the environment's program counters stay at their loops' heads between
+steps, and the temporaries a step uses are `hidden` or set back to 0), and each action is one
+step: a `d_step`, or for a choice the module makes with `\E` over directories or subsets, an
+`atomic` that chooses and then does the rest in one `d_step`. A deadlock is the same to both: the
+runners are never at an end label, and the module's step of a terminated system is the
+environment's. Where the module's `CHOOSE` picks among more than one value (`dropKeyLocks`' next
+key, with two keys), SPIN takes the least; the counts for `StoreLocking.cfg` and `-faults` show
+that TLC's choice gives the same graph.
+
+**Time**, `StoreLocking-crash.cfg` on the laptop (cowbird, 12 threads, 2026-11-07, load under 4):
+
+| | laptop | 4 cores (`taskset -c 0-3`) |
+|---|---|---|
+| TLC, with the symmetry (7,337,252 states), `-workers auto`/`4`, `-Xmx8g` | 111 s | 217 s |
+| SPIN, one core, exhaustive (14,674,009 states) | 22 s | 22 s |
+| SPIN, `-DNCORE=4` (`spin -DNOHIDDEN`) | 11 s | 12 s |
+| SPIN, `-DNCORE=8` | 8 s | |
+| compiling `pan.c` (gcc 15.2, `-O2`) | 10 to 14 s | |
+
+The whole of `spin.sh`, the four configurations that must hold and the seven mutants, compiles
+included, takes 61 s on the laptop and 75 s on 4 cores; TLC took 4 min 22 s for the four
+configurations alone, one after another on the laptop. `spin.sh` runs the configurations side by
+side, one a core, rather than SPIN's multi-core search, which is faster for one configuration but
+needs every temporary in the state. Partial order reduction is off: it reduces nothing (every step
+reads or writes the shared store) and costs a quarter of the time. Bitstate and hash compaction
+(`-DBITSTATE`, `-DHC4`) are not used: on `-crash` they missed 470 and 134,163 states.
+
 
 ### Eviction beside the layers
 
@@ -593,6 +686,11 @@ which no one synced and which is only a cache; and a published tree's data, sync
 as a layer's is, which `StoreLocking.tla` models for layers and the store's crash test runs on ext4.
 The bounds are small: three runners, one job each and a process crash, and two runners with a
 machine's crash. It is not a proof beyond them.
+
+Its runners' symmetry is sound: no expression names a runner (its `CHOOSE`s are over keys and dead
+trees, which name none), and the counts agree. Without the symmetry `StoreEviction.cfg` has 3,109,886
+states (5.58 times its 557,195; three runners, at most six), `-nested` 955,704 (5.57 times 171,460) and
+`-crash` 7,379,839 (1.98 times 3,727,288; two runners).
 
 ## The release pipeline, in TLA+
 
@@ -658,16 +756,40 @@ so (it has started; `ApprovalHoldsGroup = TRUE`), and checks the weaker reading 
 | `TagJobEnds` | an approved tag job ends: it tags, or fails naming a reason (weak fairness of GitHub's and the jobs' steps) |
 | `DeployEnds` | a release that tagged deploys, or fails where it shows (a job failed) |
 
-**Bounds and results** (cowbird, `-Xmx4g`, 2026-11-07): `WaitTicks = 2`, `Grace = 1`,
-`MaxRenames = 1` everywhere.
+**Bounds and results** (cowbird, 12 threads, `-Xmx8g`, 2026-11-07): `WaitTicks = 2`, `Grace = 1`,
+`MaxRenames = 1` everywhere. The safety configurations are checked under `LiveView` (below); the
+states without it are the model's own.
 
-| Configuration | Merges | Version runs | Push runs | Lost runs | Failures | Checks | Distinct states | Depth | Time |
-|---|---|---|---|---|---|---|---|---|---|
-| `ReleasePipeline.cfg` | 1 | 3 (one in progress, one pending, one replacing it) | ci, proofs, other | 1 | 1 | safety, `FastFail` | 2,002,482 | 39 | 28 s |
-| `ReleasePipeline-merges.cfg` | 2 (one may come while a tag job waits) | 2 | ci, proofs | 0 | 0 | safety (`FastFail` trivially: no check goes missing) | 1,474,773 | 44 | 24 s |
-| `ReleasePipeline-liveness.cfg` | 1 | 2 | ci, proofs, other | 1 | 1 | safety, `FastFail`, `TagJobEnds`, `DeployEnds` | 373,471 | 33 | 1 min 25 s |
-| `ReleasePipeline-approval-outside.cfg` | 1 | 2 | ci, proofs, other | 1 | 1 | safety but `OneTagJob`, under the weaker reading of the concurrency docs | 1,445,110 | 34 | 19 s |
-| the mutants and the finding | | | | | | to the first violation | under 30,000 each, `-v0.14.0` 234,337 (a liveness search) | | seconds, `-v0.14.0` 21 s |
+| Configuration | Merges | Version runs | Push runs | Lost runs | Failures | Checks | Distinct states | Without the view | Depth | Time |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `ReleasePipeline.cfg` | 1 | 3 (one in progress, one pending, one replacing it) | ci, proofs, other | 1 | 1 | safety, `FastFail` | 156,279 | 2,002,482 | 30 | 6 s |
+| `ReleasePipeline-merges.cfg` | 2 (one may come while a tag job waits) | 2 | ci, proofs | 0 | 0 | safety (`FastFail` trivially: no check goes missing) | 59,935 | 1,474,773 | 39 | 4 s |
+| `ReleasePipeline-liveness.cfg` | 1 | 2 | ci, proofs, other | 1 | 1 | safety, `FastFail`, `TagJobEnds` | 373,471 | (no view) | 33 | 37 s |
+| `ReleasePipeline-liveness-deploy.cfg` | the same | | | | | safety, `FastFail`, `DeployEnds` | 373,471 | (no view) | 33 | 41 s |
+| `ReleasePipeline-approval-outside.cfg` | 1 | 2 | ci, proofs, other | 1 | 1 | safety but `OneTagJob`, under the weaker reading of the concurrency docs | 105,604 | 1,445,110 | 29 | 4 s |
+| the mutants and the finding | | | | | | to the first violation | under 20,000 each, `-v0.14.0` 234,337 (a liveness search, no view) | | | seconds, `-v0.14.0` 24 s |
+
+**The view** (`VIEW LiveView`, in every configuration without a temporal property): TLC takes two
+states as one when their views are equal, so a view is sound when it keeps everything any action or
+property will still read. `LiveView` is the state without what no action and no invariant reads
+again: a run's `at` (its `head_sha`, read only by `Approve` without `ListFromCommit` and by the count
+of `RunsCounted = "all"`, so kept in those mutants); a wait's `el` once it has ended (a run never
+waits again, and only `WaitBounded`'s `el <= WaitTicks` is kept); a failure's `why` but for whether
+it is empty (all `WaitBounded` reads); and the checkout, the list and the `main` seen by a run that
+is not in its tag job and has no tag (`Approve` writes them before they are read again;
+`TagChecked`, `Includes` and `FreshList` read them only while it waits, pushes or has tagged). The
+module says which action reads each. Every state the model reaches has one view in the run, the
+invariants are functions of the view, and two states with one view have successors with one view
+each, so the run sees what the model has; it has 8 to 25 times fewer states. Every action TLC
+takes without the view it takes with it, and every expression it evaluates without it it evaluates
+with it (`-coverage`, in the three configurations); in `-merges` a pending run's start
+(`StartPending`) finds no state of its own any more, as the run it starts is one created when the
+group was free, but for its `at`. Every mutant still fails with its property under the view. A bug in a field the view leaves out is still found: `Approve` reading the list
+from `at` whatever `ListFromCommit` says, in `ReleasePipeline.cfg`, fails `FreshList` with the view
+(5,907 states) as without it (1,048). Liveness has no view (TLC's reduction of it is unsound for
+temporal properties), and is in two configurations, one property each: `TagJobEnds` and
+`DeployEnds` together took 1 min 8 s, each alone half of it, as TLC checks each property's tableau
+branches (two each, four together) beside every state, and the two run in different CI parts.
 
 A merge before the first run is needed for it to have anything to release, so the one-merge
 configurations cover a rename between a run's creation and its wait, and `-merges` one while a tag

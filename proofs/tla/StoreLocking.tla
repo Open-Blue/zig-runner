@@ -466,14 +466,27 @@ GcLock(p) ==
        ELSE /\ Put(p, [S(p) EXCEPT !.pc = "done"]) /\ UNCHANGED gc
     /\ UNCHANGED <<dirs, sh, ex, kino, kgen, booted, ghost>>
 
-(* One entry, by the name it has now (readdir's order is fixed here:     *)
-(* every interleaving with the other processes is still explored).        *)
+(* readdir's order, fixed here (every interleaving with the other         *)
+(* processes is still explored), as the lister p sees it: by the step     *)
+(* that made a directory, then its epoch, then p's own before the other   *)
+(* runners'; directories of two other runners alike in all three come in  *)
+(* either order.  An order by the runners' names (a CHOOSE over the ids,  *)
+(* which name them, as the model had it before) tells the runners apart,  *)
+(* and ProcSymmetry then leaves behaviours unexplored: with that CHOOSE,  *)
+(* StoreLocking-boot-check.cfg has 536,011 states without the symmetry    *)
+(* and 205,674 with it, fewer than the 268,006 orbits at least that two   *)
+(* runners' symmetry leaves.  With First the two counts are 382,279 and   *)
+(* 191,178: every orbit.                                                  *)
+Rank(p, d) == (d[2] * (MachineCrashes + 1) + d[3]) * 2 + (IF d[1] = p THEN 0 ELSE 1)
+First(p, T) == {d \in T : \A x \in T : Rank(p, d) <= Rank(p, x)}
+
+(* One entry, by the name it has now, the first of the listing left.      *)
 GcNext(p) ==
     /\ S(p).pc = "gc_next"
     /\ IF S(p).todo = {}
        THEN /\ Put(p, [S(p) EXCEPT !.ktodo = {k \in Keys : kino[k] # 0}, !.pc = "dk_next"])
             /\ UNCHANGED <<kino, kgen>>
-       ELSE LET d == CHOOSE x \in S(p).todo : TRUE
+       ELSE \E d \in First(p, S(p).todo) : LET
                 k == dirs[d].key
                 r == [S(p) EXCEPT !.todo = @ \ {d}]
                 new == kino[k] = 0
@@ -548,7 +561,7 @@ BcNext(p) ==
        THEN /\ booted' = TRUE
             /\ gc' = {}
             /\ \E r \in Begin(1, {}, S(p).life, {}) : Put(p, r)
-       ELSE LET d == CHOOSE x \in S(p).todo : TRUE
+       ELSE \E d \in First(p, S(p).todo) : LET
                 r == [S(p) EXCEPT !.todo = @ \ {d}]
             IN /\ IF dirs[d].name = "pub" /\ ~AsCounted(d)
                   THEN Put(p, Evict(r, dirs[d].key, "bc"))
@@ -774,6 +787,9 @@ WaitEnds == \A p \in Procs : (S(p).pc \in LockPcs) ~> (S(p).pc \notin LockPcs)
 AllEnd == <>Terminated
 
 (* The processes are interchangeable (safety checks only: TLC's symmetry  *)
-(* reduction is unsound for liveness).                                    *)
+(* reduction is unsound for liveness).  No expression names one, and the  *)
+(* CHOOSEs left are over keys, which name none, or over Pub(k), one entry *)
+(* at most (OnePub), so they choose the same whatever the runners' names. *)
+(* The listings' order is First's.                                         *)
 ProcSymmetry == Permutations(Procs)
 =============================================================================

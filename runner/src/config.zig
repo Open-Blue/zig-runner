@@ -238,6 +238,11 @@ pub const Config = struct {
     /// cache may be wiped then), so the first job does not spend 27-40 s, and the seed's 104 s,
     /// in "Set up job" (`loop.Warmer`). Direct engines only (not `RUNNER_ENGINE=cli`).
     prewarm: bool = true,
+    /// `RUNNER_PREWARM=before-listen`: with `prewarm`, the native store's warm finishes (or fails,
+    /// or runs out of `loop.Warmer.before_listen_max_ms_default`) before any runner registers and
+    /// polls, so a machine added to a pool takes jobs only once warm. The engine's warm stays in
+    /// the background.
+    prewarm_before_listen: bool = false,
     /// Output keys cost two walks of the job's filesystem, whatever the step changed: 25 s on a
     /// large checkout against 1 s on a small one (STUDY.md §3.6). When a job spends longer than
     /// this on them, later jobs for that repository skip them until the runner restarts. 0 never
@@ -494,7 +499,7 @@ pub const Config = struct {
             c.zig_local_cache_max_mb = try num(u32, v);
         if (environ.get("RUNNER_ZIG_SEED")) |v| c.zig_seed = try zigSeed(v);
         if (environ.get("RUNNER_ZIG_SEED_VERSIONS")) |v| c.zig_seed_versions = v;
-        if (environ.get("RUNNER_PREWARM")) |v| c.prewarm = try boolean(v);
+        if (environ.get("RUNNER_PREWARM")) |v| try c.setPrewarm(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_MAX_MS")) |v| c.output_keys_max_ms = try millis(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_DAYS")) |v| c.output_keys_days = try count(v);
         if (environ.get("RUNNER_ONCE")) |v| c.once = try boolean(v);
@@ -579,7 +584,7 @@ pub const Config = struct {
         else if (eq(key, "zig-local-cache-max-mb")) c.zig_local_cache_max_mb = try num(u32, val) //
         else if (eq(key, "zig-seed")) c.zig_seed = try zigSeed(val) //
         else if (eq(key, "zig-seed-versions")) c.zig_seed_versions = val //
-        else if (eq(key, "prewarm")) c.prewarm = try boolean(val) //
+        else if (eq(key, "prewarm")) try c.setPrewarm(val) //
         else if (eq(key, "output-keys-max-ms")) c.output_keys_max_ms = try millis(val) //
         else if (eq(key, "log-spool-dir")) c.log_spool_dir = val //
         else if (eq(key, "enforce-volatile")) c.enforce_volatile = try boolean(val) //
@@ -726,6 +731,12 @@ pub const Config = struct {
         const n = try num(u32, s);
         if (n > 100) return error.InvalidNumber;
         return n;
+    }
+
+    /// `true`, `false`, or `before-listen` (on, and the native warm first, before listening).
+    fn setPrewarm(c: *Config, v: []const u8) error{InvalidBool}!void {
+        c.prewarm_before_listen = std.ascii.eqlIgnoreCase(v, "before-listen");
+        c.prewarm = c.prewarm_before_listen or try boolean(v);
     }
 
     fn boolean(s: []const u8) error{InvalidBool}!bool {
@@ -1018,6 +1029,12 @@ test "the pre-warm is on by default and can be turned off" {
     try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--prewarm=false" })).prewarm);
     try env.put("RUNNER_PREWARM", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).prewarm);
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).prewarm_before_listen);
+    try env.put("RUNNER_PREWARM", "before-listen");
+    const bl = try Config.load(&env, &.{"runner"});
+    try std.testing.expect(bl.prewarm and bl.prewarm_before_listen);
+    const flag = try Config.load(&env, &.{ "runner", "--prewarm=true" });
+    try std.testing.expect(flag.prewarm and !flag.prewarm_before_listen);
     try env.put("RUNNER_PREWARM", "maybe");
     try std.testing.expectError(error.InvalidBool, Config.load(&env, &.{"runner"}));
 }

@@ -431,4 +431,40 @@ TagJobEnds == \A i \in Runs : vr[i].st \in TagJob ~> vr[i].st \in {"done", "fail
 (* A release that tagged deploys, or fails where it shows: a job failed.   *)
 Visible(i) == rel[i].jobs = "fail" \/ rel[i].dep = "failed"
 DeployEnds == \A i \in Runs : rel[i].on ~> (rel[i].dep = "deployed" \/ Visible(i))
+
+-----------------------------------------------------------------------------
+(* The view the safety configurations check under (VIEW LiveView): the    *)
+(* state with what no action and no invariant reads any more left out, so *)
+(* states that differ only there are one.  Each field it drops is written *)
+(* before it is read again, and no action reads it in between:            *)
+(*   at    read by Approve only when ~ListFromCommit, by VRuns only when    *)
+(*         RunsCounted = "all": dropped only when neither;                 *)
+(*   el    read by Poll (st = "wait") and DeployPoll (dep = "checks"); a    *)
+(*         run never comes back to either, and is 0 until it gets there    *)
+(*         (NoRun, NoRel; only the polls add to it): outside them only     *)
+(*         WaitBounded's el <= WaitTicks is kept;                           *)
+(*   why   read only by WaitBounded, for whether it is "";                  *)
+(*   co, seen   read by Poll and Push (TagJob) and by TagChecked and        *)
+(*         Includes (rel[i].on, set by Push): kept from the approval on,    *)
+(*         as Approve writes them, while the run is in its tag job or has   *)
+(*         tagged; a run that ended without a tag never reads them again;  *)
+(*   list  read by Poll and FreshList, in TagJob only.                     *)
+(* Not for liveness (unsound there), nor for a configuration whose        *)
+(* properties read a dropped field: none does.                             *)
+Bucket(el) == IF el <= WaitTicks THEN 0 ELSE WaitTicks + 1
+RunView(i) ==
+    LET r == vr[i]
+        tagging == r.st \in TagJob \/ rel[i].on IN
+    [r EXCEPT !.at = IF ListFromCommit /\ RunsCounted = "others" THEN 1 ELSE @,
+              !.el = IF r.st = "wait" THEN @ ELSE Bucket(@),
+              !.why = IF @ = "" THEN "" ELSE "failed",
+              !.co = IF tagging THEN @ ELSE 1,
+              !.list = IF r.st \in TagJob THEN @ ELSE {},
+              !.seen = IF tagging THEN @ ELSE {}]
+RelView(i) ==
+    [rel[i] EXCEPT !.el = IF rel[i].dep = "checks" THEN @ ELSE Bucket(@),
+                   !.why = IF @ = "" THEN "" ELSE "failed"]
+LiveView == <<main, ncommits, parent, isRel, jobsOf, wf, [i \in Runs |-> RunView(i)],
+              [i \in Runs |-> RelView(i)], merges, renames, lost, fails, nruns, lateOthers,
+              lateChecks>>
 =============================================================================

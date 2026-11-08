@@ -177,6 +177,37 @@ pub fn pool(c: Runner, n: u32) !Exit {
         m.engine.source = engineSource(c.cfg);
         break :m m;
     } else null;
+    if (memory) |m| if (n > 0) {
+        // A reservation that could never fit holds every runner for ever, saying only that it holds
+        // (#406): refuse to start instead, naming the settings.
+        if (m.misfit()) |bad| {
+            try c.err.print("memory gate: {f}\n", .{bad});
+            return .config;
+        }
+        // What jobs took on earlier runs, so a restart does not reserve the worst case again (#407).
+        // One file per pool: pools on one machine share the store's directory (razorbill's prod,
+        // ci and bench), and each learns its own jobs, on its own backend.
+        const path = try std.fmt.allocPrint(c.arena, "{s}/memory-gate-{s}", .{
+            try c.cfg.nativeStore(c.arena, c.environ),
+            try poolFileName(c.arena, c.cfg.name_prefix),
+        });
+        switch (m.restore(path)) {
+            .absent => try say(c, "memory gate: no learned job sizes in {s} yet", .{path}),
+            .loaded => |count| try say(
+                c,
+                "memory gate: {d} learned job sizes loaded from {s}",
+                .{ count, path },
+            ),
+            .ignored => |why| try say(
+                c,
+                "WARNING: memory gate: the learned job sizes in {s} are not used: {s}; " ++
+                    "they start again, and the file is replaced",
+                .{ path, why },
+            ),
+        }
+    };
+    // Writes what is not yet written once the sampling below has ended.
+    defer if (memory) |m| m.flush();
     // Measures the jobs running, for what jobs of their names reserve next; ends with the pool.
     var sampling: ?std.Io.Future(void) = if (memory) |m|
         c.io.concurrent(admission.Admission.sample, .{m}) catch null
@@ -185,8 +216,13 @@ pub fn pool(c: Runner, n: u32) !Exit {
     defer if (sampling) |*f| f.cancel(c.io);
     // In the background, so no runner waits for it to listen for jobs.
     const warmer = if (n > 0) try Warmer.init(c, memory, n) else null;
-    if (warmer) |w| w.start();
     defer if (warmer) |w| w.stop();
+    // `RUNNER_PREWARM=before-listen`: the exception, nothing registers until the native warm is over.
+    if (warmer) |w| if (c.cfg.prewarm_before_listen and w.native != null) {
+        w.beforeListen();
+        if (stopRequested()) return .done;
+    };
+    if (warmer) |w| w.start();
     var group: std.Io.Group = .init;
     for (slots, 0..) |*s, i| {
         s.* = .{ .c = c };
@@ -349,6 +385,11 @@ fn admit(c: Runner, g: *admission.Gate, hold: admission.Hold) !bool {
 /// or not and why, which tells an operator whether the engine's cap is being watched.
 fn checkGate(c: Runner, g: *admission.Gate) ?admission.Hold {
     const hold = g.check();
+    if (g.forced) |h| {
+        if (!g.forced_told) sayUnallocated(c, "'{s}' takes jobs although the machine has not the " ++
+            "room for one, as nothing runs and waiting would not change that: {f}", .{ c.name, h });
+        g.forced_told = true;
+    } else if (hold == null) g.forced_told = false;
     var buf: [512]u8 = undefined;
     if (g.pool.engineNews(&buf)) |news| sayUnallocated(c, "{s}", .{news});
     return hold;
@@ -433,12 +474,21 @@ pub const Warmer = struct {
     native: ?dagger.Backend.Config = null,
     /// There is an engine to warm (`engineWarm`).
     engine_warm: bool = true,
+    /// The native store's warm is over (`beforeListen` did it): `run` does not make it again.
+    native_done: bool = false,
+    /// How long `beforeListen` waits for the native warm before listening anyway.
+    before_listen_max_ms: i64 = before_listen_max_ms_default,
 
     const Calls = struct {
         warm: *const @TypeOf(dagger.warm) = dagger.warm,
         warm_native: *const @TypeOf(dagger.warmNative) = dagger.warmNative,
         socket: *const @TypeOf(engine.SocketIdentity.of) = engine.SocketIdentity.of,
     };
+
+    /// The longest `RUNNER_PREWARM=before-listen` keeps the pool from listening: over four times
+    /// the 209 s a Raspberry Pi 5 took on an empty store, so a slow disk or network still
+    /// finishes, and a warm that hangs does not keep a machine out of the pool for good.
+    pub const before_listen_max_ms_default = 15 * 60 * std.time.ms_per_s;
 
     /// What the warm is learned under at the gate.
     pub const job_name = "zig-runner pre-warm";
@@ -499,6 +549,64 @@ pub const Warmer = struct {
         return w;
     }
 
+    /// The native store's warm, to its end, before the pool registers a runner: said when it
+    /// starts and when it ends, with how long it took. A failed warm, or one that runs past
+    /// `before_listen_max_ms` (cancelled, said), lets the pool listen: the first job makes what it
+    /// needs, as without a pre-warm. A stop ends the wait at once, with no "ready" said.
+    pub fn beforeListen(w: *Warmer) void {
+        w.native_done = true;
+        const t0 = std.Io.Clock.awake.now(w.c.io).toMilliseconds();
+        sayUnallocated(w.c, "pre-warm before listening: no runner registers until the native store " ++
+            "is warm, or {d} min have passed (RUNNER_PREWARM=before-listen)", .{
+            @divTrunc(w.before_listen_max_ms, std.time.ms_per_min),
+        });
+        var done: std.atomic.Value(bool) = .init(false);
+        var future = w.c.io.concurrent(nativeThenDone, .{ w, &done }) catch {
+            w.onceNative();
+            return w.listenSoon(t0, if (stopRequested()) "stopped" else "ended");
+        };
+        var outcome: []const u8 = "ended";
+        while (!done.load(.acquire)) {
+            const waited = std.Io.Clock.awake.now(w.c.io).toMilliseconds() - t0;
+            if (stopRequested()) {
+                outcome = "stopped";
+                w.cancel.request(std.Io.Clock.real.now(w.c.io).toMilliseconds());
+                break;
+            }
+            if (waited >= w.before_listen_max_ms) {
+                outcome = "gave up";
+                w.cancel.request(std.Io.Clock.real.now(w.c.io).toMilliseconds());
+                break;
+            }
+            w.c.io.sleep(.fromMilliseconds(hold_step_ms), .awake) catch {
+                outcome = "stopped";
+                w.cancel.request(std.Io.Clock.real.now(w.c.io).toMilliseconds());
+                break;
+            };
+        }
+        future.await(w.c.io);
+        // A stop decides after the wait, not only inside it: a warm that a stop ended at once (its
+        // gate gives up on a stop) can be done before the loop first looks, and that stop would
+        // then be said as a warm that ended, and the runners as about to register.
+        if (stopRequested()) outcome = "stopped";
+        // Only a stop of the whole pool keeps the cancel; one made here was for the native warm.
+        if (!std.mem.eql(u8, outcome, "stopped")) w.cancel = .{};
+        w.listenSoon(t0, outcome);
+    }
+
+    fn nativeThenDone(w: *Warmer, done: *std.atomic.Value(bool)) void {
+        defer done.store(true, .release);
+        w.onceNative();
+    }
+
+    fn listenSoon(w: *Warmer, t0: i64, outcome: []const u8) void {
+        if (std.mem.eql(u8, outcome, "stopped")) return;
+        const ms = std.Io.Clock.awake.now(w.c.io).toMilliseconds() - t0;
+        sayUnallocated(w.c, "pre-warm before listening {s} after {d}.{d} s; the runners register now", .{
+            outcome, @divTrunc(ms, 1000), @divTrunc(@mod(ms, 1000), 100),
+        });
+    }
+
     pub fn start(w: *Warmer) void {
         w.future = w.c.io.concurrent(run, .{w}) catch |e| {
             sayUnallocated(w.c, "pre-warm not started: {s}", .{@errorName(e)});
@@ -520,7 +628,7 @@ pub const Warmer = struct {
 
     fn run(w: *Warmer) void {
         // First: the native store is what the pool's first jobs run on.
-        if (w.native != null and !stopRequested() and !w.cancel.requested.load(.acquire)) w.onceNative();
+        if (w.native != null and !w.native_done and !stopRequested() and !w.cancel.requested.load(.acquire)) w.onceNative();
         if (!w.engine_warm) return;
         var since_look: i64 = 0;
         while (!stopRequested() and !w.cancel.requested.load(.acquire)) {
@@ -1185,6 +1293,29 @@ fn withSlash(arena: Allocator, url: []const u8) ![]const u8 {
 fn deleteSession(c: Runner, base: []const u8, sid: []const u8, token: []const u8) void {
     const url = std.fmt.allocPrint(c.arena, "{s}session?sessionId={s}", .{ base, sid }) catch "";
     _ = broker.call(c.arena, c.io, .DELETE, url, token, null) catch {};
+}
+
+/// `prefix` (`RUNNER_NAME_PREFIX`) as a file name: letters, digits, `_`, `-` and `.` as they are,
+/// anything else as `_`, and "zig" for an empty one, so no prefix can name a path elsewhere.
+fn poolFileName(arena: Allocator, prefix: []const u8) ![]const u8 {
+    if (prefix.len == 0) return "zig";
+    const out = try arena.dupe(u8, prefix);
+    for (out) |*ch| {
+        if (!std.ascii.isAlphanumeric(ch.*) and ch.* != '_' and ch.* != '-' and ch.* != '.') ch.* = '_';
+    }
+    if (out[0] == '.') out[0] = '_';
+    return out;
+}
+
+test "the memory gate's file is the pool's own, and its name cannot leave the directory" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    try std.testing.expectEqualStrings("zig-ci", try poolFileName(arena, "zig-ci"));
+    try std.testing.expectEqualStrings("pibench", try poolFileName(arena, "pibench"));
+    try std.testing.expectEqualStrings("_._x_y", try poolFileName(arena, "../x/y"));
+    try std.testing.expectEqualStrings("_hidden", try poolFileName(arena, ".hidden"));
+    try std.testing.expectEqualStrings("zig", try poolFileName(arena, ""));
 }
 
 test "backoffSecs doubles from 5s up to 5 minutes" {
@@ -1928,10 +2059,18 @@ const FakeNative = struct {
     /// A stop comes while it builds: the seed's build was killed, and the warm returns as made.
     var stopped_during = false;
 
-    fn warm(_: Allocator, _: std.Io, o: dagger.Options, ready: dagger.Ready, msg: *[]const u8) anyerror!dagger.Backend.Warmed {
+    /// It runs until `released` or a cancel, as a warm that takes minutes does.
+    var block = false;
+    var released: std.atomic.Value(bool) = .init(false);
+
+    fn warm(_: Allocator, io: std.Io, o: dagger.Options, ready: dagger.Ready, msg: *[]const u8) anyerror!dagger.Backend.Warmed {
         _ = calls.fetchAdd(1, .acq_rel);
         opts = o;
         if (!ready.readyFn(ready.ptr)) return error.Cancelled;
+        while (block and !released.load(.acquire)) {
+            if (o.cancel.?.requested.load(.acquire)) return error.Cancelled;
+            io.sleep(.fromMilliseconds(5), .awake) catch return error.Cancelled;
+        }
         if (memory) |m| during = m.slots[m.slots.len - 1];
         if (stopped_during) {
             o.cancel.?.request(1);
@@ -2028,6 +2167,100 @@ test "the native pre-warm runs with no engine, through the gate, for what a job 
     FakeNative.stopped_during = false;
     w.run();
     try std.testing.expectEqual(@as(u32, 3), FakeNative.calls.load(.acquire));
+}
+
+fn releaseAfter(io: std.Io, ms: i64) void {
+    io.sleep(.fromMilliseconds(ms), .awake) catch return;
+    FakeNative.released.store(true, .release);
+}
+
+test "before-listen: the pool waits for the native warm, and a failure, a stop or the limit let it go on" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var cfg: Config = .{
+        .gh_token = "",
+        .scope = undefined,
+        .trusted_refs = "refs/heads/main",
+        .backend = .native,
+        .engine = .none,
+        .native_store = "/nonexistent/native",
+        .prewarm_before_listen = true,
+    };
+    const c = testRunner(arena, &log, &out, &cfg);
+    const w = (try Warmer.init(c, null, 1)).?;
+    defer w.arena.deinit();
+    w.calls.warm_native = FakeNative.warm;
+    FakeNative.calls.store(0, .release);
+    FakeNative.memory = null;
+    FakeNative.failure = null;
+    FakeNative.stopped_during = false;
+    const ready = "pre-warm: native store ready in ";
+    const register = "the runners register now";
+
+    // It does not return while the warm runs, and listening is announced only after it.
+    FakeNative.block = true;
+    defer FakeNative.block = false;
+    FakeNative.released.store(false, .release);
+    const t = try std.Thread.spawn(.{}, releaseAfter, .{ std.testing.io, 300 });
+    out.end = 0;
+    w.beforeListen();
+    t.join();
+    try std.testing.expect(FakeNative.released.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), FakeNative.calls.load(.acquire));
+    try std.testing.expect(w.native_done);
+    const first = std.mem.indexOf(u8, out.buffered(), "no runner registers until the native store is warm").?;
+    const warm_said = std.mem.indexOf(u8, out.buffered(), ready).?;
+    const listen_said = std.mem.indexOf(u8, out.buffered(), register).?;
+    try std.testing.expect(first < warm_said and warm_said < listen_said);
+
+    // `run` does not warm the native store a second time.
+    w.run();
+    try std.testing.expectEqual(@as(u32, 1), FakeNative.calls.load(.acquire));
+
+    // A failed warm is said, and the pool listens.
+    FakeNative.block = false;
+    FakeNative.failure = error.StoreUnsafe;
+    out.end = 0;
+    w.beforeListen();
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "pre-warm failed (StoreUnsafe)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), register) != null);
+    FakeNative.failure = null;
+
+    // The limit abandons the warm, says so, and leaves the warmer able to go on.
+    FakeNative.block = true;
+    FakeNative.released.store(false, .release);
+    w.before_listen_max_ms = 100;
+    out.end = 0;
+    w.beforeListen();
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), "gave up after 0.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), register) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), ready) == null);
+    try std.testing.expect(!w.cancel.requested.load(.acquire));
+
+    // A stop during the warm ends the wait at once, and says neither ready nor listening.
+    w.before_listen_max_ms = Warmer.before_listen_max_ms_default;
+    stop_signals.store(1, .release);
+    defer stop_signals.store(0, .release);
+    out.end = 0;
+    const t0 = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    w.beforeListen();
+    try std.testing.expect(std.Io.Clock.awake.now(std.testing.io).toMilliseconds() - t0 < 2000);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), ready) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.buffered(), register) == null);
+
+    // The same when the stopped warm is done before the wait first looks (razorbill, 2026-11-08:
+    // the loop was skipped and the stop was said as "ended ...; the runners register now").
+    // Which of the two looks first is the scheduler's, so the case runs many times.
+    FakeNative.block = false;
+    for (0..200) |_| {
+        out.end = 0;
+        w.beforeListen();
+        try std.testing.expect(std.mem.indexOf(u8, out.buffered(), register) == null);
+    }
 }
 
 test "the gate looks for the engine's cgroup only where there is an engine" {

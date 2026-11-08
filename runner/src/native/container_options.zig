@@ -267,10 +267,14 @@ pub const Volume = struct {
     name: ?[]const u8,
     /// Absolute, with no `.`, `..` or empty part.
     target: []const u8,
+    /// `:ro`: a named volume's mount is read-only (an anonymous one's is refused).
+    read_only: bool = false,
 };
 
 /// The job container's `volumes:`, all carried out.
 pub const Volumes = struct {
+    /// Every volume, in order.
+    list: []const Volume = &.{},
     /// Every volume's mount point, in order.
     targets: []const []const u8 = &.{},
     /// How many of them are named.
@@ -295,12 +299,13 @@ const sandbox_trees = [_][]const u8{ "/proc", "/sys", "/dev" };
 
 /// `raw` as GitHub's runner reads a job container's `volumes:` entry (`MountVolume.ParseVolumeString`):
 /// `target`, `source:target` or `source:target:ro` (and `target:ro`), which it passes on as
-/// `docker create -v`. Carried out: an anonymous volume and a named one, which are directories of
-/// the job's filesystem (a volume is new and empty, or holds what the image has there, as the
-/// job's own overlay does) that live as long as the job. Refused, with why: a path of the host as
-/// the source (a bind needs a policy for which paths a job may take, and the ids of its files),
-/// a read-only volume (that needs a mount), and a target that is not a plain directory of the
-/// container.
+/// `docker create -v`. Carried out: an anonymous volume, a directory of the job's filesystem (new
+/// and empty, or holding what the image has there, as the job's own overlay does) that lives as
+/// long as the job, and a named one, read-only or not, which outlives the job as Docker's does
+/// (`volumes.openNamed`, bound from the store). Refused, with why: a path of the host as the
+/// source (a bind needs a policy for which paths a job may take, and the ids of its files), an
+/// anonymous read-only volume (that would need a mount of its own), and a target that is not a
+/// plain directory of the container.
 pub fn parseVolume(arena: Allocator, raw: []const u8, why: *[]const u8) Error!Volume {
     var parts: [3][]const u8 = undefined;
     var n: usize = 0;
@@ -327,7 +332,8 @@ pub fn parseVolume(arena: Allocator, raw: []const u8, why: *[]const u8) Error!Vo
         if (!volumeName(s)) return refuseVolume(arena, why, raw, "has a source that is not a " ++
             "volume name Docker takes");
     }
-    if (read_only) return refuseVolume(arena, why, raw, "is read-only, which needs a mount of its own");
+    if (read_only and name == null) return refuseVolume(arena, why, raw, "is an anonymous " ++
+        "read-only volume, which needs a mount of its own (a named one can be read-only)");
     const clean = cleanTarget(arena, target) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.NotPlain => return refuseVolume(arena, why, raw, "has a target that is not an " ++
@@ -338,7 +344,7 @@ pub fn parseVolume(arena: Allocator, raw: []const u8, why: *[]const u8) Error!Vo
         "where the runner mounts its own directory");
     for (sandbox_trees) |t| if (under(clean, t)) return refuseVolume(arena, why, raw, "mounts " ++
         "inside a directory the sandbox mounts itself");
-    return .{ .name = name, .target = clean };
+    return .{ .name = name, .target = clean, .read_only = read_only };
 }
 
 /// Whether `path` is `tree` or below it.
@@ -374,6 +380,7 @@ fn cleanTarget(arena: Allocator, path: []const u8) error{ OutOfMemory, NotPlain 
 /// one path or one named volume at two (Docker refuses the first, and the second would need a
 /// bind to be one directory in two places).
 pub fn volumes(arena: Allocator, list: []const job_mod.Template, why: *[]const u8) Error!Volumes {
+    var all: std.ArrayList(Volume) = .empty;
     var targets: std.ArrayList([]const u8) = .empty;
     var names: std.ArrayList([]const u8) = .empty;
     for (list) |t| {
@@ -394,8 +401,9 @@ pub fn volumes(arena: Allocator, list: []const job_mod.Template, why: *[]const u
             try names.append(arena, name);
         }
         try targets.append(arena, v.target);
+        try all.append(arena, v);
     }
-    return .{ .targets = targets.items, .named = names.items.len };
+    return .{ .list = all.items, .targets = targets.items, .named = names.items.len };
 }
 
 /// Why a job container cannot be native, or null: its `ports:`, any of its `volumes:` that
@@ -649,6 +657,12 @@ test "volumes carried out: an anonymous or a named volume, read as GitHub's runn
     try expectVolume(arena, "my_vol-1.x:/var/lib/data:rw", "my_vol-1.x", "/var/lib/data");
     // `z` and the like are not read by the runner: not passed on.
     try expectVolume(arena, "cache:/cache:z", "cache", "/cache");
+    // A named volume can be read-only, in either spelling: a read-only bind of it.
+    var why: []const u8 = "";
+    for ([_][]const u8{ "cache:/cache:ro", "cache:/cache:RO" }) |raw|
+        try std.testing.expect((try parseVolume(arena, raw, &why)).read_only);
+    try std.testing.expect(!(try parseVolume(arena, "cache:/cache:rw", &why)).read_only);
+    try std.testing.expect(!(try parseVolume(arena, "cache:/cache", &why)).read_only);
     // Docker cleans the target.
     try expectVolume(arena, "/a//b/./c/", null, "/a/b/c");
     try expectVolume(arena, "v2:/opt//x", "v2", "/opt/x");
@@ -662,10 +676,9 @@ test "volumes refused, never ignored: the host, read-only, and targets that are 
     try expectVolumeRefused(arena, "/srv:/srv", "host");
     try expectVolumeRefused(arena, "/var/run/docker.sock:/var/run/docker.sock", "host");
     try expectVolumeRefused(arena, "/:/host:rw", "host");
-    // A read-only volume needs a mount, in either spelling.
-    try expectVolumeRefused(arena, "cache:/cache:ro", "read-only");
-    try expectVolumeRefused(arena, "cache:/cache:RO", "read-only");
+    // An anonymous read-only volume would need a mount of its own, in either spelling.
     try expectVolumeRefused(arena, "/data:ro", "read-only");
+    try expectVolumeRefused(arena, "/data:RO", "read-only");
     // What Docker itself refuses: a relative or `..` target, a bad name, extra parts, empty parts.
     try expectVolumeRefused(arena, "cache:data", "absolute");
     try expectVolumeRefused(arena, "cache:/a/../b", "absolute");
@@ -693,7 +706,7 @@ test "volumes refused, never ignored: the host, read-only, and targets that are 
 test "unsupported: a list of volumes is carried out whole, or the job falls back" {
     const base: job_mod.Service = .{ .name = "", .image = .{ .lit = "node:22" } };
     var jc = base;
-    jc.volumes = &.{ .{ .lit = "/data" }, .{ .lit = "cache:/cache" }, .{ .lit = "other:/other:rw" } };
+    jc.volumes = &.{ .{ .lit = "/data" }, .{ .lit = "cache:/cache" }, .{ .lit = "other:/other:ro" } };
     try std.testing.expect(unsupported(jc, false, &.{}) == null);
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -702,6 +715,10 @@ test "unsupported: a list of volumes is carried out whole, or the job falls back
     try std.testing.expectEqual(@as(usize, 2), v.named);
     try std.testing.expectEqual(@as(usize, 3), v.targets.len);
     try std.testing.expectEqualStrings("/other", v.targets[2]);
+    try std.testing.expectEqual(@as(usize, 3), v.list.len);
+    try std.testing.expectEqualStrings("other", v.list[2].name.?);
+    try std.testing.expect(v.list[2].read_only and !v.list[1].read_only);
+    try std.testing.expect(v.list[0].name == null);
 
     // One that is not carried out takes the whole list to Dagger, and the reason names it.
     jc.volumes = &.{ .{ .lit = "/data" }, .{ .lit = "/srv:/srv" } };
