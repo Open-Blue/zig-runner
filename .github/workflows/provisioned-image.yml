@@ -1,0 +1,209 @@
+# The provisioned image: the default job image (runner/src/dagger.zig, `default_image`) with the
+# runner's packages installed (set_up.zig, `provision_script` and `provision_runner_script`), for
+# linux/amd64 and linux/arm64, on GitHub's container registry, one image per way steps run (root and
+# the runner user) tagged `<fingerprint>-<variant>`. The runner pulls it, by the digest pinned in
+# runner/src/dagger/provisioned_pin.zig, instead of running apt-get on every new machine and empty
+# store (22-45 s, and Ubuntu's mirrors).
+#
+# The script is the runner's own: the binary this builds prints it, the image it runs on and the
+# fingerprint (a hash of both) for the Dockerfile (runner/provisioned.Dockerfile), so no copy of the
+# script exists besides set_up.zig's. A changed script, or a new Ubuntu digest, is a new fingerprint
+# and so a new tag, which a pull request publishes by a run of this workflow by hand on its branch,
+# then pins (`.github/scripts/provisioned-pin.sh update`); a unit test fails until the pin is the
+# current fingerprint's, so a changed script cannot keep an old image.
+#
+# On pull requests the images are built for both architectures and published nowhere: proof that
+# the script still builds. On a push to main, and by hand, they are pushed, once the build is done
+# on both: an architecture on its own runner, so apt runs natively and not under emulation. A tag
+# that exists is never replaced. Signed build provenance (`gh attestation verify`), as the runner
+# image has.
+name: provisioned image
+
+on:
+  pull_request:
+    paths:
+      - runner/provisioned.Dockerfile
+      - runner/src/dagger.zig
+      - runner/src/dagger/set_up.zig
+      - runner/src/dagger/provisioned.zig
+      - runner/src/main.zig
+      - .github/workflows/provisioned-image.yml
+      - .github/scripts/provisioned-pin.sh
+  push:
+    branches: [main]
+    paths:
+      - runner/provisioned.Dockerfile
+      - runner/src/dagger.zig
+      - runner/src/dagger/set_up.zig
+      - runner/src/dagger/provisioned.zig
+      - runner/src/main.zig
+      - .github/workflows/provisioned-image.yml
+  workflow_dispatch:
+
+# Nothing by default; each job asks for what it needs.
+permissions: {}
+
+concurrency:
+  group: provisioned-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PUBLISH: ${{ github.event_name != 'pull_request' }}
+  # BuildKit, which builds the image (setup-buildx-action would take buildx-stable-1, a moving tag), as release.yml.
+  BUILDKIT_IMAGE: moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+
+jobs:
+  # What to build: the runner binary prints each variant's base image, fingerprint and script.
+  plan:
+    name: Provisioned image (plan)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read # to check out the code
+    outputs:
+      plan: ${{ steps.plan.outputs.plan }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+      - name: Plan
+        id: plan
+        run: echo "plan=$(.github/scripts/provisioned-pin.sh fingerprints)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Provisioned image (${{ matrix.variant }}, ${{ matrix.arch }})
+    needs: plan
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+      packages: write # to push the image by digest, on main and by hand
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        variant: [root, runner]
+    env:
+      IMAGE_OWNER: ${{ github.repository_owner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+      # No build context: the Dockerfile copies nothing in.
+      - name: Empty build context
+        run: mkdir "$RUNNER_TEMP/context"
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/${IMAGE_OWNER,,}/zig-runner-base" >> "$GITHUB_ENV"
+      - name: Log in to the registry
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # Pushed by digest, untagged: the tag goes on the index of both architectures, once both exist
+      # (the next job). On a pull request it is only built, so the script is proved to build.
+      - name: Build
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ runner.temp }}/context
+          file: runner/provisioned.Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          provenance: false
+          sbom: false
+          build-args: |
+            BASE=${{ fromJSON(needs.plan.outputs.plan)[matrix.variant].base }}
+            SCRIPT=${{ fromJSON(needs.plan.outputs.plan)[matrix.variant].script }}
+            VARIANT=${{ matrix.variant }}
+            FINGERPRINT=${{ fromJSON(needs.plan.outputs.plan)[matrix.variant].fingerprint }}
+          outputs: ${{ env.PUBLISH == 'true' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) || 'type=cacheonly' }}
+      - name: Digest
+        if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - name: Keep the digest
+        if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.variant }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # The index of both architectures' images, tagged with the fingerprint, and attested. Only this job
+  # writes tags, and only on main or by hand; it does not replace a tag that exists.
+  publish:
+    name: Provisioned image (publish ${{ matrix.variant }})
+    needs: [plan, build]
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read # to check out the code
+      packages: write # to push the index to ghcr.io
+      id-token: write # to sign the image's provenance with Sigstore
+      attestations: write # to store that provenance
+      artifact-metadata: write # to record the pushed image as the attestation's artifact
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [root, runner]
+    env:
+      IMAGE_OWNER: ${{ github.repository_owner }}
+      FINGERPRINT: ${{ fromJSON(needs.plan.outputs.plan)[matrix.variant].fingerprint }}
+      VARIANT: ${{ matrix.variant }}
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-${{ matrix.variant }}-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+      - name: Log in to the registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Tag the index
+        id: index
+        run: |
+          image="ghcr.io/${IMAGE_OWNER,,}/zig-runner-base"
+          tag="$FINGERPRINT-$VARIANT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          if docker buildx imagetools inspect "$image:$tag" >/dev/null 2>&1; then
+            echo "::notice::$image:$tag exists already: left as it is (a tag is never replaced)"
+            echo "digest=$(docker buildx imagetools inspect "$image:$tag" --format '{{.Manifest.Digest}}')" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cd "$RUNNER_TEMP/digests"
+          [[ $(ls | wc -l) == 2 ]] || { echo "expected one image per architecture, found: $(ls)" >&2; exit 1; }
+          images=()
+          for digest in *; do images+=("$image@sha256:$digest"); done
+          docker buildx imagetools create -t "$image:$tag" "${images[@]}"
+          echo "digest=$(docker buildx imagetools inspect "$image:$tag" --format '{{.Manifest.Digest}}')" >> "$GITHUB_OUTPUT"
+      # The packages that went in, for whoever pins this: the runner's logs name the same.
+      - name: What was installed
+        env:
+          IMAGE: ${{ steps.index.outputs.image }}
+        run: |
+          docker run --rm "$IMAGE:$FINGERPRINT-$VARIANT" sh -c \
+            "dpkg-query -W -f '\${Package}=\${Version}\\n' | sha256sum | cut -c1-12" |
+            sed "s/^/packages fingerprint on amd64: /"
+      - name: Attest the image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.index.outputs.image }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true

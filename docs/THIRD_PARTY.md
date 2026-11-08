@@ -28,7 +28,8 @@ Fetched at build time from `runner/build.zig.zon`, pinned there by commit (the a
 
 The Dagger engine pulls these images when jobs run; none of them is part of this repository or its builds:
 - the Dagger engine image `registry.dagger.io/engine` (Apache-2.0);
-- `ubuntu:24.04` and the Ubuntu packages provisioned into it (their own licenses);
+- `ubuntu:24.04` and the Ubuntu packages provisioned into it (their own licenses), also published as
+  `ghcr.io/open-blue/zig-runner-base` (the same image with the packages installed);
 - `busybox` (musl build, GPL-2.0), pinned by digest in `runner/src/dagger.zig`, run unmodified inside job containers;
 - `oven/bun` (MIT) and `node` (MIT), the JavaScript runtimes for actions;
 - whatever images and actions workflows themselves name.

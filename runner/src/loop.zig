@@ -561,6 +561,7 @@ pub const Warmer = struct {
             .package_caches = cfg.package_caches,
             .zig_seeds = cfg.zig_seeds,
             .step_user = cfg.step_user,
+            .provisioned_image = cfg.provisioned_image,
             .cancel = &w.cancel,
             .native = w.native,
         }, .{ .ptr = w, .readyFn = ready }, &msg);
@@ -623,6 +624,7 @@ pub const Warmer = struct {
             .zig_local_cache_max_mb = cfg.zig_local_cache_max_mb,
             .zig_seeds = cfg.zig_seeds,
             .step_user = cfg.step_user,
+            .provisioned_image = cfg.provisioned_image,
             .cancel = &w.cancel,
         }, .{ .ptr = w, .readyFn = ready }, &msg);
         const ms = std.Io.Clock.awake.now(w.c.io).toMilliseconds() - w.admitted_ms;
@@ -657,6 +659,7 @@ pub const Warmer = struct {
             if (warmed.packages != null) ", packages " else "",
             warmed.packages orelse "",
         });
+        if (warmed.pulled_note) |note| sayUnallocated(w.c, "pre-warm: {s}", .{note});
     }
 
     /// This warm's turn on the engine: the directory of the engine's socket, locked, which closing
