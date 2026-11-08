@@ -113,6 +113,11 @@ pub const Paths = struct {
     pressure: []const u8 = "/proc/pressure/memory",
     /// Where the cgroup v2 hierarchy is mounted: the paths in `/proc/<pid>/cgroup` are under it.
     cgroup_root: []const u8 = "/sys/fs/cgroup",
+    /// The runner's own cgroup (`runnerMemory`).
+    self_cgroup: []const u8 = "/proc/self/cgroup",
+    /// What names the machine in the file the gate keeps (`Identity`).
+    machine_id: []const u8 = "/etc/machine-id",
+    hostname: []const u8 = "/proc/sys/kernel/hostname",
 };
 
 /// How long a job's memory takes to show in `MemAvailable`: `zig build test` reached the engine's
@@ -123,6 +128,14 @@ pub const ramp_ms = 120 * std.time.ms_per_s;
 /// and with pressure and swap growth under half their limits, so that a machine sitting at a
 /// threshold does not hold and resume runners on alternate checks.
 pub const resume_margin_mb = 256;
+
+/// A job whose name ran no longer than this in each of its last `Learned.kept` runs is expected to
+/// finish soon: it may start beside a job waiting for room, if it fits without it (#415).
+pub const short_run_ms = 60 * std.time.ms_per_s;
+
+/// A job that went ahead of the one waiting for room and has run this long was not as short as it
+/// was learned: no more go ahead on the strength of a learned run time while it runs.
+pub const overdue_ms = 2 * short_run_ms;
 
 /// The pool's shared view of memory: one per process, used by every runner's `Gate`.
 pub const Admission = struct {
@@ -148,12 +161,15 @@ pub const Admission = struct {
     waits: u64 = 0,
     /// Each runner's job, one entry per runner (`Gate.slot`): a runner runs one job at a time.
     slots: []Slot,
-    /// What jobs took, by name: on the engine, and natively. In memory only: a restart forgets
-    /// it, and jobs reserve the worst case again until each has run once.
+    /// What jobs took, by name: on the engine, and natively. Kept in a file between runs when
+    /// `restore` was called (#407); without it a restart forgets them, and jobs reserve the worst
+    /// case again until each has run once.
     learned: Learned = .{},
     learned_native: Learned = .{},
     swap: SwapGrowth = .{},
     engine: Engine = .{},
+    /// Where `learned` and `learned_native` are kept between runs, after `restore`.
+    persist: ?Persist = null,
 
     /// One runner's job. Cleared when the job ends, so a job that is over reserves nothing,
     /// however soon it ended.
@@ -187,11 +203,15 @@ pub const Admission = struct {
         high_mb: ?u32 = null,
         over_high: bool = false,
         /// The job is handed out and named but does not run yet: on a native pool it waits for
-        /// room (`Gate.start`), holding the job GitHub gave it. Counts in the reservations of
-        /// runners polling, at its estimate; not in those of the jobs waiting beside it, which
-        /// would hold each other for ever; the order they came in is `wait_seq`.
+        /// room (`Gate.start`), holding the job GitHub gave it. The one that waits longest counts
+        /// in the reservations of runners polling and of the jobs waiting behind it, at its
+        /// estimate (`withHead`); the others do not, which would hold them for ever and small
+        /// jobs behind them (#415); the order they came in is `wait_seq`.
         waiting: bool = false,
         wait_seq: u64 = 0,
+        /// The job started although it did not fit beside the first in line, because it is
+        /// expected to finish soon (`Admission.aheadOpen`, #415).
+        ahead: bool = false,
 
         fn cgroup(s: *const Slot) ?[]const u8 {
             return if (s.cgroup_len > 0) s.cgroup_buf[0..s.cgroup_len] else null;
@@ -306,21 +326,131 @@ pub const Admission = struct {
     /// started less than `ramp_ms` ago with its own estimate. A job without one reserves what
     /// a runner polling does while its name is not known, and its own backend's worst case once
     /// it is. A job waiting for room (`Slot.waiting`) reserves its estimate for as long as it
-    /// waits, unless `waiters` is false: the jobs waiting do not count each other.
+    /// waits, unless `waiters` is false: the jobs waiting do not count each other. On a native
+    /// pool the runners polling reserve natively (`native_mb`): the job one is handed runs in its
+    /// own cgroup and never in the engine, and one sent back to the engine reserves there from
+    /// `Gate.backToEngine` on (#414).
     fn reserved(a: *const Admission, now_ms: i64, polling: u32, waiters: bool) Reservation {
-        const unknown_mb = a.unknown();
         var r: Reservation = .{ .jobs = polling };
-        r.mb = @as(u64, r.jobs) * unknown_mb;
+        r.mb = @as(u64, r.jobs) * a.unknown();
+        if (a.native) r.native_mb = r.mb;
         for (a.slots) |s| {
             if (s.waiting) {
                 if (!waiters) continue;
             } else if (s.started_ms <= now_ms - ramp_ms) continue;
-            const mb: u64 = s.est_mb orelse if (s.key == null) unknown_mb else a.worstCase(s.native);
+            const mb = a.slotMb(s);
             r.jobs += 1;
             r.mb += mb;
             if (s.native or s.waiting) r.native_mb += mb;
         }
         return r;
+    }
+
+    /// The job waiting longest for room: the next to start
+    /// (`firstAlone`), whose room no other job may take (`withHead`). Null with none waiting.
+    fn head(a: *const Admission) ?*const Slot {
+        var first: ?*const Slot = null;
+        for (a.slots) |*s| {
+            if (!s.waiting) continue;
+            if (first == null or s.wait_seq < first.?.wait_seq) first = s;
+        }
+        return first;
+    }
+
+    /// `r` and, if a job waits for room that is not the one in `slot`, what that job needs to
+    /// start: a runner or a job is let through only while the job at the head of the line still has
+    /// room to start with it (#415). The jobs behind the head are not counted, so a small job
+    /// passes beside a heavy one waiting wherever there is room for both, and the head is never
+    /// delayed by a job that began after it did.
+    fn withHead(a: *const Admission, r: Reservation, slot: ?usize) Reservation {
+        const h = a.head() orelse return r;
+        if (slot) |i| if (h == &a.slots[i]) return r;
+        const mb: u64 = h.est_mb orelse a.unknown();
+        return .{ .jobs = r.jobs + 1, .mb = r.mb + mb, .native_mb = r.native_mb + mb };
+    }
+
+    /// What a job in `s` reserves: its estimate, or what a runner polling reserves while its name
+    /// is not known, and its backend's worst case once it is.
+    fn slotMb(a: *const Admission, s: Slot) u64 {
+        return s.est_mb orelse if (s.key == null) a.unknown() else a.worstCase(s.native);
+    }
+
+    /// How long jobs of this name ran, at the longest of their last `Learned.kept` runs, in either
+    /// backend's table; null for a name that has not run (`Learned.longest`).
+    fn runMs(a: *const Admission, key: ?u64) ?u32 {
+        const k = key orelse return null;
+        const native = a.learned_native.longest(k);
+        const engine = a.learned.longest(k);
+        if (native != null and engine != null) return @max(native.?, engine.?);
+        return native orelse engine;
+    }
+
+    fn waitingCount(a: *const Admission) usize {
+        var n: usize = 0;
+        for (a.slots) |s| n += @intFromBool(s.waiting);
+        return n;
+    }
+
+    /// Whether a runner polling, or a job named, that does not fit beside the first in line may
+    /// start anyway (#415): the room is the first in line's, but what goes ahead is not expected
+    /// to hold it for long. The caller checked that it fits if the first in line were not waiting
+    /// and, for a named job, that its learned run time is at most `short_run_ms` (`runMs`; a name
+    /// not learned is long). Open while:
+    /// - the first in line does not fit even with every job that went ahead of it gone, so it
+    ///   waits for jobs not expected to end soon. Once it would fit without them it waits for the
+    ///   ones ahead, and no more go before it: a steady stream of short jobs cannot keep it
+    ///   waiting, only the ones in flight can, each for as long as it was learned to run;
+    /// - some job that did not go ahead runs. With only jobs that went ahead running, the first in
+    ///   line is the one started whatever the room (`firstAlone`, #386) when they end;
+    /// - no job that went ahead has run for more than `overdue_ms`: it was learned short and is
+    ///   not, so no more go ahead on the word of a learned run time while it runs; when it ends
+    ///   its run is learned (`Learned.recordRun`) and its name is long.
+    fn aheadOpen(a: *const Admission, signal: Signals, now_ms: i64) bool {
+        const h = a.head() orelse return false;
+        var r = a.reserved(now_ms, a.polling, false);
+        var freed_mb: u64 = 0;
+        var others_run = false;
+        for (a.slots) |s| {
+            if (s.waiting or !s.running()) continue;
+            if (!s.ahead) {
+                others_run = true;
+                continue;
+            }
+            if (now_ms -| s.started_ms > overdue_ms) return false;
+            const mb = a.slotMb(s);
+            // In the reservation while it ramps up, in `available_mb` after.
+            if (s.started_ms > now_ms - ramp_ms) {
+                r.jobs -= 1;
+                r.mb -= mb;
+                if (s.native) r.native_mb -= mb;
+            } else freed_mb += mb;
+        }
+        if (!others_run) return false;
+        var without = signal;
+        if (without.available_mb) |m| without.available_mb = m + freed_mb;
+        const mb: u64 = h.est_mb orelse a.unknown();
+        r.jobs += 1;
+        r.mb += mb;
+        r.native_mb += mb;
+        return decide(a.limits, without, r, false) != null;
+    }
+
+    /// Whether a runner held for `hold` should poll anyway (#406): the hold is about room (the
+    /// machine's, or an engine cap that is smaller than the reservation), nothing runs or waits, and no other runner polls, so no job will end and free any: the machine is as
+    /// free as it gets, and a pool that never polls would never say why. Not for pressure or
+    /// swap, which pass by themselves. `claimed` is whether the runner asking is counted in
+    /// `polling`.
+    fn idleFor(a: *const Admission, hold: Hold, claimed: bool) bool {
+        switch (hold) {
+            .memory => {},
+            // The engine in use by others frees up by itself; a cap too small for the reservation
+            // does not.
+            .engine => |e| if (e.cap_mb >= e.floor_mb + (e.reserved.mb -| e.reserved.native_mb)) return false,
+            else => return false,
+        }
+        if (a.polling != @intFromBool(claimed)) return false;
+        for (a.slots) |s| if (s.waiting or s.running()) return false;
+        return true;
     }
 
     /// The job in `slot` begins (`join`) or stops sharing the engine with every other job on it
@@ -352,6 +482,7 @@ pub const Admission = struct {
         while (true) {
             a.io.sleep(.fromSeconds(1), .awake) catch return;
             a.samplePeaks();
+            a.persistNow(false);
         }
     }
 
@@ -408,6 +539,123 @@ pub const Admission = struct {
         s.high_mb = next;
     }
 
+    /// Keeps the learned estimates at `path` (in the runner's state directory, `Config.nativeStore`)
+    /// from here on, and reads what an earlier run left there (#407). A file written on another
+    /// machine, by another backend or in another format, or one that does not parse, is not used
+    /// (said in the result) and is replaced at the next write. Call once at start, before any runner
+    /// polls; `path` must outlive the pool.
+    pub fn restore(a: *Admission, path: []const u8) Restore {
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const id: Identity = .read(a.io, a.paths, a.native);
+        a.persist = .{ .path = path, .identity = id };
+        var buf: [file_max_bytes]u8 = undefined;
+        const text = std.Io.Dir.cwd().readFile(a.io, path, &buf) catch |e| return switch (e) {
+            error.FileNotFound => .absent,
+            else => .{ .ignored = "it cannot be read" },
+        };
+        if (text.len == buf.len) return .{ .ignored = "it is larger than the gate ever writes" };
+        var tables: Tables = .{};
+        var why: []const u8 = "";
+        parseTables(text, id, &tables, &why) catch |e| return .{ .ignored = switch (e) {
+            error.Format => "it is not a memory gate file, or is damaged",
+            error.WrongVersion => "it is in another format version",
+            error.Foreign => why,
+        } };
+        a.learned = tables.engine;
+        a.learned_native = tables.native;
+        return .{ .loaded = @truncate(tables.engine.len + tables.native.len) };
+    }
+
+    /// Writes the estimates if some changed since the last write, and not within
+    /// `Persist.min_interval_ms` of it unless `force`. Nothing without `restore`. A failed write is
+    /// warned of once and tried again at the next interval; what the runner knows is still in
+    /// memory.
+    fn persistNow(a: *Admission, force: bool) void {
+        var tables: Tables = undefined;
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var id: Identity = undefined;
+        const path = p: {
+            a.mu.lockUncancelable(a.io);
+            defer a.mu.unlock(a.io);
+            const persist = &(a.persist orelse return);
+            if (!persist.dirty) return;
+            const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
+            // Saturating: `written_ms` starts at the least i64, so the first write after a start
+            // goes ahead (v0.28.0 subtracted plainly, which overflowed and aborted the runner at
+            // its first job's end on razorbill).
+            if (!force and now_ms -| persist.written_ms < Persist.min_interval_ms) return;
+            if (persist.path.len > path_buf.len) return;
+            persist.dirty = false;
+            persist.written_ms = now_ms;
+            tables = .{ .engine = a.learned, .native = a.learned_native };
+            id = persist.identity;
+            @memcpy(path_buf[0..persist.path.len], persist.path);
+            break :p path_buf[0..persist.path.len];
+        };
+        var buf: [file_max_bytes]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        const written: anyerror!void = if (render(&w, id, &tables)) |_|
+            writeFileAtomic(a.io, path, w.buffered())
+        else |e|
+            e;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const persist = &(a.persist orelse return);
+        if (written) |_| {
+            persist.warned = false;
+        } else |e| {
+            persist.dirty = true;
+            if (!persist.warned) std.log.warn(
+                "memory gate: cannot write the learned estimates to {s}: {s}; they are lost " ++
+                    "if the runner restarts",
+                .{ path, @errorName(e) },
+            );
+            persist.warned = true;
+        }
+    }
+
+    /// Writes any estimate not yet written; at the pool's end.
+    pub fn flush(a: *Admission) void {
+        a.persistNow(true);
+    }
+
+    /// Whether one job could ever start on this machine (#406): its reservation plus the floor
+    /// against the machine's memory, or the cgroup limit the runner is under if that is less, and on
+    /// the engine against the engine's cap with its headroom. A pool that fails this holds every
+    /// runner for ever. Null when it fits, or when nothing can be read to say.
+    pub fn misfit(a: *Admission) ?Misfit {
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const l = a.limits;
+        const per = if (a.native) l.native_per_job_mb else l.per_job_mb;
+        const per_name = if (a.native) "RUNNER_NATIVE_MEM_PER_JOB_MB" else "RUNNER_MEM_PER_JOB_MB";
+        if (runnerMemory(a.io, a.paths)) |m| {
+            if (@as(u64, per) + l.min_available_mb > m.mb and per + l.min_available_mb > 0) return .{
+                .setting = per_name,
+                .setting_mb = per,
+                .floor_setting = "RUNNER_MIN_MEM_AVAILABLE_MB",
+                .floor_mb = l.min_available_mb,
+                .against = if (m.cgroup) "the memory limit the runner runs under is" else "the machine's memory is",
+                .limit_mb = m.mb,
+            };
+        }
+        // A native job never runs in the engine.
+        if (a.native) return null;
+        a.engine.find(a.io, a.paths, std.Io.Clock.awake.now(a.io).toMilliseconds());
+        const dir = a.engine.dir orelse return null;
+        const cap_mb = (readBytes(a.io, dir, "memory.max") orelse return null) >> 20;
+        if (@as(u64, per) + l.min_engine_headroom_mb > cap_mb and per + l.min_engine_headroom_mb > 0) return .{
+            .setting = per_name,
+            .setting_mb = per,
+            .floor_setting = "RUNNER_MIN_ENGINE_HEADROOM_MB",
+            .floor_mb = l.min_engine_headroom_mb,
+            .against = "the engine's memory cap is",
+            .limit_mb = cap_mb,
+        };
+        return null;
+    }
+
     /// How often the engine started again since the runner did (`Engine.returns`), or null while
     /// its cgroup has never been found and the gate cannot tell (the runner in a container of its
     /// own, as in deploy/compose.yaml).
@@ -452,6 +700,11 @@ pub const Gate = struct {
     claimed: bool = false,
     /// Held at the last check: the resume thresholds apply.
     holding: bool = false,
+    /// Set by `check` when it let the runner through although the machine had not the room, because
+    /// nothing else runs (`Admission.idleFor`): the hold it overrode. The caller says so.
+    forced: ?Hold = null,
+    /// The forced poll was logged, once for as long as it lasts.
+    forced_told: bool = false,
     /// The hold was logged, so its end is logged too, once each.
     announced: bool = false,
     /// The pool's pre-warm (`loop.Warmer`), not a runner: it is never counted as polling, and it
@@ -462,7 +715,11 @@ pub const Gate = struct {
     warm: bool = false,
 
     /// Null when the runner may poll for a job (and it is then counted as polling); otherwise why
-    /// not. For the pre-warm (`warm`): whether it may start now.
+    /// not. For the pre-warm (`warm`): whether it may start now. A runner polling reserves for the
+    /// runners beside it and the jobs running, and for the one job that waits longest for room
+    /// (`Admission.withHead`), not for the others waiting behind it (#415). When nothing runs and
+    /// no other runner polls, the one asking polls even without room (`Admission.idleFor`,
+    /// `forced`), so a machine that cannot fit a job says so and still works (#406).
     pub fn check(g: *Gate) ?Hold {
         const a = g.pool;
         a.mu.lockUncancelable(a.io);
@@ -471,7 +728,27 @@ pub const Gate = struct {
         const signal = a.signals(now_ms);
         // A runner asks beside every runner polling; the warm asks for itself alone.
         const asking = if (g.warm) 1 else a.polling + @intFromBool(!g.claimed);
-        const hold = decide(a.limits, signal, a.reserved(now_ms, asking, true), g.holding);
+        var r = a.withHead(a.reserved(now_ms, asking, false), null);
+        // The pre-warm is a job on the engine, not a native one, however it is counted.
+        if (g.warm and a.native) r.native_mb -|= a.unknown();
+        var hold = decide(a.limits, signal, r, g.holding);
+        // A job waits for room and the runner would take it: it may still poll if it fits without
+        // that job, since what it is handed is told at `start`, where a job that is not expected
+        // to be short waits behind the first in line. The cost is the runner it holds, and no more
+        // than half the pool's are let to (`Admission.aheadOpen`, #415).
+        if (hold != null and !g.warm and a.head() != null) {
+            const no_head = a.reserved(now_ms, asking, false);
+            if (decide(a.limits, signal, no_head, g.holding) == null and
+                a.waitingCount() < a.slots.len / 2 and a.aheadOpen(signal, now_ms))
+            {
+                hold = null;
+            }
+        }
+        g.forced = null;
+        if (hold) |h| if (!g.warm and a.idleFor(h, g.claimed)) {
+            g.forced = h;
+            hold = null;
+        };
         g.holding = hold != null;
         if (g.warm) return hold;
         if (hold == null and !g.claimed) a.polling += 1;
@@ -499,7 +776,8 @@ pub const Gate = struct {
     /// that jobs named in the same moment pass one at a time, each counting the ones before it:
     /// a burst of heavy jobs gets as far as there is room for, and the rest wait, holding the
     /// jobs GitHub gave them (`Renewer`). Waiting jobs do not reserve against each other, which
-    /// would hold them all for ever. When none else runs, the one that came first is let through
+    /// would hold them all for ever; a job that is not first in line leaves room for the one that
+    /// is (`withHead`). When none else runs, the one that came first is let through
     /// however little room there is: the machine cannot get freer, and a job over `memory.max`
     /// is the kernel's to end. Always `started` for a job that does not wait: on the engine, or
     /// the pre-warm.
@@ -512,7 +790,7 @@ pub const Gate = struct {
         const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
         const signal = a.signals(now_ms);
         const est: u64 = s.est_mb orelse a.unknown();
-        var r = a.reserved(now_ms, a.polling, false);
+        var r = a.withHead(a.reserved(now_ms, a.polling, false), g.slot);
         r.jobs += 1;
         r.mb += est;
         r.native_mb += est;
@@ -522,6 +800,23 @@ pub const Gate = struct {
             Admission.admit(s, now_ms);
             return .started;
         };
+        // No room beside the first in line, but room without it, and a name expected to be gone
+        // soon: it goes ahead (#415). A name not learned is long, and waits its turn.
+        if (a.head() != &a.slots[g.slot]) {
+            const short = if (a.runMs(s.key)) |ms| ms <= short_run_ms else false;
+            var no_head = a.reserved(now_ms, a.polling, false);
+            no_head.jobs += 1;
+            no_head.mb += est;
+            no_head.native_mb += est;
+            if (short and decide(a.limits, signal, no_head, false) == null and
+                a.aheadOpen(signal, now_ms))
+            {
+                Admission.admit(s, now_ms);
+                s.ahead = true;
+                g.holding = false;
+                return .started;
+            }
+        }
         if (!a.firstAlone(g.slot)) return .{ .wait = h };
         Admission.admit(s, now_ms);
         g.holding = false;
@@ -712,6 +1007,7 @@ pub const Gate = struct {
         defer a.changed();
         const s = a.slots[g.slot];
         a.slots[g.slot] = .{};
+        const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
         if (s.replayed) return null;
         const key = s.key orelse return null;
         const base = s.base_mb orelse return null;
@@ -730,6 +1026,11 @@ pub const Gate = struct {
         // A native job ran in a cgroup of its own: alone, whatever else ran.
         const alone = s.native or !s.overlapped();
         const after = table.record(key, seen_mb, alone);
+        // How long it ran, for the jobs that may go ahead of one waiting for room (`aheadOpen`): not
+        // a job that never started (cancelled while it waited), and not one that replayed steps,
+        // which ran less than its next real run will (above).
+        if (!s.waiting) table.recordRun(key, now_ms -| s.started_ms);
+        if (a.persist) |*p| p.dirty = true;
         if (before == after) return null;
         return .{ .seen_mb = seen_mb, .estimate_mb = after, .alone = alone, .native = s.native };
     }
@@ -759,11 +1060,15 @@ pub const Learned = struct {
     pub const kept = 5;
     /// The least a job is seen to take: one that ran while another job freed memory can measure 0.
     pub const min_mb = 64;
+    /// The longest run kept: 12 days, so that it fits the table's u32 and the file.
+    pub const max_run_ms = 1 << 30;
 
     const Entry = struct {
         key: u64,
         alone: Runs = .{},
         beside: Runs = .{},
+        /// How long the last `kept` runs took, in ms, whatever they were beside (`recordRun`).
+        ran: Runs = .{},
         used: u64 = 0,
 
         fn estimate(e: *const Entry) u32 {
@@ -772,15 +1077,21 @@ pub const Learned = struct {
         }
     };
 
-    /// The last `kept` runs' MB, oldest overwritten first.
+    /// The last `kept` runs' MB (or ms), oldest overwritten first.
     const Runs = struct {
-        mb: [kept]u32 = undefined,
+        v: [kept]u32 = undefined,
         /// Runs in `mb`, up to `kept`, and where the next one goes.
         n: u8 = 0,
         next: u8 = 0,
 
         fn slice(r: *const Runs) []const u32 {
-            return r.mb[0..r.n];
+            return r.v[0..r.n];
+        }
+
+        fn push(r: *Runs, value: u32) void {
+            r.v[r.next] = value;
+            r.next = (r.next + 1) % kept;
+            r.n = @min(r.n + 1, kept);
         }
     };
 
@@ -814,12 +1125,27 @@ pub const Learned = struct {
             break :e &l.entries[l.len - 1];
         };
         const runs = if (alone) &e.alone else &e.beside;
-        runs.mb[runs.next] = seen_mb;
-        runs.next = (runs.next + 1) % kept;
-        runs.n = @min(runs.n + 1, kept);
+        runs.push(seen_mb);
         l.tick += 1;
         e.used = l.tick;
         return e.estimate();
+    }
+
+    /// A run of `key` took `ms` from start to end; for a name `record` has seen (the job ended
+    /// with its memory learned). A run is at least 1 ms and at most `max_run_ms`.
+    fn recordRun(l: *Learned, key: u64, ms: i64) void {
+        const e = l.find(key) orelse return;
+        e.ran.push(std.math.lossyCast(u32, std.math.clamp(ms, 1, max_run_ms)));
+    }
+
+    /// How long the longest of the last `kept` runs of `key` took, in ms: not the mean, so that a
+    /// job that is sometimes long is not taken for a short one. Null for a name with no run
+    /// learned. Does not count as a use of the name.
+    fn longest(l: *const Learned, key: u64) ?u32 {
+        for (l.entries[0..l.len]) |*e| if (e.key == key) {
+            return if (e.ran.n == 0) null else std.mem.max(u32, e.ran.slice());
+        };
+        return null;
     }
 
     /// The most any known name reserves; 0 with none known.
@@ -834,6 +1160,272 @@ pub const Learned = struct {
         return null;
     }
 };
+
+// ---- What jobs took, kept between runs (#407) ----
+
+/// Where the learned estimates are kept between runs.
+pub const Persist = struct {
+    /// The file; its temp file is `path` + ".tmp".
+    path: []const u8,
+    identity: Identity,
+    /// Something was learned since the last write.
+    dirty: bool = false,
+    written_ms: i64 = std.math.minInt(i64),
+    /// A failed write was warned of already, until one succeeds.
+    warned: bool = false,
+
+    /// At most this often a change is written; a later one waits for the next look, and the pool's
+    /// end writes what is left (`Admission.flush`).
+    pub const min_interval_ms = 10 * std.time.ms_per_s;
+};
+
+/// What the estimates were measured on: a machine's memory accounting and a backend's reading of a
+/// job differ, so a file written elsewhere or by another backend is wrong here (#407).
+pub const Identity = struct {
+    machine_buf: [64]u8 = undefined,
+    machine_len: usize = 0,
+    /// `MemTotal`, in MB; 0 when unknown.
+    memory_mb: u64 = 0,
+    native: bool = false,
+
+    fn machine(i: *const Identity) []const u8 {
+        return i.machine_buf[0..i.machine_len];
+    }
+
+    /// The machine id (`/etc/machine-id`), else the host name, else "unknown"; its memory; and the
+    /// pool's backend.
+    pub fn read(io: std.Io, paths: Paths, native: bool) Identity {
+        var i: Identity = .{ .native = native };
+        for ([_][]const u8{ paths.machine_id, paths.hostname }) |file| {
+            var buf: [64]u8 = undefined;
+            const text = std.Io.Dir.cwd().readFile(io, file, &buf) catch continue;
+            const id = std.mem.trim(u8, text, " \n\t\r");
+            if (id.len == 0 or std.mem.indexOfAny(u8, id, " \n\t\r") != null) continue;
+            @memcpy(i.machine_buf[0..id.len], id);
+            i.machine_len = id.len;
+            break;
+        }
+        if (i.machine_len == 0) {
+            @memcpy(i.machine_buf[0..7], "unknown");
+            i.machine_len = 7;
+        }
+        var mem_buf: [4096]u8 = undefined;
+        if (std.Io.Dir.cwd().readFile(io, paths.meminfo, &mem_buf)) |text| {
+            i.memory_mb = parseMeminfo(text).total_mb orelse 0;
+        } else |_| {}
+        return i;
+    }
+
+    /// Why a file written for `file` is no good for `i`, or null if it is.
+    fn mismatch(i: *const Identity, file: Identity) ?[]const u8 {
+        if (!std.mem.eql(u8, i.machine(), file.machine())) return "it was written on another machine";
+        if (i.native != file.native) return "it was written by another backend";
+        // MemTotal moves a little between boots (the kernel's own reservations); a different amount
+        // of memory is another machine as far as the accounting goes (a resized VM).
+        const diff = if (i.memory_mb > file.memory_mb) i.memory_mb - file.memory_mb else file.memory_mb - i.memory_mb;
+        if (diff > @max(i.memory_mb, file.memory_mb) / 16) return "the machine's memory is not what it was";
+        return null;
+    }
+};
+
+/// What `Admission.restore` found.
+pub const Restore = union(enum) {
+    /// No file: a first start.
+    absent,
+    /// The estimates read, in both tables.
+    loaded: u32,
+    /// A file that is not used, and why; to be warned of.
+    ignored: []const u8,
+};
+
+const file_header = "zig-runner memory gate v2";
+const file_header_prefix = "zig-runner memory gate ";
+
+/// Both tables, as the file holds them.
+const Tables = struct { engine: Learned = .{}, native: Learned = .{} };
+
+/// The tables as text: the header, the identity, then one line for each name, in the order the
+/// tables hold them.
+fn render(w: *std.Io.Writer, id: Identity, t: *const Tables) std.Io.Writer.Error!void {
+    try w.print("{s}\nmachine {s}\nmemory_mb {d}\nbackend {s}\n", .{
+        file_header,
+        id.machine(),
+        id.memory_mb,
+        if (id.native) "native" else "dagger",
+    });
+    inline for (.{ "engine", "native" }) |name| {
+        const table = &@field(t, name);
+        for (table.entries[0..table.len]) |*e| {
+            try w.print("e {s} {x:0>16} {d}", .{ name, e.key, e.used });
+            inline for (.{ .{ 'A', "alone" }, .{ 'B', "beside" }, .{ 'R', "ran" } }) |run| {
+                const runs = &@field(e, run[1]);
+                try w.print(" {c} {d} {d}", .{ run[0], runs.n, runs.next });
+                for (runs.slice()) |mb| try w.print(" {d}", .{mb});
+            }
+            try w.writeByte('\n');
+        }
+    }
+}
+
+const FileError = error{ Format, WrongVersion, Foreign };
+
+/// The tables in `text` if it is a file for `id`: all of them or an error, for half a file would
+/// teach estimates that are not any run's.
+fn parseTables(text: []const u8, id: Identity, out: *Tables, why: *[]const u8) FileError!void {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    const first = lines.next() orelse return error.Format;
+    if (!std.mem.eql(u8, first, file_header)) {
+        return if (std.mem.startsWith(u8, first, file_header_prefix)) error.WrongVersion else error.Format;
+    }
+    var file: Identity = .{};
+    for (0..3) |_| {
+        var words = std.mem.tokenizeScalar(u8, lines.next() orelse return error.Format, ' ');
+        const key = words.next() orelse return error.Format;
+        const value = words.next() orelse return error.Format;
+        if (words.next() != null) return error.Format;
+        if (std.mem.eql(u8, key, "machine")) {
+            if (value.len > file.machine_buf.len) return error.Format;
+            @memcpy(file.machine_buf[0..value.len], value);
+            file.machine_len = value.len;
+        } else if (std.mem.eql(u8, key, "memory_mb")) {
+            file.memory_mb = std.fmt.parseInt(u64, value, 10) catch return error.Format;
+        } else if (std.mem.eql(u8, key, "backend")) {
+            if (std.mem.eql(u8, value, "native")) {
+                file.native = true;
+            } else if (!std.mem.eql(u8, value, "dagger")) return error.Format;
+        } else return error.Format;
+    }
+    if (id.mismatch(file)) |reason| {
+        why.* = reason;
+        return error.Foreign;
+    }
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var words = std.mem.tokenizeScalar(u8, line, ' ');
+        if (!std.mem.eql(u8, words.next() orelse return error.Format, "e")) return error.Format;
+        const which = words.next() orelse return error.Format;
+        const table = if (std.mem.eql(u8, which, "engine"))
+            &out.engine
+        else if (std.mem.eql(u8, which, "native"))
+            &out.native
+        else
+            return error.Format;
+        if (table.len == Learned.capacity) return error.Format;
+        var e: Learned.Entry = .{ .key = 0 };
+        e.key = std.fmt.parseInt(u64, words.next() orelse return error.Format, 16) catch return error.Format;
+        e.used = std.fmt.parseInt(u64, words.next() orelse return error.Format, 10) catch return error.Format;
+        inline for (.{
+            .{ "A", "alone", 1 << 20 },
+            .{ "B", "beside", 1 << 20 },
+            .{ "R", "ran", Learned.max_run_ms },
+        }) |run| {
+            const runs = &@field(e, run[1]);
+            if (!std.mem.eql(u8, words.next() orelse return error.Format, run[0])) return error.Format;
+            const n = std.fmt.parseInt(u8, words.next() orelse return error.Format, 10) catch return error.Format;
+            const next = std.fmt.parseInt(u8, words.next() orelse return error.Format, 10) catch return error.Format;
+            if (n > Learned.kept or next >= Learned.kept) return error.Format;
+            // Filled from 0 until `kept` runs are there, then overwritten oldest first.
+            if (n < Learned.kept and next != n) return error.Format;
+            runs.n = n;
+            runs.next = next;
+            for (runs.v[0..n]) |*mb| {
+                mb.* = std.fmt.parseInt(u32, words.next() orelse return error.Format, 10) catch return error.Format;
+                if (mb.* > run[2]) return error.Format;
+            }
+        }
+        if (words.next() != null) return error.Format;
+        if (table.find(e.key) != null) return error.Format;
+        table.entries[table.len] = e;
+        table.len += 1;
+        table.tick = @max(table.tick, e.used);
+    }
+}
+
+/// Writes `data` to `path` so that a reader finds the old file or the whole new one: to a temp file
+/// beside it, synced, renamed over it, and the directory synced for the rename.
+pub fn writeFileAtomic(io: std.Io, path: []const u8, data: []const u8) !void {
+    const linux = std.os.linux;
+    const cwd = std.Io.Dir.cwd();
+    var tmp_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    try cwd.createDirPath(io, dir_path);
+    {
+        const f = try cwd.createFile(io, tmp, .{});
+        defer f.close(io);
+        errdefer removeTemp(io, tmp);
+        try f.writeStreamingAll(io, data);
+        if (linux.errno(linux.fsync(f.handle)) != .SUCCESS) return error.Sync;
+    }
+    cwd.rename(tmp, cwd, path, io) catch |e| {
+        removeTemp(io, tmp);
+        return e;
+    };
+    var dir = try cwd.openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    if (linux.errno(linux.fsync(dir.handle)) != .SUCCESS) return error.Sync;
+}
+
+fn removeTemp(io: std.Io, tmp: []const u8) void {
+    std.Io.Dir.cwd().deleteFile(io, tmp) catch |e| std.log.warn(
+        "memory gate: cannot remove {s}: {s}",
+        .{ tmp, @errorName(e) },
+    );
+}
+
+/// A file of 128 names is about 28 KB.
+const file_max_bytes = 48 * 1024;
+
+// ---- A reservation that can never fit (#406) ----
+
+/// A setting whose one job could never start on this machine.
+pub const Misfit = struct {
+    /// One job's reservation and the setting it comes from.
+    setting: []const u8,
+    setting_mb: u32,
+    /// What must be left beyond it, and the setting it comes from.
+    floor_setting: []const u8,
+    floor_mb: u32,
+    /// What they were compared with ("the machine has", "the engine's cap is"), and its size.
+    against: []const u8,
+    limit_mb: u64,
+
+    pub fn format(m: Misfit, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print(
+            "{s}={d} plus {s}={d} need {d} MB for one job, but {s} {d} MB: no job could ever " ++
+                "start, and the memory gate would hold every runner for ever. Lower them, or " ++
+                "turn the gate off with RUNNER_ADMISSION=false",
+            .{
+                m.setting,                           m.setting_mb, m.floor_setting, m.floor_mb,
+                @as(u64, m.setting_mb) + m.floor_mb, m.against,    m.limit_mb,
+            },
+        );
+    }
+};
+
+/// The memory this process can have at most, in MB: the machine's, or the least `memory.max` of the
+/// cgroups the runner is in and above (a systemd `MemoryMax=`, a container's limit) if that is less.
+/// Null when `MemTotal` cannot be read.
+fn runnerMemory(io: std.Io, paths: Paths) ?struct { mb: u64, cgroup: bool } {
+    var buf: [4096]u8 = undefined;
+    const text = std.Io.Dir.cwd().readFile(io, paths.meminfo, &buf) catch return null;
+    var least: u64 = parseMeminfo(text).total_mb orelse return null;
+    var cgroup = false;
+    var rel_buf: [4096]u8 = undefined;
+    const own = std.Io.Dir.cwd().readFile(io, paths.self_cgroup, &rel_buf) catch return .{ .mb = least, .cgroup = false };
+    const rel = parseProcCgroup(own) orelse return .{ .mb = least, .cgroup = false };
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var at: []const u8 = std.fmt.bufPrint(&dir_buf, "{s}{s}", .{ paths.cgroup_root, rel }) catch
+        return .{ .mb = least, .cgroup = false };
+    while (at.len > paths.cgroup_root.len) {
+        if (readBytes(io, at, "memory.max")) |cap| if (cap >> 20 < least) {
+            least = cap >> 20;
+            cgroup = true;
+        };
+        at = std.fs.path.dirname(at) orelse break;
+    }
+    return .{ .mb = least, .cgroup = cgroup };
+}
 
 /// A job's identity across runs: its repository, its workflow file without the ref (a branch's
 /// runs and main's are one job), and its name as GitHub shows it, a matrix leg's included.
@@ -926,8 +1518,9 @@ pub fn decide(limits: Limits, s: Signals, reserved: Reservation, holding: bool) 
             .floor_mb = limits.min_available_mb,
         } };
     }
-    // The same reservations against the engine's cap, but native jobs': every other job taken
-    // runs in the engine.
+    // The same reservations against the engine's cap, less the native ones (`native_mb`): a native
+    // job runs in its own cgroup and takes nothing of it, and neither does a runner polling on a
+    // native pool, whatever job it is handed (#414). Every other job taken runs in the engine.
     if (s.engine) |e| {
         const margin: u64 = if (holding) resume_margin_mb else 0;
         const needed = limits.min_engine_headroom_mb + (reserved.mb -| reserved.native_mb);
@@ -1228,8 +1821,9 @@ fn cappedAncestor(io: std.Io, root: []const u8, start: []const u8, buf: []u8) ![
 }
 
 /// `MemAvailable`, and swap in use, in MB.
-pub fn parseMeminfo(text: []const u8) struct { available_mb: ?u64, swap_used_mb: ?u64 } {
+pub fn parseMeminfo(text: []const u8) struct { available_mb: ?u64, swap_used_mb: ?u64, total_mb: ?u64 } {
     var available: ?u64 = null;
+    var total: ?u64 = null;
     var swap_total: ?u64 = null;
     var swap_free: ?u64 = null;
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -1240,6 +1834,7 @@ pub fn parseMeminfo(text: []const u8) struct { available_mb: ?u64, swap_used_mb:
         var fields = std.mem.tokenizeScalar(u8, line[colon + 1 ..], ' ');
         const kb = std.fmt.parseInt(u64, fields.next() orelse continue, 10) catch continue;
         if (std.mem.eql(u8, key, "MemAvailable")) available = kb / 1024 //
+        else if (std.mem.eql(u8, key, "MemTotal")) total = kb / 1024 //
         else if (std.mem.eql(u8, key, "SwapTotal")) swap_total = kb / 1024 //
         else if (std.mem.eql(u8, key, "SwapFree")) swap_free = kb / 1024;
     }
@@ -1247,7 +1842,7 @@ pub fn parseMeminfo(text: []const u8) struct { available_mb: ?u64, swap_used_mb:
         swap_total.? -| swap_free.?
     else
         null;
-    return .{ .available_mb = available, .swap_used_mb = swap_used };
+    return .{ .available_mb = available, .swap_used_mb = swap_used, .total_mb = total };
 }
 
 /// `some avg10` from /proc/pressure/memory, in hundredths of a percent ("12.34" is 1234).
@@ -2046,7 +2641,7 @@ test "a native job not learned yet reserves native_per_job_mb, and a native pool
     try std.testing.expectEqual(@as(?u32, 256), slots[0].est_mb);
     const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
     try std.testing.expectEqual(
-        Reservation{ .jobs = 6, .mb = 6 * 256, .native_mb = 256 },
+        Reservation{ .jobs = 6, .mb = 6 * 256, .native_mb = 6 * 256 },
         pool.reserved(now_ms, pool.polling, true),
     );
     _ = gates[0].ended();
@@ -2092,7 +2687,10 @@ test "a native pool's runners reserve native_per_job_mb while they poll, however
     var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 5400);
     const now_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
     // razorbill: six pollers beside a learned 2.6 GB job reserved 15.8 GB, now 1.5 GB.
-    try std.testing.expectEqual(Reservation{ .jobs = 6, .mb = 6 * 256 }, pool.reserved(now_ms, 6, true));
+    try std.testing.expectEqual(
+        Reservation{ .jobs = 6, .mb = 6 * 256, .native_mb = 6 * 256 },
+        pool.reserved(now_ms, 6, true),
+    );
     var gates: [6]Gate = undefined;
     for (&gates, 0..) |*g, i| {
         g.* = .{ .pool = &pool, .slot = i };
@@ -2130,12 +2728,13 @@ test "heavy jobs handed out together start as far as there is room, and the rest
     }
     try std.testing.expectEqual(@as(usize, 2), started);
     try std.testing.expect(!slots[0].waiting and !slots[1].waiting and slots[2].waiting);
-    // A light job named meanwhile passes beside them (the heavy jobs waiting do not hold it):
-    // 1536 + 5200 + 200 fit.
+    // A light job named meanwhile waits for the first of the heavy ones, whose room it would take:
+    // 1536 + 5200 + 2600 + 200 do not fit (#415 has it start beside them where they do).
     gates[6].leave(true);
     gates[6].assigned(burst_light);
-    try std.testing.expectEqual(@as(StartTag, .started), std.meta.activeTag(gates[6].start()));
-    // The waiting jobs reserve for runners polling, not against each other.
+    try std.testing.expectEqual(@as(StartTag, .wait), std.meta.activeTag(gates[6].start()));
+    // The waiting jobs do not reserve against each other (the first in line is counted by those
+    // that ask, `withHead`).
     const now_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
     try std.testing.expectEqual(@as(u64, 2 * 2600 + 200 + 4 * 2600), pool.reserved(now_ms, 0, true).mb);
     // One heavy job ends, and the next in line starts; the others still wait.
@@ -2599,4 +3198,697 @@ test "a job is the same job on any ref, and another under another name or workfl
     try std.testing.expect(main != other);
     // Where one part ends matters: "ab" and "c" are not "a" and "bc".
     try std.testing.expect(jobKey("ab", "c", "") != jobKey("a", "bc", ""));
+}
+
+test "a native pool's runners are not counted against the engine's cap, a Dagger pool's are (#414)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/engine", .{tmp.sub_path});
+    // razorbill's bench pool: the engine busy at 2.4 GB of its 4 GB (another pool's Dagger jobs),
+    // 1696 MB under the cap, and six runners polling at 256 MB each.
+    try setEngine(tmp.dir, 2400);
+    const limits: Limits = .{ .per_job_mb = 256, .native_per_job_mb = 256, .min_available_mb = 0 };
+
+    var native_slots: [7]Admission.Slot = undefined;
+    var native_pool: Admission = .init(io, limits, &native_slots);
+    native_pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    native_pool.engine.dir = dir;
+    native_pool.native = true;
+    var native_gates: [6]Gate = undefined;
+    // 6 x 256 + 256 MB of headroom is 1792: over the 1696 free, if the pollers were the engine's.
+    for (&native_gates, 0..) |*g, i| {
+        g.* = .{ .pool = &native_pool, .slot = i };
+        try std.testing.expect(g.check() == null);
+    }
+    const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+    try std.testing.expectEqual(
+        Reservation{ .jobs = 6, .mb = 6 * 256, .native_mb = 6 * 256 },
+        native_pool.reserved(now_ms, 6, true),
+    );
+    // A job that goes back to the engine reserves there from then on.
+    native_gates[0].leave(true);
+    native_gates[0].assigned(burst_heavy);
+    try std.testing.expect(native_gates[0].start() == .started);
+    try std.testing.expectEqual(@as(?u32, null), native_gates[0].native(null));
+    native_gates[0].backToEngine();
+    const back = native_pool.reserved(now_ms, 0, true);
+    try std.testing.expectEqual(Reservation{ .jobs = 1, .mb = 256, .native_mb = 0 }, back);
+
+    // The same numbers on a Dagger pool: its runners poll for jobs that run in the engine.
+    var slots: [7]Admission.Slot = undefined;
+    var pool: Admission = .init(io, limits, &slots);
+    pool.paths = native_pool.paths;
+    pool.engine.dir = dir;
+    var gates: [6]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    for (gates[0..5]) |*g| try std.testing.expect(g.check() == null);
+    try std.testing.expect(gates[5].check().? == .engine);
+}
+
+/// A native pool of `slots.len` runners, as `burstPool`, with `n` heavy jobs named at once and
+/// waiting for room, in the order of their slots.
+fn waitingHeavy(gates: []Gate, n: usize) void {
+    for (gates[0..n]) |*g| {
+        g.leave(true);
+        g.assigned(burst_heavy);
+    }
+}
+
+test "a poller passes beside waiting heavy jobs when the first of them still has room, not when it would take it (#415)" {
+    var slots: [8]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Three heavy jobs (2600 MB each) named and waiting; nothing runs. The floor is 1536 MB.
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 6500);
+    var gates: [8]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    waitingHeavy(&gates, 3);
+    for (gates[0..3]) |*g| try std.testing.expect(slots[g.slot].waiting);
+    // Before, the poller reserved all three: 1536 + 3 x 2600 + 256 = 9592 MB, over 6500, and held.
+    // Now it reserves the first: 1536 + 2600 + 256 = 4392 MB, and polls; the two behind it do not
+    // hold it.
+    try std.testing.expect(gates[6].check() == null);
+    // A light job named meanwhile starts beside them, with room for it and the first.
+    gates[7].leave(true);
+    gates[7].assigned(burst_light);
+    try std.testing.expectEqual(@as(StartTag, .started), std.meta.activeTag(gates[7].start()));
+    // The poller is still counted; the first of the line starts at its next look, with the room
+    // that was kept for it: 1536 + 200 + 256 (the poller) + 2600 = 4592 MB of 6500.
+    try std.testing.expectEqual(@as(StartTag, .started), std.meta.activeTag(gates[0].start()));
+    try std.testing.expect(!slots[0].waiting and slots[1].waiting and slots[2].waiting);
+}
+
+test "a poller or a job that would take the room of the first in line is held, and the first starts as soon as it fits (#415)" {
+    var slots: [8]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 4200 MB: the first heavy job fits alone (1536 + 2600 = 4136), not beside a poller (4392) or
+    // a light job (4336).
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 4200);
+    var gates: [8]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    waitingHeavy(&gates, 3);
+    try std.testing.expect(gates[6].check().? == .memory);
+    try std.testing.expect(!gates[6].claimed);
+    gates[7].leave(true);
+    gates[7].assigned(burst_light);
+    try std.testing.expectEqual(@as(StartTag, .wait), std.meta.activeTag(gates[7].start()));
+    try std.testing.expect(slots[7].waiting);
+    // The second in line does not start either, whatever it asks.
+    try std.testing.expectEqual(@as(StartTag, .wait), std.meta.activeTag(gates[1].start()));
+    // The first fits and starts, with the others waiting and a light job behind it.
+    try std.testing.expectEqual(@as(StartTag, .started), std.meta.activeTag(gates[0].start()));
+    // The next in line is now the first, and it waits for the room of the one that runs.
+    try std.testing.expectEqual(@as(StartTag, .wait), std.meta.activeTag(gates[1].start()));
+    // A job that began waiting after the first one never delayed it: the light job is still
+    // waiting for the heavy one to end, then for the second's room.
+    try std.testing.expectEqual(@as(StartTag, .wait), std.meta.activeTag(gates[7].start()));
+    // The machine has a little more by now (a held job needs the resume margin more to go).
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "meminfo", .data = "MemAvailable: 4608000 kB\n" });
+    _ = gates[0].ended();
+    try std.testing.expectEqual(@as(StartTag, .started), std.meta.activeTag(gates[1].start()));
+}
+
+test "nothing fits and nothing runs: the first in line is forced and a poller is let through (#415, #406)" {
+    var slots: [4]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Under the floor: not even the first fits.
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 1000);
+    var gates: [4]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    waitingHeavy(&gates, 2);
+    // A job waits, so a poller is held: the job is the one forced.
+    try std.testing.expect(gates[2].check().? == .memory);
+    try std.testing.expect(gates[2].forced == null);
+    try std.testing.expectEqual(@as(StartTag, .forced), std.meta.activeTag(gates[0].start()));
+}
+
+test "with nothing running or named, one poller is let through however little room there is (#406)" {
+    var slots: [4]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 1000 MB available, 1536 MB floor: a poller can never pass on room.
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 1000);
+    var gates: [4]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    try std.testing.expect(gates[0].check() == null);
+    try std.testing.expect(gates[0].forced.? == .memory);
+    try std.testing.expect(gates[0].claimed);
+    // Only one: the others hold, as the rest of the pool would otherwise take jobs at once.
+    try std.testing.expect(gates[1].check().? == .memory);
+    try std.testing.expect(gates[1].forced == null);
+    // Looking again changes nothing for the one that polls.
+    try std.testing.expect(gates[0].check() == null);
+    try std.testing.expectEqual(@as(u32, 1), pool.polling);
+    // It takes a job: now something runs, and the others wait for it.
+    gates[0].leave(true);
+    try std.testing.expect(gates[1].check().? == .memory);
+    gates[0].assigned(burst_light);
+    try std.testing.expect(gates[1].check().? == .memory);
+    _ = gates[0].ended();
+    // It ended: nothing runs again, and the next one is let through.
+    try std.testing.expect(gates[1].check() == null);
+    try std.testing.expect(gates[1].forced != null);
+}
+
+test "pressure and swap holds are not overridden when nothing runs (#406)" {
+    var slots: [2]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 8000);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "pressure",
+        .data = "some avg10=50.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+    });
+    var path_buf: [256]u8 = undefined;
+    pool.paths.pressure = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/pressure", .{tmp.sub_path});
+    var gate: Gate = .{ .pool = &pool, .slot = 0 };
+    try std.testing.expect(gate.check().? == .pressure);
+    try std.testing.expect(gate.forced == null);
+}
+
+// ---- Jobs expected to finish soon go ahead of one waiting for room (#415) ----
+
+const burst_novel = jobKey("o/r", "o/r/.github/workflows/ci.yml", "docs");
+const burst_long = jobKey("o/r", "o/r/.github/workflows/ci.yml", "e2e long");
+
+fn setAvailable(dir: std.Io.Dir, mb: u64) !void {
+    var buf: [64]u8 = undefined;
+    try dir.writeFile(std.testing.io, .{
+        .sub_path = "meminfo",
+        .data = try std.fmt.bufPrint(&buf, "MemAvailable: {d} kB\n", .{mb * 1024}),
+    });
+}
+
+/// The runner of `g` is handed a job named `key`, and asks to start it.
+fn named(g: *Gate, key: u64) StartTag {
+    g.leave(true);
+    g.assigned(key);
+    return std.meta.activeTag(g.start());
+}
+
+/// What razorbill's pool has learned of these names: memory (`burstPool`), and how long each ran.
+fn learnRuns(pool: *Admission) void {
+    pool.learned_native.recordRun(burst_heavy, 270 * std.time.ms_per_s);
+    pool.learned_native.recordRun(burst_light, 5 * std.time.ms_per_s);
+    // Short memory-wise, and not short in time or not timed at all.
+    _ = pool.learned_native.record(burst_long, 200, true);
+    pool.learned_native.recordRun(burst_long, 180 * std.time.ms_per_s);
+    _ = pool.learned_native.record(burst_novel, 200, true);
+}
+
+test "short jobs start beside a heavy one waiting for room; it starts when the heavy one running ends (#415)" {
+    var slots: [12]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 6500 MB of 1536 floor: a heavy job (2600) running, ramping, and a second one waiting
+    // (1536 + 2600 + 2600 = 6736) cannot start; a short one beside the first can (4336).
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 6500);
+    learnRuns(&pool);
+    var gates: [12]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    try std.testing.expectEqual(StartTag.started, named(&gates[0], burst_heavy));
+    try std.testing.expectEqual(StartTag.wait, named(&gates[1], burst_heavy));
+    // The seven-job e2e burst: each starts at once, ahead of the heavy job waiting.
+    for (gates[2..9]) |*g| try std.testing.expectEqual(StartTag.started, named(g, burst_light));
+    for (slots[2..9]) |s| try std.testing.expect(s.ahead and !s.waiting);
+    try std.testing.expect(slots[1].waiting);
+    // Two runners poll for more: they are not held for the waiting job's room either.
+    try std.testing.expect(gates[9].check() == null);
+    try std.testing.expect(gates[10].check() == null);
+    // The heavy job running ends: the waiting one starts at its next look, with the short jobs
+    // still running (they were learned to take seconds, and do not hold what it needs).
+    _ = gates[0].ended();
+    try setAvailable(tmp.dir, 7600);
+    try std.testing.expectEqual(StartTag.started, std.meta.activeTag(gates[1].start()));
+    try std.testing.expect(!slots[1].waiting and slots[2].ahead);
+}
+
+test "a job not learned or learned long waits behind the first in line, and so does a short one with no room (#415)" {
+    var slots: [12]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 6500);
+    learnRuns(&pool);
+    var gates: [12]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    _ = named(&gates[0], burst_heavy);
+    _ = named(&gates[1], burst_heavy);
+    // Memory for each is there; the name never ran (so unknown, long), or ran for 180 s.
+    try std.testing.expectEqual(StartTag.wait, named(&gates[2], burst_novel));
+    try std.testing.expectEqual(StartTag.wait, named(&gates[3], burst_long));
+    try std.testing.expect(slots[2].waiting and !slots[2].ahead and slots[3].waiting);
+    // A short one starts beside them, and the first in line is still the first.
+    try std.testing.expectEqual(StartTag.started, named(&gates[4], burst_light));
+    // A short job that takes what is left of the room waits: 4336 + 200 + 200 x 10 > 6500.
+    try setAvailable(tmp.dir, 4500);
+    try std.testing.expectEqual(StartTag.wait, named(&gates[5], burst_light));
+    try std.testing.expectEqual(@as(?*const Admission.Slot, &slots[1]), pool.head());
+}
+
+test "no short job goes ahead once the first in line would fit without the ones ahead: a stream cannot starve it (#415)" {
+    var slots: [12]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 5200);
+    learnRuns(&pool);
+    var gates: [12]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    // A job of a name not timed runs (not ahead of anything), then the heavy one and the one
+    // waiting for it; four short jobs go ahead.
+    try std.testing.expectEqual(StartTag.started, named(&gates[6], burst_novel));
+    try std.testing.expectEqual(StartTag.started, named(&gates[0], burst_heavy));
+    try std.testing.expectEqual(StartTag.wait, named(&gates[1], burst_heavy));
+    for (gates[2..6]) |*g| try std.testing.expectEqual(StartTag.started, named(g, burst_light));
+    // The heavy job ends. The first in line needs 1536 + 200 + 4 x 200 + 2600 = 5136 MB and has
+    // 4700, so it waits for the short jobs; without them it would fit (4336, and 256 more to
+    // resume), so no more go before it: a stream of short jobs arrives and waits, each time one
+    // of them ends.
+    _ = gates[0].ended();
+    try setAvailable(tmp.dir, 4700);
+    try std.testing.expectEqual(StartTag.wait, std.meta.activeTag(gates[1].start()));
+    for (0..4) |i| {
+        try std.testing.expectEqual(StartTag.wait, named(&gates[7 + i], burst_light));
+        try std.testing.expect(!slots[7 + i].ahead);
+        if (i < 3) try std.testing.expectEqual(StartTag.wait, std.meta.activeTag(gates[1].start()));
+        _ = gates[2 + i].ended();
+    }
+    // The last one ended: the first in line starts, ahead of the stream waiting behind it.
+    try std.testing.expectEqual(StartTag.started, std.meta.activeTag(gates[1].start()));
+    for (slots[7..11]) |s| try std.testing.expect(s.waiting);
+}
+
+test "with only jobs that went ahead running, the first in line is forced when they end, not kept waiting (#415, #386)" {
+    var slots: [6]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 6500);
+    learnRuns(&pool);
+    var gates: [6]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    _ = named(&gates[0], burst_heavy);
+    _ = named(&gates[1], burst_heavy);
+    try std.testing.expectEqual(StartTag.started, named(&gates[2], burst_light));
+    _ = gates[0].ended();
+    // The first in line does not fit (4136 needed), a short job would. Only the short job runs.
+    try setAvailable(tmp.dir, 3000);
+    try std.testing.expectEqual(StartTag.wait, named(&gates[3], burst_light));
+    try std.testing.expectEqual(StartTag.wait, std.meta.activeTag(gates[1].start()));
+    _ = gates[2].ended();
+    try std.testing.expectEqual(StartTag.forced, std.meta.activeTag(gates[1].start()));
+    try std.testing.expect(!slots[1].waiting);
+}
+
+test "a job learned short that runs long delays the first in line by that run, once, and is learned long (#415)" {
+    var slots: [12]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 6500);
+    learnRuns(&pool);
+    var gates: [12]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    // A job that is not short runs besides, so the first in line waits for more than the short one.
+    try std.testing.expectEqual(StartTag.started, named(&gates[4], burst_novel));
+    _ = named(&gates[0], burst_heavy);
+    _ = named(&gates[1], burst_heavy);
+    try std.testing.expectEqual(StartTag.started, named(&gates[2], burst_light));
+    try std.testing.expectEqual(@as(?u32, 5 * std.time.ms_per_s), pool.runMs(burst_light));
+    // It runs for ten minutes (it was 5 s each time before). The heavy job ends, and the machine
+    // has what the first in line needs and not what the long job holds.
+    const ten_minutes: i64 = 10 * 60 * std.time.ms_per_s;
+    slots[2].started_ms -= ten_minutes;
+    _ = gates[0].ended();
+    try setAvailable(tmp.dir, 4100);
+    try std.testing.expectEqual(StartTag.wait, std.meta.activeTag(gates[1].start()));
+    // No more go ahead on the word of its learned time while it overruns.
+    try std.testing.expectEqual(StartTag.wait, named(&gates[3], burst_light));
+    try std.testing.expect(!slots[3].ahead);
+    // It ends: the first in line starts, delayed by that run and no more, and the run is learned.
+    slots[2].base_mb = 0;
+    slots[2].peak_mb = 100;
+    _ = gates[2].ended();
+    try setAvailable(tmp.dir, 4700);
+    try std.testing.expectEqual(StartTag.started, std.meta.activeTag(gates[1].start()));
+    try std.testing.expect(pool.runMs(burst_light).? >= ten_minutes - 1000);
+    try std.testing.expect(pool.runMs(burst_light).? > short_run_ms);
+}
+
+test "a poller is held while the pool's runners are half taken by waiting jobs (#415)" {
+    var slots: [8]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 6500);
+    learnRuns(&pool);
+    var gates: [8]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    _ = named(&gates[0], burst_heavy);
+    // Four jobs wait (the first heavy, three not short): half the runners.
+    _ = named(&gates[1], burst_heavy);
+    for (gates[2..4]) |*g| _ = named(g, burst_novel);
+    try std.testing.expect(gates[7].check() == null);
+    gates[7].leave(false);
+    _ = named(&gates[4], burst_novel);
+    try std.testing.expect(gates[7].check().? == .memory);
+}
+
+/// Where the fixtures of a pool that keeps its estimates (#407) are: meminfo, machine-id and
+/// hostname files and the gate's own file, all in `tmp`.
+const KeptFixture = struct {
+    meminfo: [256]u8 = undefined,
+    machine_id: [256]u8 = undefined,
+    hostname: [256]u8 = undefined,
+    file: [256]u8 = undefined,
+    sub_path: []const u8,
+
+    fn path(f: *KeptFixture, buf: []u8, name: []const u8) []const u8 {
+        return std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}/{s}", .{ f.sub_path, name }) catch "";
+    }
+
+    /// A pool on the machine `machine` with `mem_mb` of memory.
+    fn pool(
+        f: *KeptFixture,
+        tmp: std.Io.Dir,
+        slots: []Admission.Slot,
+        machine: []const u8,
+        mem_mb: u64,
+        native: bool,
+    ) !Admission {
+        const io = std.testing.io;
+        var text: [128]u8 = undefined;
+        try tmp.writeFile(io, .{
+            .sub_path = "meminfo",
+            .data = try std.fmt.bufPrint(&text, "MemTotal: {d} kB\nMemAvailable: {d} kB\n", .{ mem_mb * 1024, mem_mb * 512 }),
+        });
+        try tmp.writeFile(io, .{ .sub_path = "machine-id", .data = machine });
+        var p: Admission = .init(io, .{}, slots);
+        p.paths = .{
+            .meminfo = f.path(&f.meminfo, "meminfo"),
+            .pressure = "/nonexistent",
+            .machine_id = f.path(&f.machine_id, "machine-id"),
+            .hostname = "/nonexistent",
+        };
+        p.native = native;
+        return p;
+    }
+
+    fn stateFile(f: *KeptFixture) []const u8 {
+        return f.path(&f.file, "memory-gate");
+    }
+};
+
+fn expectSameLearned(want: *const Learned, got: *const Learned) !void {
+    try std.testing.expectEqual(want.len, got.len);
+    try std.testing.expectEqual(want.tick, got.tick);
+    for (want.entries[0..want.len], got.entries[0..got.len]) |w, g| {
+        try std.testing.expectEqual(w.key, g.key);
+        try std.testing.expectEqual(w.used, g.used);
+        for ([_][2]*const Learned.Runs{ .{ &w.alone, &g.alone }, .{ &w.beside, &g.beside }, .{ &w.ran, &g.ran } }) |r| {
+            try std.testing.expectEqual(r[0].n, r[1].n);
+            try std.testing.expectEqual(r[0].next, r[1].next);
+            try std.testing.expectEqualSlices(u32, r[0].slice(), r[1].slice());
+        }
+        try std.testing.expectEqual(w.estimate(), g.estimate());
+    }
+}
+
+test "a restart keeps what jobs took, natively and on the engine, in the order they were used (#407)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fix: KeptFixture = .{ .sub_path = &tmp.sub_path };
+    var slots: [2]Admission.Slot = undefined;
+    var first = try fix.pool(tmp.dir, &slots, "abc123\n", 8000, true);
+    try std.testing.expectEqual(Restore.absent, first.restore(fix.stateFile()));
+    // Seven runs of one name (the last five count), a name seen beside others, and a native one.
+    for ([_]u32{ 900, 1200, 600, 2600, 700, 800, 650 }) |mb| _ = first.learned_native.record(burst_heavy, mb, true);
+    _ = first.learned.record(burst_light, 300, false);
+    _ = first.learned.record(burst_heavy, 1600, true);
+    // How long they ran: the longest of the last five counts, 270 s.
+    for ([_]i64{ 90_000, 270_000, 4_000 }) |ms| first.learned_native.recordRun(burst_heavy, ms);
+    first.learned.recordRun(burst_light, 2_500);
+    // Used since: the light name is the one least recently used now.
+    _ = first.learned.estimate(burst_heavy);
+    first.persist.?.dirty = true;
+    first.flush();
+    try std.testing.expect(!first.persist.?.dirty);
+
+    var second_slots: [2]Admission.Slot = undefined;
+    var second = try fix.pool(tmp.dir, &second_slots, "abc123\n", 8000, true);
+    try std.testing.expectEqual(Restore{ .loaded = 3 }, second.restore(fix.stateFile()));
+    try expectSameLearned(&first.learned, &second.learned);
+    try expectSameLearned(&first.learned_native, &second.learned_native);
+    // The estimate that reserves: the most of the last five runs, 2600.
+    try std.testing.expectEqual(@as(?u32, 2600), second.learned_native.estimate(burst_heavy));
+    try std.testing.expectEqual(@as(u32, 2600), second.nativeEstimate(burst_heavy));
+    try std.testing.expectEqual(@as(?u32, 270_000), second.runMs(burst_heavy));
+    try std.testing.expectEqual(@as(?u32, 2_500), second.runMs(burst_light));
+    // Least recently used goes first when the table is full, as before the restart.
+    for (0..Learned.capacity - 1) |i| _ = second.learned.record(i, 100, true);
+    try std.testing.expectEqual(@as(?u32, null), second.learned.estimate(burst_light));
+    try std.testing.expect(second.learned.estimate(burst_heavy) != null);
+
+    // A job's end marks the estimates changed, and the next write has them.
+    var third_slots: [2]Admission.Slot = undefined;
+    var third = try fix.pool(tmp.dir, &third_slots, "abc123\n", 8000, true);
+    _ = third.restore(fix.stateFile());
+    var gate: Gate = .{ .pool = &third, .slot = 0 };
+    gate.leave(true);
+    gate.assigned(burst_light);
+    third.slots[0].base_mb = 0;
+    third.slots[0].peak_mb = 500;
+    third.slots[0].waiting = false;
+    third.slots[0].started_ms -= 3_000;
+    try std.testing.expect(!third.persist.?.dirty);
+    _ = gate.ended();
+    try std.testing.expect(third.persist.?.dirty);
+    // The first write after a start goes ahead: `written_ms` is still its start value (v0.28.0
+    // overflowed here and the runner panicked at its first job's end).
+    third.persistNow(false);
+    try std.testing.expect(!third.persist.?.dirty);
+    third.persist.?.dirty = true;
+    // Written at most every `min_interval_ms`; the pool's end writes the rest.
+    third.persist.?.written_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    third.persistNow(false);
+    try std.testing.expect(third.persist.?.dirty);
+    third.flush();
+    try std.testing.expect(!third.persist.?.dirty);
+    var fourth_slots: [2]Admission.Slot = undefined;
+    var fourth = try fix.pool(tmp.dir, &fourth_slots, "abc123\n", 8000, true);
+    try std.testing.expectEqual(Restore{ .loaded = 3 }, fourth.restore(fix.stateFile()));
+    try std.testing.expectEqual(@as(?u32, 500), fourth.learned.estimate(burst_light));
+    // The job's run was learned too: at least the 3 s it was moved back by.
+    try std.testing.expect(fourth.learned.longest(burst_light).? >= 3_000);
+    try std.testing.expect(fourth.learned.longest(burst_light).? < 30_000);
+}
+
+test "a file from another machine, memory, backend or format, or a damaged one, is not used (#407)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var fix: KeptFixture = .{ .sub_path = &tmp.sub_path };
+    var slots: [2]Admission.Slot = undefined;
+    var writer = try fix.pool(tmp.dir, &slots, "abc123\n", 8000, true);
+    _ = writer.restore(fix.stateFile());
+    _ = writer.learned_native.record(burst_heavy, 2600, true);
+    writer.persist.?.dirty = true;
+    writer.flush();
+    var good: [file_max_bytes]u8 = undefined;
+    const text = try std.Io.Dir.cwd().readFile(io, fix.stateFile(), &good);
+    try std.testing.expect(std.mem.startsWith(u8, text, "zig-runner memory gate v2\nmachine abc123\nmemory_mb 8000\nbackend native\ne native "));
+
+    const Case = struct { machine: []const u8, mem_mb: u64, native: bool, why: []const u8 };
+    const cases = [_]Case{
+        .{ .machine = "other", .mem_mb = 8000, .native = true, .why = "it was written on another machine" },
+        .{ .machine = "abc123", .mem_mb = 16000, .native = true, .why = "the machine's memory is not what it was" },
+        .{ .machine = "abc123", .mem_mb = 8000, .native = false, .why = "it was written by another backend" },
+    };
+    for (cases) |case| {
+        var s: [2]Admission.Slot = undefined;
+        var reader = try fix.pool(tmp.dir, &s, case.machine, case.mem_mb, case.native);
+        const got = reader.restore(fix.stateFile());
+        try std.testing.expectEqualStrings(case.why, got.ignored);
+        try std.testing.expectEqual(@as(usize, 0), reader.learned_native.len + reader.learned.len);
+    }
+    // A little less memory after a boot is the same machine.
+    var s: [2]Admission.Slot = undefined;
+    var again = try fix.pool(tmp.dir, &s, "abc123\n", 7900, true);
+    try std.testing.expectEqual(Restore{ .loaded = 1 }, again.restore(fix.stateFile()));
+
+    const bad = [_]struct { []const u8, []const u8 }{
+        // The last format, without the run times: not used, and warned of.
+        .{ "zig-runner memory gate v1\nmachine abc123\nmemory_mb 8000\nbackend native\ne native 0000000000000001 1 A 1 1 5 B 0 0\n", "it is in another format version" },
+        .{ "", "it is not a memory gate file, or is damaged" },
+        // A run time over what is kept, and an entry without the run times.
+        .{ "zig-runner memory gate v2\nmachine abc123\nmemory_mb 8000\nbackend native\ne native 0000000000000001 1 A 0 0 B 0 0 R 1 1 1073741825\n", "it is not a memory gate file, or is damaged" },
+        .{ "zig-runner memory gate v2\nmachine abc123\nmemory_mb 8000\nbackend native\ne native 0000000000000001 1 A 0 0 B 0 0\n", "it is not a memory gate file, or is damaged" },
+        .{ "not a gate file at all\n", "it is not a memory gate file, or is damaged" },
+        .{ "zig-runner memory gate v2\nmachine abc123\n", "it is not a memory gate file, or is damaged" },
+        .{ text[0 .. text.len - 9], "it is not a memory gate file, or is damaged" },
+        .{ "zig-runner memory gate v2\nmachine abc123\nmemory_mb 8000\nbackend native\ne native zz 1 A 0 0 B 0 0 R 0 0\n", "it is not a memory gate file, or is damaged" },
+        .{ "zig-runner memory gate v2\nmachine abc123\nmemory_mb 8000\nbackend native\ne native 0000000000000001 1 A 6 0 B 0 0 R 0 0\n", "it is not a memory gate file, or is damaged" },
+        .{ "zig-runner memory gate v2\nmachine abc123\nmemory_mb 8000\nbackend native\ne native 0000000000000001 1 A 1 0 1 B 0 0 R 0 0\n", "it is not a memory gate file, or is damaged" },
+        .{ "zig-runner memory gate v2\nmachine abc123\nmemory_mb 8000\nbackend native\ne native 0000000000000001 1 A 1 1 5 B 0 0 R 0 0\ne native 0000000000000001 2 A 1 1 5 B 0 0 R 0 0\n", "it is not a memory gate file, or is damaged" },
+        .{ "zig-runner memory gate v2\nmachine abc123\nmemory_mb 8000\nbackend native\ne native 0000000000000001 1 A 1 1 99999999999 B 0 0 R 0 0\n", "it is not a memory gate file, or is damaged" },
+    };
+    for (bad) |case| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "memory-gate", .data = case[0] });
+        var s2: [2]Admission.Slot = undefined;
+        var reader = try fix.pool(tmp.dir, &s2, "abc123\n", 8000, true);
+        const got = reader.restore(fix.stateFile());
+        try std.testing.expectEqualStrings(case[1], got.ignored);
+        // Nothing of a damaged file is kept, and the next write replaces it.
+        try std.testing.expectEqual(@as(usize, 0), reader.learned_native.len);
+        reader.persist.?.dirty = true;
+        reader.flush();
+        var s3: [2]Admission.Slot = undefined;
+        var next = try fix.pool(tmp.dir, &s3, "abc123\n", 8000, true);
+        try std.testing.expectEqual(Restore{ .loaded = 0 }, next.restore(fix.stateFile()));
+    }
+}
+
+test "an atomic write leaves the old file or the whole new one, never half, and no temp file (#407)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var buf: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/state/memory-gate", .{dir});
+    // The directory is made, the file is whole.
+    try writeFileAtomic(io, path, "old");
+    var read_buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("old", try std.Io.Dir.cwd().readFile(io, path, &read_buf));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "state/memory-gate.tmp", .{}));
+    try writeFileAtomic(io, path, "new and longer");
+    try std.testing.expectEqualStrings("new and longer", try std.Io.Dir.cwd().readFile(io, path, &read_buf));
+    try writeFileAtomic(io, path, "short");
+    try std.testing.expectEqualStrings("short", try std.Io.Dir.cwd().readFile(io, path, &read_buf));
+
+    // The rename fails (the target is a directory that is not empty): the old thing is as it was,
+    // and the temp file is gone.
+    try tmp.dir.createDirPath(io, "state/blocked/inside");
+    var blocked_buf: [256]u8 = undefined;
+    const blocked = try std.fmt.bufPrint(&blocked_buf, "{s}/state/blocked", .{dir});
+    try std.testing.expect(std.meta.isError(writeFileAtomic(io, blocked, "whole")));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "state/blocked.tmp", .{}));
+    try std.testing.expect((try tmp.dir.statFile(io, "state/blocked/inside", .{})).kind == .directory);
+
+    // The temp file cannot be made (a directory is in its place): the old file stands.
+    try tmp.dir.createDirPath(io, "state/memory-gate.tmp");
+    try std.testing.expect(std.meta.isError(writeFileAtomic(io, path, "lost")));
+    try std.testing.expectEqualStrings("short", try std.Io.Dir.cwd().readFile(io, path, &read_buf));
+}
+
+test "a failed write is warned of once and tried again, and the estimates stay in memory (#407)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fix: KeptFixture = .{ .sub_path = &tmp.sub_path };
+    var slots: [2]Admission.Slot = undefined;
+    var pool = try fix.pool(tmp.dir, &slots, "abc123\n", 8000, true);
+    _ = pool.restore(fix.stateFile());
+    // Something is in the way of the temp file.
+    try tmp.dir.createDirPath(std.testing.io, "memory-gate.tmp");
+    _ = pool.learned_native.record(burst_heavy, 2600, true);
+    pool.persist.?.dirty = true;
+    pool.flush();
+    try std.testing.expect(pool.persist.?.dirty);
+    try std.testing.expect(pool.persist.?.warned);
+    try std.testing.expectEqual(@as(?u32, 2600), pool.learned_native.estimate(burst_heavy));
+    try tmp.dir.deleteDir(std.testing.io, "memory-gate.tmp");
+    pool.flush();
+    try std.testing.expect(!pool.persist.?.dirty);
+    try std.testing.expect(!pool.persist.?.warned);
+}
+
+/// A pool with `MemTotal` of `total_mb`, for what one job needs against it (#406).
+fn fitPool(tmp: std.Io.Dir, sub_path: []const u8, slots: []Admission.Slot, total_mb: u64, limits: Limits) !Admission {
+    const Fix = struct {
+        var buf: [256]u8 = undefined;
+    };
+    var text: [64]u8 = undefined;
+    try tmp.writeFile(std.testing.io, .{
+        .sub_path = "meminfo",
+        .data = try std.fmt.bufPrint(&text, "MemTotal: {d} kB\nMemAvailable: {d} kB\n", .{ total_mb * 1024, total_mb * 1024 }),
+    });
+    var pool: Admission = .init(std.testing.io, limits, slots);
+    pool.paths = .{
+        .meminfo = try std.fmt.bufPrint(&Fix.buf, ".zig-cache/tmp/{s}/meminfo", .{sub_path}),
+        .pressure = "/nonexistent",
+        .self_cgroup = "/nonexistent",
+    };
+    return pool;
+}
+
+test "a reservation that can never fit is named at start, with the setting and the numbers (#406)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var slots: [2]Admission.Slot = undefined;
+    // The laptop benchmark: RUNNER_NATIVE_MEM_PER_JOB_MB=24000 on a machine with 18.6 GB.
+    var pool = try fitPool(tmp.dir, &tmp.sub_path, &slots, 19000, .{ .native_per_job_mb = 24000 });
+    pool.native = true;
+    const bad = pool.misfit().?;
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "RUNNER_NATIVE_MEM_PER_JOB_MB=24000 plus RUNNER_MIN_MEM_AVAILABLE_MB=1536 need 25536 MB " ++
+            "for one job, but the machine's memory is 19000 MB: no job could ever start, and the " ++
+            "memory gate would hold every runner for ever. Lower them, or turn the gate off with " ++
+            "RUNNER_ADMISSION=false",
+        try std.fmt.bufPrint(&buf, "{f}", .{bad}),
+    );
+    // The floor alone can be the setting that does not fit.
+    var floor = try fitPool(tmp.dir, &tmp.sub_path, &slots, 4000, .{ .min_available_mb = 4000, .native_per_job_mb = 256 });
+    floor.native = true;
+    try std.testing.expectEqualStrings("RUNNER_MIN_MEM_AVAILABLE_MB", floor.misfit().?.floor_setting);
+    // The Dagger pool's setting.
+    var dagger = try fitPool(tmp.dir, &tmp.sub_path, &slots, 2000, .{});
+    try std.testing.expectEqualStrings("RUNNER_MEM_PER_JOB_MB", dagger.misfit().?.setting);
+    // The defaults fit anywhere that runs jobs at all, and the gate off (0) never is a misfit.
+    var fits = try fitPool(tmp.dir, &tmp.sub_path, &slots, 8000, .{});
+    try std.testing.expectEqual(@as(?Misfit, null), fits.misfit());
+    fits.native = true;
+    try std.testing.expectEqual(@as(?Misfit, null), fits.misfit());
+    var off = try fitPool(tmp.dir, &tmp.sub_path, &slots, 100, .{ .min_available_mb = 0, .per_job_mb = 0, .native_per_job_mb = 0 });
+    try std.testing.expectEqual(@as(?Misfit, null), off.misfit());
+}
+
+test "the cgroup limit the runner runs under, and the engine's cap, are compared too (#406)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var slots: [2]Admission.Slot = undefined;
+    var pool = try fitPool(tmp.dir, &tmp.sub_path, &slots, 8000, .{ .per_job_mb = 1600, .native_per_job_mb = 1600 });
+    var root_buf: [256]u8 = undefined;
+    var own_buf: [256]u8 = undefined;
+    var self_buf: [256]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, ".zig-cache/tmp/{s}/cg", .{tmp.sub_path});
+    // A service with MemoryMax=2G: 1600 + 1536 MB do not fit in 2048.
+    try tmp.dir.createDirPath(io, "cg/system.slice/runner.service");
+    try tmp.dir.writeFile(io, .{ .sub_path = "cg/system.slice/memory.max", .data = "2147483648\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "cg/system.slice/runner.service/memory.max", .data = "max\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "self-cgroup", .data = "0::/system.slice/runner.service\n" });
+    pool.paths.cgroup_root = root;
+    pool.paths.self_cgroup = try std.fmt.bufPrint(&self_buf, ".zig-cache/tmp/{s}/self-cgroup", .{tmp.sub_path});
+    pool.native = true;
+    const bad = pool.misfit().?;
+    try std.testing.expectEqualStrings("the memory limit the runner runs under is", bad.against);
+    try std.testing.expectEqual(@as(u64, 2048), bad.limit_mb);
+    // No cap above it: the machine's 8000 MB it is.
+    try tmp.dir.writeFile(io, .{ .sub_path = "cg/system.slice/memory.max", .data = "max\n" });
+    try std.testing.expectEqual(@as(?Misfit, null), pool.misfit());
+
+    // On the engine, one job and the headroom must fit under the engine's cap, 4096 MB.
+    pool.native = false;
+    pool.limits.per_job_mb = 4000;
+    pool.engine.dir = try std.fmt.bufPrint(&own_buf, ".zig-cache/tmp/{s}/engine", .{tmp.sub_path});
+    try setEngine(tmp.dir, 0);
+    const engine_bad = pool.misfit().?;
+    try std.testing.expectEqualStrings("the engine's memory cap is", engine_bad.against);
+    try std.testing.expectEqual(@as(u64, 4096), engine_bad.limit_mb);
+    try std.testing.expectEqualStrings("RUNNER_MIN_ENGINE_HEADROOM_MB", engine_bad.floor_setting);
+    // A native job never runs in the engine: its cap is not the native pool's concern.
+    pool.native = true;
+    pool.limits.native_per_job_mb = 256;
+    try std.testing.expectEqual(@as(?Misfit, null), pool.misfit());
 }
