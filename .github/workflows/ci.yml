@@ -371,6 +371,19 @@ jobs:
           ZIG_TEST_MIN_PASSED: "500"
         run: ../.github/scripts/zig-test.sh
 
+      # Eviction's floor on a disk that is really full: a 64 MiB tmpfs in a mount namespace of the
+      # test's own (bubblewrap, no root), filled until a write fails (full-disk-test.sh, #357). The
+      # test skips everywhere else, so it would otherwise never run. Its compile is the tests'
+      # above, cached.
+      - name: Eviction on a really full disk
+        if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        timeout-minutes: 5
+        env:
+          FULL_DISK_REQUIRED: "1"
+        run: |
+          sudo apt-get install -y -qq bubblewrap >/dev/null
+          .github/scripts/full-disk-test.sh
+
       # Every test in runner/src is one the test binary has: a file that nothing reached compiled
       # and passed with its tests never run (github/http.zig's, until #326). Its compile is the
       # tests' on a runner that ran them with zig-test.sh, cached.
