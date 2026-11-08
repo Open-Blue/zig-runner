@@ -821,10 +821,14 @@ fn zstdFrames(_: void, smith: *Smith) !void {
 // seed is flipped, one at a time, as a test.
 test "zstd decoders: every bit of the small seeds flipped" {
     var buf: [400]u8 = undefined;
+    // Under Valgrind (many times slower, two decoders a run) every 37th bit: it looks for memory
+    // errors, which any input shows, not for disagreements.
+    const stride: usize = if (std.valgrind.runningOnValgrind() != 0) 37 else 1;
     inline for (zstd_files) |name| {
         const frame = @embedFile("fuzz_corpus/zstd/" ++ name ++ ".zst");
         if (comptime frame.len <= buf.len) {
-            for (0..frame.len * 8) |bit| {
+            var bit: usize = 0;
+            while (bit < frame.len * 8) : (bit += stride) {
                 @memcpy(buf[0..frame.len], frame);
                 buf[bit / 8] ^= std.math.shl(u8, 1, bit % 8);
                 zstdAgrees(buf[0..frame.len]) catch |e| {
