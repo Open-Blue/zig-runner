@@ -15,6 +15,7 @@ const Backend = @This();
 const std = @import("std");
 const job_mod = @import("../job.zig");
 const config = @import("../config.zig");
+const pg = @import("../pg.zig");
 const expr = @import("../expr.zig");
 const dagger = @import("../dagger.zig");
 const sandbox = @import("sandbox.zig");
@@ -33,6 +34,7 @@ const admission = @import("../admission.zig");
 const services = @import("services.zig");
 const images = @import("images.zig");
 const container_options = @import("container_options.zig");
+const publish = @import("publish.zig");
 const host_paths = @import("host_paths.zig");
 const native_actions = @import("actions.zig");
 const Exec = @import("../dagger/Exec.zig");
@@ -41,6 +43,7 @@ const SpanDemux = @import("../dagger/JobLog.zig").SpanDemux;
 const checkout = @import("../dagger/checkout.zig");
 const scripts = @import("../dagger/scripts.zig");
 const set_up = @import("../dagger/set_up.zig");
+const provisioned = @import("../dagger/provisioned.zig");
 const phases = @import("phases.zig");
 const hash_files = @import("hash_files.zig");
 
@@ -60,6 +63,9 @@ rootfs: []const u8,
 /// `Config.rootfs`: the operator's provisioned default image, used instead of a native pull of
 /// it; "" for none.
 operator_rootfs: []const u8 = "",
+/// `Config.provisioned_image` and `Config.provisioned_pins`.
+provisioned_image: bool = true,
+provisioned_pins: provisioned.Pins = provisioned.pinned,
 /// The job's image, once pulled (`prepareRootfs`); null with the operator's rootfs.
 image: ?oci.Image = null,
 /// The image's own env (`NAME=value`), which every step starts from.
@@ -71,6 +77,11 @@ image_gid: u32 = 0,
 groups: []const u32 = &.{},
 /// What a `container:` job's `options:` ask for (`container_options.zig`), read by `base`.
 container_opts: container_options.Options = .{},
+/// `Config.port_addresses`: the host addresses a job container may publish on (`publishPorts`).
+port_addresses: []const [4]u8 = &publish.default_addresses,
+/// `Config.port_range` and `Config.reserved_ports`.
+port_range: publish.Range = publish.default_range,
+reserved_ports: []const u16 = &.{},
 /// `Config.host_paths`: where a job container's host-path volumes may be (`hostVolumes`).
 allowed_host_paths: []const host_paths.Entry = &.{},
 /// `Config.host_paths_unmapped`.
@@ -118,6 +129,8 @@ images_dir: []const u8 = "",
 self_exe: []const u8 = "",
 /// The job's running services (`services.zig`), stopped however the job ends (`deinit`).
 service_set: services.Set = .{},
+/// The relay that publishes a job container's `ports:` (`publishPorts`), stopped first.
+publisher: ?forward.Running = null,
 /// Held while the job runs (`lock`): a directory whose lock is free is stale (`sweep`).
 lock: std.Io.File,
 /// The overlay's layers above the rootfs, oldest first.
@@ -204,6 +217,11 @@ pub const Config = struct {
     /// or `provision_runner_script` for the runner user), used instead of pulling and provisioning
     /// it natively; "" to pull it (`RUNNER_NATIVE_ROOTFS`).
     rootfs: []const u8 = "",
+    /// Pull the pre-provisioned default image (`provisioned.zig`) instead of pulling Ubuntu and
+    /// provisioning it, where `provisioned_pins` pins one (`RUNNER_PROVISIONED_IMAGE`). Failing to
+    /// pull it provisions, as without.
+    provisioned_image: bool = true,
+    provisioned_pins: provisioned.Pins = provisioned.pinned,
     /// Where jobs' layers live while they run, and pulled images and provisioned rootfs
     /// (`RUNNER_NATIVE_STORE`).
     store: []const u8 = "",
@@ -234,6 +252,16 @@ pub const Config = struct {
     /// Host paths mounted into every step. Tests bind the host's /usr into a rootfs of a few
     /// directories; phase 4's cache volumes will be these.
     binds: []const sandbox.Spec.Bind = &.{},
+    /// The host addresses a job container's `ports:` may be published on, the first for an
+    /// entry that names none (`RUNNER_NATIVE_PORT_ADDRESSES`, `publish.zig`): 127.0.0.1 alone
+    /// by default.
+    port_addresses: []const [4]u8 = &publish.default_addresses,
+    /// The host ports a job container may name (`RUNNER_NATIVE_PORT_RANGE`): 49152-65535 by
+    /// default.
+    port_range: publish.Range = publish.default_range,
+    /// The ports of the runner's own endpoints (its database, the engine, Docker), never
+    /// published (`publish.reservedPorts`).
+    reserved_ports: []const u16 = &.{},
     /// The directories a job container's host-path volume may be in (`RUNNER_NATIVE_HOST_PATHS`,
     /// `hostPathsOf`), canonical; none by default.
     host_paths: []const host_paths.Entry = &.{},
@@ -348,10 +376,20 @@ pub fn configFor(
     for (closed.items) |e| std.log.warn("native: {s}: `{s}` is not the directory checked when " ++
         "the runner started (moved, replaced or remounted since); closed for this job", .{ host_paths.setting, e });
     return .{
+        // Checked when the configuration is loaded (`Config.load`).
+        .port_addresses = publish.parseAddresses(arena, cfg.native_port_addresses) catch &publish.default_addresses,
+        .port_range = publish.parseRange(cfg.native_port_range) orelse publish.default_range,
+        // As `main.zig` found them (the database's from `PG*` too); else from the settings.
+        .reserved_ports = cfg.native_reserved_ports orelse try publish.reservedPorts(
+            arena,
+            if (cfg.database_url) |u| if (pg.parseUrl(arena, u)) |c| c.port else |_| null else null,
+            &.{ cfg.engine_host, cfg.docker_socket },
+        ),
         .host_paths = allowed,
         .host_paths_closed = closed.items,
         .host_paths_unmapped = cfg.native_host_paths_unmapped,
         .rootfs = cfg.native_rootfs,
+        .provisioned_image = cfg.provisioned_image,
         .store = try cfg.nativeStore(arena, environ),
         .self_exe = exe.path,
         .self_exe_replaced = exe.replaced,
@@ -497,6 +535,9 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         if (container_options.unsupported(jc, opts.provision and default_image, job.services)) |why| return why;
     }
     if (job.services.len > 0) if (servicesUnsupported(job, cfg)) |why| return why;
+    if (job.container) |jc| if (jc.ports.len > 0 and std.os.linux.geteuid() != 0)
+        return "a job container's `ports:` need the job's own network, which a rootless " ++
+            "runner does not give: its steps already share the host's (phase 5)";
     if (opts.nesting) return "steps that use the Dagger engine (RUNNER_DAGGER_NESTING) need Dagger";
     // dpkg gives files to other users and groups (`root:adm`), which one mapped id cannot hold.
     if (std.os.linux.geteuid() != 0 and cfg.rootfs.len == 0 and opts.provision and
@@ -860,6 +901,8 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .dir = dir,
         .rootfs = cfg.rootfs,
         .operator_rootfs = cfg.rootfs,
+        .provisioned_image = cfg.provisioned_image,
+        .provisioned_pins = cfg.provisioned_pins,
         .binds = cfg.binds,
         .lock = lock,
         .how = how,
@@ -872,6 +915,9 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
             .sync_fd = Store.syncCursor(arena, cfg.store),
         },
         .vouched = cfg.vouched,
+        .port_addresses = cfg.port_addresses,
+        .port_range = cfg.port_range,
+        .reserved_ports = cfg.reserved_ports,
         .allowed_host_paths = cfg.host_paths,
         .host_paths_unmapped = cfg.host_paths_unmapped,
         .host_paths_closed = cfg.host_paths_closed,
@@ -1288,7 +1334,10 @@ pub fn deinit(b: *Backend) void {
     defer _ = b.io.swapCancelProtection(protection);
     const arena = b.arena;
     var t = phases.now();
-    // First: their helpers hold the job's directory and network, and are in its cgroup.
+    // First: their helpers hold the job's directory and network, and are in its cgroup. The
+    // published ports go with their relay.
+    if (b.publisher) |*p| p.stop(b.io);
+    b.publisher = null;
     b.service_set.stopAll(b.io);
     b.cache_plan.release(b.io);
     t = b.timings.since(arena, .services, t);
@@ -1490,6 +1539,7 @@ pub fn base(
         try std.fmt.allocPrint(arena, "{{ {s}; }} && {s}", .{ mk_work, vols })
     else
         mk_work;
+    try b.publishPorts(ev, err_msg);
     const mk_uid: u32 = 0;
     const mk_gid: u32 = 0;
     const event_file = [_]sandbox.Spec.File{.{
@@ -2018,18 +2068,23 @@ fn seed(b: *Backend, s: volumes.Seed, as_runner: bool) ?[]const u8 {
     // Only the runner's user may look in, as in the volumes'.
     const seeds_z = arena.dupeSentinel(u8, seeds_dir, 0) catch return "out of memory";
     _ = std.os.linux.chmod(seeds_z, 0o700);
-    if (b.holdSeed(s.dir)) |held| {
-        if (held) return null;
-    } else |e| return @errorName(e);
-    {
+    // Built under the seed's lock, then held as any job holds it, past the lock let go
+    // (`ImageStore.ensure`): an eviction can come between, and a seed evicted at once is built
+    // again. A few times at most, so an eviction that takes each one cannot keep the job here.
+    for (0..seed_builds_max) |_| {
+        if (b.holdSeed(s.dir)) |held| {
+            if (held) return null;
+        } else |e| return @errorName(e);
         const lock = ImageStore.lockDir(arena, b.io, s.dir, 2) catch |e| return @errorName(e);
         defer lock.close(b.io);
         if (cwd.access(b.io, s.dir, .{})) |_| {} else |_| if (b.buildSeed(s, as_runner)) |why| return why;
     }
-    // Held as any job holds it, past the lock let go. Evicted in that moment, the job runs unseeded.
     const held = b.holdSeed(s.dir) catch |e| return @errorName(e);
-    return if (held) null else "it was evicted as it was built";
+    return if (held) null else "it was evicted as it was built, each time";
 }
+
+/// How many times `seed` builds a seed that an eviction takes as soon as it is built.
+const seed_builds_max = 3;
 
 /// Whether the seed `dir` is there, then held for the job (`ImageStore.holdDir`).
 fn holdSeed(b: *Backend, dir: []const u8) !bool {
@@ -2958,6 +3013,10 @@ fn fetchRootfs(
     const arena = b.arena;
     var why: []const u8 = "";
     var t = phases.now();
+    if (provision_it) if (try b.pullProvisioned(as_runner)) |img| {
+        _ = b.timings.since(arena, .image, t);
+        return img;
+    };
     const img = b.pull(image, creds, &why) catch |e| {
         err_msg.* = try std.fmt.allocPrint(arena, "could not pull {s} natively: {s}", .{
             image,
@@ -2986,6 +3045,36 @@ fn fetchRootfs(
     return img;
 }
 
+/// How long the pre-provisioned image may take to pull before apt provisions instead: far less
+/// than `pull_deadline`, since provisioning is the alternative and takes under a minute.
+const provisioned_pull_deadline: std.Io.Duration = .fromSeconds(5 * 60);
+
+/// The pre-provisioned default image (`provisioned.zig`) pulled into the store, or found there, as
+/// what the job's steps start from: `b.rootfs` is then the image's own tree, under the store's
+/// `oci/images/<key>/rootfs`, a path no locally provisioned rootfs (`provision`, under
+/// `rootfs/<key>/rootfs`) shares, so `Store.rootfsFingerprint` and the step cache's keys never
+/// take one for the other. Null when none is pinned or the operator turned it off, and when the
+/// pull fails (the note says why): the caller pulls Ubuntu and provisions it with apt.
+fn pullProvisioned(b: *Backend, as_runner: bool) !?oci.Image {
+    const arena = b.arena;
+    const ref = try provisioned.reference(arena, b.provisioned_image, b.provisioned_pins, .of(as_runner)) orelse
+        return null;
+    var why: []const u8 = "";
+    const img = b.pullBefore(ref, null, provisioned_pull_deadline, &why) catch |e| {
+        try b.notes.append(arena, try provisioned.fallbackNote(arena, ref, if (why.len > 0) why else @errorName(e)));
+        return null;
+    };
+    b.image = img;
+    b.image_env = img.env;
+    b.rootfs = img.rootfs;
+    try b.notes.append(arena, if (img.pulled) |p| try std.fmt.allocPrint(
+        arena,
+        "{s}, pulled natively in {d} ms ({d} KB fetched)",
+        .{ try provisioned.usedNote(arena, ref), p.ms, p.bytes / 1024 },
+    ) else try std.fmt.allocPrint(arena, "{s}, from the native store", .{try provisioned.usedNote(arena, ref)}));
+    return img;
+}
+
 /// The job container's `options:`, read (`container_options.parse`; `unsupported` has already
 /// refused what it does not carry out, so this is not expected to fail), with a note in "Set up
 /// job" for what was honoured and for what is understood and has no effect here.
@@ -3010,6 +3099,56 @@ fn readContainerOptions(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void
         if (o.user != null) ", `--user` " else "",
         o.user orelse "",
         o.no_effect,
+    }));
+}
+
+/// The job container's `ports:` published from the host (`publish.zig`): what the operator
+/// allows (`RUNNER_NATIVE_PORT_ADDRESSES`, no host port below 1024, none for a job the runner
+/// does not vouch for or a fork's pull request), each listened on by the relay in the host's
+/// network and carried to the job's port on its loopback (`forward.zig`, `Spec.publish`), for
+/// the job's life. "Set up job" says where each went, as `docker port` does. Anything refused, or
+/// a port another process holds, fails the job naming it: on Dagger it would be ignored.
+fn publishPorts(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void {
+    const arena = b.arena;
+    const jc = ev.job.container orelse return;
+    if (jc.ports.len == 0) return;
+    var why: []const u8 = "";
+    const ports = container_options.ports(arena, jc.ports, &why) catch |e| {
+        err_msg.* = if (why.len > 0) why else @errorName(e);
+        return error.BaseContainerFailed;
+    };
+    const scope = try set_up.packageCacheScope(arena, ev, ev.job.github.repository, b.caches.trusted);
+    const trusted = b.vouched and std.mem.eql(u8, scope, "repo");
+    const maps = publish.plan(arena, ports, .{
+        .addresses = b.port_addresses,
+        .range = b.port_range,
+        .reserved = b.reserved_ports,
+    }, trusted, &why) catch |e| {
+        b.job_fault = true;
+        err_msg.* = if (why.len > 0) why else @errorName(e);
+        return error.BaseContainerFailed;
+    };
+    b.publisher = forward.start(arena, b.io, b.self_exe, .{
+        .netns = b.netns,
+        // The job's nobody: an id of its range, nothing on the host.
+        .id = if (b.how.userns == .mapped) b.idBase() + 65534 else null,
+        .cgroup = if (b.job_cgroup) |j| j.servicesDir() else null,
+        .ports = maps,
+        .publish = true,
+        .reserved = b.reserved_ports,
+        // Published beyond the host's loopback: no peer of the runner's jobs, nor of a bridge's.
+        .guard = for (maps) |m| {
+            if (m.address[0] != 127) break .{ .subnet = b.subnet.base, .prefix = b.subnet.prefix };
+        } else null,
+    }, &why) catch |e| {
+        b.job_fault = true;
+        err_msg.* = try std.fmt.allocPrint(arena, "the job container's ports could not be " ++
+            "published: {s}", .{if (why.len > 0) why else @errorName(e)});
+        return error.BaseContainerFailed;
+    };
+    const lines = try publish.report(arena, maps, b.publisher.?.ports);
+    try b.notes.append(arena, try std.fmt.allocPrint(arena, "Container ports: {s}", .{
+        try std.mem.join(arena, ", ", lines),
     }));
 }
 
@@ -3369,7 +3508,18 @@ test "a musl image is told by its /lib, never through a symlink" {
 
 /// `image` pulled into the store, or found there (`oci/image.zig`), within `pull_deadline`.
 fn pull(b: *Backend, image: []const u8, creds: ?registry.Credentials, why: *[]const u8) !oci.Image {
-    const img = try pullAt(b.arena, b.gpa, b.io, b.store_cfg.root, b.how.userns == .mapped, image, creds, why);
+    return b.pullBefore(image, creds, pull_deadline, why);
+}
+
+/// `pull` within `deadline`.
+fn pullBefore(
+    b: *Backend,
+    image: []const u8,
+    creds: ?registry.Credentials,
+    deadline: std.Io.Duration,
+    why: *[]const u8,
+) !oci.Image {
+    const img = try pullWithin(b.arena, b.gpa, b.io, b.store_cfg.root, b.how.userns == .mapped, image, creds, deadline, why);
     errdefer img.lock.close(b.io);
     // Held to the job's end, as its layers are: eviction leaves it alone (`evict.zig`).
     try b.held.append(b.arena, img.lock);
@@ -3389,6 +3539,20 @@ pub fn pullAt(
     creds: ?registry.Credentials,
     why: *[]const u8,
 ) !oci.Image {
+    return pullWithin(arena, gpa, io, root, owners, image, creds, pull_deadline, why);
+}
+
+fn pullWithin(
+    arena: Allocator,
+    gpa: Allocator,
+    io: std.Io,
+    root: []const u8,
+    owners: bool,
+    image: []const u8,
+    creds: ?registry.Credentials,
+    deadline: std.Io.Duration,
+    why: *[]const u8,
+) !oci.Image {
     var local: std.http.Client = .{
         .allocator = gpa,
         .io = io,
@@ -3397,11 +3561,11 @@ pub fn pullAt(
     defer local.deinit();
     const store: ImageStore = .{ .root = root };
     const req: oci.Request = .{ .image = image, .creds = creds, .owners = owners };
-    const r = try http.within(io, pull_deadline, pullWithin, .{
+    const r = try http.within(io, deadline, pullInto, .{
         arena, gpa, io, http.client(&local), store, req, why,
     });
     return (r orelse {
-        why.* = "it took longer than 30 minutes";
+        why.* = try std.fmt.allocPrint(arena, "it took longer than {d} minutes", .{@divTrunc(deadline.toSeconds(), 60)});
         return error.Timeout;
     });
 }
@@ -3426,7 +3590,7 @@ pub fn pullImage(
     };
 }
 
-fn pullWithin(
+fn pullInto(
     arena: Allocator,
     gpa: Allocator,
     io: std.Io,
@@ -4214,8 +4378,15 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     var container = run_only;
     container.container = .{ .name = "", .image = .{ .lit = "node:22" } };
     try std.testing.expect(unsupported(io, container, root, ok) == null);
+    // Ports are published natively by a root runner (`publishPorts`); a rootless runner's steps
+    // share the host's network, and a range is not native anywhere.
     container.container.?.ports = &.{.{ .lit = "8080:80" }};
-    try expectReason("`ports:`", unsupported(io, container, root, ok));
+    if (std.os.linux.geteuid() == 0)
+        try std.testing.expect(unsupported(io, container, root, ok) == null)
+    else
+        try expectReason("rootless", unsupported(io, container, root, ok));
+    container.container.?.ports = &.{.{ .lit = "8000-8010:8000-8010" }};
+    try expectReason("`8000-8010:8000-8010`", unsupported(io, container, root, ok));
     container.container.?.ports = &.{};
     // Volumes that are directories of the job are native, and so is a path of the host (allowed
     // or failed when the job starts, `hostVolumes`); a read-only anonymous one is not.
@@ -6211,6 +6382,37 @@ test "a container job's volume where the runner mounts something fails the job, 
     try std.testing.expect(std.mem.indexOf(u8, text, "ran\n") == null);
 }
 
+const PortJob = struct {
+    cfg: Config,
+    job: job_mod.Job,
+    ok: bool = false,
+    text: []const u8 = "",
+    why: []const u8 = "",
+    arena: std.heap.ArenaAllocator = .init(std.testing.allocator),
+
+    fn run(p: *PortJob) void {
+        p.runOrFail() catch |e| {
+            p.why = @errorName(e);
+        };
+    }
+
+    fn runOrFail(p: *PortJob) !void {
+        const arena = p.arena.allocator();
+        var env: std.process.Environ.Map = .init(arena);
+        var w: std.Io.Writer.Allocating = .init(arena);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+        const res = try dagger.run(arena, std.testing.io, &env, .{
+            .native = p.cfg,
+            .step_user = .root,
+            .trusted = true,
+            .gpa = std.testing.allocator,
+        }, p.job, &log);
+        p.ok = res.succeeded;
+        p.text = w.written();
+        p.why = res.engine_error orelse p.text;
+    }
+};
+
 /// One job of `job` on `cfg`, trusted or not: whether it passed, what it printed, and why it
 /// failed (its engine error, else its log).
 fn runVolumeJob(arena: Allocator, cfg: Config, job: job_mod.Job, trusted: bool) !struct { ok: bool, text: []const u8, why: []const u8 } {
@@ -6234,6 +6436,205 @@ fn expectAll(text: []const u8, want: []const []const u8) !void {
         std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
         return error.TestUnexpectedResult;
     };
+}
+
+/// A TCP connection to `127.0.0.1:port` from the host, or null when refused.
+fn connectLoopback(port: u16) ?std.os.linux.fd_t {
+    const linux = std.os.linux;
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    const fd = std.math.cast(linux.fd_t, rc) orelse return null;
+    var sa: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    if (linux.errno(linux.connect(fd, forward.asSockaddr(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+        _ = linux.close(fd);
+        return null;
+    }
+    return fd;
+}
+
+/// A port of the host's loopback no one listens on now.
+fn freePort() !u16 {
+    const linux = std.os.linux;
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    const fd = std.math.cast(linux.fd_t, rc) orelse return error.SkipZigTest;
+    defer _ = linux.close(fd);
+    var sa: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    if (linux.errno(linux.bind(fd, forward.asSockaddr(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    _ = linux.getsockname(fd, forward.asSockaddr(&sa), &len);
+    return std.mem.bigToNative(u16, sa.port);
+}
+
+test "a container job's ports: published on the host, never another job's nor a bridge's, gone with the job; a taken port fails it; a bare one is the kernel's pick" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    const linux = std.os.linux;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    // Rootless, a job has no network of its own to publish into: those go to Dagger.
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    const img = try testregistry.testImage(arena, "test/ports", "1", try testImageLayers(arena), "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+    const image = try server.image(arena, "test/ports:1");
+    const hp = try freePort();
+
+    // The job's server, on its own 8080: "hello" to each connection, until one says "quit".
+    const serve =
+        \\python3 -c '
+        \\import socket
+        \\s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        \\s.bind(("0.0.0.0", 8080)); s.listen(8); s.settimeout(120)
+        \\while True:
+        \\    c, _ = s.accept(); c.settimeout(10)
+        \\    try:
+        \\        c.sendall(b"hello\n"); d = c.recv(16)
+        \\    except Exception:
+        \\        d = b""
+        \\    c.close()
+        \\    if d.startswith(b"quit"): break
+        \\print("served-" + str(2 + 3))
+        \\'
+    ;
+    // With no cgroup of its own, whose removal would end the relay too: the ports go with the
+    // relay's stop alone.
+    var lone = cfg;
+    lone.cgroup = .{ .parent = "none" };
+    // On every address of the host, so what keeps other jobs out is the runner's table (`input`
+    // drops their packets to the bridge's address) and the relay's guard, not the address.
+    lone.port_addresses = &.{.{ 0, 0, 0, 0 }};
+    // `hp` is the kernel's pick, from its ephemeral range.
+    lone.port_range = .{ .lo = 1024, .hi = 65535 };
+    var serving: PortJob = .{ .cfg = lone, .job = testJob(&.{testStep(serve)}) };
+    defer serving.arena.deinit();
+    serving.job.container = .{
+        .name = "",
+        .image = .{ .lit = image },
+        .ports = &.{ .{ .lit = try std.fmt.allocPrint(arena, "{d}:8080", .{hp}) }, .{ .lit = "9090" } },
+    };
+    const t = try std.Thread.spawn(.{}, PortJob.run, .{&serving});
+    var joined = false;
+    defer if (!joined) t.join();
+    // Published once the relay listens: a connection is taken (and closed while the job's
+    // server is not up yet).
+    var tries: u32 = 0;
+    while (connectLoopback(hp) == null) : (tries += 1) {
+        if (tries > 1200) return error.TestUnexpectedResult;
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+
+    // Another job reaches it neither at its own 127.0.0.1 nor at the host's address on the bridge.
+    const gw = cfg.subnet.gateway();
+    const probe_script = try std.fmt.allocPrint(arena,
+        \\python3 -c '
+        \\import socket
+        \\for name, host in (("gw", "{d}.{d}.{d}.{d}"), ("lo", "127.0.0.1")):
+        \\    s = socket.socket(); s.settimeout(3)
+        \\    try:
+        \\        s.connect((host, {d})); r = "connected"
+        \\    except Exception:
+        \\        r = "refused"
+        \\    print("other-" + name + "=" + r)
+        \\'
+    , .{ gw[0], gw[1], gw[2], gw[3], hp });
+    var other: PortJob = .{ .cfg = cfg, .job = testJob(&.{testStep(probe_script)}) };
+    defer other.arena.deinit();
+    other.job.container = .{ .name = "", .image = .{ .lit = image } };
+    other.run();
+    if (!other.ok) std.debug.print("{s}\n", .{other.text});
+    try std.testing.expect(other.ok);
+    try expectAll(other.text, &.{ "other-gw=refused", "other-lo=refused" });
+
+    // A container on another bridge of the host's (Docker's, the engine's), which the runner's
+    // table does not see: the relay refuses it by its address.
+    const bridge_script = try std.fmt.allocPrint(arena,
+        \\set -e
+        \\ip link add zrtbr0 type bridge; ip addr add 172.31.250.1/24 dev zrtbr0; ip link set zrtbr0 up
+        \\ip netns add zrtpeer; ip link add zrtv0 type veth peer name zrtv1 netns zrtpeer
+        \\ip link set zrtv0 master zrtbr0 up
+        \\ip -n zrtpeer addr add 172.31.250.2/24 dev zrtv1; ip -n zrtpeer link set zrtv1 up; ip -n zrtpeer link set lo up
+        \\ip netns exec zrtpeer python3 -c '
+        \\import socket
+        \\s = socket.socket(); s.settimeout(3)
+        \\try:
+        \\    s.connect(("172.31.250.1", {d})); d = s.recv(16); r = "hello" if d.startswith(b"hello") else "closed"
+        \\except Exception as e:
+        \\    r = "refused"
+        \\print("bridge=" + r)
+        \\'
+    , .{hp});
+    const bridged = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", bridge_script } }) catch |e| {
+        std.debug.print("the bridge peer could not be made: {s}\n", .{@errorName(e)});
+        return e;
+    };
+    _ = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", "ip netns del zrtpeer; ip link del zrtbr0" } }) catch {};
+    if (std.mem.indexOf(u8, bridged.stdout, "bridge=") == null) std.debug.print("{s}{s}\n", .{ bridged.stdout, bridged.stderr });
+    // Accepted by the host's socket and closed by the relay at once, or not let in at all.
+    try std.testing.expect(std.mem.indexOf(u8, bridged.stdout, "bridge=hello") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bridged.stdout, "bridge=") != null);
+
+    // The host reaches the job's server through it.
+    var hello = false;
+    tries = 0;
+    while (!hello and tries < 600) : (tries += 1) {
+        const fd = connectLoopback(hp) orelse break;
+        defer _ = linux.close(fd);
+        var buf: [16]u8 = undefined;
+        var fds = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+        if (linux.poll(&fds, 1, 2000) == 1) {
+            const n = linux.read(fd, &buf, buf.len);
+            if (linux.errno(n) == .SUCCESS and std.mem.startsWith(u8, buf[0..n], "hello")) {
+                hello = true;
+                _ = linux.write(fd, "quit\n", 5);
+                break;
+            }
+        }
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+    try std.testing.expect(hello);
+    t.join();
+    joined = true;
+    if (!serving.ok) std.debug.print("{s}\n", .{serving.text});
+    try std.testing.expect(serving.ok);
+    try expectAll(serving.text, &.{
+        "served-5",
+        try std.fmt.allocPrint(arena, "Container ports: 8080/tcp -> 0.0.0.0:{d}, 9090/tcp -> 0.0.0.0:", .{hp}),
+    });
+    // The bare port got a port of its own, said as Docker says it.
+    const said = "9090/tcp -> 0.0.0.0:";
+    const at = std.mem.indexOf(u8, serving.text, said).? + said.len;
+    var end = at;
+    while (end < serving.text.len and std.ascii.isDigit(serving.text[end])) end += 1;
+    const picked = try std.fmt.parseInt(u16, serving.text[at..end], 10);
+    try std.testing.expect(picked != 0 and picked != 9090);
+    // Gone with the job.
+    try std.testing.expect(connectLoopback(hp) == null);
+
+    // A port another process holds fails the job, naming it; nothing runs.
+    const holder = std.math.cast(linux.fd_t, linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0)).?;
+    defer _ = linux.close(holder);
+    var sa: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, hp), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    // The connections above may leave the port in TIME_WAIT; a listener still refuses a second.
+    const one: i32 = 1;
+    _ = linux.setsockopt(holder, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&one), 4);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.bind(holder, forward.asSockaddr(&sa), @sizeOf(linux.sockaddr.in))));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.listen(holder, 1)));
+    var taken_cfg = cfg;
+    taken_cfg.port_range = lone.port_range;
+    var taken: PortJob = .{ .cfg = taken_cfg, .job = testJob(&.{testStep("echo ran-$((1+1))")}) };
+    defer taken.arena.deinit();
+    taken.job.container = .{
+        .name = "",
+        .image = .{ .lit = image },
+        .ports = &.{.{ .lit = try std.fmt.allocPrint(arena, "{d}:8080", .{hp}) }},
+    };
+    taken.run();
+    try std.testing.expect(!taken.ok);
+    try expectAll(taken.why, &.{try std.fmt.allocPrint(arena, "publish 127.0.0.1:{d}/tcp", .{hp})});
+    try std.testing.expect(std.mem.indexOf(u8, taken.text, "ran-2") == null);
 }
 
 /// Mounts a filesystem of `fstype` at `path` (made first) with `flags`, for the root tests of host
@@ -6731,6 +7132,96 @@ test "a container job's named volume and host path together: both bound, nesting
     try expectAll(anon.text, &.{"ran-2"});
 }
 
+test "a container job's ports, host path and named volume together: each carried out, the port serves both" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    const linux = std.os.linux;
+    // Ports and host paths need a root runner.
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    var extra: oci_layer.TestTar = .{ .a = arena };
+    try extra.add(.{ .path = "srv/", .kind = .directory, .mode = 0o755 });
+    try extra.add(.{ .path = "srv/seed/", .kind = .directory, .mode = 0o755 });
+    try extra.add(.{ .path = "srv/seed/from-image", .body = "image\n" });
+    const layers = try std.mem.concat(arena, []const u8, &.{ try testImageLayers(arena), &.{try extra.finish()} });
+    const img = try testregistry.testImage(arena, "test/allthree", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+    const host = try std.fmt.allocPrint(arena, "{s}/host", .{root});
+    try tmp.dir.createDirPath(io, "host");
+    try testMount(arena, host, "tmpfs", linux.MS.NOSUID | linux.MS.NODEV);
+    defer testUnmount(arena, host);
+    try tmp.dir.createDirPath(io, "host/data");
+    try tmp.dir.writeFile(io, .{ .sub_path = "host/data/from-host", .data = "host file\n" });
+    cfg.host_paths = try testHostPaths(arena, host);
+    cfg.port_range = .{ .lo = 1024, .hi = 65535 };
+    const hp = try freePort();
+
+    // The job's server sends what the host path and the named volume hold, until one says "quit".
+    const serve =
+        \\python3 -c '
+        \\import socket
+        \\body = open("/h/from-host", "rb").read() + open("/srv/seed/from-image", "rb").read()
+        \\s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        \\s.bind(("0.0.0.0", 8080)); s.listen(8); s.settimeout(120)
+        \\while True:
+        \\    c, _ = s.accept(); c.settimeout(10)
+        \\    try:
+        \\        c.sendall(body); d = c.recv(16)
+        \\    except Exception:
+        \\        d = b""
+        \\    c.close()
+        \\    if d.startswith(b"quit"): break
+        \\print("served-" + str(2 + 3))
+        \\'
+    ;
+    var job: PortJob = .{ .cfg = cfg, .job = testJob(&.{testStep(serve)}) };
+    defer job.arena.deinit();
+    const vols = [_]job_mod.Template{ .{ .lit = "data:/srv/seed" }, .{ .lit = try std.fmt.allocPrint(arena, "{s}/data:/h:ro", .{host}) } };
+    job.job.container = .{
+        .name = "",
+        .image = .{ .lit = try server.image(arena, "test/allthree:1") },
+        .volumes = &vols,
+        .ports = &.{.{ .lit = try std.fmt.allocPrint(arena, "{d}:8080", .{hp}) }},
+    };
+    const t = try std.Thread.spawn(.{}, PortJob.run, .{&job});
+    var got = false;
+    var tries: u32 = 0;
+    while (!got and tries < 1200) : (tries += 1) {
+        if (connectLoopback(hp)) |fd| {
+            defer _ = linux.close(fd);
+            var buf: [64]u8 = undefined;
+            var fds = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+            if (linux.poll(&fds, 1, 2000) == 1) {
+                const n = linux.read(fd, &buf, buf.len);
+                if (linux.errno(n) == .SUCCESS and std.mem.eql(u8, buf[0..n], "host file\nimage\n")) {
+                    got = true;
+                    _ = linux.write(fd, "quit\n", 5);
+                }
+            }
+        }
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+    t.join();
+    if (!job.ok) std.debug.print("{s}\n", .{job.why});
+    try std.testing.expect(got);
+    try std.testing.expect(job.ok);
+    try expectAll(job.text, &.{
+        "Engine: native",
+        "served-5",
+        try std.fmt.allocPrint(arena, "Container ports: 8080/tcp -> 127.0.0.1:{d}", .{hp}),
+        "1 named, kept between jobs in the native store (repo scope, 1 new and filled from the image)",
+        "1 host path(s) bound (1 read-only), nosuid and nodev",
+    });
+    try std.testing.expect(connectLoopback(hp) == null);
+}
+
 test "the base hands a work root to the user, and the tool cache only when it is not theirs" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -6825,6 +7316,83 @@ test "native provisioning: a step on the pulled image, flattened and kept under 
     // A failing script fails with its output's last line, and leaves nothing under its key.
     try std.testing.expectError(error.BaseContainerFailed, b.provision(pulled, "echo the reason; exit 7", &err_msg));
     try std.testing.expect(std.mem.indexOf(u8, err_msg, "the reason (exit 7)") != null);
+}
+
+test "native pre-provisioned image: pulled as the rootfs; nothing pinned, a stale pin or the setting leaves it to apt; a failed pull says why" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const fp = try arena.dupe(u8, &provisioned.fingerprint(.root));
+    const tag = try std.fmt.allocPrint(arena, "{s}-root", .{fp});
+    const img = try testregistry.testImage(arena, "test/base", tag, try testImageLayers(arena), "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+    const repository = try server.image(arena, "test/base");
+    const pins: provisioned.Pins = .{
+        .root = .{ .fingerprint = fp, .digest = img.index },
+        .runner = .{ .fingerprint = "", .digest = "" },
+        .repository = repository,
+    };
+
+    // Pinned and current: its own tree is the rootfs, in the store's image area, a path no
+    // locally provisioned rootfs has, so the step cache's keys cannot take one for the other.
+    cfg.provisioned_pins = pins;
+    {
+        var b = try init(arena, std.testing.io, std.testing.allocator, cfg);
+        defer b.deinit();
+        var err_msg: []const u8 = "";
+        const got = try b.fetchRootfs(dagger.default_image, null, true, false, &err_msg);
+        try std.testing.expect(std.mem.indexOf(u8, b.rootfs, "/oci/images/") != null);
+        try std.testing.expectEqualStrings(got.rootfs, b.rootfs);
+        try std.testing.expectEqualStrings("from the image\n", try std.Io.Dir.cwd().readFileAlloc(std.testing.io, try std.fmt.allocPrint(arena, "{s}/etc/marker", .{b.rootfs}), arena, .limited(64)));
+        const note = b.notes.getLast();
+        try std.testing.expect(std.mem.indexOf(u8, note, "Provisioned image: ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, note, "@" ++ "sha256:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, note, "Provisioned natively") == null);
+    }
+
+    // Not pinned for the runner variant, a pin made for another script, and the setting off:
+    // nothing is pulled, and nothing is said.
+    const stale: provisioned.Pins = .{
+        .root = .{ .fingerprint = "000000000000", .digest = img.index },
+        .runner = pins.runner,
+        .repository = repository,
+    };
+    const before = server.requests.load(.acquire);
+    for ([_]struct { pins: provisioned.Pins, on: bool, as_runner: bool }{
+        .{ .pins = pins, .on = true, .as_runner = true },
+        .{ .pins = stale, .on = true, .as_runner = false },
+        .{ .pins = pins, .on = false, .as_runner = false },
+    }) |case| {
+        cfg.provisioned_pins = case.pins;
+        cfg.provisioned_image = case.on;
+        var b = try init(arena, std.testing.io, std.testing.allocator, cfg);
+        defer b.deinit();
+        try std.testing.expect(try b.pullProvisioned(case.as_runner) == null);
+        for (b.notes.items) |n| try std.testing.expect(std.mem.indexOf(u8, n, "Provisioned image") == null);
+    }
+    try std.testing.expectEqual(before, server.requests.load(.acquire));
+
+    // A registry that cannot be reached: no image, and the note says what could not be pulled,
+    // for the caller to provision with apt.
+    // (Not the digest the store has: an image it holds is found without asking the registry.)
+    const unseen = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    cfg.provisioned_pins = .{
+        .root = .{ .fingerprint = fp, .digest = unseen },
+        .runner = pins.runner,
+        .repository = "127.0.0.1:1/test/base",
+    };
+    cfg.provisioned_image = true;
+    var gone = try init(arena, std.testing.io, std.testing.allocator, cfg);
+    defer gone.deinit();
+    try std.testing.expect(try gone.pullProvisioned(false) == null);
+    const said = gone.notes.getLast();
+    try std.testing.expect(std.mem.indexOf(u8, said, "Provisioned image: could not pull 127.0.0.1:1/test/base:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "provisioning with apt-get instead") != null);
 }
 
 /// A runner's job ends, again and again, while the test's job runs: what it holds must stay.

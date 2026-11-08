@@ -39,6 +39,7 @@ unreported instead, and the merge queue waiting for it.
 | `proofs` | pull requests, merge queue, `main`, weekly | the Lean proofs, and the `hashFiles()` model against `glob.zig` |
 | `store model` | changes to the store or release pipeline, weekly | TLA+ models with TLC, the store's locking with SPIN |
 | `release` | tags; pull requests touching the packaging | binaries, image, provenance, deploy |
+| `provisioned image` | pull requests (build only), `main`, by hand | the default job image with the runner's packages installed, both architectures |
 | `version` | daily, or by hand | cuts the release, after approval |
 | `security` | pull requests, weekly | gitleaks and dependency review |
 | `codeql` | pull requests, merge queue, `main`, weekly | CodeQL `security-extended` |
@@ -221,7 +222,12 @@ The workflows are written to be hard to turn against the repository.
   `.github/scripts/busybox-pin.sh`), the JavaScript runtimes for actions (`oven/bun` and `node`,
   `runner/src/dagger/js.zig`), and the job base image `ubuntu:24.04` (`RUNNER_IMAGE`, checked by
   `.github/scripts/ubuntu-pin.sh`). The packages provisioning installs come from the Ubuntu archive
-  on the day the engine builds them, and the pre-warm logs their fingerprint. zizmor is installed
+  on the day they are installed, and the pre-warm logs their fingerprint. Where one is pinned
+  (`runner/src/dagger/provisioned_pin.zig`, checked by `.github/scripts/provisioned-pin.sh`), the
+  runner pulls the default image already provisioned, built by `provisioned image` from the
+  runner's own script, signed and by digest, instead of installing the packages (22-45 s, and
+  Ubuntu's mirrors) on every new machine and empty store. A pull that fails provisions as before,
+  and `RUNNER_PROVISIONED_IMAGE=false` never pulls it. zizmor is installed
   from PyPI by hash. tls.zig and GitHub's expression test cases are pinned by commit. Zig, changie,
   checksec and gitleaks are checked against pinned checksums before they run, tls.zig against its
   `.hash` too; a Renovate pull request for a new one fails until its checksums are updated.

@@ -7,3 +7,9 @@ misconfigurations:
       engine's unix socket, which the engine (privileged, as it must be to run steps) creates as
       root. A non-root runner needs that socket's ownership arranged in every deployment first;
       until then root here grants nothing the privileged engine beside it does not already have.
+  - id: DS-0002
+    paths: ["runner/provisioned.Dockerfile", "provisioned.Dockerfile"]
+    statement: >-
+      This is the job base image, not a service: it is built to be run as root by the runner, which
+      installs the packages as root, and `provision_runner_script` adds the step user itself. A
+      USER here would change who a job without a step user runs as, and the runner sets it per job.

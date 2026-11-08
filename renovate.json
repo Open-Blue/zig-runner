@@ -112,7 +112,7 @@
       ]
     },
     {
-      "description": "ubuntu, the default job image (runner/src/dagger.zig) and the shared base of every job: a digest update re-keys every step, which runs once more after it, so it gets its own pull request, which ubuntu-pin.sh gates, proposed monthly at most. A new release (24.04 to 26.04) changes what provisioning installs and is moved by hand, so none is proposed.",
+      "description": "ubuntu, the default job image (runner/src/dagger.zig) and the shared base of every job: a digest update re-keys every step, which runs once more after it, so it gets its own pull request, which ubuntu-pin.sh gates, proposed monthly at most. It also names the image the provisioned images are built on (runner/src/dagger/provisioned.zig), so a unit test fails on it until they are built again: run the 'provisioned image' workflow by hand on the pull request's branch, then provisioned-pin.sh update and commit the pin. A new release (24.04 to 26.04) changes what provisioning installs and is moved by hand, so none is proposed.",
       "matchDepNames": [
         "ubuntu"
       ],

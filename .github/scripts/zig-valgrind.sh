@@ -35,6 +35,12 @@
 # A test that does not finish would hold the job to its time limit with nothing said. ZIG_VALGRIND_TIMEOUT
 # (`timeout`'s duration, 35m by default: the whole suite takes about 25, with the build before it)
 # ends the run instead, and names the test that was running, the last the log started.
+#
+# Nor should a hang wait for that limit: ZIG_VALGRIND_STALL (seconds, 600 by default) ends the run
+# when the log has not grown for that long, and names the test the same way. The longest silence
+# of a healthy run is one test of about 7 minutes under Valgrind (the 11-08 night: test 670 of
+# 934, 404 s), so the default is well past it and a hang costs 10 minutes, not the 35; a run of
+# a few tests can say less (analysis.yml gives its changed tests 480).
 set -euo pipefail
 cd "$(dirname "$0")/../../runner"
 
@@ -75,11 +81,34 @@ reading=$!
 # The log as it grows, so a long run shows its progress.
 tail -n +1 -f --pid="$reading" "$scratch/log" 2>/dev/null &
 showing=$!
+# The watchdog: the log's size is checked every 5 seconds, and a run whose log has not grown for
+# ZIG_VALGRIND_STALL seconds is stopped (TERM, then KILL from `timeout`), with `stalled` saying so.
+(
+	stall=${ZIG_VALGRIND_STALL:-600}
+	last=-1 idle=0
+	while kill -0 "$checking" 2>/dev/null; do
+		sleep 5
+		size=$(stat -c %s "$scratch/raw")
+		if ((size == last)); then idle=$((idle + 5)); else idle=0 last=$size; fi
+		if ((idle >= stall)); then
+			: >"$scratch/stalled"
+			kill -TERM "$checking" 2>/dev/null || true
+			break
+		fi
+	done
+) &
+watching=$!
 wait "$checking"
 status=$?
-wait "$reading" "$showing"
+kill "$watching" 2>/dev/null || true
+wait "$reading" "$showing" "$watching" 2>/dev/null || true
 set -e
 echo "::$stop::"
+if [[ -f $scratch/stalled ]]; then
+	running=$(awk '/^[0-9]+\/[0-9]+ /{t=$0} END{print t}' "$scratch/log")
+	echo "::error title=Valgrind::no output for ${ZIG_VALGRIND_STALL:-600} seconds, stopped: a test that hangs, or one slower than that under Valgrind. The last test started: ${running:-none}"
+	exit 124
+fi
 case $status in
 0) echo "Valgrind: no reports, every test passed" ;;
 1)

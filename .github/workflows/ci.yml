@@ -135,6 +135,22 @@ jobs:
             sleep $((attempt * 15))
           done
 
+      # The provisioned images (runner/src/dagger/provisioned_pin.zig), pinned by digest once the
+      # "provisioned image" workflow published them: checked to be indexes for amd64 and arm64
+      # whose images are labelled with the fingerprint the pin says, so a pin of a missing or
+      # another image fails here, not on a runner. (That the fingerprint is the current script's
+      # and base image's is a unit test.) With nothing pinned there is nothing to ask. Asked of
+      # ghcr.io anonymously; only a fetch that fails (exit 75) is tried again, as for ubuntu.
+      - name: provisioned images' pin
+        run: |
+          for attempt in 1 2 3; do
+            status=0
+            .github/scripts/provisioned-pin.sh check || status=$?
+            ((status == 75 && attempt < 3)) || exit "$status"
+            echo "::warning::provisioned-pin.sh could not reach ghcr.io (attempt $attempt of 3): trying again"
+            sleep $((attempt * 15))
+          done
+
       # zizmor's online audits ask GitHub (its advisories, the pinned commits). A request that fails
       # makes zizmor exit 1, the code for its own failure, which once took a pull request out of
       # the merge queue (#194). Only that is tried again, twice, after a pause: findings (exit 10
