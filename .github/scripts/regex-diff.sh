@@ -21,6 +21,7 @@ mkdir "$s/matchers"
 zig build-exe -OReleaseSafe --dep regex --dep corpus -Mroot=tools/regexcorpus.zig -Mregex=src/regex.zig -Mcorpus=tools/corpus.zig \
 	--name regexcorpus -femit-bin="$s/regexcorpus" &
 
+echo "== fetching the problem matchers"
 n=0
 while read -r repo file; do
 	[[ -z $repo ]] && continue
@@ -31,9 +32,12 @@ while read -r repo file; do
 done <tools/regexdiff/matchers.txt
 wait
 
+echo "== generating the cases"
 (cd tools/regexdiff && go run . -out "$s/cases.json" -matchers "$s/matchers" -n "${1:-2000}" -seed "${2:-1}")
+echo "== the reference: .NET"
 docker run --rm -e DOTNET_CLI_TELEMETRY_OPTOUT=1 -e DOTNET_NOLOGO=1 \
 	-v "$PWD/tools/regexdiff/reference:/src:ro" -v "$s/cases.json:/cases.json:ro" \
 	mcr.microsoft.com/dotnet/sdk:8.0@sha256:ff39a765f04619c8d146796fc09b38499ae5984f4a2a4c3a0a57d0022855daee sh -c 'cp -r /src /tmp/ref && cd /tmp/ref && dotnet run -c Release -- /cases.json' \
 	>"$s/reference.jsonl"
+echo "== the runner's regex against it"
 "$s/regexcorpus" "$s/cases.json" "$s/reference.jsonl"

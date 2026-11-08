@@ -49,13 +49,22 @@ for ((round = 1; round <= rounds; round++)); do
 	log=$scratch/round-$round.log
 	t=$SECONDS
 	status=0
-	timeout --kill-after=10 300 "$race_test" >"$log" 2>&1 || status=$?
+	# The round's output as it comes, in a group of its own, and only text to the job (inside
+	# stop-commands). From the file with `tail --pid`, not through a pipe (zig-valgrind.sh): a
+	# process the tests left running would hold a pipe open past the round.
+	echo "::group::round $round/$rounds"
+	echo "::stop-commands::$stop"
+	timeout --kill-after=10 300 "$race_test" >"$log" 2>&1 &
+	testing=$!
+	tail -n +1 -f --pid="$testing" "$log" 2>/dev/null &
+	showing=$!
+	wait "$testing" || status=$?
+	wait "$showing" || true
+	echo "::$stop::"
+	echo "::endgroup::"
 	echo "round $round/$rounds: exit $status in $((SECONDS - t)) s, $(tail -n 1 "$log")"
 	((status == 0)) && continue
 	cp "$log" "$out/"
-	echo "::stop-commands::$stop"
-	cat "$log"
-	echo "::$stop::"
 	# The test each `FAIL (...)` belongs to, as zig-valgrind.sh finds it.
 	failed=$(awk '/^[0-9]+\/[0-9]+ /{t=$0; sub(/\.\.\..*/, "", t)} /FAIL \(/{print t}' "$log" | paste -sd ';' -)
 	((status == 124)) && failed="a test hung past 300 s (the last one started above)"
