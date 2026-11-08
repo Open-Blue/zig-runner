@@ -226,10 +226,7 @@ fn parseTmpfs(arena: Allocator, flag: []const u8, value: []const u8, why: *[]con
             "path without `.` or `..`"),
     };
     if (out.target.len <= 1) return refuse(arena, why, flag, "mounts the root directory");
-    for (runner_mounts) |m| if (under(out.target, m)) return refuse(arena, why, flag, "mounts " ++
-        "where the runner mounts its own directory");
-    for (sandbox_trees) |t| if (under(out.target, t)) return refuse(arena, why, flag, "mounts " ++
-        "inside a directory the sandbox mounts itself");
+    if (tmpfsHides(out.target)) |reason| return refuse(arena, why, flag, reason);
     const options = if (colon) |c| value[c + 1 ..] else "";
     var it = std.mem.splitScalar(u8, options, ',');
     while (it.next()) |o| {
@@ -456,6 +453,45 @@ const runner_mounts = [_][]const u8{
 };
 /// Directories the sandbox mounts itself, and everything below them.
 const sandbox_trees = [_][]const u8{ "/proc", "/sys", "/dev" };
+/// What a tmpfs must not cover besides `runner_mounts`: the runner's other mounts of a container
+/// job, and the files it puts in place (`/etc/hosts` and `/etc/resolv.conf` bound from the job's,
+/// `/etc/hostname`). A tmpfs only hides what is below its path, so it is refused at, below and
+/// above each of them.
+const runner_paths = [_][]const u8{
+    "/github/file_commands", "/github/workspace", "/etc/hosts", "/etc/resolv.conf", "/etc/hostname",
+};
+
+/// Why a `--tmpfs` at `path` (clean and absolute) is refused for what it would cover, or null. Also
+/// the sandbox's check of the mount point after the image's symlinks are followed
+/// (`sandbox.mountTmpfs`), since an allowed name can be a link onto a refused path.
+pub fn tmpfsHides(path: []const u8) ?[]const u8 {
+    if (path.len <= 1) return "mounts the root directory";
+    for (runner_mounts ++ runner_paths) |m| {
+        if (under(path, m)) return "mounts where the runner mounts its own directory or puts its " ++
+            "own file";
+        if (under(m, path)) return "mounts above a directory or file the runner mounts or puts " ++
+            "in place, which it would hide";
+    }
+    for (sandbox_trees) |t| if (under(path, t)) return "mounts inside a directory the sandbox " ++
+        "mounts itself";
+    return null;
+}
+
+/// The one rule for a job with no cgroup of its own (`RUNNER_NATIVE_CGROUP=none`), where a tmpfs
+/// is charged to nobody: every `--tmpfs` has a `size=`, and the sizes and `--shm-size` add up to
+/// at most `unaccounted_limit`. Why the options are refused, or null.
+pub const unaccounted_limit: u64 = 1 << 30;
+pub fn withoutCgroup(o: Options) ?[]const u8 {
+    var total: u64 = o.shm_size orelse 0;
+    for (o.tmpfs) |t| {
+        if (t.size == 0) return "a `--tmpfs` without a `size=` needs the job's own cgroup, which this " ++
+            "job has none of (RUNNER_NATIVE_CGROUP): it would hold up to half the host's memory";
+        total +|= t.size;
+    }
+    if (total > unaccounted_limit) return "the `--tmpfs` sizes and `--shm-size` add up to more " ++
+        "than 1 GiB, which only a job with its own cgroup (RUNNER_NATIVE_CGROUP) may ask for";
+    return null;
+}
 
 /// `raw` as GitHub's runner reads a job container's `volumes:` entry (`MountVolume.ParseVolumeString`):
 /// `target`, `source:target` or `source:target:ro` (and `target:ro`), which it passes on as
@@ -615,7 +651,9 @@ pub fn unsupported(jc: job_mod.Service, provisioned: bool, services: []const job
     if (o.user != null and provisioned) return "a job container's `--user` on the default " ++
         "image, whose steps run as RUNNER_STEP_USER's user, is not native" ++ dropped;
     if (o.tmpfs.len > 0 and jc.volumes.len > 0) {
-        const found = volumes(fba.allocator(), jc.volumes, &why) catch return null;
+        // Fail closed: a job whose volumes cannot be read here is not one to run natively.
+        const found = volumes(fba.allocator(), jc.volumes, &why) catch return "a job container's " ++
+            "`--tmpfs` could not be checked against its `volumes:`" ++ dropped;
         for (o.tmpfs) |fs| for (found.targets) |v| if (under(fs.target, v) or under(v, fs.target))
             return "a job container's `--tmpfs` is at or beside a path a volume mounts" ++ dropped;
     }
@@ -1023,4 +1061,67 @@ test "unsupported: a list of volumes is carried out whole, or the job falls back
     svc.volumes = &.{};
     jc.volumes = &.{.{ .lit = "cache:/cache" }};
     try std.testing.expect(unsupported(jc, false, &.{svc}) == null);
+}
+
+test "tmpfs refused where it would hide what the runner mounts or puts in place, above or below" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    for ([_][]const u8{
+        "/github",              "/github/home",          "/github/home/x",
+        "/github/workflow",     "/github/file_commands", "/github/file_commands/x",
+        "/github/workspace",    "/github/workspace/src", "/__w",
+        "/__w/_temp",           "/__t",                  "/__e",
+        "/etc",                 "/etc/hosts",            "/etc/resolv.conf",
+        "/etc/hostname",        "/var",                  "/var/run",
+        "/var/run/docker.sock", "/proc/x",               "/dev/shm",
+    }) |p| try expectRefused(arena, try std.fmt.allocPrint(arena, "--tmpfs {s}", .{p}), "--tmpfs");
+    // Beside them is fine, and so is a path that only shares a prefix.
+    for ([_][]const u8{ "/etc/ssl", "/github2", "/__work", "/run", "/var/tmp", "/etcetera" }) |p| {
+        var why: []const u8 = "";
+        const o = try parse(arena, try std.fmt.allocPrint(arena, "--tmpfs {s}", .{p}), &why);
+        try std.testing.expectEqualStrings(p, o.tmpfs[0].target);
+    }
+    // What the sandbox asks about the mount point it found after the image's links.
+    try std.testing.expect(tmpfsHides("/etc") != null);
+    try std.testing.expect(tmpfsHides("/github/workspace") != null);
+    try std.testing.expect(tmpfsHides("/scratch") == null);
+}
+
+test "unsupported: a tmpfs that cannot be checked against the volumes is not native" {
+    // Eight KiB of scratch: `parse` takes its part of it, and `volumes` must fit in the rest.
+    // A long enough list of tmpfs leaves it too little, and the answer is a refusal, not "native".
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    var i: usize = 0;
+    var found = false;
+    // Find a count of tmpfs that `parse` reads and `volumes` then cannot be given room for.
+    while (i < 400 and !found) : (i += 1) {
+        text.clearRetainingCapacity();
+        for (0..i) |n| try text.print(std.testing.allocator, "--tmpfs /t{d:0>40} ", .{n});
+        var jc: job_mod.Service = .{ .name = "", .image = .{ .lit = "node:22" } };
+        jc.options = .{ .lit = text.items };
+        jc.volumes = &.{.{ .lit = "/data" }};
+        const why = unsupported(jc, false, &.{}) orelse continue;
+        if (std.mem.indexOf(u8, why, "could not be checked") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "without a job cgroup: an unsized tmpfs is refused, and sizes are capped" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var why: []const u8 = "";
+    const sized = try parse(arena, "--tmpfs /a:size=64m --shm-size 128m", &why);
+    try std.testing.expect(withoutCgroup(sized) == null);
+    try std.testing.expect(withoutCgroup(try parse(arena, "--hostname h", &why)) == null);
+    const unsized = try parse(arena, "--tmpfs /a", &why);
+    try std.testing.expect(std.mem.indexOf(u8, withoutCgroup(unsized).?, "size=") != null);
+    const big_shm = try parse(arena, "--shm-size 2g", &why);
+    try std.testing.expect(std.mem.indexOf(u8, withoutCgroup(big_shm).?, "1 GiB") != null);
+    const big_sum = try parse(arena, "--tmpfs /a:size=600m --tmpfs /b:size=600m", &why);
+    try std.testing.expect(withoutCgroup(big_sum) != null);
+    const edge = try parse(arena, "--tmpfs /a:size=512m --shm-size 512m", &why);
+    try std.testing.expect(withoutCgroup(edge) == null);
 }

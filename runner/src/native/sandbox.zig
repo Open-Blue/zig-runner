@@ -30,6 +30,7 @@ const seccomp = @import("seccomp.zig");
 const health = @import("health.zig");
 const phases = @import("phases.zig");
 const host_paths = @import("host_paths.zig");
+const container_options = @import("container_options.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1672,7 +1673,27 @@ fn mountTmpfs(arena: Allocator, root: linux.fd_t, t: Spec.Tmpfs) void {
         std.fmt.allocPrintSentinel(arena, "mode={o},size={d}", .{ t.mode, t.size }, 0) catch oom()
     else
         std.fmt.allocPrintSentinel(arena, "mode={o}", .{t.mode}, 0) catch oom();
-    mountIn(arena, root, t.path, "tmpfs", "tmpfs", flags, data);
+    // The path as the image's symlinks resolve it: `/scratch -> /etc` must not put the tmpfs where
+    // `container_options` refuses one by name (the files the runner binds there, its mounts).
+    const fd = targetIn(arena, root, t.path, true) orelse fatal(about(arena, "find", t.path), @as(u32, 2));
+    defer _ = linux.close(fd);
+    if (container_options.tmpfsHides(resolvedIn(arena, root, fd))) |_| fatal(about(arena, "mount a " ++
+        "--tmpfs over what the runner mounts or puts in place, through a link in the image, at", t.path), @as(u32, 1));
+    const d: usize = @intFromPtr(data.ptr);
+    check("mount", linux.mount("tmpfs", procFd(arena, fd), "tmpfs", flags, d));
+}
+
+/// Where `fd` (opened by `openIn` under `root`) is, as a path inside `root`; "/" if it cannot be read
+/// (which `container_options.tmpfsHides` refuses).
+fn resolvedIn(arena: Allocator, root: linux.fd_t, fd: linux.fd_t) []const u8 {
+    var base: [std.fs.max_path_bytes]u8 = undefined;
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const b = linux.readlink(procFd(arena, root), &base, base.len);
+    const f = linux.readlink(procFd(arena, fd), &full, full.len);
+    if (linux.errno(b) != .SUCCESS or linux.errno(f) != .SUCCESS) return "/";
+    if (!std.mem.startsWith(u8, full[0..f], base[0..b])) return "/";
+    const rest = full[b..f];
+    return arena.dupe(u8, if (rest.len == 0) "/" else rest) catch oom();
 }
 
 /// A /dev of the nodes a step needs, bound from the host's, as runc builds one: not the host's

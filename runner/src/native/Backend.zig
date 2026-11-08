@@ -3068,6 +3068,12 @@ fn readContainerOptions(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void
         return error.BaseContainerFailed;
     };
     b.container_opts = o;
+    // A tmpfs and /dev/shm are charged to the memory cgroup of the job; with none, they would pin
+    // host memory nobody accounts for (docs/native-backend.md, "Job container options").
+    if (b.job_cgroup == null) if (container_options.withoutCgroup(o)) |reason| {
+        err_msg.* = reason;
+        return error.BaseContainerFailed;
+    };
     var more: std.ArrayList(u8) = .empty;
     if (o.hostname) |h| try more.print(b.arena, ", `--hostname` {s}", .{h});
     if (o.add_hosts.len > 0) try more.print(b.arena, ", {d} `--add-host`", .{o.add_hosts.len});
@@ -6359,6 +6365,50 @@ test "a container job's options on the native backend: hostname, add-host, shm-s
     try std.testing.expect(std.mem.indexOf(u8, r.text, "stdout] ran-from-scratch") == null);
     // Carried out here, so not reported as ignored, as on the Dagger path.
     try std.testing.expect(std.mem.indexOf(u8, r.text, "not supported here and ignored") == null);
+}
+
+test "a container job's --tmpfs through an image's link onto what the runner puts in place fails the step" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var t: oci_layer.TestTar = .{ .a = arena };
+    try t.add(.{ .path = "linked", .kind = .symlink, .link = "/etc" });
+    try t.add(.{ .path = "linkroot", .kind = .symlink, .link = "/" });
+    try t.add(.{ .path = "fine", .kind = .directory, .mode = 0o755 });
+    const lay = try testImageLayers(arena);
+    const layers = try arena.dupe([]const u8, &.{ lay[0], lay[1], try t.finish() });
+    const img = try testregistry.testImage(arena, "test/optsl", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    // The names are allowed (`/linked` and `/linkroot` are nothing the runner mounts); where the
+    // links lead is not.
+    for ([_][]const u8{ "/linked", "/linkroot" }) |p| {
+        var job = testJob(&.{testStep("echo step-ran")});
+        job.container = .{
+            .name = "",
+            .image = .{ .lit = try server.image(arena, "test/optsl:1") },
+            .options = .{ .lit = try std.fmt.allocPrint(arena, "--tmpfs {s}:size=1m", .{p}) },
+        };
+        const r = try runNativeJob(arena, cfg, job, .root);
+        try std.testing.expect(!r.res.succeeded);
+        try std.testing.expect(std.mem.indexOf(u8, r.text, "step-ran") == null);
+        // (The native set-up failed and the job went to Dagger, which this test has no engine for:
+        // it has no log. Had the tmpfs been mounted, the step would have run.)
+    }
+    // A link to somewhere harmless is followed, as Docker does.
+    var ok = testJob(&.{testStep("grep -c ' /fine tmpfs' /proc/mounts")});
+    ok.container = .{
+        .name = "",
+        .image = .{ .lit = try server.image(arena, "test/optsl:1") },
+        .options = .{ .lit = "--tmpfs /fine:size=1m" },
+    };
+    const good = try runNativeJob(arena, cfg, ok, .root);
+    try std.testing.expect(good.res.succeeded);
 }
 
 test "root runner: a container job's --memory lowers the job's memory.max, and never raises it" {
