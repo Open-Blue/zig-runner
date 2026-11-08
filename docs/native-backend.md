@@ -1697,7 +1697,12 @@ volume's mount) fails the job in "Set up job", naming both, as it would hide one
   Those containers are not the host's to let in through a trusted job's port. A host whose LAN NIC
   is itself enslaved to a bridge (`br0` for VMs) has its LAN treated so too; publish on a specific
   address and let the firewall decide, or keep 127.0.0.1. Routes that cannot be read refuse every
-  peer beyond loopback.
+  peer beyond loopback. A peer at 127/8 is always let through, which assumes the kernel drops
+  127/8 sources arriving on other interfaces, as it does unless `route_localnet` is on for one
+  (`/proc/sys/net/ipv4/conf/<if>/route_localnet`; kube-proxy turns it on for NodePorts on
+  localhost). With it on for a bridge, a container there can send a UDP datagram that appears to
+  come from 127.0.0.1. A TCP connection can't be made that way, because the replies go to the
+  host's own loopback. Don't publish UDP ports beyond loopback on such a host.
 - **Which ports**: a host port a job names (`50080:80`) must be inside
   **`RUNNER_NATIVE_PORT_RANGE`** (`--native-port-range`, `lo-hi`, 1024 <= lo <= hi), by default
   **49152-65535**, IANA's dynamic and private ports (RFC 6335), which no service is registered on.
