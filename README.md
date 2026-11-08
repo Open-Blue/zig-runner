@@ -253,7 +253,7 @@ repository:
   was built from `main`, so its `--source-ref` is `refs/heads/main`.
   The binaries' release also carries their SBOM (`zig-runner.spdx.json`: tls.zig and Zig's
   standard library, the only code compiled in besides the runner's own), attested too, and both
-  attestations' bundles for checking offline (`--bundle zig-runner.provenance.jsonl`). A release is
+  attestations' bundles for checking offline (`--bundle zig-runner.provenance.intoto.jsonl`). A release is
   published only once all of it is attached.
 - **Hardened binaries.** The runner runs as root on prod and parses what GitHub, the engine and
   jobs send it, so its binaries are made hard to exploit, and the release checks that they are

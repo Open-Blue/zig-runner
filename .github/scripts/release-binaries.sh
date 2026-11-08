@@ -19,9 +19,11 @@ dir=${2:?usage: release-binaries.sh [--complete] TAG DIR}
 
 binaries=(zig-runner-linux-x86_64 zig-runner-linux-aarch64)
 if [[ -n $complete ]]; then
-	want=("${binaries[@]}" SHA256SUMS zig-runner.spdx.json zig-runner.provenance.jsonl zig-runner.sbom.jsonl)
+	want=("${binaries[@]}" SHA256SUMS zig-runner.spdx.json zig-runner.provenance.intoto.jsonl zig-runner.sbom.jsonl)
 	have=$(gh release view "$tag" --json assets --jq '.assets[].name')
 	for name in "${want[@]}"; do
+		# Releases up to v0.28.1 carry the provenance bundle under its old name.
+		[[ $name == zig-runner.provenance.intoto.jsonl ]] && grep -qxF zig-runner.provenance.jsonl <<<"$have" && continue
 		grep -qxF "$name" <<<"$have" || {
 			echo "::error::$tag is published without $name" >&2
 			exit 1
