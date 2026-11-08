@@ -269,6 +269,30 @@ pub fn openNamed(
     key: []const []const u8,
     owner: ?u32,
 ) !Volume {
+    return openNamedWaiting(arena, io, store, key, owner, .{});
+}
+
+/// How long a job's seeding of a new named volume may take (`Backend.seedVolume` stops it then).
+pub const seed_limit_ms: u64 = 10 * 60 * 1000;
+
+/// How an open waits for another job's seeding of the volume: never for good.
+pub const Wait = struct {
+    /// Past the longest seeding, by a margin: a holder past it is stuck, not slow.
+    ms: u64 = seed_limit_ms + 60 * 1000,
+    /// The job's cancel (`dagger.Cancel.requested`): the open gives up at once when it is set.
+    cancel: ?*const std.atomic.Value(bool) = null,
+};
+
+/// `openNamed`, waiting for another job's seeding as `wait` says: `error.VolumeBusy` past its
+/// time, `error.Canceled` once the job is cancelled.
+pub fn openNamedWaiting(
+    arena: Allocator,
+    io: std.Io,
+    store: []const u8,
+    key: []const []const u8,
+    owner: ?u32,
+    wait: Wait,
+) !Volume {
     const root = try std.fmt.allocPrint(arena, "{s}/volumes", .{store});
     try std.Io.Dir.cwd().createDirPath(io, root);
     _ = linux.chmod(try arena.dupeSentinel(u8, root, 0), 0o700);
@@ -295,7 +319,7 @@ pub fn openNamed(
         // Free: this job may make it. Not free: it is in use, so it is there, or being seeded,
         // which a shared lock waits for.
         const alone = linux.errno(linux.flock(f.handle, lock_ex | lock_nb)) == .SUCCESS;
-        if (!alone and linux.errno(linux.flock(f.handle, lock_sh)) != .SUCCESS) return error.Locked;
+        if (!alone) try waitShared(io, f, wait);
         if (!Store.sameFile(arena, f, lock_path)) {
             f.close(io);
             continue;
@@ -330,6 +354,30 @@ pub fn openNamed(
         return .{ .dir = dir, .root = root, .lock = f, .new = true };
     }
     return error.Locked;
+}
+
+/// The lock `f` taken shared, polled (`LOCK_NB`) while another job holds it exclusively (a seeding),
+/// until `wait`'s time is up or the job is cancelled.
+fn waitShared(io: std.Io, f: std.Io.File, wait: Wait) !void {
+    const start = nowMs();
+    while (true) {
+        switch (linux.errno(linux.flock(f.handle, lock_sh | lock_nb))) {
+            .SUCCESS => return,
+            .AGAIN, .INTR => {},
+            else => return error.Locked,
+        }
+        if (wait.cancel) |c| if (c.load(.acquire)) return error.Canceled;
+        if (nowMs() -| start >= wait.ms) return error.VolumeBusy;
+        io.sleep(.fromMilliseconds(50), .awake) catch return error.Canceled;
+    }
+}
+
+fn nowMs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    const sec = std.math.cast(u64, ts.sec) orelse 0;
+    const nsec = std.math.cast(u64, ts.nsec) orelse 0;
+    return sec * 1000 + nsec / 1_000_000;
 }
 
 /// What a job gets of the caches (`plan`).
@@ -940,4 +988,28 @@ test "native named volumes: jobs use one at once, waiting only while a new one i
     defer retry.release(io);
     try std.testing.expect(retry.new);
     retry.share();
+}
+
+test "native named volumes: an open waits for another job's filling only so long, and not past a cancel" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const key = try namedKey(arena, "o/r", "repo", "data");
+    // A job filling it, that never ends (its image's `cp` hangs, its runner is stopped).
+    var seeding = try openNamed(arena, io, store, key, null);
+    try std.testing.expect(seeding.new);
+    defer seeding.discard(io);
+    const start = nowMs();
+    try std.testing.expectError(error.VolumeBusy, openNamedWaiting(arena, io, store, key, null, .{ .ms = 300 }));
+    const took = nowMs() - start;
+    try std.testing.expect(took >= 300 and took < 5000);
+    // Cancelled, the open gives up at once, however long it would wait.
+    var cancelled: std.atomic.Value(bool) = .init(true);
+    const before = nowMs();
+    try std.testing.expectError(error.Canceled, openNamedWaiting(arena, io, store, key, null, .{ .ms = 60_000, .cancel = &cancelled }));
+    try std.testing.expect(nowMs() - before < 5000);
 }

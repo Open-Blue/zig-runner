@@ -186,6 +186,10 @@ seed_layers: std.ArrayList([]const u8) = .empty,
 seed_ids: std.ArrayList([]const u8) = .empty,
 /// Tests: the Zig cache seed's build, in place of downloading and running a Zig release.
 test_seed_script: ?[]const u8 = null,
+/// How long a new named volume's filling from the image may take (`seedVolume`); tests shorten it.
+volume_seed_limit_ms: u64 = volumes.seed_limit_ms,
+/// Tests: the filling's script, in place of `cp -a`.
+test_volume_seed: ?[]const u8 = null,
 
 /// What the runner configures (`RUNNER_BACKEND=native`).
 pub const Config = struct {
@@ -250,6 +254,9 @@ pub const Config = struct {
     gate: ?*admission.Gate = null,
     /// Tests: see `Backend.test_seed_script`.
     test_seed_script: ?[]const u8 = null,
+    /// Tests: see `Backend.volume_seed_limit_ms` and `Backend.test_volume_seed`.
+    test_volume_seed_limit_ms: ?u64 = null,
+    test_volume_seed: ?[]const u8 = null,
     /// Tests: off, as their stores are under a checkout a non-root user owns
     /// (`Store.Prepare.check_parents`).
     check_store_parents: bool = true,
@@ -797,6 +804,8 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .flatten_at = @max(2, cfg.flatten_at),
         .gate = cfg.gate,
         .test_seed_script = cfg.test_seed_script,
+        .volume_seed_limit_ms = cfg.test_volume_seed_limit_ms orelse volumes.seed_limit_ms,
+        .test_volume_seed = cfg.test_volume_seed,
         .images_dir = cfg.images,
         .service_binds = cfg.service_binds,
         .self_exe = cfg.self_exe,
@@ -2972,14 +2981,34 @@ fn containerVolumes(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void {
             try dagger.shellQuote(&w.writer, v.target);
             continue;
         };
+        // Kept between jobs, so what one job left is the next one's: never for a job the runner
+        // does not vouch for, nor a fork's pull request on one that vouches for pull requests
+        // (scope `untrusted`), whose volumes every other such job would share.
+        if (!b.vouched or !std.mem.eql(u8, scope, "repo")) {
+            b.job_fault = true;
+            err_msg.* = try std.fmt.allocPrint(arena, "the job container's named volume `{s}` " ++
+                "is kept between jobs, which a job the runner does not vouch for (a fork's pull " ++
+                "request included) never gets: an anonymous volume (`- {s}`) lasts as long as " ++
+                "the job", .{ name, v.target });
+            return error.BaseContainerFailed;
+        }
         const key = volumes.namedKey(arena, ev.job.github.repository, scope, name) catch |e| {
             err_msg.* = try std.fmt.allocPrint(arena, "the job container's volume `{s}` is kept " ++
                 "per repository, and the job names none ({s})", .{ name, @errorName(e) });
             return error.BaseContainerFailed;
         };
-        var vol = volumes.openNamed(arena, b.io, b.store_cfg.root, key, owner) catch |e| {
+        // Waiting for another job's filling of it no longer than a filling may take, and not
+        // past the job's cancel.
+        var vol = volumes.openNamedWaiting(arena, b.io, b.store_cfg.root, key, owner, .{
+            .ms = b.volume_seed_limit_ms + 60 * 1000,
+            .cancel = if (b.cancel) |c| &c.requested else null,
+        }) catch |e| {
             err_msg.* = try std.fmt.allocPrint(arena, "could not open the job container's " ++
-                "volume `{s}`: {s}", .{ name, @errorName(e) });
+                "volume `{s}`: {s}", .{ name, switch (e) {
+                error.VolumeBusy => "another job has been filling it for longer than a filling may take",
+                error.Canceled => "the job was cancelled while another job filled it",
+                else => @errorName(e),
+            } });
             return error.BaseContainerFailed;
         };
         const bind: sandbox.Spec.Bind = .{
@@ -3012,6 +3041,27 @@ fn containerVolumes(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void {
         "for long when it needs the room", .{ anonymous, b.named_volumes, scope, new }));
 }
 
+/// Stops a new named volume's filling (`seedVolume`) past `limit_ms` or at the job's cancel: it
+/// holds the volume's lock alone, which every other job opening it waits for.
+const SeedWatch = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    fired: std.atomic.Value(bool) = .init(false),
+
+    fn run(w: *SeedWatch, b: *Backend, limit_ms: u64) void {
+        var waited: u64 = 0;
+        while (!w.done.load(.acquire)) {
+            const cancelled = if (b.cancel) |c| c.requested.load(.acquire) else false;
+            if (waited >= limit_ms or cancelled) {
+                w.fired.store(true, .release);
+                // Again each turn until it ends: the helper may not have started yet.
+                _ = b.running.kill(b.io);
+            }
+            b.io.sleep(.fromMilliseconds(100), .awake) catch return;
+            waited += 100;
+        }
+    }
+};
+
 /// What the image has at `volume.at` copied into the new volume, as Docker fills one: the
 /// directory's files, and its owner and mode (`cp -a`, run in the job's image as its root, so the
 /// ids are the job's as every step sees them), in a sandbox whose layer is dropped. Nothing there,
@@ -3036,9 +3086,23 @@ fn seedVolume(b: *Backend, volume: sandbox.Spec.Bind) ?[]const u8 {
     w.writer.writeAll("\nif [ -d \"$t\" ] && [ ! -L \"$t\" ]; then cp -a -- \"$t\"/. " ++ at ++ "/; fi\n") catch
         return "out of memory";
     var out: Captured = .{ .arena = arena };
-    const ended = b.exec(w.written(), &.{"PATH=" ++ image_path}, &.{}, 0, 0, out.output()) catch |e|
+    // Bounded: the volume's lock is held alone meanwhile, and every other job that opens it
+    // waits (`volumes.Wait`). Stopped past its time or at the job's cancel.
+    var dog: SeedWatch = .{};
+    var watch = b.io.concurrent(SeedWatch.run, .{ &dog, b, b.volume_seed_limit_ms }) catch
+        return "cannot watch the filling's time on this machine";
+    const ended = b.exec(b.test_volume_seed orelse w.written(), &.{"PATH=" ++ image_path}, &.{}, 0, 0, out.output()) catch |e| {
+        dog.done.store(true, .release);
+        watch.await(b.io);
         return @errorName(e);
+    };
+    dog.done.store(true, .release);
+    watch.await(b.io);
     b.dropLastLayer();
+    if (dog.fired.load(.acquire)) return std.fmt.allocPrint(arena, "stopped after {d} s{s}", .{
+        b.volume_seed_limit_ms / 1000,
+        if (b.cancel) |c| if (c.requested.load(.acquire)) " (the job was cancelled)" else "" else "",
+    }) catch "stopped";
     if (ended.failure.len > 0) return ended.failure;
     if (ended.code != 0) return std.fmt.allocPrint(arena, "`cp -a` exited {d}{s}", .{
         ended.code,
@@ -5877,6 +5941,8 @@ test "a container job's volumes on the native backend: directories of the job, t
     const res = try dagger.run(arena, std.testing.io, &env, .{
         .native = cfg,
         .step_user = .root,
+        // Named volumes are kept between jobs, which only trusted jobs get.
+        .trusted = true,
         .gpa = std.testing.allocator,
     }, job, &log);
     const text = w.written();
@@ -5887,7 +5953,7 @@ test "a container job's volumes on the native backend: directories of the job, t
         "made[0]",
         "cache=hello data=kept",
         "Container volumes: 1 made as directories of the job, which last as long as it; 2 named, " ++
-            "kept between jobs in the native store (untrusted scope, 2 new and filled from the image)",
+            "kept between jobs in the native store (repo scope, 2 new and filled from the image)",
     };
     for (expect) |e| if (std.mem.indexOf(u8, text, e) == null) {
         std.debug.print("missing {s} in:\n{s}\n", .{ e, text });
@@ -5932,7 +5998,7 @@ test "a container job's volume where the runner mounts something fails the job, 
 }
 
 /// One job of `job` on `cfg`, trusted or not, and what it printed.
-fn runVolumeJob(arena: Allocator, cfg: Config, job: job_mod.Job, trusted: bool) !struct { ok: bool, text: []const u8 } {
+fn runVolumeJob(arena: Allocator, cfg: Config, job: job_mod.Job, trusted: bool) !struct { ok: bool, text: []const u8, why: []const u8 } {
     var env: std.process.Environ.Map = .init(arena);
     var w: std.Io.Writer.Allocating = .init(arena);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
@@ -5944,7 +6010,8 @@ fn runVolumeJob(arena: Allocator, cfg: Config, job: job_mod.Job, trusted: bool) 
         .step_cache = true,
         .gpa = std.testing.allocator,
     }, job, &log);
-    return .{ .ok = res.succeeded, .text = w.written() };
+    const why = if (res.engine_error) |e| try std.mem.concat(arena, u8, &.{ e, "\n", w.written() }) else w.written();
+    return .{ .ok = res.succeeded, .text = w.written(), .why = why };
 }
 
 fn expectAll(text: []const u8, want: []const []const u8) !void {
@@ -5982,7 +6049,10 @@ test "a container job's named volumes: kept between jobs, filled from the image 
         testStep("sed 's/^/seeded:/' /srv/seed/from-image /srv/ro/readme; " ++
             "echo owner[$(stat -c %u:%g:%a /srv/seed)]; " ++
             "echo one > /srv/seed/kept && rm /srv/seed/from-image && echo wrote-$((2+3)); " ++
-            "r=wrote; touch /srv/ro/x 2>/dev/null || r=refused; echo ro-$r; " ++ mounts),
+            "r=wrote; touch /srv/ro/x 2>/dev/null || r=refused; echo ro-$r; " ++
+            // Nor can the job remount either otherwise.
+            "for m in 'remount,rw /srv/ro' 'remount,bind,rw /srv/ro' 'remount,bind,suid,dev /srv/seed'; do " ++
+            "mount -o $m 2>&1 && echo remount-yes-$((6*7)):$m || echo remount-no-$((40+2)); done; " ++ mounts),
         testStep("echo next-step[$(cat /srv/seed/kept)]"),
     });
     job.container = .{
@@ -6007,6 +6077,9 @@ test "a container job's named volumes: kept between jobs, filled from the image 
         "2 named, kept between jobs in the native store (repo scope, 2 new and filled from the image)",
         "Step cache: off for this job",
     });
+    // Each remount refused, and the mounts (read after) as they were.
+    try std.testing.expect(std.mem.indexOf(u8, first.text, "remount-yes-42") == null);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, first.text, "remount-no-42"));
 
     // The next job of the repository finds the volume as the last left it: not filled again.
     job.steps = &.{testStep("echo kept[$(cat /srv/seed/kept)]; f=no; test -e /srv/seed/from-image && " ++
@@ -6016,19 +6089,54 @@ test "a container job's named volumes: kept between jobs, filled from the image 
     try std.testing.expect(second.ok);
     try expectAll(second.text, &.{ "kept[one]", "filled-again=no", "readme", "(repo scope, 0 new" });
 
-    // An untrusted job of the same repository, and a trusted one of another, never see it: each
-    // gets a new volume, filled from its image.
+    // An untrusted job gets no named volume at all, failing and saying so: a fork's pull request
+    // (scope `untrusted`), and a job whose ref the runner's trusted refs do not vouch for
+    // (`Config.vouched` false, as `configFor` makes it; native only under per-job limits).
     job.steps = &.{testStep("k=apart; test -e /srv/seed/kept && k=leaked; echo kept-$k; " ++
         "sed 's/^/seeded:/' /srv/seed/from-image")};
     const untrusted = try runVolumeJob(arena, cfg, job, false);
-    if (!untrusted.ok) std.debug.print("{s}\n", .{untrusted.text});
-    try std.testing.expect(untrusted.ok);
-    try expectAll(untrusted.text, &.{ "kept-apart", "seeded:image", "(untrusted scope, 2 new" });
+    try std.testing.expect(!untrusted.ok);
+    try expectAll(untrusted.why, &.{ "named volume `data` is kept between jobs, which a job the runner does not vouch for", "anonymous volume (`- /srv/seed`)" });
+    try std.testing.expect(std.mem.indexOf(u8, untrusted.why, "kept-") == null);
+    try std.testing.expect(std.mem.indexOf(u8, untrusted.why, "runs on Dagger") == null);
+    var unvouched = cfg;
+    unvouched.vouched = false;
+    unvouched.job_limits = jobLimits(arena, std.testing.io, unvouched.cgroup);
+    if (unvouched.job_limits) {
+        const refused = try runVolumeJob(arena, unvouched, job, true);
+        try std.testing.expect(!refused.ok);
+        try expectAll(refused.why, &.{"which a job the runner does not vouch for"});
+        try std.testing.expect(std.mem.indexOf(u8, refused.why, "kept-") == null);
+    } else std.debug.print("skipped the unvouched case: no cgroup for per-job limits\n", .{});
+    // Neither left a volume of its own in the store.
+    const store_named = try std.fmt.allocPrint(arena, "{s}/volumes/o/r/untrusted", .{cfg.store});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, store_named, .{}));
+    // A trusted job of another repository never sees it: a new volume, filled from its image.
     job.github.repository = "o/other";
     const other = try runVolumeJob(arena, cfg, job, true);
     if (!other.ok) std.debug.print("{s}\n", .{other.text});
     try std.testing.expect(other.ok);
     try expectAll(other.text, &.{ "kept-apart", "seeded:image", "(repo scope, 2 new" });
+
+    // A filling that does not end (an image's `cp` that hangs) is stopped at its limit, failing
+    // the job, and the volume is removed so the next job fills it: no other job waits on it for
+    // good.
+    var slow = cfg;
+    slow.test_volume_seed = "sleep 60";
+    slow.test_volume_seed_limit_ms = 1000;
+    job.github.repository = "o/slow";
+    job.steps = &.{testStep("echo ran-$((1+1))")};
+    const started = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    const stuck = try runVolumeJob(arena, slow, job, true);
+    const took_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds() - started;
+    try std.testing.expect(!stuck.ok);
+    try expectAll(stuck.why, &.{ "could not fill the new volume `data`", "stopped after 1 s" });
+    try std.testing.expect(std.mem.indexOf(u8, stuck.why, "ran-2") == null);
+    try std.testing.expect(took_ms < 30_000);
+    const after = try runVolumeJob(arena, cfg, job, true);
+    if (!after.ok) std.debug.print("{s}\n", .{after.text});
+    try std.testing.expect(after.ok);
+    try expectAll(after.text, &.{"(repo scope, 2 new"});
 }
 
 test "the base hands a work root to the user, and the tool cache only when it is not theirs" {
