@@ -1211,17 +1211,24 @@ pub fn writeFileAtomic(io: std.Io, path: []const u8, data: []const u8) !void {
     {
         const f = try cwd.createFile(io, tmp, .{});
         defer f.close(io);
-        errdefer cwd.deleteFile(io, tmp) catch {};
+        errdefer removeTemp(io, tmp);
         try f.writeStreamingAll(io, data);
         if (linux.errno(linux.fsync(f.handle)) != .SUCCESS) return error.Sync;
     }
     cwd.rename(tmp, cwd, path, io) catch |e| {
-        cwd.deleteFile(io, tmp) catch {};
+        removeTemp(io, tmp);
         return e;
     };
     var dir = try cwd.openDir(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
     if (linux.errno(linux.fsync(dir.handle)) != .SUCCESS) return error.Sync;
+}
+
+fn removeTemp(io: std.Io, tmp: []const u8) void {
+    std.Io.Dir.cwd().deleteFile(io, tmp) catch |e| std.log.warn(
+        "memory gate: cannot remove {s}: {s}",
+        .{ tmp, @errorName(e) },
+    );
 }
 
 /// A file of 128 names is about 22 KB.
