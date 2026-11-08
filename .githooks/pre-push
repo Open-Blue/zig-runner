@@ -4,12 +4,17 @@
 #
 #   - the branch name's prefix (CI's "Branch name"; it decides the release, README "Versioning");
 #   - zig fmt, GitHub's expression cases, and the build and tests ("Tests (x86_64)");
-#     the database tests run too when PG* or ZIG_TEST_PG_URL point at a database;
+#     the database tests run too when PG* or ZIG_TEST_PG_URL point at a database; when the
+#     runner's code changed, the tests again on overlayfs, in Docker ("Test, on overlayfs":
+#     #332 passed every pull request and failed on main), and ZLint with its suppressed-errors
+#     check ("Lint (ZLint)": #327's and #332's `catch {}` reached the nightly first);
 #   - actionlint and zizmor, and the check names the release waits for (check-names.sh), when
 #     workflows changed, shellcheck and shfmt, when shell scripts did,
 #     and hadolint, when the Dockerfile did ("Workflows"), and the unsafe constructs ratchet, always;
 #   - gofmt and go vet for the Go tools under runner/tools, when they changed;
-#   - the Lean proofs, and the hashFiles model against glob.zig, when either changed ("Proofs").
+#   - the Lean proofs, and the hashFiles model against glob.zig, when either changed ("Proofs");
+#   - TLC, when the TLA+ specifications or the release pipeline they model changed ("TLC"; it takes
+#     minutes). CI also runs it on changes to the store's code, which the hook leaves to CI.
 #
 # README, "Git hooks".
 set -euo pipefail
@@ -65,6 +70,24 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 		rm -f "$log"
 		say "every test file is compiled"
 		../.github/scripts/test-files.sh >/dev/null || fail "a file's tests are not in the test binary: ../.github/scripts/test-files.sh shows which"
+		if grep -qE '^runner/|^db/|^\.github/scripts/(zig-test|zig-modules|zlint)\.sh$|^\.github/scripts/zlint-suppressed\.baseline$' <<<"$changed"; then
+			say "the tests on overlayfs, in Docker"
+			if ! command -v docker >/dev/null || ! docker info >/dev/null 2>&1; then
+				fail "the runner's code changed, and its tests on overlayfs need Docker running (CI's \"Test, on overlayfs\")"
+			fi
+			log=$(mktemp)
+			if ! ZIG_TEST_IN_CONTAINER=1 ZIG_TEST_MIN_PASSED=500 ../.github/scripts/zig-test.sh >"$log" 2>&1; then
+				grep -E 'FAIL|error|passed;|fewer than' "$log" | tail -20 >&2
+				rm -f "$log"
+				fail "the tests failed on overlayfs (ZIG_TEST_IN_CONTAINER=1 ../.github/scripts/zig-test.sh)"
+			fi
+			grep "passed;" "$log" | tail -1 | sed "s/^/$hook: on overlayfs: /" >&2
+			rm -f "$log"
+			say "ZLint, and its suppressed-errors check"
+			../.github/scripts/zlint.sh >/dev/null || fail "ZLint found problems: ../.github/scripts/zlint.sh shows them"
+			../.github/scripts/zlint.sh suppressed-errors >/dev/null ||
+				fail "a new catch {} or catch unreachable: ../.github/scripts/zlint.sh suppressed-errors shows it"
+		fi
 	)
 	say "unsafe constructs ratchet"
 	(cd "$tree" && .github/scripts/unsafe-ratchet.sh >/dev/null) || fail "more unsafe casts than the baseline: .github/scripts/unsafe-ratchet.sh shows which"
@@ -102,6 +125,12 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 		command -v lake >/dev/null || fail "proofs/ or glob.zig changed, and checking them needs Lean (proofs/README.md)"
 		(cd "$tree/proofs" && lake build >/dev/null) || fail "the proofs do not check: run lake build in proofs/"
 		(cd "$tree" && .github/scripts/glob-lean-diff.sh 2000 "$RANDOM" >&2) || fail "glob.zig and the Lean model differ"
+	fi
+	if grep -qE '^proofs/tla/|^\.github/workflows/(version|release|store-model)\.yml$|^\.github/scripts/(next-version|wait-for-checks|check-names|tlc)\.sh$|^\.github/checks-on-main$' <<<"$changed"; then
+		say "TLC, the store's and the release pipeline's models (minutes)"
+		command -v java >/dev/null || fail "the TLA+ models or the release pipeline changed, and TLC needs Java 11 or later (.github/scripts/tlc.sh)"
+		(cd "$tree" && TLC_DIR="${TLC_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/zig-runner-tlc}" .github/scripts/tlc.sh >/dev/null) ||
+			fail "TLC found an error: .github/scripts/tlc.sh shows it"
 	fi
 	git worktree remove --force "$tree"
 	trap - EXIT
