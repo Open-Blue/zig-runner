@@ -512,7 +512,9 @@ the machine thrashed for hours (#126). Two things keep that from happening again
   has run (`RUNNER_NATIVE_MEM_PER_JOB_MB`), and so does a runner polling: the job it is handed
   waits, kept, for room for its own estimate once it is named, instead of every runner reserving
   the heaviest job there was (#361), and the runners polling count only the job that has waited
-  longest, so small jobs are not held behind a queue of heavy ones (#415). What jobs took is kept
+  longest, so small jobs are not held behind a queue of heavy ones, and a job whose name has run
+  for 60 s at most each time starts beside the one waiting if it fits without it (#415). What
+  jobs took, and how long they ran, is kept
   across restarts in the native store's directory (#407). A pool whose one job could never fit
   the machine does not start and names the setting (#406). Where jobs may swap, gets a `memory.high` from its
   estimate, so one that outgrows it is slowed in its own cgroup rather than taking its neighbours'
