@@ -2107,7 +2107,7 @@ test "the native pre-warm runs with no engine, through the gate, for what a job 
 }
 
 fn releaseAfter(io: std.Io, ms: i64) void {
-    io.sleep(.fromMilliseconds(ms), .awake) catch {};
+    io.sleep(.fromMilliseconds(ms), .awake) catch return;
     FakeNative.released.store(true, .release);
 }
 
