@@ -908,10 +908,34 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   step under the pool's lock, so jobs named in the same moment pass one at a time, each counting
   the ones before it: of six `zig build test` jobs learned at 2.6 GB with 7.4 GB available, two
   start (1.5 GB floor + 5.2 GB) and four wait. Jobs waiting do not count each other, which would
-  hold them all for ever; the runners polling do count them, so no new job is taken while a heavy
-  one waits unless there is room for both. A small job named meanwhile starts beside the waiting
-  heavy ones. The wait is in the job's own log ("Waiting for room in memory before starting")
+  hold them all for ever; the runners polling count the one that has waited longest, not the rest
+  (#415: counting all of them held small jobs at GitHub for 182-266 s behind heavy jobs waiting
+  for room), so no new job is taken while the first in line waits unless there is room for both.
+  A job named meanwhile that is not first in line must leave that room too (`Admission.withHead`),
+  so the first in line is never delayed by a job that began waiting after it did. The runners
+  polling on a native pool count natively for the engine's cap: a busy engine does not hold
+  runners whose jobs never run in it (#414). The wait is in the job's own log ("Waiting for room in memory before starting")
   and ends when a reservation drops (`Admission.changes`, within 50 ms) or at the next recheck.
+  - *A machine that cannot fit one job* (#406). At start the runner compares one job's reservation
+    plus the floor (`RUNNER_NATIVE_MEM_PER_JOB_MB` or `RUNNER_MEM_PER_JOB_MB`, and
+    `RUNNER_MIN_MEM_AVAILABLE_MB`) with the machine's memory, or the memory limit of the cgroup it
+    runs under if that is less, and on the engine with the engine's cap less
+    `RUNNER_MIN_ENGINE_HEADROOM_MB`; if no job could ever start it exits with a message naming the
+    settings and the numbers (`Admission.misfit`). While running, when nothing runs, no job waits
+    and no other runner polls, one runner polls whatever the room (said in the log): a machine
+    that has less memory than at start does not idle in silence.
+  - *The estimates survive a restart* (#407). `Admission.learned` and `learned_native` are kept in
+    `memory-gate` in the native store's directory (`RUNNER_NATIVE_STORE`, `Config.nativeStore`;
+    written there for a Dagger pool too), one text line a name, versioned (`zig-runner memory gate
+    v1`), with the machine id, `MemTotal` and the backend they were measured on. It is written
+    atomically (temp file, fsync, rename, fsync of the directory) when something was learned, at
+    most every 10 s and when the pool ends, and read at start, where the log says how many were
+    loaded. A file from another machine, another amount of memory (more than 1/16 apart), another
+    backend or format version, or a damaged one, is not used and is warned of; the next write
+    replaces it. The table keeps the last five runs of a name and the 64 used most recently, as
+    before: a name's estimate is the most of those runs, so one learned low (a warm `zig build
+    test` at 64 MB) still reserves little for a cold one until a heavy run has been seen, restart
+    or not.
   - *No deadlock.* When every runner holds a job and none has room, nothing is running to free
     any: the job that came first starts regardless (said in its log), the others wait for it, and
     the next oldest follows as each ends. The machine cannot get freer, and a job over

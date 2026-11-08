@@ -177,6 +177,34 @@ pub fn pool(c: Runner, n: u32) !Exit {
         m.engine.source = engineSource(c.cfg);
         break :m m;
     } else null;
+    if (memory) |m| if (n > 0) {
+        // A reservation that could never fit holds every runner for ever, saying only that it holds
+        // (#406): refuse to start instead, naming the settings.
+        if (m.misfit()) |bad| {
+            try c.err.print("memory gate: {f}\n", .{bad});
+            return .config;
+        }
+        // What jobs took on earlier runs, so a restart does not reserve the worst case again (#407).
+        const path = try std.fmt.allocPrint(c.arena, "{s}/memory-gate", .{
+            try c.cfg.nativeStore(c.arena, c.environ),
+        });
+        switch (m.restore(path)) {
+            .absent => try say(c, "memory gate: no learned job sizes in {s} yet", .{path}),
+            .loaded => |count| try say(
+                c,
+                "memory gate: {d} learned job sizes loaded from {s}",
+                .{ count, path },
+            ),
+            .ignored => |why| try say(
+                c,
+                "WARNING: memory gate: the learned job sizes in {s} are not used: {s}; " ++
+                    "they start again, and the file is replaced",
+                .{ path, why },
+            ),
+        }
+    };
+    // Writes what is not yet written once the sampling below has ended.
+    defer if (memory) |m| m.flush();
     // Measures the jobs running, for what jobs of their names reserve next; ends with the pool.
     var sampling: ?std.Io.Future(void) = if (memory) |m|
         c.io.concurrent(admission.Admission.sample, .{m}) catch null
@@ -349,6 +377,11 @@ fn admit(c: Runner, g: *admission.Gate, hold: admission.Hold) !bool {
 /// or not and why, which tells an operator whether the engine's cap is being watched.
 fn checkGate(c: Runner, g: *admission.Gate) ?admission.Hold {
     const hold = g.check();
+    if (g.forced) |h| {
+        if (!g.forced_told) sayUnallocated(c, "'{s}' takes jobs although the machine has not the " ++
+            "room for one, as nothing runs and waiting would not change that: {f}", .{ c.name, h });
+        g.forced_told = true;
+    } else if (hold == null) g.forced_told = false;
     var buf: [512]u8 = undefined;
     if (g.pool.engineNews(&buf)) |news| sayUnallocated(c, "{s}", .{news});
     return hold;
