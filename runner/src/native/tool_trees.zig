@@ -372,7 +372,10 @@ pub fn checkOnce(
             fl.cond.waitTimeout(io, &fl.mu, .{ .duration = .{
                 .raw = .fromMilliseconds(wait_cancel_ms),
                 .clock = .awake,
-            } }) catch {};
+            } }) catch |e| switch (e) {
+                // Either way the loop looks at the cancel and the walk again.
+                error.Timeout, error.Canceled => {},
+            };
             continue;
         }
         flight.running = true;
