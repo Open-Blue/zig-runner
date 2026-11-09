@@ -1098,6 +1098,15 @@ which means hashing the tree again after every step that names one, and a change
 format. A job's first rerun after an install is the one that pays: job 1 finds no tree and
 installs, job 2 sees the tree (new keys) and finds it installed, job 3 replays.
 
+Jobs that start together share the walk (`tool_trees.checkOnce`): one that arrives while a walk of
+its volume is running waits for it to end, and the jobs waiting then share the next walk, which
+began after each of them arrived. A walk is never handed to a job that was already waiting when it
+began (a file may have been written after the walk passed it), and nothing is kept once nobody
+waits, so a later job walks itself: a directory's mtime does not move when a file's content or mode
+changes, only that file's ctime shows it, so no cheaper memo of the tree is as strong as the walk.
+A walk the job's cancel or the clock cut short is its leader's alone. The key is the volume's host
+directory, its list directory and its mount, so volumes of other scopes never share a walk.
+
 The check differs from the script where it runs. The script runs as root in the job's image, in a
 container; the port runs in the runner's process, on a directory a job can write, so it is confined
 and bounded:

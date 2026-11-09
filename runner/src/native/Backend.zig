@@ -1925,14 +1925,14 @@ fn checkToolTrees(b: *Backend) !void {
     std.crypto.hash.sha2.Sha256.hash(volume, &digest, .{});
     const root = b.store_cfg.root;
     const lists = try std.fmt.allocPrint(arena, "{s}/tool-trees/{x}", .{ root, digest[0..16] });
-    const verdict = try trees_check.check(
+    const verdict = try trees_check.checkOnce(
+        &trees_check.process_flights,
         arena,
         b.gpa,
         b.io,
         volume,
         lists,
         mount,
-        .{},
         b.caches.cancel,
     );
     b.tool_trees = verdict.env;
