@@ -1,0 +1,3 @@
+kind: Changed
+body: docs/native-backend.md says the published ports' 127/8 exemption assumes route_localnet is off on the host's bridges, and what a container can send when it is on
+time: 2026-11-08T11:25:52.999976774-05:00
