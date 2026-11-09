@@ -68,12 +68,12 @@ fn verdict(refs: []const u8, events: []const u8, g: Github) Verdict {
 /// job.
 const no_refs = "This runner trusts no ref, so it runs no job: RUNNER_TRUSTED_REFS is not set. " ++
     "Set it to the refs whose jobs may run here (refs/heads/main,refs/tags/v*), or to * to run " ++
-    "every job, on a machine untrusted code may reach (README, \"Environments\").";
+    "every job, on a machine untrusted code may reach (docs/OPERATIONS.md, \"Environments\").";
 
 /// What the runner trusts, for its log at startup: which refs and events, every ref, or none.
 pub fn mode(arena: Allocator, refs: []const u8, events: []const u8) Allocator.Error![]const u8 {
     if (none(refs)) return "trusting no ref: every job will fail before its first step; " ++
-        "set RUNNER_TRUSTED_REFS (README, \"Environments\")";
+        "set RUNNER_TRUSTED_REFS (docs/OPERATIONS.md, \"Environments\")";
     const refs_text = if (everything(refs))
         "every ref (RUNNER_TRUSTED_REFS=*)"
     else
@@ -88,7 +88,7 @@ pub fn mode(arena: Allocator, refs: []const u8, events: []const u8) Allocator.Er
 }
 
 /// Whether `labels` (comma-separated, as `RUNNER_LABELS`) include `prod`, the label of the runner
-/// untrusted code must not reach (README, "Environments"). GitHub matches labels ignoring case.
+/// untrusted code must not reach (docs/OPERATIONS.md, "Environments"). GitHub matches labels ignoring case.
 pub fn prodLabel(labels: []const u8) bool {
     var it = std.mem.tokenizeScalar(u8, labels, ',');
     while (it.next()) |raw| {

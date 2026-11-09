@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # The prefix decides the version a merge into main releases (README, "Versioning").
+  # The prefix decides the version a merge into main releases (CONTRIBUTING.md, "Versioning").
   branch:
     name: Branch name
     if: github.event_name == 'pull_request'
@@ -35,14 +35,14 @@ jobs:
             feature/?* | feat/?* | bugfix/?* | hotfix/?* | ci/?* | release/?* | docs/?* | perf/?* | refactor/?*) ;;
             renovate/?*) ;;
             *)
-              echo "::error::'$BRANCH' needs one of the prefixes feature/, feat/, bugfix/, hotfix/, ci/, release/, docs/, perf/ or refactor/ (README, \"Versioning\")"
+              echo "::error::'$BRANCH' needs one of the prefixes feature/, feat/, bugfix/, hotfix/, ci/, release/, docs/, perf/ or refactor/ (CONTRIBUTING.md, \"Versioning\")"
               exit 1
               ;;
           esac
 
   # The workflows themselves: actionlint for mistakes, zizmor for security; the shell scripts
   # they and the deployment run, with shellcheck and shfmt; and the Dockerfile, with hadolint
-  # (README, "Pipeline").
+  # (docs/CI.md).
   workflows:
     name: Workflows
     runs-on: ubuntu-26.04
@@ -277,7 +277,7 @@ jobs:
 
   # A push to main runs on prod, this project's own runner, so every merge exercises it; pull
   # requests and the merge queue run on GitHub's runner on purpose, cold every time, the worst case
-  # for a build (README, "Environments"). The repository variables PROD_RUNNER and PREPROD_RUNNER
+  # for a build (docs/OPERATIONS.md, "Environments"). The repository variables PROD_RUNNER and PREPROD_RUNNER
   # hold runs-on labels as JSON (["self-hosted","prod"]); PREPROD_RUNNER is left unset, and unset
   # means GitHub's runner. Its image is pinned (ubuntu-26.04, not ubuntu-latest) on purpose: an
   # image change moves what the native passes stand on (AppArmor's userns restriction, idmapped

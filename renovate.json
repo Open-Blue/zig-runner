@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Keeps every pinned input current, one pull request at a time (README, \"Pipeline\"). Its branches (renovate/...) bump the patch version. They merge on their own once their checks pass (through the merge queue); releases are batched daily (version.yml).",
+  "description": "Keeps every pinned input current, one pull request at a time (docs/CI.md). Its branches (renovate/...) bump the patch version. They merge on their own once their checks pass (through the merge queue); releases are batched daily (version.yml).",
   "extends": [
     "config:recommended",
     "helpers:pinGitHubActionDigests",

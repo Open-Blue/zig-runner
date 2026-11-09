@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The hardening every release binary must have, checked with checksec (slimm609/checksec, the Go
-# rewrite), which fails on any it lacks (README, "Hardening"):
+# rewrite), which fails on any it lacks (docs/CI.md, "Hardening"):
 #
 #   nx             a non-executable stack
 #   separate_code  W^X: no segment both writable and executable, code apart from data

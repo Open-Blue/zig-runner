@@ -1,11 +1,11 @@
 # Version: once a day (and when started by hand), one release of everything merged into main since
-# the last: the next version from the merged branches' prefixes and labels (README, "Versioning").
+# the last: the next version from the merged branches' prefixes and labels (CONTRIBUTING.md, "Versioning").
 # Pull requests merge on their own all day; the maintainer approves one release for all of them,
 # and is asked only when something merged.
 # The release is a commit on main: the version in build.zig.zon and the changelog batched by
 # changie, tagged. main is protected; the RELEASE_DEPLOY_KEY deploy key may bypass that, and a tag
 # it pushes starts the release workflow. The key is the prod environment's: the job waits for the
-# maintainer's approval, and only runs from main (README, "Environments").
+# maintainer's approval, and only runs from main (docs/OPERATIONS.md, "Environments").
 # main is tagged only once its own checks have passed on the commit released (ci.yml's and
 # proofs.yml's push runs): the merge queue checked each merge, but not main as it stands after
 # them. A run by hand may skip that wait (skip_main_checks), for a release that fixes what makes
@@ -101,7 +101,7 @@ jobs:
           WAIT_MINUTES: "30"
         run: |
           .github/scripts/wait-for-checks.sh "$(git rev-parse HEAD)" \
-            "$TAG is not released; once they pass, run version again (README, \"Versioning\")"
+            "$TAG is not released; once they pass, run version again (CONTRIBUTING.md, \"Versioning\")"
 
       # Checked against its pinned checksum, which CI checks on every pull request too.
       - name: Install changie

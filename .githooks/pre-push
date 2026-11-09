@@ -2,7 +2,7 @@
 # Before a push: the checks CI runs on a pull request, on exactly the commits being pushed (each is
 # checked out in a temporary worktree, so uncommitted changes neither help nor hurt):
 #
-#   - the branch name's prefix (CI's "Branch name"; it decides the release, README "Versioning");
+#   - the branch name's prefix (CI's "Branch name"; it decides the release, CONTRIBUTING.md "Versioning");
 #   - zig fmt, GitHub's expression cases, and the build and tests ("Tests (x86_64)");
 #     the database tests run too when PG* or ZIG_TEST_PG_URL point at a database; when the
 #     runner's code changed, the tests again on overlayfs, in Docker ("Test, on overlayfs":
@@ -17,7 +17,7 @@
 #     minutes), and SPIN, when the store's locking models changed (TLA+ or their Promela port in
 #     proofs/spin). CI also runs both on changes to the store's code, which the hook leaves to CI.
 #
-# README, "Git hooks".
+# CONTRIBUTING.md, "Git hooks".
 set -euo pipefail
 hook=pre-push
 top=$(git rev-parse --show-toplevel)
@@ -37,7 +37,7 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 	case $branch in
 	feature/?* | feat/?* | bugfix/?* | hotfix/?* | ci/?* | release/?* | docs/?* | perf/?* | refactor/?* | renovate/?*) ;;
 	main) fail "pushing to main: main takes changes through pull requests" ;;
-	*) fail "'$branch' needs one of the prefixes feature/, feat/, bugfix/, hotfix/, ci/, release/, docs/, perf/ or refactor/ (README, \"Versioning\")" ;;
+	*) fail "'$branch' needs one of the prefixes feature/, feat/, bugfix/, hotfix/, ci/, release/, docs/, perf/ or refactor/ (CONTRIBUTING.md, \"Versioning\")" ;;
 	esac
 
 	# What changed: against the remote branch, or where a new branch left main.
