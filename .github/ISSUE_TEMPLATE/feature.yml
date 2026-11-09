@@ -1,0 +1,23 @@
+name: Feature request
+description: Suggest something the runner should do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do that the runner makes hard or impossible.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: How it could work. If you have tried another way, say what happened.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: The backend you use (`RUNNER_BACKEND`), the workflow involved, links.

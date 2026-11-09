@@ -3,9 +3,13 @@
 Thanks for helping. This page covers setting up, making a change, and how a change reaches a
 release. The CI pipeline itself is in [docs/CI.md](docs/CI.md).
 
+Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
+
 Report a vulnerability privately, as [docs/SECURITY.md](docs/SECURITY.md) says, not in an issue.
-Report a bug in an issue with the runner's version, its backend (`RUNNER_BACKEND`), what the job
-did, and the runner's log around it, with secrets removed.
+Report a bug in an issue with the runner's version (`zig-runner --version`), its backend
+(`RUNNER_BACKEND`, and `RUNNER_ENGINE` if set), what the job did and what you expected, the
+runner's log around it with secrets removed, and the machine (OS, kernel, architecture). The bug
+form asks for each.
 
 ## Set-up
 

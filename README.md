@@ -72,6 +72,7 @@ sandbox, the error names it.
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Changing it: set-up, hooks, branches and versions, tests, the changelog |
 | [docs/CI.md](docs/CI.md) | The CI pipeline, workflow by workflow, and how it is hardened |
 | [docs/STYLE.md](docs/STYLE.md) | Code style |
+| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | How we treat each other, and how to report a problem |
 | [proofs/README.md](proofs/README.md) | The Lean proofs and the TLA+ and SPIN models |
 | [docs/SECURITY.md](docs/SECURITY.md) | Reporting a vulnerability |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md) | What changed in each release |

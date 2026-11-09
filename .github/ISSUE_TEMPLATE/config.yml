@@ -1,0 +1,7 @@
+# Blank issues stay off: a bug report without the version, backend and log can't be acted on.
+# A question that fits neither form can go to the feature form.
+blank_issues_enabled: false
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/Open-Blue/zig-runner/security/advisories/new
+    about: Report it privately, as docs/SECURITY.md says. Do not open a public issue.

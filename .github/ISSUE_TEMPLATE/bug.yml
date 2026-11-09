@@ -1,0 +1,48 @@
+name: Bug report
+description: The runner did something wrong or failed a job it should have run.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report a vulnerability here. Use
+        [private vulnerability reporting](https://github.com/Open-Blue/zig-runner/security/advisories/new),
+        as [docs/SECURITY.md](https://github.com/Open-Blue/zig-runner/blob/main/docs/SECURITY.md) says.
+  - type: input
+    id: version
+    attributes:
+      label: Runner version
+      description: The output of `zig-runner --version`.
+    validations:
+      required: true
+  - type: input
+    id: backend
+    attributes:
+      label: Backend
+      description: The value of `RUNNER_BACKEND`, and of `RUNNER_ENGINE` if you set it.
+      placeholder: "RUNNER_BACKEND=native"
+    validations:
+      required: true
+  - type: textarea
+    id: happened
+    attributes:
+      label: What the job did, and what you expected
+      description: The workflow step or action involved helps most.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: The runner's log around it
+      description: Remove secrets, tokens and private URLs first.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: machine
+    attributes:
+      label: The machine
+      description: The OS, the kernel (`uname -r`) and the architecture (`uname -m`).
+      placeholder: "Ubuntu 26.04, 7.0.0, aarch64"
+    validations:
+      required: true
