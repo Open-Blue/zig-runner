@@ -1324,6 +1324,28 @@ test "native eviction: untrusted growth leaves a repository's volume alone withi
     try testing.expect(f.there(forks[0]));
 }
 
+test "native eviction: untrusted growth in named volumes leaves a repository's named volume alone" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const arena = f.arena();
+    var dirs: [3][]const u8 = undefined;
+    // The repository's volume is the longest unused, by two days.
+    for (&dirs, [_][]const u8{ "repo", "untrusted", "untrusted" }, [_][]const u8{ "data", "data", "other" }, [_]i64{ 5, 3, 2 }) |*d, scope, name, days| {
+        var v = try volumes.openNamed(arena, testing.io, f.s.root, try volumes.namedKey(arena, "o/r", scope, name), null);
+        v.share();
+        try f.fill(v.dir, 6000);
+        try f.age(v.dir, days);
+        d.* = v.dir;
+        v.release(testing.io);
+    }
+    // Over the cap by one volume: the fork's longer unused goes, not the repository's.
+    f.s.limits = .{ .volumes_max_bytes = 13_000, .min_free_pct = 0 };
+    run(f.s, testing.io);
+    try testing.expect(f.there(dirs[0]));
+    try testing.expect(!f.there(dirs[1]));
+    try testing.expect(f.there(dirs[2]));
+}
+
 test "native eviction: a volume a job holds stays, and one used today stays over the cap" {
     const f = try Fixture.init();
     defer f.deinit();

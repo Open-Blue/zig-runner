@@ -85,8 +85,9 @@ opts_key: []const u8 = "",
 hosts_extra: []const u8 = "",
 /// `Config.port_addresses`: the host addresses a job container may publish on (`publishPorts`).
 port_addresses: []const [4]u8 = &publish.default_addresses,
-/// `Config.port_range` and `Config.reserved_ports`.
+/// `Config.port_range`, `Config.port_idle_ms` and `Config.reserved_ports`.
 port_range: publish.Range = publish.default_range,
+port_idle_ms: u64 = 300_000,
 reserved_ports: []const u16 = &.{},
 /// `Config.host_paths`: where a job container's host-path volumes may be (`hostVolumes`).
 allowed_host_paths: []const host_paths.Entry = &.{},
@@ -265,6 +266,9 @@ pub const Config = struct {
     /// The host ports a job container may name (`RUNNER_NATIVE_PORT_RANGE`): 49152-65535 by
     /// default.
     port_range: publish.Range = publish.default_range,
+    /// How long a published port's connection may be quiet before the relay closes it, in
+    /// milliseconds (`RUNNER_NATIVE_PORT_IDLE_TIMEOUT`); 0 never closes one for that.
+    port_idle_ms: u64 = 300_000,
     /// The ports of the runner's own endpoints (its database, the engine, Docker), never
     /// published (`publish.reservedPorts`).
     reserved_ports: []const u16 = &.{},
@@ -385,6 +389,7 @@ pub fn configFor(
         // Checked when the configuration is loaded (`Config.load`).
         .port_addresses = publish.parseAddresses(arena, cfg.native_port_addresses) catch &publish.default_addresses,
         .port_range = publish.parseRange(cfg.native_port_range) orelse publish.default_range,
+        .port_idle_ms = cfg.native_port_idle_timeout *| 1000,
         // As `main.zig` found them (the database's from `PG*` too); else from the settings.
         .reserved_ports = cfg.native_reserved_ports orelse try publish.reservedPorts(
             arena,
@@ -923,6 +928,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .vouched = cfg.vouched,
         .port_addresses = cfg.port_addresses,
         .port_range = cfg.port_range,
+        .port_idle_ms = cfg.port_idle_ms,
         .reserved_ports = cfg.reserved_ports,
         .allowed_host_paths = cfg.host_paths,
         .host_paths_unmapped = cfg.host_paths_unmapped,
@@ -3218,6 +3224,7 @@ fn publishPorts(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void {
         .ports = maps,
         .publish = true,
         .reserved = b.reserved_ports,
+        .limits = .{ .idle_ms = b.port_idle_ms },
         // Published beyond the host's loopback: no peer of the runner's jobs, nor of a bridge's.
         .guard = for (maps) |m| {
             if (m.address[0] != 127) break .{ .subnet = b.subnet.base, .prefix = b.subnet.prefix };
