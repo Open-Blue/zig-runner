@@ -96,8 +96,8 @@ default (`direct`) behaves exactly as before. With `none`:
   line is not printed.
 - **Jobs.** A job native can run runs natively as always. One it cannot (`Backend.unsupported` or
   `usable` give a reason, or the set-up falls back) fails before any step, in "Set up job", with
-  "this job needs the Dagger engine, and this runner has none (RUNNER_ENGINE=none). This job runs on
-  Dagger: <the reason native gave>." It does not start a `dagger` child or connect to a socket.
+  "this job needs the Dagger engine, and this runner has none (RUNNER_ENGINE=none). It cannot run
+  natively: <the reason native gave>." It does not start a `dagger` child or connect to a socket.
 - **Start-up.** The native probe runs before the runner registers (`Backend.reprobe`, which
   forgets the five minutes of back-off that would otherwise answer from memory). A failure may be
   transient (nftables busy, a module not loaded, no network yet for the image it pulls), so it is
