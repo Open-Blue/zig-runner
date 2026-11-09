@@ -107,9 +107,13 @@ do_build() {
 
 do_tests() {
 	cd "$root/runner"
-	# CI runs the suite in two parts; one machine runs them in turn.
-	ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 ZIG_TEST_PART=1/2 ../.github/scripts/zig-test.sh
-	ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 ZIG_TEST_PART=2/2 ../.github/scripts/zig-test.sh
+	# CI runs the suite in two parts; one machine runs them in turn. Both run even when the first
+	# fails, so one run reports every failure, and the stage fails if either did.
+	local rc=0 part
+	for part in 1/2 2/2; do
+		ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 ZIG_TEST_PART=$part ../.github/scripts/zig-test.sh || rc=1
+	done
+	return $rc
 }
 
 # The job a runner is handed (an `acquirejob` response), as small as one can be: two script steps.
