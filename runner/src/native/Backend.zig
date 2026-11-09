@@ -2256,6 +2256,9 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
         });
     }
     try extra.append(arena, .{ .name = "GIT_TERMINAL_PROMPT", .value = "0" });
+    // The runner's global config, with `safe.directory` (`actions.git_config_file`): a file://
+    // source is the host's, nobody's to the job's root on a root runner.
+    try extra.append(arena, .{ .name = "GIT_CONFIG_GLOBAL", .value = native_actions.git_config_path });
     // A commit fetched is the same tree every time, as Dagger's `git` keys it, so under step
     // caching it is a layer like a step's, keyed on its script (the URL and the commit), never
     // on the token in `extra`. A branch or tag moves, so its fetch always runs. The tags it reads
@@ -2286,7 +2289,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     const ended = try b.exec(
         aw.written(),
         env,
-        &.{},
+        &.{native_actions.git_config_file},
         b.uid,
         b.gid,
         out.output(),
@@ -2335,7 +2338,7 @@ fn tagsDigest(b: *Backend, url: []const u8, env: []const []const u8) !?[]const u
     try dagger.shellQuote(&aw.writer, try std.fmt.allocPrint(b.arena, "{s}.git", .{url}));
     try aw.writer.writeAll(") && printf '%s' \"$tags\" | sha256sum");
     var out: Captured = .{ .arena = b.arena };
-    const ended = try b.exec(aw.written(), env, &.{}, b.uid, b.gid, out.output());
+    const ended = try b.exec(aw.written(), env, &.{native_actions.git_config_file}, b.uid, b.gid, out.output());
     defer b.dropLastLayer();
     if (ended.code != 0 or ended.failure.len > 0 or ended.killed) return null;
     const digest = std.mem.trim(u8, out.text.items, " \n");
