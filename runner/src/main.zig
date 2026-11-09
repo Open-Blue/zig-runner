@@ -126,6 +126,15 @@ pub fn main(init: std.process.Init) !u8 {
         try err.print("config error: {s}\n", .{Config.explain(e) orelse @errorName(e)});
         return @backingInt(Exit.config);
     };
+    // `RUNNER_ENGINE=cli` runs `dagger run ... sh -c ...` and `cat` for every job. The release image
+    // (built FROM scratch) has none of them, and without this check each job would fail in "Set up
+    // job" instead of the pool not starting.
+    if (cfg.engine == .cli and !cfg.dry_run and !cfg.inspect and !cfg.db_check) {
+        if (try dagger.missingCliPrograms(arena, io, init.environ_map.get("PATH"), cfg.dagger_cmd)) |m| {
+            try err.print("config error: {s}\n", .{m});
+            return @backingInt(Exit.config);
+        }
+    }
     // The host paths jobs may bind are checked once, now: a bad entry is the operator's to fix,
     // never a list quietly narrower or wider than the one they wrote.
     // The list every job is then held to (`Backend.configFor`), never read from the setting again.

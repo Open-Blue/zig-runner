@@ -72,6 +72,16 @@ ends. Only the package tarballs (`p/`, which Zig hashes again when it unpacks th
 scope's volume. Zig's local cache volume (`RUNNER_ZIG_LOCAL_CACHE`) is kept only for jobs the
 runner vouches for.
 
+### Running jobs through the dagger CLI
+
+`RUNNER_ENGINE=cli` runs each job as `dagger run --progress=logs sh -c ...` (`DAGGER_CMD`, default
+`dagger`) and reads the session's port and token from it, instead of opening a session itself. It
+needs the dagger CLI, `sh` and `cat` on `PATH`. The release image is built `FROM scratch` and has
+none of them, so cli mode suits a runner installed on the host, or an image you extend with them.
+The runner checks for the three once at start-up and exits with a config error naming the ones it
+cannot find, so a pool without them never takes a job. If one goes missing later, "Set up job"
+names it as well, instead of blaming the Docker daemon.
+
 ### Dagger inside steps
 
 Steps get the Dagger engine (privileged nesting, for `dagger call` inside a step) only when a pool
