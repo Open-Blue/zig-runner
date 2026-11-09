@@ -1196,7 +1196,10 @@ proofs/tla/StoreEviction.tla.
   longest unused first. The last use is the mtime of the volume's lock file (`<volume>.lock`), set
   by `volumes.open`. The size is `<volume>.size`, from a walk at the end of some job: one volume a
   job, never measured first, a volume in use again at most once an hour, for at most a second (10 s
-  when it was never measured), never holding a lock, what it could not see left out. So the size
+  when it was never measured), never holding a lock, what it could not see left out. A walk cut
+  short keeps the directories it had yet to enter in the
+  size file (up to 256 KiB, for a week), and the next goes on from them: a volume too big for a
+  second is counted over several jobs, not for ever by its first second. So the size
   lags, and only ever matters at the margin.
 - **Trees.** Past `RUNNER_NATIVE_IMAGES_MAX_MB` (8 GiB) of images, rootfs and seeds together, the
   blobs go first, oldest first, as they only save a download of what is unpacked already or not
@@ -1293,8 +1296,12 @@ proofs/tla/StoreEviction.tla.
   have a budget too: a pass takes one, and more while it has time.
 - **What no budget bounds.** The `syncfs` before deleting from a dead name, once a pass, takes what the
   disk takes; each eviction's two directory fsyncs likewise, and one layer's delete. All of them are
-  at a job's end, before its result is reported. A dead tree that will not go costs that `syncfs` at
-  every job's end, for as long as it stays.
+  at a job's end, before its result is reported. A dead tree that will not go is remembered in memory
+  and left alone for an hour (`Limits.stuck_retry_ms`), neither retried nor synced for: so it costs one
+  `syncfs` an hour, and one more at each restart, not one at every job's end. A walk (`usage`) asks the
+  clock at every directory, and does not enter one too deep to name (a path of `PATH_MAX`; the kernel
+  resolves a longer one a component at a time, which cost each directory its depth, 11 s over a
+  budget of 1 s at 60,000 deep).
 - **When a sync fails.** A pass stops there: nothing more is evicted until what went is gone, or a
   disk that fails writes would take entry after entry and free nothing.
 - **Costs left.** Deleting and measuring are at a job's end, before its result is reported
@@ -1303,7 +1310,9 @@ proofs/tla/StoreEviction.tla.
 - **A really full disk.** The floor is tested on a 64 MiB tmpfs filled until a write fails with
   `ENOSPC`, in a mount namespace of bubblewrap's (`.github/scripts/full-disk-test.sh`; no root, and
   skipped where bubblewrap or user namespaces are not allowed): with a volume never measured among
-  them, the pass frees a fifth of the disk and the store takes writes again. A plain
+  them, the pass frees a fifth of the disk and the store takes writes again. The test runs
+  `Store.collect`, as a job's end does, and writes a result file that failed before. A whole job
+  through `Backend.deinit` on a full disk is not tested: it needs a native sandbox. A plain
   `unshare -rm` is refused on hosts that restrict unprivileged user namespaces (Ubuntu's AppArmor).
 
 ### P5: isolation for untrusted jobs
