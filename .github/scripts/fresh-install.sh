@@ -183,6 +183,16 @@ if [[ -r $restrict && $(cat "$restrict") == 1 ]]; then
 	fi
 fi
 
+# The runner warns when the host forwards packets for its neighbours (FORWARD policy ACCEPT), and
+# the store stress test fails any run in which a worker logged a warning. CI's hosts have Docker's
+# DROP policy; a bare machine has none, so give it the one the warning asks for. Only when there is
+# no filter FORWARD chain yet, so a machine with a firewall keeps its own.
+if ! nft list chain ip filter FORWARD >/dev/null 2>&1; then
+	nft add table ip filter
+	nft add chain ip filter FORWARD '{ type filter hook forward priority 0; policy drop; }'
+	echo "note: added an nftables FORWARD chain with policy drop (ip filter), as the runner asks"
+fi
+
 if [[ ${FRESH_INSTALL_SKIP_TESTS:-} != 1 ]]; then
 	stage native-tests-as-root do_tests
 	grep -E 'tests? passed|passed;|skipped|failed' "$log/native-tests-as-root.log" | tail -n 5 || true
