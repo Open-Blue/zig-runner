@@ -1,0 +1,9 @@
+# The reference hashFiles() for hashfiles-diff.sh is actions/runner's own script on @actions/glob
+# 0.7.0, which takes minimatch ^10.2.5. It must stay what GitHub's runner runs, so minimatch is not
+# overridden to 11. The advisory is a denial of service from crafted glob patterns; this tool runs
+# only in the project's CI, on patterns the project writes, and is never shipped. Read by
+# osv-scanner, and so by OpenSSF Scorecard's Vulnerabilities check.
+
+[[IgnoredVulns]]
+id = "GHSA-g3hv-75wg-m249"
+reason = "Test-only reference (hashfiles-diff.sh) that must match @actions/glob 0.7.0's minimatch; runs on the project's own patterns in CI, never shipped"

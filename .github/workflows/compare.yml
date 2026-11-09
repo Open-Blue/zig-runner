@@ -1,7 +1,7 @@
 name: compare
 
 # The comparison tools, weekly: the runner's own implementations against the ones they follow, on
-# fresh random cases each week (README, "Pipeline"). They search rather than check, and need the
+# fresh random cases each week (docs/CI.md). They search rather than check, and need the
 # network and containers, so they stay out of pull requests; a failure here is a case for an issue.
 #
 #   expr-diff.sh       runner/src/expr.zig against Gitea's actionslib, on random expressions

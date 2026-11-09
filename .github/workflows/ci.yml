@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # The prefix decides the version a merge into main releases (README, "Versioning").
+  # The prefix decides the version a merge into main releases (CONTRIBUTING.md, "Versioning").
   branch:
     name: Branch name
     if: github.event_name == 'pull_request'
@@ -35,14 +35,14 @@ jobs:
             feature/?* | feat/?* | bugfix/?* | hotfix/?* | ci/?* | release/?* | docs/?* | perf/?* | refactor/?*) ;;
             renovate/?*) ;;
             *)
-              echo "::error::'$BRANCH' needs one of the prefixes feature/, feat/, bugfix/, hotfix/, ci/, release/, docs/, perf/ or refactor/ (README, \"Versioning\")"
+              echo "::error::'$BRANCH' needs one of the prefixes feature/, feat/, bugfix/, hotfix/, ci/, release/, docs/, perf/ or refactor/ (CONTRIBUTING.md, \"Versioning\")"
               exit 1
               ;;
           esac
 
   # The workflows themselves: actionlint for mistakes, zizmor for security; the shell scripts
   # they and the deployment run, with shellcheck and shfmt; and the Dockerfile, with hadolint
-  # (README, "Pipeline").
+  # (docs/CI.md).
   workflows:
     name: Workflows
     runs-on: ubuntu-26.04
@@ -277,7 +277,7 @@ jobs:
 
   # A push to main runs on prod, this project's own runner, so every merge exercises it; pull
   # requests and the merge queue run on GitHub's runner on purpose, cold every time, the worst case
-  # for a build (README, "Environments"). The repository variables PROD_RUNNER and PREPROD_RUNNER
+  # for a build (docs/OPERATIONS.md, "Environments"). The repository variables PROD_RUNNER and PREPROD_RUNNER
   # hold runs-on labels as JSON (["self-hosted","prod"]); PREPROD_RUNNER is left unset, and unset
   # means GitHub's runner. Its image is pinned (ubuntu-26.04, not ubuntu-latest) on purpose: an
   # image change moves what the native passes stand on (AppArmor's userns restriction, idmapped
@@ -370,6 +370,19 @@ jobs:
           ZIG_TEST_IN_CONTAINER: "1"
           ZIG_TEST_MIN_PASSED: "500"
         run: ../.github/scripts/zig-test.sh
+
+      # Eviction's floor on a disk that is really full: a 64 MiB tmpfs in a mount namespace of the
+      # test's own (bubblewrap, no root), filled until a write fails (full-disk-test.sh, #357). The
+      # test skips everywhere else, so it would otherwise never run. Its compile is the tests'
+      # above, cached.
+      - name: Eviction on a really full disk
+        if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        timeout-minutes: 5
+        env:
+          FULL_DISK_REQUIRED: "1"
+        run: |
+          sudo apt-get install -y -qq bubblewrap >/dev/null
+          .github/scripts/full-disk-test.sh
 
       # Every test in runner/src is one the test binary has: a file that nothing reached compiled
       # and passed with its tests never run (github/http.zig's, until #326). Its compile is the

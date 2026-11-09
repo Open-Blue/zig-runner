@@ -950,7 +950,7 @@ pub fn noteNestingWithheld(x: *Exec, num: u32, script: []const u8) void {
 }
 
 pub const nesting_withheld_note = "This step names Dagger, but steps do not get the Dagger " ++
-    "engine in jobs this runner does not vouch for (README, \"Environments\"): a step's own " ++
+    "engine in jobs this runner does not vouch for (docs/OPERATIONS.md, \"Environments\"): a step's own " ++
     "Dagger client could open the cache volumes of the jobs it does vouch for.";
 
 /// The first directory of the tool cache that an answer's $GITHUB_PATH entries or $GITHUB_ENV
@@ -1177,7 +1177,7 @@ pub fn logSetUp(x: *Exec, opts: Options) !void {
     else
         "Engine: Dagger, through `dagger run`");
     if (x.nesting_withheld) x.setUpLine("Dagger in steps: off, as for every job this runner " ++
-        "does not vouch for (README, \"Environments\")");
+        "does not vouch for (docs/OPERATIONS.md, \"Environments\")");
     x.setUpLine("##[endgroup]");
     if (x.job.token_permissions.len > 0) {
         const perms = std.json.parseFromSliceLeaky(

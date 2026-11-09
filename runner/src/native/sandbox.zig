@@ -30,6 +30,7 @@ const seccomp = @import("seccomp.zig");
 const health = @import("health.zig");
 const phases = @import("phases.zig");
 const host_paths = @import("host_paths.zig");
+const container_options = @import("container_options.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -108,6 +109,29 @@ pub const Spec = struct {
     /// command, its first word found through the env's PATH as `docker run` finds it; otherwise
     /// `argv` runs under `/bin/sh`.
     container: ?Container = null,
+    /// A job container's `options:` the sandbox carries out (`container_options.zig`), for the
+    /// job's own steps: a Docker action's container has none of them, as on GitHub.
+    container_opts: ContainerOpts = .{},
+
+    /// `--hostname`, `--shm-size` and `--tmpfs`, as `docker create` sets them on the job container.
+    pub const ContainerOpts = struct {
+        /// The step's UTS hostname; empty keeps the host's.
+        hostname: []const u8 = "",
+        /// `/dev/shm`'s size in bytes; 0 for the default (`default_shm_size`).
+        shm_size: u64 = 0,
+        tmpfs: []const Tmpfs = &.{},
+    };
+
+    /// One `--tmpfs`: a new tmpfs at `path`, made if missing, mounted nosuid and nodev, and
+    /// noexec unless asked otherwise, as Docker mounts one.
+    pub const Tmpfs = struct {
+        path: []const u8,
+        /// Bytes; 0 for the kernel's default (half the memory, charged to the job's cgroup).
+        size: u64 = 0,
+        mode: u32 = 0o1777,
+        exec: bool = false,
+        read_only: bool = false,
+    };
 
     pub const Bind = struct {
         host: []const u8,
@@ -157,8 +181,25 @@ pub const Spec = struct {
         /// Directories of the job's overlay bound into the container: made in the job's overlay
         /// when missing, resolved inside each overlay.
         shares: []const Share = &.{},
+        /// An image whose `USER` is not the job's: the shares are seen by the step as that user's
+        /// (`Owner`). Only on a root runner (`Userns.mapped`).
+        owner: ?Owner = null,
 
         pub const Share = struct { from: []const u8, at: []const u8 };
+
+        /// Who the image's `USER` is, and who the job's runner user is, both as the job's ids
+        /// (below `Spec.id_count`). The shares are the job's overlay seen through an idmap that
+        /// swaps the two: what the job's user owns on disk, the step's user owns, and what the
+        /// step's user makes lands on disk as the job's user's, in the job's range and no other.
+        /// An overlay cannot be idmapped itself, so its layers are (`jobView`).
+        pub const Owner = struct {
+            uid: u32,
+            gid: u32,
+            /// The user's supplementary groups from the image's /etc/group, as the job sees them.
+            groups: []const u32 = &.{},
+            job_uid: u32,
+            job_gid: u32,
+        };
     };
 
     pub const File = struct {
@@ -170,6 +211,8 @@ pub const Spec = struct {
         /// is written to a tmpfs of the step's own (`secrets_dir`) and bound at `path` over an
         /// empty file, which goes once the step ends.
         keep: bool = false,
+        /// A container's file (`Container.owner`) owned by the step's user rather than root.
+        own: bool = false,
     };
 };
 
@@ -626,9 +669,25 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper, early: []const u
             check("unshare(mount)", linux.unshare(linux.CLONE.NEWNS));
             makePrivate();
             marks.namespaces = phases.now();
-            lowers = idmapLowers(arena, lowers, image_layers, spec.canonical, userns);
+            // A container for another user than the job's: the job's overlay, and so the shares,
+            // are seen through the ids that swap the two (`jobView`), in this mount namespace.
+            const view: ?JobView = if (spec.container) |c|
+                (if (c.owner) |o| jobView(arena, spec, o) else null)
+            else
+                null;
+            const slot_dir: ?[]const u8 = if (view != null) job_view_dir else null;
+            lowers = idmapLowers(arena, lowers, image_layers, spec.canonical, if (view) |v| v.canonical else userns, slot_dir);
             marks.idmap = phases.now();
-            mountOverlay(arena, spec, lowers, false);
+            var job_spec = spec;
+            if (view != null) {
+                job_spec.upper = std.fmt.allocPrint(arena, job_view_dir ++ "/{s}", .{spec.upper}) catch oom();
+                job_spec.work = job_view_dir ++ "/" ++ job_view_work;
+            }
+            mountOverlay(arena, job_spec, lowers, false);
+            if (view) |v| {
+                _ = linux.close(v.canonical);
+                _ = linux.close(v.slot);
+            }
             if (spec.container) |c| {
                 const mapped = arena.alloc([]const u8, c_lowers.len) catch oom();
                 for (c_lowers, mapped, 0..) |l, *m, i| {
@@ -667,6 +726,10 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper, early: []const u
     // 2. The step's own namespaces, owned by the user namespace; its first process is PID 1.
     check("unshare(mount, pid, uts, ipc)", linux.unshare(linux.CLONE.NEWNS | linux.CLONE.NEWPID |
         linux.CLONE.NEWUTS | linux.CLONE.NEWIPC));
+    if (spec.container == null and spec.container_opts.hostname.len > 0) {
+        const name = spec.container_opts.hostname;
+        check("set the hostname", linux.syscall2(.sethostname, @intFromPtr(name.ptr), name.len));
+    }
     makePrivate();
     const merged = z(arena, topOf(spec));
     // The overlay bound onto itself, a mount of this namespace's own: on a root runner it was
@@ -688,6 +751,7 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper, early: []const u
         bindAll(arena, spec, null);
         marks.binds = phases.now();
     }
+    if (spec.container == null) for (spec.container_opts.tmpfs) |t| mountTmpfs(arena, root, t);
     var secrets = false;
     for (spec.files) |f| secrets = secrets or !f.keep;
     if (secrets) check("mount the tmpfs for secret files", linux.mount(
@@ -699,8 +763,9 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper, early: []const u
     ));
     // A container's files go into the job's overlay, under the directories it shares.
     const files_root = if (spec.container) |c| shareJobDirs(arena, spec, c, root) else root;
+    const owner: ?Spec.Container.Owner = if (spec.container) |c| c.owner else null;
     for (spec.files, 0..) |f, i| {
-        if (f.keep) writeFileIn(arena, files_root, f) else bindSecretIn(arena, files_root, f, i);
+        if (f.keep) writeFileIn(arena, files_root, f, if (f.own) owner else null) else bindSecretIn(arena, files_root, f, i);
     }
     if (files_root != root) _ = linux.close(files_root);
 
@@ -725,7 +790,7 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper, early: []const u
         else
             .{ .search = .{ .name = spec.argv[0], .env = env } };
         const in_image = spec.container != null;
-        stepInit(arena, root, workdir, spec.uid, spec.gid, spec.groups, nnp, alive[0], in_image, program, argv, envp);
+        stepInit(arena, root, shmSize(spec), workdir, spec.uid, spec.gid, spec.groups, nnp, alive[0], in_image, program, argv, envp);
     }
     _ = linux.close(alive[0]);
     const st = if (spec.service) |s|
@@ -1105,6 +1170,14 @@ fn joinNetns(arena: Allocator, path: []const u8) void {
 /// job's own): made by a child, since only a process outside it may map more than its own id,
 /// and kept by its file descriptor once the child is gone.
 fn mappedUserns(inside: u32, base: u32, count: u32) linux.fd_t {
+    const one = [_]Range{.{ .inside = inside, .outside = base, .count = count }};
+    return mappedRanges(&one, &one);
+}
+
+const Range = struct { inside: u32, outside: u32, count: u32 };
+
+/// `mappedUserns` with several ranges, for the uids and for the gids.
+fn mappedRanges(uids: []const Range, gids: []const Range) linux.fd_t {
     var ready: [2]linux.fd_t = undefined;
     var hold: [2]linux.fd_t = undefined;
     check("make a pipe", linux.pipe2(&ready, .{ .CLOEXEC = true }));
@@ -1124,15 +1197,15 @@ fn mappedUserns(inside: u32, base: u32, count: u32) linux.fd_t {
     var c: [1]u8 = undefined;
     if (linux.read(ready[0], &c, 1) != 1) fatal("make the job's user namespace", @as(u32, 0));
     var buf: [128]u8 = undefined;
-    for ([_][]const u8{ "uid_map", "gid_map" }) |m| {
-        const path = std.fmt.bufPrintSentinel(&buf, "/proc/{d}/{s}", .{ pid, m }, 0) catch
+    const maps = [_]struct { []const u8, []const Range }{ .{ "uid_map", uids }, .{ "gid_map", gids } };
+    for (maps) |m| {
+        const path = std.fmt.bufPrintSentinel(&buf, "/proc/{d}/{s}", .{ pid, m[0] }, 0) catch
             unreachable;
-        var line: [64]u8 = undefined;
-        writeProc(path, std.fmt.bufPrint(&line, "{d} {d} {d}", .{
-            inside,
-            base,
-            count,
-        }) catch unreachable);
+        // All the lines in one write, as the kernel takes a map.
+        var lines: [swap_ranges * 40]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&lines);
+        for (m[1]) |r| w.print("{d} {d} {d}\n", .{ r.inside, r.outside, r.count }) catch unreachable;
+        writeProc(path, w.buffered());
     }
     const path = std.fmt.bufPrintSentinel(&buf, "/proc/{d}/ns/user", .{pid}, 0) catch unreachable;
     const fd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
@@ -1143,18 +1216,168 @@ fn mappedUserns(inside: u32, base: u32, count: u32) linux.fd_t {
     return @intCast(fd);
 }
 
+/// The most ranges `swapRanges` makes.
+const swap_ranges = 6;
+
+/// An id on disk that nothing owns (the last valid one): where `swapRanges` has the host's root.
+///
+/// Files owned by it show as the host's root through the slot's view (`X`), the mount `swapRanges`
+/// builds with `host_root`. That stays harmless only while `X` is mounted `nosuid` and `nodev`
+/// (`idmapMount` does): a setuid file there would be root's, and only `nosuid` has the kernel
+/// ignore the bit. Never mount `X` without them.
+const no_owner: u32 = std.math.maxInt(u32) - 1;
+
+/// The ranges that map ids `inside + n` to `outside + n` for `n` below `count`, but `a` to `b`
+/// and `b` to `a`: the ids of the job's user and of the step's user exchanged. With `host_root`,
+/// the id nothing owns (`no_owner`) is the host's root (outside id 0), as overlay needs to make
+/// its own work directory in an idmapped upper: the mounter's id must map.
+fn swapRanges(inside: u32, outside: u32, count: u32, a: u32, b: u32, host_root: bool, out: *[swap_ranges]Range) []const Range {
+    std.debug.assert(a < count and b < count);
+    var n: usize = 0;
+    if (a == b) {
+        out[0] = .{ .inside = inside, .outside = outside, .count = count };
+        n = 1;
+        if (host_root) {
+            out[1] = .{ .inside = no_owner, .outside = 0, .count = 1 };
+            n = 2;
+        }
+        return out[0..n];
+    }
+    const lo = @min(a, b);
+    const hi = @max(a, b);
+    // {first id, where it goes, how many}: below lo, lo, between, hi, above.
+    const parts = [_][3]u32{
+        .{ 0, 0, lo },
+        .{ lo, hi, 1 },
+        .{ lo + 1, lo + 1, hi - lo - 1 },
+        .{ hi, lo, 1 },
+        .{ hi + 1, hi + 1, count - hi - 1 },
+    };
+    for (parts) |p| {
+        if (p[2] == 0) continue;
+        out[n] = .{ .inside = inside + p[0], .outside = outside + p[1], .count = p[2] };
+        n += 1;
+    }
+    if (host_root) {
+        out[n] = .{ .inside = no_owner, .outside = 0, .count = 1 };
+        n += 1;
+    }
+    return out[0..n];
+}
+
+test "swapRanges exchanges two ids and keeps the rest" {
+    var out: [swap_ranges]Range = undefined;
+    const r = swapRanges(100, 1000, 65536, 1001, 1500, false, &out);
+    try std.testing.expectEqual(@as(usize, 5), r.len);
+    var covered: u64 = 0;
+    for (r) |x| covered += x.count;
+    try std.testing.expectEqual(@as(u64, 65536), covered);
+    // 1001 (inside 1101) goes to 1000 + 1500; 1500 (inside 1600) to 1000 + 1001.
+    try std.testing.expectEqual(Range{ .inside = 1101, .outside = 2500, .count = 1 }, r[1]);
+    try std.testing.expectEqual(Range{ .inside = 1600, .outside = 2001, .count = 1 }, r[3]);
+    // Ids at the ends.
+    const s = swapRanges(0, 0, 65536, 65535, 0, false, &out);
+    try std.testing.expectEqual(@as(usize, 3), s.len);
+    try std.testing.expectEqual(Range{ .inside = 0, .outside = 65535, .count = 1 }, s[0]);
+    try std.testing.expectEqual(Range{ .inside = 1, .outside = 1, .count = 65534 }, s[1]);
+    try std.testing.expectEqual(Range{ .inside = 65535, .outside = 0, .count = 1 }, s[2]);
+    // The host's root is one more range, past the job's.
+    const rooted = swapRanges(0, 0, 65536, 1, 2, true, &out);
+    try std.testing.expectEqual(Range{ .inside = no_owner, .outside = 0, .count = 1 }, rooted[rooted.len - 1]);
+    // One id twice is the identity.
+    const same = swapRanges(0, 0, 65536, 7, 7, false, &out);
+    var total: u64 = 0;
+    for (same) |x| {
+        try std.testing.expectEqual(x.inside, x.outside);
+        total += x.count;
+    }
+    try std.testing.expectEqual(@as(u64, 65536), total);
+}
+
+/// Where the job's directory is mounted idmapped, in the job's directory (`jobView`).
+const job_view_dir = "X";
+
+/// The overlay's work directory for it, in the job's directory: the job's own (`Spec.work`) is the
+/// host root's, which the job's ids do not include, and an overlay cannot clean up or make its
+/// work directory through ids it has no map for. Its root is the slot's root.
+const job_view_work = "VW";
+
+const JobView = struct { canonical: linux.fd_t, slot: linux.fd_t };
+
+/// The directory `name` in `dir`, made if missing and given to `id` (user and group): never by
+/// path, which a link in its place would send to its target as host root would chown it. Made
+/// with `mkdirat` (it may exist: `EEXIST`), opened `O_NOFOLLOW | O_DIRECTORY` (a link or a file
+/// there fails) and given by its descriptor. Errno zero (`SUCCESS`) when it is done.
+fn ownedDirAt(dir: linux.fd_t, name: [*:0]const u8, id: u32) linux.E {
+    const made = linux.errno(linux.mkdirat(dir, name, 0o755));
+    if (made != .SUCCESS and made != .EXIST) return made;
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true };
+    const rc = linux.openat(dir, name, flags, 0);
+    if (linux.errno(rc) != .SUCCESS) return linux.errno(rc);
+    const fd = std.math.cast(linux.fd_t, rc) orelse return .BADF;
+    defer _ = linux.close(fd);
+    return linux.errno(linux.fchown(fd, id, id));
+}
+
+test "ownedDirAt makes a directory and refuses a link or a file in its place" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir: linux.fd_t = tmp.dir.handle;
+    const me = linux.getuid();
+    try std.testing.expectEqual(linux.E.SUCCESS, ownedDirAt(dir, "VW", me));
+    // Again: it exists.
+    try std.testing.expectEqual(linux.E.SUCCESS, ownedDirAt(dir, "VW", me));
+    // A link, to a directory that is there or to none: not followed.
+    try tmp.dir.createDir(std.testing.io, "target", .default_dir);
+    try tmp.dir.symLink(std.testing.io, "target", "LINK", .{});
+    try std.testing.expect(ownedDirAt(dir, "LINK", me) != .SUCCESS);
+    try tmp.dir.symLink(std.testing.io, "/nonexistent/elsewhere", "DANGLING", .{});
+    try std.testing.expect(ownedDirAt(dir, "DANGLING", me) != .SUCCESS);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "FILE", .data = "x" });
+    try std.testing.expect(ownedDirAt(dir, "FILE", me) != .SUCCESS);
+}
+
+/// The job's directory seen with the job's user's ids and the step's user's exchanged
+/// (`Container.Owner`), at `job_view_dir`, writable: the job's overlay is mounted from it (its
+/// upper and work directory, and the layers with the slot's host ids), and a Docker action's
+/// shares come out of that overlay. The layers with the canonical ids get the same exchange
+/// through the user namespace returned as `canonical`, and `slot` is the directory's; the caller
+/// closes both. Overlay takes idmapped layers, the upper and the work directory among them, from
+/// Linux 5.19; an overlay cannot itself be idmapped, so its layers are.
+fn jobView(arena: Allocator, spec: Spec, o: Spec.Container.Owner) JobView {
+    var u: [swap_ranges]Range = undefined;
+    var g: [swap_ranges]Range = undefined;
+    const count = spec.id_count;
+    if (o.uid >= count or o.gid >= count or o.job_uid >= count or o.job_gid >= count)
+        fatal("find the image's user among the job's ids", @as(u32, 22));
+    const canonical = mappedRanges(
+        swapRanges(0, spec.id_base, count, o.job_uid, o.uid, false, &u),
+        swapRanges(0, spec.id_base, count, o.job_gid, o.gid, false, &g),
+    );
+    const slot = mappedRanges(
+        swapRanges(spec.id_base, spec.id_base, count, o.job_uid, o.uid, true, &u),
+        swapRanges(spec.id_base, spec.id_base, count, o.job_gid, o.gid, true, &g),
+    );
+    const owned = ownedDirAt(linux.AT.FDCWD, z(arena, job_view_work), spec.id_base);
+    if (owned != .SUCCESS) fatal("give the job's root the work directory", @backingInt(owned));
+    idmapMount(arena, ".", job_view_dir, slot, false, false);
+    return .{ .canonical = canonical, .slot = slot };
+}
+
 /// The lower layers with the canonical ids replaced by mounts of them idmapped through `userns`:
 /// the image's (the last `image_layers`: the rootfs, and the Zig cache seeds above it) at `R`,
 /// `R1`, ..., and the job's own that are stored (`canonical`) at `S0`, `S1`, ... by position. The
 /// host's root's files are the job's root's, its uid 1001's the job's 1001's, whichever slot's
 /// range the job has, without a copy of a layer per range. Linux 5.19 lets overlay take an
-/// idmapped layer. The step's upper is not idmapped: what it writes has the slot's host ids.
+/// idmapped layer. The step's upper is not idmapped: what it writes has the slot's host ids,
+/// and the layers that have them are taken from `slot_dir` when it is given.
 fn idmapLowers(
     arena: Allocator,
     lowers: []const []const u8,
     image_layers: u32,
     canonical: []const bool,
     userns: linux.fd_t,
+    slot_dir: ?[]const u8,
 ) []const []const u8 {
     const out = arena.dupe([]const u8, lowers) catch oom();
     const n = @min(@max(image_layers, 1), lowers.len);
@@ -1164,7 +1387,16 @@ fn idmapLowers(
         out[out.len - 1 - k] = at;
     }
     for (0..lowers.len - n) |k| {
-        if (k >= canonical.len or !canonical[k]) continue;
+        if (k >= canonical.len or !canonical[k]) {
+            // The job's layers with the slot's host ids are in the job's directory, which
+            // `slot_dir` is the idmapped view of (`jobView`).
+            if (slot_dir) |d| {
+                if (lowers[k].len == 0 or lowers[k][0] == '/')
+                    fatal("find a job layer in the job's directory", @as(u32, 22));
+                out[k] = std.fmt.allocPrint(arena, "{s}/{s}", .{ d, lowers[k] }) catch oom();
+            }
+            continue;
+        }
         const at = std.fmt.allocPrint(arena, "S{d}", .{k}) catch oom();
         idmapLayer(arena, lowers[k], at, userns);
         out[k] = at;
@@ -1179,25 +1411,31 @@ fn idmapLowers(
 /// (exec checks the overlay's mount, not the lower's). They keep the mount itself, should it ever
 /// be reached, from being written or lending its set-id files or devices.
 fn idmapLayer(arena: Allocator, layer: []const u8, at: []const u8, userns: linux.fd_t) void {
+    idmapMount(arena, layer, at, userns, true, true);
+}
+
+/// `layer` cloned at `at` (in the job's directory) idmapped through `userns`: with the mounts
+/// below it when `recursive`, read-only when `read_only`; nosuid and nodev either way.
+fn idmapMount(arena: Allocator, layer: []const u8, at: []const u8, userns: linux.fd_t, recursive: bool, read_only: bool) void {
+    const recurse: usize = if (recursive) 0x8000 else 0;
     const open_tree_clone = 1;
-    const at_recursive = 0x8000;
     const tree = linux.syscall3(
         .open_tree,
         @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))),
         @intFromPtr(z(arena, layer)),
-        open_tree_clone | at_recursive | linux.SOCK.CLOEXEC,
+        open_tree_clone | recurse | linux.SOCK.CLOEXEC,
     );
     check("open a lower layer's mount", tree);
     const rdonly = 0x1;
     const nosuid = 0x2;
     const nodev = 0x4;
     const idmap = 0x00100000;
-    var attr: MountAttr = .{ .set = idmap | rdonly | nosuid | nodev, .userns_fd = @intCast(userns) };
+    var attr: MountAttr = .{ .set = idmap | (if (read_only) @as(u64, rdonly) else 0) | nosuid | nodev, .userns_fd = @intCast(userns) };
     check("idmap a lower layer", linux.syscall5(
         .mount_setattr,
         tree,
         @intFromPtr(""),
-        linux.AT.EMPTY_PATH | at_recursive,
+        linux.AT.EMPTY_PATH | recurse,
         @intFromPtr(&attr),
         @sizeOf(MountAttr),
     ));
@@ -1246,6 +1484,9 @@ fn shareJobDirs(arena: Allocator, spec: Spec, c: Spec.Container, root: linux.fd_
     for (c.shares) |sh| {
         const from = makeDirsOpen(arena, job, sh.from);
         defer _ = linux.close(from);
+        // The step's user's, however the directory was made (root's, by the helper, or the
+        // job's user's, seen as the step's already).
+        if (c.owner) |o| check(about(arena, "give the step's user", sh.from), linux.fchownat(from, "", o.uid, o.gid, linux.AT.EMPTY_PATH));
         const at = makeDirsOpen(arena, root, sh.at);
         defer _ = linux.close(at);
         check(about(arena, "share", sh.at), linux.mount(
@@ -1405,6 +1646,7 @@ const Warning = struct {
 fn stepInit(
     arena: Allocator,
     root: linux.fd_t,
+    shm_size: u64,
     workdir: [*:0]const u8,
     uid: u32,
     gid: u32,
@@ -1417,7 +1659,7 @@ fn stepInit(
     envp: [*:null]const ?[*:0]const u8,
 ) noreturn {
     armParentDeath(alive);
-    makeDev(arena, root);
+    makeDev(arena, root, shm_size);
     mountIn(arena, root, "/proc", "proc", "proc", linux.MS.NOSUID | linux.MS.NODEV |
         linux.MS.NOEXEC, null);
     // The host's /sys, read-only with every mount under it, as BuildKit mounts sysfs read-only.
@@ -1623,9 +1865,52 @@ pub fn installSeccomp() void {
     check("install the seccomp filter", seccomp.install());
 }
 
+/// Docker's default `/dev/shm`, which `--shm-size` replaces.
+pub const default_shm_size: u64 = 64 << 20;
+
+/// `/dev/shm`'s size for the step: `--shm-size` of the job container's options, for its own steps.
+fn shmSize(spec: Spec) u64 {
+    const asked = spec.container_opts.shm_size;
+    return if (spec.container == null and asked > 0) asked else default_shm_size;
+}
+
+/// One `--tmpfs` of the job container: its mount point made when the overlay has none, then a
+/// tmpfs there, nosuid and nodev as Docker's always is (`Tmpfs.exec`, `Tmpfs.read_only`).
+fn mountTmpfs(arena: Allocator, root: linux.fd_t, t: Spec.Tmpfs) void {
+    makeDirsIn(arena, root, t.path, null);
+    var flags: u32 = linux.MS.NOSUID | linux.MS.NODEV;
+    if (!t.exec) flags |= linux.MS.NOEXEC;
+    if (t.read_only) flags |= linux.MS.RDONLY;
+    const data = if (t.size > 0)
+        std.fmt.allocPrintSentinel(arena, "mode={o},size={d}", .{ t.mode, t.size }, 0) catch oom()
+    else
+        std.fmt.allocPrintSentinel(arena, "mode={o}", .{t.mode}, 0) catch oom();
+    // The path as the image's symlinks resolve it: `/scratch -> /etc` must not put the tmpfs where
+    // `container_options` refuses one by name (the files the runner binds there, its mounts).
+    const fd = targetIn(arena, root, t.path, true) orelse fatal(about(arena, "find", t.path), @as(u32, 2));
+    defer _ = linux.close(fd);
+    if (container_options.tmpfsHides(resolvedIn(arena, root, fd))) |_| fatal(about(arena, "mount a " ++
+        "--tmpfs over what the runner mounts or puts in place, through a link in the image, at", t.path), @as(u32, 1));
+    const d: usize = @intFromPtr(data.ptr);
+    check("mount", linux.mount("tmpfs", procFd(arena, fd), "tmpfs", flags, d));
+}
+
+/// Where `fd` (opened by `openIn` under `root`) is, as a path inside `root`; "/" if it cannot be read
+/// (which `container_options.tmpfsHides` refuses).
+fn resolvedIn(arena: Allocator, root: linux.fd_t, fd: linux.fd_t) []const u8 {
+    var base: [std.fs.max_path_bytes]u8 = undefined;
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const b = linux.readlink(procFd(arena, root), &base, base.len);
+    const f = linux.readlink(procFd(arena, fd), &full, full.len);
+    if (linux.errno(b) != .SUCCESS or linux.errno(f) != .SUCCESS) return "/";
+    if (!std.mem.startsWith(u8, full[0..f], base[0..b])) return "/";
+    const rest = full[b..f];
+    return arena.dupe(u8, if (rest.len == 0) "/" else rest) catch oom();
+}
+
 /// A /dev of the nodes a step needs, bound from the host's, as runc builds one: not the host's
 /// whole /dev, which would hand a step its disks.
-fn makeDev(arena: Allocator, root: linux.fd_t) void {
+fn makeDev(arena: Allocator, root: linux.fd_t, shm_size: u64) void {
     const ms = linux.MS;
     mountIn(arena, root, "/dev", "tmpfs", "tmpfs", ms.NOSUID | ms.NOEXEC, "mode=755,size=65536k");
     for ([_][]const u8{ "null", "zero", "full", "random", "urandom", "tty" }) |name| {
@@ -1643,7 +1928,8 @@ fn makeDev(arena: Allocator, root: linux.fd_t) void {
     mountIn(arena, root, "/dev/pts", "devpts", "devpts", ms.NOSUID | ms.NOEXEC, "newinstance," ++
         "ptmxmode=0666,mode=0620");
     const shm_flags = ms.NOSUID | ms.NODEV | ms.NOEXEC;
-    mountIn(arena, root, "/dev/shm", "shm", "tmpfs", shm_flags, "mode=1777,size=65536k");
+    const shm_data = std.fmt.allocPrintSentinel(arena, "mode=1777,size={d}", .{shm_size}, 0) catch oom();
+    mountIn(arena, root, "/dev/shm", "shm", "tmpfs", shm_flags, shm_data);
     const links = [_][2][*:0]const u8{
         .{ "pts/ptmx", "ptmx" },
         .{ "/proc/self/fd", "fd" },
@@ -1795,10 +2081,11 @@ fn procFd(arena: Allocator, fd: linux.fd_t) [*:0]const u8 {
 
 /// Writes `f` into the overlay, `f.path` resolved inside it, its missing parents made as
 /// `withNewFile` makes them (root's, 0755).
-fn writeFileIn(arena: Allocator, root: linux.fd_t, f: Spec.File) void {
+fn writeFileIn(arena: Allocator, root: linux.fd_t, f: Spec.File, owner: ?Spec.Container.Owner) void {
     const fd = createIn(arena, root, f.path, f.mode, true);
     defer _ = linux.close(fd);
     writeAll(fd, f.contents);
+    if (owner) |o| check(about(arena, "give the step's user", f.path), linux.fchown(fd, o.uid, o.gid));
 }
 
 /// A secret file (`Spec.File.keep` false): written to the step's tmpfs (`secrets_dir`), and bound

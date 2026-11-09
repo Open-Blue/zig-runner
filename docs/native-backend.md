@@ -176,7 +176,8 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   on a rootless runner or with an image given by an expression (native since P6, below, their
   images pulled by P3), JavaScript and local `uses:` actions (P7, `actions.preload`), remote `uses:` actions in an
   image with no git to fetch them with, `docker://` images
-  that cannot be pulled or run as a non-root `USER` (P7), Dagger in steps
+  that cannot be pulled, or whose non-root `USER` the image does not have, is past the job's
+  ids, or runs on a rootless runner (P7), Dagger in steps
   (`RUNNER_DAGGER_NESTING`), and a
   machine whose probe fails (no user namespaces, nftables refusing the jobs' rules, no default
   route, the jobs' ids taken on the host, the jobs' subnet overlapping a route of the host's). A
@@ -821,7 +822,7 @@ What it does not do yet (debt, with the phase that pays it):
   oracle. Frame checksums are not checked; the blob's digest is checked before and the diff id
   after, which covers it. Dictionaries are refused, and so is a window over 128 MiB.
 - **Rootless** (tests, the laptop): only root is mapped, so every file is the runner's,
-  directories keep their owner's write bit, an image whose `USER` is not root cannot run, and the
+  directories keep their owner's write bit, an image whose `USER` is not root cannot run a Docker action, and the
   default image cannot be provisioned (dpkg gives files to other ids, `root:adm`, which fails with
   `EINVAL`): such a job goes to Dagger unless `RUNNER_NATIVE_ROOTFS` is set. Phase 5's
   subordinate ids pay this.
@@ -1196,7 +1197,10 @@ proofs/tla/StoreEviction.tla.
   longest unused first. The last use is the mtime of the volume's lock file (`<volume>.lock`), set
   by `volumes.open`. The size is `<volume>.size`, from a walk at the end of some job: one volume a
   job, never measured first, a volume in use again at most once an hour, for at most a second (10 s
-  when it was never measured), never holding a lock, what it could not see left out. So the size
+  when it was never measured), never holding a lock, what it could not see left out. A walk cut
+  short keeps the directories it had yet to enter in the
+  size file (up to 256 KiB, for a week), and the next goes on from them: a volume too big for a
+  second is counted over several jobs, not for ever by its first second. So the size
   lags, and only ever matters at the margin.
 - **Trees.** Past `RUNNER_NATIVE_IMAGES_MAX_MB` (8 GiB) of images, rootfs and seeds together, the
   blobs go first, oldest first, as they only save a download of what is unpacked already or not
@@ -1293,8 +1297,12 @@ proofs/tla/StoreEviction.tla.
   have a budget too: a pass takes one, and more while it has time.
 - **What no budget bounds.** The `syncfs` before deleting from a dead name, once a pass, takes what the
   disk takes; each eviction's two directory fsyncs likewise, and one layer's delete. All of them are
-  at a job's end, before its result is reported. A dead tree that will not go costs that `syncfs` at
-  every job's end, for as long as it stays.
+  at a job's end, before its result is reported. A dead tree that will not go is remembered in memory
+  and left alone for an hour (`Limits.stuck_retry_ms`), neither retried nor synced for: so it costs one
+  `syncfs` an hour, and one more at each restart, not one at every job's end. A walk (`usage`) asks the
+  clock at every directory, and does not enter one too deep to name (a path of `PATH_MAX`; the kernel
+  resolves a longer one a component at a time, which cost each directory its depth, 11 s over a
+  budget of 1 s at 60,000 deep).
 - **When a sync fails.** A pass stops there: nothing more is evicted until what went is gone, or a
   disk that fails writes would take entry after entry and free nothing.
 - **Costs left.** Deleting and measuring are at a job's end, before its result is reported
@@ -1303,7 +1311,9 @@ proofs/tla/StoreEviction.tla.
 - **A really full disk.** The floor is tested on a 64 MiB tmpfs filled until a write fails with
   `ENOSPC`, in a mount namespace of bubblewrap's (`.github/scripts/full-disk-test.sh`; no root, and
   skipped where bubblewrap or user namespaces are not allowed): with a volume never measured among
-  them, the pass frees a fifth of the disk and the store takes writes again. A plain
+  them, the pass frees a fifth of the disk and the store takes writes again. The test runs
+  `Store.collect`, as a job's end does, and writes a result file that failed before. A whole job
+  through `Backend.deinit` on a full disk is not tested: it needs a native sandbox. A plain
   `unshare -rm` is refused on hosts that restrict unprivileged user namespaces (Ubuntu's AppArmor).
 
 ### P5: isolation for untrusted jobs
@@ -1471,7 +1481,8 @@ runner's behaviour as remembered, not re-read for this change.)
 `runner/src/native/container_options.zig` reads `options:`. A native job carries out or accepts only
 the flags below; **any other flag, a stray word, or an `options:` with an expression in it sends
 the job to Dagger, naming the flag in "Set up job"**. Dagger reads none of `options:`, so a flag
-sent there is dropped, not carried out, and the note says so (it also logs a warning, #368). A
+sent there is dropped, not carried out, and the note says so (it also logs a warning, #368, which
+a native job, that carries everything out, no longer logs). A
 `--user` the image does not know (a name or group missing from its `/etc/passwd` or `/etc/group`)
 fails the job, as `docker create` does, instead of falling back to run as root.
 
@@ -1481,7 +1492,41 @@ fails the job, as `docker create` does, instead of falling back to run as root.
 | `--user`/`-u` (`name`, `uid`, `name:group`, `uid:gid`) | Carried out: resolved in the image's own `/etc/passwd` and `/etc/group` as its `USER` is, over it. Refused on the runner's default image, whose step user is `RUNNER_STEP_USER`'s choice (that provisioning is not the container's). A rootless runner maps only root, so there it fails as an image `USER` does. The base makes `/__w` (workspace, `_temp`, the tool cache) as root and gives it to that user (the tool cache only when it is not that user's already, so an image's large `/opt/hostedtoolcache` is not copied up): GitHub mounts `/__w` from the host, so an image never has to carry a writable one. |
 | `--workdir`/`-w` | Understood, no effect: every step is `docker exec -w`, native steps take the same directory. Counted in "Set up job". |
 | `--health-cmd`, `--health-interval`, `--health-timeout`, `--health-start-period`, `--health-start-interval`, `--health-retries`, `--no-healthcheck` | Understood, no effect: nothing waits for a job container's health. Durations and counts are checked as Docker reads them; one it would refuse is refused. |
-| Everything else: `--cpus`, `--memory`, `--privileged`, `--cap-add`, `--security-opt`, `--device`, `--gpus`, `--ulimit`, `--shm-size`, `--network`, `--add-host`, `--dns`, `--hostname`, `--init`, `-t`/`-i`, `--entrypoint`, `--name`, `--label`, `--platform`, `--pull`, `--read-only`, `--tmpfs`, `--sysctl`, `--pid`, `--ipc`, `--userns`, `-v`/`--mount`, `-p`, `--env-file`, `--group-add` | Refused (Dagger). Each changes the container: limits, privileges, devices, networks and mounts are the sandbox's (`sandbox.zig`, `seccomp.zig`, `nft.zig`, the cgroup code), which this does not touch. |
+| `--hostname`/`-h` | Carried out: the steps' UTS hostname (`sethostname` in the step's own UTS namespace), and a line `127.0.0.1 <hostname>` in the job's hosts file, as Docker names the container in its own. A name Docker would refuse (RFC 1123, at most 64 characters) is refused. |
+| `--add-host name:ip` (also `name=ip`) | Carried out: a line in the job's hosts file (`Backend.writeHosts`), which the job's services share. An IPv4 address only; `host-gateway` (the host's address) and IPv6 are refused. The hosts file is the job's own, so a key of the job's layers differs per job (step caching does not replay across jobs that use it). |
+| `--shm-size` | Carried out: the size of the step's `/dev/shm` (a tmpfs, so memory the job's cgroup is charged for), over Docker's 64 MiB. A number of bytes or with `b`, `k`, `m`, `g`, `t`, whole numbers only; zero is refused. With no job cgroup (`RUNNER_NATIVE_CGROUP=none`) nothing is charged for it, so the job fails when `--shm-size` and the `--tmpfs` sizes add up to more than 1 GiB. |
+| `--tmpfs path[:options]` | Carried out: a new tmpfs in each of the job's own steps (not a Docker action's container), the directory made if the image has none, **nosuid and nodev always** and noexec unless `exec` is given, as Docker mounts one; `size=` and `mode=` (default 1777), `rw`, `ro`. With no job cgroup (`RUNNER_NATIVE_CGROUP=none`) a tmpfs has no memory account to be charged to, so an unsized `--tmpfs` (the kernel's default is half the host's memory) fails the job, as does a total of `size=`s and `--shm-size` above 1 GiB. Refused: `suid`, `dev`, `uid=`, `gid=` and any other mount option, the root, a path at, under or **above** the runner's own mounts and files (`/__w`, `/__t`, `/__e`, `/github/home`, `/github/workflow`, `/github/file_commands`, `/github/workspace`, `/var/run/docker.sock`, `/etc/hosts`, `/etc/resolv.conf`, `/etc/hostname`: so `/github` and `/etc` too, which would hide them), or under the sandbox's (`/proc`, `/sys`, `/dev`), a mount point that an image's symlink leads onto one of those (the step fails; the path is checked again after the links are followed), the same path twice, and a path at or beside a `volumes:` target (a tmpfs would hide the volume). |
+| `--memory`/`-m` | Carried out within the job's own cgroup: it lowers the job's `memory.max` to the value when that is below the runner's limit for a job (`RUNNER_NATIVE_MEMORY_MAX_MB`), and never raises it: above that limit the runner's holds, and "Set up job" says so. A job with no cgroup (`RUNNER_NATIVE_CGROUP=none`) fails instead of running without it. Below 6 MiB is refused, as Docker does. `--memory-swap` is not read (refused): a job may not swap anyway. |
+| `--init` | Understood, no effect: a step's first process is its shell, which does not reap other processes' orphans or forward signals as `tini` does; orphans are reaped when the step ends. Counted in "Set up job". |
+| **Security-sensitive, never native:** `--privileged`, `--cap-add`, `--cap-drop`, `--security-opt`, `--device`, `--device-cgroup-rule`, `--userns`, `--network`/`--net` (including `host`), `--pid`, `--ipc`, `--uts`, `--cgroup-parent`, `--cgroupns`, `--sysctl`, `--runtime`, `--gpus` | Refused, never honoured natively: each asks for more than the sandbox grants (capabilities and the seccomp filter, the user namespace, the job's own network, PID and IPC namespaces, the cgroup the runner makes) and the sandbox has no flag to widen them. The job goes to Dagger, with the flag named in "Set up job" and the fact that Dagger drops it (a job that needs one runs on Docker's runner instead). |
+| Everything else: `--cpus` (a cpu controller the job's cgroup does not have), `--cpuset-cpus`, `--ulimit`, `--pids-limit`, `--network-alias`, `-t`/`-i`, `--entrypoint` (it changes how the job container itself starts, which a native job does not have: its steps are the only processes), `--name`, `--label`, `--platform`, `--pull`, `--read-only`, `--dns`, `-v`/`--volume`/`--mount` (use `volumes:`), `-p`/`--publish` (use `ports:`), `--env-file`, `--group-add`, `--oom-kill-disable`, `--restart` | Refused (Dagger, which drops them): each changes the container beyond the options above, in a way the sandbox does not carry out. |
+
+**Which flags are in use (#352, 2026-11-08).** GitHub code search over public workflows
+(`.github/workflows`), `container:` and `services:` `options:` strings together. Files whose
+`options:` starts with the flag, by the search's own count (a loose count, in the order of
+magnitude): `--health-cmd` 19.9k, `--user` 8.2k, `--privileged` 7.7k, `-v` 1.5k, `--gpus` 1.5k,
+`--ipc` 1.4k, `--entrypoint` 0.9k, `--security-opt` 0.9k, `-e` 0.65k, `--shm-size` 0.6k,
+`--init` 0.56k, `--cap-add` 0.5k, `--cpus` 0.46k, `--name` 0.43k, `--device` 0.33k, `-u` 0.30k,
+`--platform` 0.29k, `--tmpfs` 0.25k, `--network` 0.14k, `--env` 0.1k, `--memory` 90, `--sysctl` 86,
+`--workdir` 80, `--hostname` 55, `--add-host` 46, `--ulimit` 37. And a sample of 3,495 files
+(300 per seed flag at most, so the ranks are the seeds' in part): of 1,611 job container
+`options:` strings whose key could be told, 193 carried only flags the native job honoured
+before this change, 427 carry only flags it honours now, and 865 hold a security flag
+(`--privileged`, `--cap-add`, `--security-opt`, `--device`, `--ipc`, `--gpus`...), which stay
+refused. Most-used in the sample's job containers: `--user` 295, `--security-opt` 307,
+`--privileged` 280, `--cap-add` 235, `--shm-size` 185, `--cpus` 167, `--ipc` 161, `--init` 155,
+`--device` 150, `--memory` 127, `--volume` 116, `--tmpfs` 56, `--entrypoint` 45. Services use
+`--health-*` far above the rest (`services.zig` honours them), then `--entrypoint` and `--volume`.
+That is what chose `--shm-size`, `--init`, `--tmpfs`, `--memory`, `--hostname` and
+`--add-host` for this change; `--cpus` (167) needs the cpu controller in the job's cgroup and is
+left for a change that can give the job one.
+
+**Never native, whatever the use.** `--privileged`, `--cap-add`, `--security-opt`, `--device`,
+`--userns`, `--network`, `--pid`, `--ipc` and `--uts` ask the container for more than the sandbox
+has, and the sandbox is what makes a job from a fork or a pull request safe to run on the
+host. They are refused with the flag named (`container_options.zig` knows no flag it does not
+carry out), the job goes to Dagger, which drops them, and with `RUNNER_ENGINE=none` it fails
+with the reason. A workflow that needs one belongs on a runner that is allowed to give it.
 
 `volumes:` and `ports:` are read from GitHub's runner (`ContainerInfo.cs`, `DockerCommandManager.DockerCreate`
 and `ContainerOperationProvider.cs` at actions/runner 5ba50443, read with `gh api` for #352): a
@@ -1573,11 +1618,18 @@ host directory only when the operator allows it, and only on a root runner:
   `nosuid` and `nodev`**. A job reading or writing the runner's paths could read its secrets or
   change other jobs. The mount must be `nosuid,nodev` on the host, not only in the job: the job's
   root can make a setuid file in a directory it writes, and a host user running it from the host's
-  mount would get the volumes' ids (which own every job's cache volumes). Mount the filesystem
-  with `-o nosuid,nodev`, or bind the directory onto itself so (`mount --bind /srv/data /srv/data
-  && mount -o remount,bind,nosuid,nodev /srv/data`, or `Options=bind,nosuid,nodev` in a systemd
-  mount unit). A **rootless runner refuses to start** with the setting, and fails a job that asks
-  for one: its jobs' root is the runner's own user on the host, with no idmapping, so a job would
+  mount would get the volumes' ids (which own every job's cache volumes). **Mount the whole
+  filesystem with `-o nosuid,nodev`**, in `/etc/fstab` or a systemd mount unit, so it lasts. A
+  bind of the one directory onto itself (`mount --bind /srv/data /srv/data && mount -o
+  remount,bind,nosuid,nodev /srv/data`) also passes, but is weaker: it covers only the runner's
+  mount namespace, so a container or service with mounts of its own that show the filesystem
+  still runs a setuid file a job left there, and one made by hand is gone after a reboot (the
+  runner then refuses to start, naming the entry). The runner also refuses an entry its own mount
+  table, or the host's (pid 1's: a service manager may give the runner a mount namespace of its
+  own), shows at another path without `nosuid` and `nodev` (`/srv` bound at `/mnt/srv`), at start
+  and for each job (`host_paths.exposedElsewhere`, which follows the mount tree as the kernel's
+  path walk does). Exports over NFS or SMB, and other namespaces' mounts, are beyond what it sees. A **rootless runner refuses to start** with
+  the setting, and fails a job that asks for one: its jobs' root is the runner's own user on the host, with no idmapping, so a job would
   write as the runner and could change its files.
 - **The list is the one checked at start.** Each job holds it to what the runner checked then
   (`host_paths.recheck`): an entry whose path now resolves elsewhere (a symlink repointed), or is
@@ -1697,7 +1749,12 @@ volume's mount) fails the job in "Set up job", naming both, as it would hide one
   Those containers are not the host's to let in through a trusted job's port. A host whose LAN NIC
   is itself enslaved to a bridge (`br0` for VMs) has its LAN treated so too; publish on a specific
   address and let the firewall decide, or keep 127.0.0.1. Routes that cannot be read refuse every
-  peer beyond loopback.
+  peer beyond loopback. A peer at 127/8 is always let through, which assumes the kernel drops
+  127/8 sources arriving on other interfaces, as it does unless `route_localnet` is on for one
+  (`/proc/sys/net/ipv4/conf/<if>/route_localnet`; kube-proxy turns it on for NodePorts on
+  localhost). With it on for a bridge, a container there can send a UDP datagram that appears to
+  come from 127.0.0.1. A TCP connection can't be made that way, because the replies go to the
+  host's own loopback. Don't publish UDP ports beyond loopback on such a host.
 - **Which ports**: a host port a job names (`50080:80`) must be inside
   **`RUNNER_NATIVE_PORT_RANGE`** (`--native-port-range`, `lo-hi`, 1024 <= lo <= hi), by default
   **49152-65535**, IANA's dynamic and private ports (RFC 6335), which no service is registered on.
@@ -1755,8 +1812,12 @@ Services' `options:` are unchanged: they still log the flags they do not carry o
 (`services.zig`), as the Dagger path does. Making them refuse as the job container's do is a
 separate change.
 
-Tests: the flag table, in every spelling Docker reads, and a refusal for each of 35 flags in three
-spellings (`container_options.zig`); the volume grammar as GitHub's runner reads it, a refusal for
+Tests: the flag table, in every spelling Docker reads, a refusal for each of 40 flags in three
+spellings, and for the values of the honoured flags that are unsafe or unreadable, a security flag
+among them (`container_options.zig`); a job with `--hostname`, `--add-host`, `--shm-size`, `--tmpfs` and
+`--init` whose steps see them (hostname, hosts, `/proc/mounts` with nosuid, nodev and noexec, a
+tmpfs that executes only when asked), and one whose `--memory` lowers the job's `memory.max` and
+is capped at the runner's (`Backend.zig`, the second as root); the volume grammar as GitHub's runner reads it, a refusal for
 each entry above, and `unsupported`'s reasons for ports, volumes (with and without services),
 options and expressions (`container_options.zig`, `Backend.zig`); a native job with `--user app -e
 ... --workdir ... --health-*` that runs as the image's `app` user with the options' env over the
@@ -1842,10 +1903,23 @@ Dagger.** What it covers, as built:
   ```
 
 - Falls back to Dagger, with "This job runs on Dagger: ..." in "Set up job": a `docker://` image
-  that is not in the store (or no store), and an image whose `USER` is not root (GitHub's
-  documentation requires root for Docker actions; Dagger's path gives another user the
-  directories it writes, which here needs an idmapped share, below). For `uses:` actions, see
-  "The action loader" below.
+  that is not in the store (or no store), and, on a rootless runner, an image whose `USER` is not
+  root (GitHub's documentation requires root for Docker actions; a root runner gives another user
+  the shares through an idmap, below), or on a root runner a `USER` that is not in the image's
+  /etc/passwd or /etc/group (`docker run` refuses it too) or is past the job's ids (65536 a job).
+  For `uses:` actions, see "The action loader" below.
+- A non-root `USER` (`name`, `uid`, `name:group`, `uid:gid`, resolved in the image's own files as
+  Docker does, its supplementary groups from /etc/group) owns the shares for the step:
+  `/github/workspace`, `/github/home`, `/github/file_commands` and `/github/workflow`. An overlay
+  cannot be idmapped, so the job's overlay is mounted for such a step from idmapped layers
+  (`sandbox.jobView`): the layers, the step's upper and a work directory of its own, seen through
+  ids that swap the job's user (the runner user, or root) with the image's user. What the job's
+  user owns, the action's user owns; what the action makes lands on disk as the job's user's, so
+  the next step needs no walk of the layer, no copy and no `chown` of the workspace, and the
+  shares keep the mount flags they have. No id outside the job's range appears on either side
+  (the host's root, which overlay needs to make its work directory, is mapped to an id nothing
+  owns). The file commands and the event are given to the user, and the shares' roots too (a
+  directory the helper made, `/github/home` the first time).
 - Parity kept explicitly: on a root runner with steps as the runner user, what the action made or
   changed in the workspace is given to the runner user afterwards (the files in the step's layer
   under the workspace, through no symlink), as Dagger copies the workspace back owned by it; a
@@ -1861,8 +1935,8 @@ What it does not do yet, and who pays:
   pre-flight judged the commit's. With every kind of action native, the only way that bites is an
   image the commit's version did not need and the store lacks: the step fails saying so, where
   Dagger would have pulled it. Gone with P3's pull.
-- **Images with a non-root `USER`, and a `RUN` as one.** They need the shares idmapped so the
-  image's user owns them, as Dagger's `owner:` does. Debt of P7.
+- **A `RUN` as a non-root user in a Dockerfile.** It needs the builder's own filesystem owned by
+  that user; the final `USER` of a built image runs natively on a root runner (#351).
 - **The pull.** Images come from the operator's directory until P3's store replaces
   `images.lookup`.
 - **Small differences from Dagger's path**, none visible to an action that follows GitHub's
@@ -1956,8 +2030,8 @@ as on Dagger (`actions.loadLocal`, through `Backend.readFile`).
   `js.runtimes`' images; with the pull it gets them on a miss, and `preload`'s runtime check goes.
 - P3's image store replaces `images.lookup(arena, io, dir, ref)`: return `Image{ rootfs, entrypoint,
   cmd, env, user }` for the reference, pulled when missing. `docker_action.unsupported` then needs
-  no store check (an image is pulled, not refused) but keeps the `USER` check until the idmapped
-  shares; `Config.images` and `RUNNER_NATIVE_IMAGES` go.
+  no store check (an image is pulled, not refused) but keeps the `USER` check
+  (`docker_action.userReason`); `Config.images` and `RUNNER_NATIVE_IMAGES` go.
 - P2's per-job helper: `sandbox.Spec.Container` is a field of the step's spec; the per-job helper
   takes it with the step and mounts the container's overlay in the step's own namespace (the
   job's overlay and its layer as for any step). Its layer store: the action's step always runs
@@ -2745,6 +2819,20 @@ Surprises:
   `GITHUB_ACTION` to the step's label (`docker://alpine:3.22`) and logs no "Process completed with
   exit code" for a Docker action; the native path does the same, so a job's results do not depend
   on the backend.
+
+- **A non-root `USER` is an idmap of the layers, not of the share (#351).** The shares are bound out
+  of the job's overlay, and the kernel does not idmap an overlay (`mount_setattr` gives `EINVAL`,
+  tried on 7.0); it takes idmapped layers, the upper and the work directory among them (5.19).
+  The job's overlay is therefore mounted again for such a step from the layers seen through a
+  swap of two ids, and mounting it rejects what is easy to miss: the work directory must be new
+  (`VW`; the job's own is the host root's, which the swap does not map, and overlay then mounts
+  read-only with `errno 75` in the log, so the first write is `EROFS`), and the host's root must
+  be in the map too, as the mounter that makes `work/work` (any id will do that nothing owns). The
+  mount must be made after the helper's `unshare(CLONE_NEWNS)`: before it, it lands in the runner's
+  own namespace and the job's directory cannot then be removed (`EOVERFLOW`). A swap, not a shift,
+  because both users keep their files: the image's `/home/app` is in the layers the swap does
+  not touch (the rootfs under the container is mounted as before). The cost over a root action
+  is the second `mount_setattr` per layer, not a walk of the workspace as Dagger's copy is.
 
 Measured: 11.3 ms a `docker://` step natively on the laptop (rootless), against a cold `run:` step
 at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.

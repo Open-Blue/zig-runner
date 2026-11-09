@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Before a commit: no commits on main, and what is being committed is formatted (Zig, Go) and its
 # workflows lint clean. Checks the staged content, not the working tree. pre-push runs the rest
-# of CI's checks. README, "Git hooks".
+# of CI's checks. CONTRIBUTING.md, "Git hooks".
 set -euo pipefail
 hook=pre-commit
 top=$(git rev-parse --show-toplevel)

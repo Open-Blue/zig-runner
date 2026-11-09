@@ -2,13 +2,15 @@
 # Eviction's floor on a disk that is really full (src/native/evict.zig), not a simulated shortage:
 # the test binary runs in a mount namespace of its own (bubblewrap, so no root) with a 64 MiB tmpfs,
 # which the test fills until a write fails with ENOSPC. Where bubblewrap or unprivileged user
-# namespaces are not there, it says so and exits 0, as the test skips without ZIG_RUNNER_FULL_DISK.
+# namespaces are not there, it says so and exits 0, as the test skips without ZIG_RUNNER_FULL_DISK;
+# with FULL_DISK_REQUIRED=1 (CI, which installs bubblewrap) it fails instead.
 #
 #   full-disk-test.sh        from anywhere
 set -euo pipefail
 cd "$(dirname "$0")/../../runner"
 
 if ! command -v bwrap >/dev/null || ! bwrap --ro-bind / / true 2>/dev/null; then
+	[[ ${FULL_DISK_REQUIRED:-} == 1 ]] && { echo "::error::full-disk-test.sh: no bubblewrap, or no user namespaces" >&2 && exit 1; }
 	echo "full-disk-test.sh: no bubblewrap, or no user namespaces: skipped" >&2
 	exit 0
 fi

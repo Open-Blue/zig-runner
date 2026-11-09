@@ -61,6 +61,9 @@ pub const Limits = struct {
     /// How often a volume in use is walked again: its size only steers eviction, and a walk is
     /// what the eviction must not cost more than. Tests: 0.
     remeasure_s: i64 = 60 * 60,
+    /// How long a dead tree that would not go is left alone before it is tried again: each try
+    /// costs a `syncfs` at a job's end, before its result is reported. Tests: shorter.
+    stuck_retry_ms: i64 = 60 * 60 * 1000,
 };
 
 /// How long a walk of an entry may take: the first, of one never measured, and any later one. A
@@ -71,6 +74,11 @@ const measure_again_ms = 1000;
 const least_removed = 64;
 /// What a walk may keep in memory of the directories' paths.
 const measure_max_stack = 16 * 1024 * 1024;
+/// What a walk cut short keeps of the directories it has yet to enter, beside the size, so the
+/// next one goes on from there; more than this and the next starts over.
+const resume_max_bytes = 256 * 1024;
+/// A walk cut short is gone on with for this long, then started over.
+const resume_max_age_s = 7 * 24 * 60 * 60;
 /// The most entries of an area looked at, so a store's size bounds the pass's memory.
 const max_entries = 16 * 1024;
 /// How deep a key goes, from `<owner>`, 0: `<owner>/<repository>/<scope>/<name>/<image>/runner`.
@@ -120,6 +128,10 @@ const Entry = struct {
     measured_s: i64 = 0,
     /// Its bytes when last measured.
     bytes: u64 = 0,
+    /// A walk cut short: what it had counted, and the directories (paths below `dir`) it had
+    /// yet to enter. Empty when the last walk was whole.
+    walked: u64 = 0,
+    pending: []const []const u8 = &.{},
     /// A dead runner's private copy (`volumes.open`), which only takes room.
     private: bool = false,
 };
@@ -142,7 +154,7 @@ pub fn run(s: Store, io: std.Io) void {
     var synced = syncDead(arena, io, s.root);
     if (!synced) return;
     var budget: Budget = .init(io, lim.budget_ms);
-    for (all_areas) |a| if (!removeDead(arena, io, s.root, a, &budget)) return;
+    for (all_areas) |a| if (!removeDead(arena, io, s.root, a, &budget, lim.stuck_retry_ms)) return;
     const vols = listVolumes(arena, io, s.root) catch return;
     const waited = treesWait(arena, io, s.root);
     var trees: []Entry = if (waited) &.{} else listTrees(arena, io, s.root, &budget) catch return;
@@ -176,7 +188,7 @@ pub fn run(s: Store, io: std.Io) void {
     }
     if (evicted) {
         if (!wait) dropRefs(arena, io, s.root);
-        if (synced) for (all_areas) |a| if (!removeDead(arena, io, s.root, a, &budget)) return;
+        if (synced) for (all_areas) |a| if (!removeDead(arena, io, s.root, a, &budget, lim.stuck_retry_ms)) return;
     }
 }
 
@@ -542,10 +554,26 @@ fn entryOf(arena: Allocator, io: std.Io, dir: []const u8, area: []const u8, volu
     if (e.measured_s == 0) return e;
     const f = Store.openPlain(arena, size) orelse return e;
     defer f.close(io);
-    var buf: [32]u8 = undefined;
-    const got = linux.read(f.handle, &buf, buf.len);
-    if (linux.errno(got) != .SUCCESS) return e;
-    e.bytes = std.fmt.parseInt(u64, std.mem.trim(u8, buf[0..got], " \n"), 10) catch 0;
+    var text: std.ArrayList(u8) = .empty;
+    var buf: [4096]u8 = undefined;
+    while (text.items.len < resume_max_bytes + buf.len) {
+        const got = linux.read(f.handle, &buf, buf.len);
+        if (linux.errno(got) != .SUCCESS or got == 0) break;
+        text.appendSlice(arena, buf[0..got]) catch return e;
+    }
+    var lines = std.mem.tokenizeScalar(u8, text.items, '\n');
+    e.bytes = std.fmt.parseInt(u64, std.mem.trim(u8, lines.next() orelse return e, " "), 10) catch 0;
+    const walk = lines.next() orelse return e;
+    if (!std.mem.startsWith(u8, walk, "walk ") or now(io) - e.measured_s > resume_max_age_s) return e;
+    const walked = std.fmt.parseInt(u64, walk["walk ".len..], 10) catch return e;
+    var pending: std.ArrayList([]const u8) = .empty;
+    while (lines.next()) |l| {
+        // A path is kept with a `/` before it, the walk's root being the one with nothing after.
+        if (l[0] != '/') return e;
+        pending.append(arena, l[1..]) catch return e;
+    }
+    e.walked = walked;
+    e.pending = pending.items;
     return e;
 }
 
@@ -756,6 +784,10 @@ var test_sync_fails = false;
 var test_no_inodes = false;
 /// Called between the walks and the tree half of a pass. Tests.
 var test_after_walks: ?*const fn () void = null;
+/// Every removal fails, as of a tree a mount holds or a file the filesystem will not unlink. Tests.
+var test_stuck = false;
+/// A walk (`usage`) stops after this many directories, as on a volume too big for its second. Tests.
+var test_dirs_max: u32 = 0;
 /// Levels `removeSome` went down. Tests.
 var test_descents: u32 = 0;
 /// A directory listing says no entry's kind, as on a filesystem that reports DT_UNKNOWN. Tests.
@@ -773,6 +805,9 @@ fn syncDead(arena: Allocator, io: std.Io, root: []const u8) bool {
         var it = dir.iterate();
         while (it.next(io) catch null) |e| {
             if (!std.mem.startsWith(u8, e.name, ".dead-")) continue;
+            // One that would not go is not worth a sync.
+            const p = std.fmt.allocPrint(arena, "{s}/{s}", .{ dir_path, e.name }) catch return false;
+            if (Stuck.waiting(io, p)) continue;
             if (test_sync_ms > 0) io.sleep(.fromMilliseconds(test_sync_ms), .awake) catch {};
             test_syncs += 1;
             if (!test_sync_fails and linux.errno(linux.syncfs(dir.handle)) == .SUCCESS) return true;
@@ -783,10 +818,48 @@ fn syncDead(arena: Allocator, io: std.Io, root: []const u8) bool {
     return true;
 }
 
+/// The dead trees that would not go, kept in memory for `Limits.stuck_retry_ms`: until then a pass
+/// neither tries one again nor syncs the filesystem for it, which a job's end would pay every time,
+/// before its result is reported. Not on disk: a restart tries them once, and a tree that
+/// stays costs one sync an hour at most. Paths are kept by hash, so a full table costs no memory.
+const Stuck = struct {
+    const slots = 8;
+    var mu: std.Io.Mutex = .init;
+    var hashes: [slots]u64 = @splat(0);
+    var until_ms: [slots]i64 = @splat(0);
+
+    fn waiting(io: std.Io, path: []const u8) bool {
+        const h = std.hash.Wyhash.hash(0, path);
+        const t = std.Io.Clock.awake.now(io).toMilliseconds();
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        for (hashes, until_ms) |x, until| if (x == h and t < until) return true;
+        return false;
+    }
+
+    /// `path` left alone for `ms`; when the table is full, the one that is up soonest is forgotten.
+    fn add(io: std.Io, path: []const u8, ms: i64) void {
+        const h = std.hash.Wyhash.hash(0, path);
+        const t = std.Io.Clock.awake.now(io).toMilliseconds();
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        var pick: usize = 0;
+        for (hashes, until_ms, 0..) |x, until, i| {
+            if (x == h) {
+                pick = i;
+                break;
+            }
+            if (until < until_ms[pick]) pick = i;
+        }
+        hashes[pick] = h;
+        until_ms[pick] = t +| ms;
+    }
+};
+
 /// Every `.dead-` entry of the area removed, as far as the budget goes. False only when the budget
 /// stopped it, which tells the pass to free no more yet: one that cannot be removed is logged and
-/// stops nothing, or it would stop every eviction for good.
-fn removeDead(arena: Allocator, io: std.Io, root: []const u8, name: []const u8, budget: *Budget) bool {
+/// stops nothing, or it would stop every eviction for good; it is left alone for `retry_ms`.
+fn removeDead(arena: Allocator, io: std.Io, root: []const u8, name: []const u8, budget: *Budget, retry_ms: i64) bool {
     const dir_path = std.fmt.allocPrint(arena, "{s}/{s}", .{ root, name }) catch return false;
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return true;
     defer dir.close(io);
@@ -798,10 +871,14 @@ fn removeDead(arena: Allocator, io: std.Io, root: []const u8, name: []const u8, 
     }
     for (dead.items) |n| {
         const p = std.fmt.allocPrint(arena, "{s}/{s}", .{ dir_path, n }) catch return false;
-        switch (removeSome(arena, p, io, budget)) {
+        if (Stuck.waiting(io, p)) continue;
+        switch (if (test_stuck) .stuck else removeSome(arena, p, io, budget)) {
             .gone => {},
             .spent => return false,
-            .stuck => std.log.warn("native: cannot remove {s}; it stays, and eviction goes on", .{p}),
+            .stuck => {
+                std.log.warn("native: cannot remove {s}; it stays, and eviction goes on", .{p});
+                Stuck.add(io, p, retry_ms);
+            },
         }
     }
     return true;
@@ -964,7 +1041,8 @@ fn measureOne(arena: Allocator, io: std.Io, entries: []Entry, remeasure: i64) vo
     const t = now(io);
     for (entries) |*e| {
         if (e.private) continue;
-        const stale = e.measured_s == 0 or (e.used_s >= e.measured_s and t - e.measured_s >= remeasure);
+        const stale = e.measured_s == 0 or e.pending.len > 0 or
+            (e.used_s >= e.measured_s and t - e.measured_s >= remeasure);
         if (!stale) continue;
         if (pick == null or e.measured_s < pick.?.measured_s) pick = e;
     }
@@ -972,15 +1050,28 @@ fn measureOne(arena: Allocator, io: std.Io, entries: []Entry, remeasure: i64) vo
     _ = measure(arena, io, e, if (e.measured_s == 0) measure_new_ms else measure_again_ms);
 }
 
-/// `e` walked for up to `ms` and the size kept beside it; whether the walk was whole.
+/// `e` walked for up to `ms` and the size kept beside it; whether the walk was whole. A walk cut
+/// short keeps the directories it has yet to enter beside the size, and the next goes on from
+/// there: a volume too big to walk in one pass is counted over several, not for ever by its
+/// first second.
 fn measure(arena: Allocator, io: std.Io, e: *Entry, ms: i64) bool {
-    const seen = usage(io, e.dir, .init(io, ms));
+    const from: Walk = if (e.pending.len > 0)
+        .{ .bytes = e.walked, .whole = false, .pending = e.pending }
+    else
+        .{ .bytes = 0, .whole = false };
+    const seen = usage(arena, io, e.dir, .init(io, ms), from);
     // Cut short, it is too small: what it saw before, if more, is the better guess.
     e.bytes = if (seen.whole) seen.bytes else @max(seen.bytes, e.bytes);
+    e.walked = seen.bytes;
+    e.pending = seen.pending;
     e.measured_s = now(io);
     const p = std.fmt.allocPrintSentinel(arena, "{s}.size", .{e.dir}, 0) catch return seen.whole;
-    var buf: [32]u8 = undefined;
-    const text = std.fmt.bufPrint(&buf, "{d}\n", .{e.bytes}) catch return seen.whole;
+    var text: std.ArrayList(u8) = .empty;
+    text.print(arena, "{d}\n", .{e.bytes}) catch return seen.whole;
+    if (e.pending.len > 0) {
+        text.print(arena, "walk {d}\n", .{e.walked}) catch return seen.whole;
+        for (e.pending) |l| text.print(arena, "/{s}\n", .{l}) catch return seen.whole;
+    }
     // Not synced: lost, it is measured again. Never trusted further than that.
     const flags: linux.O = .{
         .ACCMODE = .WRONLY,
@@ -994,26 +1085,53 @@ fn measure(arena: Allocator, io: std.Io, e: *Entry, ms: i64) bool {
     if (linux.errno(rc) != .SUCCESS) return seen.whole;
     const fd = std.math.cast(linux.fd_t, rc) orelse return seen.whole;
     defer _ = linux.close(fd);
-    _ = linux.write(fd, text.ptr, text.len);
+    var done: usize = 0;
+    while (done < text.items.len) {
+        const w = linux.write(fd, text.items[done..].ptr, text.items.len - done);
+        if (linux.errno(w) != .SUCCESS or w == 0) break;
+        done += w;
+    }
     return seen.whole;
 }
 
+/// What a walk found: the bytes on disk so far, whether it saw the whole tree, and when it did
+/// not, the directories (below the tree's top) it had yet to enter, if few enough to keep.
+const Walk = struct { bytes: u64, whole: bool, pending: []const []const u8 = &.{} };
+
 /// The bytes on disk of the tree `dir`, a file with several links shared among them, through no
 /// symlink and to any depth, in a tree jobs may be writing: what vanishes is passed over. Not whole
-/// when `budget` or `measure_max_stack` cut it short.
-fn usage(io: std.Io, dir: []const u8, budget: Budget) struct { bytes: u64, whole: bool } {
+/// when `budget` or `measure_max_stack` cut it short, or a directory is too deep to name (a path
+/// of `PATH_MAX`, which the kernel resolves one component at a time, each directory costing its
+/// depth: a chain of directories with no files would overrun any budget that a check every few
+/// entries lets through). It goes on from `from`'s directories, counting from its bytes. The
+/// clock is asked at every directory, and a directory cut short is left to the next walk whole.
+/// What is kept for the next walk is in `out`.
+fn usage(out: Allocator, io: std.Io, dir: []const u8, budget: Budget, from: Walk) Walk {
     var pass: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer pass.deinit();
     const a = pass.allocator();
     const root = Store.openRoot(a, dir) catch return .{ .bytes = 0, .whole = false };
     defer _ = linux.close(root);
     var stack: std.ArrayList([]const u8) = .empty;
-    stack.append(a, "") catch return .{ .bytes = 0, .whole = false };
     var held: usize = 0;
-    var total: u64 = 0;
+    if (from.pending.len == 0) {
+        stack.append(a, "") catch return .{ .bytes = 0, .whole = false };
+    } else for (from.pending) |p| {
+        held += p.len + @sizeOf([]const u8);
+        stack.append(a, a.dupe(u8, p) catch return .{ .bytes = from.bytes, .whole = false }) catch
+            return .{ .bytes = from.bytes, .whole = false };
+    }
+    var total: u64 = from.bytes;
+    var whole = true;
     var seen: u32 = 0;
+    var dirs: u32 = 0;
     var name: [256:0]u8 = undefined;
     while (stack.pop()) |rel| {
+        // The directory not yet listed is the first to be, next time.
+        const before_total = total;
+        const before_len = stack.items.len;
+        dirs +%= 1;
+        if (budget.late() or (test_dirs_max != 0 and dirs > test_dirs_max)) return stopped(out, total, &stack, rel, before_len);
         const fd = if (rel.len == 0) root else Store.openRel(a, root, rel) catch continue;
         defer if (fd != root) {
             _ = linux.close(fd);
@@ -1021,7 +1139,7 @@ fn usage(io: std.Io, dir: []const u8, budget: Budget) struct { bytes: u64, whole
         var it = (std.Io.Dir{ .handle = fd }).iterate();
         while (it.next(io) catch null) |e| {
             seen +%= 1;
-            if (seen % 64 == 0 and budget.late()) return .{ .bytes = total, .whole = false };
+            if (seen % 64 == 0 and budget.late()) return stopped(out, before_total, &stack, rel, before_len);
             if (e.name.len > 255) continue;
             @memcpy(name[0..e.name.len], e.name);
             name[e.name.len] = 0;
@@ -1035,13 +1153,35 @@ fn usage(io: std.Io, dir: []const u8, budget: Budget) struct { bytes: u64, whole
             const sub = (if (rel.len == 0)
                 a.dupe(u8, e.name)
             else
-                std.fmt.allocPrint(a, "{s}/{s}", .{ rel, e.name })) catch return .{ .bytes = total, .whole = false };
+                std.fmt.allocPrint(a, "{s}/{s}", .{ rel, e.name })) catch return stopped(out, before_total, &stack, rel, before_len);
+            if (sub.len >= linux.PATH_MAX - 1) {
+                whole = false;
+                continue;
+            }
             held += sub.len + @sizeOf([]const u8);
-            if (held > measure_max_stack) return .{ .bytes = total, .whole = false };
-            stack.append(a, sub) catch return .{ .bytes = total, .whole = false };
+            if (held > measure_max_stack) return stopped(out, before_total, &stack, rel, before_len);
+            stack.append(a, sub) catch return stopped(out, before_total, &stack, rel, before_len);
         }
     }
-    return .{ .bytes = total, .whole = true };
+    return .{ .bytes = total, .whole = whole };
+}
+
+/// A walk stopped in the directory `rel`, to be listed again whole: the bytes counted before it
+/// and the directories it had yet to enter (`stack`, cut back to `len` entries, with `rel` put
+/// on it), kept in `out` unless they are too many for the size file or a name in them has a line
+/// break, in which case the next walk starts over.
+fn stopped(out: Allocator, total: u64, stack: *std.ArrayList([]const u8), rel: []const u8, len: usize) Walk {
+    stack.shrinkRetainingCapacity(len);
+    stack.appendAssumeCapacity(rel);
+    var bytes: usize = 0;
+    for (stack.items) |p| {
+        bytes += p.len + 2;
+        if (bytes > resume_max_bytes or std.mem.indexOfScalar(u8, p, '\n') != null)
+            return .{ .bytes = total, .whole = false };
+    }
+    const kept = out.alloc([]const u8, stack.items.len) catch return .{ .bytes = total, .whole = false };
+    for (stack.items, kept) |p, *k| k.* = out.dupe(u8, p) catch return .{ .bytes = total, .whole = false };
+    return .{ .bytes = total, .whole = false, .pending = kept };
 }
 
 // --- tests ---
@@ -1295,6 +1435,7 @@ test "native eviction: the disk's floor frees room on a disk that is really full
     const day1 = try f.volume("d1", 12 * mib, 1);
     const today = try f.volume("today", 12 * mib, 0);
     try std.Io.Dir.cwd().deleteFile(testing.io, try std.fmt.allocPrint(arena, "{s}.size", .{day2}));
+    try std.Io.Dir.cwd().createDirPath(testing.io, try std.fmt.allocPrint(arena, "{s}/layers", .{f.s.root}));
     const ballast = try std.fmt.allocPrintSentinel(arena, "{s}/ballast", .{f.s.root}, 0);
     const wrote = try fillDisk(ballast);
     var st: linux.Statx = undefined;
@@ -1302,9 +1443,13 @@ test "native eviction: the disk's floor frees room on a disk that is really full
     try testing.expectEqual(wrote, st.size);
     // Really full: a file cannot grow, and the floor sees the shortage.
     try testing.expect(shortBy(arena, f.s.root, 20) != null);
+    // The job's result cannot be written yet.
+    if (std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/early", .{f.s.root}), .data = "x" })) |_| return error.TestUnexpectedResult else |_| {}
     // No cap: only the floor asks for room, a fifth of the disk.
     f.s.limits = .{ .volumes_max_bytes = 0, .min_free_pct = 20 };
-    run(f.s, testing.io);
+    // As a job's end runs it (`Backend.deinit`): layers first, then these, with the gc lock
+    // made on the full disk.
+    f.s.collect(arena, testing.io);
     try testing.expect(shortBy(arena, f.s.root, 20) == null);
     // One volume is a little short of a fifth of the disk: the two longest unused go, the one never
     // measured among them (a walk finds its size, though its file could not be written).
@@ -1313,6 +1458,7 @@ test "native eviction: the disk's floor frees room on a disk that is really full
     // Room again: the store takes writes.
     f.s.limits.min_free_pct = 0;
     try f.fill(day1, 1000);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/result", .{f.s.root}), .data = "done" });
 }
 
 test "native eviction: a dead runner's private copy goes, a running job's stays" {
@@ -2592,4 +2738,99 @@ test "native eviction: a volume left read-only with a lock for its inner volume 
     run(f.s, io);
     try testing.expect(!f.there(dir));
     try testing.expectEqual(@as(usize, 0), try f.deadLeft());
+}
+
+test "native eviction: a walk of a chain of directories too deep to name ends at once, not after its budget" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const io = testing.io;
+    const depth = 10_000;
+    const dir = try f.volume("deep", 6000, 30);
+    try needsDeepDirs(f, depth);
+    var fd = try Store.openDirAt(linux.AT.FDCWD, try f.arena().dupeSentinel(u8, dir, 0));
+    for (0..depth) |_| {
+        try goDown(fd);
+        const n = try Store.openDirAt(fd, "a");
+        _ = linux.close(fd);
+        fd = n;
+    }
+    _ = linux.close(fd);
+    // Each directory below a path's length used to cost its depth to open, and the clock was asked
+    // every 64 of them: 11 s over a budget of 1 s at 60,000 deep, and minutes with more.
+    const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
+    const seen = usage(f.arena(), io, dir, .init(io, 5000), .{ .bytes = 0, .whole = false });
+    try testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - t0 < 1500);
+    try testing.expect(!seen.whole);
+    try testing.expect(seen.bytes > 6000);
+    // The chain is removed as a pass removes one: the test directory's own cleanup would take minutes.
+    var budget: Budget = .init(io, 60_000);
+    while (removeSome(f.arena(), dir, io, &budget) == .spent) budget = .init(io, 60_000);
+}
+
+test "native eviction: a volume too big for a pass's walk is counted over several, from where the last stopped" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const io = testing.io;
+    const arena = f.arena();
+    const dir = try f.volume("big", 10, 30);
+    const payload: [5000]u8 = @splat('x');
+    for (0..40) |i| {
+        const d = try std.fmt.allocPrint(arena, "{s}/d{d}/s", .{ dir, i });
+        try std.Io.Dir.cwd().createDirPath(io, d);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/f", .{d}), .data = &payload });
+    }
+    const all = usage(arena, io, dir, .init(io, 60_000), .{ .bytes = 0, .whole = false });
+    try testing.expect(all.whole);
+    // Nine directories a walk: 81 of them need nine walks, each from the size file the one
+    // before left.
+    test_dirs_max = 9;
+    defer test_dirs_max = 0;
+    var walks: usize = 0;
+    var last: u64 = 0;
+    while (walks < 50) {
+        var e = try entryOf(arena, io, dir, "volumes", true, false);
+        _ = measure(arena, io, &e, 60_000);
+        try testing.expect(e.bytes >= last);
+        last = e.bytes;
+        walks += 1;
+        if (e.pending.len == 0) break;
+    }
+    try testing.expect(walks > 3 and walks < 50);
+    const done = try entryOf(arena, io, dir, "volumes", true, false);
+    try testing.expectEqual(all.bytes, done.bytes);
+    try testing.expectEqual(@as(usize, 0), done.pending.len);
+    // A later walk starts over from the top, and ends in the same place.
+    test_dirs_max = 0;
+    var again = done;
+    try testing.expect(measure(arena, io, &again, 60_000));
+    try testing.expectEqual(all.bytes, again.bytes);
+}
+
+test "native eviction: a dead tree that will not go costs a sync once, not at every job's end" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const io = testing.io;
+    const first = Hostile.p(f, "{s}/volumes/.dead-stuck-1", .{f.s.root});
+    try std.Io.Dir.cwd().createDirPath(io, first);
+    f.s.limits = .{ .volumes_max_bytes = 0, .min_free_pct = 0, .stuck_retry_ms = 600_000 };
+    test_stuck = true;
+    defer test_stuck = false;
+    test_syncs = 0;
+    for (0..5) |_| run(f.s, io);
+    try testing.expectEqual(@as(u32, 1), test_syncs);
+    // Another dead tree is still synced for, and one whose time is up is tried again.
+    const second = Hostile.p(f, "{s}/volumes/.dead-stuck-2", .{f.s.root});
+    try std.Io.Dir.cwd().createDirPath(io, second);
+    f.s.limits.stuck_retry_ms = 1;
+    run(f.s, io);
+    try testing.expectEqual(@as(u32, 2), test_syncs);
+    try io.sleep(.fromMilliseconds(20), .awake);
+    run(f.s, io);
+    try testing.expectEqual(@as(u32, 3), test_syncs);
+    // Whatever stopped it gone, it goes, and the first, still waiting, is left to its time.
+    test_stuck = false;
+    try io.sleep(.fromMilliseconds(20), .awake);
+    run(f.s, io);
+    try testing.expect(!f.there(second));
+    try testing.expect(f.there(first));
 }

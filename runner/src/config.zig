@@ -335,7 +335,7 @@ pub const Config = struct {
             error.ProdTrustsNoRef => "RUNNER_LABELS includes prod, but RUNNER_TRUSTED_REFS is " ++
                 "not set, so this runner would fail every job. Set it to the refs prod may run " ++
                 "(RUNNER_TRUSTED_REFS=refs/heads/main,refs/tags/v*), or to * to trust every ref " ++
-                "(README, \"Environments\").",
+                "(docs/OPERATIONS.md, \"Environments\").",
             error.EngineNoneNoNesting => "RUNNER_DAGGER_NESTING gives steps the Dagger engine, " ++
                 "and RUNNER_ENGINE=none has none: turn one of them off.",
             error.InvalidNativeRootfs => "RUNNER_NATIVE_ROOTFS is a directory's absolute path: " ++

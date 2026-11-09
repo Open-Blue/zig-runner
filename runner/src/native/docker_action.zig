@@ -43,9 +43,85 @@ fn shares(arena: Allocator, workspace: []const u8) ![]const sandbox.Spec.Contain
     });
 }
 
+/// Who a Docker action's image runs as, resolved as Docker resolves its `USER`.
+pub const ImageUser = struct { uid: u32, gid: u32, groups: []const u32 };
+
+/// `path` in an image's layers, `lowers` top first: the first layer that has it, "" when none
+/// does or one deletes it. The image's own links are followed, inside it.
+fn textInLayers(arena: Allocator, lowers: []const []const u8, path: []const u8) []const u8 {
+    for (lowers) |layer| switch (sandbox.readFollowingIn(arena, layer, path, 4 << 20) catch return "") {
+        .text => |t| return t,
+        .whiteout => return "",
+        .missing => {},
+    };
+    return "";
+}
+
+/// The image's `USER` (`user`, not root: `images.runsAsRoot`) as ids the job reaches, from the
+/// image's /etc/passwd and /etc/group (a name there, or a number; `images.userIds`), or why it
+/// cannot be: a name the image does not have (`docker run` refuses it as well), or ids past the
+/// job's range, which only root outside could give (`Backend.ids_per_slot`).
+pub fn resolveUser(arena: Allocator, lowers: []const []const u8, user: []const u8) !union(enum) {
+    ok: ImageUser,
+    refused: []const u8,
+} {
+    const passwd = textInLayers(arena, lowers, "/etc/passwd");
+    const group = textInLayers(arena, lowers, "/etc/group");
+    const ids = images.userIds(user, passwd, group) orelse return .{ .refused = try std.fmt.allocPrint(
+        arena,
+        "the image's USER {s} is not in its /etc/passwd or /etc/group",
+        .{user},
+    ) };
+    if (ids.uid >= Backend.ids_per_slot or ids.gid >= Backend.ids_per_slot) return .{
+        .refused = try std.fmt.allocPrint(arena, "the image's USER {s} is uid {d} and gid {d}, " ++
+            "and a job has the ids below {d} only", .{ user, ids.uid, ids.gid, Backend.ids_per_slot }),
+    };
+    return .{ .ok = .{
+        .uid = ids.uid,
+        .gid = ids.gid,
+        .groups = try Backend.mappedGroups(arena, try images.supplementaryGroups(arena, passwd, group, user)),
+    } };
+}
+
+/// Who an image run as `user` runs as, or why it cannot be run natively: root always can; another
+/// user only on a root runner (the shares are idmapped, `sandbox.Spec.Container.owner`), and one
+/// the image has. Resolved once, so what is checked is what is used.
+pub fn userCheck(arena: Allocator, lowers: []const []const u8, ref: []const u8, user: []const u8) !union(enum) {
+    root,
+    ok: ImageUser,
+    refused: []const u8,
+} {
+    if (images.runsAsRoot(user)) return .root;
+    if (std.os.linux.geteuid() != 0) return .{ .refused = try std.fmt.allocPrint(arena, "the image " ++
+        "{s} runs as USER {s}, and a rootless runner's Docker actions run as root only", .{ ref, user }) };
+    return switch (try resolveUser(arena, lowers, user)) {
+        .ok => |u| .{ .ok = u },
+        .refused => |why| .{ .refused = try std.fmt.allocPrint(arena, "{s}: {s}", .{ ref, why }) },
+    };
+}
+
+test "userCheck resolves the user once: root is root, and a name the image lacks is refused" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    try std.testing.expect((try userCheck(arena, &.{}, "img", "")) == .root);
+    try std.testing.expect((try userCheck(arena, &.{}, "img", "root")) == .root);
+    // Rootless: refused for the runner; as root: for the image having no such user. Never `.ok`.
+    try std.testing.expect((try userCheck(arena, &.{}, "img", "nobody-here")) == .refused);
+    try std.testing.expect((try userReason(arena, &.{}, "img", "nobody-here")) != null);
+}
+
+/// Why an image run as `user` cannot be run natively, or null (`userCheck`).
+pub fn userReason(arena: Allocator, lowers: []const []const u8, ref: []const u8, user: []const u8) !?[]const u8 {
+    return switch (try userCheck(arena, lowers, ref, user)) {
+        .root, .ok => null,
+        .refused => |why| why,
+    };
+}
+
 /// Why a job's Docker actions cannot run natively yet, or null: each `docker://` step's image
-/// must be pulled natively (P3, `find`) and run as root. `Backend.unsupported` leaves these steps
-/// to this, since it needs the image's config.
+/// must be pulled natively (P3, `find`) and its `USER` one the job's ids reach (`userReason`).
+/// `Backend.unsupported` leaves these steps to this, since it needs the image's config.
 pub fn unsupported(
     arena: Allocator,
     gpa: Allocator,
@@ -66,13 +142,9 @@ pub fn unsupported(
             .missing => |why| return why,
             // GitHub's documentation asks for root ("Docker actions must be run by the default
             // Docker user"); Dagger's path gives another USER the directories it writes, which
-            // here would be an idmapped share of the workspace.
-            .image => |img| if (!images.runsAsRoot(img.user)) return try std.fmt.allocPrint(
-                arena,
-                "the image {s} runs as USER {s}, and native Docker actions run as root only " ++
-                    "yet",
-                .{ d.image, img.user },
-            ),
+            // here are idmapped shares of the workspace.
+            .image => |img| if (try userReason(arena, &.{img.rootfs}, d.image, img.user)) |why|
+                return why,
         }
     }
     return null;
@@ -143,10 +215,30 @@ pub fn run(
         },
     };
     if (img_lowers.len == 0) img_lowers = try arena.dupe([]const u8, &.{img.rootfs});
+    // Another USER than root: the shares are theirs for the step (`sandbox.Spec.Container.owner`).
+    var step_user: ImageUser = .{ .uid = 0, .gid = 0, .groups = &.{} };
+    var owner: ?sandbox.Spec.Container.Owner = null;
     if (!images.runsAsRoot(img.user)) {
-        _ = try x.actionFailed(num, "{s}: the image runs as USER {s}; native Docker actions " ++
-            "run as root only yet", .{ dr.label, img.user });
-        return null;
+        switch (try userCheck(arena, img_lowers, ref, img.user)) {
+            .refused => |w| {
+                _ = try x.actionFailed(num, "{s}: {s}", .{ dr.label, w });
+                return null;
+            },
+            .ok => |u| step_user = u,
+            .root => {},
+        }
+        if (b.how.userns != .mapped) {
+            _ = try x.actionFailed(num, "{s}: a rootless runner's Docker actions run as root " ++
+                "only", .{dr.label});
+            return null;
+        }
+        owner = .{
+            .uid = step_user.uid,
+            .gid = step_user.gid,
+            .groups = step_user.groups,
+            .job_uid = b.uid,
+            .job_gid = b.gid,
+        };
     }
     const info: Exec.ImageInfo = .{
         .id = ref,
@@ -167,12 +259,14 @@ pub fn run(
         .contents = "",
         .mode = 0o644,
         .keep = true,
+        .own = true,
     });
     try files.append(arena, .{
         .path = dagger.event_path,
         .contents = try x.ev.eventJson(),
         .mode = 0o644,
         .keep = true,
+        .own = true,
     });
 
     // The container's own layer goes when the step ends; what it shares is the job's.
@@ -201,12 +295,13 @@ pub fn run(
     const workdir = b.workdir;
     b.workdir = dagger.docker_workspace;
     defer b.workdir = workdir;
-    const ended = try b.execOn(argv, env, files.items, 0, 0, out, .{
+    const ended = try b.execOn(argv, env, files.items, step_user.uid, step_user.gid, out, .{
         .lowers = img_lowers,
         .upper = upper,
         .work = "CW",
         .merged = "C",
         .shares = try shares(arena, x.ev.workspace),
+        .owner = owner,
     });
     demux.flushPartial();
     out.chunkFn(out.ptr, try markerLine(arena, "end", num, x.sh.mark));
@@ -353,9 +448,10 @@ fn planBuild(b: *Backend, bd: Build, ctx: []const u8, digests: bool) !struct { d
         },
     };
     const p = (try dockerfile.plan(arena, ins, base, if (digests) try baseId(arena, b.io, base) else "", &.{}, context)).ok;
-    if (!images.runsAsRoot(p.config.user)) {
-        b.build_reason = try std.fmt.allocPrint(arena, "the image runs as USER {s}, and native " ++
-            "Docker actions run as root only yet", .{p.config.user});
+    // Whether the USER is one the image has is known once it is built (`run`).
+    if (!images.runsAsRoot(p.config.user) and b.how.userns != .mapped) {
+        b.build_reason = try std.fmt.allocPrint(arena, "the image runs as USER {s}, and a " ++
+            "rootless runner's Docker actions run as root only", .{p.config.user});
         return error.Refused;
     }
     for (p.steps) |st| if (st.op == .run and !images.runsAsRoot(st.op.run.user)) {
@@ -551,6 +647,7 @@ fn combined(arena: Allocator, layer: []const u8, fc: u32) ![]const u8 {
 // --- tests ---
 
 const sink = @import("../sink.zig");
+const runner_config = @import("../config.zig");
 const testStep = @import("../dagger/testing.zig").testStep;
 const testJob = @import("../dagger/testing.zig").testJob;
 
@@ -854,4 +951,146 @@ test "a job whose docker:// step never runs stays native, though its image canno
     try std.testing.expect(std.mem.indexOf(u8, text, "Engine: native") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "This job runs on Dagger") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ran in image") != null);
+}
+
+test "an image's USER, as Docker resolves it, as ids the job reaches" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    // The user is in the upper layer; the group file is the lower one's.
+    try tmp.dir.createDirPath(io, "lower/etc");
+    try tmp.dir.createDirPath(io, "upper/etc");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lower/etc/passwd", .data = "app:x:7:7::/h:/bin/sh\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lower/etc/group", .data = "staff:x:50:app,actionuser\nuser:x:1501:\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "upper/etc/passwd", .data = "actionuser:x:1500:1500::/home/a:/bin/sh\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const stack = [_][]const u8{
+        try std.fmt.allocPrint(arena, "{s}/upper", .{root}),
+        try std.fmt.allocPrint(arena, "{s}/lower", .{root}),
+    };
+    // A name the top layer has; its file hides the lower one's, so `app` is not there.
+    const named = (try resolveUser(arena, &stack, "actionuser")).ok;
+    try std.testing.expectEqual(@as(u32, 1500), named.uid);
+    try std.testing.expectEqual(@as(u32, 1500), named.gid);
+    try std.testing.expectEqualSlices(u32, &.{50}, named.groups);
+    try std.testing.expect((try resolveUser(arena, &stack, "app")) == .refused);
+    // A number the image does not list is Docker's too: gid 0 unless one is given.
+    const bare = (try resolveUser(arena, &stack, "4000")).ok;
+    try std.testing.expectEqual(@as(u32, 4000), bare.uid);
+    try std.testing.expectEqual(@as(u32, 0), bare.gid);
+    const both = (try resolveUser(arena, &stack, "4000:1501")).ok;
+    try std.testing.expectEqual(@as(u32, 1501), both.gid);
+    // Past the job's ids: not native, whoever the user is.
+    try std.testing.expect((try resolveUser(arena, &stack, "70000")) == .refused);
+    try std.testing.expect((try resolveUser(arena, &stack, "1:70000")) == .refused);
+}
+
+test "on a root runner, a Docker action as the image's USER writes the workspace and file commands" {
+    if (std.os.linux.geteuid() != 0) {
+        std.debug.print("native backend test skipped: it needs root\n", .{});
+        return error.SkipZigTest;
+    }
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    cfg.images = try testImage(arena, &tmp, "zr-test/user:1",
+        \\{"config":{"User":"actionuser","Env":["PATH=/usr/bin:/bin"]}}
+    );
+    // The image's own files: the user's home is theirs, and /etc/group names a group of theirs.
+    const base = try std.fmt.allocPrint(arena, "images/{s}/rootfs", .{try images.key(arena, "zr-test/user:1")});
+    try tmp.dir.writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "{s}/etc/passwd", .{base}),
+        .data = "root:x:0:0:root:/root:/bin/sh\nactionuser:x:1500:1500::/home/actionuser:/bin/sh\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "{s}/etc/group", .{base}),
+        .data = "root:x:0:\nactionuser:x:1500:\nstaff:x:50:actionuser\n",
+    });
+    try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/home/actionuser", .{base}));
+    const image_home = try std.fmt.allocPrintSentinel(arena, "{s}/{s}/rootfs/home/actionuser", .{
+        cfg.images,
+        try images.key(arena, "zr-test/user:1"),
+    }, 0);
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.chown(image_home, 1500, 1500));
+    // /github is the runner user's in the provisioned image, /tmp is everyone's.
+    try tmp.dir.createDirPath(io, "rootfs/github");
+    const github = try std.fmt.allocPrintSentinel(arena, "{s}/github", .{cfg.rootfs}, 0);
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.chown(github, 1001, 1001));
+    const tmp_dir = try std.fmt.allocPrintSentinel(arena, "{s}/tmp", .{cfg.rootfs}, 0);
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.chmod(tmp_dir, 0o1777));
+
+    for ([_]struct { user: runner_config.StepUser, job: u32 }{
+        .{ .user = .runner, .job = 1001 },
+        .{ .user = .root, .job = 0 },
+    }) |c| {
+        var s1 = testStep("echo kept > kept.txt; mkdir keep-dir; echo in-dir > keep-dir/f");
+        s1.name = "job";
+        // As the image's user: it reads and changes what the job made, makes its own files and
+        // directories, writes its file commands and /github/home, has its group, and writes
+        // nothing of the image but its own home.
+        const s2 = dockerStep("zr-test/user:1", &.{
+            .{ .name = "entrypoint", .value = .{ .lit = "sh" } },
+            .{ .name = "args", .value = .{ .lit = "-c \"echo ids=$(id -u):$(id -g):$(id -G); " ++
+                "cat kept.txt keep-dir/f; echo changed >> kept.txt; echo made > made.txt; " ++
+                "mkdir sub; echo x > sub/f; echo said=hi >> $GITHUB_OUTPUT; " ++
+                "echo FROM_ACTION=yes >> $GITHUB_ENV; echo HOME=$HOME; touch /github/home/h; " ++
+                "echo mine >> /home/actionuser/f; rm keep-dir/f; " ++
+                "test -w /etc/passwd || echo etc not writable; test -s /github/workflow/event.json " ++
+                "&& echo event\"" } },
+        });
+        // The job's user after it: every file is theirs, the action's included.
+        const s3 = testStep("id -u; echo more >> made.txt && echo more >> sub/f && " ++
+            "echo more >> kept.txt && stat -c 'owner %u' made.txt sub sub/f kept.txt . && " ++
+            "stat -c 'home %u' /github/home/h && test \"$FROM_ACTION\" = yes && echo env ok; " ++
+            "ls keep-dir | wc -l");
+        const job = testJob(&.{ s1, s2, s3 });
+
+        var env: std.process.Environ.Map = .init(arena);
+        var w: std.Io.Writer.Allocating = .init(arena);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+        const res = try dagger.run(arena, io, &env, .{
+            .native = cfg,
+            .step_user = c.user,
+            .gpa = std.testing.allocator,
+        }, job, &log);
+        const text = w.written();
+        errdefer std.debug.print("{s}\n", .{text});
+        for (res.steps) |st| try std.testing.expectEqual(dagger.Outcome.success, st.outcome);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Engine: native") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "ids=1500:1500:1500 50") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "HOME=/github/home") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "etc not writable") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "event") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "env ok") != null);
+        const owner = try std.fmt.allocPrint(arena, "owner {d}", .{c.job});
+        try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, text, owner));
+        const home_owner = try std.fmt.allocPrint(arena, "home {d}", .{c.job});
+        try std.testing.expect(std.mem.indexOf(u8, text, home_owner) != null);
+
+        // The action as the job's first step, as the image's user: its file commands are
+        // applied, and the job's user's step after it writes its own beside them.
+        const first = dockerStep("zr-test/user:1", &.{
+            .{ .name = "entrypoint", .value = .{ .lit = "sh" } },
+            .{ .name = "args", .value = .{ .lit = "-c \"echo FROM_DOCKER=yes >> $GITHUB_ENV\"" } },
+        });
+        const after = testStep("test \"$FROM_DOCKER\" = yes && echo v=1 >> \"$GITHUB_OUTPUT\" && " ++
+            "echo wrote its output");
+        var w2: std.Io.Writer.Allocating = .init(arena);
+        var log2: sink.LogSink = .{ .stdout = .{ .writer = &w2.writer } };
+        const res2 = try dagger.run(arena, io, &env, .{
+            .native = cfg,
+            .step_user = c.user,
+            .gpa = std.testing.allocator,
+        }, testJob(&.{ first, after }), &log2);
+        errdefer std.debug.print("{s}\n", .{w2.written()});
+        for (res2.steps) |st| try std.testing.expectEqual(dagger.Outcome.success, st.outcome);
+        try std.testing.expect(std.mem.indexOf(u8, w2.written(), "wrote its output") != null);
+    }
 }

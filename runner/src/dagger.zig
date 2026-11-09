@@ -3217,6 +3217,51 @@ test "a second cancel can shorten the grace period, never lengthen it" {
     try std.testing.expectEqual(@as(i64, 2_000), c.hard_deadline_ms.load(.acquire));
 }
 
+test "a cancel before the first step: the steps that survive it run and are reported (#437)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var hog = testStep("hog");
+    var after = testStep("after");
+    after.condition = "success()";
+    var always = testStep("always");
+    always.condition = "always()";
+    var on_cancel = testStep("on-cancel");
+    on_cancel.condition = "cancelled()";
+    hog.name = "Hog";
+    const steps = [_]job_mod.Step{ hog, after, always, on_cancel };
+    const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "a\\n"), try exec(arena, "C2", 0, "b\\n") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var rec: Recorder = .{ .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    var cancel: Cancel = .{};
+    cancel.request(std.Io.Clock.real.now(std.testing.io).toMilliseconds() + 100_000);
+    const res = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+        .cancel = &cancel,
+        .observer = .{ .ptr = &rec, .startedFn = Recorder.started, .finishedFn = Recorder.finished },
+    }, testJob(&steps), &log);
+    // Hog and After are skipped; Always and On cancel run, and each is told to the observer (the
+    // live view), so the step list names all four.
+    const want = [_][]const u8{
+        "finish 1 Hog skipped",
+        "finish 2 n skipped",
+        "start 3 n t",
+        "finish 3 n success",
+        "start 4 n t",
+        "finish 4 n success",
+    };
+    try std.testing.expectEqual(want.len, rec.events.items.len);
+    for (want, rec.events.items) |expected, got| try std.testing.expectEqualStrings(expected, got);
+    const outcomes = [_]Outcome{ .skipped, .skipped, .success, .success };
+    for (outcomes, res.steps) |expected, got| try std.testing.expectEqual(expected, got.outcome);
+    try std.testing.expect(res.cancelled and !res.succeeded);
+}
+
 test "a cancel between steps does not stop the next step" {
     var f: FakeAbort = .{};
     var c: Cancel = .{};
