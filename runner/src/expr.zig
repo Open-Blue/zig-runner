@@ -1571,7 +1571,58 @@ pub fn evalCondition(arena: Allocator, cond: []const u8, scope: Scope) Error!boo
     return toBool(v);
 }
 
+/// Whether an `if:` expression is false whatever the job's state and contexts: it reads no
+/// context, calls no status function (`failure()` is true once a step failed) and no `hashFiles`,
+/// so it has one value, and that is false (`if: false`, `if: ${{ 1 == 2 }}`). A step with one never
+/// runs, and the native backend does not pull what only such a step uses. An expression that does
+/// not parse is not never true: the job's own evaluation reports it.
+pub fn neverTrue(arena: Allocator, cond: []const u8) Allocator.Error!bool {
+    var text = std.mem.trim(u8, cond, " \t\r\n");
+    if (std.mem.startsWith(u8, text, "${{") and std.mem.endsWith(u8, text, "}}"))
+        text = std.mem.trim(u8, text[3 .. text.len - 2], " \t\r\n");
+    if (text.len == 0) return false;
+    const n = parse(arena, text, null, null) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    if (!isConstant(n)) return false;
+    const v = evaluate(arena, text, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    return !toBool(v);
+}
+
+/// Whether `n` reads nothing but its own literals: no context, and no function but the pure ones.
+fn isConstant(n: *const Node) bool {
+    return switch (n.*) {
+        .literal => true,
+        .ident, .prop, .index, .star => false,
+        .call => |c| blk: {
+            for ([_][]const u8{ "success", "always", "failure", "cancelled", "hashFiles" }) |f|
+                if (std.ascii.eqlIgnoreCase(c.name, f)) break :blk false;
+            for (c.args) |a| if (!isConstant(a)) break :blk false;
+            break :blk true;
+        },
+        .not => |i| isConstant(i),
+        .bin => |b| isConstant(b.l) and isConstant(b.r),
+    };
+}
+
 // --- tests ---
+
+test "neverTrue: only a condition with one value, false" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    for ([_][]const u8{ "false", "${{ false }}", " ${{false}} ", "1 == 2", "!true", "''", "0", "null", "contains('abc', 'x')", "false && true", "format('{0}', '') == 'x'" }) |c|
+        try std.testing.expect(try neverTrue(ar, c));
+    for ([_][]const u8{
+        "",             "true",              "success()",             "always()",  "failure()", "cancelled()", "false || always()",    "github.event_name == 'push'",
+        "env.X == 'y'", "steps.a.outputs.b", "hashFiles('x') == 'y'", "matrix.os", "'x'",       "1",           "contains('abc', 'b')", "(((",
+        "inputs.x",
+    }) |c| try std.testing.expect(!(try neverTrue(ar, c)));
+}
 
 fn tctx(entries: []const Value.Entry) Scope {
     return .{ .contexts = entries };

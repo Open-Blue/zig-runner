@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A docker:// step that never runs (an if: that is false whatever the job''s state) no longer decides whether the job runs natively: its image is not pulled, so one that cannot be pulled no longer moves the whole job to Dagger (#351)'
+time: 2026-11-08T10:32:38.726635953-05:00
