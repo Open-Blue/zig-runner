@@ -228,11 +228,7 @@ pub fn loadLocal(b: *Backend, x: *Exec, u: job_mod.Uses) !Exec.LoadResult {
 fn imageReason(b: *Backend, image: []const u8) !?[]const u8 {
     return switch (try docker_action.find(b.arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, image, &b.held)) {
         .missing => |why| why,
-        .image => |img| if (images.runsAsRoot(img.user)) null else try std.fmt.allocPrint(
-            b.arena,
-            "the image {s} runs as USER {s}, and native Docker actions run as root only yet",
-            .{ image, img.user },
-        ),
+        .image => |img| try docker_action.userReason(b.arena, &.{img.rootfs}, image, img.user),
     };
 }
 
