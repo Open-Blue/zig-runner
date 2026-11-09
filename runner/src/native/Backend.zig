@@ -545,8 +545,8 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
         return "a job container's `ports:` need the job's own network, which a rootless " ++
             "runner does not give: its steps already share the host's (phase 5)";
     if (opts.nesting) return "`dagger call` in a step (RUNNER_DAGGER_NESTING) needs a Dagger " ++
-        "engine, which the native backend does not provide: keep an engine for this pool " ++
-        "(RUNNER_ENGINE not `none`) and the job runs on Dagger, or turn nesting off";
+        "engine, which the native backend does not provide; a pool that needs it keeps an " ++
+        "engine (RUNNER_ENGINE not `none`)";
     // dpkg gives files to other users and groups (`root:adm`), which one mapped id cannot hold.
     if (std.os.linux.geteuid() != 0 and cfg.rootfs.len == 0 and opts.provision and
         std.mem.eql(u8, dagger.resolveImage(if (job.container) |jc| switch (jc.image) {
@@ -4515,7 +4515,7 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     try expectReason("`dagger call` in a step", nesting_why);
     try expectReason("needs a Dagger engine", nesting_why);
     try expectReason("RUNNER_ENGINE not `none`", nesting_why);
-    try expectReason("turn nesting off", nesting_why);
+    try expectReason("a pool that needs it keeps an engine", nesting_why);
 
     // A job the runner does not vouch for, from GitHub or a saved one (`--exec-job`).
     var remote = ok;

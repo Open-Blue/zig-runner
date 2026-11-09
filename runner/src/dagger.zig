@@ -5791,8 +5791,8 @@ test "without an engine, a job native cannot run fails at once and says why, sta
     msg = res.engine_error orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, msg, "RUNNER_ENGINE=none). This job runs on " ++
         "Dagger: `dagger call` in a step (RUNNER_DAGGER_NESTING) needs a Dagger engine, which the " ++
-        "native backend does not provide: keep an engine for this pool (RUNNER_ENGINE not `none`) " ++
-        "and the job runs on Dagger, or turn nesting off.") != null);
+        "native backend does not provide; a pool that needs it keeps an engine (RUNNER_ENGINE not " ++
+        "`none`).") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "could not start Dagger") == null);
     // No native backend at all: the same refusal, with no reason to give.
     res = try run(arena, std.testing.io, &env, .{
