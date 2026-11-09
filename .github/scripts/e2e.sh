@@ -258,12 +258,17 @@ wait_run() {
 jobs_of() { api "repos/$repo/actions/runs/$1/attempts/${2:-1}/jobs?per_page=50"; }
 # jobs_settled ID [ATTEMPT]: the run's jobs once each has a conclusion. The run being completed does
 # not mean the jobs list says so yet: during an incident it showed `null` for jobs that had
-# succeeded. Re-reads for up to a minute; what it last read, if some job never settles.
+# succeeded. Nor does it mean the step lists are there: the runner had reported every step of a
+# cancelled job (#437) while the list, read 10 s after the job completed, still showed `Always` with no
+# conclusion and no `On cancel` (the job's API page showed all of them minutes later), and for the
+# native runner showed no steps at all. So a job that ran also needs its steps, each concluded.
+# Re-reads for up to a minute; what it last read, if some job never settles.
 jobs_settled() {
 	local jobs=""
 	for _ in $(seq 20); do
 		jobs=$(jobs_of "$@" 2>/dev/null) || jobs=""
-		jq -e '(.jobs | length) > 0 and all(.jobs[]; .status == "completed" and .conclusion != null)' \
+		jq -e '(.jobs | length) > 0 and all(.jobs[]; .status == "completed" and .conclusion != null and
+			(.conclusion == "skipped" or ((.steps | length) > 0 and all(.steps[]; .conclusion != null))))' \
 			<<<"$jobs" >/dev/null 2>&1 && break
 		sleep 3
 	done
