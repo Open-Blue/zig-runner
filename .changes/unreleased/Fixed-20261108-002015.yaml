@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Native backend: a job container''s host-path volumes are refused on a mount without nosuid and nodev on the host, nested with another volume, on a rootless runner, or on a filesystem that cannot be idmapped unless RUNNER_NATIVE_HOST_PATHS_UNMAPPED=true; mount points are made before any bind and through no mount; each job is held to the list checked at start; the runner''s executable, App key directory and env files are refused; and a refused source says nothing of what exists on the host'
-time: 2026-11-08T00:20:15.867933548-05:00

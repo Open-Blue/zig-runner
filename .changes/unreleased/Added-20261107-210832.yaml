@@ -1,3 +1,0 @@
-kind: Added
-body: 'Native backend: a job container''s named volumes outlive the job as Docker''s do, kept in the native store per repository and trust scope, filled from the image when new, read-only with `:ro`, and evicted like the cache volumes'
-time: 2026-11-07T21:08:32.174314385-05:00

@@ -1,3 +1,0 @@
-kind: Changed
-body: CI scripts stream their progress into the job log as they run (tlc.sh and spin.sh per configuration, zig-stress.sh per round, store-crash.sh every 25 crash points, the comparison scripts per phase), not only a summary at the end
-time: 2026-11-08T01:54:30.190678761-05:00

@@ -1,3 +1,0 @@
-kind: Changed
-body: CI runs eviction's really-full-disk test (full-disk-test.sh) on every pull request that can affect the tests, instead of only by hand
-time: 2026-11-08T10:25:24.00906361-05:00

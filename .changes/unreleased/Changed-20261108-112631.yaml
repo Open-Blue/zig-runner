@@ -1,3 +1,0 @@
-kind: Changed
-body: A native job container's --tmpfs is refused above the runner's mounts and files (/github, /etc) and where an image's symlink leads onto them, and with no job cgroup (RUNNER_NATIVE_CGROUP=none) an unsized --tmpfs or more than 1 GiB of --tmpfs and --shm-size fails the job
-time: 2026-11-08T11:26:31.386034944-05:00

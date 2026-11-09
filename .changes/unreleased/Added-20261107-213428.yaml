@@ -1,3 +1,0 @@
-kind: Added
-body: 'Native backend: a job container''s host-path volumes, off by default, bound only from the directories RUNNER_NATIVE_HOST_PATHS allows (never for untrusted jobs), nosuid and nodev, read-only with `:ro`, idmapped through the volumes'' id range; a path not allowed fails the job naming the setting'
-time: 2026-11-07T21:34:28.559997925-05:00

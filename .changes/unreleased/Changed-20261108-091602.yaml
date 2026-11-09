@@ -1,3 +1,0 @@
-kind: Changed
-body: Valgrind in CI stops a run whose log has not grown for ten minutes (eight for a pull request's changed tests) and names the test that was running, instead of waiting for the job's limit
-time: 2026-11-08T09:16:02.897169171-05:00

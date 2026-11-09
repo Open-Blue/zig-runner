@@ -1,3 +1,0 @@
-kind: Added
-body: The runner can pull the default job image already provisioned, built by a new "provisioned image" workflow for linux/amd64 and linux/arm64 from the runner's own provisioning script and pinned by digest, instead of running apt-get on every new machine and empty store (22-45 s, and Ubuntu's mirrors). A pull that fails provisions as before and "Set up job" says so; RUNNER_PROVISIONED_IMAGE=false never pulls it. Nothing is pinned yet, so nothing changes until a maintainer publishes the images and pins them (provisioned-pin.sh).
-time: 2026-11-07T21:38:37.411617027-05:00

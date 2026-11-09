@@ -1,3 +1,0 @@
-kind: Added
-body: The nightly fuzz job has a zstd target that holds the runner's own zstd decoder to std's on every input (the same bytes or both an error, within a window limit, a heap limit and an output cap, and no hang), seeded with frames of every literals and sequences mode, and a test that flips each bit of the small seeds. It found three things std's decoder takes that libzstd refuses (an offset past the window, a Huffman tree that is not complete, a literal stream not used up), which the runner's decoder refuses with errors of their own; the decoder also now refuses a block over its window and a frame that is not the size its header says
-time: 2026-11-08T02:52:03.827247835-05:00

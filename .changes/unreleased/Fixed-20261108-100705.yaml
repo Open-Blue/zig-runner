@@ -1,3 +1,0 @@
-kind: Fixed
-body: The end to end suite reads a cancelled job's steps only once each has its conclusion, not when GitHub's step list still lags behind the finished job (#437)
-time: 2026-11-08T10:07:05.925557688-05:00

@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Native backend: a job container''s explicit host ports must be inside RUNNER_NATIVE_PORT_RANGE (49152-65535 by default) and never the runner''s own database, engine or Docker port; ports published beyond loopback refuse peers of the runner''s jobs and of the host''s bridges; 127.0.0.1 is published on ::1 too; the relay connects without blocking, closes idle connections, lets a newcomer replace the quietest and caps new UDP clients a second'
-time: 2026-11-08T00:45:25.021159706-05:00

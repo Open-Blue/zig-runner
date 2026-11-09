@@ -1,3 +1,0 @@
-kind: Added
-body: 'Native backend: a job container''s `ports:` are published from the host by a relay of the runner''s (TCP and UDP), on 127.0.0.1 unless RUNNER_NATIVE_PORT_ADDRESSES allows other addresses, with a bare port given one the kernel picks and reported as `docker port` does; no port below 1024, none for untrusted jobs'
-time: 2026-11-07T21:56:54.121194248-05:00

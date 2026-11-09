@@ -1,3 +1,0 @@
-kind: Fixed
-body: A host path (RUNNER_NATIVE_HOST_PATHS) that the runner's mount table also shows at another path without nosuid and nodev is refused at start and closed for each job; the docs say to mount the whole filesystem nosuid,nodev, since a self-bind covers only the runner's mount namespace and is lost at reboot
-time: 2026-11-08T10:14:08.33750257-05:00

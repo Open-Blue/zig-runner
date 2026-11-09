@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Eviction no longer overruns a job''s end on a chain of directories with no files: a walk of a volume asks the clock at every directory, and a directory too deep to name is not walked a component at a time. A volume too big to walk in one pass is counted over several, resuming from the directories the last one left in its size file. A dead tree that will not go is left alone for an hour instead of costing a syncfs at every job''s end (#357).'
-time: 2026-11-08T09:49:20.744063163-05:00

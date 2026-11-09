@@ -1,3 +1,0 @@
-kind: Added
-body: 'Native job containers honour more of `options:`: `--hostname`, `--add-host`, `--shm-size`, `--tmpfs` (nosuid and nodev, noexec unless asked), `--memory` (within the job''s cgroup limit, never above it) and `--init` (#352). Security-sensitive flags (`--privileged`, `--cap-add`, `--security-opt`, `--device`, `--network`, `--pid`, `--ipc`, `--userns`) stay refused, naming the flag. A native job no longer logs the Dagger path''s "options not supported here and ignored" warning for settings it carries out.'
-time: 2026-11-08T10:27:13.683305119-05:00
