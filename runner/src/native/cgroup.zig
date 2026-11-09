@@ -541,6 +541,13 @@ pub const Job = struct {
         return j.steps_dir orelse j.dir;
     }
 
+    /// The job's `memory.max` set to `bytes`, for a job container's `--memory`: the caller only
+    /// lowers it, never past what the operator allows a job.
+    pub fn lowerMemory(j: Job, arena: Allocator, bytes: u64) !void {
+        const text = try std.fmt.allocPrint(arena, "{d}", .{bytes});
+        if (write(arena, j.dir, "memory.max", text) != .SUCCESS) return error.MemoryLimitFailed;
+    }
+
     /// Where a service's helper, and the relay, join.
     pub fn servicesDir(j: Job) []const u8 {
         return j.services_dir orelse j.dir;
@@ -837,6 +844,23 @@ fn writeParent(t: *std.testing.TmpDir, swap: ?[]const u8, jobs: bool) !void {
         .sub_path = "cgroup.stat",
         .data = if (jobs) "nr_descendants 2\nnr_dying_descendants 0\n" else "nr_descendants 0\n",
     });
+}
+
+test "native cgroup: a job container's --memory is written as the job's memory.max" {
+    const io = std.testing.io;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeParent(&tmp, null, false);
+    const job: Job = .{ .dir = try tmp.dir.realPathFileAlloc(io, ".", arena) };
+    try job.lowerMemory(arena, 128 << 20);
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "134217728",
+        std.mem.trim(u8, try tmp.dir.readFile(io, "memory.max", &buf), "\n\x00"),
+    );
 }
 
 test "native cgroup: every job's start holds all jobs to their limits on the parent" {

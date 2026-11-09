@@ -77,6 +77,12 @@ image_gid: u32 = 0,
 groups: []const u32 = &.{},
 /// What a `container:` job's `options:` ask for (`container_options.zig`), read by `base`.
 container_opts: container_options.Options = .{},
+/// What of them the sandbox carries out in each of the job's own steps (`readContainerOptions`),
+/// and the same as the text `below` keys the job's layers by ("" when none is set).
+sandbox_opts: sandbox.Spec.ContainerOpts = .{},
+opts_key: []const u8 = "",
+/// The `/etc/hosts` lines of `--add-host` and `--hostname`, added to the job's hosts file.
+hosts_extra: []const u8 = "",
 /// `Config.port_addresses`: the host addresses a job container may publish on (`publishPorts`).
 port_addresses: []const [4]u8 = &publish.default_addresses,
 /// `Config.port_range` and `Config.reserved_ports`.
@@ -1136,7 +1142,13 @@ fn resolvPaths(cfg: *const Config) []const []const u8 {
 /// host's, as steps get it, and a line naming the loopback, `services.hostsLine`) bound in place
 /// of the host's, read-only.
 pub fn serviceHosts(b: *Backend, names: []const []const u8) !void {
-    const line = try services.hostsLine(b.arena, names);
+    try b.writeHosts(try services.hostsLine(b.arena, names));
+}
+
+/// The job's hosts file: the host's, `hosts_extra` (the container's `--add-host`s) and `line`
+/// (its services' names), in place of the host's in every bind. Nothing to write is no file.
+fn writeHosts(b: *Backend, service_line: []const u8) !void {
+    const line = try std.mem.concat(b.arena, u8, &.{ b.hosts_extra, service_line });
     if (line.len == 0) return;
     const cwd = std.Io.Dir.cwd();
     const host = cwd.readFileAlloc(b.io, "/etc/hosts", b.arena, .limited(1 << 20)) catch
@@ -2587,6 +2599,7 @@ fn execIn(
         .canonical = canonical,
         .volume_id_base = volumeIdBase(b.subid_base),
         .container = container,
+        .container_opts = b.sandbox_opts,
     }, &b.running, out);
     b.timings.helper(arena, ended.helper, ended.spawned, ended.ended);
     if (new_layer) try b.layers.append(arena, .{ .name = upper, .path = upper_path });
@@ -2679,6 +2692,7 @@ fn below(b: *Backend) ?Store.Key {
         .userns = @tagName(b.how.userns),
         .binds = binds,
         .seeds = b.seed_ids.items,
+        .container_opts = b.opts_key,
     }, null);
 }
 
@@ -2694,6 +2708,9 @@ pub const Below = struct {
     /// release, architecture and step user each was built for, and which build it is, as one
     /// evicted is built again and need not be the same tree.
     seeds: []const []const u8 = &.{},
+    /// The job container's `--hostname`, `--shm-size` and `--tmpfs`, which the steps run under
+    /// (`setUpSandboxOptions`); "" for none, which keys as before.
+    container_opts: []const u8 = "",
 };
 
 /// `below`'s digest (`KeyHasher.plain("below a base")`, then each field). `bytes`, when given,
@@ -2723,6 +2740,10 @@ pub fn belowKey(in: Below, bytes: ?*std.Io.Writer) Store.Key {
         // Each bind's flag, or none when no bind is a volume (the model's empty `volumes`).
         h.int(if (volumes_bound) in.binds.len else 0);
         if (volumes_bound) for (in.binds) |bd| h.int(@intFromBool(bd.volume));
+    }
+    if (in.container_opts.len > 0) {
+        h.field("container options");
+        h.field(in.container_opts);
     }
     return h.final();
 }
@@ -3093,13 +3114,72 @@ fn readContainerOptions(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void
         return error.BaseContainerFailed;
     };
     b.container_opts = o;
+    // A tmpfs and /dev/shm are charged to the memory cgroup of the job; with none, they would pin
+    // host memory nobody accounts for (docs/native-backend.md, "Job container options").
+    if (b.job_cgroup == null) if (container_options.withoutCgroup(o)) |reason| {
+        err_msg.* = reason;
+        return error.BaseContainerFailed;
+    };
+    var more: std.ArrayList(u8) = .empty;
+    if (o.hostname) |h| try more.print(b.arena, ", `--hostname` {s}", .{h});
+    if (o.add_hosts.len > 0) try more.print(b.arena, ", {d} `--add-host`", .{o.add_hosts.len});
+    if (o.shm_size) |n| try more.print(b.arena, ", `--shm-size` {d} MiB", .{n >> 20});
+    if (o.tmpfs.len > 0) try more.print(b.arena, ", {d} `--tmpfs`", .{o.tmpfs.len});
+    if (o.memory) |n| try more.print(b.arena, ", `--memory` {d} MiB{s}", .{
+        n >> 20,
+        try b.limitMemory(n, err_msg),
+    });
+    try b.setUpSandboxOptions(o);
     try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Container options: {d} " ++
-        "`--env`{s}{s}; {d} understood and without effect natively (`--workdir`, `--health-*`)", .{
+        "`--env`{s}{s}{s}; {d} understood and without effect natively (`--workdir`, " ++
+        "`--health-*`, `--init`)", .{
         o.env.len,
         if (o.user != null) ", `--user` " else "",
         o.user orelse "",
+        more.items,
         o.no_effect,
     }));
+}
+
+/// `--memory` as a limit of the job's cgroup, lowered when it is below the runner's own for a
+/// job (never raised: the operator's limit is the most a job gets). The words that follow the
+/// number in "Set up job". A job with no cgroup of its own cannot be held to one: it fails
+/// rather than run without the limit it asked for.
+fn limitMemory(b: *Backend, want: u64, err_msg: *[]const u8) ![]const u8 {
+    const j = b.job_cgroup orelse {
+        err_msg.* = "the job container's `--memory` needs the job's own cgroup, which this " ++
+            "job has none of (RUNNER_NATIVE_CGROUP)";
+        return error.BaseContainerFailed;
+    };
+    if (b.limits.memory_max) |have| if (want >= have) return try std.fmt.allocPrint(b.arena, " (the runner's limit of {d} MiB is lower, and holds)", .{have >> 20});
+    j.lowerMemory(b.arena, want) catch {
+        err_msg.* = "the job container's `--memory` could not be set on the job's cgroup";
+        return error.BaseContainerFailed;
+    };
+    b.limits.memory_max = want;
+    return "";
+}
+
+/// `--hostname`, `--add-host`, `--shm-size` and `--tmpfs` ready for the steps' sandboxes and the
+/// job's hosts file; what changes a step's result is in `opts_key`, so the job's layers are not
+/// replayed for a job that asked for something else.
+fn setUpSandboxOptions(b: *Backend, o: container_options.Options) !void {
+    const arena = b.arena;
+    const tmpfs = try arena.alloc(sandbox.Spec.Tmpfs, o.tmpfs.len);
+    var key: std.ArrayList(u8) = .empty;
+    for (o.tmpfs, tmpfs) |t, *out| {
+        out.* = .{ .path = t.target, .size = t.size, .mode = t.mode, .exec = t.exec, .read_only = t.read_only };
+        try key.print(arena, "tmpfs {s} {d} {o} {} {};", .{ t.target, t.size, t.mode, t.exec, t.read_only });
+    }
+    if (o.hostname) |h| try key.print(arena, "hostname {s};", .{h});
+    if (o.shm_size) |n| try key.print(arena, "shm {d};", .{n});
+    b.sandbox_opts = .{ .hostname = o.hostname orelse "", .shm_size = o.shm_size orelse 0, .tmpfs = tmpfs };
+    b.opts_key = key.items;
+    var hosts: std.ArrayList(u8) = .empty;
+    if (o.hostname) |h| try hosts.print(arena, "127.0.0.1\t{s}\n", .{h});
+    for (o.add_hosts) |h| try hosts.print(arena, "{s}\t{s}\n", .{ h.ip, h.name });
+    b.hosts_extra = hosts.items;
+    try b.writeHosts("");
 }
 
 /// The job container's `ports:` published from the host (`publish.zig`): what the operator
@@ -4407,6 +4487,16 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     try expectReason("`--cpus`", unsupported(io, container, root, ok));
     container.container.?.options = .{ .lit = "--user 1001 -e A=1 --workdir /w --health-cmd true" };
     try std.testing.expect(unsupported(io, container, root, ok) == null);
+    container.container.?.options = .{ .lit = "--hostname h --add-host a:10.0.0.1 --shm-size 1g " ++
+        "--tmpfs /scratch --memory 1g --init" };
+    try std.testing.expect(unsupported(io, container, root, ok) == null);
+    // What would widen the sandbox is never native: each is named, and Dagger's drop of it said.
+    for ([_][]const u8{ "--privileged", "--cap-add NET_ADMIN", "--security-opt apparmor=unconfined", "--device /dev/fuse", "--network host", "--pid host", "--ipc host", "--userns host" }) |flag| {
+        container.container.?.options = .{ .lit = flag };
+        const why = unsupported(io, container, root, ok);
+        try expectReason(flag[0 .. std.mem.indexOfScalar(u8, flag, ' ') orelse flag.len], why);
+        try expectReason("Dagger drops", why);
+    }
     container.container.?.options = .{ .expr = "matrix.options" };
     try expectReason("expression", unsupported(io, container, root, ok));
     container.container.?.options = null;
@@ -6288,6 +6378,143 @@ test "a container job's options on the native backend: --user and --env, the res
     };
     // `-e HOME=` loses to GitHub's `HOME=/github/home`: never the option's value.
     try std.testing.expect(std.mem.indexOf(u8, text, "home-is[/elsewhere]") == null);
+}
+
+test "a container job's options on the native backend: hostname, add-host, shm-size and tmpfs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const layers = try testImageLayers(arena);
+    const img = try testregistry.testImage(arena, "test/optsb", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    // None of the tmpfs paths is in the image: Docker makes each. Every step has them, and what
+    // a step writes to one is gone with its mount, not in the step's layer.
+    var job = testJob(&.{
+        testStep("echo hostname=$(cat /proc/sys/kernel/hostname)\n" ++
+            "grep -E 'db.test|other.test|boxy' /etc/hosts\n" ++
+            "grep -E ' (/dev/shm|/scratch|/fast) ' /proc/mounts\n" ++
+            "echo hello > /scratch/f && echo scratch-wrote\n" ++
+            "printf '#!/bin/sh\\necho ran-from-fast\\n' > /fast/p && chmod +x /fast/p && /fast/p\n" ++
+            "printf '#!/bin/sh\\necho ran-from-scratch\\n' > /scratch/p && chmod +x /scratch/p\n" ++
+            "/scratch/p 2>/dev/null || echo noexec-held"),
+        testStep("cat /proc/sys/kernel/hostname; ls /scratch | wc -l"),
+    });
+    job.container = .{
+        .name = "",
+        .image = .{ .lit = try server.image(arena, "test/optsb:1") },
+        .options = .{ .lit = "--hostname boxy.local --add-host db.test:10.1.2.3 " ++
+            "--add-host=other.test=10.1.2.4 --shm-size 128m --init " ++
+            "--tmpfs /scratch:size=1m --tmpfs /fast:exec,mode=0755,size=1m" },
+    };
+    const r = try runNativeJob(arena, cfg, job, .root);
+    if (!r.res.succeeded) std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(r.res.succeeded);
+    try expectLines(r.text, &.{
+        "Engine: native",
+        "hostname=boxy.local",
+        "10.1.2.3\tdb.test",
+        "10.1.2.4\tother.test",
+        "127.0.0.1\tboxy.local",
+        "/dev/shm tmpfs rw,nosuid,nodev,noexec",
+        "size=131072k",
+        "/scratch tmpfs rw,nosuid,nodev,noexec",
+        "size=1024k",
+        "/fast tmpfs rw,nosuid,nodev,",
+        "scratch-wrote",
+        "ran-from-fast",
+        "noexec-held",
+        "`--hostname` boxy.local, 2 `--add-host`, `--shm-size` 128 MiB, 2 `--tmpfs`",
+        "1 understood and without effect natively",
+    });
+    // (The script's own text, in the log's "Run" group, holds the word; its output would be a line.)
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "stdout] ran-from-scratch") == null);
+    // Carried out here, so not reported as ignored, as on the Dagger path.
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "not supported here and ignored") == null);
+}
+
+test "a container job's --tmpfs through an image's link onto what the runner puts in place fails the step" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var t: oci_layer.TestTar = .{ .a = arena };
+    try t.add(.{ .path = "linked", .kind = .symlink, .link = "/etc" });
+    try t.add(.{ .path = "linkroot", .kind = .symlink, .link = "/" });
+    try t.add(.{ .path = "fine", .kind = .directory, .mode = 0o755 });
+    const lay = try testImageLayers(arena);
+    const layers = try arena.dupe([]const u8, &.{ lay[0], lay[1], try t.finish() });
+    const img = try testregistry.testImage(arena, "test/optsl", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    // The names are allowed (`/linked` and `/linkroot` are nothing the runner mounts); where the
+    // links lead is not.
+    for ([_][]const u8{ "/linked", "/linkroot" }) |p| {
+        var job = testJob(&.{testStep("echo step-ran")});
+        job.container = .{
+            .name = "",
+            .image = .{ .lit = try server.image(arena, "test/optsl:1") },
+            .options = .{ .lit = try std.fmt.allocPrint(arena, "--tmpfs {s}:size=1m", .{p}) },
+        };
+        const r = try runNativeJob(arena, cfg, job, .root);
+        try std.testing.expect(!r.res.succeeded);
+        try std.testing.expect(std.mem.indexOf(u8, r.text, "step-ran") == null);
+        // (The native set-up failed and the job went to Dagger, which this test has no engine for:
+        // it has no log. Had the tmpfs been mounted, the step would have run.)
+    }
+    // A link to somewhere harmless is followed, as Docker does.
+    var ok = testJob(&.{testStep("grep -c ' /fine tmpfs' /proc/mounts")});
+    ok.container = .{
+        .name = "",
+        .image = .{ .lit = try server.image(arena, "test/optsl:1") },
+        .options = .{ .lit = "--tmpfs /fine:size=1m" },
+    };
+    const good = try runNativeJob(arena, cfg, ok, .root);
+    try std.testing.expect(good.res.succeeded);
+}
+
+test "root runner: a container job's --memory lowers the job's memory.max, and never raises it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    cfg.cgroup.memory_max_mb = 256;
+    const layers = try testImageLayers(arena);
+    const img = try testregistry.testImage(arena, "test/optsm", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    // The job's cgroup is the steps' parent: its limit, as the step sees the host's file.
+    var step = testStep("cg=$(cut -d: -f3 /proc/self/cgroup | sed 's,/steps$,,')\n" ++
+        "echo \"memory.max=$(cat /sys/fs/cgroup$cg/memory.max)\"");
+    step.name = "limit";
+    const image = try server.image(arena, "test/optsm:1");
+    var job = testJob(&.{step});
+    job.container = .{ .name = "", .image = .{ .lit = image }, .options = .{ .lit = "--memory 128m" } };
+    const lowered = try runNativeJob(arena, cfg, job, .root);
+    if (!lowered.res.succeeded) std.debug.print("{s}\n", .{lowered.text});
+    try std.testing.expect(lowered.res.succeeded);
+    try expectLines(lowered.text, &.{ "memory.max=134217728", "`--memory` 128 MiB" });
+
+    // Above the runner's limit: the runner's holds, and "Set up job" says so.
+    job.container = .{ .name = "", .image = .{ .lit = image }, .options = .{ .lit = "-m 4g" } };
+    const capped = try runNativeJob(arena, cfg, job, .root);
+    try std.testing.expect(capped.res.succeeded);
+    try expectLines(capped.text, &.{ "memory.max=268435456", "the runner's limit of 256 MiB is lower" });
 }
 
 test "a container job's volumes on the native backend: directories of the job, there for every step" {
