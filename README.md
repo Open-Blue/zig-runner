@@ -2,555 +2,87 @@
 
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Open-Blue/zig-runner/badge)](https://scorecard.dev/viewer/?uri=github.com/Open-Blue/zig-runner)
 
-A self-hosted GitHub Actions runner in Zig. One small process runs many runners; each job's
-steps run in a [Dagger](https://dagger.io) engine, which caches them across runs.
+A self-hosted GitHub Actions runner written in Zig. One small process runs many runners, and each
+job's steps run in one of two backends:
 
-This repository holds only what the runner needs to be built, run and deployed:
+- **Dagger** (the default): each step runs in a [Dagger](https://dagger.io) engine, which caches
+  steps across runs.
+- **Native** (`RUNNER_BACKEND=native`): the runner runs steps itself, with Linux namespaces,
+  overlayfs, cgroup v2 and seccomp. The image pull, layer store and sandbox are Zig in this
+  repository, with no runc or containerd. See [docs/native-backend.md](docs/native-backend.md).
 
-- `runner/`: the source, `build.zig`, and the `Dockerfile` for the runner image
-- `deploy/`: a systemd unit, a Docker Compose file, the engine's configuration, an example env file
-- `db/migrations/`: the schema for the optional Postgres mode (run state and logs)
+It is built for trusted jobs on machines you own. It splits jobs by trust, keeps untrusted jobs
+away from trusted caches, and takes a job only when the machine has the memory for it.
 
-Build and run, with Zig 0.17 and Docker on the machine:
+## Quick start
+
+You need Zig 0.17, and Docker for the Dagger backend.
 
 ```sh
 cd runner
 zig build -Doptimize=ReleaseSafe
-cp ../deploy/runner.env.example /etc/zig-runner.env   # then fill in GH_TOKEN (or a GitHub App) and GH_SCOPE
+cp ../deploy/runner.env.example /etc/zig-runner.env   # then set GH_TOKEN (or a GitHub App) and GH_SCOPE
 zig-out/bin/runner
 ```
 
-Or install `deploy/zig-runner.service` and run it under systemd, or `docker compose -f deploy/compose.yaml up`.
+To run it as a service, install `deploy/zig-runner.service` under systemd, or run
+`docker compose -f deploy/compose.yaml up`. Release binaries and images are on the
+[releases page](https://github.com/Open-Blue/zig-runner/releases), each with signed build
+provenance ([docs/CI.md](docs/CI.md), "Hardening", shows how to check one).
 
-Optional, for a rootless native runner on Ubuntu 23.10 and later (24.04 by default), where AppArmor
-lets only programs with a `userns` rule make user namespaces
-(`kernel.apparmor_restrict_unprivileged_userns=1`): `deploy/apparmor/usr.local.bin.zig-runner`
-grants that to `/usr/local/bin/zig-runner` alone, and nothing else (the runner is not confined any
-further or less; it is not a root runner's need, nor the Dagger backend's). Instead of lifting the
-sysctl for the whole machine, the operator installs it:
+## Configuration
+
+Every setting is in [deploy/runner.env.example](deploy/runner.env.example), with what it does and
+why its default is what it is. The ones most setups touch:
+
+- **Authentication.** Either `GH_TOKEN`, or a GitHub App, which reaches only the repositories it is
+  installed on: `GH_APP_ID` (the App's ID or Client ID) and `GH_APP_PRIVATE_KEY_FILE` (or
+  `GH_APP_PRIVATE_KEY`). The App needs "Administration: read and write" on a repository, or
+  "Self-hosted runners: read and write" on an organization. The runner mints installation tokens
+  and refreshes them before they expire.
+- **Trust.** `RUNNER_TRUSTED_REFS` and `RUNNER_TRUSTED_EVENTS` say which jobs a runner runs, and
+  which of them share the repository's trusted caches. An unset `RUNNER_TRUSTED_REFS` trusts
+  nothing. See [docs/OPERATIONS.md](docs/OPERATIONS.md), "Environments".
+- **Memory.** The memory gate is on by default: a runner asks GitHub for a job only while the
+  machine has room for it. See [docs/OPERATIONS.md](docs/OPERATIONS.md), "Memory".
+
+### Rootless native runners on Ubuntu
+
+On Ubuntu 23.10 and later, AppArmor lets only programs with a `userns` rule make user namespaces
+(`kernel.apparmor_restrict_unprivileged_userns=1`), and a rootless native runner needs one. Rather
+than lift the sysctl for the whole machine, install the profile in `deploy/apparmor/`, which grants
+it to `/usr/local/bin/zig-runner` alone and confines nothing else:
 
 ```sh
 sudo install -m 0644 deploy/apparmor/usr.local.bin.zig-runner /etc/apparmor.d/
 sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.zig-runner
 ```
 
-A profile attaches by path: edit the path in the file if the runner is installed elsewhere. The
-runner never installs it; when the restriction stops its sandbox, the refusal says so and names it.
+The profile attaches by path, so edit it if the runner is installed elsewhere. Root runners and the
+Dagger backend don't need it. The runner never installs it, but when the restriction stops its
+sandbox, the error names it.
 
-Instead of `GH_TOKEN`, the runner can manage its registrations as a GitHub App, which reaches only
-the repositories it is installed on: `GH_APP_ID` (the App's ID or Client ID) and
-`GH_APP_PRIVATE_KEY_FILE` (or `GH_APP_PRIVATE_KEY`), with the permission "Administration: read and
-write" for a repository ("Self-hosted runners: read and write" for an organization). It mints
-installation tokens itself and refreshes them before they expire. `deploy/runner.env.example` has
-the details, including mounting the key under Compose.
+## Documentation
 
-## Versioning
-
-Releases follow [semantic versioning](https://semver.org/) and are cut by CI, not by hand. Pull
-requests merge on their own once their checks pass, and once a day (or when `version` is run by
-hand) everything merged into `main` since the last release becomes one new version, its binaries
-and its image, after the maintainer approves it. What it bumps comes from the branches' prefixes,
-which CI checks; the largest bump among them wins:
-
-| Branch | Bumps |
+| Document | For |
 | --- | --- |
-| `bugfix/*`, `hotfix/*`, `ci/*`, and Renovate's `renovate/*` | patch: `v1.2.3` → `v1.2.4` |
-| `feature/*`, `feat/*`, `release/*`, `docs/*`, `perf/*`, `refactor/*` | minor: `v1.2.3` → `v1.3.0` |
-| any of them, labelled `breaking` | major: `v1.2.3` → `v2.0.0` |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | Running it: trust and environments, caches, deploying releases, rebooting, memory |
+| [docs/native-backend.md](docs/native-backend.md) | The native backend's design, its phases and what each one taught |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Measurements on the reference machine, a Raspberry Pi 5 |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Changing it: set-up, hooks, branches and versions, tests, the changelog |
+| [docs/CI.md](docs/CI.md) | The CI pipeline, workflow by workflow, and how it is hardened |
+| [docs/STYLE.md](docs/STYLE.md) | Code style |
+| [proofs/README.md](proofs/README.md) | The Lean proofs and the TLA+ and SPIN models |
+| [docs/SECURITY.md](docs/SECURITY.md) | Reporting a vulnerability |
+| [docs/CHANGELOG.md](docs/CHANGELOG.md) | What changed in each release |
 
-`feature/*` is for larger features, `feat/*` for small ones; neither breaks anything unless the
-pull request carries the `breaking` label. In a stack, each pull request merged into `main`
-counts toward the next release; one merged into another's branch instead counts toward that one's
-bump when it reaches `main`. The release commits the version to `runner/build.zig.zon`
-and the changelog on `main`, and tags that commit. It does so only once `main`'s own checks have
-passed on the commit it releases ("Tests (x86_64)", "Database tests", "Workflows" and
-"Proofs" on the push to `main`, listed in `.github/checks-on-main`), waiting up to 30 minutes for them;
-a check that never runs there fails the wait as soon as the commit's runs have finished. When they cannot pass because of
-what the release fixes (prod's runner, broken by the release before), run `version` by hand with
-`skip_main_checks`; it still waits for approval.
+## Repository layout
 
-[semantic-release](https://github.com/semantic-release/semantic-release) and
-[release-please](https://github.com/googleapis/release-please) do this job from
-[Conventional Commits](https://www.conventionalcommits.org) in commit messages instead (`feat:`,
-`fix:`, `feat!:`). They are not used here: the version comes from the branch, and either would
-decide the version, write the changelog and tag the release alongside this, disagreeing with it.
-
-## Pipeline
-
-`ci` checks every pull request: the branch name, the workflows (actionlint, and
-[zizmor](https://docs.zizmor.sh) for security), the format, build and tests, the database tests
-against TimescaleDB, and the release's own builds, for both targets in ReleaseSafe ("Release
-builds"), so code that does not compile for aarch64 fails here rather than after the tag, and
-the same builds on GitHub's arm64 runner, where the aarch64 binary is run ("Release builds
-(arm64)"), and the tests on both architectures ("Tests (x86_64)", "Tests (arm64)", and the native
-backend's tests as root in two parts each, "Native tests as root (…)"), natively on arm64 as on
-razorbill;
-`proofs` checks the Lean proofs and `release` the packaging (below). Every one of these is a
-required check, and reports on every pull request and in the merge queue: on a change that cannot
-affect what a job checks, it reports without running its steps
-(`.github/scripts/ci-scope.sh tests|binaries|proofs|packaging`, each with the list of files that
-can; the build and tests run for any file it does not know, the others only for the files they
-read). A path filter would instead leave the check unreported, and the merge queue waiting for
-it. The GitHub client's tests run over real connections to a local server
-(`src/github/testserver.zig`), so how it handles redirects and tokens is tested, not described. A merge into
-`main` goes through the merge queue, which runs these checks again on top of `main`; `automerge` turns on
-auto-merge for every pull request from a branch of this repository that is based on `main` (not a stack's), so it joins the queue once its
-checks pass (Renovate does the same for its own). Once a day, `version` releases what merged since
-the last release, if anything did: it waits for approval in the `prod` environment, commits and
-tags the release, and the tag runs `release`: the binaries (compiled directly,
-`.github/scripts/build-binaries.sh`), the image from those same binaries after a
-[Trivy](https://trivy.dev) scan, each with signed build provenance. On pull requests and in the
-merge queue, `release` builds and scans the same, publishing nothing ("Binaries (check)", "Binaries
-(same as zig build)" and "Image"), when the change touches the packaging. `scorecard` grades the
-repository weekly with [OpenSSF Scorecard](https://scorecard.dev). `codeql` runs
-[CodeQL](https://codeql.github.com) with its `security-extended` queries over what it has a
-language for (the workflows, the Go comparison tools under `runner/tools`, the Python generator),
-one job per language, on every pull request, in the merge queue, on `main` and weekly; it is a
-checked-in workflow rather than the repository's default setup, which must stay off for its
-uploads to be accepted.
-`security` runs on every pull request, and neither of its checks is required yet. "Secrets" runs
-[gitleaks](https://github.com/gitleaks/gitleaks) (`.github/scripts/install-gitleaks.sh`, pinned by
-version and checksum) over the pull request's own commits, and weekly over `main`'s whole history,
-failing on any finding; the log names the rule, file, line and commit, never the value. A finding
-that is not a secret (a test fixture, an example key, a hash) is allowed in `.gitleaks.toml`, as
-narrowly as it can be (one rule, one file, the line's shape) and with a comment saying why;
-`gitleaks:allow` comments in the code are ignored, so every exception is in that one file.
-"Dependency review" runs
-[`actions/dependency-review-action`](https://github.com/actions/dependency-review-action) on the
-dependencies a pull request adds or changes, failing on a known vulnerability of moderate severity
-or worse, or on a license outside the permissive ones an MIT project can take in (MIT, Apache-2.0,
-BSD, ISC, Zlib, Unicode; the list and its one exception are in `security.yml`). It reads GitHub's
-dependency graph, which sees the Go tools' modules under `runner/tools/` (indirect ones included)
-and the actions the workflows use. It does not see `runner/build.zig.zon` (no Zig support:
-tls.zig, the one dependency compiled into the runner, is followed by Renovate and listed in
-[docs/THIRD_PARTY.md](docs/THIRD_PARTY.md) by hand), the images `runner/Dockerfile`, `deploy/compose.yaml`
-and the scripts pin (Trivy scans the release's image), or the .NET reference program, which has no
-packages.
-"End to end" (`ci`, `.github/scripts/e2e.sh`) runs the runner built from the pull request for
-real, on GitHub's runner: it starts the pinned Dagger engine as `deploy/compose.yaml` does,
-registers the runner's just-in-time runners on the private `Open-Blue/runner-bench` under a label
-of the run's own, dispatches that repository's `e2e.yml` and `e2e-cancel.yml` at it, and checks the
-jobs, steps and logs through GitHub's API: a script installing into the tool cache, a service, a
-`docker://` step, a JavaScript action, the file commands, a masked secret, a cancelled run, and a
-rerun replayed from the step cache. It does it twice, on Dagger and with `RUNNER_BACKEND=native`,
-and leaves each job's queue and run times for both in the `e2e-timings` artifact. Everything on
-runner-bench is done as the GitHub App `zig-runner-e2e`, whose key is the `e2e` environment's
-secret: a pull request from a fork, which does not get it, skips the job's steps, still reporting.
-It is not a required check yet. Before a release, run the same suite by hand against a pool from
-`main` (the laptop's, or razorbill's when it serves runner-bench, trusting `refs/heads/main`):
-`.github/scripts/e2e.sh check <its label>`, with gh logged in.
-`compare` runs the comparison tools weekly
-(`.github/scripts/*-diff.sh`): the expression evaluator, YAML reader, `hashFiles()`, problem
-matcher regular expressions, HPACK decoder and RS256 signing against the implementations they
-follow, on fresh random cases; and lints the tools' own Go (`.github/scripts/go-lint.sh`: `go vet`,
-a pinned staticcheck and Go's race detector, which "Go tools" in `ci` also runs on a pull request
-that changes them, and govulncheck for information).
-CodeQL and Semgrep read no Zig, so the runner's own code has analysis of its own. "Lint (ZLint)"
-(`ci`, `.github/scripts/zlint.sh`) runs [ZLint](https://github.com/DonIsaac/zlint) on every pull
-request, pinned and checked against its release's checksum, with the rules that find bugs
-(`runner/zlint.json`; the script says why each other rule is off), and its suppressed-errors rule
-against the baseline of `catch {}` sites that were read and meant. `analysis` runs nightly: "Fuzz"
-runs each of `runner/src/fuzz.zig`'s targets (an image layer's tar, PAX and paths applied beside a
-directory it must not reach; image references, registry challenges and manifests; expressions,
-YAML, regular expressions, HPACK, `hashFiles()` patterns, minisign signatures, workflow commands
-and problem matchers; the runner's zstd decoder against std's, input for input) with Zig's coverage-guided fuzzer (`.github/scripts/zig-fuzz.sh`, LLVM-built,
-for a bounded number of runs), keeping each target's corpus in the Actions cache and failing,
-named after the target, on a crash, a failed check, a leak or a hang, with the input as an
-artifact; `zig build test` runs the same targets over their seed corpus every time. Locally:
-`zig build test -Dllvm --fuzz` (add `-Dtest-filter='fuzz: YAML'` for one target). "Valgrind" runs
-every test under memcheck (`.github/scripts/zig-valgrind.sh`), for reads of memory never written
-and accesses outside an allocation, which Debug's safety checks miss; known-benign reports are
-suppressed in `.github/valgrind.supp`, each with why (a pull request that adds or edits a test
-runs just those, `.github/scripts/changed-tests.sh`; a run that does not finish is stopped, naming
-the test it was in). "ThreadSanitizer, native" runs the native
-backend's tests under ThreadSanitizer on x86_64 and arm64, rootless and as root, with the runner
-binary they start for each step built with it too (`ZIG_TEST_SANITIZE_THREAD=1`, which ci's
-Database tests job sets where those tests skip); "ThreadSanitizer, end to end" runs ci's end-to-end
-suite on both backends with a runner built under it (`e2e.sh build BIN tsan`), failing on any report
-in the runner's log or the jobs' (`e2e.sh races`). TSan's runtime needs glibc's dynamic loader, so
-these builds are dynamically linked PIEs, not the release's static PIE.
-"Stress" runs the concurrency-sensitive tests (cancels, deadlines, the memory gate, the native
-store's locks, the database, the broker's long-poll, log uploads;
-`.github/scripts/zig-race-tests.sh` names them) 100 times over under stress-ng's CPU and memory
-load, with the database, and fails on the first round that fails, its output an artifact
-(`.github/scripts/zig-stress.sh`). It is four jobs of 25 rounds each, "Stress (1/4)" to "(4/4)",
-each loaded as its own runner's cores size it; the rounds are independent runs, so 100 in all
-reach what 100 on one runner do, on four machines. A failing part's output is `stress-output-K`.
-**Mutation testing** asks whether the tests would notice the code being wrong:
-`runner/tools/mutate.py` changes a module's code one thing at a time (a comparison flipped, `and`
-for `or`, `true` for `false`, a `return error.X` guard taken away, an integer constant off by one,
-a statement deleted), compiles each change from a copy of `runner/src` with only that module's
-tests (`--test-filter`), runs them with a timeout, and counts each mutant killed, survived, timed
-out or not compiled. Its report lists every survivor by file, line and change: most are a missing
-test, a few a change that means the same thing. The modules are the security-critical ones: secret
-masking (`masking`: `redact.zig`, `dagger/JobLog.zig`), workflow commands (`commands`),
-expressions (`expr`), the native store's keys and publishing (`store`) and `minisign`. Locally,
-after `zig build --fetch` in `runner/`: `python3 runner/tools/mutate.py masking` (`--all --out DIR`
-for every module, `--sample N` for a quicker look, `--list` for the mutants alone, `--shard K/N`
-and `--merge` to split a run and join its results; `--expr-cases DIR` holds `expr`'s mutants to
-GitHub's own expression cases too, as `expr-conformance.sh` does). The five modules make about 2,400 mutants,
-each a compile, which is hours of every core: too slow for a pull request, and for a laptop doing
-anything else. `mutation` runs it for one module when asked for (Actions, "Run workflow"), over
-four of GitHub's runners, with the report in the last job's summary and as the `mutation-report`
-artifact. Mull and other LLVM-level tools cannot be used: they instrument through a clang pass
-plugin, which Zig has no way to load.
-"Coverage" (`.github/scripts/zig-coverage.sh`)
-measures which lines the tests reach with [kcov](https://github.com/SimonKagstrom/kcov) (Ubuntu's
-package, pinned to the version checked): the rootless tests, the native backend's tests as root,
-and the runner binary those tests start for their sandboxes and networks, merged into one report.
-Four jobs, "Coverage (1/4)" to "(4/4)", each run every fourth test of both passes
-(`ZIG_TEST_PART`), and "Coverage" merges their kcov output (`zig-coverage.sh --merge`) into the
-report, which counts the lines one whole run does.
-The `coverage` artifact holds kcov's HTML report, Cobertura XML and JSON, with the total, each
-directory's and every file's line coverage in `summary.json`; the job summary lists the
-security-relevant files (masking in `dagger/JobLog.zig`, workflow commands, expressions, YAML, the
-native store, sandbox, networks and image handling, minisign and the GitHub client) least-covered
-first. Nothing is sent to a coverage service. It runs nightly and on every pull request that changes
-`runner/src`, reporting without failing; `COVERAGE_MIN=<percent>` on its step makes it fail below
-that total, the way to hold a floor once the numbers have settled. kcov needs the tests compiled
-by LLVM and not position-independent (the script says why), which changes nothing they test.
-Locally, with kcov installed: `.github/scripts/zig-coverage.sh /tmp/coverage`, then open
-`/tmp/coverage/html/index.html`.
-`proofs` checks the [Lean proofs](proofs/README.md) (the step cache, the regex matcher's loops, and
-the `hashFiles()` walk) and compares the walk's model with `runner/src/glob.zig` on random cases,
-when either changes and weekly ("Proofs"). The workflows are written to be hard to turn against the
-repository:
-
-- **Least privilege.** Each workflow grants nothing by default; each job asks for only what it
-  needs, with a comment saying why. Checkouts keep no credentials for later steps. Only the
-  release's own jobs can publish: pull requests' and the merge queue's checks hold read access
-  alone ("Image" scans and builds; "Image (publish)", on a tag, pushes and attests).
-- **Pinned inputs.** Actions are pinned by commit and images by digest, not by tag, which their
-  owner (or whoever takes their repository) can move, BuildKit and its SBOM scanner included, and
-  the busybox the runner itself puts into job containers (`runner/src/dagger.zig`), pinned by its
-  multi-arch index digest so one pin serves amd64 and arm64; the Workflows job checks on every
-  pull request that this pin is a pullable index with the applets the runner uses
-  (`.github/scripts/busybox-pin.sh`). [Renovate](https://docs.renovatebot.com)
-  proposes updates a week after their release. The exceptions are the Dagger engine in
-  `deploy/compose.yaml`, pinned by tag and held there on purpose: the runner speaks one engine
-  version's protocol, and a new engine starts with an empty cache. The JavaScript runtimes for
-  actions (`oven/bun` and `node`, `runner/src/dagger/js.zig`) are pinned by their multi-arch index
-  digests too. zizmor is installed from PyPI by hash (`.github/zizmor-requirements.txt`,
-  `.github/scripts/zizmor.sh`). The job base image `ubuntu:24.04` (`RUNNER_IMAGE`) is pinned by its multi-arch index digest
-  (`runner/src/dagger.zig`, checked by `.github/scripts/ubuntu-pin.sh`); the packages provisioning
-  installs into it come from the Ubuntu archive on the day the engine builds them, and the pre-warm
-  logs their fingerprint. tls.zig and GitHub's expression
-  test cases are pinned by commit. Zig, changie, checksec and gitleaks are checked against pinned checksums
-  before they run, tls.zig against its `.hash` as well; a Renovate pull request for a new Zig, tls.zig or
-  changie fails until its checksums are updated (changie's by the Workflows job, which downloads
-  it on every pull request, though only the release runs it).
-- **Verifiable releases.** Every binary and image has a signed provenance attestation saying which
-  workflow built it from which commit. Check a binary as razorbill does, built by `release.yml` from
-  its tag on GitHub's own runners:
-
-  ```sh
-  gh attestation verify zig-runner-linux-x86_64 --repo Open-Blue/zig-runner \
-    --signer-workflow Open-Blue/zig-runner/.github/workflows/release.yml \
-    --source-ref refs/tags/<tag> --deny-self-hosted-runners
-  ```
-
-  and the image the same way (`oci://ghcr.io/open-blue/zig-runner:<tag>`); an image rebuilt by hand
-  was built from `main`, so its `--source-ref` is `refs/heads/main`.
-  The binaries' release also carries their SBOM (`zig-runner.spdx.json`: tls.zig and Zig's
-  standard library, the only code compiled in besides the runner's own), attested too, and both
-  attestations' bundles for checking offline (`--bundle zig-runner.provenance.intoto.jsonl`). A release is
-  published only once all of it is attached.
-- **Hardened binaries.** The runner runs as root on prod and parses what GitHub, the engine and
-  jobs send it, so its binaries are made hard to exploit, and the release checks that they are
-  before publishing them. Both are static position-independent executables (`-fPIE`;
-  `runner/build.zig`'s `pie`, on by default, so `zig build`, the image and the release make the
-  same binary): the kernel loads each at a random address, where before they sat at the fixed
-  0x1000000. They have full RELRO (what is relocated at startup is read-only before the runner's
-  code runs), a non-executable stack, and no segment both writable and executable (W^X). PIE costs
-  0-3% on the hot paths ([docs/BENCHMARKS.md](docs/BENCHMARKS.md), "Position-independent executable").
-  Intel CET (IBT and shadow stacks) is not available: Zig 0.17 has no `-fcf-protection` for Zig
-  code, so the binaries carry no CET note. [checksec](https://github.com/slimm609/checksec) 3.2
-  (`.github/scripts/checksec.sh`, pinned by version and checksum) fails the release, and on pull
-  requests "Release builds", "Release builds (arm64)" and "Binaries (check)", on any
-  binary without PIE, full RELRO, NX or W^X:
-
-  ```sh
-  .github/scripts/checksec.sh zig-runner-linux-x86_64 zig-runner-linux-aarch64
-  ```
-- **Scanned.** Trivy checks the Dockerfile and the image before a push, with its vulnerability
-  database fetched once, with retries, from Google's mirror first; accepted findings are in
-  `.trivyignore.yaml`, each with why. GitHub's secret scanning blocks pushes carrying credentials
-  (push protection), and gitleaks scans every pull request's commits and, weekly, the whole history
-  (`security`, above); dependency review checks the dependencies a pull request brings.
-- **Checked.** actionlint and zizmor check the workflows, shellcheck every shell script
-  (`.github/scripts/shellcheck.sh`) and shfmt its format (`.github/scripts/shfmt.sh`, shfmt's
-  defaults: tabs; `-w` formats), hadolint the Dockerfile (`.github/scripts/hadolint.sh`; a finding
-  kept is ignored on its instruction, with why), `busybox-pin.sh` the runner's busybox pin, and CodeQL the
-  workflows, the Go tools and the Python generators, which `go vet`, staticcheck and the race
-  detector check too (`.github/scripts/go-lint.sh`); every job has a time limit. The Database
-  tests job runs every test under
-  ThreadSanitizer (`zig build test -Dsanitize-thread` locally); ZLint checks the runner's Zig, and
-  `analysis` fuzzes its parsers, runs its tests under Valgrind, its native backend's tests and the
-  end-to-end suite under ThreadSanitizer, its concurrency-sensitive tests under load, and measures
-  the tests' coverage, nightly (above). Vulnerabilities
-  are reported privately ([docs/SECURITY.md](docs/SECURITY.md)).
-- **One secret, one step.** The deploy key that may push to `main` is the `prod` environment's,
-  which deploys only from `main` and waits for approval; it is loaded only in the step that pushes,
-  and pushes only to GitHub's pinned host key.
-- **No pull request code with secrets.** The one workflow on `pull_request_target`, `automerge`,
-  runs `main`'s copy and checks out and runs nothing of the pull request; its app key only turns on
-  auto-merge. The release starts from `version`, `main`'s workflow on a schedule or by hand, and
-  waits for the maintainer's approval. No person reviews a merge: for now each pull request has an
-  automated review by the assistant, what reaches `main` is what passed CI, and approving the
-  release is the human check (#104).
-
-### Code style
-
-[docs/STYLE.md](docs/STYLE.md): Zig's style guide for names, semantic compression for when to make
-an abstraction, Locality of Behaviour for where code lives, and TigerStyle for the rest, in that
-order when they disagree.
-
-### Git hooks
-
-`.githooks` runs CI's pull-request checks before code leaves your machine. Turn them on once per
-clone:
-
-```sh
-git config core.hooksPath .githooks
-```
-
-- **pre-commit** refuses a commit on `main`, and checks that what is staged is formatted (`zig fmt`,
-  `gofmt`) and that staged workflows pass actionlint.
-- **pre-push** runs, on exactly the commits being pushed (in a temporary worktree): the branch
-  name's prefix, `zig fmt` over the project, GitHub's expression cases, and the build and tests
-  (`.github/scripts/zig-test.sh`; the database tests too when `PG*` or `ZIG_TEST_PG_URL` point at
-  one); actionlint and zizmor when workflows changed; `gofmt` and `go vet` for changed Go tools;
-  the Lean proofs and the `hashFiles()` model against `glob.zig` when either changed. It takes
-  about 20 s.
-
-They need the project's Zig (`minimum_zig_version` in `runner/build.zig.zon`) first on `PATH`, or
-`ZIG=/path/to/zig`; Go for actionlint; python3 with venv for zizmor when workflows change; and Lean
-(`lake`, from [elan](https://github.com/leanprover/elan)) when the proofs or `glob.zig` change.
-`--no-verify` skips them; CI checks the same things regardless.
-
-## Environments
-
-A pull request can change any workflow and name any runner in `runs-on`, so jobs are split by
-trust, and the runner itself enforces it:
-
-- **prod**, the runner on the maintainer's machine (`runs-on: [self-hosted, prod]`), runs only jobs
-  from pushes to `main`, version tags and `workflow_dispatch` there, whose workflow file comes from
-  one of those refs too (`RUNNER_TRUSTED_REFS`, `RUNNER_TRUSTED_EVENTS`; `src/trust.zig`). Any
-  other job fails before a step runs, with the reason in its log. The protection fails closed: an
-  unset or empty `RUNNER_TRUSTED_REFS` trusts no ref, so every job fails, and a runner whose
-  `RUNNER_LABELS` include `prod` refuses to start without it. Trusting every ref takes
-  `RUNNER_TRUSTED_REFS=*` (prod starts with it, but logs a warning). `RUNNER_TRUSTED_EVENTS`
-  defaults to `push,workflow_dispatch`, and `*` trusts every event. The runner logs what it
-  trusts when it starts ("trusting refs refs/heads/main,refs/tags/v* and events
-  push,workflow_dispatch"). The `prod` GitHub environment holds the release's deploy key, deploys
-  only from `main`, and waits for the maintainer's approval.
-- **pre-prod**, where pull requests and the merge queue run, is GitHub's `ubuntu-26.04`, on
-  purpose: a hosted runner starts cold every time, so every pull request builds and tests the
-  project in the worst case, with no caches to hide a slow or broken first build. Nothing there is
-  trusted or holds a secret.
-
-Package caches (Go's modules, Zig's packages, cargo's sources, the tool cache and the rest) are
-Dagger cache volumes, keyed by repository and by trust, and several are not checked again when
-used. A job shares the repository's `repo` volumes only when the runner vouches for it: it passes
-the trust gate on `RUNNER_TRUSTED_REFS` and `RUNNER_TRUSTED_EVENTS` lists that name what they trust
-(`trust.vouches`), and it is not a fork's pull request. Every other job, including a
-same-repository pull request, a `workflow_run` or `issue_comment` a fork set off, and a fork's pull
-request whose repository was deleted, gets the `untrusted` volumes. A `*` in either list lets every
-job through without vouching for any, so all of a pre-prod runner's jobs share the `untrusted`
-volumes with each other, and none can write what prod reads. With step caching, these volumes are
-the runner's own, and what they hold is outside every step's key (their identity, repository and
-trust scope included, is in it): a replayed step does not write into them again, so a step that
-installs a tool into the tool cache itself (not through a setup action, which runs every time) and
-is replayed after the volume was pruned leaves a later step a PATH to a directory that is gone
-(proofs/README.md, "Against today's code"; #102).
-
-Zig jobs' global cache is seeded by default. Zig 0.17's `zig build` first compiles a build runner
-that is the same for every project: 104 s on one core and about 1 GB. The runner builds it once per
-engine, with `zig build --help` on a `build.zig` it writes itself, for each release in
-`RUNNER_ZIG_SEED_VERSIONS` (comma-separated; by default the Zig the runner is built with) and each
-Zig version the runner's tool-cache check finds in a `repo` job's tool cache (`zig/<version>/`), at
-most 3 in all. A version only picks which official, signed release is seeded, never its content.
-Before seeding from a release, the runner downloads its tarball and `.minisig` from ziglang.org
-and checks the signature, and its trusted comment, against Zig's public key, pinned in
-`runner/src/zig_release.zig`, natively (Ed25519 over BLAKE2b-512). Only then does the seed build get
-the tarball's sha256, which its exec checks the tarball it downloads against. A release that does
-not verify is not seeded, and "Set up job" says so. `RUNNER_ZIG_SEED=<version>=<sha256>` pins one
-release by digest instead. The seed never takes anything from a job, so one seed safely goes to
-`repo` and `untrusted` jobs in every repository. Copying such a seed into an empty global cache on
-the laptop cut a cold `zig build test` of zig-runner from 146 s to 49 s. It also cut the engine's
-working-set rise per job from 0.98 to 0.55 GB (runner-bench `zig-seed.yml`, `zig_cache=seeded`).
-A seed that cannot be built leaves the job unseeded, and "Set up job" says which happened. Zig's
-global cache is never shared between jobs: Zig runs what it finds in `o/` without checking it, so
-each job gets the seed (or, without one, an empty cache) as its own copy, and what it adds there is
-gone when it ends. Only the package tarballs (`p/`, which Zig hashes again when it unpacks them)
-stay in the scope's volume. Zig's local cache volume (`RUNNER_ZIG_LOCAL_CACHE`) is kept only for
-jobs the runner vouches for; an untrusted job's is its own.
-
-Steps get the Dagger engine (`RUNNER_DAGGER_NESTING`, privileged nesting, for `dagger call` inside
-a step) only when a pool turns it on (`RUNNER_DAGGER_NESTING=true`; off by default, and the runner
-logs which at startup), and then only in jobs the runner vouches for, the same jobs that get the
-`repo` volumes. A step's
-own Dagger client is in the runner's namespace and can open any cache volume by its key, which is
-no secret, so in any other job it could write what trusted jobs read (#228). A step there that
-names Dagger and fails is told why, and "Set up job" says so (`Dagger in steps: off`). Still, run
-**one engine per trust level**: untrusted jobs on one engine share its `untrusted` volumes, the
-engine's other state (its layer cache, and through a trusted job's nesting the engine itself) is
-not scoped at all, and nesting is control of the host. A second instance on prod's machine
-(`zig-runner@sandbox.service`) gets its own engine, or none.
-
-Pushes to `main` run CI on prod, so every merge exercises the runner; the repository variable
-`PROD_RUNNER` holds prod's `runs-on` labels as JSON (unset, GitHub's runner stands in):
-
-```sh
-gh variable set PROD_RUNNER --body '["self-hosted","prod"]'
-```
-
-Pull requests therefore do not exercise the runner itself, which is the price of the cold builds.
-Most do not run `zig build` either: on GitHub's runners CI calls the compiler directly
-(`.github/scripts/zig-test.sh`), and only a pull request that touches the packaging runs "Binaries
-(same as zig build)" in `release.yml`, which builds the x86_64 binary with `zig build` and checks it
-is byte for byte the release's. A self-hosted pre-prod remains possible (`PREPROD_RUNNER`, and
-`deploy/runner.preprod.env.example` for a runner that trusts every ref and event
-(`RUNNER_TRUSTED_REFS=*`, `RUNNER_TRUSTED_EVENTS=*`), with no secrets and no access to its Dagger
-engine from steps; the engine is built for `linux/amd64` and `linux/arm64` only), but the project
-leaves it unset. The release still builds on GitHub's runners.
-
-Workflows name `prod` (or `pre-prod`, should one exist), never just `zig`, which any of this project's
-runners carries. Workflows from
-outside contributors' pull requests also wait for approval before they run at all.
-
-## Deploying releases
-
-A release deploys itself to razorbill. Once its binaries and image are built, and CI has passed on
-the tagged commit, `release` records a GitHub deployment of the version to the `razorbill`
-environment. The tagged commit is the release commit `version` pushes to `main`, which the merge
-queue never checked; the push starts `ci` on it, on prod, at the same time as `release`. So the
-deploy job waits, up to 40 minutes, until the checks in `.github/checks-on-main` ("Tests (x86_64)",
-"Database tests", "Workflows", "Proofs"), "Binaries", "Image" and "Image (publish)" have each
-completed on that commit, and fails, naming the check, as soon as
-one has not succeeded or once the wait runs out. (The deployment cannot list them as
-`required_contexts`: GitHub matches those against commit statuses only, not Actions check runs.)
-Once the check passes (re-run it), re-run the release's failed jobs: that is the deploy job alone.
-Re-running all of its jobs works too: the binaries job finds the release published, checks that
-it is complete and attested, and leaves it alone. To rebuild one tag's image, run `release` by hand
-from `main` with the tag (v0.14.0 or later): it waits for approval in `prod`, and moves `latest`
-only for the newest version tag.
-
-When CI cannot pass for a reason that is not the release's (a prod runner that is down, perhaps
-because the release before broke it), a maintainer deploys by hand, with a token that can write
-deployments and no checks required; the agent on razorbill still checks the binary's checksum and
-provenance:
-
-```sh
-jq -n --arg ref v1.2.3 '{ref: $ref, environment: "razorbill", auto_merge: false,
-  required_contexts: [], description: ("zig-runner " + $ref + ", by hand")}' |
-  gh api -X POST repos/Open-Blue/zig-runner/deployments --input -
-```
-
-On razorbill,
-`zig-runner-deploy.timer` asks every minute; for a new deployment `deploy/zig-runner-deploy`:
-
-1. refuses a version older than the one installed, unless `ALLOW_DOWNGRADE` in
-   `/etc/zig-runner-deploy.env` names it (a rollback on purpose);
-2. downloads the release's binary, checks it against `SHA256SUMS`, and checks its provenance:
-   built by `release.yml`, from that tag, on GitHub's own runners (`gh attestation verify`, offline,
-   on the attestations and Sigstore trust root it fetched). A fetch that fails for a reason of the
-   moment (no network, a rate limit, a timeout, Sigstore's CDN) reports nothing, and the timer
-   tries again a minute later, up to `ATTEMPTS` (30) times before it reports failure; a check that
-   fails reports failure at once;
-3. installs it and restarts every runner instance (`zig-runner.service` and `zig-runner@*.service`,
-   or `UNITS`), each finishing its running jobs first;
-4. reports success once each instance is listening for jobs again, or puts the previous binary
-   back and reports failure.
-
-The outcome shows under the repository's Environments, on the deployment. The `razorbill`
-environment takes deployments of `v*` tags only (its deployment tag policy). Nothing reaches into the
-machine: it asks GitHub, with a token that can only read and report deployments. To set it up, on
-the machine, with `gh` 2.68 or later from [cli.github.com](https://cli.github.com) (Debian's
-package cannot verify provenance) and a fine-grained token for this repository with Deployments
-read and write, Attestations and Contents read:
-
-```sh
-sudo install -m 0755 deploy/zig-runner-deploy /usr/local/bin/
-sudo install -m 0600 deploy/zig-runner-deploy.env.example /etc/zig-runner-deploy.env   # GH_TOKEN
-sudo cp deploy/zig-runner-deploy.service deploy/zig-runner-deploy.timer /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now zig-runner-deploy.timer
-```
-
-### Rebooting the machine
-
-The engine keeps its cache across a restart only if it is allowed to mark it clean first (see
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md)), and Docker gives a container 10 s at shutdown. So stop the runner
-instances (each finishes its running jobs), then the engine with time to spare, then reboot:
-
-```sh
-sudo systemctl stop zig-runner.service 'zig-runner@*.service'
-docker stop -t 300 <engine container>
-sudo reboot
-```
-
-The engine's restart policy is `unless-stopped`, and Docker counts a `docker stop` as stopped on
-purpose: after the reboot the engine stays down while the runners come back, and every job fails
-with no engine socket. Start it again (`docker start <engine container>`), then check that
-`/run/dagger/engine.sock` exists and the engine's log has no `unclean` or `wiping` line.
-
-### Memory
-
-Four heavy jobs taken at once on razorbill filled the engine's 4 GB, then the Pi's 2 GB of swap, and
-the machine thrashed for hours (#126). Two things keep that from happening again:
-
-- **The runner's memory gate**, on by default. A runner asks GitHub for a job only while the
-  machine has the memory for it, reserving room for the jobs its pool's other runners may be
-  handed at the same moment, and stops while memory pressure or swap growth says the machine is
-  struggling. A held runner removes its registration, so GitHub gives the job to another runner;
-  running jobs are never touched. Where it can find the engine container's cgroup (a runner on
-  the host, reaching the engine over a unix socket), it holds on the engine's own memory cap and
-  swap too, since the engine can fill its cap while the machine still has memory (#142), and
-  learns from it what each job (by repository, workflow and name) takes, so that a light job
-  reserves less than a heavy one once it has run (#144). A native job (`RUNNER_BACKEND=native`)
-  is measured in a cgroup of its own and learned apart from Dagger's, reserves 256 MB until it
-  has run (`RUNNER_NATIVE_MEM_PER_JOB_MB`), and so does a runner polling: the job it is handed
-  waits, kept, for room for its own estimate once it is named, instead of every runner reserving
-  the heaviest job there was (#361), and the runners polling count only the job that has waited
-  longest, so small jobs are not held behind a queue of heavy ones, and a job whose name has run
-  for 60 s at most each time starts beside the one waiting if it fits without it (#415). What
-  jobs took, and how long they ran, is kept
-  across restarts in the native store's directory (#407). A pool whose one job could never fit
-  the machine does not start and names the setting (#406). Where jobs may swap, gets a `memory.high` from its
-  estimate, so one that outgrows it is slowed in its own cgroup rather than taking its neighbours'
-  memory (docs/native-backend.md, P4). All native jobs together stay under the machine's memory less a
-  third, with no swap, each under two thirds of that, and a job that cannot be held to it does not
-  run natively (docs/native-backend.md, "Bounded jobs"). The limits and why they are what they
-  are are in `deploy/runner.env.example` (`RUNNER_MIN_MEM_AVAILABLE_MB` and the rest;
-  `RUNNER_ADMISSION=false` turns it off). The gate sees only its own process's runners: run one
-  pool per machine.
-- **No swap for the engine**, optional. With `--memory 4g` alone, Docker lets a container swap as
-  much again; `--memory-swap` equal to `--memory` (`memswap_limit` in compose) gives it none. A
-  job that outgrows the engine then fails inside it, killed by the kernel, instead of the whole
-  machine slowing to a crawl. The trade-off is a failed job in place of a slow one, and the risk
-  that the process killed is the engine itself, whose unclean restart wipes its cache: check which
-  process the kernel picks before relying on it. razorbill does not use it today.
-
-An engine that stops answering altogether (frozen, deadlocked) would hold a step for good, so a
-step's query with nothing at all heard from the engine for `RUNNER_ENGINE_SILENCE_TIMEOUT` seconds
-(600 by default) is aborted and the step failed, saying why (#100). Nothing heard means no health
-check (the engine sends one every 5 s), no byte of an answer and no log line; a swapping engine
-answers late but not that late, and keeps logging. It applies only while a step runs, and the
-runner logs the timeout when it starts. Raise it for an engine that is often that slow; `0` turns
-it off.
-
-## Benchmarks
-
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md) has what was measured on the reference machine, a Raspberry Pi 5:
-where a job's time goes (the engine, not the runner), what an engine restart does to its cache, what
-installing Zig costs, and the earlier study's results with their verdicts.
-
-## Changelog
-
-[docs/CHANGELOG.md](docs/CHANGELOG.md) is kept with [changie](https://changie.dev): each change is a file
-under `.changes/unreleased/`, written with `changie new` in the pull request that makes it. The
-release batches them into the version's notes (`changie batch <version> && changie merge`), which
-are also its GitHub release's notes.
+- `runner/`: the source, `build.zig`, and the `Dockerfile` for the runner image
+- `deploy/`: systemd units, Compose files, the engine's configuration, example env files, the
+  AppArmor profile, and the release deploy agent
+- `db/migrations/`: the schema for the optional Postgres mode (run state and logs)
+- `proofs/`: Lean proofs, TLA+ specifications and SPIN models
 
 ## Origin
 
@@ -559,19 +91,19 @@ The runner was developed in
 with a read API and a frontend by [@philgutowski](https://github.com/philgutowski), the Tiger Data
 schema by [@rafayet-git](https://github.com/rafayet-git), and the design documents, specification,
 deployment guide, measurements and Agda proofs. Releases v0.1.0 and v0.2.0 were made there. This
-repository carries the runner's history from that work and continues it with only what the runner
-needs to build, run and deploy; the rest stays in the original repository.
+repository carries the runner's history, and only what it needs to build, run and deploy.
 
-Comments in `runner/src`, `db` and `proofs` cite three of those documents ("SPEC §3", "DESIGN §6",
-"STUDY.md §3.6"). They are not in this repository; they are at the commit the runner was split
-from, so the section numbers match:
-[SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/SPEC.md) (the
-specification: configuration, the GitHub protocol, the database, what differs from GitHub's
-runner),
+Comments in `runner/src`, `db` and `proofs` cite three documents from that work ("SPEC §3",
+"DESIGN §6", "STUDY.md §3.6"). They are at the commit the runner was split from, so the section
+numbers match:
+[SPEC.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/SPEC.md)
+(configuration, the GitHub protocol, the database, what differs from GitHub's runner),
 [DESIGN.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/DESIGN.md) (the
 design) and
 [STUDY.md](https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/STUDY.md) (the
 experiments).
 
-Licence: see [LICENSE](LICENSE); the vendored third-party code is listed in
+## License
+
+See [LICENSE](LICENSE). Vendored third-party code is listed in
 [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).

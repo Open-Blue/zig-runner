@@ -12,6 +12,7 @@ const native_net = @import("native/net.zig");
 const NativeStore = @import("native/Store.zig");
 const native_evict = @import("native/evict.zig");
 const native_cgroup = @import("native/cgroup.zig");
+const native_publish = @import("native/publish.zig");
 
 pub const Scope = union(enum) {
     repo: struct { owner: []const u8, name: []const u8 },
@@ -119,6 +120,11 @@ pub const Config = struct {
     /// razorbill's Install Zig under load. Only in jobs without `dagger_nesting`, whose steps
     /// cannot reach the lists' volume (`set_up.verifyToolTrees`).
     tool_trees: bool = true,
+    /// Pull the default image already provisioned (`dagger/provisioned.zig`, from ghcr.io) instead
+    /// of running `apt-get install` in it, when this build pins one; any failure to pull provisions
+    /// with apt as before (`RUNNER_PROVISIONED_IMAGE`). Off for a host that must pull from nowhere
+    /// but the Ubuntu mirrors.
+    provisioned_image: bool = true,
     /// Reuse a step's result from an earlier run when its inputs are unchanged (steps that use
     /// secrets always run). A workflow can opt out with `ZIG_RUNNER_STEP_CACHE: false` in its env.
     step_cache: bool = true,
@@ -142,6 +148,16 @@ pub const Config = struct {
     native_subid_base: u32 = NativeBackend.default_subid_base,
     /// The native jobs' network on a root runner (`RUNNER_NATIVE_SUBNET`, `net.Subnet.parse`).
     native_subnet: []const u8 = native_net.Subnet.default_text,
+    /// The host addresses a native job container's `ports:` may be published on, colon- or
+    /// comma-separated IPv4 (`RUNNER_NATIVE_PORT_ADDRESSES`, `native/publish.zig`); the first is
+    /// where an entry with no address goes. Empty, the default: 127.0.0.1 alone.
+    native_port_addresses: []const u8 = "",
+    /// The host ports a native job container may name in its `ports:` (`8080:80`), `lo-hi`
+    /// (`RUNNER_NATIVE_PORT_RANGE`, `native/publish.zig`). Empty, the default: 49152-65535.
+    native_port_range: []const u8 = "",
+    /// The ports of the runner's own endpoints, which no job publishes (`publish.reservedPorts`),
+    /// as `main.zig` found them: its database's, and a `tcp://` engine or Docker host's.
+    native_reserved_ports: ?[]const u16 = null,
     /// The host directories a native job container's `volumes:` may bind, colon- or
     /// comma-separated (`RUNNER_NATIVE_HOST_PATHS`, `native/host_paths.zig`); empty, the default,
     /// allows none. Checked when the runner starts (`Backend.hostPathsOf`).
@@ -298,6 +314,8 @@ pub const Config = struct {
         InvalidBackend,
         InvalidNativeRootfs,
         InvalidNativeSubnet,
+        InvalidNativePortAddresses,
+        InvalidNativePortRange,
         InvalidNativeMinFree,
         InvalidNativeSubidBase,
         InvalidNativeCgroup,
@@ -317,11 +335,16 @@ pub const Config = struct {
             error.ProdTrustsNoRef => "RUNNER_LABELS includes prod, but RUNNER_TRUSTED_REFS is " ++
                 "not set, so this runner would fail every job. Set it to the refs prod may run " ++
                 "(RUNNER_TRUSTED_REFS=refs/heads/main,refs/tags/v*), or to * to trust every ref " ++
-                "(README, \"Environments\").",
+                "(docs/OPERATIONS.md, \"Environments\").",
             error.EngineNoneNoNesting => "RUNNER_DAGGER_NESTING gives steps the Dagger engine, " ++
                 "and RUNNER_ENGINE=none has none: turn one of them off.",
             error.InvalidNativeRootfs => "RUNNER_NATIVE_ROOTFS is a directory's absolute path: " ++
                 "overlay takes it as a layer from the job's directory.",
+            error.InvalidNativePortAddresses => "RUNNER_NATIVE_PORT_ADDRESSES is a list of IPv4 " ++
+                "addresses (0.0.0.0 for every address of the host), separated by commas or " ++
+                "colons; empty is 127.0.0.1 alone.",
+            error.InvalidNativePortRange => "RUNNER_NATIVE_PORT_RANGE is the host ports a job " ++
+                "container may name, lo-hi with 1024 <= lo <= hi <= 65535; empty is 49152-65535.",
             error.InvalidNativeMinFree => "RUNNER_NATIVE_MIN_FREE_PCT is a percentage, 0 to 100",
             error.InvalidNativeSubnet => "RUNNER_NATIVE_SUBNET is an IPv4 network a.b.c.d/p " ++
                 "with no host bits set and a prefix of 8 to 23 bits (room for every job's " ++
@@ -383,6 +406,8 @@ pub const Config = struct {
         if (c.native_rootfs.len > 0 and !std.fs.path.isAbsolutePosix(c.native_rootfs))
             return error.InvalidNativeRootfs;
         _ = try native_net.Subnet.parse(c.native_subnet);
+        if (!native_publish.validAddresses(c.native_port_addresses)) return error.InvalidNativePortAddresses;
+        if (native_publish.parseRange(c.native_port_range) == null) return error.InvalidNativePortRange;
         if (c.native_subid_base < NativeBackend.min_subid_base) return error.InvalidNativeSubidBase;
         if (c.native_cgroup.len > 0 and !std.mem.eql(u8, c.native_cgroup, "self") and
             !std.mem.eql(u8, c.native_cgroup, "none") and !native_cgroup.within(c.native_cgroup))
@@ -456,6 +481,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_DAGGER_NESTING")) |v| c.dagger_nesting = try boolean(v);
         if (environ.get("RUNNER_PACKAGE_CACHES")) |v| c.package_caches = try boolean(v);
         if (environ.get("RUNNER_TOOL_TREES")) |v| c.tool_trees = try boolean(v);
+        if (environ.get("RUNNER_PROVISIONED_IMAGE")) |v| c.provisioned_image = try boolean(v);
         if (environ.get("RUNNER_STEP_CACHE")) |v| c.step_cache = try boolean(v);
         if (environ.get("RUNNER_STEP_USER")) |v| c.step_user = try stepUser(v);
         if (environ.get("RUNNER_BACKEND")) |v| c.backend = try stepBackend(v);
@@ -464,6 +490,8 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_ROOTLESS")) |v| c.native_rootless = try boolean(v);
         if (environ.get("RUNNER_NATIVE_SUBID_BASE")) |v| c.native_subid_base = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_SUBNET")) |v| c.native_subnet = v;
+        if (environ.get("RUNNER_NATIVE_PORT_ADDRESSES")) |v| c.native_port_addresses = v;
+        if (environ.get("RUNNER_NATIVE_PORT_RANGE")) |v| c.native_port_range = v;
         if (environ.get("RUNNER_NATIVE_HOST_PATHS")) |v| c.native_host_paths = v;
         if (environ.get("RUNNER_NATIVE_HOST_PATHS_UNMAPPED")) |v| c.native_host_paths_unmapped = try boolean(v);
         if (environ.get("RUNNER_NATIVE_STORE_MAX_MB")) |v| c.native_store_max_mb = try num(u64, v);
@@ -548,6 +576,7 @@ pub const Config = struct {
         else if (eq(key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
         else if (eq(key, "package-caches")) c.package_caches = try boolean(val) //
         else if (eq(key, "tool-trees")) c.tool_trees = try boolean(val) //
+        else if (eq(key, "provisioned-image")) c.provisioned_image = try boolean(val) //
         else if (eq(key, "step-cache")) c.step_cache = try boolean(val) //
         else if (eq(key, "step-user")) c.step_user = try stepUser(val) //
         else if (eq(key, "backend")) c.backend = try stepBackend(val) //
@@ -556,6 +585,8 @@ pub const Config = struct {
         else if (eq(key, "native-rootless")) c.native_rootless = try boolean(val) //
         else if (eq(key, "native-subid-base")) c.native_subid_base = try num(u32, val) //
         else if (eq(key, "native-subnet")) c.native_subnet = val //
+        else if (eq(key, "native-port-addresses")) c.native_port_addresses = val //
+        else if (eq(key, "native-port-range")) c.native_port_range = val //
         else if (eq(key, "native-host-paths")) c.native_host_paths = val //
         else if (eq(key, "native-host-paths-unmapped")) c.native_host_paths_unmapped = try boolean(val) //
         else if (eq(key, "native-store-max-mb")) c.native_store_max_mb = try num(u64, val) //
@@ -987,6 +1018,24 @@ test "the native subnet and ids: defaults, and values that are refused" {
         "--native-subnet=172.30.0.0/20",
     })).native_subnet);
     _ = env.swapRemove("RUNNER_NATIVE_SUBNET");
+    // The addresses a job container's ports may be published on: IPv4 only, checked at load.
+    try env.put("RUNNER_NATIVE_PORT_ADDRESSES", "0.0.0.0,192.168.1.5");
+    try std.testing.expectEqualStrings("0.0.0.0,192.168.1.5", (try Config.load(&env, &.{"runner"})).native_port_addresses);
+    try env.put("RUNNER_NATIVE_PORT_ADDRESSES", "localhost");
+    try std.testing.expectError(error.InvalidNativePortAddresses, Config.load(&env, &.{"runner"}));
+    try std.testing.expectError(error.InvalidNativePortAddresses, Config.load(&env, &.{
+        "runner",
+        "--native-port-addresses=::1",
+    }));
+    _ = env.swapRemove("RUNNER_NATIVE_PORT_ADDRESSES");
+    // The host ports a job may name: lo-hi, checked at load.
+    try env.put("RUNNER_NATIVE_PORT_RANGE", "30000-39999");
+    try std.testing.expectEqualStrings("30000-39999", (try Config.load(&env, &.{"runner"})).native_port_range);
+    for ([_][]const u8{ "80-90", "8080", "9000-8000" }) |bad| {
+        try env.put("RUNNER_NATIVE_PORT_RANGE", bad);
+        try std.testing.expectError(error.InvalidNativePortRange, Config.load(&env, &.{"runner"}));
+    }
+    _ = env.swapRemove("RUNNER_NATIVE_PORT_RANGE");
     try env.put("RUNNER_NATIVE_SUBID_BASE", "99999");
     try std.testing.expectError(error.InvalidNativeSubidBase, Config.load(&env, &.{"runner"}));
     try env.put("RUNNER_NATIVE_SUBID_BASE", "100000");
@@ -1085,6 +1134,17 @@ test "the tool cache's trees are checked in Set up job unless turned off" {
     try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--tool-trees=false" })).tool_trees);
     try env.put("RUNNER_TOOL_TREES", "0");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).tool_trees);
+}
+
+test "the provisioned image is on by default and can be turned off" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expect((try Config.load(&env, &.{"runner"})).provisioned_image);
+    try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--provisioned-image=false" })).provisioned_image);
+    try env.put("RUNNER_PROVISIONED_IMAGE", "false");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).provisioned_image);
 }
 
 test "step caching is on by default and can be turned off" {

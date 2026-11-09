@@ -203,7 +203,7 @@ the runner, is the difference (the runner's own work is 0.11 s of CPU a job, see
 ## Position-independent executable
 
 *2026-11-01, zig-runner at main (after v0.23.0).* The release's binaries became static
-position-independent executables (README, "Hardened binaries"), which the rule allowed only if it
+position-independent executables (docs/CI.md, "Hardening"), which the rule allowed only if it
 cost no more than about 3%. Measured on the laptop (Ryzen 5 PRO 4650U), on AC and the balanced
 power profile, both checked every 2 s throughout (never changed by hand), with the load average
 recorded; both builds ReleaseSafe for x86_64-linux-musl as the release builds them, run in turn.

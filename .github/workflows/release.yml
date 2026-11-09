@@ -91,7 +91,7 @@ jobs:
         if: steps.published.outputs.published == 'false'
         run: .github/scripts/build-binaries.sh "$TAG" dist
 
-      # Static PIE, full RELRO, NX and W^X, or nothing is published (README, "Hardening").
+      # Static PIE, full RELRO, NX and W^X, or nothing is published (docs/CI.md, "Hardening").
       - name: Hardening
         if: steps.published.outputs.published == 'false'
         run: .github/scripts/checksec.sh dist/zig-runner-linux-x86_64 dist/zig-runner-linux-aarch64
@@ -454,7 +454,7 @@ jobs:
 
   # The release, recorded as a deployment to razorbill: the agent there (deploy/zig-runner-deploy)
   # installs it once its checksum and provenance check out, restarts the runners, and reports back
-  # to the deployment (README, "Deploying releases"). Not on a run by hand, which rebuilds an image.
+  # to the deployment (docs/OPERATIONS.md, "Deploying releases"). Not on a run by hand, which rebuilds an image.
   # Only once CI has passed on the tagged commit: the release commit, which version.yml pushes to
   # main with the deploy key, and which nothing checked before it was tagged (the merge queue
   # checked what merged, not the commit that adds the version and the changelog to it). That push,
@@ -493,14 +493,14 @@ jobs:
       # ci.yml's build and tests run on prod, and are usually done before the image is; otherwise
       # this waits, up to WAIT_MINUTES, and fails, naming the check, as soon as one has not
       # succeeded or once the wait runs out (wait-for-checks.sh). Once they pass, re-running this
-      # job deploys (README, "Deploying releases").
+      # job deploys (docs/OPERATIONS.md, "Deploying releases").
       - name: Wait for the tagged commit's checks
         env:
           GH_TOKEN: ${{ github.token }}
           WAIT_MINUTES: "40"
         run: |
           .github/scripts/wait-for-checks.sh "$GITHUB_SHA" \
-            "$TAG is not deployed (README, \"Deploying releases\")"
+            "$TAG is not deployed (docs/OPERATIONS.md, \"Deploying releases\")"
 
       # required_contexts: none, because the step above is the check. GitHub matches
       # required_contexts against commit statuses only, not Actions check runs: tried on 2026-10-28,

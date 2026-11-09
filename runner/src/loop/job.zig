@@ -672,6 +672,7 @@ fn runJobSteps(
         .zig_seed_registry = cfg.zig_seed_registry,
         .step_cache = c.cfg.step_cache,
         .step_user = c.cfg.step_user,
+        .provisioned_image = c.cfg.provisioned_image,
         // Skipped for a repository whose jobs spend too long on them (see `SlowOutputs`).
         .output_keys = c.cfg.output_keys and !slowOutputs(c, job.github.repository),
         .output_keys_days = c.cfg.output_keys_days,

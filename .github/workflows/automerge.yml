@@ -1,7 +1,7 @@
 name: automerge
 
 # Every pull request from a branch of this repository merges on its own once its checks pass: this
-# turns on auto-merge, so the merge queue takes it when it is green (README, "Pipeline"). Releases
+# turns on auto-merge, so the merge queue takes it when it is green (docs/CI.md). Releases
 # are batched separately (version.yml), so merging asks the maintainer nothing.
 #
 # It needs a GitHub App's token, not GITHUB_TOKEN: GitHub starts no workflow for what that token

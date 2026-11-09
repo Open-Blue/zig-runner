@@ -3,12 +3,13 @@ const Config = @import("config.zig").Config;
 const loop = @import("loop.zig");
 const inspect = @import("inspect.zig");
 const dagger = @import("dagger.zig");
-const set_up = @import("dagger/set_up.zig");
+const provisioned = @import("dagger/provisioned.zig");
 const sandbox = @import("native/sandbox.zig");
 const net = @import("native/net.zig");
 const nft = @import("native/nft.zig");
 
 const forward = @import("native/forward.zig");
+const native_publish = @import("native/publish.zig");
 const trust = @import("trust.zig");
 const job_mod = @import("job.zig");
 const db = @import("db.zig");
@@ -46,6 +47,7 @@ comptime {
     _ = @import("native/container_options.zig");
     _ = @import("native/images.zig");
     _ = @import("native/forward.zig");
+    _ = @import("native/publish.zig");
     _ = @import("native/volumes.zig");
     _ = @import("native/docker_action.zig");
     _ = @import("native/dockerfile.zig");
@@ -152,6 +154,12 @@ pub fn main(init: std.process.Init) !u8 {
         return @backingInt(Exit.config);
     };
     const secrets = try allSecrets(arena, &cfg, pg_cfg);
+    // The ports a job container must never publish on the host (`native/publish.zig`).
+    cfg.native_reserved_ports = try native_publish.reservedPorts(arena, if (pg_cfg) |p| p.port else null, &.{
+        cfg.engine_host,
+        cfg.docker_socket,
+        init.environ_map.get("DOCKER_HOST") orelse "",
+    });
 
     var out_buf: [4096]u8 = undefined;
     var stdout: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
@@ -393,16 +401,29 @@ fn printVersionIfAsked(io: std.Io, args: []const [:0]const u8) !bool {
 
 /// `--provision-script`: the shell script the default image is provisioned with when steps run as
 /// the runner user (`set_up.provision_runner_script`), for making the native backend's rootfs
-/// from `ubuntu:24.04` (docs/native-backend.md, "The rootfs"; .github/scripts/e2e.sh). Answered,
-/// as `--version`, before the configuration is read.
+/// from `ubuntu:24.04` (docs/native-backend.md, "The rootfs"; .github/scripts/e2e.sh);
+/// `--provision-script=root` is the root user's. `--provisioned-image=root|runner` prints the image
+/// the pre-provisioned image is built on and its fingerprint (`provisioned.describe`), for the
+/// workflow that builds and tags it. Answered, as `--version`, before the configuration is read.
 fn printProvisionIfAsked(io: std.Io, args: []const [:0]const u8) !bool {
-    for (args[1..]) |arg| if (std.mem.eql(u8, arg, "--provision-script")) {
+    for (args[1..]) |arg| {
+        const script = std.mem.eql(u8, arg, "--provision-script") or
+            std.mem.startsWith(u8, arg, "--provision-script=");
+        const image = std.mem.startsWith(u8, arg, "--provisioned-image=");
+        if (!script and !image) continue;
+        const variant = std.meta.stringToEnum(
+            provisioned.Variant,
+            if (std.mem.indexOfScalar(u8, arg, '=')) |at| arg[at + 1 ..] else "runner",
+        ) orelse {
+            std.log.err("{s}: the variant is root or runner", .{arg});
+            return error.InvalidArgument;
+        };
         var out_buf: [256]u8 = undefined;
         var w: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
-        try w.interface.print("{s}\n", .{set_up.provision_runner_script});
+        if (script) try w.interface.print("{s}\n", .{variant.script()}) else try provisioned.describe(&w.interface, variant);
         try w.interface.flush();
         return true;
-    };
+    }
     return false;
 }
 
@@ -611,6 +632,7 @@ fn execJobFile(
         .zig_seeds = if (cfg.zig_seed) |*s| s[0..1] else &.{},
         .step_cache = cfg.step_cache,
         .step_user = cfg.step_user,
+        .provisioned_image = cfg.provisioned_image,
         .output_keys = cfg.output_keys,
         .enforce_volatile = cfg.enforce_volatile,
         .output_keys_days = cfg.output_keys_days,

@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # The prefix decides the version a merge into main releases (README, "Versioning").
+  # The prefix decides the version a merge into main releases (CONTRIBUTING.md, "Versioning").
   branch:
     name: Branch name
     if: github.event_name == 'pull_request'
@@ -35,14 +35,14 @@ jobs:
             feature/?* | feat/?* | bugfix/?* | hotfix/?* | ci/?* | release/?* | docs/?* | perf/?* | refactor/?*) ;;
             renovate/?*) ;;
             *)
-              echo "::error::'$BRANCH' needs one of the prefixes feature/, feat/, bugfix/, hotfix/, ci/, release/, docs/, perf/ or refactor/ (README, \"Versioning\")"
+              echo "::error::'$BRANCH' needs one of the prefixes feature/, feat/, bugfix/, hotfix/, ci/, release/, docs/, perf/ or refactor/ (CONTRIBUTING.md, \"Versioning\")"
               exit 1
               ;;
           esac
 
   # The workflows themselves: actionlint for mistakes, zizmor for security; the shell scripts
   # they and the deployment run, with shellcheck and shfmt; and the Dockerfile, with hadolint
-  # (README, "Pipeline").
+  # (docs/CI.md).
   workflows:
     name: Workflows
     runs-on: ubuntu-26.04
@@ -132,6 +132,22 @@ jobs:
             .github/scripts/ubuntu-pin.sh || status=$?
             ((status == 75 && attempt < 3)) || exit "$status"
             echo "::warning::ubuntu-pin.sh could not reach Docker Hub (attempt $attempt of 3): trying again"
+            sleep $((attempt * 15))
+          done
+
+      # The provisioned images (runner/src/dagger/provisioned_pin.zig), pinned by digest once the
+      # "provisioned image" workflow published them: checked to be indexes for amd64 and arm64
+      # whose images are labelled with the fingerprint the pin says, so a pin of a missing or
+      # another image fails here, not on a runner. (That the fingerprint is the current script's
+      # and base image's is a unit test.) With nothing pinned there is nothing to ask. Asked of
+      # ghcr.io anonymously; only a fetch that fails (exit 75) is tried again, as for ubuntu.
+      - name: provisioned images' pin
+        run: |
+          for attempt in 1 2 3; do
+            status=0
+            .github/scripts/provisioned-pin.sh check || status=$?
+            ((status == 75 && attempt < 3)) || exit "$status"
+            echo "::warning::provisioned-pin.sh could not reach ghcr.io (attempt $attempt of 3): trying again"
             sleep $((attempt * 15))
           done
 
@@ -261,7 +277,7 @@ jobs:
 
   # A push to main runs on prod, this project's own runner, so every merge exercises it; pull
   # requests and the merge queue run on GitHub's runner on purpose, cold every time, the worst case
-  # for a build (README, "Environments"). The repository variables PROD_RUNNER and PREPROD_RUNNER
+  # for a build (docs/OPERATIONS.md, "Environments"). The repository variables PROD_RUNNER and PREPROD_RUNNER
   # hold runs-on labels as JSON (["self-hosted","prod"]); PREPROD_RUNNER is left unset, and unset
   # means GitHub's runner. Its image is pinned (ubuntu-26.04, not ubuntu-latest) on purpose: an
   # image change moves what the native passes stand on (AppArmor's userns restriction, idmapped
