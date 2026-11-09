@@ -248,7 +248,8 @@ The workflows are written to be hard to turn against the repository.
   hand was built from `main`, so its `--source-ref` is `refs/heads/main`. The release also carries
   its SBOM (`zig-runner.spdx.json`: tls.zig and Zig's standard library, the only code compiled in
   besides the runner's own), attested too, and both attestations' bundles for checking offline
-  (`--bundle zig-runner.provenance.jsonl`). A release is published only once all of it is attached.
+  (`--bundle zig-runner.provenance.intoto.jsonl`; `zig-runner.provenance.jsonl` up to v0.28.1). A
+  release is published only once all of it is attached.
 - **Hardened binaries.** The runner runs as root on prod and parses what GitHub, the engine and
   jobs send it, so its binaries are hard to exploit, and the release checks that they are before
   publishing them. Both are static position-independent executables (`runner/build.zig`'s `pie`,
