@@ -1046,6 +1046,12 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
     before: a name's estimate is the most of those runs, so one learned low (a warm `zig build
     test` at 64 MB) still reserves little for a cold one until a heavy run has been seen, restart
     or not.
+  - *Learned by trust scope* (#465). A name is learned under its repository, workflow file and job
+    name (`admission.jobKeyIn`) and the trust scope the backends keep volumes apart by (`repo` or
+    `untrusted`, `packageCacheScope`), so a fork's pull request that reuses a trusted job's name
+    cannot teach it a size or a run time. A job the runner refused (`trust.refusal`, or a
+    `container:` it does not run) is not learned from at all (`Gate.replayed`). The trusted key is
+    the one kept files already hold, so they stay valid.
   - *No deadlock.* When every runner holds a job and none has room, nothing is running to free
     any: the job that came first starts regardless (said in its log), the others wait for it, and
     the next oldest follows as each ends. The machine cannot get freer, and a job over
