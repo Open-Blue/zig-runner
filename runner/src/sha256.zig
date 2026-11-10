@@ -110,7 +110,7 @@ pub const Features = struct {
 /// it only when the CPU has the instructions), x86_64's CPUID.
 pub fn detect() Features {
     return .{
-        .accelerated = switch (builtin.os.tag) {
+        .accelerated = instructions_available and switch (builtin.os.tag) {
             .linux => switch (builtin.cpu.arch) {
                 .aarch64 => hasHwcapSha2(std.os.linux.getauxval(std.elf.AT.HWCAP)),
                 .x86_64 => hasCpuidSha(cpuid(0, 0), cpuid(1, 0), cpuid(7, 0)),
@@ -180,6 +180,19 @@ const k: [64]u32 = .{
     0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208, 0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2,
 };
 
+/// Whether `compressSha2` can be compiled for this build. The compiler's own x86_64 backend (Debug
+/// builds, and any build with `-fno-llvm`) encodes inline assembly itself and refuses `sha256msg1`
+/// unless the target has SHA-NI ("InvalidInstruction (Zig compiler bug)"); LLVM assembles it
+/// whatever the target says. There the baseline stands in and `detect` reports no instructions.
+const instructions_available = switch (builtin.cpu.arch) {
+    .aarch64 => true,
+    .x86_64 => builtin.zig_backend != .stage2_x86_64 or
+        builtin.cpu.hasAll(.x86, &.{ .sha, .ssse3, .sse4_1 }),
+    else => false,
+};
+
+const compressInstructions = if (instructions_available) compressSha2 else compressBaseline;
+
 /// The block function on the SHA-2 instructions, the sequences `std.crypto.hash.sha2` uses when
 /// built for a CPU that has them. Only called after `detect` said the CPU does.
 ///
@@ -187,7 +200,7 @@ const k: [64]u32 = .{
 /// x86_64 any instruction assembles, but aarch64's `sha256h` is refused for the baseline CPU, so
 /// each block starts with `.arch_extension sha2`, which lets the assembler take it. That changes
 /// nothing the compiler generates, only what the assembler accepts afterwards.
-fn compressInstructions(state: *[8]u32, blocks: []const u8) void {
+fn compressSha2(state: *[8]u32, blocks: []const u8) void {
     std.debug.assert(blocks.len % Sha256.block_length == 0);
     const V4u32 = @Vector(4, u32);
     var rest = blocks;
