@@ -710,7 +710,9 @@ fn countFds(io: std.Io) !usize {
 
 /// The flocks this process holds (/proc/locks: `1: FLOCK ADVISORY WRITE <pid> ...`).
 fn countLocks(arena: Allocator, io: std.Io) !usize {
-    const text = try std.Io.Dir.cwd().readFileAlloc(io, "/proc/locks", arena, .limited(1 << 20));
+    // `readFile` into a buffer: /proc/locks has size 0, so `readFileAlloc` read nothing and this
+    // counted no lock, ever.
+    const text = try std.Io.Dir.cwd().readFile(io, "/proc/locks", try arena.alloc(u8, 1 << 20));
     const pid = try print(arena, "{d}", .{linux.getpid()});
     var n: usize = 0;
     var lines = std.mem.splitScalar(u8, text, '\n');
