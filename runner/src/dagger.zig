@@ -1028,6 +1028,55 @@ pub fn splitEnv(
 
 // --- running a job ---
 
+/// The programs `RUNNER_ENGINE=cli` runs: `dagger_cmd` (`DAGGER_CMD`), then `sh` and `cat`, which
+/// the `session_script` it hands to `dagger run` uses. The release image is built `FROM scratch`
+/// and has none of the three.
+const cli_programs = [_][]const u8{ "sh", "cat" };
+
+/// Whether `name` resolves as `execvp` would: a name with a slash as given, any other in one of
+/// the directories of `path` (unset: execvp's default).
+fn onPath(io: std.Io, path: ?[]const u8, name: []const u8) bool {
+    const cwd = std.Io.Dir.cwd();
+    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        cwd.access(io, name, .{ .execute = true }) catch return false;
+        return true;
+    }
+    var dirs = std.mem.splitScalar(u8, path orelse "/usr/local/bin:/bin:/usr/bin", ':');
+    while (dirs.next()) |dir| {
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ if (dir.len == 0) "." else dir, name }) catch continue;
+        cwd.access(io, full, .{ .execute = true }) catch continue;
+        return true;
+    }
+    return false;
+}
+
+/// What `RUNNER_ENGINE=cli` lacks on `path`, as a message, or null when `dagger_cmd`, `sh` and
+/// `cat` are all there. Checked once at start-up (`main`) so a pool without them takes no job, and
+/// again when a session never started, so the job's error names them rather than the Docker daemon.
+pub fn missingCliPrograms(
+    arena: Allocator,
+    io: std.Io,
+    path: ?[]const u8,
+    dagger_cmd: []const u8,
+) !?[]const u8 {
+    var missing: std.ArrayList(u8) = .empty;
+    for ([_][]const u8{dagger_cmd} ++ cli_programs) |name| {
+        if (onPath(io, path, name)) continue;
+        if (missing.items.len > 0) try missing.appendSlice(arena, ", ");
+        try missing.print(arena, "`{s}`", .{name});
+    }
+    if (missing.items.len == 0) return null;
+    return try std.fmt.allocPrint(arena, "RUNNER_ENGINE=cli needs the dagger CLI (DAGGER_CMD, " ++
+        "`{s}`), `sh` and `cat` on PATH, but {s} not found on PATH ({s}). The release image is " ++
+        "built FROM scratch and has none of them: use a runner installed on the host, an image " ++
+        "that adds them, or the default RUNNER_ENGINE=direct", .{
+        dagger_cmd,
+        missing.items,
+        path orelse "unset",
+    });
+}
+
 /// Prints the session's port and token for the runner, then waits for stdin to close.
 const session_script = "printf '%s %s\\n' \"$DAGGER_SESSION_PORT\" \"$DAGGER_SESSION_TOKEN\"; " ++
     "cat >/dev/null";
@@ -1093,6 +1142,15 @@ pub fn run(
     ) catch |e| {
         // A job sent here from native (`backend_note`) says why, and what Dagger lacked: a bare
         // `FileNotFound` out of `spawn` names neither.
+        if (e == error.FileNotFound and opts.test_session_argv == null) {
+            const lacks = try missingCliPrograms(arena, io, env.get("PATH"), opts.dagger_cmd);
+            const why = lacks orelse try std.fmt.allocPrint(arena, "could not start `{s}`: not " ++
+                "found (DAGGER_CMD)", .{opts.dagger_cmd});
+            return fail(&sh, results, if (opts.backend_note) |note|
+                try std.fmt.allocPrint(arena, "{s}. {s}", .{ why, note })
+            else
+                why);
+        }
         const note = opts.backend_note orelse return e;
         return fail(&sh, results, try std.fmt.allocPrint(arena, "could not start Dagger ({s}). " ++
             "{s}", .{ @errorName(e), note }));
@@ -1119,7 +1177,7 @@ pub fn run(
         sh.flush();
     }
 
-    var http = switch (try sessionTransport(arena, io, &child, &sh, results)) {
+    var http = switch (try sessionTransport(arena, io, &env, opts.dagger_cmd, &child, &sh, results)) {
         .failed => |result| return result,
         .transport => |t| t,
     };
@@ -1300,6 +1358,8 @@ const SessionStart = union(enum) { transport: HttpTransport, failed: Result };
 fn sessionTransport(
     arena: Allocator,
     io: std.Io,
+    env: *const std.process.Environ.Map,
+    dagger_cmd: []const u8,
     child: *std.process.Child,
     sh: *JobLog,
     results: []StepResult,
@@ -1307,7 +1367,9 @@ fn sessionTransport(
     var first: [512]u8 = undefined;
     var out_reader = child.stdout.?.readerStreaming(io, &first);
     const line = (out_reader.interface.takeDelimiter('\n') catch null) orelse {
-        const why = "could not start a Dagger session (is the Docker daemon running?)";
+        // `dagger run` found no `sh` to run, or the script no `cat`: the Docker daemon is not why.
+        const why = try missingCliPrograms(arena, io, env.get("PATH"), dagger_cmd) orelse
+            "could not start a Dagger session (is the Docker daemon running?)";
         return .{ .failed = try fail(sh, results, why) };
     };
     var parts = std.mem.tokenizeScalar(u8, line, ' ');
@@ -3566,6 +3628,75 @@ test "run reports an engine error when the session cannot start" {
     try std.testing.expect(!res.succeeded);
     try std.testing.expect(res.engine_error != null);
     try std.testing.expectEqual(Outcome.not_run, res.steps[0].outcome);
+}
+
+test "missingCliPrograms names what RUNNER_ENGINE=cli lacks on PATH, and nothing when all are there" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    // Nothing on PATH, as in the release image (built FROM scratch).
+    const none = (try missingCliPrograms(arena, io, dir, "dagger")).?;
+    try std.testing.expect(std.mem.indexOf(u8, none, "`dagger`, `sh`, `cat` not found on PATH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, none, "RUNNER_ENGINE=cli needs the dagger CLI") != null);
+    try std.testing.expect(std.mem.indexOf(u8, none, "FROM scratch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, none, "Docker") == null);
+
+    // A DAGGER_CMD given as a path is named as given.
+    const bad = (try missingCliPrograms(arena, io, dir, "/nonexistent/dagger")).?;
+    try std.testing.expect(std.mem.indexOf(u8, bad, "`/nonexistent/dagger`, `sh`, `cat` not") != null);
+
+    // Executable files in a PATH directory are found; one without the execute bit is not.
+    for ([_][]const u8{ "dagger", "sh" }) |n| {
+        const f = try tmp.dir.createFile(io, n, .{ .permissions = .executable_file });
+        f.close(io);
+    }
+    const f = try tmp.dir.createFile(io, "cat", .{});
+    f.close(io);
+    const some = (try missingCliPrograms(arena, io, dir, "dagger")).?;
+    try std.testing.expect(std.mem.indexOf(u8, some, "but `cat` not found on PATH") != null);
+    try tmp.dir.setFilePermissions(io, "cat", .executable_file, .{});
+    try std.testing.expect(try missingCliPrograms(arena, io, dir, "dagger") == null);
+}
+
+test "run names a missing dagger CLI, not the Docker daemon, when it cannot start one" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    try env.put("PATH", "/nonexistent-path-dir");
+    const steps = [_]job_mod.Step{testStep("a")};
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{}, testJob(&steps), &log);
+    try std.testing.expect(!res.succeeded);
+    const msg = res.engine_error.?;
+    try std.testing.expect(std.mem.indexOf(u8, msg, "`/nonexistent/dagger`, `sh`, `cat` not found on PATH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "Docker daemon") == null);
+}
+
+test "run names a missing sh or cat when the session child ends without reporting" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    try env.put("PATH", "/nonexistent-path-dir");
+    const steps = [_]job_mod.Step{testStep("a")};
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{
+        .dagger_cmd = "/bin/sh",
+        .test_session_argv = &.{ "/bin/sh", "-c", "exit 127" },
+    }, testJob(&steps), &log);
+    const msg = res.engine_error.?;
+    try std.testing.expect(std.mem.indexOf(u8, msg, "`sh`, `cat` not found on PATH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "Docker daemon") == null);
 }
 
 test "run evaluates expressions in conditions, names, env, scripts and the steps context" {

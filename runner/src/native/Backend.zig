@@ -4609,8 +4609,10 @@ test "a job sent to Dagger that cannot start it fails with the reason it was sen
     }, testJob(&.{testStep("echo hi")}), &log);
     try std.testing.expect(!res.succeeded);
     const msg = res.engine_error orelse "";
-    try std.testing.expect(std.mem.indexOf(u8, msg, "could not start Dagger (FileNotFound). " ++
-        "This job runs on Dagger: the native store is not set up") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "`/nonexistent/dagger`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "not found on PATH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, ". This job runs on Dagger: the native " ++
+        "store is not set up") != null);
 }
 
 test "parity: a native job's base has the environment of Dagger's base container" {
