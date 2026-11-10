@@ -28,6 +28,7 @@ const http = @import("../github/http.zig");
 const docker = @import("../dagger/docker.zig");
 const cgroup = @import("cgroup.zig");
 const evict = @import("evict.zig");
+const reaper = @import("reaper.zig");
 const volumes = @import("volumes.zig");
 const trees_check = @import("tool_trees.zig");
 const admission = @import("../admission.zig");
@@ -8066,6 +8067,8 @@ fn replayableLines(arena: Allocator, text: []const u8) ![]const []const u8 {
 }
 
 fn storeLayers(arena: Allocator, store: []const u8) !usize {
+    // What a job's end evicted is deleted after it returns (`reaper`).
+    reaper.drain(std.testing.io);
     const p = try std.fmt.allocPrint(arena, "{s}/layers", .{store});
     var dir = try std.Io.Dir.cwd().openDir(std.testing.io, p, .{ .iterate = true });
     defer dir.close(std.testing.io);
