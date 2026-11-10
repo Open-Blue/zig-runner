@@ -58,7 +58,9 @@ pub fn enqueue(io: std.Io, path: []const u8) bool {
     queued += 1;
     if (!running) {
         running = true;
-        const thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, run, .{io}) catch {
+        // The default stack: a delete of a deep tree and its permissions' repair (`Store.removeTree`)
+        // keep path buffers on it, and 256 KiB overflowed in a debug build.
+        const thread = std.Thread.spawn(.{}, run, .{io}) catch {
             running = false;
             queued -= 1;
             gpa.free(copy);
