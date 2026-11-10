@@ -107,9 +107,12 @@ engine() {
 
 # The default image, provisioned for steps run as the runner user, exported into a directory
 # (docs/native-backend.md, "The rootfs"): the image is the runner's own pin (default_image), the
-# script its own (--provision-script). Writes $rootfs.ok, or $rootfs.failed, which `start` waits on.
+# script its own (--provision-script). Writes $rootfs.ok, or $rootfs.failed, which `start` waits on,
+# and its pid to $out/rootfs.pid, so that `start` can tell a build that is slow from one that died.
 make_rootfs() {
 	local bin image script
+	mkdir -p "$out"
+	echo $$ >"$out/rootfs.pid"
 	bin=$(realpath "${1:?}")
 	image=$(tr -d '\n' <runner/src/dagger.zig |
 		grep -oE '"ubuntu:[A-Za-z0-9._-]+" *\+\+ *"@sha256:[a-f0-9]{64}"' | tr -d '" +')
@@ -126,6 +129,36 @@ make_rootfs() {
 		echo "rootfs: provisioning $image failed" >&2
 	fi
 	docker rm zig-runner-e2e-rootfs >/dev/null || true
+}
+
+# wait_rootfs: until `e2e.sh rootfs` has left $rootfs.ok, or $rootfs.failed, at most $timeout s (the
+# suite's own limit). The build runs apt against Ubuntu's archive, so how long it takes depends on
+# the network: it is waited for as long as its process (the pid in $out/rootfs.pid) is alive, and
+# one that exited without a marker is reported at once. Prints the build's last line every minute.
+wait_rootfs() {
+	local deadline=$((SECONDS + timeout)) pid="" waited=0
+	while ((SECONDS < deadline)); do
+		sudo test -e "$rootfs.ok" -o -e "$rootfs.failed" && break
+		[[ -z $pid && -e $out/rootfs.pid ]] && pid=$(<"$out/rootfs.pid")
+		# Not started yet: the step that starts it runs well before this one, so 30 s is plenty.
+		if [[ -z $pid ]] && ((waited >= 30)); then
+			echo "no native rootfs: e2e.sh rootfs never started (no $out/rootfs.pid)" >&2 && exit 1
+		fi
+		if [[ -n $pid ]] && ! kill -0 "$pid" 2>/dev/null; then
+			# It may have finished between the two checks.
+			sudo test -e "$rootfs.ok" -o -e "$rootfs.failed" && break
+			echo "no native rootfs: e2e.sh rootfs (pid $pid) exited without a result; its log:" >&2
+			tail -n 5 "$out/rootfs.log" >&2 2>/dev/null || true
+			exit 1
+		fi
+		if ((waited > 0 && waited % 60 == 0)); then
+			echo "waiting for the native rootfs, ${waited} s so far; rootfs.log: $(tail -n 1 "$out/rootfs.log" 2>/dev/null)"
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+	sudo test -e "$rootfs.ok" ||
+		{ echo "no native rootfs (e2e.sh rootfs): ${waited} s, and the build $(sudo test -e "$rootfs.failed" && echo failed || echo is still running)" >&2 && exit 1; }
 }
 
 start() {
@@ -145,11 +178,7 @@ start() {
 	sudo test -S "$engine_dir/engine.sock" || { echo "no engine (e2e.sh engine)" >&2 && exit 1; }
 	local native=()
 	if [[ $backend == native ]]; then
-		for _ in $(seq 300); do
-			sudo test -e "$rootfs.ok" -o -e "$rootfs.failed" && break
-			sleep 1
-		done
-		sudo test -e "$rootfs.ok" || { echo "no native rootfs (e2e.sh rootfs)" >&2 && exit 1; }
+		wait_rootfs
 		# Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; ci.yml's Test lifts it too.
 		sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
 		native=(RUNNER_NATIVE_ROOTFS="$rootfs")
@@ -383,7 +412,7 @@ expect() {
 check() {
 	label=${2:?}
 	backend=${3:-dagger}
-	local nonce tag jobs state started running
+	local nonce tag jobs jobid state started running log=$out/runner-$backend.log
 	if [[ -n ${E2E_GH_TOKEN:-} ]]; then
 		export GH_TOKEN=$E2E_GH_TOKEN
 	else
@@ -406,22 +435,30 @@ check() {
 	cancel=$(find_run e2e-cancel.yml "e2e-cancel $tag") || { fail "the e2e-cancel run never appeared" && exit 1; }
 	echo "runs: https://github.com/$repo/actions/runs/$main and .../$cancel"
 
-	# The cancel, once its long step has started. The step list says so, but it can lag behind the
-	# job (during an incident `hog` started in 3 s and the list never showed it), so a job that has
-	# plainly been running for 30 s on a runner counts too. That cannot let a Hog that never started
-	# pass: the checks below need the step cancelled (not skipped) and its output in the log.
+	# The cancel, once its long step has started. The runner's own log says so exactly: it holds each
+	# step's output as "[job ID step N stdout] ...", ID being this run's job. No other run's Hog can
+	# write that line for this ID: the job is this dispatch's own, and the log is this pass's own.
+	# GitHub's step list says so too, but it can lag behind the job (during an incident `hog`
+	# started in 3 s and the list never showed it), so either counts. The job merely running does
+	# not: when "Set up job" alone takes over 30 s, a cancel on that clock lands before Hog starts
+	# and skips it. The last resort, 5 minutes of the job running without either signal, cannot let
+	# a Hog that never started pass: the checks below need the step cancelled and its output.
 	started="" running=0
 	for _ in $(seq $((timeout / 5))); do
 		jobs=$(jobs_of "$cancel" 2>/dev/null) || jobs=""
 		state=$(jq -r '.jobs[0].steps[]? | select(.name == "Hog") | .status' <<<"$jobs" 2>/dev/null) || state=""
 		[[ $state == in_progress || $state == completed ]] && { started=1 && break; }
+		jobid=$(jq -r '.jobs[0].id // empty' <<<"$jobs" 2>/dev/null) || jobid=""
+		if [[ -n $jobid ]] && grep -qE "^\[job $jobid step [0-9]+ stdout\] e2e-hog started\r?$" "$log" 2>/dev/null; then
+			started=1 && break
+		fi
 		if jq -e '.jobs[0] | .status == "in_progress" and ((.runner_name // "") != "")' <<<"$jobs" >/dev/null 2>&1; then
 			running=$((running + 1))
 		else
 			running=0
 		fi
-		if ((running >= 6)); then
-			echo "e2e-cancel: the step list does not show Hog after 30 s of the job running; cancelling anyway"
+		if ((running >= 60)); then
+			echo "e2e-cancel: neither the runner's log nor the step list shows Hog after 5 minutes of the job running; cancelling anyway"
 			started=1 && break
 		fi
 		sleep 5
