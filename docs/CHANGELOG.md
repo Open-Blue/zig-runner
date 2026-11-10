@@ -10,6 +10,11 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.32.0 - 2026-11-10
+### Changed
+* SHA-256 uses the CPU's SHA-2 instructions when it has them (checked once, at the first hash), with the same one binary per architecture: the digests of tool trees, image layers and blobs, and step keys are 5 to 7 times faster on a Raspberry Pi 5 and on x86_64 with SHA-NI, and unchanged on CPUs without them
+* A native job's end now shows the parts of its collect (touch, directory sync, scan, evict, rest), and a pass queues evicted layers for the reaper without starting its thread until the pass is done, so the thread's directory sync and deletes cannot slow the pass's own renames and unlinks on a slow disk
+
 ## v0.31.0 - 2026-11-10
 ### Added
 * Step cache misses are explainable. A native step that is not replayed now logs which part of its key changed since its last run (`Not replayed: the tool tree /opt/hostedtoolcache/zig changed (a1b2c3d4 → e5f6a7b8)`), and `zig-runner key-diff <key-a> <key-b>` prints two layers' key parts side by side. The parts are digests, kept beside each layer and in a per-step index; keys are unchanged, so existing caches still hit.

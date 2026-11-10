@@ -1,3 +1,0 @@
-kind: Changed
-body: 'SHA-256 uses the CPU''s SHA-2 instructions when it has them (checked once, at the first hash), with the same one binary per architecture: the digests of tool trees, image layers and blobs, and step keys are 5 to 7 times faster on a Raspberry Pi 5 and on x86_64 with SHA-NI, and unchanged on CPUs without them'
-time: 2026-11-10T14:03:17.216882742-05:00
