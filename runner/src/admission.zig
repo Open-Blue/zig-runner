@@ -3729,13 +3729,15 @@ test "an untrusted job learns apart from the trusted job of its name, and a refu
     // (c) A trusted job learns as before.
     _ = runJob(&g, trusted, 2600, 270_000, false);
     try std.testing.expectEqual(@as(?u32, 2600), pool.learned_native.estimate(trusted));
-    try std.testing.expectEqual(@as(?u32, 270_000), pool.runMs(trusted));
+    // `ended` measures on the clock, so a slow machine adds a millisecond or so to the run.
+    const trusted_ms = pool.runMs(trusted).?;
+    try std.testing.expect(trusted_ms >= 270_000 and trusted_ms < 271_000);
 
     // (a) Five tiny untrusted runs of the same name (the table keeps the last five) change
     // neither the trusted estimate nor its run time; they teach their own entry.
     for (0..5) |_| _ = runJob(&g, forged, 1, 2_000, false);
     try std.testing.expectEqual(@as(?u32, 2600), pool.learned_native.estimate(trusted));
-    try std.testing.expectEqual(@as(?u32, 270_000), pool.runMs(trusted));
+    try std.testing.expectEqual(@as(?u32, trusted_ms), pool.runMs(trusted));
     try std.testing.expectEqual(@as(u32, 2600), pool.nativeEstimate(trusted));
     try std.testing.expectEqual(@as(?u32, Learned.min_mb), pool.learned_native.estimate(forged));
     try std.testing.expect(pool.runMs(forged).? < 60_000);
