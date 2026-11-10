@@ -9,6 +9,8 @@ const broker = @import("../github/broker.zig");
 const runservice = @import("../github/runservice.zig");
 const job_mod = @import("../job.zig");
 const trust = @import("../trust.zig");
+const Evaluator = @import("../dagger/Evaluator.zig");
+const packageCacheScope = @import("../dagger/set_up.zig").packageCacheScope;
 const dagger = @import("../dagger.zig");
 const zig_release = @import("../zig_release.zig");
 const db = @import("../db.zig");
@@ -230,6 +232,19 @@ fn acquire(
     }
 }
 
+/// The job's identity for the memory gate, in the trust scope the backends keep volumes apart by
+/// (`packageCacheScope`): an untrusted job must not teach a trusted job's name its own size and run
+/// time (`admission.jobKeyIn`). A job whose scope cannot be told is untrusted.
+fn gateKey(c: Runner, job: job_mod.Job, name: []const u8) u64 {
+    const g = job.github;
+    const trusted = trust.vouches(c.cfg.trusted_refs, c.cfg.trusted_events, g) and scope: {
+        var ev = Evaluator.init(c.arena, &job) catch break :scope false;
+        const scope = packageCacheScope(c.arena, &ev, g.repository, true) catch break :scope false;
+        break :scope std.mem.eql(u8, scope, "repo");
+    };
+    return admission.jobKeyIn(trusted, g.repository, g.workflow_ref, name);
+}
+
 /// One job from its broker message `body` to completejob: acquire it, run it, upload what GitHub
 /// shows, and say how the cycle ended.
 pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
@@ -244,8 +259,7 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     // Known by name now: it reserves what jobs of its name took (`admission.Learned`), and what it
     // takes is learned when it ends.
     const job_name = if (job.display_name.len > 0) job.display_name else job.github.job;
-    const g = job.github;
-    if (c.gate) |gate| gate.assigned(admission.jobKey(g.repository, g.workflow_ref, job_name));
+    if (c.gate) |gate| gate.assigned(gateKey(c, job, job_name));
     defer if (c.gate) |gate| if (gate.ended()) |learned| sayUnallocated(
         c,
         "job '{s}' {s} {f} at most ({s}); reserving {f} for it while it starts",
@@ -635,6 +649,9 @@ fn runJobSteps(
     if (refused) |why| try c.err.print("job refused: {s}\n", .{why});
     const unsupported: ?[]const u8 = refused orelse job.container_error orelse job.services_error;
     if (unsupported) |why| {
+        // Nothing of it ran: not learned from, whatever name it has (the reservation is released
+        // when the job ends, as for any job).
+        if (c.gate) |gate| gate.replayed();
         try log.append(job.check_run_id, 0, .stderr, why);
         return failedInSetUp(c.arena, job.steps.len);
     }
@@ -711,6 +728,81 @@ fn failedInSetUp(arena: std.mem.Allocator, steps: usize) !dagger.Result {
         .succeeded = false,
         .set_up_failed = true,
     };
+}
+
+test "the gate learns a job in its trust scope, and not at all from one the runner refused (#465)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var out_buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var stdout_log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var cfg: Config = .{
+        .gh_token = "",
+        .scope = undefined,
+        .trusted_refs = "refs/heads/main",
+        .trusted_events = "push",
+    };
+    const c = testRunner(arena, &stdout_log, &err, &cfg);
+    const wf = "o/r/.github/workflows/ci.yml@refs/heads/main";
+    const main: job_mod.Github = .{
+        .repository = "o/r",
+        .ref = "refs/heads/main",
+        .event_name = "push",
+        .workflow_ref = wf,
+    };
+    var job: job_mod.Job = .{
+        .plan_id = "p",
+        .job_id = "j",
+        .job_token = "t",
+        .check_run_id = 7,
+        .secrets = &.{},
+        .steps = &.{},
+        .github = main,
+    };
+    const trusted = admission.jobKeyIn(true, "o/r", wf, "zig");
+    const untrusted = admission.jobKeyIn(false, "o/r", wf, "zig");
+    try std.testing.expectEqual(trusted, gateKey(c, job, "zig"));
+    // An event the runner does not vouch for, a ref it does not, and a fork's pull request on a
+    // runner that does vouch for pull requests.
+    job.github.event_name = "pull_request";
+    try std.testing.expectEqual(untrusted, gateKey(c, job, "zig"));
+    job.github = main;
+    job.github.ref = "refs/heads/topic";
+    try std.testing.expectEqual(untrusted, gateKey(c, job, "zig"));
+    job.github = main;
+    cfg.trusted_events = "push,pull_request";
+    job.github.event_name = "pull_request";
+    const fork =
+        \\{"github":{"t":2,"d":[{"k":"event","v":{"t":2,"d":[{"k":"pull_request","v":{"t":2,"d":[
+        \\{"k":"head","v":{"t":2,"d":[{"k":"repo","v":{"t":2,"d":[{"k":"full_name","v":"someone/r"}]}}]}}]}}]}}]}}
+    ;
+    try std.testing.expectEqual(trusted, gateKey(c, job, "zig"));
+    job.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena, fork, .{});
+    try std.testing.expectEqual(untrusted, gateKey(c, job, "zig"));
+
+    // A refused job: the steps are failed in set-up and the gate is told not to learn from it.
+    var slots: [1]admission.Admission.Slot = undefined;
+    var pool: admission.Admission = .init(std.testing.io, .{}, &slots);
+    var gate: admission.Gate = .{ .pool = &pool, .slot = 0 };
+    cfg.trusted_events = "push";
+    var runner = c;
+    runner.gate = &gate;
+    job.github = main;
+    job.github.ref = "refs/heads/topic";
+    gate.leave(true);
+    gate.assigned(gateKey(c, job, "zig"));
+    pool.slots[0].base_mb = 0;
+    pool.slots[0].peak_mb = 5000;
+    var cancel: dagger.Cancel = .{};
+    var log: sink.LogSink = .{ .collect = .{ .arena = arena, .io = std.testing.io, .inner = &stdout_log } };
+    const result = try runJobSteps(runner, job, &log, &cancel, undefined, undefined, null);
+    try std.testing.expect(result.set_up_failed);
+    try std.testing.expect(gate.ended() == null);
+    try std.testing.expectEqual(@as(usize, 0), pool.learned.len);
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), pool.slots[0].started_ms);
 }
 
 test "a job failed before its steps fails in Set up job" {
