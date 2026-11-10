@@ -18,7 +18,6 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-const Allocator = std.mem.Allocator;
 const Store = @import("Store.zig");
 
 /// The most trees waiting. The trees a pass evicts are few (it stops at the cap or the floor).
