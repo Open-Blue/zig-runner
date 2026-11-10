@@ -318,6 +318,15 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     const job_started_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
     var reporter = try startReporter(c, job, job_started_ms);
     const result = try runJobSteps(c, job, log, &cancel, &live, &step_logs, if (reporter) |*r| r else null);
+    // A native job's teardown (its eviction of the store, its network, its cgroup) comes after its
+    // result is reported to GitHub, not before: the result does not depend on it. It runs on every
+    // path out of here, and before the gate lets go of the job (`gate.ended`, deferred above), so
+    // the job's memory stays counted while its cgroup is up, and before the runner polls again,
+    // so the next job never meets the slot, the network or the cgroup this one still holds.
+    var phases: ?[]const u8 = result.native_phases;
+    defer if (result.teardown) |t| {
+        _ = t.run();
+    };
     // The engine was starting when this job opened its session, so its cache may have been
     // wiped: warmed again for the next job.
     if (result.engine_waited) if (c.warmer) |w| w.request();
@@ -351,8 +360,17 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     }
 
     const conclusion = jobConclusion(result);
-    if (try completeJobWithRetry(c, jr, job, conclusion, shown, result, log.currentSecrets())) |failed| return failed;
-    try sayJob(log, c.arena, job, "job {s}", .{@tagName(conclusion)});
+    const failed = try completeJobWithRetry(c, jr, job, conclusion, shown, result, log.currentSecrets());
+    if (failed == null) try sayJob(log, c.arena, job, "job {s}", .{@tagName(conclusion)});
+    // The result is with GitHub: the job's hold needs no more renewing, and the teardown can go.
+    renewer.stop.store(true, .release);
+    if (result.teardown) |t| phases = t.run();
+    if (phases) |p| try c.err.print("job {d} '{s}': native phases (ms): {s}\n", .{
+        job.check_run_id,
+        jobName(job),
+        p,
+    });
+    if (failed) |f| return f;
     return .{ .job = result.succeeded };
 }
 
@@ -684,7 +702,13 @@ fn runJobSteps(
         .sink_job_id = job.check_run_id,
         .runner_name = c.name,
         .native = native,
+        // Reported first, torn down after (`handleJob`).
+        .defer_teardown = true,
     }, job, log);
+    // Whatever ends this call before its caller has the result: the teardown must still run.
+    errdefer if (result.teardown) |t| {
+        _ = t.run();
+    };
     // A cancel can also end the job through a query it cut short (past the grace period).
     if (cancel.requested.load(.acquire)) {
         result.cancelled = true;
@@ -761,12 +785,6 @@ fn reportCacheAndKeys(
     log: *sink.LogSink,
     result: dagger.Result,
 ) !void {
-    // Where a native job's time went (`dagger.Result.native_phases`), for native-phases.sh.
-    if (result.native_phases) |p| try c.err.print("job {d} '{s}': native phases (ms): {s}\n", .{
-        job.check_run_id,
-        jobName(job),
-        p,
-    });
     if (c.cfg.step_cache and job.steps.len > 0) {
         var replayed: usize = 0;
         // Read a line at a time, not held: the log can be the 64 MiB it keeps.
