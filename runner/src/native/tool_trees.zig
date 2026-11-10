@@ -132,6 +132,23 @@ pub fn check(
     limits: Limits,
     cancel: ?*const dagger.Cancel,
 ) Allocator.Error!Verdict {
+    return (try walk(arena, gpa, io, cache, lists, mount, limits, cancel)).verdict;
+}
+
+/// What a walk found, and whether it was cut short (the job's cancel, the clock): a walk that
+/// was is no answer for another job.
+const Walked = struct { verdict: Verdict, stopped: bool };
+
+fn walk(
+    arena: Allocator,
+    gpa: Allocator,
+    io: std.Io,
+    cache: []const u8,
+    lists: []const u8,
+    mount: []const u8,
+    limits: Limits,
+    cancel: ?*const dagger.Cancel,
+) Allocator.Error!Walked {
     var c: Check = .{
         .io = io,
         .gpa = gpa,
@@ -145,11 +162,11 @@ pub fn check(
     var full: std.ArrayList(u8) = .empty;
     var note: std.ArrayList(u8) = .empty;
     var skipped: std.ArrayList(u8) = .empty;
-    const root = openRoot(arena, cache) orelse return .{
+    const root = openRoot(arena, cache) orelse return .{ .stopped = false, .verdict = .{
         .env = "",
         .full = "",
         .note = "Tool cache: not checked (the volume cannot be opened)",
-    };
+    } };
     defer _ = linux.close(root);
     // Whatever was found before a trouble is checked: one level that cannot be read, or too many
     // names in it, costs those names and no others.
@@ -215,7 +232,165 @@ pub fn check(
     });
     if (c.spent) |why| try text.print(arena, "; reading stopped: {s}", .{why});
     if (c.why) |why| try text.print(arena, "; stopped: {s}", .{why});
-    return .{ .env = env.items, .full = full.items, .note = text.items };
+    return .{
+        .verdict = .{ .env = env.items, .full = full.items, .note = text.items },
+        .stopped = c.why != null,
+    };
+}
+
+/// The checks of the process that are running or waited for, by volume (`checkOnce`).
+pub var process_flights: Flights = .{};
+
+/// Single-flight for `check`. Jobs that start together walk the same tree, each stat-ing every
+/// file (razorbill, a Pi 5: 220 ms for one job, 590 ms when seven start at once). A walk is
+/// never reused for a job that was already waiting when it began, because a file may have been
+/// written after the walk passed it. So a job arriving while a walk is running waits for it to
+/// end, and the jobs that wait at that moment share the next walk, which began after every one of
+/// them arrived: what it saw is no older than what that job's own walk would have seen. Nothing is
+/// remembered once nobody is waiting, so a job that arrives later walks the tree itself, whatever
+/// the tree's times say: a write to a file moves no directory's mtime, and only the file's own
+/// ctime shows it.
+pub const Flights = struct {
+    mu: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    /// One per volume (`key`) with a caller in `checkOnce`. Few; looked at in order.
+    list: std.ArrayList(*Flight) = .empty,
+    /// Walks begun, all volumes (what the tests count).
+    walks: u64 = 0,
+
+    const Flight = struct {
+        key: []u8,
+        /// Callers using it, running or waiting; it goes with the last.
+        users: u32 = 0,
+        running: bool = false,
+        /// Walks begun, and the number of the one `done` is of (0: none).
+        begun: u64 = 0,
+        done_walk: u64 = 0,
+        done: ?Verdict = null,
+
+        /// Keeps `v` as the answer of walk `n`, unless there is no memory for it.
+        fn keep(f: *Flight, n: u64, v: Verdict) void {
+            const a = std.heap.smp_allocator;
+            const env = a.dupe(u8, v.env) catch return;
+            const full = a.dupe(u8, v.full) catch return a.free(env);
+            const note = a.dupe(u8, v.note) catch {
+                a.free(env);
+                a.free(full);
+                return;
+            };
+            f.forget();
+            f.done = .{ .env = env, .full = full, .note = note };
+            f.done_walk = n;
+        }
+
+        fn forget(f: *Flight) void {
+            const a = std.heap.smp_allocator;
+            if (f.done) |v| {
+                a.free(v.env);
+                a.free(v.full);
+                a.free(v.note);
+            }
+            f.done = null;
+        }
+    };
+
+    /// Removes a flight nobody uses (the lock is held).
+    fn drop(fl: *Flights, f: *Flight) void {
+        const a = std.heap.smp_allocator;
+        for (fl.list.items, 0..) |x, i| if (x == f) {
+            _ = fl.list.swapRemove(i);
+            break;
+        };
+        f.forget();
+        a.free(f.key);
+        a.destroy(f);
+    }
+};
+
+/// How often a waiting job looks at its cancel.
+const wait_cancel_ms = 100;
+
+/// `check` for the jobs of one process: concurrent calls for one volume share a walk as
+/// `Flights` says. Same arguments and answer as `check` with default limits. The key is
+/// everything the answer depends on, so volumes of other scopes (other trust) never share one,
+/// and a walk cut short (cancelled, out of time) is the leader's alone: the others walk.
+pub fn checkOnce(
+    fl: *Flights,
+    arena: Allocator,
+    gpa: Allocator,
+    io: std.Io,
+    cache: []const u8,
+    lists: []const u8,
+    mount: []const u8,
+    cancel: ?*const dagger.Cancel,
+) Allocator.Error!Verdict {
+    const key = try std.fmt.allocPrint(std.heap.smp_allocator, "{s}\x00{s}\x00{s}", .{ cache, lists, mount });
+    defer std.heap.smp_allocator.free(key);
+    fl.mu.lockUncancelable(io);
+    var flight: *Flights.Flight = for (fl.list.items) |f| {
+        if (std.mem.eql(u8, f.key, key)) break f;
+    } else blk: {
+        const f = std.heap.smp_allocator.create(Flights.Flight) catch {
+            fl.mu.unlock(io);
+            return error.OutOfMemory;
+        };
+        f.* = .{ .key = std.heap.smp_allocator.dupe(u8, key) catch {
+            std.heap.smp_allocator.destroy(f);
+            fl.mu.unlock(io);
+            return error.OutOfMemory;
+        } };
+        fl.list.append(std.heap.smp_allocator, f) catch {
+            std.heap.smp_allocator.free(f.key);
+            std.heap.smp_allocator.destroy(f);
+            fl.mu.unlock(io);
+            return error.OutOfMemory;
+        };
+        break :blk f;
+    };
+    flight.users += 1;
+    // A walk numbered above this began after this call did.
+    const arrived = flight.begun;
+    defer {
+        flight.users -= 1;
+        if (flight.users == 0) fl.drop(flight);
+        fl.mu.unlock(io);
+    }
+    while (true) {
+        if (flight.done_walk > arrived) if (flight.done) |v| return .{
+            .env = try arena.dupe(u8, v.env),
+            .full = try arena.dupe(u8, v.full),
+            .note = try arena.dupe(u8, v.note),
+        };
+        const cancelled = if (cancel) |x| x.requested.load(.acquire) else false;
+        if (cancelled) {
+            // It walks alone and stops at once; no one waits for it.
+            fl.mu.unlock(io);
+            defer fl.mu.lockUncancelable(io);
+            return check(arena, gpa, io, cache, lists, mount, .{}, cancel);
+        }
+        if (flight.running) {
+            fl.cond.waitTimeout(io, &fl.mu, .{ .duration = .{
+                .raw = .fromMilliseconds(wait_cancel_ms),
+                .clock = .awake,
+            } }) catch |e| switch (e) {
+                // Either way the loop looks at the cancel and the walk again.
+                error.Timeout, error.Canceled => {},
+            };
+            continue;
+        }
+        flight.running = true;
+        flight.begun += 1;
+        fl.walks += 1;
+        const mine = flight.begun;
+        fl.mu.unlock(io);
+        const walked = walk(arena, gpa, io, cache, lists, mount, .{}, cancel);
+        fl.mu.lockUncancelable(io);
+        flight.running = false;
+        defer fl.cond.broadcast(io);
+        const w = try walked;
+        if (!w.stopped) flight.keep(mine, w.verdict);
+        return w.verdict;
+    }
 }
 
 fn appendCapped(
@@ -1575,4 +1750,70 @@ test "tool trees: a cancel that lands in the lists' upkeep is there for what run
     var task = try std.testing.io.concurrent(arena_state.run, .{ path, &cancelled });
     task.cancel(std.testing.io);
     try std.testing.expect(cancelled);
+}
+
+test "tool trees: calls that overlap share a walk, and any answer is a walk's own" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    const fresh = try checkWith(arena, f, .{}, null);
+    var flights: Flights = .{};
+    defer flights.list.deinit(std.heap.smp_allocator);
+    const Caller = struct {
+        fn run(fl: *Flights, ff: Fixture, ar: *std.heap.ArenaAllocator, out: *Verdict, ok: *bool) void {
+            // Each caller its own arena (one is not shared between threads); the test frees them.
+            const v = checkOnce(fl, ar.allocator(), std.heap.smp_allocator, std.testing.io, ff.cache, ff.lists, "/t", null) catch return;
+            out.* = v;
+            ok.* = true;
+        }
+    };
+    var verdicts: [6]Verdict = undefined;
+    var oks: [6]bool = @splat(false);
+    var arenas: [6]std.heap.ArenaAllocator = @splat(.init(std.heap.page_allocator));
+    defer for (&arenas) |*x| x.deinit();
+    var threads: [6]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Caller.run, .{ &flights, f, &arenas[i], &verdicts[i], &oks[i] });
+    for (threads) |t| t.join();
+    for (verdicts, oks) |v, ok| {
+        try std.testing.expect(ok);
+        try std.testing.expectEqualStrings(fresh.env, v.env);
+        try std.testing.expectEqualStrings(fresh.full, v.full);
+    }
+    try std.testing.expect(flights.walks >= 1 and flights.walks <= 6);
+    // Nothing is kept once the last caller is gone.
+    try std.testing.expectEqual(@as(usize, 0), flights.list.items.len);
+}
+
+test "tool trees: a change after an answer is in the next answer, whatever the tree's times say" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    const tree = try std.fmt.allocPrint(arena, "{s}/{s}", .{ f.cache, tree_rel });
+    var flights: Flights = .{};
+    defer flights.list.deinit(std.heap.smp_allocator);
+    const gpa = std.testing.allocator;
+    var last = try checkOnce(&flights, arena, gpa, io, f.cache, f.lists, "/t", null);
+    // A file's content (the directory's mtime does not move), a mode, a new file, a link.
+    for ([_][]const u8{
+        "printf 'changed\\n' > zig",
+        "chmod 4755 zig",
+        "printf new > added",
+        "ln -s ../../x zig-link2",
+    }) |edit| {
+        const run = try std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", try std.fmt.allocPrint(arena, "cd \"$0\" && {s}", .{edit}), tree } });
+        try std.testing.expect(run.term == .exited and run.term.exited == 0);
+        const now = try checkOnce(&flights, arena, gpa, io, f.cache, f.lists, "/t", null);
+        const walked = try checkWith(arena, f, .{}, null);
+        try std.testing.expectEqualStrings(walked.env, now.env);
+        try std.testing.expectEqualStrings(walked.full, now.full);
+        try std.testing.expect(!std.mem.eql(u8, last.env, now.env) or !std.mem.eql(u8, last.full, now.full));
+        last = now;
+    }
 }
