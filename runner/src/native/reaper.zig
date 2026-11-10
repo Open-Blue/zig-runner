@@ -95,7 +95,7 @@ fn run(io: std.Io) void {
     while (true) {
         const path = next(io) orelse return;
         defer finish(io, path);
-        while (test_hold.load(.acquire)) io.sleep(.fromMilliseconds(1), .awake) catch {};
+        while (test_hold.load(.acquire)) io.sleep(.fromMilliseconds(1), .awake) catch return;
         // A rename is durable only once its directory is: sync it before the first tree under it
         // goes, not once a tree.
         const dir = std.fs.path.dirname(path) orelse ".";
