@@ -161,6 +161,9 @@ scope: []const u8 = "untrusted",
 repository: []const u8 = "",
 /// The store's layers the job uses, held shared until it ends (`Store.Layer`).
 held: std.ArrayList(std.Io.File) = .empty,
+/// The locks (also in `held`) of the stored layers the job's stack has used, oldest first, kept
+/// past a flatten, which leaves the stack one layer; `Store.touchChain` at the job's end.
+chain: std.ArrayList(std.Io.File) = .empty,
 /// Past this many layers, the stack is merged into one (`flatten`).
 flatten_at: usize = default_flatten_at,
 /// `abort` while an exec waits for its key's lock (`Store.lockKey`): the wait ends.
@@ -1377,6 +1380,8 @@ pub fn deinit(b: *Backend) void {
     t = b.timings.since(arena, .veth_rm, t);
     removeJobDir(arena, b.io, b.dir);
     t = b.timings.since(arena, .tree_rm, t);
+    // Before the layers are let go: ancestors end up the more recently used (`Store.touchChain`).
+    Store.touchChain(b.io, b.chain.items);
     for (b.held.items) |f| f.close(b.io);
     if (b.slot) |s| s.lock.close(b.io);
     b.lock.close(b.io);
@@ -2844,6 +2849,7 @@ fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
     errdefer lock.close(b.io);
     try b.layers.ensureUnusedCapacity(arena, 1);
     try b.held.ensureUnusedCapacity(arena, 1);
+    try b.chain.ensureUnusedCapacity(arena, 1);
     const name = try b.layerName('l');
     const link = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name });
     std.Io.Dir.cwd().symLink(b.io, hit.layer.fs, link, .{}) catch |e| {
@@ -2855,6 +2861,7 @@ fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
         return .{};
     };
     b.held.appendAssumeCapacity(hit.layer.lock);
+    b.chain.appendAssumeCapacity(hit.layer.lock);
     b.layers.appendAssumeCapacity(.{
         .name = name,
         .path = hit.layer.fs,
@@ -2875,6 +2882,7 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) 
     if (rec.log.len > Store.max_record_bytes) return;
     // Room first: once the layer has moved, the job must hold it and point at it.
     b.held.ensureUnusedCapacity(arena, 1) catch return;
+    b.chain.ensureUnusedCapacity(arena, 1) catch return;
     const top = &b.layers.items[b.layers.items.len - 1];
     const t = phases.now();
     try b.canonicalize(top);
@@ -2897,6 +2905,7 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) 
         return;
     };
     b.held.appendAssumeCapacity(layer.lock);
+    b.chain.appendAssumeCapacity(layer.lock);
     b.published = true;
     const canonical = top.canonical;
     top.* = .{ .name = name, .path = layer.fs, .key = key, .canonical = canonical };
