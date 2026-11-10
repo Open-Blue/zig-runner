@@ -3,6 +3,7 @@
 const Evaluator = @This();
 
 const std = @import("std");
+const Sha256 = @import("../sha256.zig").Sha256;
 const job_mod = @import("../job.zig");
 const expr = @import("../expr.zig");
 const context = @import("../context.zig");
@@ -309,7 +310,7 @@ pub fn setServices(
 /// id, which no step here can use, so only its shape matters).
 fn stableId(arena: Allocator, dagger_id: []const u8) ![]const u8 {
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(dagger_id, &digest, .{});
+    Sha256.hash(dagger_id, &digest, .{});
     return std.fmt.allocPrint(arena, "{x}", .{&digest});
 }
 

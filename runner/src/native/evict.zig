@@ -33,6 +33,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const Store = @import("Store.zig");
+const reaper = @import("reaper.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -178,7 +179,7 @@ pub fn run(s: Store, io: std.Io) void {
     if (lim.images_max_bytes > 0 and over_by > 0 and blobs.evict(arena, io, s.root, over_by))
         evicted = capped(arena, io, s.root, trees, lim.images_max_bytes, blobs.bytes, lim, &budget, &synced, "images") or evicted;
     if (!synced) return;
-    if (shortOf(arena, s)) |short| {
+    if (shortOf(arena, io, s)) |short| {
         var left = short;
         const before = blobs.bytes;
         _ = blobs.evict(arena, io, s.root, left);
@@ -192,8 +193,11 @@ pub fn run(s: Store, io: std.Io) void {
     }
 }
 
-/// What the disk is short of: `shortBy` by the store's limit.
-pub fn shortOf(arena: Allocator, s: Store) ?u64 {
+/// What the disk is short of: `shortBy` by the store's limit. Nothing while evicted layers are
+/// still being deleted (`reaper`): their room is not back yet, and counting the disk short now
+/// would evict what the cap does not ask for.
+pub fn shortOf(arena: Allocator, io: std.Io, s: Store) ?u64 {
+    if (reaper.pending(io)) return null;
     return shortBy(arena, s.root, s.limits.min_free_pct);
 }
 

@@ -7,6 +7,7 @@ const provisioned = @import("dagger/provisioned.zig");
 const sandbox = @import("native/sandbox.zig");
 const net = @import("native/net.zig");
 const nft = @import("native/nft.zig");
+const key_diff = @import("native/key_diff.zig");
 
 const forward = @import("native/forward.zig");
 const native_publish = @import("native/publish.zig");
@@ -25,15 +26,18 @@ const engine = @import("engine.zig");
 const build_version = @import("version.zig");
 
 comptime {
+    _ = @import("sha256.zig");
     _ = @import("sink.zig");
     _ = @import("native/Backend.zig");
     _ = @import("native/cgroup.zig");
     _ = @import("native/Store.zig");
     _ = @import("native/evict.zig");
+    _ = @import("native/reaper.zig");
     _ = @import("native/sandbox.zig");
     _ = @import("native/net.zig");
     _ = @import("native/seccomp.zig");
     _ = @import("native/nft.zig");
+    _ = @import("native/key_diff.zig");
     _ = @import("native/oci/layer.zig");
     _ = @import("native/oci/zstd.zig");
     _ = @import("native/oci/registry.zig");
@@ -119,6 +123,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (args.len == 5 and std.mem.eql(u8, args[1], net.command))
         return net.upMain(arena, args[2], args[3], args[4]);
     if (args.len >= 3 and std.mem.eql(u8, args[1], nft.command)) return nft.main(args[2..]);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], key_diff.command)) return keyDiff(arena, init, args[2..]);
     if (try printVersionIfAsked(io, args)) return @backingInt(Exit.done);
     if (try printProvisionIfAsked(io, args)) return @backingInt(Exit.done);
 
@@ -406,6 +411,23 @@ fn printVersionIfAsked(io: std.Io, args: []const [:0]const u8) !bool {
         return true;
     };
     return false;
+}
+
+/// `key-diff <key-a> <key-b>`: the components of two native step keys side by side
+/// (`key_diff.run`), from the store `RUNNER_NATIVE_STORE` names, or the default one. Answered
+/// before the configuration is read, as `--version` is: it reads the store and needs no token.
+fn keyDiff(arena: std.mem.Allocator, init: std.process.Init, args: []const [:0]const u8) !u8 {
+    var out_buf: [4096]u8 = undefined;
+    var out_w: std.Io.File.Writer = .initStreaming(.stdout(), init.io, &out_buf);
+    var err_buf: [1024]u8 = undefined;
+    var err_w: std.Io.File.Writer = .initStreaming(.stderr(), init.io, &err_buf);
+    const root = try Config.defaultNativeStore(arena, init.environ_map);
+    const list = try arena.alloc([]const u8, args.len);
+    for (args, list) |a, *l| l.* = a;
+    const code = try key_diff.run(arena, init.io, list, root, &out_w.interface, &err_w.interface);
+    try out_w.interface.flush();
+    try err_w.interface.flush();
+    return code;
 }
 
 /// `--provision-script`: the shell script the default image is provisioned with when steps run as

@@ -650,6 +650,13 @@ pub const Job = struct {
     /// cgroup removed once they are gone. `io` null: not waited for (a failed `make`, where none
     /// ran).
     pub fn remove(j: Job, arena: Allocator, io: ?std.Io) void {
+        _ = j.removed(arena, io);
+    }
+
+    /// `remove`, and whether the cgroup is gone (or was): the kernel refuses to remove one that
+    /// still holds a process, so a true answer shows that every process of the job, in its steps
+    /// and services too, has exited.
+    pub fn removed(j: Job, arena: Allocator, io: ?std.Io) bool {
         // The children by name, so a sweep's `Job{ .dir = ... }` removes a dead runner's too.
         if (write(arena, j.dir, "cgroup.kill", "1") != .SUCCESS) if (io) |i| {
             for ([_][]const u8{ "", "/" ++ steps_name, "/" ++ services_name }) |child| {
@@ -663,13 +670,13 @@ pub const Job = struct {
                 }
             }
         };
-        const p = arena.dupeSentinel(u8, j.dir, 0) catch return;
+        const p = arena.dupeSentinel(u8, j.dir, 0) catch return false;
         // The killed processes leave the cgroup as they exit, which takes a moment.
         for (0..200) |_| {
             removeEmpty(arena, j.dir, steps_name);
             removeEmpty(arena, j.dir, services_name);
             switch (linux.errno(linux.rmdir(p))) {
-                .SUCCESS, .NOENT => return,
+                .SUCCESS, .NOENT => return true,
                 .BUSY => {},
                 else => break,
             }
@@ -677,6 +684,7 @@ pub const Job = struct {
             i.sleep(.fromMilliseconds(10), .awake) catch break;
         }
         std.log.warn("native: cannot remove the job's cgroup {s}", .{j.dir});
+        return false;
     }
 };
 
@@ -997,6 +1005,43 @@ test "native cgroup: the steps' cgroup kills as a group, the services' does not,
     job.remove(arena, io);
     for ([_][]const u8{ steps, services, job.dir }) |gone|
         try std.testing.expectError(error.FileNotFound, readIn(io, gone, "cgroup.procs", &buf));
+}
+
+test "native cgroup: a removal that is not whole says so, and one that is shows every process gone" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    // Where the kernel's refusal is a directory that is not empty: nothing is removed, and the
+    // caller is told (a cgroup that still holds a process is refused as `BUSY`).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const top = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const busy = try std.fmt.allocPrint(arena, "{s}/busy", .{top});
+    try std.Io.Dir.cwd().createDirPath(io, busy);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/left", .{busy}), .data = "" });
+    try std.testing.expect(!(Job{ .dir = busy }).removed(arena, io));
+    const empty = try std.fmt.allocPrint(arena, "{s}/empty", .{top});
+    try std.Io.Dir.cwd().createDirPath(io, empty);
+    try std.testing.expect((Job{ .dir = empty }).removed(arena, io));
+    try std.testing.expect((Job{ .dir = empty }).removed(arena, io));
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    // A real job with a process left in it: killed, and the cgroup gone only once it has exited.
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    const cg_top = try std.fmt.allocPrint(arena, "{s}/zig-runner-test-{s}", .{ mount_point, &hex });
+    defer (Job{ .dir = cg_top }).remove(arena, io);
+    ensure(arena, cg_top) catch return error.SkipZigTest;
+    const set: Limits = .{ .memory_max = 1 << 30, .pids_max = 64, .memory_total = 1 << 30 };
+    const job = try Job.make(arena, io, cg_top, "left-over", set);
+    var child = try std.process.spawn(io, .{ .argv = &.{ "sleep", "60" } });
+    defer child.kill(io);
+    const pid = try std.fmt.allocPrint(arena, "{d}", .{child.id.?});
+    try std.testing.expect(write(arena, job.stepsDir(), "cgroup.procs", pid) == .SUCCESS);
+    try std.testing.expect(job.removed(arena, io));
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(error.FileNotFound, readIn(io, job.dir, "cgroup.procs", &buf));
 }
 
 test "native cgroup: a job between steps has nothing in its cgroup, and still counts" {

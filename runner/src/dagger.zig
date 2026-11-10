@@ -261,6 +261,28 @@ pub const StepResult = struct {
     completed_ms: i64 = 0,
 };
 
+/// A native job's teardown (`Backend.deinit`): the services, the cgroup, the network, the job's
+/// directory and the store's eviction. The job's result does not depend on any of it, so
+/// `runNative` can hand it to the caller to run after the result is reported. It holds the job's
+/// slot, subnet, cgroup and store lock until it has run, so it must run before the caller starts
+/// another job, and before the memory gate lets go of the job (`admission.Gate.ended`).
+pub const Teardown = struct {
+    backend: *Backend,
+    arena: Allocator,
+    phases: ?[]const u8 = null,
+    done: bool = false,
+
+    /// Tears the job down, once; later calls return the phases again. Cancel-protected inside,
+    /// so a runner that is stopping still finishes it.
+    pub fn run(t: *Teardown) ?[]const u8 {
+        if (t.done) return t.phases;
+        t.done = true;
+        t.backend.deinit();
+        t.phases = t.backend.timings.text(t.arena, null, .all) catch null;
+        return t.phases;
+    }
+};
+
 /// How a job went: every step, the engine's error if it had one, and the annotations.
 pub const Result = struct {
     steps: []StepResult,
@@ -291,6 +313,10 @@ pub const Result = struct {
     /// On the native backend: where the job's time went, phase by phase (`native/phases.zig`),
     /// its teardown included, for the runner's own log (.github/scripts/native-phases.sh).
     native_phases: ?[]const u8 = null,
+    /// With `Options.defer_teardown`, a native job's teardown not run yet: the caller runs it
+    /// (`Teardown.run`) once it has reported the result, on every path out, and then has the
+    /// phases. Null when the job is torn down, or ran on Dagger.
+    teardown: ?*Teardown = null,
     /// With output keys: how many always-run steps keyed the steps after them on their output, how
     /// many fell back, and why the last one did. For the runner's own log, so an operator sees how
     /// often they apply without turning on step debug.
@@ -720,6 +746,9 @@ pub const Options = struct {
     /// `RUNNER_BACKEND=native`: run the job on the native backend when it can
     /// (`Backend.unsupported`), else on Dagger with "Set up job" saying why.
     native: ?Backend.Config = null,
+    /// A native job is not torn down before `run` returns: its result carries the teardown
+    /// (`Result.teardown`), for the caller to run after reporting it.
+    defer_teardown: bool = false,
     /// Why a job that could have been native runs on Dagger, for "Set up job" (set by `run`).
     backend_note: ?[]const u8 = null,
     /// `RUNNER_ENGINE=none`: this runner has no Dagger engine, so a job native cannot run fails at
@@ -1243,7 +1272,7 @@ fn runNative(
     defer noteReusedSteps(&sh, native_reused_note);
     // What failed and on which path, as "Set up job" says it (`Backend.initWhy`).
     var why: []const u8 = "";
-    var b = Backend.initWhy(arena, io, opts.gpa, cfg, &why) catch |e| {
+    const made = Backend.initWhy(arena, io, opts.gpa, cfg, &why) catch |e| {
         const what = if (why.len > 0) why else @errorName(e);
         // A job that would have no limits (P4, P5's `job_limits`, #367): not native, and not
         // failed either, where there is an engine to hold it (`Backend.jobCgroup` says why).
@@ -1264,16 +1293,23 @@ fn runNative(
             try std.fmt.allocPrint(arena, "could not make the job's native store: {s}", .{what}),
         );
     };
-    // Once, after the steps (so its teardown is timed into the result) or on an error.
-    var torn_down = false;
-    defer if (!torn_down) b.deinit();
+    // In the arena, so the teardown can outlive this call (`Teardown`).
+    const b = try arena.create(Backend);
+    b.* = made;
+    var teardown: Teardown = .{ .backend = b, .arena = arena };
+    // Once: after the steps, here or when the caller says (`Options.defer_teardown`), or on an
+    // error.
+    var handed_over = false;
+    defer if (!handed_over) {
+        _ = teardown.run();
+    };
     b.caches = .of(opts_in);
     // The runtime its JavaScript actions get, for the preload in the base (`native/actions.zig`).
     b.js_runtime = opts.js_runtime;
     b.cancel = opts.cancel;
     // Which ids the job's steps have, as "Set up job" says (`Backend.idsNote`).
     opts.backend_note = try b.idsNote(arena);
-    var result = runSteps(arena, io, opts, job, &sh, results, b.transport(), &b) catch |e| switch (e) {
+    var result = runSteps(arena, io, opts, job, &sh, results, b.transport(), b) catch |e| switch (e) {
         // What its `uses:` actions are is known once they are fetched, in the job's image as the
         // base pulled and provisioned it: one native cannot run yet sends the job to Dagger,
         // before anything is logged (`native/actions.zig`).
@@ -1285,9 +1321,16 @@ fn runNative(
         },
         else => return e,
     };
-    b.deinit();
-    torn_down = true;
-    result.native_phases = b.timings.text(arena, null, .all) catch null;
+    if (opts.defer_teardown) {
+        // The caller reports the result first and runs the teardown after (`Teardown.run`). The
+        // arena is the caller's, and lives until it has.
+        const kept = try arena.create(Teardown);
+        kept.* = teardown;
+        handed_over = true;
+        result.teardown = kept;
+        return result;
+    }
+    result.native_phases = teardown.run();
     return result;
 }
 

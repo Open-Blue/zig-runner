@@ -233,7 +233,7 @@ On a root runner, each step runs:
   resolver is a resolv.conf of its own, made from the host's as Docker makes a container's on its
   default bridge (`net.Resolver`): the loopback's nameservers left out (systemd-resolved's
   127.0.0.53 is the host's loopback; its upstream list, `/run/systemd/resolve/resolv.conf`, is
-  used behind its stub) and IPv6 ones too (the job has none), search domains and options kept, and
+  used behind its stub) and IPv6 ones too (the job has none), search domains and options kept, with `options timeout:2 attempts:5` unless the host sets them, and
   Google's 8.8.8.8 and 8.8.4.4 when nothing else is left, as Docker and BuildKit do ("Set up job"
   says so). The jobs' rules let UDP and TCP to port 53 of those nameservers through, out of
   whichever interface the host routes them by, and on to the host itself when one is its own
@@ -553,6 +553,51 @@ What it changes on the host, which is shared by every runner on it:
   the restriction is what stops the probe's sandbox, `Backend.usable`'s reason names the profile.
   Whether the runner using it directly, instead of through `unshare`, works is not yet
   measured; `launch` still starts under `unshare` while the sysctl is 1.
+
+#### Reading a miss (`native/key_diff.zig`)
+
+A key is a digest, so a miss says nothing about its cause, and the bug that hurts is an input a step
+depends on that the key leaves out. So each key's parts are kept beside it, and a step that misses
+says which part differs from its last run. Nothing here changes a key: the parts are written as the
+key is made (`Backend.keyFor`), and a record without them (a layer an older runner made) is a step
+with nothing to compare, never a miss.
+
+- **The parts** are `name<TAB>value` lines, in the order the key hashes them: `parent` (the layer
+  below, in full; a base has `base format`, `base scope`, `base repository`, `base rootfs`,
+  `base userns`, `base binds`, `base zig cache seeds` and `base container options` in its place),
+  `script`, `env NAME` for each stable variable, `tool tree <path>` and `full tool tree <path>` for
+  each tree the job's tool cache check found (the variables `ZIG_RUNNER_TOOL_TREES` and `..._FULL`
+  are split into their trees, so the path names what changed), `uid`, `gid`, `workdir`, `file <path>`
+  and `groups`. A value is a digest (`sha:` and 16 hex digits of the sha256 of the content, never
+  the content) or a plain value that is no secret (an id, a path, the userns mode). Secret
+  variables, volatile ones (`dagger.volatile_env`) and the event are not in the key, so not here;
+  a step that uses a secret has no key. At most 256 parts and 32 KiB; past that, the rest is folded
+  into one `more` digest.
+- **Where they are**: `layers/<key>/components` (beside `meta`, not in it, never read to replay), and
+  the latest of each step in `steps/<id>`, which survives the layer being evicted: `key <hex>` and
+  the parts. `<id>` is a digest of the job's cache scope, repository, workflow, job id and display
+  name (which tells matrix cells apart) and which step of it (`step 3`, `base`, `fetch`). The scope
+  is in it, so a fork's untrusted jobs and the repository's own never read or write each other's
+  entries. An entry is made when a step is replayed or published (a failure is not, so the next run
+  compares with the last that worked), and removed by `collect` after 30 days unused.
+- **The log**: on a miss of a step that has an entry, the step's log begins with one line:
+
+  ```
+  Not replayed: the tool tree /opt/hostedtoolcache/zig changed (a1b2c3d4 → e5f6a7b8)
+  Not replayed: the step's script changed (0f1e2d3c → 9a8b7c6d)
+  Not replayed: the environment variable CC is new (4d5e6f70)
+  Not replayed: the base rootfs changed (...)
+  Not replayed: an earlier step did not replay: the step's script changed (...)
+  Not replayed: its key is the same as last time, but the stored layer is gone (evicted, or ...)
+  ```
+
+  The first part that differs, in the order above, is named, with the first eight digits of each
+  digest. A step whose own parts are as they were and only its `parent` differs says the cause is
+  the job's first miss. A step's first run, or an old record, logs nothing.
+- **`zig-runner key-diff <key-a> <key-b> [--store=DIR]`** prints two layers' parts side by side, a
+  `!` before each that differs. A key is its name under `layers/` or a prefix of six digits or
+  more; the store is `RUNNER_NATIVE_STORE` or the default. Find a step's last two keys in the
+  job's earlier logs or by `ls -t layers/`; the layer's `components` file is the same text.
 
 #### Measured (laptop "cowbird", balanced profile, 2026-10-31, another agent benchmarking)
 
@@ -1024,6 +1069,12 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
       (`Admission.cooldownHold`), short or not, for the memory the kill freed is spoken for by
       neighbours still growing. With nothing else running it starts as usual, and the forced
       start of the first in line still holds.
+  - *Learned by trust scope* (#465). A name is learned under its repository, workflow file and job
+    name (`admission.jobKeyIn`) and the trust scope the backends keep volumes apart by (`repo` or
+    `untrusted`, `packageCacheScope`), so a fork's pull request that reuses a trusted job's name
+    cannot teach it a size or a run time. A job the runner refused (`trust.refusal`, or a
+    `container:` it does not run) is not learned from at all (`Gate.replayed`). The trusted key is
+    the one kept files already hold, so they stay valid.
   - *No deadlock.* When every runner holds a job and none has room, nothing is running to free
     any: the job that came first starts regardless (said in its log), the others wait for it, and
     the next oldest follows as each ends. The machine cannot get freer, and a job over
@@ -1137,6 +1188,39 @@ waits, so a later job walks itself: a directory's mtime does not move when a fil
 changes, only that file's ctime shows it, so no cheaper memo of the tree is as strong as the walk.
 A walk the job's cancel or the clock cut short is its leader's alone. The key is the volume's host
 directory, its list directory and its mount, so volumes of other scopes never share a walk.
+
+The walk is made by the last job out, when it can (`tool_trees.walkIdle`, `Backend.walkToolCacheIdle`),
+and the next job is told its answer instead of walking: a "verdict" kept in the runner's store
+(`tool-trees/<hash>/.verdict`, beside the lists, in no volume a step mounts). Soundness is that no
+step can have written to the trees between that walk and the job that takes it, and each condition
+that shows it is one a failure of costs a walk, never trust:
+
+- The walk is made only while holding the volume's lock exclusively (`flock` non-blocking, taken
+  after the job's own shared one is given up), so no job anywhere holds the volume, and only after
+  the job's cgroup was removed (`cgroup.Job.removed`: the kernel refuses while a process is left),
+  with the job's volumes let go after that, so any other job's processes were gone when it let go.
+  A job that lets go without that proof (no cgroup, `RUNNER_NATIVE_CGROUP=none`, or a cgroup the
+  kernel would not remove) leaves a `.unproven` mark beside the lists, and no verdict is made while
+  it stands; the runner's first job removes it (after the sweep of what a dead runner left).
+- It is kept only if the walk was whole: not cut short, no budget spent, no tree left out, and no
+  racy file (a file whose ctime is within `racy_s` of the walk's start, or not proven at rest by a
+  read lease), as a later write to one might leave nothing for a later walk to see. The walk's own
+  limits are tighter (5 s, 128 MB read) because a job that opens the volume waits for it, polled so
+  that its cancel is seen (`volumes.openWaiting`).
+- A job reads the verdict when it opens the volume (`volumes.plan`), before any step of any job
+  can write to it, and removes it, whether or not it checks the trees; a verdict that cannot be
+  removed is not used. So a verdict is read only by jobs that opened before the first removal, and
+  every step of every job runs after that.
+- A verdict is of one boot (`boot_id`), one mount path, and the volume's lock file as its last
+  open left it (inode and mtime, which every open sets: an open by anything that does not take
+  verdicts, such as an older runner, and an evicted and recreated volume, are differences).
+  Two jobs that open together are not both told: the second finds the first's open in the mtime and
+  walks (`checkOnce`, as above).
+- Host-side changes while no job is in the volume: the runner's first job drops every verdict, and
+  one is not used past an hour (`tool_trees.verdict_max_age_ms`) or from the future.
+
+On a filesystem where no lease proves a file at rest (anything but ext4 and tmpfs, `leasesSeeMappings`)
+every file is racy, so no verdict is made there.
 
 The check differs from the script where it runs. The script runs as root in the job's image, in a
 container; the port runs in the runner's process, on a directory a job can write, so it is confined

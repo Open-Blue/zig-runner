@@ -10,6 +10,30 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.32.0 - 2026-11-10
+### Changed
+* SHA-256 uses the CPU's SHA-2 instructions when it has them (checked once, at the first hash), with the same one binary per architecture: the digests of tool trees, image layers and blobs, and step keys are 5 to 7 times faster on a Raspberry Pi 5 and on x86_64 with SHA-NI, and unchanged on CPUs without them
+* A native job's end now shows the parts of its collect (touch, directory sync, scan, evict, rest), and a pass queues evicted layers for the reaper without starting its thread until the pass is done, so the thread's directory sync and deletes cannot slow the pass's own renames and unlinks on a slow disk
+
+## v0.31.0 - 2026-11-10
+### Added
+* Step cache misses are explainable. A native step that is not replayed now logs which part of its key changed since its last run (`Not replayed: the tool tree /opt/hostedtoolcache/zig changed (a1b2c3d4 → e5f6a7b8)`), and `zig-runner key-diff <key-a> <key-b>` prints two layers' key parts side by side. The parts are digests, kept beside each layer and in a per-step index; keys are unchanged, so existing caches still hit.
+* Tests that a job the runner does not vouch for, and a fork's pull request, cannot change anything a trusted job of the repository reads or replays on the native backend: its cache volumes, the rootfs, the Zig seed, the stored layers and the runner's own files.
+* The pre-commit hook scans the staged changes for secrets with gitleaks, using CI's .gitleaks.toml, so a token is caught before it is committed; without gitleaks it says so and goes ahead
+### Changed
+* A native job's result is reported to GitHub before the job is torn down. Its teardown (the store's eviction, the network, the cgroup, the job's directory) used to run first, so every job's completion waited for it; it now runs right after the result is sent and before the runner polls again, holding the job's slot, network and memory reservation until it ends, so a following job never meets what it still holds.
+* The native backend no longer rewrites a tool-cache tree's list when a walk finds it unchanged, and the native phases line splits the layer sync into sync_wb, sync_fsync, sync_meta and, when the whole filesystem was synced, syncfs.
+* The last job out of the tool cache's volume walks its trees for the next job, which is told the answer instead of walking, when no job holds the volume, every process of the job is gone, and the walk was whole with no racy file; a job that opens a volume the last job is walking waits cancellably
+* A native job's teardown costs less before the runner polls again: a job's network is taken down by letting go of its namespace, the kernel removing the veth after, and an evicted layer's tree is deleted by one background thread after its rename out of the store, which the disk's floor waits for.
+### Fixed
+* The end to end check no longer fails when the network is slow: the native half waits for its rootfs for as long as the build runs (and stops at once if it dies), and the cancel test cancels once the runner's log shows its step started, not after a fixed 30 s (#458).
+* Layer eviction no longer removes a chain's base before its newest layer: a job now marks the layers it used with the base most recent, so the least-recently-used order evicts a step's layer before its parents.
+* The memory gate no longer learns a job's size and run time from untrusted jobs of the same name, or from jobs the runner refused, which let a fork's pull request shrink a trusted job's estimate.
+* The nightly Valgrind run takes every 13th failure of the allocation-failure tests instead of all of them, so a slow runner no longer pushes it past its time limit
+* The native store's once-per-boot check of its layers runs after every boot again: it read the boot id from /proc with a call that reads nothing there, so after the first check no boot, a power cut's included, was ever checked
+* The End to end job ends a hang in its own step, with the runner's and engine's logs kept, instead of being cancelled at the job's limit with no log: each pass has a step limit, the suite a clock of its own, and the cancel test's last resort scales with the wait limit
+* A native job's resolver retries a lost DNS query sooner: a job has one nameserver where its host may have two (Tailscale's second is an IPv6 one the job cannot reach), so a single lost query left `git fetch` failing with `Could not resolve host` after glibc's two tries 5 s apart. The job's resolv.conf now adds `options timeout:2 attempts:5` (the same 10 s in all) unless the host's file sets them.
+
 ## v0.30.0 - 2026-11-10
 ### Added
 * A fresh-install script (`.github/scripts/fresh-install.sh`) that, on a clean machine, installs Zig, builds the runner, runs the native tests as root and runs a real job through the native backend with no engine, for throwaway cloud VMs (#377).

@@ -19,6 +19,7 @@
 //! zstd" (`fuzz.zig`) holds it to std's decoder on every input, and says where they differ.
 
 const std = @import("std");
+const Sha256 = @import("../../sha256.zig").Sha256;
 const zstd = std.compress.zstd;
 
 const Allocator = std.mem.Allocator;
@@ -821,7 +822,7 @@ fn decompressAll(gpa: Allocator, compressed: []const u8) ![]u8 {
 
 fn digestHex(bytes: []const u8) [64]u8 {
     var sum: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &sum, .{});
+    Sha256.hash(bytes, &sum, .{});
     return std.fmt.bytesToHex(sum, .lower);
 }
 
