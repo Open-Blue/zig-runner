@@ -40,6 +40,7 @@ const linux = std.os.linux;
 
 const Allocator = std.mem.Allocator;
 const Backend = @import("Backend.zig");
+const reaper = @import("reaper.zig");
 const Store = @import("Store.zig");
 const evict = @import("evict.zig");
 const layers = @import("layers.zig");
@@ -455,6 +456,8 @@ test "native store under load: one worker (run only by the test above, in a proc
             3 => try runTreeJob(&w, job_arena.allocator(), io, n),
             else => try runJob(&w, job_arena.allocator(), io, n),
         }
+        // The reaper's thread has descriptors of its own while it deletes what a job's end evicted.
+        reaper.drain(io);
         const fds = try countFds(io);
         if (n == 1) fds_kept = fds;
         if (n > 1 and fds > fds_kept) w.fault("{d} fds open after {s} {d}, {d} before", .{ fds, what, n, fds_kept });

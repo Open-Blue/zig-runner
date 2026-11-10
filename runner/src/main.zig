@@ -31,6 +31,7 @@ comptime {
     _ = @import("native/cgroup.zig");
     _ = @import("native/Store.zig");
     _ = @import("native/evict.zig");
+    _ = @import("native/reaper.zig");
     _ = @import("native/sandbox.zig");
     _ = @import("native/net.zig");
     _ = @import("native/seccomp.zig");

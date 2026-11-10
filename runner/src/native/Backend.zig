@@ -28,6 +28,7 @@ const http = @import("../github/http.zig");
 const docker = @import("../dagger/docker.zig");
 const cgroup = @import("cgroup.zig");
 const evict = @import("evict.zig");
+const reaper = @import("reaper.zig");
 const volumes = @import("volumes.zig");
 const trees_check = @import("tool_trees.zig");
 const admission = @import("../admission.zig");
@@ -947,6 +948,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
             .max_bytes = cfg.store_max_bytes,
             .limits = cfg.store_limits,
             .sync_fd = Store.syncCursor(arena, cfg.store),
+            .defer_delete = true,
         },
         .vouched = cfg.vouched,
         .port_addresses = cfg.port_addresses,
@@ -1393,14 +1395,21 @@ pub fn deinit(b: *Backend) void {
     if (processes_gone) b.walkToolCacheIdle() else b.noteProcessesMayRemain();
     b.cache_plan.release(b.io);
     t = b.timings.since(arena, .tool_walk, t);
-    if (b.slot) |s| {
+    // The namespace's last reference goes with its mount, and the kernel then takes the veth down
+    // with it, in a batch of its own after this returns (`cleanup_net`): about 20 ms on a laptop
+    // that an explicit delete waited for. The host's end may outlive this a moment, which the
+    // slot's next holder never sees: it removes whatever it finds of the slot's veth under the
+    // slot's lock, which is let go below (`jobNetwork`). A job with no namespace (its helper
+    // failed) may have a veth of its slot all the same, so that one is deleted here.
+    if (b.netns) |p| {
+        detachNetns(arena, p);
+    } else if (b.slot) |s| {
         var sock = net.Socket.open() catch null;
         if (sock) |*so| {
             so.deleteVeth(s.n);
             so.close();
         }
     }
-    if (b.netns) |p| detachNetns(arena, p);
     t = b.timings.since(arena, .veth_rm, t);
     removeJobDir(arena, b.io, b.dir);
     t = b.timings.since(arena, .tree_rm, t);
@@ -6330,6 +6339,38 @@ test "root runner: slots are the host's, so two runners with different stores ne
     try std.testing.expect(sock.index(net.hostLink(&buf, second.slot.?.n)) != null);
 }
 
+test "root runner: a job's veth goes with its namespace, and the next job of the slot never meets it" {
+    // `deinit` deletes no veth: the namespace's mount goes and the kernel takes the veth down
+    // after, in a batch. A job that comes up in the slot at once finds the host's end (named for
+    // the slot) still there or not, and `jobNetwork` removes it under the slot's lock, so
+    // `addVeth`'s exclusive create never meets it.
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var sock = try net.Socket.open();
+    defer sock.close();
+    var buf: [16]u8 = undefined;
+    var slot: ?u32 = null;
+    // Back to back, each in the slot the last let go, with no wait for the kernel.
+    for (0..12) |_| {
+        var b = try init(arena, io, std.testing.allocator, cfg);
+        if (slot) |n| try std.testing.expectEqual(n, b.slot.?.n);
+        slot = b.slot.?.n;
+        try std.testing.expect(sock.index(net.hostLink(&buf, slot.?)) != null);
+        b.deinit();
+    }
+    // And left alone, the veth is gone soon after the last job: nothing deleted it by name.
+    var waited: u32 = 0;
+    while (sock.index(net.hostLink(&buf, slot.?)) != null and waited < 5000) : (waited += 10)
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    try std.testing.expect(sock.index(net.hostLink(&buf, slot.?)) == null);
+}
+
 test "native sweep: a job's directory its runner is removing is left to it; a dead runner's goes" {
     // Found by the store's stress test: a runner's removal took the lock file early, another
     // runner's sweep made a new one, found it free, and removed the directory alongside its
@@ -8218,6 +8259,8 @@ fn replayableLines(arena: Allocator, text: []const u8) ![]const []const u8 {
 }
 
 fn storeLayers(arena: Allocator, store: []const u8) !usize {
+    // What a job's end evicted is deleted after it returns (`reaper`).
+    reaper.drain(std.testing.io);
     const p = try std.fmt.allocPrint(arena, "{s}/layers", .{store});
     var dir = try std.Io.Dir.cwd().openDir(std.testing.io, p, .{ .iterate = true });
     defer dir.close(std.testing.io);
