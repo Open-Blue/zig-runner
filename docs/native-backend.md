@@ -233,7 +233,7 @@ On a root runner, each step runs:
   resolver is a resolv.conf of its own, made from the host's as Docker makes a container's on its
   default bridge (`net.Resolver`): the loopback's nameservers left out (systemd-resolved's
   127.0.0.53 is the host's loopback; its upstream list, `/run/systemd/resolve/resolv.conf`, is
-  used behind its stub) and IPv6 ones too (the job has none), search domains and options kept, and
+  used behind its stub) and IPv6 ones too (the job has none), search domains and options kept, with `options timeout:2 attempts:5` unless the host sets them, and
   Google's 8.8.8.8 and 8.8.4.4 when nothing else is left, as Docker and BuildKit do ("Set up job"
   says so). The jobs' rules let UDP and TCP to port 53 of those nameservers through, out of
   whichever interface the host routes them by, and on to the host itself when one is its own
