@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The native store''s once-per-boot check of its layers runs after every boot again: it read the boot id from /proc with a call that reads nothing there, so after the first check no boot, a power cut''s included, was ever checked'
-time: 2026-11-10T09:19:22.560917276-05:00

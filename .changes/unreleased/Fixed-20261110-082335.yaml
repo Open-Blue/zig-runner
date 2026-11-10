@@ -1,3 +1,0 @@
-kind: Fixed
-body: The nightly Valgrind run takes every 13th failure of the allocation-failure tests instead of all of them, so a slow runner no longer pushes it past its time limit
-time: 2026-11-10T08:23:35.472242708-05:00

@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Layer eviction no longer removes a chain''s base before its newest layer: a job now marks the layers it used with the base most recent, so the least-recently-used order evicts a step''s layer before its parents.'
-time: 2026-11-10T01:34:08.845225658-05:00

@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A native job''s resolver retries a lost DNS query sooner: a job has one nameserver where its host may have two (Tailscale''s second is an IPv6 one the job cannot reach), so a single lost query left `git fetch` failing with `Could not resolve host` after glibc''s two tries 5 s apart. The job''s resolv.conf now adds `options timeout:2 attempts:5` (the same 10 s in all) unless the host''s file sets them.'
-time: 2026-11-10T11:37:21.262990092-05:00

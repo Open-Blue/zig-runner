@@ -1,3 +1,0 @@
-kind: Fixed
-body: The memory gate no longer learns a job's size and run time from untrusted jobs of the same name, or from jobs the runner refused, which let a fork's pull request shrink a trusted job's estimate.
-time: 2026-11-10T02:36:47.881572924-05:00

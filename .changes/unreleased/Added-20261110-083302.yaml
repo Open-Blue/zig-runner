@@ -1,3 +1,0 @@
-kind: Added
-body: The pre-commit hook scans the staged changes for secrets with gitleaks, using CI's .gitleaks.toml, so a token is caught before it is committed; without gitleaks it says so and goes ahead
-time: 2026-11-10T08:33:02.60920243-05:00

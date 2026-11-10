@@ -1,3 +1,0 @@
-kind: Changed
-body: 'A native job''s teardown costs less before the runner polls again: a job''s network is taken down by letting go of its namespace, the kernel removing the veth after, and an evicted layer''s tree is deleted by one background thread after its rename out of the store, which the disk''s floor waits for.'
-time: 2026-11-10T08:52:18.994430087-05:00
