@@ -104,6 +104,9 @@ pub const Config = struct {
     /// (`engine.Session.watch`, #100). 0 turns it off. Ten minutes: a swapping engine answers
     /// late, not that late.
     engine_silence_timeout_secs: u32 = 600,
+    /// Seconds between the health lines in the log (`admission.Admission.heartbeat`), said only
+    /// while a job runs or waits. 0 turns them off.
+    health_interval_secs: u32 = 60,
     /// The Docker API socket (from DOCKER_HOST when it is `unix://`).
     docker_socket: []const u8 = "/var/run/docker.sock",
     /// Give each step's commands access to the job's Dagger engine
@@ -479,6 +482,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_ENGINE_HOST")) |v| c.engine_host = v;
         if (environ.get("RUNNER_ENGINE_SILENCE_TIMEOUT")) |v|
             c.engine_silence_timeout_secs = try secs(v);
+        if (environ.get("RUNNER_HEALTH_INTERVAL")) |v| c.health_interval_secs = try secs(v);
         if (environ.get("DOCKER_HOST")) |v| if (std.mem.startsWith(u8, v, "unix://")) {
             c.docker_socket = v["unix://".len..];
         };
@@ -579,6 +583,7 @@ pub const Config = struct {
         else if (eq(key, "engine-container")) c.engine_container = val //
         else if (eq(key, "engine-host")) c.engine_host = val //
         else if (eq(key, "engine-silence-timeout")) c.engine_silence_timeout_secs = try secs(val) //
+        else if (eq(key, "health-interval")) c.health_interval_secs = try secs(val) //
         else if (eq(key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
         else if (eq(key, "package-caches")) c.package_caches = try boolean(val) //
         else if (eq(key, "tool-trees")) c.tool_trees = try boolean(val) //
@@ -949,6 +954,22 @@ test "the engine silence timeout: ten minutes by default, in seconds, 0 turns it
     c = try Config.load(&env, &.{ "runner", "--engine-silence-timeout=1200" });
     try std.testing.expectEqual(@as(u32, 1200), c.engine_silence_timeout_secs);
     try env.put("RUNNER_ENGINE_SILENCE_TIMEOUT", "86401");
+    try std.testing.expectError(error.InvalidNumber, Config.load(&env, &.{"runner"}));
+}
+
+test "the health interval: a minute by default, in seconds, 0 turns it off" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    var c = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqual(@as(u32, 60), c.health_interval_secs);
+    try env.put("RUNNER_HEALTH_INTERVAL", "0");
+    c = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqual(@as(u32, 0), c.health_interval_secs);
+    c = try Config.load(&env, &.{ "runner", "--health-interval=15" });
+    try std.testing.expectEqual(@as(u32, 15), c.health_interval_secs);
+    try env.put("RUNNER_HEALTH_INTERVAL", "often");
     try std.testing.expectError(error.InvalidNumber, Config.load(&env, &.{"runner"}));
 }
 
