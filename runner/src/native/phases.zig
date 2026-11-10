@@ -45,11 +45,19 @@ pub const Phase = enum {
     size,
     record,
     sync,
+    // The sync's parts: the write-back wait, the entries' fsyncs, the meta's write and fsync, and
+    // `syncfs`, which is there only when the entry took it (too many entries, or a file unreadable).
+    sync_wb,
+    sync_fsync,
+    sync_meta,
+    syncfs,
     rename,
     flatten,
     // The job's teardown (`Backend.deinit`).
     services,
     cgroup_rm,
+    // The tool cache's trees walked once no job holds them (`Backend.walkToolCacheIdle`).
+    tool_walk,
     veth_rm,
     tree_rm,
     collect,

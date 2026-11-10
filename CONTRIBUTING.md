@@ -44,8 +44,9 @@ clone:
 git config core.hooksPath .githooks
 ```
 
-- **pre-commit** refuses a commit on `main`, and checks that what is staged is formatted
-  (`zig fmt`, `gofmt`) and that staged workflows pass actionlint.
+- **pre-commit** refuses a commit on `main`, and checks that what is staged holds no secret
+  (gitleaks, with CI's `.gitleaks.toml`; skipped with a note when gitleaks is not installed), is
+  formatted (`zig fmt`, `gofmt`), and that staged workflows pass actionlint.
 - **pre-push** checks exactly the commits being pushed, in a temporary worktree. Always: the branch
   name's prefix, `zig fmt`, GitHub's expression cases, the build and tests, and the unsafe
   constructs ratchet. When runner code changed: the tests again on overlayfs (in Docker) and ZLint.

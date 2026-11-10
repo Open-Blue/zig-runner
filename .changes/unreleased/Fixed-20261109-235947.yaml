@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The end to end check no longer fails when the network is slow: the native half waits for its rootfs for as long as the build runs (and stops at once if it dies), and the cancel test cancels once the runner''s log shows its step started, not after a fixed 30 s (#458).'
+time: 2026-11-09T23:59:47.03784063-05:00

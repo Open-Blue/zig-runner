@@ -541,6 +541,8 @@ fn runJob(w: *Worker, arena: Allocator, io: std.Io, n: usize) !void {
                 replayed = true;
                 continue;
             }
+            // The runner's own note on why a step ran (`Backend.explainMiss`), not its output.
+            if (std.mem.indexOf(u8, l, "] Not replayed: ") != null) continue;
             if (mine.items.len > 0) try mine.append(arena, 0x1f);
             try mine.appendSlice(arena, l);
             const at = std.mem.indexOf(u8, l, tag) orelse continue;
@@ -713,7 +715,9 @@ fn countFds(io: std.Io) !usize {
 
 /// The flocks this process holds (/proc/locks: `1: FLOCK ADVISORY WRITE <pid> ...`).
 fn countLocks(arena: Allocator, io: std.Io) !usize {
-    const text = try std.Io.Dir.cwd().readFileAlloc(io, "/proc/locks", arena, .limited(1 << 20));
+    // `readFile` into a buffer: /proc/locks has size 0, so `readFileAlloc` read nothing and this
+    // counted no lock, ever.
+    const text = try std.Io.Dir.cwd().readFile(io, "/proc/locks", try arena.alloc(u8, 1 << 20));
     const pid = try print(arena, "{d}", .{linux.getpid()});
     var n: usize = 0;
     var lines = std.mem.splitScalar(u8, text, '\n');

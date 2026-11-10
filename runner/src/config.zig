@@ -680,6 +680,15 @@ pub const Config = struct {
         environ: *const std.process.Environ.Map,
     ) ![]const u8 {
         if (c.native_store.len > 0) return c.native_store;
+        return defaultNativeStore(arena, environ);
+    }
+
+    /// `nativeStore` with no setting: for the commands that read the store without a configuration.
+    pub fn defaultNativeStore(
+        arena: std.mem.Allocator,
+        environ: *const std.process.Environ.Map,
+    ) ![]const u8 {
+        if (environ.get("RUNNER_NATIVE_STORE")) |v| if (v.len > 0) return v;
         if (std.os.linux.geteuid() == 0) return "/var/lib/zig-runner/native";
         if (environ.get("XDG_CACHE_HOME")) |d| if (d.len > 0)
             return std.fmt.allocPrint(arena, "{s}/zig-runner/native", .{d});
