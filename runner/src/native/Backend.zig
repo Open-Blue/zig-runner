@@ -8765,8 +8765,18 @@ fn expectUntrustedLeavesTrustedAlone(arena: Allocator, kind: Untrusted) !void {
     const seeds_dir = try std.fmt.allocPrint(arena, "{s}/seeds", .{store});
     // Each volume's tree; the runner's own bookkeeping beside them (`.lock`, `.size`) is its own.
     var before_volumes: std.ArrayList(TreeSum) = .empty;
-    for ([_][]const u8{ "npm", "toolcache", "zig-packages", "zig-local", "zig-builtin", "node-compile-cache" }) |name|
+    for ([_][]const u8{ "npm", "zig-packages", "zig-local", "zig-builtin", "node-compile-cache" }) |name|
         try before_volumes.append(arena, try TreeSum.of(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ volumes_dir, name })));
+    // The tool cache is a volume per image.
+    const tool_dir = try std.fmt.allocPrint(arena, "{s}/toolcache", .{volumes_dir});
+    var tools = try std.Io.Dir.cwd().openDir(io, tool_dir, .{ .iterate = true });
+    defer tools.close(io);
+    var tool_it = tools.iterate();
+    while (try tool_it.next(io)) |e| {
+        if (e.kind != .directory) continue;
+        try before_volumes.append(arena, try TreeSum.of(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ tool_dir, e.name })));
+    }
+    try std.testing.expect(before_volumes.items.len >= 6);
     const before_rootfs = try TreeSum.of(arena, c.cfg.rootfs);
     const before_seeds = try TreeSum.of(arena, seeds_dir);
     const before_layers = try LayerSums.of(arena, store);
