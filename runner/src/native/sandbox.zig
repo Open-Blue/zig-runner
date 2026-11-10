@@ -1265,6 +1265,29 @@ fn swapRanges(inside: u32, outside: u32, count: u32, a: u32, b: u32, host_root: 
     return out[0..n];
 }
 
+test "a signal waits for a step's own PID 1 to handle it, and goes on once it does" {
+    // The test process stands for PID 1, and USR2 for the signal: unhandled, then handled.
+    const me = linux.getpid();
+    const dfl: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.DFL }, .mask = linux.sigemptyset(), .flags = 0 };
+    const catch_it: linux.Sigaction = .{
+        .handler = .{ .handler = struct {
+            fn f(_: linux.SIG) callconv(.c) void {}
+        }.f },
+        .mask = linux.sigemptyset(),
+        .flags = 0,
+    };
+    defer _ = linux.sigaction(.USR2, &dfl, null);
+    try std.testing.expect(!Warning.handles(me, .USR2));
+    var w: Warning = .{ .pid1 = me, .born = phases.now(), .held = .USR2 };
+    w.tendHeld();
+    try std.testing.expect(w.held != null);
+    try std.testing.expect(w.busy());
+    _ = linux.sigaction(.USR2, &catch_it, null);
+    try std.testing.expect(Warning.handles(me, .USR2));
+    w.tendHeld();
+    try std.testing.expect(w.held == null);
+}
+
 test "swapRanges exchanges two ids and keeps the rest" {
     var out: [swap_ranges]Range = undefined;
     const r = swapRanges(100, 1000, 65536, 1001, 1500, false, &out);
@@ -1524,7 +1547,7 @@ fn makeDirsOpen(arena: Allocator, root: linux.fd_t, path: []const u8) linux.fd_t
 fn superviseStep(pid: linux.pid_t, own_program: bool, early: []const u8) u32 {
     const pidfd_rc = linux.pidfd_open(pid, 0);
     const pidfd: ?linux.fd_t = if (linux.errno(pidfd_rc) == .SUCCESS) @intCast(pidfd_rc) else null;
-    var warning: Warning = .{ .pid1 = if (own_program) pid else null };
+    var warning: Warning = .{ .pid1 = if (own_program) pid else null, .born = phases.now() };
     var stopped = false;
     for (early) |byte| stopped = stopped or !warning.take(byte);
     while (!stopped) {
@@ -1587,6 +1610,10 @@ const Warning = struct {
     pid1: ?linux.pid_t,
     /// A signal no process could be forked for yet.
     pending: ?linux.SIG = null,
+    /// A signal for `pid1` that waits for it to have a handler for it (`tend`).
+    held: ?linux.SIG = null,
+    /// When the step's PID 1 was forked, on `phases.now`'s clock.
+    born: u64,
     /// The process sending it. Its zombie must be reaped: PID 1 cannot finish exiting while one
     /// of its namespace is left (`zap_pid_ns_processes`), and the step would never end.
     sender: ?linux.pid_t = null,
@@ -1598,19 +1625,60 @@ const Warning = struct {
             @backingInt(linux.SIG.TERM) => .TERM,
             else => return false,
         };
-        if (w.pid1) |p| _ = linux.kill(p, sig);
         w.drop();
+        w.held = if (w.pid1 != null) sig else null;
         w.pending = sig;
         w.tend();
         return true;
     }
 
     fn busy(w: *const Warning) bool {
-        return w.pending != null or w.sender != null;
+        return w.pending != null or w.sender != null or w.held != null;
+    }
+
+    /// How long a step's own PID 1 may be without a handler for a signal before it is sent anyway.
+    const hold_ns = 2 * std.time.ns_per_s;
+
+    /// The signal for `pid1`, sent once it can be heard. The kernel drops a signal sent to a
+    /// namespace's PID 1 that has no handler for it, where any other process would have been ended
+    /// by it, and a Docker action's command (`sh -c 'trap ... INT; ...'`) installs its handler
+    /// some time after its exec, and the runner's own set-up before that: a step stopped within
+    /// a moment of its start, as a post step is when the job's limit is already near, would
+    /// never hear it. So it waits for the handler, or for a script that ignores the signal, and
+    /// gives up after `hold_ns`, as a process that has none is not going to get one.
+    fn tendHeld(w: *Warning) void {
+        const sig = w.held orelse return;
+        const p = w.pid1.?;
+        if (!handles(p, sig) and phases.now() -| w.born < hold_ns) return;
+        w.held = null;
+        _ = linux.kill(p, sig);
+    }
+
+    /// Whether `pid` catches or ignores `sig` (`SigCgt` and `SigIgn` of /proc/<pid>/status).
+    fn handles(pid: linux.pid_t, sig: linux.SIG) bool {
+        var path_buf: [32]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/status", .{pid}, 0) catch return true;
+        const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        const fd = std.math.cast(linux.fd_t, rc) orelse return true;
+        defer _ = linux.close(fd);
+        var buf: [2048]u8 = undefined;
+        const n = linux.read(fd, &buf, buf.len);
+        if (linux.errno(n) != .SUCCESS) return true;
+        const shift = std.math.cast(u6, @backingInt(sig) - 1) orelse return true;
+        const bit = @as(u64, 1) << shift;
+        for ([_][]const u8{ "SigIgn:", "SigCgt:" }) |key| {
+            const at = std.mem.indexOf(u8, buf[0..n], key) orelse continue;
+            const rest = std.mem.trimStart(u8, buf[at + key.len .. n], " \t");
+            const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+            const mask = std.fmt.parseUnsigned(u64, rest[0..end], 16) catch continue;
+            if (mask & bit != 0) return true;
+        }
+        return false;
     }
 
     /// Forks for the signal waiting for it, and reaps a sender that is done.
     fn tend(w: *Warning) void {
+        w.tendHeld();
         if (w.sender) |p| {
             var status: i32 = 0;
             const rc = linux.waitpid(p, &status, linux.W.NOHANG);
@@ -1632,6 +1700,7 @@ const Warning = struct {
     /// Whatever is still being sent, given up on: the next stage, or the end of the step.
     fn drop(w: *Warning) void {
         w.pending = null;
+        w.held = null;
         const p = w.sender orelse return;
         w.sender = null;
         _ = linux.kill(p, .KILL);
