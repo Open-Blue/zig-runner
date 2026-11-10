@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The native backend''s root tests pass on RHEL-family hosts (AlmaLinux 10): they no longer lose a step''s `sleep` behind RHEL''s single-binary coreutils, copy PAM''s authselect links as links, miss `/etc/pki` behind `/etc/ssl`, or set-uid a script.'
+time: 2026-11-09T00:52:18.615911572-05:00

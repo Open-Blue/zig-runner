@@ -3973,6 +3973,19 @@ const execAnswer = @import("../dagger/testing.zig").exec;
 /// must run): a rootfs of a few directories with the host's /usr bound over it, in the
 /// test's directory, and the runner binary the build copied for the tests (`ZIG_RUNNER_TEST_EXE`).
 /// Rootless unless the tests run as root, where the job gets its range of ids and its network.
+/// The host's /etc/pki for a test whose steps verify TLS on the host's rootfs (`testConfig`'s):
+/// RHEL's /etc/ssl/certs and cert.pem are links into it. Only such a test asks for it, as a
+/// container job's image has no /etc/pki to bind it onto.
+fn withHostPki(arena: Allocator, tmp: *std.testing.TmpDir, cfg: *Config) !void {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/etc/pki", .{}) catch return;
+    try tmp.dir.createDirPath(io, "rootfs/etc/pki");
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{
+        .host = "/etc/pki",
+        .at = "/etc/pki",
+    }} });
+}
+
 pub fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
     const io = std.testing.io;
     var env = try std.testing.environ.createMap(arena);
@@ -4408,7 +4421,9 @@ fn waitForProcess(number: []const u8) !void {
 }
 
 /// Whether a `sleep <number>` runs on this machine, seen from outside any namespace. The numbers
-/// are the tests' own. Exactly that command line: a step's `sh -c` holds its script's text too.
+/// are the tests' own. Exactly that command line, or `sleep` behind a path or a shebang's
+/// arguments (RHEL's single-binary coreutils shows `/usr/bin/coreutils --coreutils-prog-shebang=sleep
+/// /usr/bin/sleep 613.7`): a step's `sh -c` holds its script's text too.
 fn processRuns(number: []const u8) bool {
     const io = std.testing.io;
     var name_buf: [64]u8 = undefined;
@@ -4422,7 +4437,9 @@ fn processRuns(number: []const u8) bool {
         const path = std.fmt.bufPrint(&path_buf, "{s}/cmdline", .{e.name}) catch continue;
         var buf: [128]u8 = undefined;
         const line = proc.readFile(io, path, &buf) catch continue;
-        if (std.mem.eql(u8, line, want)) return true;
+        if (!std.mem.endsWith(u8, line, want)) continue;
+        const before = line.len - want.len;
+        if (before == 0 or line[before - 1] == '/') return true;
     }
     return false;
 }
@@ -5433,7 +5450,7 @@ fn sudoRootfs(arena: Allocator, root: []const u8) !void {
         \\cp /usr/bin/sudo rootfs/opt/sudo && chmod 4755 rootfs/opt/sudo
         \\mkdir -p rootfs/opt/sudo-plugins
         \\cp /usr/libexec/sudo/sudoers.so rootfs/opt/sudo-plugins/
-        \\cp -a /etc/pam.d rootfs/etc/
+        \\cp -aL /etc/pam.d rootfs/etc/
         \\for f in /etc/security /etc/login.defs /etc/nsswitch.conf; do
         \\  [ -e "$f" ] && cp -a "$f" rootfs/etc/ || true
         \\done
@@ -5530,7 +5547,8 @@ test "root runner: a job's own network, out of reach of the host's services and 
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cfg = try testConfig(arena, &tmp);
+    var cfg = try testConfig(arena, &tmp);
+    try withHostPki(arena, &tmp, &cfg);
 
     // Listeners on the host's 127.0.0.1 and on all its addresses (the bridge's among them), which
     // a step must not reach.
@@ -8216,14 +8234,21 @@ test "root runner: jobs in different slots share a stored layer, its owners thei
     try sudoRootfs(arena, try tmp.dir.realPathFileAlloc(io, ".", arena));
     // Steps as the runner user, whose sudo reaches the job's root: a file of its own, and a
     // set-uid copy of `id` owned by the job's root.
-    const make = testStep("echo x >> /shared/made; /opt/sudo -n mkdir -p /w && " ++
+    // RHEL's `id` is a script for its single-binary coreutils, which the kernel gives no
+    // privilege by its mode: there the binary itself is copied, and told which program to be.
+    var head: [2]u8 = undefined;
+    const single = std.mem.eql(u8, std.Io.Dir.cwd().readFile(io, "/usr/bin/id", &head) catch "", "#!");
+    const suid_src = if (single) "/usr/bin/coreutils" else "/usr/bin/id";
+    const suid_id = if (single) "/w/suid --coreutils-prog=id -u" else "/w/suid -u";
+    const make = testStep(try std.fmt.allocPrint(arena, "echo x >> /shared/made; /opt/sudo -n mkdir -p /w && " ++
         "/opt/sudo -n chown 1001:1001 /w && echo mine > /w/mine && " ++
-        "/opt/sudo -n cp /usr/bin/id /w/suid && /opt/sudo -n chmod 4755 /w/suid");
+        "/opt/sudo -n cp {s} /w/suid && /opt/sudo -n chmod 4755 /w/suid", .{suid_src}));
     // Run as the runner user, the set-uid file works through the stored layer (euid 0), and
     // that 0 is the second job's root: its own range of host ids.
-    const look = testStep("stat -c 'seen %n %u:%g %a' /w/mine /w/suid; echo suid-euid=$(/w/suid -u); " ++
+    const look = testStep(try std.fmt.allocPrint(arena, "stat -c 'seen %n %u:%g %a' /w/mine /w/suid; " ++
+        "echo suid-euid=$({s}); " ++
         "head -n1 /proc/self/uid_map | tr -s ' ' | sed 's/^ //; s/^/map /'; " ++
-        "echo more >> /w/mine && stat -c 'copied up %u:%g' /w/mine");
+        "echo more >> /w/mine && stat -c 'copied up %u:%g' /w/mine", .{suid_id}));
     // The first job in another slot than the first free one, which a second runner holds.
     var other = c.cfg;
     try tmp.dir.createDirPath(io, "store-2");
