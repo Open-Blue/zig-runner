@@ -27,7 +27,7 @@ const std = @import("std");
 const linux = std.os.linux;
 
 const Allocator = std.mem.Allocator;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha256 = @import("../sha256.zig").Sha256;
 const dagger = @import("../dagger.zig");
 const Eviction = @import("evict.zig");
 const reaper = @import("reaper.zig");

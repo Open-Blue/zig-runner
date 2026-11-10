@@ -48,7 +48,7 @@ const Store = @import("Store.zig");
 const dagger = @import("../dagger.zig");
 
 const Allocator = std.mem.Allocator;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha256 = @import("../sha256.zig").Sha256;
 const Error = glob.Fs.Error;
 
 /// GitHub's own limit for one `hashFiles()` (`_hashFileTimeoutSeconds` in actions/runner's

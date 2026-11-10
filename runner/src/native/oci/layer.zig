@@ -26,7 +26,7 @@ const sandbox = @import("../sandbox.zig");
 const zstd = @import("zstd.zig");
 
 const Allocator = std.mem.Allocator;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha256 = @import("../../sha256.zig").Sha256;
 
 /// How a layer is written.
 pub const Options = struct {

@@ -13,6 +13,7 @@
 const Backend = @This();
 
 const std = @import("std");
+const Sha256 = @import("../sha256.zig").Sha256;
 const job_mod = @import("../job.zig");
 const config = @import("../config.zig");
 const pg = @import("../pg.zig");
@@ -10093,10 +10094,10 @@ test "a native set-up that fails says what it did and on which path" {
 
 /// GitHub's `hashFiles()` of files with these contents, in this order.
 fn hashOfFiles(contents: []const []const u8) [64]u8 {
-    var all = std.crypto.hash.sha2.Sha256.init(.{});
+    var all = Sha256.init(.{});
     for (contents) |c| {
         var d: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(c, &d, .{});
+        Sha256.hash(c, &d, .{});
         all.update(&d);
     }
     return std.fmt.bytesToHex(all.finalResult(), .lower);

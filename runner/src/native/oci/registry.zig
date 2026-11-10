@@ -15,7 +15,7 @@ const std = @import("std");
 const http = @import("../../github/http.zig");
 
 const Allocator = std.mem.Allocator;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha256 = @import("../../sha256.zig").Sha256;
 
 /// An image reference, normalized as Docker does: `ubuntu:24.04` is
 /// `docker.io/library/ubuntu:24.04`, pulled from `registry-1.docker.io`.
