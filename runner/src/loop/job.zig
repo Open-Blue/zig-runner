@@ -259,7 +259,10 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     // Known by name now: it reserves what jobs of its name took (`admission.Learned`), and what it
     // takes is learned when it ends.
     const job_name = if (job.display_name.len > 0) job.display_name else job.github.job;
-    if (c.gate) |gate| gate.assigned(gateKey(c, job, job_name));
+    if (c.gate) |gate| {
+        gate.assigned(gateKey(c, job, job_name));
+        gate.named(job_name);
+    }
     defer if (c.gate) |gate| if (gate.ended()) |learned| sayUnallocated(
         c,
         "job '{s}' {s} {f} at most ({s}); reserving {f} for it while it starts",

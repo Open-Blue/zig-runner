@@ -1,0 +1,3 @@
+kind: Added
+body: 'A `health:` line in the runner''s log once a minute while a job runs or waits (`RUNNER_HEALTH_INTERVAL`, 0 turns it off): memory, swap, pressure, load, what the memory gate has reserved, and each running job''s name, age and memory, so that the last lines before an outage show what the machine looked like.'
+time: 2026-11-10T17:16:08.80983358-05:00
