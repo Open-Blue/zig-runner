@@ -316,7 +316,7 @@ pub const Admission = struct {
         if (est_mb <= a.limits.native_per_job_mb) return null;
         for (a.slots, 0..) |s, i| {
             if (i != slot and !s.waiting and s.running())
-                return .{ .cooldown = .{ .left_ms = @intCast(a.cooldown_until_ms - now_ms) } };
+                return .{ .cooldown = .{ .left_ms = std.math.lossyCast(u64, a.cooldown_until_ms - now_ms) } };
         }
         return null;
     }
@@ -332,7 +332,7 @@ pub const Admission = struct {
         if (std.Io.Dir.cwd().readFile(a.io, a.paths.meminfo, &mem_buf)) |text| {
             if (parseMeminfo(text).total_mb) |t| most = @min(most, t);
         } else |_| {}
-        return @intCast(@max(seen_mb, @min(base * oom_raise_num / oom_raise_den, most)));
+        return std.math.lossyCast(u32, @max(seen_mb, @min(base * oom_raise_num / oom_raise_den, most)));
     }
 
     /// Whether the job in `slot` is the one waiting longest and no other job runs: the one that
@@ -373,7 +373,7 @@ pub const Admission = struct {
     /// where the gate reserves, and not where a run is recorded, so that the margin can change
     /// without relearning and is never counted twice by a later run.
     fn margined(a: *const Admission, mb: u32) u32 {
-        return mb +| @as(u32, @intCast((@as(u64, mb) * a.limits.margin_percent + 99) / 100));
+        return mb +| std.math.lossyCast(u32, (@as(u64, mb) * a.limits.margin_percent + 99) / 100);
     }
 
     /// `mb` learned for a name, or null, as it reserves.
