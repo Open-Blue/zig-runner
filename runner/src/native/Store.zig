@@ -317,8 +317,8 @@ pub fn touchChain(io: std.Io, locks: []const std.Io.File) void {
     for (locks, 0..) |l, i| {
         const ns = now_ns + @as(i128, locks.len - 1 - i);
         const t: linux.timespec = .{
-            .sec = @intCast(@divFloor(ns, std.time.ns_per_s)),
-            .nsec = @intCast(@mod(ns, std.time.ns_per_s)),
+            .sec = std.math.cast(@FieldType(linux.timespec, "sec"), @divFloor(ns, std.time.ns_per_s)) orelse return,
+            .nsec = std.math.cast(@FieldType(linux.timespec, "nsec"), @mod(ns, std.time.ns_per_s)) orelse return,
         };
         _ = linux.utimensat(l.handle, null, &[2]linux.timespec{ t, t }, 0);
     }
