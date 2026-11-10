@@ -31,6 +31,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const dagger = @import("../dagger.zig");
 const Eviction = @import("evict.zig");
 const phases = @import("phases.zig");
+const key_diff = @import("key_diff.zig");
 
 /// The store's directory.
 root: []const u8,
@@ -157,7 +158,7 @@ pub fn secure(arena: Allocator, io: std.Io, root: []const u8, how: Prepare) !?[]
     const cwd = std.Io.Dir.cwd();
     if (!std.fs.path.isAbsolute(root))
         return try std.fmt.allocPrint(arena, "the native store {s} is not an absolute path", .{root});
-    for ([_][]const u8{ "layers", "keys", "jobs" }) |d|
+    for ([_][]const u8{ "layers", "keys", "jobs", "steps" }) |d|
         try cwd.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, d }));
     const owner = linux.geteuid();
     if (how.check_parents) if (try unsafeParents(arena, io, root, owner)) |why| return why;
@@ -302,8 +303,36 @@ pub fn open(s: Store, arena: Allocator, io: std.Io, key: Key) !?Hit {
     return .{ .layer = .{ .fs = try join(arena, dir, "fs"), .lock = f }, .rec = rec };
 }
 
+/// Marks a job's chain of stored layers (`locks`, oldest first, each held) as used, the base last
+/// and newest, so `collect`'s least-recently-used order evicts a child before its parent.
+///
+/// A step's layer is a diff over its parents' (an overlay lower each), and a job reaches a layer
+/// only through every ancestor's `open` or `publish`, each earlier than its child's: left alone,
+/// the ancestors are always the older and go first. A child kept without its parent still
+/// replays (the parent's key is hashed into its own), but only after the parent has run again, so
+/// the job saves one step and pays for the rest. Each ancestor a nanosecond newer keeps the order
+/// exact where the clock is coarse. Nothing here stops an eviction: only the order changes, so the
+/// cap and the disk's floor free the same bytes.
+pub fn touchChain(io: std.Io, locks: []const std.Io.File) void {
+    const now_ns = std.Io.Clock.real.now(io).toNanoseconds();
+    for (locks, 0..) |l, i| {
+        const ns = now_ns + @as(i128, locks.len - 1 - i);
+        const t: linux.timespec = .{
+            .sec = std.math.cast(@FieldType(linux.timespec, "sec"), @divFloor(ns, std.time.ns_per_s)) orelse return,
+            .nsec = std.math.cast(@FieldType(linux.timespec, "nsec"), @mod(ns, std.time.ns_per_s)) orelse return,
+        };
+        _ = linux.utimensat(l.handle, null, &[2]linux.timespec{ t, t }, 0);
+    }
+}
+
 /// What replaying a stored step needs: its output as printed, and its file commands.
-pub const Record = struct { log: []const u8, fc: []const u8 };
+pub const Record = struct {
+    log: []const u8,
+    fc: []const u8,
+    /// The key's components (`key_diff.zig`), written beside the record for `key-diff`. Advisory:
+    /// not in `meta`, never read to replay, so an entry without them is whole.
+    components: []const u8 = "",
+};
 
 /// A step that printed more than this is not published: its replay would hold it all in memory.
 /// Dagger's limit on a recorded output (`dagger.max_recorded_bytes`).
@@ -524,7 +553,9 @@ pub fn publish(
 }
 
 /// `publish`, its phases (the upper's size, its record written, the sync, the rename) sampled
-/// into `ph` when given (`phases.zig`).
+/// into `ph` when given (`phases.zig`). The sync is one sample for the whole and one for each
+/// part: the write-back wait, the entries' fsyncs, the meta, and the filesystem's `syncfs` when
+/// the entry was past `sync_tree_max` or had a file that could not be opened.
 pub fn publishTimed(
     s: Store,
     arena: Allocator,
@@ -570,6 +601,10 @@ pub fn publishTimed(
     Sha256.hash(rec.fc, &m.fc_sha, .{});
     try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "log"), .data = rec.log });
     try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "fc"), .data = rec.fc });
+    if (rec.components.len > 0) cwd.writeFile(io, .{
+        .sub_path = try join(arena, tmp, "components"),
+        .data = rec.components,
+    }) catch |e| std.log.warn("native: a layer's key components cannot be written: {s}", .{@errorName(e)});
     lock = try cwd.createFile(io, try join(arena, tmp, "lock"), .{});
     if (!flock(lock.?, lock_sh)) return error.Locked;
     try cwd.rename(upper, cwd, fs_tmp, io);
@@ -586,6 +621,7 @@ pub fn publishTimed(
     const entry = try openRoot(arena, tmp);
     defer _ = linux.close(entry);
     var whole_disk = false;
+    var syncfs_ns: ?u64 = null;
     const todo = writeBack(arena, io, entry, sync_tree_max) catch |e| switch (e) {
         error.Unreadable, error.TooLarge => no: {
             whole_disk = true;
@@ -593,8 +629,12 @@ pub fn publishTimed(
         },
         else => return e,
     };
-    if (whole_disk) try s.syncDisk(lock.?);
-    var sync_ns = phases.now() -| t;
+    const wb_ns = phases.now() -| t;
+    t = phases.now();
+    if (whole_disk) {
+        try s.syncDisk(lock.?);
+        syncfs_ns = phases.now() -| t;
+    }
     t = phases.now();
     // Measured once written: a file the kernel is still writing back can show fewer blocks
     // than it takes (a block short, the stress test found, under other publishers' syncfs),
@@ -606,14 +646,30 @@ pub fn publishTimed(
     try meta.writeStreamingAll(io, try m.write(arena));
     // Its blocks allocated now, or its own fsync would need a commit of its own for them.
     _ = syncRange(meta.handle, sync_file_range_write);
-    if (!whole_disk) syncEntries(entry, todo) catch |e| switch (e) {
-        error.Unreadable => try s.syncDisk(lock.?),
-        else => return error.Sync,
-    };
+    var meta_ns = phases.now() -| t;
+    t = phases.now();
+    var fsync_ns: u64 = 0;
+    if (!whole_disk) {
+        const unreadable = if (syncEntries(entry, todo)) |_| false else |e| switch (e) {
+            error.Unreadable => true,
+            else => return error.Sync,
+        };
+        fsync_ns = phases.now() -| t;
+        if (unreadable) {
+            t = phases.now();
+            try s.syncDisk(lock.?);
+            syncfs_ns = phases.now() -| t;
+        }
+    }
+    t = phases.now();
     if (linux.errno(linux.fsync(meta.handle)) != .SUCCESS) return error.Sync;
+    meta_ns += phases.now() -| t;
     if (ph) |p| {
-        sync_ns += phases.now() -| t;
-        p.add(arena, .sync, sync_ns);
+        p.add(arena, .sync, wb_ns + meta_ns + fsync_ns + (syncfs_ns orelse 0));
+        p.add(arena, .sync_wb, wb_ns);
+        p.add(arena, .sync_fsync, fsync_ns);
+        p.add(arena, .sync_meta, meta_ns);
+        if (syncfs_ns) |ns| p.add(arena, .syncfs, ns);
         t = phases.now();
     }
     const dir = try s.layerDir(arena, key);
@@ -918,6 +974,7 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
         }
     }
     s.dropKeyLocks(arena, io);
+    key_diff.sweep(arena, io, s.root);
     Eviction.run(s, io);
 }
 
@@ -2071,6 +2128,44 @@ test "native store: a walk that passes the limit stops, and a large entry syncs 
     try std.testing.expect(try s.open(arena, io, large) == null);
 }
 
+test "native store: a publish's phases show the sync's parts, and syncfs only when it was taken" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}) };
+    try prepare(arena, io, s.root, .{ .check_parents = false });
+    var never: std.atomic.Value(bool) = .init(false);
+    var ph: phases.Phases = .{};
+    for ([_]struct { name: []const u8, files: usize }{
+        .{ .name = "under", .files = 3 },
+        .{ .name = "over", .files = sync_tree_max + 1 },
+    }) |c| {
+        const dir = try std.fmt.allocPrint(arena, "{s}/up-{s}", .{ root, c.name });
+        try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "up-{s}", .{c.name}));
+        for (0..c.files) |i| try tmp.dir.writeFile(io, .{
+            .sub_path = try std.fmt.allocPrint(arena, "up-{s}/f{d}", .{ c.name, i }),
+            .data = "x",
+        });
+        var kh: KeyHasher = .plain(c.name);
+        const k = kh.final();
+        const kl = try s.lockKey(arena, io, k, &never);
+        defer kl.close(io);
+        const before = ph.mark();
+        const l = try s.publishTimed(arena, io, k, .fetch, dir, .{ .log = "", .fc = "" }, &ph);
+        l.lock.close(io);
+        const line = try ph.text(arena, before, .steps);
+        for ([_][]const u8{ "sync=", "sync_wb=", "sync_fsync=", "sync_meta=" }) |name| {
+            try std.testing.expect(std.mem.indexOf(u8, line, name) != null);
+        }
+        const took = std.mem.indexOf(u8, line, "syncfs=") != null;
+        try std.testing.expectEqual(c.files > sync_tree_max, took);
+    }
+}
+
 test "native store: a checkout's size of entries is synced on its own, not with the whole disk" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -2663,6 +2758,40 @@ test "native store: over its cap, collect evicts the least recently used layers 
     try std.testing.expect(try s.open(arena, io, keys[1]) == null);
     (try s.open(arena, io, keys[0])).?.layer.lock.close(io);
     (try s.open(arena, io, keys[2])).?.layer.lock.close(io);
+}
+
+test "native eviction: over its cap, a chain loses its newest layer first, and the floor still frees all" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    // A job's chain, base to leaf, each held until its end as `Backend.chain` does.
+    var keys: [3]Key = undefined;
+    var locks: [3]std.Io.File = undefined;
+    var bytes: u64 = 0;
+    for (&keys, &locks, [_][]const u8{ "base", "mid", "leaf" }) |*k, *lock, name| {
+        k.*, const l = try testLayer(arena, io, tmp, &s, name);
+        lock.* = l.lock;
+        bytes = accounted(try metaOf(arena, io, std.fs.path.dirname(l.fs).?));
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    // As published, the ancestors are the least recently used, and would go first.
+    touchChain(io, &locks);
+    for (locks) |l| l.close(io);
+    // Room for two: the leaf goes, not the base or the layer between. A leaf is a diff over its
+    // parents, so a parent kept without the leaf still serves every job up to the leaf's step.
+    s.max_bytes = 2 * bytes;
+    s.collect(arena, io);
+    try std.testing.expect(try s.open(arena, io, keys[2]) == null);
+    (try s.open(arena, io, keys[0])).?.layer.lock.close(io);
+    (try s.open(arena, io, keys[1])).?.layer.lock.close(io);
+    // The order is no shield: past the cap it goes on, ancestors and all, to nothing.
+    s.max_bytes = 0;
+    s.collect(arena, io);
+    for (keys[0..2]) |k| try std.testing.expect(try s.open(arena, io, k) == null);
 }
 
 test "native store: a layer counts its record and its own files, not only its tree" {

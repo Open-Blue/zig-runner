@@ -554,6 +554,51 @@ What it changes on the host, which is shared by every runner on it:
   Whether the runner using it directly, instead of through `unshare`, works is not yet
   measured; `launch` still starts under `unshare` while the sysctl is 1.
 
+#### Reading a miss (`native/key_diff.zig`)
+
+A key is a digest, so a miss says nothing about its cause, and the bug that hurts is an input a step
+depends on that the key leaves out. So each key's parts are kept beside it, and a step that misses
+says which part differs from its last run. Nothing here changes a key: the parts are written as the
+key is made (`Backend.keyFor`), and a record without them (a layer an older runner made) is a step
+with nothing to compare, never a miss.
+
+- **The parts** are `name<TAB>value` lines, in the order the key hashes them: `parent` (the layer
+  below, in full; a base has `base format`, `base scope`, `base repository`, `base rootfs`,
+  `base userns`, `base binds`, `base zig cache seeds` and `base container options` in its place),
+  `script`, `env NAME` for each stable variable, `tool tree <path>` and `full tool tree <path>` for
+  each tree the job's tool cache check found (the variables `ZIG_RUNNER_TOOL_TREES` and `..._FULL`
+  are split into their trees, so the path names what changed), `uid`, `gid`, `workdir`, `file <path>`
+  and `groups`. A value is a digest (`sha:` and 16 hex digits of the sha256 of the content, never
+  the content) or a plain value that is no secret (an id, a path, the userns mode). Secret
+  variables, volatile ones (`dagger.volatile_env`) and the event are not in the key, so not here;
+  a step that uses a secret has no key. At most 256 parts and 32 KiB; past that, the rest is folded
+  into one `more` digest.
+- **Where they are**: `layers/<key>/components` (beside `meta`, not in it, never read to replay), and
+  the latest of each step in `steps/<id>`, which survives the layer being evicted: `key <hex>` and
+  the parts. `<id>` is a digest of the job's cache scope, repository, workflow, job id and display
+  name (which tells matrix cells apart) and which step of it (`step 3`, `base`, `fetch`). The scope
+  is in it, so a fork's untrusted jobs and the repository's own never read or write each other's
+  entries. An entry is made when a step is replayed or published (a failure is not, so the next run
+  compares with the last that worked), and removed by `collect` after 30 days unused.
+- **The log**: on a miss of a step that has an entry, the step's log begins with one line:
+
+  ```
+  Not replayed: the tool tree /opt/hostedtoolcache/zig changed (a1b2c3d4 → e5f6a7b8)
+  Not replayed: the step's script changed (0f1e2d3c → 9a8b7c6d)
+  Not replayed: the environment variable CC is new (4d5e6f70)
+  Not replayed: the base rootfs changed (...)
+  Not replayed: an earlier step did not replay: the step's script changed (...)
+  Not replayed: its key is the same as last time, but the stored layer is gone (evicted, or ...)
+  ```
+
+  The first part that differs, in the order above, is named, with the first eight digits of each
+  digest. A step whose own parts are as they were and only its `parent` differs says the cause is
+  the job's first miss. A step's first run, or an old record, logs nothing.
+- **`zig-runner key-diff <key-a> <key-b> [--store=DIR]`** prints two layers' parts side by side, a
+  `!` before each that differs. A key is its name under `layers/` or a prefix of six digits or
+  more; the store is `RUNNER_NATIVE_STORE` or the default. Find a step's last two keys in the
+  job's earlier logs or by `ls -t layers/`; the layer's `components` file is the same text.
+
 #### Measured (laptop "cowbird", balanced profile, 2026-10-31, another agent benchmarking)
 
 The runner binary built `ReleaseSafe`, `--exec-job` on a run-only job of 50 trivial steps (`true`)
