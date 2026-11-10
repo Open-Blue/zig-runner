@@ -1,3 +1,0 @@
-kind: Changed
-body: 'A published port''s relay closes a connection quiet for 5 minutes by default; RUNNER_NATIVE_PORT_IDLE_TIMEOUT (seconds, 0 for never) sets that, so idle connection pools and websockets can outlive it. With none set, a newcomer still takes the place of a connection quiet 10 s once all 64 places are taken. Part of #428.'
-time: 2026-11-08T21:58:46.387512911-05:00

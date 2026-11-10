@@ -1,3 +1,0 @@
-kind: Fixed
-body: RUNNER_ENGINE=cli names the program it cannot find (the dagger CLI, `sh` or `cat`) in "Set up job", and refuses to start without them, instead of blaming the Docker daemon (#389)
-time: 2026-11-08T22:09:45.398492417-05:00

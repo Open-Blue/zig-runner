@@ -1,3 +1,0 @@
-kind: Changed
-body: 'The refusals of RUNNER_DAGGER_NESTING under the native backend and RUNNER_ENGINE=none now say why (`dagger call` in a step needs a Dagger engine) and what to do: keep an engine for that pool, or turn nesting off. The docs now state that native refuses nesting for good.'
-time: 2026-11-08T21:57:38.968748768-05:00

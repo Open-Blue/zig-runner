@@ -10,6 +10,18 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.30.0 - 2026-11-10
+### Added
+* A fresh-install script (`.github/scripts/fresh-install.sh`) that, on a clean machine, installs Zig, builds the runner, runs the native tests as root and runs a real job through the native backend with no engine, for throwaway cloud VMs (#377).
+### Changed
+* The refusals of RUNNER_DAGGER_NESTING under the native backend and RUNNER_ENGINE=none now say why (`dagger call` in a step needs a Dagger engine) and what to do: keep an engine for that pool, or turn nesting off. The docs now state that native refuses nesting for good.
+* A published port's relay closes a connection quiet for 5 minutes by default; RUNNER_NATIVE_PORT_IDLE_TIMEOUT (seconds, 0 for never) sets that, so idle connection pools and websockets can outlive it. With none set, a newcomer still takes the place of a connection quiet 10 s once all 64 places are taken. Part of #428.
+* The native backend's check of the tool cache's trees is shared by jobs that start together: jobs that wait on one volume at the same moment share one walk of its files instead of each stat-ing all ~19,500 files of Zig at once (part of #359).
+### Fixed
+* RUNNER_ENGINE=cli names the program it cannot find (the dagger CLI, `sh` or `cat`) in "Set up job", and refuses to start without them, instead of blaming the Docker daemon (#389)
+* The native backend's fetch of an action, a local action's preflight and the checkout of a job read a file:// source on git before 2.50 (Ubuntu 24.04, Debian 13): git's ownership check no longer refuses a repository the job's root does not own, as the runner's `safe.directory` now reaches it through a global config file
+* The native backend's root tests pass on RHEL-family hosts (AlmaLinux 10): they no longer lose a step's `sleep` behind RHEL's single-binary coreutils, copy PAM's authselect links as links, miss `/etc/pki` behind `/etc/ssl`, or set-uid a script.
+
 ## v0.29.0 - 2026-11-09
 ### Added
 * Native backend: a job container's named volumes outlive the job as Docker's do, kept in the native store per repository and trust scope, filled from the image when new, read-only with `:ro`, and evicted like the cache volumes
