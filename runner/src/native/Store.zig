@@ -580,7 +580,7 @@ pub fn publishTimed(
     if (rec.components.len > 0) cwd.writeFile(io, .{
         .sub_path = try join(arena, tmp, "components"),
         .data = rec.components,
-    }) catch {};
+    }) catch |e| std.log.warn("native: a layer's key components cannot be written: {s}", .{@errorName(e)});
     lock = try cwd.createFile(io, try join(arena, tmp, "lock"), .{});
     if (!flock(lock.?, lock_sh)) return error.Locked;
     try cwd.rename(upper, cwd, fs_tmp, io);

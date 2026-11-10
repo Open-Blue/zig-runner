@@ -248,7 +248,10 @@ pub fn writeIndex(
     }) catch return;
     const cwd = std.Io.Dir.cwd();
     cwd.writeFile(io, .{ .sub_path = tmp, .data = text }) catch return;
-    cwd.rename(tmp, cwd, indexPath(arena, root, id) catch return, io) catch cwd.deleteFile(io, tmp) catch {};
+    cwd.rename(tmp, cwd, indexPath(arena, root, id) catch return, io) catch |e| {
+        std.log.debug("native: the step index cannot be written: {s}", .{@errorName(e)});
+        cwd.deleteFile(io, tmp) catch |e2| std.log.debug("native: {s}: {s}", .{ tmp, @errorName(e2) });
+    };
 }
 
 /// Removes the index entries (and temporary files) nothing has refreshed for `index_days`.
@@ -262,7 +265,8 @@ pub fn sweep(arena: Allocator, io: std.Io, root: []const u8) void {
     var it = dir.iterate();
     while (it.next(io) catch null) |e| {
         const st = dir.statFile(io, e.name, .{}) catch continue;
-        if (st.mtime.toNanoseconds() < old) dir.deleteFile(io, e.name) catch {};
+        if (st.mtime.toNanoseconds() < old) dir.deleteFile(io, e.name) catch |err|
+            std.log.debug("native: {s}: {s}", .{ e.name, @errorName(err) });
     }
 }
 

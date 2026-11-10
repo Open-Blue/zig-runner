@@ -2680,9 +2680,8 @@ fn keyFor(
     else for (b.below_parts) |c| try cb.add(c.name, c.value);
     try cb.addDigest("script", script);
     for (b.env.items) |e| if (Store.stableEnv(e.name)) try envComponent(&cb, e.name, e.value);
-    var ids_text: [24]u8 = undefined;
-    try cb.add("uid", std.fmt.bufPrint(&ids_text, "{d}", .{uid}) catch unreachable);
-    try cb.add("gid", std.fmt.bufPrint(&ids_text, "{d}", .{gid}) catch unreachable);
+    try cb.add("uid", try std.fmt.allocPrint(b.arena, "{d}", .{uid}));
+    try cb.add("gid", try std.fmt.allocPrint(b.arena, "{d}", .{gid}));
     try cb.add("workdir", b.workdir);
     for (files) |f| {
         if (!f.keep) return null;

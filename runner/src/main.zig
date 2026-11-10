@@ -419,12 +419,13 @@ fn keyDiff(arena: std.mem.Allocator, init: std.process.Init, args: []const [:0]c
     var out_w: std.Io.File.Writer = .initStreaming(.stdout(), init.io, &out_buf);
     var err_buf: [1024]u8 = undefined;
     var err_w: std.Io.File.Writer = .initStreaming(.stderr(), init.io, &err_buf);
-    defer out_w.interface.flush() catch {};
-    defer err_w.interface.flush() catch {};
     const root = try Config.defaultNativeStore(arena, init.environ_map);
     const list = try arena.alloc([]const u8, args.len);
     for (args, list) |a, *l| l.* = a;
-    return key_diff.run(arena, init.io, list, root, &out_w.interface, &err_w.interface);
+    const code = try key_diff.run(arena, init.io, list, root, &out_w.interface, &err_w.interface);
+    try out_w.interface.flush();
+    try err_w.interface.flush();
+    return code;
 }
 
 /// `--provision-script`: the shell script the default image is provisioned with when steps run as
