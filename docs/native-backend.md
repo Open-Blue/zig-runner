@@ -1732,7 +1732,8 @@ volume's mount) fails the job in "Set up job", naming both, as it would hide one
   sockets).
 - **The relay does not stall.** Its connect to the job's port is non-blocking (given up after 10 s),
   so a job port whose backlog is full holds up no other connection or port. A connection with no
-  byte either way for 5 minutes is closed, and when all 64 places are taken a newcomer takes the
+  byte either way for 5 minutes is closed (`RUNNER_NATIVE_PORT_IDLE_TIMEOUT`, in seconds; 0 never closes
+  one for being quiet, as Docker's proxy), and when all 64 places are taken a newcomer takes the
   place of the connection quiet longest once that one has been quiet 10 s, so connections held open
   and silent cannot lock the port out.
 - **Where: 127.0.0.1 by default.** `RUNNER_NATIVE_PORT_ADDRESSES` (`--native-port-addresses`,

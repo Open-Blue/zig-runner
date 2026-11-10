@@ -62,7 +62,10 @@ pub const Spec = struct {
         /// A connection to the job's port that has not completed in this long is given up: the
         /// connect is non-blocking, so one the job's full backlog holds never stalls the others.
         connect_ms: u64 = 10_000,
-        /// A connection with no byte either way for this long is closed.
+        /// A connection with no byte either way for this long is closed; 0 never closes one for
+        /// that (`RUNNER_NATIVE_PORT_IDLE_TIMEOUT`). Even then the slots bound the relay: when all
+        /// `max_conns` are in use a newcomer takes the place of the one quiet longest once it has
+        /// been quiet `evict_idle_ms`, so idle connections cannot hold resources without limit.
         idle_ms: u64 = 300_000,
         /// How long a connection must have been quiet before a newcomer may take its place.
         evict_idle_ms: u64 = 10_000,
@@ -528,8 +531,9 @@ const Conn = struct {
         c.* = .{};
     }
 
-    /// When it is given up: its connect's timeout, or its idle one.
+    /// When it is given up: its connect's timeout, or its idle one (never, with none set).
     fn deadline(c: *const Conn, l: Spec.Limits) u64 {
+        if (!c.connecting and l.idle_ms == 0) return std.math.maxInt(u64);
         return c.last + if (c.connecting) l.connect_ms else l.idle_ms;
     }
 };
@@ -1439,6 +1443,30 @@ test "a published port's quiet connections make way for a newcomer, and idle one
     // Past the idle timeout, every connection that said nothing is closed.
     io.sleep(.fromMilliseconds(1800), .awake) catch {};
     try std.testing.expect(!testStillOpen(newcomer, 500));
+}
+
+test "a published port with no idle timeout keeps a quiet connection" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    const exe = try testExe(arena);
+    const server = std.math.cast(linux.fd_t, linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0)).?;
+    defer _ = linux.close(server);
+    var sa = loopback4(0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.bind(server, asSockaddr(&sa), @sizeOf(linux.sockaddr.in))));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.listen(server, 512)));
+    var why: []const u8 = "";
+    var r = try start(arena, io, exe, .{
+        .ports = &.{.{ .host = 0, .container = boundPort(server) }},
+        .publish = true,
+        .limits = .{ .idle_ms = 0 },
+    }, &why);
+    defer r.stop(io);
+    const quiet = testConnect(r.ports[0], false) orelse return error.TestUnexpectedResult;
+    defer _ = linux.close(quiet);
+    io.sleep(.fromMilliseconds(1800), .awake) catch {};
+    try std.testing.expect(testStillOpen(quiet, 300));
 }
 
 test "a published UDP port takes only so many new clients a second" {

@@ -155,6 +155,9 @@ pub const Config = struct {
     /// The host ports a native job container may name in its `ports:` (`8080:80`), `lo-hi`
     /// (`RUNNER_NATIVE_PORT_RANGE`, `native/publish.zig`). Empty, the default: 49152-65535.
     native_port_range: []const u8 = "",
+    /// Seconds a published port's connection may be quiet before the relay closes it
+    /// (`RUNNER_NATIVE_PORT_IDLE_TIMEOUT`, `native/forward.zig`); 0 never closes one for that.
+    native_port_idle_timeout: u64 = 300,
     /// The ports of the runner's own endpoints, which no job publishes (`publish.reservedPorts`),
     /// as `main.zig` found them: its database's, and a `tcp://` engine or Docker host's.
     native_reserved_ports: ?[]const u16 = null,
@@ -493,6 +496,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_SUBNET")) |v| c.native_subnet = v;
         if (environ.get("RUNNER_NATIVE_PORT_ADDRESSES")) |v| c.native_port_addresses = v;
         if (environ.get("RUNNER_NATIVE_PORT_RANGE")) |v| c.native_port_range = v;
+        if (environ.get("RUNNER_NATIVE_PORT_IDLE_TIMEOUT")) |v| c.native_port_idle_timeout = try num(u64, v);
         if (environ.get("RUNNER_NATIVE_HOST_PATHS")) |v| c.native_host_paths = v;
         if (environ.get("RUNNER_NATIVE_HOST_PATHS_UNMAPPED")) |v| c.native_host_paths_unmapped = try boolean(v);
         if (environ.get("RUNNER_NATIVE_STORE_MAX_MB")) |v| c.native_store_max_mb = try num(u64, v);
@@ -588,6 +592,7 @@ pub const Config = struct {
         else if (eq(key, "native-subnet")) c.native_subnet = val //
         else if (eq(key, "native-port-addresses")) c.native_port_addresses = val //
         else if (eq(key, "native-port-range")) c.native_port_range = val //
+        else if (eq(key, "native-port-idle-timeout")) c.native_port_idle_timeout = try num(u64, val) //
         else if (eq(key, "native-host-paths")) c.native_host_paths = val //
         else if (eq(key, "native-host-paths-unmapped")) c.native_host_paths_unmapped = try boolean(val) //
         else if (eq(key, "native-store-max-mb")) c.native_store_max_mb = try num(u64, val) //
@@ -996,6 +1001,18 @@ test "the native jobs' cgroups and limits: defaults, settings, and parents that 
         try env.put("RUNNER_NATIVE_CGROUP", bad);
         try std.testing.expectError(error.InvalidNativeCgroup, Config.load(&env, &.{"runner"}));
     }
+}
+
+test "the native port idle timeout: 300 s by default, 0 for none" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expectEqual(@as(u64, 300), (try Config.load(&env, &.{"runner"})).native_port_idle_timeout);
+    try env.put("RUNNER_NATIVE_PORT_IDLE_TIMEOUT", "0");
+    try std.testing.expectEqual(@as(u64, 0), (try Config.load(&env, &.{"runner"})).native_port_idle_timeout);
+    try env.put("RUNNER_NATIVE_PORT_IDLE_TIMEOUT", "soon");
+    try std.testing.expectError(error.InvalidNumber, Config.load(&env, &.{"runner"}));
 }
 
 test "the native subnet and ids: defaults, and values that are refused" {
