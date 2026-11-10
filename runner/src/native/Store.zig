@@ -303,6 +303,28 @@ pub fn open(s: Store, arena: Allocator, io: std.Io, key: Key) !?Hit {
     return .{ .layer = .{ .fs = try join(arena, dir, "fs"), .lock = f }, .rec = rec };
 }
 
+/// Marks a job's chain of stored layers (`locks`, oldest first, each held) as used, the base last
+/// and newest, so `collect`'s least-recently-used order evicts a child before its parent.
+///
+/// A step's layer is a diff over its parents' (an overlay lower each), and a job reaches a layer
+/// only through every ancestor's `open` or `publish`, each earlier than its child's: left alone,
+/// the ancestors are always the older and go first. A child kept without its parent still
+/// replays (the parent's key is hashed into its own), but only after the parent has run again, so
+/// the job saves one step and pays for the rest. Each ancestor a nanosecond newer keeps the order
+/// exact where the clock is coarse. Nothing here stops an eviction: only the order changes, so the
+/// cap and the disk's floor free the same bytes.
+pub fn touchChain(io: std.Io, locks: []const std.Io.File) void {
+    const now_ns = std.Io.Clock.real.now(io).toNanoseconds();
+    for (locks, 0..) |l, i| {
+        const ns = now_ns + @as(i128, locks.len - 1 - i);
+        const t: linux.timespec = .{
+            .sec = std.math.cast(@FieldType(linux.timespec, "sec"), @divFloor(ns, std.time.ns_per_s)) orelse return,
+            .nsec = std.math.cast(@FieldType(linux.timespec, "nsec"), @mod(ns, std.time.ns_per_s)) orelse return,
+        };
+        _ = linux.utimensat(l.handle, null, &[2]linux.timespec{ t, t }, 0);
+    }
+}
+
 /// What replaying a stored step needs: its output as printed, and its file commands.
 pub const Record = struct {
     log: []const u8,
@@ -2736,6 +2758,40 @@ test "native store: over its cap, collect evicts the least recently used layers 
     try std.testing.expect(try s.open(arena, io, keys[1]) == null);
     (try s.open(arena, io, keys[0])).?.layer.lock.close(io);
     (try s.open(arena, io, keys[2])).?.layer.lock.close(io);
+}
+
+test "native eviction: over its cap, a chain loses its newest layer first, and the floor still frees all" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    // A job's chain, base to leaf, each held until its end as `Backend.chain` does.
+    var keys: [3]Key = undefined;
+    var locks: [3]std.Io.File = undefined;
+    var bytes: u64 = 0;
+    for (&keys, &locks, [_][]const u8{ "base", "mid", "leaf" }) |*k, *lock, name| {
+        k.*, const l = try testLayer(arena, io, tmp, &s, name);
+        lock.* = l.lock;
+        bytes = accounted(try metaOf(arena, io, std.fs.path.dirname(l.fs).?));
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    // As published, the ancestors are the least recently used, and would go first.
+    touchChain(io, &locks);
+    for (locks) |l| l.close(io);
+    // Room for two: the leaf goes, not the base or the layer between. A leaf is a diff over its
+    // parents, so a parent kept without the leaf still serves every job up to the leaf's step.
+    s.max_bytes = 2 * bytes;
+    s.collect(arena, io);
+    try std.testing.expect(try s.open(arena, io, keys[2]) == null);
+    (try s.open(arena, io, keys[0])).?.layer.lock.close(io);
+    (try s.open(arena, io, keys[1])).?.layer.lock.close(io);
+    // The order is no shield: past the cap it goes on, ancestors and all, to nothing.
+    s.max_bytes = 0;
+    s.collect(arena, io);
+    for (keys[0..2]) |k| try std.testing.expect(try s.open(arena, io, k) == null);
 }
 
 test "native store: a layer counts its record and its own files, not only its tree" {
