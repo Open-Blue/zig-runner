@@ -962,7 +962,7 @@ pub const Gate = struct {
         defer a.mu.unlock(a.io);
         const s = &a.slots[g.slot];
         if (!s.running()) return;
-        s.name_len = @intCast(copyPrintable(&s.name_buf, name));
+        s.name_len = std.math.lossyCast(u8, copyPrintable(&s.name_buf, name));
     }
 
     /// The runner's job runs on the native backend, in the cgroup `dir` (`native/cgroup.zig`), or
@@ -2022,7 +2022,7 @@ pub const HealthJob = struct {
     on_engine: bool = false,
 
     fn setName(j: *HealthJob, name: []const u8) void {
-        j.name_len = @intCast(copyPrintable(&j.name_buf, name));
+        j.name_len = std.math.lossyCast(u8, copyPrintable(&j.name_buf, name));
     }
 };
 
@@ -2091,7 +2091,7 @@ const Elapsed = struct {
     ms: i64,
 
     pub fn format(e: Elapsed, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        const s: u64 = @intCast(@max(e.ms, 0) / std.time.ms_per_s);
+        const s: u64 = std.math.lossyCast(u64, @max(e.ms, 0) / std.time.ms_per_s);
         if (s < 60) return w.print("{d}s", .{s});
         if (s < 3600) return w.print("{d}m{d:0>2}s", .{ s / 60, s % 60 });
         try w.print("{d}h{d:0>2}m", .{ s / 3600, s % 3600 / 60 });
