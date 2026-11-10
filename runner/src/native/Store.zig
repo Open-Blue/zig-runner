@@ -30,6 +30,7 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const dagger = @import("../dagger.zig");
 const Eviction = @import("evict.zig");
+const reaper = @import("reaper.zig");
 const phases = @import("phases.zig");
 
 /// The store's directory.
@@ -42,6 +43,9 @@ limits: Eviction.Limits = .{},
 /// it reports a write error since then even if another job's `syncfs` was told first, which one
 /// opened at the publish would miss. Null: the publish's own.
 sync_fd: ?linux.fd_t = null,
+/// Whether an evicted layer's tree is deleted by `reaper`'s thread, after the job's end has
+/// returned, rather than by `collect`. Off in tests that count what is left when it returns.
+defer_delete: bool = false,
 
 pub const default_max_bytes: u64 = 10 * 1024 * 1024 * 1024;
 
@@ -858,7 +862,8 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
     while (it.next(io) catch null) |e| {
         const full = join(arena, layers, e.name) catch return;
         if (std.mem.startsWith(u8, e.name, ".dead-")) {
-            removeTree(arena, io, full);
+            // What a crash or a full queue left (`reaper`): the sweep of an evicted layer's tree.
+            s.discard(arena, io, full);
             continue;
         }
         if (std.mem.startsWith(u8, e.name, ".tmp-")) {
@@ -897,7 +902,7 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
     // The disk's floor counts here first: a layer is the cheapest thing the store has to make
     // again. So under it a layer goes as the rest does (`evict.floor`), sparing recent use, and
     // only past the cap whatever its use.
-    const keep = @min(s.max_bytes, total -| (Eviction.shortOf(arena, s) orelse 0));
+    const keep = @min(s.max_bytes, total -| (Eviction.shortOf(arena, io, s) orelse 0));
     const budget: Eviction.Budget = .init(io, s.limits.budget_ms);
     if (total > keep) {
         std.mem.sort(Entry, entries.items, {}, struct {
@@ -959,8 +964,15 @@ fn evictOpened(s: Store, arena: Allocator, io: std.Io, name: []const u8, lock: ?
         &std.fmt.bytesToHex(raw, .lower),
     }) catch return false;
     cwd.rename(full, cwd, dead, io) catch return false;
-    removeTree(arena, io, dead);
+    s.discard(arena, io, dead);
     return true;
+}
+
+/// Deletes the dead tree `path`: by the reaper's thread when the store defers, unless its queue
+/// is full, and else here.
+fn discard(s: Store, arena: Allocator, io: std.Io, path: []const u8) void {
+    if (s.defer_delete and reaper.enqueue(io, path)) return;
+    removeTree(arena, io, path);
 }
 
 /// The lock files of keys no step is running now, removed so `keys/` does not grow with every
@@ -2727,6 +2739,91 @@ test "native store: under the disk's floor a pass takes what its budget allows o
     var it = d.iterate();
     while (try it.next(io)) |_| left += 1;
     try std.testing.expectEqual(@as(usize, 19), left);
+}
+
+/// What `layers/` holds, names only.
+fn layerNames(arena: Allocator, io: std.Io, s: Store) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    var d = try std.Io.Dir.cwd().openDir(io, try join(arena, s.root, "layers"), .{ .iterate = true });
+    defer d.close(io);
+    var it = d.iterate();
+    while (try it.next(io)) |e| try names.append(arena, try arena.dupe(u8, e.name));
+    return names.items;
+}
+
+test "native store: an evicted layer is gone to every lookup at once, its tree deleted after by the reaper" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "", .defer_delete = true };
+    const k, const l = try testLayer(arena, io, tmp, &s, "up");
+    l.lock.close(io);
+    s.max_bytes = 0;
+    reaper.test_hold.store(true, .release);
+    defer reaper.test_hold.store(false, .release);
+    s.collect(arena, io);
+    // The key finds nothing, though the tree is still on the disk under its dead name.
+    try std.testing.expect(try s.open(arena, io, k) == null);
+    try std.testing.expect(reaper.pending(io));
+    const held = try layerNames(arena, io, s);
+    try std.testing.expectEqual(@as(usize, 1), held.len);
+    try std.testing.expect(std.mem.startsWith(u8, held[0], ".dead-"));
+    reaper.test_hold.store(false, .release);
+    reaper.drain(io);
+    try std.testing.expectEqual(@as(usize, 0), (try layerNames(arena, io, s)).len);
+}
+
+test "native store: a dead tree left by a crash is deleted by the next collect, the sweep at start-up" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}), .defer_delete = true };
+    try prepare(arena, io, s.root, .{ .check_parents = false });
+    try tmp.dir.createDirPath(io, "store/layers/.dead-0123456789abcdef/fs/a/b");
+    try tmp.dir.writeFile(io, .{ .sub_path = "store/layers/.dead-0123456789abcdef/fs/a/b/f", .data = "x" });
+    // A directory its owner took the permissions from, as a step's `chmod 000` leaves one.
+    try tmp.dir.createDirPath(io, "store/layers/.dead-fedcba9876543210/fs/locked");
+    const locked = try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/store/layers/.dead-fedcba9876543210/fs/locked", .{root}), 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(locked, 0)));
+    s.collect(arena, io);
+    reaper.drain(io);
+    try std.testing.expectEqual(@as(usize, 0), (try layerNames(arena, io, s)).len);
+}
+
+test "native store: a full queue is deleted inline, and the floor waits for what the reaper has" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "", .defer_delete = true };
+    var keys: [20]Key = undefined;
+    for (&keys, 0..) |*k, i| {
+        k.*, const l = try testLayer(arena, io, tmp, &s, try std.fmt.allocPrint(arena, "up{d}", .{i}));
+        l.lock.close(io);
+    }
+    s.max_bytes = 0;
+    reaper.test_hold.store(true, .release);
+    defer reaper.test_hold.store(false, .release);
+    s.collect(arena, io);
+    // The thread took one and 16 wait; the other three were deleted by `collect`, as they were
+    // before the reaper, so a store evicting faster than the disk deletes is slowed, not grown.
+    try std.testing.expectEqual(@as(usize, 17), (try layerNames(arena, io, s)).len);
+    // The disk is short by any measure here, but its room is not back yet.
+    s.limits.min_free_pct = 100;
+    try std.testing.expect(Eviction.shortOf(arena, io, s) == null);
+    reaper.test_hold.store(false, .release);
+    reaper.drain(io);
+    try std.testing.expectEqual(@as(usize, 0), (try layerNames(arena, io, s)).len);
+    try std.testing.expect(Eviction.shortOf(arena, io, s) != null);
 }
 
 test "native store: a key published already stays, and the second upper is put back where it was" {
