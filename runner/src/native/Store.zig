@@ -31,6 +31,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const dagger = @import("../dagger.zig");
 const Eviction = @import("evict.zig");
 const phases = @import("phases.zig");
+const key_diff = @import("key_diff.zig");
 
 /// The store's directory.
 root: []const u8,
@@ -157,7 +158,7 @@ pub fn secure(arena: Allocator, io: std.Io, root: []const u8, how: Prepare) !?[]
     const cwd = std.Io.Dir.cwd();
     if (!std.fs.path.isAbsolute(root))
         return try std.fmt.allocPrint(arena, "the native store {s} is not an absolute path", .{root});
-    for ([_][]const u8{ "layers", "keys", "jobs" }) |d|
+    for ([_][]const u8{ "layers", "keys", "jobs", "steps" }) |d|
         try cwd.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, d }));
     const owner = linux.geteuid();
     if (how.check_parents) if (try unsafeParents(arena, io, root, owner)) |why| return why;
@@ -303,7 +304,13 @@ pub fn open(s: Store, arena: Allocator, io: std.Io, key: Key) !?Hit {
 }
 
 /// What replaying a stored step needs: its output as printed, and its file commands.
-pub const Record = struct { log: []const u8, fc: []const u8 };
+pub const Record = struct {
+    log: []const u8,
+    fc: []const u8,
+    /// The key's components (`key_diff.zig`), written beside the record for `key-diff`. Advisory:
+    /// not in `meta`, never read to replay, so an entry without them is whole.
+    components: []const u8 = "",
+};
 
 /// A step that printed more than this is not published: its replay would hold it all in memory.
 /// Dagger's limit on a recorded output (`dagger.max_recorded_bytes`).
@@ -572,6 +579,10 @@ pub fn publishTimed(
     Sha256.hash(rec.fc, &m.fc_sha, .{});
     try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "log"), .data = rec.log });
     try cwd.writeFile(io, .{ .sub_path = try join(arena, tmp, "fc"), .data = rec.fc });
+    if (rec.components.len > 0) cwd.writeFile(io, .{
+        .sub_path = try join(arena, tmp, "components"),
+        .data = rec.components,
+    }) catch |e| std.log.warn("native: a layer's key components cannot be written: {s}", .{@errorName(e)});
     lock = try cwd.createFile(io, try join(arena, tmp, "lock"), .{});
     if (!flock(lock.?, lock_sh)) return error.Locked;
     try cwd.rename(upper, cwd, fs_tmp, io);
@@ -941,6 +952,7 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
         }
     }
     s.dropKeyLocks(arena, io);
+    key_diff.sweep(arena, io, s.root);
     Eviction.run(s, io);
 }
 

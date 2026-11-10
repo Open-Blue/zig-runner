@@ -1,0 +1,3 @@
+kind: Added
+body: 'Step cache misses are explainable. A native step that is not replayed now logs which part of its key changed since its last run (`Not replayed: the tool tree /opt/hostedtoolcache/zig changed (a1b2c3d4 → e5f6a7b8)`), and `zig-runner key-diff <key-a> <key-b>` prints two layers'' key parts side by side. The parts are digests, kept beside each layer and in a per-step index; keys are unchanged, so existing caches still hit.'
+time: 2026-11-10T01:36:24.502545978-05:00

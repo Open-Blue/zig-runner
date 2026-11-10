@@ -538,6 +538,8 @@ fn runJob(w: *Worker, arena: Allocator, io: std.Io, n: usize) !void {
                 replayed = true;
                 continue;
             }
+            // The runner's own note on why a step ran (`Backend.explainMiss`), not its output.
+            if (std.mem.indexOf(u8, l, "] Not replayed: ") != null) continue;
             if (mine.items.len > 0) try mine.append(arena, 0x1f);
             try mine.appendSlice(arena, l);
             const at = std.mem.indexOf(u8, l, tag) orelse continue;

@@ -46,6 +46,7 @@ const set_up = @import("../dagger/set_up.zig");
 const provisioned = @import("../dagger/provisioned.zig");
 const phases = @import("phases.zig");
 const hash_files = @import("hash_files.zig");
+const key_diff = @import("key_diff.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -153,6 +154,17 @@ store_cfg: Store = .{ .root = "" },
 /// A layer of the job's was published (`publishTop`): its end syncs the layers' directory, so
 /// the renames outlive a crash (`Store.syncLayers`).
 published: bool = false,
+/// What a step is across runs, without its place in the job (`stepIdent`): the cache scope, the
+/// repository, the workflow, the job and its display name. Set in `base`.
+ident: [5][]const u8 = .{ "", "", "", "", "" },
+/// The base's key parts (`below`), which stand where a step's parent layer does in its components.
+below_parts: []const key_diff.Component = &.{},
+/// The components of the key `keyFor` made last, for `claimKey` to compare and `publishTop` to
+/// keep (`key_diff.zig`).
+pending: ?Pending = null,
+/// The first reason in this job that a keyed layer was not replayed, for the steps above it that
+/// miss only because it did (`explainMiss`).
+first_miss: ?[]const u8 = null,
 /// `Config.vouched`, and the job's cache scope and repository from it (`base`): a vouched fork's
 /// pull request keys its layers apart from its repository's own jobs, as its package caches are
 /// (`set_up.packageCacheScope`).
@@ -1490,6 +1502,7 @@ pub fn base(
     }
     b.repository = ev.job.github.repository;
     b.scope = try set_up.packageCacheScope(arena, ev, b.repository, b.vouched);
+    b.ident = .{ b.scope, b.repository, ev.job.github.workflow, ev.job.job_id, ev.job.display_name };
     const event = try ev.eventJson();
     const event_in_env = plan.step_cache and event.len <= set_up.max_event_env;
     if (event_in_env) try b.put(dagger.event_env, event);
@@ -1575,7 +1588,7 @@ pub fn base(
     defer b.workdir = workdir;
     const key = try b.keyFor(.base, mk, files, mk_uid, mk_gid);
     // Nothing can stop the base: no step is running, so no cancel reaches it.
-    const claim = b.claimKey(key) catch |e| {
+    const claim = b.claimKey(key, "base") catch |e| {
         err_msg.* = @errorName(e);
         return error.BaseContainerFailed;
     };
@@ -1724,7 +1737,8 @@ pub fn execScript(
             null
         else
             try b.keyFor(.step, script, &.{}, b.uid, b.gid);
-        const claim = b.claimKey(key) catch |e| switch (e) {
+        const label = try std.fmt.allocPrint(arena, "step {d}", .{num});
+        const claim = b.claimKey(key, label) catch |e| switch (e) {
             error.Stopped => {
                 x.err_msg = "the step was stopped";
                 return error.EngineFailed;
@@ -1732,6 +1746,7 @@ pub fn execScript(
             else => return e,
         };
         defer claim.release(b.io);
+        if (claim.why) |line| x.sh.append(num, line);
         if (claim.hit) |rec| {
             const data = try recordAnswer(arena, rec);
             // A record that points into the tool cache's volume, which is in no layer: the volume
@@ -2281,7 +2296,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
         null
     else
         try b.keyFor(.step, try std.fmt.allocPrint(arena, "{s}\n# tags {s}", .{ aw.written(), tags.? }), &.{}, b.uid, b.gid);
-    const claim = b.claimKey(key) catch |e| switch (e) {
+    const claim = b.claimKey(key, "fetch") catch |e| switch (e) {
         error.Stopped => {
             f.result = .{ .failed = "the step was stopped" };
             return f;
@@ -2646,6 +2661,7 @@ fn keyFor(
     gid: u32,
 ) !?Store.Key {
     _ = b.store orelse return null;
+    b.pending = null;
     const parent = if (b.layers.items.len > 0)
         b.layers.items[b.layers.items.len - 1].key orelse return null
     else
@@ -2656,19 +2672,97 @@ fn keyFor(
     h.int(gid);
     h.field(b.workdir);
     h.int(files.len);
+    // The same parts as components, to say what differs on a miss (`key_diff.zig`): digests, never
+    // the content, and nothing the key does not hold.
+    var cb: key_diff.Builder = .init(b.arena);
+    if (b.layers.items.len > 0)
+        try cb.add(key_diff.parent_name, &Store.hex(parent))
+    else for (b.below_parts) |c| try cb.add(c.name, c.value);
+    try cb.addDigest("script", script);
+    for (b.env.items) |e| if (Store.stableEnv(e.name)) try envComponent(&cb, e.name, e.value);
+    try cb.add("uid", try std.fmt.allocPrint(b.arena, "{d}", .{uid}));
+    try cb.add("gid", try std.fmt.allocPrint(b.arena, "{d}", .{gid}));
+    try cb.add("workdir", b.workdir);
     for (files) |f| {
         if (!f.keep) return null;
         h.field(f.path);
         h.field(f.contents);
         h.int(f.mode);
+        try cb.addDigest(try std.fmt.allocPrint(b.arena, "file {s}", .{f.path}), f.contents);
     }
     // What a step may read is in its groups too. Hashed only if it has some, which leaves every
     // other key as it was; a layer stored before steps had them was made without, and misses.
     if (uid == b.uid and gid == b.gid and b.groups.len > 0) {
         h.int(b.groups.len);
         for (b.groups) |g| h.int(g);
+        var groups: std.ArrayList(u8) = .empty;
+        for (b.groups) |g| try groups.print(b.arena, "{d} ", .{g});
+        try cb.addDigest("groups", groups.items);
     }
-    return h.final();
+    const key = h.final();
+    b.pending = .{ .key = key, .comps = try cb.finish() };
+    return key;
+}
+
+/// One stable variable as components: a digest of its value (a tree check's value, a line for
+/// each tree: the tree's path is the name, as it is what a reader knows it by).
+fn envComponent(cb: *key_diff.Builder, name: []const u8, value: []const u8) !void {
+    const label = if (std.mem.eql(u8, name, set_up.tool_trees_env))
+        "tool tree "
+    else if (std.mem.eql(u8, name, trees_check.full_env))
+        "full tool tree "
+    else
+        return cb.addDigest(try std.fmt.allocPrint(cb.arena, "env {s}", .{name}), value);
+    var lines = std.mem.tokenizeScalar(u8, value, '\n');
+    while (lines.next()) |line| {
+        const sp = std.mem.indexOfScalar(u8, line, ' ') orelse {
+            try cb.addDigest(try std.fmt.allocPrint(cb.arena, "env {s}", .{name}), line);
+            continue;
+        };
+        try cb.add(
+            try std.fmt.allocPrint(cb.arena, "{s}{s}", .{ label, line[sp + 1 ..] }),
+            try std.fmt.allocPrint(cb.arena, "sha:{s}", .{line[0..@min(sp, 16)]}),
+        );
+    }
+}
+
+/// A key's components, held until the key is claimed.
+const Pending = struct {
+    key: Store.Key,
+    comps: []const key_diff.Component,
+    /// Which step it is (`stepIdent`), set when the key is claimed.
+    label: []const u8 = "",
+};
+
+/// Who step `label` ("base", "fetch", "step 3") is across runs, the id of its entry in the
+/// store's index of steps (`key_diff.identity`): the scope is in it, so a fork's pull request never
+/// reads or writes what the repository's own jobs do.
+fn stepIdent(b: *const Backend, label: []const u8) [32]u8 {
+    return key_diff.identity(&.{ b.ident[0], b.ident[1], b.ident[2], b.ident[3], b.ident[4], label });
+}
+
+/// What the store knew of this step when `key` was not in it, as a line for the step's log: the
+/// first component that differs from the key the step had when last replayed or published, or why
+/// there is none. Null when this is the step's first run, or when nothing is known. A step whose
+/// own parts are as they were, but whose layer below is new, says so with the first such miss
+/// of the job.
+fn explainMiss(b: *Backend, c: Pending, label: []const u8) ?[]const u8 {
+    const s = b.store orelse return null;
+    const arena = b.arena;
+    const was = key_diff.readIndex(arena, b.io, s.root, &b.stepIdent(label)) orelse return null;
+    if (std.mem.eql(u8, was.key, &Store.hex(c.key)))
+        return "Not replayed: its key is the same as last time, but the stored layer is gone " ++
+            "(evicted, or made by a run that did not finish)";
+    const ch = key_diff.firstChange(was.comps, c.comps) orelse return null;
+    if (std.mem.eql(u8, ch.name, key_diff.parent_name)) {
+        const cause = b.first_miss orelse return key_diff.describe(arena, ch) catch null;
+        return std.fmt.allocPrint(arena, "Not replayed: an earlier step did not replay: {s}", .{
+            cause["Not replayed: ".len..],
+        }) catch null;
+    }
+    const line = key_diff.describe(arena, ch) catch return null;
+    if (b.first_miss == null) b.first_miss = line;
+    return line;
 }
 
 /// What a base's layer, and so every layer above it, depends on besides its own script: the
@@ -2697,7 +2791,7 @@ fn below(b: *Backend) ?Store.Key {
     for (binds) |*bd| if (std.mem.eql(u8, bd.at, "/etc/resolv.conf")) {
         bd.host = "/etc/resolv.conf";
     };
-    return belowKey(.{
+    const in: Below = .{
         .format = Store.store_format,
         .scope = b.scope,
         .repository = b.repository,
@@ -2706,7 +2800,29 @@ fn below(b: *Backend) ?Store.Key {
         .binds = binds,
         .seeds = b.seed_ids.items,
         .container_opts = b.opts_key,
-    }, null);
+    };
+    b.below_parts = belowParts(b.arena, in) catch &.{};
+    return belowKey(in, null);
+}
+
+/// `below`'s fields as components (`key_diff.zig`), for the base's miss to say which changed.
+fn belowParts(arena: Allocator, in: Below) ![]const key_diff.Component {
+    var cb: key_diff.Builder = .init(arena);
+    try cb.add("base format", in.format);
+    try cb.add("base scope", in.scope);
+    try cb.add("base repository", in.repository);
+    try cb.addDigest("base rootfs", in.fingerprint);
+    try cb.add("base userns", in.userns);
+    var binds: std.ArrayList(u8) = .empty;
+    for (in.binds) |bd| try binds.print(arena, "{s}:{s}:{}:{}:{}\n", .{
+        bd.host, bd.at, bd.read_only, bd.optional, bd.volume,
+    });
+    try cb.addDigest("base binds", binds.items);
+    var layers: std.ArrayList(u8) = .empty;
+    for (in.seeds) |l| try layers.print(arena, "{s}\n", .{l});
+    try cb.addDigest("base zig cache seeds", layers.items);
+    try cb.addDigest("base container options", in.container_opts);
+    return cb.finish();
 }
 
 /// What `below` hashes, as values: the store's format and what it reads from the job.
@@ -2805,16 +2921,26 @@ const Claim = struct {
     key: ?Store.Key = null,
     lock: ?std.Io.File = null,
     hit: ?Store.Record = null,
+    /// Why the key was not in the store, when the store can say (`explainMiss`).
+    why: ?[]const u8 = null,
 
     fn release(c: Claim, io: std.Io) void {
         if (c.lock) |l| l.close(io);
     }
 };
 
-fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
+fn claimKey(
+    b: *Backend,
+    key: ?Store.Key,
+    label: []const u8,
+) error{ Stopped, OutOfMemory }!Claim {
     const k = key orelse return .{};
     const s = b.store.?;
     const arena = b.arena;
+    // Components are those of this key or none (`keyFetched` claims keys `keyFor` did not make).
+    if (b.pending) |*p| {
+        if (std.mem.eql(u8, &p.key, &k)) p.label = label else b.pending = null;
+    }
     const t = phases.now();
     defer _ = b.timings.since(arena, .claim, t);
     b.stop_wait.store(false, .release);
@@ -2839,7 +2965,11 @@ fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
         });
         lock.close(b.io);
         return .{};
-    }) orelse return .{ .key = k, .lock = lock };
+    }) orelse return .{
+        .key = k,
+        .lock = lock,
+        .why = if (b.pending) |p| b.explainMiss(p, label) else null,
+    };
     errdefer hit.layer.lock.close(b.io);
     errdefer lock.close(b.io);
     try b.layers.ensureUnusedCapacity(arena, 1);
@@ -2861,7 +2991,14 @@ fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
         .key = k,
         .canonical = b.how.userns == .mapped,
     });
+    if (b.pending) |p| b.remember(p);
     return .{ .key = k, .lock = lock, .hit = hit.rec };
+}
+
+/// Makes the key `p` the one its step is known by (`key_diff.writeIndex`).
+fn remember(b: *Backend, p: Pending) void {
+    const s = b.store orelse return;
+    key_diff.writeIndex(b.arena, b.io, s.root, &b.stepIdent(p.label), &Store.hex(p.key), p.comps);
 }
 
 /// The stack's top layer, which an exec under `key` just left, given the canonical ids
@@ -2869,9 +3006,12 @@ fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
 /// its record, and the job's stack then links to it. Its parent is in the store (`keyFor`). A
 /// failure to publish leaves the layer the job's own, and is logged: the job goes on, uncached from
 /// here. One to shift its ids is the job's: the layer is then half one range's, half the other's.
-fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) !void {
+fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec_in: Store.Record) !void {
     const s = b.store orelse return;
     const arena = b.arena;
+    var rec = rec_in;
+    const pend: ?Pending = if (b.pending) |p| if (std.mem.eql(u8, &p.key, &key)) p else null else null;
+    if (pend) |p| rec.components = key_diff.render(arena, p.comps) catch "";
     if (rec.log.len > Store.max_record_bytes) return;
     // Room first: once the layer has moved, the job must hold it and point at it.
     b.held.ensureUnusedCapacity(arena, 1) catch return;
@@ -2900,6 +3040,7 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) 
     b.published = true;
     const canonical = top.canonical;
     top.* = .{ .name = name, .path = layer.fs, .key = key, .canonical = canonical };
+    if (pend) |p| b.remember(p);
 }
 
 /// The stack's top layer, the job's own (not the store's), dropped and removed: an exec whose
@@ -2931,7 +3072,7 @@ pub fn keyFetched(b: *Backend, what: []const u8) !void {
     };
     var h: Store.KeyHasher = .init(.step);
     h.core(p, what, &[_]job_mod.EnvVar{});
-    const claim = b.claimKey(h.final()) catch |e| {
+    const claim = b.claimKey(h.final(), "fetched") catch |e| {
         b.layers.appendAssumeCapacity(fetched);
         return e;
     };
@@ -8114,6 +8255,63 @@ test "native step cache: a failure is not replayed, and the steps before it are"
     try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "s2"));
 }
 
+test "native step cache: a miss says which part of the key changed, from the step's last run" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    const first = testJob(&.{ testStep("echo one"), testStep("echo two") });
+    const j1 = try runCached(arena, c.cfg, first, "j1");
+    try expectSucceeded(j1);
+    // The first run of a step has nothing to compare with.
+    try std.testing.expect(std.mem.indexOf(u8, j1.text, "Not replayed") == null);
+
+    // Every layer has its key's components, and none holds a script's text or a value.
+    var layers = try std.Io.Dir.cwd().openDir(io, try std.fmt.allocPrint(arena, "{s}/layers", .{c.cfg.store}), .{ .iterate = true });
+    defer layers.close(io);
+    var n: usize = 0;
+    var it = layers.iterate();
+    while (try it.next(io)) |e| {
+        const text = try layers.readFileAlloc(io, try std.fmt.allocPrint(arena, "{s}/components", .{e.name}), arena, .limited(64 * 1024));
+        try std.testing.expect(std.mem.indexOf(u8, text, "script\tsha:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "echo") == null);
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
+
+    // Same job: replayed, so nothing to explain.
+    const same = try runCached(arena, c.cfg, first, "j2");
+    try std.testing.expect(std.mem.indexOf(u8, same.text, "Not replayed") == null);
+
+    // A second step with another script: its own script is named. The first one replays.
+    const edited = testJob(&.{ testStep("echo one"), testStep("echo three") });
+    const j3 = try runCached(arena, c.cfg, edited, "j3");
+    try expectSucceeded(j3);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, j3.text, "Not replayed: the step's script changed ("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, j3.text, "Not replayed"));
+
+    // The first step changed: the second misses only because of it, and says so.
+    const earlier = testJob(&.{ testStep("echo zero"), testStep("echo three") });
+    const j4 = try runCached(arena, c.cfg, earlier, "j4");
+    try expectSucceeded(j4);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, j4.text, "Not replayed"));
+    try std.testing.expect(std.mem.indexOf(u8, j4.text, "Not replayed: an earlier step did not replay: the step's script changed (") != null);
+}
+
+test "native step cache: a step's identity holds its scope, so trusted and untrusted jobs never share a record" {
+    var b: Backend = undefined;
+    b.ident = .{ "repo", "o/r", "ci", "build", "build" };
+    const trusted = b.stepIdent("step 2");
+    b.ident[0] = "untrusted";
+    try std.testing.expect(!std.mem.eql(u8, &trusted, &b.stepIdent("step 2")));
+    b.ident[0] = "repo";
+    try std.testing.expectEqualSlices(u8, &trusted, &b.stepIdent("step 2"));
+    try std.testing.expect(!std.mem.eql(u8, &trusted, &b.stepIdent("step 3")));
+}
+
 test "native step cache: steps with secrets or run-specific values always run, and nothing after them is kept" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -8160,6 +8358,8 @@ test "nothing is keyed above a layer with no key: what a Docker action or a moun
     const arena = a.allocator();
     var b: Backend = undefined;
     b.store = .{ .root = "/nowhere" };
+    b.arena = arena;
+    b.pending = null;
     b.env = .empty;
     b.workdir = "/w";
     b.layers = .empty;
