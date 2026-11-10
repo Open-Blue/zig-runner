@@ -1414,16 +1414,19 @@ pub fn deinit(b: *Backend) void {
     removeJobDir(arena, b.io, b.dir);
     t = b.timings.since(arena, .tree_rm, t);
     // Before the layers are let go: ancestors end up the more recently used (`Store.touchChain`).
+    const whole = t;
     Store.touchChain(b.io, b.chain.items);
     for (b.held.items) |f| f.close(b.io);
     if (b.slot) |s| s.lock.close(b.io);
     b.lock.close(b.io);
+    t = b.timings.since(arena, .collect_touch, t);
     if (b.published) b.store_cfg.syncLayers(arena);
     if (b.store_cfg.sync_fd) |fd| _ = std.os.linux.close(fd);
+    t = b.timings.since(arena, .collect_syncdir, t);
     // The store kept under its cap, now that this job holds none of its layers: whether or not
     // the job cached steps, as Dockerfile builds publish layers too (`layers.zig`).
-    if (b.store_cfg.root.len > 0) b.store_cfg.collect(arena, b.io);
-    _ = b.timings.since(arena, .collect, t);
+    if (b.store_cfg.root.len > 0) b.store_cfg.collectTimed(arena, b.io, &b.timings);
+    _ = b.timings.since(arena, .collect, whole);
 }
 
 fn detachNetns(arena: Allocator, path: []const u8) void {

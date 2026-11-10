@@ -60,6 +60,14 @@ pub const Phase = enum {
     tool_walk,
     veth_rm,
     tree_rm,
+    // The parts of `collect`, which is the whole of what follows the job's directory: the layers'
+    // use marked and its locks let go, the layers' directory synced, then `Store.collect`'s scan
+    // of the layers, its evictions, and the rest (key locks, the step index, the other areas).
+    collect_touch,
+    collect_syncdir,
+    collect_scan,
+    collect_evict,
+    collect_rest,
     collect,
 
     pub fn setUp(p: Phase) bool {
