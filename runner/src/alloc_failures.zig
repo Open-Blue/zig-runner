@@ -27,6 +27,19 @@ const Allocator = std.mem.Allocator;
 const check = std.testing.checkAllAllocationFailures;
 const gpa = std.testing.allocator;
 
+/// Under Valgrind a run is tens of times slower, and these tests rerun their input once per
+/// allocation: the job message's took 4 to 9 minutes of the nightly's 35 (11-09, 11-10). What
+/// they check, a failure that comes back as an answer or another error, or a leak, the
+/// allocators here find without Valgrind, in ci at full speed. So under it only every
+/// `valgrind_stride`th allocation is failed, for what Valgrind adds (memory errors on those
+/// paths), and `checkAllAllocationFailures`, which cannot skip any, is not run (as `fuzz.zig`
+/// takes every 37th input there).
+const valgrind_stride = 13;
+
+fn stride() usize {
+    return if (std.valgrind.runningOnValgrind() != 0) valgrind_stride else 1;
+}
+
 /// An arena for these tests: like `std.heap.ArenaAllocator`, everything is freed at `deinit`, but
 /// each allocation is its own call to `child`, so the failing allocator can fail any one of them.
 /// Its bookkeeping lives in `std.testing.allocator`, outside what is counted.
@@ -89,7 +102,7 @@ fn expected(e: anyerror, comptime allowed: []const anyerror) bool {
 /// `checkAllAllocationFailures`, then `checkEachAllocationFailure`, saying which input failed.
 pub fn checkOne(comptime f: anytype, args: anytype) !void {
     const fmt = if (@TypeOf(args[0]) == []const u8) "\"{s}\"" else "{any}";
-    check(gpa, f, args) catch |e| {
+    if (stride() == 1) check(gpa, f, args) catch |e| {
         std.debug.print("allocation failures: failed for input " ++ fmt ++ "\n", .{args[0]});
         return e;
     };
@@ -114,7 +127,8 @@ fn checkEachAllocationFailure(comptime f: anytype, args: anytype) !void {
         try once.checkFreed();
         n = once.count;
     }
-    for (0..n) |i| {
+    var i: usize = 0;
+    while (i < n) : (i += stride()) {
         var once: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i };
         if (@call(.auto, f, .{once.allocator()} ++ args)) |_| {
             if (once.failed) return error.SwallowedOutOfMemoryError;
@@ -134,7 +148,8 @@ pub fn checkNoLeaks(comptime f: anytype, args: anytype) !void {
         try @call(.auto, f, .{failing.allocator()} ++ args);
         n = failing.alloc_index;
     }
-    for (0..n) |i| {
+    var i: usize = 0;
+    while (i < n) : (i += stride()) {
         var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = i });
         @call(.auto, f, .{failing.allocator()} ++ args) catch |e| if (e != error.OutOfMemory) return e;
         if (failing.allocated_bytes != failing.freed_bytes) {
