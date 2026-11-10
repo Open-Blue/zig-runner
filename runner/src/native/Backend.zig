@@ -4143,6 +4143,47 @@ test "a run-only job on the native backend: file commands, masks, exit codes and
     try std.testing.expect(try it.next(std.testing.io) == null);
 }
 
+test "a native job's result comes back before its teardown, which holds the job's directory until it runs" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    var res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+        .defer_teardown = true,
+    }, testJob(&.{testStep("echo reported-first")}), &log);
+    try std.testing.expect(res.succeeded);
+    // The result is in hand, and the job is still up: its directory is there, and no teardown
+    // phase (down to the store's eviction) has been timed.
+    const t = res.teardown orelse return error.TestUnexpectedResult;
+    try std.testing.expect(res.native_phases == null);
+    const jobs_path = try std.fmt.allocPrint(arena, "{s}/jobs", .{cfg.store});
+    {
+        var jobs = try std.Io.Dir.cwd().openDir(std.testing.io, jobs_path, .{ .iterate = true });
+        defer jobs.close(std.testing.io);
+        var it = jobs.iterate();
+        try std.testing.expect(try it.next(std.testing.io) != null);
+    }
+    try std.testing.expect(!t.done);
+    const timed = t.run() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, timed, "collect=") != null);
+    // Once: the second call changes nothing and returns the same phases.
+    try std.testing.expectEqualStrings(timed, t.run().?);
+    res.teardown = null;
+    var jobs = try std.Io.Dir.cwd().openDir(std.testing.io, jobs_path, .{ .iterate = true });
+    defer jobs.close(std.testing.io);
+    var it = jobs.iterate();
+    try std.testing.expect(try it.next(std.testing.io) == null);
+}
+
 test "a cancel stops a native step, and every process it started, well inside the ladder" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
