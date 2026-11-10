@@ -16,7 +16,14 @@ away from trusted caches, and takes a job only when the machine has the memory f
 
 ## Quick start
 
-You need Zig 0.17, and Docker for the Dagger backend.
+You need Zig 0.17 and, on a bare machine, `git curl xz-utils sudo nftables iproute2 util-linux procps`
+(the native backend needs the last four). To get Zig, run `.github/scripts/install-zig.sh`, which
+installs the pinned version after checking ziglang.org's published checksum (it appends the
+directory to the file `GITHUB_PATH` names), or download it from
+[ziglang.org](https://ziglang.org/download/) and check the checksum yourself. The Dagger backend also
+needs Docker; the native backend with `RUNNER_ENGINE=none` needs none. A cold build takes about five
+minutes. [.github/scripts/fresh-install.sh](.github/scripts/fresh-install.sh) does all of this on a
+throwaway machine ([docs/OPERATIONS.md](docs/OPERATIONS.md), "A fresh install").
 
 ```sh
 cd runner

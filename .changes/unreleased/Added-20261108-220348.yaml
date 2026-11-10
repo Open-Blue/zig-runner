@@ -1,0 +1,3 @@
+kind: Added
+body: A fresh-install script (`.github/scripts/fresh-install.sh`) that, on a clean machine, installs Zig, builds the runner, runs the native tests as root and runs a real job through the native backend with no engine, for throwaway cloud VMs (#377).
+time: 2026-11-08T22:03:48.445596024-05:00

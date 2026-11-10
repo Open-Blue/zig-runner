@@ -148,6 +148,39 @@ sudo cp deploy/zig-runner-deploy.service deploy/zig-runner-deploy.timer /etc/sys
 sudo systemctl daemon-reload && sudo systemctl enable --now zig-runner-deploy.timer
 ```
 
+## A fresh install
+
+`.github/scripts/fresh-install.sh` tests what the README says on a machine with nothing of ours on
+it (#377). As root, from a fresh `git clone`, it installs the packages the build and the sandbox
+need, installs Zig with `install-zig.sh` (pinned, checked against ziglang.org's checksum), builds
+with `zig build -Doptimize=ReleaseSafe`, runs the native tests as root with
+`ZIG_RUNNER_REQUIRE_NATIVE=1`, and runs a real job through the built binary: `--exec-job` on a saved
+job, native backend, no Dagger engine. That job needs no credentials, no Docker and no GitHub, only
+a registry to pull `ubuntu:24.04` from. Each stage's output is in `$FRESH_INSTALL_WORK/log`
+(`/var/tmp/zig-runner-fresh` by default), and the script ends with the time each took.
+
+On a cloud VM (#377's suggestion): a Spot `e2-standard-4` (4 vCPU, 16 GB) with a 60 GB balanced
+disk, Debian 13, no snapshot schedule, SSH only, and a billing budget alert set first.
+
+```sh
+git clone https://github.com/Open-Blue/zig-runner && cd zig-runner
+sudo .github/scripts/fresh-install.sh
+```
+
+**Delete the VM afterwards**: a stopped VM still charges for its disk. The root tests start
+sandboxes with cgroups and nftables and can take down the machine they run on, which is why this is
+a machine to lose. On Ubuntu, AppArmor stops unprivileged user namespaces; `FRESH_INSTALL_LIFT_APPARMOR=1`
+lifts the sysctl for the run, as CI does, and restores it after (never do that in a container: the
+sysctl is the host's).
+
+To also try a runner registered with GitHub, set `FRESH_INSTALL_REGISTER=1`, `GH_SCOPE`, and either
+`GH_TOKEN` or `GH_APP_ID` with `GH_APP_PRIVATE_KEY_FILE`. The script starts one runner with a label
+of its own for `FRESH_INSTALL_REGISTER_SECONDS` (90), checks that it was accepted and listens, and
+stops it, which removes the registration. Dispatch a workflow with `runs-on: [self-hosted,
+<the label it prints>]` in that time. **Don't register it on a public repository**: a fork's pull
+request could run code on the VM. Use a private repository or a test organization, and delete the
+token or the App's installation after.
+
 ## Rebooting the machine
 
 The engine keeps its cache across a restart only if it can mark the cache clean first (see
