@@ -9673,7 +9673,7 @@ test "root runner: native gate accuracy, each job's own cgroup against the engin
     // Two jobs as on razorbill's soak: the second starts while the first holds its memory.
     const mb = 300;
     var slots: [4]admission.Admission.Slot = undefined;
-    var pool: admission.Admission = .init(io, .{}, &slots);
+    var pool: admission.Admission = .init(io, .{ .margin_percent = 0 }, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
     pool.engine.dir = parent;
     var gates: [4]admission.Gate = undefined;
@@ -9742,7 +9742,7 @@ test "root runner: a native job's cgroup gets memory.high from what the gate res
     if (!can) return error.SkipZigTest;
     cfg.cgroup.swap = true;
     var slots: [1]admission.Admission.Slot = undefined;
-    var pool: admission.Admission = .init(io, .{}, &slots);
+    var pool: admission.Admission = .init(io, .{ .margin_percent = 0 }, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
     pool.native = true;
     var gate: admission.Gate = .{ .pool = &pool };
@@ -9809,7 +9809,7 @@ test "root runner: with no swap a job past what the gate reserves is not held th
     defer parent.remove(arena);
     cfg.cgroup.memory_max_mb = 1536;
     var slots: [1]admission.Admission.Slot = undefined;
-    var pool: admission.Admission = .init(io, .{}, &slots);
+    var pool: admission.Admission = .init(io, .{ .margin_percent = 0 }, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
     pool.native = true;
     var gate: admission.Gate = .{ .pool = &pool };

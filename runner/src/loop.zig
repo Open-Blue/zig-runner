@@ -1919,7 +1919,7 @@ test "a pre-warm that found everything cached is not learned from: the cold warm
     var cfg: Config = .{ .gh_token = "", .scope = undefined, .trusted_refs = "refs/heads/main" };
     const c = testRunner(arena, &log, &out, &cfg);
     var slots: [2]admission.Admission.Slot = undefined;
-    var memory: admission.Admission = .init(std.testing.io, .{}, &slots);
+    var memory: admission.Admission = .init(std.testing.io, .{ .margin_percent = 0 }, &slots);
     memory.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
     const w = try testWarmer(c, &memory);
     defer w.arena.deinit();

@@ -538,6 +538,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_MEM_PER_JOB_MB")) |v| l.per_job_mb = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_MEM_PER_JOB_MB")) |v|
             l.native_per_job_mb = try num(u32, v);
+        if (environ.get("RUNNER_MEM_MARGIN_PERCENT")) |v| l.margin_percent = try percent(v);
         if (environ.get("RUNNER_MAX_MEM_PRESSURE")) |v| l.max_pressure = try percent(v);
         if (environ.get("RUNNER_MAX_SWAP_GROWTH_MB")) |v| l.max_swap_growth_mb = try num(u32, v);
         if (environ.get("RUNNER_MIN_ENGINE_HEADROOM_MB")) |v|
@@ -628,6 +629,7 @@ pub const Config = struct {
         else if (eq(key, "min-mem-available-mb")) l.min_available_mb = try num(u32, val) //
         else if (eq(key, "mem-per-job-mb")) l.per_job_mb = try num(u32, val) //
         else if (eq(key, "native-mem-per-job-mb")) l.native_per_job_mb = try num(u32, val) //
+        else if (eq(key, "mem-margin-percent")) l.margin_percent = try percent(val) //
         else if (eq(key, "max-mem-pressure")) l.max_pressure = try percent(val) //
         else if (eq(key, "max-swap-growth-mb")) l.max_swap_growth_mb = try num(u32, val) //
         else if (eq(key, "min-engine-headroom-mb")) l.min_engine_headroom_mb = try num(u32, val) //
@@ -1275,6 +1277,7 @@ test "the memory gate is on by default, with limits from the environment or flag
     try env.put("RUNNER_MEM_PER_JOB_MB", "0");
     try env.put("RUNNER_NATIVE_MEM_PER_JOB_MB", "128");
     try env.put("RUNNER_MAX_MEM_PRESSURE", "20");
+    try env.put("RUNNER_MEM_MARGIN_PERCENT", "15");
     try env.put("RUNNER_MAX_SWAP_GROWTH_MB", "128");
     try env.put("RUNNER_MIN_ENGINE_HEADROOM_MB", "512");
     const scope = "/sys/fs/cgroup/system.slice/docker-e.scope";
@@ -1287,6 +1290,7 @@ test "the memory gate is on by default, with limits from the environment or flag
         .max_swap_growth_mb = 128,
         .min_engine_headroom_mb = 512,
         .native_per_job_mb = 128,
+        .margin_percent = 15,
     }, set.admission_limits);
     const native = try Config.load(&env, &.{ "runner", "--native-mem-per-job-mb=0" });
     try std.testing.expectEqual(@as(u32, 0), native.admission_limits.native_per_job_mb);
