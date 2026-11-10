@@ -532,7 +532,8 @@ pub const Admission = struct {
             listed += 1;
         }
         var w: std.Io.Writer = .fixed(buf);
-        writeHealth(&w, snap, jobs[0..listed], more) catch {};
+        // A line too long for the buffer is sent cut, not lost.
+        writeHealth(&w, snap, jobs[0..listed], more) catch return w.buffered();
         return w.buffered();
     }
 

@@ -412,7 +412,8 @@ fn sampleAndReport(c: Runner, m: *admission.Admission) void {
         c.io.sleep(.fromSeconds(1), .awake) catch return;
         m.tick();
         var buf: [2048]u8 = undefined;
-        if (m.heartbeat(&buf)) |line| c.log.say(line) catch {};
+        if (m.heartbeat(&buf)) |line| c.log.say(line) catch |e|
+            std.log.warn("health line not written: {s}", .{@errorName(e)});
     }
 }
 
