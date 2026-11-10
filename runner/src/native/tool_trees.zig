@@ -1763,9 +1763,8 @@ test "tool trees: calls that overlap share a walk, and any answer is a walk's ow
     var flights: Flights = .{};
     defer flights.list.deinit(std.heap.smp_allocator);
     const Caller = struct {
-        fn run(fl: *Flights, ff: Fixture, out: *Verdict, ok: *bool) void {
-            var ar: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-            // Kept: the verdict lives in the arena, which the test frees.
+        fn run(fl: *Flights, ff: Fixture, ar: *std.heap.ArenaAllocator, out: *Verdict, ok: *bool) void {
+            // Each caller its own arena (one is not shared between threads); the test frees them.
             const v = checkOnce(fl, ar.allocator(), std.heap.smp_allocator, std.testing.io, ff.cache, ff.lists, "/t", null) catch return;
             out.* = v;
             ok.* = true;
@@ -1773,8 +1772,10 @@ test "tool trees: calls that overlap share a walk, and any answer is a walk's ow
     };
     var verdicts: [6]Verdict = undefined;
     var oks: [6]bool = @splat(false);
+    var arenas: [6]std.heap.ArenaAllocator = @splat(.init(std.heap.page_allocator));
+    defer for (&arenas) |*x| x.deinit();
     var threads: [6]std.Thread = undefined;
-    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Caller.run, .{ &flights, f, &verdicts[i], &oks[i] });
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Caller.run, .{ &flights, f, &arenas[i], &verdicts[i], &oks[i] });
     for (threads) |t| t.join();
     for (verdicts, oks) |v, ok| {
         try std.testing.expect(ok);
