@@ -13,6 +13,7 @@
 const Backend = @This();
 
 const std = @import("std");
+const Sha256 = @import("../sha256.zig").Sha256;
 const job_mod = @import("../job.zig");
 const config = @import("../config.zig");
 const pg = @import("../pg.zig");
@@ -28,6 +29,7 @@ const http = @import("../github/http.zig");
 const docker = @import("../dagger/docker.zig");
 const cgroup = @import("cgroup.zig");
 const evict = @import("evict.zig");
+const reaper = @import("reaper.zig");
 const volumes = @import("volumes.zig");
 const trees_check = @import("tool_trees.zig");
 const admission = @import("../admission.zig");
@@ -46,6 +48,7 @@ const set_up = @import("../dagger/set_up.zig");
 const provisioned = @import("../dagger/provisioned.zig");
 const phases = @import("phases.zig");
 const hash_files = @import("hash_files.zig");
+const key_diff = @import("key_diff.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -153,6 +156,17 @@ store_cfg: Store = .{ .root = "" },
 /// A layer of the job's was published (`publishTop`): its end syncs the layers' directory, so
 /// the renames outlive a crash (`Store.syncLayers`).
 published: bool = false,
+/// What a step is across runs, without its place in the job (`stepIdent`): the cache scope, the
+/// repository, the workflow, the job and its display name. Set in `base`.
+ident: [5][]const u8 = .{ "", "", "", "", "" },
+/// The base's key parts (`below`), which stand where a step's parent layer does in its components.
+below_parts: []const key_diff.Component = &.{},
+/// The components of the key `keyFor` made last, for `claimKey` to compare and `publishTop` to
+/// keep (`key_diff.zig`).
+pending: ?Pending = null,
+/// The first reason in this job that a keyed layer was not replayed, for the steps above it that
+/// miss only because it did (`explainMiss`).
+first_miss: ?[]const u8 = null,
 /// `Config.vouched`, and the job's cache scope and repository from it (`base`): a vouched fork's
 /// pull request keys its layers apart from its repository's own jobs, as its package caches are
 /// (`set_up.packageCacheScope`).
@@ -161,6 +175,9 @@ scope: []const u8 = "untrusted",
 repository: []const u8 = "",
 /// The store's layers the job uses, held shared until it ends (`Store.Layer`).
 held: std.ArrayList(std.Io.File) = .empty,
+/// The locks (also in `held`) of the stored layers the job's stack has used, oldest first, kept
+/// past a flatten, which leaves the stack one layer; `Store.touchChain` at the job's end.
+chain: std.ArrayList(std.Io.File) = .empty,
 /// Past this many layers, the stack is merged into one (`flatten`).
 flatten_at: usize = default_flatten_at,
 /// `abort` while an exec waits for its key's lock (`Store.lockKey`): the wait ends.
@@ -849,6 +866,9 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
     return initWhy(arena, io, gpa, cfg, &why);
 }
 
+/// Set by the first job of the process (`initWhy`).
+var verdicts_dropped: std.atomic.Value(bool) = .init(false);
+
 /// `init`, saying in `why` what failed and on which path ("making /var/lib/.../P/etc:
 /// FileNotFound"), for "Set up job": an error's name alone does not say which of the job's
 /// directories, locks, helpers or files it was.
@@ -868,6 +888,9 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .none => null,
     });
     (Store{ .root = cfg.store }).checkOncePerBoot(arena, io);
+    // What was done to a volume while no runner was up is not in a verdict from before: the first
+    // job of a process drops them all (`tool_trees.takeVerdict`).
+    if (!verdicts_dropped.swap(true, .acq_rel)) trees_check.dropVerdicts(arena, io, cfg.store);
     t = ph.since(arena, .sweep, t);
     var raw: [8]u8 = undefined;
     io.random(&raw);
@@ -926,6 +949,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
             .max_bytes = cfg.store_max_bytes,
             .limits = cfg.store_limits,
             .sync_fd = Store.syncCursor(arena, cfg.store),
+            .defer_delete = true,
         },
         .vouched = cfg.vouched,
         .port_addresses = cfg.port_addresses,
@@ -1359,33 +1383,51 @@ pub fn deinit(b: *Backend) void {
     if (b.publisher) |*p| p.stop(b.io);
     b.publisher = null;
     b.service_set.stopAll(b.io);
-    b.cache_plan.release(b.io);
     t = b.timings.since(arena, .services, t);
+    // The volumes are let go only once every process of the job is gone, which the removal of its
+    // cgroup shows (the kernel refuses while one is left): another job that takes a volume
+    // exclusively then knows that no job's process is left in it (`walkToolCacheIdle`).
+    var processes_gone = false;
     if (b.job_cgroup) |j| {
         if (b.gate) |g| g.nativeDone();
-        j.remove(arena, b.io);
+        processes_gone = j.removed(arena, b.io);
     }
     t = b.timings.since(arena, .cgroup_rm, t);
-    if (b.slot) |s| {
+    if (processes_gone) b.walkToolCacheIdle() else b.noteProcessesMayRemain();
+    b.cache_plan.release(b.io);
+    t = b.timings.since(arena, .tool_walk, t);
+    // The namespace's last reference goes with its mount, and the kernel then takes the veth down
+    // with it, in a batch of its own after this returns (`cleanup_net`): about 20 ms on a laptop
+    // that an explicit delete waited for. The host's end may outlive this a moment, which the
+    // slot's next holder never sees: it removes whatever it finds of the slot's veth under the
+    // slot's lock, which is let go below (`jobNetwork`). A job with no namespace (its helper
+    // failed) may have a veth of its slot all the same, so that one is deleted here.
+    if (b.netns) |p| {
+        detachNetns(arena, p);
+    } else if (b.slot) |s| {
         var sock = net.Socket.open() catch null;
         if (sock) |*so| {
             so.deleteVeth(s.n);
             so.close();
         }
     }
-    if (b.netns) |p| detachNetns(arena, p);
     t = b.timings.since(arena, .veth_rm, t);
     removeJobDir(arena, b.io, b.dir);
     t = b.timings.since(arena, .tree_rm, t);
+    // Before the layers are let go: ancestors end up the more recently used (`Store.touchChain`).
+    const whole = t;
+    Store.touchChain(b.io, b.chain.items);
     for (b.held.items) |f| f.close(b.io);
     if (b.slot) |s| s.lock.close(b.io);
     b.lock.close(b.io);
+    t = b.timings.since(arena, .collect_touch, t);
     if (b.published) b.store_cfg.syncLayers(arena);
     if (b.store_cfg.sync_fd) |fd| _ = std.os.linux.close(fd);
+    t = b.timings.since(arena, .collect_syncdir, t);
     // The store kept under its cap, now that this job holds none of its layers: whether or not
     // the job cached steps, as Dockerfile builds publish layers too (`layers.zig`).
-    if (b.store_cfg.root.len > 0) b.store_cfg.collect(arena, b.io);
-    _ = b.timings.since(arena, .collect, t);
+    if (b.store_cfg.root.len > 0) b.store_cfg.collectTimed(arena, b.io, &b.timings);
+    _ = b.timings.since(arena, .collect, whole);
 }
 
 fn detachNetns(arena: Allocator, path: []const u8) void {
@@ -1490,6 +1532,7 @@ pub fn base(
     }
     b.repository = ev.job.github.repository;
     b.scope = try set_up.packageCacheScope(arena, ev, b.repository, b.vouched);
+    b.ident = .{ b.scope, b.repository, ev.job.github.workflow, ev.job.job_id, ev.job.display_name };
     const event = try ev.eventJson();
     const event_in_env = plan.step_cache and event.len <= set_up.max_event_env;
     if (event_in_env) try b.put(dagger.event_env, event);
@@ -1575,7 +1618,7 @@ pub fn base(
     defer b.workdir = workdir;
     const key = try b.keyFor(.base, mk, files, mk_uid, mk_gid);
     // Nothing can stop the base: no step is running, so no cancel reaches it.
-    const claim = b.claimKey(key) catch |e| {
+    const claim = b.claimKey(key, "base") catch |e| {
         err_msg.* = @errorName(e);
         return error.BaseContainerFailed;
     };
@@ -1724,7 +1767,8 @@ pub fn execScript(
             null
         else
             try b.keyFor(.step, script, &.{}, b.uid, b.gid);
-        const claim = b.claimKey(key) catch |e| switch (e) {
+        const label = try std.fmt.allocPrint(arena, "step {d}", .{num});
+        const claim = b.claimKey(key, label) catch |e| switch (e) {
             error.Stopped => {
                 x.err_msg = "the step was stopped";
                 return error.EngineFailed;
@@ -1732,6 +1776,7 @@ pub fn execScript(
             else => return e,
         };
         defer claim.release(b.io);
+        if (claim.why) |line| x.sh.append(num, line);
         if (claim.hit) |rec| {
             const data = try recordAnswer(arena, rec);
             // A record that points into the tool cache's volume, which is in no layer: the volume
@@ -1927,12 +1972,17 @@ fn checkToolTrees(b: *Backend) !void {
     const arena = b.arena;
     const volume = b.cache_plan.tool_cache_host orelse return;
     const mount = b.cache_plan.tool_cache.?;
+    // What the last job out found when it left the volume, read as this job opened it
+    // (`volumes.plan`, `tool_trees.takeVerdict`): no walk then.
+    if (b.cache_plan.tool_verdict) |v| {
+        b.tool_trees = v.env;
+        b.tool_trees_full = v.full;
+        try b.notes.append(arena, v.note);
+        return;
+    }
     // In the runner's store beside the volumes, where no step can write: a list a job could
     // forge would pass a changed file (`tool_trees.zig`).
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(volume, &digest, .{});
-    const root = b.store_cfg.root;
-    const lists = try std.fmt.allocPrint(arena, "{s}/tool-trees/{x}", .{ root, digest[0..16] });
+    const lists = try trees_check.listsDir(arena, b.store_cfg.root, volume);
     const verdict = try trees_check.checkOnce(
         &trees_check.process_flights,
         arena,
@@ -1946,6 +1996,31 @@ fn checkToolTrees(b: *Backend) !void {
     b.tool_trees = verdict.env;
     b.tool_trees_full = verdict.full;
     try b.notes.append(arena, verdict.note);
+}
+
+/// A job that lets the tool cache's volume go with processes that may be alive in it says so,
+/// before it lets go, so that no job makes a verdict of the volume (`tool_trees.markUnproven`).
+fn noteProcessesMayRemain(b: *Backend) void {
+    const volume = b.cache_plan.tool_cache_host orelse return;
+    const lists = trees_check.listsDir(b.arena, b.store_cfg.root, volume) catch return;
+    if (!trees_check.markUnproven(b.arena, b.io, lists))
+        std.log.warn("native: cannot note that {s} may have processes left", .{volume});
+}
+
+/// The last job out of the tool cache's volume walks its trees for the next job
+/// (`tool_trees.walkIdle`), the walk that job would make first thing. Only when this job's
+/// processes are gone (`deinit`: a job without a cgroup, `RUNNER_NATIVE_CGROUP=none`, never
+/// gets here), the exclusive lock on the volume is free (no job anywhere holds it, so none can
+/// run a step in it, and any other job's processes were gone when it let go), and the job checks
+/// the trees at all. A walk that was not whole, or saw a racy file, leaves no verdict, and the next
+/// job walks as it always did.
+fn walkToolCacheIdle(b: *Backend) void {
+    if (!b.caches.tool_trees) return;
+    const mount = b.cache_plan.tool_cache orelse return;
+    const arena = b.arena;
+    const idle = b.cache_plan.idleToolCache(arena) orelse return;
+    const lists = trees_check.listsDir(arena, b.store_cfg.root, idle.dir) catch return;
+    _ = trees_check.walkIdle(arena, b.gpa, b.io, idle.dir, lists, mount, idle.left, trees_check.idle_limits);
 }
 
 /// `set_up.zig_builtin_seed_script` on the `builtin.zig` volume, bound beside the seed's own `b/`
@@ -2281,7 +2356,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
         null
     else
         try b.keyFor(.step, try std.fmt.allocPrint(arena, "{s}\n# tags {s}", .{ aw.written(), tags.? }), &.{}, b.uid, b.gid);
-    const claim = b.claimKey(key) catch |e| switch (e) {
+    const claim = b.claimKey(key, "fetch") catch |e| switch (e) {
         error.Stopped => {
             f.result = .{ .failed = "the step was stopped" };
             return f;
@@ -2646,6 +2721,7 @@ fn keyFor(
     gid: u32,
 ) !?Store.Key {
     _ = b.store orelse return null;
+    b.pending = null;
     const parent = if (b.layers.items.len > 0)
         b.layers.items[b.layers.items.len - 1].key orelse return null
     else
@@ -2656,19 +2732,97 @@ fn keyFor(
     h.int(gid);
     h.field(b.workdir);
     h.int(files.len);
+    // The same parts as components, to say what differs on a miss (`key_diff.zig`): digests, never
+    // the content, and nothing the key does not hold.
+    var cb: key_diff.Builder = .init(b.arena);
+    if (b.layers.items.len > 0)
+        try cb.add(key_diff.parent_name, &Store.hex(parent))
+    else for (b.below_parts) |c| try cb.add(c.name, c.value);
+    try cb.addDigest("script", script);
+    for (b.env.items) |e| if (Store.stableEnv(e.name)) try envComponent(&cb, e.name, e.value);
+    try cb.add("uid", try std.fmt.allocPrint(b.arena, "{d}", .{uid}));
+    try cb.add("gid", try std.fmt.allocPrint(b.arena, "{d}", .{gid}));
+    try cb.add("workdir", b.workdir);
     for (files) |f| {
         if (!f.keep) return null;
         h.field(f.path);
         h.field(f.contents);
         h.int(f.mode);
+        try cb.addDigest(try std.fmt.allocPrint(b.arena, "file {s}", .{f.path}), f.contents);
     }
     // What a step may read is in its groups too. Hashed only if it has some, which leaves every
     // other key as it was; a layer stored before steps had them was made without, and misses.
     if (uid == b.uid and gid == b.gid and b.groups.len > 0) {
         h.int(b.groups.len);
         for (b.groups) |g| h.int(g);
+        var groups: std.ArrayList(u8) = .empty;
+        for (b.groups) |g| try groups.print(b.arena, "{d} ", .{g});
+        try cb.addDigest("groups", groups.items);
     }
-    return h.final();
+    const key = h.final();
+    b.pending = .{ .key = key, .comps = try cb.finish() };
+    return key;
+}
+
+/// One stable variable as components: a digest of its value (a tree check's value, a line for
+/// each tree: the tree's path is the name, as it is what a reader knows it by).
+fn envComponent(cb: *key_diff.Builder, name: []const u8, value: []const u8) !void {
+    const label = if (std.mem.eql(u8, name, set_up.tool_trees_env))
+        "tool tree "
+    else if (std.mem.eql(u8, name, trees_check.full_env))
+        "full tool tree "
+    else
+        return cb.addDigest(try std.fmt.allocPrint(cb.arena, "env {s}", .{name}), value);
+    var lines = std.mem.tokenizeScalar(u8, value, '\n');
+    while (lines.next()) |line| {
+        const sp = std.mem.indexOfScalar(u8, line, ' ') orelse {
+            try cb.addDigest(try std.fmt.allocPrint(cb.arena, "env {s}", .{name}), line);
+            continue;
+        };
+        try cb.add(
+            try std.fmt.allocPrint(cb.arena, "{s}{s}", .{ label, line[sp + 1 ..] }),
+            try std.fmt.allocPrint(cb.arena, "sha:{s}", .{line[0..@min(sp, 16)]}),
+        );
+    }
+}
+
+/// A key's components, held until the key is claimed.
+const Pending = struct {
+    key: Store.Key,
+    comps: []const key_diff.Component,
+    /// Which step it is (`stepIdent`), set when the key is claimed.
+    label: []const u8 = "",
+};
+
+/// Who step `label` ("base", "fetch", "step 3") is across runs, the id of its entry in the
+/// store's index of steps (`key_diff.identity`): the scope is in it, so a fork's pull request never
+/// reads or writes what the repository's own jobs do.
+fn stepIdent(b: *const Backend, label: []const u8) [32]u8 {
+    return key_diff.identity(&.{ b.ident[0], b.ident[1], b.ident[2], b.ident[3], b.ident[4], label });
+}
+
+/// What the store knew of this step when `key` was not in it, as a line for the step's log: the
+/// first component that differs from the key the step had when last replayed or published, or why
+/// there is none. Null when this is the step's first run, or when nothing is known. A step whose
+/// own parts are as they were, but whose layer below is new, says so with the first such miss
+/// of the job.
+fn explainMiss(b: *Backend, c: Pending, label: []const u8) ?[]const u8 {
+    const s = b.store orelse return null;
+    const arena = b.arena;
+    const was = key_diff.readIndex(arena, b.io, s.root, &b.stepIdent(label)) orelse return null;
+    if (std.mem.eql(u8, was.key, &Store.hex(c.key)))
+        return "Not replayed: its key is the same as last time, but the stored layer is gone " ++
+            "(evicted, or made by a run that did not finish)";
+    const ch = key_diff.firstChange(was.comps, c.comps) orelse return null;
+    if (std.mem.eql(u8, ch.name, key_diff.parent_name)) {
+        const cause = b.first_miss orelse return key_diff.describe(arena, ch) catch null;
+        return std.fmt.allocPrint(arena, "Not replayed: an earlier step did not replay: {s}", .{
+            cause["Not replayed: ".len..],
+        }) catch null;
+    }
+    const line = key_diff.describe(arena, ch) catch return null;
+    if (b.first_miss == null) b.first_miss = line;
+    return line;
 }
 
 /// What a base's layer, and so every layer above it, depends on besides its own script: the
@@ -2697,7 +2851,7 @@ fn below(b: *Backend) ?Store.Key {
     for (binds) |*bd| if (std.mem.eql(u8, bd.at, "/etc/resolv.conf")) {
         bd.host = "/etc/resolv.conf";
     };
-    return belowKey(.{
+    const in: Below = .{
         .format = Store.store_format,
         .scope = b.scope,
         .repository = b.repository,
@@ -2706,7 +2860,29 @@ fn below(b: *Backend) ?Store.Key {
         .binds = binds,
         .seeds = b.seed_ids.items,
         .container_opts = b.opts_key,
-    }, null);
+    };
+    b.below_parts = belowParts(b.arena, in) catch &.{};
+    return belowKey(in, null);
+}
+
+/// `below`'s fields as components (`key_diff.zig`), for the base's miss to say which changed.
+fn belowParts(arena: Allocator, in: Below) ![]const key_diff.Component {
+    var cb: key_diff.Builder = .init(arena);
+    try cb.add("base format", in.format);
+    try cb.add("base scope", in.scope);
+    try cb.add("base repository", in.repository);
+    try cb.addDigest("base rootfs", in.fingerprint);
+    try cb.add("base userns", in.userns);
+    var binds: std.ArrayList(u8) = .empty;
+    for (in.binds) |bd| try binds.print(arena, "{s}:{s}:{}:{}:{}\n", .{
+        bd.host, bd.at, bd.read_only, bd.optional, bd.volume,
+    });
+    try cb.addDigest("base binds", binds.items);
+    var layers: std.ArrayList(u8) = .empty;
+    for (in.seeds) |l| try layers.print(arena, "{s}\n", .{l});
+    try cb.addDigest("base zig cache seeds", layers.items);
+    try cb.addDigest("base container options", in.container_opts);
+    return cb.finish();
 }
 
 /// What `below` hashes, as values: the store's format and what it reads from the job.
@@ -2805,16 +2981,26 @@ const Claim = struct {
     key: ?Store.Key = null,
     lock: ?std.Io.File = null,
     hit: ?Store.Record = null,
+    /// Why the key was not in the store, when the store can say (`explainMiss`).
+    why: ?[]const u8 = null,
 
     fn release(c: Claim, io: std.Io) void {
         if (c.lock) |l| l.close(io);
     }
 };
 
-fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
+fn claimKey(
+    b: *Backend,
+    key: ?Store.Key,
+    label: []const u8,
+) error{ Stopped, OutOfMemory }!Claim {
     const k = key orelse return .{};
     const s = b.store.?;
     const arena = b.arena;
+    // Components are those of this key or none (`keyFetched` claims keys `keyFor` did not make).
+    if (b.pending) |*p| {
+        if (std.mem.eql(u8, &p.key, &k)) p.label = label else b.pending = null;
+    }
     const t = phases.now();
     defer _ = b.timings.since(arena, .claim, t);
     b.stop_wait.store(false, .release);
@@ -2839,11 +3025,16 @@ fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
         });
         lock.close(b.io);
         return .{};
-    }) orelse return .{ .key = k, .lock = lock };
+    }) orelse return .{
+        .key = k,
+        .lock = lock,
+        .why = if (b.pending) |p| b.explainMiss(p, label) else null,
+    };
     errdefer hit.layer.lock.close(b.io);
     errdefer lock.close(b.io);
     try b.layers.ensureUnusedCapacity(arena, 1);
     try b.held.ensureUnusedCapacity(arena, 1);
+    try b.chain.ensureUnusedCapacity(arena, 1);
     const name = try b.layerName('l');
     const link = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, name });
     std.Io.Dir.cwd().symLink(b.io, hit.layer.fs, link, .{}) catch |e| {
@@ -2855,13 +3046,21 @@ fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
         return .{};
     };
     b.held.appendAssumeCapacity(hit.layer.lock);
+    b.chain.appendAssumeCapacity(hit.layer.lock);
     b.layers.appendAssumeCapacity(.{
         .name = name,
         .path = hit.layer.fs,
         .key = k,
         .canonical = b.how.userns == .mapped,
     });
+    if (b.pending) |p| b.remember(p);
     return .{ .key = k, .lock = lock, .hit = hit.rec };
+}
+
+/// Makes the key `p` the one its step is known by (`key_diff.writeIndex`).
+fn remember(b: *Backend, p: Pending) void {
+    const s = b.store orelse return;
+    key_diff.writeIndex(b.arena, b.io, s.root, &b.stepIdent(p.label), &Store.hex(p.key), p.comps);
 }
 
 /// The stack's top layer, which an exec under `key` just left, given the canonical ids
@@ -2869,12 +3068,16 @@ fn claimKey(b: *Backend, key: ?Store.Key) error{ Stopped, OutOfMemory }!Claim {
 /// its record, and the job's stack then links to it. Its parent is in the store (`keyFor`). A
 /// failure to publish leaves the layer the job's own, and is logged: the job goes on, uncached from
 /// here. One to shift its ids is the job's: the layer is then half one range's, half the other's.
-fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) !void {
+fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec_in: Store.Record) !void {
     const s = b.store orelse return;
     const arena = b.arena;
+    var rec = rec_in;
+    const pend: ?Pending = if (b.pending) |p| if (std.mem.eql(u8, &p.key, &key)) p else null else null;
+    if (pend) |p| rec.components = key_diff.render(arena, p.comps) catch "";
     if (rec.log.len > Store.max_record_bytes) return;
     // Room first: once the layer has moved, the job must hold it and point at it.
     b.held.ensureUnusedCapacity(arena, 1) catch return;
+    b.chain.ensureUnusedCapacity(arena, 1) catch return;
     const top = &b.layers.items[b.layers.items.len - 1];
     const t = phases.now();
     try b.canonicalize(top);
@@ -2897,9 +3100,11 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec: Store.Record) 
         return;
     };
     b.held.appendAssumeCapacity(layer.lock);
+    b.chain.appendAssumeCapacity(layer.lock);
     b.published = true;
     const canonical = top.canonical;
     top.* = .{ .name = name, .path = layer.fs, .key = key, .canonical = canonical };
+    if (pend) |p| b.remember(p);
 }
 
 /// The stack's top layer, the job's own (not the store's), dropped and removed: an exec whose
@@ -2931,7 +3136,7 @@ pub fn keyFetched(b: *Backend, what: []const u8) !void {
     };
     var h: Store.KeyHasher = .init(.step);
     h.core(p, what, &[_]job_mod.EnvVar{});
-    const claim = b.claimKey(h.final()) catch |e| {
+    const claim = b.claimKey(h.final(), "fetched") catch |e| {
         b.layers.appendAssumeCapacity(fetched);
         return e;
     };
@@ -4137,6 +4342,47 @@ test "a run-only job on the native backend: file commands, masks, exit codes and
     try std.testing.expectEqualStrings("# summary\n", res.summaries[0]);
     // The job's layers went with it.
     const jobs_path = try std.fmt.allocPrint(arena, "{s}/jobs", .{cfg.store});
+    var jobs = try std.Io.Dir.cwd().openDir(std.testing.io, jobs_path, .{ .iterate = true });
+    defer jobs.close(std.testing.io);
+    var it = jobs.iterate();
+    try std.testing.expect(try it.next(std.testing.io) == null);
+}
+
+test "a native job's result comes back before its teardown, which holds the job's directory until it runs" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    var res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+        .defer_teardown = true,
+    }, testJob(&.{testStep("echo reported-first")}), &log);
+    try std.testing.expect(res.succeeded);
+    // The result is in hand, and the job is still up: its directory is there, and no teardown
+    // phase (down to the store's eviction) has been timed.
+    const t = res.teardown orelse return error.TestUnexpectedResult;
+    try std.testing.expect(res.native_phases == null);
+    const jobs_path = try std.fmt.allocPrint(arena, "{s}/jobs", .{cfg.store});
+    {
+        var jobs = try std.Io.Dir.cwd().openDir(std.testing.io, jobs_path, .{ .iterate = true });
+        defer jobs.close(std.testing.io);
+        var it = jobs.iterate();
+        try std.testing.expect(try it.next(std.testing.io) != null);
+    }
+    try std.testing.expect(!t.done);
+    const timed = t.run() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, timed, "collect=") != null);
+    // Once: the second call changes nothing and returns the same phases.
+    try std.testing.expectEqualStrings(timed, t.run().?);
+    res.teardown = null;
     var jobs = try std.Io.Dir.cwd().openDir(std.testing.io, jobs_path, .{ .iterate = true });
     defer jobs.close(std.testing.io);
     var it = jobs.iterate();
@@ -6097,6 +6343,38 @@ test "root runner: slots are the host's, so two runners with different stores ne
     try std.testing.expect(sock.index(net.hostLink(&buf, second.slot.?.n)) != null);
 }
 
+test "root runner: a job's veth goes with its namespace, and the next job of the slot never meets it" {
+    // `deinit` deletes no veth: the namespace's mount goes and the kernel takes the veth down
+    // after, in a batch. A job that comes up in the slot at once finds the host's end (named for
+    // the slot) still there or not, and `jobNetwork` removes it under the slot's lock, so
+    // `addVeth`'s exclusive create never meets it.
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var sock = try net.Socket.open();
+    defer sock.close();
+    var buf: [16]u8 = undefined;
+    var slot: ?u32 = null;
+    // Back to back, each in the slot the last let go, with no wait for the kernel.
+    for (0..12) |_| {
+        var b = try init(arena, io, std.testing.allocator, cfg);
+        if (slot) |n| try std.testing.expectEqual(n, b.slot.?.n);
+        slot = b.slot.?.n;
+        try std.testing.expect(sock.index(net.hostLink(&buf, slot.?)) != null);
+        b.deinit();
+    }
+    // And left alone, the veth is gone soon after the last job: nothing deleted it by name.
+    var waited: u32 = 0;
+    while (sock.index(net.hostLink(&buf, slot.?)) != null and waited < 5000) : (waited += 10)
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    try std.testing.expect(sock.index(net.hostLink(&buf, slot.?)) == null);
+}
+
 test "native sweep: a job's directory its runner is removing is left to it; a dead runner's goes" {
     // Found by the store's stress test: a runner's removal took the lock file early, another
     // runner's sweep made a new one, found it free, and removed the directory alongside its
@@ -7985,6 +8263,8 @@ fn replayableLines(arena: Allocator, text: []const u8) ![]const []const u8 {
 }
 
 fn storeLayers(arena: Allocator, store: []const u8) !usize {
+    // What a job's end evicted is deleted after it returns (`reaper`).
+    reaper.drain(std.testing.io);
     const p = try std.fmt.allocPrint(arena, "{s}/layers", .{store});
     var dir = try std.Io.Dir.cwd().openDir(std.testing.io, p, .{ .iterate = true });
     defer dir.close(std.testing.io);
@@ -8073,6 +8353,63 @@ test "native step cache: a failure is not replayed, and the steps before it are"
     try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "s2"));
 }
 
+test "native step cache: a miss says which part of the key changed, from the step's last run" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    const first = testJob(&.{ testStep("echo one"), testStep("echo two") });
+    const j1 = try runCached(arena, c.cfg, first, "j1");
+    try expectSucceeded(j1);
+    // The first run of a step has nothing to compare with.
+    try std.testing.expect(std.mem.indexOf(u8, j1.text, "Not replayed") == null);
+
+    // Every layer has its key's components, and none holds a script's text or a value.
+    var layers = try std.Io.Dir.cwd().openDir(io, try std.fmt.allocPrint(arena, "{s}/layers", .{c.cfg.store}), .{ .iterate = true });
+    defer layers.close(io);
+    var n: usize = 0;
+    var it = layers.iterate();
+    while (try it.next(io)) |e| {
+        const text = try layers.readFileAlloc(io, try std.fmt.allocPrint(arena, "{s}/components", .{e.name}), arena, .limited(64 * 1024));
+        try std.testing.expect(std.mem.indexOf(u8, text, "script\tsha:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "echo") == null);
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
+
+    // Same job: replayed, so nothing to explain.
+    const same = try runCached(arena, c.cfg, first, "j2");
+    try std.testing.expect(std.mem.indexOf(u8, same.text, "Not replayed") == null);
+
+    // A second step with another script: its own script is named. The first one replays.
+    const edited = testJob(&.{ testStep("echo one"), testStep("echo three") });
+    const j3 = try runCached(arena, c.cfg, edited, "j3");
+    try expectSucceeded(j3);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, j3.text, "Not replayed: the step's script changed ("));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, j3.text, "Not replayed"));
+
+    // The first step changed: the second misses only because of it, and says so.
+    const earlier = testJob(&.{ testStep("echo zero"), testStep("echo three") });
+    const j4 = try runCached(arena, c.cfg, earlier, "j4");
+    try expectSucceeded(j4);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, j4.text, "Not replayed"));
+    try std.testing.expect(std.mem.indexOf(u8, j4.text, "Not replayed: an earlier step did not replay: the step's script changed (") != null);
+}
+
+test "native step cache: a step's identity holds its scope, so trusted and untrusted jobs never share a record" {
+    var b: Backend = undefined;
+    b.ident = .{ "repo", "o/r", "ci", "build", "build" };
+    const trusted = b.stepIdent("step 2");
+    b.ident[0] = "untrusted";
+    try std.testing.expect(!std.mem.eql(u8, &trusted, &b.stepIdent("step 2")));
+    b.ident[0] = "repo";
+    try std.testing.expectEqualSlices(u8, &trusted, &b.stepIdent("step 2"));
+    try std.testing.expect(!std.mem.eql(u8, &trusted, &b.stepIdent("step 3")));
+}
+
 test "native step cache: steps with secrets or run-specific values always run, and nothing after them is kept" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -8119,6 +8456,8 @@ test "nothing is keyed above a layer with no key: what a Docker action or a moun
     const arena = a.allocator();
     var b: Backend = undefined;
     b.store = .{ .root = "/nowhere" };
+    b.arena = arena;
+    b.pending = null;
     b.env = .empty;
     b.workdir = "/w";
     b.layers = .empty;
@@ -8602,6 +8941,368 @@ test "native cache volumes: kept between jobs, apart by scope, Zig's local cache
         "Zig local cache: this job's own (not kept between untrusted jobs)",
     });
     try std.testing.expect(std.mem.indexOf(u8, third.text, "stdout] leaked") == null);
+}
+
+/// A fork's pull request for `job`: its head repository is another's, so its cache scope is
+/// `untrusted` whatever the runner vouches for (`set_up.packageCacheScope`).
+fn asFork(arena: Allocator, job: job_mod.Job) !job_mod.Job {
+    const ctx =
+        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"event","v":{"t":2,"d":[
+    ++
+        \\{"k":"pull_request","v":{"t":2,"d":[{"k":"head","v":
+    ++
+        \\{"t":2,"d":[{"k":"repo","v":{"t":2,"d":[{"k":"full_name","v":
+    ++ "\"someone/r\"}]}}]}" ++ "}]}}]}}]}}";
+    var out = job;
+    out.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena, ctx, .{});
+    return out;
+}
+
+/// A tree's digest over its content, modes, owners and links (`Store.treeDigest`): what a write
+/// anywhere in it would change. Compared before and after a hostile job.
+fn treeSum(arena: Allocator, path: []const u8) !Store.Key {
+    return Store.treeDigest(arena, std.testing.io, path, .content, .host);
+}
+
+/// The names in the store's `layers/`, each with its tree's digest.
+const LayerSums = struct {
+    names: []const []const u8,
+    sums: []const Store.Key,
+
+    fn of(arena: Allocator, store: []const u8) !LayerSums {
+        const path = try std.fmt.allocPrint(arena, "{s}/layers", .{store});
+        var dir = try std.Io.Dir.cwd().openDir(std.testing.io, path, .{ .iterate = true });
+        defer dir.close(std.testing.io);
+        var names: std.ArrayList([]const u8) = .empty;
+        var sums: std.ArrayList(Store.Key) = .empty;
+        var it = dir.iterate();
+        while (try it.next(std.testing.io)) |e| {
+            if (e.kind != .directory) continue;
+            try names.append(arena, try arena.dupe(u8, e.name));
+            try sums.append(arena, try treeSum(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ path, e.name })));
+        }
+        return .{ .names = names.items, .sums = sums.items };
+    }
+
+    /// Every layer of `before` is still there, as it was: a job may add layers, never change one.
+    fn expectKept(before: LayerSums, after: LayerSums) !void {
+        for (before.names, before.sums) |n, sum| {
+            const at = for (after.names, 0..) |m, i| {
+                if (std.mem.eql(u8, n, m)) break i;
+            } else {
+                std.debug.print("layer {s} is gone\n", .{n});
+                return error.TestUnexpectedResult;
+            };
+            if (!std.mem.eql(u8, &sum, &after.sums[at])) {
+                std.debug.print("layer {s} changed\n", .{n});
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+};
+
+/// A tree as it is now: its digest, and one line per entry (path, kind, size) to say what changed
+/// when the digest did.
+const TreeSum = struct {
+    path: []const u8,
+    sum: Store.Key,
+    listing: []const u8,
+
+    fn of(arena: Allocator, path: []const u8) !TreeSum {
+        const io = std.testing.io;
+        var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+        defer dir.close(io);
+        var walker = try dir.walk(arena);
+        defer walker.deinit();
+        var out: std.Io.Writer.Allocating = .init(arena);
+        while (try walker.next(io)) |e| {
+            const st = e.dir.statFile(io, e.basename, .{ .follow_symlinks = false }) catch null;
+            try out.writer.print("{s} {s} {d}\n", .{ e.path, @tagName(e.kind), if (st) |s| s.size else 0 });
+        }
+        return .{ .path = path, .sum = try treeSum(arena, path), .listing = out.written() };
+    }
+
+    /// The tree at `before.path` is what `before` saw.
+    fn expectSame(before: TreeSum, arena: Allocator) !void {
+        const now = try of(arena, before.path);
+        if (std.mem.eql(u8, &before.sum, &now.sum)) return;
+        std.debug.print("{s} changed.\nbefore:\n{s}now:\n{s}", .{ before.path, before.listing, now.listing });
+        return error.TestUnexpectedResult;
+    }
+};
+
+fn readTrimmed(arena: Allocator, path: []const u8) ![]const u8 {
+    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, arena, .limited(4096));
+    return std.mem.trim(u8, text, "\n");
+}
+
+/// What makes a job untrusted in `expectUntrustedLeavesTrustedAlone`.
+const Untrusted = enum {
+    /// A fork's pull request on a runner that vouches for pull requests: scope `untrusted`.
+    fork,
+    /// A job the runner does not vouch for (`Config.vouched` false), which runs natively only on a
+    /// root runner under per-job limits (`untrustedRefusal`).
+    unvouched,
+};
+
+/// The trust boundary of the native backend, end to end (docs/native-backend.md, "Trust scopes"):
+/// a trusted job of a repository fills every place the repository's jobs share, an untrusted job
+/// of the same repository then does everything a hostile one can to reach them, and nothing a
+/// trusted job reads or replays has changed. Every shared place is listed in the pull request
+/// that added this, with what keeps it apart.
+fn expectUntrustedLeavesTrustedAlone(arena: Allocator, kind: Untrusted) !void {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try cachedConfig(arena, &tmp);
+    // The seed's build, without a Zig release to download: a file where Zig's cache would be.
+    c.cfg.test_seed_script = "mkdir -p /zig-seed/o/s && echo seeded > /zig-seed/o/s/f";
+    const caches: volumes.Options = .{
+        .package_caches = true,
+        .trusted = true,
+        .zig_local_cache = true,
+        .zig_local_cache_max_mb = 1,
+        .zig_seeds = &.{.{ .version = "0.0.1", .sha256 = "00" }},
+    };
+    var hostile_cfg = c.cfg;
+    var hostile_caches = caches;
+    var parent: ?TestCgroup = null;
+    if (kind == .unvouched) {
+        if (std.os.linux.geteuid() != 0) {
+            std.debug.print("skipped the unvouched case: it needs a root runner\n", .{});
+            return error.SkipZigTest;
+        }
+        hostile_cfg.vouched = false;
+        hostile_caches.trusted = false;
+        parent = try testCgroup(arena, &hostile_cfg);
+        hostile_cfg.job_limits = jobLimits(arena, io, hostile_cfg.cgroup);
+        if (!hostile_cfg.job_limits) {
+            std.debug.print("skipped the unvouched case: no cgroup for per-job limits\n", .{});
+            return error.SkipZigTest;
+        }
+    }
+    defer if (parent) |p| p.remove(arena);
+    const store = c.cfg.store;
+    const gate_file = try std.fmt.allocPrint(arena, "{s}/memory-gate-test", .{store});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = gate_file, .data = "learned job sizes\n" });
+
+    // The trusted job fills the volumes the repository's jobs share, with a secret each.
+    // Who runs a step, told by a file the keys do not hold (`/shared` is bound at `Config.binds`,
+    // and its contents are in no key): the same steps, written by different jobs, say who ran.
+    const who_trusted = "run-by-the-trusted-job";
+    const who_hostile = "run-by-the-hostile-job";
+    const who_file = try std.fmt.allocPrint(arena, "{s}/who", .{c.shared});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = who_file, .data = who_trusted ++ "\n" });
+    const seed_job = testJob(&.{testStep("echo secret > /root/.npm/trusted-secret # npm\n" ++
+        "echo secret > $RUNNER_TOOL_CACHE/trusted-secret\n" ++
+        "echo secret > /root/.cache/zig/p/trusted-secret # zig\n" ++
+        "echo secret > $ZIG_LOCAL_CACHE_DIR/trusted-secret")});
+    const seeded = try runCachedJob(arena, c.cfg, seed_job, caches, .{ .ran = "t0" });
+    try expectSucceeded(seeded);
+
+    const volumes_dir = try std.fmt.allocPrint(arena, "{s}/volumes/o/r/repo", .{store});
+    const seeds_dir = try std.fmt.allocPrint(arena, "{s}/seeds", .{store});
+    // Each volume's tree; the runner's own bookkeeping beside them (`.lock`, `.size`) is its own.
+    var before_volumes: std.ArrayList(TreeSum) = .empty;
+    for ([_][]const u8{ "npm", "zig-packages", "zig-local", "zig-builtin", "node-compile-cache" }) |name|
+        try before_volumes.append(arena, try TreeSum.of(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ volumes_dir, name })));
+    // The tool cache is a volume per image.
+    const tool_dir = try std.fmt.allocPrint(arena, "{s}/toolcache", .{volumes_dir});
+    var tools = try std.Io.Dir.cwd().openDir(io, tool_dir, .{ .iterate = true });
+    defer tools.close(io);
+    var tool_it = tools.iterate();
+    while (try tool_it.next(io)) |e| {
+        if (e.kind != .directory) continue;
+        try before_volumes.append(arena, try TreeSum.of(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ tool_dir, e.name })));
+    }
+    try std.testing.expect(before_volumes.items.len >= 6);
+    const before_rootfs = try TreeSum.of(arena, c.cfg.rootfs);
+    const before_seeds = try TreeSum.of(arena, seeds_dir);
+    const before_layers = try LayerSums.of(arena, store);
+    try std.testing.expectEqualStrings("secret", try readTrimmed(arena, try std.fmt.allocPrint(arena, "{s}/npm/trusted-secret", .{volumes_dir})));
+
+    // What a hostile step tries, with the steps after it that publish layers a trusted job could
+    // look up (`/shared` counts how often each really ran). The same steps run as the trusted job's
+    // later: a stored layer that was found by their key would replay without running them.
+    const attack = try std.fmt.allocPrint(arena,
+        \\cat /shared/who > /root/.npm/head # npm
+        \\cat /shared/who > $RUNNER_TOOL_CACHE/head
+        \\cat /shared/who > /root/.cache/zig/p/head # zig
+        \\cat /shared/who > /root/.cache/zig/o/s/f
+        \\cat /shared/who >> /etc/passwd
+        \\ln -s /etc/passwd /root/.npm/link-abs
+        \\ln -s ../../repo/npm /root/.npm/link-up
+        \\ln /etc/passwd /tmp/hardlink && cat /shared/who >> /tmp/hardlink
+        \\n=$(find / -path /proc -prune -o -path /sys -prune -o -path /usr -prune -o -name trusted-secret -print 2>/dev/null | wc -l)
+        \\echo found-$n-secrets
+        \\for p in {0s}/volumes/o/r/repo/npm/head {0s}/memory-gate-test {0s}/layers/head /run/zig-runner/head; do
+        \\  if {{ echo x > $p; }} 2>/dev/null; then echo wrote-to-host; fi
+        \\  if [ -e $p ]; then echo sees-host; fi
+        \\done
+        \\if [ -e /run/zig-runner ]; then echo sees-run-dir; fi
+        \\echo trusted-mounts-$(grep -c '/volumes/o/r/repo' /proc/self/mountinfo)
+        \\echo gate-mounts-$(grep -c 'memory-gate' /proc/self/mountinfo)
+        \\if ln /usr/bin/env /root/.npm/host-hardlink 2>/dev/null; then echo linked-host-file; fi
+        \\if echo x >> /usr/bin/env 2>/dev/null; then echo wrote-host-binary; fi
+        \\echo attack-done-$((2+3))
+    , .{store});
+    var hostile = testJob(&.{
+        testStep(attack),
+        testStep("echo x >> /shared/b1; mkdir -p /tmp/k; echo layer > /tmp/k/f"),
+        testStep("echo x >> /shared/b2; cat /tmp/k/f"),
+    });
+    if (kind == .fork) hostile = try asFork(arena, hostile);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = who_file, .data = who_hostile ++ "\n" });
+    const first = try runCachedJob(arena, hostile_cfg, hostile, hostile_caches, .{ .ran = "h1" });
+    if (!first.res.succeeded) std.debug.print("{s}\n", .{first.text});
+    try expectSucceeded(first);
+    try expectLines(first.text, &.{
+        "found-0-secrets",
+        "trusted-mounts-0",
+        "gate-mounts-0",
+        "attack-done-5",
+    });
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first.text, "stdout] wrote-"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first.text, "stdout] sees-"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first.text, "stdout] linked-"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first.text, "stdout] sees-run"));
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "b1"));
+
+    // The job did write, into volumes of its own scope: the attack reached what it could reach.
+    const hostile_volumes = try std.fmt.allocPrint(arena, "{s}/volumes/o/r/untrusted", .{store});
+    try std.testing.expectEqualStrings(who_hostile, try readTrimmed(arena, try std.fmt.allocPrint(arena, "{s}/npm/head", .{hostile_volumes})));
+
+    // Nothing a trusted job shares has changed: its volumes, the rootfs and the Zig seed every
+    // job starts from, the layers it published, and the runner's own state.
+    for (before_volumes.items) |v| try v.expectSame(arena);
+    try before_rootfs.expectSame(arena);
+    try before_seeds.expectSame(arena);
+    try before_layers.expectKept(try LayerSums.of(arena, store));
+    try std.testing.expectEqualStrings("learned job sizes", try readTrimmed(arena, gate_file));
+
+    // The control: the hostile job's own run again replays its layers (so they were published and
+    // the next check means something).
+    const again = try runCachedJob(arena, hostile_cfg, hostile, hostile_caches, .{ .ran = "h2" });
+    try expectSucceeded(again);
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "b1"));
+    try std.testing.expect(std.mem.count(u8, again.text, dagger.native_reused_note) >= 2);
+
+    // The same steps as a trusted job: nothing replays, whatever the hostile job published. Each
+    // step runs, and writes its own commit into the trusted volumes.
+    var same = hostile;
+    same.context_data = .null;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = who_file, .data = who_trusted ++ "\n" });
+    const trusted = try runCachedJob(arena, c.cfg, same, caches, .{ .ran = "t1" });
+    try expectSucceeded(trusted);
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "b1"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "b2"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, trusted.text, dagger.native_reused_note));
+    try std.testing.expectEqualStrings(who_trusted, try readTrimmed(arena, try std.fmt.allocPrint(arena, "{s}/npm/head", .{volumes_dir})));
+    try std.testing.expectEqualStrings("secret", try readTrimmed(arena, try std.fmt.allocPrint(arena, "{s}/npm/trusted-secret", .{volumes_dir})));
+    // And what the hostile job planted in its own scope is still its own.
+    try std.testing.expectEqualStrings(who_hostile, try readTrimmed(arena, try std.fmt.allocPrint(arena, "{s}/npm/head", .{hostile_volumes})));
+    // With no cache volume in the job, their paths are not in the key and the trust scope alone
+    // keeps the two apart: the same steps are replayed for their own side, never the other's.
+    var plain = testJob(&.{
+        testStep("echo x >> /shared/c1; mkdir -p /tmp/p; echo plain > /tmp/p/f"),
+        testStep("echo x >> /shared/c2; cat /tmp/p/f"),
+    });
+    if (kind == .fork) plain = try asFork(arena, plain);
+    const no_caches: volumes.Options = .{ .trusted = hostile_caches.trusted };
+    try expectSucceeded(try runCachedJob(arena, hostile_cfg, plain, no_caches, .{ .ran = "p1" }));
+    try expectSucceeded(try runCachedJob(arena, hostile_cfg, plain, no_caches, .{ .ran = "p2" }));
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "c1"));
+    plain.context_data = .null;
+    const plain_trusted = try runCachedJob(arena, c.cfg, plain, .{ .trusted = true }, .{ .ran = "p3" });
+    try expectSucceeded(plain_trusted);
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "c1"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "c2"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, plain_trusted.text, dagger.native_reused_note));
+
+    // A trusted job that reads the caches finds the trusted ones only.
+    const reader = testJob(&.{testStep("cat /root/.npm/head # npm\ncat $RUNNER_TOOL_CACHE/head\n" ++
+        "cat /root/.npm/trusted-secret")});
+    const read = try runCachedJob(arena, c.cfg, reader, caches, .{});
+    try expectSucceeded(read);
+    try expectLines(read.text, &.{ "stdout] " ++ who_trusted, "stdout] secret" });
+    try std.testing.expect(std.mem.indexOf(u8, read.text, who_hostile) == null);
+}
+
+test "native trust: a fork's pull request on a runner that vouches for pull requests reaches nothing a trusted job reads or replays" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    try expectUntrustedLeavesTrustedAlone(a.allocator(), .fork);
+}
+
+test "root runner: a job the runner does not vouch for reaches nothing a trusted job reads or replays" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    try expectUntrustedLeavesTrustedAlone(a.allocator(), .unvouched);
+}
+
+test "native trust: every key a job's layers are stored under differs by trust scope and by repository" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const trusted_in: Below = .{
+        .format = Store.store_format,
+        .scope = "repo",
+        .repository = "o/r",
+        .fingerprint = "the same rootfs",
+        .userns = "mapped",
+        .binds = &.{},
+    };
+    var fork_in = trusted_in;
+    fork_in.scope = "untrusted";
+    var other_in = trusted_in;
+    other_in.repository = "o/other";
+    const trusted_base = belowKey(trusted_in, null);
+    const fork_base = belowKey(fork_in, null);
+    const other_base = belowKey(other_in, null);
+    try std.testing.expect(!std.mem.eql(u8, &trusted_base, &fork_base));
+    try std.testing.expect(!std.mem.eql(u8, &trusted_base, &other_base));
+    try std.testing.expect(!std.mem.eql(u8, &fork_base, &other_base));
+
+    // A step, an action's fetched tree and the steps above them are keyed from their parent, so
+    // the same script above different bases is never the same key.
+    const script = "echo same script";
+    var keys: [3]Store.Key = undefined;
+    for ([_]Store.Key{ trusted_base, fork_base, other_base }, &keys) |parent, *k| {
+        var h: Store.KeyHasher = .init(.step);
+        h.core(parent, script, &[_]job_mod.EnvVar{});
+        var above: Store.KeyHasher = .init(.step);
+        above.core(h.final(), "the next step", &[_]job_mod.EnvVar{});
+        k.* = above.final();
+    }
+    try std.testing.expect(!std.mem.eql(u8, &keys[0], &keys[1]));
+    try std.testing.expect(!std.mem.eql(u8, &keys[0], &keys[2]));
+
+    // A Dockerfile build's layer, from one builder key.
+    var builder: Store.Key = undefined;
+    @memset(&builder, 0x5a);
+    const build_trusted = @import("layers.zig").layerKey(Store.store_format, "repo", "mapped", builder, null);
+    const build_fork = @import("layers.zig").layerKey(Store.store_format, "untrusted", "mapped", builder, null);
+    try std.testing.expect(!std.mem.eql(u8, &build_trusted, &build_fork));
+
+    // In a real store: what the untrusted job publishes, the trusted job's key does not find.
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const store: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}) };
+    try Store.prepare(arena, io, store.root, .{ .check_parents = false });
+    try tmp.dir.createDirPath(io, "up/d");
+    try tmp.dir.writeFile(io, .{ .sub_path = "up/d/f", .data = "planted by the fork" });
+    var never: std.atomic.Value(bool) = .init(false);
+    const lock = try store.lockKey(arena, io, keys[1], &never);
+    defer lock.close(io);
+    const layer = try store.publish(arena, io, keys[1], .fetch, try std.fmt.allocPrint(arena, "{s}/up", .{root}), .{ .log = "", .fc = "" });
+    layer.lock.close(io);
+    try std.testing.expect(try store.open(arena, io, keys[0]) == null);
+    try std.testing.expect(try store.open(arena, io, keys[2]) == null);
+    const hit = (try store.open(arena, io, keys[1])).?;
+    hit.layer.lock.close(io);
 }
 
 /// The tests' tree as root, for the tests that reach no limit (`testConfig`).
@@ -9396,10 +10097,10 @@ test "a native set-up that fails says what it did and on which path" {
 
 /// GitHub's `hashFiles()` of files with these contents, in this order.
 fn hashOfFiles(contents: []const []const u8) [64]u8 {
-    var all = std.crypto.hash.sha2.Sha256.init(.{});
+    var all = Sha256.init(.{});
     for (contents) |c| {
         var d: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(c, &d, .{});
+        Sha256.hash(c, &d, .{});
         all.update(&d);
     }
     return std.fmt.bytesToHex(all.finalResult(), .lower);

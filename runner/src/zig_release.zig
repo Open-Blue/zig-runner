@@ -10,6 +10,7 @@
 //! never what is in it. A few at most (`max_versions`): each costs a download at startup, a seed
 //! build per engine and about 60 MB in every Zig job's global cache.
 const std = @import("std");
+const Sha256 = @import("sha256.zig").Sha256;
 const builtin = @import("builtin");
 const config = @import("config.zig");
 const minisign = @import("minisign.zig");
@@ -78,7 +79,7 @@ pub fn check(
         if (std.mem.eql(u8, w, file)) break;
     } else return error.WrongFile;
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(tarball, &digest, .{});
+    Sha256.hash(tarball, &digest, .{});
     return .{
         .version = try arena.dupe(u8, version),
         .sha256 = try arena.dupe(u8, &std.fmt.bytesToHex(digest, .lower)),
@@ -277,7 +278,7 @@ test "check: a signed tarball gives its sha256; a tampered one, or another relea
     const seed = try check(arena, pk, "0.17.0", tarball, f.minisig);
     try std.testing.expectEqualStrings("0.17.0", seed.version);
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(tarball, &digest, .{});
+    Sha256.hash(tarball, &digest, .{});
     try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), seed.sha256);
     try std.testing.expectError(error.BadSignature, check(arena, pk, "0.17.0", "a fixture standing in for a Zig tarbalL", f.minisig));
     // A genuine signature of another release's file, served as this one.

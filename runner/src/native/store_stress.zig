@@ -35,11 +35,13 @@
 //! and the steps' own nonces and sleeps are the machine's.
 
 const std = @import("std");
+const Sha256 = @import("../sha256.zig").Sha256;
 const builtin = @import("builtin");
 const linux = std.os.linux;
 
 const Allocator = std.mem.Allocator;
 const Backend = @import("Backend.zig");
+const reaper = @import("reaper.zig");
 const Store = @import("Store.zig");
 const evict = @import("evict.zig");
 const layers = @import("layers.zig");
@@ -455,6 +457,8 @@ test "native store under load: one worker (run only by the test above, in a proc
             3 => try runTreeJob(&w, job_arena.allocator(), io, n),
             else => try runJob(&w, job_arena.allocator(), io, n),
         }
+        // The reaper's thread has descriptors of its own while it deletes what a job's end evicted.
+        reaper.drain(io);
         const fds = try countFds(io);
         if (n == 1) fds_kept = fds;
         if (n > 1 and fds > fds_kept) w.fault("{d} fds open after {s} {d}, {d} before", .{ fds, what, n, fds_kept });
@@ -538,6 +542,8 @@ fn runJob(w: *Worker, arena: Allocator, io: std.Io, n: usize) !void {
                 replayed = true;
                 continue;
             }
+            // The runner's own note on why a step ran (`Backend.explainMiss`), not its output.
+            if (std.mem.indexOf(u8, l, "] Not replayed: ") != null) continue;
             if (mine.items.len > 0) try mine.append(arena, 0x1f);
             try mine.appendSlice(arena, l);
             const at = std.mem.indexOf(u8, l, tag) orelse continue;
@@ -645,7 +651,7 @@ fn runBuild(w: *Worker, arena: Allocator, io: std.Io, dir: []const u8, n: usize)
         const b = w.rand.uintLessThan(usize, builds);
         if (got[b] != null) continue;
         var key: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(try print(arena, "stress build {d}", .{b}), &key, .{});
+        Sha256.hash(try print(arena, "stress build {d}", .{b}), &key, .{});
         const hex = std.fmt.bytesToHex(key, .lower);
         w.stats.builds += 1;
         got[b] = if (try ls.get(arena, io, &hex)) |p| hit: {
@@ -710,7 +716,9 @@ fn countFds(io: std.Io) !usize {
 
 /// The flocks this process holds (/proc/locks: `1: FLOCK ADVISORY WRITE <pid> ...`).
 fn countLocks(arena: Allocator, io: std.Io) !usize {
-    const text = try std.Io.Dir.cwd().readFileAlloc(io, "/proc/locks", arena, .limited(1 << 20));
+    // `readFile` into a buffer: /proc/locks has size 0, so `readFileAlloc` read nothing and this
+    // counted no lock, ever.
+    const text = try std.Io.Dir.cwd().readFile(io, "/proc/locks", try arena.alloc(u8, 1 << 20));
     const pid = try print(arena, "{d}", .{linux.getpid()});
     var n: usize = 0;
     var lines = std.mem.splitScalar(u8, text, '\n');

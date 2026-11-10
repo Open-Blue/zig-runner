@@ -14,6 +14,7 @@
 //! any image (`Backend.fetchRootfs`). Either falls back to provisioning when the pull fails.
 
 const std = @import("std");
+const Sha256 = @import("../sha256.zig").Sha256;
 const set_up = @import("set_up.zig");
 const default_image = @import("../dagger.zig").default_image;
 const pin = @import("provisioned_pin.zig");
@@ -64,7 +65,7 @@ pub const fingerprint_len = 12;
 /// follows the archive's day and so cannot be known before the image is built; the workflow logs
 /// that one.
 pub fn fingerprint(v: Variant) [fingerprint_len]u8 {
-    var h: std.crypto.hash.sha2.Sha256 = .init(.{});
+    var h: Sha256 = .init(.{});
     h.update(default_image);
     h.update("\n");
     h.update(v.script());
@@ -128,7 +129,7 @@ test "the fingerprint follows the script and the image, and names each variant a
     const runner = fingerprint(.runner);
     try std.testing.expect(!std.mem.eql(u8, &root, &runner));
     for (root) |c| try std.testing.expect(std.ascii.isHex(c));
-    var h: std.crypto.hash.sha2.Sha256 = .init(.{});
+    var h: Sha256 = .init(.{});
     h.update(default_image ++ "\n" ++ set_up.provision_script);
     var d: [32]u8 = undefined;
     h.final(&d);

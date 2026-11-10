@@ -282,6 +282,35 @@ test "publish: what the operator allows, by address, port and trust" {
     try std.testing.expectEqual(@as(usize, 0), (try plan(arena, &.{}, lo, false, &why)).len);
 }
 
+test "publish: an untrusted job gets no port, whatever shape it asks for and whatever the operator allows" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var why: []const u8 = "";
+    // The widest the operator can allow, and a port in its range, so only the job's trust refuses.
+    const open: Allowed = .{
+        .addresses = &.{ .{ 0, 0, 0, 0 }, .{ 127, 0, 0, 1 } },
+        .range = .{ .lo = 1024, .hi = 65535 },
+    };
+    const asks = [_]container_options.Port{
+        .{ .container = 80 },
+        .{ .container = 53, .udp = true },
+        .{ .host = 50080, .container = 80 },
+        .{ .address = .{ 127, 0, 0, 1 }, .host = 50081, .container = 80 },
+        .{ .address = .{ 0, 0, 0, 0 }, .host = 50082, .container = 80, .udp = true },
+    };
+    for (asks) |ask| {
+        why = "";
+        try std.testing.expectError(error.Refused, plan(arena, &.{ask}, open, false, &why));
+        try std.testing.expect(std.mem.indexOf(u8, why, "does not vouch for") != null);
+    }
+    // Among trusted ports, one is enough to refuse the lot.
+    why = "";
+    try std.testing.expectError(error.Refused, plan(arena, &asks, open, false, &why));
+    // The same asks are the trusted job's to have.
+    _ = try plan(arena, &asks, open, true, &why);
+}
+
 test "publish: the operator's range, and the runner's own endpoints' ports" {
     try std.testing.expectEqual(default_range, parseRange("").?);
     try std.testing.expectEqual(Range{ .lo = 30000, .hi = 39999 }, parseRange(" 30000-39999 ").?);

@@ -1496,8 +1496,20 @@ fn runnerMemory(io: std.Io, paths: Paths) ?struct { mb: u64, cgroup: bool } {
 }
 
 /// A job's identity across runs: its repository, its workflow file without the ref (a branch's
-/// runs and main's are one job), and its name as GitHub shows it, a matrix leg's included.
+/// runs and main's are one job), and its name as GitHub shows it, a matrix leg's included. This is
+/// the trusted scope's job: see `jobKeyIn`.
 pub fn jobKey(repository: []const u8, workflow_ref: []const u8, name: []const u8) u64 {
+    return jobKeyIn(true, repository, workflow_ref, name);
+}
+
+/// `jobKey` within a trust scope: what an untrusted job took is learned apart from what a trusted
+/// job of the same name took (`dagger.packageCacheScope`, the scope the backends keep volumes
+/// apart by). Without the scope, a fork's pull request that edits only a workflow's body, with the
+/// same file and job name, taught the heavy trusted job's estimate and run time its own tiny ones
+/// (#465). The trusted key is the one the gate always had, so the entries a persisted file already
+/// holds stay the trusted scope's (they were learned mostly from trusted jobs, and dropping them
+/// would only send every job back to the worst case once); the file's format is unchanged.
+pub fn jobKeyIn(trusted: bool, repository: []const u8, workflow_ref: []const u8, name: []const u8) u64 {
     const at = std.mem.lastIndexOfScalar(u8, workflow_ref, '@') orelse workflow_ref.len;
     var h: std.hash.Wyhash = .init(0);
     // Each ended by a 0 byte, so that no two different triples hash the same bytes.
@@ -1505,6 +1517,8 @@ pub fn jobKey(repository: []const u8, workflow_ref: []const u8, name: []const u8
         h.update(part);
         h.update(&.{0});
     }
+    // Appended for the untrusted scope only, so that the trusted key does not change.
+    if (!trusted) h.update("untrusted\x00");
     return h.final();
 }
 
@@ -3950,6 +3964,89 @@ test "a restart keeps what jobs took, natively and on the engine, in the order t
     // The job's run was learned too: at least the 3 s it was moved back by.
     try std.testing.expect(fourth.learned.longest(burst_light).? >= 3_000);
     try std.testing.expect(fourth.learned.longest(burst_light).? < 30_000);
+}
+
+/// One job of `key` that ran natively for `ms`, peaking at `mb`, through the gate as the loop
+/// drives it (`leave`, `assigned`, `native`, `ended`).
+fn runJob(g: *Gate, key: u64, mb: u64, ms: i64, refused: bool) ?Learned.Change {
+    g.leave(true);
+    g.assigned(key);
+    _ = g.native("/cg");
+    const s = &g.pool.slots[g.slot];
+    s.base_mb = 0;
+    s.peak_mb = mb;
+    s.waiting = false;
+    s.started_ms -= ms;
+    // The loop's refusal (`trust.refusal`, or a `container:` it cannot run) comes after `assigned`.
+    if (refused) g.replayed();
+    return g.ended();
+}
+
+test "an untrusted job learns apart from the trusted job of its name, and a refused job learns nothing (#465)" {
+    var slots: [2]Admission.Slot = undefined;
+    var pool: Admission = .init(std.testing.io, .{}, &slots);
+    pool.native = true;
+    var g: Gate = .{ .pool = &pool, .slot = 0 };
+    const wf = "o/r/.github/workflows/ci.yml@refs/heads/main";
+    const trusted = jobKeyIn(true, "o/r", wf, "test (zig)");
+    const forged = jobKeyIn(false, "o/r", wf, "test (zig)");
+    try std.testing.expect(trusted != forged);
+    // The trusted scope is the key the gate always had, so a file kept before the scope existed
+    // still holds the trusted job's entries.
+    try std.testing.expectEqual(jobKey("o/r", wf, "test (zig)"), trusted);
+
+    // (c) A trusted job learns as before.
+    _ = runJob(&g, trusted, 2600, 270_000, false);
+    try std.testing.expectEqual(@as(?u32, 2600), pool.learned_native.estimate(trusted));
+    // `ended` measures on the clock, so a slow machine adds a millisecond or so to the run.
+    const trusted_ms = pool.runMs(trusted).?;
+    try std.testing.expect(trusted_ms >= 270_000 and trusted_ms < 271_000);
+
+    // (a) Five tiny untrusted runs of the same name (the table keeps the last five) change
+    // neither the trusted estimate nor its run time; they teach their own entry.
+    for (0..5) |_| _ = runJob(&g, forged, 1, 2_000, false);
+    try std.testing.expectEqual(@as(?u32, 2600), pool.learned_native.estimate(trusted));
+    try std.testing.expectEqual(@as(?u32, trusted_ms), pool.runMs(trusted));
+    try std.testing.expectEqual(@as(u32, 2600), pool.nativeEstimate(trusted));
+    try std.testing.expectEqual(@as(?u32, Learned.min_mb), pool.learned_native.estimate(forged));
+    try std.testing.expect(pool.runMs(forged).? < 60_000);
+
+    // (b) A refused job records nothing, under any name, and its reservation is released.
+    const refused = jobKeyIn(true, "o/r", wf, "refused");
+    const before = pool.learned_native.len;
+    try std.testing.expect(runJob(&g, refused, 5000, 90_000, true) == null);
+    try std.testing.expectEqual(before, pool.learned_native.len);
+    try std.testing.expectEqual(@as(?u32, null), pool.learned_native.estimate(refused));
+    try std.testing.expectEqual(@as(?u32, null), pool.runMs(refused));
+    try std.testing.expect(!pool.slots[0].running() and !pool.slots[0].waiting);
+    const r = pool.reserved(std.Io.Clock.awake.now(pool.io).toMilliseconds(), 0, true);
+    try std.testing.expectEqual(@as(u32, 0), r.jobs);
+    try std.testing.expectEqual(@as(u64, 0), r.mb);
+}
+
+test "a file kept before job keys had a trust scope serves the trusted scope (#465)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fix: KeptFixture = .{ .sub_path = &tmp.sub_path };
+    const wf = "o/r/.github/workflows/ci.yml";
+    // The key as it was computed before the scope existed.
+    var h: std.hash.Wyhash = .init(0);
+    for ([_][]const u8{ "o/r", wf, "test (zig)" }) |part| {
+        h.update(part);
+        h.update(&.{0});
+    }
+    const old_key = h.final();
+    var slots: [2]Admission.Slot = undefined;
+    var writer = try fix.pool(tmp.dir, &slots, "abc123\n", 8000, true);
+    _ = writer.restore(fix.stateFile());
+    _ = writer.learned_native.record(old_key, 2600, true);
+    writer.persist.?.dirty = true;
+    writer.flush();
+    var read_slots: [2]Admission.Slot = undefined;
+    var reader = try fix.pool(tmp.dir, &read_slots, "abc123\n", 8000, true);
+    try std.testing.expectEqual(Restore{ .loaded = 1 }, reader.restore(fix.stateFile()));
+    try std.testing.expectEqual(@as(?u32, 2600), reader.learned_native.estimate(jobKeyIn(true, "o/r", wf, "test (zig)")));
+    try std.testing.expectEqual(@as(?u32, null), reader.learned_native.estimate(jobKeyIn(false, "o/r", wf, "test (zig)")));
 }
 
 test "a file from another machine, memory, backend or format, or a damaged one, is not used (#407)" {

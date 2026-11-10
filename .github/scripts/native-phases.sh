@@ -15,8 +15,8 @@
 set -euo pipefail
 
 order="store sweep dir cgroup resolver slot nat netns image provision caches actions base claim
-spawn namespaces idmap overlay binds root run exit unshift size record sync rename flatten
-services cgroup_rm veth_rm tree_rm collect"
+spawn namespaces idmap overlay binds root run exit unshift size record sync sync_wb sync_fsync sync_meta syncfs rename flatten
+services cgroup_rm tool_walk veth_rm tree_rm collect_touch collect_syncdir collect_scan collect_evict collect_rest collect"
 
 table() {
 	awk -v order="$order" '
@@ -35,7 +35,7 @@ table() {
 	}
 	function count(list,   a) { return split(list, a, " ") }
 	BEGIN { setup = "store sweep dir cgroup resolver slot nat netns image provision caches actions base"
-		teardown = "services cgroup_rm veth_rm tree_rm collect" }
+		teardown = "services cgroup_rm tool_walk veth_rm tree_rm collect" }
 	{
 		at = index($0, "native phases (ms): ")
 		if (at == 0) next

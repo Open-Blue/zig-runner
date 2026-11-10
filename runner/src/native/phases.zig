@@ -45,13 +45,29 @@ pub const Phase = enum {
     size,
     record,
     sync,
+    // The sync's parts: the write-back wait, the entries' fsyncs, the meta's write and fsync, and
+    // `syncfs`, which is there only when the entry took it (too many entries, or a file unreadable).
+    sync_wb,
+    sync_fsync,
+    sync_meta,
+    syncfs,
     rename,
     flatten,
     // The job's teardown (`Backend.deinit`).
     services,
     cgroup_rm,
+    // The tool cache's trees walked once no job holds them (`Backend.walkToolCacheIdle`).
+    tool_walk,
     veth_rm,
     tree_rm,
+    // The parts of `collect`, which is the whole of what follows the job's directory: the layers'
+    // use marked and its locks let go, the layers' directory synced, then `Store.collect`'s scan
+    // of the layers, its evictions, and the rest (key locks, the step index, the other areas).
+    collect_touch,
+    collect_syncdir,
+    collect_scan,
+    collect_evict,
+    collect_rest,
     collect,
 
     pub fn setUp(p: Phase) bool {

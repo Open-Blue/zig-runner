@@ -29,7 +29,7 @@ const Backend = @import("Backend.zig");
 const dockerfile = @import("dockerfile.zig");
 const layers = @import("layers.zig");
 
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha256 = @import("../sha256.zig").Sha256;
 const Allocator = std.mem.Allocator;
 
 const vectors = @embedFile("testdata/step_keys.tsv");

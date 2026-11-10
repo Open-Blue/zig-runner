@@ -30,7 +30,10 @@
 #                                   job logs (a tsan build's; stop the runner first)
 #
 # Settings: E2E_REPO (Open-Blue/runner-bench), E2E_REF (main: the workflows' ref, and the one ref
-# CI's runner trusts), E2E_TIMEOUT (seconds to wait for each run, 600), E2E_OUT (where the
+# CI's runner trusts), E2E_TIMEOUT (seconds to wait for each run, or for the native rootfs, 600),
+# E2E_SUITE_LIMIT (seconds `check` as a whole may wait for the runs, 300 in CI; a hang ends there
+# with a message instead of at the step's or the job's limit, so that the logs survive; the
+# reads after it get 90 s more), E2E_OUT (where the
 # timings and the runner's log go), E2E_ZIG_RUNNER_REF (the zig-runner commit whose
 # install-zig.sh the tool cache job runs, main). `start` also takes GH_APP_ID and
 # GH_APP_PRIVATE_KEY_FILE, the runner's own (deploy/runner.env.example).
@@ -44,6 +47,10 @@ cd "$(dirname "$0")/../.."
 repo=${E2E_REPO:-Open-Blue/runner-bench}
 ref=${E2E_REF:-main}
 timeout=${E2E_TIMEOUT:-600}
+# `check`'s own clock, from the script's start: every wait ends by suite_end, and the reads after
+# it (the jobs' lists and logs) by hard_end, so that the step's limit in ci.yml is never what ends it.
+suite_end=$((SECONDS + ${E2E_SUITE_LIMIT:-1800}))
+hard_end=$((suite_end + 90))
 out=$(realpath -m "${E2E_OUT:-${RUNNER_TEMP:-/tmp}/e2e}")
 mkdir -p "$out"
 # The engine the runner speaks to (runner/src/engine.zig, client_version), pinned by digest;
@@ -107,9 +114,12 @@ engine() {
 
 # The default image, provisioned for steps run as the runner user, exported into a directory
 # (docs/native-backend.md, "The rootfs"): the image is the runner's own pin (default_image), the
-# script its own (--provision-script). Writes $rootfs.ok, or $rootfs.failed, which `start` waits on.
+# script its own (--provision-script). Writes $rootfs.ok, or $rootfs.failed, which `start` waits on,
+# and its pid to $out/rootfs.pid, so that `start` can tell a build that is slow from one that died.
 make_rootfs() {
 	local bin image script
+	mkdir -p "$out"
+	echo $$ >"$out/rootfs.pid"
 	bin=$(realpath "${1:?}")
 	image=$(tr -d '\n' <runner/src/dagger.zig |
 		grep -oE '"ubuntu:[A-Za-z0-9._-]+" *\+\+ *"@sha256:[a-f0-9]{64}"' | tr -d '" +')
@@ -126,6 +136,36 @@ make_rootfs() {
 		echo "rootfs: provisioning $image failed" >&2
 	fi
 	docker rm zig-runner-e2e-rootfs >/dev/null || true
+}
+
+# wait_rootfs: until `e2e.sh rootfs` has left $rootfs.ok, or $rootfs.failed, at most $timeout s (the
+# suite's own limit). The build runs apt against Ubuntu's archive, so how long it takes depends on
+# the network: it is waited for as long as its process (the pid in $out/rootfs.pid) is alive, and
+# one that exited without a marker is reported at once. Prints the build's last line every minute.
+wait_rootfs() {
+	local deadline=$((SECONDS + timeout)) pid="" waited=0
+	while ((SECONDS < deadline)); do
+		sudo test -e "$rootfs.ok" -o -e "$rootfs.failed" && break
+		[[ -z $pid && -e $out/rootfs.pid ]] && pid=$(<"$out/rootfs.pid")
+		# Not started yet: the step that starts it runs well before this one, so 30 s is plenty.
+		if [[ -z $pid ]] && ((waited >= 30)); then
+			echo "no native rootfs: e2e.sh rootfs never started (no $out/rootfs.pid)" >&2 && exit 1
+		fi
+		if [[ -n $pid ]] && ! kill -0 "$pid" 2>/dev/null; then
+			# It may have finished between the two checks.
+			sudo test -e "$rootfs.ok" -o -e "$rootfs.failed" && break
+			echo "no native rootfs: e2e.sh rootfs (pid $pid) exited without a result; its log:" >&2
+			tail -n 5 "$out/rootfs.log" >&2 2>/dev/null || true
+			exit 1
+		fi
+		if ((waited > 0 && waited % 60 == 0)); then
+			echo "waiting for the native rootfs, ${waited} s so far; rootfs.log: $(tail -n 1 "$out/rootfs.log" 2>/dev/null)"
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+	sudo test -e "$rootfs.ok" ||
+		{ echo "no native rootfs (e2e.sh rootfs): ${waited} s, and the build $(sudo test -e "$rootfs.failed" && echo failed || echo is still running)" >&2 && exit 1; }
 }
 
 start() {
@@ -145,11 +185,7 @@ start() {
 	sudo test -S "$engine_dir/engine.sock" || { echo "no engine (e2e.sh engine)" >&2 && exit 1; }
 	local native=()
 	if [[ $backend == native ]]; then
-		for _ in $(seq 300); do
-			sudo test -e "$rootfs.ok" -o -e "$rootfs.failed" && break
-			sleep 1
-		done
-		sudo test -e "$rootfs.ok" || { echo "no native rootfs (e2e.sh rootfs)" >&2 && exit 1; }
+		wait_rootfs
 		# Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; ci.yml's Test lifts it too.
 		sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
 		native=(RUNNER_NATIVE_ROOTFS="$rootfs")
@@ -236,6 +272,7 @@ dispatch() {
 find_run() {
 	local id
 	for _ in $(seq 60); do
+		((SECONDS < suite_end)) || return 1
 		id=$(api "repos/$repo/actions/workflows/$1/runs?event=workflow_dispatch&per_page=50" \
 			--jq ".workflow_runs[] | select(.display_title == \"$2\") | .id" 2>/dev/null | head -n1)
 		[[ -n $id ]] && { echo "$id" && return 0; }
@@ -244,9 +281,11 @@ find_run() {
 	return 1
 }
 
-# wait_run ID [ATTEMPT]: until that attempt of the run has completed, at most $timeout s.
+# wait_run ID [ATTEMPT]: until that attempt of the run has completed, at most $timeout s, and not
+# past the suite's own limit.
 wait_run() {
 	local deadline=$((SECONDS + timeout)) state
+	((deadline <= suite_end)) || deadline=$suite_end
 	while ((SECONDS < deadline)); do
 		state=$(api "repos/$repo/actions/runs/$1" --jq '"\(.run_attempt) \(.status)"' 2>/dev/null) || state=""
 		[[ $state == "${2:-1} completed" ]] && return 0
@@ -270,6 +309,7 @@ jobs_settled() {
 		jq -e '(.jobs | length) > 0 and all(.jobs[]; .status == "completed" and .conclusion != null and
 			(.conclusion == "skipped" or ((.steps | length) > 0 and all(.steps[]; .conclusion != null))))' \
 			<<<"$jobs" >/dev/null 2>&1 && break
+		((SECONDS < hard_end)) || break
 		sleep 3
 	done
 	printf '%s\n' "$jobs"
@@ -281,6 +321,7 @@ run_conclusion() {
 	for _ in $(seq 20); do
 		c=$(api "repos/$repo/actions/runs/$1" --jq '.conclusion // empty' 2>/dev/null) || c=""
 		[[ -n $c ]] && break
+		((SECONDS < hard_end)) || break
 		sleep 3
 	done
 	echo "$c"
@@ -311,7 +352,7 @@ job_log() {
 			return 0
 		fi
 		why=$(tr '\n' ' ' <"$out/log.err")
-		((i < tries && log_budget >= 3)) || break
+		((i < tries && log_budget >= 3 && SECONDS < hard_end)) || break
 		sleep 3
 		log_budget=$((log_budget - 3))
 	done
@@ -362,7 +403,13 @@ check_replay() {
 	echo "rerun (attempt $1): $(grep -cF 'Reused from' "$log" || true) steps replayed"
 }
 
-# The suite's runs, cancelled if still going# The suite's runs, cancelled if still going, when it ends early.
+# stuck_run ID: where a run that did not finish is, per job: its status, and the step it is in.
+stuck_run() {
+	jobs_of "$1" 2>/dev/null | jq -r '.jobs[]? | "  \(.name): \(.status) \(.conclusion // "")" +
+		(([.steps[]? | select(.status == "in_progress") | .name] | join(", ")) as $s | if $s == "" then "" else " (in step: \($s))" end)' >&2 || true
+}
+
+# The suite's runs, cancelled if still going, when it ends early.
 cancel_runs() {
 	local r
 	for r in ${main:-} ${cancel:-}; do
@@ -383,7 +430,7 @@ expect() {
 check() {
 	label=${2:?}
 	backend=${3:-dagger}
-	local nonce tag jobs state started running
+	local nonce tag jobs jobid state started running log=$out/runner-$backend.log
 	if [[ -n ${E2E_GH_TOKEN:-} ]]; then
 		export GH_TOKEN=$E2E_GH_TOKEN
 	else
@@ -406,31 +453,49 @@ check() {
 	cancel=$(find_run e2e-cancel.yml "e2e-cancel $tag") || { fail "the e2e-cancel run never appeared" && exit 1; }
 	echo "runs: https://github.com/$repo/actions/runs/$main and .../$cancel"
 
-	# The cancel, once its long step has started. The step list says so, but it can lag behind the
-	# job (during an incident `hog` started in 3 s and the list never showed it), so a job that has
-	# plainly been running for 30 s on a runner counts too. That cannot let a Hog that never started
-	# pass: the checks below need the step cancelled (not skipped) and its output in the log.
+	# The cancel, once its long step has started. The runner's own log says so exactly: it holds each
+	# step's output as "[job ID step N stdout] ...", ID being this run's job. No other run's Hog can
+	# write that line for this ID: the job is this dispatch's own, and the log is this pass's own.
+	# GitHub's step list says so too, but it can lag behind the job (during an incident `hog`
+	# started in 3 s and the list never showed it), so either counts. The job merely running does
+	# not: when "Set up job" alone takes over 30 s, a cancel on that clock lands before Hog starts
+	# and skips it. The last resort, a tenth of $timeout (5 minutes by default) of the job running
+	# without either signal, cannot let a Hog that never started pass: the checks below need the step
+	# cancelled and its output.
 	started="" running=0
-	for _ in $(seq $((timeout / 5))); do
+	local hog_end=$((SECONDS + timeout)) last_resort=$((timeout / 10))
+	((hog_end <= suite_end)) || hog_end=$suite_end
+	while ((SECONDS < hog_end)); do
 		jobs=$(jobs_of "$cancel" 2>/dev/null) || jobs=""
 		state=$(jq -r '.jobs[0].steps[]? | select(.name == "Hog") | .status' <<<"$jobs" 2>/dev/null) || state=""
 		[[ $state == in_progress || $state == completed ]] && { started=1 && break; }
+		jobid=$(jq -r '.jobs[0].id // empty' <<<"$jobs" 2>/dev/null) || jobid=""
+		if [[ -n $jobid ]] && grep -qE "^\[job $jobid step [0-9]+ stdout\] e2e-hog started\r?$" "$log" 2>/dev/null; then
+			started=1 && break
+		fi
 		if jq -e '.jobs[0] | .status == "in_progress" and ((.runner_name // "") != "")' <<<"$jobs" >/dev/null 2>&1; then
 			running=$((running + 1))
 		else
 			running=0
 		fi
-		if ((running >= 6)); then
-			echo "e2e-cancel: the step list does not show Hog after 30 s of the job running; cancelling anyway"
+		if ((running >= last_resort)); then
+			echo "e2e-cancel: neither the runner's log nor the step list shows Hog after $((running * 5)) s of the job running; cancelling anyway"
 			started=1 && break
 		fi
 		sleep 5
 	done
-	if [[ -n $started ]]; then sleep 3; else fail "e2e-cancel: its Hog step never started"; fi
+	if [[ -n $started ]]; then
+		sleep 3
+	else
+		fail "e2e-cancel: its Hog step never started, within $timeout s or the suite's ${E2E_SUITE_LIMIT:-1800} s"
+		stuck_run "$cancel"
+	fi
 	api -X POST "repos/$repo/actions/runs/$cancel/cancel" >/dev/null
 
-	wait_run "$main" || fail "e2e: not done within $timeout s"
-	wait_run "$cancel" || fail "e2e-cancel: not done within $timeout s"
+	# A run that does not finish is a hang, not a failed check: say where it is, and stop, so that the
+	# step ends here with the runner's log, not at its limit.
+	wait_run "$main" || { fail "e2e: not done within $timeout s (the suite's limit is ${E2E_SUITE_LIMIT:-1800} s)" && stuck_run "$main" && exit 1; }
+	wait_run "$cancel" || { fail "e2e-cancel: not done within $timeout s (the suite's limit is ${E2E_SUITE_LIMIT:-1800} s)" && stuck_run "$cancel" && exit 1; }
 
 	jobs=$(jobs_settled "$main")
 	record e2e 1 "$jobs"
