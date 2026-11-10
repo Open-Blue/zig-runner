@@ -3961,6 +3961,19 @@ const execAnswer = @import("../dagger/testing.zig").exec;
 /// must run): a rootfs of a few directories with the host's /usr bound over it, in the
 /// test's directory, and the runner binary the build copied for the tests (`ZIG_RUNNER_TEST_EXE`).
 /// Rootless unless the tests run as root, where the job gets its range of ids and its network.
+/// The host's /etc/pki for a test whose steps verify TLS on the host's rootfs (`testConfig`'s):
+/// RHEL's /etc/ssl/certs and cert.pem are links into it. Only such a test asks for it, as a
+/// container job's image has no /etc/pki to bind it onto.
+fn withHostPki(arena: Allocator, tmp: *std.testing.TmpDir, cfg: *Config) !void {
+    const io = std.testing.io;
+    std.Io.Dir.cwd().access(io, "/etc/pki", .{}) catch return;
+    try tmp.dir.createDirPath(io, "rootfs/etc/pki");
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{
+        .host = "/etc/pki",
+        .at = "/etc/pki",
+    }} });
+}
+
 pub fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
     const io = std.testing.io;
     var env = try std.testing.environ.createMap(arena);
@@ -3991,14 +4004,6 @@ pub fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
         .data = "",
     });
     var cfg = try testConfigAt(arena, try d.realPathFileAlloc(io, ".", arena), exe);
-    // RHEL's /etc/ssl/certs and cert.pem are links into /etc/pki, which Python reads through them.
-    if (std.Io.Dir.cwd().access(io, "/etc/pki", .{})) |_| {
-        try d.createDirPath(io, "rootfs/etc/pki");
-        cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{
-            .host = "/etc/pki",
-            .at = "/etc/pki",
-        }} });
-    } else |_| {}
     // As root, the root runner's path where this machine has it: under limits, in a tree of the
     // tests' own. They do not depend on it: nothing here takes more than it asks for by itself,
     // and the tests that reach limits have parents of their own (`testCgroup`).
@@ -5524,7 +5529,8 @@ test "root runner: a job's own network, out of reach of the host's services and 
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cfg = try testConfig(arena, &tmp);
+    var cfg = try testConfig(arena, &tmp);
+    try withHostPki(arena, &tmp, &cfg);
 
     // Listeners on the host's 127.0.0.1 and on all its addresses (the bridge's among them), which
     // a step must not reach.
