@@ -78,6 +78,8 @@ pub const Options = struct {
     shared: bool = false,
     margin: ?u32 = null,
     horizon_s: u32 = 6 * 3600,
+    /// Print each start (measured jobs).
+    trace: bool = false,
 };
 
 const pool_names = [3][]const u8{ "prod", "ci", "bench" };
@@ -394,6 +396,7 @@ pub fn run(jobs_in: []const Job, opt: Options) !Result {
                         r.gate.noHigh(opt.machine.job_cap_mb);
                         l.started_ms = now_ms;
                         r.state = .running;
+                        if (opt.trace and !l.job.warm) std.debug.print("START\tt={d}\tpool={s}\t{s}\tdelay={d}\tforced={}\tavail={d}\n", .{ @divTrunc(now_ms, 1000) - shift_s, pool_names[poolIndex(pools, pool)], l.job.name, @divTrunc(now_ms - l.arrived_ms, 1000), st == .forced, last_avail });
                     },
                 }
             }
@@ -572,21 +575,23 @@ fn buildScenarios(arena: std.mem.Allocator) ![]Scenario {
         try list.append(arena, .{ .name = "A-burst-all-pools", .jobs = jobs.items, .kill = false });
     }
 
-    // B: a job whose real peak is 40% above what it was learned at (1500 -> 2100), on two
-    // pools together, with small jobs about.
+    // B: jobs whose real peak is 40% above what they were learned at (1200 -> 1680, 600 -> 840), on
+    // three pools together, with small jobs about.
     {
         var jobs: std.ArrayList(Job) = .empty;
         const learned = [_]Job{
-            .{ .name = "big", .pool = bench_pool, .arrive_s = 0, .dur_s = 150, .peak_mb = 1500 },
-            .{ .name = "big-ci", .pool = ci_pool, .arrive_s = 0, .dur_s = 150, .peak_mb = 1500 },
+            .{ .name = "big", .pool = bench_pool, .arrive_s = 0, .dur_s = 150, .peak_mb = 1200 },
+            .{ .name = "big-ci", .pool = ci_pool, .arrive_s = 0, .dur_s = 150, .peak_mb = 1200 },
+            .{ .name = "mid-prod", .pool = prod_pool, .arrive_s = 0, .dur_s = 150, .peak_mb = 600 },
             .{ .name = "small", .pool = bench_pool, .arrive_s = 0, .dur_s = 10, .peak_mb = 100 },
         };
         try warmUp(arena, &jobs, &learned);
         const steps = [_]Job{
-            .{ .name = "big", .pool = bench_pool, .arrive_s = 0, .dur_s = 150, .peak_mb = 2100 },
-            .{ .name = "big", .pool = bench_pool, .arrive_s = 2, .dur_s = 150, .peak_mb = 2100 },
-            .{ .name = "big-ci", .pool = ci_pool, .arrive_s = 4, .dur_s = 150, .peak_mb = 2100 },
-            .{ .name = "small", .pool = bench_pool, .arrive_s = 6, .dur_s = 10, .peak_mb = 100 },
+            .{ .name = "big", .pool = bench_pool, .arrive_s = 0, .dur_s = 150, .peak_mb = 1680 },
+            .{ .name = "big", .pool = bench_pool, .arrive_s = 2, .dur_s = 150, .peak_mb = 1680 },
+            .{ .name = "big-ci", .pool = ci_pool, .arrive_s = 4, .dur_s = 150, .peak_mb = 1680 },
+            .{ .name = "mid-prod", .pool = prod_pool, .arrive_s = 6, .dur_s = 150, .peak_mb = 840 },
+            .{ .name = "small", .pool = bench_pool, .arrive_s = 8, .dur_s = 10, .peak_mb = 100 },
             .{ .name = "small", .pool = bench_pool, .arrive_s = 30, .dur_s = 10, .peak_mb = 100 },
         };
         try tail(arena, &jobs, &steps);
@@ -613,6 +618,29 @@ fn buildScenarios(arena: std.mem.Allocator) ![]Scenario {
         };
         try tail(arena, &jobs, &steps);
         try list.append(arena, .{ .name = "C-kill-and-rerun", .jobs = jobs.items, .kill = true });
+    }
+
+    // C2: the same on one pool (bench) alone: the kill and its rerun are in one gate's sight, so
+    // the raise after a kill and the cooldown can act. Real 2900 against 1200 learned, two runners
+    // of the same name beside a third of another, and small jobs about.
+    {
+        var jobs: std.ArrayList(Job) = .empty;
+        const learned = [_]Job{
+            .{ .name = "heavy", .pool = bench_pool, .arrive_s = 0, .dur_s = 120, .peak_mb = 1200 },
+            .{ .name = "heavy2", .pool = bench_pool, .arrive_s = 0, .dur_s = 120, .peak_mb = 1200 },
+            .{ .name = "small", .pool = bench_pool, .arrive_s = 0, .dur_s = 10, .peak_mb = 100 },
+        };
+        try warmUp(arena, &jobs, &learned);
+        const steps = [_]Job{
+            .{ .name = "heavy", .pool = bench_pool, .arrive_s = 0, .dur_s = 120, .peak_mb = 2900, .reruns = 3 },
+            .{ .name = "heavy", .pool = bench_pool, .arrive_s = 1, .dur_s = 120, .peak_mb = 2900, .reruns = 3 },
+            .{ .name = "heavy2", .pool = bench_pool, .arrive_s = 2, .dur_s = 120, .peak_mb = 2900, .reruns = 3 },
+            .{ .name = "small", .pool = bench_pool, .arrive_s = 8, .dur_s = 10, .peak_mb = 100 },
+            .{ .name = "small", .pool = bench_pool, .arrive_s = 60, .dur_s = 10, .peak_mb = 100 },
+            .{ .name = "small", .pool = bench_pool, .arrive_s = 120, .dur_s = 10, .peak_mb = 100 },
+        };
+        try tail(arena, &jobs, &steps);
+        try list.append(arena, .{ .name = "C2-kill-one-pool", .jobs = jobs.items, .kill = true });
     }
 
     // D: a long-tail mix, three pools, an hour: 14 names with log-normal sizes (median 300 MB,
@@ -658,6 +686,22 @@ test "replay: variants over the scenarios" {
         if (has_budget) {
             const rs = try run(sc.jobs, .{ .kill = sc.kill, .shared = true });
             report(sc.name, "shared=on", rs);
+        }
+    }
+}
+
+test "replay: trace A" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const scenarios = try buildScenarios(arena_state.allocator());
+    for (scenarios) |sc| {
+        if (!std.mem.startsWith(u8, sc.name, "A-") and !std.mem.startsWith(u8, sc.name, "T+") and !std.mem.startsWith(u8, sc.name, "B-") and !std.mem.startsWith(u8, sc.name, "C-")) continue;
+        std.debug.print("SCEN {s}\n", .{sc.name});
+        std.debug.print("TRACE {s} shared=false\n", .{variantName()});
+        _ = try run(sc.jobs, .{ .kill = sc.kill, .trace = true });
+        if (has_budget) {
+            std.debug.print("TRACE {s} shared=true\n", .{variantName()});
+            _ = try run(sc.jobs, .{ .kill = sc.kill, .shared = true, .trace = true });
         }
     }
 }
