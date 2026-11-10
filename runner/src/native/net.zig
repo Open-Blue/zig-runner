@@ -614,6 +614,11 @@ pub const resolv_paths = [_][]const u8{ "/etc/resolv.conf", "/run/systemd/resolv
 /// glibc's MAXNS: the resolver reads no more than three nameservers.
 pub const max_nameservers = 3;
 
+/// The job's resolver tries each query `retry_attempts` times, `retry_timeout` seconds apart
+/// (glibc's and musl's `options timeout: attempts:`), unless its host's file says otherwise.
+const retry_timeout = 2;
+const retry_attempts = 5;
+
 /// What Docker and BuildKit fall back to when the host names no nameserver a container can
 /// reach.
 pub const fallback_nameservers = [_][4]u8{ .{ 8, 8, 8, 8 }, .{ 8, 8, 4, 4 } };
@@ -637,6 +642,8 @@ pub fn jobResolver(arena: Allocator, io: std.Io, paths: []const []const u8, subn
 pub fn filterResolvConf(arena: Allocator, text: []const u8, subnet: Subnet, source: []const u8) !Resolver {
     var out: std.ArrayList(u8) = .empty;
     var kept: std.ArrayList([4]u8) = .empty;
+    var has_timeout = false;
+    var has_attempts = false;
     try out.print(arena, "# The host's resolver ({s}) for the job's network: only its IPv4 " ++
         "nameservers off the loopback (zig-runner).\n", .{if (source.len > 0) source else "none"});
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -652,8 +659,20 @@ pub fn filterResolvConf(arena: Allocator, text: []const u8, subnet: Subnet, sour
             } else try kept.append(arena, addr);
             continue;
         }
+        if (std.mem.eql(u8, key, "options")) while (words.next()) |opt| {
+            has_timeout = has_timeout or std.mem.startsWith(u8, opt, "timeout:");
+            has_attempts = has_attempts or std.mem.startsWith(u8, opt, "attempts:");
+        };
         try out.print(arena, "{s}\n", .{line});
     }
+    // A job has one nameserver where its host may have two (Tailscale's second is an IPv6 one), so
+    // a query the first loses has no other to go to: glibc's default of two tries 5 s apart left a
+    // job with "Could not resolve host" after 10 s for one lost packet. Shorter, more tries, the
+    // same 10 s in all, and a host's own choice kept.
+    if (!has_timeout or !has_attempts) try out.print(arena, "options{s}{s}\n", .{
+        if (has_timeout) "" else std.fmt.comptimePrint(" timeout:{d}", .{retry_timeout}),
+        if (has_attempts) "" else std.fmt.comptimePrint(" attempts:{d}", .{retry_attempts}),
+    });
     const fallback = kept.items.len == 0;
     if (fallback) try kept.appendSlice(arena, &fallback_nameservers);
     for (kept.items) |a| try out.print(arena, "nameserver {d}.{d}.{d}.{d}\n", .{ a[0], a[1], a[2], a[3] });
@@ -695,6 +714,15 @@ test "a host's resolver for a job's network: loopback and IPv6 nameservers out, 
     try std.testing.expect(std.mem.indexOf(u8, ts.conf, "nameserver 100.100.100.100\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts.conf, "search tail74f5b5.ts.net\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, ts.conf, "fd7a") == null);
+    // One nameserver left, so a lost query is retried sooner and more often than glibc's default.
+    try std.testing.expect(std.mem.indexOf(u8, ts.conf, "options timeout:2 attempts:5\n") != null);
+    // A host's own choice is kept, and only what it leaves out is added.
+    const own = try filterResolvConf(arena, "nameserver 10.0.0.1\noptions edns0 timeout:1\n", sub, "x");
+    try std.testing.expect(std.mem.indexOf(u8, own.conf, "options edns0 timeout:1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, own.conf, "options attempts:5\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, own.conf, "timeout:2") == null);
+    const both = try filterResolvConf(arena, "nameserver 10.0.0.1\noptions timeout:3 attempts:1\n", sub, "x");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, both.conf, "options"));
     // systemd-resolved's stub: nothing reachable, so the fallback, with its options kept.
     const stub = try filterResolvConf(arena, "nameserver 127.0.0.53\noptions edns0 trust-ad\n" ++
         "search lan\n", sub, "/etc/resolv.conf");
