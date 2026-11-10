@@ -258,6 +258,15 @@ slowing to a crawl. The trade-off is a failed job in place of a slow one, and th
 process killed is the engine itself, whose unclean restart wipes its cache: check which process the
 kernel picks before relying on it. razorbill doesn't use it today.
 
+### The health line
+
+While a job runs or waits, the runner logs one `health:` line a minute (`RUNNER_HEALTH_INTERVAL`
+seconds, 0 for none; nothing while the pool is idle): `MemAvailable` and `SwapFree`, memory PSI
+(`some`/`full` avg10), I/O PSI (`some` avg10), the load averages, what the gate has reserved, the
+jobs running and waiting, and for each running job its name, elapsed time and working set (with a
+`~` when it is the engine's, which every job on it shares). After a machine drops off, the last
+`health:` lines in the journal show what it looked like (`journalctl -u <unit> | grep health:`).
+
 ### An engine that stops answering
 
 An engine that stops answering altogether (frozen, deadlocked) would hold a step for good. So a
