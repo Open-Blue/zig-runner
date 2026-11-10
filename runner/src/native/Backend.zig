@@ -8604,6 +8604,358 @@ test "native cache volumes: kept between jobs, apart by scope, Zig's local cache
     try std.testing.expect(std.mem.indexOf(u8, third.text, "stdout] leaked") == null);
 }
 
+/// A fork's pull request for `job`: its head repository is another's, so its cache scope is
+/// `untrusted` whatever the runner vouches for (`set_up.packageCacheScope`).
+fn asFork(arena: Allocator, job: job_mod.Job) !job_mod.Job {
+    const ctx =
+        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"event","v":{"t":2,"d":[
+    ++
+        \\{"k":"pull_request","v":{"t":2,"d":[{"k":"head","v":
+    ++
+        \\{"t":2,"d":[{"k":"repo","v":{"t":2,"d":[{"k":"full_name","v":
+    ++ "\"someone/r\"}]}}]}" ++ "}]}}]}}]}}";
+    var out = job;
+    out.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena, ctx, .{});
+    return out;
+}
+
+/// A tree's digest over its content, modes, owners and links (`Store.treeDigest`): what a write
+/// anywhere in it would change. Compared before and after a hostile job.
+fn treeSum(arena: Allocator, path: []const u8) !Store.Key {
+    return Store.treeDigest(arena, std.testing.io, path, .content, .host);
+}
+
+/// The names in the store's `layers/`, each with its tree's digest.
+const LayerSums = struct {
+    names: []const []const u8,
+    sums: []const Store.Key,
+
+    fn of(arena: Allocator, store: []const u8) !LayerSums {
+        const path = try std.fmt.allocPrint(arena, "{s}/layers", .{store});
+        var dir = try std.Io.Dir.cwd().openDir(std.testing.io, path, .{ .iterate = true });
+        defer dir.close(std.testing.io);
+        var names: std.ArrayList([]const u8) = .empty;
+        var sums: std.ArrayList(Store.Key) = .empty;
+        var it = dir.iterate();
+        while (try it.next(std.testing.io)) |e| {
+            if (e.kind != .directory) continue;
+            try names.append(arena, try arena.dupe(u8, e.name));
+            try sums.append(arena, try treeSum(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ path, e.name })));
+        }
+        return .{ .names = names.items, .sums = sums.items };
+    }
+
+    /// Every layer of `before` is still there, as it was: a job may add layers, never change one.
+    fn expectKept(before: LayerSums, after: LayerSums) !void {
+        for (before.names, before.sums) |n, sum| {
+            const at = for (after.names, 0..) |m, i| {
+                if (std.mem.eql(u8, n, m)) break i;
+            } else {
+                std.debug.print("layer {s} is gone\n", .{n});
+                return error.TestUnexpectedResult;
+            };
+            if (!std.mem.eql(u8, &sum, &after.sums[at])) {
+                std.debug.print("layer {s} changed\n", .{n});
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+};
+
+/// A tree as it is now: its digest, and one line per entry (path, kind, size) to say what changed
+/// when the digest did.
+const TreeSum = struct {
+    path: []const u8,
+    sum: Store.Key,
+    listing: []const u8,
+
+    fn of(arena: Allocator, path: []const u8) !TreeSum {
+        const io = std.testing.io;
+        var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+        defer dir.close(io);
+        var walker = try dir.walk(arena);
+        defer walker.deinit();
+        var out: std.Io.Writer.Allocating = .init(arena);
+        while (try walker.next(io)) |e| {
+            const st = e.dir.statFile(io, e.basename, .{ .follow_symlinks = false }) catch null;
+            try out.writer.print("{s} {s} {d}\n", .{ e.path, @tagName(e.kind), if (st) |s| s.size else 0 });
+        }
+        return .{ .path = path, .sum = try treeSum(arena, path), .listing = out.written() };
+    }
+
+    /// The tree at `before.path` is what `before` saw.
+    fn expectSame(before: TreeSum, arena: Allocator) !void {
+        const now = try of(arena, before.path);
+        if (std.mem.eql(u8, &before.sum, &now.sum)) return;
+        std.debug.print("{s} changed.\nbefore:\n{s}now:\n{s}", .{ before.path, before.listing, now.listing });
+        return error.TestUnexpectedResult;
+    }
+};
+
+fn readTrimmed(arena: Allocator, path: []const u8) ![]const u8 {
+    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, arena, .limited(4096));
+    return std.mem.trim(u8, text, "\n");
+}
+
+/// What makes a job untrusted in `expectUntrustedLeavesTrustedAlone`.
+const Untrusted = enum {
+    /// A fork's pull request on a runner that vouches for pull requests: scope `untrusted`.
+    fork,
+    /// A job the runner does not vouch for (`Config.vouched` false), which runs natively only on a
+    /// root runner under per-job limits (`untrustedRefusal`).
+    unvouched,
+};
+
+/// The trust boundary of the native backend, end to end (docs/native-backend.md, "Trust scopes"):
+/// a trusted job of a repository fills every place the repository's jobs share, an untrusted job
+/// of the same repository then does everything a hostile one can to reach them, and nothing a
+/// trusted job reads or replays has changed. Every shared place is listed in the pull request
+/// that added this, with what keeps it apart.
+fn expectUntrustedLeavesTrustedAlone(arena: Allocator, kind: Untrusted) !void {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try cachedConfig(arena, &tmp);
+    // The seed's build, without a Zig release to download: a file where Zig's cache would be.
+    c.cfg.test_seed_script = "mkdir -p /zig-seed/o/s && echo seeded > /zig-seed/o/s/f";
+    const caches: volumes.Options = .{
+        .package_caches = true,
+        .trusted = true,
+        .zig_local_cache = true,
+        .zig_local_cache_max_mb = 1,
+        .zig_seeds = &.{.{ .version = "0.0.1", .sha256 = "00" }},
+    };
+    var hostile_cfg = c.cfg;
+    var hostile_caches = caches;
+    var parent: ?TestCgroup = null;
+    if (kind == .unvouched) {
+        if (std.os.linux.geteuid() != 0) {
+            std.debug.print("skipped the unvouched case: it needs a root runner\n", .{});
+            return error.SkipZigTest;
+        }
+        hostile_cfg.vouched = false;
+        hostile_caches.trusted = false;
+        parent = try testCgroup(arena, &hostile_cfg);
+        hostile_cfg.job_limits = jobLimits(arena, io, hostile_cfg.cgroup);
+        if (!hostile_cfg.job_limits) {
+            std.debug.print("skipped the unvouched case: no cgroup for per-job limits\n", .{});
+            return error.SkipZigTest;
+        }
+    }
+    defer if (parent) |p| p.remove(arena);
+    const store = c.cfg.store;
+    const gate_file = try std.fmt.allocPrint(arena, "{s}/memory-gate-test", .{store});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = gate_file, .data = "learned job sizes\n" });
+
+    // The trusted job fills the volumes the repository's jobs share, with a secret each.
+    // Who runs a step, told by a file the keys do not hold (`/shared` is bound at `Config.binds`,
+    // and its contents are in no key): the same steps, written by different jobs, say who ran.
+    const who_trusted = "run-by-the-trusted-job";
+    const who_hostile = "run-by-the-hostile-job";
+    const who_file = try std.fmt.allocPrint(arena, "{s}/who", .{c.shared});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = who_file, .data = who_trusted ++ "\n" });
+    const seed_job = testJob(&.{testStep("echo secret > /root/.npm/trusted-secret # npm\n" ++
+        "echo secret > $RUNNER_TOOL_CACHE/trusted-secret\n" ++
+        "echo secret > /root/.cache/zig/p/trusted-secret # zig\n" ++
+        "echo secret > $ZIG_LOCAL_CACHE_DIR/trusted-secret")});
+    const seeded = try runCachedJob(arena, c.cfg, seed_job, caches, .{ .ran = "t0" });
+    try expectSucceeded(seeded);
+
+    const volumes_dir = try std.fmt.allocPrint(arena, "{s}/volumes/o/r/repo", .{store});
+    const seeds_dir = try std.fmt.allocPrint(arena, "{s}/seeds", .{store});
+    // Each volume's tree; the runner's own bookkeeping beside them (`.lock`, `.size`) is its own.
+    var before_volumes: std.ArrayList(TreeSum) = .empty;
+    for ([_][]const u8{ "npm", "toolcache", "zig-packages", "zig-local", "zig-builtin", "node-compile-cache" }) |name|
+        try before_volumes.append(arena, try TreeSum.of(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ volumes_dir, name })));
+    const before_rootfs = try TreeSum.of(arena, c.cfg.rootfs);
+    const before_seeds = try TreeSum.of(arena, seeds_dir);
+    const before_layers = try LayerSums.of(arena, store);
+    try std.testing.expectEqualStrings("secret", try readTrimmed(arena, try std.fmt.allocPrint(arena, "{s}/npm/trusted-secret", .{volumes_dir})));
+
+    // What a hostile step tries, with the steps after it that publish layers a trusted job could
+    // look up (`/shared` counts how often each really ran). The same steps run as the trusted job's
+    // later: a stored layer that was found by their key would replay without running them.
+    const attack = try std.fmt.allocPrint(arena,
+        \\cat /shared/who > /root/.npm/head # npm
+        \\cat /shared/who > $RUNNER_TOOL_CACHE/head
+        \\cat /shared/who > /root/.cache/zig/p/head # zig
+        \\cat /shared/who > /root/.cache/zig/o/s/f
+        \\cat /shared/who >> /etc/passwd
+        \\ln -s /etc/passwd /root/.npm/link-abs
+        \\ln -s ../../repo/npm /root/.npm/link-up
+        \\ln /etc/passwd /tmp/hardlink && cat /shared/who >> /tmp/hardlink
+        \\n=$(find / -path /proc -prune -o -path /sys -prune -o -path /usr -prune -o -name trusted-secret -print 2>/dev/null | wc -l)
+        \\echo found-$n-secrets
+        \\for p in {0s}/volumes/o/r/repo/npm/head {0s}/memory-gate-test {0s}/layers/head /run/zig-runner/head; do
+        \\  if {{ echo x > $p; }} 2>/dev/null; then echo wrote-to-host; fi
+        \\  if [ -e $p ]; then echo sees-host; fi
+        \\done
+        \\if [ -e /run/zig-runner ]; then echo sees-run-dir; fi
+        \\echo trusted-mounts-$(grep -c '/volumes/o/r/repo' /proc/self/mountinfo)
+        \\echo gate-mounts-$(grep -c 'memory-gate' /proc/self/mountinfo)
+        \\if ln /usr/bin/env /root/.npm/host-hardlink 2>/dev/null; then echo linked-host-file; fi
+        \\if echo x >> /usr/bin/env 2>/dev/null; then echo wrote-host-binary; fi
+        \\echo attack-done-$((2+3))
+    , .{store});
+    var hostile = testJob(&.{
+        testStep(attack),
+        testStep("echo x >> /shared/b1; mkdir -p /tmp/k; echo layer > /tmp/k/f"),
+        testStep("echo x >> /shared/b2; cat /tmp/k/f"),
+    });
+    if (kind == .fork) hostile = try asFork(arena, hostile);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = who_file, .data = who_hostile ++ "\n" });
+    const first = try runCachedJob(arena, hostile_cfg, hostile, hostile_caches, .{ .ran = "h1" });
+    if (!first.res.succeeded) std.debug.print("{s}\n", .{first.text});
+    try expectSucceeded(first);
+    try expectLines(first.text, &.{
+        "found-0-secrets",
+        "trusted-mounts-0",
+        "gate-mounts-0",
+        "attack-done-5",
+    });
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first.text, "stdout] wrote-"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first.text, "stdout] sees-"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first.text, "stdout] linked-"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first.text, "stdout] sees-run"));
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "b1"));
+
+    // The job did write, into volumes of its own scope: the attack reached what it could reach.
+    const hostile_volumes = try std.fmt.allocPrint(arena, "{s}/volumes/o/r/untrusted", .{store});
+    try std.testing.expectEqualStrings(who_hostile, try readTrimmed(arena, try std.fmt.allocPrint(arena, "{s}/npm/head", .{hostile_volumes})));
+
+    // Nothing a trusted job shares has changed: its volumes, the rootfs and the Zig seed every
+    // job starts from, the layers it published, and the runner's own state.
+    for (before_volumes.items) |v| try v.expectSame(arena);
+    try before_rootfs.expectSame(arena);
+    try before_seeds.expectSame(arena);
+    try before_layers.expectKept(try LayerSums.of(arena, store));
+    try std.testing.expectEqualStrings("learned job sizes", try readTrimmed(arena, gate_file));
+
+    // The control: the hostile job's own run again replays its layers (so they were published and
+    // the next check means something).
+    const again = try runCachedJob(arena, hostile_cfg, hostile, hostile_caches, .{ .ran = "h2" });
+    try expectSucceeded(again);
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "b1"));
+    try std.testing.expect(std.mem.count(u8, again.text, dagger.native_reused_note) >= 2);
+
+    // The same steps as a trusted job: nothing replays, whatever the hostile job published. Each
+    // step runs, and writes its own commit into the trusted volumes.
+    var same = hostile;
+    same.context_data = .null;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = who_file, .data = who_trusted ++ "\n" });
+    const trusted = try runCachedJob(arena, c.cfg, same, caches, .{ .ran = "t1" });
+    try expectSucceeded(trusted);
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "b1"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "b2"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, trusted.text, dagger.native_reused_note));
+    try std.testing.expectEqualStrings(who_trusted, try readTrimmed(arena, try std.fmt.allocPrint(arena, "{s}/npm/head", .{volumes_dir})));
+    try std.testing.expectEqualStrings("secret", try readTrimmed(arena, try std.fmt.allocPrint(arena, "{s}/npm/trusted-secret", .{volumes_dir})));
+    // And what the hostile job planted in its own scope is still its own.
+    try std.testing.expectEqualStrings(who_hostile, try readTrimmed(arena, try std.fmt.allocPrint(arena, "{s}/npm/head", .{hostile_volumes})));
+    // With no cache volume in the job, their paths are not in the key and the trust scope alone
+    // keeps the two apart: the same steps are replayed for their own side, never the other's.
+    var plain = testJob(&.{
+        testStep("echo x >> /shared/c1; mkdir -p /tmp/p; echo plain > /tmp/p/f"),
+        testStep("echo x >> /shared/c2; cat /tmp/p/f"),
+    });
+    if (kind == .fork) plain = try asFork(arena, plain);
+    const no_caches: volumes.Options = .{ .trusted = hostile_caches.trusted };
+    try expectSucceeded(try runCachedJob(arena, hostile_cfg, plain, no_caches, .{ .ran = "p1" }));
+    try expectSucceeded(try runCachedJob(arena, hostile_cfg, plain, no_caches, .{ .ran = "p2" }));
+    try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "c1"));
+    plain.context_data = .null;
+    const plain_trusted = try runCachedJob(arena, c.cfg, plain, .{ .trusted = true }, .{ .ran = "p3" });
+    try expectSucceeded(plain_trusted);
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "c1"));
+    try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "c2"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, plain_trusted.text, dagger.native_reused_note));
+
+    // A trusted job that reads the caches finds the trusted ones only.
+    const reader = testJob(&.{testStep("cat /root/.npm/head # npm\ncat $RUNNER_TOOL_CACHE/head\n" ++
+        "cat /root/.npm/trusted-secret")});
+    const read = try runCachedJob(arena, c.cfg, reader, caches, .{});
+    try expectSucceeded(read);
+    try expectLines(read.text, &.{ "stdout] " ++ who_trusted, "stdout] secret" });
+    try std.testing.expect(std.mem.indexOf(u8, read.text, who_hostile) == null);
+}
+
+test "native trust: a fork's pull request on a runner that vouches for pull requests reaches nothing a trusted job reads or replays" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    try expectUntrustedLeavesTrustedAlone(a.allocator(), .fork);
+}
+
+test "root runner: a job the runner does not vouch for reaches nothing a trusted job reads or replays" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    try expectUntrustedLeavesTrustedAlone(a.allocator(), .unvouched);
+}
+
+test "native trust: every key a job's layers are stored under differs by trust scope and by repository" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const trusted_in: Below = .{
+        .format = Store.store_format,
+        .scope = "repo",
+        .repository = "o/r",
+        .fingerprint = "the same rootfs",
+        .userns = "mapped",
+        .binds = &.{},
+    };
+    var fork_in = trusted_in;
+    fork_in.scope = "untrusted";
+    var other_in = trusted_in;
+    other_in.repository = "o/other";
+    const trusted_base = belowKey(trusted_in, null);
+    const fork_base = belowKey(fork_in, null);
+    const other_base = belowKey(other_in, null);
+    try std.testing.expect(!std.mem.eql(u8, &trusted_base, &fork_base));
+    try std.testing.expect(!std.mem.eql(u8, &trusted_base, &other_base));
+    try std.testing.expect(!std.mem.eql(u8, &fork_base, &other_base));
+
+    // A step, an action's fetched tree and the steps above them are keyed from their parent, so
+    // the same script above different bases is never the same key.
+    const script = "echo same script";
+    var keys: [3]Store.Key = undefined;
+    for ([_]Store.Key{ trusted_base, fork_base, other_base }, &keys) |parent, *k| {
+        var h: Store.KeyHasher = .init(.step);
+        h.core(parent, script, &[_]job_mod.EnvVar{});
+        var above: Store.KeyHasher = .init(.step);
+        above.core(h.final(), "the next step", &[_]job_mod.EnvVar{});
+        k.* = above.final();
+    }
+    try std.testing.expect(!std.mem.eql(u8, &keys[0], &keys[1]));
+    try std.testing.expect(!std.mem.eql(u8, &keys[0], &keys[2]));
+
+    // A Dockerfile build's layer, from one builder key.
+    var builder: Store.Key = undefined;
+    @memset(&builder, 0x5a);
+    const build_trusted = @import("layers.zig").layerKey(Store.store_format, "repo", "mapped", builder, null);
+    const build_fork = @import("layers.zig").layerKey(Store.store_format, "untrusted", "mapped", builder, null);
+    try std.testing.expect(!std.mem.eql(u8, &build_trusted, &build_fork));
+
+    // In a real store: what the untrusted job publishes, the trusted job's key does not find.
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const store: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}) };
+    try Store.prepare(arena, io, store.root, .{ .check_parents = false });
+    try tmp.dir.createDirPath(io, "up/d");
+    try tmp.dir.writeFile(io, .{ .sub_path = "up/d/f", .data = "planted by the fork" });
+    var never: std.atomic.Value(bool) = .init(false);
+    const lock = try store.lockKey(arena, io, keys[1], &never);
+    defer lock.close(io);
+    const layer = try store.publish(arena, io, keys[1], .fetch, try std.fmt.allocPrint(arena, "{s}/up", .{root}), .{ .log = "", .fc = "" });
+    layer.lock.close(io);
+    try std.testing.expect(try store.open(arena, io, keys[0]) == null);
+    try std.testing.expect(try store.open(arena, io, keys[2]) == null);
+    const hit = (try store.open(arena, io, keys[1])).?;
+    hit.layer.lock.close(io);
+}
+
 /// The tests' tree as root, for the tests that reach no limit (`testConfig`).
 const test_parent = cgroup.mount_point ++ "/zig-runner-test";
 
