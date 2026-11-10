@@ -289,6 +289,11 @@ pub const Admission = struct {
     /// may start whatever the room (`Gate.start`). A job handed out and not named yet counts as
     /// running, for it may be a job that fits, or end at once.
     fn firstAlone(a: *const Admission, slot: usize) bool {
+        // Another pool's job holds room on this machine: it frees it within `ramp_ms`, or when it
+        // ends, so the first job here waits for that instead of starting into memory another pool
+        // has taken (as `idleFor` does for a poll). Without this the budget held only polls back,
+        // and an idle pool's first job went past every other pool's reservation.
+        if (a.peers.jobs > 0) return false;
         const mine = a.slots[slot].wait_seq;
         for (a.slots, 0..) |s, i| {
             if (i == slot) continue;
@@ -4277,6 +4282,29 @@ test "another pool's reservation takes room from this one's gate, and is given b
     _ = other.ended();
     try std.testing.expect(g.check() == null);
     try std.testing.expectEqual(@as(u64, 0), ci.peers.mb);
+}
+
+test "an idle pool's first job waits for another pool's reservation, and starts once it is given back" {
+    var s: Shared = .{ .tmp = undefined };
+    try s.init();
+    defer s.deinit();
+    var slots_a: [1]Admission.Slot = undefined;
+    var slots_b: [1]Admission.Slot = undefined;
+    var ci = try s.pool("ci", 100, 1000, &slots_a);
+    defer Shared.free(&ci);
+    var bench = try s.pool("bench", 200, 2000, &slots_b);
+    defer Shared.free(&bench);
+    var g: Gate = .{ .pool = &ci, .slot = 0 };
+    var other: Gate = .{ .pool = &bench, .slot = 0 };
+    // Room for one job beside the floor, and the other pool has just started one.
+    try s.available(2000);
+    startedJob(&bench, 0, 1000);
+    // Alone in its pool, the job would be the first in line and start whatever the room; with
+    // the other pool's job holding room it waits.
+    try std.testing.expectEqual(StartTag.wait, named(&g, 0xc1));
+    // That job ends and gives its room back: the first in line now goes, as before.
+    _ = other.ended();
+    try std.testing.expect(g.start() != .wait);
 }
 
 test "a pool does not count its own lines, and the record lists each job once" {

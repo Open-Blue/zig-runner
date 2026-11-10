@@ -1019,8 +1019,10 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
     differs, it expired, or it expires more than two ramps ahead; a crash leaves lines for at most
     `ramp_ms`. A file that is missing, has another header, damaged lines or cannot be locked counts
     as no reservations, warned of once: the gate is as before. So a gate is stricter only while
-    another pool has a job ramping up, and a poll that would be forced through on an idle pool
-    (`idleFor`) is not while one has. Pollers are not published (an engine pool's runners alone
+    another pool has a job ramping up, and neither a poll that would be forced through on an idle
+    pool (`idleFor`) nor the first job in line that would start whatever the room (`firstAlone`) is
+    while one has: they wait for that job to give the room back (a replay of the gate showed an idle
+    pool's first job otherwise going past every other pool's reservation). Pollers are not published (an engine pool's runners alone
     would reserve more than 8 GB), and a job's lines are written after the gate admits it, so two
     pools that admit in the same few milliseconds can still both pass; the next check of either
     sees both. On by default for a root runner, whose `/run/zig-runner` only root writes and which
