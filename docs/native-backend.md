@@ -96,8 +96,8 @@ default (`direct`) behaves exactly as before. With `none`:
   line is not printed.
 - **Jobs.** A job native can run runs natively as always. One it cannot (`Backend.unsupported` or
   `usable` give a reason, or the set-up falls back) fails before any step, in "Set up job", with
-  "this job needs the Dagger engine, and this runner has none (RUNNER_ENGINE=none). This job runs on
-  Dagger: <the reason native gave>." It does not start a `dagger` child or connect to a socket.
+  "this job needs the Dagger engine, and this runner has none (RUNNER_ENGINE=none). It cannot run
+  natively: <the reason native gave>." It does not start a `dagger` child or connect to a socket.
 - **Start-up.** The native probe runs before the runner registers (`Backend.reprobe`, which
   forgets the five minutes of back-off that would otherwise answer from memory). A failure may be
   transient (nftables busy, a module not loaded, no network yet for the image it pulls), so it is
@@ -108,7 +108,8 @@ default (`direct`) behaves exactly as before. With `none`:
   can, and until then refuses again, clearly, every 10 s plus the retries. A bad native
   configuration (a store path that cannot be resolved) is a config error, exit 1. Without the
   probe, every job in its back-off would fail with the reason. `RUNNER_DAGGER_NESTING=true` with
-  `none` is a configuration error (`EngineNoneNoNesting`): a step could never get its engine.
+  `none` is a configuration error (`EngineNoneNoNesting`): a step could never get its engine, and the
+  message says to keep an engine for that pool or turn nesting off.
 - **Deploy.** `deploy/compose.engineless.yaml` layered over `compose.yaml` drops the engine service
   and its volumes and the runner's `depends_on`, and gives the runner what the native backend needs
   ("Under `deploy/compose.yaml`", P1): `privileged: true`, `network_mode: host`, `cgroup: private`
@@ -116,9 +117,16 @@ default (`direct`) behaves exactly as before. With `none`:
   (`RUNNER_NATIVE_STORE`) and the host's `/run/zig-runner`. Checked with `docker compose config`
   only; a job has not been run through it.
 
-What still needs an engine: steps that use the Dagger engine (`RUNNER_DAGGER_NESTING`, which `none` refuses), and
-whatever native lists as unsupported at the time. This is the list the fallbacks are being retired
-from; a job on it fails fast instead of waiting.
+What still needs an engine: whatever native lists as unsupported at the time. This is the list the
+fallbacks are being retired from; a job on it fails fast instead of waiting.
+
+Nesting (`RUNNER_DAGGER_NESTING`, `dagger call` in a step) is on that list for good: the native
+backend's end state is to refuse it, and that is not a gap waiting for a port. A Dagger client in a
+step needs a Dagger engine, a privileged container runtime, and the native backend is engine-free by
+design; bundling and running one would undo that. A job with nesting on falls back to Dagger when
+the pool has an engine, and `RUNNER_ENGINE=none` refuses to start with it. To use `dagger call` in
+steps, keep an engine for that pool (`RUNNER_ENGINE` not `none`); otherwise turn nesting off. This
+says nothing about `docker build` or `docker run` in a step, which is a separate question.
 
 ## Phases
 
@@ -178,7 +186,7 @@ default image, with no `container:`, `services:`, `uses:` actions, output keys o
   image with no git to fetch them with, `docker://` images
   that cannot be pulled, or whose non-root `USER` the image does not have, is past the job's
   ids, or runs on a rootless runner (P7), Dagger in steps
-  (`RUNNER_DAGGER_NESTING`), and a
+  (`RUNNER_DAGGER_NESTING`, refused for good: "What still needs an engine", above), and a
   machine whose probe fails (no user namespaces, nftables refusing the jobs' rules, no default
   route, the jobs' ids taken on the host, the jobs' subnet overlapping a route of the host's). A
   failed probe is tried again after five minutes, not kept for the process's life. (Until P3

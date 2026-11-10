@@ -80,6 +80,11 @@ and then only in jobs the runner vouches for. A step's own Dagger client can ope
 by its key, which is no secret, so in any other job it could write what trusted jobs read (#228). A
 step there that uses Dagger and fails is told why, and "Set up job" says `Dagger in steps: off`.
 
+The native backend refuses nesting for good, because `dagger call` needs a Dagger engine and native
+steps run without one. A pool that needs it keeps an engine (`RUNNER_ENGINE` not `none`), and its
+jobs run on Dagger; `RUNNER_ENGINE=none` with nesting on stops at start-up, saying so. Otherwise
+turn nesting off.
+
 Run **one engine per trust level**. Untrusted jobs on one engine share its `untrusted` volumes; the
 engine's other state (its layer cache, and through a trusted job's nesting the engine itself) is
 not scoped at all; and nesting is control of the host. A second instance on prod's machine

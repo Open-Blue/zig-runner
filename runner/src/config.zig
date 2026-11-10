@@ -336,8 +336,9 @@ pub const Config = struct {
                 "not set, so this runner would fail every job. Set it to the refs prod may run " ++
                 "(RUNNER_TRUSTED_REFS=refs/heads/main,refs/tags/v*), or to * to trust every ref " ++
                 "(docs/OPERATIONS.md, \"Environments\").",
-            error.EngineNoneNoNesting => "RUNNER_DAGGER_NESTING gives steps the Dagger engine, " ++
-                "and RUNNER_ENGINE=none has none: turn one of them off.",
+            error.EngineNoneNoNesting => "RUNNER_DAGGER_NESTING lets `dagger call` run in a step, " ++
+                "which needs a Dagger engine, and RUNNER_ENGINE=none has none: keep an engine for " ++
+                "this pool (RUNNER_ENGINE not `none`), or turn nesting off.",
             error.InvalidNativeRootfs => "RUNNER_NATIVE_ROOTFS is a directory's absolute path: " ++
                 "overlay takes it as a layer from the job's directory.",
             error.InvalidNativePortAddresses => "RUNNER_NATIVE_PORT_ADDRESSES is a list of IPv4 " ++
@@ -837,6 +838,10 @@ test "RUNNER_ENGINE=none needs the native backend, and leaves no engine to reach
     // Steps that use the engine cannot run without one: a configuration error, not failed jobs.
     try env.put("RUNNER_DAGGER_NESTING", "true");
     try std.testing.expectError(error.EngineNoneNoNesting, Config.load(&env, &.{"runner"}));
+    // The operator is told why, and what to do about it.
+    const why = Config.explain(error.EngineNoneNoNesting).?;
+    for ([_][]const u8{ "`dagger call` run in a step", "needs a Dagger engine", "RUNNER_ENGINE not `none`", "turn nesting off" }) |part|
+        try std.testing.expect(std.mem.indexOf(u8, why, part) != null);
     try std.testing.expect((try Config.load(&env, &.{ "runner", "--engine=cli" })).dagger_nesting);
 }
 
