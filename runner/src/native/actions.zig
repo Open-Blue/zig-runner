@@ -187,7 +187,7 @@ fn readOwn(b: *Backend, job: job_mod.Job, path: []const u8) !?[]const u8 {
     try dagger.shellQuote(w, try std.fmt.allocPrint(arena, "{s}{s}", .{ path, if (path.len > 0) "/" else "" }));
     try w.print("\"$f\" > {s}; exit 0; fi\ndone\nexit 3\n", .{out_path});
     var out: Backend.Captured = .{ .arena = arena };
-    const ended = try b.execOn(&.{ "sh", "-c", aw.written() }, try gitEnv(b, job, true), &.{}, 0, 0, out.output(), null);
+    const ended = try b.execOn(&.{ "sh", "-c", aw.written() }, try gitEnv(b, job, true), &.{git_config_file}, 0, 0, out.output(), null);
     const layer = try b.layerPath(b.layers.items.len - 1);
     // Its layer is a look, nothing the job keeps: dropped, so it leaves no unkeyed layer below
     // the base, and the job's steps keep their keys (P2).
@@ -237,11 +237,25 @@ fn imageReason(b: *Backend, image: []const u8) !?[]const u8 {
     };
 }
 
+/// Where git reads its global config in the job's image (`git_config_file`).
+pub const git_config_path = "/etc/zig-runner-gitconfig";
+
+/// git's global config for the fetch: `safe.directory`, because the fetch is the job's root's and
+/// a file:// source is the host's (its files are nobody's to the job's root on a root runner), and
+/// git's ownership check would refuse to read it. It is a file and not the environment's config
+/// (`GIT_CONFIG_COUNT`, `-c`) because a local fetch spawns `upload-pack` with that stripped
+/// (git's `local_repo_env`), and git before 2.50 reads `safe.directory` only from a global or
+/// system file there. Written by the runner, bound read-only for the step and gone after it.
+pub const git_config_file: sandbox.Spec.File = .{
+    .path = git_config_path,
+    .contents = "[safe]\n\tdirectory = *\n",
+};
+
 /// git's environment in the job's image before the base is made (the container's env is not set
-/// yet): its PATH and HOME, no prompt, and its config through the environment, never a command
-/// line: the job's token for the job's own repository (`own`), as Dagger's `git` has it, and
-/// `safe.directory` (the fetch is the job's root's; a file:// source is the host's, and git's
-/// ownership check would refuse to read it).
+/// yet): its PATH and HOME, no prompt, its global config the runner's own (`git_config_file`: the
+/// image's `~/.gitconfig` is not read, so the fetch is the same in every image), and the rest of
+/// its config through the environment, never a command line: the job's token for the job's own
+/// repository (`own`), as Dagger's `git` has it.
 fn gitEnv(b: *Backend, job: job_mod.Job, own: bool) ![]const []const u8 {
     const arena = b.arena;
     const server = std.mem.trimEnd(u8, job.github.server_url, "/");
@@ -250,9 +264,9 @@ fn gitEnv(b: *Backend, job: job_mod.Job, own: bool) ![]const []const u8 {
         "PATH=" ++ Backend.image_path,
         "HOME=/root",
         "GIT_TERMINAL_PROMPT=0",
+        "GIT_CONFIG_GLOBAL=" ++ git_config_path,
     });
     var git_config: std.ArrayList([2][]const u8) = .empty;
-    try git_config.append(arena, .{ "safe.directory", "*" });
     if (own and job.job_token.len > 0) {
         const basic = try std.fmt.allocPrint(arena, "x-access-token:{s}", .{job.job_token});
         const enc = std.base64.standard.Encoder;
@@ -262,6 +276,7 @@ fn gitEnv(b: *Backend, job: job_mod.Job, own: bool) ![]const []const u8 {
             try std.fmt.allocPrint(arena, "AUTHORIZATION: basic {s}", .{enc.encode(b64, basic)}),
         });
     }
+    if (git_config.items.len == 0) return env.items;
     try env.append(arena, try std.fmt.allocPrint(arena, "GIT_CONFIG_COUNT={d}", .{git_config.items.len}));
     for (git_config.items, 0..) |c, i| {
         try env.append(arena, try std.fmt.allocPrint(arena, "GIT_CONFIG_KEY_{d}={s}", .{ i, c[0] }));
@@ -296,7 +311,7 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
 
     const env = try gitEnv(b, job, std.mem.eql(u8, repository, job.github.repository));
     var out: Backend.Captured = .{ .arena = arena };
-    const ended = try b.execOn(&.{ "sh", "-c", aw.written() }, env, &.{}, 0, 0, out.output(), null);
+    const ended = try b.execOn(&.{ "sh", "-c", aw.written() }, env, &.{git_config_file}, 0, 0, out.output(), null);
     // `sh` found no git in the image (any image is native since P3, not only the provisioned
     // default one): Dagger fetches with git of its own.
     if (ended.failure.len == 0 and ended.code == 127) return error.NoGit;

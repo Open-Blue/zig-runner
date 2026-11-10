@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The native backend''s fetch of an action, a local action''s preflight and the checkout of a job read a file:// source on git before 2.50 (Ubuntu 24.04, Debian 13): git''s ownership check no longer refuses a repository the job''s root does not own, as the runner''s `safe.directory` now reaches it through a global config file'
+time: 2026-11-08T22:52:18.652634204-05:00
