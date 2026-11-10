@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Before a commit: no commits on main, and what is being committed is formatted (Zig, Go) and its
-# workflows lint clean. Checks the staged content, not the working tree. pre-push runs the rest
-# of CI's checks. CONTRIBUTING.md, "Git hooks".
+# Before a commit: no commits on main, what is being committed holds no secret (gitleaks), is
+# formatted (Zig, Go), and its workflows lint clean. Checks the staged content, not the working
+# tree. pre-push runs the rest of CI's checks. CONTRIBUTING.md, "Git hooks".
 set -euo pipefail
 hook=pre-commit
 top=$(git rev-parse --show-toplevel)
@@ -10,6 +10,19 @@ cd "$top"
 
 [[ $(git symbolic-ref --short -q HEAD || true) != main ]] ||
 	fail "this is main; commit on a branch (main takes changes through pull requests)"
+
+# A secret is caught before it is committed, not after CI's "Secrets" job finds it on GitHub, where
+# it has to be revoked. The staged changes only, with CI's settings: the repository's
+# .gitleaks.toml, and no `gitleaks:allow` comments (a finding is allowed only in .gitleaks.toml,
+# where its reason is written down). Without gitleaks the commit goes ahead, said, and CI still
+# scans.
+if command -v gitleaks >/dev/null; then
+	gitleaks git --pre-commit --staged --config .gitleaks.toml --redact --ignore-gitleaks-allow \
+		--no-banner --log-level warn --verbose . ||
+		fail "gitleaks found a secret in what is staged (above, redacted); unstage it, or allow it in .gitleaks.toml with the reason"
+else
+	say "gitleaks is not installed, so the staged changes were not scanned for secrets (.github/scripts/install-gitleaks.sh, or brew install gitleaks)"
+fi
 
 mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACMR)
 bad=()
