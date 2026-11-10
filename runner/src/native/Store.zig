@@ -524,7 +524,9 @@ pub fn publish(
 }
 
 /// `publish`, its phases (the upper's size, its record written, the sync, the rename) sampled
-/// into `ph` when given (`phases.zig`).
+/// into `ph` when given (`phases.zig`). The sync is one sample for the whole and one for each
+/// part: the write-back wait, the entries' fsyncs, the meta, and the filesystem's `syncfs` when
+/// the entry was past `sync_tree_max` or had a file that could not be opened.
 pub fn publishTimed(
     s: Store,
     arena: Allocator,
@@ -586,6 +588,7 @@ pub fn publishTimed(
     const entry = try openRoot(arena, tmp);
     defer _ = linux.close(entry);
     var whole_disk = false;
+    var syncfs_ns: ?u64 = null;
     const todo = writeBack(arena, io, entry, sync_tree_max) catch |e| switch (e) {
         error.Unreadable, error.TooLarge => no: {
             whole_disk = true;
@@ -593,8 +596,12 @@ pub fn publishTimed(
         },
         else => return e,
     };
-    if (whole_disk) try s.syncDisk(lock.?);
-    var sync_ns = phases.now() -| t;
+    const wb_ns = phases.now() -| t;
+    t = phases.now();
+    if (whole_disk) {
+        try s.syncDisk(lock.?);
+        syncfs_ns = phases.now() -| t;
+    }
     t = phases.now();
     // Measured once written: a file the kernel is still writing back can show fewer blocks
     // than it takes (a block short, the stress test found, under other publishers' syncfs),
@@ -606,14 +613,30 @@ pub fn publishTimed(
     try meta.writeStreamingAll(io, try m.write(arena));
     // Its blocks allocated now, or its own fsync would need a commit of its own for them.
     _ = syncRange(meta.handle, sync_file_range_write);
-    if (!whole_disk) syncEntries(entry, todo) catch |e| switch (e) {
-        error.Unreadable => try s.syncDisk(lock.?),
-        else => return error.Sync,
-    };
+    var meta_ns = phases.now() -| t;
+    t = phases.now();
+    var fsync_ns: u64 = 0;
+    if (!whole_disk) {
+        const unreadable = if (syncEntries(entry, todo)) |_| false else |e| switch (e) {
+            error.Unreadable => true,
+            else => return error.Sync,
+        };
+        fsync_ns = phases.now() -| t;
+        if (unreadable) {
+            t = phases.now();
+            try s.syncDisk(lock.?);
+            syncfs_ns = phases.now() -| t;
+        }
+    }
+    t = phases.now();
     if (linux.errno(linux.fsync(meta.handle)) != .SUCCESS) return error.Sync;
+    meta_ns += phases.now() -| t;
     if (ph) |p| {
-        sync_ns += phases.now() -| t;
-        p.add(arena, .sync, sync_ns);
+        p.add(arena, .sync, wb_ns + meta_ns + fsync_ns + (syncfs_ns orelse 0));
+        p.add(arena, .sync_wb, wb_ns);
+        p.add(arena, .sync_fsync, fsync_ns);
+        p.add(arena, .sync_meta, meta_ns);
+        if (syncfs_ns) |ns| p.add(arena, .syncfs, ns);
         t = phases.now();
     }
     const dir = try s.layerDir(arena, key);
@@ -2069,6 +2092,44 @@ test "native store: a walk that passes the limit stops, and a large entry syncs 
     );
     try tmp.dir.access(io, "t/d/g0", .{});
     try std.testing.expect(try s.open(arena, io, large) == null);
+}
+
+test "native store: a publish's phases show the sync's parts, and syncfs only when it was taken" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}) };
+    try prepare(arena, io, s.root, .{ .check_parents = false });
+    var never: std.atomic.Value(bool) = .init(false);
+    var ph: phases.Phases = .{};
+    for ([_]struct { name: []const u8, files: usize }{
+        .{ .name = "under", .files = 3 },
+        .{ .name = "over", .files = sync_tree_max + 1 },
+    }) |c| {
+        const dir = try std.fmt.allocPrint(arena, "{s}/up-{s}", .{ root, c.name });
+        try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "up-{s}", .{c.name}));
+        for (0..c.files) |i| try tmp.dir.writeFile(io, .{
+            .sub_path = try std.fmt.allocPrint(arena, "up-{s}/f{d}", .{ c.name, i }),
+            .data = "x",
+        });
+        var kh: KeyHasher = .plain(c.name);
+        const k = kh.final();
+        const kl = try s.lockKey(arena, io, k, &never);
+        defer kl.close(io);
+        const before = ph.mark();
+        const l = try s.publishTimed(arena, io, k, .fetch, dir, .{ .log = "", .fc = "" }, &ph);
+        l.lock.close(io);
+        const line = try ph.text(arena, before, .steps);
+        for ([_][]const u8{ "sync=", "sync_wb=", "sync_fsync=", "sync_meta=" }) |name| {
+            try std.testing.expect(std.mem.indexOf(u8, line, name) != null);
+        }
+        const took = std.mem.indexOf(u8, line, "syncfs=") != null;
+        try std.testing.expectEqual(c.files > sync_tree_max, took);
+    }
 }
 
 test "native store: a checkout's size of entries is synced on its own, not with the whole disk" {

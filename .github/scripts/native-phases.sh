@@ -15,7 +15,7 @@
 set -euo pipefail
 
 order="store sweep dir cgroup resolver slot nat netns image provision caches actions base claim
-spawn namespaces idmap overlay binds root run exit unshift size record sync rename flatten
+spawn namespaces idmap overlay binds root run exit unshift size record sync sync_wb sync_fsync sync_meta syncfs rename flatten
 services cgroup_rm veth_rm tree_rm collect"
 
 table() {

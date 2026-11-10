@@ -1,0 +1,3 @@
+kind: Changed
+body: The native backend no longer rewrites a tool-cache tree's list when a walk finds it unchanged, and the native phases line splits the layer sync into sync_wb, sync_fsync, sync_meta and, when the whole filesystem was synced, syncfs.
+time: 2026-11-10T00:20:24.120911651-05:00

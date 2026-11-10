@@ -663,7 +663,8 @@ const Check = struct {
         std.mem.sort(Entry, entries.items, {}, Entry.less);
 
         const list_path = try std.fmt.allocPrint(t, "{s}/{s}.stat", .{ lists, rel });
-        const old = c.readList(t, list_path, entries.items);
+        const old_text = c.readText(t, list_path);
+        const old = if (old_text) |text| c.readList(t, text, entries.items) else null;
         var sums = Sha256.init(.{});
         var all = Sha256.init(.{});
         var reread: usize = 0;
@@ -715,8 +716,11 @@ const Check = struct {
         };
         sums.final(&digest.sum);
         all.final(&digest.full);
-        // One that would not be read again is not written.
-        if (out.items.len <= max_list_bytes) keepList(t, c.io, list_path, out.items);
+        // One that would not be read again is not written, and one that is the list already there
+        // is not written again: the old file is the same bytes, and nothing reads its times (only
+        // half-written parts are aged, in `walkLists`).
+        const unchanged = if (old_text) |text| std.mem.eql(u8, text, out.items) else false;
+        if (out.items.len <= max_list_bytes and !unchanged) keepList(t, c.io, list_path, out.items);
         return digest;
     }
 
@@ -855,14 +859,19 @@ const Check = struct {
         h.final(&f.hash);
     }
 
-    /// The list at `path`, when it holds exactly the regular files' paths in order and each line
-    /// parses; otherwise null and every file is read.
-    fn readList(c: *Check, t: Allocator, path: []const u8, entries: []const Entry) ?[]Line {
+    /// The bytes of the list at `path`, null if there is none or it is too big to be one.
+    fn readText(c: *Check, t: Allocator, path: []const u8) ?[]const u8 {
         const text = std.Io.Dir.cwd().readFileAlloc(c.io, path, t, .limited(max_list_bytes)) catch |e| {
             rearm(c.io, e);
             return null;
         };
         c.charge(text.len) catch return null;
+        return text;
+    }
+
+    /// The list `text`, when it holds exactly the regular files' paths in order and each line
+    /// parses; otherwise null and every file is read.
+    fn readList(c: *Check, t: Allocator, text: []const u8, entries: []const Entry) ?[]Line {
         const lines = t.alloc(Line, entries.len) catch return null;
         c.charge(lines.len * @sizeOf(Line)) catch return null;
         var rows = std.mem.splitScalar(u8, text, '\n');
@@ -1265,6 +1274,34 @@ test "tool trees: a list spares the reading, and a change it cannot hide is read
     try std.testing.expect(!std.mem.eql(u8, first.env, third.env));
     try expectIn(third.note, tree_rel ++ " (5 files, 1 read)");
     try expectIn(third.env, try shellDigest(arena, tree));
+}
+
+test "tool trees: a walk that finds the list it read is not written over it, and a change is" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    const dir_fd = linux.open(try std.fmt.allocPrintSentinel(arena, "{s}", .{f.cache}, 0), .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    try std.testing.expect(linux.errno(dir_fd) == .SUCCESS);
+    defer _ = linux.close(std.math.cast(linux.fd_t, dir_fd).?);
+    if (!leasesSeeMappings(fsType(std.math.cast(linux.fd_t, dir_fd).?))) return error.SkipZigTest;
+    const list = try std.fmt.allocPrint(arena, "{s}/{s}.stat", .{ f.lists, tree_rel });
+    _ = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    const first = try std.Io.Dir.cwd().statFile(io, list, .{});
+    _ = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    const second = try std.Io.Dir.cwd().statFile(io, list, .{});
+    try std.testing.expectEqual(first.inode, second.inode);
+    try std.testing.expectEqual(first.mtime.nanoseconds, second.mtime.nanoseconds);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "{s}/{s}/new-file", .{ f.cache, tree_rel }),
+        .data = "new\n",
+    });
+    _ = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    const third = try std.Io.Dir.cwd().statFile(io, list, .{});
+    try std.testing.expect(third.inode != second.inode);
 }
 
 test "tool trees: a file written within the clock's tick of the check is read next time" {
