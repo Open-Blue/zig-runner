@@ -864,6 +864,9 @@ pub fn init(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config) !Backend 
     return initWhy(arena, io, gpa, cfg, &why);
 }
 
+/// Set by the first job of the process (`initWhy`).
+var verdicts_dropped: std.atomic.Value(bool) = .init(false);
+
 /// `init`, saying in `why` what failed and on which path ("making /var/lib/.../P/etc:
 /// FileNotFound"), for "Set up job": an error's name alone does not say which of the job's
 /// directories, locks, helpers or files it was.
@@ -883,6 +886,9 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .none => null,
     });
     (Store{ .root = cfg.store }).checkOncePerBoot(arena, io);
+    // What was done to a volume while no runner was up is not in a verdict from before: the first
+    // job of a process drops them all (`tool_trees.takeVerdict`).
+    if (!verdicts_dropped.swap(true, .acq_rel)) trees_check.dropVerdicts(arena, io, cfg.store);
     t = ph.since(arena, .sweep, t);
     var raw: [8]u8 = undefined;
     io.random(&raw);
@@ -1374,13 +1380,19 @@ pub fn deinit(b: *Backend) void {
     if (b.publisher) |*p| p.stop(b.io);
     b.publisher = null;
     b.service_set.stopAll(b.io);
-    b.cache_plan.release(b.io);
     t = b.timings.since(arena, .services, t);
+    // The volumes are let go only once every process of the job is gone, which the removal of its
+    // cgroup shows (the kernel refuses while one is left): another job that takes a volume
+    // exclusively then knows that no job's process is left in it (`walkToolCacheIdle`).
+    var processes_gone = false;
     if (b.job_cgroup) |j| {
         if (b.gate) |g| g.nativeDone();
-        j.remove(arena, b.io);
+        processes_gone = j.removed(arena, b.io);
     }
     t = b.timings.since(arena, .cgroup_rm, t);
+    if (processes_gone) b.walkToolCacheIdle() else b.noteProcessesMayRemain();
+    b.cache_plan.release(b.io);
+    t = b.timings.since(arena, .tool_walk, t);
     if (b.slot) |s| {
         var sock = net.Socket.open() catch null;
         if (sock) |*so| {
@@ -1947,12 +1959,17 @@ fn checkToolTrees(b: *Backend) !void {
     const arena = b.arena;
     const volume = b.cache_plan.tool_cache_host orelse return;
     const mount = b.cache_plan.tool_cache.?;
+    // What the last job out found when it left the volume, read as this job opened it
+    // (`volumes.plan`, `tool_trees.takeVerdict`): no walk then.
+    if (b.cache_plan.tool_verdict) |v| {
+        b.tool_trees = v.env;
+        b.tool_trees_full = v.full;
+        try b.notes.append(arena, v.note);
+        return;
+    }
     // In the runner's store beside the volumes, where no step can write: a list a job could
     // forge would pass a changed file (`tool_trees.zig`).
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(volume, &digest, .{});
-    const root = b.store_cfg.root;
-    const lists = try std.fmt.allocPrint(arena, "{s}/tool-trees/{x}", .{ root, digest[0..16] });
+    const lists = try trees_check.listsDir(arena, b.store_cfg.root, volume);
     const verdict = try trees_check.checkOnce(
         &trees_check.process_flights,
         arena,
@@ -1966,6 +1983,31 @@ fn checkToolTrees(b: *Backend) !void {
     b.tool_trees = verdict.env;
     b.tool_trees_full = verdict.full;
     try b.notes.append(arena, verdict.note);
+}
+
+/// A job that lets the tool cache's volume go with processes that may be alive in it says so,
+/// before it lets go, so that no job makes a verdict of the volume (`tool_trees.markUnproven`).
+fn noteProcessesMayRemain(b: *Backend) void {
+    const volume = b.cache_plan.tool_cache_host orelse return;
+    const lists = trees_check.listsDir(b.arena, b.store_cfg.root, volume) catch return;
+    if (!trees_check.markUnproven(b.arena, b.io, lists))
+        std.log.warn("native: cannot note that {s} may have processes left", .{volume});
+}
+
+/// The last job out of the tool cache's volume walks its trees for the next job
+/// (`tool_trees.walkIdle`), the walk that job would make first thing. Only when this job's
+/// processes are gone (`deinit`: a job without a cgroup, `RUNNER_NATIVE_CGROUP=none`, never
+/// gets here), the exclusive lock on the volume is free (no job anywhere holds it, so none can
+/// run a step in it, and any other job's processes were gone when it let go), and the job checks
+/// the trees at all. A walk that was not whole, or saw a racy file, leaves no verdict, and the next
+/// job walks as it always did.
+fn walkToolCacheIdle(b: *Backend) void {
+    if (!b.caches.tool_trees) return;
+    const mount = b.cache_plan.tool_cache orelse return;
+    const arena = b.arena;
+    const idle = b.cache_plan.idleToolCache(arena) orelse return;
+    const lists = trees_check.listsDir(arena, b.store_cfg.root, idle.dir) catch return;
+    _ = trees_check.walkIdle(arena, b.gpa, b.io, idle.dir, lists, mount, idle.left, trees_check.idle_limits);
 }
 
 /// `set_up.zig_builtin_seed_script` on the `builtin.zig` volume, bound beside the seed's own `b/`

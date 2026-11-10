@@ -592,8 +592,16 @@ jobs:
     name: End to end
     if: github.event_name != 'push'
     runs-on: ubuntu-26.04
-    timeout-minutes: 25
+    # Setup takes about 4 minutes, a pass 2 to 3, and the whole job 5 to 10; the limit is what a hang
+    # costs. The two passes' step limits below (11 and 12 minutes) are their worst cases, so that a
+    # hang ends in a step with its own message, and the log steps after it still run.
+    timeout-minutes: 30
     environment: e2e
+    env:
+      # Each wait for a run (or the native rootfs), and all of `check`'s waits together (e2e.sh): a
+      # hang is reported by the script, 240 s and 300 s, well inside the steps' limits.
+      E2E_TIMEOUT: 240
+      E2E_SUITE_LIMIT: 300
     permissions:
       contents: read # to check out the code
     steps:
@@ -666,6 +674,8 @@ jobs:
 
       - name: End to end on Dagger
         if: steps.go.outputs.run == 'true'
+        # Worst case: the engine's wait 180 s, the suite 300 s and the reads after it 90 s, stop 35 s.
+        timeout-minutes: 11
         env:
           GH_APP_ID: ${{ vars.E2E_GH_APP_ID }}
           E2E_GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -681,6 +691,8 @@ jobs:
       # Run whatever Dagger's pass found, so one push shows both.
       - name: End to end, native
         if: ${{ !cancelled() && steps.go.outputs.run == 'true' }}
+        # Worst case: the rootfs's wait 240 s, the suite 300 s and the reads after it 90 s, stop 35 s.
+        timeout-minutes: 12
         env:
           GH_APP_ID: ${{ vars.E2E_GH_APP_ID }}
           E2E_GH_TOKEN: ${{ steps.app.outputs.token }}

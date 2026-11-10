@@ -137,7 +137,14 @@ pub fn check(
 
 /// What a walk found, and whether it was cut short (the job's cancel, the clock): a walk that
 /// was is no answer for another job.
-const Walked = struct { verdict: Verdict, stopped: bool };
+const Walked = struct {
+    verdict: Verdict,
+    stopped: bool,
+    /// Whole, and nothing in it that a later walk would not trust: every tree found and listed,
+    /// none left out, no budget spent, the walk not cut short, and no racy file (`Check.racy_files`).
+    /// Only such a walk is kept as a verdict (`walkIdle`).
+    clean: bool = false,
+};
 
 fn walk(
     arena: Allocator,
@@ -162,7 +169,7 @@ fn walk(
     var full: std.ArrayList(u8) = .empty;
     var note: std.ArrayList(u8) = .empty;
     var skipped: std.ArrayList(u8) = .empty;
-    const root = openRoot(arena, cache) orelse return .{ .stopped = false, .verdict = .{
+    const root = openRoot(arena, cache) orelse return .{ .stopped = false, .clean = false, .verdict = .{
         .env = "",
         .full = "",
         .note = "Tool cache: not checked (the volume cannot be opened)",
@@ -235,6 +242,8 @@ fn walk(
     return .{
         .verdict = .{ .env = env.items, .full = full.items, .note = text.items },
         .stopped = c.why != null,
+        .clean = c.why == null and c.complete and c.spent == null and c.left_out == 0 and
+            c.racy_files == 0,
     };
 }
 
@@ -393,6 +402,273 @@ pub fn checkOnce(
     }
 }
 
+/// What a job that opens the tool cache's volume is told of it by the last job out. That job, once
+/// no job anywhere holds the volume (an exclusive, non-blocking flock on its lock, taken after its
+/// own processes are known dead), walks the trees (`walkIdle`) and keeps the answer in the runner's
+/// store, in a file no step can reach. The next job to open the volume (`takeVerdict`) reads it and
+/// removes it before any step runs, whether or not it trusts it, and takes the answer instead of
+/// walking: nothing wrote to the trees in between, because nothing could. A job that finds no
+/// verdict walks (`checkOnce`), so every doubt below costs a walk and nothing else.
+///
+/// What a verdict is trusted for is checked on reading:
+///  - the boot's id, so one made before a reboot (and any file a crash left) is never used;
+///  - the volume's lock file, its inode and mtime, which every open of the volume sets (the last
+///    use `evict.zig` goes by): an open by anything that did not take the verdict, a job of an
+///    older runner included, or a volume evicted and made again, is a difference;
+///  - the mount, the digests being of paths as steps see them;
+///  - its age, `verdict_max_age_ms`, which bounds what is done to the volume from the host while
+///    no job is in it (an administrator's edit): a clock set back is no age at all;
+///  - and that it could be removed, as a verdict that stays would be read again after a job wrote.
+/// The runner also drops every verdict when its first job begins (`dropVerdicts`), so what was
+/// changed on the host while no runner was up is seen too.
+///
+/// A walk is kept only when it was `clean` (`Walked.clean`): whole, not cut short, no budget spent
+/// and no racy file, since a racy file is one a later walk would read again because a write to it
+/// could leave no trace in its ctime. Without a verdict the next job's walk finds the same.
+const verdict_name = ".verdict";
+/// Left by a job that let the volume go without knowing its processes were gone (no cgroup, or one
+/// the kernel would not remove): while it stands no verdict is made, and the runner's first job
+/// removes it (`dropVerdicts`), when a sweep has dealt with what a dead job left.
+const unproven_name = ".unproven";
+const verdict_magic = "zig-runner tool-trees verdict 1";
+const max_verdict_bytes = 3 * max_env + max_note + 4096;
+/// A verdict older than this is not used. Any host-side change to the volume while no job is in it
+/// is seen by the next job at the latest this long after the last job left.
+pub const verdict_max_age_ms: i64 = 60 * 60 * 1000;
+
+/// What the volume's lock file looked like (`leftBy`): the last open of the volume set its mtime.
+pub const Left = struct { ino: u64, sec: i64, nsec: u32 };
+
+/// `fd`'s inode and mtime, null if they cannot be told.
+pub fn leftBy(fd: linux.fd_t) ?Left {
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true, .MTIME = true }, &st)) != .SUCCESS)
+        return null;
+    return .{ .ino = st.ino, .sec = st.mtime.sec, .nsec = st.mtime.nsec };
+}
+
+/// Where the lists of the volume at `volume` (its directory on the host) are kept, and its
+/// verdict: in the store, beside the volumes and in none a step mounts.
+pub fn listsDir(arena: Allocator, store: []const u8, volume: []const u8) Allocator.Error![]const u8 {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(volume, &digest, .{});
+    return std.fmt.allocPrint(arena, "{s}/tool-trees/{x}", .{ store, digest[0..16] });
+}
+
+/// The boot's id. Read by hand: a file of `/proc` says it is empty (no size), which a read of
+/// the whole file takes for its end.
+fn bootId(arena: Allocator, io: std.Io) ?[]const u8 {
+    _ = io;
+    const raw = linux.open("/proc/sys/kernel/random/boot_id", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(raw) != .SUCCESS) return null;
+    const fd = std.math.cast(linux.fd_t, raw) orelse return null;
+    defer _ = linux.close(fd);
+    var buf: [64]u8 = undefined;
+    const n = linux.read(fd, &buf, buf.len);
+    if (linux.errno(n) != .SUCCESS) return null;
+    const id = std.mem.trim(u8, buf[0..n], " \n");
+    return if (id.len == 0) null else arena.dupe(u8, id) catch null;
+}
+
+/// The verdict of the lists at `lists` removed: whether none is left there.
+pub fn dropVerdict(arena: Allocator, io: std.Io, lists: []const u8) bool {
+    const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ lists, verdict_name }) catch return false;
+    std.Io.Dir.cwd().deleteFile(io, path) catch |e| switch (e) {
+        error.FileNotFound => return true,
+        else => {
+            rearm(io, e);
+            return false;
+        },
+    };
+    return true;
+}
+
+/// Notes that a job let the volume of `lists` go with processes of its own that may be alive.
+/// False if that could not be noted, which the caller says.
+pub fn markUnproven(arena: Allocator, io: std.Io, lists: []const u8) bool {
+    const cwd = std.Io.Dir.cwd();
+    const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ lists, unproven_name }) catch return false;
+    cwd.createDirPath(io, lists) catch |e| return rearmed(io, e, false);
+    cwd.writeFile(io, .{ .sub_path = path, .data = "" }) catch |e| return rearmed(io, e, false);
+    return true;
+}
+
+/// Every verdict, and every note of an unproven job, of the store removed (a runner's first job:
+/// `Backend.initWhy`).
+pub fn dropVerdicts(arena: Allocator, io: std.Io, store: []const u8) void {
+    const root = std.fmt.allocPrint(arena, "{s}/tool-trees", .{store}) catch return;
+    var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |e| return rearm(io, e);
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch |e| noEntry(io, e)) |entry| {
+        if (entry.kind != .directory) continue;
+        const lists = std.fmt.allocPrint(arena, "{s}/{s}", .{ root, entry.name }) catch return;
+        _ = dropVerdict(arena, io, lists);
+        const mark = std.fmt.allocPrint(arena, "{s}/{s}", .{ lists, unproven_name }) catch return;
+        std.Io.Dir.cwd().deleteFile(io, mark) catch |e| rearm(io, e);
+    }
+}
+
+/// The verdict a job is given when it opens the volume, or null. It is read and then removed, in
+/// that order, by every job that opens the volume (`take` false: one that does not check the
+/// trees only removes it), before any step of the job or any other that read it can have run:
+/// every reader reads before the first removal, and no step runs before its own job's. A verdict
+/// that cannot be removed is not used, as the next reader would use it after a step wrote.
+/// `left` is the lock file as the job found it before it set its own mtime.
+pub fn takeVerdict(
+    arena: Allocator,
+    io: std.Io,
+    lists: []const u8,
+    mount: []const u8,
+    left: ?Left,
+    take: bool,
+) ?Verdict {
+    const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ lists, verdict_name }) catch return null;
+    const cwd = std.Io.Dir.cwd();
+    const text = if (take) cwd.readFileAlloc(io, path, arena, .limited(max_verdict_bytes)) catch null else null;
+    if (!dropVerdict(arena, io, lists)) return null;
+    const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
+    const p = parseVerdict(text orelse return null) orelse return null;
+    const boot = bootId(arena, io) orelse return null;
+    const mine = left orelse return null;
+    if (!std.mem.eql(u8, p.boot, boot) or !std.mem.eql(u8, p.mount, mount) or
+        p.left.ino != mine.ino or p.left.sec != mine.sec or p.left.nsec != mine.nsec) return null;
+    if (now_ms < p.at_ms or now_ms - p.at_ms > verdict_max_age_ms) return null;
+    return .{
+        .env = p.verdict.env,
+        .full = p.verdict.full,
+        .note = std.fmt.allocPrint(arena, "{s} (as the last job left it)", .{p.verdict.note}) catch return null,
+    };
+}
+
+const Parsed = struct { boot: []const u8, at_ms: i64, left: Left, mount: []const u8, verdict: Verdict };
+
+fn parseVerdict(text: []const u8) ?Parsed {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    if (!std.mem.eql(u8, lines.next() orelse return null, verdict_magic)) return null;
+    const boot = field(&lines, "boot") orelse return null;
+    const at_ms = std.fmt.parseInt(i64, field(&lines, "at") orelse return null, 10) catch return null;
+    var lock = std.mem.splitScalar(u8, field(&lines, "lock") orelse return null, ' ');
+    const left: Left = .{
+        .ino = std.fmt.parseInt(u64, lock.next() orelse return null, 10) catch return null,
+        .sec = std.fmt.parseInt(i64, lock.next() orelse return null, 10) catch return null,
+        .nsec = std.fmt.parseInt(u32, lock.next() orelse return null, 10) catch return null,
+    };
+    const mount = field(&lines, "mount") orelse return null;
+    var sizes: [3]usize = undefined;
+    for (&sizes, [_][]const u8{ "env", "full", "note" }) |*size, name|
+        size.* = std.fmt.parseInt(usize, field(&lines, name) orelse return null, 10) catch return null;
+    if ((lines.next() orelse return null).len != 0) return null;
+    const blob = lines.rest();
+    const total = sizes[0] + sizes[1] + sizes[2];
+    if (blob.len != total + "end\n".len or !std.mem.eql(u8, blob[total..], "end\n")) return null;
+    return .{
+        .boot = boot,
+        .at_ms = at_ms,
+        .left = left,
+        .mount = mount,
+        .verdict = .{
+            .env = blob[0..sizes[0]],
+            .full = blob[sizes[0] .. sizes[0] + sizes[1]],
+            .note = blob[sizes[0] + sizes[1] .. total],
+        },
+    };
+}
+
+/// The next line, `name` and a space and its value.
+fn field(lines: *std.mem.SplitIterator(u8, .scalar), name: []const u8) ?[]const u8 {
+    const line = lines.next() orelse return null;
+    if (line.len <= name.len or !std.mem.startsWith(u8, line, name) or line[name.len] != ' ') return null;
+    return line[name.len + 1 ..];
+}
+
+/// A verdict written whole or not at all (a rename), so a reader never sees a part.
+fn writeVerdict(
+    arena: Allocator,
+    io: std.Io,
+    lists: []const u8,
+    v: Verdict,
+    mount: []const u8,
+    left: Left,
+    at_ms: i64,
+) bool {
+    if (std.mem.indexOfScalar(u8, mount, '\n') != null) return false;
+    const boot = bootId(arena, io) orelse return false;
+    const text = std.fmt.allocPrint(arena, "{s}\n" ++ "boot {s}\nat {d}\nlock {d} {d} {d}\nmount {s}\n" ++
+        "env {d}\nfull {d}\nnote {d}\n\n{s}{s}{s}end\n", .{
+        verdict_magic,
+        boot,
+        at_ms,
+        left.ino,
+        left.sec,
+        left.nsec,
+        mount,
+        v.env.len,
+        v.full.len,
+        v.note.len,
+        v.env,
+        v.full,
+        v.note,
+    }) catch return false;
+    if (text.len > max_verdict_bytes) return false;
+    const cwd = std.Io.Dir.cwd();
+    const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ lists, verdict_name }) catch return false;
+    cwd.createDirPath(io, lists) catch |e| return rearmed(io, e, false);
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    const part = std.fmt.allocPrint(arena, "{s}.{x}", .{ path, &raw }) catch return false;
+    cwd.writeFile(io, .{ .sub_path = part, .data = text }) catch |e| {
+        rearm(io, e);
+        cwd.deleteFile(io, part) catch |d| rearm(io, d);
+        return false;
+    };
+    cwd.rename(part, cwd, path, io) catch |e| {
+        rearm(io, e);
+        cwd.deleteFile(io, part) catch |d| rearm(io, d);
+        return false;
+    };
+    return true;
+}
+
+/// What the walk at the end of a job may spend: it holds the volume exclusively, so a job that
+/// opens it waits (cancellably, `volumes.openWaiting`) for as long as this takes. A tree whose list
+/// is whole costs a stat per file (about 0.1 s on the laptop, 0.2-0.6 s on a Pi 5); one that must
+/// be read again, such as a tree installed by this very job on a slow disk, gives up here and is
+/// left to the next job's own walk.
+pub const idle_limits: Limits = .{
+    .time_ms = 5_000,
+    .tree_ms = 5_000,
+    .read_bytes = 128 << 20,
+    .tree_read_bytes = 128 << 20,
+};
+
+/// A walk of the trees under `cache` for the next job, kept as a verdict if it was `clean`. The
+/// caller holds the volume exclusively and knows that no process of any job is left in it. `left`
+/// is the volume's lock file as the last open of it left it. Whether a verdict was kept.
+pub fn walkIdle(
+    arena: Allocator,
+    gpa: Allocator,
+    io: std.Io,
+    cache: []const u8,
+    lists: []const u8,
+    mount: []const u8,
+    left: Left,
+    limits: Limits,
+) bool {
+    // Whatever stands there is of an older state, and is no longer to be read.
+    if (!dropVerdict(arena, io, lists)) return false;
+    const mark = std.fmt.allocPrint(arena, "{s}/{s}", .{ lists, unproven_name }) catch return false;
+    if (std.Io.Dir.cwd().access(io, mark, .{})) |_| return false else |e| switch (e) {
+        error.FileNotFound => {},
+        else => return rearmed(io, e, false),
+    }
+    // The age counts from when the walk began: a write it had not seen yet is no younger.
+    const at_ms = std.Io.Clock.real.now(io).toMilliseconds();
+    const w = walk(arena, gpa, io, cache, lists, mount, limits, null) catch return false;
+    if (!w.clean) return false;
+    return writeVerdict(arena, io, lists, w.verdict, mount, left, at_ms);
+}
+
 fn appendCapped(
     arena: Allocator,
     list: *std.ArrayList(u8),
@@ -425,6 +701,8 @@ const Check = struct {
     spent: ?[]const u8 = null,
     /// Trees left out, whether or not the note names them.
     left_out: usize = 0,
+    /// Files listed as racy, for their ctime or because no lease proved them at rest.
+    racy_files: u32 = 0,
     /// Every tree was found (the walk to them was not cut short), so a list without one is stale.
     complete: bool = true,
     /// The tree being checked: what it has spent, its own deadline, and why it was given up on.
@@ -687,6 +965,7 @@ const Check = struct {
                 const st = e.stat;
                 // Racy: written lately, or not known to be at rest (`hashFile`).
                 const racy = e.racy or st.ctime >= c.racy_from;
+                if (racy) c.racy_files += 1;
                 try out.print(t, "{s}\t{d}\t{d}\t{d}\t", .{ e.path, st.size, st.ino, st.mtime });
                 if (racy) try out.appendSlice(t, "racy") else try out.print(t, "{d}", .{st.ctime});
                 try out.print(t, "\t{x}\n", .{&e.hash});
@@ -1046,7 +1325,7 @@ fn keepList(t: Allocator, io: std.Io, path: []const u8, text: []const u8) void {
 
 /// The filesystem `fd` is on, 0 if that cannot be told: `struct statfs`'s `f_type`, first, a long
 /// on x86_64 and aarch64.
-fn fsType(fd: linux.fd_t) u64 {
+pub fn fsType(fd: linux.fd_t) u64 {
     var st: [120]u8 align(8) = undefined;
     if (linux.errno(linux.syscall2(.fstatfs, std.math.cast(usize, fd) orelse return 0, @intFromPtr(&st))) != .SUCCESS)
         return 0;
@@ -1056,7 +1335,7 @@ fn fsType(fd: linux.fd_t) u64 {
 /// Whether a read lease on this filesystem is refused while a writable mapping holds the file:
 /// only those it was seen on (the test "a file a shared mapping still writes"). A file anywhere
 /// else is read again at each check, which costs a read and never trust.
-fn leasesSeeMappings(fs_type: u64) bool {
+pub fn leasesSeeMappings(fs_type: u64) bool {
     const ext4 = 0xef53;
     const tmpfs = 0x01021994;
     return fs_type == ext4 or fs_type == tmpfs;
@@ -1853,4 +2132,171 @@ test "tool trees: a change after an answer is in the next answer, whatever the t
         try std.testing.expect(!std.mem.eql(u8, last.env, now.env) or !std.mem.eql(u8, last.full, now.full));
         last = now;
     }
+}
+
+/// The walk's limits where the files' ctimes are not held against them (a tree written just now).
+fn idleNow() Limits {
+    var l = idle_limits;
+    l.racy_s = 0;
+    return l;
+}
+
+fn skipWithoutLeases(arena: Allocator, f: Fixture) !void {
+    const fd = linux.open(try arena.dupeSentinel(u8, f.cache, 0), .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    try std.testing.expect(linux.errno(fd) == .SUCCESS);
+    defer _ = linux.close(std.math.cast(linux.fd_t, fd).?);
+    if (!leasesSeeMappings(fsType(std.math.cast(linux.fd_t, fd).?))) return error.SkipZigTest;
+}
+
+fn verdictPath(arena: Allocator, f: Fixture) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}/{s}", .{ f.lists, verdict_name });
+}
+
+const left_now: Left = .{ .ino = 7, .sec = 1_700_000_000, .nsec = 123 };
+
+test "tool trees: an idle walk leaves a verdict that the next job takes, once, as a walk would give it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    try skipWithoutLeases(arena, f);
+    const cwd = std.Io.Dir.cwd();
+    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, idleNow()));
+    try cwd.access(io, try verdictPath(arena, f), .{});
+    const walked = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    const taken = takeVerdict(arena, io, f.lists, "/t", left_now, true) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(walked.env, taken.env);
+    try std.testing.expectEqualStrings(walked.full, taken.full);
+    try expectIn(taken.note, "as the last job left it");
+    // Read and removed: the next job to open the volume walks.
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, try verdictPath(arena, f), .{}));
+    try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", left_now, true));
+}
+
+test "tool trees: a verdict is not used for another boot, mount, last open, age, or a job that checks nothing" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    try skipWithoutLeases(arena, f);
+    const cwd = std.Io.Dir.cwd();
+    const path = try verdictPath(arena, f);
+    const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
+    const boot = bootId(arena, io) orelse return error.SkipZigTest;
+    const lim = idleNow();
+    // Each is a verdict that a walk made, changed in one thing, or taken by a job in another.
+    const Case = struct { from: []const u8, to: []const u8 };
+    const cases = [_]Case{
+        .{ .from = "boot ", .to = "boot 00000000-0000-0000-0000-000000000000\nold " }, // another boot
+        .{ .from = "mount /t", .to = "mount /u" },
+        .{ .from = "lock 7 ", .to = "lock 8 " },
+        .{ .from = "lock 7 1700000000 ", .to = "lock 7 1700000001 " },
+        .{ .from = "lock 7 1700000000 123", .to = "lock 7 1700000000 124" },
+    };
+    for (cases) |c| {
+        try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim));
+        const text = try cwd.readFileAlloc(io, path, arena, .unlimited);
+        const at = std.mem.indexOf(u8, text, c.from) orelse return error.TestUnexpectedResult;
+        const changed = try std.mem.concat(arena, u8, &.{ text[0..at], c.to, text[at + c.from.len ..] });
+        try cwd.writeFile(io, .{ .sub_path = path, .data = changed });
+        try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", left_now, true));
+        try std.testing.expectError(error.FileNotFound, cwd.access(io, path, .{}));
+    }
+    // What the volume's last open was: any other open of it, or a volume made again.
+    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim));
+    for ([_]Left{
+        .{ .ino = 7, .sec = left_now.sec + 1, .nsec = 123 },
+        .{ .ino = 9, .sec = left_now.sec, .nsec = 123 },
+    }) |other| {
+        try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", other, true));
+        try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim));
+    }
+    try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", null, true));
+    // A job that does not check the trees takes nothing, and the verdict is gone for the next.
+    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim));
+    try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", left_now, false));
+    try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", left_now, true));
+    // Age: past the limit, and from the future (a clock set back).
+    for ([_]i64{ now_ms - verdict_max_age_ms - 5_000, now_ms + 60_000 }) |at_ms| {
+        try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim));
+        const text = try cwd.readFileAlloc(io, path, arena, .unlimited);
+        const from = try std.fmt.allocPrint(arena, "boot {s}\nat ", .{boot});
+        const start = std.mem.indexOf(u8, text, from).? + from.len;
+        const end = std.mem.indexOfScalarPos(u8, text, start, '\n').?;
+        const changed = try std.fmt.allocPrint(arena, "{s}{d}{s}", .{ text[0..start], at_ms, text[end..] });
+        try cwd.writeFile(io, .{ .sub_path = path, .data = changed });
+        try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", left_now, true));
+    }
+    // Not whole (cut short, or corrupted): nothing is taken from it.
+    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim));
+    const text = try cwd.readFileAlloc(io, path, arena, .unlimited);
+    try cwd.writeFile(io, .{ .sub_path = path, .data = text[0 .. text.len - 6] });
+    try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", left_now, true));
+}
+
+test "tool trees: no verdict from a walk with racy files, one cut short, or a tree left out, nor while one cannot be removed" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    try skipWithoutLeases(arena, f);
+    const cwd = std.Io.Dir.cwd();
+    const gpa = std.testing.allocator;
+    const path = try verdictPath(arena, f);
+    // Everything was written within the hour: all of it is racy.
+    var racy = idleNow();
+    racy.racy_s = 3600;
+    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, racy));
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, path, .{}));
+    // A tree that gives up (here, for too many files) is left out: the next job's walk says so.
+    var small = idleNow();
+    small.tree_files = 1;
+    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, small));
+    // Out of time at the first look.
+    var late = idleNow();
+    late.time_ms = -1_000_000;
+    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, late));
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, path, .{}));
+    // And the older verdict a failed walk finds is gone, not left to be read.
+    try std.testing.expect(walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, idleNow()));
+    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, racy));
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, path, .{}));
+    // A verdict that cannot be removed is not read (here, a directory where it is).
+    try cwd.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/in", .{path}));
+    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, idleNow()));
+    try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", left_now, true));
+}
+
+test "tool trees: a job that let go with processes that may remain stops verdicts until the runner's next first job" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    try skipWithoutLeases(arena, f);
+    const gpa = std.testing.allocator;
+    const cwd = std.Io.Dir.cwd();
+    const root = std.fs.path.dirname(f.lists).?;
+    const store = try std.fmt.allocPrint(arena, "{s}/store", .{root});
+    const one = try std.fmt.allocPrint(arena, "{s}/tool-trees/aa", .{store});
+    try std.testing.expect(markUnproven(arena, io, one));
+    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, one, "/t", left_now, idleNow()));
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ one, verdict_name }), .{}));
+    try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ one, verdict_name }), .data = "x" });
+    dropVerdicts(arena, io, store);
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ one, verdict_name }), .{}));
+    try std.testing.expectError(error.FileNotFound, cwd.access(io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ one, unproven_name }), .{}));
+    // With the mark gone the walk is kept again.
+    try std.testing.expect(walkIdle(arena, gpa, io, f.cache, one, "/t", left_now, idleNow()));
 }

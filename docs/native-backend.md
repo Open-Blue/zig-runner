@@ -1166,6 +1166,39 @@ changes, only that file's ctime shows it, so no cheaper memo of the tree is as s
 A walk the job's cancel or the clock cut short is its leader's alone. The key is the volume's host
 directory, its list directory and its mount, so volumes of other scopes never share a walk.
 
+The walk is made by the last job out, when it can (`tool_trees.walkIdle`, `Backend.walkToolCacheIdle`),
+and the next job is told its answer instead of walking: a "verdict" kept in the runner's store
+(`tool-trees/<hash>/.verdict`, beside the lists, in no volume a step mounts). Soundness is that no
+step can have written to the trees between that walk and the job that takes it, and each condition
+that shows it is one a failure of costs a walk, never trust:
+
+- The walk is made only while holding the volume's lock exclusively (`flock` non-blocking, taken
+  after the job's own shared one is given up), so no job anywhere holds the volume, and only after
+  the job's cgroup was removed (`cgroup.Job.removed`: the kernel refuses while a process is left),
+  with the job's volumes let go after that, so any other job's processes were gone when it let go.
+  A job that lets go without that proof (no cgroup, `RUNNER_NATIVE_CGROUP=none`, or a cgroup the
+  kernel would not remove) leaves a `.unproven` mark beside the lists, and no verdict is made while
+  it stands; the runner's first job removes it (after the sweep of what a dead runner left).
+- It is kept only if the walk was whole: not cut short, no budget spent, no tree left out, and no
+  racy file (a file whose ctime is within `racy_s` of the walk's start, or not proven at rest by a
+  read lease), as a later write to one might leave nothing for a later walk to see. The walk's own
+  limits are tighter (5 s, 128 MB read) because a job that opens the volume waits for it, polled so
+  that its cancel is seen (`volumes.openWaiting`).
+- A job reads the verdict when it opens the volume (`volumes.plan`), before any step of any job
+  can write to it, and removes it, whether or not it checks the trees; a verdict that cannot be
+  removed is not used. So a verdict is read only by jobs that opened before the first removal, and
+  every step of every job runs after that.
+- A verdict is of one boot (`boot_id`), one mount path, and the volume's lock file as its last
+  open left it (inode and mtime, which every open sets: an open by anything that does not take
+  verdicts, such as an older runner, and an evicted and recreated volume, are differences).
+  Two jobs that open together are not both told: the second finds the first's open in the mtime and
+  walks (`checkOnce`, as above).
+- Host-side changes while no job is in the volume: the runner's first job drops every verdict, and
+  one is not used past an hour (`tool_trees.verdict_max_age_ms`) or from the future.
+
+On a filesystem where no lease proves a file at rest (anything but ext4 and tmpfs, `leasesSeeMappings`)
+every file is racy, so no verdict is made there.
+
 The check differs from the script where it runs. The script runs as root in the job's image, in a
 container; the port runs in the runner's process, on a directory a job can write, so it is confined
 and bounded:

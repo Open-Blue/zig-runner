@@ -1,0 +1,3 @@
+kind: Changed
+body: The last job out of the tool cache's volume walks its trees for the next job, which is told the answer instead of walking, when no job holds the volume, every process of the job is gone, and the walk was whole with no racy file; a job that opens a volume the last job is walking waits cancellably
+time: 2026-11-10T08:46:36.417020029-05:00

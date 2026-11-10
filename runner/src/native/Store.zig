@@ -454,7 +454,12 @@ pub fn checkEntry(s: Store, arena: Allocator, io: std.Io, name: []const u8) !?u6
 pub fn checkOncePerBoot(s: Store, arena: Allocator, io: std.Io) void {
     const cwd = std.Io.Dir.cwd();
     const mark = join(arena, s.root, "boot") catch return;
-    const boot = cwd.readFileAlloc(io, "/proc/sys/kernel/random/boot_id", arena, .limited(64)) catch return;
+    // `readFile`, which reads to the end, and not `readFileAlloc`: a /proc file's size is 0, so
+    // that read nothing, every boot matched the empty mark, and no boot after the first was ever
+    // checked.
+    var boot_buf: [64]u8 = undefined;
+    const boot = cwd.readFile(io, "/proc/sys/kernel/random/boot_id", &boot_buf) catch return;
+    if (boot.len == 0) return;
     if (checkedIn(arena, io, mark, boot)) return;
     const gc = cwd.createFile(io, join(arena, s.root, "gc.lock") catch return, .{
         .truncate = false,
@@ -2026,8 +2031,15 @@ test "native store: after a boot a layer whose tree changed is evicted, once" {
     l1.lock.close(io);
     const cut, const l2 = try testLayer(arena, io, tmp, &s, "cut");
     l2.lock.close(io);
-    // This boot's check passes both, and marks the store.
+    // This boot's check passes both, and marks the store with this boot's id: a mark that came
+    // out empty (the id read as 0 bytes, as /proc files are by their size) would match an empty
+    // read on every later boot, and no boot would be checked again.
     s.checkOncePerBoot(arena, io);
+    var id_buf: [64]u8 = undefined;
+    const id = try std.Io.Dir.cwd().readFile(io, "/proc/sys/kernel/random/boot_id", &id_buf);
+    try std.testing.expectEqual(@as(usize, 37), id.len);
+    const mark = try tmp.dir.readFileAlloc(io, "store/boot", arena, .limited(64));
+    try std.testing.expectEqualStrings(id, mark);
     (try s.open(arena, io, kept)).?.layer.lock.close(io);
     (try s.open(arena, io, cut)).?.layer.lock.close(io);
 

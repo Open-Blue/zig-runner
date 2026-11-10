@@ -56,6 +56,8 @@ pub const Phase = enum {
     // The job's teardown (`Backend.deinit`).
     services,
     cgroup_rm,
+    // The tool cache's trees walked once no job holds them (`Backend.walkToolCacheIdle`).
+    tool_walk,
     veth_rm,
     tree_rm,
     collect,
