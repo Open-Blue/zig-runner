@@ -1,0 +1,3 @@
+kind: Changed
+body: A native job's end now shows the parts of its collect (touch, directory sync, scan, evict, rest), and a pass queues evicted layers for the reaper without starting its thread until the pass is done, so the thread's directory sync and deletes cannot slow the pass's own renames and unlinks on a slow disk
+time: 2026-11-10T14:44:32.985275074-05:00

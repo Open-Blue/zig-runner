@@ -42,6 +42,9 @@ var stuck_count: usize = 0;
 
 const gpa = std.heap.page_allocator;
 
+/// Whether a `collect` is queuing trees now: the thread takes no tree meanwhile (`hold`).
+var holding = false;
+
 /// Tests: while set, the thread deletes nothing, so a test can fill the queue.
 pub var test_hold: std.atomic.Value(bool) = .init(false);
 
@@ -56,19 +59,52 @@ pub fn enqueue(io: std.Io, path: []const u8) bool {
     const copy = gpa.dupe(u8, path) catch return false;
     queue[queued] = copy;
     queued += 1;
-    if (!running) {
-        running = true;
-        // The default stack: a delete of a deep tree and its permissions' repair (`Store.removeTree`)
-        // keep path buffers on it, and 256 KiB overflowed in a debug build.
-        const thread = std.Thread.spawn(.{}, run, .{io}) catch {
-            running = false;
-            queued -= 1;
-            gpa.free(copy);
-            return false;
-        };
-        thread.detach();
+    // A thread alive goes on to it; else `release` starts one once `collect` is done.
+    if (!holding and !running and !spawn(io)) {
+        queued -= 1;
+        gpa.free(copy);
+        return false;
     }
     return true;
+}
+
+/// Starts the thread, under `mu`; false when none could be.
+fn spawn(io: std.Io) bool {
+    running = true;
+    // The default stack: a delete of a deep tree and its permissions' repair (`Store.removeTree`)
+    // keep path buffers on it, and 256 KiB overflowed in a debug build.
+    const thread = std.Thread.spawn(.{}, run, .{io}) catch {
+        running = false;
+        return false;
+    };
+    thread.detach();
+    return true;
+}
+
+/// Called by a `collect` before it queues: the trees it evicts wait, the thread untouched, until
+/// `release`. The thread's directory sync and its deletes are journal writes, and on a slow disk
+/// (an SD card) the renames, unlinks and directory reads that `collect` goes on with wait behind
+/// them, the job's end with them: queued only once its own work is done, the deletes cost it
+/// nothing. A tree the thread is deleting already goes on, and it stops after that one.
+pub fn hold(io: std.Io) void {
+    mu.lockUncancelable(io);
+    defer mu.unlock(io);
+    holding = true;
+}
+
+/// Called when that `collect` is done: the thread starts if there is a tree to delete and none is
+/// running. When none can start, the trees are deleted here, as when the queue is full.
+pub fn release(io: std.Io) void {
+    mu.lockUncancelable(io);
+    holding = false;
+    defer mu.unlock(io);
+    if (queued == 0 or running) return;
+    if (spawn(io)) return;
+    // No thread: this one deletes, with `running` set so that no other starts meanwhile.
+    running = true;
+    mu.unlock(io);
+    run(io);
+    mu.lockUncancelable(io);
 }
 
 fn known(path: []const u8) bool {
@@ -116,7 +152,7 @@ fn run(io: std.Io) void {
 fn next(io: std.Io) ?[]u8 {
     mu.lockUncancelable(io);
     defer mu.unlock(io);
-    if (queued == 0) {
+    if (queued == 0 or holding) {
         running = false;
         return null;
     }

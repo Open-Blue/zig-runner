@@ -906,13 +906,29 @@ fn join(arena: Allocator, dir: []const u8, name: []const u8) ![]const u8 {
 /// of keys no step is running, and keeps what is beside the layers within its own limits
 /// (`evict.run`). One runner at a time collects; another finding it busy goes on.
 pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
+    s.collectTimed(arena, io, null);
+}
+
+/// `collect`, its scan, its evictions and the rest sampled into `ph` when given (`phases.zig`).
+pub fn collectTimed(s: Store, arena: Allocator, io: std.Io, ph: ?*phases.Phases) void {
+    const t = phases.now();
     const cwd = std.Io.Dir.cwd();
     const gc = cwd.createFile(io, join(arena, s.root, "gc.lock") catch return, .{
         .truncate = false,
     }) catch return;
     defer gc.close(io);
     if (!flock(gc, lock_ex | lock_nb)) return;
+    // The deletes of what this pass evicts start when it is done (`reaper.hold`).
+    if (s.defer_delete) {
+        reaper.hold(io);
+        defer reaper.release(io);
+        s.collectLocked(arena, io, ph, t);
+    } else s.collectLocked(arena, io, ph, t);
+}
 
+fn collectLocked(s: Store, arena: Allocator, io: std.Io, ph: ?*phases.Phases, start: u64) void {
+    var t = start;
+    const cwd = std.Io.Dir.cwd();
     const layers = join(arena, s.root, "layers") catch return;
     var dir = cwd.openDir(io, layers, .{ .iterate = true }) catch return;
     defer dir.close(io);
@@ -960,6 +976,7 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
             .used_ns = used_ns,
         }) catch return;
     }
+    if (ph) |p| t = p.since(arena, .collect_scan, t);
     // The disk's floor counts here first: a layer is the cheapest thing the store has to make
     // again. So under it a layer goes as the rest does (`evict.floor`), sparing recent use, and
     // only past the cap whatever its use.
@@ -983,9 +1000,11 @@ pub fn collect(s: Store, arena: Allocator, io: std.Io) void {
             }
         }
     }
+    if (ph) |p| t = p.since(arena, .collect_evict, t);
     s.dropKeyLocks(arena, io);
     key_diff.sweep(arena, io, s.root);
     Eviction.run(s, io);
+    if (ph) |p| _ = p.since(arena, .collect_rest, t);
 }
 
 /// What an entry counts for against the cap: its tree, and its record, as a step that printed much
@@ -2955,9 +2974,9 @@ test "native store: a full queue is deleted inline, and the floor waits for what
     reaper.test_hold.store(true, .release);
     defer reaper.test_hold.store(false, .release);
     s.collect(arena, io);
-    // The thread took one and 16 wait; the other three were deleted by `collect`, as they were
+    // The thread starts only after the pass, so 16 wait; the other four were deleted by `collect`, as they were
     // before the reaper, so a store evicting faster than the disk deletes is slowed, not grown.
-    try std.testing.expectEqual(@as(usize, 17), (try layerNames(arena, io, s)).len);
+    try std.testing.expectEqual(@as(usize, 16), (try layerNames(arena, io, s)).len);
     // The disk is short by any measure here, but its room is not back yet.
     s.limits.min_free_pct = 100;
     try std.testing.expect(Eviction.shortOf(arena, io, s) == null);
@@ -3150,4 +3169,27 @@ test "native store: sameFile tells the file a path names from another on the sam
     try tmp.dir.deleteFile(io, "one");
     try tmp.dir.writeFile(io, .{ .sub_path = "one", .data = "1" });
     try std.testing.expect(!sameFile(arena, f, one));
+}
+
+test "native store: trees queued while a collect holds the reaper wait for its release" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const s: Store = .{ .root = root, .defer_delete = true };
+    try tmp.dir.createDirPath(io, ".dead-0123456789abcdef/fs");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".dead-0123456789abcdef/fs/f", .data = "x" });
+    const dead = try join(arena, root, ".dead-0123456789abcdef");
+    reaper.hold(io);
+    s.discard(arena, io, dead);
+    // Queued, and no thread takes it while the pass goes on: its deletes would wait its renames.
+    io.sleep(.fromMilliseconds(100), .awake) catch {};
+    try std.testing.expect(reaper.pending(io));
+    try tmp.dir.access(io, ".dead-0123456789abcdef/fs/f", .{});
+    reaper.release(io);
+    reaper.drain(io);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".dead-0123456789abcdef", .{}));
 }
