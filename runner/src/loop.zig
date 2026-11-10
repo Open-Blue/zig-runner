@@ -174,6 +174,7 @@ pub fn pool(c: Runner, n: u32) !Exit {
         const entries = try c.arena.alloc(admission.Admission.Slot, n + 1);
         m.* = .init(c.io, c.cfg.admission_limits, entries);
         m.native = c.cfg.backend == .native;
+        m.health_interval_ms = c.cfg.health_interval_secs *| std.time.ms_per_s;
         m.engine.source = engineSource(c.cfg);
         break :m m;
     } else null;
@@ -210,7 +211,7 @@ pub fn pool(c: Runner, n: u32) !Exit {
     defer if (memory) |m| m.flush();
     // Measures the jobs running, for what jobs of their names reserve next; ends with the pool.
     var sampling: ?std.Io.Future(void) = if (memory) |m|
-        c.io.concurrent(admission.Admission.sample, .{m}) catch null
+        c.io.concurrent(sampleAndReport, .{ c, m }) catch null
     else
         null;
     defer if (sampling) |*f| f.cancel(c.io);
@@ -400,6 +401,20 @@ fn holdingBack(c: Runner, g: *admission.Gate, hold: admission.Hold) void {
     if (g.announced) return;
     sayUnallocated(c, "'{s}' holding back from new jobs: {f}", .{ c.name, hold });
     g.announced = true;
+}
+
+/// `Admission.sample`, and the health line (`Admission.heartbeat`) after each second's reading,
+/// until cancelled with the pool. The sampler already wakes every second, so the line needs no
+/// thread or timer of its own; its buffer is on this stack, so it is said however little memory
+/// the machine has left.
+fn sampleAndReport(c: Runner, m: *admission.Admission) void {
+    while (true) {
+        c.io.sleep(.fromSeconds(1), .awake) catch return;
+        m.tick();
+        var buf: [2048]u8 = undefined;
+        if (m.heartbeat(&buf)) |line| c.log.say(line) catch |e|
+            std.log.warn("health line not written: {s}", .{@errorName(e)});
+    }
 }
 
 /// As `say`, on the stack: `serve`'s runner has the process's arena, which a line for every hold
@@ -831,6 +846,7 @@ pub const Warmer = struct {
             }
             w.gate.leave(true);
             w.gate.assigned(admission.jobKey("", "", job_name));
+            w.gate.named(job_name);
             w.admitted = true;
         }
         w.admitted_ms = std.Io.Clock.awake.now(w.c.io).toMilliseconds();

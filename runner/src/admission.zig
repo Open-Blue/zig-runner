@@ -111,6 +111,9 @@ pub const high_grow_margin_mb = 256;
 pub const Paths = struct {
     meminfo: []const u8 = "/proc/meminfo",
     pressure: []const u8 = "/proc/pressure/memory",
+    /// Read for the health line only (`Admission.heartbeat`), never by the gate.
+    pressure_io: []const u8 = "/proc/pressure/io",
+    loadavg: []const u8 = "/proc/loadavg",
     /// Where the cgroup v2 hierarchy is mounted: the paths in `/proc/<pid>/cgroup` are under it.
     cgroup_root: []const u8 = "/sys/fs/cgroup",
     /// The runner's own cgroup (`runnerMemory`).
@@ -170,6 +173,12 @@ pub const Admission = struct {
     engine: Engine = .{},
     /// Where `learned` and `learned_native` are kept between runs, after `restore`.
     persist: ?Persist = null,
+    /// How often `heartbeat` says how the machine and the gate are doing, in ms; 0 never
+    /// (`Config.health_interval_secs`).
+    health_interval_ms: u32 = 0,
+    /// When the last health line was due (awake clock, ms); null before the first. Kept across idle
+    /// stretches, so a stream of short jobs logs once per interval, not once per job.
+    health_last_ms: ?i64 = null,
 
     /// One runner's job. Cleared when the job ends, so a job that is over reserves nothing,
     /// however soon it ended.
@@ -212,6 +221,11 @@ pub const Admission = struct {
         /// The job started although it did not fit beside the first in line, because it is
         /// expected to finish soon (`Admission.aheadOpen`, #415).
         ahead: bool = false,
+        /// The job's name for the health line (`Gate.named`): printable ASCII, cut short.
+        name_buf: [name_max]u8 = @splat(0),
+        name_len: u8 = 0,
+
+        pub const name_max = 20;
 
         fn cgroup(s: *const Slot) ?[]const u8 {
             return if (s.cgroup_len > 0) s.cgroup_buf[0..s.cgroup_len] else null;
@@ -476,14 +490,67 @@ pub const Admission = struct {
         s.peak_mb = e.used_mb;
     }
 
+    /// The health line for `buf`, when one is due: `health_interval_ms` have passed since the last
+    /// and a job runs or waits; null otherwise, so an idle pool's log stays quiet. Only the stack
+    /// and `buf` are used, so it can be said while the machine is out of memory. The machine's
+    /// files are read here once per line, through the readers the gate uses.
+    pub fn heartbeat(a: *Admission, buf: []u8) ?[]const u8 {
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
+        var active = false;
+        for (a.slots) |s| active = active or s.running();
+        if (!healthDue(a.health_interval_ms, a.health_last_ms, now_ms, active)) return null;
+        a.health_last_ms = now_ms;
+        const engine = if (a.engine.dir) |dir| readEngine(a.io, dir) else null;
+        var snap = readHealth(a.io, a.paths);
+        snap.reserved_mb = a.reserved(now_ms, a.polling, true).mb;
+        var jobs: [max_health_jobs]HealthJob = undefined;
+        var listed: usize = 0;
+        var more: u32 = 0;
+        for (a.slots) |*s| {
+            if (!s.running()) continue;
+            if (s.waiting) {
+                snap.waiting += 1;
+                continue;
+            }
+            snap.running += 1;
+            if (listed == jobs.len) {
+                more += 1;
+                continue;
+            }
+            var j: HealthJob = .{ .elapsed_ms = now_ms -| s.started_ms };
+            j.setName(s.name_buf[0..s.name_len]);
+            if (s.native) {
+                if (s.cgroup()) |dir| j.mb = workingSetMb(a.io, dir);
+            } else if (engine) |e| {
+                // One cgroup for every job on the engine: its working set, not the job's own.
+                j.mb = e.used_mb;
+                j.on_engine = true;
+            }
+            jobs[listed] = j;
+            listed += 1;
+        }
+        var w: std.Io.Writer = .fixed(buf);
+        // A line too long for the buffer is sent cut, not lost.
+        writeHealth(&w, snap, jobs[0..listed], more) catch return w.buffered();
+        return w.buffered();
+    }
+
     /// Raises the peak of every job running, once a second, from the engine's working set, until
     /// cancelled with the pool. It reads nothing while no job is being measured.
     pub fn sample(a: *Admission) void {
         while (true) {
             a.io.sleep(.fromSeconds(1), .awake) catch return;
-            a.samplePeaks();
-            a.persistNow(false);
+            a.tick();
         }
+    }
+
+    /// What `sample` does each second; the pool's own sampler (`loop.sampleAndReport`) also says
+    /// the health line after it.
+    pub fn tick(a: *Admission) void {
+        a.samplePeaks();
+        a.persistNow(false);
     }
 
     /// A Dagger job's peak is the engine's, not its own: the engine is one cgroup for every job,
@@ -885,6 +952,17 @@ pub const Gate = struct {
         // nothing is measured on the engine, nothing learned, and every job there reserves
         // `per_job_mb`.
         a.engineBaseline(s);
+    }
+
+    /// The job's name, as the health line shows it (`Admission.heartbeat`). Not the gate's key: that
+    /// is a hash, which says nothing to someone reading the log after an outage.
+    pub fn named(g: *Gate, name: []const u8) void {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const s = &a.slots[g.slot];
+        if (!s.running()) return;
+        s.name_len = std.math.lossyCast(u8, copyPrintable(&s.name_buf, name));
     }
 
     /// The runner's job runs on the native backend, in the cgroup `dir` (`native/cgroup.zig`), or
@@ -1835,7 +1913,12 @@ fn cappedAncestor(io: std.Io, root: []const u8, start: []const u8, buf: []u8) ![
 }
 
 /// `MemAvailable`, and swap in use, in MB.
-pub fn parseMeminfo(text: []const u8) struct { available_mb: ?u64, swap_used_mb: ?u64, total_mb: ?u64 } {
+pub fn parseMeminfo(text: []const u8) struct {
+    available_mb: ?u64,
+    swap_used_mb: ?u64,
+    total_mb: ?u64,
+    swap_free_mb: ?u64 = null,
+} {
     var available: ?u64 = null;
     var total: ?u64 = null;
     var swap_total: ?u64 = null;
@@ -1856,15 +1939,25 @@ pub fn parseMeminfo(text: []const u8) struct { available_mb: ?u64, swap_used_mb:
         swap_total.? -| swap_free.?
     else
         null;
-    return .{ .available_mb = available, .swap_used_mb = swap_used, .total_mb = total };
+    return .{
+        .available_mb = available,
+        .swap_used_mb = swap_used,
+        .total_mb = total,
+        .swap_free_mb = swap_free,
+    };
 }
 
 /// `some avg10` from /proc/pressure/memory, in hundredths of a percent ("12.34" is 1234).
 pub fn parsePressure(text: []const u8) ?u32 {
+    return parsePressureKind(text, "some ");
+}
+
+/// `avg10` of the line starting with `kind` ("some " or "full ") in a PSI file, as `parsePressure`.
+fn parsePressureKind(text: []const u8, kind: []const u8) ?u32 {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "some ")) continue;
-        var fields = std.mem.tokenizeScalar(u8, line["some ".len..], ' ');
+        if (!std.mem.startsWith(u8, line, kind)) continue;
+        var fields = std.mem.tokenizeScalar(u8, line[kind.len..], ' ');
         while (fields.next()) |field| {
             if (!std.mem.startsWith(u8, field, "avg10=")) continue;
             return hundredths(field["avg10=".len..]);
@@ -1885,6 +1978,287 @@ fn hundredths(s: []const u8) ?u32 {
         if (digits.len == 1) frac *= 10;
     }
     return whole * 100 + frac;
+}
+
+// ---- The health line (`Admission.heartbeat`) ----
+
+/// Most jobs named in one health line; the rest are counted ("+3 more").
+const max_health_jobs = 16;
+
+/// A health line goes on a second line, `health: jobs ...`, once the first is this long.
+const health_wrap = 160;
+
+/// Whether the health line is due: the setting is on, a job runs or waits, and `interval_ms` have
+/// passed since the last (or none was said yet).
+pub fn healthDue(interval_ms: u32, last_ms: ?i64, now_ms: i64, active: bool) bool {
+    if (interval_ms == 0 or !active) return false;
+    const last = last_ms orelse return true;
+    return now_ms - last >= interval_ms;
+}
+
+/// What the machine and the gate look like, for one health line. A field that could not be read
+/// (another OS, a kernel without PSI) is null and prints as "?". PSI in hundredths of a percent.
+pub const HealthSnapshot = struct {
+    available_mb: ?u64 = null,
+    swap_free_mb: ?u64 = null,
+    mem_some: ?u32 = null,
+    mem_full: ?u32 = null,
+    io_some: ?u32 = null,
+    /// The 1, 5 and 15 minute load averages, in hundredths.
+    load: ?[3]u32 = null,
+    reserved_mb: u64 = 0,
+    running: u32 = 0,
+    waiting: u32 = 0,
+};
+
+/// A job running, for the health line.
+pub const HealthJob = struct {
+    name_buf: [Admission.Slot.name_max]u8 = @splat(0),
+    name_len: u8 = 0,
+    elapsed_ms: i64,
+    /// Its working set; null if not readable.
+    mb: ?u64 = null,
+    /// `mb` is the engine's, shared by every job on it, not the job's own.
+    on_engine: bool = false,
+
+    fn setName(j: *HealthJob, name: []const u8) void {
+        j.name_len = std.math.lossyCast(u8, copyPrintable(&j.name_buf, name));
+    }
+};
+
+/// Copies up to `dest.len` bytes of `name`, each one that is not printable ASCII or is a space as
+/// "_": a job's display name is the workflow author's, and the line is one for grep and one per
+/// job. Returns the length.
+fn copyPrintable(dest: []u8, name: []const u8) usize {
+    const n = @min(dest.len, name.len);
+    for (dest[0..n], name[0..n]) |*d, c| d.* = if (c > ' ' and c < 0x7f) c else '_';
+    return n;
+}
+
+/// The machine's files for a health line: memory, swap, pressure and load. The gate's parsers on
+/// the gate's paths, read into buffers on the stack.
+pub fn readHealth(io: std.Io, paths: Paths) HealthSnapshot {
+    var h: HealthSnapshot = .{};
+    var mem_buf: [4096]u8 = undefined;
+    if (std.Io.Dir.cwd().readFile(io, paths.meminfo, &mem_buf)) |text| {
+        const m = parseMeminfo(text);
+        h.available_mb = m.available_mb;
+        h.swap_free_mb = m.swap_free_mb;
+    } else |_| {}
+    var psi_buf: [256]u8 = undefined;
+    if (std.Io.Dir.cwd().readFile(io, paths.pressure, &psi_buf)) |text| {
+        h.mem_some = parsePressureKind(text, "some ");
+        h.mem_full = parsePressureKind(text, "full ");
+    } else |_| {}
+    if (std.Io.Dir.cwd().readFile(io, paths.pressure_io, &psi_buf)) |text| {
+        h.io_some = parsePressureKind(text, "some ");
+    } else |_| {}
+    var load_buf: [128]u8 = undefined;
+    if (std.Io.Dir.cwd().readFile(io, paths.loadavg, &load_buf)) |text| h.load = parseLoadavg(text) else |_| {}
+    return h;
+}
+
+/// The three load averages of /proc/loadavg ("0.52 0.40 0.35 1/234 5678"), in hundredths.
+fn parseLoadavg(text: []const u8) ?[3]u32 {
+    var fields = std.mem.tokenizeScalar(u8, text, ' ');
+    var load: [3]u32 = undefined;
+    for (&load) |*l| l.* = hundredths(fields.next() orelse return null) orelse return null;
+    return load;
+}
+
+/// Hundredths as "12.34"; "?" for none.
+const Hundredths = struct {
+    v: ?u32,
+
+    pub fn format(h: Hundredths, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const v = h.v orelse return w.writeAll("?");
+        try w.print("{d}.{d:0>2}", .{ v / 100, v % 100 });
+    }
+};
+
+/// MB as "1234M"; "?" for none.
+const Mb = struct {
+    v: ?u64,
+
+    pub fn format(m: Mb, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const v = m.v orelse return w.writeAll("?");
+        try w.print("{d}M", .{v});
+    }
+};
+
+/// A duration in ms as "45s", "3m12s" or "2h05m".
+const Elapsed = struct {
+    ms: i64,
+
+    pub fn format(e: Elapsed, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const s: u64 = std.math.lossyCast(u64, @max(e.ms, 0) / std.time.ms_per_s);
+        if (s < 60) return w.print("{d}s", .{s});
+        if (s < 3600) return w.print("{d}m{d:0>2}s", .{ s / 60, s % 60 });
+        try w.print("{d}h{d:0>2}m", .{ s / 3600, s % 3600 / 60 });
+    }
+};
+
+/// One health line, `health:` first so that it greps, and a second one when the jobs are many:
+/// `health: mem_avail=2310M swap_free=1024M psi_mem=0.12/0.00 psi_io=1.50 load=0.52/0.40/0.35
+/// reserved=3072M running=2 waiting=1 jobs=[build@3m12s=812M zig@45s=~1843M]`. A job's memory is
+/// its cgroup's working set; with a `~` it is the engine's, shared by every job on it. `more` jobs
+/// were not listed. Writes no newline at the end.
+pub fn writeHealth(
+    w: *std.Io.Writer,
+    h: HealthSnapshot,
+    jobs: []const HealthJob,
+    more: u32,
+) std.Io.Writer.Error!void {
+    try w.print("health: mem_avail={f} swap_free={f} psi_mem={f}/{f} psi_io={f} ", .{
+        Mb{ .v = h.available_mb },
+        Mb{ .v = h.swap_free_mb },
+        Hundredths{ .v = h.mem_some },
+        Hundredths{ .v = h.mem_full },
+        Hundredths{ .v = h.io_some },
+    });
+    if (h.load) |l| try w.print("load={f}/{f}/{f}", .{
+        Hundredths{ .v = l[0] },
+        Hundredths{ .v = l[1] },
+        Hundredths{ .v = l[2] },
+    }) else try w.writeAll("load=?");
+    try w.print(" reserved={f} running={d} waiting={d}", .{
+        Mb{ .v = h.reserved_mb },
+        h.running,
+        h.waiting,
+    });
+    if (jobs.len == 0 and more == 0) return;
+    try w.writeAll(" jobs=[");
+    var line_start: usize = 0;
+    for (jobs, 0..) |j, i| {
+        if (i > 0) {
+            if (w.end - line_start > health_wrap) {
+                try w.writeAll("\nhealth: jobs ");
+                line_start = w.end;
+            } else try w.writeByte(' ');
+        }
+        try w.print("{s}@{f}={s}{f}", .{
+            j.name_buf[0..j.name_len],
+            Elapsed{ .ms = j.elapsed_ms },
+            if (j.on_engine) "~" else "",
+            Mb{ .v = j.mb },
+        });
+    }
+    if (more > 0) try w.print(" +{d}more", .{more});
+    try w.writeAll("]");
+}
+
+test "the health line: fixed inputs, exact text" {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var build: HealthJob = .{ .elapsed_ms = 192_000, .mb = 812 };
+    build.setName("build");
+    var zig: HealthJob = .{ .elapsed_ms = 45_000, .mb = 1843, .on_engine = true };
+    zig.setName("zig test");
+    try writeHealth(&w, .{
+        .available_mb = 2310,
+        .swap_free_mb = 1024,
+        .mem_some = 12,
+        .mem_full = 0,
+        .io_some = 150,
+        .load = .{ 52, 40, 1035 },
+        .reserved_mb = 3072,
+        .running = 2,
+        .waiting = 1,
+    }, &.{ build, zig }, 0);
+    try std.testing.expectEqualStrings(
+        "health: mem_avail=2310M swap_free=1024M psi_mem=0.12/0.00 psi_io=1.50 " ++
+            "load=0.52/0.40/10.35 reserved=3072M running=2 waiting=1 " ++
+            "jobs=[build@3m12s=812M zig_test@45s=~1843M]",
+        w.buffered(),
+    );
+}
+
+test "the health line: nothing readable, no jobs, long lists wrap" {
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeHealth(&w, .{}, &.{}, 0);
+    try std.testing.expectEqualStrings(
+        "health: mem_avail=? swap_free=? psi_mem=?/? psi_io=? load=? reserved=0M running=0 waiting=0",
+        w.buffered(),
+    );
+    w = .fixed(&buf);
+    var jobs: [9]HealthJob = undefined;
+    for (&jobs) |*j| {
+        j.* = .{ .elapsed_ms = 7_500_000 };
+        j.setName("a-job-name-of-20ch!");
+    }
+    try writeHealth(&w, .{ .running = 9 }, &jobs, 3);
+    const text = w.buffered();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "\nhealth: jobs a-job-name-of-20ch!@2h05m=?") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, " +3more]"));
+    // A line that does not fit the buffer is cut, not an error that loses it.
+    var small: [40]u8 = undefined;
+    var sw: std.Io.Writer = .fixed(&small);
+    try std.testing.expectError(error.WriteFailed, writeHealth(&sw, .{}, &.{}, 0));
+}
+
+test "job names for the health line are one printable word" {
+    var buf: [Admission.Slot.name_max]u8 = undefined;
+    const n = copyPrintable(&buf, "test (zig)\nforged line, and more");
+    try std.testing.expectEqualStrings("test_(zig)_forged_li", buf[0..n]);
+}
+
+test "the health line is due once per interval, and only while a job runs or waits" {
+    const t = 1_000_000;
+    // Off.
+    try std.testing.expect(!healthDue(0, null, t, true));
+    // Idle: quiet, however long it has been.
+    try std.testing.expect(!healthDue(60_000, null, t, false));
+    try std.testing.expect(!healthDue(60_000, t - 600_000, t, false));
+    // The first line comes at once; then one per interval.
+    try std.testing.expect(healthDue(60_000, null, t, true));
+    try std.testing.expect(!healthDue(60_000, t - 59_999, t, true));
+    try std.testing.expect(healthDue(60_000, t - 60_000, t, true));
+}
+
+test "the pool's heartbeat: quiet while idle, then one line per interval from the gate's readers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "meminfo",
+        .data = "MemAvailable: 2365440 kB\nSwapTotal: 2097152 kB\nSwapFree: 1048576 kB\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "psi",
+        .data = "some avg10=0.12 avg60=0.00 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=1\n",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "psi_io", .data = "some avg10=1.50 avg60=0 avg300=0 total=1\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "load", .data = "0.52 0.40 0.35 1/234 5678\n" });
+    var dir_buf: [4][256]u8 = undefined;
+    const sub = tmp.sub_path;
+    var slots: [2]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
+    pool.paths = .{
+        .meminfo = try std.fmt.bufPrint(&dir_buf[0], ".zig-cache/tmp/{s}/meminfo", .{sub}),
+        .pressure = try std.fmt.bufPrint(&dir_buf[1], ".zig-cache/tmp/{s}/psi", .{sub}),
+        .pressure_io = try std.fmt.bufPrint(&dir_buf[2], ".zig-cache/tmp/{s}/psi_io", .{sub}),
+        .loadavg = try std.fmt.bufPrint(&dir_buf[3], ".zig-cache/tmp/{s}/load", .{sub}),
+    };
+    pool.health_interval_ms = 60_000;
+    var buf: [1024]u8 = undefined;
+    // Idle.
+    try std.testing.expect(pool.heartbeat(&buf) == null);
+    var gate: Gate = .{ .pool = &pool, .slot = 0 };
+    try std.testing.expect(gate.check() == null);
+    gate.leave(true);
+    gate.named("build");
+    const line = pool.heartbeat(&buf).?;
+    try std.testing.expect(std.mem.startsWith(u8, line, "health: mem_avail=2310M swap_free=1024M " ++
+        "psi_mem=0.12/0.00 psi_io=1.50 load=0.52/0.40/0.35 reserved="));
+    try std.testing.expect(std.mem.indexOf(u8, line, " running=1 waiting=0 jobs=[build@") != null);
+    // Not again until the interval has passed.
+    try std.testing.expect(pool.heartbeat(&buf) == null);
+    // The gate's own setting off: never.
+    pool.health_last_ms = null;
+    pool.health_interval_ms = 0;
+    try std.testing.expect(pool.heartbeat(&buf) == null);
 }
 
 test "MemAvailable and swap in use from /proc/meminfo" {
