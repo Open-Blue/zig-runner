@@ -35,6 +35,7 @@
 //! and the steps' own nonces and sleeps are the machine's.
 
 const std = @import("std");
+const Sha256 = @import("../sha256.zig").Sha256;
 const builtin = @import("builtin");
 const linux = std.os.linux;
 
@@ -650,7 +651,7 @@ fn runBuild(w: *Worker, arena: Allocator, io: std.Io, dir: []const u8, n: usize)
         const b = w.rand.uintLessThan(usize, builds);
         if (got[b] != null) continue;
         var key: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(try print(arena, "stress build {d}", .{b}), &key, .{});
+        Sha256.hash(try print(arena, "stress build {d}", .{b}), &key, .{});
         const hex = std.fmt.bytesToHex(key, .lower);
         w.stats.builds += 1;
         got[b] = if (try ls.get(arena, io, &hex)) |p| hit: {

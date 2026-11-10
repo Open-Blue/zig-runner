@@ -57,7 +57,7 @@ const sandbox = @import("sandbox.zig");
 const hash_files = @import("hash_files.zig");
 
 const Allocator = std.mem.Allocator;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha256 = @import("../sha256.zig").Sha256;
 
 /// The second variable (`FULL TREE` lines), beside `set_up.tool_trees_env`.
 pub const full_env = "ZIG_RUNNER_TOOL_TREES_FULL";

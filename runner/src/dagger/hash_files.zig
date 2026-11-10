@@ -2,6 +2,7 @@
 //! (`Fs`), and the found files hashed by `sha256sum` there.
 
 const std = @import("std");
+const Sha256 = @import("../sha256.zig").Sha256;
 const job_mod = @import("../job.zig");
 const sink = @import("../sink.zig");
 const expr = @import("../expr.zig");
@@ -236,7 +237,7 @@ fn foldDigests(
     stdout: []const u8,
     expected: usize,
 ) Allocator.Error!expr.HashFiles.Result {
-    var result = std.crypto.hash.sha2.Sha256.init(.{});
+    var result = Sha256.init(.{});
     var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, stdout, "\n"), '\n');
     var n: usize = 0;
     while (lines.next()) |line_in| {
@@ -315,7 +316,7 @@ test "hashFiles finds files as GitHub's script does, through Dagger, and hashes 
     // In GitHub's order, depth-first; node_modules' file excluded. Directories are skipped there.
     try std.testing.expect(std.mem.indexOf(u8, seen[8], "loadContainerFromID(id:\"C0\") { withNewFile(path:\"/tmp/zig-runner-hashfiles\",contents:\"a/package-lock.json\\npackage-lock.json\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[8], "[ -d \\\"$f\\\" ] ||") != null);
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var h = Sha256.init(.{});
     h.update(&(@as([32]u8, @splat(0x11))));
     h.update(&(@as([32]u8, @splat(0x22))));
     const want = try std.fmt.allocPrint(arena, "echo key-{s}", .{&std.fmt.bytesToHex(h.finalResult(), .lower)});
