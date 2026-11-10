@@ -855,6 +855,51 @@ test "native volumes: the job's caches, by scope and step user, as the Dagger ba
     try std.testing.expect(cached.uv_env == null);
 }
 
+test "native volumes: whatever an untrusted job names, its volumes stay in its own scope's tree" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const testing = @import("../dagger/testing.zig");
+    var job = testing.testJob(&.{testing.testStep("npm ci && zig build test && uv sync")});
+    job.github.repository = "o/r";
+    const opts: Options = .{ .package_caches = true, .trusted = false, .zig_local_cache = true };
+    // The job chooses its image, and the tool cache is a volume per image: none of these names a
+    // place outside the untrusted tree, let alone the repository's (`component`).
+    const images = [_][]const u8{
+        "../../repo/toolcache/x",   "repo/../../repo/npm", "/etc",                 ".",
+        "..",                       "",                    "x.lock",               "x.private-1",
+        "../untrusted/../repo/npm", "ubuntu:24.04/../..",  "a\x00b/../../../repo",
+    };
+    const untrusted_tree = try std.fmt.allocPrint(arena, "{s}/volumes/o/r/untrusted/", .{store});
+    for (images) |image| {
+        var p = try plan(arena, io, store, opts, "untrusted", job, image, false, false, null);
+        defer p.release(io);
+        try std.testing.expect(p.binds.items.len > 0);
+        for (p.binds.items) |b| {
+            try std.testing.expect(std.mem.startsWith(u8, b.host, untrusted_tree));
+            var parts = std.mem.splitScalar(u8, b.host[untrusted_tree.len..], '/');
+            while (parts.next()) |part| {
+                try std.testing.expect(part.len > 0 and !std.mem.eql(u8, part, ".") and !std.mem.eql(u8, part, ".."));
+            }
+        }
+    }
+    // The repository's tree was never made by any of them, and nothing escaped to the store's
+    // other directories.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "volumes/o/r/repo", .{}));
+    var top = try tmp.dir.openDir(io, ".", .{ .iterate = true });
+    defer top.close(io);
+    var it = top.iterate();
+    while (try it.next(io)) |e| try std.testing.expectEqualStrings("volumes", e.name);
+    var vols = try tmp.dir.openDir(io, "volumes/o/r", .{ .iterate = true });
+    defer vols.close(io);
+    var inside = vols.iterate();
+    while (try inside.next(io)) |e| try std.testing.expectEqualStrings("untrusted", e.name);
+}
+
 test "native volumes: the pre-warm names a seed where a job's plan does, for each step user" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
