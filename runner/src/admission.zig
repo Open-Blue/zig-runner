@@ -170,6 +170,11 @@ pub const Admission = struct {
     engine: Engine = .{},
     /// Where `learned` and `learned_native` are kept between runs, after `restore`.
     persist: ?Persist = null,
+    /// The record of reservations the pools of this machine share, if this one takes part
+    /// (`Budget`, `RUNNER_SHARED_MEMORY_BUDGET`); and what the other pools had reserved at the last
+    /// look (`refreshPeers`), which `reserved` counts beside this pool's own.
+    budget: ?Budget = null,
+    peers: Peers = .{},
 
     /// One runner's job. Cleared when the job ends, so a job that is over reserves nothing,
     /// however soon it ended.
@@ -241,11 +246,14 @@ pub const Admission = struct {
 
     fn changed(a: *Admission) void {
         _ = a.epoch.fetchAdd(1, .release);
+        // Every change of a reservation is one the other pools should see.
+        a.publish();
     }
 
     /// What the gate reads now: the machine's and the engine's memory, pressure and swap growth.
     /// With the lock held.
     fn signals(a: *Admission, now_ms: i64) Signals {
+        a.refreshPeers();
         if (a.engine.dir == null) a.engine.find(a.io, a.paths, now_ms);
         const reading = read(a.io, a.paths, a.engine.dir);
         // Its files are gone: the engine's container was recreated, under a new cgroup. The jobs
@@ -334,6 +342,11 @@ pub const Admission = struct {
         var r: Reservation = .{ .jobs = polling };
         r.mb = @as(u64, r.jobs) * a.unknown();
         if (a.native) r.native_mb = r.mb;
+        // The other pools' jobs still ramping up take the machine's memory, not this engine's cap
+        // (`peers`), so they are counted as native ones.
+        r.jobs += a.peers.jobs;
+        r.mb += a.peers.mb;
+        r.native_mb += a.peers.mb;
         for (a.slots) |s| {
             if (s.waiting) {
                 if (!waiters) continue;
@@ -450,6 +463,8 @@ pub const Admission = struct {
         }
         if (a.polling != @intFromBool(claimed)) return false;
         for (a.slots) |s| if (s.waiting or s.running()) return false;
+        // Another pool's job will free its reservation (within `ramp_ms`, or when it ends).
+        if (a.peers.jobs > 0) return false;
         return true;
     }
 
@@ -525,6 +540,7 @@ pub const Admission = struct {
         if (working_mb +| high_grow_margin_mb < high) return;
         const available = read(a.io, a.paths, null).available_mb orelse return;
         const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
+        a.refreshPeers();
         const others = a.reserved(now_ms, 0, true).mb;
         if (available < @as(u64, a.limits.min_available_mb) + others + high_step_mb) return;
         const next = high +| high_step_mb;
@@ -688,6 +704,47 @@ pub const Admission = struct {
             ),
         } catch null;
     }
+
+    /// Reads what the other pools have reserved (`Budget.peers`) into `peers`, which `reserved`
+    /// counts. With the lock held. Nothing is counted without a `budget`, or when it cannot be
+    /// read.
+    fn refreshPeers(a: *Admission) void {
+        const b = &(a.budget orelse return);
+        a.peers = b.peers(a.io, std.Io.Clock.real.now(a.io).toMilliseconds());
+    }
+
+    /// Writes this pool's reservations to the shared record (`Budget.publish`): one for each job
+    /// started less than `ramp_ms` ago, as `reserved` counts them, with the time they stop
+    /// counting. A job waiting for room has not started and reserves nothing there: the pools'
+    /// pollers are not published either, since an engine pool's runners alone would reserve more
+    /// than a small machine has. With the lock held.
+    fn publish(a: *Admission) void {
+        const b = &(a.budget orelse return);
+        const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
+        const wall_ms = std.Io.Clock.real.now(a.io).toMilliseconds();
+        var own: [Budget.max_own]Budget.Mine = undefined;
+        var n: usize = 0;
+        for (a.slots, 0..) |s, i| {
+            if (n == own.len) break;
+            if (s.waiting or !s.running() or s.started_ms <= now_ms - ramp_ms) continue;
+            own[n] = .{
+                .slot = @truncate(i),
+                .mb = a.slotMb(s),
+                .expiry_ms = wall_ms + (s.started_ms + ramp_ms - now_ms),
+            };
+            n += 1;
+        }
+        b.publish(a.io, wall_ms, own[0..n]);
+    }
+
+    /// Takes this pool's lines out of the shared record, at the pool's end: what a runner stopped
+    /// no longer reserves.
+    pub fn release(a: *Admission) void {
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const b = &(a.budget orelse return);
+        b.publish(a.io, std.Io.Clock.real.now(a.io).toMilliseconds(), &.{});
+    }
 };
 
 /// One runner's place at the gate. The runner is counted in `Admission.polling` from the check that
@@ -798,6 +855,7 @@ pub const Gate = struct {
         g.holding = hold != null;
         const h = hold orelse {
             Admission.admit(s, now_ms);
+            a.publish();
             return .started;
         };
         // No room beside the first in line, but room without it, and a name expected to be gone
@@ -812,6 +870,7 @@ pub const Gate = struct {
                 a.aheadOpen(signal, now_ms))
             {
                 Admission.admit(s, now_ms);
+                a.publish();
                 s.ahead = true;
                 g.holding = false;
                 return .started;
@@ -819,6 +878,7 @@ pub const Gate = struct {
         }
         if (!a.firstAlone(g.slot)) return .{ .wait = h };
         Admission.admit(s, now_ms);
+        a.publish();
         g.holding = false;
         return .{ .forced = h };
     }
@@ -830,7 +890,10 @@ pub const Gate = struct {
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
         const s = &a.slots[g.slot];
-        if (s.waiting) Admission.admit(s, std.Io.Clock.awake.now(a.io).toMilliseconds());
+        if (s.waiting) {
+            Admission.admit(s, std.Io.Clock.awake.now(a.io).toMilliseconds());
+            a.publish();
+        }
     }
 
     /// The runner stops polling; `took_job` when because it was handed a job, whose memory is then
@@ -1872,6 +1935,207 @@ fn hundredths(s: []const u8) ?u32 {
     }
     return whole * 100 + frac;
 }
+
+// ---- A memory budget shared by the pools of one machine ----
+
+/// What the other pools of the machine have reserved and not yet used (`Budget.peers`).
+pub const Peers = struct { jobs: u32 = 0, mb: u64 = 0 };
+
+/// The record the pools of one machine keep of what each has reserved for jobs that do not show
+/// in `MemAvailable` yet. Each pool's gate counts only its own reservations (`Admission.reserved`),
+/// so two pools could each admit a job into the same free memory, and on razorbill (three pools,
+/// 8 GB) a pool's job taking its first minutes of memory held the others back as swap growth
+/// while none knew what the others had been promised. A pool writes one line for each job it has
+/// admitted and that is within its ramp (`ramp_ms`), and a gate takes the other pools' lines from
+/// what it considers available, as it does its own pool's reservations: the same rule, so a job
+/// is reserved until it ends or its ramp is over, when its memory is in `MemAvailable`, and never
+/// both.
+///
+/// The record is a text file in a directory only root writes (`default_path`; a runner that is not
+/// root does not share one, see `Admission.budget`), updated under an exclusive `flock` and read
+/// under a shared one. A line holds the pool's name, its process (pid and start time, so that a
+/// pid that was reused is not taken for the process that wrote it), the runner's slot, the MB and
+/// when the reservation expires (wall clock, ms: the pools do not share a monotonic clock). A line
+/// whose process is gone or that has expired is ignored, and pruned at the next write: a runner
+/// that crashed leaves its lines to expire, at most `ramp_ms` after they were written. A file
+/// that is missing, damaged or locked for a second counts as no reservations: the gate is then as
+/// it was before the pools shared one, which is the safe side for a runner and the worse side
+/// for the machine, said once in the log.
+pub const Budget = struct {
+    path: []const u8,
+    /// The pool's name (`RUNNER_NAME_PREFIX`, as a file name: no spaces).
+    pool: []const u8,
+    /// This process, as the lines name it.
+    pid: i32,
+    start: u64,
+    /// Where `/proc/<pid>/stat` is read; tests point it at a fixture.
+    proc: []const u8 = "/proc",
+    /// Lines written and not yet taken back: a pool that never reserved leaves the file alone.
+    wrote: bool = false,
+    warned: bool = false,
+
+    pub const default_path = "/run/zig-runner/memory-budget";
+    const header = "zig-runner memory budget v1";
+    const max_bytes = 32 * 1024;
+    pub const max_own = 256;
+    /// A line that expires later than this is not one a gate wrote.
+    const max_expiry_ms = 2 * ramp_ms;
+
+    /// One of this pool's reservations: a job started and still ramping up.
+    pub const Mine = struct { slot: u32, mb: u64, expiry_ms: i64 };
+
+    /// A budget for this process in the pool `pool`; null when its start time cannot be read, and
+    /// the pools then do not share one.
+    pub fn open(io: std.Io, path: []const u8, pool: []const u8) ?Budget {
+        const pid = std.os.linux.getpid();
+        const start = processStart(io, "/proc", pid) orelse return null;
+        return .{ .path = path, .pool = pool, .pid = pid, .start = start };
+    }
+
+    /// The start time of `pid` in clock ticks since boot (field 22 of `<proc>/<pid>/stat`), or
+    /// null when there is no such process. Whoever reuses the pid starts later.
+    fn processStart(io: std.Io, proc: []const u8, pid: i32) ?u64 {
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{d}/stat", .{ proc, pid }) catch return null;
+        var buf: [1024]u8 = undefined;
+        const text = std.Io.Dir.cwd().readFile(io, path, &buf) catch return null;
+        // The command name, which may hold spaces and brackets, is the one thing that ends at the
+        // last `)`; the fields after it are 3 (state) onwards.
+        const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return null;
+        var fields = std.mem.tokenizeScalar(u8, text[close + 1 ..], ' ');
+        for (0..19) |_| _ = fields.next() orelse return null;
+        const ticks = std.mem.trimEnd(u8, fields.next() orelse return null, "\n");
+        return std.fmt.parseInt(u64, ticks, 10) catch null;
+    }
+
+    const Line = struct {
+        pool: []const u8,
+        pid: i32,
+        start: u64,
+        slot: u32,
+        mb: u64,
+        expiry_ms: i64,
+    };
+
+    fn parseLine(line: []const u8) ?Line {
+        var f = std.mem.tokenizeScalar(u8, line, ' ');
+        return .{
+            .pool = f.next() orelse return null,
+            .pid = std.fmt.parseInt(i32, f.next() orelse return null, 10) catch return null,
+            .start = std.fmt.parseInt(u64, f.next() orelse return null, 10) catch return null,
+            .slot = std.fmt.parseInt(u32, f.next() orelse return null, 10) catch return null,
+            .mb = std.fmt.parseInt(u64, f.next() orelse return null, 10) catch return null,
+            .expiry_ms = std.fmt.parseInt(i64, f.next() orelse return null, 10) catch return null,
+        };
+    }
+
+    fn isMine(b: *const Budget, l: Line) bool {
+        return l.pid == b.pid and l.start == b.start and std.mem.eql(u8, l.pool, b.pool);
+    }
+
+    /// Whether a line still reserves: not expired, and written by a process that is still the one
+    /// running under that pid.
+    fn live(b: *const Budget, io: std.Io, l: Line, now_ms: i64) bool {
+        if (l.expiry_ms <= now_ms or l.expiry_ms > now_ms + max_expiry_ms) return false;
+        if (b.isMine(l)) return true;
+        return (processStart(io, b.proc, l.pid) orelse return false) == l.start;
+    }
+
+    /// The file locked as `how` says, waiting up to a second for another gate's update, which is
+    /// a few lines long.
+    fn lock(b: *const Budget, io: std.Io, how: std.Io.File.Lock, create: bool) !std.Io.File {
+        const cwd = std.Io.Dir.cwd();
+        if (create) try cwd.createDirPath(io, std.fs.path.dirname(b.path) orelse "/");
+        const f = if (create)
+            try cwd.createFile(io, b.path, .{
+                .read = true,
+                .truncate = false,
+                .permissions = .fromMode(0o600),
+            })
+        else
+            try cwd.openFile(io, b.path, .{ .mode = .read_write });
+        errdefer f.close(io);
+        for (0..50) |_| {
+            if (try f.tryLock(io, how)) return f;
+            try io.sleep(.fromMilliseconds(20), .awake);
+        }
+        return error.Locked;
+    }
+
+    /// What the other pools have reserved, live at `now_ms` (wall clock). None when the file is
+    /// missing, damaged or cannot be locked.
+    pub fn peers(b: *Budget, io: std.Io, now_ms: i64) Peers {
+        const f = b.lock(io, .shared, false) catch |e| {
+            if (e != error.FileNotFound) b.warn(e);
+            return .{};
+        };
+        defer f.close(io);
+        var buf: [max_bytes]u8 = undefined;
+        const n = f.readPositionalAll(io, &buf, 0) catch |e| {
+            b.warn(e);
+            return .{};
+        };
+        if (n == buf.len) return .{};
+        var lines = std.mem.splitScalar(u8, buf[0..n], '\n');
+        const first = lines.next() orelse return .{};
+        if (!std.mem.eql(u8, first, header)) return .{};
+        var p: Peers = .{};
+        while (lines.next()) |text| {
+            const l = parseLine(text) orelse continue;
+            if (b.isMine(l) or !b.live(io, l, now_ms)) continue;
+            p.jobs += 1;
+            p.mb +|= l.mb;
+        }
+        return p;
+    }
+
+    /// Makes `own` this process's lines, in place of the ones it wrote before, and drops every
+    /// line that is no longer live. With nothing to write and nothing written before, the file
+    /// is not touched.
+    pub fn publish(b: *Budget, io: std.Io, now_ms: i64, own: []const Mine) void {
+        if (own.len == 0 and !b.wrote) return;
+        b.write(io, now_ms, own) catch |e| {
+            b.warn(e);
+            return;
+        };
+        b.wrote = own.len > 0;
+    }
+
+    fn write(b: *Budget, io: std.Io, now_ms: i64, own: []const Mine) !void {
+        const f = try b.lock(io, .exclusive, true);
+        defer f.close(io);
+        var old: [max_bytes]u8 = undefined;
+        const n = try f.readPositionalAll(io, &old, 0);
+        var out: [max_bytes]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        try w.print("{s}\n", .{header});
+        // What other processes wrote stays while it is live; a file that is not ours to read (no
+        // header, too large) is replaced.
+        if (n < old.len) {
+            var lines = std.mem.splitScalar(u8, old[0..n], '\n');
+            if (std.mem.eql(u8, lines.next() orelse "", header)) while (lines.next()) |text| {
+                const l = parseLine(text) orelse continue;
+                if (b.isMine(l) or !b.live(io, l, now_ms)) continue;
+                try w.print("{s}\n", .{text});
+            };
+        }
+        for (own) |m| try w.print("{s} {d} {d} {d} {d} {d}\n", .{
+            b.pool, b.pid, b.start, m.slot, m.mb, m.expiry_ms,
+        });
+        try f.setLength(io, 0);
+        try f.writePositionalAll(io, w.buffered(), 0);
+    }
+
+    fn warn(b: *Budget, e: anyerror) void {
+        if (b.warned) return;
+        b.warned = true;
+        std.log.warn(
+            "memory gate: the machine's shared reservations in {s} are not used: {s}; this pool " ++
+                "counts its own, as without them (RUNNER_SHARED_MEMORY_BUDGET=false stops this)",
+            .{ b.path, @errorName(e) },
+        );
+    }
+};
 
 test "MemAvailable and swap in use from /proc/meminfo" {
     // Trimmed from razorbill at idle.
@@ -3891,4 +4155,269 @@ test "the cgroup limit the runner runs under, and the engine's cap, are compared
     pool.native = true;
     pool.limits.native_per_job_mb = 256;
     try std.testing.expectEqual(@as(?Misfit, null), pool.misfit());
+}
+
+// ---- The pools of a machine share one budget ----
+
+const Shared = struct {
+    tmp: std.testing.TmpDir,
+    path_buf: [96]u8 = undefined,
+    budget_path: []const u8 = "",
+    proc_path: []const u8 = "",
+
+    /// A machine with a fake /proc and a record file in a directory of its own.
+    fn init(s: *Shared) !void {
+        s.tmp = std.testing.tmpDir(.{});
+        const name = s.tmp.sub_path;
+        s.budget_path = try std.fmt.bufPrint(s.path_buf[0..48], ".zig-cache/tmp/{s}/budget", .{name});
+        s.proc_path = try std.fmt.bufPrint(s.path_buf[48..], ".zig-cache/tmp/{s}/proc", .{name});
+        try s.tmp.dir.createDirPath(std.testing.io, "proc");
+    }
+
+    fn deinit(s: *Shared) void {
+        s.tmp.cleanup();
+    }
+
+    /// A process in the fake /proc that started at `start` ticks; the stat line has a command name
+    /// with a space and a bracket, which is where parsing goes wrong.
+    fn process(s: *Shared, pid: i32, start: u64) !void {
+        var dir: [32]u8 = undefined;
+        var text: [160]u8 = undefined;
+        try s.tmp.dir.createDirPath(std.testing.io, try std.fmt.bufPrint(&dir, "proc/{d}", .{pid}));
+        try s.tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = try std.fmt.bufPrint(&dir, "proc/{d}/stat", .{pid}),
+            .data = try std.fmt.bufPrint(
+                &text,
+                "{d} (zig run) ner) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {d} 0 0\n",
+                .{ pid, start },
+            ),
+        });
+    }
+
+    fn available(s: *Shared, mb: u64) !void {
+        var buf: [64]u8 = undefined;
+        try s.tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = "meminfo",
+            .data = try std.fmt.bufPrint(&buf, "MemAvailable: {d} kB\n", .{mb * 1024}),
+        });
+    }
+
+    /// A native pool `name` that is process `pid`, started at `start`, on this machine.
+    fn pool(s: *Shared, name: []const u8, pid: i32, start: u64, slots: []Admission.Slot) !Admission {
+        try s.process(pid, start);
+        var a: Admission = .init(std.testing.io, .{}, slots);
+        a.native = true;
+        const meminfo = try std.fmt.allocPrint(
+            std.testing.allocator,
+            ".zig-cache/tmp/{s}/meminfo",
+            .{s.tmp.sub_path},
+        );
+        a.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
+        a.budget = .{
+            .path = s.budget_path,
+            .pool = name,
+            .pid = pid,
+            .start = start,
+            .proc = s.proc_path,
+        };
+        return a;
+    }
+
+    fn free(a: *Admission) void {
+        std.testing.allocator.free(a.paths.meminfo);
+    }
+
+    fn record(s: *Shared) ![]u8 {
+        return s.tmp.dir.readFileAlloc(std.testing.io, "budget", std.testing.allocator, .limited(4096));
+    }
+};
+
+/// The job in `slot` of `a` started now, reserving `mb`: handed out and past the gate.
+fn startedJob(a: *Admission, slot: usize, mb: u32) void {
+    a.mu.lockUncancelable(a.io);
+    defer a.mu.unlock(a.io);
+    a.slots[slot] = .{
+        .started_ms = std.Io.Clock.awake.now(a.io).toMilliseconds(),
+        .est_mb = mb,
+        .native = true,
+    };
+    a.publish();
+}
+
+fn expectHeld(g: *Gate) !void {
+    try std.testing.expect(g.check() != null);
+}
+
+test "another pool's reservation takes room from this one's gate, and is given back when its job ends" {
+    var s: Shared = .{ .tmp = undefined };
+    try s.init();
+    defer s.deinit();
+    var slots_a: [1]Admission.Slot = undefined;
+    var slots_b: [1]Admission.Slot = undefined;
+    var ci = try s.pool("ci", 100, 1000, &slots_a);
+    defer Shared.free(&ci);
+    var bench = try s.pool("bench", 200, 2000, &slots_b);
+    defer Shared.free(&bench);
+    var g: Gate = .{ .pool = &ci, .slot = 0 };
+    var other: Gate = .{ .pool = &bench, .slot = 0 };
+    // 1536 floor + 256 for the runner asking: 1792 is enough alone, 2792 is not.
+    try s.available(2000);
+    try std.testing.expect(g.check() == null);
+    g.leave(false);
+    startedJob(&bench, 0, 1000);
+    const hold = g.check() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 2), hold.memory.reserved.jobs);
+    try std.testing.expectEqual(@as(u64, 1256), hold.memory.reserved.mb);
+    // The other pool's reservation is the machine's, not this engine's: its cap is untouched.
+    try std.testing.expectEqual(hold.memory.reserved.mb, hold.memory.reserved.native_mb);
+    // Idle here, and no room: without the other pool this poll would be forced through
+    // (`idleFor`), but its job will free the room.
+    try std.testing.expect(g.forced == null);
+    // The job ends: its line goes at once, not at its expiry.
+    _ = other.ended();
+    try std.testing.expect(g.check() == null);
+    try std.testing.expectEqual(@as(u64, 0), ci.peers.mb);
+}
+
+test "a pool does not count its own lines, and the record lists each job once" {
+    var s: Shared = .{ .tmp = undefined };
+    try s.init();
+    defer s.deinit();
+    var slots: [2]Admission.Slot = undefined;
+    var ci = try s.pool("ci", 100, 1000, &slots);
+    defer Shared.free(&ci);
+    startedJob(&ci, 0, 500);
+    startedJob(&ci, 1, 300);
+    ci.refreshPeers();
+    try std.testing.expectEqual(Peers{}, ci.peers);
+    const text = try s.record();
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, text, "\n"));
+    try std.testing.expect(std.mem.startsWith(u8, text, "zig-runner memory budget v1\nci 100 1000 0 500 "));
+    // A restart of the pool is a new process: the old one's lines are another's, until it is gone.
+    var again: Budget = ci.budget.?;
+    again.pid = 101;
+    again.start = 1001;
+    try s.process(101, 1001);
+    try std.testing.expectEqual(Peers{ .jobs = 2, .mb = 800 }, again.peers(std.testing.io, wallNow()));
+}
+
+fn wallNow() i64 {
+    return std.Io.Clock.real.now(std.testing.io).toMilliseconds();
+}
+
+test "a line whose process is gone, that was reused, or that expired is not counted, and is pruned" {
+    var s: Shared = .{ .tmp = undefined };
+    try s.init();
+    defer s.deinit();
+    var slots: [1]Admission.Slot = undefined;
+    var ci = try s.pool("ci", 100, 1000, &slots);
+    defer Shared.free(&ci);
+    try s.process(300, 3000); // alive
+    try s.process(400, 4001); // the pid was reused: it started after the line's writer
+    const now = wallNow();
+    var text: [1024]u8 = undefined;
+    const lines = try std.fmt.bufPrint(
+        &text,
+        "zig-runner memory budget v1\n" ++
+            "live 300 3000 0 100 {[ok]d}\n" ++
+            "gone 999 1 0 200 {[ok]d}\n" ++
+            "reused 400 4000 0 400 {[ok]d}\n" ++
+            "late 300 3000 1 800 {[old]d}\n" ++
+            "far 300 3000 2 1600 {[far]d}\n" ++
+            "torn 300 3000\n",
+        .{ .ok = now + 60_000, .old = now - 1, .far = now + 10 * ramp_ms },
+    );
+    try s.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "budget", .data = lines });
+    try std.testing.expectEqual(Peers{ .jobs = 1, .mb = 100 }, ci.budget.?.peers(std.testing.io, now));
+    // The next write keeps the live line and drops the rest.
+    startedJob(&ci, 0, 64);
+    const kept = try s.record();
+    defer std.testing.allocator.free(kept);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "live 300") != null);
+    for ([_][]const u8{ "gone", "reused", "late", "far", "torn" }) |gone|
+        try std.testing.expect(std.mem.indexOf(u8, kept, gone) == null);
+}
+
+test "a record that is missing or damaged leaves the gate as it was" {
+    var s: Shared = .{ .tmp = undefined };
+    try s.init();
+    defer s.deinit();
+    var slots: [1]Admission.Slot = undefined;
+    var ci = try s.pool("ci", 100, 1000, &slots);
+    defer Shared.free(&ci);
+    var g: Gate = .{ .pool = &ci, .slot = 0 };
+    try s.available(2000);
+    try std.testing.expect(g.check() == null);
+    g.leave(false);
+    try std.testing.expectEqual(Peers{}, ci.peers);
+    for ([_][]const u8{ "", "not a budget\nbench 200 2000 0 5000 99999999999999\n", "zig-runner memory budget v1\n\x00\xff\n" }) |data| {
+        try s.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "budget", .data = data });
+        try std.testing.expect(g.check() == null);
+        g.leave(false);
+    }
+    // And a damaged file is replaced by the next write, not left to hold the pool's lines out.
+    startedJob(&ci, 0, 64);
+    const text = try s.record();
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "zig-runner memory budget v1\nci 100 1000 0 64 "));
+}
+
+test "a job that has started using memory is not counted twice, in the record or against another pool" {
+    var s: Shared = .{ .tmp = undefined };
+    try s.init();
+    defer s.deinit();
+    var slots_a: [1]Admission.Slot = undefined;
+    var slots_b: [1]Admission.Slot = undefined;
+    var ci = try s.pool("ci", 100, 1000, &slots_a);
+    defer Shared.free(&ci);
+    var bench = try s.pool("bench", 200, 2000, &slots_b);
+    defer Shared.free(&bench);
+    var g: Gate = .{ .pool = &ci, .slot = 0 };
+    // bench's job started over `ramp_ms` ago: its memory is in MemAvailable (low now), so it is
+    // not reserved on top of it, as in its own pool's gate.
+    bench.slots[0] = .{
+        .started_ms = std.Io.Clock.awake.now(bench.io).toMilliseconds() - ramp_ms - 1,
+        .est_mb = 1000,
+        .native = true,
+    };
+    bench.publish();
+    try s.available(2000);
+    try std.testing.expect(g.check() == null);
+    try std.testing.expectEqual(Peers{}, ci.peers);
+    // Within the ramp the line counts until the ramp is over: it expires with it.
+    bench.slots[0].started_ms += 5_001;
+    bench.publish();
+    g.leave(false);
+    try expectHeld(&g);
+    try std.testing.expectEqual(@as(u32, 1), ci.peers.jobs);
+    const text = try s.record();
+    defer std.testing.allocator.free(text);
+    var f = std.mem.tokenizeScalar(u8, text[std.mem.indexOfScalar(u8, text, '\n').? + 1 ..], ' ');
+    for (0..5) |_| _ = f.next();
+    const expiry = try std.fmt.parseInt(i64, std.mem.trimEnd(u8, f.next().?, "\n"), 10);
+    try std.testing.expect(expiry > wallNow() and expiry <= wallNow() + 5_000);
+}
+
+test "a pool that stops takes its lines out, and a pool that never reserved leaves the file alone" {
+    var s: Shared = .{ .tmp = undefined };
+    try s.init();
+    defer s.deinit();
+    var slots_a: [1]Admission.Slot = undefined;
+    var slots_b: [1]Admission.Slot = undefined;
+    var ci = try s.pool("ci", 100, 1000, &slots_a);
+    defer Shared.free(&ci);
+    var bench = try s.pool("bench", 200, 2000, &slots_b);
+    defer Shared.free(&bench);
+    ci.publish();
+    try std.testing.expectError(error.FileNotFound, s.tmp.dir.statFile(std.testing.io, "budget", .{}));
+    startedJob(&bench, 0, 700);
+    ci.refreshPeers();
+    try std.testing.expectEqual(@as(u64, 700), ci.peers.mb);
+    bench.release();
+    ci.refreshPeers();
+    try std.testing.expectEqual(Peers{}, ci.peers);
+    const text = try s.record();
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("zig-runner memory budget v1\n", text);
 }

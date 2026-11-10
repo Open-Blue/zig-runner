@@ -1001,6 +1001,34 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
     before: a name's estimate is the most of those runs, so one learned low (a warm `zig build
     test` at 64 MB) still reserves little for a cold one until a heavy run has been seen, restart
     or not.
+  - *Pools share one budget* (`RUNNER_SHARED_MEMORY_BUDGET`, `Admission.budget`, `Budget`). Each
+    gate counted only its own pool's reservations, so two pools on one machine (razorbill's prod,
+    ci and bench) could each admit a job into the same free memory, and a pool's job in its first
+    minutes held the others back as swap growth while none knew what the others were promised.
+    A root runner now keeps one line for each job its pool started less than `ramp_ms` ago (and
+    that is not waiting for room) in `/run/zig-runner/memory-budget`: pool name, pid, the pid's
+    start time (field 22 of `/proc/<pid>/stat`, so a reused pid is not taken for the writer),
+    the runner's slot, MB, and the expiry in wall-clock ms. It is updated whenever a reservation
+    changes (a job handed out, named, native, back on the engine, started from waiting, ended) and
+    emptied when the pool ends; updates hold an exclusive `flock`, reads a shared one, each waiting
+    up to a second. A gate reads the other pools' lines at every check (`Admission.refreshPeers`)
+    and adds them to `reserved` as native MB, which counts against `MemAvailable` and not against
+    the engine's cap. Same rule as the pool's own: a job reserves until it ends or its ramp is
+    over, when its memory is in `MemAvailable`, never both; a line expires at the end of its ramp.
+    A line is ignored (and pruned at the next write) when its process is gone, its start time
+    differs, it expired, or it expires more than two ramps ahead; a crash leaves lines for at most
+    `ramp_ms`. A file that is missing, has another header, damaged lines or cannot be locked counts
+    as no reservations, warned of once: the gate is as before. So a gate is stricter only while
+    another pool has a job ramping up, and a poll that would be forced through on an idle pool
+    (`idleFor`) is not while one has. Pollers are not published (an engine pool's runners alone
+    would reserve more than 8 GB), and a job's lines are written after the gate admits it, so two
+    pools that admit in the same few milliseconds can still both pass; the next check of either
+    sees both. On by default for a root runner, whose `/run/zig-runner` only root writes and which
+    shares the slots with the other pools; off for a runner that is not root, since a per-user
+    file would coordinate only pools of one user while the memory is the machine's, and a file
+    other users can write would let any of them hold every pool. `RUNNER_SHARED_MEMORY_BUDGET=false`
+    turns it off. A unit under `ProtectSystem=strict` needs `RuntimeDirectory=zig-runner` and
+    `RuntimeDirectoryPreserve=yes` (as the slots do) or the pool warns once and counts its own.
   - *No deadlock.* When every runner holds a job and none has room, nothing is running to free
     any: the job that came first starts regardless (said in its log), the others wait for it, and
     the next oldest follows as each ends. The machine cannot get freer, and a job over

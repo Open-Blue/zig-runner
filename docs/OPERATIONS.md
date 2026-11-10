@@ -234,6 +234,11 @@ the machine thrashed for hours (#126). Two things keep that from happening again
   The runners polling count only the job that has waited longest, so small jobs aren't held behind
   a queue of heavy ones, and a job whose name has run for 60 s at most each time starts beside the
   one waiting if it fits without it (#415).
+- Pools on one machine share one budget (`RUNNER_SHARED_MEMORY_BUDGET`, on for a root runner): each
+  writes what its jobs still ramping up have reserved to `/run/zig-runner/memory-budget`, and every
+  gate takes the other pools' live lines off `MemAvailable`, so two pools don't admit a job each
+  into the same free memory. The directory must be writable: under `ProtectSystem=strict` the unit
+  needs `RuntimeDirectory=zig-runner` and `RuntimeDirectoryPreserve=yes`.
 - What jobs took, and how long they ran, is kept across restarts in the native store's directory
   (#407). A pool whose one job could never fit the machine doesn't start, and names the setting
   (#406).
