@@ -992,7 +992,7 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
     `memory-gate-<RUNNER_NAME_PREFIX>` in the native store's directory (`RUNNER_NATIVE_STORE`,
     `Config.nativeStore`; written there for a Dagger pool too; one file for each pool, as pools on
     one machine share the directory), one text line a name, versioned (`zig-runner memory gate
-    v2`), with the machine id, `MemTotal` and the backend they were measured on. It is written
+    v3`; v2, without `Entry.held`, is still read, as nothing held), with the machine id, `MemTotal` and the backend they were measured on. It is written
     atomically (temp file, fsync, rename, fsync of the directory) when something was learned, at
     most every 10 s and when the pool ends, and read at start, where the log says how many were
     loaded. A file from another machine, another amount of memory (more than 1/16 apart), another
@@ -1001,6 +1001,29 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
     before: a name's estimate is the most of those runs, so one learned low (a warm `zig build
     test` at 64 MB) still reserves little for a cold one until a heavy run has been seen, restart
     or not.
+  - *How the estimate is sized* (from Autopilot, Borg and HTCondor, and oomd's pause). Four rules
+    on top of "the most of the last five runs", none of which changes what is recorded:
+    - A **margin** of `RUNNER_MEM_MARGIN_PERCENT` (10) is added when a learned size is reserved
+      (`Admission.margined`), not when it is recorded, so it is never counted twice. It does not
+      apply to the operator's `RUNNER_MEM_PER_JOB_MB` and `RUNNER_NATIVE_MEM_PER_JOB_MB`. The
+      native `memory.high` follows the reservation. 0 turns it off.
+    - **Raised at once, lowered by an eighth a run** (`Learned.decay_den`). A run above the
+      estimate raises it immediately, as before. When the heaviest run leaves the last five, the
+      estimate falls by at most an eighth of itself with each run recorded (`Entry.held`) instead
+      of in one step, so a rare heavy run is not forgotten the run after it leaves the window:
+      from 2600 MB to 300 MB takes about 16 runs. Counted in runs, not hours, so a job that runs
+      once a week keeps what it needed.
+    - A native job **killed for memory** (`oom_kill` in the job cgroup's `memory.events`, read in
+      `Gate.nativeDone`) was cut short, so what it took is a lower bound. It is learned at half
+      as much again as the larger of that and its estimate (`Admission.oomRaise`), capped at its
+      `memory.max` and the machine's memory, and never below what it was seen to take: the next
+      run reserves room for more than it got. The runner warns of it. The Dagger path cannot tell
+      which job the engine's kill was for (one cgroup for all), so it is not raised there.
+    - After such a kill, a **big** job (an estimate over `RUNNER_NATIVE_MEM_PER_JOB_MB`) named
+      within 30 s (`oom_cooldown_ms`) waits while any other job runs
+      (`Admission.cooldownHold`), short or not, for the memory the kill freed is spoken for by
+      neighbours still growing. With nothing else running it starts as usual, and the forced
+      start of the first in line still holds.
   - *No deadlock.* When every runner holds a job and none has room, nothing is running to free
     any: the job that came first starts regardless (said in its log), the others wait for it, and
     the next oldest follows as each ends. The machine cannot get freer, and a job over

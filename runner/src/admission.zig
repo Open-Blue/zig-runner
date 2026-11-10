@@ -85,7 +85,28 @@ pub const Limits = struct {
     /// runners' worth is razorbill's 1.5 GB floor. 0 reserves nothing for native jobs and sets no
     /// `memory.high`.
     native_per_job_mb: u32 = 256,
+    /// Percent added to what a job's name is learned to take when it reserves (`RUNNER_MEM_MARGIN_PERCENT`),
+    /// not to what is recorded: the last five runs' highest is a sample, and the next run may
+    /// exceed it. Autopilot adds 10 to 15 percent to a limit learned from per-window peaks, and
+    /// this is the low end, since the gate's floor (`min_available_mb`) is a margin too. Not on
+    /// `per_job_mb` or `native_per_job_mb`, which are the operator's numbers. 0 turns it off.
+    margin_percent: u32 = 10,
 };
+
+/// What a native job killed for memory (`memory.events` `oom_kill`) is learned to need, in
+/// proportion to what it was reserved or took: its peak is a lower bound, since the kill cut the
+/// run short, so the next run reserves half as much again (Borg raises a reservation at once, and
+/// HTCondor retries a killed job with a larger request). Capped at the job's `memory.max` and the
+/// machine's memory (`Admission.oomRaise`).
+pub const oom_raise_num = 3;
+pub const oom_raise_den = 2;
+
+/// After a job is killed for memory, no big job starts beside others for this long
+/// (`Admission.cooldownHold`): the kill frees memory at once, but the neighbours that ran when it
+/// happened are still growing, and the ones started in the same minutes are not in `MemAvailable`
+/// yet. oomd waits 15 s after an action; this is twice that, as a gate looks only every few
+/// seconds (`Admission.recheck`). Not a setting.
+pub const oom_cooldown_ms = 30 * std.time.ms_per_s;
 
 /// The `memory.high` of a native job that reserves `est_mb` (learned, or `native_per_job_mb`):
 /// twice the estimate, since a job varies with what it is given (a cache missed, a larger change),
@@ -170,6 +191,9 @@ pub const Admission = struct {
     engine: Engine = .{},
     /// Where `learned` and `learned_native` are kept between runs, after `restore`.
     persist: ?Persist = null,
+    /// Until when (awake clock, ms) a job was last killed for memory holds big jobs back
+    /// (`cooldownHold`).
+    cooldown_until_ms: i64 = std.math.minInt(i64),
 
     /// One runner's job. Cleared when the job ends, so a job that is over reserves nothing,
     /// however soon it ended.
@@ -212,6 +236,11 @@ pub const Admission = struct {
         /// The job started although it did not fit beside the first in line, because it is
         /// expected to finish soon (`Admission.aheadOpen`, #415).
         ahead: bool = false,
+        /// The native job's cgroup counted an OOM kill (`nativeDone`): what it took is a lower
+        /// bound, and `oom_cap_mb` is the most a raised estimate may be (its `memory.max`; 0 if
+        /// it had none).
+        killed: bool = false,
+        oom_cap_mb: u64 = 0,
 
         fn cgroup(s: *const Slot) ?[]const u8 {
             return if (s.cgroup_len > 0) s.cgroup_buf[0..s.cgroup_len] else null;
@@ -277,6 +306,35 @@ pub const Admission = struct {
         s.started_ms = now_ms;
     }
 
+    /// Holds a named job of `est_mb` while a kill for memory is recent (`oom_cooldown_ms`) and another
+    /// job runs: the memory that the kill freed is spoken for by jobs still growing. Only a job
+    /// bigger than `native_per_job_mb` waits; a small one cannot take a machine down. Never with
+    /// nothing else running, so a job that waits for nothing is not kept waiting (`Gate.start`
+    /// forces the first in line then, as for any hold).
+    fn cooldownHold(a: *const Admission, slot: usize, est_mb: u64, now_ms: i64) ?Hold {
+        if (now_ms >= a.cooldown_until_ms) return null;
+        if (est_mb <= a.limits.native_per_job_mb) return null;
+        for (a.slots, 0..) |s, i| {
+            if (i != slot and !s.waiting and s.running())
+                return .{ .cooldown = .{ .left_ms = @intCast(a.cooldown_until_ms - now_ms) } };
+        }
+        return null;
+    }
+
+    /// What a job killed for memory is to reserve next: its estimate and what it was seen to take
+    /// (a lower bound), raised by `oom_raise_num`/`oom_raise_den`, up to `cap_mb` (its `memory.max`)
+    /// and the machine's memory, but never below what it was seen to take.
+    fn oomRaise(a: *const Admission, seen_mb: u32, estimate_mb: u32, cap_mb: u64) u32 {
+        const base: u64 = @max(seen_mb, estimate_mb);
+        var most: u64 = 1 << 20;
+        if (cap_mb > 0) most = @min(most, cap_mb);
+        var mem_buf: [4096]u8 = undefined;
+        if (std.Io.Dir.cwd().readFile(a.io, a.paths.meminfo, &mem_buf)) |text| {
+            if (parseMeminfo(text).total_mb) |t| most = @min(most, t);
+        } else |_| {}
+        return @intCast(@max(seen_mb, @min(base * oom_raise_num / oom_raise_den, most)));
+    }
+
     /// Whether the job in `slot` is the one waiting longest and no other job runs: the one that
     /// may start whatever the room (`Gate.start`). A job handed out and not named yet counts as
     /// running, for it may be a job that fits, or end at once.
@@ -307,7 +365,20 @@ pub const Admission = struct {
     fn worstCase(a: *const Admission, native: bool) u32 {
         const floor = if (native) a.limits.native_per_job_mb else a.limits.per_job_mb;
         if (floor == 0) return 0;
-        return @max(floor, if (native) a.learned_native.largest() else a.learned.largest());
+        const largest = if (native) a.learned_native.largest() else a.learned.largest();
+        return @max(floor, a.margined(largest));
+    }
+
+    /// What a job learned to take reserves: `mb` and `Limits.margin_percent` more. Applied here,
+    /// where the gate reserves, and not where a run is recorded, so that the margin can change
+    /// without relearning and is never counted twice by a later run.
+    fn margined(a: *const Admission, mb: u32) u32 {
+        return mb +| @as(u32, @intCast((@as(u64, mb) * a.limits.margin_percent + 99) / 100));
+    }
+
+    /// `mb` learned for a name, or null, as it reserves.
+    fn reserve(a: *const Admission, learned: ?u32) ?u32 {
+        return a.margined(learned orelse return null);
     }
 
     /// What a job of this name reserves once it runs natively: what it took natively, or
@@ -318,7 +389,7 @@ pub const Admission = struct {
     fn nativeEstimate(a: *Admission, key: ?u64) u32 {
         if (a.limits.native_per_job_mb == 0) return 0;
         const k = key orelse return a.limits.native_per_job_mb;
-        return a.learned_native.estimate(k) orelse a.limits.native_per_job_mb;
+        return a.reserve(a.learned_native.estimate(k)) orelse a.limits.native_per_job_mb;
     }
 
     /// What may start without showing in the machine's or the engine's memory yet: what a runner
@@ -794,15 +865,17 @@ pub const Gate = struct {
         r.jobs += 1;
         r.mb += est;
         r.native_mb += est;
-        const hold = decide(a.limits, signal, r, g.holding);
-        g.holding = hold != null;
-        const h = hold orelse {
+        const decided = decide(a.limits, signal, r, g.holding);
+        // After the room: a cooldown is no reason to ask for more room once it ends.
+        g.holding = decided != null;
+        const h = decided orelse a.cooldownHold(g.slot, est, now_ms) orelse {
             Admission.admit(s, now_ms);
             return .started;
         };
         // No room beside the first in line, but room without it, and a name expected to be gone
-        // soon: it goes ahead (#415). A name not learned is long, and waits its turn.
-        if (a.head() != &a.slots[g.slot]) {
+        // soon: it goes ahead (#415). A name not learned is long, and waits its turn. Not in a
+        // cooldown, which holds every big job, short or not.
+        if (h != .cooldown and a.head() != &a.slots[g.slot]) {
             const short = if (a.runMs(s.key)) |ms| ms <= short_run_ms else false;
             var no_head = a.reserved(now_ms, a.polling, false);
             no_head.jobs += 1;
@@ -873,13 +946,13 @@ pub const Gate = struct {
             s.est_mb = if (a.limits.native_per_job_mb == 0)
                 0
             else
-                a.learned_native.estimate(key) orelse a.learned.estimate(key) orelse
-                    a.worstCase(true);
+                a.reserve(a.learned_native.estimate(key)) orelse
+                    a.reserve(a.learned.estimate(key)) orelse a.worstCase(true);
             // It waits for room (`start`) before anything of it runs.
             s.waiting = true;
             a.waits += 1;
             s.wait_seq = a.waits;
-        } else if (a.limits.per_job_mb > 0) s.est_mb = a.learned.estimate(key);
+        } else if (a.limits.per_job_mb > 0) s.est_mb = a.reserve(a.learned.estimate(key));
         // Measured on the engine until it goes native, so a job a native pool sends to Dagger is
         // learned there. Without the engine's cgroup (another OS, `RUNNER_ENGINE_CGROUP=none`)
         // nothing is measured on the engine, nothing learned, and every job there reserves
@@ -965,7 +1038,7 @@ pub const Gate = struct {
         s.over_high = false;
         s.est_mb = null;
         if (a.limits.per_job_mb > 0) if (s.key) |k| {
-            s.est_mb = a.learned.estimate(k);
+            s.est_mb = a.reserve(a.learned.estimate(k));
         };
         s.base_mb = null;
         a.engineBaseline(s);
@@ -982,6 +1055,13 @@ pub const Gate = struct {
             var buf: [512]u8 = undefined;
             if (readIn(a.io, dir, "memory.events", &buf)) |text| {
                 s.over_high = (parseStat(text, "high") orelse 0) > 0;
+                // A kill took a process of the job: what it took is a lower bound (`ended`), and
+                // big jobs wait a while (`cooldownHold`).
+                if ((parseStat(text, "oom_kill") orelse 0) > 0) {
+                    s.killed = true;
+                    s.oom_cap_mb = (readBytes(a.io, dir, "memory.max") orelse 0) >> 20;
+                    a.cooldown_until_ms = std.Io.Clock.awake.now(a.io).toMilliseconds() + oom_cooldown_ms;
+                }
             } else |_| {}
         }
         s.cgroup_len = 0;
@@ -1023,6 +1103,17 @@ pub const Gate = struct {
         // Separate tables: an engine reading is not a native one (the module's doc comment).
         const table = if (s.native) &a.learned_native else &a.learned;
         const before = table.estimate(key);
+        // A native job killed for memory was cut short: what it took is a lower bound. It is
+        // learned as the raised estimate, so the next run reserves room for more than it got, and
+        // not as a small run that teaches a size too small to finish in.
+        if (s.native and s.killed) {
+            const raised = a.oomRaise(seen_mb, before orelse s.est_mb orelse 0, s.oom_cap_mb);
+            std.log.warn(
+                "memory gate: job {x:0>16} was killed for memory at {d} MB; its next run reserves {d} MB",
+                .{ key, seen_mb, raised },
+            );
+            seen_mb = raised;
+        }
         // A native job ran in a cgroup of its own: alone, whatever else ran.
         const alone = s.native or !s.overlapped();
         const after = table.record(key, seen_mb, alone);
@@ -1060,6 +1151,11 @@ pub const Learned = struct {
     pub const kept = 5;
     /// The least a job is seen to take: one that ran while another job freed memory can measure 0.
     pub const min_mb = 64;
+    /// Each run recorded lowers a name's estimate by at most this fraction of it (`Entry.held`):
+    /// without it the estimate fell in one step, from the heaviest of the last five runs to the
+    /// next, the run after a rare heavy one left them. By 1/8 a run, the estimate halves in
+    /// about five runs; counted in runs, not hours, as a job that runs rarely is also seen rarely.
+    pub const decay_den = 8;
     /// The longest run kept: 12 days, so that it fits the table's u32 and the file.
     pub const max_run_ms = 1 << 30;
 
@@ -1070,10 +1166,19 @@ pub const Learned = struct {
         /// How long the last `kept` runs took, in ms, whatever they were beside (`recordRun`).
         ran: Runs = .{},
         used: u64 = 0,
+        /// The least the estimate falls to when the run that set it leaves the last `kept`: it
+        /// comes down by `1/decay_den` of itself with each run recorded (`record`), not in one
+        /// step. Raised at once, lowered slowly (Autopilot, Borg). 0 in a file from before it.
+        held: u32 = 0,
+
+        fn window(e: *const Entry) u32 {
+            if (e.alone.n > 0) return std.mem.max(u32, e.alone.slice());
+            if (e.beside.n == 0) return 0;
+            return std.mem.min(u32, e.beside.slice());
+        }
 
         fn estimate(e: *const Entry) u32 {
-            if (e.alone.n > 0) return std.mem.max(u32, e.alone.slice());
-            return std.mem.min(u32, e.beside.slice());
+            return @max(e.window(), e.held);
         }
     };
 
@@ -1124,8 +1229,10 @@ pub const Learned = struct {
             l.entries[l.len - 1] = .{ .key = key };
             break :e &l.entries[l.len - 1];
         };
+        const prior = e.estimate();
         const runs = if (alone) &e.alone else &e.beside;
         runs.push(seen_mb);
+        e.held = prior - prior / decay_den;
         l.tick += 1;
         e.used = l.tick;
         return e.estimate();
@@ -1238,7 +1345,11 @@ pub const Restore = union(enum) {
     ignored: []const u8,
 };
 
-const file_header = "zig-runner memory gate v2";
+/// v3 adds `Entry.held` to each line. A v2 file is read as it was (held 0), so an upgrade keeps
+/// what was learned; v3 is written, so an older runner reading it refuses it by its version and
+/// learns again, as it does for any file it does not know.
+const file_header = "zig-runner memory gate v3";
+const file_header_v2 = "zig-runner memory gate v2";
 const file_header_prefix = "zig-runner memory gate ";
 
 /// Both tables, as the file holds them.
@@ -1262,7 +1373,7 @@ fn render(w: *std.Io.Writer, id: Identity, t: *const Tables) std.Io.Writer.Error
                 try w.print(" {c} {d} {d}", .{ run[0], runs.n, runs.next });
                 for (runs.slice()) |mb| try w.print(" {d}", .{mb});
             }
-            try w.writeByte('\n');
+            try w.print(" H {d}\n", .{e.held});
         }
     }
 }
@@ -1274,7 +1385,8 @@ const FileError = error{ Format, WrongVersion, Foreign };
 fn parseTables(text: []const u8, id: Identity, out: *Tables, why: *[]const u8) FileError!void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     const first = lines.next() orelse return error.Format;
-    if (!std.mem.eql(u8, first, file_header)) {
+    const v2 = std.mem.eql(u8, first, file_header_v2);
+    if (!v2 and !std.mem.eql(u8, first, file_header)) {
         return if (std.mem.startsWith(u8, first, file_header_prefix)) error.WrongVersion else error.Format;
     }
     var file: Identity = .{};
@@ -1332,6 +1444,11 @@ fn parseTables(text: []const u8, id: Identity, out: *Tables, why: *[]const u8) F
                 mb.* = std.fmt.parseInt(u32, words.next() orelse return error.Format, 10) catch return error.Format;
                 if (mb.* > run[2]) return error.Format;
             }
+        }
+        if (!v2) {
+            if (!std.mem.eql(u8, words.next() orelse return error.Format, "H")) return error.Format;
+            e.held = std.fmt.parseInt(u32, words.next() orelse return error.Format, 10) catch return error.Format;
+            if (e.held > 1 << 20) return error.Format;
         }
         if (words.next() != null) return error.Format;
         if (table.find(e.key) != null) return error.Format;
@@ -1454,6 +1571,8 @@ pub const Hold = union(enum) {
     engine: struct { used_mb: u64, cap_mb: u64, reserved: Reservation, floor_mb: u32 },
     /// MB a minute.
     engine_swap: struct { now: u64, limit: u32 },
+    /// A job was killed for memory a moment ago and others still run (`Admission.cooldownHold`).
+    cooldown: struct { left_ms: u64 },
 
     pub fn format(h: Hold, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (h) {
@@ -1473,6 +1592,11 @@ pub const Hold = union(enum) {
             .pressure => |p| try w.print(
                 "memory pressure {d}.{d:0>2}% (PSI some avg10), limit {d}%",
                 .{ p.now / 100, p.now % 100, p.limit },
+            ),
+            .cooldown => |c| try w.print(
+                "a job was killed for memory recently and others still run; big jobs wait " ++
+                    "{d} s more",
+                .{(c.left_ms + std.time.ms_per_s - 1) / std.time.ms_per_s},
             ),
             .swap => |s| try w.print("swap growing {d} MB/min, limit {d} MB/min", .{
                 s.now,
@@ -1940,6 +2064,23 @@ test "the defaults on razorbill: three jobs at once from idle, not four" {
 }
 
 /// `jobs` jobs at the default `per_job_mb`, as every job reserved before #144.
+/// The tests that measure the learned sizes themselves run without the margin; its own tests turn
+/// it on.
+const no_margin: Limits = .{ .margin_percent = 0 };
+
+/// Records runs of `mb` for `key` until its estimate is `mb`, the number of runs that took; the
+/// estimate may only fall by `1/Learned.decay_den` a run.
+fn settle(l: *Learned, key: u64, mb: u32) usize {
+    var runs: usize = 0;
+    while (l.estimate(key).? != mb) : (runs += 1) {
+        const before = l.estimate(key).?;
+        const after = l.record(key, mb, true);
+        std.debug.assert(after >= before - before / Learned.decay_den and after <= before);
+        std.debug.assert(runs < 200);
+    }
+    return runs;
+}
+
 fn flat(jobs: u32) Reservation {
     return .{ .jobs = jobs, .mb = @as(u64, jobs) * (Limits{}).per_job_mb };
 }
@@ -1993,7 +2134,7 @@ test "the pool reserves memory for runners polling and jobs just started" {
     const meminfo = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/meminfo", .{tmp.sub_path});
 
     var slots: [4]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
     var gates: [4]Gate = undefined;
     for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
@@ -2017,7 +2158,7 @@ test "the pool reserves memory for runners polling and jobs just started" {
 
 test "what may lower a reservation moves the count a held runner waits on" {
     var slots: [2]Admission.Slot = undefined;
-    var pool: Admission = .init(std.testing.io, .{}, &slots);
+    var pool: Admission = .init(std.testing.io, no_margin, &slots);
     var g: Gate = .{ .pool = &pool };
     var seen = pool.changes();
     g.leave(true);
@@ -2049,7 +2190,7 @@ test "a job that is over reserves nothing, however soon it ended" {
     const meminfo = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/meminfo", .{tmp.sub_path});
 
     var slots: [4]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
     var gates: [4]Gate = undefined;
     for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
@@ -2279,7 +2420,7 @@ test "the engine's cgroup is found through its socket's listener, or not, saying
     const host = try std.fmt.bufPrint(&host_buf, "unix://{s}", .{sock});
 
     var slots: [1]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     const paths: Paths = .{
         .meminfo = "/nonexistent",
         .pressure = "/nonexistent",
@@ -2296,7 +2437,7 @@ test "the engine's cgroup is found through its socket's listener, or not, saying
     try std.testing.expectEqual(@as(?[]const u8, null), pool.engineNews(&buf));
 
     // No engine there: said once with why, and not looked for again for a minute.
-    var none: Admission = .init(io, .{}, &slots);
+    var none: Admission = .init(io, no_margin, &slots);
     none.paths = paths;
     none.engine.source = .{ .host = "unix:///nonexistent/engine.sock" };
     var g2: Gate = .{ .pool = &none };
@@ -2306,7 +2447,7 @@ test "the engine's cgroup is found through its socket's listener, or not, saying
     _ = g2.check();
     try std.testing.expectEqual(@as(?[]const u8, null), none.engineNews(&buf));
     // An engine reached over TCP, or through Docker, has no socket to follow.
-    var tcp: Admission = .init(io, .{}, &slots);
+    var tcp: Admission = .init(io, no_margin, &slots);
     tcp.paths = paths;
     tcp.engine.source = .{ .host = "tcp://127.0.0.1:1234" };
     var g3: Gate = .{ .pool = &tcp };
@@ -2314,7 +2455,7 @@ test "the engine's cgroup is found through its socket's listener, or not, saying
     const why = tcp.engineNews(&buf).?;
     try std.testing.expect(std.mem.indexOf(u8, why, "EngineHostNotUnixSocket") != null);
     // Off: nothing looked for, nothing said.
-    var off: Admission = .init(io, .{}, &slots);
+    var off: Admission = .init(io, no_margin, &slots);
     off.paths = paths;
     var g4: Gate = .{ .pool = &off };
     _ = g4.check();
@@ -2331,7 +2472,7 @@ test "an engine container recreated is looked for again, and counted as an engin
     var dir_buf: [160]u8 = undefined;
     const dir = try std.fmt.bufPrint(&dir_buf, "{s}/docker-a.scope", .{root});
     var slots: [1]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent", .cgroup_root = root };
     pool.engine.source = .{ .cgroup = dir };
     var gate: Gate = .{ .pool = &pool };
@@ -2389,7 +2530,7 @@ test "a job known to be light lets the next runner through where the worst case 
     const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/engine", .{tmp.sub_path});
     try setEngine(tmp.dir, 600);
     var slots: [2]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
     pool.engine.dir = dir;
     var gates: [2]Gate = .{ .{ .pool = &pool, .slot = 0 }, .{ .pool = &pool, .slot = 1 } };
@@ -2430,7 +2571,7 @@ test "a job's dentries and inodes are not learned as its size" {
     const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/engine", .{tmp.sub_path});
     try setEngine(tmp.dir, 600);
     var slots: [1]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
     pool.engine.dir = dir;
     var gate: Gate = .{ .pool = &pool, .slot = 0 };
@@ -2457,7 +2598,7 @@ test "a job heavier than configured raises what an unknown job reserves" {
     const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/engine", .{tmp.sub_path});
     try setEngine(tmp.dir, 600);
     var slots: [2]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
     pool.engine.dir = dir;
     var gates: [2]Gate = .{ .{ .pool = &pool, .slot = 0 }, .{ .pool = &pool, .slot = 1 } };
@@ -2488,8 +2629,11 @@ test "a name reserves the most it took in its last five runs; a full table forge
     try std.testing.expectEqual(@as(?u32, null), l.estimate(1));
     try std.testing.expectEqual(@as(u32, 1000), l.record(1, 1000, true));
     for (0..4) |_| try std.testing.expectEqual(@as(u32, 1000), l.record(1, 300, true));
-    // A sixth run: the heavy one is no longer among the last five.
-    try std.testing.expectEqual(@as(u32, 300), l.record(1, 300, true));
+    // A sixth run: the heavy one is no longer among the last five, and the estimate comes down
+    // by an eighth of itself, not to 300 at once.
+    try std.testing.expectEqual(@as(u32, 875), l.record(1, 300, true));
+    try std.testing.expectEqual(@as(u32, 875), l.largest());
+    _ = settle(&l, 1, 300);
     try std.testing.expectEqual(@as(u32, 300), l.largest());
 
     // Full: a new name takes the place of the one least recently used, name 3, since names 1
@@ -2515,7 +2659,7 @@ test "sampling raises the peaks of jobs running only; a job seen to take nothing
     const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/engine", .{tmp.sub_path});
     try setEngine(tmp.dir, 1000);
     var slots: [3]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
     pool.engine.dir = dir;
     var running: Gate = .{ .pool = &pool, .slot = 0 };
@@ -2556,7 +2700,7 @@ test "a native job is measured in its own cgroup, alone, and not against the eng
     try setEngine(tmp.dir, 1000);
     try writeCgroup(tmp.dir, "job", "max", 0, .{}, null);
     var slots: [2]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
     pool.engine.dir = engine;
     var on_dagger: Gate = .{ .pool = &pool, .slot = 0 };
@@ -2618,7 +2762,7 @@ test "a native job not learned yet reserves native_per_job_mb, and a native pool
     var path_buf: [256]u8 = undefined;
     const meminfo = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/meminfo", .{tmp.sub_path});
     var slots: [6]Admission.Slot = undefined;
-    const limits: Limits = .{ .per_job_mb = 1536 };
+    const limits: Limits = .{ .per_job_mb = 1536, .margin_percent = 0 };
     var dagger_pool: Admission = .init(io, limits, &slots);
     dagger_pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
     var gates: [6]Gate = undefined;
@@ -2668,7 +2812,7 @@ fn burstPool(tmp: std.Io.Dir, sub_path: []const u8, slots: []Admission.Slot, ava
         var buf: [256]u8 = undefined;
     };
     const meminfo = try std.fmt.bufPrint(&Paths_.buf, ".zig-cache/tmp/{s}/meminfo", .{sub_path});
-    var pool: Admission = .init(std.testing.io, .{}, slots);
+    var pool: Admission = .init(std.testing.io, no_margin, slots);
     pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
     pool.native = true;
     _ = pool.learned_native.record(burst_heavy, 2600, true);
@@ -2697,7 +2841,7 @@ test "a native pool's runners reserve native_per_job_mb while they poll, however
         try std.testing.expect(g.check() == null);
     }
     // The engine's pool keeps its worst case: a job there starts the moment it is handed out.
-    var dagger_pool: Admission = .init(std.testing.io, .{}, &slots);
+    var dagger_pool: Admission = .init(std.testing.io, no_margin, &slots);
     _ = dagger_pool.learned.record(burst_heavy, 1600, true);
     try std.testing.expectEqual(@as(u32, 1600), dagger_pool.unknown());
 }
@@ -2806,7 +2950,7 @@ test "a native job is learned from its own cgroup under its name, apart from the
     const job = try std.fmt.bufPrint(&job_buf, ".zig-cache/tmp/{s}/job", .{tmp.sub_path});
     try setEngine(tmp.dir, 1000);
     var slots: [1]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
     pool.engine.dir = engine;
     pool.native = true;
@@ -2868,7 +3012,7 @@ test "a native job at its memory.high gets more while the host has memory to spa
     var mem_buf: [256]u8 = undefined;
     const meminfo = try std.fmt.bufPrint(&mem_buf, ".zig-cache/tmp/{s}/meminfo", .{tmp.sub_path});
     var slots: [2]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
     var gate: Gate = .{ .pool = &pool };
     const available = struct {
@@ -2938,7 +3082,7 @@ test "a native job at its memory.high gets more while the host has memory to spa
 test "a native job not learned yet, with no memory.high, reserves the most any native job took" {
     const io = std.testing.io;
     var slots: [2]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
     var gate: Gate = .{ .pool = &pool };
     const new = jobKey("o/r", "o/r/.github/workflows/ci.yml", "new");
@@ -2992,7 +3136,7 @@ test "a native job that cannot swap gets no memory.high, and the gate raises non
     const job = try std.fmt.bufPrint(&job_buf, ".zig-cache/tmp/{s}/job", .{tmp.sub_path});
     try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 6144000 kB\n" });
     var slots: [1]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
     var gate: Gate = .{ .pool = &pool };
     gate.leave(true);
@@ -3018,7 +3162,7 @@ test "a native job held down at its memory.high is learned at no less than it, s
     var job_buf: [256]u8 = undefined;
     const job = try std.fmt.bufPrint(&job_buf, ".zig-cache/tmp/{s}/job", .{tmp.sub_path});
     var slots: [1]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
     var gate: Gate = .{ .pool = &pool };
     const zig = jobKey("o/r", "o/r/.github/workflows/ci.yml", "test (zig)");
@@ -3056,7 +3200,7 @@ test "a native job held down at its memory.high is learned at no less than it, s
 
 test "without the engine's cgroup nothing is learned, and every job reserves per_job_mb" {
     var slots: [2]Admission.Slot = undefined;
-    var pool: Admission = .init(std.testing.io, .{}, &slots);
+    var pool: Admission = .init(std.testing.io, no_margin, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
     var gate: Gate = .{ .pool = &pool };
     try std.testing.expect(gate.check() == null);
@@ -3078,7 +3222,7 @@ test "a pre-warm is let through on an idle machine whose pollers fill the gate, 
     var path_buf: [256]u8 = undefined;
     const meminfo = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/meminfo", .{tmp.sub_path});
     var slots: [17]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
     var gates: [16]Gate = undefined;
     for (&gates, 0..) |*g, i| {
@@ -3115,7 +3259,7 @@ test "a job that replayed steps from the cache is not learned from, and still fr
     const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/engine", .{tmp.sub_path});
     try setEngine(tmp.dir, 600);
     var slots: [1]Admission.Slot = undefined;
-    var pool: Admission = .init(io, .{}, &slots);
+    var pool: Admission = .init(io, no_margin, &slots);
     pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
     pool.engine.dir = dir;
     var gate: Gate = .{ .pool = &pool };
@@ -3144,8 +3288,9 @@ test "runs beside other jobs are upper bounds: the most alone, else the least be
     // Only runs beside others: the least of them, which still bounds the job's own peak.
     try std.testing.expectEqual(@as(u32, 2970), l.record(1, 3170, false));
     try std.testing.expectEqual(@as(u32, 2600), l.record(1, 2600, false));
-    // A run alone replaces them, lower or not.
-    try std.testing.expectEqual(@as(u32, 1600), l.record(1, 1600, true));
+    // A run alone replaces them, lower or not, as far as the estimate falls at a run: an eighth.
+    try std.testing.expectEqual(@as(u32, 2275), l.record(1, 1600, true));
+    _ = settle(&l, 1, 1600);
     try std.testing.expectEqual(@as(u32, 1600), l.largest());
     // Later runs beside others do not raise it.
     try std.testing.expectEqual(@as(u32, 1600), l.record(1, 3100, false));
@@ -3154,7 +3299,7 @@ test "runs beside other jobs are upper bounds: the most alone, else the least be
 
 test "jobs that share the engine at any moment are each marked as overlapped" {
     var slots: [3]Admission.Slot = undefined;
-    var pool: Admission = .init(std.testing.io, .{}, &slots);
+    var pool: Admission = .init(std.testing.io, no_margin, &slots);
     var gates: [3]Gate = undefined;
     for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
     // Alone, until another starts beside it: both marked, and the mark stays after it ends.
@@ -3209,7 +3354,7 @@ test "a native pool's runners are not counted against the engine's cap, a Dagger
     // razorbill's bench pool: the engine busy at 2.4 GB of its 4 GB (another pool's Dagger jobs),
     // 1696 MB under the cap, and six runners polling at 256 MB each.
     try setEngine(tmp.dir, 2400);
-    const limits: Limits = .{ .per_job_mb = 256, .native_per_job_mb = 256, .min_available_mb = 0 };
+    const limits: Limits = .{ .per_job_mb = 256, .native_per_job_mb = 256, .min_available_mb = 0, .margin_percent = 0 };
 
     var native_slots: [7]Admission.Slot = undefined;
     var native_pool: Admission = .init(io, limits, &native_slots);
@@ -3583,7 +3728,7 @@ const KeptFixture = struct {
             .data = try std.fmt.bufPrint(&text, "MemTotal: {d} kB\nMemAvailable: {d} kB\n", .{ mem_mb * 1024, mem_mb * 512 }),
         });
         try tmp.writeFile(io, .{ .sub_path = "machine-id", .data = machine });
-        var p: Admission = .init(io, .{}, slots);
+        var p: Admission = .init(io, no_margin, slots);
         p.paths = .{
             .meminfo = f.path(&f.meminfo, "meminfo"),
             .pressure = "/nonexistent",
@@ -3696,7 +3841,7 @@ test "a file from another machine, memory, backend or format, or a damaged one, 
     writer.flush();
     var good: [file_max_bytes]u8 = undefined;
     const text = try std.Io.Dir.cwd().readFile(io, fix.stateFile(), &good);
-    try std.testing.expect(std.mem.startsWith(u8, text, "zig-runner memory gate v2\nmachine abc123\nmemory_mb 8000\nbackend native\ne native "));
+    try std.testing.expect(std.mem.startsWith(u8, text, "zig-runner memory gate v3\nmachine abc123\nmemory_mb 8000\nbackend native\ne native "));
 
     const Case = struct { machine: []const u8, mem_mb: u64, native: bool, why: []const u8 };
     const cases = [_]Case{
@@ -3891,4 +4036,252 @@ test "the cgroup limit the runner runs under, and the engine's cap, are compared
     pool.native = true;
     pool.limits.native_per_job_mb = 256;
     try std.testing.expectEqual(@as(?Misfit, null), pool.misfit());
+}
+
+// ---- Sizing from published practice: margin, slow lowering, OOM kills ----
+
+test "a learned size reserves its margin, rounded up, and the table keeps what was seen" {
+    var slots: [2]Admission.Slot = undefined;
+    var pool: Admission = .init(std.testing.io, .{}, &slots);
+    try std.testing.expectEqual(@as(u32, 10), pool.limits.margin_percent);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    const zig = jobKey("o/r", "o/r/.github/workflows/ci.yml", "test (zig)");
+    _ = pool.learned.record(zig, 1600, true);
+    var gate: Gate = .{ .pool = &pool };
+    gate.leave(true);
+    gate.assigned(zig);
+    // 1600 + 10 percent, reserved; 1600, recorded.
+    try std.testing.expectEqual(@as(?u32, 1760), slots[0].est_mb);
+    try std.testing.expectEqual(@as(?u32, 1600), pool.learned.estimate(zig));
+    // The worst case an unknown job reserves is the margined largest, and never less than the floor.
+    try std.testing.expectEqual(@as(u32, 1760), pool.worstCase(false));
+    try std.testing.expectEqual(@as(u32, 1024), (Admission.init(std.testing.io, .{}, slots[1..]).worstCase(false)));
+    // Rounded up: 1001 MB is 1102, not 1101.
+    try std.testing.expectEqual(@as(u32, 1102), pool.margined(1001));
+    try std.testing.expectEqual(@as(u32, 0), pool.margined(0));
+    // A run is not recorded with the margin, so it is not compounded: the next run's record is
+    // what it took, and the reservation again 10 percent over the table.
+    _ = gate.ended();
+    pool.limits.margin_percent = 0;
+    gate.leave(true);
+    gate.assigned(zig);
+    try std.testing.expectEqual(@as(?u32, 1600), slots[0].est_mb);
+    // The operator's numbers carry none: an unlearned job reserves per_job_mb as set.
+    pool.limits.margin_percent = 15;
+    try std.testing.expectEqual(@as(u32, 1024), pool.limits.per_job_mb);
+    try std.testing.expectEqual(@as(u32, 1840), pool.margined(1600));
+}
+
+test "a native job learned reserves the margin too, and its memory.high follows the reservation" {
+    var slots: [1]Admission.Slot = undefined;
+    var pool: Admission = .init(std.testing.io, .{}, &slots);
+    pool.native = true;
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    const zig = jobKey("o/r", "o/r/.github/workflows/ci.yml", "test (zig)");
+    _ = pool.learned_native.record(zig, 1000, true);
+    try std.testing.expectEqual(@as(u32, 1100), pool.nativeEstimate(zig));
+    // A name not seen keeps the configured default.
+    try std.testing.expectEqual(@as(u32, 256), pool.nativeEstimate(zig +% 1));
+    var gate: Gate = .{ .pool = &pool };
+    gate.leave(true);
+    gate.assigned(zig);
+    try std.testing.expectEqual(@as(?u32, nativeHighMb(1100)), gate.native(null) orelse nativeHighMb(1100));
+    try std.testing.expectEqual(@as(?u32, 1100), slots[0].est_mb);
+}
+
+test "raised at once, lowered by an eighth a run: the estimate does not fall in a step" {
+    var l: Learned = .{};
+    try std.testing.expectEqual(@as(u32, 800), l.record(7, 800, true));
+    // Higher than the estimate: it replaces it at once.
+    try std.testing.expectEqual(@as(u32, 2000), l.record(7, 2000, true));
+    for (0..4) |_| try std.testing.expectEqual(@as(u32, 2000), l.record(7, 500, true));
+    // The 2000 leaves the last five; the estimate is 7/8 of itself, then 7/8 of that.
+    try std.testing.expectEqual(@as(u32, 1750), l.record(7, 500, true));
+    try std.testing.expectEqual(@as(u32, 1532), l.record(7, 500, true));
+    // A rise during the fall is taken at once, and the fall starts again from there.
+    try std.testing.expectEqual(@as(u32, 1900), l.record(7, 1900, true));
+    try std.testing.expectEqual(@as(u32, 1900), l.record(7, 1900, true));
+    // It ends at what the window says, and no lower.
+    const runs = settle(&l, 7, 500);
+    try std.testing.expect(runs >= 5 and runs < 40);
+    try std.testing.expectEqual(@as(u32, 500), l.estimate(7).?);
+    // The smallest size still falls, and stops at the window.
+    try std.testing.expectEqual(@as(u32, 64), l.record(8, 64, true));
+    try std.testing.expectEqual(@as(u32, 64), l.record(8, 64, true));
+}
+
+test "the held size is kept in the file, and a file from before it still loads as it was" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var fix: KeptFixture = .{ .sub_path = &tmp.sub_path };
+    var slots: [2]Admission.Slot = undefined;
+    var writer = try fix.pool(tmp.dir, &slots, "abc123\n", 8000, true);
+    _ = writer.restore(fix.stateFile());
+    _ = writer.learned_native.record(burst_heavy, 2600, true);
+    for (0..5) |_| _ = writer.learned_native.record(burst_heavy, 300, true);
+    // The heavy run left the window; 2275 is held, and kept.
+    try std.testing.expectEqual(@as(?u32, 2275), writer.learned_native.estimate(burst_heavy));
+    writer.persist.?.dirty = true;
+    writer.flush();
+    var s2: [2]Admission.Slot = undefined;
+    var reader = try fix.pool(tmp.dir, &s2, "abc123\n", 8000, true);
+    try std.testing.expectEqual(Restore{ .loaded = 1 }, reader.restore(fix.stateFile()));
+    try std.testing.expectEqual(@as(?u32, 2275), reader.learned_native.estimate(burst_heavy));
+    try std.testing.expectEqual(@as(u32, 2275), reader.learned_native.entries[0].held);
+
+    // A v2 file, as v0.30.0 wrote it: loads, with nothing held, so it reserves what it did.
+    try tmp.dir.writeFile(io, .{ .sub_path = "memory-gate", .data = "zig-runner memory gate v2\nmachine abc123\nmemory_mb 8000\nbackend native\n" ++
+        "e native 0000000000000001 1 A 2 2 2600 300 B 0 0 R 0 0\n" });
+    var s3: [2]Admission.Slot = undefined;
+    var old = try fix.pool(tmp.dir, &s3, "abc123\n", 8000, true);
+    try std.testing.expectEqual(Restore{ .loaded = 1 }, old.restore(fix.stateFile()));
+    try std.testing.expectEqual(@as(?u32, 2600), old.learned_native.estimate(1));
+    try std.testing.expectEqual(@as(u32, 0), old.learned_native.entries[0].held);
+    // It is rewritten as v3 at the next write, and then reads back the same.
+    old.persist.?.dirty = true;
+    old.flush();
+    var buf: [file_max_bytes]u8 = undefined;
+    const text = try std.Io.Dir.cwd().readFile(io, fix.stateFile(), &buf);
+    try std.testing.expect(std.mem.startsWith(u8, text, "zig-runner memory gate v3\n"));
+    try std.testing.expect(std.mem.endsWith(u8, text, " H 0\n"));
+
+    // A v3 line without its held value, or with a v2 line's ending under v3, is damaged.
+    const bad = [_][]const u8{
+        "zig-runner memory gate v3\nmachine abc123\nmemory_mb 8000\nbackend native\ne native 0000000000000001 1 A 0 0 B 0 0 R 0 0\n",
+        "zig-runner memory gate v3\nmachine abc123\nmemory_mb 8000\nbackend native\ne native 0000000000000001 1 A 0 0 B 0 0 R 0 0 H x\n",
+        "zig-runner memory gate v3\nmachine abc123\nmemory_mb 8000\nbackend native\ne native 0000000000000001 1 A 0 0 B 0 0 R 0 0 H 1048577\n",
+        "zig-runner memory gate v3\nmachine abc123\nmemory_mb 8000\nbackend native\ne native 0000000000000001 1 A 0 0 B 0 0 R 0 0 H 0 1\n",
+        "zig-runner memory gate v2\nmachine abc123\nmemory_mb 8000\nbackend native\ne native 0000000000000001 1 A 0 0 B 0 0 R 0 0 H 0\n",
+    };
+    for (bad) |file| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "memory-gate", .data = file });
+        var s4: [2]Admission.Slot = undefined;
+        var r = try fix.pool(tmp.dir, &s4, "abc123\n", 8000, true);
+        try std.testing.expectEqualStrings("it is not a memory gate file, or is damaged", r.restore(fix.stateFile()).ignored);
+    }
+}
+
+/// A native job in a cgroup `job` under `tmp` that had `oom_kill` kills and read `working_mb` MB,
+/// under a `memory.max` of `max`; `gate` is told of it, it is done, and the job ended.
+fn killedJob(
+    tmp: std.Io.Dir,
+    sub_path: []const u8,
+    gate: *Gate,
+    key: u64,
+    max: []const u8,
+    working_mb: u64,
+    oom_kill: u32,
+) !?Learned.Change {
+    var job_buf: [256]u8 = undefined;
+    const job = try std.fmt.bufPrint(&job_buf, ".zig-cache/tmp/{s}/job", .{sub_path});
+    gate.leave(true);
+    gate.assigned(key);
+    try writeCgroup(tmp, "job", max, 0, .{}, null);
+    _ = gate.native(job);
+    try writeCgroup(tmp, "job", max, working_mb * mib, .{}, null);
+    var ev: [128]u8 = undefined;
+    try tmp.writeFile(std.testing.io, .{
+        .sub_path = "job/memory.events",
+        .data = try std.fmt.bufPrint(&ev, "low 0\nhigh 0\nmax 3\noom 1\noom_kill {d}\noom_group_kill 0\n", .{oom_kill}),
+    });
+    gate.nativeDone();
+    return gate.ended();
+}
+
+test "a native job killed for memory is learned at half as much again, up to what it may have" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "meminfo", .data = "MemTotal: 8192000 kB\n" });
+    var mem_buf: [256]u8 = undefined;
+    const meminfo = try std.fmt.bufPrint(&mem_buf, ".zig-cache/tmp/{s}/meminfo", .{tmp.sub_path});
+    var slots: [1]Admission.Slot = undefined;
+    var pool: Admission = .init(std.testing.io, no_margin, &slots);
+    pool.native = true;
+    pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
+    var gate: Gate = .{ .pool = &pool };
+    const zig = jobKey("o/r", "o/r/.github/workflows/ci.yml", "test (zig)");
+
+    // Learned at 1000 and killed at its 1500 MB limit: the next run reserves 1500 (1000 x 1.5 is
+    // 1500, and it was seen to take 1500), not the 1500 of a run cut short taken as its size.
+    _ = pool.learned_native.record(zig, 1000, true);
+    var change = (try killedJob(tmp.dir, &tmp.sub_path, &gate, zig, "1572864000", 1400, 1)).?;
+    try std.testing.expectEqual(@as(u32, 1500), change.estimate_mb);
+    try std.testing.expectEqual(@as(?u32, 1500), pool.learned_native.estimate(zig));
+
+    // Killed again, at its limit of 1500: raised to what it may have, no more (1500 x 1.5 = 2250).
+    // Seen at 1490, the cap is 1500.
+    try std.testing.expectEqual(@as(?Learned.Change, null), try killedJob(tmp.dir, &tmp.sub_path, &gate, zig, "1572864000", 1490, 1));
+    try std.testing.expectEqual(@as(?u32, 1500), pool.learned_native.estimate(zig));
+
+    // Killed with a limit well above (a kill from the machine's memory): half as much again.
+    change = (try killedJob(tmp.dir, &tmp.sub_path, &gate, zig, "max", 1500, 1)).?;
+    try std.testing.expectEqual(@as(u32, 2250), change.estimate_mb);
+
+    // The machine's memory caps it: 8000 MB.
+    _ = pool.learned_native.record(zig, 6000, true);
+    for (0..5) |_| _ = pool.learned_native.record(zig, 6000, true);
+    change = (try killedJob(tmp.dir, &tmp.sub_path, &gate, zig, "max", 7000, 1)).?;
+    try std.testing.expectEqual(@as(u32, 8000), change.estimate_mb);
+
+    // A name never seen: its reservation, `native_per_job_mb`, and what it took, raised.
+    const fresh = jobKey("o/r", "o/r/.github/workflows/ci.yml", "fresh");
+    change = (try killedJob(tmp.dir, &tmp.sub_path, &gate, fresh, "max", 300, 2)).?;
+    try std.testing.expectEqual(@as(u32, 450), change.estimate_mb);
+
+    // No kill: learned as it was, as before.
+    const calm = jobKey("o/r", "o/r/.github/workflows/ci.yml", "calm");
+    change = (try killedJob(tmp.dir, &tmp.sub_path, &gate, calm, "max", 300, 0)).?;
+    try std.testing.expectEqual(@as(u32, 300), change.estimate_mb);
+}
+
+test "a kill for memory holds big jobs back for a while when others run, and never when none does" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var slots: [4]Admission.Slot = undefined;
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 20000);
+    var gates: [4]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    const now_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+
+    // No kill yet: a heavy job starts beside a light one, with room for both.
+    try std.testing.expectEqual(StartTag.started, named(&gates[0], burst_light));
+    try std.testing.expectEqual(StartTag.started, named(&gates[1], burst_heavy));
+    _ = gates[1].ended();
+
+    // A job killed for memory: the light job beside it still runs.
+    _ = try killedJob(tmp.dir, &tmp.sub_path, &gates[2], burst_novel, "max", 100, 1);
+    try std.testing.expect(pool.cooldown_until_ms > now_ms);
+    try std.testing.expect(pool.cooldown_until_ms <= now_ms + oom_cooldown_ms + 1000);
+
+    // Another heavy job waits for the cooldown, for room it has; a light one is not held.
+    gates[1].leave(true);
+    gates[1].assigned(burst_heavy);
+    const held = gates[1].start();
+    try std.testing.expect(held == .wait and held.wait == .cooldown);
+    try std.testing.expect(held.wait.cooldown.left_ms > 0 and held.wait.cooldown.left_ms <= oom_cooldown_ms);
+    var text_buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&text_buf);
+    try held.wait.format(&w);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "killed for memory") != null);
+    try std.testing.expectEqual(StartTag.started, named(&gates[3], burst_light));
+    _ = gates[3].ended();
+
+    // The cooldown ends: it starts.
+    pool.cooldown_until_ms = now_ms - 1;
+    try std.testing.expectEqual(StartTag.started, std.meta.activeTag(gates[1].start()));
+    _ = gates[1].ended();
+
+    // In a cooldown with nothing else running, a big job starts at once: waiting would not help.
+    _ = gates[0].ended();
+    pool.cooldown_until_ms = now_ms + oom_cooldown_ms;
+    try std.testing.expectEqual(StartTag.started, named(&gates[1], burst_heavy));
+    // ... and so does the forced start of the first in line when there is no room either.
+    _ = gates[1].ended();
+    try setAvailable(tmp.dir, 100);
+    try std.testing.expectEqual(StartTag.forced, named(&gates[1], burst_heavy));
+    // With another running, a second one waits: for room, as before, and for the cooldown.
+    gates[2].leave(true);
+    gates[2].assigned(burst_heavy);
+    try std.testing.expectEqual(StartTag.wait, std.meta.activeTag(gates[2].start()));
 }

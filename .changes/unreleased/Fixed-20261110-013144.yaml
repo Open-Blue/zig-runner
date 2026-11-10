@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The memory gate sizes jobs more carefully (from Autopilot, Borg and HTCondor): a learned size reserves RUNNER_MEM_MARGIN_PERCENT (10) more than was recorded, a learned size falls by at most an eighth a run after its heaviest run leaves the last five instead of in one step, a native job killed for memory is learned at half as much again (up to its memory.max and the machine''s memory) instead of as the small run it was cut to, and for 30 s after such a kill no big job starts beside others unless nothing else runs. The memory-gate file is now v3; v2 files are still read.'
+time: 2026-11-10T01:31:44.533224779-05:00
