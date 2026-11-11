@@ -2092,13 +2092,30 @@ fn noteProcessesMayRemain(b: *Backend) void {
 /// run a step in it, and any other job's processes were gone when it let go), and the job checks
 /// the trees at all. A walk that was not whole, or saw a racy file, leaves no verdict, and the next
 /// job walks as it always did.
+///
+/// The walk runs on a thread of its own, holding the locks this takes (`tool_trees.IdleWalks`), so
+/// the teardown, and the runner's next poll, do not wait for it. If the thread cannot be had the
+/// walk is made here, as it was.
 fn walkToolCacheIdle(b: *Backend) void {
     if (!b.caches.tool_trees) return;
     const mount = b.cache_plan.tool_cache orelse return;
     const arena = b.arena;
     const idle = b.cache_plan.idleToolCache(arena) orelse return;
     const lists = trees_check.listsDir(arena, b.store_cfg.root, idle.dir) catch return;
-    _ = trees_check.walkIdle(arena, b.gpa, b.io, idle.dir, lists, mount, idle.left, trees_check.idle_limits);
+    if (b.cache_plan.idleHandoff()) |held| {
+        const started = trees_check.process_idle_walks.start(b.io, .{
+            .dir = idle.dir,
+            .lists = lists,
+            .mount = mount,
+            .left = idle.left,
+            .lock = held.lock,
+            .other = held.other,
+        });
+        if (started) return;
+        _ = std.os.linux.close(held.lock);
+        if (held.other) |fd| _ = std.os.linux.close(fd);
+    }
+    _ = trees_check.walkIdle(arena, b.gpa, b.io, idle.dir, lists, mount, idle.left, trees_check.idle_limits, null);
 }
 
 /// `set_up.zig_builtin_seed_script` on the `builtin.zig` volume, bound beside the seed's own `b/`
@@ -5690,7 +5707,7 @@ test "native tool trees: a job's first step ends the epoch of the tool cache for
     var last = try volumes.plan(arena, io, c.cfg.store, caches, "repo", install, dagger.default_image, false, false, null);
     const idle = last.idleToolCache(arena) orelse return error.TestUnexpectedResult;
     const lists = try trees_check.listsDir(arena, c.cfg.store, idle.dir);
-    const kept = trees_check.walkIdle(arena, std.testing.allocator, io, idle.dir, lists, last.tool_cache.?, idle.left, trees_check.idle_limits);
+    const kept = trees_check.walkIdle(arena, std.testing.allocator, io, idle.dir, lists, last.tool_cache.?, idle.left, trees_check.idle_limits, null);
     last.release(io);
     if (!kept) return error.SkipZigTest; // a filesystem that proves nothing at rest
     // A job that has opened the volume and not run anything is told it, as is one that opens after.
