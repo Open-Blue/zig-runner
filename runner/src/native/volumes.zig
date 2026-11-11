@@ -1536,6 +1536,8 @@ test "native volumes: an open reads and stamps the lock file with its stamp lock
     defer first.release(io);
     // Another runner is between its read of the lock file's mtime and its stamp: this open comes
     // after it, so it cannot write its stamp over that one's.
+    // Valgrind does not let a blocked `fcntl` of one thread stand aside for the others.
+    if (std.valgrind.runningOnValgrind() != 0) return error.SkipZigTest;
     const other = stampLock(first.lock.handle) orelse return error.SkipZigTest;
     const Opener = struct {
         fn run(st: []const u8, k: []const []const u8, done: *std.atomic.Value(bool)) void {
