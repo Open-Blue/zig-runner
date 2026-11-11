@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Model-checks with TLC the TLA+ modules under proofs/tla that SPIN does not: a configuration with a
-# Promela one beside it (proofs/spin, spin.sh: StoreLocking.tla, StoreEviction.tla and
-# ReleasePipeline.tla, proofs/README.md "The store's locking, in TLA+" and "The release pipeline, in
+# Promela one beside it (proofs/spin, spin.sh: StoreLocking.tla, StoreDeferred.tla,
+# StoreEviction.tla and ReleasePipeline.tla, proofs/README.md "The store's locking, in TLA+" and "The release pipeline, in
 # TLA+") is SPIN's, unless TLC_ALL=1. tla2tools.jar is the TLA+ project's v1.7.4 release,
 # checked against the sha256 pinned here, so a changed or replaced jar fails the job instead of
 # checking the model. A new version means a new checksum from that release's asset.

@@ -445,9 +445,10 @@ close, so an `open` waiting on the evicted lock file waits for ever: `AllEnd`), 
 fairness the liveness checks assume is no stronger than the module's ("The store's locking, in
 SPIN").
 
-**The deferred sync** is a module of its own, `tla/StoreDeferred.tla` (TLC only: `StoreLocking` and its
-SPIN port model a publish that is durable when it is renamed in, which `Store.publishTimed` still is
-without `defer_sync`). A publish there is renamed in with a meta that says `pending` and names the boot;
+**The deferred sync** is a module of its own, `tla/StoreDeferred.tla` (`StoreLocking` models a
+publish that is durable when it is renamed in, which `Store.publishTimed` still is without
+`defer_sync`), checked with SPIN on its port, `proofs/spin/StoreDeferredModel.pml`, made as the
+others are. A publish there is renamed in with a meta that says `pending` and names the boot;
 the job's next publish makes the previous layer durable (the data's sync through the job's descriptor,
 then the durable meta renamed over it, then its directory's fsync), and its end the last, after its
 result was reported. A machine crash keeps the synced data and the committed meta, and may lose a
@@ -468,7 +469,11 @@ takes a pending layer: `NoWrongValid`), `-mark-first` (the durable mark before t
 With `OwnerOnly` the poison protects a holder's later lookups only, so the model cannot tell it from
 the ownership rule; it is kept for the layers a job already holds, and `StoreDeferred-owner-only.cfg`
 (`PoisonOnFail = FALSE`, `OwnerOnly = TRUE`) must hold: the ownership rule is sufficient alone in
-the model.
+the model. SPIN's states are TLC's plus one (the module has no symmetry and no fairness):
+`StoreDeferred.cfg` 36,661 and 36,662, `-owner-only` 34,601 and 34,602, and the five mutants, run
+to the end with `TypeOK` alone, 1,851, 109, 4,123, 4,555 and 2,559 (`-mark-first`, `-no-end-sync`,
+`-no-poison`, `-shared-pending`, `-trust-pending`), each one more in SPIN; each fails with the
+invariant it names in both.
 
 **Bounds** (the processes run one job each; a job's steps pick their keys freely):
 
@@ -691,9 +696,11 @@ Every module, one configuration after another on the laptop, compiles included (
 | `StoreLocking`, 13 configurations | 298 s | 160 s | 3.5 GB | 2.3 GB |
 | `StoreEviction`, 13 | 71 s | 53 s | 3.2 GB | 1.6 GB |
 | `ReleasePipeline`, 11 | 126 s | 58 s | 3.0 GB | 0.8 GB |
+| `StoreDeferred`, 7 | 9 s | 9 s | 0.6 GB | 17 MB |
 
-and the whole of `spin.sh`, side by side on the laptop's 12 threads, takes about 65 s. Most of a
-small configuration's time is gcc's: each process's actions share one copy of the invariants'
+and the whole of `spin.sh`, side by side on the laptop's 12 threads, takes about 65 s
+(`StoreDeferred`'s seven are small enough that both tools' time is start-up and compiling). Most
+of a small configuration's time is gcc's: each process's actions share one copy of the invariants'
 code (the port's header says how), which took `ReleasePipeline.cfg`'s compile from 17 s to 3 s, and
 a mutant's hash table is 32 MB (`-w22`), not 512, as its search stops at the first violation.
 `spin.sh` runs the configurations side by side, one a core, rather than SPIN's multi-core search,
