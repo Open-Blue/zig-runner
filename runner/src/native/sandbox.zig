@@ -104,7 +104,7 @@ pub const Spec = struct {
     /// (`jobView` maps that job's directory its own way).
     upper_canonical: bool = false,
     /// `upper_canonical`: the file, relative to `root`, that keeps the job's user namespace for the
-    /// upper's map (`keepUpperUserns`), made once for the job; "" or a file that cannot be opened
+    /// upper's map (`Backend.keepUserns`), made once for the job; "" or a file that cannot be opened
     /// makes the same namespace for this step.
     upper_userns: []const u8 = "",
     /// `mapped`: the first on-disk id of the cache volumes' range (`Bind.volume`), which the job
@@ -1444,11 +1444,15 @@ pub fn usernsMain(arena: Allocator, path: []const u8, base_text: []const u8, cou
     const count = std.fmt.parseInt(u32, count_text, 10) catch return 1;
     const ns = upperUserns(base, count);
     defer _ = linux.close(ns);
-    const file = linux.open(z(arena, path), .{ .ACCMODE = .RDONLY, .CREAT = true, .CLOEXEC = true }, 0o444);
+    // A file made here and no other (a link or a file already at the path fails), mounted over
+    // through its descriptor, so what the root bind mount lands on is what was made.
+    const file = linux.open(z(arena, path), .{ .ACCMODE = .RDONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o444);
     check("make the user namespace's file", file);
-    _ = linux.close(std.math.cast(linux.fd_t, file) orelse return 1);
+    const made = std.math.cast(linux.fd_t, file) orelse return 1;
+    defer _ = linux.close(made);
     const from = std.fmt.allocPrintSentinel(arena, "/proc/self/fd/{d}", .{ns}, 0) catch oom();
-    check("keep the user namespace", linux.mount(from, z(arena, path), null, linux.MS.BIND, 0));
+    const onto = std.fmt.allocPrintSentinel(arena, "/proc/self/fd/{d}", .{made}, 0) catch oom();
+    check("keep the user namespace", linux.mount(from, onto, null, linux.MS.BIND, 0));
     return 0;
 }
 
@@ -1457,7 +1461,14 @@ pub fn usernsMain(arena: Allocator, path: []const u8, base_text: []const u8, cou
 fn keptUserns(arena: Allocator, path: []const u8) linux.fd_t {
     const fd = linux.open(z(arena, path), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(fd) != .SUCCESS) return -1;
-    return std.math.cast(linux.fd_t, fd) orelse -1;
+    const kept = std.math.cast(linux.fd_t, fd) orelse return -1;
+    // Only a user namespace will do: with the mount gone (unmounted from outside) the file is a
+    // plain one, which the idmap would refuse and fail the step.
+    const ns_get_nstype = 0xb703;
+    const is_user = linux.ioctl(kept, ns_get_nstype, 0);
+    if (linux.errno(is_user) == .SUCCESS and is_user == linux.CLONE.NEWUSER) return kept;
+    _ = linux.close(kept);
+    return -1;
 }
 
 /// The lower layers with the canonical ids replaced by mounts of them idmapped through `userns`:

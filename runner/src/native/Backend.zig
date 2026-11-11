@@ -9151,6 +9151,36 @@ test "root runner: the kept user namespace for the idmapped uppers maps the job'
     try std.testing.expect(!(after.term == .exited and after.term.exited == 0));
 }
 
+test "root runner: a step whose kept user namespace is unmounted makes its own and runs; a planted file at its path stops the helper" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var b = try init(arena, io, std.testing.allocator, cfg);
+    defer b.deinit();
+    b.idmapped_min_entries = 0;
+    if (!b.idmappedUpper()) return error.SkipZigTest;
+    var out: Captured = .{ .arena = arena };
+    const first = try b.exec("echo one > /f", &.{"PATH=/usr/bin"}, &.{}, 0, 0, out.output());
+    try std.testing.expect(first.failure.len == 0 and first.code == 0);
+    try std.testing.expect(b.upper_userns != null);
+    // Unmounted from outside: the file is a plain one, and the next step makes its own namespace.
+    const kept = try std.fmt.allocPrintSentinel(arena, "{s}/userns", .{b.dir}, 0);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.umount2(kept, std.os.linux.MNT.DETACH)));
+    var out2: Captured = .{ .arena = arena };
+    const second = try b.exec("echo two > /g", &.{"PATH=/usr/bin"}, &.{}, 0, 0, out2.output());
+    try std.testing.expect(second.failure.len == 0 and second.code == 0);
+    // A file already at the path: the helper fails rather than mount over it.
+    const planted = try std.fmt.allocPrint(arena, "{s}/planted", .{b.dir});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = planted, .data = "x" });
+    const refused = try std.process.run(arena, io, .{ .argv = &.{ b.self_exe, sandbox.userns_command, planted, "1900065536", "65536" } });
+    try std.testing.expect(!(refused.term == .exited and refused.term.exited == 0));
+}
+
 test "native step cache: a long job's layers are flattened, files, deletions and replays intact" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();

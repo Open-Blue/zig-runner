@@ -267,11 +267,19 @@ pub fn readEntries(arena: Allocator, io: std.Io, root: []const u8, id: []const u
 
 /// `readEntries`' file written, if the number changed. Best effort, like `writeIndex`.
 pub fn writeEntries(arena: Allocator, io: std.Io, root: []const u8, id: []const u8, entries: u64) void {
-    if (readEntries(arena, io, root, id)) |n| if (n == entries) return;
     const path = std.fmt.allocPrint(arena, "{s}/steps/{s}.n", .{ root, id }) catch return;
     const text = std.fmt.allocPrint(arena, "{d}\n", .{entries}) catch return;
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text }) catch |e|
+    // Written every time, under a temporary name and renamed as `writeIndex` does: a reader never
+    // sees half, and the file's age is the step's last run (`sweep` drops what nothing refreshed).
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    const tmp = std.fmt.allocPrint(arena, "{s}/steps/.tmp-{s}", .{ root, &std.fmt.bytesToHex(raw, .lower) }) catch return;
+    const cwd = std.Io.Dir.cwd();
+    cwd.writeFile(io, .{ .sub_path = tmp, .data = text }) catch return;
+    cwd.rename(tmp, cwd, path, io) catch |e| {
         std.log.debug("native: the step's size cannot be written: {s}", .{@errorName(e)});
+        cwd.deleteFile(io, tmp) catch {};
+    };
 }
 
 test "a step's last layer size is kept and read back" {
