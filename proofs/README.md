@@ -670,9 +670,9 @@ Every module, one configuration after another on the laptop, compiles included (
 and the whole of `spin.sh`, side by side on the laptop's 12 threads, takes about 65 s. Most of a
 small configuration's time is gcc's: each process's actions share one copy of the invariants'
 code (the port's header says how), which took `ReleasePipeline.cfg`'s compile from 17 s to 3 s, and
-a mutant's hash table is 32 MB (`-w22`), not 512, as its search stops at the first violation. `spin.sh` runs the configurations side by
-side, one a core, rather than SPIN's multi-core search, which is faster for one configuration but
-needs every temporary in the state. Partial order reduction is off: it reduces nothing (every step
+a mutant's hash table is 32 MB (`-w22`), not 512, as its search stops at the first violation.
+`spin.sh` runs the configurations side by side, one a core, rather than SPIN's multi-core search,
+which is faster for one configuration but needs every temporary in the state. Partial order reduction is off: it reduces nothing (every step
 reads or writes the shared store) and costs a quarter of the time. Bitstate and hash compaction
 (`-DBITSTATE`, `-DHC4`) are not used: on `-crash` they missed 470 and 134,163 states.
 
