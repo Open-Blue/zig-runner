@@ -284,8 +284,7 @@ jobs:
       - name: Install Valgrind
         if: steps.tests.outputs.mode != 'none'
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends valgrind
+          sudo .github/scripts/apt.sh install --no-install-recommends valgrind
           valgrind --version
 
       - name: Every test under memcheck
@@ -515,8 +514,7 @@ jobs:
       # pinned here, so every night loads the machine the same way.
       - name: Install stress-ng
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends stress-ng=0.20.01-1
+          sudo .github/scripts/apt.sh install --no-install-recommends stress-ng=0.20.01-1
           stress-ng --version
 
       - name: Wait for the database
@@ -580,8 +578,7 @@ jobs:
         env:
           KCOV_VERSION: 43+dfsg-2
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends "kcov=$KCOV_VERSION"
+          sudo .github/scripts/apt.sh install --no-install-recommends "kcov=$KCOV_VERSION"
           kcov --version
 
       - name: Coverage, part ${{ matrix.part }} of 4
@@ -635,8 +632,7 @@ jobs:
         env:
           KCOV_VERSION: 43+dfsg-2
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends "kcov=$KCOV_VERSION"
+          sudo .github/scripts/apt.sh install --no-install-recommends "kcov=$KCOV_VERSION"
           kcov --version
 
       - name: Merge
