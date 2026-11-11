@@ -12,6 +12,9 @@
 #       For a container build, which has no apt.sh: prints a shell command, ending in "&& ", that
 #       repoints the container's sources at a fallback mirror, or prints nothing when the primary
 #       archive answers (or no mirror does). A caller puts it in front of the build's own script.
+#   apt.sh mirror-suffix
+#       The command, starting with " && ", that undoes mirror-prefix: after the build's script, so a
+#       published image's sources are exactly what they would be without the fallback.
 #
 # The trust is unchanged. Only the URIs are rewritten: the keyrings (Signed-By) stay Ubuntu's, and
 # apt checks every index and package against them, so a mirror can serve only what Ubuntu signed.
@@ -25,6 +28,8 @@
 set -euo pipefail
 
 apt_dir=${APT_DIR:-/etc/apt}
+# Where mirror-prefix keeps the container's own sources, until mirror-suffix puts them back.
+backup=/var/tmp/zig-runner-apt-orig
 
 # The first mirror that answers is used. Kept to ones that carry every pocket (checked 2026-11-11
 # for noble and resolute); ubuntu-ports (arm64) is not on kernel.org.
@@ -71,8 +76,16 @@ answers() {
 
 # The sed command that points every Ubuntu archive URI at MIRROR, over the source files in DIR.
 rewrite_command() {
-	printf '%s' "for f in $2/sources.list $2/sources.list.d/*.sources $2/sources.list.d/*.list $2/apt-mirrors.txt; do " \
+	printf '%s' "mkdir -p $backup && cp -a --parents $2/sources.list $2/sources.list.d $2/apt-mirrors.txt $backup 2>/dev/null; " \
+		"for f in $2/sources.list $2/sources.list.d/*.sources $2/sources.list.d/*.list $2/apt-mirrors.txt; do " \
 		"[ -f \"\$f\" ] && sed -i -E 's#$official#$1#g' \"\$f\"; done; true"
+}
+
+# The command that puts a container's sources back as mirror-prefix found them, for the end of a
+# build whose image is published: the image must not keep the mirror (only the lists, which the
+# provision script removes itself). Printed with its " && ", to go after the build's own script.
+mirror_suffix() {
+	printf ' && %s' "cp -a $backup/${1:?apt dir}/. $1/ && rm -rf $backup"
 }
 
 mirror_prefix() {
@@ -146,6 +159,9 @@ install)
 mirror-prefix)
 	shift
 	mirror_prefix "$@"
+	;;
+mirror-suffix)
+	mirror_suffix /etc/apt
 	;;
 *)
 	echo "usage: apt.sh install [apt-get options] PACKAGE... | apt.sh mirror-prefix ARCH CODENAME" >&2
