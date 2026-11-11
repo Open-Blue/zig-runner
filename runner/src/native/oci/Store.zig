@@ -57,7 +57,14 @@ pub fn prepare(s: Store, arena: Allocator, io: std.Io) !void {
     for ([_][]const u8{ "oci", "oci/blobs/sha256", "oci/refs", "oci/images", "rootfs" }) |d| {
         const p = try std.fmt.allocPrint(arena, "{s}/{s}", .{ s.root, d });
         try std.Io.Dir.cwd().createDirPath(io, p);
-        _ = linux.chmod(try arena.dupeSentinel(u8, p, 0), 0o700);
+        // Only when it is not 0700 already: a chmod that changes nothing still writes the inode
+        // (its ctime) into the filesystem's journal, five of them for every job's image, which
+        // jobs starting together queue for.
+        const z = try arena.dupeSentinel(u8, p, 0);
+        var st: linux.Statx = undefined;
+        if (linux.errno(linux.statx(linux.AT.FDCWD, z, 0, .{ .MODE = true }, &st)) == .SUCCESS and
+            st.mode & 0o7777 == 0o700) continue;
+        _ = linux.chmod(z, 0o700);
     }
 }
 

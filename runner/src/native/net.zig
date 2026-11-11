@@ -95,6 +95,16 @@ pub fn hostLink(buf: *[16]u8, slot: u32) []const u8 {
     return std.fmt.bufPrint(buf, "zrh{d}", .{slot}) catch unreachable;
 }
 
+/// Whether the host has a link named `name`, from sysfs. Not `Socket.index` for one that is
+/// usually not there: asking the kernel for a link's index by name makes it run `modprobe
+/// netdev-<name>` (`dev_load`) when there is none and the caller may load modules, a process
+/// started and waited for, which took 5 ms a job, and more with jobs starting together.
+pub fn linkExists(name: []const u8) bool {
+    var path: [64]u8 = undefined;
+    const p = std.fmt.bufPrintSentinel(&path, "/sys/class/net/{s}", .{name}, 0) catch return true;
+    return linux.errno(linux.access(p, 0)) == .SUCCESS;
+}
+
 /// The helper's subcommand that makes a job's network (`main.zig` dispatches it):
 /// `zig-runner native-net <namespace file> <slot> <subnet>`.
 pub const command = "native-net";
@@ -104,7 +114,8 @@ pub const command = "native-net";
 /// without capabilities on the host's, since the namespace's owner is the host's root, not the
 /// job's; no IPv6 on its `eth0`, whose link-local address would reach the host past the IPv4
 /// rules), then the slot's veth pair, isolated on the bridge, its address and the default route.
-/// The runner holds the slot's lock and removed a dead job's veth of it (`Backend.jobNetwork`).
+/// The runner holds the slot's lock until the helper has ended (`Backend.jobNetwork`), so a veth
+/// of the slot that is there is a dead job's, and is removed first.
 /// A helper, as a thread of the runner must not change its namespace. Exits 0, or 1 with why on
 /// stderr.
 pub fn upMain(
@@ -139,6 +150,7 @@ pub fn upMain(
     if (linux.errno(kept) != .SUCCESS) return fail("keep the namespace", linux.errno(kept));
     const ns = linux.open("/proc/self/ns/net", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(ns) != .SUCCESS) return fail("open the namespace", linux.errno(ns));
+    host.deleteVeth(slot);
     host.addVeth(slot, @intCast(ns)) catch return fail("make the veth pair", .INVAL);
     job.configureJob(subnet, slot) catch return fail("configure the job's network", .INVAL);
     return 0;
@@ -322,6 +334,7 @@ pub const Socket = struct {
     /// Removes slot `n`'s veth pair (both ends go with the host's); none there is no error.
     pub fn deleteVeth(s: *Socket, slot: u32) void {
         var buf: [16]u8 = undefined;
+        if (!linkExists(hostLink(&buf, slot))) return;
         const i = s.index(hostLink(&buf, slot)) orelse return;
         var m: Message = .init(.RTM_DELLINK, 0);
         m.ifinfo(i, 0);
