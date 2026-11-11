@@ -198,6 +198,13 @@ how: Launch,
 /// network namespace's file.
 slot: ?Slot = null,
 netns: ?[]const u8 = null,
+/// The network helper (`jobNetwork`) while it runs beside the job's set-up, until the first use of
+/// the namespace waits for it (`networkPath`). `net_mu` serialises that wait, `net_why` is what
+/// it said when it failed, and `net_ns` the time the job spent on it (starting it, then waiting).
+net_helper: ?NetHelper = null,
+net_mu: std.Io.Mutex = .init,
+net_why: ?[]const u8 = null,
+net_ns: u64 = 0,
 /// On a root runner, the nameservers the job's resolver names (`net.Resolver`), which the jobs'
 /// rules let its DNS through to (`natRulesFor`).
 nameservers: []const [4]u8 = &.{},
@@ -1279,33 +1286,67 @@ fn jobNetwork(b: *Backend, cfg: Config, why: *[]const u8) !void {
         return error.JobNetworkFailed;
     }
     t = b.timings.since(arena, .nat, t);
-    defer _ = b.timings.since(arena, .netns, t);
     const path = try std.fmt.allocPrint(arena, "{s}/netns", .{b.dir});
     const slot = try std.fmt.allocPrint(arena, "{d}", .{n});
-    var child = std.process.spawn(b.io, .{
+    const child = std.process.spawn(b.io, .{
         .argv = &.{ cfg.self_exe, net.command, path, slot, subnet },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .pipe,
     }) catch |e| return failed(why, arena, "starting the job's network helper", cfg.self_exe, e);
-    var err: std.ArrayList(u8) = .empty;
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const got = child.stderr.?.readStreaming(b.io, &.{&buf}) catch break;
-        if (got == 0) break;
-        try err.appendSlice(arena, buf[0..got]);
+    // The helper runs while the job's image and caches are set up, which need no network: the
+    // kernel serialises every link change on one lock, so with many jobs starting together each
+    // helper waits for the others' (33-130 ms against 8 on a Pi 5 with seven jobs), time a job
+    // spends elsewhere. The first thing that needs the namespace waits for it (`networkPath`).
+    b.net_helper = .{ .child = child, .path = path };
+    b.net_ns += phases.now() -| t;
+}
+
+/// What `jobNetwork` started, still running.
+const NetHelper = struct {
+    child: std.process.Child,
+    path: []const u8,
+};
+
+/// The job's network namespace's file, once its helper has made it (the wait for it is the
+/// job's `netns` phase); null on a job with no namespace of its own. Fails with
+/// `error.JobNetworkFailed` when the helper did, every time it is asked: nothing runs in a
+/// network that is not there. Every use of `b.netns` outside the teardown asks here.
+pub fn networkPath(b: *Backend) !?[]const u8 {
+    b.net_mu.lockUncancelable(b.io);
+    defer b.net_mu.unlock(b.io);
+    if (b.net_helper) |started| {
+        var h = started;
+        const arena = b.arena;
+        const t = phases.now();
+        b.net_helper = null;
+        b.netns = h.path;
+        var err: std.ArrayList(u8) = .empty;
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const got = h.child.stderr.?.readStreaming(b.io, &.{&buf}) catch break;
+            if (got == 0) break;
+            err.appendSlice(arena, buf[0..got]) catch break;
+        }
+        const term = h.child.wait(b.io) catch |e| {
+            b.net_why = std.fmt.allocPrint(arena, "waiting for the job's network helper {s}: {s}", .{
+                b.self_exe, @errorName(e),
+            }) catch "waiting for the job's network helper";
+            b.timings.add(arena, .netns, b.net_ns + (phases.now() -| t));
+            return error.JobNetworkFailed;
+        };
+        b.net_ns += phases.now() -| t;
+        b.timings.add(arena, .netns, b.net_ns);
+        if (term != .exited or term.exited != 0) {
+            const said = std.mem.trim(u8, err.items, " \n");
+            std.log.warn("native: the job's network: {s}", .{said});
+            b.net_why = std.fmt.allocPrint(arena, "making the job's network {s} ({s} {s}): {s}", .{
+                h.path, b.self_exe, net.command, if (said.len > 0) said else "it failed",
+            }) catch "making the job's network failed";
+        }
     }
-    const term = child.wait(b.io) catch |e|
-        return failed(why, arena, "waiting for the job's network helper", cfg.self_exe, e);
-    b.netns = path;
-    if (term != .exited or term.exited != 0) {
-        const said = std.mem.trim(u8, err.items, " \n");
-        std.log.warn("native: the job's network: {s}", .{said});
-        why.* = try std.fmt.allocPrint(arena, "making the job's network {s} ({s} {s}): {s}", .{
-            path, cfg.self_exe, net.command, if (said.len > 0) said else "it failed",
-        });
-        return error.JobNetworkFailed;
-    }
+    if (b.net_why != null) return error.JobNetworkFailed;
+    return b.netns;
 }
 
 /// The first slot whose lock in `dir` no process holds, locked. The directory is made only
@@ -1402,6 +1443,8 @@ pub fn deinit(b: *Backend) void {
     // slot's next holder never sees: it removes whatever it finds of the slot's veth under the
     // slot's lock, which is let go below (`jobNetwork`). A job with no namespace (its helper
     // failed) may have a veth of its slot all the same, so that one is deleted here.
+    // Its helper first, if one is still running; why it failed is said already.
+    _ = b.networkPath() catch |e| std.log.debug("native: teardown: the job's network: {s}", .{@errorName(e)});
     if (b.netns) |p| {
         detachNetns(arena, p);
     } else if (b.slot) |s| {
@@ -2643,6 +2686,10 @@ fn execIn(
     const upper_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, upper });
     try std.Io.Dir.cwd().createDirPath(b.io, upper_path);
     const base_id = b.idBase();
+    const netns = b.networkPath() catch return .{
+        .code = 1,
+        .failure = b.net_why orelse "the job's network could not be made",
+    };
     // The upper's root is the overlay's `/`: the job's root's, as the image's `/` is, so a step
     // as root can make files there. Rootless, the runner's own user is the job's root already.
     if (b.how.userns == .mapped) {
@@ -2680,7 +2727,7 @@ fn execIn(
         .userns = b.how.userns,
         .id_base = base_id,
         .id_count = ids_per_slot,
-        .netns = b.netns,
+        .netns = netns,
         .mount_points = mount_points,
         .cgroup = if (b.job_cgroup) |j| j.stepsDir() else null,
         .image_layers = @intCast(b.seed_layers.items.len + 1),
@@ -3426,8 +3473,13 @@ fn publishPorts(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void {
         err_msg.* = if (why.len > 0) why else @errorName(e);
         return error.BaseContainerFailed;
     };
+    const netns = b.networkPath() catch |e| {
+        b.job_fault = true;
+        err_msg.* = b.net_why orelse @errorName(e);
+        return error.BaseContainerFailed;
+    };
     b.publisher = forward.start(arena, b.io, b.self_exe, .{
-        .netns = b.netns,
+        .netns = netns,
         // The job's nobody: an id of its range, nothing on the host.
         .id = if (b.how.userns == .mapped) b.idBase() + 65534 else null,
         .cgroup = if (b.job_cgroup) |j| j.servicesDir() else null,
@@ -6335,12 +6387,32 @@ test "root runner: slots are the host's, so two runners with different stores ne
     defer second.deinit();
     try std.testing.expect(first.slot.?.n != second.slot.?.n);
     try std.testing.expect(first.idBase() != second.idBase());
-    // The second job's set-up left the first's veth alone, and both are on the bridge.
+    // The second job's set-up left the first's veth alone, and both are on the bridge: once each
+    // job's network helper is done, as `init` only starts it.
+    _ = try first.networkPath();
+    _ = try second.networkPath();
     var sock = try net.Socket.open();
     defer sock.close();
     var buf: [16]u8 = undefined;
     try std.testing.expect(sock.index(net.hostLink(&buf, first.slot.?.n)) != null);
     try std.testing.expect(sock.index(net.hostLink(&buf, second.slot.?.n)) != null);
+}
+
+test "root runner: a job whose network helper fails starts, and its first use of the network fails, every time" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    // `false` for the helper: it exits 1 and says nothing.
+    cfg.self_exe = "/usr/bin/false";
+    var b = try init(arena, std.testing.io, std.testing.allocator, cfg);
+    defer b.deinit();
+    try std.testing.expectError(error.JobNetworkFailed, b.networkPath());
+    try std.testing.expect(std.mem.indexOf(u8, b.net_why.?, "making the job's network") != null);
+    try std.testing.expectError(error.JobNetworkFailed, b.networkPath());
 }
 
 test "root runner: a job's veth goes with its namespace, and the next job of the slot never meets it" {
@@ -6365,6 +6437,8 @@ test "root runner: a job's veth goes with its namespace, and the next job of the
         var b = try init(arena, io, std.testing.allocator, cfg);
         if (slot) |n| try std.testing.expectEqual(n, b.slot.?.n);
         slot = b.slot.?.n;
+        // The helper runs beside the set-up: the veth is there once the first use waited for it.
+        try std.testing.expect(try b.networkPath() != null);
         try std.testing.expect(sock.index(net.hostLink(&buf, slot.?)) != null);
         b.deinit();
     }

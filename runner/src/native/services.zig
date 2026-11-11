@@ -264,7 +264,7 @@ fn startOne(
         .userns = b.how.userns,
         .id_base = b.idBase(),
         .id_count = Backend.ids_per_slot,
-        .netns = b.netns,
+        .netns = try b.networkPath(),
         .mount_points = Backend.mount_points,
         // P4: the service's helper and everything it starts are in the job's cgroup, held to
         // the job's limits and measured with it.
@@ -366,7 +366,7 @@ fn startRelay(b: *Backend, x: *Exec, ls: u32) !bool {
     if (maps.items.len == 0) return true;
     var why: []const u8 = "";
     b.service_set.relay = forward.start(arena, b.io, b.self_exe, .{
-        .netns = b.netns,
+        .netns = try b.networkPath(),
         // The job's nobody: an id of its range, nothing on the host.
         .id = if (b.how.userns == .mapped) b.idBase() + nobody else null,
         .cgroup = if (b.job_cgroup) |j| j.servicesDir() else null,

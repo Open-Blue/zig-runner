@@ -229,7 +229,15 @@ On a root runner, each step runs:
   (`IFLA_BRPORT_ISOLATED`), and `FORWARD` drops traffic from `zr0` back to `zr0`. IPv6 is off on the
   job's `eth0` and on the bridge, so no link-local address slips past those IPv4 rules (`lo` keeps
   its ::1). Ports below 1024 and ping work without capabilities on the host's
-  (`ip_unprivileged_port_start=0`, `ping_group_range`, set in the job's namespace only). Its
+  (`ip_unprivileged_port_start=0`, `ping_group_range`, set in the job's namespace only). The
+  namespace is made by a helper (`native-net`) that the job starts and does not wait for: it runs
+  while the job's image and caches are set up, and the first thing that needs the network (a
+  sandbox, a service, a published port) waits for it; the job's `netns` phase is the time it
+  spent starting the helper and that wait. The kernel takes one lock for every link change, so
+  seven jobs starting together queue for it (33-130 ms each on a Pi 5, against 8 ms for one job
+  alone), which the set-up now spends on other work; a bridge that is already up with its address
+  is only read, not changed again, for the same reason. A helper that failed fails that first
+  use, not the job's start. Its
   resolver is a resolv.conf of its own, made from the host's as Docker makes a container's on its
   default bridge (`net.Resolver`): the loopback's nameservers left out (systemd-resolved's
   127.0.0.53 is the host's loopback; its upstream list, `/run/systemd/resolve/resolv.conf`, is
