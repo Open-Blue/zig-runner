@@ -10,7 +10,7 @@
 #   ci-scope.sh go           Go tools (ci.yml)
 #   ci-scope.sh analysis     Fuzz, Valgrind, ThreadSanitizer, Stress, ZLint (suppressed-errors) (analysis.yml)
 #   ci-scope.sh store        Store stress, Store crash (analysis.yml)
-#   ci-scope.sh coverage     Coverage (analysis.yml)
+#   ci-scope.sh coverage     Coverage's own tooling (analysis.yml)
 #
 # Sets `run=true` or `run=false` in GITHUB_OUTPUT, and says why. The jobs still run, and report,
 # either way: a required check that never reports holds the merge queue forever, which a
@@ -162,9 +162,12 @@ needed() {
 		esac
 		;;
 	coverage)
-		# The runner's code and its tests as zig-coverage.sh compiles and measures them.
+		# What runs the measurement, not what it measures: a pull request that changes the runner's
+		# code is measured by the night's run (about 1 GB of raw reports a part, over an hour of
+		# runner time), so only a change to this job's own tooling runs the four parts, to see them
+		# work (they report nothing and merge nothing on a pull request).
 		case $1 in
-		runner/src/* | runner/build.zig.zon | .github/workflows/analysis.yml | \
+		.github/workflows/analysis.yml | \
 			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
 			.github/scripts/zig-modules.sh | .github/scripts/zig-coverage.sh | \
 			.github/scripts/native-service-images.sh) return 0 ;;
