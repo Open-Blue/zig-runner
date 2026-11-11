@@ -278,7 +278,7 @@ pub fn writeEntries(arena: Allocator, io: std.Io, root: []const u8, id: []const 
     cwd.writeFile(io, .{ .sub_path = tmp, .data = text }) catch return;
     cwd.rename(tmp, cwd, path, io) catch |e| {
         std.log.debug("native: the step's size cannot be written: {s}", .{@errorName(e)});
-        cwd.deleteFile(io, tmp) catch {};
+        cwd.deleteFile(io, tmp) catch |e2| std.log.debug("native: {s}: {s}", .{ tmp, @errorName(e2) });
     };
 }
 
