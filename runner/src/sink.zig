@@ -13,9 +13,24 @@ pub const StdoutSink = struct {
     secrets: []const []const u8 = &.{},
     /// `secrets` indexed, when they came from a `redact.Set` (see `LogSink.setSecretSet`).
     index: ?*const redact.Set = null,
-    /// Set when several runners in the process share the sink: each line is written whole.
-    io: ?std.Io = null,
-    mu: std.Io.Mutex = .init,
+    /// Set when several runners in the process share the sink: each line is written whole. Kept
+    /// outside the sink: `LogSink`'s `switch (s.*)` copies the whole union, so a mutex in it was
+    /// read, unlocked, while another job's thread held it (ThreadSanitizer, whenever two jobs
+    /// log at once). A copied pointer is only ever read.
+    lock: ?*Lock = null,
+
+    pub const Lock = struct {
+        io: std.Io,
+        mu: std.Io.Mutex = .init,
+
+        fn take(l: ?*Lock) void {
+            if (l) |k| k.mu.lockUncancelable(k.io);
+        }
+
+        fn give(l: ?*Lock) void {
+            if (l) |k| k.mu.unlock(k.io);
+        }
+    };
 
     /// Buffered; never blocks on anything but the underlying writer.
     pub fn append(
@@ -25,8 +40,8 @@ pub const StdoutSink = struct {
         stream: Stream,
         line: []const u8,
     ) Error!void {
-        if (s.io) |io| s.mu.lockUncancelable(io);
-        defer if (s.io) |io| s.mu.unlock(io);
+        Lock.take(s.lock);
+        defer Lock.give(s.lock);
         try s.writer.print("[job {d} step {d} {s}] ", .{ job_id, step_number, @tagName(stream) });
         try redact.writeWith(s.writer, line, s.secrets, s.index);
         try s.writer.writeByte('\n');
@@ -37,16 +52,16 @@ pub const StdoutSink = struct {
     /// A line from the runner itself, bare: a `[job 0 step 0 ...]` prefix would pass it off as
     /// some step's output.
     pub fn say(s: *StdoutSink, line: []const u8) Error!void {
-        if (s.io) |io| s.mu.lockUncancelable(io);
-        defer if (s.io) |io| s.mu.unlock(io);
+        Lock.take(s.lock);
+        defer Lock.give(s.lock);
         try redact.writeWith(s.writer, line, s.secrets, s.index);
         try s.writer.writeByte('\n');
         try s.writer.flush();
     }
 
     pub fn flush(s: *StdoutSink) Error!void {
-        if (s.io) |io| s.mu.lockUncancelable(io);
-        defer if (s.io) |io| s.mu.unlock(io);
+        Lock.take(s.lock);
+        defer Lock.give(s.lock);
         try s.writer.flush();
     }
 

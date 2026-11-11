@@ -1622,8 +1622,13 @@ test "a job with no room waits kept, starts when a reservation drops, and a canc
 
     var out_buf: [4096]u8 = undefined;
     var out: std.Io.Writer = .fixed(&out_buf);
-    var stdout_log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
-    var log: sink.LogSink = .{ .collect = .{ .arena = arena, .io = io, .inner = &stdout_log } };
+    // As in the runner: one console, locked (as main.zig locks it), shared by the jobs, and a
+    // collector of its own for each job. One collector for both waiters raced (#361's test under
+    // ThreadSanitizer: 19 reports on its sequence numbers and redaction buffer).
+    var console_lock: sink.StdoutSink.Lock = .{ .io = io };
+    var stdout_log: sink.LogSink = .{ .stdout = .{ .writer = &out, .lock = &console_lock } };
+    var log_a: sink.LogSink = .{ .collect = .{ .arena = arena, .io = io, .inner = &stdout_log } };
+    var log_b: sink.LogSink = .{ .collect = .{ .arena = arena, .io = io, .inner = &stdout_log } };
     var err_buf: [1024]u8 = undefined;
     var err: std.Io.Writer = .fixed(&err_buf);
     var cfg: Config = .{ .gh_token = "", .scope = undefined };
@@ -1656,8 +1661,8 @@ test "a job with no room waits kept, starts when a reservation drops, and a canc
     var cancel_b: dagger.Cancel = .{};
     var wait_a: Wait = .{};
     var wait_b: Wait = .{};
-    var waiting_a = try io.concurrent(Wait.run, .{ &wait_a, c, &gates[1], &log, job, &cancel_a });
-    var waiting_b = try io.concurrent(Wait.run, .{ &wait_b, c, &gates[2], &log, job, &cancel_b });
+    var waiting_a = try io.concurrent(Wait.run, .{ &wait_a, c, &gates[1], &log_a, job, &cancel_a });
+    var waiting_b = try io.concurrent(Wait.run, .{ &wait_b, c, &gates[2], &log_b, job, &cancel_b });
     io.sleep(.fromMilliseconds(300), .awake) catch {};
     // No room: both wait, and neither has started.
     try std.testing.expect(!wait_a.done.load(.acquire) and !wait_b.done.load(.acquire));
