@@ -1443,7 +1443,8 @@ pub fn deinit(b: *Backend) void {
     // slot's next holder never sees: it removes whatever it finds of the slot's veth under the
     // slot's lock, which is let go below (`jobNetwork`). A job with no namespace (its helper
     // failed) may have a veth of its slot all the same, so that one is deleted here.
-    _ = b.networkPath() catch {};
+    // Its helper first, if one is still running; why it failed is said already.
+    _ = b.networkPath() catch |e| std.log.debug("native: teardown: the job's network: {s}", .{@errorName(e)});
     if (b.netns) |p| {
         detachNetns(arena, p);
     } else if (b.slot) |s| {
