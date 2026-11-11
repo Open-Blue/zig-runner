@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Model-checks the native store's locking protocol with SPIN: proofs/spin/StoreLockingModel.pml, the
-# Promela port of proofs/tla/StoreLocking.tla (proofs/README.md, "The store's locking, in SPIN").
+# Model-checks the TLA+ modules with SPIN, on their Promela ports: proofs/spin/<Module>Model.pml for
+# proofs/tla/<Module>.tla, StoreLocking's, StoreEviction's and ReleasePipeline's (proofs/README.md,
+# "The store's locking, in SPIN").
 # SPIN is 6.5.2, Ubuntu's spin 6.5.2+dfsg-2build1 (store-model.yml pins the package), and any other
 # version fails here, so a changed SPIN is a change made on purpose.
 #
-# Each proofs/spin/StoreLocking*.pml is a configuration written from the proofs/tla .cfg of the same
-# name (proofs/spin/cfg.py; a stale one fails the job). A configuration of the protocol as the code has
-# it must hold, and must reach exactly the states its `spin-states:` line says: TLC's count without
-# symmetry, and SPIN's first state. A different count means the two models have drifted apart. A
-# mutant, the code with one guard taken away, says "must fail: <invariant>" in its first line and must
-# fail with that invariant's assertion.
+# Each proofs/spin/<Module>*.pml but <Module>Model.pml is a configuration written from the proofs/tla
+# .cfg of the same name (proofs/spin/cfg.py; a stale one fails the job). A configuration of the
+# protocol as the code has it must hold, and must reach exactly the states its `spin-states:` line
+# says: TLC's count without symmetry, and SPIN's first state. A different count means the two models
+# have drifted apart. A configuration with temporal properties (its `spin-ltl:` line) then checks
+# each of them alone, with SPIN's weak fairness (pan -a -f), on the model built with LIVENESS. A
+# mutant, the code with one guard taken away, says "must fail: <property>" in its first line and must
+# fail with that invariant's assertion, or, for a temporal property, with that property's claim.
 #
 # The search is exhaustive: no bitstate or hash compaction, which may miss states, and no partial
 # order reduction, which reduces nothing here (every step touches the shared store) and costs time.
@@ -31,52 +34,101 @@ if [[ $(spin -V 2>&1) != "$version" ]]; then
 fi
 python3 -I "$here/cfg.py" --check
 
+# build <name> safety|liveness: spin -a and gcc in the current directory, pan-<kind> the verifier.
+# The safety one has no never claim; the liveness one has the stutter of LIVENESS and the claims.
+# A variable no step reads (a ghost a mutant does not check) stays in the state (-o2), as it is in
+# TLC's.
+build() {
+	local name=$1 kind=$2
+	if [[ $kind == safety ]]; then
+		spin -o2 -a "$name.pml" >spin-safety.out 2>&1 &&
+			gcc -O2 -w -DSAFETY -DNOREDUCE -DNOCLAIM -o pan-safety pan.c >gcc-safety.out 2>&1
+	else
+		spin -o2 -DLIVENESS -a "$name.pml" >spin-liveness.out 2>&1 &&
+			gcc -O2 -w -DNOREDUCE -o pan-liveness pan.c >gcc-liveness.out 2>&1
+	fi
+}
+
+# live <property>: pan-liveness on one claim, its report in pan-<property>.out.
+live() {
+	./pan-liveness -m1000000 -w"$hw" -a -f -N "$1" >"pan-$1.out" 2>&1 || true
+}
+
+stored() { sed -n 's/^ *\([0-9]*\) states, stored.*/\1/p' "$1"; }
+elapsed() { sed -n 's/^pan: elapsed time \(.*\)/\1/p' "$1"; }
+
 # check <name>: compiles and runs one configuration in $dir/<name>; the verdict is in result.
 check() {
-	local name=$1 w="$dir/$1" started=$SECONDS
+	local name=$1 w="$dir/$1" started=$SECONDS first want ltl p verdict ns hw=22
 	rm -rf "${w:?}"
 	mkdir -p "$w"
 	cp "$here"/*.pml "$w"/
+	cd "$w"
 	echo "[$name] spin, gcc and pan started"
-	(
-		cd "$w"
-		spin -a "$name.pml" >spin.out 2>&1 &&
-			gcc -O2 -w -DSAFETY -DNOREDUCE -o pan pan.c >gcc.out 2>&1 &&
-			{ ./pan -m100000 -w26 >pan.out 2>&1 || true; }
-	) || {
-		echo "$name: spin -a or gcc failed" >"$w/result"
-		echo "[$name] $(cat "$w/result")"
-		echo "$name" >>"$dir/finished"
-		return
-	}
-	local first want stored
-	first=$(head -n 1 "$here/$name.pml")
-	stored=$(sed -n 's/^ *\([0-9]*\) states, stored.*/\1/p' "$w/pan.out")
-	if grep -q 'must fail:' <<<"$first"; then
-		want=$(sed -n 's/.*must fail: \([A-Za-z]*\).*/\1/p' <<<"$first")
-		if grep -q "^pan:1: assertion violated $want " "$w/pan.out"; then
-			echo "ok: fails with $want (${stored:-?} states to the first violation)" >"$w/result"
+	first=$(head -n 1 "$name.pml")
+	want=$(sed -n 's/.*must fail: \([A-Za-z]*\).*/\1/p' <<<"$first")
+	ltl=$(sed -n 's/^ \* spin-ltl: \([A-Za-z ]*\).*/\1/p' "$name.pml")
+	# The hash table's size, 2^hw slots: about twice the states the spin-states line says, or 2^22
+	# for a mutant, which stops at its first violation. The size is only speed, never which states
+	# are found (each slot is a chain), and its memory is 8 bytes a slot: 32 MB for a mutant, not
+	# the 512 MB of -w26.
+	ns=$(sed -n 's/^ \* spin-states: \([0-9]*\).*/\1/p' "$name.pml")
+	if [[ -n $ns ]]; then
+		hw=19
+		while ((hw < 26 && (1 << (hw - 1)) < ns)); do hw=$((hw + 1)); done
+	fi
+	if [[ -n $want && " $ltl " == *" $want "* ]]; then
+		# A mutant that must fail a temporal property: its claim's violation, under fairness.
+		if ! build "$name" liveness; then
+			verdict="$name: spin -a or gcc failed"
+		elif live "$want" && grep -qE '^pan:1: (acceptance cycle|claim violated)' "pan-$want.out"; then
+			verdict="ok: fails $want ($(stored "pan-$want.out") states to the first violation)"
 		else
-			echo "$name: SPIN did not fail with $want" >"$w/result"
+			verdict="$name: SPIN did not fail $want"
 		fi
+	elif ! build "$name" safety; then
+		verdict="$name: spin -a or gcc failed"
 	else
-		want=$(sed -n 's/^ \* spin-states: \([0-9]*\).*/\1/p' "$here/$name.pml")
-		if ! grep -q 'errors: 0$' "$w/pan.out" || grep -qE 'max search depth too small|violated|out of memory' "$w/pan.out"; then
-			echo "$name: SPIN found an error, or did not finish" >"$w/result"
-		elif [[ $stored != "$want" ]]; then
-			echo "$name: $stored states, not the $want of its spin-states line: the Promela and the TLA+ differ" >"$w/result"
+		./pan-safety -m100000 -w"$hw" >pan.out 2>&1 || true
+		if [[ -n $want ]]; then
+			if grep -q "^pan:1: assertion violated $want " pan.out; then
+				verdict="ok: fails with $want ($(stored pan.out) states to the first violation)"
+			else
+				verdict="$name: SPIN did not fail with $want"
+			fi
 		else
-			echo "ok: holds, $stored states, $(sed -n 's/^pan: elapsed time \(.*\)/\1/p' "$w/pan.out")" >"$w/result"
+			want=$(sed -n 's/^ \* spin-states: \([0-9]*\).*/\1/p' "$name.pml")
+			if ! grep -q 'errors: 0$' pan.out || grep -qE 'max search depth too small|violated|out of memory' pan.out; then
+				verdict="$name: SPIN found an error, or did not finish"
+			elif [[ $(stored pan.out) != "$want" ]]; then
+				verdict="$name: $(stored pan.out) states, not the $want of its spin-states line: the Promela and the TLA+ differ"
+			else
+				verdict="ok: holds, $(stored pan.out) states, $(elapsed pan.out)"
+				if [[ -n $ltl ]] && ! build "$name" liveness; then
+					verdict="$name: spin -a or gcc failed (LIVENESS)"
+				fi
+				for p in $ltl; do
+					[[ $verdict == ok:* ]] || break
+					live "$p"
+					if ! grep -q 'errors: 0$' "pan-$p.out" ||
+						grep -qE 'max search depth too small|violated|acceptance cycle|out of memory' "pan-$p.out"; then
+						verdict="$name: SPIN found $p violated, or did not finish"
+					else
+						verdict+="; $p holds ($(stored "pan-$p.out") states with its claim, $(elapsed "pan-$p.out"))"
+					fi
+				done
+			fi
 		fi
 	fi
-	echo "[$name] ended after $((SECONDS - started)) s: $(cat "$w/result")"
+	echo "$verdict" >result
+	echo "[$name] ended after $((SECONDS - started)) s: $verdict"
 	echo "$name" >>"$dir/finished"
 }
 
 names=()
-for f in "$here"/StoreLocking*.pml; do
+for f in "$here"/*.pml; do
 	f=$(basename "$f" .pml)
-	[[ $f == StoreLockingModel ]] || names+=("$f")
+	[[ $f == *Model ]] || names+=("$f")
 done
 # The largest first, so the long ones start at once.
 mapfile -t names < <(for n in "${names[@]}"; do
@@ -102,7 +154,7 @@ for n in "${names[@]}"; do
 		wait -n
 		running=$((running - 1))
 	fi
-	check "$n" &
+	(check "$n") &
 	pids+=($!)
 	running=$((running + 1))
 done
@@ -114,7 +166,7 @@ for n in "${names[@]}"; do
 	r=$(cat "$dir/$n/result")
 	echo "== $n: ${r#ok: }"
 	if [[ $r != ok:* ]]; then
-		cat "$dir/$n/spin.out" "$dir/$n/gcc.out" "$dir/$n/pan.out" 2>/dev/null | tail -n 40
+		cat "$dir/$n"/spin-*.out "$dir/$n"/gcc-*.out "$dir/$n"/pan*.out 2>/dev/null | tail -n 40
 		status=1
 	fi
 done

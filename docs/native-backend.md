@@ -716,6 +716,83 @@ What it covers, as built:
   an evicted layer is a miss, a kept doubtful one could be a hit. One another job holds stays.
   `store-crash.sh errors` makes the disk fail writes and checks each of these, and that the next
   publish of the same job is refused with the disk working again.
+- **A job's last layer is made durable after its result is reported.** (`RUNNER_NATIVE_DEFER_SYNC`,
+  on by default; off, every layer is synced before it is published.) A publish renames its layer
+  into `layers/` at once, without waiting for its data to reach the disk (`Store.defer_sync`): its
+  `meta` carries the line `pending <boot id> <mount id>` right after its format line, so a `meta` a
+  crash cut short can never read as a durable one's. The boot id is the kernel's, new at every boot;
+  the mount id is the store's filesystem's unique mount id (`STATX_MNT_ID_UNIQUE`, Linux 6.8, never
+  reused in a boot), so the same boot with the filesystem mounted again, or its device lost and
+  back, is another page cache. Where either cannot be read, or the job has no sync descriptor,
+  the publish syncs before it renames.
+  The job's next publish makes the previous layer durable first (`Store.settlePending`), so at most
+  one layer is pending, and the last is made durable in the teardown (`Backend.deinit`), after the
+  result was reported and before the runner polls again, so its next job never shares the disk with
+  it. Making it durable is one `syncfs` on the descriptor the job opened at its start (the
+  superblock's write error outlives an inode the kernel evicted, which a descriptor opened later
+  would miss), then `meta.new` without the line, fsynced, renamed over `meta`, and the directory
+  fsynced. The data is written either way: this moves the cost out of the time a job reports, it does
+  not remove it (early write-back gained nothing on the Pi). The per-file or `syncfs` choice below is
+  for publishes that sync before they rename; a settle always takes `syncfs`.
+  **Who may read a pending layer.** Only the job that published it, from the page cache that holds what it
+  renamed in. Any other job gets a miss (`open` returns null and leaves the layer) until the layer is
+  durable, because nothing vouches for the pages of a job that may be killed or whose write-back may
+  fail: after a write error the kernel marks the pages clean and may drop them, and a later read
+  comes from the disk.
+  **What it costs another job.** A job that waits for the key (matrix jobs with the same first
+  steps) misses the pending layer when it gets the lock, runs the step itself, and its publish
+  loses to the entry already there. It then keeps its own upper as a job-private layer under the
+  key (`Backend.publishTop`, only when the rename lost to an existing entry, `error.PublishLost`):
+  the key is derived from what made the layer, so its later steps are keyed as if it were the
+  stored one, nothing else sees it, and it goes with the job's directory. The private parent is
+  sound under the step cache's hypothesis (`Disciplined`), the same one that replaying a child over
+  a parent run again after an eviction rests on; a step that breaks it can yield a replayed tree no
+  single run produced. Unlike on main, where such children were built on the stored entry's own
+  tree, the children published here were built on this job's copy. A follow-up could publish them
+  only when the private parent and the stored layer have equal `treeDigest`s; it is not built.
+  So the cost is one step run twice, not an uncached rest of the job. The
+  layer is available to others once its publisher made it durable: at the publisher's next publish,
+  or at its teardown for its last layer (`RUNNER_NATIVE_DEFER_SYNC=false` has none of this).
+  **Every publish after a job's first waits for the previous layer's settle**: one `syncfs`, which
+  on a busy disk waits for other jobs' writes (5-8 s beside a writer on the Pi's SD card); a job of
+  many short steps on a busy disk pays it at each. The settle is on the publish's path, not the
+  teardown's, except for the last layer.
+  A pending layer of another boot or mount is refused and evicted by `open` and by the check at a
+  boot's first job (`checkOncePerBoot`), whatever its files hold. A pending layer whose job was
+  killed (nobody holds its lock) is evicted by the next `collect`.
+  **Failure.** If the settle fails, or the job had already failed a sync, the layer is poisoned at once
+  (`Store.poison`: its `meta` renamed to `meta.bad`), whoever holds it: a job that holds it keeps its
+  mount, but no lookup returns it, `open` and `collect` evict it as soon as no job holds it, and
+  the job's other layers renamed since its last good sync are evicted at its end as above.
+  **What a finished job promises changed.** A job reported finished may lose its last layer to a
+  power cut in the window between its report and its teardown's sync (one `syncfs`: 0.7 s on the
+  Pi's SD card for a warm build, 0.85-1 s for a cold one, longer while the disk is busy); the layer
+  is then a clean cache miss, never a broken layer. Once the teardown has finished, the layer
+  survives a power cut as before. A runner killed in the window leaves the layer pending, unusable
+  by any job and evicted by `collect`, so a cache miss as well.
+  **What this relies on**: the kernel's boot id and mount id (the mount id, Linux 6.8, also
+  guarantees Linux 5.8's errseq, which reports a `syncfs` write error once per descriptor and
+  filesystem); that a `syncfs` through the job's descriptor reports a write error the page cache
+  lost track of; that a
+  holder of a layer poisoned after its pages were dropped is the one case it cannot help (that job's
+  mount keeps reading, and the job's own later layers fail their sync closed; the job's next step
+  is told in its log with a warning); and that a machine
+  restored from a snapshot with an older disk under the same boot id and mount id is not a thing
+  that happens.
+  Which way a layer's data is made durable when a publish does sync before it renames is chosen
+  for the job that waits for it (`sync_choice.zig`): its own files' write-back and fsyncs from
+  threads, up to a number of entries, or one `syncfs` past it. The number was 512 always; now it is
+  64 when the disk is quiet (PSI `some avg10` under 5 percent and under 4 MiB of `Dirty` plus
+  `Writeback`, where one `syncfs` costs 155-169 ms on the Pi's SD card), 4096 when the disk is busy
+  (`avg10` of 20 percent or more, or, without PSI, 256 MiB dirty), where a `syncfs` waited 5-8 s for
+  another job's writes, and 512 otherwise and where `/proc/pressure/io` and `/proc/meminfo` give
+  nothing. Dirty data is the machine's, this layer's own included, so by itself it only keeps a disk
+  from being called quiet. The thresholds are starting points from the Pi's measurements, to be
+  fitted there; no hysteresis between jobs is built. Each way is sufficient alone and the rename is
+  after it, so a wrong reading changes the time and nothing else.
+  The model (`proofs/tla/StoreDeferred.tla`) and `store-crash.sh` (step 11, the cut between
+  `reported` and `settled`, the refusal of a pending layer after the crash, and a failed settle
+  of a layer a job holds) check the above.
 - **Early write-back: measured, not built.** Starting `sync_file_range(WRITE)` of the upper's files
   in a thread when a step that will be published ends, so that the publish waits for less, was
   tried (laptop NVMe, ext4, a layer of 20,000 files of 2 KiB and one of four 64 MiB files, freshly

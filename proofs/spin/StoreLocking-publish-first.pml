@@ -19,6 +19,7 @@
 #define CHECKBOOT 1
 #define EVRECHECK 1
 #define LOOKUPFIRST 0
+#define EVUNLOCK 1
 #define CHK_TypeOK
 #define CHK_NoBuildLost
 #include "StoreLockingModel.pml"

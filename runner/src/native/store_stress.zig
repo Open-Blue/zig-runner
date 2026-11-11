@@ -57,6 +57,8 @@ const print = std.fmt.allocPrint;
 
 /// Set in a worker's environment: `root|index|seed|deadline_ms|cap`.
 const worker_env = "ZIG_TEST_STORE_STRESS_WORKER";
+/// Set in a worker's environment by the deferred variant.
+const defer_env = "ZIG_TEST_STORE_STRESS_DEFER";
 const worker_test = "native store under load: one worker (run only by the test above, " ++
     "in a process of its own)";
 
@@ -80,6 +82,18 @@ const limits: evict.Limits = .{
 };
 
 test "native store under load: processes share one store under a small cap" {
+    return stress(false);
+}
+
+// The jobs' last layers renamed in before their data is on disk (`Store.defer_sync`): a job waiting
+// for a key misses the pending layer of the job that ran it and runs the step again, and `collect`
+// evicts the pending layers of nothing alive, while the entry checks look at the pending ones. So
+// keys do run in two jobs at once, and a lost publish is logged; the rest holds. Half the time.
+test "native store under load: with the deferred sync, jobs miss one another's pending layers" {
+    return stress(true);
+}
+
+fn stress(deferred: bool) !void {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -91,7 +105,10 @@ test "native store under load: processes share one store under a small cap" {
     const cfg = try Backend.testConfig(arena, &tmp);
     const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
     var env = try std.testing.environ.createMap(arena);
-    const seconds = try envInt(&env, "ZIG_TEST_STORE_STRESS_SECONDS", 30);
+    const seconds = if (deferred)
+        (try envInt(&env, "ZIG_TEST_STORE_STRESS_SECONDS", 30) + 1) / 2
+    else
+        try envInt(&env, "ZIG_TEST_STORE_STRESS_SECONDS", 30);
     if (seconds == 0) {
         std.debug.print("native store under load: skipped (ZIG_TEST_STORE_STRESS_SECONDS=0)\n", .{});
         return error.SkipZigTest;
@@ -136,6 +153,7 @@ test "native store under load: processes share one store under a small cap" {
     const children = try arena.alloc(std.process.Child, procs);
     for (children, 0..) |*child, i| {
         var wenv = try env.clone(arena);
+        if (deferred) try wenv.put(defer_env, "1");
         const wseed = @as(u64, seed) +% @as(u64, i) *% 0x9e3779b97f4a7c15;
         try wenv.put(worker_env, try print(arena, "{s}|{d}|{d}|{d}|{d}", .{ root, i, wseed, deadline, cap }));
         const in = try tmp.dir.openFile(io, "worker.in", .{});
@@ -178,6 +196,7 @@ test "native store under load: processes share one store under a small cap" {
         // cannot be replayed, a lock that cannot be taken are all warnings.
         var lines = std.mem.splitScalar(u8, err_text, '\n');
         while (lines.next()) |l| {
+            if (deferred and std.mem.indexOf(u8, l, "cannot publish a layer to the store: PublishLost") != null) continue;
             if (std.mem.indexOf(u8, l, "(err)") != null or std.mem.indexOf(u8, l, "(warn)") != null)
                 try faults.add("worker {d} logged: {s}", .{ i, l });
         }
@@ -194,7 +213,7 @@ test "native store under load: processes share one store under a small cap" {
     const canary = try tmp.dir.readFileAlloc(io, "shared/canary", arena, .limited(64));
     if (!std.mem.eql(u8, canary, "untouched")) try faults.add("a file outside the volumes was written: {s}", .{canary});
     const overlaps = try tmp.dir.readFileAlloc(io, "shared/overlaps", arena, .limited(1 << 20));
-    if (overlaps.len > 0) try faults.add("keys ran in two jobs at once (chain, nonce):\n{s}", .{overlaps});
+    if (overlaps.len > 0 and !deferred) try faults.add("keys ran in two jobs at once (chain, nonce):\n{s}", .{overlaps});
 
     // A last collect, as the last job's would: nothing half made or half removed is left, no key
     // lock and no job's directory, every entry whole and the store within its cap.
@@ -428,6 +447,10 @@ test "native store under load: one worker (run only by the test above, in a proc
     var cfg = try Backend.testConfigAt(arena, root, exe);
     cfg.store_max_bytes = try std.fmt.parseInt(u64, f.next().?, 10);
     cfg.store_limits = limits;
+    // Synced before published unless the variant is the deferred one: the check that a chain's key
+    // is run once at a time reads a pending layer's miss for the other jobs (they run its step
+    // again) as a second run.
+    cfg.defer_sync = env.get(defer_env) != null;
     const shared = try print(arena, "{s}/shared", .{root});
     cfg.binds = try std.mem.concat(arena, @TypeOf(cfg.binds[0]), &.{
         cfg.binds,
@@ -485,16 +508,17 @@ test "native store under load: one worker (run only by the test above, in a proc
 
 /// A step of chain `c`: marks itself running (a second run of the key at once finds the mark),
 /// writes a nonce of its own into its layer with padding of a random size, prints it on stdout
-/// and stderr, sets it in $GITHUB_ENV, records that it ran it, sleeps a little, and unmarks.
-fn stepScript(arena: Allocator, c: []const u8) ![]const u8 {
+/// and stderr, sets it in $GITHUB_ENV, records that it ran it, sleeps a little, and unmarks (with
+/// the deferred sync, where overlaps are expected, the mark another run removed is no failure).
+fn stepScript(arena: Allocator, c: []const u8, overlaps_ok: bool) ![]const u8 {
     return print(arena,
         \\c={s}; r=$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')
         \\n=$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')
         \\mkdir /shared/running/$c 2>/dev/null || echo "$c $n" >> /shared/overlaps
         \\mkdir -p /w; {{ echo $n; head -c $((r % 3000)) /dev/zero; }} > /w/$c
         \\echo "@$c $n out"; echo "@$c $n err" >&2; echo "S_$c=$n" >> "$GITHUB_ENV"
-        \\echo $c > /shared/live/$n; sleep 0.$((r % 4)); rmdir /shared/running/$c
-    , .{c});
+        \\echo $c > /shared/live/$n; sleep 0.$((r % 4)); rmdir /shared/running/$c{s}
+    , .{ c, if (overlaps_ok) " || true" else "" });
 }
 
 /// The last step, which always runs (it reads $GITHUB_SHA): what each step's layer and file
@@ -518,7 +542,7 @@ fn runJob(w: *Worker, arena: Allocator, io: std.Io, n: usize) !void {
     for (chain[0..depth]) |*ch| ch.* = alphabet[w.rand.uintLessThan(usize, alphabet.len)];
     const c = chain[0..depth];
     const steps = try arena.alloc(job_mod.Step, depth + 1);
-    for (steps[0..depth], 1..) |*st, i| st.* = testStep(try stepScript(arena, c[0..i]));
+    for (steps[0..depth], 1..) |*st, i| st.* = testStep(try stepScript(arena, c[0..i], w.cfg.defer_sync));
     steps[depth] = testStep(try finalScript(arena, c));
 
     var env: std.process.Environ.Map = .init(arena);

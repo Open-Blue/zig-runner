@@ -72,6 +72,19 @@
       "enabled": false
     },
     {
+      "description": "yamldiff's reference parser is the one nektos/act reads workflows and action.yml files with, go.yaml.in/yaml/v3 (act's go.mod has gopkg.in/yaml.v3), so a new major is a different reference, not an update (#503 moved it to v4). Patch and minor updates within v3 still come. Raise the major by hand when act does.",
+      "matchFileNames": [
+        "runner/tools/yamldiff/go.mod"
+      ],
+      "matchDepNames": [
+        "go.yaml.in/yaml/v3"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "enabled": false
+    },
+    {
       "description": "The JavaScript runtimes for actions (runner/src/dagger/js.zig): a new major changes what every action runs on, so it moves by hand, when GitHub's runner moves. Digest and minor updates within them still come.",
       "matchFileNames": [
         "runner/src/dagger/js.zig"
