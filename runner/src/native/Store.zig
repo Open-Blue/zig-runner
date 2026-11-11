@@ -391,21 +391,18 @@ pub const Epoch = struct {
 
 /// The epoch of the filesystem `path` is on, or null when the boot id or the mount's unique id
 /// (Linux 6.8) cannot be read: a publish then syncs before it renames.
-fn epochOf(io: std.Io, path: []const u8) ?Epoch {
+noinline fn epochOf(arena: Allocator, io: std.Io, path: []const u8) ?Epoch {
     const boot = bootId(io) orelse return null;
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len >= buf.len) return null;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
+    const z = arena.dupeSentinel(u8, path, 0) catch return null;
     var st: linux.Statx = undefined;
-    const rc = linux.statx(linux.AT.FDCWD, buf[0..path.len :0], 0, .{ .MNT_ID_UNIQUE = true }, &st);
+    const rc = linux.statx(linux.AT.FDCWD, z, 0, .{ .MNT_ID_UNIQUE = true }, &st);
     if (linux.errno(rc) != .SUCCESS or !st.mask.MNT_ID_UNIQUE) return null;
     return .{ .boot = boot, .mnt = st.mnt_id };
 }
 
 /// This boot's id, or null when it cannot be read: a publish is then made synchronous, and a pending
 /// layer is refused.
-fn bootId(io: std.Io) ?BootId {
+noinline fn bootId(io: std.Io) ?BootId {
     var buf: [64]u8 = undefined;
     const text = std.Io.Dir.cwd().readFile(io, "/proc/sys/kernel/random/boot_id", &buf) catch return null;
     const id = std.mem.trimEnd(u8, text, "\n");
@@ -413,7 +410,7 @@ fn bootId(io: std.Io) ?BootId {
 }
 
 fn inThisBoot(s: Store, arena: Allocator, io: std.Io, e: Epoch) bool {
-    const now = s.epoch orelse epochOf(io, join(arena, s.root, "layers") catch return false) orelse return false;
+    const now = s.epoch orelse epochOf(arena, io, join(arena, s.root, "layers") catch return false) orelse return false;
     return now.mnt == e.mnt and std.mem.eql(u8, &now.boot, &e.boot);
 }
 
@@ -762,10 +759,7 @@ fn publishStaged(
     // boot id (`Meta.pending`): after a crash nothing returns it.
     // Needs the job's descriptor, so the settle's `syncfs` reports a write error the page cache
     // lost track of (the superblock's, which outlives an evicted inode).
-    const lazy: ?Epoch = if (s.defer_sync and s.sync_log != null and s.sync_fd != null)
-        s.epoch orelse epochOf(io, try join(arena, s.root, "layers"))
-    else
-        null;
+    const lazy = s.deferEpoch(arena, io);
     const entry = try openRoot(arena, tmp);
     defer _ = linux.close(entry);
     var whole_disk = false;
@@ -835,14 +829,26 @@ fn publishStaged(
     // The rename is not synced here: an entry whose rename a crash lost is only a miss, made
     // again. The job syncs the layers' directory once, at its end (`syncLayers`), and until then
     // the entry is in its log: one a failed sync leaves in doubt is evicted (`dropUnsynced`).
-    if (lazy != null) s.sync_log.?.pending = key;
-    if (s.sync_log) |l| l.renamed(arena, key) catch {
+    s.noteRenamed(arena, key, lazy != null);
+    if (ph) |p| _ = p.since(arena, .rename, t);
+    return .{ .fs = try join(arena, dir, "fs"), .lock = lock.? };
+}
+
+/// The job's log told of the layer just renamed in, `pending` if its data is not yet synced.
+fn noteRenamed(s: Store, arena: Allocator, key: Key, pending: bool) void {
+    const l = s.sync_log orelse return;
+    if (pending) l.pending = key;
+    l.renamed(arena, key) catch {
         // Not tracked, so it could not be evicted if a sync fails: nothing more is published.
         std.log.warn("native: out of memory noting a published layer; the job publishes no more", .{});
         l.failed = true;
     };
-    if (ph) |p| _ = p.since(arena, .rename, t);
-    return .{ .fs = try join(arena, dir, "fs"), .lock = lock.? };
+}
+
+/// Where a publish beginning now may leave its layer's data unsynced (`defer_sync`), or null.
+fn deferEpoch(s: Store, arena: Allocator, io: std.Io) ?Epoch {
+    if (!s.defer_sync or s.sync_log == null or s.sync_fd == null) return null;
+    return s.epoch orelse epochOf(arena, io, join(arena, s.root, "layers") catch return null);
 }
 
 /// The most entries a layer may have for its own files to be synced one by one, for a sync beginning
@@ -1119,7 +1125,7 @@ pub const SyncLog = struct {
 /// outcome. A failure (`error.Sync`), or a job already failed, marks the job as any sync's does, and
 /// poisons the layer at once (`poison`): a job that holds it keeps its mount, but no lookup returns
 /// it, and its pages, clean after a failed write-back, may be dropped and read back from the disk.
-pub fn settlePending(s: Store, arena: Allocator, io: std.Io, ph: ?*phases.Phases) !void {
+pub noinline fn settlePending(s: Store, arena: Allocator, io: std.Io, ph: ?*phases.Phases) !void {
     const l = s.sync_log orelse return;
     const key = l.pending orelse return;
     l.pending = null;
@@ -2574,7 +2580,7 @@ test "native store: a deferred publish is renamed in pending, this boot may use 
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(io, ".") == null) return error.SkipZigTest;
+    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
     var s = lazyStore(arena);
     const k, const l = try testLayer(arena, io, tmp, &s, "up");
     const dir = std.fs.path.dirname(l.fs).?;
@@ -2604,7 +2610,7 @@ test "native store: a pending layer of another boot is refused and evicted, and 
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(io, ".") == null) return error.SkipZigTest;
+    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
     var s = lazyStore(arena);
     const k, const l = try testLayer(arena, io, tmp, &s, "up");
     l.lock.close(io);
@@ -2636,7 +2642,7 @@ test "native store: the next publish settles the job's previous layer, and a fai
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(io, ".") == null) return error.SkipZigTest;
+    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
     var s = lazyStore(arena);
     // A quiet disk: past a few dozen entries a layer is synced with `syncfs`.
     s.sync_load = .{ .io_some = 0, .dirty_kib = 0 };
@@ -2688,7 +2694,7 @@ test "native store: another job gets a miss for a pending layer, and a layer who
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(io, ".") == null) return error.SkipZigTest;
+    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
     var s = lazyStore(arena);
     const key, const l = try testLayer(arena, io, tmp, &s, "bad");
     const dir = std.fs.path.dirname(l.fs).?;
@@ -2719,7 +2725,7 @@ test "native store: a job already failed poisons the pending layer it never sett
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(io, ".") == null) return error.SkipZigTest;
+    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
     var s = lazyStore(arena);
     const key, const l = try testLayer(arena, io, tmp, &s, "up");
     // As after the note of the rename ran out of memory: failed, with a layer pending.
@@ -2737,7 +2743,7 @@ test "native store: collect evicts a pending layer no job holds, a killed job's,
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(io, ".") == null) return error.SkipZigTest;
+    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
     var s = lazyStore(arena);
     const key, const l = try testLayer(arena, io, tmp, &s, "up");
     const other: Store = .{ .root = s.root };
@@ -2756,7 +2762,7 @@ test "native store: a pending layer of another mount of this boot is refused, an
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const here = epochOf(io, ".") orelse return error.SkipZigTest;
+    const here = epochOf(arena, io, ".") orelse return error.SkipZigTest;
     var s = lazyStore(arena);
     s.epoch = here;
     const key, const l = try testLayer(arena, io, tmp, &s, "up");
