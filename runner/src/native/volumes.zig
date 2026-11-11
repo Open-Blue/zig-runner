@@ -355,7 +355,8 @@ const stamp_wait_ms: u64 = 2_000;
 /// Whether `fd` is on NFS or SMB, where the stamp lock is not used (`stampLock`).
 fn onNetworkFs(fd: linux.fd_t) bool {
     var buf: [128]u8 align(8) = undefined;
-    const rc = linux.syscall2(.fstatfs, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(&buf));
+    const fd_arg = std.math.cast(usize, fd) orelse return true;
+    const rc = linux.syscall2(.fstatfs, fd_arg, @intFromPtr(&buf));
     if (linux.errno(rc) != .SUCCESS) return true;
     const magic = std.mem.readInt(u32, buf[0..4], .little);
     return switch (magic) {
