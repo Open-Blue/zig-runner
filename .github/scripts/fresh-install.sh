@@ -83,9 +83,8 @@ do_packages() {
 	# nftables for the sandbox network, procps for the tests (ps), sudo because zig-test.sh runs the
 	# root tests through it, ca-certificates for TLS.
 	if command -v apt-get >/dev/null; then
-		export DEBIAN_FRONTEND=noninteractive
-		apt-get update -qq
-		apt-get install -y -qq git curl xz-utils ca-certificates util-linux iproute2 nftables procps sudo \
+		# apt.sh falls back to a mirror when Ubuntu's archive is down.
+		"$root/.github/scripts/apt.sh" install git curl xz-utils ca-certificates util-linux iproute2 nftables procps sudo \
 			openssl python3
 	elif command -v dnf >/dev/null; then
 		dnf install -y git curl xz sudo ca-certificates util-linux iproute nftables procps-ng openssl python3
