@@ -938,7 +938,8 @@ const Check = struct {
 
         var entries: std.ArrayList(Entry) = .empty;
         try c.walk(t, top, "", 0, &entries);
-        std.mem.sort(Entry, entries.items, {}, Entry.less);
+        try c.charge(entries.items.len * (@sizeOf(Entry) + @sizeOf(SortKey)));
+        try sortEntries(t, entries.items);
 
         const list_path = try std.fmt.allocPrint(t, "{s}/{s}.stat", .{ lists, rel });
         const old_text = c.readText(t, list_path);
@@ -946,9 +947,9 @@ const Check = struct {
         var sums = Sha256.init(.{});
         var all = Sha256.init(.{});
         var reread: usize = 0;
-        var out: std.ArrayList(u8) = .empty;
         var buf: [2 * max_path + 128]u8 = undefined;
         var files: usize = 0;
+        var any_racy = false;
         var i: usize = 0;
         for (entries.items) |*e| {
             try c.poll();
@@ -962,18 +963,20 @@ const Check = struct {
                     try c.hashFile(t, top, e);
                     reread += 1;
                 }
-                const st = e.stat;
                 // Racy: written lately, or not known to be at rest (`hashFile`).
-                const racy = e.racy or st.ctime >= c.racy_from;
-                if (racy) c.racy_files += 1;
-                try out.print(t, "{s}\t{d}\t{d}\t{d}\t", .{ e.path, st.size, st.ino, st.mtime });
-                if (racy) try out.appendSlice(t, "racy") else try out.print(t, "{d}", .{st.ctime});
-                try out.print(t, "\t{x}\n", .{&e.hash});
+                if (e.racy or e.stat.ctime >= c.racy_from) {
+                    e.racy = true;
+                    any_racy = true;
+                    c.racy_files += 1;
+                }
                 // `sha256sum`'s line, which install-zig.sh pins the digest of.
-                const line = std.fmt.bufPrint(&buf, "{x}  {s}\n", .{ &e.hash, e.path }) catch
-                    return c.giveUp("a path is too long");
-                sums.update(line);
                 hex = std.fmt.bytesToHex(e.hash, .lower);
+                var n: usize = 0;
+                n = put(&buf, n, &hex);
+                n = put(&buf, n, "  ");
+                n = put(&buf, n, e.path);
+                n = put(&buf, n, "\n");
+                sums.update(buf[0..n]);
                 extra = &hex;
             }
             const type_char: u8 = switch (e.kind) {
@@ -982,10 +985,24 @@ const Check = struct {
                 .link => 'l',
                 .other => 'o',
             };
-            const line = std.fmt.bufPrint(&buf, "{c} {o} {d} {s} {d} {s}\n", .{
-                type_char, e.mode, e.path.len, e.path, extra.len, extra,
-            }) catch return c.giveUp("a path is too long");
-            all.update(line);
+            // The line is `type mode(octal) len(path) path len(extra) extra`, as printed with
+            // "{c} {o} {d} {s} {d} {s}\n": by hand, as a line a file costs this every walk.
+            if (e.path.len + extra.len + 40 > buf.len) return c.giveUp("a path is too long");
+            var n: usize = 0;
+            buf[n] = type_char;
+            buf[n + 1] = ' ';
+            n += 2;
+            n = putUint(&buf, n, e.mode, 8);
+            buf[n] = ' ';
+            n = putUint(&buf, n + 1, e.path.len, 10);
+            buf[n] = ' ';
+            n = put(&buf, n + 1, e.path);
+            buf[n] = ' ';
+            n = putUint(&buf, n + 1, extra.len, 10);
+            buf[n] = ' ';
+            n = put(&buf, n + 1, extra);
+            buf[n] = '\n';
+            all.update(buf[0 .. n + 1]);
         }
         var digest: Digest = .{
             .sum = undefined,
@@ -995,6 +1012,19 @@ const Check = struct {
         };
         sums.final(&digest.sum);
         all.final(&digest.full);
+        // A list whose every line was kept, with no file racy now, is the list already there: a
+        // line is made of the very path, size, inode, mtime, ctime and hash that `keep` just
+        // compared, and a kept line was not racy (its ctime is older than the check that made it,
+        // so than this one). It is not made again, nor written.
+        if (old_text != null and old != null and reread == 0 and !any_racy) return digest;
+        var out: std.ArrayList(u8) = .empty;
+        for (entries.items) |e| {
+            if (e.kind != .file) continue;
+            const st = e.stat;
+            try out.print(t, "{s}\t{d}\t{d}\t{d}\t", .{ e.path, st.size, st.ino, st.mtime });
+            if (e.racy) try out.appendSlice(t, "racy") else try out.print(t, "{d}", .{st.ctime});
+            try out.print(t, "\t{x}\n", .{&e.hash});
+        }
         // One that would not be read again is not written, and one that is the list already there
         // is not written again: the old file is the same bytes, and nothing reads its times (only
         // half-written parts are aged, in `walkLists`).
@@ -1052,7 +1082,11 @@ const Check = struct {
             if (c.tree_path > c.limits.tree_path_bytes) return c.giveUp("too many bytes of paths");
             const path_len = here.len + 1 + e.name.len;
             try c.charge(@sizeOf(Entry) + 2 * path_len + 150);
-            const path = try std.fmt.allocPrint(t, "{s}/{s}", .{ here, e.name });
+            // Not `allocPrint`: this runs for every entry of every walk.
+            const path = try t.alloc(u8, path_len);
+            @memcpy(path[0..here.len], here);
+            path[here.len] = '/';
+            @memcpy(path[here.len + 1 ..], e.name);
             var target: []const u8 = "";
             if (kind == .link) {
                 var tb: [max_path]u8 = undefined;
@@ -1168,6 +1202,46 @@ const Check = struct {
 
 const Kind = enum { file, dir, link, other };
 
+/// `s` copied into `buf` at `at`; where it ends.
+fn put(buf: []u8, at: usize, s: []const u8) usize {
+    @memcpy(buf[at..][0..s.len], s);
+    return at + s.len;
+}
+
+/// `v` in `base` (8 or 10) copied into `buf` at `at`; where it ends.
+fn putUint(buf: []u8, at: usize, v: u64, base: u8) usize {
+    var digits: [24]u8 = undefined;
+    var n: usize = digits.len;
+    var x = v;
+    while (true) {
+        n -= 1;
+        digits[n] = '0' + @as(u8, @truncate(x % base));
+        x /= base;
+        if (x == 0) break;
+    }
+    return put(buf, at, digits[n..]);
+}
+
+const SortKey = struct { path: []const u8, at: u32 };
+
+/// `entries` in the byte order of their paths. The order is what both digests are over. Sorted
+/// through keys, not the entries (about 150 bytes each, which a sort would move again and again),
+/// then moved once.
+fn sortEntries(t: Allocator, entries: []Entry) Allocator.Error!void {
+    const keys = try t.alloc(SortKey, entries.len);
+    for (entries, keys, 0..) |e, *k, at| k.* = .{ .path = e.path, .at = @truncate(at) };
+    std.mem.sortUnstable(SortKey, keys, {}, struct {
+        fn less(_: void, a: SortKey, b: SortKey) bool {
+            return pathLess({}, a.path, b.path);
+        }
+    }.less);
+    const sorted = try t.alloc(Entry, entries.len);
+    for (keys, sorted) |k, *o| o.* = entries[k.at];
+    @memcpy(entries, sorted);
+    t.free(sorted);
+    t.free(keys);
+}
+
 /// An entry of a tree: its path from the tree's top (`./a/b`), what it is, its mode and stat, and
 /// a regular file's sha256 or a link's target.
 const Entry = struct {
@@ -1179,10 +1253,6 @@ const Entry = struct {
     hash: [Sha256.digest_length]u8 = undefined,
     /// Not known to be at rest: listed so that the next check reads it again.
     racy: bool = false,
-
-    fn less(_: void, a: Entry, b: Entry) bool {
-        return pathLess({}, a.path, b.path);
-    }
 };
 
 /// Whether the link at `path` (`./a/b`) with this `target` may lead out of the tree, taking its
@@ -2299,4 +2369,87 @@ test "tool trees: a job that let go with processes that may remain stops verdict
     try std.testing.expectError(error.FileNotFound, cwd.access(io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ one, unproven_name }), .{}));
     // With the mark gone the walk is kept again.
     try std.testing.expect(walkIdle(arena, gpa, io, f.cache, one, "/t", left_now, idleNow()));
+}
+
+test "tool trees: the digests are the same from a list, kept untouched, as from a cold walk" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    try skipWithoutLeases(arena, f);
+    const cold = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    const warm = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    try expectIn(warm.note, tree_rel ++ " (5 files, 0 read)");
+    try std.testing.expectEqualStrings(cold.env, warm.env);
+    try std.testing.expectEqualStrings(cold.full, warm.full);
+    // No list at all: the same again.
+    try tmp.dir.deleteTree(std.testing.io, "lists");
+    try tmp.dir.createDirPath(std.testing.io, "lists");
+    const fresh = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    try std.testing.expectEqualStrings(cold.env, fresh.env);
+    try std.testing.expectEqualStrings(cold.full, fresh.full);
+}
+
+test "tool trees: a tree that the list spares a reading of is still caught when a job changes it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    try skipWithoutLeases(arena, f);
+    const tree = try std.fmt.allocPrint(arena, "{s}/{s}", .{ f.cache, tree_rel });
+    var last = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    last = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    try expectIn(last.note, tree_rel ++ " (5 files, 0 read)");
+    // Each change, made to the tree the previous walk left (kept as it was), is seen in the
+    // second digest, and in the first when it is a regular file's.
+    const Change = struct { script: []const u8, files: bool };
+    for ([_]Change{
+        // A file removed.
+        .{ .script = "rm a/x", .files = true },
+        // A file added.
+        .{ .script = "printf new > added", .files = true },
+        // A file replaced by a link to another, which has the same content.
+        .{ .script = "rm a-b/x && ln -s ../zig a-b/x", .files = true },
+        // A file put over another by a rename, the same size.
+        .{ .script = "printf 'other\n' > tmp-file && mv tmp-file 'with space'", .files = true },
+        // A file's content changed, its size, mtime and (as far as a job can) ctime kept.
+        .{ .script = "touch -r zig ref && printf 'zig binarY\n' > zig && touch -r ref zig && rm ref", .files = true },
+        // A directory replaced by a link to another.
+        .{ .script = "rm -r lib/std && ln -s ../empty lib/std", .files = false },
+        // A mode.
+        .{ .script = "chmod 755 added", .files = false },
+        // A directory.
+        .{ .script = "mkdir new-dir", .files = false },
+    }) |change| {
+        const script = try std.fmt.allocPrint(arena, "cd \"$0\" && {s}", .{change.script});
+        const ran = try std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", script, tree } });
+        try std.testing.expect(ran.term == .exited and ran.term.exited == 0);
+        const before = last;
+        last = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+        try std.testing.expect(!std.mem.eql(u8, before.full, last.full));
+        if (change.files) {
+            try std.testing.expect(!std.mem.eql(u8, before.env, last.env));
+            try expectIn(last.env, try shellDigest(arena, tree));
+        }
+        // The same again, from what that walk kept.
+        const again = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+        try std.testing.expectEqualStrings(last.env, again.env);
+        try std.testing.expectEqualStrings(last.full, again.full);
+    }
+}
+
+test "tool trees: numbers are written in a line as fmt writes them" {
+    var buf: [64]u8 = undefined;
+    for ([_]u64{ 0, 1, 7, 8, 9, 10, 0o644, 0o4755, 0o7777, 4000, 123456789, std.math.maxInt(u64) }) |v| {
+        const n10 = putUint(&buf, 0, v, 10);
+        var want: [64]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{d}", .{v}), buf[0..n10]);
+        const n8 = putUint(&buf, 0, v, 8);
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{o}", .{v}), buf[0..n8]);
+    }
 }

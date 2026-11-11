@@ -1189,6 +1189,20 @@ changes, only that file's ctime shows it, so no cheaper memo of the tree is as s
 A walk the job's cancel or the clock cut short is its leader's alone. The key is the volume's host
 directory, its list directory and its mount, so volumes of other scopes never share a walk.
 
+What a walk costs when no file is read (the `tool_walk` phase, 113.7 ms median on razorbill for Zig's
+19,505 files) was measured on the laptop, ReleaseSafe, before it was changed: 118 ms, of which 64 ms
+reading the directories and a `statx` of each entry, 29 ms sorting the entries, 7 ms parsing the list,
+and 16 ms making the list's lines again and the two digests' lines (the SHA-256 of them is a few
+ms of it; the formatting was most). No shortcut that skips the `statx` of each file is sound, since a
+directory's mtime moves for none of a file's content, mode or ctime, so the floor is that read. The
+rest was cut without changing what is hashed, so no kept state is invalid: paths are joined by
+copying, not formatting; the entries are sorted by key and moved once (they are about 150 bytes
+each); the digests' lines are written by hand; and when every line of the list was kept and no file
+is racy, the list is not made again (it would be the bytes already there, as every field of each
+line was just compared with the file's). It is 82 ms now. A walk that reads a file, or finds a racy
+one, is as before, and a changed, added, removed or replaced file, link or directory is in the
+digests as it was (`tool trees: a tree that the list spares a reading of is still caught...`).
+
 The walk is made by the last job out, when it can (`tool_trees.walkIdle`, `Backend.walkToolCacheIdle`),
 and the next job is told its answer instead of walking: a "verdict" kept in the runner's store
 (`tool-trees/<hash>/.verdict`, beside the lists, in no volume a step mounts). Soundness is that no
@@ -1294,8 +1308,8 @@ which `std.Io` uses to interrupt blocked calls (a job's cancel, a timeout): the 
 ignore it (an earlier cut did, and a native end-to-end job never got its cancel). `F_SETSIG` makes
 it SIGURG, whose default is to be ignored. The writer's open then waits until the check lets go of
 the file, or fails with EAGAIN if it does not wait. On the
-laptop, for the real Zig 0.17.0 tree (19,505 files), a check is 0.5 s with no list and 0.1 s with
-one, with 22 MiB of peak memory in the test process; the script reads the same tree in about 1 s,
+laptop, for the real Zig 0.17.0 tree (19,505 files), a check is 0.5 s with no list and 0.08 s with
+one (0.12 s before the cut above), with 22 MiB of peak memory in the test process; the script reads the same tree in about 1 s,
 by its own comment. A tree of 65,532 hard links of 3.8 KB paths (the case that took 1.5 GB, or 6.1
 GB with four checks at once) is left out in 8 ms with 9 MiB, and 27 MiB with four at once.
 
