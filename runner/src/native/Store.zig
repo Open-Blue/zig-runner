@@ -24,6 +24,7 @@
 const Store = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 
 const Allocator = std.mem.Allocator;
@@ -679,7 +680,6 @@ fn publishStaged(
     // and the store would count less than it holds.
     m.bytes = try treeBytes(arena, io, fs_tmp);
     if (ph) |p| t = p.since(arena, .size, t);
-    _ = added.fetchAdd(accounted(m), .monotonic);
     const meta = try cwd.createFile(io, try join(arena, tmp, "meta"), .{});
     defer meta.close(io);
     try meta.writeStreamingAll(io, try m.write(arena));
@@ -722,6 +722,10 @@ fn publishStaged(
         .{ .NOREPLACE = true },
     );
     if (linux.errno(rc) != .SUCCESS) return error.Publish;
+    // Counted once the layer is in `layers/`, not before: a pass whose scan began meanwhile would
+    // not see it and would also take what was added so far off (`collectLocked`), leaving it in
+    // neither. Counted after, a pass that does see it only counts it twice, until the next.
+    _ = added.fetchAdd(accounted(m), .monotonic);
     // The rename is not synced here: an entry whose rename a crash lost is only a miss, made
     // again. The job syncs the layers' directory once, at its end (`syncLayers`), and until then
     // the entry is in its log: one a failed sync leaves in doubt is evicted (`dropUnsynced`).
@@ -965,6 +969,33 @@ pub fn detach(s: Store, arena: Allocator) ?Store {
     return c;
 }
 
+/// The layers' directory of `s` synced once for the jobs whose logs are `logs`: one descriptor, one
+/// `fsync`, since an error is reported once per descriptor and a second job's fresh one would not
+/// see what the first's found. A failure marks every log (`dropUnsynced` then evicts what each
+/// renamed), a success clears them.
+pub fn syncLayersBatch(s: Store, arena: Allocator, logs: []const *SyncLog) void {
+    const p = join(arena, s.root, "layers") catch return markAll(logs);
+    const opened: ?linux.fd_t = if (builtin.is_test and test_dir_fd != null) null else openRoot(arena, p) catch |e| {
+        std.log.warn("native: cannot open {s} to sync it ({s}); the layers just published are in doubt", .{ p, @errorName(e) });
+        return markAll(logs);
+    };
+    defer if (opened) |f| {
+        _ = linux.close(f);
+    };
+    const fd = opened orelse test_dir_fd.?;
+    const e = linux.errno(linux.fsync(fd));
+    if (e == .SUCCESS) {
+        for (logs) |l| l.since.clearRetainingCapacity();
+        return;
+    }
+    std.log.warn("native: cannot sync {s} ({t}); the layers just published are in doubt", .{ p, e });
+    markAll(logs);
+}
+
+fn markAll(logs: []const *SyncLog) void {
+    for (logs) |l| l.failed = true;
+}
+
 pub fn syncLayers(s: Store, arena: Allocator) void {
     const p = join(arena, s.root, "layers") catch return;
     const fd = openRoot(arena, p) catch |e| {
@@ -1075,6 +1106,18 @@ fn lagMargin(max_bytes: u64) u64 {
     return @max(max_bytes / 16, 64 * 1024 * 1024);
 }
 
+/// What the store holds as far as a job's end knows (`lagFits`). Tests.
+pub fn knownBytes() u64 {
+    return known_total.load(.monotonic) +| added.load(.monotonic);
+}
+
+/// Tests: `collectLocked` holds after its scan while `test_pause_after_scan` is set, and says it is
+/// there in `test_scanned`, so a test can publish or open a layer in the middle of a pass.
+pub var test_pause_after_scan: std.atomic.Value(bool) = .init(false);
+pub var test_scanned: std.atomic.Value(bool) = .init(false);
+/// Tests: the descriptor of the layers' directory that a batch's sync uses instead of opening it.
+pub var test_dir_fd: ?linux.fd_t = null;
+
 fn lagFitsOf(known: u64, extra: u64, max_bytes: u64) bool {
     return known +| extra <= max_bytes +| lagMargin(max_bytes);
 }
@@ -1140,6 +1183,10 @@ fn collectLocked(s: Store, arena: Allocator, io: std.Io, ph: ?*phases.Phases, st
         }) catch return;
     }
     if (ph) |p| t = p.since(arena, .collect_scan, t);
+    if (builtin.is_test) {
+        test_scanned.store(true, .release);
+        while (test_pause_after_scan.load(.acquire)) io.sleep(.fromMilliseconds(1), .awake) catch break;
+    }
     // The disk's floor counts here first: a layer is the cheapest thing the store has to make
     // again. So under it a layer goes as the rest does (`evict.floor`), sparing recent use, and
     // only past the cap whatever its use.

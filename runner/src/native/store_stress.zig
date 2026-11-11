@@ -460,15 +460,19 @@ test "native store under load: one worker (run only by the test above, in a proc
             3 => try runTreeJob(&w, job_arena.allocator(), io, n),
             else => try runJob(&w, job_arena.allocator(), io, n),
         }
-        // The collector's and the reaper's threads have descriptors of their own while they sync, and
-        // while they delete what a job's end evicted.
-        _ = collector.drain(io, null);
-        reaper.drain(io);
-        const fds = try countFds(io);
-        if (n == 1) fds_kept = fds;
-        if (n > 1 and fds > fds_kept) w.fault("{d} fds open after {s} {d}, {d} before", .{ fds, what, n, fds_kept });
-        const locks = try countLocks(job_arena.allocator(), io);
-        if (locks > 0) w.fault("{d} flocks held after {s} {d}", .{ locks, what, n });
+        // The collector's and the reaper's threads have descriptors and locks of their own while they
+        // sync and collect and while they delete what a job's end evicted, so the counts are taken
+        // after a wait, on every eighth job only: the others begin while the last one's upkeep may
+        // still run, as in a runner.
+        if (n % 8 == 0 and n >= 8) {
+            _ = collector.drain(io, null);
+            reaper.drain(io);
+            const fds = try countFds(io);
+            if (n == 8) fds_kept = fds;
+            if (n > 8 and fds > fds_kept) w.fault("{d} fds open after {s} {d}, {d} before", .{ fds, what, n, fds_kept });
+            const locks = try countLocks(job_arena.allocator(), io);
+            if (locks > 0) w.fault("{d} flocks held after {s} {d}", .{ locks, what, n });
+        }
         try io.sleep(.fromMilliseconds(w.rand.uintLessThan(u32, 30)), .awake);
     }
 

@@ -257,9 +257,13 @@ pub fn main(init: std.process.Init) !u8 {
     var sweep: StaleSweep = .{ .gpa = init.gpa, .io = io, .cfg = &cfg, .log = log };
     sweep.start(stale);
     defer sweep.stop();
-    // A job's upkeep of the store that its end handed to a thread is let finish, within a limit
-    // (`collector.drain`): the stop's own wait, and a second signal ends it at once.
-    defer _ = collector.drain(io, 5000);
+    // A job's upkeep of the store that its end handed to a thread is let finish: its syncs and the
+    // eviction of what a failed one left in doubt without a limit, its collect within one
+    // (`collector.drain`). A second signal ends the wait at once.
+    defer {
+        collector.drainSync(io);
+        _ = collector.drain(io, 5000);
+    }
     return runPool(init, &cfg, log, err, secrets, name, if (store) |*st| st else null);
 }
 

@@ -54,6 +54,12 @@ var queued: usize = 0;
 /// Whether a thread is running, decided under `mu`: set by whoever starts one, cleared by the
 /// thread when it finds the queue empty.
 var running = false;
+/// Jobs handed over, jobs whose layers' directory has been synced and whose dropped layers are
+/// evicted, and jobs served whole (`drain`, `drainSync`): counters, so that a wait is for what was
+/// handed over before it began, not for the thread to be idle, which a busy runner's never is.
+var submitted: u64 = 0;
+var synced: u64 = 0;
+var served: u64 = 0;
 
 /// Tests: how many passes ran, and how many ran at once at the most.
 pub var passes: std.atomic.Value(u32) = .init(0);
@@ -84,8 +90,10 @@ pub fn submit(io: std.Io, s: Store, sync: bool, job_id: u64) bool {
     }
     queue[queued] = t;
     queued += 1;
+    submitted += 1;
     if (!running and !spawn(io)) {
         queued -= 1;
+        submitted -= 1;
         t.destroy();
         return false;
     }
@@ -111,16 +119,34 @@ pub fn pending(io: std.Io) bool {
     return running or queued > 0;
 }
 
-/// Waits for the queue to be empty and the thread gone, for at most `limit_ms` (null: as long as it
-/// takes); whether it is. A stopping runner calls it so that the pass it started is not cut off,
-/// and a second signal does not wait for it (`main.onStopSignal`).
+/// Waits until the jobs handed over before this call are served, for at most `limit_ms` (null: as
+/// long as it takes); whether they are. Not for the thread to be idle: another job's upkeep handed
+/// over meanwhile is not waited for. A stopping runner calls it so that the pass it started is not
+/// cut off, and a second signal does not wait for it (`main.onStopSignal`).
 pub fn drain(io: std.Io, limit_ms: ?u64) bool {
+    return waitFor(io, &served, limit_ms);
+}
+
+/// `drain` for the jobs' directory syncs and the eviction of what a failed one left in doubt only:
+/// a stop does not cut these short, as that would leave layers in doubt that a job had not
+/// dropped; the collect after is what a limit may cut (`drain`).
+pub fn drainSync(io: std.Io) void {
+    _ = waitFor(io, &synced, null);
+}
+
+fn waitFor(io: std.Io, counter: *const u64, limit_ms: ?u64) bool {
+    mu.lockUncancelable(io);
+    const target = submitted;
+    mu.unlock(io);
     const start = phases.now();
-    while (pending(io)) {
+    while (true) {
+        mu.lockUncancelable(io);
+        const done = counter.* >= target;
+        mu.unlock(io);
+        if (done) return true;
         if (limit_ms) |l| if (phases.now() -| start > l * std.time.ns_per_ms) return false;
         io.sleep(.fromMilliseconds(2), .awake) catch return false;
     }
-    return true;
 }
 
 fn run(io: std.Io) void {
@@ -139,6 +165,9 @@ fn run(io: std.Io) void {
         mu.unlock(io);
         pass(io, batch[0..n]);
         for (batch[0..n]) |t| t.destroy();
+        mu.lockUncancelable(io);
+        served += n;
+        mu.unlock(io);
     }
 }
 
@@ -154,11 +183,29 @@ fn pass(io: std.Io, tasks: []const *Task) void {
     var ph: phases.Phases = .{};
     const start = phases.now();
     var t = start;
-    for (tasks) |task| {
-        if (task.sync) task.store.syncLayers(arena);
-        task.store.dropUnsynced(arena, io);
-    }
+    // One descriptor and one `fsync` for the batch (`Store.syncLayersBatch`), then each job's layers
+    // in doubt, if it failed, evicted.
+    var logs: [max_queued]*Store.SyncLog = undefined;
+    var n_logs: usize = 0;
+    var first: ?*const Task = null;
+    for (tasks) |task| if (task.sync) {
+        const l = task.store.sync_log orelse {
+            // Not tracked (no room for a log): its own sync, which has nothing to mark.
+            task.store.syncLayers(arena);
+            continue;
+        };
+        logs[n_logs] = l;
+        n_logs += 1;
+        if (first == null) first = task;
+    };
+    if (first) |f| f.store.syncLayersBatch(arena, logs[0..n_logs]);
+    for (tasks) |task| task.store.dropUnsynced(arena, io);
     t = ph.since(arena, .collect_syncdir, t);
+    {
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        synced += tasks.len;
+    }
     for (tasks, 0..) |task, i| {
         if (task.store.root.len == 0) continue;
         var later = false;
@@ -266,7 +313,6 @@ test "collector: a job whose sync failed is not taken, and a layer a job holds i
     const arena = a.allocator();
     var s: Store = .{ .root = "", .defer_collect = true, .sync_log = Store.newSyncLog(arena), .max_bytes = 0 };
     const k, const held = try Store.testLayer(arena, io, tmp, &s, "held");
-    _ = k;
     const k2, const free = try Store.testLayer(arena, io, tmp, &s, "free");
     free.lock.close(io);
     s.sync_log.?.failed = true;
@@ -276,10 +322,11 @@ test "collector: a job whose sync failed is not taken, and a layer a job holds i
     try testing.expect(drain(io, 10_000));
     // Over its cap (0) and collected off the job's path: the held layer stays, the free one goes.
     try testing.expect(try s.open(arena, io, k2) == null);
-    try testing.expect(std.fs.path.dirname(held.fs) != null);
     var check: std.heap.ArenaAllocator = .init(testing.allocator);
     defer check.deinit();
-    try testing.expectEqual(@as(usize, 1), (try Store.layerNames(check.allocator(), io, s)).len);
+    const left = try Store.layerNames(check.allocator(), io, s);
+    try testing.expectEqual(@as(usize, 1), left.len);
+    try testing.expectEqualStrings(&Store.hex(k), left[0]);
     held.lock.close(io);
 }
 
@@ -301,4 +348,98 @@ test "collector: a runner that stops waits for the thread within its limit and n
     test_hold.store(false, .release);
     try testing.expect(drain(io, 10_000));
     try testing.expect(!pending(io));
+}
+
+/// A pass paused after its scan, for a test to act in the middle of it.
+fn pausedPass(io: std.Io, s: Store, sync: bool) !void {
+    test_hold.store(true, .release);
+    Store.test_scanned.store(false, .release);
+    Store.test_pause_after_scan.store(true, .release);
+    try testing.expect(submit(io, s, sync, 0));
+    test_hold.store(false, .release);
+    while (!Store.test_scanned.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+}
+
+test "collector: a layer opened or published while a pass runs is kept and counted" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var s: Store = .{ .root = "", .defer_collect = true, .sync_log = Store.newSyncLog(arena), .max_bytes = 0 };
+    const k, const mine = try Store.testLayer(arena, io, tmp, &s, "mine");
+    // The job's end let it go; the next job opens it during the pass, which would evict it.
+    mine.lock.close(io);
+    defer Store.test_pause_after_scan.store(false, .release);
+    try pausedPass(io, s, true);
+    const opened = (try s.open(arena, io, k)).?;
+    // Published after the scan: in `added`, which the pass does not take off.
+    const before = Store.knownBytes();
+    const k2, const late = try Store.testLayer(arena, io, tmp, &s, "late");
+    late.lock.close(io);
+    try testing.expect(Store.knownBytes() > before);
+    Store.test_pause_after_scan.store(false, .release);
+    try testing.expect(drain(io, 10_000));
+    // Held while the pass evicted: kept. The one published after the scan is not in the pass's list,
+    // so it stays for the next (the cap is 0, and nothing holds it).
+    var check: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer check.deinit();
+    const left = try Store.layerNames(check.allocator(), io, s);
+    try testing.expectEqual(@as(usize, 2), left.len);
+    try testing.expect(std.mem.eql(u8, left[0], &Store.hex(k)) or std.mem.eql(u8, left[1], &Store.hex(k)));
+    try testing.expect(std.mem.eql(u8, left[0], &Store.hex(k2)) or std.mem.eql(u8, left[1], &Store.hex(k2)));
+    opened.layer.lock.close(io);
+    // The late layer was counted after the scan, so it is still in `added` and was not lost: the
+    // pass stored what it saw and took off only what was added before it looked.
+    try testing.expect(Store.knownBytes() >= 5000);
+}
+
+test "collector: a failed directory sync on the thread marks the batch, and the layers in doubt are evicted there" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var s: Store = .{ .root = "", .defer_collect = true, .sync_log = Store.newSyncLog(arena), .max_bytes = Store.default_max_bytes };
+    const k, const l = try Store.testLayer(arena, io, tmp, &s, "doubt");
+    l.lock.close(io);
+    try testing.expectEqual(@as(usize, 1), s.sync_log.?.since.items.len);
+    // Two jobs in one batch: the same failed descriptor, one `fsync`, both logs marked.
+    var other_log: Store.SyncLog = .{};
+    try other_log.since.append(arena, try arena.dupe(u8, &Store.hex(k)));
+    var other = s;
+    other.sync_log = &other_log;
+    Store.test_dir_fd = -1;
+    defer Store.test_dir_fd = null;
+    test_hold.store(true, .release);
+    defer test_hold.store(false, .release);
+    try testing.expect(submit(io, s, true, 1));
+    try testing.expect(submit(io, other, true, 2));
+    test_hold.store(false, .release);
+    try testing.expect(drain(io, 10_000));
+    var check: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer check.deinit();
+    // Evicted by the thread, with the job's own log untouched (its arena may be gone).
+    try testing.expectEqual(@as(usize, 0), (try Store.layerNames(check.allocator(), io, s)).len);
+    try testing.expect(!s.sync_log.?.failed);
+}
+
+test "collector: a wait is for what was handed over before it, not for the thread to be idle" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const s = try testStore(a.allocator(), io, tmp);
+    // Nothing handed over: nothing to wait for, though a pass is running.
+    test_hold.store(true, .release);
+    defer test_hold.store(false, .release);
+    try testing.expect(drain(io, 0));
+    try testing.expect(submit(io, s, true, 0));
+    try testing.expect(!drain(io, 20));
+    test_hold.store(false, .release);
+    try testing.expect(drain(io, 10_000));
+    drainSync(io);
 }
