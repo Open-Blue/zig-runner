@@ -1226,8 +1226,8 @@ that shows it is one a failure of costs a walk, never trust:
   removed is not used. The file is read once, but its answer is kept in the runner's memory as the
   volume's "epoch" (`tool_trees.Epochs`), and the jobs of the same process that open the volume
   while it stands are told the same. The epoch ends before the first process is started with the
-  volume mounted, by any job (`Backend.endToolEpoch`, called from `execIn` before the sandbox is
-  made, so a step, a pre or post script, a Docker build or a set-up script alike; the runner's own
+  volume mounted, by any job (`volumes.endEpochs`, called from `execIn` before the sandbox is
+  made, for every volume bind and any volume nested with it, so a step, a pre or post script, a Docker build or a set-up script alike; the runner's own
   set-up scripts that do not use the volume are run without it mounted), and when its last member
   lets the volume go, so it never spans a last job out's walk. A job uses the verdict only if the
   epoch still stands when it checks the trees (`Plan.verdictStands`, in "Set up job", before any
@@ -1237,9 +1237,20 @@ that shows it is one a failure of costs a walk, never trust:
 - A verdict is of one boot (`boot_id`), one mount path, and the volume's lock file as its last
   open left it (inode and mtime, which every open sets: an open by anything that does not take
   verdicts, such as an older runner, and an evicted and recreated volume, are differences). The
-  epoch holds the same for its members: each open of the process stamps the lock file and joins
-  in one critical section (`volumes.stamp_mu`), and must find the file as the previous member left
-  it, or the epoch ends. The check (`Epochs.valid`) compares the file again, so another runner's
+  epoch holds the same for its members: each open reads the lock file's mtime and sets it with an
+  exclusive lock on the file's first byte held (`volumes.stampLock`, an open-file-description
+  lock, so it excludes other processes as well as other threads and is not the volume's flock),
+  and joins the epoch in the same critical section (`volumes.stamp_mu`), so another runner's open
+  cannot come between the read and the stamp and have its own written over. It must find the file
+  as the previous member left it, or the epoch ends. The stamp is an explicit time, now or a
+  nanosecond past what was there, so two opens in one clock tick differ; an open whose stamp is
+  not known to differ (a filesystem with coarse times, a failed `utimensat`, no stamp lock) shares
+  nothing and ends what stands. A runner older than this does not take the lock: its open may
+  still fall between a newer one's read and stamp, a window of microseconds that an open had
+  before epochs. An epoch is as old as its walk (`Verdict.at_ms`), checked when it is joined and
+  when it is used. The step user's tool cache (`evict.nested`) is a directory of the root user's,
+  so a root step can write to it without opening it: it has no epoch, and a bind of either
+  volume ends the other's. The check (`Epochs.valid`) compares the file again, so another runner's
   open of the volume, which stamps it and may then write, ends the epoch for those that joined
   before it as well as those that come after. An epoch is of one volume, so one of another trust
   scope (its own volume) is never told of it, and a runner that restarts has none and drops the

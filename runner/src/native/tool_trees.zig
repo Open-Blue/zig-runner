@@ -100,7 +100,8 @@ pub const Limits = struct {
 
 /// What steps are given (`env`, `full`: `DIGEST TREE` lines, `Exec.tool_trees`) and the line
 /// "Set up job" says.
-pub const Verdict = struct { env: []const u8, full: []const u8, note: []const u8 };
+/// `at_ms` is when the walk that made it began, for a verdict taken from the store (`takeVerdict`).
+pub const Verdict = struct { env: []const u8, full: []const u8, note: []const u8, at_ms: i64 = 0 };
 
 const resolve_no_xdev = 0x01;
 const resolve_no_symlinks = 0x04;
@@ -539,6 +540,7 @@ pub fn takeVerdict(
         .env = p.verdict.env,
         .full = p.verdict.full,
         .note = std.fmt.allocPrint(arena, "{s} (as the last job left it)", .{p.verdict.note}) catch return null,
+        .at_ms = p.at_ms,
     };
 }
 
@@ -579,20 +581,23 @@ pub const Epochs = struct {
         es: *Epochs,
         arena: Allocator,
         io: std.Io,
+        volume: []const u8,
         lists: []const u8,
         mount: []const u8,
         left: ?Left,
         stamp: ?Left,
         take: bool,
+        share: bool,
     ) Entered {
         es.mu.lockUncancelable(io);
         defer es.mu.unlock(io);
         const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
+        // An open that cannot tell its stamp from what it found could not be told from a foreign
+        // one by the next: nothing is shared through it, and what stands ends.
+        const known = share and if (left) |l| if (stamp) |t| !sameLeft(l, t) else false else false;
         for (es.list.items) |e| {
             if (e.ended or !std.mem.eql(u8, e.lists, lists) or !std.mem.eql(u8, e.mount, mount)) continue;
-            const young = now_ms >= e.born_ms and now_ms - e.born_ms <= verdict_max_age_ms;
-            const same = if (left) |l| stamp != null and sameLeft(e.last, l) else false;
-            if (!young or !same) {
+            if (!known or !e.young(now_ms) or !sameLeft(e.last, left.?)) {
                 e.ended = true;
                 continue;
             }
@@ -603,14 +608,23 @@ pub const Epochs = struct {
             return .{ .verdict = v, .epoch = e };
         }
         const v = takeVerdict(arena, io, lists, mount, left, take) orelse return .{};
-        const next = stamp orelse return .{ .verdict = v };
+        if (!known) return .{ .verdict = v };
         const a = std.heap.smp_allocator;
         const e = a.create(Epoch) catch return .{ .verdict = v };
         const kept = copyVerdict(a, v);
         const l = a.dupe(u8, lists) catch null;
         const m = a.dupe(u8, mount) catch null;
-        if (kept != null and l != null and m != null) {
-            e.* = .{ .lists = l.?, .mount = m.?, .verdict = kept.?, .born_ms = now_ms, .last = next, .members = 1 };
+        const d = a.dupe(u8, volume) catch null;
+        if (kept != null and l != null and m != null and d != null) {
+            e.* = .{
+                .lists = l.?,
+                .mount = m.?,
+                .volume = d.?,
+                .verdict = kept.?,
+                .born_ms = v.at_ms,
+                .last = stamp.?,
+                .members = 1,
+            };
             if (es.list.append(a, e)) |_| {
                 return .{ .verdict = v, .epoch = e };
             } else |_| {}
@@ -619,13 +633,14 @@ pub const Epochs = struct {
         if (kept) |k| freeVerdict(a, k);
         if (l) |x| a.free(x);
         if (m) |x| a.free(x);
+        if (d) |x| a.free(x);
         a.destroy(e);
         return .{ .verdict = v };
     }
 
     /// Whether `e`'s verdict is still of the volume, whose lock file is `lock`: no step started in
-    /// it since the walk, and nothing but this process's jobs has opened it since the last of
-    /// them did.
+    /// it since the walk, nothing but this process's jobs has opened it since the last of them
+    /// did, and the walk is not older than a verdict may be.
     pub fn valid(es: *Epochs, io: std.Io, e: *Epoch, lock: linux.fd_t) bool {
         es.mu.lockUncancelable(io);
         defer es.mu.unlock(io);
@@ -635,20 +650,22 @@ pub const Epochs = struct {
             return false;
         };
         // A difference is a foreign open, or one that has stamped but not joined yet: a walk.
-        if (!sameLeft(now, e.last)) {
+        if (!sameLeft(now, e.last) or !e.young(std.Io.Clock.real.now(io).toMilliseconds())) {
             e.ended = true;
             return false;
         }
         return true;
     }
 
-    /// A process is about to start with the volume of `lists` mounted: its verdicts are of the past.
-    pub fn end(es: *Epochs, io: std.Io, lists: []const u8) void {
+    /// A process is about to start with the volume at `volume` mounted: the verdicts of it, and of
+    /// any volume inside it or holding it (the step user's tool cache is a directory of the root
+    /// user's: a step of one can write to the other's trees), are of the past.
+    pub fn end(es: *Epochs, io: std.Io, volume: []const u8) void {
         es.mu.lockUncancelable(io);
         defer es.mu.unlock(io);
-        for (es.list.items) |e| if (std.mem.eql(u8, e.lists, lists)) {
-            e.ended = true;
-        };
+        for (es.list.items) |e| {
+            if (nests(e.volume, volume) or nests(volume, e.volume)) e.ended = true;
+        }
     }
 
     /// A member let the volume go. The epoch goes with its last.
@@ -665,6 +682,7 @@ pub const Epochs = struct {
         freeVerdict(a, e.verdict);
         a.free(e.lists);
         a.free(e.mount);
+        a.free(e.volume);
         a.destroy(e);
     }
 };
@@ -672,13 +690,26 @@ pub const Epochs = struct {
 pub const Epoch = struct {
     lists: []u8,
     mount: []u8,
+    /// The volume's directory on the host.
+    volume: []u8,
     verdict: Verdict,
+    /// When the walk began, the age of the verdict.
     born_ms: i64,
     /// The lock file as the last member's open left it.
     last: Left,
     members: u32,
     ended: bool = false,
+
+    fn young(e: Epoch, now_ms: i64) bool {
+        return now_ms >= e.born_ms and now_ms - e.born_ms <= verdict_max_age_ms;
+    }
 };
+
+/// Whether `inner` is `outer` or a path below it.
+fn nests(inner: []const u8, outer: []const u8) bool {
+    if (!std.mem.startsWith(u8, inner, outer)) return false;
+    return inner.len == outer.len or inner[outer.len] == '/';
+}
 
 /// The epochs of this runner's jobs.
 pub var process_epochs: Epochs = .{};
@@ -698,7 +729,7 @@ fn copyVerdict(a: Allocator, v: Verdict) ?Verdict {
         a.free(full);
         return null;
     };
-    return .{ .env = env, .full = full, .note = note };
+    return .{ .env = env, .full = full, .note = note, .at_ms = v.at_ms };
 }
 
 fn freeVerdict(a: Allocator, v: Verdict) void {
@@ -2618,4 +2649,132 @@ test "tool trees: numbers are written in a line as fmt writes them" {
         const n8 = putUint(&buf, 0, v, 8);
         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{o}", .{v}), buf[0..n8]);
     }
+}
+
+/// A verdict that a walk made of the fixture, taken by the first job of `es` as it found `left`
+/// and stamped `stamp`, with its walk's age set to `at_ms`. The lock file is a real one, so a
+/// check can read its mtime.
+fn epochFor(arena: Allocator, es: *Epochs, f: Fixture, lock: linux.fd_t, left: Left, stamp: Left, at_ms: i64) !?Epochs.Entered {
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left, idleNow()));
+    const path = try verdictPath(arena, f);
+    const boot = bootId(arena, io) orelse return null;
+    const text = try cwd.readFileAlloc(io, path, arena, .unlimited);
+    const from = try std.fmt.allocPrint(arena, "boot {s}\nat ", .{boot});
+    const start = std.mem.indexOf(u8, text, from).? + from.len;
+    const end = std.mem.indexOfScalarPos(u8, text, start, '\n').?;
+    const changed = try std.fmt.allocPrint(arena, "{s}{d}{s}", .{ text[0..start], at_ms, text[end..] });
+    try cwd.writeFile(io, .{ .sub_path = path, .data = changed });
+    _ = lock;
+    return es.enter(arena, io, f.cache, f.lists, "/t", left, stamp, true, true);
+}
+
+fn setMtime(fd: linux.fd_t, l: Left) void {
+    const times = [2]linux.timespec{ .{ .sec = 0, .nsec = (1 << 30) - 2 }, .{ .sec = l.sec, .nsec = l.nsec } };
+    _ = linux.utimensat(fd, null, &times, 0);
+}
+
+test "tool trees: an epoch is as old as its walk, not its taking, when it is joined and when it is checked" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    try skipWithoutLeases(arena, f);
+    try tmp.dir.writeFile(io, .{ .sub_path = "lock", .data = "" });
+    const lock = linux.open(try arena.dupeSentinel(u8, try tmp.dir.realPathFileAlloc(io, "lock", arena), 0), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    const fd = std.math.cast(linux.fd_t, lock) orelse return error.TestUnexpectedResult;
+    defer _ = linux.close(fd);
+    const ino = leftBy(fd).?.ino;
+    const first: Left = .{ .ino = ino, .sec = 1_700_000_000, .nsec = 1 };
+    const second: Left = .{ .ino = ino, .sec = 1_700_000_000, .nsec = 2 };
+    const third: Left = .{ .ino = ino, .sec = 1_700_000_000, .nsec = 3 };
+    var es: Epochs = .{};
+    // The walk was 59 minutes and 59.5 seconds ago: taken now, young; in a second, too old.
+    const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
+    const told = (try epochFor(arena, &es, f, fd, first, second, now_ms - verdict_max_age_ms + 500)) orelse return error.SkipZigTest;
+    const e = told.epoch orelse return error.TestUnexpectedResult;
+    setMtime(fd, second);
+    try std.testing.expect(es.valid(io, e, fd));
+    io.sleep(.fromMilliseconds(700), .awake) catch {};
+    // Neither a job that opens now (told nothing, as it finds the epoch ended) nor a check is.
+    const late = es.enter(arena, io, f.cache, f.lists, "/t", second, third, true, true);
+    try std.testing.expect(late.verdict == null and late.epoch == null);
+    try std.testing.expect(!es.valid(io, e, fd));
+    es.leave(io, e);
+    try std.testing.expectEqual(@as(usize, 0), es.list.items.len);
+}
+
+test "tool trees: an open that cannot tell its stamp from what it found shares nothing" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    try skipWithoutLeases(arena, f);
+    var es: Epochs = .{};
+    // Its own verdict, as on main, but no epoch, for a stamp equal to what it found or not known.
+    for ([_]?Left{ left_now, null }) |stamp| {
+        try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, idleNow()));
+        const alone = es.enter(arena, io, f.cache, f.lists, "/t", left_now, stamp, true, true);
+        try std.testing.expect(alone.verdict != null and alone.epoch == null);
+        try std.testing.expectEqual(@as(usize, 0), es.list.items.len);
+    }
+}
+
+test "tool trees: checks, ends and leaves from threads at once neither crash nor leak, and no check outlives an end" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    try skipWithoutLeases(arena, f);
+    try tmp.dir.writeFile(io, .{ .sub_path = "lock", .data = "" });
+    const lock = linux.open(try arena.dupeSentinel(u8, try tmp.dir.realPathFileAlloc(io, "lock", arena), 0), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    const fd = std.math.cast(linux.fd_t, lock) orelse return error.TestUnexpectedResult;
+    defer _ = linux.close(fd);
+    const ino = leftBy(fd).?.ino;
+    var es: Epochs = .{};
+    const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
+    var last: Left = .{ .ino = ino, .sec = 1_700_000_000, .nsec = 1 };
+    const told = (try epochFor(arena, &es, f, fd, .{ .ino = ino, .sec = 1_700_000_000, .nsec = 0 }, last, now_ms)) orelse return error.SkipZigTest;
+    const e = told.epoch.?;
+    // Three more members, each opening as the last left it.
+    for (0..3) |_| {
+        const next: Left = .{ .ino = ino, .sec = 1_700_000_000, .nsec = last.nsec + 1 };
+        const j = es.enter(arena, io, f.cache, f.lists, "/t", last, next, true, true);
+        try std.testing.expect(j.epoch == e);
+        last = next;
+    }
+    setMtime(fd, last);
+    const Member = struct {
+        fn run(x: *Epochs, ep: *Epoch, fdesc: linux.fd_t, ended: *const std.atomic.Value(bool), late: *std.atomic.Value(u32)) void {
+            const i = std.testing.io;
+            var after_end = false;
+            for (0..2000) |_| {
+                const was_ended = ended.load(.acquire);
+                const ok = x.valid(i, ep, fdesc);
+                if (was_ended and ok) after_end = true;
+            }
+            if (after_end) _ = late.fetchAdd(1, .monotonic);
+            x.leave(i, ep);
+        }
+    };
+    var ended: std.atomic.Value(bool) = .init(false);
+    var late: std.atomic.Value(u32) = .init(0);
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Member.run, .{ &es, e, fd, &ended, &late });
+    io.sleep(.fromMilliseconds(1), .awake) catch {};
+    es.end(io, f.cache);
+    ended.store(true, .release);
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(u32, 0), late.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), es.list.items.len);
 }

@@ -211,14 +211,17 @@ pub fn openWaiting(
         if (linux.errno(linux.flock(lock.handle, lock_ex | lock_nb)) != .SUCCESS) return error.Locked;
         break :private copy;
     } else dir;
-    // As the last open left it, and then its last use, which an eviction goes by.
+    // As the last open left it, and then its last use, which an eviction goes by. Read and set
+    // with the file's stamp lock held, by every runner that knows of it, so that no other open can
+    // come between the two and have its stamp written over (`stampLock`).
     stamp_mu.lockUncancelable(io);
     defer stamp_mu.unlock(io);
+    const range = stampLock(lock.handle);
+    defer if (range) |fd| {
+        _ = linux.close(fd);
+    };
     const left = tool_trees.leftBy(lock.handle);
-    _ = linux.utimensat(lock.handle, null, null, 0);
-    // Read as well: the next change of the file's times is then told apart from this one, even
-    // within a clock tick.
-    const stamp = tool_trees.leftBy(lock.handle);
+    const stamp = stampOnce(io, lock.handle, left, range != null);
     const at_z = try arena.dupeSentinel(u8, at, 0);
     switch (linux.errno(linux.mkdir(at_z, 0o755))) {
         .SUCCESS => {},
@@ -313,6 +316,55 @@ pub const Wait = struct {
 /// of this process come in the order they stamped (`tool_trees.Epochs`). Nothing that waits is
 /// done under it: the lock it takes is already held.
 var stamp_mu: std.Io.Mutex = .init;
+
+/// An exclusive lock on the first byte of the lock file's inode, held while an open reads its
+/// mtime and sets it: an open file description's (`F_OFD_SETLKW`), so it excludes the other
+/// threads of this process and every other process, and is let go with the descriptor. It is not
+/// the volume's flock, which jobs hold for as long as they run, and is not seen by it. A runner
+/// older than this does not take it, and its open may still come between the two; that is the
+/// window an open had before. Null if it cannot be taken (no write access to the file): the open
+/// then says nothing of its stamp (`stampOnce`), and no job is told a verdict that is shared.
+fn stampLock(lock: linux.fd_t) ?linux.fd_t {
+    var buf: [40]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&buf, "/proc/self/fd/{d}", .{lock}, 0) catch return null;
+    const raw = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (linux.errno(raw) != .SUCCESS) return null;
+    const fd = std.math.cast(linux.fd_t, raw) orelse return null;
+    var fl: linux.Flock = .{ .type = 1, .whence = 0, .start = 0, .len = 1, .pid = 0, ._unused = {} };
+    while (true) switch (linux.errno(linux.fcntl(fd, linux.F.OFD_SETLKW, @intFromPtr(&fl)))) {
+        .SUCCESS => return fd,
+        .INTR => continue,
+        else => {
+            _ = linux.close(fd);
+            return null;
+        },
+    };
+}
+
+/// Sets the lock file's mtime to now, or to a nanosecond past what it was if the clock is not
+/// ahead of it, and returns what it reads back. Null when it is not known to differ from `left`
+/// (a failed `utimensat`, a filesystem whose times are too coarse to tell two opens apart, or
+/// `held` false, no stamp lock): the next open could not tell this one from the last.
+fn stampOnce(io: std.Io, fd: linux.fd_t, left: ?tool_trees.Left, held: bool) ?tool_trees.Left {
+    const before = left orelse {
+        _ = linux.utimensat(fd, null, null, 0);
+        return null;
+    };
+    const was: i128 = @as(i128, before.sec) * std.time.ns_per_s + before.nsec;
+    const now: i128 = std.Io.Clock.real.now(io).nanoseconds;
+    const to = @max(now, was + 1);
+    const omit = (1 << 30) - 2;
+    const sec = std.math.cast(isize, @divFloor(to, std.time.ns_per_s)) orelse return null;
+    const nsec = std.math.cast(isize, @mod(to, std.time.ns_per_s)) orelse return null;
+    const times = [2]linux.timespec{ .{ .sec = 0, .nsec = omit }, .{ .sec = sec, .nsec = nsec } };
+    if (linux.errno(linux.utimensat(fd, null, &times, 0)) != .SUCCESS) {
+        _ = linux.utimensat(fd, null, null, 0);
+        return null;
+    }
+    const after = tool_trees.leftBy(fd) orelse return null;
+    if (!held or (after.sec == before.sec and after.nsec == before.nsec)) return null;
+    return after;
+}
 
 /// What an open tells its caller of the lock file's mtime before anything else can change it from
 /// this process: as it was found (`left`) and as this open set it (`stamp`).
@@ -511,9 +563,28 @@ const ToolHook = struct {
             h.failed = true;
             return;
         };
-        h.told = tool_trees.process_epochs.enter(h.arena, h.io, lists, h.mount, left, stamp, h.take);
+        // The step user's tool cache is a directory of the root user's (`evict.nested`): a root
+        // step can write there without opening, or stamping, the lock beside it.
+        const share = !std.mem.eql(u8, std.fs.path.basename(dir), evict.nested);
+        h.told = tool_trees.process_epochs.enter(h.arena, h.io, dir, lists, h.mount, left, stamp, h.take, share);
     }
 };
+
+/// Ends the epochs of the volumes among `binds`, and of those nested with them, before a process is
+/// started with them mounted (`tool_trees.Epochs.end`).
+pub fn endEpochs(io: std.Io, binds: []const sandbox.Spec.Bind) void {
+    for (binds) |bd| if (bd.volume) tool_trees.process_epochs.end(io, bd.host);
+}
+
+/// `binds` without the volume at `host`.
+pub fn without(arena: Allocator, binds: []const sandbox.Spec.Bind, host: []const u8) Allocator.Error![]const sandbox.Spec.Bind {
+    var kept: std.ArrayList(sandbox.Spec.Bind) = .empty;
+    for (binds) |bd| {
+        if (bd.volume and std.mem.eql(u8, bd.host, host)) continue;
+        try kept.append(arena, bd);
+    }
+    return kept.items;
+}
 
 /// The job's caches, as the Dagger backend gives them (`set_up.basePlan`): its volumes opened
 /// and held, their mounts, the variables that point at them, and the seeds it runs with.
@@ -1220,7 +1291,7 @@ test "native volumes: the last job out leaves the tool cache's trees for the nex
     try std.testing.expect(three.tool_verdict != null);
     // And one that opens after the first step started finds none, whatever the step did to the tree.
     try installTool(arena, io, volume, "changed by a step\n");
-    tool_trees.process_epochs.end(io, lists);
+    tool_trees.process_epochs.end(io, volume);
     var three_b = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
     try std.testing.expect(three_b.tool_verdict == null);
     three_b.release(io);
@@ -1296,7 +1367,7 @@ test "native volumes: jobs that open before any step ran share the verdict, and 
     try std.testing.expect(one.verdictStands(io) and two.verdictStands(io) and four.verdictStands(io));
 
     // The first step of any job that has the volume mounted, which then writes to it.
-    tool_trees.process_epochs.end(io, left.lists);
+    tool_trees.process_epochs.end(io, left.volume);
     try installTool(arena, io, left.volume, "a step's tool\n");
     // Whoever has not checked yet walks, and so does whoever opens next: nobody is told of the past.
     try std.testing.expect(!one.verdictStands(io) and !two.verdictStands(io) and !three.verdictStands(io));
@@ -1325,7 +1396,6 @@ test "native volumes: an open that is not this process's ends the epoch, for tho
         var one = try leaveOne(arena, io, store, job, opts, "repo");
         try std.testing.expect(one.tool_verdict != null);
         // Another runner opens the volume (it stamps the lock file) and may write at once.
-        io.sleep(.fromMilliseconds(20), .awake) catch {};
         const key = [_][]const u8{ "o", "r", "repo", "toolcache", dagger.imageName(dagger.default_image) };
         const foreign = try open(arena, io, store, &key, .shared, null);
         switch (when) {
@@ -1397,6 +1467,113 @@ test "native volumes: an epoch is of one scope, ends with its last member, and a
     try std.testing.expect(restarted.tool_verdict == null);
 }
 
+test "native volumes: a step that mounts a volume ends the epochs of it and of the volumes nested with it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const testing = @import("../dagger/testing.zig");
+    var job = testing.testJob(&.{testing.testStep("echo")});
+    job.github.repository = "o/r";
+    const opts: Options = .{ .package_caches = true, .trusted = true, .tool_trees = true };
+    const left = (try leaveVerdict(arena, io, store, job, opts, "repo")) orelse return error.SkipZigTest;
+
+    // The step user's tool cache is a directory of the root user's: no job is told of it by an
+    // epoch, as a root step can write there without opening it.
+    var runner = try plan(arena, io, store, opts, "repo", job, dagger.default_image, true, false, null);
+    try std.testing.expect(runner.tool_epoch == null);
+    try std.testing.expect(std.mem.endsWith(u8, runner.tool_cache_host.?, "/" ++ evict.nested));
+    runner.release(io);
+
+    // And a bind of it ends the root volume's epoch, as a bind of the root volume does.
+    for ([_][]const u8{ "/runner", "" }) |below| {
+        var one = try leaveOne(arena, io, store, job, opts, "repo");
+        try std.testing.expect(one.tool_epoch != null);
+        const host = try std.fmt.allocPrint(arena, "{s}{s}", .{ left.volume, below });
+        endEpochs(io, &.{.{ .host = host, .at = "/x", .volume = true }});
+        try std.testing.expect(!one.verdictStands(io));
+        one.release(io);
+        if (below.len > 0) _ = (try leaveVerdict(arena, io, store, job, opts, "repo")) orelse return error.SkipZigTest;
+    }
+    // A bind that is no volume, or another one, does not.
+    _ = (try leaveVerdict(arena, io, store, job, opts, "repo")) orelse return error.SkipZigTest;
+    var two = try leaveOne(arena, io, store, job, opts, "repo");
+    defer two.release(io);
+    endEpochs(io, &.{
+        .{ .host = left.volume, .at = "/y" },
+        .{ .host = try std.fmt.allocPrint(arena, "{s}-other", .{left.volume}), .at = "/z", .volume = true },
+    });
+    try std.testing.expect(two.verdictStands(io));
+}
+
+test "native volumes: a set-up script is run without the tool cache, whose volume is the only bind left out" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const binds = [_]sandbox.Spec.Bind{
+        .{ .host = "/v/tool", .at = "/opt/tools", .volume = true },
+        .{ .host = "/v/zig", .at = "/z", .volume = true },
+        .{ .host = "/v/tool", .at = "/not-a-volume" },
+    };
+    const kept = try without(a.allocator(), &binds, "/v/tool");
+    try std.testing.expectEqual(@as(usize, 2), kept.len);
+    try std.testing.expectEqualStrings("/z", kept[0].at);
+    try std.testing.expectEqualStrings("/not-a-volume", kept[1].at);
+}
+
+test "native volumes: an open reads and stamps the lock file with its stamp lock held, and waits for another's" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const key = [_][]const u8{ "o", "r", "repo", "toolcache", "img" };
+    const first = try open(arena, io, store, &key, .shared, null);
+    defer first.release(io);
+    // Another runner is between its read of the lock file's mtime and its stamp: this open comes
+    // after it, so it cannot write its stamp over that one's.
+    const other = stampLock(first.lock.handle) orelse return error.SkipZigTest;
+    const Opener = struct {
+        fn run(st: []const u8, k: []const []const u8, done: *std.atomic.Value(bool)) void {
+            var ar: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            defer ar.deinit();
+            if (open(ar.allocator(), std.testing.io, st, k, .shared, null)) |v| v.release(std.testing.io) else |_| {}
+            done.store(true, .release);
+        }
+    };
+    var done: std.atomic.Value(bool) = .init(false);
+    const t = try std.Thread.spawn(.{}, Opener.run, .{ store, &key, &done });
+    io.sleep(.fromMilliseconds(150), .awake) catch {};
+    const waited = !done.load(.acquire);
+    _ = linux.close(other);
+    t.join();
+    try std.testing.expect(waited);
+    try std.testing.expect(done.load(.acquire));
+}
+
+test "native volumes: opens in one clock tick still stamp the lock file apart" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const key = [_][]const u8{ "o", "r", "repo", "toolcache", "img" };
+    var seen: ?tool_trees.Left = null;
+    for (0..50) |_| {
+        const v = try open(arena, io, store, &key, .shared, null);
+        defer v.release(io);
+        const now = tool_trees.leftBy(v.lock.handle).?;
+        if (seen) |s| try std.testing.expect(s.sec != now.sec or s.nsec != now.nsec);
+        seen = now;
+    }
+}
+
 test "native volumes: a verdict is not used after the volume was opened by anything that did not take it, or made again" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -1424,7 +1601,6 @@ test "native volumes: a verdict is not used after the volume was opened by anyth
         switch (how) {
             // A runner of another version, which knows nothing of verdicts, opens it and writes.
             .opened_by_another => {
-                io.sleep(.fromMilliseconds(20), .awake) catch {};
                 const key = [_][]const u8{ "o", "r", "repo", "toolcache", dagger.imageName(dagger.default_image) };
                 const old = try open(arena, io, store, &key, .shared, null);
                 try installTool(arena, io, volume, "written by an older runner's step\n");

@@ -219,9 +219,6 @@ gate: ?*admission.Gate = null,
 /// What the job's options say of caches, and what it got of them (`setUpCaches`).
 caches: volumes.Options = .{},
 cache_plan: volumes.Plan = .{},
-/// Set once a process of this job may have been started with the tool cache's volume mounted, and
-/// the epoch of the volume ended (`endToolEpoch`).
-tool_epoch_ended: bool = false,
 /// `ZIG_RUNNER_TOOL_TREES`' value, when "Set up job" checked the tool cache's trees
 /// (`checkToolTrees`): a step's key holds it, and `Exec.toolDirNotHeld` reads it.
 tool_trees: ?[]const u8 = null,
@@ -2003,32 +2000,12 @@ fn checkToolTrees(b: *Backend) !void {
     try b.notes.append(arena, verdict.note);
 }
 
-/// Ends the epoch of the tool cache's volume (`tool_trees.Epochs`) before a process is started
-/// with it mounted: from then on a step may write to the trees, and no job is told of them again
-/// by a verdict. Before every start of a process, so before the first of any step, action, build
-/// or set-up script that has the volume bound; once per job suffices, the epoch being ended then.
-fn endToolEpoch(b: *Backend) !void {
-    if (b.tool_epoch_ended) return;
-    const volume = b.cache_plan.tool_cache_host orelse return;
-    for (b.binds) |bd| if (bd.volume and std.mem.eql(u8, bd.host, volume)) {
-        const lists = try trees_check.listsDir(b.arena, b.store_cfg.root, volume);
-        trees_check.process_epochs.end(b.io, lists);
-        b.tool_epoch_ended = true;
-        return;
-    };
-}
-
 /// `binds` without the tool cache's volume, for a script of the runner's own that is run in set-up
 /// and does not use it: a process started with it mounted could write to its trees
-/// (`endToolEpoch`), and what is not mounted cannot.
+/// (`volumes.endEpochs`), and what is not mounted cannot.
 fn withoutToolCache(b: *Backend, binds: []const sandbox.Spec.Bind) []const sandbox.Spec.Bind {
     const volume = b.cache_plan.tool_cache_host orelse return binds;
-    var kept: std.ArrayList(sandbox.Spec.Bind) = .empty;
-    for (binds) |bd| {
-        if (bd.volume and std.mem.eql(u8, bd.host, volume)) continue;
-        kept.append(b.arena, bd) catch return binds;
-    }
-    return kept.items;
+    return volumes.without(b.arena, binds, volume) catch binds;
 }
 
 /// A job that lets the tool cache's volume go with processes that may be alive in it says so,
@@ -2697,7 +2674,10 @@ fn execIn(
     }
     @memcpy(lowers[n .. lowers.len - 1], b.seed_layers.items);
     lowers[lowers.len - 1] = b.rootfs;
-    try b.endToolEpoch();
+    // Before the process exists: from then on a step may write to a tree, and no job is told of
+    // the trees by a verdict again (`tool_trees.Epochs`). Every start with a volume mounted, a
+    // step, an action's pre or post script, a Docker build or a set-up script alike.
+    volumes.endEpochs(b.io, b.binds);
     const ended = try sandbox.run(arena, b.io, b.how.argv_prefix, .{
         .root = b.dir,
         .lowers = lowers,
