@@ -1446,7 +1446,7 @@ pub fn usernsMain(arena: Allocator, path: []const u8, base_text: []const u8, cou
     defer _ = linux.close(ns);
     const file = linux.open(z(arena, path), .{ .ACCMODE = .RDONLY, .CREAT = true, .CLOEXEC = true }, 0o444);
     check("make the user namespace's file", file);
-    _ = linux.close(@intCast(file));
+    _ = linux.close(std.math.cast(linux.fd_t, file) orelse return 1);
     const from = std.fmt.allocPrintSentinel(arena, "/proc/self/fd/{d}", .{ns}, 0) catch oom();
     check("keep the user namespace", linux.mount(from, z(arena, path), null, linux.MS.BIND, 0));
     return 0;
@@ -1457,7 +1457,7 @@ pub fn usernsMain(arena: Allocator, path: []const u8, base_text: []const u8, cou
 fn keptUserns(arena: Allocator, path: []const u8) linux.fd_t {
     const fd = linux.open(z(arena, path), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(fd) != .SUCCESS) return -1;
-    return @intCast(fd);
+    return std.math.cast(linux.fd_t, fd) orelse -1;
 }
 
 /// The lower layers with the canonical ids replaced by mounts of them idmapped through `userns`:
