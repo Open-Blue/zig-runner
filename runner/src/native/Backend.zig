@@ -30,6 +30,7 @@ const docker = @import("../dagger/docker.zig");
 const cgroup = @import("cgroup.zig");
 const evict = @import("evict.zig");
 const reaper = @import("reaper.zig");
+const collector = @import("collector.zig");
 const volumes = @import("volumes.zig");
 const trees_check = @import("tool_trees.zig");
 const admission = @import("../admission.zig");
@@ -967,6 +968,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
             .sync_fd = Store.syncCursor(arena, cfg.store),
             .sync_log = Store.newSyncLog(arena),
             .defer_delete = true,
+            .defer_collect = true,
         },
         .vouched = cfg.vouched,
         .port_addresses = cfg.port_addresses,
@@ -1475,6 +1477,18 @@ pub fn deinit(b: *Backend) void {
     if (b.slot) |s| s.lock.close(b.io);
     b.lock.close(b.io);
     t = b.timings.since(arena, .collect_touch, t);
+    // The rest of the upkeep is off the way to the runner's next job (`collector`): the layers'
+    // directory synced and the store kept under its cap. Not when the job's sync failed (its layers
+    // are dropped before it returns), or the store may be past its cap, which is then collected
+    // here, after the thread's own pass, so the cap holds however many jobs end at once.
+    if (b.store_cfg.defer_collect and b.store_cfg.root.len > 0) {
+        if (b.store_cfg.lagFits(arena, b.io) and collector.submit(b.io, b.store_cfg, b.published)) {
+            _ = b.timings.since(arena, .collect, whole);
+            if (b.store_cfg.sync_fd) |fd| _ = std.os.linux.close(fd);
+            return;
+        }
+        _ = collector.drain(b.io, null);
+    }
     if (b.published) b.store_cfg.syncLayers(arena);
     // After a failed sync, what this job renamed since the last good one is evicted.
     b.store_cfg.dropUnsynced(arena, b.io);
@@ -8474,7 +8488,9 @@ fn replayableLines(arena: Allocator, text: []const u8) ![]const []const u8 {
 }
 
 fn storeLayers(arena: Allocator, store: []const u8) !usize {
-    // What a job's end evicted is deleted after it returns (`reaper`).
+    // What a job's end evicted is deleted after it returns (`reaper`), and a job's end collects
+    // after it returns (`collector`).
+    _ = collector.drain(std.testing.io, null);
     reaper.drain(std.testing.io);
     const p = try std.fmt.allocPrint(arena, "{s}/layers", .{store});
     var dir = try std.Io.Dir.cwd().openDir(std.testing.io, p, .{ .iterate = true });
@@ -9025,7 +9041,12 @@ test "native step cache: past its cap the store lets go of every layer no job ho
     var c = try cachedConfig(arena, &tmp);
     c.cfg.store_max_bytes = 0;
     const job = testJob(&.{testStep("echo x >> /shared/s")});
-    for ([_][]const u8{ "j1", "j2" }) |ran| try expectSucceeded(try runCached(arena, c.cfg, job, ran));
+    for ([_][]const u8{ "j1", "j2" }) |ran| {
+        try expectSucceeded(try runCached(arena, c.cfg, job, ran));
+        // A job's end collects once the runner polls again (`collector`): the layer is let go
+        // before the next job only because this waits for it.
+        _ = collector.drain(std.testing.io, null);
+    }
     try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "s"));
     try std.testing.expectEqual(@as(usize, 0), try storeLayers(arena, c.cfg.store));
 }

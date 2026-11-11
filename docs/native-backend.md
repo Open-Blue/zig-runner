@@ -752,6 +752,20 @@ What it covers, as built:
   whole (by `meta` and their files' lengths, without reading them) go too; so an upgrade across a
   `store_format` bump empties `layers/` at its first job's end, as an older format's meta is not
   whole to it. What is beside the layers is the next section's ("Eviction").
+  The job's end hands this, and the sync of the layers' directory that makes its renames durable,
+  to a thread (`collector.zig`), so the runner polls for its next job without waiting for them (on
+  a Pi 5's SD card they took 12-24 ms of a job's end, and 200-700 ms under load). One thread at a
+  time, and jobs ending while it works are served by one pass; a new job's set-up does not wait
+  for it (the first job after a boot waits for a pass at most, `checkOncePerBoot`). The cap holds
+  to within a sixteenth of it (at least 64 MiB): the runner counts what its jobs publish since the
+  last pass (`Store.lagFits`), and a job's end that finds the store past that, the disk short of
+  its floor, no pass yet since the process began, a job whose sync failed (it drops its layers
+  first), or a full queue, waits for the thread and collects before it returns, as it did. A
+  stopping runner waits for the thread for five seconds; a pass cut short leaves what a killed
+  `collect` always left (renamed-away layers, swept at the next). What a pass evicts is as it was:
+  nothing a job holds, in the order of use the job's end left (`touchChain` still runs before it
+  returns). Its timings are logged as "store upkeep", beside the job's `native phases` line, whose
+  `collect` is then the hand-over only.
 - **Flattening**: before a step on a stack of 100 layers (`default_flatten_at`), the stack is
   merged into one (`Store.flatten`): later entries win, whiteouts are kept (they hide the
   rootfs), opaque directories stay opaque, files are hard links and directories are made with
