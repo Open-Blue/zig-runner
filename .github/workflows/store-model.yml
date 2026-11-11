@@ -1,10 +1,10 @@
 name: store model
 
-# The TLA+ models, checked with TLC: the native store's locking protocols (proofs/tla/StoreLocking.tla
-# and StoreEviction.tla, proofs/README.md "The store's locking, in TLA+") and the release pipeline
-# (ReleasePipeline.tla, "The release pipeline, in TLA+"); StoreLocking is checked with SPIN
-# instead, on its Promela port (proofs/spin, "The store's locking, in SPIN"). Their safety and
-# liveness must hold, and each mutant (the code with one guard taken away) and finding must fail.
+# The TLA+ models: the native store's locking protocols (proofs/tla/StoreLocking.tla and
+# StoreEviction.tla, proofs/README.md "The store's locking, in TLA+") and the release pipeline
+# (ReleasePipeline.tla, "The release pipeline, in TLA+"), checked with SPIN on their Promela ports
+# (proofs/spin, "The store's locking, in SPIN"), and with TLC any module that has none. Their safety
+# and liveness must hold, and each mutant (the code with one guard taken away) and finding must fail.
 # tla2tools.jar is pinned with its sha256 in tlc.sh, SPIN as Ubuntu's package below. On pull requests and pushes to main that touch the store, its callers,
 # the release's workflows and scripts, or the models, and weekly with the proofs. Not a required
 # check, so a path filter is enough (proofs.yml needs ci-scope.sh because it is one), and the merge
@@ -61,9 +61,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # In three parts side by side (tlc.sh, TLC_PART), by the times the configurations note: one after
-  # another they take under 4 minutes now that StoreLocking is SPIN's, the longest
-  # (ReleasePipeline-liveness-deploy.cfg) under a minute, so each part takes about 70 s.
+  # In three parts side by side (tlc.sh, TLC_PART), by the times the configurations note. With
+  # every module SPIN's, TLC has nothing to check here unless TLC_ALL is set.
   tlc:
     name: TLC (${{ matrix.part }}/3)
     runs-on: ubuntu-26.04
@@ -88,12 +87,12 @@ jobs:
       - name: Check the store's locking and the release pipeline
         env:
           TLC_PART: ${{ matrix.part }}/3
-          # While SPIN takes StoreLocking's liveness over, TLC checks StoreLocking too, beside it.
+          # While SPIN takes StoreEviction and ReleasePipeline over, TLC checks every module too.
           TLC_ALL: "1"
         run: .github/scripts/tlc.sh
 
-  # StoreLocking's configurations and mutants, safety and liveness (proofs/spin, the Promela port of
-  # StoreLocking.tla), side by side on the runner's cores.
+  # Every module's configurations and mutants, safety and liveness (proofs/spin, the Promela ports
+  # of the modules under proofs/tla), side by side on the runner's cores.
   spin:
     name: SPIN
     runs-on: ubuntu-26.04
@@ -115,5 +114,5 @@ jobs:
           sudo .github/scripts/apt.sh install --no-install-recommends "spin=$SPIN_VERSION"
           spin -V
 
-      - name: Check the store's locking
+      - name: Check the store's locking and the release pipeline
         run: .github/scripts/spin.sh

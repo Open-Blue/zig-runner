@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Model-checks the native store's locking protocol with SPIN: proofs/spin/StoreLockingModel.pml, the
-# Promela port of proofs/tla/StoreLocking.tla (proofs/README.md, "The store's locking, in SPIN").
+# Model-checks the TLA+ modules with SPIN, on their Promela ports: proofs/spin/<Module>Model.pml for
+# proofs/tla/<Module>.tla, StoreLocking's, StoreEviction's and ReleasePipeline's (proofs/README.md,
+# "The store's locking, in SPIN").
 # SPIN is 6.5.2, Ubuntu's spin 6.5.2+dfsg-2build1 (store-model.yml pins the package), and any other
 # version fails here, so a changed SPIN is a change made on purpose.
 #
@@ -35,13 +36,15 @@ python3 -I "$here/cfg.py" --check
 
 # build <name> safety|liveness: spin -a and gcc in the current directory, pan-<kind> the verifier.
 # The safety one has no never claim; the liveness one has the stutter of LIVENESS and the claims.
+# A variable no step reads (a ghost a mutant does not check) stays in the state (-o2), as it is in
+# TLC's.
 build() {
 	local name=$1 kind=$2
 	if [[ $kind == safety ]]; then
-		spin -a "$name.pml" >spin-safety.out 2>&1 &&
+		spin -o2 -a "$name.pml" >spin-safety.out 2>&1 &&
 			gcc -O2 -w -DSAFETY -DNOREDUCE -DNOCLAIM -o pan-safety pan.c >gcc-safety.out 2>&1
 	else
-		spin -DLIVENESS -a "$name.pml" >spin-liveness.out 2>&1 &&
+		spin -o2 -DLIVENESS -a "$name.pml" >spin-liveness.out 2>&1 &&
 			gcc -O2 -w -DNOREDUCE -o pan-liveness pan.c >gcc-liveness.out 2>&1
 	fi
 }
