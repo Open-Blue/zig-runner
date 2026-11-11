@@ -1107,7 +1107,7 @@ fn settle(s: Store, arena: Allocator, io: std.Io, key: Key) !void {
     m.bytes = try treeBytes(arena, io, try join(arena, dir, "fs"));
     m.pending = null;
     const new = try join(arena, dir, "meta.new");
-    errdefer cwd.deleteFile(io, new) catch {};
+    errdefer cwd.deleteFile(io, new) catch |e| std.log.warn("native: cannot remove {s}: {t}", .{ new, e });
     const f = try cwd.createFile(io, new, .{});
     defer f.close(io);
     try f.writeStreamingAll(io, try m.write(arena));

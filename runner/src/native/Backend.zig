@@ -1420,7 +1420,7 @@ pub fn deinit(b: *Backend) void {
     // not wait for it (`Store.settlePending`): now, while the job still holds it and before the runner
     // polls again, so the next job never shares the disk with it. A failure was logged, and marks the
     // job: `dropUnsynced`, below, evicts the layer.
-    b.store_cfg.settlePending(arena, b.io, &b.timings) catch {};
+    b.store_cfg.settlePending(arena, b.io, &b.timings) catch |e| std.log.debug("native: the job's last layer is not durable: {t}", .{e});
     t = phases.now();
     // Before the layers are let go: ancestors end up the more recently used (`Store.touchChain`).
     const whole = t;
