@@ -2733,8 +2733,7 @@ fn runIn(
 /// kernel and its filesystems do not change under it); null in `idmapped_upper` is the question
 /// not yet asked. Where it does not work, or `Config.idmapped_upper` is off, or the runner is
 /// rootless, the answer is no, and each layer is shifted when it is published or flattened.
-var idmapped_upper_known: std.atomic.Value(u8) = .init(0);
-const idmapped_unknown = 0;
+var idmapped_upper_known: std.atomic.Value(u8) = .init(0); // 0: not asked yet
 const idmapped_yes = 1;
 const idmapped_no = 2;
 
