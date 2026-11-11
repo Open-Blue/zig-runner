@@ -180,6 +180,9 @@ held: std.ArrayList(std.Io.File) = .empty,
 chain: std.ArrayList(std.Io.File) = .empty,
 /// Past this many layers, the stack is merged into one (`flatten`).
 flatten_at: usize = default_flatten_at,
+/// The file keeping the user namespace the idmapped uppers' mounts use (`keepUserns`), once made.
+upper_userns: ?[]const u8 = null,
+upper_userns_tried: bool = false,
 /// Whether a step's upper may be written through an idmapped mount (`idmappedUpper`): the
 /// config's say, `Config.idmapped_upper`.
 idmapped_upper: bool = true,
@@ -1465,6 +1468,7 @@ pub fn deinit(b: *Backend) void {
     // failed) may have a veth of its slot all the same, so that one is deleted here.
     // Its helper first, if one is still running; why it failed is said already.
     _ = b.networkPath() catch |e| std.log.debug("native: teardown: the job's network: {s}", .{@errorName(e)});
+    if (b.upper_userns_tried) detachNetns(arena, std.fmt.allocPrint(arena, "{s}/userns", .{b.dir}) catch "");
     if (b.netns) |p| {
         detachNetns(arena, p);
     } else if (b.slot) |s| {
@@ -1535,6 +1539,7 @@ fn sweep(arena: Allocator, io: std.Io, store: []const u8, cg_parent: ?[]const u8
         // a live job's directory taken for stale did before `removeJobDir`).
         std.log.warn("native: removing {s}, a job directory a runner left (it died)", .{path});
         detachNetns(arena, std.fmt.allocPrint(arena, "{s}/netns", .{path}) catch return);
+        detachNetns(arena, std.fmt.allocPrint(arena, "{s}/userns", .{path}) catch return);
         if (cg_parent) |p| (cgroup.Job{
             .dir = std.fmt.allocPrint(arena, "{s}/{s}", .{ p, e.name }) catch return,
         }).remove(arena, io);
@@ -2795,6 +2800,7 @@ fn runIn(
         .image_layers = @intCast(b.seed_layers.items.len + 1),
         .canonical = canonical,
         .upper_canonical = idmapped,
+        .upper_userns = if (idmapped) (b.keepUserns() orelse "") else "",
         .volume_id_base = volumeIdBase(b.subid_base),
         .container = container,
         .container_opts = b.sandbox_opts,
@@ -2842,6 +2848,34 @@ test "a step's upper is idmapped by its layer's last size, else by its job's ear
     try std.testing.expect(chooseUpper(20, true, null, 370));
     try std.testing.expect(!chooseUpper(20, true, null, 3));
     try std.testing.expect(!chooseUpper(20, true, null, 0));
+}
+
+/// The job's user namespace for its idmapped uppers kept in a file of the job's directory, made
+/// once by a helper (`sandbox.usernsMain`) at the first step that needs it, so no step makes it:
+/// the same map every step would make (`sandbox.upperUserns`, from the job's own ids), reachable
+/// only through this job's directory, and unmounted with the job (`teardown`, `sweep`). Null when
+/// the helper failed; the steps then make their own.
+fn keepUserns(b: *Backend) ?[]const u8 {
+    if (b.upper_userns_tried) return b.upper_userns;
+    b.upper_userns_tried = true;
+    const arena = b.arena;
+    const path = "userns";
+    const full = std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, path }) catch return null;
+    const first = std.fmt.allocPrint(arena, "{d}", .{b.idBase()}) catch return null;
+    const count = std.fmt.allocPrint(arena, "{d}", .{ids_per_slot}) catch return null;
+    const ran = std.process.run(arena, b.io, .{
+        .argv = &.{ b.self_exe, sandbox.userns_command, full, first, count },
+    }) catch |e| {
+        std.log.warn("native: cannot start the user namespace's helper: {s}", .{@errorName(e)});
+        return null;
+    };
+    if (ran.term != .exited or ran.term.exited != 0) {
+        std.log.warn("native: the user namespace's helper failed: {s}", .{std.mem.trim(u8, ran.stderr, " \n")});
+        detachNetns(arena, full);
+        return null;
+    }
+    b.upper_userns = path;
+    return path;
 }
 
 /// Whether this machine writes a step's upper through an idmapped mount, found once by running
@@ -9092,6 +9126,29 @@ test "root runner: a step with a large layer takes the idmapped upper once its s
     const small = try whiteoutOwners(arena, small_cfg.store, "etc/passwd");
     try std.testing.expectEqual(@as(usize, 2), small.len);
     for (small) |o| try std.testing.expectEqual(@as(u32, 65534), o);
+}
+
+test "root runner: the kept user namespace for the idmapped uppers maps the job's ids and the host's root, and goes with its mount" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    const file = try std.fmt.allocPrint(arena, "{s}/userns", .{try tmp.dir.realPathFileAlloc(io, ".", arena)});
+    const made = try std.process.run(arena, io, .{ .argv = &.{ c.cfg.self_exe, sandbox.userns_command, file, "1900065536", "65536" } });
+    try std.testing.expect(made.term == .exited and made.term.exited == 0);
+    // Seen from inside: the job's ids from 0, and the host's root as the id nothing owns.
+    const seen = try std.process.run(arena, io, .{ .argv = &.{ "nsenter", try std.fmt.allocPrint(arena, "--user={s}", .{file}), "--no-fork", "cat", "/proc/self/uid_map", "/proc/self/gid_map" } });
+    try std.testing.expect(seen.term == .exited and seen.term.exited == 0);
+    const rows = std.mem.count(u8, seen.stdout, "         0 1900065536      65536") + std.mem.count(u8, seen.stdout, "4294967294          0          1");
+    try std.testing.expectEqual(@as(usize, 4), rows);
+    // Unmounted, the file is just a file again.
+    _ = std.os.linux.umount2(try arena.dupeSentinel(u8, file, 0), std.os.linux.MNT.DETACH);
+    const after = try std.process.run(arena, io, .{ .argv = &.{ "nsenter", try std.fmt.allocPrint(arena, "--user={s}", .{file}), "--no-fork", "true" } });
+    try std.testing.expect(!(after.term == .exited and after.term.exited == 0));
 }
 
 test "native step cache: a long job's layers are flattened, files, deletions and replays intact" {
