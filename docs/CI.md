@@ -138,11 +138,12 @@ Nightly, at full length, for the runner's own code. A pull request gets a lighte
 whole suite costs about 6 runner-hours (34 jobs): a pull request that adds or edits a test runs just
 those tests under Valgrind (`.github/scripts/changed-tests.sh`), and one that changes the workflow,
 its scripts or the zstd decoder (`ci-scope.sh analysis`) also runs Fuzz at 50K runs a target, one
-Stress job of 5 rounds, and ThreadSanitizer, native; one that changes the native store (`ci-scope.sh
+Stress job of 5 rounds; one that changes the runner's code (`ci-scope.sh tsan`) runs both
+ThreadSanitizer jobs, native and end to end; one that changes the native store (`ci-scope.sh
 store`) runs Store stress for 90 seconds a pass, and Store crash. None of these is a required check.
 What a pull request leaves to the night: every test under Valgrind, the full fuzz budgets, 100
-stress rounds, ten-minute store stress passes, ThreadSanitizer, end to end, and Coverage (a change
-to Coverage's own tooling runs its four parts, uploading and merging nothing).
+stress rounds, ten-minute store stress passes, and Coverage (a change to Coverage's own tooling
+runs its four parts, uploading and merging nothing).
 
 - **Fuzz** runs each of `runner/src/fuzz.zig`'s targets with Zig's coverage-guided fuzzer
   (`.github/scripts/zig-fuzz.sh`, LLVM-built, for a bounded number of runs): an image layer's tar,

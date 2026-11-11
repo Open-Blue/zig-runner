@@ -8,7 +8,8 @@
 #   ci-scope.sh proofs       Proofs (proofs.yml)
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)
 #   ci-scope.sh go           Go tools (ci.yml)
-#   ci-scope.sh analysis     Fuzz, Valgrind, ThreadSanitizer, Stress, ZLint (suppressed-errors) (analysis.yml)
+#   ci-scope.sh analysis     Fuzz, Valgrind, Stress, ZLint (suppressed-errors) (analysis.yml)
+#   ci-scope.sh tsan         ThreadSanitizer, native; ThreadSanitizer, end to end (analysis.yml)
 #   ci-scope.sh store        Store stress, Store crash (analysis.yml)
 #   ci-scope.sh coverage     Coverage's own tooling (analysis.yml)
 #
@@ -145,6 +146,15 @@ needed() {
 		*) return 1 ;;
 		esac
 		;;
+	tsan)
+		# Every change to the runner's code: a race is a property of the code that changed, which no
+		# test that changed has to name, and the night is too late to learn of one.
+		case $1 in
+		runner/src/* | runner/build.zig | .github/workflows/analysis.yml | \
+			.github/scripts/ci-scope.sh) return 0 ;;
+		*) return 1 ;;
+		esac
+		;;
 	store)
 		# What its jobs run through: the store and its layers, the key locks and publishes in
 		# Backend, the mounts in sandbox. A change there can lose a layer in ways ci's 30 s of
@@ -178,9 +188,9 @@ needed() {
 }
 
 case $scope in
-tests | binaries | e2e | proofs | packaging | go | analysis | store | coverage) ;;
+tests | binaries | e2e | proofs | packaging | go | analysis | tsan | store | coverage) ;;
 *)
-	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|analysis|store|coverage" >&2
+	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|analysis|tsan|store|coverage" >&2
 	exit 2
 	;;
 esac

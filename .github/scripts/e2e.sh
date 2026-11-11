@@ -21,7 +21,7 @@
 # root through sudo, once on Dagger and once native:
 #
 #   e2e.sh build BIN [tsan]         the runner, x86_64 ReleaseSafe, compiled directly (zig-modules.sh);
-#                                   with tsan, under ThreadSanitizer (analysis.yml, nightly)
+#                                   with tsan, under ThreadSanitizer (analysis.yml)
 #   e2e.sh engine                   start the pinned engine, as deploy/compose.yaml runs it
 #   e2e.sh rootfs BIN               the native backend's rootfs: ubuntu:24.04, provisioned
 #   e2e.sh start BIN BACKEND LABEL  a pool of the runner, in the background, serving LABEL

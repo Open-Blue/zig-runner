@@ -67,11 +67,11 @@ name: analysis
 # Each search costs more than a pull request should wait for, so they run here and not in ci; a
 # failure is a case for an issue (or a fix), not a broken main. Valgrind on the tests a pull request
 # adds or edits, and ZLint's suppressed-errors rule (ci's Lint job), are cheap enough to run on
-# every pull request that could change what they find. A pull request that changes this workflow
-# or what it runs sees the rest work, in miniature: Fuzz for 50K runs a target, Stress as one job
-# of 5 rounds, Store stress for 90 seconds a pass; ThreadSanitizer, end to end, and Coverage's merge
-# and its uploads run only at night, and Coverage's parts only for a change to Coverage's own
-# tooling. The night runs everything, at full length. Coverage reports only, failing on nothing
+# every pull request that could change what they find, and so are both ThreadSanitizer jobs, on
+# every change to the runner's code. A pull request that changes this workflow or what it runs sees
+# the rest work, in miniature: Fuzz for 50K runs a target, Stress as one job of 5 rounds, Store
+# stress for 90 seconds a pass; Coverage's merge and its uploads run only at night, and Coverage's
+# parts only for a change to Coverage's own tooling. The night runs everything, at full length. Coverage reports only, failing on nothing
 # but a report that did not come out. To hold the total above a floor later, set COVERAGE_MIN (a
 # percentage) on its Coverage step, and make "Coverage" a required check once the floor has held
 # for a while (zig-coverage.sh).
@@ -102,6 +102,7 @@ on:
       - .github/scripts/zig-stress.sh
       - .github/scripts/store-crash.sh
       - runner/src/**
+      - runner/build.zig
       - .github/scripts/zlint.sh
       - .github/scripts/zlint-suppressed.baseline
   # zig-test.sh and e2e.sh are not listed: ci runs them on every change that touches them, and
@@ -126,17 +127,24 @@ jobs:
     outputs:
       analysis: ${{ steps.analysis.outputs.run }}
       store: ${{ steps.store.outputs.run }}
+      tsan: ${{ steps.tsan.outputs.run }}
       coverage: ${{ steps.coverage.outputs.run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Whether this change can affect Fuzz, Valgrind and ThreadSanitizer
+      - name: Whether this change can affect Fuzz, Valgrind and Stress
         id: analysis
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: .github/scripts/ci-scope.sh analysis
+
+      - name: Whether this change can affect ThreadSanitizer
+        id: tsan
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: .github/scripts/ci-scope.sh tsan
 
       - name: Whether this change can affect Store stress and Store crash
         id: store
@@ -318,7 +326,7 @@ jobs:
   tsan-native:
     name: ThreadSanitizer, native (${{ matrix.arch }})
     needs: scope
-    if: needs.scope.outputs.analysis == 'true'
+    if: needs.scope.outputs.tsan == 'true'
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 60
     permissions:
@@ -362,12 +370,12 @@ jobs:
   # fails on any report in the runner's log or the jobs' logs. The same e2e environment, App and
   # runner-bench workflows; skipped, still reporting, without its key.
   #
-  # Not on a pull request: both passes and the build under ThreadSanitizer cost about nine runner
-  # minutes, and ci's End to end is what a pull request must pass. The night runs it.
+  # On every pull request that changes the runner's code, with ThreadSanitizer, native: about nine
+  # runner minutes, and a race found before it merges, not the night after.
   tsan-e2e:
     name: ThreadSanitizer, end to end
     needs: scope
-    if: needs.scope.outputs.analysis == 'true' && github.event_name != 'pull_request'
+    if: needs.scope.outputs.tsan == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     environment: e2e
