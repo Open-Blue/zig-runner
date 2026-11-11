@@ -117,13 +117,19 @@ engine() {
 # script its own (--provision-script). Writes $rootfs.ok, or $rootfs.failed, which `start` waits on,
 # and its pid to $out/rootfs.pid, so that `start` can tell a build that is slow from one that died.
 make_rootfs() {
-	local bin image script
+	local bin image prefix script
 	mkdir -p "$out"
 	echo $$ >"$out/rootfs.pid"
 	bin=$(realpath "${1:?}")
 	image=$(tr -d '\n' <runner/src/dagger.zig |
 		grep -oE '"ubuntu:[A-Za-z0-9._-]+" *\+\+ *"@sha256:[a-f0-9]{64}"' | tr -d '" +')
 	script=$("$bin" --provision-script)
+	# With Ubuntu's archive down, the container's sources point at a mirror first (apt.sh, which
+	# prints nothing while the archive answers); the runner's script is otherwise the one it ships.
+	prefix=$(.github/scripts/apt.sh mirror-prefix "$(dpkg --print-architecture)" noble)
+	if [[ -n $prefix ]]; then
+		script="$prefix$script$(.github/scripts/apt.sh mirror-suffix)"
+	fi
 	sudo rm -rf "$rootfs" "$rootfs.ok" "$rootfs.failed"
 	sudo mkdir -p "$rootfs"
 	if docker run --name zig-runner-e2e-rootfs "$image" sh -c "$script" &&
