@@ -183,6 +183,11 @@ flatten_at: usize = default_flatten_at,
 /// Whether a step's upper may be written through an idmapped mount (`idmappedUpper`): the
 /// config's say, `Config.idmapped_upper`.
 idmapped_upper: bool = true,
+/// `Config.idmapped_min_entries`.
+idmapped_min_entries: u64 = idmapped_min_entries_default,
+/// The most entries any layer of this job's earlier steps held, as published or as their step last
+/// published it (`key_diff.readEntries`): what a step with no history of its own is guessed from.
+earlier_entries: u64 = 0,
 /// `abort` while an exec waits for its key's lock (`Store.lockKey`): the wait ends.
 waiting: std.atomic.Value(bool) = .init(false),
 stop_wait: std.atomic.Value(bool) = .init(false),
@@ -320,6 +325,9 @@ pub const Config = struct {
     /// kernel and the filesystem allow it (`idmappedUpper`); off, or where they do not, every
     /// layer is shifted (`Store.unshift`) as before.
     idmapped_upper: bool = true,
+    /// A step's upper is idmapped only when its layer is expected to hold this many entries
+    /// (`upperIdmapped`); 0 for every step, which the tests that compare the two ways ask for.
+    idmapped_min_entries: u64 = idmapped_min_entries_default,
     /// Tests: services' images from a directory filled ahead (`images.find`: `rootfs/` and
     /// `config.json` per reference) instead of P3's pull; "" pulls them, as in production.
     images: []const u8 = "",
@@ -978,6 +986,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .host_paths_closed = cfg.host_paths_closed,
         .flatten_at = @max(2, cfg.flatten_at),
         .idmapped_upper = cfg.idmapped_upper,
+        .idmapped_min_entries = cfg.idmapped_min_entries,
         .gate = cfg.gate,
         .test_seed_script = cfg.test_seed_script,
         .volume_seed_limit_ms = cfg.test_volume_seed_limit_ms orelse volumes.seed_limit_ms,
@@ -2710,7 +2719,7 @@ fn execIn(
     };
     // A container with an owner has its own idmaps of the job's directory (`sandbox.jobView`).
     const owned = if (container) |c| c.owner != null else false;
-    const idmapped = new_layer and !owned and b.idmappedUpper();
+    const idmapped = new_layer and !owned and b.upperIdmapped() and b.idmappedUpper();
     return b.runIn(argv, env, files, uid, gid, out, container, new_layer, idmapped);
 }
 
@@ -2793,6 +2802,46 @@ fn runIn(
     b.timings.helper(arena, ended.helper, ended.spawned, ended.ended);
     if (new_layer) try b.layers.append(arena, .{ .name = upper, .path = upper_path, .canonical = idmapped });
     return ended;
+}
+
+/// The fewest entries (files, directories, anything) a step's layer must hold for its upper to be
+/// idmapped: the idmapped upper costs about 0.8 ms a step (a second user namespace and two
+/// mounts) and the shift (`Store.unshift`) about 0.3 ms and 30 us an entry, measured on the
+/// laptop (a three-file layer 0.45 ms, 20,000 files 570 ms), so the two meet near 15 to 25
+/// entries. A step takes the way that is faster for its layer, by what its layer last held.
+pub const idmapped_min_entries_default = 20;
+
+/// Whether the step about to run writes its upper idmapped rather than shifted afterwards,
+/// by what is known of its layer (`chooseUpper`): its step's last published size
+/// (`key_diff.readEntries`), else what the job's earlier steps made.
+fn upperIdmapped(b: *Backend) bool {
+    if (b.idmapped_min_entries == 0) return true;
+    const p = b.pending orelse return chooseUpper(b.idmapped_min_entries, false, null, b.earlier_entries);
+    const s = b.store orelse return false;
+    const last = if (p.label.len > 0) key_diff.readEntries(b.arena, b.io, s.root, &b.stepIdent(p.label)) else null;
+    return chooseUpper(b.idmapped_min_entries, true, last, b.earlier_entries);
+}
+
+/// The choice itself. A step with no key (`keyed` false) is never published, so nothing is
+/// shifted for it unless the stack is flattened: the shift costs it nothing. A keyed step with a
+/// recorded size takes it. One without (its first run) is taken for as large as the largest layer
+/// the job's earlier steps made, so a job that has made large layers goes on making them, and
+/// its first step, with nothing before it, is shifted.
+fn chooseUpper(min: u64, keyed: bool, last: ?u64, earlier: u64) bool {
+    if (!keyed) return false;
+    return (last orelse earlier) >= min;
+}
+
+test "a step's upper is idmapped by its layer's last size, else by its job's earlier layers" {
+    // Never published: shifted, whatever came before.
+    try std.testing.expect(!chooseUpper(20, false, 5000, 5000));
+    // A known size decides, whatever the job did before.
+    try std.testing.expect(chooseUpper(20, true, 20, 0));
+    try std.testing.expect(!chooseUpper(20, true, 19, 5000));
+    // First run: by the job's earlier layers; with none, shifted.
+    try std.testing.expect(chooseUpper(20, true, null, 370));
+    try std.testing.expect(!chooseUpper(20, true, null, 3));
+    try std.testing.expect(!chooseUpper(20, true, null, 0));
 }
 
 /// Whether this machine writes a step's upper through an idmapped mount, found once by running
@@ -3204,7 +3253,11 @@ fn claimKey(
         .key = k,
         .canonical = b.how.userns == .mapped,
     });
-    if (b.pending) |p| b.remember(p);
+    if (b.pending) |p| {
+        b.remember(p);
+        if (key_diff.readEntries(arena, b.io, s.root, &b.stepIdent(p.label))) |n|
+            b.earlier_entries = @max(b.earlier_entries, n);
+    }
     return .{ .key = k, .lock = lock, .hit = hit.rec };
 }
 
@@ -3256,7 +3309,11 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec_in: Store.Recor
     b.published = true;
     const canonical = top.canonical;
     top.* = .{ .name = name, .path = layer.fs, .key = key, .canonical = canonical };
-    if (pend) |p| b.remember(p);
+    b.earlier_entries = @max(b.earlier_entries, layer.entries);
+    if (pend) |p| {
+        b.remember(p);
+        key_diff.writeEntries(arena, b.io, s.root, &b.stepIdent(p.label), layer.entries);
+    }
 }
 
 /// The stack's top layer, the job's own (not the store's), dropped and removed: an exec whose
@@ -8930,6 +8987,7 @@ test "root runner: an idmapped upper leaves the layers the shift does, and each 
     try tmp.dir.createDirPath(std.testing.io, "store-shifted");
     shifted.cfg.store = try std.fmt.allocPrint(arena, "{s}/store-shifted", .{try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena)});
     idmapped.cfg.idmapped_upper = true;
+    idmapped.cfg.idmapped_min_entries = 0;
     shifted.cfg.idmapped_upper = false;
     var steps: [idmapped_steps.len]job_mod.Step = undefined;
     for (idmapped_steps, &steps) |s, *o| o.* = testStep(s);
@@ -8982,6 +9040,58 @@ test "root runner: an idmapped upper leaves the layers the shift does, and each 
     for ([_]CachedRun{ reads_idmapped, reads_shifted }) |r| {
         try std.testing.expect(std.mem.count(u8, r.text, dagger.native_reused_note) >= 1);
     }
+}
+
+/// The owners on disk of every whiteout of `name` in the layers of `store`.
+fn whiteoutOwners(arena: Allocator, store: []const u8, name: []const u8) ![]const u32 {
+    var out: std.ArrayList(u32) = .empty;
+    const layers = try std.fmt.allocPrint(arena, "{s}/layers", .{store});
+    var dir = try std.Io.Dir.cwd().openDir(std.testing.io, layers, .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var it = dir.iterate();
+    while (try it.next(std.testing.io)) |e| {
+        const p = try std.fmt.allocPrintSentinel(arena, "{s}/{s}/fs/{s}", .{ layers, e.name, name }, 0);
+        var st: std.os.linux.Statx = undefined;
+        if (std.os.linux.errno(std.os.linux.statx(std.os.linux.AT.FDCWD, p, std.os.linux.AT.SYMLINK_NOFOLLOW, .{ .UID = true, .TYPE = true }, &st)) != .SUCCESS) continue;
+        if (st.mode & std.os.linux.S.IFMT == std.os.linux.S.IFCHR) try out.append(arena, st.uid);
+    }
+    return out.items;
+}
+
+test "root runner: a step with a large layer takes the idmapped upper once its size is known, a small one the shift" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    // Large: sixty files and a deletion (an overlay whiteout, whose owner says how the upper was
+    // written: 65534 shifted, the id nothing owns idmapped). The second run changes the script, so
+    // the step runs again, knowing its last layer's size.
+    var big1 = testStep("mkdir /w && for i in $(seq 60); do echo $i > /w/f$i; done; rm /etc/group");
+    var big2 = testStep("mkdir /w && for i in $(seq 60); do echo $i > /w/f$i; done; rm /etc/group; : again");
+    const r1 = try runCached(arena, c.cfg, testJob(@as(*const [1]job_mod.Step, &big1)), "j1");
+    try expectSucceeded(r1);
+    if (idmapped_upper_known.load(.acquire) == idmapped_no) return error.SkipZigTest;
+    const r2 = try runCached(arena, c.cfg, testJob(@as(*const [1]job_mod.Step, &big2)), "j2");
+    try expectSucceeded(r2);
+    const owners = try whiteoutOwners(arena, c.cfg.store, "etc/group");
+    try std.testing.expectEqual(@as(usize, 2), owners.len);
+    try std.testing.expect(std.mem.indexOfScalar(u32, owners, 65534) != null);
+    try std.testing.expect(std.mem.indexOfScalar(u32, owners, std.math.maxInt(u32) - 1) != null);
+    // A small step stays shifted, run again (in a store of its own: a step is known by its place
+    // in the job, which the big one's job shares).
+    var small_cfg = c.cfg;
+    try tmp.dir.createDirPath(std.testing.io, "store-small");
+    small_cfg.store = try std.fmt.allocPrint(arena, "{s}/store-small", .{try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena)});
+    var small1 = testStep("echo a > /s; rm /etc/passwd");
+    var small2 = testStep("echo a > /s; rm /etc/passwd; : again");
+    try expectSucceeded(try runCached(arena, small_cfg, testJob(@as(*const [1]job_mod.Step, &small1)), "j3"));
+    try expectSucceeded(try runCached(arena, small_cfg, testJob(@as(*const [1]job_mod.Step, &small2)), "j4"));
+    const small = try whiteoutOwners(arena, small_cfg.store, "etc/passwd");
+    try std.testing.expectEqual(@as(usize, 2), small.len);
+    for (small) |o| try std.testing.expectEqual(@as(u32, 65534), o);
 }
 
 test "native step cache: a long job's layers are flattened, files, deletions and replays intact" {

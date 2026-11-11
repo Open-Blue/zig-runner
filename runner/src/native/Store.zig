@@ -278,6 +278,10 @@ pub const Layer = struct {
     /// The layer's tree, an overlay lower.
     fs: []const u8,
     lock: std.Io.File,
+    /// How many entries (files, directories, anything) the tree held when it was published: the
+    /// walk that wrote it to disk counted them. `sync_tree_max` + 1 for one too large to be
+    /// counted whole.
+    entries: u64 = 0,
 };
 
 /// What made a layer, which says what its record must hold: a step's file commands end with its
@@ -656,6 +660,7 @@ fn publishStaged(
     defer _ = linux.close(entry);
     var whole_disk = false;
     var syncfs_ns: ?u64 = null;
+    var counted: u64 = sync_tree_max + 1;
     const todo = writeBack(arena, io, entry, sync_tree_max) catch |e| switch (e) {
         error.Unreadable, error.TooLarge => no: {
             whole_disk = true;
@@ -663,6 +668,7 @@ fn publishStaged(
         },
         else => return e,
     };
+    if (!whole_disk) counted = todo.len;
     const wb_ns = phases.now() -| t;
     t = phases.now();
     if (whole_disk) {
@@ -726,7 +732,7 @@ fn publishStaged(
         l.failed = true;
     };
     if (ph) |p| _ = p.since(arena, .rename, t);
-    return .{ .fs = try join(arena, dir, "fs"), .lock = lock.? };
+    return .{ .fs = try join(arena, dir, "fs"), .lock = lock.?, .entries = counted };
 }
 
 /// The filesystem's writes on disk, for an entry too large for its own fsyncs: through the
