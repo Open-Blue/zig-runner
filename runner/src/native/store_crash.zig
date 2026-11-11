@@ -834,6 +834,12 @@ fn absent(arena: Allocator, io: std.Io, sp: Spec) !void {
             return error.TestUnexpectedResult;
         }
     }
+    // A layer left pending by a failed settle on a filesystem that went read-only could not be
+    // evicted or poisoned; no job takes it (not its publisher's), and `collect` evicts it.
+    if (std.mem.eql(u8, sp.arg, "settle")) {
+        std.debug.print("native store crash: no layer is a hit\n", .{});
+        return;
+    }
     // A journal that aborted may have lost the directories too.
     var d = std.Io.Dir.cwd().openDir(io, try print(arena, "{s}/layers", .{s.root}), .{ .iterate = true }) catch |e| {
         std.debug.print("native store crash: no layer is published (layers/: {s})\n", .{@errorName(e)});
@@ -856,6 +862,13 @@ fn absent(arena: Allocator, io: std.Io, sp: Spec) !void {
 fn failSettle(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: Spec, s: *Store) !void {
     s.defer_sync = true;
     const held = try publishLayerHeld(s.*, arena, io, sp, "a");
+    // Made while the disk works: a failed `syncfs` aborts the journal, and the filesystem is then
+    // read-only, the poison's rename with it (the layer is refused all the same: another job's).
+    const upper = try print(arena, "{s}/uppers/b", .{sp.root});
+    try makeTree(arena, io, upper, "b");
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, keyOf("b"), &never);
+    defer kl.close(io);
     try hook(io, env, flip_env, "on");
     const r = s.settlePending(arena, io, null);
     try hook(io, env, flip_env, "off");
@@ -867,7 +880,8 @@ fn failSettle(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map,
         return error.TestUnexpectedResult;
     }
     // The layer is refused at once though a job (here the writer itself) still holds it: its pages
-    // may be clean after the failed write-back and dropped, and read back from the disk.
+    // may be clean after the failed write-back and dropped, and read back from the disk. A miss, or
+    // an entry no job may evict while it is held; never a hit.
     if (s.open(arena, io, keyOf("a"))) |maybe| {
         if (maybe) |hit| {
             hit.layer.lock.close(io);
@@ -876,11 +890,6 @@ fn failSettle(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map,
         }
     } else |e| if (e != error.Invalid) return e;
     // Fail closed, as after any failed sync: the next publish is refused, the layer evicted at the end.
-    const upper = try print(arena, "{s}/uppers/b", .{sp.root});
-    try makeTree(arena, io, upper, "b");
-    var never: std.atomic.Value(bool) = .init(false);
-    const kl = try s.lockKey(arena, io, keyOf("b"), &never);
-    defer kl.close(io);
     if (s.publish(arena, io, keyOf("b"), .step, upper, .{ .log = try logOf(arena, "b"), .fc = record_fc })) |l| {
         l.lock.close(io);
         std.debug.print("native store crash: the job published a layer after its settle failed\n", .{});
@@ -888,12 +897,16 @@ fn failSettle(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map,
     } else |e| if (e != error.Sync) return e;
     held.close(io);
     s.dropUnsynced(arena, io);
-    if (try s.open(arena, io, keyOf("a"))) |hit| {
-        hit.layer.lock.close(io);
-        std.debug.print("native store crash: the layer whose settle failed is a hit\n", .{});
-        return error.TestUnexpectedResult;
-    }
-    std.debug.print("native store crash: settle: the settle failed with error.Sync, and the layer is evicted\n", .{});
+    // Evicted if the disk lets it be, else still no job's hit: the filesystem is read-only after the
+    // failed `syncfs` (the journal aborts), where the poison's rename cannot be made either.
+    if (s.open(arena, io, keyOf("a"))) |maybe| {
+        if (maybe) |hit| {
+            hit.layer.lock.close(io);
+            std.debug.print("native store crash: the layer whose settle failed is a hit\n", .{});
+            return error.TestUnexpectedResult;
+        }
+    } else |_| {}
+    std.debug.print("native store crash: settle: the settle failed with error.Sync, and the layer is no hit\n", .{});
 }
 
 /// A disk that fails writes, and the publish on it.

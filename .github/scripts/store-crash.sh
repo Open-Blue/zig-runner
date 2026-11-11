@@ -321,7 +321,7 @@ error_case() {
 	mounted=()
 	mount_at /dev/mapper/store-fail "$w/mnt"
 	if [[ $arg != no-cursor ]]; then
-		store_test absent "$w/mnt/w" >"$w/case.log" 2>&1 || rc=1
+		store_test absent "$w/mnt/w" "$arg" >"$w/case.log" 2>&1 || rc=1
 		grep 'native store crash' "$w/case.log" || cat "$w/case.log"
 	fi
 	return "$rc"
