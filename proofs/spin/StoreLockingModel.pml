@@ -9,9 +9,11 @@
  *   NP NS MAXCRASH MC MAXCORR MAXWERR      |Procs|, Steps, MaxCrashes, MachineCrashes,
  *                                          MaxCorrupts, MaxWriteErrors
  *   NSK NBK                                |StepKeys|, |BuildKeys|
- *   OLDENTRY BUILDHOLDS SYNCBEFORE HEEDSYNC SYNCLAYERS CHECKBOOT EVRECHECK LOOKUPFIRST
+ *   OLDENTRY BUILDHOLDS SYNCBEFORE HEEDSYNC SYNCLAYERS CHECKBOOT EVRECHECK LOOKUPFIRST EVUNLOCK
  *                                          the module's Boolean constants, 0 or 1, in its order
  *   CHK_<Invariant>                        one for each invariant the .cfg lists
+ *   LTL_<Property>                         one for each temporal property it lists
+ * and spin.sh defines LIVENESS when it checks those (spin -DLIVENESS).
  *
  * The module's values, encoded:
  *   Procs      0 .. NP-1; runner q is SPIN's process q+1. Keys are 0 .. NK-1, the step keys first,
@@ -385,7 +387,7 @@ inline check() {
 
 /* ------------------------------------------------------------------------------------------- */
 
-/* Runner ME: Proc(ME) \/ Crash(ME), an option an action (or a branch of one). */
+/* Runner ME: Proc(ME), an option an action (or a branch of one). Crash(ME) is Env's (crash()). */
 proctype Runner() {
 	do
 	/* The job's steps. */
@@ -733,7 +735,7 @@ proctype Runner() {
 	/* EvDone */
 	:: d_step { S.pc == EV_DONE ->
 		if
-		:: S.evd != NODIR -> ex[S.evd] = 0
+		:: S.evd != NODIR && EVUNLOCK -> ex[S.evd] = 0
 		:: else
 		fi;
 		evReturn(1); check() }
@@ -758,24 +760,31 @@ proctype Runner() {
 		fi;
 		S.rtd = NODIR; S.rtOrig = N_NONE; S.pc = S.rtRet; check() }
 
-	/* What happens to the processes. */
-
-	/* Crash(ME) */
-	:: d_step { crashes < MAXCRASH && S.pc != DONE && S.pc != CRASHED ->
-		crashes++;
-		idle(ME); S.pc = CRASHED;
-		for (ix : 0 .. ND - 1) { sh[ix] = sh[ix] & ~PMASK(ME); ex[ix] = ex[ix] & ~BIT(ME) }
-		gc = gc & ~BIT(ME);
-		check() }
 	od
 }
 
-/* MachineCrash, Corrupt, and Next's step of a terminated system, which changes nothing. Env is
- * always at an end label and the runners never are, so a state with no step is an invalid end
- * state to SPIN exactly when it is a deadlock to TLC. */
+/* Crash(q): Env's, not runner q's, so that a runner's steps are Proc(q) and nothing else, which is
+ * what the module's weak fairness is of. Env stays at its loop's head, as a runner does, so the
+ * states are the same whichever process takes the step. */
+inline crash(q) {
+	d_step { NP > (q) && crashes < MAXCRASH && st[q].pc != DONE && st[q].pc != CRASHED ->
+		crashes++;
+		idle(q); st[q].pc = CRASHED;
+		for (ix : 0 .. ND - 1) { sh[ix] = sh[ix] & ~PMASK(q); ex[ix] = ex[ix] & ~BIT(q) }
+		gc = gc & ~BIT(q);
+		check() }
+}
+
+/* Crash, MachineCrash, Corrupt, and Next's step of a terminated system, which changes nothing.
+ * Env is always at an end label and the runners never are, so a state with no step is an invalid
+ * end state to SPIN exactly when it is a deadlock to TLC. */
 proctype Env() {
 end:
 	do
+	:: crash(0)
+	:: crash(1)
+	:: crash(2)
+	:: crash(3)
 	/* MachineCrash: cb := lost \in SUBSET cm, a directory at a time. */
 	:: atomic { mcrashes < MC ->
 		d_step {
@@ -825,9 +834,32 @@ end:
 		pick();
 		skip; /* an if, a do or pick() may not end in a d_step */
 		d_step { dirs[cd].recOk = 0; corrupts++; check() } }
+#ifdef LIVENESS
+	/* Any state may stutter, as [Next]_vars lets it: with SPIN's weak fairness (pan -f) Env must
+	 * move whenever it can, and this is the move that forces nothing, so a crash, the machine's or
+	 * the hand's change is never forced, as the module never forces one, while a runner that can
+	 * take a step must take one, which is WF_vars(Proc(p)). */
+	:: booted || !booted -> skip
+#else
 	:: atomic { TERMINATED -> skip }
+#endif
 	od
 }
+
+/* Liveness, the module's temporal properties, checked one at a time (pan -a -f -N <name>) on a
+ * configuration that defines LIVENESS. The module's fairness is WF_vars(Proc(p)) for each p, which
+ * is SPIN's weak fairness of each runner process: Proc(p) is enabled exactly when runner p has an
+ * executable option (Crash is Env's), and every one of its steps changes the state (each sets its
+ * pc, or takes a member from a set it works through). Env is fair too, which its stutter keeps
+ * from forcing anything. */
+#define INLOCK(q) (NP > (q) && st[q].pc >= LK_CREATE && st[q].pc <= LK_SAME)
+#ifdef LTL_WaitEnds
+ltl WaitEnds { [] ((INLOCK(0) -> <> !INLOCK(0)) && (INLOCK(1) -> <> !INLOCK(1)) &&
+                   (INLOCK(2) -> <> !INLOCK(2)) && (INLOCK(3) -> <> !INLOCK(3))) }
+#endif
+#ifdef LTL_AllEnd
+ltl AllEnd { <> TERMINATED }
+#endif
 
 /* Init: SPIN's first state, then one step to each of the module's initial states (each runner's
  * first key chosen into ck0 .. ck3), and the processes are made: init is pid 0, runner q pid q+1, Env
