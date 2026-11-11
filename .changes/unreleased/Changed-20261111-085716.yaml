@@ -1,0 +1,3 @@
+kind: Changed
+body: A native job that lost a step's layer to another job's pending one keeps caching its later steps over its own copy; a deferred layer whose sync fails mid-job warns in the next step's log; the store stress test also runs with the deferred sync.
+time: 2026-11-11T08:57:16.219586193-05:00

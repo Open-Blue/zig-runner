@@ -9,7 +9,7 @@
 //! ZIG_TEST_STORE_CRASH is `MODE ROOT SCRATCH ARG`: ROOT is on the disk under test, SCRATCH is on
 //! another (what is expected is built there, never on the disk that crashes).
 //!
-//!   write   runs step ARG (1-10) of a sequence, as a job would, and marks the log at the points
+//!   write   runs step ARG (1-11) of a sequence, as a job would, and marks the log at the points
 //!           the checks need (ZIG_TEST_STORE_CRASH_MARK NAME):
 //!             1  a job publishes three small layers (`writeBack`, `syncEntries`) and syncs the layers' directory;
 //!             2  the next publishes a large one (over `sync_tree_max` entries: `syncfs`) and a small
@@ -25,9 +25,14 @@
 //!             9  an image (`oci.Store.ensure`), a rootfs flattened from it, whose files are its
 //!                image's by hard link, another unused, a seed and a blob;
 //!            10  `evict.run` under a cap evicts all of those but the rootfs a job holds, its image
-//!                among them, which must not reach the rootfs through the links they share.
+//!                among them, which must not reach the rootfs through the links they share;
+//!            11  a job that leaves its layers' data to be synced later (`Store.defer_sync`)
+//!                publishes two, reports (the mark `reported`), makes its last durable as its end
+//!                does (`settled`) and syncs the layers' directory. A cut after `reported` and
+//!                before `settled` leaves pending layers, which no boot may return.
 //!   verify  what a job finds on a disk put back to a point in the log: the first job after the
-//!           crash is a job after a reboot (`checkOncePerBoot`), and then no layer `open` accepts
+//!           crash is a job after a reboot (`checkOncePerBoot`, in another boot than the one that
+//!           wrote: a pending layer is refused, whatever its data), and then no layer `open` accepts
 //!           differs from what was published (its tree's digest, its record), no directory
 //!           `ensure` or `adoptSeed` published differs, and no layer a job had finished and
 //!           synced (ARG: the last mark the log passed) is missing, unless a collect may have
@@ -39,8 +44,8 @@
 //!           its own name, as an eviction that deleted before it renamed would leave it (`halve`),
 //!           or evicted and back (`undo`), for the script to show that `verify` fails on each.
 //!   fail    a publish on a disk that fails writes (ZIG_TEST_STORE_CRASH_FLIP on|off switches
-//!           them; ARG: `small`, `large`, `cursor` or `no-cursor`): it must fail,
-//!           and publish nothing.
+//!           them; ARG: `small`, `large`, `cursor`, `no-cursor` or `settle`, a deferred layer's
+//!           sync that fails): it must fail, and publish nothing.
 //!   absent  that no layer is published under ROOT (after the disk was mounted again).
 //!
 //! Each prints what it checked, and fails with what was wrong.
@@ -59,8 +64,11 @@ const spec_env = "ZIG_TEST_STORE_CRASH";
 const mark_env = "ZIG_TEST_STORE_CRASH_MARK";
 const flip_env = "ZIG_TEST_STORE_CRASH_FLIP";
 
-/// The layers the sequence publishes, in order (step 1: a, b, c; 2: big, d; 3: e; 4: f).
-const names = [_][]const u8{ "a", "b", "c", "big", "d", "e", "f" };
+/// The layers the sequence publishes, in order (step 1: a, b, c; 2: big, d; 3: e; 4: f; 11: p1, p2).
+const names = [_][]const u8{ "a", "b", "c", "big", "d", "e", "f", "p1", "p2" };
+/// The boot a verified disk is in: not the boot the sequence ran in, which the pending layers of
+/// step 11 name, since the disk is put back inside one boot and a real crash is followed by another.
+const next_boot: Store.Epoch = .{ .boot = "00000000-0000-4000-8000-000000000b07".*, .mnt = 1 };
 /// Over `Store.sync_tree_max` entries, whatever it is: directories of 30 files.
 const big = "big";
 const ensure_key = "k1";
@@ -213,12 +221,27 @@ fn publishLayer(s: Store, arena: Allocator, io: std.Io, sp: Spec, name: []const 
     l.lock.close(io);
 }
 
+/// `publishLayer`, the layer held until the caller lets go of the returned lock, as a job holds its
+/// layers until its end.
+fn publishLayerHeld(s: Store, arena: Allocator, io: std.Io, sp: Spec, name: []const u8) !std.Io.File {
+    const upper = try print(arena, "{s}/uppers/{s}", .{ sp.root, name });
+    try makeTree(arena, io, upper, name);
+    const key = keyOf(name);
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, key, &never);
+    defer kl.close(io);
+    const l = try s.publish(arena, io, key, .step, upper, .{ .log = try logOf(arena, name), .fc = record_fc });
+    return l.lock;
+}
+
 /// A job's beginning and end: its descriptor on the store's filesystem (`syncCursor`), and the
 /// layers' directory synced at the end (`syncLayers`).
 fn job(arena: Allocator, io: std.Io, sp: Spec) !Store {
     const root = try sp.store(arena);
     try Store.prepare(arena, io, root, .{ .check_parents = false });
-    return .{ .root = root, .sync_fd = Store.syncCursor(arena, root), .sync_log = Store.newSyncLog(arena) };
+    // `sync_load` empty: which way a layer is synced is then its entries' count alone, so `big`
+    // takes `syncfs` and the small ones their own files' fsyncs, as the cases below assume.
+    return .{ .root = root, .sync_fd = Store.syncCursor(arena, root), .sync_log = Store.newSyncLog(arena), .sync_load = .{} };
 }
 
 fn write(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: Spec) !void {
@@ -348,6 +371,17 @@ fn write(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: 
                 try settle(arena, io, try print(arena, "{s}/{s}", .{ s.root, t.dir }), days);
             if (linux.errno(linux.syncfs(s.sync_fd.?)) != .SUCCESS) return error.Sync;
         },
+        11 => {
+            s.defer_sync = true;
+            var held: [2]std.Io.File = undefined;
+            for (names[7..9], &held) |n, *h| h.* = try publishLayerHeld(s, arena, io, sp, n);
+            try hook(io, env, mark_env, "reported");
+            // The job's end: its last layer made durable while the job still holds it.
+            try s.settlePending(arena, io, null);
+            for (held) |h| h.close(io);
+            try hook(io, env, mark_env, "settled");
+            s.syncLayers(arena);
+        },
         10 => {
             const rf1 = (try OciStore.holdDir(arena, io, try print(arena, "{s}/rootfs/rf1", .{s.root}))) orelse return error.NoRootfs;
             defer rf1.close(io);
@@ -443,7 +477,12 @@ fn required(mark: []const u8) []const []const u8 {
         .{ .mark = "before-trees", .names = names[6..7] },
         .{ .mark = "trees-evicted", .names = names[6..7] },
         .{ .mark = "after-10", .names = names[6..7] },
-        .{ .mark = "synced", .names = names[6..7] },
+        // The two of step 11 only once its end has run: until `settled` they may be lost, a clean
+        // miss, and until the directory sync after it their renames may be.
+        .{ .mark = "reported", .names = names[6..7] },
+        .{ .mark = "settled", .names = names[6..7] },
+        .{ .mark = "after-11", .names = names[6..9] },
+        .{ .mark = "synced", .names = names[6..9] },
     };
     for (table) |m| if (std.mem.eql(u8, m.mark, mark)) return m.names;
     return &.{};
@@ -485,12 +524,16 @@ fn exists(io: std.Io, p: []const u8) bool {
 fn verify(arena: Allocator, io: std.Io, sp: Spec) !void {
     var faults: Faults = .{ .arena = arena };
     // The first job after the crash is the first of a boot.
-    const s: Store = .{ .root = try sp.store(arena) };
+    const s: Store = .{ .root = try sp.store(arena), .epoch = next_boot };
     std.Io.Dir.cwd().deleteFile(io, try print(arena, "{s}/boot", .{s.root})) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
+    // A layer left pending by the boot that crashed is refused, evicted by `open` for every other
+    // one, and by the boot's check for the rest: whatever it holds, a crash may have emptied it.
+    const pending = try refusePending(arena, io, s, &faults);
     s.checkOncePerBoot(arena, io);
+    try noPendingLeft(arena, io, s, &faults);
 
     var hits: usize = 0;
     for (names) |n| {
@@ -555,15 +598,53 @@ fn verify(arena: Allocator, io: std.Io, sp: Spec) !void {
     }
     const tree_dead = try verifyTrees(arena, io, s, sp, &faults);
     const vols = try verifyVolumes(arena, io, s, sp, &faults);
+    std.debug.print("native store crash: {d} pending layers of the crashed boot\n", .{pending});
     std.debug.print("native store crash: after {s}: {d} layers hit, {d} directories published, whole, " ++
         "{d} volumes, {d} dead\n", .{ sp.arg, hits, dirs, vols.there, vols.dead + tree_dead });
     try faults.done("verify");
 }
 
+/// Whether the layer `name` has a meta that says it is pending: its data not yet synced when it was
+/// renamed in.
+fn isPending(arena: Allocator, io: std.Io, s: Store, name: []const u8) bool {
+    const meta = std.Io.Dir.cwd().readFileAlloc(io, print(arena, "{s}/layers/{s}/meta", .{ s.root, name }) catch return false, arena, .limited(1024)) catch return false;
+    return std.mem.indexOf(u8, meta, "\npending ") != null;
+}
+
+/// Every pending layer on the disk is refused by `open` (every other one; the rest are left to
+/// the boot's check), and how many there were. `s` is in a boot other than the one they name.
+fn refusePending(arena: Allocator, io: std.Io, s: Store, faults: *Faults) !usize {
+    var found: usize = 0;
+    for (names, 0..) |n, i| {
+        const hex = Store.hex(keyOf(n));
+        if (!isPending(arena, io, s, &hex)) continue;
+        found += 1;
+        if (i % 2 == 0) continue;
+        const hit = s.open(arena, io, keyOf(n)) catch |e| {
+            try faults.add("pending layer {s}: open failed with {s}", .{ n, @errorName(e) });
+            continue;
+        };
+        if (hit) |h| {
+            h.layer.lock.close(io);
+            try faults.add("pending layer {s} of the crashed boot is a hit", .{n});
+        }
+    }
+    return found;
+}
+
+/// After the boot's check no layer on the disk is pending.
+fn noPendingLeft(arena: Allocator, io: std.Io, s: Store, faults: *Faults) !void {
+    for (names) |n| {
+        const hex = Store.hex(keyOf(n));
+        if (isPending(arena, io, s, &hex))
+            try faults.add("layer {s} is still pending after the boot's check", .{n});
+    }
+}
+
 /// `mark`, or one the log passed after it, in the order of the sequence's last step.
 fn past(mark: []const u8, of: []const u8) bool {
     const order = [_][]const u8{
-        "after-7", "before-evict", "evicted", "after-8", "after-9", "before-trees", "trees-evicted", "after-10", "synced",
+        "after-7", "before-evict", "evicted", "after-8", "after-9", "before-trees", "trees-evicted", "after-10", "reported", "settled", "after-11", "synced",
     };
     const m = for (order, 0..) |o, i| {
         if (std.mem.eql(u8, o, mark)) break i;
@@ -718,6 +799,21 @@ fn corrupt(arena: Allocator, io: std.Io, sp: Spec) !void {
         std.debug.print("native store crash: made {s} again\n", .{v});
         return;
     }
+    if (std.mem.eql(u8, sp.arg, "pending")) {
+        // A layer pending in the boot that verifies, with a byte of its tree changed: the page cache
+        // would hold exactly what was renamed, so `open` trusts it, and the check must see the change.
+        const dir = try print(arena, "{s}/store/layers/{s}", .{ sp.root, &Store.hex(keyOf("f")) });
+        const meta = try print(arena, "{s}/meta", .{dir});
+        const text = try cwd.readFileAlloc(io, meta, arena, .limited(1024));
+        const at = std.mem.indexOf(u8, text, "kind ").?;
+        try cwd.writeFile(io, .{ .sub_path = meta, .data = try print(arena, "{s}pending {s} {d}\n{s}", .{ text[0..at], &next_boot.boot, next_boot.mnt, text[at..] }) });
+        const path = try print(arena, "{s}/fs/f0", .{dir});
+        const data = try cwd.readFileAlloc(io, path, arena, .limited(1 << 20));
+        data[0] ^= 1;
+        try cwd.writeFile(io, .{ .sub_path = path, .data = data });
+        std.debug.print("native store crash: changed {s} and left its layer pending in the verifier's boot\n", .{path});
+        return;
+    }
     const path = try print(arena, "{s}/store/layers/{s}/fs/f0", .{ sp.root, &Store.hex(keyOf("f")) });
     const data = try cwd.readFileAlloc(io, path, arena, .limited(1 << 20));
     if (std.mem.eql(u8, sp.arg, "truncate")) {
@@ -738,6 +834,12 @@ fn absent(arena: Allocator, io: std.Io, sp: Spec) !void {
             return error.TestUnexpectedResult;
         }
     }
+    // A layer left pending by a failed settle on a filesystem that went read-only could not be
+    // evicted or poisoned; no job takes it (not its publisher's), and `collect` evicts it.
+    if (std.mem.eql(u8, sp.arg, "settle")) {
+        std.debug.print("native store crash: no layer is a hit\n", .{});
+        return;
+    }
     // A journal that aborted may have lost the directories too.
     var d = std.Io.Dir.cwd().openDir(io, try print(arena, "{s}/layers", .{s.root}), .{ .iterate = true }) catch |e| {
         std.debug.print("native store crash: no layer is published (layers/: {s})\n", .{@errorName(e)});
@@ -754,6 +856,59 @@ fn absent(arena: Allocator, io: std.Io, sp: Spec) !void {
     std.debug.print("native store crash: no layer is published\n", .{});
 }
 
+/// A deferred layer's sync on a disk that fails writes: the layer was renamed in while the disk
+/// worked (pending, a job's to settle), and the settle must fail, with error.Sync; the job then
+/// publishes no more, and its end evicts the layer, so nothing is published once it is over.
+fn failSettle(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: Spec, s: *Store) !void {
+    s.defer_sync = true;
+    const held = try publishLayerHeld(s.*, arena, io, sp, "a");
+    // Made while the disk works: a failed `syncfs` aborts the journal, and the filesystem is then
+    // read-only, the poison's rename with it (the layer is refused all the same: another job's).
+    const upper = try print(arena, "{s}/uppers/b", .{sp.root});
+    try makeTree(arena, io, upper, "b");
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, keyOf("b"), &never);
+    defer kl.close(io);
+    try hook(io, env, flip_env, "on");
+    const r = s.settlePending(arena, io, null);
+    try hook(io, env, flip_env, "off");
+    if (r) |_| {
+        std.debug.print("native store crash: the settle succeeded on a disk that failed its writes\n", .{});
+        return error.TestUnexpectedResult;
+    } else |e| if (e != error.Sync) {
+        std.debug.print("native store crash: the settle failed with {s}, not error.Sync\n", .{@errorName(e)});
+        return error.TestUnexpectedResult;
+    }
+    // The layer is refused at once though a job (here the writer itself) still holds it: its pages
+    // may be clean after the failed write-back and dropped, and read back from the disk. A miss, or
+    // an entry no job may evict while it is held; never a hit.
+    if (s.open(arena, io, keyOf("a"))) |maybe| {
+        if (maybe) |hit| {
+            hit.layer.lock.close(io);
+            std.debug.print("native store crash: a held layer whose settle failed is still a hit\n", .{});
+            return error.TestUnexpectedResult;
+        }
+    } else |e| if (e != error.Invalid) return e;
+    // Fail closed, as after any failed sync: the next publish is refused, the layer evicted at the end.
+    if (s.publish(arena, io, keyOf("b"), .step, upper, .{ .log = try logOf(arena, "b"), .fc = record_fc })) |l| {
+        l.lock.close(io);
+        std.debug.print("native store crash: the job published a layer after its settle failed\n", .{});
+        return error.TestUnexpectedResult;
+    } else |e| if (e != error.Sync) return e;
+    held.close(io);
+    s.dropUnsynced(arena, io);
+    // Evicted if the disk lets it be, else still no job's hit: the filesystem is read-only after the
+    // failed `syncfs` (the journal aborts), where the poison's rename cannot be made either.
+    if (s.open(arena, io, keyOf("a"))) |maybe| {
+        if (maybe) |hit| {
+            hit.layer.lock.close(io);
+            std.debug.print("native store crash: the layer whose settle failed is a hit\n", .{});
+            return error.TestUnexpectedResult;
+        }
+    } else |_| {}
+    std.debug.print("native store crash: settle: the settle failed with error.Sync, and the layer is no hit\n", .{});
+}
+
 /// A disk that fails writes, and the publish on it.
 fn fail(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: Spec) !void {
     const cwd = std.Io.Dir.cwd();
@@ -763,6 +918,7 @@ fn fail(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: S
         _ = linux.close(fd);
     };
     const eq = std.mem.eql;
+    if (eq(u8, sp.arg, "settle")) return failSettle(arena, io, env, sp, &s);
     const name: []const u8 = if (eq(u8, sp.arg, "small")) "a" else big;
     var other: ?std.Io.File = null;
     var other_fd: ?linux.fd_t = null;

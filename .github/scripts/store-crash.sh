@@ -129,7 +129,7 @@ crash() {
 	"$w/mark" start
 	mkdir "$w/mnt/w"
 	local step
-	for step in 1 2 3 4 5 6 7 8 9 10; do
+	for step in 1 2 3 4 5 6 7 8 9 10 11; do
 		store_test write "$w/mnt/w" "$step" >"$w/step.log" 2>&1 || {
 			cat "$w/step.log"
 			echo "::error title=Store crash::step $step of the sequence failed"
@@ -181,6 +181,7 @@ crash() {
 
 	local limit mark kind bad=0 count=0 started=$SECONDS
 	: >"$w/outcomes.txt"
+	: >"$w/pending.txt"
 	mkdir -p "$w/failures"
 	while read -r limit mark kind; do
 		count=$((count + 1))
@@ -196,6 +197,14 @@ crash() {
 	awk '{print $2}' "$w/points.txt" | sort | uniq -c | sed 's/^/  /'
 	((bad == 0)) || {
 		echo "::error title=Store crash::$bad of $count crash points failed the store's checks"
+		return 1
+	}
+	echo "pending layers of the crashed boot on the disk, all refused (points):"
+	sort "$w/pending.txt" | uniq -c | sed 's/^/  /'
+	# The window between a job's report and its end's sync, as the deferred sync leaves it: with no
+	# crash point inside it the refusal would pass whatever `open` did.
+	grep -q '^[1-9][0-9]* pending' "$w/pending.txt" || {
+		echo "::error title=Store crash::no crash point fell between a job's report and its end's sync: no disk had a pending layer"
 		return 1
 	}
 	# The eviction's own crash points, not only the ones around it.
@@ -220,6 +229,7 @@ point() {
 		why="e2fsck: $(grep -m 3 -v '^$' "$w/fsck.log" | tr '\n' ';')"
 	fi
 	[[ -n $why ]] || grep -o '[0-9]* layers hit.*dead$' "$w/verify.log" >>"$w/outcomes.txt" || true
+	[[ -n $why ]] || grep -o '[0-9]* pending layers' "$w/verify.log" >>"$w/pending.txt" || true
 	losetup -d "$point_dev"
 	if [[ -n $why ]]; then
 		echo "FAIL after $limit entries ($kind, last mark $mark): $why"
@@ -243,7 +253,7 @@ mount_point() {
 # the check must fail, or it checks nothing.
 controls() {
 	local how
-	for how in truncate flip halve undo tree; do
+	for how in truncate flip halve undo tree pending; do
 		restore "$1"
 		mount_point
 		store_test corrupt "$work/check/w" "$how" >/dev/null 2>&1
@@ -263,7 +273,7 @@ errors() {
 	need_target dm-flakey
 	local w=$work arg failed=0
 	mkdir -p "$w/mnt" "$w/scratch"
-	for arg in small large cursor no-cursor; do
+	for arg in small large cursor no-cursor settle; do
 		echo "--- $arg"
 		if ! error_case "$arg"; then
 			failed=$((failed + 1))
@@ -311,7 +321,7 @@ error_case() {
 	mounted=()
 	mount_at /dev/mapper/store-fail "$w/mnt"
 	if [[ $arg != no-cursor ]]; then
-		store_test absent "$w/mnt/w" >"$w/case.log" 2>&1 || rc=1
+		store_test absent "$w/mnt/w" "$arg" >"$w/case.log" 2>&1 || rc=1
 		grep 'native store crash' "$w/case.log" || cat "$w/case.log"
 	fi
 	return "$rc"
