@@ -236,8 +236,13 @@ On a root runner, each step runs:
   spent starting the helper and that wait. The kernel takes one lock for every link change, so
   seven jobs starting together queue for it (33-130 ms each on a Pi 5, against 8 ms for one job
   alone), which the set-up now spends on other work; a bridge that is already up with its address
-  is only read, not changed again, for the same reason. A helper that failed fails that first
-  use, not the job's start. Its
+  is only read, not changed again, for the same reason. The helper also removes a dead job's veth
+  of the slot (the host's end of a job just ended lingers a moment) before it makes the slot's
+  own, under the slot's lock, which the job holds until the helper has ended: the job's own
+  thread once did, and waited for that lock. The helper ends before it removes or makes anything if its parent is no longer the runner that started it (a runner killed mid set-up has let the lock go, and another job may hold the slot), and the runner's wait for it is not cancelled. Whether a veth is there is read from sysfs, not
+  asked of the kernel by name, which runs `modprobe netdev-<name>` for a link that is not there
+  (5 ms a job, more with seven starting together). The helper starts before the job's cgroup is
+  made. A helper that failed fails that first use, not the job's start. Its
   resolver is a resolv.conf of its own, made from the host's as Docker makes a container's on its
   default bridge (`net.Resolver`): the loopback's nameservers left out (systemd-resolved's
   127.0.0.53 is the host's loopback; its upstream list, `/run/systemd/resolve/resolv.conf`, is
