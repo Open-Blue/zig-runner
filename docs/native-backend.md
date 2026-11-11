@@ -690,6 +690,31 @@ What it covers, as built:
   each file and directory, which ext4 serves with one journal commit; a large layer's `syncfs`
   instead), and published by one `renameat2(RENAME_NOREPLACE)`. An upper that cannot be put back after a failure is left there
   and logged, never deleted.
+  A sync that fails (an `fsync`, the write-back wait, the `syncfs`, the directory sync at the job's
+  end) **fails closed**: its publish fails with `error.Sync` (nothing renamed into `layers/`, the
+  staged entry removed and the upper back, the step's result untouched, only not cached), logged
+  once with the call and its errno, and never retried on the same descriptor, as a second `fsync`
+  or `syncfs` after an error already told may succeed without the data being there (the errors are
+  told once, per file and per filesystem: Linux 5.8's errseq). After one, the job publishes
+  nothing more (its later steps run uncached), and at its end, once it holds none of its layers,
+  every layer it renamed since its last successful `syncfs` or layers-directory sync is evicted
+  (`Store.SyncLog`, `dropUnsynced`): each one's own sync did succeed before its rename, but a
+  success reported after an error that may have been taken by another descriptor is no proof, and
+  an evicted layer is a miss, a kept doubtful one could be a hit. One another job holds stays.
+  `store-crash.sh errors` makes the disk fail writes and checks each of these, and that the next
+  publish of the same job is refused with the disk working again.
+- **Early write-back: measured, not built.** Starting `sync_file_range(WRITE)` of the upper's files
+  in a thread when a step that will be published ends, so that the publish waits for less, was
+  tried (laptop NVMe, ext4, a layer of 20,000 files of 2 KiB and one of four 64 MiB files, freshly
+  written, three runs each). The publish's sync fell from about 1.1 s to 0.2 s (`syncfs`) and from
+  2.7 s to 0.1-0.4 s, but the walk itself took the time (0.8 s and 2.5 s: `WRITE` blocks once the
+  disk's queue is full), so from the step's end to the layer published the saving was the work
+  done meanwhile: 0.35 s with 300 ms of other work between, none within the noise (about 0.2 s)
+  with the 20 ms a step's end really has before it publishes. The disk's bandwidth is the cost,
+  and it is paid whichever call starts it, as the `syncfs` design note says for the Pi. What could
+  help is a pass during a long step, over files not touched for a while, which overlaps the
+  step's own CPU time with write-back; that costs I/O beside the job's own and writes files that
+  change again, and a laptop's NVMe cannot show the effect, so it waits for razorbill's bench.
 - **Replay**: the stored raw output (markers and all) and combined file commands go through
   `Exec.collect` as Dagger's answer for a cached exec does, with the earlier job's ran marker, so
   the log is `JobLog.replayNotLive`'s, byte-identical by construction, and outputs, env, PATH,
