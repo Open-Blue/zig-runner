@@ -1277,6 +1277,9 @@ fn swapRanges(inside: u32, outside: u32, count: u32, a: u32, b: u32, host_root: 
 }
 
 test "a signal waits for a step's own PID 1 to handle it, and goes on once it does" {
+    // Memcheck installs its own handler for every signal, so /proc/<pid>/status shows USR2 as
+    // caught before the test has: what `handles` reads cannot be told apart from the test's own.
+    if (std.valgrind.runningOnValgrind() != 0) return error.SkipZigTest;
     // The test process stands for PID 1, and USR2 for the signal: unhandled, then handled.
     const me = linux.getpid();
     const dfl: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.DFL }, .mask = linux.sigemptyset(), .flags = 0 };

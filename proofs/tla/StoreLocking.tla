@@ -39,7 +39,8 @@ CONSTANTS
     SyncLayersAtEnd,   \* a job that published fsyncs layers/ at its end (syncLayers)
     CheckAfterBoot,    \* the first job of a boot checks every tree (checkOncePerBoot)
     EvictRechecks,     \* evict checks its lock is on the file the path names (the fix)
-    BuildLooksUpFirst  \* layers.zig looks its key up under the key's lock before it publishes
+    BuildLooksUpFirst, \* layers.zig looks its key up under the key's lock before it publishes
+    EvictUnlocks       \* evict's deferred close lets its exclusive lock go
 
 ASSUME StepKeys \cap BuildKeys = {} /\ Steps \in Nat \ {0}
 
@@ -633,9 +634,12 @@ EvRename(p) ==
             /\ UNCHANGED dirs
     /\ UNCHANGED <<sh, kino, kgen, gc, booted, ghost>>
 
+(* The deferred close.  Without it (~EvictUnlocks, a liveness mutant) the *)
+(* lock stays on the unlinked file, and open's blocking LOCK_SH on it,     *)
+(* opened before the rename, waits for ever.                               *)
 EvDone(p) ==
     /\ S(p).pc = "ev_done"
-    /\ ex' = IF S(p).evd = NoDir THEN ex ELSE [ex EXCEPT ![S(p).evd] = {}]
+    /\ ex' = IF S(p).evd = NoDir \/ ~EvictUnlocks THEN ex ELSE [ex EXCEPT ![S(p).evd] = {}]
     /\ Put(p, EvReturn(S(p), TRUE))
     /\ UNCHANGED <<dirs, sh, kino, kgen, gc, booted, ghost>>
 
