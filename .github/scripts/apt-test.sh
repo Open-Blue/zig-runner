@@ -31,13 +31,20 @@ grep -q '^Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' /etc/apt/so
 ! grep -E '^URIs:.*ubuntu[.]com' /etc/apt/sources.list.d/ubuntu.sources
 IN
 
-# The archive up: nothing is rewritten.
-run_in "archive up" <<'IN'
+# The archive up: nothing is rewritten. Skipped while the archive really is down, when the
+# fallback rightly rewrites the sources.
+archive_up=0
+curl -fsS -o /dev/null --max-time 10 http://archive.ubuntu.com/ubuntu/dists/noble/InRelease && archive_up=1
+if ((archive_up)); then
+	run_in "archive up" <<'IN'
 cp /etc/apt/sources.list.d/ubuntu.sources /before
 /apt.sh install tree
 tree --version
 cmp /etc/apt/sources.list.d/ubuntu.sources /before
 IN
+else
+	echo "== archive up: skipped, the archive does not answer from here"
+fi
 
 # Nothing works: the script fails and puts the sources back.
 run_in "nothing works" "${down[@]}" <<'IN'
@@ -51,8 +58,10 @@ IN
 
 # The container builds' prefix, computed on the host: empty with the archive up; with it down (the
 # probe pointed at a closed port) a rewrite, which a container's `sh -c` runs before its script.
-echo "== prefix, archive up"
-test -z "$(.github/scripts/apt.sh mirror-prefix amd64 noble)"
+if ((archive_up)); then
+	echo "== prefix, archive up"
+	test -z "$(.github/scripts/apt.sh mirror-prefix amd64 noble)"
+fi
 prefix=$(APT_PRIMARY_PROBE=http://127.0.0.1:9/InRelease .github/scripts/apt.sh mirror-prefix amd64 noble)
 test -n "$prefix"
 echo "== prefix, archive down"
