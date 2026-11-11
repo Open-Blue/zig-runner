@@ -381,6 +381,11 @@ fn hpackBlocks(_: void, smith: *Smith) !void {
 const LayerBox = struct {
     base: linux.fd_t,
     path: []const u8,
+    /// What `apply` runs its inflating thread on. Not `std.testing.io`, whose threads allocate
+    /// their tasks from the testing allocator and free them after the awaiting thread has been
+    /// woken: the input's run can end, and its leak check start, while a worker is still in that
+    /// `free`, which the checker reports as a corrupted bucket (found by the nightly's fuzzing).
+    io: std.Io,
 };
 
 test "fuzz: OCI layer" {
@@ -394,7 +399,9 @@ test "fuzz: OCI layer" {
     const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena);
     const rc = linux.open(try arena.dupeSentinel(u8, path, 0), .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
     try std.testing.expect(linux.errno(rc) == .SUCCESS);
-    const box: LayerBox = .{ .base = try fd(rc), .path = path };
+    var threaded: std.Io.Threaded = .init(std.heap.smp_allocator, .{});
+    defer threaded.deinit();
+    const box: LayerBox = .{ .base = try fd(rc), .path = path, .io = threaded.io() };
     defer _ = linux.close(box.base);
 
     const host = try std.fmt.allocPrint(arena, "{s}/outside/host", .{path});
@@ -473,7 +480,7 @@ fn ociLayer(box: *const LayerBox, smith: *Smith) !void {
     var r: std.Io.Reader = .fixed(blob);
     var totals: layer.Totals = .{};
     const opts: layer.Options = .{ .owners = false, .max_bytes = 1 << 20, .max_entries = 1000 };
-    layer.apply(std.testing.allocator, std.testing.io, root, &r, "", opts, &totals) catch |e| switch (e) {
+    layer.apply(std.testing.allocator, box.io, root, &r, "", opts, &totals) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => {},
     };
