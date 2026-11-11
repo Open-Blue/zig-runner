@@ -87,8 +87,6 @@ jobs:
       - name: Check the store's locking and the release pipeline
         env:
           TLC_PART: ${{ matrix.part }}/3
-          # While SPIN takes StoreDeferred over, TLC checks every module too.
-          TLC_ALL: "1"
         run: .github/scripts/tlc.sh
 
   # Every module's configurations and mutants, safety and liveness (proofs/spin, the Promela ports
