@@ -39,6 +39,8 @@ const Task = struct {
     store: Store,
     /// Whether the job published a layer: its renames are in the layers' directory, not yet synced.
     sync: bool,
+    /// The job's id, for the log line of the pass that serves it.
+    job_id: u64,
 
     fn destroy(t: *Task) void {
         t.arena.deinit();
@@ -63,13 +65,13 @@ pub var test_wait = true;
 /// Tests: while set, the thread takes no work, so a test can queue several jobs' upkeep.
 pub var test_hold: std.atomic.Value(bool) = .init(false);
 
-/// Hands `s`'s upkeep over: `sync` if the job published a layer. False when it is not taken (no
+/// Hands `s`'s upkeep over: `sync` if the job published a layer; `job_id` is named in the log. False when it is not taken (no
 /// room, the job's sync failed, the queue is full, no thread could be started), and then it is the
 /// caller's to run before it returns. Everything the thread uses is copied here, from the caller's
 /// arena, which may be freed as soon as this returns.
-pub fn submit(io: std.Io, s: Store, sync: bool) bool {
+pub fn submit(io: std.Io, s: Store, sync: bool, job_id: u64) bool {
     const t = gpa.create(Task) catch return false;
-    t.* = .{ .arena = .init(gpa), .store = undefined, .sync = sync };
+    t.* = .{ .arena = .init(gpa), .store = undefined, .sync = sync, .job_id = job_id };
     t.store = s.detach(t.arena.allocator()) orelse {
         t.destroy();
         return false;
@@ -166,7 +168,10 @@ fn pass(io: std.Io, tasks: []const *Task) void {
     _ = ph.since(arena, .collect, t);
     _ = passes.fetchAdd(1, .monotonic);
     const text = ph.text(arena, null, .all) catch return;
-    std.log.info("native: store upkeep of {d} job(s), after they returned (ms): {s}", .{ tasks.len, text });
+    // The jobs it served, so that an analysis can give each its share (`native-phases.sh`).
+    var ids: std.Io.Writer.Allocating = .init(arena);
+    for (tasks, 0..) |task, i| ids.writer.print("{s}{d}", .{ if (i > 0) "," else "", task.job_id }) catch return;
+    std.log.info("native: store upkeep of job(s) {s}, after they returned (ms): {s}", .{ ids.written(), text });
 }
 
 const testing = std.testing;
@@ -190,7 +195,7 @@ test "collector: a job's upkeep runs on the thread, after submit returned, from 
     defer testing.allocator.free(root);
     test_hold.store(true, .release);
     defer test_hold.store(false, .release);
-    try testing.expect(submit(io, s, true));
+    try testing.expect(submit(io, s, true, 0));
     // The job's end returns and frees its arena: the thread has only its own copy.
     job.deinit();
     try testing.expect(pending(io));
@@ -215,7 +220,7 @@ test "collector: jobs ending together are served by one pass at a time, and each
     defer test_hold.store(false, .release);
     const passes_before = passes.load(.monotonic);
     most_active.store(0, .monotonic);
-    for (0..5) |_| try testing.expect(submit(io, s, true));
+    for (0..5) |_| try testing.expect(submit(io, s, true, 0));
     test_hold.store(false, .release);
     try testing.expect(drain(io, 10_000));
     // The five were queued before the thread took any: one pass served them.
@@ -224,7 +229,7 @@ test "collector: jobs ending together are served by one pass at a time, and each
     // A queue longer than `max_queued` is the caller's own.
     test_hold.store(true, .release);
     var taken: usize = 0;
-    for (0..max_queued + 3) |_| taken += @intFromBool(submit(io, s, false));
+    for (0..max_queued + 3) |_| taken += @intFromBool(submit(io, s, false, 0));
     try testing.expectEqual(@as(usize, max_queued), taken);
     test_hold.store(false, .release);
     try testing.expect(drain(io, 10_000));
@@ -265,9 +270,9 @@ test "collector: a job whose sync failed is not taken, and a layer a job holds i
     const k2, const free = try Store.testLayer(arena, io, tmp, &s, "free");
     free.lock.close(io);
     s.sync_log.?.failed = true;
-    try testing.expect(!submit(io, s, true));
+    try testing.expect(!submit(io, s, true, 0));
     s.sync_log.?.failed = false;
-    try testing.expect(submit(io, s, true));
+    try testing.expect(submit(io, s, true, 0));
     try testing.expect(drain(io, 10_000));
     // Over its cap (0) and collected off the job's path: the held layer stays, the free one goes.
     try testing.expect(try s.open(arena, io, k2) == null);
@@ -287,7 +292,7 @@ test "collector: a runner that stops waits for the thread within its limit and n
     const s = try testStore(a.allocator(), io, tmp);
     test_hold.store(true, .release);
     defer test_hold.store(false, .release);
-    try testing.expect(submit(io, s, true));
+    try testing.expect(submit(io, s, true, 0));
     const t = phases.now();
     // Stuck: given up on after the limit, the work left for the next start (the dead names and the
     // layers are swept by its first collect).

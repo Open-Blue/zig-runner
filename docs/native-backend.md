@@ -297,6 +297,7 @@ RUNNER_NATIVE_VOLUMES_MAX_MB=16384                # default; the cache volumes' 
 RUNNER_NATIVE_IMAGES_MAX_MB=8192                  # default; images', rootfs' and seeds' cap, 0 for none ("Eviction")
 RUNNER_NATIVE_MIN_FREE_PCT=10                     # default; the disk's floor, 0 for none ("Eviction")
 RUNNER_NATIVE_ROOTLESS=0                          # default; 1 for a rootless runner
+RUNNER_NATIVE_DEFER_COLLECT=true                  # default; false runs a job's store upkeep before its end returns
 RUNNER_NATIVE_IDMAPPED_UPPER=true                 # default; false shifts each layer's ids with a
                                                   # walk instead of writing them through an
                                                   # idmapped upper ("The canonical ids")
@@ -764,8 +765,9 @@ What it covers, as built:
   stopping runner waits for the thread for five seconds; a pass cut short leaves what a killed
   `collect` always left (renamed-away layers, swept at the next). What a pass evicts is as it was:
   nothing a job holds, in the order of use the job's end left (`touchChain` still runs before it
-  returns). Its timings are logged as "store upkeep", beside the job's `native phases` line, whose
-  `collect` is then the hand-over only.
+  returns). Its timings are logged as "store upkeep of job(s) IDS", beside the job's `native phases`
+  line, whose `collect` is then the hand-over only (`native-phases.sh` reads both). `RUNNER_NATIVE_DEFER_COLLECT=false`
+  runs it before the job's end returns, as it did.
 - **Flattening**: before a step on a stack of 100 layers (`default_flatten_at`), the stack is
   merged into one (`Store.flatten`): later entries win, whiteouts are kept (they hide the
   rootfs), opaque directories stay opaque, files are hard links and directories are made with
