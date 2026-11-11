@@ -77,5 +77,10 @@ fi
 prefix=$(APT_PRIMARY_PROBE=http://127.0.0.1:9/InRelease .github/scripts/apt.sh mirror-prefix amd64 noble)
 test -n "$prefix"
 echo "== prefix, archive down"
-docker run --rm "${down[@]}" "$image" sh -c "${prefix}apt-get update -q && apt-get install -y -q tree >/dev/null && tree --version"
+suffix=$(.github/scripts/apt.sh mirror-suffix)
+# The build's script here is an install plus the lists' removal, as the runner's; afterwards the
+# sources must be byte-identical to the image's, with no backup left.
+docker run --rm "${down[@]}" "$image" sh -c "cp -a /etc/apt /before-apt && ${prefix}apt-get update -q &&
+	apt-get install -y -q tree >/dev/null && tree --version && rm -rf /var/lib/apt/lists/*${suffix} &&
+	diff -r /before-apt /etc/apt && test ! -e /var/tmp/zig-runner-apt-orig && echo sources-restored" | grep -q sources-restored
 echo "apt-test: ok"

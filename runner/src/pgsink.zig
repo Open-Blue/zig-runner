@@ -386,7 +386,11 @@ test "integration: a quiet job's last lines are written by the background flushe
     pgs.last_flush_ms = Io.Clock.real.now(std.testing.io).toMilliseconds();
     try pgs.append(5, 1, .stdout, "only line, then silence");
     try std.testing.expectEqual(@as(u64, 0), try countLogs(&sc)); // not yet: below the thresholds
-    try std.testing.io.sleep(.fromMilliseconds(600), .awake);
+    // The flusher wakes every 100 ms, but a loaded machine can hold it off much longer: wait for its
+    // write, up to 10 s, rather than a fixed while.
+    var waited_ms: u32 = 0;
+    while (try countLogs(&sc) == 0 and waited_ms < 10_000) : (waited_ms += 50)
+        try std.testing.io.sleep(.fromMilliseconds(50), .awake);
     try std.testing.expectEqual(@as(u64, 1), try countLogs(&sc)); // written without another append or an explicit flush
 }
 
