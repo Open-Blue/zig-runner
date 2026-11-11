@@ -1242,10 +1242,15 @@ that shows it is one a failure of costs a walk, never trust:
   lock on the descriptor the open holds, so it excludes other processes as well as other threads
   and is not the volume's flock), and joins the epoch in the same critical section, so
   another runner's open cannot come between the read and the stamp and have its own written over.
-  The lock is polled: an open that finds it held never stamps without it. It waits, sees the
-  job's cancel (`error.Canceled`), and fails with `error.VolumeBusy` after a minute
-  (`Wait.stamp_ms`, a holder that is stopped). Only where nobody could share anyway does it stamp
-  without the lock, and say nothing of its stamp. The lock file is opened read-write for it (`Store.lockBeside`); one the runner
+  The lock is polled: an open that finds the outer lock (`<img>.lock`, which no job can reach)
+  held never stamps without it. It waits as the shared lock does (`Wait.ms`), sees the job's
+  cancel (`error.Canceled`), and fails with `error.VolumeBusy` only for a holder stuck for that
+  long. The step user's lock (`runner.lock`) is inside the root user's volume, where a root-user
+  step can open it and hold a lock on it (reading is enough): it is waited for 100 ms, and then
+  the open stamps without the lock and says nothing of its stamp, so such a lock can stop
+  sharing, and never stalls or fails an open. Where nobody could share anyway (below) an open
+  stamps without the lock too. The stamp lock is taken by every cache volume `openWaiting` opens,
+  not only the tool cache's. The lock file is opened read-write for it (`Store.lockBeside`); one the runner
   can only read gets no stamp lock, so shares nothing. A store on NFS or SMB is not shared
   through: there Linux makes a flock a POSIX lock of the whole file, and the jobs' shared ones
   would conflict with the stamp lock, so `onNetworkFs` turns it off.
@@ -1273,17 +1278,24 @@ that shows it is one a failure of costs a walk, never trust:
   (`Epochs.end`, in both directions). The stamp is also a use of the outer volume for eviction
   (`evict.zig` goes by the lock's mtime), so a step user's recent job keeps the root volume, and
   the `runner/` in it, from being the oldest.
+- The walk of the last job out (`Plan.idleToolCache`) also takes the other user's lock
+  exclusively, without waiting, when that file is there, and makes no verdict if it cannot: a job
+  of the other user in the same directory tree could write to the trees being walked.
 - What sharing does not protect against, plainly:
-  - A runner older than this (during an upgrade) does not take the stamp locks, so its open may
-    fall between a newer one's read and stamp, or write a mtime over its stamp: the window of
-    microseconds that every open had before epochs.
-  - A hostile job in a rootless runner is the runner's own user, and can write `runner.lock`
-    (inside the volume) and the files a verdict is of. Sharing, like the verdict before it,
-    protects against a job's mistakes and against jobs of untrusted scopes (which have volumes of
-    their own), not against a hostile trusted job on a rootless runner.
+  - Upgrade every pool that shares a store together. A runner older than this takes no stamp
+    locks, so its open may fall between a newer one's read and stamp, or write a mtime over its
+    stamp: the window of microseconds that every open had before epochs.
+  - Mixed step users on one store are covered by the stamps of both locks and the walk's two locks
+    above, as far as a lock file a job cannot forge goes (next point).
+  - A rootless runner's jobs run as the runner's own user, so a root-user step can write
+    `runner.lock` and the trees a verdict is of, and forge a chain, as it could the verdict before
+    epochs. Sharing protects against a job's mistakes and against jobs of untrusted scopes (which
+    have volumes of their own), not against a hostile trusted job on a rootless runner.
   - A store on NFS or SMB shares nothing (Linux makes a flock a POSIX lock of the file there, which
-    the stamp lock would conflict with), nor does one whose times are coarser than a second's
-    fraction, where two opens cannot be told apart.
+    the stamp lock would conflict with; `onNetworkFs`). Other filesystems that do the same (9p,
+    some FUSE) are not detected: there a lock held by a job's own flock could keep opens from
+    sharing, or wait them up to `Wait.ms`. A store whose times are coarse (whole seconds) shares
+    nothing either, as two opens cannot be told apart.
 - Host-side changes while no job is in the volume: the runner's first job drops every verdict, and
   one is not used past an hour (`tool_trees.verdict_max_age_ms`) or from the future.
 
