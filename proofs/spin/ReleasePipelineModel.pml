@@ -296,30 +296,36 @@ inline check() {
 
 /* GitHub: CreateWf(c, w) and FinishWf(c, w), for every commit and workflow. */
 #define GH(cc, w) \
-	:: d_step { MAXC >= (cc) && WF(cc, w) == W_CREATING -> WF(cc, w) = W_QUEUED; check() } \
-	:: d_step { MAXC >= (cc) && WF(cc, w) == W_CREATING && lost < MAXLOST -> WF(cc, w) = W_LOST; lost++; check() } \
-	:: d_step { MAXC >= (cc) && WF(cc, w) == W_QUEUED -> WF(cc, w) = W_PASS; check() } \
+	:: d_step { MAXC >= (cc) && WF(cc, w) == W_CREATING -> WF(cc, w) = W_QUEUED} \
+	:: d_step { MAXC >= (cc) && WF(cc, w) == W_CREATING && lost < MAXLOST -> WF(cc, w) = W_LOST; lost++} \
+	:: d_step { MAXC >= (cc) && WF(cc, w) == W_QUEUED -> WF(cc, w) = W_PASS} \
 	:: d_step { MAXC >= (cc) && (w) != WC && WF(cc, w) == W_QUEUED && fails < MAXFAILS -> \
-		WF(cc, w) = W_FAIL; fails++; check() }
+		WF(cc, w) = W_FAIL; fails++ }
 #define GHC(cc) GH(cc, WA) GH(cc, WB) GH(cc, WC)
 
 proctype GitHub() {
 	do
+	:: atomic {
+	if
 	GHC(1) GHC(2) GHC(3) GHC(4) GHC(5) GHC(6)
+	fi;
+	d_step { check() } }
 	od
 }
 
 /* Job(i), for run ME. */
 proctype Job() {
 	do
+	:: atomic {
+	if
 	/* StartPending */
 	:: d_step { R.st == PENDING &&
 	            !INGROUP(vr[1].st) && !(MAXRUNS > 1 && INGROUP(vr[2].st)) && !(MAXRUNS > 2 && INGROUP(vr[3].st)) ->
-		R.st = CHECK; check() }
+		R.st = CHECK }
 	/* Check */
-	:: d_step { R.st == CHECK -> R.st = (isRel[TIP] -> DONE : APPROVAL); check() }
+	:: d_step { R.st == CHECK -> R.st = (isRel[TIP] -> DONE : APPROVAL) }
 	/* ApprovalTimeout */
-	:: d_step { R.st == APPROVAL -> R.st = FAILED; R.why = Y_APPROVAL; check() }
+	:: d_step { R.st == APPROVAL -> R.st = FAILED; R.why = Y_APPROVAL }
 	/* Poll */
 	:: d_step { R.st == WAIT && CANPOLL(R.co, R.el) ->
 		oc = R.co; ol = R.list; oe = R.el;
@@ -329,8 +335,7 @@ proctype Job() {
 		:: out == O_PASS -> R.st = PUSH
 		:: out == O_WAIT -> R.el++
 		:: else -> R.st = FAILED; R.why = out
-		fi;
-		check() }
+		fi }
 	/* Push */
 	:: d_step { R.st == PUSH ->
 		cx = ncommits + 1;
@@ -345,14 +350,13 @@ proctype Job() {
 			:: else -> R.st = FAILED; R.why = Y_MOVED
 			fi;
 			L.on = 1; L.c = cx; L.jobs = J_QUEUED; L.dep = D_WAIT; L.el = 0; L.why = Y_NONE
-		fi;
-		check() }
+		fi }
 	/* Build */
-	:: d_step { L.on && L.jobs == J_QUEUED -> L.jobs = J_PASS; check() }
-	:: d_step { L.on && L.jobs == J_QUEUED && fails < MAXFAILS -> L.jobs = J_FAIL; fails++; check() }
+	:: d_step { L.on && L.jobs == J_QUEUED -> L.jobs = J_PASS }
+	:: d_step { L.on && L.jobs == J_QUEUED && fails < MAXFAILS -> L.jobs = J_FAIL; fails++ }
 	/* DeployStart */
 	:: d_step { L.on && L.dep == D_WAIT && L.jobs != J_QUEUED ->
-		L.dep = (DEPLOYEXPLICIT && L.jobs == J_PASS -> D_CHECKS : D_SKIPPED); check() }
+		L.dep = (DEPLOYEXPLICIT && L.jobs == J_PASS -> D_CHECKS : D_SKIPPED) }
 	/* DeployPoll */
 	:: d_step { L.on && L.dep == D_CHECKS && CANPOLL(L.c, L.el) ->
 		oc = L.c; ol = jobsOf[oc]; oe = L.el;
@@ -362,8 +366,9 @@ proctype Job() {
 		:: out == O_PASS -> L.dep = D_DEPLOYED
 		:: out == O_WAIT -> L.el++
 		:: else -> L.dep = D_FAILED; L.why = out
-		fi;
-		check() }
+		fi }
+	fi;
+	d_step { check() } }
 	od
 }
 
@@ -385,8 +390,7 @@ inline merge(mj) {
 		cx = ncommits + 1; ex = TIP;
 		newCommit(cx, ex, mj, 0);
 		mainSeq[mainLen] = cx; mainLen++;
-		merges++;
-		check() }
+		merges++ }
 }
 
 /* Approve(i) */
@@ -396,13 +400,14 @@ inline approve(i) {
 		vr[i].st = (isRel[cx] -> DONE : WAIT);
 		vr[i].co = cx;
 		vr[i].list = (LISTFROMCOMMIT -> jobsOf[cx] : jobsOf[vr[i].at]);
-		onMain(); vr[i].seen = lx;
-		check() }
+		onMain(); vr[i].seen = lx }
 }
 
 proctype Env() {
 end:
 	do
+	:: atomic {
+	if
 	/* Merge: {"t", "old"}, {"t", "new"}, {"t", "old", "new"} */
 	:: merge(3)
 	:: merge(5)
@@ -418,8 +423,7 @@ end:
 		}
 		vr[cx].st = (INPROGRESS -> PENDING : CHECK);
 		vr[cx].at = TIP;
-		nruns++;
-		check() }
+		nruns++ }
 	:: approve(1)
 	:: approve(2)
 	:: approve(3)
@@ -429,6 +433,8 @@ end:
 #else
 	:: atomic { ENDED -> skip }
 #endif
+	fi;
+	d_step { check() } }
 	od
 }
 

@@ -33,7 +33,8 @@
  *              stuck, synced, src, id), FALSE before TRUE (rank()).
  *
  * The rest is StoreLockingModel.pml's: each action one step, choices made into cd, cm, cb and
- * ck0 .. ck2 before its d_step, temporaries hidden, check() at the end of every step, Crash Env's.
+ * ck0 .. ck2 before its d_step, temporaries hidden, check() at the end of every step (once a
+ * process, after its actions' `if`), Crash Env's.
  */
 
 #define NID 16
@@ -256,6 +257,8 @@ inline check() {
 
 proctype Runner() {
 	do
+	:: atomic {
+	if
 	/* A job. */
 
 	/* Open */
@@ -269,19 +272,17 @@ proctype Runner() {
 		if
 		:: ky == INNER -> planted = 0
 		:: else
-		fi;
-		check() }
+		fi }
 	/* FlockSh */
 	:: d_step { S.pc == FLOCK_SH && NOEX(S.fdk, S.fdg) ->
-		add(ME, S.fdk, S.fdg, 0); S.pc = SAME; check() }
+		add(ME, S.fdk, S.fdg, 0); S.pc = SAME }
 	/* Same */
 	:: d_step { S.pc == SAME ->
 		if
 		:: OPENRECHECK && lockIno[S.key] != S.fdg ->
 			drop(ME, S.fdk, S.fdg); S.fdk = 0; S.fdg = 0; S.pc = OPEN
 		:: else -> S.pc = LOOK
-		fi;
-		check() }
+		fi }
 	/* Look */
 	:: d_step { S.pc == LOOK ->
 		ky = S.key;
@@ -290,11 +291,10 @@ proctype Runner() {
 		:: dirOf[ky] == 0 && ISVOL(ky) ->
 			nextId++; dirOf[ky] = nextId; S.held = nextId; S.pc = USE
 		:: else -> drop(ME, S.fdk, S.fdg); S.pc = FLOCK_EX
-		fi;
-		check() }
+		fi }
 	/* FlockEx */
 	:: d_step { S.pc == FLOCK_EX && FREE(S.fdk, S.fdg) ->
-		add(ME, S.fdk, S.fdg, 1); S.pc = SAME_EX; check() }
+		add(ME, S.fdk, S.fdg, 1); S.pc = SAME_EX }
 	/* SameEx */
 	:: d_step { S.pc == SAME_EX ->
 		ky = S.key;
@@ -306,35 +306,34 @@ proctype Runner() {
 			:: dirOf[ky] != 0 -> S.pc = DOWN
 			:: else -> tmp = tmp | BIT(ky); S.pc = MAKE
 			fi
-		fi;
-		check() }
+		fi }
 	/* Make */
 	:: d_step { S.pc == MAKE ->
-		ky = S.key; nextId++; dirOf[ky] = nextId; tmp = tmp & ~BIT(ky); S.pc = DOWN; check() }
+		ky = S.key; nextId++; dirOf[ky] = nextId; tmp = tmp & ~BIT(ky); S.pc = DOWN }
 	/* Down */
-	:: d_step { S.pc == DOWN -> drop(ME, S.fdk, S.fdg); S.pc = FLOCK_SH2; check() }
+	:: d_step { S.pc == DOWN -> drop(ME, S.fdk, S.fdg); S.pc = FLOCK_SH2 }
 	/* FlockSh2 */
 	:: d_step { S.pc == FLOCK_SH2 && NOEX(S.fdk, S.fdg) ->
-		add(ME, S.fdk, S.fdg, 0); S.pc = (DOWNRECHECK -> SAME : ASSUME); check() }
+		add(ME, S.fdk, S.fdg, 0); S.pc = (DOWNRECHECK -> SAME : ASSUME) }
 	/* Assume */
 	:: d_step { S.pc == ASSUME ->
 		ky = S.key;
-		S.held = (dirOf[ky] != 0 -> dirOf[ky] : nextId); S.pc = USE; check() }
+		S.held = (dirOf[ky] != 0 -> dirOf[ky] : nextId); S.pc = USE }
 	/* Plant */
 	:: d_step { S.pc == USE && S.key == OUTER && plants < MAXPLANT && FREE(INNER, lockIno[INNER]) ->
-		plants++; planted = 1; lockIno[INNER] = 0; check() }
+		plants++; planted = 1; lockIno[INNER] = 0 }
 	/* Use */
 	:: d_step { S.pc == USE ->
-		drop(ME, S.fdk, S.fdg); S.fdk = 0; S.fdg = 0; S.held = 0; S.pc = GC_LOCK; check() }
+		drop(ME, S.fdk, S.fdg); S.fdk = 0; S.fdg = 0; S.held = 0; S.pc = GC_LOCK }
 
 	/* evict.run. Next1's choice of the next job's key: key 0 (or the end), then key 1. */
 
 	/* GcLock */
 	:: d_step { S.pc == GC_LOCK && gc == 0 ->
-		gc = BIT(ME); S.todo = (1 << NK) - 1; S.pc = GC_DEAD; check() }
-	:: d_step { S.pc == GC_LOCK && gc != 0 -> gv = S.round + 1; begin(ME, gv, 0); check() }
+		gc = BIT(ME); S.todo = (1 << NK) - 1; S.pc = GC_DEAD }
+	:: d_step { S.pc == GC_LOCK && gc != 0 -> gv = S.round + 1; begin(ME, gv, 0) }
 	:: d_step { S.pc == GC_LOCK && gc != 0 && NK > 1 && !PAST(S.round + 1) ->
-		gv = S.round + 1; begin(ME, gv, 1); check() }
+		gv = S.round + 1; begin(ME, gv, 1) }
 	/* GcDead: no live tree */
 	:: d_step { S.pc == GC_DEAD && !ANYLIVE ->
 		cn = 0;
@@ -342,8 +341,7 @@ proctype Runner() {
 		if
 		:: cn && !STUCKGOES -> stopped = 1; S.pc = GC_END
 		:: else -> S.pc = GC_NEXT
-		fi;
-		check() }
+		fi }
 	/* GcDead: a live tree. The sync first, when one is owed; else the least live tree, three ways. */
 	:: atomic { S.pc == GC_DEAD && ANYLIVE ->
 		d_step {
@@ -375,48 +373,44 @@ proctype Runner() {
 				:: cb == 1 -> stucks++; dstuck[dx] = 1
 				:: cb == 2 -> S.pc = GC_NEXT
 				fi
-			fi;
-			check() } }
+			fi } }
 	/* GcEnd */
-	:: d_step { S.pc == GC_END -> gc = 0; gv = S.round + 1; begin(ME, gv, 0); check() }
+	:: d_step { S.pc == GC_END -> gc = 0; gv = S.round + 1; begin(ME, gv, 0) }
 	:: d_step { S.pc == GC_END && NK > 1 && !PAST(S.round + 1) ->
-		gc = 0; gv = S.round + 1; begin(ME, gv, 1); check() }
+		gc = 0; gv = S.round + 1; begin(ME, gv, 1) }
 	/* GcNext, the keys done */
-	:: d_step { S.pc == GC_NEXT && S.todo == 0 -> gc = 0; gv = S.round + 1; begin(ME, gv, 0); check() }
+	:: d_step { S.pc == GC_NEXT && S.todo == 0 -> gc = 0; gv = S.round + 1; begin(ME, gv, 0) }
 	:: d_step { S.pc == GC_NEXT && S.todo == 0 && NK > 1 && !PAST(S.round + 1) ->
-		gc = 0; gv = S.round + 1; begin(ME, gv, 1); check() }
+		gc = 0; gv = S.round + 1; begin(ME, gv, 1) }
 	/* GcNext, the least key left: passed over, or evicted when there is something there. */
 	:: d_step { S.pc == GC_NEXT && S.todo != 0 ->
 		ky = (HAS(S.todo, 0) -> 0 : (HAS(S.todo, 1) -> 1 : 2));
-		S.todo = S.todo & ~BIT(ky); check() }
+		S.todo = S.todo & ~BIT(ky) }
 	:: d_step { S.pc == GC_NEXT && S.todo != 0 &&
 	            !((lockIno[(HAS(S.todo, 0) -> 0 : (HAS(S.todo, 1) -> 1 : 2))] == 0 &&
 	               dirOf[(HAS(S.todo, 0) -> 0 : (HAS(S.todo, 1) -> 1 : 2))] == 0) ||
 	              ((HAS(S.todo, 0) -> 0 : (HAS(S.todo, 1) -> 1 : 2)) == INNER && dirOf[OUTER] != 0)) ->
 		ky = (HAS(S.todo, 0) -> 0 : (HAS(S.todo, 1) -> 1 : 2));
-		S.todo = S.todo & ~BIT(ky); S.evk = ky; S.pc = EV_OPEN; check() }
+		S.todo = S.todo & ~BIT(ky); S.evk = ky; S.pc = EV_OPEN }
 	/* EvOpen */
 	:: d_step { S.pc == EV_OPEN ->
 		ky = S.evk;
 		if
 		:: lockIno[ky] == 0 -> S.pc = GC_NEXT
 		:: else -> S.fdk = ky; S.fdg = lockIno[ky]; S.pc = (EVLOCKS -> EV_FLOCK : EV_INNER)
-		fi;
-		check() }
+		fi }
 	/* EvFlock */
 	:: d_step { S.pc == EV_FLOCK ->
 		if
 		:: FREE(S.fdk, S.fdg) -> add(ME, S.fdk, S.fdg, 1); S.pc = EV_SAME
 		:: else -> evFail()
-		fi;
-		check() }
+		fi }
 	/* EvSame */
 	:: d_step { S.pc == EV_SAME ->
 		if
 		:: EVRECHECK && lockIno[S.evk] != S.fdg -> drop(ME, S.fdk, S.fdg); evFail()
 		:: else -> S.pc = EV_INNER
-		fi;
-		check() }
+		fi }
 	/* EvInner */
 	:: d_step { S.pc == EV_INNER ->
 		ky = S.evk;
@@ -435,8 +429,7 @@ proctype Runner() {
 			:: else -> dropMine(ME); evFail()
 			fi
 		:: else -> S.pc = EV_RENAME
-		fi;
-		check() }
+		fi }
 	/* EvRename */
 	:: d_step { S.pc == EV_RENAME ->
 		ky = S.evk; dx = dirOf[ky];
@@ -456,8 +449,7 @@ proctype Runner() {
 			:: else
 			fi;
 			S.pc = EV_SYNC
-		fi;
-		check() }
+		fi }
 	/* EvSync */
 	:: d_step { S.pc == EV_SYNC ->
 		if
@@ -470,7 +462,7 @@ proctype Runner() {
 			}
 		:: else
 		fi;
-		S.pc = EV_UNLINK; check() }
+		S.pc = EV_UNLINK }
 	/* EvUnlink */
 	:: d_step { S.pc == EV_UNLINK ->
 		ky = S.evk;
@@ -478,7 +470,9 @@ proctype Runner() {
 		:: lockIno[ky] == S.fdg -> lockIno[ky] = 0
 		:: else
 		fi;
-		dropMine(ME); S.fdk = 0; S.fdg = 0; S.fd2k = 0; S.fd2g = 0; S.pc = GC_NEXT; check() }
+		dropMine(ME); S.fdk = 0; S.fdg = 0; S.fd2k = 0; S.fd2g = 0; S.pc = GC_NEXT }
+	fi;
+	d_step { check() } }
 	od
 }
 
@@ -488,14 +482,15 @@ inline crash(q) {
 		crashes++;
 		idle(q); st[q].pc = CRASHED;
 		dropMine(q);
-		gc = gc & ~BIT(q);
-		check() }
+		gc = gc & ~BIT(q) }
 }
 
 /* Crash, MachineCrash and Next's step of a terminated system; as StoreLockingModel.pml's Env. */
 proctype Env() {
 end:
 	do
+	:: atomic {
+	if
 	:: crash(0)
 	:: crash(1)
 	:: crash(2)
@@ -547,14 +542,15 @@ end:
 			gc = 0;
 			begin(0, ROUNDS, ck0);
 			if :: NP > 1 -> begin(1, ROUNDS, ck1) :: else fi;
-			if :: NP > 2 -> begin(2, ROUNDS, ck2) :: else fi;
-			check() } }
+			if :: NP > 2 -> begin(2, ROUNDS, ck2) :: else fi } }
 #ifdef LIVENESS
 	/* The stutter (StoreLockingModel.pml says why). */
 	:: planted || !planted -> skip
 #else
 	:: atomic { TERMINATED -> skip }
 #endif
+	fi;
+	d_step { check() } }
 	od
 }
 

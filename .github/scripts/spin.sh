@@ -51,7 +51,7 @@ build() {
 
 # live <property>: pan-liveness on one claim, its report in pan-<property>.out.
 live() {
-	./pan-liveness -m1000000 -w26 -a -f -N "$1" >"pan-$1.out" 2>&1 || true
+	./pan-liveness -m1000000 -w"$hw" -a -f -N "$1" >"pan-$1.out" 2>&1 || true
 }
 
 stored() { sed -n 's/^ *\([0-9]*\) states, stored.*/\1/p' "$1"; }
@@ -59,7 +59,7 @@ elapsed() { sed -n 's/^pan: elapsed time \(.*\)/\1/p' "$1"; }
 
 # check <name>: compiles and runs one configuration in $dir/<name>; the verdict is in result.
 check() {
-	local name=$1 w="$dir/$1" started=$SECONDS first want ltl p verdict
+	local name=$1 w="$dir/$1" started=$SECONDS first want ltl p verdict ns hw=22
 	rm -rf "${w:?}"
 	mkdir -p "$w"
 	cp "$here"/*.pml "$w"/
@@ -68,6 +68,15 @@ check() {
 	first=$(head -n 1 "$name.pml")
 	want=$(sed -n 's/.*must fail: \([A-Za-z]*\).*/\1/p' <<<"$first")
 	ltl=$(sed -n 's/^ \* spin-ltl: \([A-Za-z ]*\).*/\1/p' "$name.pml")
+	# The hash table's size, 2^hw slots: about twice the states the spin-states line says, or 2^22
+	# for a mutant, which stops at its first violation. The size is only speed, never which states
+	# are found (each slot is a chain), and its memory is 8 bytes a slot: 32 MB for a mutant, not
+	# the 512 MB of -w26.
+	ns=$(sed -n 's/^ \* spin-states: \([0-9]*\).*/\1/p' "$name.pml")
+	if [[ -n $ns ]]; then
+		hw=19
+		while ((hw < 26 && (1 << (hw - 1)) < ns)); do hw=$((hw + 1)); done
+	fi
 	if [[ -n $want && " $ltl " == *" $want "* ]]; then
 		# A mutant that must fail a temporal property: its claim's violation, under fairness.
 		if ! build "$name" liveness; then
@@ -80,7 +89,7 @@ check() {
 	elif ! build "$name" safety; then
 		verdict="$name: spin -a or gcc failed"
 	else
-		./pan-safety -m100000 -w26 >pan.out 2>&1 || true
+		./pan-safety -m100000 -w"$hw" >pan.out 2>&1 || true
 		if [[ -n $want ]]; then
 			if grep -q "^pan:1: assertion violated $want " pan.out; then
 				verdict="ok: fails with $want ($(stored pan.out) states to the first violation)"

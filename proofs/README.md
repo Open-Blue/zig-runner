@@ -658,9 +658,19 @@ hash table, `-w26`), compiles aside (laptop, 2026-11-11, load 15 from other work
 | SPIN, `-DNCORE=8` | 8 s | |
 | compiling `pan.c` (gcc 15.2, `-O2`) | 10 to 14 s | |
 
-The whole of `spin.sh`, the four configurations that must hold and the seven mutants, compiles
-included, takes 61 s on the laptop and 75 s on 4 cores; TLC took 4 min 22 s for the four
-configurations alone, one after another on the laptop. `spin.sh` runs the configurations side by
+Every module, one configuration after another on the laptop, compiles included (2026-11-11, load
+2 to 9 from other work; TLC as `tlc.sh` runs it, with its symmetry and view, `-workers auto`):
+
+| Module | TLC | SPIN, one core | TLC's memory | SPIN's |
+|---|---|---|---|---|
+| `StoreLocking`, 13 configurations | 298 s | 160 s | 3.5 GB | 2.3 GB |
+| `StoreEviction`, 13 | 71 s | 53 s | 3.2 GB | 1.6 GB |
+| `ReleasePipeline`, 11 | 126 s | 58 s | 3.0 GB | 0.8 GB |
+
+and the whole of `spin.sh`, side by side on the laptop's 12 threads, takes about 65 s. Most of a
+small configuration's time is gcc's: each process's actions share one copy of the invariants'
+code (the port's header says how), which took `ReleasePipeline.cfg`'s compile from 17 s to 3 s, and
+a mutant's hash table is 32 MB (`-w22`), not 512, as its search stops at the first violation. `spin.sh` runs the configurations side by
 side, one a core, rather than SPIN's multi-core search, which is faster for one configuration but
 needs every temporary in the state. Partial order reduction is off: it reduces nothing (every step
 reads or writes the shared store) and costs a quarter of the time. Bitstate and hash compaction

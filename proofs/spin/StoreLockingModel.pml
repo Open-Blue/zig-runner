@@ -38,6 +38,11 @@
  * one d_step. (SPIN does not restore a hidden variable when its search backs up inside an
  * `atomic`, so a choice must not be kept in one.) SPIN's states are then the module's states and
  * one more, SPIN's first, before init has run.
+ *
+ * A process's loop is one `atomic`: an `if` whose options are the actions, then check() once, in
+ * a d_step of its own. The states inside an atomic are not stored, so this is the states of a
+ * check() at the end of every action, and check()'s code is in pan.c once a process rather than
+ * once an action: a fifth of the code, and gcc compiles it in a fifth of the time.
  */
 
 #define NK (NSK + NBK)
@@ -304,7 +309,7 @@ inline evReturn(ok) {
 }
 
 /* The invariants the configuration checks, in the state the step reached; then the choices are
- * set back to 0. Every step ends with it, inside its d_step. */
+ * set back to 0. Every step ends with it, in the atomic of the process that took the step. */
 inline check() {
 #ifdef CHK_TypeOK
 	/* Names, parts, keys and the sets' members are in range by their encoding; the rest: */
@@ -390,6 +395,8 @@ inline check() {
 /* Runner ME: Proc(ME), an option an action (or a branch of one). Crash(ME) is Env's (crash()). */
 proctype Runner() {
 	do
+	:: atomic {
+	if
 	/* The job's steps. */
 
 	/* LkCreate */
@@ -399,39 +406,36 @@ proctype Runner() {
 		:: kino[ky] == 0 -> kgen[ky]++; kino[ky] = kgen[ky]; S.kfk = ky; S.kfg = kgen[ky]
 		:: else -> S.kfk = ky; S.kfg = kino[ky]
 		fi;
-		S.pc = LK_FLOCK; check() }
+		S.pc = LK_FLOCK }
 	/* LkFlock */
-	:: d_step { S.pc == LK_FLOCK && KFREE(S.kfk, S.kfg) -> S.klk = 1; S.pc = LK_SAME; check() }
-	:: d_step { S.pc == LK_FLOCK && !KFREE(S.kfk, S.kfg) -> S.kfk = 0; S.kfg = 0; S.pc = LK_CREATE; check() }
+	:: d_step { S.pc == LK_FLOCK && KFREE(S.kfk, S.kfg) -> S.klk = 1; S.pc = LK_SAME }
+	:: d_step { S.pc == LK_FLOCK && !KFREE(S.kfk, S.kfg) -> S.kfk = 0; S.kfg = 0; S.pc = LK_CREATE }
 	:: d_step { S.pc == LK_FLOCK && !KFREE(S.kfk, S.kfg) && S.mode == M_STEP ->
-		S.kfk = 0; S.kfg = 0; S.pc = STEP_END; check() }
+		S.kfk = 0; S.kfg = 0; S.pc = STEP_END }
 	/* LkSame */
 	:: d_step { S.pc == LK_SAME ->
 		ky = S.key;
 		if
 		:: kino[ky] != 0 && S.kfk == ky && S.kfg == kino[ky] -> S.owns = (S.mode == M_STEP); S.pc = S.after
 		:: else -> S.klk = 0; S.kfk = 0; S.kfg = 0; S.pc = LK_CREATE
-		fi;
-		check() }
+		fi }
 	/* OpFile */
 	:: d_step { S.pc == OP_FILE ->
 		ky = S.key; lowestPub(ky);
 		if
 		:: dx != NODIR && (dirs[dx].parts & LOCK) -> S.opd = dx; S.pc = OP_FLOCK
 		:: else -> missed()
-		fi;
-		check() }
+		fi }
 	/* OpFlock */
 	:: d_step { S.pc == OP_FLOCK && ex[S.opd] == 0 ->
-		sh[S.opd] = sh[S.opd] | BIT(MEID); S.pc = OP_SAME; check() }
+		sh[S.opd] = sh[S.opd] | BIT(MEID); S.pc = OP_SAME }
 	/* OpSame */
 	:: d_step { S.pc == OP_SAME ->
 		dx = S.opd;
 		if
 		:: ISPUB(dx, S.key) && (dirs[dx].parts & LOCK) -> S.pc = OP_READ
 		:: else -> sh[dx] = sh[dx] & ~BIT(MEID); S.opd = NODIR; missed()
-		fi;
-		check() }
+		fi }
 	/* OpRead */
 	:: d_step { S.pc == OP_READ ->
 		dx = S.opd;
@@ -439,58 +443,53 @@ proctype Runner() {
 		:: VALIDATES(dx) ->
 			badRead = badRead || !INTACT(dx); S.held = S.held | BIT(dx); S.opd = NODIR; S.pc = STEP_END
 		:: else -> sh[dx] = sh[dx] & ~BIT(MEID); S.opd = NODIR; ky = S.key; evict(ky, R_OPEN)
-		fi;
-		check() }
+		fi }
 	/* Run: ok = FALSE, then ok = TRUE by its cases. */
-	:: d_step { S.pc == RUN -> S.pc = STEP_END; check() }
+	:: d_step { S.pc == RUN -> S.pc = STEP_END }
 	:: d_step { S.pc == RUN && S.mode == M_BUILD && BUILDHOLDS && LOOKUPFIRST ->
-		S.pc = LK_CREATE; S.after = OP_FILE; S.mode = M_LOOKUP; check() }
+		S.pc = LK_CREATE; S.after = OP_FILE; S.mode = M_LOOKUP }
 	:: d_step { S.pc == RUN && S.mode == M_BUILD && BUILDHOLDS && !LOOKUPFIRST ->
-		S.pc = LK_CREATE; S.after = PB_MKDIR; check() }
+		S.pc = LK_CREATE; S.after = PB_MKDIR }
 	:: d_step { S.pc == RUN && ((S.mode == M_BUILD && !BUILDHOLDS) || (S.mode != M_BUILD && S.keyed)) ->
-		S.pc = PB_MKDIR; check() }
+		S.pc = PB_MKDIR }
 	/* PbMkdir */
 	:: d_step { S.pc == PB_MKDIR ->
 		dx = MEID;
 		dirs[dx].name = N_TMP; dirs[dx].key = S.key; dirs[dx].parts = 0; dirs[dx].fsOk = 1;
 		dirs[dx].recOk = 1; dirs[dx].synced = 0; dirs[dx].linked = 0; dirs[dx].old = 0;
-		S.moved = 0; S.pc = PB_WRITE; check() }
+		S.moved = 0; S.pc = PB_WRITE }
 	/* PbWrite */
 	:: d_step { S.pc == PB_WRITE ->
 		dx = MEID;
 		if
 		:: dirs[dx].name == N_NONE -> S.pc = PB_FAIL
 		:: else -> dirs[dx].parts = dirs[dx].parts | REC; S.pc = PB_LOCK
-		fi;
-		check() }
+		fi }
 	/* PbLock: enabled when Gone, or when no one holds the lock exclusively. */
 	:: d_step { S.pc == PB_LOCK && (dirs[MEID].name == N_NONE || ex[MEID] == 0) ->
 		dx = MEID;
 		if
 		:: dirs[dx].name == N_NONE -> S.pc = PB_FAIL
 		:: else -> dirs[dx].parts = dirs[dx].parts | LOCK; sh[dx] = sh[dx] | BIT(dx); S.pc = PB_MOVE
-		fi;
-		check() }
+		fi }
 	/* PbMove */
 	:: d_step { S.pc == PB_MOVE ->
 		dx = MEID;
 		if
 		:: dirs[dx].name == N_NONE -> S.pc = PB_FAIL
 		:: else -> dirs[dx].parts = dirs[dx].parts | FS; dirs[dx].fsOk = 1; S.moved = 1; S.pc = PB_BACK
-		fi;
-		check() }
+		fi }
 	/* PbBack */
-	:: d_step { S.pc == PB_BACK -> S.pc = PB_META; check() }
+	:: d_step { S.pc == PB_BACK -> S.pc = PB_META }
 	:: d_step { S.pc == PB_BACK && werrors < MAXWERR ->
-		werrors++; S.werr = 1; S.pc = (HEEDSYNC -> PB_FAIL : PB_META); check() }
+		werrors++; S.werr = 1; S.pc = (HEEDSYNC -> PB_FAIL : PB_META) }
 	/* PbMeta */
 	:: d_step { S.pc == PB_META ->
 		dx = MEID;
 		if
 		:: dirs[dx].name == N_NONE -> S.pc = PB_FAIL
 		:: else -> dirs[dx].parts = dirs[dx].parts | META; S.pc = PB_SYNC
-		fi;
-		check() }
+		fi }
 	/* PbSync */
 	:: d_step { S.pc == PB_SYNC ->
 		dx = MEID;
@@ -498,9 +497,9 @@ proctype Runner() {
 		:: SYNCBEFORE && dirs[dx].name != N_NONE -> dirs[dx].synced = 1
 		:: else
 		fi;
-		S.pc = PB_RENAME; check() }
+		S.pc = PB_RENAME }
 	:: d_step { S.pc == PB_SYNC && werrors < MAXWERR ->
-		werrors++; S.werr = 1; S.pc = (HEEDSYNC -> PB_FAIL : PB_RENAME); check() }
+		werrors++; S.werr = 1; S.pc = (HEEDSYNC -> PB_FAIL : PB_RENAME) }
 	/* PbRename */
 	:: d_step { S.pc == PB_RENAME ->
 		ky = S.key; lowestPub(ky);
@@ -513,8 +512,7 @@ proctype Runner() {
 			:: else
 			fi
 		:: else -> S.pc = PB_FAIL
-		fi;
-		check() }
+		fi }
 	/* PbFail */
 	:: d_step { S.pc == PB_FAIL ->
 		dx = MEID;
@@ -536,13 +534,12 @@ proctype Runner() {
 		if
 		:: back && !gone -> removeTree(dx, nv)
 		:: else -> S.pc = nv
-		fi;
-		check() }
+		fi }
 	/* StepEnd: Begin's member with key 0 (or the job's end), then with key 1. */
 	:: d_step { S.pc == STEP_END ->
-		nv = S.step + 1; hm = S.held; cn = S.life; gv = S.pubd; begin(ME, 0); check() }
+		nv = S.step + 1; hm = S.held; cn = S.life; gv = S.pubd; begin(ME, 0) }
 	:: d_step { S.pc == STEP_END && NK > 1 && !PASTSTEPS(S.step + 1, S.life) ->
-		nv = S.step + 1; hm = S.held; cn = S.life; gv = S.pubd; begin(ME, 1); check() }
+		nv = S.step + 1; hm = S.held; cn = S.life; gv = S.pubd; begin(ME, 1) }
 	/* End */
 	:: d_step { S.pc == END ->
 		for (ix : 0 .. ND - 1) {
@@ -551,7 +548,7 @@ proctype Runner() {
 			:: else
 			fi
 		}
-		S.held = 0; S.pc = END_SYNC; check() }
+		S.held = 0; S.pc = END_SYNC }
 	/* EndSync */
 	:: d_step { S.pc == END_SYNC ->
 		if
@@ -570,7 +567,7 @@ proctype Runner() {
 			:: else
 			fi
 		}
-		S.pubd = 0; S.pc = GC_LOCK; check() }
+		S.pubd = 0; S.pc = GC_LOCK }
 
 	/* Store.collect. */
 
@@ -587,8 +584,7 @@ proctype Runner() {
 			}
 			S.pc = GC_NEXT
 		:: else -> S.pc = DONE
-		fi;
-		check() }
+		fi }
 	/* GcNext, the listing done */
 	:: d_step { S.pc == GC_NEXT && S.todo == 0 ->
 		S.ktodo = 0;
@@ -598,7 +594,7 @@ proctype Runner() {
 			:: else
 			fi
 		}
-		S.pc = DK_NEXT; check() }
+		S.pc = DK_NEXT }
 	/* GcNext, an entry: cd \in First(ME, todo), and cb whether an entry that looks whole is
 	 * evicted (past the cap). */
 	:: atomic { S.pc == GC_NEXT && S.todo != 0 ->
@@ -633,10 +629,9 @@ proctype Runner() {
 				:: LOOKSWHOLE(dx) && !cb -> skip
 				:: else -> evict(ky, R_GC)
 				fi
-			fi;
-			check() } }
+			fi } }
 	/* GcUnlock */
-	:: d_step { S.pc == GC_UNLOCK -> S.kfk = 0; S.kfg = 0; S.klk = 0; S.pc = GC_NEXT; check() }
+	:: d_step { S.pc == GC_UNLOCK -> S.kfk = 0; S.kfg = 0; S.klk = 0; S.pc = GC_NEXT }
 	/* DkNext */
 	:: d_step { S.pc == DK_NEXT ->
 		if
@@ -648,19 +643,18 @@ proctype Runner() {
 			:: kino[ky] != 0 && KFREE(ky, kino[ky]) -> S.kfk = ky; S.kfg = kino[ky]; S.klk = 1; S.pc = DK_DEL
 			:: else
 			fi
-		fi;
-		check() }
+		fi }
 	/* DkDel */
 	:: d_step { S.pc == DK_DEL ->
-		kino[S.kfk] = 0; S.kfk = 0; S.kfg = 0; S.klk = 0; S.pc = DK_NEXT; check() }
+		kino[S.kfk] = 0; S.kfk = 0; S.kfg = 0; S.klk = 0; S.pc = DK_NEXT }
 
 	/* Store.checkOncePerBoot. */
 
 	/* Boot: goes on (Begin's member with key 0, then key 1), or waits for gc.lock. */
 	:: d_step { S.pc == BOOT && (booted || !CHECKBOOT) ->
-		nv = 1; hm = 0; cn = S.life; gv = 0; begin(ME, 0); check() }
+		nv = 1; hm = 0; cn = S.life; gv = 0; begin(ME, 0) }
 	:: d_step { S.pc == BOOT && (booted || !CHECKBOOT) && NK > 1 ->
-		nv = 1; hm = 0; cn = S.life; gv = 0; begin(ME, 1); check() }
+		nv = 1; hm = 0; cn = S.life; gv = 0; begin(ME, 1) }
 	:: d_step { S.pc == BOOT && !(booted || !CHECKBOOT) && gc == 0 ->
 		gc = BIT(ME); S.todo = 0;
 		for (ix : 0 .. ND - 1) {
@@ -669,12 +663,12 @@ proctype Runner() {
 			:: else
 			fi
 		}
-		S.pc = BC_NEXT; check() }
+		S.pc = BC_NEXT }
 	/* BcNext, the check done (key 0, then key 1) */
 	:: d_step { S.pc == BC_NEXT && S.todo == 0 ->
-		booted = 1; gc = 0; nv = 1; hm = 0; cn = S.life; gv = 0; begin(ME, 0); check() }
+		booted = 1; gc = 0; nv = 1; hm = 0; cn = S.life; gv = 0; begin(ME, 0) }
 	:: d_step { S.pc == BC_NEXT && S.todo == 0 && NK > 1 ->
-		booted = 1; gc = 0; nv = 1; hm = 0; cn = S.life; gv = 0; begin(ME, 1); check() }
+		booted = 1; gc = 0; nv = 1; hm = 0; cn = S.life; gv = 0; begin(ME, 1) }
 	/* BcNext, an entry: cd \in First(ME, todo) */
 	:: atomic { S.pc == BC_NEXT && S.todo != 0 ->
 		d_step { cm = S.todo; first() };
@@ -686,8 +680,7 @@ proctype Runner() {
 			if
 			:: dirs[dx].name == N_PUB && !ASCOUNTED(dx) -> ky = dirs[dx].key; evict(ky, R_BC)
 			:: else
-			fi;
-			check() } }
+			fi } }
 
 	/* Store.evict. */
 
@@ -701,24 +694,21 @@ proctype Runner() {
 			:: dirs[dx].parts & LOCK -> S.evd = dx; S.pc = EV_FLOCK
 			:: else -> S.evd = NODIR; S.pc = EV_RENAME
 			fi
-		fi;
-		check() }
+		fi }
 	/* EvFlock */
 	:: d_step { S.pc == EV_FLOCK ->
 		dx = S.evd;
 		if
 		:: sh[dx] == 0 && ex[dx] == 0 -> ex[dx] = BIT(ME); S.pc = (EVRECHECK -> EV_SAME : EV_RENAME)
 		:: else -> evReturn(0)
-		fi;
-		check() }
+		fi }
 	/* EvSame */
 	:: d_step { S.pc == EV_SAME ->
 		dx = S.evd;
 		if
 		:: ISPUB(dx, S.evk) && (dirs[dx].parts & LOCK) -> S.pc = EV_RENAME
 		:: else -> ex[dx] = 0; evReturn(0)
-		fi;
-		check() }
+		fi }
 	/* EvRename */
 	:: d_step { S.pc == EV_RENAME ->
 		ky = S.evk; lowestPub(ky);
@@ -730,26 +720,25 @@ proctype Runner() {
 			:: else
 			fi;
 			evReturn(0)
-		fi;
-		check() }
+		fi }
 	/* EvDone */
 	:: d_step { S.pc == EV_DONE ->
 		if
 		:: S.evd != NODIR && EVUNLOCK -> ex[S.evd] = 0
 		:: else
 		fi;
-		evReturn(1); check() }
+		evReturn(1) }
 	/* Rt: \E x \in parts, an option a part ("fs" is emptied, then removed), and the end. */
 	:: d_step { S.pc == RT && (dirs[S.rtd].parts & META) ->
-		dirs[S.rtd].parts = dirs[S.rtd].parts & ~META; check() }
+		dirs[S.rtd].parts = dirs[S.rtd].parts & ~META }
 	:: d_step { S.pc == RT && (dirs[S.rtd].parts & REC) ->
-		dirs[S.rtd].parts = dirs[S.rtd].parts & ~REC; check() }
+		dirs[S.rtd].parts = dirs[S.rtd].parts & ~REC }
 	:: d_step { S.pc == RT && (dirs[S.rtd].parts & LOCK) ->
-		dirs[S.rtd].parts = dirs[S.rtd].parts & ~LOCK; check() }
+		dirs[S.rtd].parts = dirs[S.rtd].parts & ~LOCK }
 	:: d_step { S.pc == RT && (dirs[S.rtd].parts & FS) && dirs[S.rtd].fsOk ->
-		dirs[S.rtd].fsOk = 0; check() }
+		dirs[S.rtd].fsOk = 0 }
 	:: d_step { S.pc == RT && (dirs[S.rtd].parts & FS) && !dirs[S.rtd].fsOk ->
-		dirs[S.rtd].parts = dirs[S.rtd].parts & ~FS; check() }
+		dirs[S.rtd].parts = dirs[S.rtd].parts & ~FS }
 	:: d_step { S.pc == RT && dirs[S.rtd].parts == 0 ->
 		dx = S.rtd;
 		if
@@ -758,8 +747,10 @@ proctype Runner() {
 			dirs[dx].recOk = 0; dirs[dx].synced = 0; dirs[dx].linked = 0; dirs[dx].old = 0
 		:: else
 		fi;
-		S.rtd = NODIR; S.rtOrig = N_NONE; S.pc = S.rtRet; check() }
+		S.rtd = NODIR; S.rtOrig = N_NONE; S.pc = S.rtRet }
 
+	fi;
+	d_step { check() } }
 	od
 }
 
@@ -771,8 +762,7 @@ inline crash(q) {
 		crashes++;
 		idle(q); st[q].pc = CRASHED;
 		for (ix : 0 .. ND - 1) { sh[ix] = sh[ix] & ~PMASK(q); ex[ix] = ex[ix] & ~BIT(q) }
-		gc = gc & ~BIT(q);
-		check() }
+		gc = gc & ~BIT(q) }
 }
 
 /* Crash, MachineCrash, Corrupt, and Next's step of a terminated system, which changes nothing.
@@ -781,6 +771,8 @@ inline crash(q) {
 proctype Env() {
 end:
 	do
+	:: atomic {
+	if
 	:: crash(0)
 	:: crash(1)
 	:: crash(2)
@@ -817,8 +809,7 @@ end:
 				fi
 			}
 			gc = 0;
-			booted = 0;
-			check() } }
+			booted = 0 } }
 	/* Corrupt */
 	:: atomic { corrupts < MAXCORR &&
 		(CORRUPTIBLE(0) || CORRUPTIBLE(1) || CORRUPTIBLE(2) || CORRUPTIBLE(3) ||
@@ -833,7 +824,7 @@ end:
 		};
 		pick();
 		skip; /* an if, a do or pick() may not end in a d_step */
-		d_step { dirs[cd].recOk = 0; corrupts++; check() } }
+		d_step { dirs[cd].recOk = 0; corrupts++ } }
 #ifdef LIVENESS
 	/* Any state may stutter, as [Next]_vars lets it: with SPIN's weak fairness (pan -f) Env must
 	 * move whenever it can, and this is the move that forces nothing, so a crash, the machine's or
@@ -843,6 +834,8 @@ end:
 #else
 	:: atomic { TERMINATED -> skip }
 #endif
+	fi;
+	d_step { check() } }
 	od
 }
 
