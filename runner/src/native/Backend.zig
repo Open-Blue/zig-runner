@@ -6387,7 +6387,10 @@ test "root runner: slots are the host's, so two runners with different stores ne
     defer second.deinit();
     try std.testing.expect(first.slot.?.n != second.slot.?.n);
     try std.testing.expect(first.idBase() != second.idBase());
-    // The second job's set-up left the first's veth alone, and both are on the bridge.
+    // The second job's set-up left the first's veth alone, and both are on the bridge: once each
+    // job's network helper is done, as `init` only starts it.
+    _ = try first.networkPath();
+    _ = try second.networkPath();
     var sock = try net.Socket.open();
     defer sock.close();
     var buf: [16]u8 = undefined;
