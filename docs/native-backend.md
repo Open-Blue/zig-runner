@@ -789,9 +789,18 @@ What it covers, as built:
   ends, so a layer is published (or flattened) with no walk and no `chown`. The shift cost the Pi
   3.4 ms at the median for an end-to-end publisher, 22.5 ms for a warm build and 64 ms for a cold
   build; on the laptop 0.45 ms for a three-file layer and about 570 ms for one of 20,000 files
-  (about 28 us a file). The idmapped upper costs every step, published or not, about 0.8 ms (a
-  second user namespace for the map with the host's root, and the two mounts), so it pays from a
-  layer of some twenty entries upwards and costs a little on the smallest. The kernel does the translation of an ACL's
+  (about 28 us a file). The idmapped upper's map is a user namespace
+  with the host's root in it, which the job makes once and keeps in a file of its directory
+  (`userns`, bind-mounted by `native-userns` as the network namespace is, unmounted with the job in
+  `teardown` and `sweep`); made by each step it cost 0.26 ms more than the shift's mount phase
+  (release build, a three-file layer, the laptop under other agents' load), kept it costs no more
+  than that phase without the shift, which is 0.3 ms for a three-file layer. The helper that makes
+  it is one process spawn for the job, made at its first idmapped step. A step takes whichever way
+  is faster for its layer (`Backend.upperIdmapped`, `idmapped_min_entries_default`, 20 entries): by
+  the size its step's last layer had (`key_diff.readEntries`, kept beside the step's index entry
+  when a layer is published, from the walk that wrote it to disk), else by the largest layer the
+  job's earlier steps made; a step with no key is never published and so never shifted, and the
+  first step of a job with no history is shifted. The kernel does the translation of an ACL's
   and a capability's ids as it does for any idmapped mount, so nothing is reread or put back. What
   differs on disk is only the overlay's own whiteouts, which its mounter (the host's root) makes:
   they are owned by the id nothing owns (4294967294), which `X` maps from the host's root so the

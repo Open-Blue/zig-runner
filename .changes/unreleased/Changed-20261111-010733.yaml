@@ -1,0 +1,3 @@
+kind: Changed
+body: 'A native step now takes the idmapped upper or the shift by the size its layer had when its step last ran (20 entries or more: idmapped; a step with no history follows its job''s earlier layers), and the idmapped upper''s user namespace is made once for the job and kept in a file of its directory, so a step that uses it no longer pays for making one (0.26 ms in a release build).'
+time: 2026-11-11T01:07:33.34477518-05:00
