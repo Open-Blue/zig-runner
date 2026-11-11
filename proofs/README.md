@@ -55,8 +55,9 @@ lists where the encoding differs.
 | `Axioms.lean` | the axioms gate: the allow list, and the main theorems it prints |
 
 One model here is not Lean: `tla/StoreLocking.tla`, the native store's locking protocol at the level
-of system calls, model-checked with TLC in `store-model.yml` ([The store's locking, in
-TLA+](#the-stores-locking-in-tla)). It checks what `Runner/Native.lean` assumes when it takes store
+of system calls, model-checked with SPIN on its Promela port in `store-model.yml` ([The store's
+locking, in TLA+](#the-stores-locking-in-tla)), as are `tla/StoreEviction.tla` and
+`tla/ReleasePipeline.tla`. It checks what `Runner/Native.lean` assumes when it takes store
 operations as whole entries.
 
 ## The step cache
@@ -353,14 +354,14 @@ one rename of a complete entry, an eviction one entry removed, a reader takes an
 misses (`Native.Op`, `ops_keep_honest`, `Torn`), and `race_irrelevant` shows which of two racing
 writers wins does not matter. Those are hypotheses about the system calls under it, with several
 runners sharing one store and any of them dying between any two calls. `tla/StoreLocking.tla` is a
-TLA+ model of that layer, and what it shows is what lets the Lean model have whole entries. Its
-safety configurations are checked with SPIN, on a Promela port of the module that reaches exactly
-the same states ("The store's locking, in SPIN", below), and its liveness with TLC:
+TLA+ model of that layer, and what it shows is what lets the Lean model have whole entries. It is
+checked with SPIN, safety and liveness, on a Promela port of the module that reaches exactly the
+same states ("The store's locking, in SPIN", below), and so are the two other modules,
+`StoreEviction.tla` and `ReleasePipeline.tla`:
 
 ```
-.github/scripts/spin.sh   # SPIN 6.5.2: StoreLocking's safety configurations and its mutants
-.github/scripts/tlc.sh    # fetches tla2tools.jar v1.7.4, checks its sha256, runs the rest
-TLC_ALL=1 .github/scripts/tlc.sh   # ... and StoreLocking's safety with TLC too
+.github/scripts/spin.sh   # SPIN 6.5.2: every module's configurations and mutants
+TLC_ALL=1 .github/scripts/tlc.sh   # TLC on the same configurations (tla2tools.jar v1.7.4, its sha256 checked)
 ```
 
 CI runs them (`store-model.yml`) on pull requests and pushes that touch `runner/src/native/Store.zig`,
@@ -428,7 +429,7 @@ explore every state of a bounded instance, and the bounds are below.
 | `WaitEnds` | a claim waiting on its key's lock gets it, is cancelled, or its process dies: a holder that finishes or crashes lets it go on (weak fairness of each process) |
 | `AllEnd` | every job ends, so no blocking flock waits for ever |
 
-And seven mutants, each the code with one guard taken away, which SPIN (and TLC) must reject with the
+And eight mutants, each the code with one guard taken away, which SPIN (and TLC) must reject with the
 invariant the configuration's first line names (`spin.sh` fails if it does not, so a model that
 could no longer see a broken protocol fails CI): `StoreLocking-unlocked-build.cfg` (`layers.zig`'s
 publish without the key's lock, as it was: `NoWrongValid`), `StoreLocking-unchecked-evict.cfg`
@@ -438,7 +439,11 @@ publish without the key's lock, as it was: `NoWrongValid`), `StoreLocking-unchec
 `StoreLocking-no-dir-sync.cfg` (a job's end without `syncLayers`: `NoLostPublish`),
 `StoreLocking-no-boot-check.cfg` (`StoreLocking-boot-check.cfg`, which must hold, without
 `checkOncePerBoot`: `NoBadRead`) and `StoreLocking-publish-first.cfg` (`layers.zig`'s publish under
-the key's lock but publishing before it looks the key up, as #299 had it: `NoBuildLost`).
+the key's lock but publishing before it looks the key up, as #299 had it: `NoBuildLost`). The
+eighth is liveness's: `StoreLocking-evict-keeps-lock.cfg` (`Store.evict` without its deferred
+close, so an `open` waiting on the evicted lock file waits for ever: `AllEnd`), there to show the
+fairness the liveness checks assume is no stronger than the module's ("The store's locking, in
+SPIN").
 
 **The deferred sync** is a module of its own, `tla/StoreDeferred.tla` (TLC only: `StoreLocking` and its
 SPIN port model a publish that is durable when it is renamed in, which `Store.publishTimed` still is
@@ -597,27 +602,27 @@ twice; and more runners, keys or steps than the bounds.
 
 ### The store's locking, in SPIN
 
-CI checks `StoreLocking`'s safety with SPIN 6.5.2, not TLC: `proofs/spin/StoreLockingModel.pml`
-is the module in Promela, action for action, and `.github/scripts/spin.sh` checks every safety
-configuration and every mutant with it, side by side on the machine's cores. TLC still checks
-`StoreLocking-liveness.cfg` (SPIN's weak fairness is per process, and would force the crashes and
-the hand's changes, which the module never forces). `StoreLocking.tla` stays the documented model:
+CI checks `StoreLocking` with SPIN 6.5.2, not TLC: `proofs/spin/StoreLockingModel.pml` is the
+module in Promela, action for action, and `.github/scripts/spin.sh` checks every configuration,
+liveness among them, and every mutant with it, side by side on the machine's cores.
+`StoreLocking.tla` stays the documented model:
 the actions above, their comments and the code they cite are the module's, and the port says only
 how it encodes them.
 
 **Kept in step.** A change to one is a change to the other, in the same pull request:
 
 - The configurations are the `.cfg` files. `proofs/spin/cfg.py` writes each
-  `proofs/spin/StoreLocking*.pml` from the `.cfg` of the same name (constants as `#define`s, the
-  invariants it lists, the "must fail" line), and `spin.sh` fails when one is stale, missing or left
+  `proofs/spin/<Module>*.pml` from the `.cfg` of the same name (constants as `#define`s, the
+  invariants and temporal properties it lists, the "must fail" line), and `spin.sh` fails when one is stale, missing or left
   over, so the two have the same configurations and mutants. A new mutant is a new `.cfg`, then
   `cfg.py`.
 - Each configuration that must hold says how many states it has without the symmetry
   (`states without symmetry:`, TLC's count), and SPIN must find exactly that many and one more
   (SPIN's first state, before `init` sets the variables): a change to the Promela that the TLA+
   does not have, or the other way round, changes one count and not the other. After a change to
-  the module, run `TLC_ALL=1 .github/scripts/tlc.sh` with `SYMMETRY` taken out of the
-  configurations for the new counts, change the Promela, and the counts must agree.
+  the module, run `TLC_ALL=1 .github/scripts/tlc.sh` with `SYMMETRY` (or `VIEW`) taken out of the
+  configurations for the new counts, change the Promela, and the counts must agree. The other
+  modules' configurations say it the same way, `ReleasePipeline`'s as `states without the view:`.
 
 **Faithful, by the counts.** With partial order reduction off and no symmetry (SPIN has none),
 SPIN's states are TLC's without the symmetry, plus one, in every configuration, including each
@@ -629,6 +634,7 @@ mutant run to the end with its invariant off:
 | `StoreLocking-crash.cfg` | 14,674,008 | 14,674,009 |
 | `StoreLocking-faults.cfg` | 10,758,378 | 10,758,379 |
 | `StoreLocking-boot-check.cfg` | 382,279 | 382,280 |
+| `StoreLocking-liveness.cfg`, its safety (TLC has no symmetry there) | 167,362 | 167,363 |
 | the seven mutants, no invariant | 521,379, 1,593, 1,034, 6,683, 3,814, 46,604, 8,040 | each one more |
 
 And every mutant fails with the assertion of the invariant its first line names. What makes the
@@ -643,6 +649,30 @@ environment's. Where the module's `CHOOSE` picks among more than one value (`dro
 key, with two keys), SPIN takes the least; the counts for `StoreLocking.cfg` and `-faults` show
 that TLC's choice gives the same graph.
 
+**Liveness, with the module's fairness.** `Spec`'s fairness is `WF_vars(Proc(p))` for each runner:
+a runner that can take a step of its own keeps taking them, and nothing forces a process's crash,
+the machine's or the hand's change. SPIN's weak fairness (`pan -f`) is of processes: a process
+that has a step it can take from some point on takes one. The port makes the two the same. A
+runner's process has the steps of `Proc(p)` and nothing else (each runner's `Crash` is the
+environment's, which leaves the states as they were, and every step of `Proc(p)` changes the
+state), so it is enabled exactly when `Proc(p)` is. The environment is a process too, and SPIN's
+fairness would force its crashes and changes; built for liveness (`spin -DLIVENESS`), it can
+also take a step that changes nothing, in any state, as `[Next]_vars` lets TLA+ stutter, so it is
+never forced to do anything else. The properties are LTL (`ltl WaitEnds`, `ltl AllEnd`, from
+`~>` and `<>`), and `spin.sh` checks each alone (`pan -a -f -N <property>`) once the
+configuration's safety search has found its count. The stutter is not in that safety search, which
+then sees a deadlock as TLC does.
+
+The fairness is no stronger than the module's: `StoreLocking-evict-keeps-lock.cfg` (an eviction
+that never lets its lock go, so an `open` that waits on it waits for ever) must fail `AllEnd`, and
+fails it with SPIN as with TLC. Without the stutter, SPIN's fairness forces the environment to
+crash the waiting runner, and SPIN finds no error in the mutant. With the stutter, SPIN and TLC
+agree on every verdict: both properties hold in `StoreLocking-liveness.cfg`, and in the mutant
+`WaitEnds` holds and `AllEnd` fails (TLC, each property alone, 169,970 states either way).
+`StoreLocking-liveness.cfg` took TLC 46 s and 2.8 GB (`-workers auto`); SPIN takes 0.6 s for its
+safety search and 2 s (`WaitEnds`) and 12 s (`AllEnd`) for its properties, about 570 MB each (the
+hash table, `-w26`), compiles aside (laptop, 2026-11-11, load 15 from other work).
+
 **Time**, `StoreLocking-crash.cfg` on the laptop (cowbird, 12 threads, 2026-11-07, load under 4):
 
 | | laptop | 4 cores (`taskset -c 0-3`) |
@@ -653,11 +683,21 @@ that TLC's choice gives the same graph.
 | SPIN, `-DNCORE=8` | 8 s | |
 | compiling `pan.c` (gcc 15.2, `-O2`) | 10 to 14 s | |
 
-The whole of `spin.sh`, the four configurations that must hold and the seven mutants, compiles
-included, takes 61 s on the laptop and 75 s on 4 cores; TLC took 4 min 22 s for the four
-configurations alone, one after another on the laptop. `spin.sh` runs the configurations side by
-side, one a core, rather than SPIN's multi-core search, which is faster for one configuration but
-needs every temporary in the state. Partial order reduction is off: it reduces nothing (every step
+Every module, one configuration after another on the laptop, compiles included (2026-11-11, load
+2 to 9 from other work; TLC as `tlc.sh` runs it, with its symmetry and view, `-workers auto`):
+
+| Module | TLC | SPIN, one core | TLC's memory | SPIN's |
+|---|---|---|---|---|
+| `StoreLocking`, 13 configurations | 298 s | 160 s | 3.5 GB | 2.3 GB |
+| `StoreEviction`, 13 | 71 s | 53 s | 3.2 GB | 1.6 GB |
+| `ReleasePipeline`, 11 | 126 s | 58 s | 3.0 GB | 0.8 GB |
+
+and the whole of `spin.sh`, side by side on the laptop's 12 threads, takes about 65 s. Most of a
+small configuration's time is gcc's: each process's actions share one copy of the invariants'
+code (the port's header says how), which took `ReleasePipeline.cfg`'s compile from 17 s to 3 s, and
+a mutant's hash table is 32 MB (`-w22`), not 512, as its search stops at the first violation.
+`spin.sh` runs the configurations side by side, one a core, rather than SPIN's multi-core search,
+which is faster for one configuration but needs every temporary in the state. Partial order reduction is off: it reduces nothing (every step
 reads or writes the shared store) and costs a quarter of the time. Bitstate and hash compaction
 (`-DBITSTATE`, `-DHC4`) are not used: on `-crash` they missed 470 and 134,163 states.
 
@@ -717,6 +757,28 @@ trees, which name none), and the counts agree. Without the symmetry `StoreEvicti
 states (5.58 times its 557,195; three runners, at most six), `-nested` 955,704 (5.57 times 171,460) and
 `-crash` 7,379,839 (1.98 times 3,727,288; two runners).
 
+**In SPIN.** `proofs/spin/StoreEvictionModel.pml` is the module in Promela, made as
+`StoreLockingModel.pml` is ("The store's locking, in SPIN"), and `spin.sh` checks every
+configuration with it. The module's sets of tuples are arrays by their one free coordinate: the
+flocks by process and key (a process holds at most one on a key's files at a time), the dead trees
+by id (a tree is renamed to a dead name once). Its `CHOOSE` over dead trees is TLC's least, which
+orders records by their fields in the order the module first names them (key, stuck, synced, src,
+id; TLC's own output shows it), and over keys the least by name. SPIN's states are TLC's without
+the symmetry, plus one:
+
+| Configuration | TLC, no symmetry | SPIN |
+|---|---|---|
+| `StoreEviction.cfg` | 3,109,886 | 3,109,887 |
+| `StoreEviction-crash.cfg` | 7,379,839 | 7,379,840 |
+| `StoreEviction-nested.cfg` | 955,704 | 955,705 |
+| `StoreEviction-liveness.cfg`, its safety | 11,743 | 11,744 |
+| the nine mutants, `TypeOK` only | 3,075,380, 90, 483, 2,500, 333, 7,275, 695, 983,854, 2,208,722 | each one more |
+
+and every mutant fails with the invariant its first line names. `AllEnd` holds under the module's
+fairness, encoded as for `StoreLocking` (each runner's `Crash` the environment's, which stutters);
+an eviction that never lets its locks go fails it with TLC (10,064 states) and SPIN alike, and SPIN
+without the stutter misses it.
+
 ## The release pipeline, in TLA+
 
 `tla/ReleasePipeline.tla` models how a merge into `main` becomes a tag and a deployment, at the
@@ -725,10 +787,10 @@ read from the commit the job checked out, and `wait-for-checks.sh` failing at on
 never started, once every workflow run on the commit has finished, leaving out the waiting
 workflows' own runs. Until #408 merges, `main`'s own pipeline is the mutant
 `ReleasePipeline-inline-list.cfg` (and has no fast fail at all, `-no-fast-fail.cfg`). It is checked
-by the same `.github/scripts/tlc.sh`, in `store-model.yml`, which also runs on changes to
-`version.yml`, `release.yml`, `next-version.sh`, `wait-for-checks.sh`, `check-names.sh` and
-`.github/checks-on-main`. As for the store, TLC explores every state of a bounded instance; it is
-not a proof for every size.
+by the same `.github/scripts/spin.sh`, on its Promela port (below), in `store-model.yml`, which also
+runs on changes to `version.yml`, `release.yml`, `next-version.sh`, `wait-for-checks.sh`,
+`check-names.sh` and `.github/checks-on-main`. As for the store, SPIN explores every state of a
+bounded instance; it is not a proof for every size.
 
 **What is modelled**, and what it is in the workflows:
 
@@ -857,6 +919,28 @@ tag job on the commit its run was made at, and in the deploy job), which it did 
 Under the weaker reading of the concurrency docs, two tag jobs can run at once, and everything else
 still holds: the atomic push, not the group, keeps a tag on `main` and checked (the second push is
 refused, or the second tag job finds nothing to release).
+
+**In SPIN.** `proofs/spin/ReleasePipelineModel.pml` is the module in Promela, made as
+`StoreLockingModel.pml` is ("The store's locking, in SPIN"), and `spin.sh` checks every
+configuration with it. It has no view: SPIN explores the model's own states, 8 to 25 times as many
+as TLC under `LiveView`, in seconds, so the view's soundness (above) is no longer something the
+check relies on, and each count is TLC's without the view, plus one. The processes follow `Spec`'s
+fairness: GitHub (every `CreateWf` and `FinishWf`, one weakly fair action) is one process, each
+run's `Job(i)` one, and the steps that are not fair (`Merge`, `Create`, `Approve`) are the
+environment's, which stutters when built for liveness; so SPIN's weak fairness of processes is
+`WF_vars(GitHub) /\ \A i : WF_vars(Job(i))`.
+
+| Configuration | TLC, no view | SPIN |
+|---|---|---|
+| `ReleasePipeline.cfg` | 2,002,482 | 2,002,483 |
+| `ReleasePipeline-merges.cfg` | 1,474,773 | 1,474,774 |
+| `ReleasePipeline-approval-outside.cfg` | 1,445,110 | 1,445,111 |
+| `ReleasePipeline-liveness.cfg`, `-liveness-deploy.cfg`, their safety | 373,471 | 373,472 |
+| `ReleasePipeline-v0.14.0.cfg`, its safety | 234,337 | 234,338 |
+| `-inline-list`, `-no-fast-fail`, `-non-atomic`, `-own-run` and the finding `-other-wf`, `TypeOK` only | 1,762,794, 1,994,742, 2,247,573, 1,996,236, 2,002,482 | each one more |
+
+Every mutant and the finding fail with the property their first line names, `-v0.14.0`
+`DeployEnds` with an acceptance cycle of its claim, and `TagJobEnds` and `DeployEnds` hold.
 
 **Not modelled**: GitHub's own bugs (a check run reported wrong, a lost approval, an API that
 lies rather than fails: a failed request counts as a poll with nothing found, which the model's
