@@ -950,6 +950,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
             .limits = cfg.store_limits,
             .sync_fd = Store.syncCursor(arena, cfg.store),
             .sync_log = Store.newSyncLog(arena),
+            .defer_sync = true,
             .defer_delete = true,
         },
         .vouched = cfg.vouched,
@@ -1415,6 +1416,12 @@ pub fn deinit(b: *Backend) void {
     t = b.timings.since(arena, .veth_rm, t);
     removeJobDir(arena, b.io, b.dir);
     t = b.timings.since(arena, .tree_rm, t);
+    // The job's last layer was renamed in with its data not yet on disk, so that the job's result did
+    // not wait for it (`Store.settlePending`): now, while the job still holds it and before the runner
+    // polls again, so the next job never shares the disk with it. A failure was logged, and marks the
+    // job: `dropUnsynced`, below, evicts the layer.
+    b.store_cfg.settlePending(arena, b.io, &b.timings) catch {};
+    t = phases.now();
     // Before the layers are let go: ancestors end up the more recently used (`Store.touchChain`).
     const whole = t;
     Store.touchChain(b.io, b.chain.items);

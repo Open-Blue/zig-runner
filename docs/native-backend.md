@@ -703,6 +703,47 @@ What it covers, as built:
   an evicted layer is a miss, a kept doubtful one could be a hit. One another job holds stays.
   `store-crash.sh errors` makes the disk fail writes and checks each of these, and that the next
   publish of the same job is refused with the disk working again.
+- **A job's last layer is made durable after its result is reported.** Every layer a step
+  publishes is renamed into `layers/` at once, without waiting for its data to reach the disk
+  (`Store.defer_sync`, set by the backend): its `meta` carries the line `pending <boot id>` (the
+  kernel's `/proc/sys/kernel/random/boot_id`, new at every boot), which a pending layer's
+  `meta` has right after its format line, so a `meta` a crash cut short can never read as a durable
+  one's. The job's next publish makes the previous layer durable first (`Store.settlePending`:
+  the data synced, then `meta.new` written without the line, fsynced, renamed over `meta`, and its
+  directory fsynced), so at most one layer is pending, and the last is made durable in the job's
+  teardown (`Backend.deinit`), after the result was reported and before the runner polls again, so
+  the runner's next job never shares the disk with it. The data is written either way: this moves
+  the cost out of the time a job reports, it does not remove it (measured on the Pi in #483's
+  work: early write-back gained nothing, the disk's bandwidth is the cost whichever call
+  starts it).
+  A lookup (`open`) takes a pending layer only in the boot that renamed it in: the page cache
+  holds exactly what was renamed, whatever the disk does, and a failure of the later write-back
+  fails closed as above (the job's layers since its last good sync are evicted). A pending layer
+  naming another boot, or when the boot id cannot be read, is refused and evicted by `open`
+  and by the check at a boot's first job (`checkOncePerBoot`), whatever its files hold: after a
+  crash the disk may keep its rename and any part of its data. The kernel's boot id is the only
+  thing this relies on (a machine restored from a snapshot with its boot id and an older disk is
+  not covered); where it cannot be read, the publish syncs before it renames, as it did.
+  **What a finished job promises changed.** A job that was reported finished may lose its last
+  layer to a power cut in the window between its report and its teardown's sync (the sync of one
+  layer: 0.7 s on the Pi's SD card for a warm build, 0.85-1 s for a cold one, and longer while the
+  disk is busy); the layer is then a clean cache miss, never a broken layer. Once the teardown has finished, the layer
+  survives a power cut as before. A runner killed (not the machine) between the two leaves the
+  layer pending in this boot, valid until the next one; nothing makes it durable, so a power cut
+  after that loses it too.
+  Which way a layer's data is made durable is chosen for the job that waits for it
+  (`sync_choice.zig`), at each publish that syncs and each settle: its own files' write-back and
+  fsyncs from threads, up to a number of entries, or one `syncfs` past it. The number was 512
+  always; now it is 64 when the disk is quiet (PSI `some avg10` under 5 percent and under 4 MiB
+  of `Dirty` plus `Writeback`, where one `syncfs` costs 155-169 ms on the Pi's SD card), 4096 when
+  the disk is busy (`avg10` of 20 percent or more, or, without PSI, 256 MiB dirty), where a
+  `syncfs` waited 5-8 s for another job's writes, and 512 otherwise and where `/proc/pressure/io` and
+  `/proc/meminfo` give nothing. Dirty data is the machine's, this layer's own included, so by
+  itself it only keeps a disk from being called quiet. The thresholds are starting points from the
+  Pi's measurements, to be fitted there; no hysteresis between jobs is built. Each way is
+  sufficient alone and the rename is after it, so a wrong reading changes the time and nothing else.
+  The model (`proofs/tla/StoreDeferred.tla`) and `store-crash.sh` (step 11, the cut between
+  `reported` and `settled`, and the refusal of a pending layer after the crash) check the above.
 - **Early write-back: measured, not built.** Starting `sync_file_range(WRITE)` of the upper's files
   in a thread when a step that will be published ends, so that the publish waits for less, was
   tried (laptop NVMe, ext4, a layer of 20,000 files of 2 KiB and one of four 64 MiB files, freshly

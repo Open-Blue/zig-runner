@@ -440,6 +440,22 @@ publish without the key's lock, as it was: `NoWrongValid`), `StoreLocking-unchec
 `checkOncePerBoot`: `NoBadRead`) and `StoreLocking-publish-first.cfg` (`layers.zig`'s publish under
 the key's lock but publishing before it looks the key up, as #299 had it: `NoBuildLost`).
 
+**The deferred sync** is a module of its own, `tla/StoreDeferred.tla` (TLC only: `StoreLocking` and its
+SPIN port model a publish that is durable when it is renamed in, which `Store.publishTimed` still is
+without `defer_sync`). A publish there is renamed in with a meta that says `pending` and names the boot;
+the job's next publish makes the previous layer durable (the data's fsyncs, then the durable meta
+renamed over it, then its directory's fsync), and its end the last, after its result was reported.
+A machine crash keeps the synced data and the committed meta, and may lose a rename no directory sync
+covered. Safety: `NoWrongValid` (at any instant, a layer `open` takes has a whole tree: a pending mark
+of another boot is refused), `NoLostPublish` (a layer of a job whose end has finished survives a crash
+that follows, unless a failed sync evicted it: between the result and the end's sync it may not, which
+is the one promise that changed), and `MarkedHasData`. `StoreDeferred.cfg` has two runners, two layers
+a job, a machine crash and a failed sync, and holds; three mutants must fail:
+`StoreDeferred-trust-pending.cfg` (a lookup that ignores the boot a pending mark names:
+`NoWrongValid`), `StoreDeferred-mark-first.cfg` (the durable mark before the data's fsyncs:
+`NoWrongValid`) and `StoreDeferred-no-end-sync.cfg` (an end that leaves its last layer pending:
+`NoLostPublish`).
+
 **Bounds** (the processes run one job each; a job's steps pick their keys freely):
 
 | Configuration | Runners | Keys | Steps a job | Process crashes | Machine crashes | Hand's changes | Sync errors | Checks |

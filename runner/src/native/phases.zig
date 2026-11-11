@@ -54,6 +54,9 @@ pub const Phase = enum {
     rename,
     flatten,
     // The job's teardown (`Backend.deinit`).
+    // The job's last layer made durable (`Store.settlePending`), after its result was reported; also
+    // sampled by a publish that makes the job's previous one durable.
+    settle,
     services,
     cgroup_rm,
     // The tool cache's trees walked once no job holds them (`Backend.walkToolCacheIdle`).
