@@ -31,6 +31,10 @@ apt_dir=${APT_DIR:-/etc/apt}
 amd64_mirrors="http://mirrors.edge.kernel.org/ubuntu/ http://mirror.us.leaseweb.net/ubuntu/"
 arm64_mirrors="http://mirrors.ocf.berkeley.edu/ubuntu-ports/ http://ftp.tu-chemnitz.de/pub/linux/ubuntu-ports/"
 
+# GitHub's hosted runners list the archive in /etc/apt/apt-mirrors.txt (azure.archive first, then
+# archive and security, which sources.list.d/ubuntu.sources names as mirror+file:), so that file is
+# rewritten too.
+#
 # The hosts of Ubuntu's own archive, as they appear in a source's URI (regional and cloud names
 # included), and nothing else: other repositories on the machine are left alone.
 official='https?://[A-Za-z0-9.]*(archive|security|ports)[.]ubuntu[.]com/ubuntu(-ports)?/?'
@@ -67,7 +71,7 @@ answers() {
 
 # The sed command that points every Ubuntu archive URI at MIRROR, over the source files in DIR.
 rewrite_command() {
-	printf '%s' "for f in $2/sources.list $2/sources.list.d/*.sources $2/sources.list.d/*.list; do " \
+	printf '%s' "for f in $2/sources.list $2/sources.list.d/*.sources $2/sources.list.d/*.list $2/apt-mirrors.txt; do " \
 		"[ -f \"\$f\" ] && sed -i -E 's#$official#$1#g' \"\$f\"; done; true"
 }
 
@@ -110,7 +114,7 @@ apt_install() {
 
 	# The originals, kept so each mirror is tried from them, and put back when none works.
 	saved=$(mktemp -d)
-	sources=("$apt_dir/sources.list" "$apt_dir"/sources.list.d/*.sources "$apt_dir"/sources.list.d/*.list)
+	sources=("$apt_dir/sources.list" "$apt_dir"/sources.list.d/*.sources "$apt_dir"/sources.list.d/*.list "$apt_dir/apt-mirrors.txt")
 	local f
 	for f in "${sources[@]}"; do
 		[[ -f $f ]] && cp -p "$f" "$saved/$(echo "$f" | tr / _)"

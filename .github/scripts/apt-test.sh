@@ -46,6 +46,18 @@ else
 	echo "== archive up: skipped, the archive does not answer from here"
 fi
 
+# The hosted runners' layout: the sources name a mirror list (mirror+file:), which names the archive.
+run_in "archive down, hosted runner layout" "${down[@]}" <<'IN'
+sed -i 's#^URIs: .*#URIs: mirror+file:/etc/apt/apt-mirrors.txt#' /etc/apt/sources.list.d/ubuntu.sources
+printf '%s\n' 'http://azure.archive.ubuntu.com/ubuntu/	priority:1' \
+	'https://archive.ubuntu.com/ubuntu/	priority:2' \
+	'https://security.ubuntu.com/ubuntu/	priority:3' >/etc/apt/apt-mirrors.txt
+/apt.sh install tree
+tree --version
+grep -qE 'kernel[.]org|leaseweb' /etc/apt/apt-mirrors.txt
+! grep -E 'ubuntu[.]com' /etc/apt/apt-mirrors.txt
+IN
+
 # Nothing works: the script fails and puts the sources back.
 run_in "nothing works" "${down[@]}" <<'IN'
 cp /etc/apt/sources.list.d/ubuntu.sources /before
