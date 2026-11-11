@@ -407,8 +407,9 @@ pub fn checkOnce(
 /// own processes are known dead), walks the trees (`walkIdle`) and keeps the answer in the runner's
 /// store, in a file no step can reach. The next job to open the volume (`takeVerdict`) reads it and
 /// removes it before any step runs, whether or not it trusts it, and takes the answer instead of
-/// walking: nothing wrote to the trees in between, because nothing could. A job that finds no
-/// verdict walks (`checkOnce`), so every doubt below costs a walk and nothing else.
+/// walking: nothing wrote to the trees in between, because nothing could. The jobs of the same
+/// process that open the volume before any step has run in it are told the same (`Epochs`). A job
+/// that finds no verdict walks (`checkOnce`), so every doubt below costs a walk and nothing else.
 ///
 /// What a verdict is trusted for is checked on reading:
 ///  - the boot's id, so one made before a reboot (and any file a crash left) is never used;
@@ -539,6 +540,171 @@ pub fn takeVerdict(
         .full = p.verdict.full,
         .note = std.fmt.allocPrint(arena, "{s} (as the last job left it)", .{p.verdict.note}) catch return null,
     };
+}
+
+/// What the jobs of one runner process that open a volume before any step of any of them has run
+/// in it are told alike: the verdict the first took from the store. The first to read a verdict
+/// removes it, so the jobs that open after it would find none and walk, though nothing has been
+/// written either: what stops a job from taking the same answer is not the file but a step. An
+/// epoch of a volume lasts until the first process is started with the volume mounted
+/// (`Epochs.end`, from `Backend.execIn`, before the process exists), or until its last member lets
+/// the volume go. A member uses the verdict only if the epoch still stands when it checks the
+/// trees (`Epochs.valid`), which is before any step of its own: so what it is told is as old as
+/// the walk it would have made then, and no step wrote in between.
+///
+/// A job that opens the volume with a lock file that is not as the epoch's last member left it
+/// (`Epochs.enter`) ends the epoch: something that is not one of this process's jobs opened it.
+/// So does a check (`valid`) that finds the lock file's mtime moved, which is what another
+/// runner's open of the volume does, before or after the member's own. Every open stamps the file
+/// and joins in one critical section (`volumes.stamp_mu`), so the process's own opens come in
+/// the order they stamped.
+///
+/// An epoch belongs to the volume's list directory and mount, which are of one scope (trusted or
+/// not, as the volume's path has it), so no job of another scope is ever told of it. It is gone
+/// when its last member lets go, so it never spans a last job out's walk; and a runner that
+/// restarts has none, and drops the store's verdicts before its first job (`dropVerdicts`).
+pub const Epochs = struct {
+    mu: std.Io.Mutex = .init,
+    list: std.ArrayList(*Epoch) = .empty,
+
+    /// What `enter` gives a job that opens the volume.
+    pub const Entered = struct { verdict: ?Verdict = null, epoch: ?*Epoch = null };
+
+    /// A job opened the volume, which it found as `left` and stamped as `stamp`
+    /// (`volumes.openWaiting`, in the same critical section as the stamp). It is given the verdict
+    /// of the epoch it joins, or of one it starts from the store's file (`takeVerdict`: the file is
+    /// removed either way, and by a job that does not `take` the trees). A job that does not take
+    /// is not a member: its steps end the epoch all the same.
+    pub fn enter(
+        es: *Epochs,
+        arena: Allocator,
+        io: std.Io,
+        lists: []const u8,
+        mount: []const u8,
+        left: ?Left,
+        stamp: ?Left,
+        take: bool,
+    ) Entered {
+        es.mu.lockUncancelable(io);
+        defer es.mu.unlock(io);
+        const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
+        for (es.list.items) |e| {
+            if (e.ended or !std.mem.eql(u8, e.lists, lists) or !std.mem.eql(u8, e.mount, mount)) continue;
+            const young = now_ms >= e.born_ms and now_ms - e.born_ms <= verdict_max_age_ms;
+            const same = if (left) |l| stamp != null and sameLeft(e.last, l) else false;
+            if (!young or !same) {
+                e.ended = true;
+                continue;
+            }
+            e.last = stamp.?;
+            if (!take) return .{};
+            const v = copyVerdict(arena, e.verdict) orelse return .{};
+            e.members += 1;
+            return .{ .verdict = v, .epoch = e };
+        }
+        const v = takeVerdict(arena, io, lists, mount, left, take) orelse return .{};
+        const next = stamp orelse return .{ .verdict = v };
+        const a = std.heap.smp_allocator;
+        const e = a.create(Epoch) catch return .{ .verdict = v };
+        const kept = copyVerdict(a, v);
+        const l = a.dupe(u8, lists) catch null;
+        const m = a.dupe(u8, mount) catch null;
+        if (kept != null and l != null and m != null) {
+            e.* = .{ .lists = l.?, .mount = m.?, .verdict = kept.?, .born_ms = now_ms, .last = next, .members = 1 };
+            if (es.list.append(a, e)) |_| {
+                return .{ .verdict = v, .epoch = e };
+            } else |_| {}
+        }
+        // No memory to keep it: this job is told, as when verdicts were its alone.
+        if (kept) |k| freeVerdict(a, k);
+        if (l) |x| a.free(x);
+        if (m) |x| a.free(x);
+        a.destroy(e);
+        return .{ .verdict = v };
+    }
+
+    /// Whether `e`'s verdict is still of the volume, whose lock file is `lock`: no step started in
+    /// it since the walk, and nothing but this process's jobs has opened it since the last of
+    /// them did.
+    pub fn valid(es: *Epochs, io: std.Io, e: *Epoch, lock: linux.fd_t) bool {
+        es.mu.lockUncancelable(io);
+        defer es.mu.unlock(io);
+        if (e.ended) return false;
+        const now = leftBy(lock) orelse {
+            e.ended = true;
+            return false;
+        };
+        // A difference is a foreign open, or one that has stamped but not joined yet: a walk.
+        if (!sameLeft(now, e.last)) {
+            e.ended = true;
+            return false;
+        }
+        return true;
+    }
+
+    /// A process is about to start with the volume of `lists` mounted: its verdicts are of the past.
+    pub fn end(es: *Epochs, io: std.Io, lists: []const u8) void {
+        es.mu.lockUncancelable(io);
+        defer es.mu.unlock(io);
+        for (es.list.items) |e| if (std.mem.eql(u8, e.lists, lists)) {
+            e.ended = true;
+        };
+    }
+
+    /// A member let the volume go. The epoch goes with its last.
+    pub fn leave(es: *Epochs, io: std.Io, e: *Epoch) void {
+        es.mu.lockUncancelable(io);
+        defer es.mu.unlock(io);
+        e.members -= 1;
+        if (e.members > 0) return;
+        const a = std.heap.smp_allocator;
+        for (es.list.items, 0..) |x, i| if (x == e) {
+            _ = es.list.swapRemove(i);
+            break;
+        };
+        freeVerdict(a, e.verdict);
+        a.free(e.lists);
+        a.free(e.mount);
+        a.destroy(e);
+    }
+};
+
+pub const Epoch = struct {
+    lists: []u8,
+    mount: []u8,
+    verdict: Verdict,
+    born_ms: i64,
+    /// The lock file as the last member's open left it.
+    last: Left,
+    members: u32,
+    ended: bool = false,
+};
+
+/// The epochs of this runner's jobs.
+pub var process_epochs: Epochs = .{};
+
+fn sameLeft(a: Left, b: Left) bool {
+    return a.ino == b.ino and a.sec == b.sec and a.nsec == b.nsec;
+}
+
+fn copyVerdict(a: Allocator, v: Verdict) ?Verdict {
+    const env = a.dupe(u8, v.env) catch return null;
+    const full = a.dupe(u8, v.full) catch {
+        a.free(env);
+        return null;
+    };
+    const note = a.dupe(u8, v.note) catch {
+        a.free(env);
+        a.free(full);
+        return null;
+    };
+    return .{ .env = env, .full = full, .note = note };
+}
+
+fn freeVerdict(a: Allocator, v: Verdict) void {
+    a.free(v.env);
+    a.free(v.full);
+    a.free(v.note);
 }
 
 const Parsed = struct { boot: []const u8, at_ms: i64, left: Left, mount: []const u8, verdict: Verdict };

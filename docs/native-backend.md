@@ -1223,13 +1223,28 @@ that shows it is one a failure of costs a walk, never trust:
   that its cancel is seen (`volumes.openWaiting`).
 - A job reads the verdict when it opens the volume (`volumes.plan`), before any step of any job
   can write to it, and removes it, whether or not it checks the trees; a verdict that cannot be
-  removed is not used. So a verdict is read only by jobs that opened before the first removal, and
-  every step of every job runs after that.
+  removed is not used. The file is read once, but its answer is kept in the runner's memory as the
+  volume's "epoch" (`tool_trees.Epochs`), and the jobs of the same process that open the volume
+  while it stands are told the same. The epoch ends before the first process is started with the
+  volume mounted, by any job (`Backend.endToolEpoch`, called from `execIn` before the sandbox is
+  made, so a step, a pre or post script, a Docker build or a set-up script alike; the runner's own
+  set-up scripts that do not use the volume are run without it mounted), and when its last member
+  lets the volume go, so it never spans a last job out's walk. A job uses the verdict only if the
+  epoch still stands when it checks the trees (`Plan.verdictStands`, in "Set up job", before any
+  step of its own): the answer is then no older than the walk it would have made itself, and no
+  process wrote in between. A job that finds the epoch ended walks (`checkOnce`, as above), as one
+  that opens later does. A job's set-up that fails or is cancelled after it joined only lets go.
 - A verdict is of one boot (`boot_id`), one mount path, and the volume's lock file as its last
   open left it (inode and mtime, which every open sets: an open by anything that does not take
-  verdicts, such as an older runner, and an evicted and recreated volume, are differences).
-  Two jobs that open together are not both told: the second finds the first's open in the mtime and
-  walks (`checkOnce`, as above).
+  verdicts, such as an older runner, and an evicted and recreated volume, are differences). The
+  epoch holds the same for its members: each open of the process stamps the lock file and joins
+  in one critical section (`volumes.stamp_mu`), and must find the file as the previous member left
+  it, or the epoch ends. The check (`Epochs.valid`) compares the file again, so another runner's
+  open of the volume, which stamps it and may then write, ends the epoch for those that joined
+  before it as well as those that come after. An epoch is of one volume, so one of another trust
+  scope (its own volume) is never told of it, and a runner that restarts has none and drops the
+  store's verdicts before its first job. Two runner processes never share an epoch: the second
+  finds the file removed or the mtime moved, and walks.
 - Host-side changes while no job is in the volume: the runner's first job drops every verdict, and
   one is not used past an hour (`tool_trees.verdict_max_age_ms`) or from the future.
 

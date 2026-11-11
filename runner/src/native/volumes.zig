@@ -212,8 +212,13 @@ pub fn openWaiting(
         break :private copy;
     } else dir;
     // As the last open left it, and then its last use, which an eviction goes by.
+    stamp_mu.lockUncancelable(io);
+    defer stamp_mu.unlock(io);
     const left = tool_trees.leftBy(lock.handle);
     _ = linux.utimensat(lock.handle, null, null, 0);
+    // Read as well: the next change of the file's times is then told apart from this one, even
+    // within a clock tick.
+    const stamp = tool_trees.leftBy(lock.handle);
     const at_z = try arena.dupeSentinel(u8, at, 0);
     switch (linux.errno(linux.mkdir(at_z, 0o755))) {
         .SUCCESS => {},
@@ -233,6 +238,7 @@ pub fn openWaiting(
     }
     if (owner) |o| if (linux.errno(linux.lchown(at_z, o, o)) != .SUCCESS)
         return error.VolumeNotOwned;
+    if (wait.stamped) |h| if (!private) h.call(h, at, left, stamp);
     return .{ .dir = at, .root = root, .lock = lock, .private = private, .left = left };
 }
 
@@ -299,6 +305,19 @@ pub const Wait = struct {
     ms: u64 = seed_limit_ms + 60 * 1000,
     /// The job's cancel (`dagger.Cancel.requested`): the open gives up at once when it is set.
     cancel: ?*const std.atomic.Value(bool) = null,
+    /// Told of the open when it has stamped the lock file, in the same critical section.
+    stamped: ?*Stamped = null,
+};
+
+/// Held by every open from reading the lock file's mtime to being done with it, so that the opens
+/// of this process come in the order they stamped (`tool_trees.Epochs`). Nothing that waits is
+/// done under it: the lock it takes is already held.
+var stamp_mu: std.Io.Mutex = .init;
+
+/// What an open tells its caller of the lock file's mtime before anything else can change it from
+/// this process: as it was found (`left`) and as this open set it (`stamp`).
+pub const Stamped = struct {
+    call: *const fn (*Stamped, dir: []const u8, left: ?tool_trees.Left, stamp: ?tool_trees.Left) void,
 };
 
 /// `openNamed`, waiting for another job's seeding as `wait` says: `error.VolumeBusy` past its
@@ -421,6 +440,9 @@ pub const Plan = struct {
     /// What the last job out said of the tool cache's trees (`tool_trees.takeVerdict`), read when
     /// the volume was opened and so before any step of any job could write to it. Null: walk.
     tool_verdict: ?tool_trees.Verdict = null,
+    /// The epoch of the volume this job is a member of, when it was told its verdict by one
+    /// (`tool_trees.Epochs`): the verdict is used only while it stands (`verdictStands`).
+    tool_epoch: ?*tool_trees.Epoch = null,
     /// Zig's local cache volume, when its generations are rolled (`zig_local_cache_max_mb`).
     zig_local_roll: ?[]const u8 = null,
     /// The volume of the `builtin.zig` files the local cache's manifests name, bound once the
@@ -446,7 +468,18 @@ pub const Plan = struct {
         return .{ .dir = v.dir, .left = tool_trees.leftBy(v.lock.handle) orelse return null };
     }
 
+    /// Whether the verdict the job was told still describes the tool cache: true when no epoch
+    /// holds it (the job's alone), else while the epoch stands (`tool_trees.Epochs.valid`). Asked
+    /// before any step of the job runs.
+    pub fn verdictStands(p: *Plan, io: std.Io) bool {
+        const e = p.tool_epoch orelse return true;
+        const v = p.held.items[p.tool_held orelse return false];
+        return tool_trees.process_epochs.valid(io, e, v.lock.handle);
+    }
+
     pub fn release(p: *Plan, io: std.Io) void {
+        if (p.tool_epoch) |e| tool_trees.process_epochs.leave(io, e);
+        p.tool_epoch = null;
         for (p.held.items) |v| v.release(io);
         p.held.clearRetainingCapacity();
     }
@@ -458,6 +491,28 @@ pub const Seed = struct {
     dir: []const u8,
     /// Where the global cache is, relative to the layer's root: the step user's.
     cache: []const u8,
+};
+
+/// `plan`'s part of an open of the tool cache's volume (`Wait.stamped`).
+const ToolHook = struct {
+    base: Stamped = .{ .call = call },
+    arena: Allocator,
+    io: std.Io,
+    store: []const u8,
+    mount: []const u8,
+    take: bool,
+    told: tool_trees.Epochs.Entered = .{},
+    /// The verdict could not be looked at, so it may stand: the open fails.
+    failed: bool = false,
+
+    fn call(base: *Stamped, dir: []const u8, left: ?tool_trees.Left, stamp: ?tool_trees.Left) void {
+        const h: *ToolHook = @fieldParentPtr("base", base);
+        const lists = tool_trees.listsDir(h.arena, h.store, dir) catch {
+            h.failed = true;
+            return;
+        };
+        h.told = tool_trees.process_epochs.enter(h.arena, h.io, lists, h.mount, left, stamp, h.take);
+    }
 };
 
 /// The job's caches, as the Dagger backend gives them (`set_up.basePlan`): its volumes opened
@@ -497,17 +552,27 @@ pub fn plan(
         // The tool cache holds binaries built for one image: one per image, by name.
         if (std.mem.eql(u8, d.name, "toolcache")) try key.append(arena, dagger.imageName(job_image));
         if (as_runner) try key.append(arena, dagger.runner_user);
-        const v = try openWaiting(arena, io, store, key.items, .shared, owner, wait);
-        try p.held.append(arena, v);
         const path = if (as_runner) try set_up.runnerCachePath(arena, i) else d.path;
-        if (std.mem.eql(u8, d.name, "toolcache")) {
+        const is_tool = std.mem.eql(u8, d.name, "toolcache");
+        // Told as the open stamps the volume, before anything of this job can write to it. The
+        // file is removed whether or not the job checks the trees: a verdict left standing would
+        // be read after a step wrote. Jobs that open before any step has run in the volume are
+        // told the same (`tool_trees.Epochs`).
+        var hook: ToolHook = .{ .arena = arena, .io = io, .store = store, .mount = path, .take = opts.tool_trees };
+        var tool_wait = wait;
+        if (is_tool) tool_wait.stamped = &hook.base;
+        const v = try openWaiting(arena, io, store, key.items, .shared, owner, tool_wait);
+        if (is_tool) p.tool_epoch = hook.told.epoch;
+        if (hook.failed) {
+            v.release(io);
+            return error.OutOfMemory;
+        }
+        try p.held.append(arena, v);
+        if (is_tool) {
             p.tool_cache = path;
             p.tool_cache_host = v.dir;
             p.tool_held = p.held.items.len - 1;
-            // Before anything of this job can write to it, and removed whether or not the job
-            // checks the trees: a verdict left standing would be read after a step wrote.
-            const lists = try tool_trees.listsDir(arena, store, v.dir);
-            p.tool_verdict = tool_trees.takeVerdict(arena, io, lists, path, v.left, opts.tool_trees);
+            p.tool_verdict = hook.told.verdict;
         }
         const zig = std.mem.eql(u8, d.name, set_up.zig_packages);
         // Zig's global cache is the job's own (its layers, over the seed); only its package
@@ -1150,10 +1215,15 @@ test "native volumes: the last job out leaves the tool cache's trees for the nex
     const told = two.tool_verdict orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, told.env, "zig-x86_64-linux-0.17.0") != null);
     try std.testing.expectError(error.FileNotFound, cwd.access(io, try verdictFile(arena, store, two), .{}));
-    // One that opens meanwhile finds none, whatever the first one does to the tree next.
-    try installTool(arena, io, volume, "changed by a step\n");
+    // One that opens meanwhile, before any step has run, is told the same.
     var three = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
-    try std.testing.expect(three.tool_verdict == null);
+    try std.testing.expect(three.tool_verdict != null);
+    // And one that opens after the first step started finds none, whatever the step did to the tree.
+    try installTool(arena, io, volume, "changed by a step\n");
+    tool_trees.process_epochs.end(io, lists);
+    var three_b = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
+    try std.testing.expect(three_b.tool_verdict == null);
+    three_b.release(io);
     // And two that hold it are not the last out.
     try std.testing.expect(two.idleToolCache(arena) == null);
     two.release(io);
@@ -1174,6 +1244,157 @@ test "native volumes: the last job out leaves the tool cache's trees for the nex
     var six = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
     defer six.release(io);
     try std.testing.expect(six.tool_verdict == null);
+}
+
+fn leaveOne(arena: Allocator, io: std.Io, store: []const u8, job: job_mod.Job, opts: Options, scope: []const u8) !Plan {
+    return plan(arena, io, store, opts, scope, job, dagger.default_image, false, false, null);
+}
+
+/// A volume with a verdict left by a last job out, as the next job finds it: its lists and mount,
+/// or null on a filesystem that does not prove its files at rest.
+fn leaveVerdict(arena: Allocator, io: std.Io, store: []const u8, job: job_mod.Job, opts: Options, scope: []const u8) !?struct { volume: []const u8, lists: []const u8 } {
+    var lim = tool_trees.idle_limits;
+    lim.racy_s = 0;
+    var one = try leaveOne(arena, io, store, job, opts, scope);
+    const volume = one.tool_cache_host.?;
+    try installTool(arena, io, volume, "zig binary\n");
+    const lists = try tool_trees.listsDir(arena, store, volume);
+    const idle = one.idleToolCache(arena) orelse return error.TestUnexpectedResult;
+    const kept = tool_trees.walkIdle(arena, std.testing.allocator, io, idle.dir, lists, one.tool_cache.?, idle.left, lim);
+    one.release(io);
+    return if (kept) .{ .volume = volume, .lists = lists } else null;
+}
+
+test "native volumes: jobs that open before any step ran share the verdict, and the first step ends it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const testing = @import("../dagger/testing.zig");
+    var job = testing.testJob(&.{testing.testStep("echo")});
+    job.github.repository = "o/r";
+    const opts: Options = .{ .package_caches = true, .trusted = true, .tool_trees = true };
+    const left = (try leaveVerdict(arena, io, store, job, opts, "repo")) orelse return error.SkipZigTest;
+
+    var one = try leaveOne(arena, io, store, job, opts, "repo");
+    var two = try leaveOne(arena, io, store, job, opts, "repo");
+    var three = try leaveOne(arena, io, store, job, opts, "repo");
+    try std.testing.expect(one.tool_verdict != null);
+    try std.testing.expect(two.tool_verdict != null);
+    try std.testing.expect(three.tool_verdict != null);
+    try std.testing.expectEqualStrings(one.tool_verdict.?.full, three.tool_verdict.?.full);
+    // One that does not check the trees is no member, and does not break the chain.
+    var other = opts;
+    other.tool_trees = false;
+    var unchecked = try leaveOne(arena, io, store, job, other, "repo");
+    try std.testing.expect(unchecked.tool_verdict == null);
+    var four = try leaveOne(arena, io, store, job, opts, "repo");
+    try std.testing.expect(four.tool_verdict != null);
+    try std.testing.expect(one.verdictStands(io) and two.verdictStands(io) and four.verdictStands(io));
+
+    // The first step of any job that has the volume mounted, which then writes to it.
+    tool_trees.process_epochs.end(io, left.lists);
+    try installTool(arena, io, left.volume, "a step's tool\n");
+    // Whoever has not checked yet walks, and so does whoever opens next: nobody is told of the past.
+    try std.testing.expect(!one.verdictStands(io) and !two.verdictStands(io) and !three.verdictStands(io));
+    var five = try leaveOne(arena, io, store, job, opts, "repo");
+    try std.testing.expect(five.tool_verdict == null);
+    for ([_]*Plan{ &one, &two, &three, &four, &five, &unchecked }) |p| p.release(io);
+    // Nothing is left of the epoch once its members let go.
+    try std.testing.expectEqual(@as(usize, 0), tool_trees.process_epochs.list.items.len);
+}
+
+test "native volumes: an open that is not this process's ends the epoch, for those who joined and those who come" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const testing = @import("../dagger/testing.zig");
+    var job = testing.testJob(&.{testing.testStep("echo")});
+    job.github.repository = "o/r";
+    const opts: Options = .{ .package_caches = true, .trusted = true, .tool_trees = true };
+    _ = (try leaveVerdict(arena, io, store, job, opts, "repo")) orelse return error.SkipZigTest;
+
+    for ([_]enum { before_check, before_open }{ .before_check, .before_open }) |when| {
+        var one = try leaveOne(arena, io, store, job, opts, "repo");
+        try std.testing.expect(one.tool_verdict != null);
+        // Another runner opens the volume (it stamps the lock file) and may write at once.
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+        const key = [_][]const u8{ "o", "r", "repo", "toolcache", dagger.imageName(dagger.default_image) };
+        const foreign = try open(arena, io, store, &key, .shared, null);
+        switch (when) {
+            .before_check => try std.testing.expect(!one.verdictStands(io)),
+            .before_open => {
+                var two = try leaveOne(arena, io, store, job, opts, "repo");
+                defer two.release(io);
+                try std.testing.expect(two.tool_verdict == null);
+                try std.testing.expect(!one.verdictStands(io));
+            },
+        }
+        one.release(io);
+        // The last out cannot walk (the foreign job holds it), so the next finds nothing.
+        var next = try leaveOne(arena, io, store, job, opts, "repo");
+        try std.testing.expect(next.tool_verdict == null);
+        next.release(io);
+        foreign.release(io);
+        try std.testing.expectEqual(@as(usize, 0), tool_trees.process_epochs.list.items.len);
+        // A verdict again for the second round.
+        _ = (try leaveVerdict(arena, io, store, job, opts, "repo")) orelse return error.SkipZigTest;
+    }
+}
+
+test "native volumes: an epoch is of one scope, ends with its last member, and a restart has none" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const testing = @import("../dagger/testing.zig");
+    var job = testing.testJob(&.{testing.testStep("echo")});
+    job.github.repository = "o/r";
+    const opts: Options = .{ .package_caches = true, .trusted = true, .tool_trees = true };
+    const left = (try leaveVerdict(arena, io, store, job, opts, "repo")) orelse return error.SkipZigTest;
+
+    var trusted = try leaveOne(arena, io, store, job, opts, "repo");
+    try std.testing.expect(trusted.tool_verdict != null);
+    // A job of another trust opens another volume: it is told nothing of this one's, and cannot
+    // end or be told of its epoch.
+    var untrusted = try leaveOne(arena, io, store, job, opts, "pr");
+    try std.testing.expect(untrusted.tool_verdict == null);
+    try std.testing.expect(untrusted.tool_epoch == null);
+    try std.testing.expect(untrusted.tool_cache_host != null);
+    try std.testing.expect(!std.mem.eql(u8, untrusted.tool_cache_host.?, trusted.tool_cache_host.?));
+    try std.testing.expect(trusted.verdictStands(io));
+    untrusted.release(io);
+
+    // A job that failed in set-up, or was cancelled, lets go having run nothing: the epoch stays
+    // for the member that remains and is gone with it.
+    var failed = try leaveOne(arena, io, store, job, opts, "repo");
+    try std.testing.expect(failed.tool_verdict != null);
+    failed.release(io);
+    try std.testing.expect(trusted.verdictStands(io));
+    trusted.release(io);
+    try std.testing.expectEqual(@as(usize, 0), tool_trees.process_epochs.list.items.len);
+
+    // No member left, no verdict in the store (it was taken): the next job walks, and the last
+    // out leaves a new one, which a runner that restarted drops before its first job.
+    var next = try leaveOne(arena, io, store, job, opts, "repo");
+    try std.testing.expect(next.tool_verdict == null);
+    next.release(io);
+    _ = left;
+    _ = (try leaveVerdict(arena, io, store, job, opts, "repo")) orelse return error.SkipZigTest;
+    tool_trees.dropVerdicts(arena, io, store);
+    var restarted = try leaveOne(arena, io, store, job, opts, "repo");
+    defer restarted.release(io);
+    try std.testing.expect(restarted.tool_verdict == null);
 }
 
 test "native volumes: a verdict is not used after the volume was opened by anything that did not take it, or made again" {
