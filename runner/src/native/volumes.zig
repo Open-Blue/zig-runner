@@ -2013,7 +2013,7 @@ fn waitIdle(io: std.Io) !void {
     var n: u32 = 0;
     while (n < 5000) : (n += 1) {
         if (!tool_trees.process_idle_walks.busy(io)) return;
-        io.sleep(.fromMilliseconds(1), .awake) catch {};
+        try io.sleep(.fromMilliseconds(1), .awake);
     }
     return error.TestUnexpectedResult;
 }
