@@ -1,0 +1,3 @@
+kind: Changed
+body: Run CodeQL's go and python analyses only when Go or Python files change, and actions on every change; the weekly run analyzes all three
+time: 2026-11-11T12:41:32.510066287-05:00

@@ -11,6 +11,8 @@
 #   ci-scope.sh analysis     Fuzz, Valgrind, ThreadSanitizer, Stress, ZLint (suppressed-errors) (analysis.yml)
 #   ci-scope.sh store        Store stress, Store crash (analysis.yml)
 #   ci-scope.sh coverage     Coverage (analysis.yml)
+#   ci-scope.sh codeql-actions, codeql-go, codeql-python
+#                            Analyze (actions), Analyze (go), Analyze (python) (codeql.yml)
 #
 # Sets `run=true` or `run=false` in GITHUB_OUTPUT, and says why. The jobs still run, and report,
 # either way: a required check that never reports holds the merge queue forever, which a
@@ -24,7 +26,8 @@
 # proofs, the packaging and the Go tools read a few files, named, so a file not on their list is one they do not
 # read. Every scope runs everything for anything that is not a pull request or a merge group (a push
 # to main, a tag, a schedule, a run by hand), and for anything this cannot work out (no base
-# commit, a failed fetch).
+# commit, a failed fetch). The codeql scopes alone also compare a push to main with the commit
+# before it (BASE is the push's `before`); codeql.yml's weekly run and a run by hand run in full.
 #
 # BASE is the commit the change is compared with: the pull request's base, or the merge group's.
 # A pull request is tested merged into main, which may since have moved past its base: the diff
@@ -161,6 +164,26 @@ needed() {
 		*) return 1 ;;
 		esac
 		;;
+	codeql-actions)
+		# The workflows are what it reads, and nothing says which of the repository's files they
+		# run (a script a workflow calls, an action's pin): every change is read.
+		return 0
+		;;
+	codeql-go)
+		# What it builds and reads: the comparison tools' sources and modules under runner/tools,
+		# and the workflow and this script, which decide what runs.
+		case $1 in
+		runner/tools/*.go | runner/tools/*/go.mod | runner/tools/*/go.sum | \
+			.github/workflows/codeql.yml | .github/scripts/ci-scope.sh) return 0 ;;
+		*) return 1 ;;
+		esac
+		;;
+	codeql-python)
+		case $1 in
+		*.py | .github/workflows/codeql.yml | .github/scripts/ci-scope.sh) return 0 ;;
+		*) return 1 ;;
+		esac
+		;;
 	coverage)
 		# The runner's code and its tests as zig-coverage.sh compiles and measures them.
 		case $1 in
@@ -175,14 +198,20 @@ needed() {
 }
 
 case $scope in
-tests | binaries | e2e | proofs | packaging | go | analysis | store | coverage) ;;
+tests | binaries | e2e | proofs | packaging | go | analysis | store | coverage | codeql-*) ;;
 *)
-	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|analysis|store|coverage" >&2
+	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|analysis|store|coverage|codeql-LANGUAGE" >&2
 	exit 2
 	;;
 esac
 case ${GITHUB_EVENT_NAME:-} in
 pull_request | merge_group) ;;
+push)
+	case $scope in
+	codeql-*) ;;
+	*) decide true "push: everything runs" ;;
+	esac
+	;;
 *) decide true "${GITHUB_EVENT_NAME:-no event}: everything runs" ;;
 esac
 [[ ${BASE:-} =~ ^[0-9a-f]{40}$ ]] || decide true "no base commit to compare with: everything runs"
