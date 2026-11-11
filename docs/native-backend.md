@@ -1249,7 +1249,7 @@ began (a file may have been written after the walk passed it), and nothing is ke
 waits, so a later job walks itself: a directory's mtime does not move when a file's content or mode
 changes, only that file's ctime shows it, so no cheaper memo of the tree is as strong as the walk.
 Taking the walk already in flight was considered for a job that arrives late (it waits for that
-walk to end and then for the next, up to two walks) and is not sound. What a walk begun before the
+walk to end and then for the next: up to two walks, which is today's cost) and is not sound. What a walk begun before the
 job arrived may have missed is a write, after the walk passed the file, by a step that was running
 in the volume: and the job's own predecessor in a `needs:` chain may be such a step, finished
 before the job started, so its write must be seen. #481's epochs do not give the condition: they
@@ -1282,12 +1282,13 @@ its next poll, do not wait for it (0.1 s on the laptop, 0.2-0.6 s on a Pi 5). Th
 volume's exclusive locks as before, then gives the thread duplicates of their descriptors (a lock
 belongs to the open file description, so it outlives the job's own close): between the proof that
 no process is in the volume and the walk nothing comes. A job of this process that opens the volume
-meanwhile asks the walk to stop first (`IdleWalks.preempt`, from `volumes.openWaiting`), and the
-walk, which looks at its cancel at every 64th entry, lets go of the locks and keeps no verdict
-(`Walked.clean`), so the job neither waits for it nor is told anything, and walks itself. A job of
-another process cannot ask and waits for the lock as it did. The thread owns its memory (the job's
-arena goes with the job), and a runner that stops ends the walks and waits for them
-(`IdleWalks.stopAll`). The next job is told the answer instead of walking: a "verdict" kept in the runner's store
+meanwhile waits for the walk (`IdleWalks.wait`, from `volumes.openWaiting`, polled every ms so its
+cancel is seen) and is told the verdict it leaves: no slower than the walk it would make itself, and
+what the teardown's walk gave it before. A job of another process waits for the lock as before. The
+thread owns its memory (the job's arena goes with the job), and a runner that stops, or a local
+replay that ends, asks the walks to end and waits for them without a limit, since the kernel
+releases a lock only when no thread holds its descriptor (`IdleWalks.stopAll`; the verdict is a
+rename, so it is whole or absent). The next job is told the answer instead of walking: a "verdict" kept in the runner's store
 (`tool-trees/<hash>/.verdict`, beside the lists, in no volume a step mounts). Soundness is that no
 step can have written to the trees between that walk and the job that takes it, and each condition
 that shows it is one a failure of costs a walk, never trust:

@@ -876,20 +876,21 @@ pub fn walkIdle(
 /// open file description, so it stays while a duplicate is open, and the job's own letting go does
 /// not release it. Nothing then comes between the proof that no process is in the volume (the
 /// job's cgroup was removed, the lock taken) and the walk: a job that opens the volume meanwhile
-/// waits for the lock, as it did while the walk ran in the teardown. What is new is that such a
-/// job in this process first asks the walk to stop (`preempt`, from `volumes.openWaiting`), and
-/// the walk, which looks at its cancel at every 64th entry, lets go of the locks and keeps no
-/// verdict. A job of another process cannot ask and waits for the walk, as before. The job that
-/// stopped it then walks itself (`checkOnce`), as any job that finds no verdict does.
+/// waits for the lock, as it did while the walk ran in the teardown, and is told the verdict. A
+/// job of this process waits for the walk itself (`wait`, from `volumes.openWaiting`), polled
+/// every ms and so cancellable, which is no slower for it than the walk it would otherwise make.
 ///
 /// Everything a walk uses is its own, on the heap: the job's arena goes with the job. `stopAll` is
-/// for a runner that stops: the walks are asked to end and waited for, so none is cut off with
-/// its verdict half written.
+/// for a runner that stops: the walks are asked to end, which their next look at the cancel sees,
+/// and waited for, so no thread still uses a descriptor, and so a lock, when the process ends. A
+/// verdict is a rename, so one is whole or not there whenever the walk ends.
 pub const IdleWalks = struct {
     mu: std.Io.Mutex = .init,
     list: std.ArrayList(*Idle) = .empty,
     /// Walks started, whether or not one kept a verdict (what the tests count).
     started: u64 = 0,
+    /// Tests: `start` finds no thread to run the walk on.
+    no_thread: bool = false,
 
     /// What `start` takes: strings it copies, and descriptors it owns once it returns true.
     pub const Handoff = struct {
@@ -945,6 +946,7 @@ pub const IdleWalks = struct {
     /// Begins a walk on a thread of its own. False when it could not (no memory, no thread): the
     /// descriptors are then still the caller's, and it walks itself or lets go.
     pub fn start(is: *IdleWalks, io: std.Io, h: Handoff) bool {
+        if (is.no_thread) return false;
         const a = std.heap.smp_allocator;
         const w = a.create(Idle) catch return false;
         const dir = a.dupe(u8, h.dir) catch {
@@ -983,38 +985,47 @@ pub const IdleWalks = struct {
         return true;
     }
 
-    /// A job is about to open the volume at `dir`: a walk of it, or of one nested with it, is
-    /// asked to stop and waited for until it has let go of its locks, a few ms (its next look at
-    /// its cancel), so that the lock is free for the job at once.
-    pub fn preempt(is: *IdleWalks, io: std.Io, dir: []const u8) void {
-        is.stopWhere(io, dir);
-    }
-
-    /// A runner that stops: every walk is asked to end, and waited for.
-    pub fn stopAll(is: *IdleWalks, io: std.Io) void {
-        is.stopWhere(io, null);
-    }
-
-    fn stopWhere(is: *IdleWalks, io: std.Io, dir: ?[]const u8) void {
-        // Past this the open's own wait for the lock takes over.
-        var waited_ms: u32 = 0;
-        while (waited_ms < preempt_max_ms) : (waited_ms += 1) {
-            if (!is.ask(io, dir)) return;
-            io.sleep(.fromMilliseconds(1), .awake) catch return;
+    /// A job is about to open the volume at `dir`: it waits, until the walk of it (or of one nested
+    /// with it) has let go of its locks and left its verdict, as it waited for the lock when the walk
+    /// ran in the teardown. Waiting is never slower for the job than the whole walk it would make
+    /// itself instead, and ends with the verdict, which that walk would have been. Polled every ms,
+    /// so the job's `cancel` is seen, and `error.VolumeBusy` past `limit_ms`.
+    pub fn wait(
+        is: *IdleWalks,
+        io: std.Io,
+        dir: []const u8,
+        cancel: ?*const std.atomic.Value(bool),
+        limit_ms: u64,
+    ) error{ Canceled, VolumeBusy }!void {
+        var waited_ms: u64 = 0;
+        while (is.present(io, dir)) : (waited_ms += 1) {
+            if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
+            if (waited_ms >= limit_ms) return error.VolumeBusy;
+            io.sleep(.fromMilliseconds(1), .awake) catch return error.Canceled;
         }
     }
 
-    /// Asks the walks of `dir` (all of them: null) to stop; whether any is still there.
-    fn ask(is: *IdleWalks, io: std.Io, dir: ?[]const u8) bool {
+    /// A runner that stops: every walk is asked to end, and waited for without a limit, since the
+    /// kernel releases a lock only when no thread still holds its descriptor. A walk looks at its
+    /// cancel at every 64th entry and every block it reads, so this takes a block's read.
+    pub fn stopAll(is: *IdleWalks, io: std.Io) void {
+        while (is.ask(io)) io.sleep(.fromMilliseconds(1), .awake) catch return;
+    }
+
+    /// Asks every walk to stop; whether any is still there.
+    fn ask(is: *IdleWalks, io: std.Io) bool {
         is.mu.lockUncancelable(io);
         defer is.mu.unlock(io);
-        var any = false;
-        for (is.list.items) |w| {
-            if (dir) |d| if (!nests(d, w.h.dir) and !nests(w.h.dir, d)) continue;
-            w.cancel.requested.store(true, .release);
-            any = true;
-        }
-        return any;
+        for (is.list.items) |w| w.cancel.requested.store(true, .release);
+        return is.list.items.len > 0;
+    }
+
+    /// Whether a walk of `dir`, or of a volume nested with it, is there.
+    fn present(is: *IdleWalks, io: std.Io, dir: []const u8) bool {
+        is.mu.lockUncancelable(io);
+        defer is.mu.unlock(io);
+        for (is.list.items) |w| if (nests(dir, w.h.dir) or nests(w.h.dir, dir)) return true;
+        return false;
     }
 
     /// Whether a walk is running or waiting to begin.
@@ -1034,9 +1045,6 @@ pub const IdleWalks = struct {
         w.free();
     }
 };
-
-/// The longest a job waits for a walk to stop (`IdleWalks.preempt`).
-const preempt_max_ms = 2_000;
 
 /// The walks of this process's jobs.
 pub var process_idle_walks: IdleWalks = .{};

@@ -1,3 +1,0 @@
-kind: Changed
-body: The last job out's walk of the tool cache's trees runs on a thread after the job has let go, so a runner takes its next job without waiting for it; a job that opens the volume meanwhile stops the walk
-time: 2026-11-11T09:47:51.806207326-05:00

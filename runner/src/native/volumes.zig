@@ -188,9 +188,9 @@ pub fn openWaiting(
             else => return e,
         };
         errdefer f.close(io);
-        // The last job out's walk of this volume, if one is running on its thread, lets go of its
-        // locks first: this job does not wait for it (`tool_trees.IdleWalks`).
-        tool_trees.process_idle_walks.preempt(io, dir);
+        // The last job out's walk of this volume, if one is running on its thread, is waited for:
+        // it leaves the verdict this job is told (`tool_trees.IdleWalks`).
+        try tool_trees.process_idle_walks.wait(io, dir, wait.cancel, wait.ms);
         switch (sharing) {
             .shared => try waitShared(io, f, wait, dir),
             .locked => if (linux.errno(linux.flock(f.handle, lock_ex)) != .SUCCESS) return error.Locked,
@@ -547,8 +547,8 @@ pub fn openNamedWaiting(
 fn waitShared(io: std.Io, f: std.Io.File, wait: Wait, dir: []const u8) !void {
     const start = nowMs();
     while (true) {
-        // A walk that began while this open waited is asked to stop too (it holds the lock).
-        tool_trees.process_idle_walks.preempt(io, dir);
+        // A walk that began while this open waited holds the lock: waited for the same way.
+        try tool_trees.process_idle_walks.wait(io, dir, wait.cancel, wait.ms);
         switch (linux.errno(linux.flock(f.handle, lock_sh | lock_nb))) {
             .SUCCESS => return,
             .AGAIN, .INTR => {},
@@ -2048,7 +2048,7 @@ test "native volumes: the last job's walk runs after it let go, holds the volume
     if (next.tool_verdict == null) return error.SkipZigTest;
 }
 
-test "native volumes: a job that opens the volume stops the last job's walk, which keeps no verdict" {
+test "native volumes: a job that opens the volume waits for the last job's walk and is told its verdict" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -2061,17 +2061,91 @@ test "native volumes: a job that opens the volume stops the last job's walk, whi
     job.github.repository = "o/r";
     const opts: Options = .{ .package_caches = true, .trusted = true, .tool_trees = true };
     var one = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
-    // The walk would not begin before it is asked to stop; it is asked by the next job's open.
     var hold: std.atomic.Value(bool) = .init(true);
-    const lists = (try handOff(arena, io, store, &one, &hold)).?;
-    const t0 = nowMs();
-    var next = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
-    defer next.release(io);
-    // Not the 50 ms poll of a lock held for the walk, nor the walk itself.
-    try std.testing.expect(nowMs() - t0 < 40);
-    try std.testing.expect(next.tool_verdict == null);
+    _ = try handOff(arena, io, store, &one, &hold);
+    const Opener = struct {
+        fn run(ar: Allocator, st: []const u8, o: Options, j: job_mod.Job, out: *?anyerror, told: *bool) void {
+            if (plan(ar, std.testing.io, st, o, "repo", j, dagger.default_image, false, false, null)) |p| {
+                var q = p;
+                told.* = q.tool_verdict != null;
+                q.release(std.testing.io);
+                out.* = null;
+            } else |e| out.* = e;
+        }
+    };
+    var other: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer other.deinit();
+    var result: ?anyerror = error.StillWaiting;
+    var told = false;
+    var thread = try std.Thread.spawn(.{}, Opener.run, .{ other.allocator(), store, opts, job, &result, &told });
+    // The walk has not begun, and the open is waiting for it, not walking or failing.
+    io.sleep(.fromMilliseconds(100), .awake) catch return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?anyerror, error.StillWaiting), result);
+    try std.testing.expect(tool_trees.process_idle_walks.busy(io));
+    hold.store(false, .release);
+    thread.join();
+    try std.testing.expectEqual(@as(?anyerror, null), result);
     try std.testing.expect(!tool_trees.process_idle_walks.busy(io));
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, try std.fmt.allocPrint(arena, "{s}/.verdict", .{lists}), .{}));
+    // A filesystem that does not prove its files at rest keeps no verdict, which is as it was.
+    if (!told) return error.SkipZigTest;
+}
+
+test "native volumes: a cancelled open does not wait for the last job's walk" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const testing = @import("../dagger/testing.zig");
+    var job = testing.testJob(&.{testing.testStep("echo")});
+    job.github.repository = "o/r";
+    var cancel: dagger.Cancel = .{};
+    const opts: Options = .{ .package_caches = true, .trusted = true, .tool_trees = true, .cancel = &cancel };
+    var one = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
+    var hold: std.atomic.Value(bool) = .init(true);
+    _ = try handOff(arena, io, store, &one, &hold);
+    cancel.requested.store(true, .release);
+    try std.testing.expectError(error.Canceled, plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null));
+    // The walk was never asked to stop: it goes on, and ends when it is let begin.
+    try std.testing.expect(tool_trees.process_idle_walks.busy(io));
+    hold.store(false, .release);
+    try waitIdle(io);
+}
+
+test "native volumes: a walk with no thread to run on is the caller's, its descriptors too" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const testing = @import("../dagger/testing.zig");
+    var job = testing.testJob(&.{testing.testStep("echo")});
+    job.github.repository = "o/r";
+    const opts: Options = .{ .package_caches = true, .trusted = true, .tool_trees = true };
+    var one = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
+    const volume = one.tool_cache_host.?;
+    const idle = one.idleToolCache(arena) orelse return error.TestUnexpectedResult;
+    const held = one.idleHandoff() orelse return error.TestUnexpectedResult;
+    var walks: tool_trees.IdleWalks = .{ .no_thread = true };
+    try std.testing.expect(!walks.start(io, .{
+        .dir = idle.dir,
+        .lists = "/none",
+        .mount = "/t",
+        .left = idle.left,
+        .lock = held.lock,
+        .other = held.other,
+    }));
+    try std.testing.expect(!walks.busy(io));
+    // The caller closes what it was refused (`Backend.walkToolCacheIdle`), and then lets go: the
+    // lock is free, which no leaked duplicate would allow.
+    _ = linux.close(held.lock);
+    if (held.other) |fd| _ = linux.close(fd);
+    one.release(io);
+    try std.testing.expect(try lockIsFree(arena, volume));
 }
 
 test "native volumes: a runner that stops ends the last job's walk and frees its locks" {
@@ -2095,4 +2169,31 @@ test "native volumes: a runner that stops ends the last job's walk and frees its
     try std.testing.expect(!tool_trees.process_idle_walks.busy(io));
     try std.testing.expect(try lockIsFree(arena, volume));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, try std.fmt.allocPrint(arena, "{s}/.verdict", .{lists}), .{}));
+}
+
+test "native volumes: a runner that stops while a walk runs waits for it, and the walk keeps nothing whole or leaves a verdict" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const testing = @import("../dagger/testing.zig");
+    var job = testing.testJob(&.{testing.testStep("echo")});
+    job.github.repository = "o/r";
+    const opts: Options = .{ .package_caches = true, .trusted = true, .tool_trees = true };
+    var one = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
+    const volume = one.tool_cache_host.?;
+    var hold: std.atomic.Value(bool) = .init(true);
+    _ = try handOff(arena, io, store, &one, &hold);
+    // Let it begin, then stop: wherever the cancel lands (before its first look, between two, or
+    // after its last, when the verdict is kept), the walk is over and its locks are let go when
+    // `stopAll` returns, and a next job is told a verdict or walks.
+    hold.store(false, .release);
+    tool_trees.process_idle_walks.stopAll(io);
+    try std.testing.expect(!tool_trees.process_idle_walks.busy(io));
+    try std.testing.expect(try lockIsFree(arena, volume));
+    var next = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
+    next.release(io);
 }

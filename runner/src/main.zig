@@ -650,6 +650,8 @@ fn execJobFile(
         return @backingInt(Exit.config);
     };
     log.setSecrets(job.secrets);
+    // A native job's last-out walk of the tool cache runs on a thread: ended before this returns.
+    defer tool_trees.process_idle_walks.stopAll(io);
     const res = try dagger.run(arena, io, init.environ_map, .{
         .dagger_cmd = cfg.dagger_cmd,
         .image = cfg.image,
