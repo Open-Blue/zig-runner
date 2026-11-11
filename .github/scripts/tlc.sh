@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Model-checks the native store's locking protocols (proofs/tla/StoreLocking.tla, whose safety
-# configurations are SPIN's (spin.sh) and its liveness TLC's, and StoreEviction.tla, proofs/README.md
+# Model-checks the native store's locking protocols (proofs/tla/StoreLocking.tla, whose
+# configurations are SPIN's (spin.sh), and StoreEviction.tla, proofs/README.md
 # "The store's locking, in TLA+") and the release pipeline
 # (proofs/tla/ReleasePipeline.tla, "The release pipeline, in TLA+") with TLC. tla2tools.jar is the TLA+ project's v1.7.4 release,
 # checked against the sha256 pinned here, so a changed or replaced jar fails the job instead of
@@ -49,8 +49,8 @@ tlc() {
 }
 
 # A configuration that SPIN checks (proofs/spin/<name>.pml, written from the .cfg: StoreLocking's
-# safety and its mutants, .github/scripts/spin.sh) is left to SPIN, unless TLC_ALL=1 (TLC then
-# checks it too, in minutes; the .cfg's `states without symmetry:` is TLC's count without SYMMETRY).
+# and its mutants, .github/scripts/spin.sh) is left to SPIN, unless TLC_ALL=1 (TLC then checks it
+# too, in minutes; the .cfg's `states without symmetry:` is TLC's count without SYMMETRY).
 #
 # TLC_PART=K/N checks part K of N, so N jobs share the configurations: each is given to the part
 # with the least expected time so far, the longest first (its `tlc-seconds:` comment, or a few
