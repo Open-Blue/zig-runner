@@ -696,9 +696,11 @@ Every module, one configuration after another on the laptop, compiles included (
 | `StoreLocking`, 13 configurations | 298 s | 160 s | 3.5 GB | 2.3 GB |
 | `StoreEviction`, 13 | 71 s | 53 s | 3.2 GB | 1.6 GB |
 | `ReleasePipeline`, 11 | 126 s | 58 s | 3.0 GB | 0.8 GB |
+| `StoreDeferred`, 7 | 9 s | 9 s | 0.6 GB | 17 MB |
 
-and the whole of `spin.sh`, side by side on the laptop's 12 threads, takes about 65 s. Most of a
-small configuration's time is gcc's: each process's actions share one copy of the invariants'
+and the whole of `spin.sh`, side by side on the laptop's 12 threads, takes about 65 s
+(`StoreDeferred`'s seven are small enough that both tools' time is start-up and compiling). Most
+of a small configuration's time is gcc's: each process's actions share one copy of the invariants'
 code (the port's header says how), which took `ReleasePipeline.cfg`'s compile from 17 s to 3 s, and
 a mutant's hash table is 32 MB (`-w22`), not 512, as its search stops at the first violation.
 `spin.sh` runs the configurations side by side, one a core, rather than SPIN's multi-core search,
