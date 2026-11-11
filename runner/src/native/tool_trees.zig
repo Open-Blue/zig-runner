@@ -54,6 +54,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const dagger = @import("../dagger.zig");
 const sandbox = @import("sandbox.zig");
+const evict = @import("evict.zig");
 const hash_files = @import("hash_files.zig");
 
 const Allocator = std.mem.Allocator;
@@ -163,6 +164,7 @@ fn walk(
         .limits = limits,
         .cancel = cancel,
         .deadline_ms = nowMs(io) + limits.time_ms,
+        .skip_nested = !std.mem.eql(u8, std.fs.path.basename(cache), evict.nested),
         .racy_from = @as(i128, std.Io.Clock.real.now(io).toNanoseconds()) -
             @as(i128, limits.racy_s) * std.time.ns_per_s,
     };
@@ -587,14 +589,13 @@ pub const Epochs = struct {
         left: ?Left,
         stamp: ?Left,
         take: bool,
-        share: bool,
     ) Entered {
         es.mu.lockUncancelable(io);
         defer es.mu.unlock(io);
         const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
         // An open that cannot tell its stamp from what it found could not be told from a foreign
         // one by the next: nothing is shared through it, and what stands ends.
-        const known = share and if (left) |l| if (stamp) |t| !sameLeft(l, t) else false else false;
+        const known = if (left) |l| if (stamp) |t| !sameLeft(l, t) else false else false;
         for (es.list.items) |e| {
             if (e.ended or !std.mem.eql(u8, e.lists, lists) or !std.mem.eql(u8, e.mount, mount)) continue;
             if (!known or !e.young(now_ms) or !sameLeft(e.last, left.?)) {
@@ -890,6 +891,9 @@ const Check = struct {
     deadline_ms: i64,
     /// Files with a ctime from here on are "racy" (ns since the epoch).
     racy_from: i128,
+    /// The volume is the root user's, so the step user's own (`evict.nested`), a directory in it, is
+    /// not one of its trees: another volume with its own check, lock and verdict.
+    skip_nested: bool = false,
     visited: u32 = 0,
     read: u64 = 0,
     why: ?[]const u8 = null,
@@ -1006,6 +1010,7 @@ const Check = struct {
             c.why = c.why orelse "too many tools or versions";
         }
         for (names.items) |name| {
+            if (c.skip_nested and depth == 0 and std.mem.eql(u8, name, evict.nested)) continue;
             const rel = if (prefix.len == 0)
                 name
             else
@@ -2667,7 +2672,7 @@ fn epochFor(arena: Allocator, es: *Epochs, f: Fixture, lock: linux.fd_t, left: L
     const changed = try std.fmt.allocPrint(arena, "{s}{d}{s}", .{ text[0..start], at_ms, text[end..] });
     try cwd.writeFile(io, .{ .sub_path = path, .data = changed });
     _ = lock;
-    return es.enter(arena, io, f.cache, f.lists, "/t", left, stamp, true, true);
+    return es.enter(arena, io, f.cache, f.lists, "/t", left, stamp, true);
 }
 
 fn setMtime(fd: linux.fd_t, l: Left) void {
@@ -2701,7 +2706,7 @@ test "tool trees: an epoch is as old as its walk, not its taking, when it is joi
     try std.testing.expect(es.valid(io, e, fd));
     io.sleep(.fromMilliseconds(700), .awake) catch {};
     // Neither a job that opens now (told nothing, as it finds the epoch ended) nor a check is.
-    const late = es.enter(arena, io, f.cache, f.lists, "/t", second, third, true, true);
+    const late = es.enter(arena, io, f.cache, f.lists, "/t", second, third, true);
     try std.testing.expect(late.verdict == null and late.epoch == null);
     try std.testing.expect(!es.valid(io, e, fd));
     es.leave(io, e);
@@ -2721,7 +2726,7 @@ test "tool trees: an open that cannot tell its stamp from what it found shares n
     // Its own verdict, as on main, but no epoch, for a stamp equal to what it found or not known.
     for ([_]?Left{ left_now, null }) |stamp| {
         try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, idleNow()));
-        const alone = es.enter(arena, io, f.cache, f.lists, "/t", left_now, stamp, true, true);
+        const alone = es.enter(arena, io, f.cache, f.lists, "/t", left_now, stamp, true);
         try std.testing.expect(alone.verdict != null and alone.epoch == null);
         try std.testing.expectEqual(@as(usize, 0), es.list.items.len);
     }
@@ -2749,7 +2754,7 @@ test "tool trees: checks, ends and leaves from threads at once neither crash nor
     // Three more members, each opening as the last left it.
     for (0..3) |_| {
         const next: Left = .{ .ino = ino, .sec = 1_700_000_000, .nsec = last.nsec + 1 };
-        const j = es.enter(arena, io, f.cache, f.lists, "/t", last, next, true, true);
+        const j = es.enter(arena, io, f.cache, f.lists, "/t", last, next, true);
         try std.testing.expect(j.epoch == e);
         last = next;
     }
@@ -2777,4 +2782,24 @@ test "tool trees: checks, ends and leaves from threads at once neither crash nor
     for (threads) |t| t.join();
     try std.testing.expectEqual(@as(u32, 0), late.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), es.list.items.len);
+}
+
+test "tool trees: the step user's volume inside the root user's is not one of its trees, and is its own volume's" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    const before = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    try tmp.dir.createDirPath(io, "cache/" ++ evict.nested ++ "/zig/0.17.0/x64");
+    try tmp.dir.writeFile(io, .{ .sub_path = "cache/" ++ evict.nested ++ "/zig/0.17.0/x64/zig", .data = "runner's\n" });
+    const after = try checkWith(arena, f, .{ .racy_s = 0 }, null);
+    try std.testing.expectEqualStrings(before.env, after.env);
+    try std.testing.expectEqualStrings(before.full, after.full);
+    // Walked as a volume of its own, the same directory is the cache, and its trees are its own.
+    const inner: Fixture = .{ .cache = try std.fmt.allocPrint(arena, "{s}/" ++ evict.nested, .{f.cache}), .lists = try std.fmt.allocPrint(arena, "{s}-inner", .{f.lists}) };
+    const own = try checkWith(arena, inner, .{ .racy_s = 0 }, null);
+    try expectIn(own.env, "zig/0.17.0/x64");
 }

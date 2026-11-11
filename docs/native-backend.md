@@ -1239,23 +1239,36 @@ that shows it is one a failure of costs a walk, never trust:
   verdicts, such as an older runner, and an evicted and recreated volume, are differences). The
   epoch holds the same for its members: each open reads the lock file's mtime and sets it with an
   exclusive lock on the file's first byte held (`volumes.stampLock`, an open-file-description
-  lock, so it excludes other processes as well as other threads and is not the volume's flock),
-  and joins the epoch in the same critical section (`volumes.stamp_mu`), so another runner's open
-  cannot come between the read and the stamp and have its own written over. It must find the file
-  as the previous member left it, or the epoch ends. The stamp is an explicit time, now or a
-  nanosecond past what was there, so two opens in one clock tick differ; an open whose stamp is
-  not known to differ (a filesystem with coarse times, a failed `utimensat`, no stamp lock) shares
-  nothing and ends what stands. A runner older than this does not take the lock: its open may
-  still fall between a newer one's read and stamp, a window of microseconds that an open had
-  before epochs. An epoch is as old as its walk (`Verdict.at_ms`), checked when it is joined and
-  when it is used. The step user's tool cache (`evict.nested`) is a directory of the root user's,
-  so a root step can write to it without opening it: it has no epoch, and a bind of either
-  volume ends the other's. The check (`Epochs.valid`) compares the file again, so another runner's
-  open of the volume, which stamps it and may then write, ends the epoch for those that joined
-  before it as well as those that come after. An epoch is of one volume, so one of another trust
-  scope (its own volume) is never told of it, and a runner that restarts has none and drops the
-  store's verdicts before its first job. Two runner processes never share an epoch: the second
-  finds the file removed or the mtime moved, and walks.
+  lock on the descriptor the open holds, so it excludes other processes as well as other threads
+  and is not the volume's flock), and joins the epoch in the same critical section
+  (`volumes.stamp_mu`), so another runner's open cannot come between the read and the stamp and
+  have its own written over. The lock is polled, so the job's cancel is seen, and given up on
+  after two seconds (a holder that is stopped); the open then says nothing of its stamp and
+  shares nothing. The lock file is opened read-write for it (`Store.lockBeside`); one the runner
+  can only read gets no stamp lock, so shares nothing. A store on NFS or SMB is not shared
+  through: there Linux makes a flock a POSIX lock of the whole file, and the jobs' shared ones
+  would conflict with the stamp lock, so `onNetworkFs` turns it off.
+  The open must find the file as the previous member left it, or the epoch ends. The stamp is an
+  explicit time, now or a nanosecond past what was there, and it counts only if it reads back
+  exactly as asked: on a filesystem that keeps coarser times (whole seconds: ext3, ext4 with
+  128-byte inodes, FAT) it almost never does, so no two opens could be told apart there and none
+  shares. A runner older than this does not take the stamp lock: its open may still fall between
+  a newer one's read and stamp, a window of microseconds that an open had before epochs. An epoch
+  is as old as its walk (`Verdict.at_ms`), checked when it is joined and when it is used. An
+  epoch is of one volume, so one of another trust scope (its own volume) is never told of it, and
+  a runner that restarts has none and drops the store's verdicts before its first job. Two
+  runner processes never share an epoch: the second finds the file removed or the mtime moved,
+  and walks.
+- The step user's tool cache (`evict.nested`, `runner/`) is a directory of the root user's volume
+  and a volume of its own: its own lock, lists, walk, verdict and epoch. The root volume's walk
+  does not count it among its trees (`Check.skip_nested`), so a job of the step user changing it
+  is not a change to the root volume's trees that its lock never shows; the root user's steps that
+  name a path under it replay as they would for any directory no checked tree holds. A bind of
+  either volume ends the epoch of the other, in this process (`Epochs.end`). What is not covered
+  is a root-user job of another runner process writing in `runner/` while this one's step-user
+  jobs share an epoch of it: that job stamps the root volume's lock, not `runner.lock`. A pool
+  that mixes the two users in several runner processes of one store has that exposure, as the
+  verdict's one taker had before epochs.
 - Host-side changes while no job is in the volume: the runner's first job drops every verdict, and
   one is not used past an hour (`tool_trees.verdict_max_age_ms`) or from the future.
 
