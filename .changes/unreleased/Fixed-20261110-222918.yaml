@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'A native job''s layer store now fails closed when a sync fails: a failed fsync, write-back wait, syncfs or layers-directory sync fails that publish (nothing renamed in, the staged entry removed, the step''s result unaffected), is logged once with its errno and never retried on the same descriptor, and the job publishes nothing more and evicts at its end every layer it renamed since its last successful sync, as an error already told to one descriptor could make a later sync report success for data that was lost.'
+time: 2026-11-10T22:29:18.471991648-05:00

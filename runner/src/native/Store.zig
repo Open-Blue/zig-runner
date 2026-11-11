@@ -44,6 +44,9 @@ limits: Eviction.Limits = .{},
 /// it reports a write error since then even if another job's `syncfs` was told first, which one
 /// opened at the publish would miss. Null: the publish's own.
 sync_fd: ?linux.fd_t = null,
+/// What the job's syncs have found, shared by every copy of this `Store` (`SyncLog`). Null:
+/// nothing is tracked, and a failed sync fails only its own publish.
+sync_log: ?*SyncLog = null,
 /// Whether an evicted layer's tree is deleted by `reaper`'s thread, after the job's end has
 /// returned, rather than by `collect`. Off in tests that count what is left when it returns.
 defer_delete: bool = false,
@@ -575,8 +578,30 @@ pub fn publishTimed(
     rec: Record,
     ph: ?*phases.Phases,
 ) !Layer {
+    // A failed sync fails this publish (the entry discarded, the upper back), and marks the job:
+    // none of its later publishes is made (`SyncLog`).
+    return s.publishStaged(arena, io, key, kind, upper, rec, ph) catch |e| {
+        if (e == error.Sync) if (s.sync_log) |l| {
+            l.failed = true;
+        };
+        return e;
+    };
+}
+
+fn publishStaged(
+    s: Store,
+    arena: Allocator,
+    io: std.Io,
+    key: Key,
+    kind: Kind,
+    upper: []const u8,
+    rec: Record,
+    ph: ?*phases.Phases,
+) !Layer {
     if (recordFault(kind, rec)) |e| return e;
     if (!s.keyLocked(arena, io, key)) return error.KeyNotLocked;
+    // After a failed sync nothing more is published by this job (`SyncLog`), before anything moves.
+    if (s.sync_log) |l| if (l.failed) return error.Sync;
     var t = phases.now();
     const cwd = std.Io.Dir.cwd();
     var raw: [8]u8 = undefined;
@@ -671,7 +696,8 @@ pub fn publishTimed(
         }
     }
     t = phases.now();
-    if (linux.errno(linux.fsync(meta.handle)) != .SUCCESS) return error.Sync;
+    const meta_errno = linux.errno(linux.fsync(meta.handle));
+    if (meta_errno != .SUCCESS) return syncError("fsync of the meta", meta_errno);
     meta_ns += phases.now() -| t;
     if (ph) |p| {
         p.add(arena, .sync, wb_ns + meta_ns + fsync_ns + (syncfs_ns orelse 0));
@@ -692,7 +718,13 @@ pub fn publishTimed(
     );
     if (linux.errno(rc) != .SUCCESS) return error.Publish;
     // The rename is not synced here: an entry whose rename a crash lost is only a miss, made
-    // again. The job syncs the layers' directory once, at its end (`syncLayers`).
+    // again. The job syncs the layers' directory once, at its end (`syncLayers`), and until then
+    // the entry is in its log: one a failed sync leaves in doubt is evicted (`dropUnsynced`).
+    if (s.sync_log) |l| l.renamed(arena, key) catch {
+        // Not tracked, so it could not be evicted if a sync fails: nothing more is published.
+        std.log.warn("native: out of memory noting a published layer; the job publishes no more", .{});
+        l.failed = true;
+    };
     if (ph) |p| _ = p.since(arena, .rename, t);
     return .{ .fs = try join(arena, dir, "fs"), .lock = lock.? };
 }
@@ -700,7 +732,18 @@ pub fn publishTimed(
 /// The filesystem's writes on disk, for an entry too large for its own fsyncs: through the
 /// descriptor the job opened at its start (`sync_fd`), or `lock`, a descriptor on the same disk.
 fn syncDisk(s: Store, lock: std.Io.File) !void {
-    if (linux.errno(linux.syncfs(s.sync_fd orelse lock.handle)) != .SUCCESS) return error.Sync;
+    const e = linux.errno(linux.syncfs(s.sync_fd orelse lock.handle));
+    if (e != .SUCCESS) return syncError("syncfs", e);
+    // Everything renamed before it is on the disk now; this entry's own rename comes after.
+    if (s.sync_log) |l| l.since.clearRetainingCapacity();
+}
+
+/// A failed sync call, logged with its errno, and the error a publish gives for it. Never
+/// retried: a failed `fsync` or `syncfs` reports the error once and may have dropped the data it
+/// could not write, so a second call on the same descriptor succeeding proves nothing.
+fn syncError(what: []const u8, e: linux.E) error{Sync} {
+    std.log.warn("native: {s} failed ({t}); the layer is not published, and none will be by this job", .{ what, e });
+    return error.Sync;
 }
 
 /// The data of the tree `root` written to disk and waited for, and nothing else of its
@@ -771,15 +814,15 @@ fn writeBack(arena: Allocator, io: std.Io, root: linux.fd_t, max: u64) ![]const 
 /// is reported once for the file, so an `fsync` through a descriptor opened after it would not
 /// see it. A kernel or filesystem without the call leaves it to the fsyncs.
 fn waitWritten(fds: []const linux.fd_t) !void {
-    var failed = false;
+    var failed: ?linux.E = null;
     for (fds) |f| {
         switch (linux.errno(syncRange(f, sync_file_range_wait))) {
             .SUCCESS, .NOSYS, .INVAL, .OPNOTSUPP => {},
-            else => failed = true,
+            else => |e| failed = failed orelse e,
         }
         _ = linux.close(f);
     }
-    if (failed) return error.Sync;
+    if (failed) |e| return syncError("write-back of a file", e);
 }
 
 fn syncRange(f: linux.fd_t, how: u32) usize {
@@ -824,12 +867,14 @@ const SyncWork = struct {
     todo: []const Synced,
     next: std.atomic.Value(usize) = .init(0),
     unreadable: std.atomic.Value(bool) = .init(false),
-    failed: std.atomic.Value(bool) = .init(false),
+    /// The first failed `fsync`'s errno, 0 for none.
+    failed: std.atomic.Value(u16) = .init(0),
 
     /// A failed `fsync` first: `error.Unreadable` sends the caller to `syncfs`, which may not
     /// report a write error an `fsync` has already taken, and the layer would be published.
     fn result(w: *const SyncWork) !void {
-        if (w.failed.load(.acquire)) return error.Sync;
+        const failed = w.failed.load(.acquire);
+        if (failed != 0) return syncError("fsync", std.enums.fromInt(linux.E, failed) orelse .IO);
         if (w.unreadable.load(.acquire)) return error.Unreadable;
     }
 
@@ -842,7 +887,7 @@ const SyncWork = struct {
             _ = arena_state.reset(.retain_capacity);
             w.one(arena_state.allocator(), w.todo[i]) catch |e| switch (e) {
                 error.Unreadable => w.unreadable.store(true, .release),
-                else => w.failed.store(true, .release),
+                else => {},
             };
         }
     }
@@ -854,12 +899,19 @@ const SyncWork = struct {
             _ = linux.close(dir);
         };
         if (s.name.len == 0) {
-            if (linux.errno(linux.fsync(dir)) != .SUCCESS) return error.Sync;
-            return;
+            return w.fsynced(dir);
         }
         const f = try openFileAt(dir, s.name);
         defer _ = linux.close(f);
-        if (linux.errno(linux.fsync(f)) != .SUCCESS) return error.Sync;
+        return w.fsynced(f);
+    }
+
+    /// `fsync` of `fd`, its errno kept for `result` if it is the first to fail.
+    fn fsynced(w: *SyncWork, fd: linux.fd_t) !void {
+        const e = linux.errno(linux.fsync(fd));
+        if (e == .SUCCESS) return;
+        _ = w.failed.cmpxchgStrong(0, @backingInt(e), .acq_rel, .acquire);
+        return error.Sync;
     }
 };
 
@@ -891,10 +943,69 @@ pub fn syncCursor(arena: Allocator, root: []const u8) ?linux.fd_t {
 
 pub fn syncLayers(s: Store, arena: Allocator) void {
     const p = join(arena, s.root, "layers") catch return;
-    const fd = openRoot(arena, p) catch return;
+    const fd = openRoot(arena, p) catch |e| {
+        std.log.warn("native: cannot open {s} to sync it ({s}); the layers just published are in doubt", .{ p, @errorName(e) });
+        if (s.sync_log) |l| l.failed = true;
+        return;
+    };
     defer _ = linux.close(fd);
-    if (linux.errno(linux.fsync(fd)) != .SUCCESS)
-        std.log.warn("native: cannot sync {s}; a crash now may lose the layers just published", .{p});
+    s.syncLayersDir(fd, p);
+}
+
+/// `syncLayers` on the open directory `fd`, which `p` names. Once: a failure is logged and the job
+/// is marked failed, so `dropUnsynced` evicts what the rename was to make durable.
+fn syncLayersDir(s: Store, fd: linux.fd_t, p: []const u8) void {
+    const e = linux.errno(linux.fsync(fd));
+    if (e == .SUCCESS) {
+        if (s.sync_log) |l| l.since.clearRetainingCapacity();
+        return;
+    }
+    std.log.warn("native: cannot sync {s} ({t}); the layers just published are in doubt", .{ p, e });
+    if (s.sync_log) |l| l.failed = true;
+}
+
+/// What a job's syncs have found. A `syncfs` error is told once per descriptor and per filesystem
+/// (Linux 5.8, errseq), and a failed `fsync` may have dropped the dirty data it could not write,
+/// so after one failure nothing renamed since the last good sync (`syncDisk`, `syncLayers`) can be
+/// vouched for, and nothing that follows can be either. The job's publishes are then refused, and
+/// its layers renamed since are evicted at its end (`dropUnsynced`). One job's, so no lock: a job
+/// publishes its steps one at a time.
+pub const SyncLog = struct {
+    /// A sync of this job failed.
+    failed: bool = false,
+    /// The names (`hex` of the key) of the layers this job renamed into `layers/` since the last
+    /// successful `syncfs` or `syncLayers`.
+    since: std.ArrayList([]const u8) = .empty,
+
+    fn renamed(l: *SyncLog, arena: Allocator, key: Key) !void {
+        try l.since.append(arena, try arena.dupe(u8, &hex(key)));
+    }
+};
+
+/// A log for a job beginning now; null when `arena` has no room, and the job is then not tracked.
+pub fn newSyncLog(arena: Allocator) ?*SyncLog {
+    const l = arena.create(SyncLog) catch return null;
+    l.* = .{};
+    return l;
+}
+
+/// After a failed sync, the layers this job renamed since the last good one evicted, so none of
+/// them is a hit that a lost write could have emptied. Each one's own sync succeeded before its
+/// rename, but the success of a `syncfs` or `fsync` that follows an error already taken is no
+/// proof, so the store does not vouch for them. Called once the job holds none of its layers; one
+/// another job holds stays, and is counted in the log. Nothing is done without a failure.
+pub fn dropUnsynced(s: Store, arena: Allocator, io: std.Io) void {
+    const l = s.sync_log orelse return;
+    if (!l.failed or l.since.items.len == 0) return;
+    var held: usize = 0;
+    for (l.since.items) |name| if (!s.evict(arena, io, name)) {
+        held += 1;
+    };
+    std.log.warn("native: {d} layers renamed since the last good sync were evicted after a failed sync ({d} held by other jobs stay)", .{
+        l.since.items.len - held,
+        held,
+    });
+    l.since.clearRetainingCapacity();
 }
 
 fn join(arena: Allocator, dir: []const u8, name: []const u8) ![]const u8 {
@@ -2094,7 +2205,7 @@ test "native store: a failed fsync is not lost to an unreadable file's fallback"
     try w.result();
     w.unreadable.store(true, .release);
     try std.testing.expectError(error.Unreadable, w.result());
-    w.failed.store(true, .release);
+    w.failed.store(@backingInt(linux.E.IO), .release);
     try std.testing.expectError(error.Sync, w.result());
 }
 
@@ -2169,6 +2280,85 @@ test "native store: a walk that passes the limit stops, and a large entry syncs 
     );
     try tmp.dir.access(io, "t/d/g0", .{});
     try std.testing.expect(try s.open(arena, io, large) == null);
+}
+
+test "native store: after a failed sync the job publishes nothing more, and what it renamed since the last good sync is evicted" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log = newSyncLog(arena).?;
+    var s: Store = .{ .root = "", .sync_log = log };
+    const first, const l1 = try testLayer(arena, io, tmp, &s, "first");
+    l1.lock.close(io);
+    try std.testing.expectEqual(@as(usize, 1), log.since.items.len);
+    try std.testing.expect(!log.failed);
+
+    // A large entry's `syncfs` on a descriptor that fails: the publish fails, the upper is back.
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try tmp.dir.createDirPath(io, "big");
+    for (0..sync_tree_max + 1) |i| try tmp.dir.writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "big/g{d}", .{i}),
+        .data = "",
+    });
+    var bad = s;
+    bad.sync_fd = -1;
+    var never: std.atomic.Value(bool) = .init(false);
+    var big_key: KeyHasher = .plain("big");
+    const big = big_key.final();
+    const big_lock = try s.lockKey(arena, io, big, &never);
+    defer big_lock.close(io);
+    const big_upper = try std.fmt.allocPrint(arena, "{s}/big", .{root});
+    try std.testing.expectError(error.Sync, bad.publish(arena, io, big, .fetch, big_upper, .{ .log = "", .fc = "" }));
+    try tmp.dir.access(io, "big/g0", .{});
+    try std.testing.expect(try s.open(arena, io, big) == null);
+    try std.testing.expect(log.failed);
+
+    // Nothing more is published by the job, though this sync would work: not even a small entry,
+    // and its upper stays where it was.
+    try tmp.dir.createDirPath(io, "later");
+    try tmp.dir.writeFile(io, .{ .sub_path = "later/f", .data = "x" });
+    var later_key: KeyHasher = .plain("later");
+    const later = later_key.final();
+    const later_lock = try s.lockKey(arena, io, later, &never);
+    defer later_lock.close(io);
+    try std.testing.expectError(error.Sync, s.publish(arena, io, later, .fetch, try std.fmt.allocPrint(arena, "{s}/later", .{root}), .{ .log = "", .fc = "" }));
+    try tmp.dir.access(io, "later/f", .{});
+
+    // The layer renamed before the failure is a hit until the job's end, then it is not one.
+    (try s.open(arena, io, first)).?.layer.lock.close(io);
+    s.dropUnsynced(arena, io);
+    try std.testing.expect(try s.open(arena, io, first) == null);
+    try std.testing.expectEqual(@as(usize, 0), log.since.items.len);
+}
+
+test "native store: a layers directory that cannot be synced fails the job's layers since the last good sync, and a good one clears them" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log = newSyncLog(arena).?;
+    var s: Store = .{ .root = "", .sync_log = log };
+    const synced, const l1 = try testLayer(arena, io, tmp, &s, "synced");
+    l1.lock.close(io);
+    s.syncLayers(arena);
+    try std.testing.expectEqual(@as(usize, 0), log.since.items.len);
+    try std.testing.expect(!log.failed);
+    const doubtful, const l2 = try testLayer(arena, io, tmp, &s, "doubtful");
+    l2.lock.close(io);
+    // Without a failure nothing is evicted.
+    s.dropUnsynced(arena, io);
+    (try s.open(arena, io, doubtful)).?.layer.lock.close(io);
+    // A descriptor that fails: the sync of the directory reports it, once.
+    s.syncLayersDir(-1, "layers");
+    try std.testing.expect(log.failed);
+    s.dropUnsynced(arena, io);
+    try std.testing.expect(try s.open(arena, io, doubtful) == null);
+    (try s.open(arena, io, synced)).?.layer.lock.close(io);
 }
 
 test "native store: a publish's phases show the sync's parts, and syncfs only when it was taken" {
@@ -3186,7 +3376,7 @@ test "native store: trees queued while a collect holds the reaper wait for its r
     reaper.hold(io);
     s.discard(arena, io, dead);
     // Queued, and no thread takes it while the pass goes on: its deletes would wait its renames.
-    io.sleep(.fromMilliseconds(100), .awake) catch {};
+    io.sleep(.fromMilliseconds(20), .awake) catch {};
     try std.testing.expect(reaper.pending(io));
     try tmp.dir.access(io, ".dead-0123456789abcdef/fs/f", .{});
     reaper.release(io);

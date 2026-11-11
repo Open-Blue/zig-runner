@@ -218,7 +218,7 @@ fn publishLayer(s: Store, arena: Allocator, io: std.Io, sp: Spec, name: []const 
 fn job(arena: Allocator, io: std.Io, sp: Spec) !Store {
     const root = try sp.store(arena);
     try Store.prepare(arena, io, root, .{ .check_parents = false });
-    return .{ .root = root, .sync_fd = Store.syncCursor(arena, root) };
+    return .{ .root = root, .sync_fd = Store.syncCursor(arena, root), .sync_log = Store.newSyncLog(arena) };
 }
 
 fn write(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: Spec) !void {
@@ -829,4 +829,30 @@ fn fail(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: S
         std.debug.print("native store crash: and the layer is a hit\n", .{});
         return error.TestUnexpectedResult;
     }
+
+    // Fail closed: the disk works again (the flip is off), but the job's sync has failed, and a
+    // later `syncfs` on its descriptor would succeed, the error being told once. So no later
+    // publish of the job is made, and none is a hit.
+    const later = "b";
+    const later_upper = try print(arena, "{s}/uppers/{s}", .{ sp.root, later });
+    try makeTree(arena, io, later_upper, later);
+    const later_key = keyOf(later);
+    const later_lock = try s.lockKey(arena, io, later_key, &never);
+    defer later_lock.close(io);
+    if (s.publish(arena, io, later_key, .step, later_upper, .{ .log = try logOf(arena, later), .fc = record_fc })) |l| {
+        l.lock.close(io);
+        std.debug.print("native store crash: the job published a layer after its sync failed\n", .{});
+        return error.TestUnexpectedResult;
+    } else |e| if (e != error.Sync) {
+        std.debug.print("native store crash: the later publish failed with {s}, not error.Sync\n", .{@errorName(e)});
+        return error.TestUnexpectedResult;
+    }
+    s.syncLayers(arena);
+    s.dropUnsynced(arena, io);
+    if (try s.open(arena, io, later_key)) |hit| {
+        hit.layer.lock.close(io);
+        std.debug.print("native store crash: the refused layer is a hit\n", .{});
+        return error.TestUnexpectedResult;
+    }
+    std.debug.print("native store crash: {s}: and the job's next publish was refused\n", .{sp.arg});
 }

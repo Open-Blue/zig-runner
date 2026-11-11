@@ -35,7 +35,9 @@
 # (`syncfs`), and a publish whose own writes succeed but whose job saw another write fail
 # (`Store.sync_fd`, the descriptor opened at the job's start: a `syncfs` on one opened at the
 # publish would not report an error another job's `syncfs` had already). Each must fail, with
-# error.Sync, and leave no layer published, also once the disk is mounted again.
+# error.Sync, and leave no layer published, also once the disk is mounted again. And the
+# store fails closed: with the disk working again, the same job's next publish is refused with
+# error.Sync, as a later `syncfs` on its descriptor would report success (the error is told once).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 

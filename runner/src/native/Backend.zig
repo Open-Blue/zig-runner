@@ -956,6 +956,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
             .max_bytes = cfg.store_max_bytes,
             .limits = cfg.store_limits,
             .sync_fd = Store.syncCursor(arena, cfg.store),
+            .sync_log = Store.newSyncLog(arena),
             .defer_delete = true,
         },
         .vouched = cfg.vouched,
@@ -1465,6 +1466,8 @@ pub fn deinit(b: *Backend) void {
     b.lock.close(b.io);
     t = b.timings.since(arena, .collect_touch, t);
     if (b.published) b.store_cfg.syncLayers(arena);
+    // After a failed sync, what this job renamed since the last good one is evicted.
+    b.store_cfg.dropUnsynced(arena, b.io);
     if (b.store_cfg.sync_fd) |fd| _ = std.os.linux.close(fd);
     t = b.timings.since(arena, .collect_syncdir, t);
     // The store kept under its cap, now that this job holds none of its layers: whether or not
@@ -3142,7 +3145,8 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec_in: Store.Recor
         return;
     };
     const layer = s.publishTimed(arena, b.io, key, kind, top.path, rec, &b.timings) catch |e| {
-        std.log.warn("native: cannot publish a layer to the store: {s}", .{@errorName(e)});
+        // A failed sync was logged with its errno, once, by the store.
+        if (e != error.Sync) std.log.warn("native: cannot publish a layer to the store: {s}", .{@errorName(e)});
         cwd.deleteFile(b.io, link) catch {};
         return;
     };
