@@ -874,7 +874,7 @@ const SyncWork = struct {
     /// report a write error an `fsync` has already taken, and the layer would be published.
     fn result(w: *const SyncWork) !void {
         const failed = w.failed.load(.acquire);
-        if (failed != 0) return syncError("fsync", @fromBackingInt(@intCast(failed)));
+        if (failed != 0) return syncError("fsync", std.enums.fromInt(linux.E, failed) orelse .IO);
         if (w.unreadable.load(.acquire)) return error.Unreadable;
     }
 
