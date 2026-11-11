@@ -720,7 +720,11 @@ fn publishStaged(
     // The rename is not synced here: an entry whose rename a crash lost is only a miss, made
     // again. The job syncs the layers' directory once, at its end (`syncLayers`), and until then
     // the entry is in its log: one a failed sync leaves in doubt is evicted (`dropUnsynced`).
-    if (s.sync_log) |l| if (arena.dupe(u8, &hex(key))) |name| l.since.append(arena, name) catch {} else |_| {};
+    if (s.sync_log) |l| l.renamed(arena, key) catch {
+        // Not tracked, so it could not be evicted if a sync fails: nothing more is published.
+        std.log.warn("native: out of memory noting a published layer; the job publishes no more", .{});
+        l.failed = true;
+    };
     if (ph) |p| _ = p.since(arena, .rename, t);
     return .{ .fs = try join(arena, dir, "fs"), .lock = lock.? };
 }
@@ -972,6 +976,10 @@ pub const SyncLog = struct {
     /// The names (`hex` of the key) of the layers this job renamed into `layers/` since the last
     /// successful `syncfs` or `syncLayers`.
     since: std.ArrayList([]const u8) = .empty,
+
+    fn renamed(l: *SyncLog, arena: Allocator, key: Key) !void {
+        try l.since.append(arena, try arena.dupe(u8, &hex(key)));
+    }
 };
 
 /// A log for a job beginning now; null when `arena` has no room, and the job is then not tracked.
