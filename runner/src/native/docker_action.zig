@@ -321,8 +321,11 @@ pub fn run(
     // owned by it: a later step as the runner user can change what the action wrote, and write
     // its own file commands where the action's were made (the directory too, when the action
     // was the job's first step and made it).
+    // The layer's ids are the slot's host ids, or the canonical ones when its upper was written
+    // through an idmapped mount (`Backend.idmappedUpper`).
+    const host_base: u32 = if (b.layers.items[b.layers.items.len - 1].canonical) 0 else b.idBase();
     if (b.how.userns == .mapped and b.uid != 0) for (try shares(arena, x.ev.workspace)) |sh|
-        ownShared(b.io, layer, sh.from, b.idBase() + b.uid, b.idBase() + b.gid);
+        ownShared(b.io, layer, sh.from, host_base + b.uid, host_base + b.gid);
     var answer: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(.{
         .exitCode = ended.code,
