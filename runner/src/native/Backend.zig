@@ -998,10 +998,10 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
     t = phases.now();
     b.binds = try b.jobBinds(cfg, why);
     t = b.timings.since(arena, .resolver, t);
+    try b.jobLimitsOrRefuse(cfg, cg_parent, why);
     // The network's helper first of what is left, so that it runs beside the cgroup's set-up and
     // the image's and caches': it needs the resolver's nameservers (the NAT rules) and nothing of
-    // the cgroup. A job refused for want of limits has had its network made for nothing, torn
-    // down again with it (`deinit`).
+    // the cgroup. A job refused for want of limits is refused before (`jobLimitsOrRefuse`).
     if (b.how.userns == .mapped) try b.jobNetwork(cfg, why);
     t = phases.now();
     try b.jobCgroup(cfg, cg_parent, &id, why);
@@ -1015,6 +1015,24 @@ fn failed(why: *[]const u8, arena: Allocator, what: []const u8, path: []const u8
     why.* = std.fmt.allocPrint(arena, "{s} {s}: {s}", .{ what, path, @errorName(e) }) catch
         @errorName(e);
     return e;
+}
+
+const untrusted_limits_why = "native steps run a job this runner does not vouch for only within " ++
+    "a cgroup of its own with memory and process limits, which could not be made for it";
+
+/// The job's limits (`b.limits`), and the refusal of a job the runner does not vouch for that has
+/// none (`untrustedRefusal`, decided on `Config.job_limits`): it does not run natively. Before
+/// the job takes a slot or makes a network, so that a refusal is never masked by their errors.
+fn jobLimitsOrRefuse(b: *Backend, cfg: Config, parent: cgroup.Parent, why_out: *[]const u8) !void {
+    b.limits = cgroup.Limits.of(b.io, cfg.cgroup, switch (parent) {
+        .dir => |d| d,
+        .none => null,
+    });
+    const limited = b.limits.memory_max != null and b.limits.pids_max != null;
+    if (!cfg.vouched and !limited) {
+        why_out.* = untrusted_limits_why;
+        return error.NoJobLimits;
+    }
 }
 
 /// The job's cgroup under `parent`, named as its directory is, with its limits, and all jobs'
@@ -1033,19 +1051,6 @@ fn jobCgroup(
     why_out: *[]const u8,
 ) !void {
     const arena = b.arena;
-    b.limits = cgroup.Limits.of(b.io, cfg.cgroup, switch (parent) {
-        .dir => |d| d,
-        .none => null,
-    });
-    const untrusted_why = "native steps run a job this runner does not vouch for only within a " ++
-        "cgroup of its own with memory and process limits, which could not be made for it";
-    // A job the runner does not vouch for runs natively only within limits of its own
-    // (`untrustedRefusal`, decided on `Config.job_limits`): without them it does not run.
-    const limited = b.limits.memory_max != null and b.limits.pids_max != null;
-    if (!cfg.vouched and !limited) {
-        why_out.* = untrusted_why;
-        return error.NoJobLimits;
-    }
     const why: []const u8 = switch (parent) {
         .none => |w| w,
         .dir => |dir| if (cgroup.Job.make(arena, b.io, dir, name, b.limits)) |j| {
@@ -1053,7 +1058,7 @@ fn jobCgroup(
             // a job with no cgroup, for one the runner does not vouch for.
             if (!cfg.vouched and (j.all.memory == null or j.all.pids == null)) {
                 j.remove(arena, b.io);
-                why_out.* = untrusted_why;
+                why_out.* = untrusted_limits_why;
                 return error.NoJobLimits;
             }
             b.job_cgroup = j;
@@ -1115,7 +1120,7 @@ fn jobCgroup(
         }),
     };
     if (!cfg.vouched) {
-        why_out.* = untrusted_why;
+        why_out.* = untrusted_limits_why;
         return error.NoJobLimits;
     }
     if (!std.mem.eql(u8, cfg.cgroup.parent, "none")) {
@@ -1299,8 +1304,9 @@ fn jobNetwork(b: *Backend, cfg: Config, why: *[]const u8) !void {
     t = b.timings.since(arena, .nat, t);
     const path = try std.fmt.allocPrint(arena, "{s}/netns", .{b.dir});
     const slot = try std.fmt.allocPrint(arena, "{d}", .{n});
+    const runner_pid = try std.fmt.allocPrint(arena, "{d}", .{std.os.linux.getpid()});
     const child = std.process.spawn(b.io, .{
-        .argv = &.{ cfg.self_exe, net.command, path, slot, subnet },
+        .argv = &.{ cfg.self_exe, net.command, path, slot, subnet, runner_pid },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .pipe,
@@ -1338,6 +1344,11 @@ pub fn networkPath(b: *Backend) !?[]const u8 {
         const t = phases.now();
         b.net_helper = null;
         b.netns = h.path;
+        // Not cancelled: a cancel here would drop the helper still running, and the teardown
+        // would let the slot's lock go under it, where another job's helper may remove the
+        // slot's veth and the late one make its own (`net.upMain`). Its run is bounded.
+        const protection = b.io.swapCancelProtection(.blocked);
+        defer _ = b.io.swapCancelProtection(protection);
         var err: std.ArrayList(u8) = .empty;
         var buf: [4096]u8 = undefined;
         while (true) {
@@ -6606,6 +6617,7 @@ test "root runner: the network helper removes a dead job's veth of its slot befo
     // A slot no job of these tests takes. The first namespace stays mounted, so its veth stays,
     // as a dead job's does until the kernel is done with its namespace: the second helper finds it.
     const slot = try std.fmt.allocPrint(arena, "{d}", .{net.max_slots - 1});
+    const runner_pid = try std.fmt.allocPrint(arena, "{d}", .{std.os.linux.getpid()});
     var sock = try net.Socket.open();
     defer sock.close();
     var buf: [16]u8 = undefined;
@@ -6615,11 +6627,61 @@ test "root runner: the network helper removes a dead job's veth of its slot befo
     @memset(&paths, "");
     for (&paths, 0..) |*path, i| {
         path.* = try std.fmt.allocPrint(arena, "{s}/netns-{d}", .{ root, i });
-        const ran = try std.process.run(arena, io, .{ .argv = &.{ cfg.self_exe, net.command, path.*, slot, subnet } });
+        const ran = try std.process.run(arena, io, .{ .argv = &.{ cfg.self_exe, net.command, path.*, slot, subnet, runner_pid } });
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, ran.term);
         try std.testing.expectEqualStrings("", ran.stderr);
         try std.testing.expect(sock.index(net.hostLink(&buf, net.max_slots - 1)) != null);
     }
+}
+
+test "root runner: a network helper whose runner is not its parent makes and removes nothing" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const subnet = try std.fmt.allocPrint(arena, "{f}", .{cfg.subnet});
+    const slot = try std.fmt.allocPrint(arena, "{d}", .{net.max_slots - 2});
+    const path = try std.fmt.allocPrint(arena, "{s}/netns", .{root});
+    defer detachNetns(arena, path);
+    // Another pid than the helper's parent: as when its runner died and another job holds the slot.
+    const other = try std.fmt.allocPrint(arena, "{d}", .{std.os.linux.getpid() + 1});
+    const ran = try std.process.run(arena, io, .{ .argv = &.{ cfg.self_exe, net.command, path, slot, subnet, other } });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, ran.term);
+    var sock = try net.Socket.open();
+    defer sock.close();
+    var buf: [16]u8 = undefined;
+    try std.testing.expect(sock.index(net.hostLink(&buf, net.max_slots - 2)) == null);
+}
+
+test "root runner: a cancelled wait for the network helper still waits for it" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var b = try init(arena, io, std.testing.allocator, cfg);
+    defer b.deinit();
+    const Wait = struct {
+        fn run(bb: *Backend) void {
+            _ = bb.networkPath() catch {};
+        }
+    };
+    var waiting = try io.concurrent(Wait.run, .{&b});
+    waiting.cancel(io);
+    // The helper has ended, so its veth is there: the cancel did not drop it still running.
+    var sock = try net.Socket.open();
+    defer sock.close();
+    var buf: [16]u8 = undefined;
+    try std.testing.expect(b.net_helper == null);
+    try std.testing.expect(sock.index(net.hostLink(&buf, b.slot.?.n)) != null);
 }
 
 test "native sweep: a job's directory its runner is removing is left to it; a dead runner's goes" {

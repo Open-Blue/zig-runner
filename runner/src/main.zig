@@ -120,8 +120,8 @@ pub fn main(init: std.process.Init) !u8 {
     // started a thread when it makes its namespaces.
     if (args.len == 2 and std.mem.eql(u8, args[1], sandbox.command)) return sandbox.main(arena);
     if (args.len == 2 and std.mem.eql(u8, args[1], forward.command)) return forward.main(arena);
-    if (args.len == 5 and std.mem.eql(u8, args[1], net.command))
-        return net.upMain(arena, args[2], args[3], args[4]);
+    if (args.len == 6 and std.mem.eql(u8, args[1], net.command))
+        return net.upMain(arena, args[2], args[3], args[4], args[5]);
     if (args.len >= 3 and std.mem.eql(u8, args[1], nft.command)) return nft.main(args[2..]);
     if (args.len >= 2 and std.mem.eql(u8, args[1], key_diff.command)) return keyDiff(arena, init, args[2..]);
     if (try printVersionIfAsked(io, args)) return @backingInt(Exit.done);
