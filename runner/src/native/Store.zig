@@ -2692,7 +2692,8 @@ test "native store: a checkout's size of entries is synced on its own, not with 
         .data = "x",
     });
     // A descriptor that fails: `syncfs` would refuse the publish, so it was not called.
-    const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}), .sync_fd = -1 };
+    // Neither quiet nor busy: the limit is `sync_tree_max`.
+    var s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}), .sync_fd = -1, .sync_load = .{} };
     try prepare(arena, io, s.root, .{ .check_parents = false });
     var kh: KeyHasher = .plain("checkout");
     const k = kh.final();
@@ -2702,6 +2703,32 @@ test "native store: a checkout's size of entries is synced on its own, not with 
     const upper = try std.fmt.allocPrint(arena, "{s}/t", .{root});
     const l = try s.publish(arena, io, k, .fetch, upper, .{ .log = "", .fc = "" });
     l.lock.close(io);
+
+    // The same on a quiet disk is past the limit of a few dozen: `syncfs`, which the descriptor refuses.
+    s.sync_load = .{ .io_some = 0, .dirty_kib = 0 };
+    try tmp.dir.createDirPath(io, "q");
+    for (0..sync_choice.quiet_limit + 1) |i| try tmp.dir.writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "q/f{d}", .{i}),
+        .data = "x",
+    });
+    var qh: KeyHasher = .plain("quiet");
+    const quiet = qh.final();
+    const ql = try s.lockKey(arena, io, quiet, &never);
+    defer ql.close(io);
+    const q_upper = try std.fmt.allocPrint(arena, "{s}/q", .{root});
+    try std.testing.expectError(error.Sync, s.publish(arena, io, quiet, .fetch, q_upper, .{ .log = "", .fc = "" }));
+
+    // And on a busy disk 600 entries are synced file by file, which a failing descriptor never sees.
+    const busy_log = newSyncLog(arena);
+    s.sync_log = busy_log;
+    s.sync_load = .{ .io_some = 2500 };
+    for (sync_choice.quiet_limit + 1..600) |i| try tmp.dir.writeFile(io, .{
+        .sub_path = try std.fmt.allocPrint(arena, "q/f{d}", .{i}),
+        .data = "x",
+    });
+    const bl = try s.publish(arena, io, quiet, .fetch, q_upper, .{ .log = "", .fc = "" });
+    bl.lock.close(io);
+    try std.testing.expect(!busy_log.?.failed);
 }
 
 test "native store: a publish syncs the entry's own tree, and a file it cannot open falls back to the filesystem's" {
