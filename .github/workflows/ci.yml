@@ -91,6 +91,11 @@ jobs:
       - name: Tool cache tree check
         run: .github/scripts/tool-trees-test.sh
 
+      # apt.sh's fallback to a mirror, in a container whose route to Ubuntu's archive is cut: the
+      # install still works, with apt's keyrings unchanged. Uses the real mirrors.
+      - name: apt mirror fallback
+        run: .github/scripts/apt-test.sh
+
       # The changie the release installs, against its pinned checksum: a new version (Renovate's)
       # fails here until the checksum is updated, not at the release, after it was approved.
       - name: changie's checksum
@@ -381,7 +386,7 @@ jobs:
         env:
           FULL_DISK_REQUIRED: "1"
         run: |
-          sudo apt-get install -y -qq bubblewrap >/dev/null
+          sudo .github/scripts/apt.sh install bubblewrap
           .github/scripts/full-disk-test.sh
 
       # Every test in runner/src is one the test binary has: a file that nothing reached compiled

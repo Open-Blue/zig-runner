@@ -124,6 +124,9 @@ make_rootfs() {
 	image=$(tr -d '\n' <runner/src/dagger.zig |
 		grep -oE '"ubuntu:[A-Za-z0-9._-]+" *\+\+ *"@sha256:[a-f0-9]{64}"' | tr -d '" +')
 	script=$("$bin" --provision-script)
+	# With Ubuntu's archive down, the container's sources point at a mirror first (apt.sh, which
+	# prints nothing while the archive answers); the runner's script is otherwise the one it ships.
+	script="$(.github/scripts/apt.sh mirror-prefix "$(dpkg --print-architecture)" noble)$script"
 	sudo rm -rf "$rootfs" "$rootfs.ok" "$rootfs.failed"
 	sudo mkdir -p "$rootfs"
 	if docker run --name zig-runner-e2e-rootfs "$image" sh -c "$script" &&
