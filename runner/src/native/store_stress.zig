@@ -499,16 +499,17 @@ test "native store under load: one worker (run only by the test above, in a proc
 
 /// A step of chain `c`: marks itself running (a second run of the key at once finds the mark),
 /// writes a nonce of its own into its layer with padding of a random size, prints it on stdout
-/// and stderr, sets it in $GITHUB_ENV, records that it ran it, sleeps a little, and unmarks.
-fn stepScript(arena: Allocator, c: []const u8) ![]const u8 {
+/// and stderr, sets it in $GITHUB_ENV, records that it ran it, sleeps a little, and unmarks (with
+/// the deferred sync, where overlaps are expected, the mark another run removed is no failure).
+fn stepScript(arena: Allocator, c: []const u8, overlaps_ok: bool) ![]const u8 {
     return print(arena,
         \\c={s}; r=$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')
         \\n=$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')
         \\mkdir /shared/running/$c 2>/dev/null || echo "$c $n" >> /shared/overlaps
         \\mkdir -p /w; {{ echo $n; head -c $((r % 3000)) /dev/zero; }} > /w/$c
         \\echo "@$c $n out"; echo "@$c $n err" >&2; echo "S_$c=$n" >> "$GITHUB_ENV"
-        \\echo $c > /shared/live/$n; sleep 0.$((r % 4)); rmdir /shared/running/$c
-    , .{c});
+        \\echo $c > /shared/live/$n; sleep 0.$((r % 4)); rmdir /shared/running/$c{s}
+    , .{ c, if (overlaps_ok) " || true" else "" });
 }
 
 /// The last step, which always runs (it reads $GITHUB_SHA): what each step's layer and file
@@ -532,7 +533,7 @@ fn runJob(w: *Worker, arena: Allocator, io: std.Io, n: usize) !void {
     for (chain[0..depth]) |*ch| ch.* = alphabet[w.rand.uintLessThan(usize, alphabet.len)];
     const c = chain[0..depth];
     const steps = try arena.alloc(job_mod.Step, depth + 1);
-    for (steps[0..depth], 1..) |*st, i| st.* = testStep(try stepScript(arena, c[0..i]));
+    for (steps[0..depth], 1..) |*st, i| st.* = testStep(try stepScript(arena, c[0..i], w.cfg.defer_sync));
     steps[depth] = testStep(try finalScript(arena, c));
 
     var env: std.process.Environ.Map = .init(arena);
