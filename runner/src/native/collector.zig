@@ -368,6 +368,9 @@ test "collector: a layer opened or published while a pass runs is kept and count
     defer a.deinit();
     const arena = a.allocator();
     var s: Store = .{ .root = "", .defer_collect = true, .sync_log = Store.newSyncLog(arena), .max_bytes = 0 };
+    // Known, so what is added after the scan shows (unknown, it saturates): this test passed only
+    // when an earlier one in the process had run a pass.
+    Store.testKnownEmpty();
     const k, const mine = try Store.testLayer(arena, io, tmp, &s, "mine");
     // The job's end let it go; the next job opens it during the pass, which would evict it.
     mine.lock.close(io);

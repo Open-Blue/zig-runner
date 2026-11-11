@@ -1325,6 +1325,13 @@ pub fn knownBytes() u64 {
     return known_total.load(.monotonic) +| added.load(.monotonic);
 }
 
+/// Tests: the store's total known, at zero, as a pass would leave an empty store. Until a pass has
+/// run in the process it is unknown (the maximum), and what is added to it saturates.
+pub fn testKnownEmpty() void {
+    known_total.store(0, .monotonic);
+    added.store(0, .monotonic);
+}
+
 /// Tests: `collectLocked` holds after its scan while `test_pause_after_scan` is set, and says it is
 /// there in `test_scanned`, so a test can publish or open a layer in the middle of a pass.
 pub var test_pause_after_scan: std.atomic.Value(bool) = .init(false);
