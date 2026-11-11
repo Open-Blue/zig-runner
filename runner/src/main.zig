@@ -178,8 +178,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     var out_buf: [4096]u8 = undefined;
     var stdout: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
+    var console_lock: sink.StdoutSink.Lock = .{ .io = io };
     var console: sink.LogSink = .{
-        .stdout = .{ .writer = &stdout.interface, .secrets = secrets, .io = io },
+        .stdout = .{ .writer = &stdout.interface, .secrets = secrets, .lock = &console_lock },
     };
     defer console.close();
 
