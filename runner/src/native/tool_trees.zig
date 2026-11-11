@@ -54,7 +54,6 @@ const std = @import("std");
 const linux = std.os.linux;
 const dagger = @import("../dagger.zig");
 const sandbox = @import("sandbox.zig");
-const evict = @import("evict.zig");
 const hash_files = @import("hash_files.zig");
 
 const Allocator = std.mem.Allocator;
@@ -164,7 +163,6 @@ fn walk(
         .limits = limits,
         .cancel = cancel,
         .deadline_ms = nowMs(io) + limits.time_ms,
-        .skip_nested = !std.mem.eql(u8, std.fs.path.basename(cache), evict.nested),
         .racy_from = @as(i128, std.Io.Clock.real.now(io).toNanoseconds()) -
             @as(i128, limits.racy_s) * std.time.ns_per_s,
     };
@@ -560,7 +558,7 @@ pub fn takeVerdict(
 /// (`Epochs.enter`) ends the epoch: something that is not one of this process's jobs opened it.
 /// So does a check (`valid`) that finds the lock file's mtime moved, which is what another
 /// runner's open of the volume does, before or after the member's own. Every open stamps the file
-/// and joins in one critical section (`volumes.stamp_mu`), so the process's own opens come in
+/// and joins in one critical section (that open's stamp lock on the file), so the process's own opens come in
 /// the order they stamped.
 ///
 /// An epoch belongs to the volume's list directory and mount, which are of one scope (trusted or
@@ -891,9 +889,6 @@ const Check = struct {
     deadline_ms: i64,
     /// Files with a ctime from here on are "racy" (ns since the epoch).
     racy_from: i128,
-    /// The volume is the root user's, so the step user's own (`evict.nested`), a directory in it, is
-    /// not one of its trees: another volume with its own check, lock and verdict.
-    skip_nested: bool = false,
     visited: u32 = 0,
     read: u64 = 0,
     why: ?[]const u8 = null,
@@ -1010,7 +1005,6 @@ const Check = struct {
             c.why = c.why orelse "too many tools or versions";
         }
         for (names.items) |name| {
-            if (c.skip_nested and depth == 0 and std.mem.eql(u8, name, evict.nested)) continue;
             const rel = if (prefix.len == 0)
                 name
             else
@@ -2782,24 +2776,4 @@ test "tool trees: checks, ends and leaves from threads at once neither crash nor
     for (threads) |t| t.join();
     try std.testing.expectEqual(@as(u32, 0), late.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), es.list.items.len);
-}
-
-test "tool trees: the step user's volume inside the root user's is not one of its trees, and is its own volume's" {
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    const arena = a.allocator();
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const f = try fixture(arena, &tmp);
-    const before = try checkWith(arena, f, .{ .racy_s = 0 }, null);
-    try tmp.dir.createDirPath(io, "cache/" ++ evict.nested ++ "/zig/0.17.0/x64");
-    try tmp.dir.writeFile(io, .{ .sub_path = "cache/" ++ evict.nested ++ "/zig/0.17.0/x64/zig", .data = "runner's\n" });
-    const after = try checkWith(arena, f, .{ .racy_s = 0 }, null);
-    try std.testing.expectEqualStrings(before.env, after.env);
-    try std.testing.expectEqualStrings(before.full, after.full);
-    // Walked as a volume of its own, the same directory is the cache, and its trees are its own.
-    const inner: Fixture = .{ .cache = try std.fmt.allocPrint(arena, "{s}/" ++ evict.nested, .{f.cache}), .lists = try std.fmt.allocPrint(arena, "{s}-inner", .{f.lists}) };
-    const own = try checkWith(arena, inner, .{ .racy_s = 0 }, null);
-    try expectIn(own.env, "zig/0.17.0/x64");
 }

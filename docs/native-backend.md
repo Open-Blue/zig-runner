@@ -1240,11 +1240,12 @@ that shows it is one a failure of costs a walk, never trust:
   epoch holds the same for its members: each open reads the lock file's mtime and sets it with an
   exclusive lock on the file's first byte held (`volumes.stampLock`, an open-file-description
   lock on the descriptor the open holds, so it excludes other processes as well as other threads
-  and is not the volume's flock), and joins the epoch in the same critical section
-  (`volumes.stamp_mu`), so another runner's open cannot come between the read and the stamp and
-  have its own written over. The lock is polled, so the job's cancel is seen, and given up on
-  after two seconds (a holder that is stopped); the open then says nothing of its stamp and
-  shares nothing. The lock file is opened read-write for it (`Store.lockBeside`); one the runner
+  and is not the volume's flock), and joins the epoch in the same critical section, so
+  another runner's open cannot come between the read and the stamp and have its own written over.
+  The lock is polled: an open that finds it held never stamps without it. It waits, sees the
+  job's cancel (`error.Canceled`), and fails with `error.VolumeBusy` after a minute
+  (`Wait.stamp_ms`, a holder that is stopped). Only where nobody could share anyway does it stamp
+  without the lock, and say nothing of its stamp. The lock file is opened read-write for it (`Store.lockBeside`); one the runner
   can only read gets no stamp lock, so shares nothing. A store on NFS or SMB is not shared
   through: there Linux makes a flock a POSIX lock of the whole file, and the jobs' shared ones
   would conflict with the stamp lock, so `onNetworkFs` turns it off.
@@ -1260,15 +1261,29 @@ that shows it is one a failure of costs a walk, never trust:
   runner processes never share an epoch: the second finds the file removed or the mtime moved,
   and walks.
 - The step user's tool cache (`evict.nested`, `runner/`) is a directory of the root user's volume
-  and a volume of its own: its own lock, lists, walk, verdict and epoch. The root volume's walk
-  does not count it among its trees (`Check.skip_nested`), so a job of the step user changing it
-  is not a change to the root volume's trees that its lock never shows; the root user's steps that
-  name a path under it replay as they would for any directory no checked tree holds. A bind of
-  either volume ends the epoch of the other, in this process (`Epochs.end`). What is not covered
-  is a root-user job of another runner process writing in `runner/` while this one's step-user
-  jobs share an epoch of it: that job stamps the root volume's lock, not `runner.lock`. A pool
-  that mixes the two users in several runner processes of one store has that exposure, as the
-  verdict's one taker had before epochs.
+  and a volume of its own: its own lock (`runner.lock`, inside the root volume), lists, verdict
+  and epoch. The root volume's walk covers it, as the directory it is, so a step user's job
+  that changes it must be seen by the root user's lock, and a root user's job that writes there
+  by the step user's. Each open therefore stamps the other's lock too, under that lock's stamp
+  lock, outer lock (`<img>.lock`, outside any volume) first in every process: an open of the
+  step user's volume stamps the root volume's, and an open of the root user's stamps
+  `runner.lock` if it is a regular file there (opened without following a link, as
+  `evict.innerLock` does). Any epoch of either then ends when the other's volume is opened, in
+  any runner, and in this process also when a process starts with either mounted
+  (`Epochs.end`, in both directions). The stamp is also a use of the outer volume for eviction
+  (`evict.zig` goes by the lock's mtime), so a step user's recent job keeps the root volume, and
+  the `runner/` in it, from being the oldest.
+- What sharing does not protect against, plainly:
+  - A runner older than this (during an upgrade) does not take the stamp locks, so its open may
+    fall between a newer one's read and stamp, or write a mtime over its stamp: the window of
+    microseconds that every open had before epochs.
+  - A hostile job in a rootless runner is the runner's own user, and can write `runner.lock`
+    (inside the volume) and the files a verdict is of. Sharing, like the verdict before it,
+    protects against a job's mistakes and against jobs of untrusted scopes (which have volumes of
+    their own), not against a hostile trusted job on a rootless runner.
+  - A store on NFS or SMB shares nothing (Linux makes a flock a POSIX lock of the file there, which
+    the stamp lock would conflict with), nor does one whose times are coarser than a second's
+    fraction, where two opens cannot be told apart.
 - Host-side changes while no job is in the volume: the runner's first job drops every verdict, and
   one is not used past an hour (`tool_trees.verdict_max_age_ms`) or from the future.
 
