@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Model-checks the native store's locking protocol with SPIN: proofs/spin/StoreLockingModel.pml, the
-# Promela port of proofs/tla/StoreLocking.tla (proofs/README.md, "The store's locking, in SPIN").
+# Model-checks the TLA+ modules with SPIN, on their Promela ports: proofs/spin/<Module>Model.pml for
+# proofs/tla/<Module>.tla, StoreLocking's, StoreEviction's and ReleasePipeline's (proofs/README.md,
+# "The store's locking, in SPIN").
 # SPIN is 6.5.2, Ubuntu's spin 6.5.2+dfsg-2build1 (store-model.yml pins the package), and any other
 # version fails here, so a changed SPIN is a change made on purpose.
 #
@@ -35,20 +36,22 @@ python3 -I "$here/cfg.py" --check
 
 # build <name> safety|liveness: spin -a and gcc in the current directory, pan-<kind> the verifier.
 # The safety one has no never claim; the liveness one has the stutter of LIVENESS and the claims.
+# A variable no step reads (a ghost a mutant does not check) stays in the state (-o2), as it is in
+# TLC's.
 build() {
 	local name=$1 kind=$2
 	if [[ $kind == safety ]]; then
-		spin -a "$name.pml" >spin-safety.out 2>&1 &&
+		spin -o2 -a "$name.pml" >spin-safety.out 2>&1 &&
 			gcc -O2 -w -DSAFETY -DNOREDUCE -DNOCLAIM -o pan-safety pan.c >gcc-safety.out 2>&1
 	else
-		spin -DLIVENESS -a "$name.pml" >spin-liveness.out 2>&1 &&
+		spin -o2 -DLIVENESS -a "$name.pml" >spin-liveness.out 2>&1 &&
 			gcc -O2 -w -DNOREDUCE -o pan-liveness pan.c >gcc-liveness.out 2>&1
 	fi
 }
 
 # live <property>: pan-liveness on one claim, its report in pan-<property>.out.
 live() {
-	./pan-liveness -m1000000 -w26 -a -f -N "$1" >"pan-$1.out" 2>&1 || true
+	./pan-liveness -m1000000 -w"$hw" -a -f -N "$1" >"pan-$1.out" 2>&1 || true
 }
 
 stored() { sed -n 's/^ *\([0-9]*\) states, stored.*/\1/p' "$1"; }
@@ -56,7 +59,7 @@ elapsed() { sed -n 's/^pan: elapsed time \(.*\)/\1/p' "$1"; }
 
 # check <name>: compiles and runs one configuration in $dir/<name>; the verdict is in result.
 check() {
-	local name=$1 w="$dir/$1" started=$SECONDS first want ltl p verdict
+	local name=$1 w="$dir/$1" started=$SECONDS first want ltl p verdict ns hw=22
 	rm -rf "${w:?}"
 	mkdir -p "$w"
 	cp "$here"/*.pml "$w"/
@@ -65,6 +68,15 @@ check() {
 	first=$(head -n 1 "$name.pml")
 	want=$(sed -n 's/.*must fail: \([A-Za-z]*\).*/\1/p' <<<"$first")
 	ltl=$(sed -n 's/^ \* spin-ltl: \([A-Za-z ]*\).*/\1/p' "$name.pml")
+	# The hash table's size, 2^hw slots: about twice the states the spin-states line says, or 2^22
+	# for a mutant, which stops at its first violation. The size is only speed, never which states
+	# are found (each slot is a chain), and its memory is 8 bytes a slot: 32 MB for a mutant, not
+	# the 512 MB of -w26.
+	ns=$(sed -n 's/^ \* spin-states: \([0-9]*\).*/\1/p' "$name.pml")
+	if [[ -n $ns ]]; then
+		hw=19
+		while ((hw < 26 && (1 << (hw - 1)) < ns)); do hw=$((hw + 1)); done
+	fi
 	if [[ -n $want && " $ltl " == *" $want "* ]]; then
 		# A mutant that must fail a temporal property: its claim's violation, under fairness.
 		if ! build "$name" liveness; then
@@ -77,7 +89,7 @@ check() {
 	elif ! build "$name" safety; then
 		verdict="$name: spin -a or gcc failed"
 	else
-		./pan-safety -m100000 -w26 >pan.out 2>&1 || true
+		./pan-safety -m100000 -w"$hw" >pan.out 2>&1 || true
 		if [[ -n $want ]]; then
 			if grep -q "^pan:1: assertion violated $want " pan.out; then
 				verdict="ok: fails with $want ($(stored pan.out) states to the first violation)"

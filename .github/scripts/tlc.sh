@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Model-checks the native store's locking protocols (proofs/tla/StoreLocking.tla, whose
-# configurations are SPIN's (spin.sh), and StoreEviction.tla, proofs/README.md
-# "The store's locking, in TLA+") and the release pipeline
-# (proofs/tla/ReleasePipeline.tla, "The release pipeline, in TLA+") with TLC. tla2tools.jar is the TLA+ project's v1.7.4 release,
+# Model-checks with TLC the TLA+ modules under proofs/tla that SPIN does not: a configuration with a
+# Promela one beside it (proofs/spin, spin.sh: StoreLocking.tla, StoreEviction.tla and
+# ReleasePipeline.tla, proofs/README.md "The store's locking, in TLA+" and "The release pipeline, in
+# TLA+") is SPIN's, unless TLC_ALL=1. tla2tools.jar is the TLA+ project's v1.7.4 release,
 # checked against the sha256 pinned here, so a changed or replaced jar fails the job instead of
 # checking the model. A new version means a new checksum from that release's asset.
 #
@@ -48,9 +48,10 @@ tlc() {
 	return "$rc"
 }
 
-# A configuration that SPIN checks (proofs/spin/<name>.pml, written from the .cfg: StoreLocking's
-# and its mutants, .github/scripts/spin.sh) is left to SPIN, unless TLC_ALL=1 (TLC then checks it
-# too, in minutes; the .cfg's `states without symmetry:` is TLC's count without SYMMETRY).
+# A configuration that SPIN checks (proofs/spin/<name>.pml, written from the .cfg,
+# .github/scripts/spin.sh) is left to SPIN, unless TLC_ALL=1 (TLC then checks it too, in minutes;
+# the .cfg's `states without symmetry:` or `states without the view:` is TLC's count without its
+# SYMMETRY or VIEW, which SPIN has to find).
 #
 # TLC_PART=K/N checks part K of N, so N jobs share the configurations: each is given to the part
 # with the least expected time so far, the longest first (its `tlc-seconds:` comment, or a few

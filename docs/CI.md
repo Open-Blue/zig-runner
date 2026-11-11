@@ -37,7 +37,7 @@ unreported instead, and the merge queue waiting for it.
 | --- | --- | --- |
 | `ci` | pull requests, merge queue, `main` | branch name, workflows, format, build, tests, release builds, end to end |
 | `proofs` | pull requests, merge queue, `main`, weekly | the Lean proofs, and the `hashFiles()` model against `glob.zig` |
-| `store model` | changes to the store or release pipeline, weekly | TLA+ models with TLC, the store's locking with SPIN |
+| `store model` | changes to the store or release pipeline, weekly | the TLA+ models, with SPIN on their Promela ports |
 | `release` | tags; pull requests touching the packaging | binaries, image, provenance, deploy |
 | `provisioned image` | pull requests (build only), `main`, by hand | the default job image with the runner's packages installed, both architectures |
 | `version` | daily, or by hand | cuts the release, after approval |
@@ -206,7 +206,9 @@ instrument through a clang pass plugin, which Zig can't load.
 `proofs` checks the [Lean proofs](../proofs/README.md) (the step cache, the regex matcher's loops,
 and the `hashFiles()` walk) and compares the walk's model with `runner/src/glob.zig` on random
 cases. `store model` checks the TLA+ models of the native store's locking and eviction and of the
-release pipeline with TLC, and the store's locking with SPIN. Each model's mutants must fail.
+release pipeline with SPIN, on their Promela ports, which reach the same states as TLC does
+([proofs/README.md](../proofs/README.md)). Each model's mutants must fail. Its TLC jobs check any
+module that has no port yet, and none on `main` now.
 
 ## Hardening
 
