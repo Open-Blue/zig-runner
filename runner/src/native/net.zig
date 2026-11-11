@@ -95,8 +95,18 @@ pub fn hostLink(buf: *[16]u8, slot: u32) []const u8 {
     return std.fmt.bufPrint(buf, "zrh{d}", .{slot}) catch unreachable;
 }
 
+/// Whether the host has a link named `name`, from sysfs. Not `Socket.index` for one that is
+/// usually not there: asking the kernel for a link's index by name makes it run `modprobe
+/// netdev-<name>` (`dev_load`) when there is none and the caller may load modules, a process
+/// started and waited for, which took 5 ms a job, and more with jobs starting together.
+pub fn linkExists(name: []const u8) bool {
+    var path: [64]u8 = undefined;
+    const p = std.fmt.bufPrintSentinel(&path, "/sys/class/net/{s}", .{name}, 0) catch return true;
+    return linux.errno(linux.access(p, 0)) == .SUCCESS;
+}
+
 /// The helper's subcommand that makes a job's network (`main.zig` dispatches it):
-/// `zig-runner native-net <namespace file> <slot> <subnet>`.
+/// `zig-runner native-net <namespace file> <slot> <subnet> <runner pid>`.
 pub const command = "native-net";
 
 /// The helper's entry: the bridge (if it is not there), a new network namespace kept by
@@ -104,7 +114,11 @@ pub const command = "native-net";
 /// without capabilities on the host's, since the namespace's owner is the host's root, not the
 /// job's; no IPv6 on its `eth0`, whose link-local address would reach the host past the IPv4
 /// rules), then the slot's veth pair, isolated on the bridge, its address and the default route.
-/// The runner holds the slot's lock and removed a dead job's veth of it (`Backend.jobNetwork`).
+/// The runner holds the slot's lock until the helper has ended (`Backend.jobNetwork`), so a veth
+/// of the slot that is there is a dead job's, and is removed first. A helper whose runner has
+/// died no longer has that lock (it is close-on-exec, and the runner's death lets it go), so
+/// another job may hold the slot: the helper ends, before it removes or makes anything of the
+/// slot's, once its parent is no longer the runner that started it (`parent_text`, its pid).
 /// A helper, as a thread of the runner must not change its namespace. Exits 0, or 1 with why on
 /// stderr.
 pub fn upMain(
@@ -112,7 +126,9 @@ pub fn upMain(
     path: []const u8,
     slot_text: []const u8,
     subnet_text: []const u8,
+    parent_text: []const u8,
 ) u8 {
+    const parent = std.fmt.parseInt(linux.pid_t, parent_text, 10) catch return fail("a runner pid", .INVAL);
     const slot = std.fmt.parseInt(u32, slot_text, 10) catch return fail("a slot number", .INVAL);
     if (slot >= max_slots) return fail("a slot number", .INVAL);
     const subnet = Subnet.parse(subnet_text) catch return fail("a subnet", .INVAL);
@@ -139,6 +155,11 @@ pub fn upMain(
     if (linux.errno(kept) != .SUCCESS) return fail("keep the namespace", linux.errno(kept));
     const ns = linux.open("/proc/self/ns/net", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(ns) != .SUCCESS) return fail("open the namespace", linux.errno(ns));
+    if (linux.getppid() != parent) return fail("find the runner that holds the slot's lock", .SRCH);
+    host.deleteVeth(slot);
+    // Again: the delete may have waited for the kernel's lock for link changes, and the runner
+    // may have died meanwhile.
+    if (linux.getppid() != parent) return fail("find the runner that holds the slot's lock", .SRCH);
     host.addVeth(slot, @intCast(ns)) catch return fail("make the veth pair", .INVAL);
     job.configureJob(subnet, slot) catch return fail("configure the job's network", .INVAL);
     return 0;
@@ -322,6 +343,7 @@ pub const Socket = struct {
     /// Removes slot `n`'s veth pair (both ends go with the host's); none there is no error.
     pub fn deleteVeth(s: *Socket, slot: u32) void {
         var buf: [16]u8 = undefined;
+        if (!linkExists(hostLink(&buf, slot))) return;
         const i = s.index(hostLink(&buf, slot)) orelse return;
         var m: Message = .init(.RTM_DELLINK, 0);
         m.ifinfo(i, 0);

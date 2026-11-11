@@ -145,6 +145,10 @@ pub const Config = struct {
     /// Native steps on a runner that is not root (`RUNNER_NATIVE_ROOTLESS`), with only root
     /// mapped inside (`Backend.Config.rootless`); off, such a runner sends every job to Dagger.
     native_rootless: bool = false,
+    /// Whether a native job's last layer is renamed into the store before its data is on disk and
+    /// made durable in the job's teardown (`RUNNER_NATIVE_DEFER_SYNC`, `Store.defer_sync`); off,
+    /// every layer is synced before it is published.
+    native_defer_sync: bool = true,
     /// The first host id of the native jobs' ranges on a root runner
     /// (`RUNNER_NATIVE_SUBID_BASE`, `Backend.Config.subid_base`): at least
     /// `NativeBackend.min_subid_base`.
@@ -500,6 +504,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_ROOTFS")) |v| c.native_rootfs = v;
         if (environ.get("RUNNER_NATIVE_STORE")) |v| c.native_store = v;
         if (environ.get("RUNNER_NATIVE_ROOTLESS")) |v| c.native_rootless = try boolean(v);
+        if (environ.get("RUNNER_NATIVE_DEFER_SYNC")) |v| c.native_defer_sync = try boolean(v);
         if (environ.get("RUNNER_NATIVE_SUBID_BASE")) |v| c.native_subid_base = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_IDMAPPED_UPPER")) |v| c.native_idmapped_upper = try boolean(v);
         if (environ.get("RUNNER_NATIVE_SUBNET")) |v| c.native_subnet = v;
@@ -599,6 +604,7 @@ pub const Config = struct {
         else if (eq(key, "native-rootfs")) c.native_rootfs = val //
         else if (eq(key, "native-store")) c.native_store = val //
         else if (eq(key, "native-rootless")) c.native_rootless = try boolean(val) //
+        else if (eq(key, "native-defer-sync")) c.native_defer_sync = try boolean(val) //
         else if (eq(key, "native-subid-base")) c.native_subid_base = try num(u32, val) //
         else if (eq(key, "native-idmapped-upper")) c.native_idmapped_upper = try boolean(val) //
         else if (eq(key, "native-subnet")) c.native_subnet = val //

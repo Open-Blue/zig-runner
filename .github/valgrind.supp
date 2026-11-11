@@ -24,3 +24,11 @@
    Memcheck:Addr4
    fun:config.Config.fromEnviron
 }
+
+# The same probe at the start of `Store.publishStaged`, whose frame in a debug build is about 8 KiB
+# (many error unions and format argument tuples, one slot each).
+{
+   zig-stack-probe-store-publishstaged
+   Memcheck:Addr4
+   fun:native.Store.publishStaged
+}

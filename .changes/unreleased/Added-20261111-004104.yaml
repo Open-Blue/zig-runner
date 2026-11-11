@@ -1,0 +1,3 @@
+kind: Added
+body: RUNNER_NATIVE_DEFER_SYNC (on by default) turns off the native store's deferred sync of a job's last layer; a pending layer is read only by the job that published it, and a layer whose deferred sync failed is refused at once, whoever holds it.
+time: 2026-11-11T00:41:04.947607168-05:00

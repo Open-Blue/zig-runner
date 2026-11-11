@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The repository no longer holds a built yamldiff (4.9 MB) that #503 committed by mistake, and .gitignore keeps out what go build writes in each Go tool''s directory'
+time: 2026-11-11T18:06:02.176729498-05:00

@@ -10,6 +10,7 @@ const nft = @import("native/nft.zig");
 const key_diff = @import("native/key_diff.zig");
 
 const forward = @import("native/forward.zig");
+const tool_trees = @import("native/tool_trees.zig");
 const native_publish = @import("native/publish.zig");
 const trust = @import("trust.zig");
 const job_mod = @import("job.zig");
@@ -33,6 +34,7 @@ comptime {
     _ = @import("native/Store.zig");
     _ = @import("native/evict.zig");
     _ = @import("native/reaper.zig");
+    _ = @import("native/sync_choice.zig");
     _ = @import("native/sandbox.zig");
     _ = @import("native/net.zig");
     _ = @import("native/seccomp.zig");
@@ -120,8 +122,8 @@ pub fn main(init: std.process.Init) !u8 {
     // started a thread when it makes its namespaces.
     if (args.len == 2 and std.mem.eql(u8, args[1], sandbox.command)) return sandbox.main(arena);
     if (args.len == 2 and std.mem.eql(u8, args[1], forward.command)) return forward.main(arena);
-    if (args.len == 5 and std.mem.eql(u8, args[1], net.command))
-        return net.upMain(arena, args[2], args[3], args[4]);
+    if (args.len == 6 and std.mem.eql(u8, args[1], net.command))
+        return net.upMain(arena, args[2], args[3], args[4], args[5]);
     if (args.len >= 3 and std.mem.eql(u8, args[1], nft.command)) return nft.main(args[2..]);
     if (args.len >= 2 and std.mem.eql(u8, args[1], key_diff.command)) return keyDiff(arena, init, args[2..]);
     if (try printVersionIfAsked(io, args)) return @backingInt(Exit.done);
@@ -177,8 +179,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     var out_buf: [4096]u8 = undefined;
     var stdout: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
+    var console_lock: sink.StdoutSink.Lock = .{ .io = io };
     var console: sink.LogSink = .{
-        .stdout = .{ .writer = &stdout.interface, .secrets = secrets, .io = io },
+        .stdout = .{ .writer = &stdout.interface, .secrets = secrets, .lock = &console_lock },
     };
     defer console.close();
 
@@ -382,6 +385,8 @@ fn runPool(
     name: []const u8,
     store: ?*db.Store,
 ) !u8 {
+    // The last job out's tool-cache walks, on threads of their own, end before the process does.
+    defer tool_trees.process_idle_walks.stopAll(init.io);
     return @backingInt(try loop.pool(.{
         .arena = init.arena.allocator(),
         .gpa = init.gpa,
@@ -647,6 +652,8 @@ fn execJobFile(
         return @backingInt(Exit.config);
     };
     log.setSecrets(job.secrets);
+    // A native job's last-out walk of the tool cache runs on a thread: ended before this returns.
+    defer tool_trees.process_idle_walks.stopAll(io);
     const res = try dagger.run(arena, io, init.environ_map, .{
         .dagger_cmd = cfg.dagger_cmd,
         .image = cfg.image,
