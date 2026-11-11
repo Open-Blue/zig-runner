@@ -2030,12 +2030,14 @@ fn checkToolTrees(b: *Backend) !void {
     const mount = b.cache_plan.tool_cache.?;
     // What the last job out found when it left the volume, read as this job opened it
     // (`volumes.plan`, `tool_trees.takeVerdict`): no walk then.
-    if (b.cache_plan.tool_verdict) |v| {
+    // Only while no step has started in the volume since the walk, which the epoch it was told
+    // by says (`volumes.Plan.verdictStands`): else this job walks, as one that opened later does.
+    if (b.cache_plan.tool_verdict) |v| if (b.cache_plan.verdictStands(b.io)) {
         b.tool_trees = v.env;
         b.tool_trees_full = v.full;
         try b.notes.append(arena, v.note);
         return;
-    }
+    };
     // In the runner's store beside the volumes, where no step can write: a list a job could
     // forge would pass a changed file (`tool_trees.zig`).
     const lists = try trees_check.listsDir(arena, b.store_cfg.root, volume);
@@ -2052,6 +2054,14 @@ fn checkToolTrees(b: *Backend) !void {
     b.tool_trees = verdict.env;
     b.tool_trees_full = verdict.full;
     try b.notes.append(arena, verdict.note);
+}
+
+/// `binds` without the tool cache's volume, for a script of the runner's own that is run in set-up
+/// and does not use it: a process started with it mounted could write to its trees
+/// (`volumes.endEpochs`), and what is not mounted cannot.
+fn withoutToolCache(b: *Backend, binds: []const sandbox.Spec.Bind) []const sandbox.Spec.Bind {
+    const volume = b.cache_plan.tool_cache_host orelse return binds;
+    return volumes.without(b.arena, binds, volume) catch binds;
 }
 
 /// A job that lets the tool cache's volume go with processes that may be alive in it says so,
@@ -2090,7 +2100,7 @@ fn seedBuiltin(b: *Backend, volume: sandbox.Spec.Bind, as_runner: bool) void {
     const at = "/zig-runner-builtin";
     var beside = volume;
     beside.at = at;
-    b.binds = std.mem.concat(arena, sandbox.Spec.Bind, &.{ saved, &.{beside} }) catch return;
+    b.binds = std.mem.concat(arena, sandbox.Spec.Bind, &.{ b.withoutToolCache(saved), &.{beside} }) catch return;
     const dir = set_up.zigBuiltinDir(arena, as_runner) catch return;
     const script = std.fmt.allocPrint(arena, "set -- {s} {s} ''\n{s}", .{
         at,
@@ -2124,6 +2134,9 @@ fn rollZigLocal(b: *Backend, as_runner: bool) void {
         set_up.zig_local_roll_script,
     }) catch return;
     var out: Captured = .{ .arena = arena };
+    const saved = b.binds;
+    defer b.binds = saved;
+    b.binds = b.withoutToolCache(saved);
     const ended = b.exec(script, &.{"PATH=" ++ image_path}, &.{}, 0, 0, out.output()) catch |e| {
         std.log.warn("native: Zig local cache not rolled: {s}", .{@errorName(e)});
         return;
@@ -2744,6 +2757,10 @@ fn runIn(
     }
     @memcpy(lowers[n .. lowers.len - 1], b.seed_layers.items);
     lowers[lowers.len - 1] = b.rootfs;
+    // Before the process exists: from then on a step may write to a tree, and no job is told of
+    // the trees by a verdict again (`tool_trees.Epochs`). Every start with a volume mounted, a
+    // step, an action's pre or post script, a Docker build or a set-up script alike.
+    volumes.endEpochs(b.io, b.binds);
     const ended = try sandbox.run(arena, b.io, b.how.argv_prefix, .{
         .root = b.dir,
         .lowers = lowers,
@@ -5627,6 +5644,36 @@ test "native tool cache volume: a replayed step that points into it runs again (
     _ = try runCachedJob(arena, c.cfg, in_layer, .{}, .{ .ran = "j5" });
     _ = try runCachedJob(arena, c.cfg, in_layer, .{}, .{ .ran = "j6" });
     try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "layer"));
+}
+
+test "native tool trees: a job's first step ends the epoch of the tool cache for those that have not checked yet" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    const caches: volumes.Options = .{ .package_caches = true, .trusted = true, .tool_trees = true };
+    const install = testJob(&.{testStep("mkdir -p $RUNNER_TOOL_CACHE/t/1/x64 && echo v1 > $RUNNER_TOOL_CACHE/t/1/x64/bin")});
+    // The first job leaves a tree. Its own walk as the last out saw the files too new to be told
+    // from a later write, so the walk is made again once they are old enough.
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j1" });
+    io.sleep(.fromMilliseconds(2_200), .awake) catch {};
+    var last = try volumes.plan(arena, io, c.cfg.store, caches, "repo", install, dagger.default_image, false, false, null);
+    const idle = last.idleToolCache(arena) orelse return error.TestUnexpectedResult;
+    const lists = try trees_check.listsDir(arena, c.cfg.store, idle.dir);
+    const kept = trees_check.walkIdle(arena, std.testing.allocator, io, idle.dir, lists, last.tool_cache.?, idle.left, trees_check.idle_limits);
+    last.release(io);
+    if (!kept) return error.SkipZigTest; // a filesystem that proves nothing at rest
+    // A job that has opened the volume and not run anything is told it, as is one that opens after.
+    var waiting = try volumes.plan(arena, io, c.cfg.store, caches, "repo", install, dagger.default_image, false, false, null);
+    defer waiting.release(io);
+    try std.testing.expect(waiting.tool_verdict != null);
+    try std.testing.expect(waiting.verdictStands(io));
+    // A whole job runs a step in the volume: from then on the waiting job's verdict is of the past.
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j2" });
+    try std.testing.expect(!waiting.verdictStands(io));
 }
 
 test "native tool trees: an installing step replays while its tree is held, not once changed" {

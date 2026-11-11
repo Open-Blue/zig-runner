@@ -1285,13 +1285,79 @@ that shows it is one a failure of costs a walk, never trust:
   that its cancel is seen (`volumes.openWaiting`).
 - A job reads the verdict when it opens the volume (`volumes.plan`), before any step of any job
   can write to it, and removes it, whether or not it checks the trees; a verdict that cannot be
-  removed is not used. So a verdict is read only by jobs that opened before the first removal, and
-  every step of every job runs after that.
+  removed is not used. The file is read once, but its answer is kept in the runner's memory as the
+  volume's "epoch" (`tool_trees.Epochs`), and the jobs of the same process that open the volume
+  while it stands are told the same. The epoch ends before the first process is started with the
+  volume mounted, by any job (`volumes.endEpochs`, called from `execIn` before the sandbox is
+  made, for every volume bind and any volume nested with it, so a step, a pre or post script, a Docker build or a set-up script alike; the runner's own
+  set-up scripts that do not use the volume are run without it mounted), and when its last member
+  lets the volume go, so it never spans a last job out's walk. A job uses the verdict only if the
+  epoch still stands when it checks the trees (`Plan.verdictStands`, in "Set up job", before any
+  step of its own): the answer is then no older than the walk it would have made itself, and no
+  process wrote in between. A job that finds the epoch ended walks (`checkOnce`, as above), as one
+  that opens later does. A job's set-up that fails or is cancelled after it joined only lets go.
 - A verdict is of one boot (`boot_id`), one mount path, and the volume's lock file as its last
   open left it (inode and mtime, which every open sets: an open by anything that does not take
-  verdicts, such as an older runner, and an evicted and recreated volume, are differences).
-  Two jobs that open together are not both told: the second finds the first's open in the mtime and
-  walks (`checkOnce`, as above).
+  verdicts, such as an older runner, and an evicted and recreated volume, are differences). The
+  epoch holds the same for its members: each open reads the lock file's mtime and sets it with an
+  exclusive lock on the file's first byte held (`volumes.stampLock`, an open-file-description
+  lock on the descriptor the open holds, so it excludes other processes as well as other threads
+  and is not the volume's flock), and joins the epoch in the same critical section, so
+  another runner's open cannot come between the read and the stamp and have its own written over.
+  The lock is polled: an open that finds the outer lock (`<img>.lock`, which no job can reach)
+  held never stamps without it. It waits as the shared lock does (`Wait.ms`), sees the job's
+  cancel (`error.Canceled`), and fails with `error.VolumeBusy` only for a holder stuck for that
+  long. The step user's lock (`runner.lock`) is inside the root user's volume, where a root-user
+  step can open it and hold a lock on it (reading is enough): it is waited for 100 ms, and then
+  the open stamps without the lock and says nothing of its stamp, so such a lock can stop
+  sharing, and never stalls or fails an open. Where nobody could share anyway (below) an open
+  stamps without the lock too. The stamp lock is taken by every cache volume `openWaiting` opens,
+  not only the tool cache's. The lock file is opened read-write for it (`Store.lockBeside`); one the runner
+  can only read gets no stamp lock, so shares nothing. A store on NFS or SMB is not shared
+  through: there Linux makes a flock a POSIX lock of the whole file, and the jobs' shared ones
+  would conflict with the stamp lock, so `onNetworkFs` turns it off.
+  The open must find the file as the previous member left it, or the epoch ends. The stamp is an
+  explicit time, now or a nanosecond past what was there, and it counts only if it reads back
+  exactly as asked: on a filesystem that keeps coarser times (whole seconds: ext3, ext4 with
+  128-byte inodes, FAT) it almost never does, so no two opens could be told apart there and none
+  shares. A runner older than this does not take the stamp lock: its open may still fall between
+  a newer one's read and stamp, a window of microseconds that an open had before epochs. An epoch
+  is as old as its walk (`Verdict.at_ms`), checked when it is joined and when it is used. An
+  epoch is of one volume, so one of another trust scope (its own volume) is never told of it, and
+  a runner that restarts has none and drops the store's verdicts before its first job. Two
+  runner processes never share an epoch: the second finds the file removed or the mtime moved,
+  and walks.
+- The step user's tool cache (`evict.nested`, `runner/`) is a directory of the root user's volume
+  and a volume of its own: its own lock (`runner.lock`, inside the root volume), lists, verdict
+  and epoch. The root volume's walk covers it, as the directory it is, so a step user's job
+  that changes it must be seen by the root user's lock, and a root user's job that writes there
+  by the step user's. Each open therefore stamps the other's lock too, under that lock's stamp
+  lock, outer lock (`<img>.lock`, outside any volume) first in every process: an open of the
+  step user's volume stamps the root volume's, and an open of the root user's stamps
+  `runner.lock` if it is a regular file there (opened without following a link, as
+  `evict.innerLock` does). Any epoch of either then ends when the other's volume is opened, in
+  any runner, and in this process also when a process starts with either mounted
+  (`Epochs.end`, in both directions). The stamp is also a use of the outer volume for eviction
+  (`evict.zig` goes by the lock's mtime), so a step user's recent job keeps the root volume, and
+  the `runner/` in it, from being the oldest.
+- The walk of the last job out (`Plan.idleToolCache`) also takes the other user's lock
+  exclusively, without waiting, when that file is there, and makes no verdict if it cannot: a job
+  of the other user in the same directory tree could write to the trees being walked.
+- What sharing does not protect against, plainly:
+  - Upgrade every pool that shares a store together. A runner older than this takes no stamp
+    locks, so its open may fall between a newer one's read and stamp, or write a mtime over its
+    stamp: the window of microseconds that every open had before epochs.
+  - Mixed step users on one store are covered by the stamps of both locks and the walk's two locks
+    above, as far as a lock file a job cannot forge goes (next point).
+  - A rootless runner's jobs run as the runner's own user, so a root-user step can write
+    `runner.lock` and the trees a verdict is of, and forge a chain, as it could the verdict before
+    epochs. Sharing protects against a job's mistakes and against jobs of untrusted scopes (which
+    have volumes of their own), not against a hostile trusted job on a rootless runner.
+  - A store on NFS or SMB shares nothing (Linux makes a flock a POSIX lock of the file there, which
+    the stamp lock would conflict with; `onNetworkFs`). Other filesystems that do the same (9p,
+    some FUSE) are not detected: there a lock held by a job's own flock could keep opens from
+    sharing, or wait them up to `Wait.ms`. A store whose times are coarse (whole seconds) shares
+    nothing either, as two opens cannot be told apart.
 - Host-side changes while no job is in the volume: the runner's first job drops every verdict, and
   one is not used past an hour (`tool_trees.verdict_max_age_ms`) or from the future.
 

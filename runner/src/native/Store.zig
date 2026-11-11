@@ -1222,15 +1222,25 @@ fn isRegular(fd: linux.fd_t) bool {
 pub fn lockBeside(arena: Allocator, io: std.Io, path: []const u8) !std.Io.File {
     const cwd = std.Io.Dir.cwd();
     const z = try arena.dupeSentinel(u8, path, 0);
-    const flags: linux.O = .{
-        .ACCMODE = .RDONLY,
+    // Read-write, so a volume's open can hold a byte-range lock on it (`volumes.stampLock`); a
+    // file the runner may only read (another user's) is a lock all the same, and the open that
+    // finds it so shares nothing.
+    var flags: linux.O = .{
+        .ACCMODE = .RDWR,
         .CREAT = true,
         .NOFOLLOW = true,
         .NONBLOCK = true,
         .CLOEXEC = true,
     };
     for (0..8) |_| {
-        const rc = linux.open(z, flags, 0o644);
+        var rc = linux.open(z, flags, 0o644);
+        switch (linux.errno(rc)) {
+            .ACCES, .PERM, .ROFS => {
+                flags.ACCMODE = .RDONLY;
+                rc = linux.open(z, flags, 0o644);
+            },
+            else => {},
+        }
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 const fd = std.math.cast(linux.fd_t, rc) orelse return error.Locked;
