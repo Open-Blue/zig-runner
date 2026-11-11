@@ -2128,8 +2128,13 @@ test "native eviction: names a job planted under a dead tree do not stop the rem
     try cwd.rename(Hostile.p(f, "{s}/a", .{build}), cwd, Hostile.p(f, "{s}/a", .{dead}), testing.io);
     const old = try f.volume("old", 6000, 30);
     f.s.limits = .{ .volumes_max_bytes = 1, .min_free_pct = 0, .budget_ms = 15 };
-    var passes: usize = 0;
-    while (passes < 300 and (try f.deadLeft() > 0 or f.there(old))) : (passes += 1) run(f.s, testing.io);
+    // Bounded by time, not by passes: each pass has 15 ms, and a loaded machine (the
+    // ThreadSanitizer suite's twelve shards) gets less done in each, so the 170 passes this takes
+    // alone, 256 under ThreadSanitizer, ran past a cap of 300. A removal that is stuck still
+    // fails, at the deadline.
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 120 * std.time.ms_per_s;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline and
+        (try f.deadLeft() > 0 or f.there(old))) run(f.s, testing.io);
     try testing.expectEqual(@as(usize, 0), try f.deadLeft());
     try testing.expect(!f.there(old));
 }
