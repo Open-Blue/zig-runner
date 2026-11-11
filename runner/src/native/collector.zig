@@ -57,6 +57,9 @@ var running = false;
 pub var passes: std.atomic.Value(u32) = .init(0);
 var active: std.atomic.Value(u32) = .init(0);
 pub var most_active: std.atomic.Value(u32) = .init(0);
+/// Tests of a whole job: whether its end waits for the thread, so that what the store holds is as
+/// when the end collected itself. The stress test turns it off to run the thread as it runs.
+pub var test_wait = true;
 /// Tests: while set, the thread takes no work, so a test can queue several jobs' upkeep.
 pub var test_hold: std.atomic.Value(bool) = .init(false);
 

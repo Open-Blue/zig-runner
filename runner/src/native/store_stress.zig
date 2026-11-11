@@ -433,6 +433,8 @@ test "native store under load: one worker (run only by the test above, in a proc
         cfg.binds,
         &.{.{ .host = shared, .at = "/shared", .read_only = false }},
     });
+    // Jobs' upkeep runs on its thread, as it does in a runner.
+    collector.test_wait = false;
     var w: Worker = .{
         .index = index,
         .cfg = cfg,

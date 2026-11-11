@@ -13,6 +13,7 @@
 const Backend = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Sha256 = @import("../sha256.zig").Sha256;
 const job_mod = @import("../job.zig");
 const config = @import("../config.zig");
@@ -1485,6 +1486,8 @@ pub fn deinit(b: *Backend) void {
         if (b.store_cfg.lagFits(arena, b.io) and collector.submit(b.io, b.store_cfg, b.published)) {
             _ = b.timings.since(arena, .collect, whole);
             if (b.store_cfg.sync_fd) |fd| _ = std.os.linux.close(fd);
+            // Tests read the store when a job returns, as they did; the thread has tests of its own.
+            if (builtin.is_test and collector.test_wait) _ = collector.drain(b.io, null);
             return;
         }
         _ = collector.drain(b.io, null);
@@ -8488,9 +8491,7 @@ fn replayableLines(arena: Allocator, text: []const u8) ![]const []const u8 {
 }
 
 fn storeLayers(arena: Allocator, store: []const u8) !usize {
-    // What a job's end evicted is deleted after it returns (`reaper`), and a job's end collects
-    // after it returns (`collector`).
-    _ = collector.drain(std.testing.io, null);
+    // What a job's end evicted is deleted after it returns (`reaper`).
     reaper.drain(std.testing.io);
     const p = try std.fmt.allocPrint(arena, "{s}/layers", .{store});
     var dir = try std.Io.Dir.cwd().openDir(std.testing.io, p, .{ .iterate = true });
@@ -9041,12 +9042,7 @@ test "native step cache: past its cap the store lets go of every layer no job ho
     var c = try cachedConfig(arena, &tmp);
     c.cfg.store_max_bytes = 0;
     const job = testJob(&.{testStep("echo x >> /shared/s")});
-    for ([_][]const u8{ "j1", "j2" }) |ran| {
-        try expectSucceeded(try runCached(arena, c.cfg, job, ran));
-        // A job's end collects once the runner polls again (`collector`): the layer is let go
-        // before the next job only because this waits for it.
-        _ = collector.drain(std.testing.io, null);
-    }
+    for ([_][]const u8{ "j1", "j2" }) |ran| try expectSucceeded(try runCached(arena, c.cfg, job, ran));
     try std.testing.expectEqual(@as(usize, 2), runs(arena, c.shared, "s"));
     try std.testing.expectEqual(@as(usize, 0), try storeLayers(arena, c.cfg.store));
 }
