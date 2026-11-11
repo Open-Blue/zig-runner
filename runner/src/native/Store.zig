@@ -55,8 +55,8 @@ defer_sync: bool = false,
 /// What the disk is doing, when a test says so; null reads the machine's (`sync_choice.read`).
 sync_load: ?sync_choice.Load = null,
 /// The boot this store takes itself to be in, when a test says so (a crash test replays a disk
-/// inside one boot); null reads the kernel's (`bootId`).
-boot_id: ?BootId = null,
+/// inside one boot); null reads the kernel's (`epochOf`).
+epoch: ?Epoch = null,
 /// Whether an evicted layer's tree is deleted by `reaper`'s thread, after the job's end has
 /// returned, rather than by `collect`. Off in tests that count what is left when it returns.
 defer_delete: bool = false,
@@ -310,8 +310,10 @@ pub fn open(s: Store, arena: Allocator, io: std.Io, key: Key) !?Hit {
         f.close(io);
         return null;
     }
-    const rec = s.readEntry(arena, io, dir) catch {
+    const rec = s.readEntry(arena, io, dir) catch |e| {
         f.close(io);
+        // Another job's layer not yet durable is a miss, and is that job's to make durable or poison.
+        if (e == error.PendingOfAnotherJob) return null;
         if (s.evict(arena, io, &hex(key))) return null;
         return error.Invalid;
     };
@@ -378,6 +380,29 @@ const boot_id_len = 36;
 pub const BootId = [boot_id_len]u8;
 const pending_line = "pending ";
 
+/// What a pending layer's page cache belongs to: the boot, and the mount of the store's filesystem
+/// (`STATX_MNT_ID_UNIQUE`, never reused in a boot). The same boot with the filesystem unmounted and
+/// mounted again, or its device lost and back, is another cache: what was in the old one may never
+/// have reached the disk.
+pub const Epoch = struct {
+    boot: BootId,
+    mnt: u64,
+};
+
+/// The epoch of the filesystem `path` is on, or null when the boot id or the mount's unique id
+/// (Linux 6.8) cannot be read: a publish then syncs before it renames.
+fn epochOf(io: std.Io, path: []const u8) ?Epoch {
+    const boot = bootId(io) orelse return null;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len >= buf.len) return null;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    var st: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, buf[0..path.len :0], 0, .{ .MNT_ID_UNIQUE = true }, &st);
+    if (linux.errno(rc) != .SUCCESS or !st.mask.MNT_ID_UNIQUE) return null;
+    return .{ .boot = boot, .mnt = st.mnt_id };
+}
+
 /// This boot's id, or null when it cannot be read: a publish is then made synchronous, and a pending
 /// layer is refused.
 fn bootId(io: std.Io) ?BootId {
@@ -387,14 +412,14 @@ fn bootId(io: std.Io) ?BootId {
     return if (id.len == boot_id_len) id[0..boot_id_len].* else null;
 }
 
-fn inThisBoot(s: Store, io: std.Io, id: BootId) bool {
-    const now = s.boot_id orelse bootId(io) orelse return false;
-    return std.mem.eql(u8, &now, &id);
+fn inThisBoot(s: Store, arena: Allocator, io: std.Io, e: Epoch) bool {
+    const now = s.epoch orelse epochOf(io, join(arena, s.root, "layers") catch return false) orelse return false;
+    return now.mnt == e.mnt and std.mem.eql(u8, &now.boot, &e.boot);
 }
 
 const Meta = struct {
-    /// The boot a layer whose data was not yet synced was renamed in (`pending_line`); null once it was.
-    pending: ?BootId = null,
+    /// Where a layer whose data was not yet synced was renamed in (`pending_line`); null once it was.
+    pending: ?Epoch = null,
     kind: Kind,
     bytes: u64,
     log_len: u64,
@@ -402,16 +427,18 @@ const Meta = struct {
     log_sha: Key,
     fc_sha: Key,
 
-    /// A pending layer's meta has the line `pending <boot id>` right after its format: a meta cut
+    /// A pending layer's meta has the line `pending <boot id> <mount id>` right after its format: a meta cut
     /// short (it is not synced, so a crash may) can then never read as a durable one, whose lines are
     /// the same without it.
     fn write(m: Meta, arena: Allocator) ![]const u8 {
-        return std.fmt.allocPrint(arena, "format {s}\n{s}{s}{s}kind {t}\nbytes {d}\nlog {d} {s}\n" ++
+        const pending = if (m.pending) |e|
+            try std.fmt.allocPrint(arena, "{s}{s} {d}\n", .{ pending_line, &e.boot, e.mnt })
+        else
+            "";
+        return std.fmt.allocPrint(arena, "format {s}\n{s}kind {t}\nbytes {d}\nlog {d} {s}\n" ++
             "fc {d} {s}\n", .{
             store_format,
-            if (m.pending) |_| pending_line else "",
-            if (m.pending) |*b| b else "",
-            if (m.pending) |_| "\n" else "",
+            pending,
             m.kind,
             m.bytes,
             m.log_len,
@@ -429,8 +456,11 @@ const Meta = struct {
         for (want) |name| {
             if (name[0] == 'k') if (lines.peek()) |next| if (std.mem.startsWith(u8, next, pending_line)) {
                 const id = next[pending_line.len..];
-                if (id.len != boot_id_len) return error.BadMeta;
-                m.pending = id[0..boot_id_len].*;
+                if (id.len < boot_id_len + 2 or id[boot_id_len] != ' ') return error.BadMeta;
+                m.pending = .{
+                    .boot = id[0..boot_id_len].*,
+                    .mnt = std.fmt.parseInt(u64, id[boot_id_len + 1 ..], 10) catch return error.BadMeta,
+                };
                 _ = lines.next();
             };
             const line = lines.next() orelse return error.BadMeta;
@@ -457,13 +487,25 @@ const Meta = struct {
     }
 };
 
+/// Whether `dir` is the layer this job renamed in and has not yet made durable.
+fn owns(s: Store, dir: []const u8) bool {
+    const l = s.sync_log orelse return false;
+    const key = l.pending orelse return false;
+    return std.mem.eql(u8, std.fs.path.basename(dir), &hex(key));
+}
+
 /// The entry in `dir` read and checked whole: its tree there, its `meta` this format's, its
 /// record's files of the lengths and sha256s it says, and the record one its kind may have.
 fn readEntry(s: Store, arena: Allocator, io: std.Io, dir: []const u8) !Record {
     const m = try metaOf(arena, io, dir);
-    // A pending layer is one this boot may read, from the page cache that holds exactly what was
-    // renamed in. Another boot's is refused: its data may never have reached the disk.
-    if (m.pending) |b| if (!s.inThisBoot(io, b)) return error.PendingOfAnotherBoot;
+    // A pending layer is the publishing job's to read, from the page cache that holds what it
+    // renamed in. Another boot's or mount's is refused: its data may never have reached the disk.
+    // Another job of this boot gets a miss, not the layer, until it is durable: nothing vouches for
+    // the page cache of a job that may fail its sync or be killed (`settlePending`).
+    if (m.pending) |e| {
+        if (!s.inThisBoot(arena, io, e)) return error.PendingOfAnotherBoot;
+        if (!s.owns(dir)) return error.PendingOfAnotherJob;
+    }
     if (!isDir(arena, try join(arena, dir, "fs"))) return error.NoTree;
     const cwd = std.Io.Dir.cwd();
     const limit: std.Io.Limit = .limited(max_record_bytes + 1);
@@ -496,10 +538,10 @@ pub fn checkEntry(s: Store, arena: Allocator, io: std.Io, name: []const u8) !?u6
     };
     defer f.close(io);
     if (!flock(f, lock_sh) or !sameFile(arena, f, lock_path)) return null;
-    _ = try s.readEntry(arena, io, dir);
     const m = try metaOf(arena, io, dir);
     // A layer whose data is not yet synced counts what the page cache will take (`settle` counts it again).
     if (m.pending != null) return m.bytes;
+    _ = try s.readEntry(arena, io, dir);
     const bytes = try treeBytes(arena, io, try join(arena, dir, "fs"));
     if (bytes != m.bytes) {
         std.debug.print("native store: {s}'s tree takes {d} bytes, its meta says {d}\n", .{ name, bytes, m.bytes });
@@ -564,7 +606,7 @@ fn treeAsCounted(s: Store, arena: Allocator, io: std.Io, dir: []const u8) bool {
     const m = metaOf(arena, io, dir) catch return false;
     // Pending: this boot's is a job's still being synced, its blocks not yet counted; another's is
     // evicted, which is what its mark is for.
-    if (m.pending) |b| return s.inThisBoot(io, b);
+    if (m.pending) |e| return s.inThisBoot(arena, io, e);
     const fs = join(arena, dir, "fs") catch return false;
     return m.bytes == (treeBytes(arena, io, fs) catch return false);
 }
@@ -718,7 +760,12 @@ fn publishStaged(
     // Unless this layer is left for the job's next publish or its end (`defer_sync`): then the
     // entry is renamed in at once with a meta that says so, and what the sync is for holds by the
     // boot id (`Meta.pending`): after a crash nothing returns it.
-    const lazy: ?BootId = if (s.defer_sync and s.sync_log != null) s.boot_id orelse bootId(io) else null;
+    // Needs the job's descriptor, so the settle's `syncfs` reports a write error the page cache
+    // lost track of (the superblock's, which outlives an evicted inode).
+    const lazy: ?Epoch = if (s.defer_sync and s.sync_log != null and s.sync_fd != null)
+        s.epoch orelse epochOf(io, try join(arena, s.root, "layers"))
+    else
+        null;
     const entry = try openRoot(arena, tmp);
     defer _ = linux.close(entry);
     var whole_disk = false;
@@ -1061,26 +1108,47 @@ pub const SyncLog = struct {
     }
 };
 
-/// The job's layer renamed in with its data not yet on disk (`defer_sync`) made durable now: its data
-/// synced, the way `sync_choice` finds cheapest, and then its meta written again without the
-/// pending mark (`meta.new` fsynced and renamed over `meta`, the entry's directory fsynced). The mark
-/// comes last, so a crash leaves the layer pending (refused after the boot, `readEntry`) or durable
-/// with its data on disk, never durable without it. The caller still holds the layer, so an eviction
-/// cannot take it meanwhile. Called by the job's next publish, and by its end, after its result was
-/// reported. Once: the layer is no longer pending, whatever the outcome; a failure (`error.Sync`) is
-/// logged and marks the job failed as any sync's does, so its end evicts the layer (`dropUnsynced`).
+/// The job's layer renamed in with its data not yet on disk (`defer_sync`) made durable now: the
+/// filesystem synced through the job's descriptor (`sync_fd`: the superblock's write error outlives
+/// an inode the kernel evicted, a fresh descriptor's would not see it), and then its meta written
+/// again without the pending mark (`meta.new` fsynced and renamed over `meta`, the entry's
+/// directory fsynced). The mark comes last, so a crash leaves the layer pending (refused after the
+/// boot, `readEntry`) or durable with its data on disk, never durable without it. The caller still
+/// holds the layer, so an eviction cannot take it meanwhile. Called by the job's next publish, and by
+/// its end, after its result was reported. Once: the layer is no longer pending, whatever the
+/// outcome. A failure (`error.Sync`), or a job already failed, marks the job as any sync's does, and
+/// poisons the layer at once (`poison`): a job that holds it keeps its mount, but no lookup returns
+/// it, and its pages, clean after a failed write-back, may be dropped and read back from the disk.
 pub fn settlePending(s: Store, arena: Allocator, io: std.Io, ph: ?*phases.Phases) !void {
     const l = s.sync_log orelse return;
     const key = l.pending orelse return;
     l.pending = null;
-    if (l.failed) return error.Sync;
+    if (l.failed) {
+        s.poison(arena, io, key);
+        return error.Sync;
+    }
     const t = phases.now();
     s.settle(arena, io, key) catch |e| {
         l.failed = true;
-        if (e != error.Sync) std.log.warn("native: cannot make a published layer durable: {s}; the job's layers since the last good sync are evicted", .{@errorName(e)});
+        s.poison(arena, io, key);
+        if (e != error.Sync) std.log.warn("native: cannot make a published layer durable: {s}; it is refused from now on, and the job's layers since the last good sync are evicted", .{@errorName(e)});
         return error.Sync;
     };
     if (ph) |p| _ = p.since(arena, .settle, t);
+}
+
+/// The layer `key` made unreadable to every lookup now, whoever holds it: its meta renamed to
+/// `meta.bad`, so `open` finds a broken entry and evicts it when no job holds it, and `collect`
+/// does too. If it cannot be renamed, the meta is removed; if not even that, it is logged.
+fn poison(s: Store, arena: Allocator, io: std.Io, key: Key) void {
+    const cwd = std.Io.Dir.cwd();
+    const dir = s.layerDir(arena, key) catch return;
+    const meta = join(arena, dir, "meta") catch return;
+    const bad = join(arena, dir, "meta.bad") catch return;
+    cwd.rename(meta, cwd, bad, io) catch |e| {
+        if (e == error.FileNotFound) return;
+        cwd.deleteFile(io, meta) catch |e2| std.log.warn("native: cannot refuse layer {s} ({t}, {t}); it stays a hit for this boot", .{ &hex(key), e, e2 });
+    };
 }
 
 fn settle(s: Store, arena: Allocator, io: std.Io, key: Key) !void {
@@ -1092,16 +1160,10 @@ fn settle(s: Store, arena: Allocator, io: std.Io, key: Key) !void {
     if (m.pending == null) return;
     const lock = try cwd.openFile(io, try join(arena, dir, "lock"), .{});
     defer lock.close(io);
-    // As a publish's sync, with the choice made now.
-    var whole_disk = false;
-    const todo = writeBack(arena, io, entry, s.syncLimit(io)) catch |e| switch (e) {
-        error.Unreadable, error.TooLarge => no: {
-            whole_disk = true;
-            break :no &.{};
-        },
-        else => return e,
-    };
-    if (whole_disk) try s.syncDisk(lock);
+    // Every dirty page of the filesystem, this layer's among them, through the job's descriptor.
+    // The per-file way of a publish (`sync_choice`) would use fresh descriptors, which a lost write
+    // error can miss (`defer_sync`).
+    try s.syncDisk(lock);
     // Measured once written, as a publish does: at the rename the blocks of what was only in the
     // page cache were not counted.
     m.bytes = try treeBytes(arena, io, try join(arena, dir, "fs"));
@@ -1111,14 +1173,6 @@ fn settle(s: Store, arena: Allocator, io: std.Io, key: Key) !void {
     const f = try cwd.createFile(io, new, .{});
     defer f.close(io);
     try f.writeStreamingAll(io, try m.write(arena));
-    _ = syncRange(f.handle, sync_file_range_write);
-    if (!whole_disk) {
-        const unreadable = if (syncEntries(entry, todo)) |_| false else |e| switch (e) {
-            error.Unreadable => true,
-            else => return error.Sync,
-        };
-        if (unreadable) try s.syncDisk(lock);
-    }
     const e = linux.errno(linux.fsync(f.handle));
     if (e != .SUCCESS) return syncError("fsync of the meta", e);
     try cwd.rename(new, cwd, try join(arena, dir, "meta"), io);
@@ -1215,6 +1269,9 @@ fn collectLocked(s: Store, arena: Allocator, io: std.Io, ph: ?*phases.Phases, st
             _ = s.evict(arena, io, e.name);
             continue;
         };
+        // Pending, with no job holding it (its lock is free): its job was killed, and nothing will make
+        // it durable or refuse it. One a live job holds stays.
+        if (meta.pending != null and s.evict(arena, io, e.name)) continue;
         const bytes = accounted(meta);
         var st: linux.Statx = undefined;
         const lock_z = arena.dupeSentinel(u8, join(arena, full, "lock") catch return, 0) catch
@@ -2507,7 +2564,7 @@ test "native store: a layers directory that cannot be synced fails the job's lay
 
 /// A job's store that leaves its layers' data to be synced later, whatever the disk is doing.
 fn lazyStore(arena: Allocator) Store {
-    return .{ .root = "", .sync_log = newSyncLog(arena), .defer_sync = true, .sync_load = .{} };
+    return .{ .root = "", .sync_log = newSyncLog(arena), .defer_sync = true, .sync_load = .{}, .sync_fd = syncCursor(arena, ".") };
 }
 
 test "native store: a deferred publish is renamed in pending, this boot may use it, and settling makes it durable" {
@@ -2517,7 +2574,7 @@ test "native store: a deferred publish is renamed in pending, this boot may use 
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (bootId(io) == null) return error.SkipZigTest;
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
     var s = lazyStore(arena);
     const k, const l = try testLayer(arena, io, tmp, &s, "up");
     const dir = std.fs.path.dirname(l.fs).?;
@@ -2547,7 +2604,7 @@ test "native store: a pending layer of another boot is refused and evicted, and 
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (bootId(io) == null) return error.SkipZigTest;
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
     var s = lazyStore(arena);
     const k, const l = try testLayer(arena, io, tmp, &s, "up");
     l.lock.close(io);
@@ -2579,7 +2636,7 @@ test "native store: the next publish settles the job's previous layer, and a fai
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (bootId(io) == null) return error.SkipZigTest;
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
     var s = lazyStore(arena);
     // A quiet disk: past a few dozen entries a layer is synced with `syncfs`.
     s.sync_load = .{ .io_some = 0, .dirty_kib = 0 };
@@ -2620,9 +2677,101 @@ test "native store: the next publish settles the job's previous layer, and a fai
     l2.lock.close(io);
     s.dropUnsynced(arena, io);
     try std.testing.expect(try s.open(arena, io, second) == null);
-    // As after any failed sync, what was renamed since the last good one (the layers' directory's)
-    // is in doubt too (`dropUnsynced`).
-    try std.testing.expect(try s.open(arena, io, first) == null);
+    // `first` was made durable by a good `syncfs` before: not in doubt.
+    (try s.open(arena, io, first)).?.layer.lock.close(io);
+}
+
+test "native store: another job gets a miss for a pending layer, and a layer whose settle failed is refused at once, held or not" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
+    var s = lazyStore(arena);
+    const key, const l = try testLayer(arena, io, tmp, &s, "bad");
+    const dir = std.fs.path.dirname(l.fs).?;
+    // Another job of this boot: a miss, and the layer stays for its job to settle.
+    const other: Store = .{ .root = s.root };
+    try std.testing.expect(try other.open(arena, io, key) == null);
+    try std.testing.expect((try metaOf(arena, io, dir)).pending != null);
+    // Its own job holds it too, as a replayed step would.
+    const held = (try s.open(arena, io, key)).?;
+    // The settle fails (a failing descriptor stands for EIO).
+    s.sync_fd = -1;
+    try std.testing.expectError(error.Sync, s.settlePending(arena, io, null));
+    // Refused now, though held: no lookup returns it, whoever holds it.
+    const third: Store = .{ .root = s.root };
+    try std.testing.expectError(error.Invalid, third.open(arena, io, key));
+    try std.testing.expectError(error.Invalid, s.open(arena, io, key));
+    // The holder keeps its tree.
+    try tmp.dir.access(io, try std.fmt.allocPrint(arena, "store/layers/{s}/fs/f", .{hex(key)}), .{});
+    held.layer.lock.close(io);
+    l.lock.close(io);
+    try std.testing.expect(try third.open(arena, io, key) == null);
+}
+
+test "native store: a job already failed poisons the pending layer it never settles" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
+    var s = lazyStore(arena);
+    const key, const l = try testLayer(arena, io, tmp, &s, "up");
+    // As after the note of the rename ran out of memory: failed, with a layer pending.
+    s.sync_log.?.failed = true;
+    try std.testing.expectError(error.Sync, s.settlePending(arena, io, null));
+    try std.testing.expectError(error.Invalid, s.open(arena, io, key));
+    l.lock.close(io);
+    try std.testing.expect(try s.open(arena, io, key) == null);
+}
+
+test "native store: collect evicts a pending layer no job holds, a killed job's, and keeps a held one" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
+    var s = lazyStore(arena);
+    const key, const l = try testLayer(arena, io, tmp, &s, "up");
+    const other: Store = .{ .root = s.root };
+    other.collect(arena, io);
+    try std.testing.expect(isDir(arena, std.fs.path.dirname(l.fs).?));
+    l.lock.close(io);
+    other.collect(arena, io);
+    try std.testing.expect(!isDir(arena, std.fs.path.dirname(l.fs).?));
+    try std.testing.expect(try other.open(arena, io, key) == null);
+}
+
+test "native store: a pending layer of another mount of this boot is refused, and no sync descriptor means no deferral" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const here = epochOf(io, ".") orelse return error.SkipZigTest;
+    var s = lazyStore(arena);
+    s.epoch = here;
+    const key, const l = try testLayer(arena, io, tmp, &s, "up");
+    l.lock.close(io);
+    try std.testing.expect((try metaOf(arena, io, std.fs.path.dirname(l.fs).?)).pending != null);
+    (try s.open(arena, io, key)).?.layer.lock.close(io);
+    // The same boot, the store's filesystem mounted again.
+    s.epoch = .{ .boot = here.boot, .mnt = here.mnt + 1 };
+    try std.testing.expect(try s.open(arena, io, key) == null);
+    // Without the job's descriptor a publish syncs before it renames.
+    var t = lazyStore(arena);
+    t.sync_fd = null;
+    const key2, const l2 = try testLayer(arena, io, tmp, &t, "plain");
+    l2.lock.close(io);
+    try std.testing.expect((try metaOf(arena, io, try std.fmt.allocPrint(arena, "{s}/layers/{s}", .{ t.root, hex(key2) }))).pending == null);
 }
 
 test "native store: a publish without the setting syncs before it renames, as it did" {

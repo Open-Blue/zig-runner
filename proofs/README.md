@@ -443,18 +443,25 @@ the key's lock but publishing before it looks the key up, as #299 had it: `NoBui
 **The deferred sync** is a module of its own, `tla/StoreDeferred.tla` (TLC only: `StoreLocking` and its
 SPIN port model a publish that is durable when it is renamed in, which `Store.publishTimed` still is
 without `defer_sync`). A publish there is renamed in with a meta that says `pending` and names the boot;
-the job's next publish makes the previous layer durable (the data's fsyncs, then the durable meta
-renamed over it, then its directory's fsync), and its end the last, after its result was reported.
-A machine crash keeps the synced data and the committed meta, and may lose a rename no directory sync
-covered. Safety: `NoWrongValid` (at any instant, a layer `open` takes has a whole tree: a pending mark
-of another boot is refused), `NoLostPublish` (a layer of a job whose end has finished survives a crash
-that follows, unless a failed sync evicted it: between the result and the end's sync it may not, which
-is the one promise that changed), and `MarkedHasData`. `StoreDeferred.cfg` has two runners, two layers
-a job, a machine crash and a failed sync, and holds; three mutants must fail:
-`StoreDeferred-trust-pending.cfg` (a lookup that ignores the boot a pending mark names:
-`NoWrongValid`), `StoreDeferred-mark-first.cfg` (the durable mark before the data's fsyncs:
-`NoWrongValid`) and `StoreDeferred-no-end-sync.cfg` (an end that leaves its last layer pending:
-`NoLostPublish`).
+the job's next publish makes the previous layer durable (the data's sync through the job's descriptor,
+then the durable meta renamed over it, then its directory's fsync), and its end the last, after its
+result was reported. A machine crash keeps the synced data and the committed meta, and may lose a
+rename no directory sync covered. Within a boot a pending layer's write-back may fail and its pages be
+dropped (`WbLoss`); the writer's settle then fails and poisons the layer whoever holds it
+(`PoisonOnFail`), a runner may be killed (`MaxRunnerCrashes`), and reader jobs hold what they open.
+Only the publishing job takes its own pending layer (`OwnerOnly`); `collect` evicts one nobody owns or
+holds. Safety: `NoWrongValid` (no other job's lookup, at any instant, takes a layer whose tree is not
+whole, no reader holds one, and nothing durable has a broken tree), `NoLostPublish` (a layer of a job
+whose end has finished survives a crash that follows, unless a failed sync evicted or poisoned it:
+between the result and the end's sync it may not, which is the one promise that changed), and
+`MarkedHasData`. `StoreDeferred.cfg` (two runners, a reader, two layers a job, a machine crash, a
+killed runner, a failed sync) holds; five mutants must fail: `-trust-pending` (no boot check, any job
+takes a pending layer: `NoWrongValid`), `-mark-first` (the durable mark before the data's sync:
+`NoWrongValid`), `-no-end-sync` (an end that leaves its last layer pending: `NoLostPublish`),
+`-no-poison` (any job takes a pending layer and a failed settle does not refuse it: `NoWrongValid`) and
+`-shared-pending` (a failed settle refuses its layer but any job takes a pending one: `NoWrongValid`).
+With `OwnerOnly` the poison protects a holder's later lookups only, so the model cannot tell it from
+the ownership rule; it is kept for the layers a job already holds.
 
 **Bounds** (the processes run one job each; a job's steps pick their keys freely):
 

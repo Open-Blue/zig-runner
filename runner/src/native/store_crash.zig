@@ -68,7 +68,7 @@ const flip_env = "ZIG_TEST_STORE_CRASH_FLIP";
 const names = [_][]const u8{ "a", "b", "c", "big", "d", "e", "f", "p1", "p2" };
 /// The boot a verified disk is in: not the boot the sequence ran in, which the pending layers of
 /// step 11 name, since the disk is put back inside one boot and a real crash is followed by another.
-const next_boot: Store.BootId = "00000000-0000-4000-8000-000000000b07".*;
+const next_boot: Store.Epoch = .{ .boot = "00000000-0000-4000-8000-000000000b07".*, .mnt = 1 };
 /// Over `Store.sync_tree_max` entries, whatever it is: directories of 30 files.
 const big = "big";
 const ensure_key = "k1";
@@ -524,7 +524,7 @@ fn exists(io: std.Io, p: []const u8) bool {
 fn verify(arena: Allocator, io: std.Io, sp: Spec) !void {
     var faults: Faults = .{ .arena = arena };
     // The first job after the crash is the first of a boot.
-    const s: Store = .{ .root = try sp.store(arena), .boot_id = next_boot };
+    const s: Store = .{ .root = try sp.store(arena), .epoch = next_boot };
     std.Io.Dir.cwd().deleteFile(io, try print(arena, "{s}/boot", .{s.root})) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -806,7 +806,7 @@ fn corrupt(arena: Allocator, io: std.Io, sp: Spec) !void {
         const meta = try print(arena, "{s}/meta", .{dir});
         const text = try cwd.readFileAlloc(io, meta, arena, .limited(1024));
         const at = std.mem.indexOf(u8, text, "kind ").?;
-        try cwd.writeFile(io, .{ .sub_path = meta, .data = try print(arena, "{s}pending {s}\n{s}", .{ text[0..at], &next_boot, text[at..] }) });
+        try cwd.writeFile(io, .{ .sub_path = meta, .data = try print(arena, "{s}pending {s} {d}\n{s}", .{ text[0..at], &next_boot.boot, next_boot.mnt, text[at..] }) });
         const path = try print(arena, "{s}/fs/f0", .{dir});
         const data = try cwd.readFileAlloc(io, path, arena, .limited(1 << 20));
         data[0] ^= 1;
@@ -866,6 +866,15 @@ fn failSettle(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map,
         std.debug.print("native store crash: the settle failed with {s}, not error.Sync\n", .{@errorName(e)});
         return error.TestUnexpectedResult;
     }
+    // The layer is refused at once though a job (here the writer itself) still holds it: its pages
+    // may be clean after the failed write-back and dropped, and read back from the disk.
+    if (s.open(arena, io, keyOf("a"))) |maybe| {
+        if (maybe) |hit| {
+            hit.layer.lock.close(io);
+            std.debug.print("native store crash: a held layer whose settle failed is still a hit\n", .{});
+            return error.TestUnexpectedResult;
+        }
+    } else |e| if (e != error.Invalid) return e;
     // Fail closed, as after any failed sync: the next publish is refused, the layer evicted at the end.
     const upper = try print(arena, "{s}/uppers/b", .{sp.root});
     try makeTree(arena, io, upper, "b");

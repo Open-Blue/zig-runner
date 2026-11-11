@@ -427,6 +427,9 @@ test "native store under load: one worker (run only by the test above, in a proc
     var cfg = try Backend.testConfigAt(arena, root, exe);
     cfg.store_max_bytes = try std.fmt.parseInt(u64, f.next().?, 10);
     cfg.store_limits = limits;
+    // Synced before published: the test's check that a chain's key is run once at a time reads a
+    // pending layer's miss for the other jobs (they run its step again) as a second run.
+    cfg.defer_sync = false;
     const shared = try print(arena, "{s}/shared", .{root});
     cfg.binds = try std.mem.concat(arena, @TypeOf(cfg.binds[0]), &.{
         cfg.binds,

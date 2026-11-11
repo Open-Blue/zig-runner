@@ -267,6 +267,9 @@ pub const Config = struct {
     /// `_apt`, `chown` to other users and `tar` with owners fail, and steps share the host's
     /// network. Off: a rootless runner sends every job to Dagger.
     rootless: bool = false,
+    /// Whether a job's last layer is made durable after its result is reported
+    /// (`RUNNER_NATIVE_DEFER_SYNC`, `Store.defer_sync`).
+    defer_sync: bool = true,
     /// The first host id of the jobs' ranges on a root runner (`RUNNER_NATIVE_SUBID_BASE`): slot
     /// n's 65536 ids start at `subid_base + n * 65536`.
     subid_base: u32 = default_subid_base,
@@ -423,6 +426,7 @@ pub fn configFor(
         .self_exe_replaced = exe.replaced,
         .vouched = vouched,
         .rootless = cfg.native_rootless,
+        .defer_sync = cfg.native_defer_sync,
         .subid_base = cfg.native_subid_base,
         .subnet = try net.Subnet.parse(cfg.native_subnet),
         .store_max_bytes = cfg.native_store_max_mb * 1024 * 1024,
@@ -950,7 +954,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
             .limits = cfg.store_limits,
             .sync_fd = Store.syncCursor(arena, cfg.store),
             .sync_log = Store.newSyncLog(arena),
-            .defer_sync = true,
+            .defer_sync = cfg.defer_sync,
             .defer_delete = true,
         },
         .vouched = cfg.vouched,
@@ -8530,7 +8534,10 @@ test "native step cache: two jobs with one key at once run it once; the other re
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const c = try cachedConfig(arena, &tmp);
+    var c = try cachedConfig(arena, &tmp);
+    // Synced before it is published: a layer left pending is the publishing job's alone, and the
+    // job waiting for the key would run the step again (`Store.defer_sync`).
+    c.cfg.defer_sync = false;
     // A file of its own each time: the other job's root may be another host id.
     const job = testJob(&.{testStep("sleep 1; mktemp /shared/slow.XXXXXX")});
     const Other = struct {
