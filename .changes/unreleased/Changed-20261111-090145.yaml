@@ -1,0 +1,3 @@
+kind: Changed
+body: A native job on a root runner now writes a step's upper through an idmapped mount once it has made one large layer or is expected to (80 entries or more, by the size the step's layer had last time or its job's earlier layers), keeping the mount's user namespace in a file of the job's directory so later steps pay nothing to make it; with that, the idmapped upper is never slower than shifting the layer's ids afterwards.
+time: 2026-11-11T09:01:45.489730481-05:00

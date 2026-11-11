@@ -2810,44 +2810,55 @@ fn runIn(
     return ended;
 }
 
-/// The fewest entries (files, directories, anything) a step's layer must hold for its upper to be
-/// idmapped: the idmapped upper costs about 0.8 ms a step (a second user namespace and two
-/// mounts) and the shift (`Store.unshift`) about 0.3 ms and 30 us an entry, measured on the
-/// laptop (a three-file layer 0.45 ms, 20,000 files 570 ms), so the two meet near 15 to 25
-/// entries. A step takes the way that is faster for its layer, by what its layer last held.
-pub const idmapped_min_entries_default = 20;
+/// The fewest entries (files, directories, anything) a step's layer must be expected to hold for
+/// a job to start using the idmapped upper (`chooseUpper`). Once the job has its user namespace
+/// kept (`keepUserns`) the idmapped upper is never slower than the shift, whatever the layer,
+/// measured on the laptop (ReleaseSafe, under other agents' load: the mount phase and the shift
+/// together, shifted against idmapped: 1 entry 751 against 609 us, 4 entries 2075 against 602, 21
+/// entries 2080 against 792, 201 entries 12171 against 871). What it costs is making that
+/// namespace, one helper spawn of about 2.4 ms for the job, which the shift's 30 us an entry pays
+/// back at about 80 entries. So a job starts with the shift and starts using the idmapped upper at
+/// the first step expected to make a layer that large.
+pub const idmapped_min_entries_default = 80;
 
-/// Whether the step about to run writes its upper idmapped rather than shifted afterwards,
-/// by what is known of its layer (`chooseUpper`): its step's last published size
-/// (`key_diff.readEntries`), else what the job's earlier steps made.
+/// Whether the step about to run writes its upper idmapped rather than shifted afterwards
+/// (`chooseUpper`), by whether its job has its namespace and what is known of its layer: its
+/// step's last published size (`key_diff.readEntries`), else what the job's earlier steps made.
 fn upperIdmapped(b: *Backend) bool {
     if (b.idmapped_min_entries == 0) return true;
-    const p = b.pending orelse return chooseUpper(b.idmapped_min_entries, false, null, b.earlier_entries);
+    const have = b.upper_userns != null;
+    const p = b.pending orelse return chooseUpper(b.idmapped_min_entries, false, have, null, b.earlier_entries);
     const s = b.store orelse return false;
     const last = if (p.label.len > 0) key_diff.readEntries(b.arena, b.io, s.root, &b.stepIdent(p.label)) else null;
-    return chooseUpper(b.idmapped_min_entries, true, last, b.earlier_entries);
+    return chooseUpper(b.idmapped_min_entries, true, have, last, b.earlier_entries);
 }
 
 /// The choice itself. A step with no key (`keyed` false) is never published, so nothing is
-/// shifted for it unless the stack is flattened: the shift costs it nothing. A keyed step with a
-/// recorded size takes it. One without (its first run) is taken for as large as the largest layer
-/// the job's earlier steps made, so a job that has made large layers goes on making them, and
-/// its first step, with nothing before it, is shifted.
-fn chooseUpper(min: u64, keyed: bool, last: ?u64, earlier: u64) bool {
+/// shifted for it unless the stack is flattened: the shift costs it nothing, and the idmapped
+/// upper something. A keyed step of a job that has its namespace (`have`) takes the idmapped
+/// upper. Otherwise it starts one only for a layer expected to hold `min` entries: what its step's
+/// last layer held, or for a step with no history (its first run) the largest layer the job's
+/// earlier steps made, so a job that has made large layers goes on making them. A job's first
+/// step, with nothing before it, is shifted.
+fn chooseUpper(min: u64, keyed: bool, have: bool, last: ?u64, earlier: u64) bool {
     if (!keyed) return false;
+    if (have) return true;
     return (last orelse earlier) >= min;
 }
 
-test "a step's upper is idmapped by its layer's last size, else by its job's earlier layers" {
+test "a step's upper is idmapped once its job has the namespace, or by its layer's last size" {
     // Never published: shifted, whatever came before.
-    try std.testing.expect(!chooseUpper(20, false, 5000, 5000));
-    // A known size decides, whatever the job did before.
-    try std.testing.expect(chooseUpper(20, true, 20, 0));
-    try std.testing.expect(!chooseUpper(20, true, 19, 5000));
+    try std.testing.expect(!chooseUpper(80, false, true, 5000, 5000));
+    // With the namespace: always.
+    try std.testing.expect(chooseUpper(80, true, true, 0, 0));
+    try std.testing.expect(chooseUpper(80, true, true, null, 0));
+    // Without it: a known size decides, whatever the job did before.
+    try std.testing.expect(chooseUpper(80, true, false, 80, 0));
+    try std.testing.expect(!chooseUpper(80, true, false, 79, 5000));
     // First run: by the job's earlier layers; with none, shifted.
-    try std.testing.expect(chooseUpper(20, true, null, 370));
-    try std.testing.expect(!chooseUpper(20, true, null, 3));
-    try std.testing.expect(!chooseUpper(20, true, null, 0));
+    try std.testing.expect(chooseUpper(80, true, false, null, 370));
+    try std.testing.expect(!chooseUpper(80, true, false, null, 3));
+    try std.testing.expect(!chooseUpper(80, true, false, null, 0));
 }
 
 /// The job's user namespace for its idmapped uppers kept in a file of the job's directory, made
@@ -9100,11 +9111,11 @@ test "root runner: a step with a large layer takes the idmapped upper once its s
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const c = try cachedConfig(arena, &tmp);
-    // Large: sixty files and a deletion (an overlay whiteout, whose owner says how the upper was
+    // Large: a hundred and twenty files and a deletion (an overlay whiteout, whose owner says how the upper was
     // written: 65534 shifted, the id nothing owns idmapped). The second run changes the script, so
     // the step runs again, knowing its last layer's size.
-    var big1 = testStep("mkdir /w && for i in $(seq 60); do echo $i > /w/f$i; done; rm /etc/group");
-    var big2 = testStep("mkdir /w && for i in $(seq 60); do echo $i > /w/f$i; done; rm /etc/group; : again");
+    var big1 = testStep("mkdir /w && for i in $(seq 120); do echo $i > /w/f$i; done; rm /etc/group");
+    var big2 = testStep("mkdir /w && for i in $(seq 120); do echo $i > /w/f$i; done; rm /etc/group; : again");
     const r1 = try runCached(arena, c.cfg, testJob(@as(*const [1]job_mod.Step, &big1)), "j1");
     try expectSucceeded(r1);
     if (idmapped_upper_known.load(.acquire) == idmapped_no) return error.SkipZigTest;
