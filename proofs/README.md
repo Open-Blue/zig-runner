@@ -461,7 +461,9 @@ takes a pending layer: `NoWrongValid`), `-mark-first` (the durable mark before t
 `-no-poison` (any job takes a pending layer and a failed settle does not refuse it: `NoWrongValid`) and
 `-shared-pending` (a failed settle refuses its layer but any job takes a pending one: `NoWrongValid`).
 With `OwnerOnly` the poison protects a holder's later lookups only, so the model cannot tell it from
-the ownership rule; it is kept for the layers a job already holds.
+the ownership rule; it is kept for the layers a job already holds, and `StoreDeferred-owner-only.cfg`
+(`PoisonOnFail = FALSE`, `OwnerOnly = TRUE`) must hold: the ownership rule is sufficient alone in
+the model.
 
 **Bounds** (the processes run one job each; a job's steps pick their keys freely):
 

@@ -1844,6 +1844,7 @@ pub fn execScript(
         };
         defer claim.release(b.io);
         if (claim.why) |line| x.sh.append(num, line);
+        if (b.settleWarning()) |line| x.sh.append(num, line);
         if (claim.hit) |rec| {
             const data = try recordAnswer(arena, rec);
             // A record that points into the tool cache's volume, which is in no layer: the volume
@@ -3219,6 +3220,16 @@ fn claimKey(
     return .{ .key = k, .lock = lock, .hit = hit.rec };
 }
 
+/// What to tell the job once a deferred layer's sync failed mid-job: the steps after it ran over a
+/// layer whose data may be lost, and this is otherwise seen only in the runner's log at the job's end.
+fn settleWarning(b: *Backend) ?[]const u8 {
+    const l = b.store_cfg.sync_log orelse return null;
+    if (!l.settle_failed or l.settle_told) return null;
+    l.settle_told = true;
+    return "##[warning]Writing an earlier step's layer to the disk failed: that layer is not cached, " ++
+        "and the steps that ran over it may have read data that was lost. The steps after this one run uncached.";
+}
+
 /// Makes the key `p` the one its step is known by (`key_diff.writeIndex`).
 fn remember(b: *Backend, p: Pending) void {
     const s = b.store orelse return;
@@ -3260,6 +3271,11 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec_in: Store.Recor
         // A failed sync was logged with its errno, once, by the store.
         if (e != error.Sync) std.log.warn("native: cannot publish a layer to the store: {s}", .{@errorName(e)});
         cwd.deleteFile(b.io, link) catch {};
+        // The key has an entry already (another job's, perhaps not yet durable, so this job could not
+        // replay it): this job's own upper stays its own layer under the key, which is derived from
+        // what made it, so its later steps are keyed and cached as if it were the stored one. Nothing
+        // else sees it, and it goes with the job's directory.
+        if (e == error.Publish) top.key = key;
         return;
     };
     b.held.appendAssumeCapacity(layer.lock);
@@ -8776,6 +8792,57 @@ test "native step cache: two jobs with one key at once run it once; the other re
     const notes = std.mem.count(u8, mine.text, dagger.native_reused_note) +
         std.mem.count(u8, other_text, dagger.native_reused_note);
     try std.testing.expectEqual(@as(usize, 1), notes);
+}
+
+/// The files in `shared` whose names start with `prefix`: one for each run of a step that makes one.
+fn madeBy(io: std.Io, shared: []const u8, prefix: []const u8) usize {
+    var dir = std.Io.Dir.cwd().openDir(io, shared, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    var n: usize = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| n += @intFromBool(std.mem.startsWith(u8, e.name, prefix));
+    return n;
+}
+
+test "native step cache: with the deferred sync, a job that lost a key to another's pending layer keeps caching its later steps" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    // The first step is the same in both jobs, and the other waits for its key: the first job's layer
+    // is pending when it gets the lock, so it runs the step too, and its publish loses. Its second
+    // step is then keyed over its own layer, and a third run replays both from the store.
+    const job = testJob(&.{ testStep("sleep 1; mktemp /shared/first.XXXXXX"), testStep("mktemp /shared/second.XXXXXX") });
+    const Other = struct {
+        fn run(cfg: Config, j: job_mod.Job, ok: *bool) void {
+            var b: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            const r = runCached(b.allocator(), cfg, j, "j2") catch {
+                b.deinit();
+                return;
+            };
+            ok.* = r.res.succeeded;
+            b.deinit();
+        }
+    };
+    var other_ok = false;
+    var other = try io.concurrent(Other.run, .{ c.cfg, job, &other_ok });
+    const mine = try runCached(arena, c.cfg, job, "j1");
+    other.await(io);
+    try expectSucceeded(mine);
+    try std.testing.expect(other_ok);
+    const before_first = madeBy(io, c.shared, "first.");
+    const before_second = madeBy(io, c.shared, "second.");
+    try std.testing.expect(before_first >= 1 and before_first <= 2);
+    try std.testing.expect(before_second >= 1 and before_second <= 2);
+    // Both jobs ended, so every layer is durable and a later job replays everything.
+    const third = try runCached(arena, c.cfg, job, "j3");
+    try expectSucceeded(third);
+    try std.testing.expectEqual(before_first, madeBy(io, c.shared, "first."));
+    try std.testing.expectEqual(before_second, madeBy(io, c.shared, "second."));
+    try std.testing.expect(std.mem.count(u8, third.text, dagger.native_reused_note) >= 2);
 }
 
 /// The first host id of the job's range, from "Set up job" ("ids 0-65535 are host ids N-...").

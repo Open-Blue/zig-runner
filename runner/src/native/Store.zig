@@ -1108,6 +1108,9 @@ pub const SyncLog = struct {
     /// The layer renamed in with its data not yet synced (`Store.defer_sync`), at most one: the next
     /// publish and the job's end settle it first (`Store.settlePending`).
     pending: ?Key = null,
+    /// A deferred layer's settle failed (`settlePending`), and whether the job was told (`Backend`).
+    settle_failed: bool = false,
+    settle_told: bool = false,
 
     fn renamed(l: *SyncLog, arena: Allocator, key: Key) !void {
         try l.since.append(arena, try arena.dupe(u8, &hex(key)));
@@ -1130,12 +1133,14 @@ pub noinline fn settlePending(s: Store, arena: Allocator, io: std.Io, ph: ?*phas
     const key = l.pending orelse return;
     l.pending = null;
     if (l.failed) {
+        l.settle_failed = true;
         s.poison(arena, io, key);
         return error.Sync;
     }
     const t = phases.now();
     s.settle(arena, io, key) catch |e| {
         l.failed = true;
+        l.settle_failed = true;
         s.poison(arena, io, key);
         if (e != error.Sync) std.log.warn("native: cannot make a published layer durable: {s}; it is refused from now on, and the job's layers since the last good sync are evicted", .{@errorName(e)});
         return error.Sync;
@@ -1153,7 +1158,7 @@ fn poison(s: Store, arena: Allocator, io: std.Io, key: Key) void {
     const bad = join(arena, dir, "meta.bad") catch return;
     cwd.rename(meta, cwd, bad, io) catch |e| {
         if (e == error.FileNotFound) return;
-        cwd.deleteFile(io, meta) catch |e2| std.log.warn("native: cannot refuse layer {s} ({t}, {t}); it stays a hit for this boot", .{ &hex(key), e, e2 });
+        cwd.deleteFile(io, meta) catch |e2| std.log.warn("native: cannot poison layer {s} ({t}, {t}); it is refused all the same (its job is the only one that may read it) and evicted when the disk allows", .{ &hex(key), e, e2 });
     };
 }
 
@@ -2717,6 +2722,8 @@ test "native store: another job gets a miss for a pending layer, and a layer who
     // The settle fails (a failing descriptor stands for EIO).
     s.sync_fd = -1;
     try std.testing.expectError(error.Sync, s.settlePending(arena, io, null));
+    // The job is told (`Backend.settleWarning`).
+    try std.testing.expect(s.sync_log.?.settle_failed);
     // Refused now, though held: no lookup returns it, whoever holds it.
     const third: Store = .{ .root = s.root };
     try std.testing.expectError(error.Invalid, third.open(arena, io, key));

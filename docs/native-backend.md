@@ -737,7 +737,20 @@ What it covers, as built:
   renamed in. Any other job gets a miss (`open` returns null and leaves the layer) until the layer is
   durable, because nothing vouches for the pages of a job that may be killed or whose write-back may
   fail: after a write error the kernel marks the pages clean and may drop them, and a later read
-  comes from the disk. It costs another job at most the one layer until the publisher's teardown.
+  comes from the disk.
+  **What it costs another job.** A job that waits for the key (matrix jobs with the same first
+  steps) misses the pending layer when it gets the lock, runs the step itself, and its publish
+  loses to the entry already there. It then keeps its own upper as a job-private layer under the
+  key (`Backend.publishTop`): the key is derived from what made the layer, so its later steps are
+  keyed and cached exactly as if it were the stored one, nothing else sees it, and it goes with the
+  job's directory. Its later layers are published over it, as any job's are over a parent whose
+  entry another job made. So the cost is one step run twice, not an uncached rest of the job. The
+  layer is available to others once its publisher made it durable: at the publisher's next publish,
+  or at its teardown for its last layer (`RUNNER_NATIVE_DEFER_SYNC=false` has none of this).
+  **Every publish after a job's first waits for the previous layer's settle**: one `syncfs`, which
+  on a busy disk waits for other jobs' writes (5-8 s beside a writer on the Pi's SD card); a job of
+  many short steps on a busy disk pays it at each. The settle is on the publish's path, not the
+  teardown's, except for the last layer.
   A pending layer of another boot or mount is refused and evicted by `open` and by the check at a
   boot's first job (`checkOncePerBoot`), whatever its files hold. A pending layer whose job was
   killed (nobody holds its lock) is evicted by the next `collect`.
@@ -751,10 +764,13 @@ What it covers, as built:
   is then a clean cache miss, never a broken layer. Once the teardown has finished, the layer
   survives a power cut as before. A runner killed in the window leaves the layer pending, unusable
   by any job and evicted by `collect`, so a cache miss as well.
-  **What this relies on**: the kernel's boot id and mount id; that a `syncfs` through the job's
-  descriptor reports a write error the page cache lost track of (Linux 5.8's errseq); that a
+  **What this relies on**: the kernel's boot id and mount id (the mount id, Linux 6.8, also
+  guarantees Linux 5.8's errseq, which reports a `syncfs` write error once per descriptor and
+  filesystem); that a `syncfs` through the job's descriptor reports a write error the page cache
+  lost track of; that a
   holder of a layer poisoned after its pages were dropped is the one case it cannot help (that job's
-  mount keeps reading, and the job's own later layers fail their sync closed); and that a machine
+  mount keeps reading, and the job's own later layers fail their sync closed; the job's next step
+  is told in its log with a warning); and that a machine
   restored from a snapshot with an older disk under the same boot id and mount id is not a thing
   that happens.
   Which way a layer's data is made durable when a publish does sync before it renames is chosen
