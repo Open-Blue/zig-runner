@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Model-checks the TLA+ modules with SPIN, on their Promela ports: proofs/spin/<Module>Model.pml for
-# proofs/tla/<Module>.tla, StoreLocking's, StoreEviction's and ReleasePipeline's (proofs/README.md,
-# "The store's locking, in SPIN").
+# proofs/tla/<Module>.tla, StoreLocking's, StoreDeferred's, StoreEviction's and ReleasePipeline's
+# (proofs/README.md, "The store's locking, in SPIN").
 # SPIN is 6.5.2, Ubuntu's spin 6.5.2+dfsg-2build1 (store-model.yml pins the package), and any other
 # version fails here, so a changed SPIN is a change made on purpose.
 #

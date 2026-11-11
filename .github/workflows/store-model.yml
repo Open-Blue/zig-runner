@@ -1,7 +1,7 @@
 name: store model
 
-# The TLA+ models: the native store's locking protocols (proofs/tla/StoreLocking.tla and
-# StoreEviction.tla, proofs/README.md "The store's locking, in TLA+") and the release pipeline
+# The TLA+ models: the native store's locking protocols (proofs/tla/StoreLocking.tla,
+# StoreDeferred.tla and StoreEviction.tla, proofs/README.md "The store's locking, in TLA+") and the release pipeline
 # (ReleasePipeline.tla, "The release pipeline, in TLA+"), checked with SPIN on their Promela ports
 # (proofs/spin, "The store's locking, in SPIN"), and with TLC any module that has none. Their safety
 # and liveness must hold, and each mutant (the code with one guard taken away) and finding must fail.
@@ -87,6 +87,8 @@ jobs:
       - name: Check the store's locking and the release pipeline
         env:
           TLC_PART: ${{ matrix.part }}/3
+          # While SPIN takes StoreDeferred over, TLC checks every module too.
+          TLC_ALL: "1"
         run: .github/scripts/tlc.sh
 
   # Every module's configurations and mutants, safety and liveness (proofs/spin, the Promela ports

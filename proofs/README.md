@@ -445,9 +445,10 @@ close, so an `open` waiting on the evicted lock file waits for ever: `AllEnd`), 
 fairness the liveness checks assume is no stronger than the module's ("The store's locking, in
 SPIN").
 
-**The deferred sync** is a module of its own, `tla/StoreDeferred.tla` (TLC only: `StoreLocking` and its
-SPIN port model a publish that is durable when it is renamed in, which `Store.publishTimed` still is
-without `defer_sync`). A publish there is renamed in with a meta that says `pending` and names the boot;
+**The deferred sync** is a module of its own, `tla/StoreDeferred.tla` (`StoreLocking` models a
+publish that is durable when it is renamed in, which `Store.publishTimed` still is without
+`defer_sync`), checked with SPIN on its port, `proofs/spin/StoreDeferredModel.pml`, made as the
+others are. A publish there is renamed in with a meta that says `pending` and names the boot;
 the job's next publish makes the previous layer durable (the data's sync through the job's descriptor,
 then the durable meta renamed over it, then its directory's fsync), and its end the last, after its
 result was reported. A machine crash keeps the synced data and the committed meta, and may lose a
@@ -468,7 +469,11 @@ takes a pending layer: `NoWrongValid`), `-mark-first` (the durable mark before t
 With `OwnerOnly` the poison protects a holder's later lookups only, so the model cannot tell it from
 the ownership rule; it is kept for the layers a job already holds, and `StoreDeferred-owner-only.cfg`
 (`PoisonOnFail = FALSE`, `OwnerOnly = TRUE`) must hold: the ownership rule is sufficient alone in
-the model.
+the model. SPIN's states are TLC's plus one (the module has no symmetry and no fairness):
+`StoreDeferred.cfg` 36,661 and 36,662, `-owner-only` 34,601 and 34,602, and the five mutants, run
+to the end with `TypeOK` alone, 1,851, 109, 4,123, 4,555 and 2,559 (`-mark-first`, `-no-end-sync`,
+`-no-poison`, `-shared-pending`, `-trust-pending`), each one more in SPIN; each fails with the
+invariant it names in both.
 
 **Bounds** (the processes run one job each; a job's steps pick their keys freely):
 
