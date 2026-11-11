@@ -97,6 +97,19 @@ jobs:
       # No build context: the Dockerfile copies nothing in.
       - name: Empty build context
         run: mkdir "$RUNNER_TEMP/context"
+      # The runner's script is built as it is. When Ubuntu's archive does not answer here, a command
+      # in front of it points the container's sources at a mirror (apt.sh): the image is the same
+      # packages, signed by Ubuntu's keys as always, and the product's own script is not touched. A command after it puts the sources back, so the
+      # published image's are what they would be without the fallback.
+      - name: Apt mirror, if the archive is down
+        id: mirror
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          prefix=$(.github/scripts/apt.sh mirror-prefix "$ARCH" noble)
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          # After the script, the sources are put back: the published image never keeps the mirror.
+          [[ -z $prefix ]] || echo "suffix=$(.github/scripts/apt.sh mirror-suffix)" >> "$GITHUB_OUTPUT"
       - name: Image name
         run: echo "IMAGE=ghcr.io/${IMAGE_OWNER,,}/zig-runner-base" >> "$GITHUB_ENV"
       - name: Log in to the registry
@@ -119,7 +132,7 @@ jobs:
           sbom: false
           build-args: |
             BASE=${{ fromJSON(needs.plan.outputs.plan)[matrix.variant].base }}
-            SCRIPT=${{ fromJSON(needs.plan.outputs.plan)[matrix.variant].script }}
+            SCRIPT=${{ steps.mirror.outputs.prefix }}${{ fromJSON(needs.plan.outputs.plan)[matrix.variant].script }}${{ steps.mirror.outputs.suffix }}
             VARIANT=${{ matrix.variant }}
             FINGERPRINT=${{ fromJSON(needs.plan.outputs.plan)[matrix.variant].fingerprint }}
           outputs: ${{ env.PUBLISH == 'true' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) || 'type=cacheonly' }}

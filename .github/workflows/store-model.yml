@@ -110,8 +110,7 @@ jobs:
         env:
           SPIN_VERSION: 6.5.2+dfsg-2build1
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends "spin=$SPIN_VERSION"
+          sudo .github/scripts/apt.sh install --no-install-recommends "spin=$SPIN_VERSION"
           spin -V
 
       - name: Check the store's locking
