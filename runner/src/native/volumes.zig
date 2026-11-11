@@ -188,8 +188,11 @@ pub fn openWaiting(
             else => return e,
         };
         errdefer f.close(io);
+        // The last job out's walk of this volume, if one is running on its thread, lets go of its
+        // locks first: this job does not wait for it (`tool_trees.IdleWalks`).
+        tool_trees.process_idle_walks.preempt(io, dir);
         switch (sharing) {
-            .shared => try waitShared(io, f, wait),
+            .shared => try waitShared(io, f, wait, dir),
             .locked => if (linux.errno(linux.flock(f.handle, lock_ex)) != .SUCCESS) return error.Locked,
             .private => private = linux.errno(linux.flock(f.handle, lock_ex | lock_nb)) != .SUCCESS,
         }
@@ -502,7 +505,7 @@ pub fn openNamedWaiting(
         // Free: this job may make it. Not free: it is in use, so it is there, or being seeded,
         // which a shared lock waits for.
         const alone = linux.errno(linux.flock(f.handle, lock_ex | lock_nb)) == .SUCCESS;
-        if (!alone) try waitShared(io, f, wait);
+        if (!alone) try waitShared(io, f, wait, dir);
         if (!Store.sameFile(arena, f, lock_path)) {
             f.close(io);
             continue;
@@ -541,9 +544,11 @@ pub fn openNamedWaiting(
 
 /// The lock `f` taken shared, polled (`LOCK_NB`) while another job holds it exclusively (a seeding),
 /// until `wait`'s time is up or the job is cancelled.
-fn waitShared(io: std.Io, f: std.Io.File, wait: Wait) !void {
+fn waitShared(io: std.Io, f: std.Io.File, wait: Wait, dir: []const u8) !void {
     const start = nowMs();
     while (true) {
+        // A walk that began while this open waited is asked to stop too (it holds the lock).
+        tool_trees.process_idle_walks.preempt(io, dir);
         switch (linux.errno(linux.flock(f.handle, lock_sh | lock_nb))) {
             .SUCCESS => return,
             .AGAIN, .INTR => {},
@@ -625,6 +630,20 @@ pub const Plan = struct {
         return .{ .dir = v.dir, .left = tool_trees.leftBy(v.lock.handle) orelse return null };
     }
 
+    /// The exclusive locks that `idleToolCache` took, as duplicates that outlive `release`: a lock
+    /// belongs to the open file description, so the job's own letting go leaves it held while a
+    /// duplicate is open (`tool_trees.IdleWalks`). Close-on-exec, or a process the runner starts
+    /// meanwhile would keep the volume locked. Null: no descriptor to duplicate.
+    pub fn idleHandoff(p: *Plan) ?struct { lock: linux.fd_t, other: ?linux.fd_t } {
+        const v = p.held.items[p.tool_held orelse return null];
+        const lock = dupCloexec(v.lock.handle) orelse return null;
+        const other = if (p.idle_other) |fd| dupCloexec(fd) orelse {
+            _ = linux.close(lock);
+            return null;
+        } else null;
+        return .{ .lock = lock, .other = other };
+    }
+
     /// Whether the verdict the job was told still describes the tool cache: true when no epoch
     /// holds it (the job's alone), else while the epoch stands (`tool_trees.Epochs.valid`). Asked
     /// before any step of the job runs.
@@ -643,6 +662,12 @@ pub const Plan = struct {
         p.held.clearRetainingCapacity();
     }
 };
+
+fn dupCloexec(fd: linux.fd_t) ?linux.fd_t {
+    const rc = linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 3);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return std.math.cast(linux.fd_t, rc);
+}
 
 /// A Zig cache seed's layer: built in `dir` when it is not there yet.
 pub const Seed = struct {
@@ -1380,7 +1405,7 @@ test "native volumes: the last job out leaves the tool cache's trees for the nex
     const mount = one.tool_cache.?;
     const lists = try tool_trees.listsDir(arena, store, volume);
     const idle = one.idleToolCache(arena) orelse return error.TestUnexpectedResult;
-    const kept = tool_trees.walkIdle(arena, std.testing.allocator, io, idle.dir, lists, mount, idle.left, lim);
+    const kept = tool_trees.walkIdle(arena, std.testing.allocator, io, idle.dir, lists, mount, idle.left, lim, null);
     one.release(io);
     if (!kept) return error.SkipZigTest; // a filesystem that does not prove its files at rest
     try cwd.access(io, try verdictFile(arena, store, one), .{});
@@ -1407,7 +1432,7 @@ test "native volumes: the last job out leaves the tool cache's trees for the nex
     // A job that does not check the trees still takes the verdict away, so none is read after it.
     var four = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
     const idle_four = four.idleToolCache(arena) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(tool_trees.walkIdle(arena, std.testing.allocator, io, idle_four.dir, lists, mount, idle_four.left, lim));
+    try std.testing.expect(tool_trees.walkIdle(arena, std.testing.allocator, io, idle_four.dir, lists, mount, idle_four.left, lim, null));
     four.release(io);
     var other = opts;
     other.tool_trees = false;
@@ -1435,7 +1460,7 @@ fn leaveVerdict(arena: Allocator, io: std.Io, store: []const u8, job: job_mod.Jo
     try installTool(arena, io, volume, "zig binary\n");
     const lists = try tool_trees.listsDir(arena, store, volume);
     const idle = one.idleToolCache(arena) orelse return error.TestUnexpectedResult;
-    const kept = tool_trees.walkIdle(arena, std.testing.allocator, io, idle.dir, lists, one.tool_cache.?, idle.left, lim);
+    const kept = tool_trees.walkIdle(arena, std.testing.allocator, io, idle.dir, lists, one.tool_cache.?, idle.left, lim, null);
     one.release(io);
     return if (kept) .{ .volume = volume, .lists = lists } else null;
 }
@@ -1581,7 +1606,7 @@ fn leaveVerdictAs(arena: Allocator, io: std.Io, store: []const u8, job: job_mod.
     try installTool(arena, io, volume, "tool\n");
     const lists = try tool_trees.listsDir(arena, store, volume);
     const idle = r.idleToolCache(arena) orelse return error.TestUnexpectedResult;
-    const kept = tool_trees.walkIdle(arena, std.testing.allocator, io, idle.dir, lists, r.tool_cache.?, idle.left, lim);
+    const kept = tool_trees.walkIdle(arena, std.testing.allocator, io, idle.dir, lists, r.tool_cache.?, idle.left, lim, null);
     r.release(io);
     return if (kept) volume else null;
 }
@@ -1891,7 +1916,7 @@ test "native volumes: a verdict is not used after the volume was opened by anyth
         try installTool(arena, io, volume, "zig binary\n");
         const lists = try tool_trees.listsDir(arena, store, volume);
         const idle = one.idleToolCache(arena) orelse return error.TestUnexpectedResult;
-        const kept = tool_trees.walkIdle(arena, std.testing.allocator, io, idle.dir, lists, one.tool_cache.?, idle.left, lim);
+        const kept = tool_trees.walkIdle(arena, std.testing.allocator, io, idle.dir, lists, one.tool_cache.?, idle.left, lim, null);
         one.release(io);
         if (!kept) return error.SkipZigTest;
         switch (how) {
@@ -1947,4 +1972,127 @@ test "native volumes: a job waits for the last job's walk and is still cancelled
     cancel.requested.store(true, .release);
     thread.join();
     try std.testing.expectEqual(@as(?anyerror, error.Canceled), result);
+}
+
+/// A last job out's walk handed to `tool_trees.process_idle_walks`, as `Backend.walkToolCacheIdle`
+/// does it, the job then letting go. The tree holds more than 64 entries, so a walk that is asked
+/// to stop sees it (it looks at its cancel at every 64th). Null when the walk could not start.
+fn handOff(arena: Allocator, io: std.Io, store: []const u8, one: *Plan, hold: *const std.atomic.Value(bool)) !?[]const u8 {
+    const volume = one.tool_cache_host.?;
+    try installTool(arena, io, volume, "zig binary\n");
+    for (0..200) |i| {
+        const f = try std.fmt.allocPrint(arena, "{s}/zig/0.17.0/zig-x86_64-linux-0.17.0/f{d}", .{ volume, i });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = f, .data = "x" });
+    }
+    const lists = try tool_trees.listsDir(arena, store, volume);
+    const idle = one.idleToolCache(arena) orelse return error.TestUnexpectedResult;
+    const held = one.idleHandoff() orelse return error.TestUnexpectedResult;
+    var lim = tool_trees.idle_limits;
+    lim.racy_s = 0;
+    try std.testing.expect(tool_trees.process_idle_walks.start(io, .{
+        .dir = idle.dir,
+        .lists = lists,
+        .mount = one.tool_cache.?,
+        .left = idle.left,
+        .lock = held.lock,
+        .other = held.other,
+        .limits = lim,
+        .hold = hold,
+    }));
+    one.release(io);
+    return lists;
+}
+
+fn lockIsFree(arena: Allocator, volume: []const u8) !bool {
+    const f = try std.Io.Dir.cwd().openFile(std.testing.io, try std.fmt.allocPrint(arena, "{s}.lock", .{volume}), .{});
+    defer f.close(std.testing.io);
+    return linux.errno(linux.flock(f.handle, lock_ex | lock_nb)) == .SUCCESS;
+}
+
+fn waitIdle(io: std.Io) !void {
+    var n: u32 = 0;
+    while (n < 5000) : (n += 1) {
+        if (!tool_trees.process_idle_walks.busy(io)) return;
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "native volumes: the last job's walk runs after it let go, holds the volume, and leaves a verdict" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const testing = @import("../dagger/testing.zig");
+    var job = testing.testJob(&.{testing.testStep("echo")});
+    job.github.repository = "o/r";
+    const opts: Options = .{ .package_caches = true, .trusted = true, .tool_trees = true };
+    var one = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
+    const volume = one.tool_cache_host.?;
+    var hold: std.atomic.Value(bool) = .init(true);
+    const started = tool_trees.process_idle_walks.started;
+    _ = try handOff(arena, io, store, &one, &hold);
+    try std.testing.expectEqual(started + 1, tool_trees.process_idle_walks.started);
+    // The job has let go and the walk has not begun: the volume is still exclusively the walk's,
+    // so no job can run a step in it before the walk has seen it.
+    try std.testing.expect(!try lockIsFree(arena, volume));
+    hold.store(false, .release);
+    try waitIdle(io);
+    try std.testing.expect(try lockIsFree(arena, volume));
+    var next = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
+    defer next.release(io);
+    // A filesystem that does not prove its files at rest keeps no verdict, which is as it was.
+    if (next.tool_verdict == null) return error.SkipZigTest;
+}
+
+test "native volumes: a job that opens the volume stops the last job's walk, which keeps no verdict" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const testing = @import("../dagger/testing.zig");
+    var job = testing.testJob(&.{testing.testStep("echo")});
+    job.github.repository = "o/r";
+    const opts: Options = .{ .package_caches = true, .trusted = true, .tool_trees = true };
+    var one = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
+    // The walk would not begin before it is asked to stop; it is asked by the next job's open.
+    var hold: std.atomic.Value(bool) = .init(true);
+    const lists = (try handOff(arena, io, store, &one, &hold)).?;
+    const t0 = nowMs();
+    var next = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
+    defer next.release(io);
+    // Not the 50 ms poll of a lock held for the walk, nor the walk itself.
+    try std.testing.expect(nowMs() - t0 < 40);
+    try std.testing.expect(next.tool_verdict == null);
+    try std.testing.expect(!tool_trees.process_idle_walks.busy(io));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, try std.fmt.allocPrint(arena, "{s}/.verdict", .{lists}), .{}));
+}
+
+test "native volumes: a runner that stops ends the last job's walk and frees its locks" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const testing = @import("../dagger/testing.zig");
+    var job = testing.testJob(&.{testing.testStep("echo")});
+    job.github.repository = "o/r";
+    const opts: Options = .{ .package_caches = true, .trusted = true, .tool_trees = true };
+    var one = try plan(arena, io, store, opts, "repo", job, dagger.default_image, false, false, null);
+    const volume = one.tool_cache_host.?;
+    var hold: std.atomic.Value(bool) = .init(true);
+    const lists = (try handOff(arena, io, store, &one, &hold)).?;
+    try std.testing.expect(tool_trees.process_idle_walks.busy(io));
+    tool_trees.process_idle_walks.stopAll(io);
+    try std.testing.expect(!tool_trees.process_idle_walks.busy(io));
+    try std.testing.expect(try lockIsFree(arena, volume));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, try std.fmt.allocPrint(arena, "{s}/.verdict", .{lists}), .{}));
 }

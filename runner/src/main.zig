@@ -10,6 +10,7 @@ const nft = @import("native/nft.zig");
 const key_diff = @import("native/key_diff.zig");
 
 const forward = @import("native/forward.zig");
+const tool_trees = @import("native/tool_trees.zig");
 const native_publish = @import("native/publish.zig");
 const trust = @import("trust.zig");
 const job_mod = @import("job.zig");
@@ -382,6 +383,8 @@ fn runPool(
     name: []const u8,
     store: ?*db.Store,
 ) !u8 {
+    // The last job out's tool-cache walks, on threads of their own, end before the process does.
+    defer tool_trees.process_idle_walks.stopAll(init.io);
     return @backingInt(try loop.pool(.{
         .arena = init.arena.allocator(),
         .gpa = init.gpa,
