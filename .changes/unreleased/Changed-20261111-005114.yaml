@@ -1,0 +1,3 @@
+kind: Changed
+body: 'CI''s end-to-end pass on the Dagger backend still runs on every push but no longer fails the check: on GitHub''s runner the engine is slow enough to fail jobs that are right, which took pull requests out of the merge queue while the native pass and main were green.'
+time: 2026-11-11T00:51:14.967547003-05:00

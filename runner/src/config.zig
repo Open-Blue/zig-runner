@@ -153,6 +153,10 @@ pub const Config = struct {
     /// (`RUNNER_NATIVE_SUBID_BASE`, `Backend.Config.subid_base`): at least
     /// `NativeBackend.min_subid_base`.
     native_subid_base: u32 = NativeBackend.default_subid_base,
+    /// A native step's upper written through an idmapped mount, where the kernel allows it
+    /// (`RUNNER_NATIVE_IDMAPPED_UPPER`, `Backend.Config.idmapped_upper`); off, each layer's ids are
+    /// shifted after its step.
+    native_idmapped_upper: bool = true,
     /// The native jobs' network on a root runner (`RUNNER_NATIVE_SUBNET`, `net.Subnet.parse`).
     native_subnet: []const u8 = native_net.Subnet.default_text,
     /// The host addresses a native job container's `ports:` may be published on, colon- or
@@ -502,6 +506,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_ROOTLESS")) |v| c.native_rootless = try boolean(v);
         if (environ.get("RUNNER_NATIVE_DEFER_SYNC")) |v| c.native_defer_sync = try boolean(v);
         if (environ.get("RUNNER_NATIVE_SUBID_BASE")) |v| c.native_subid_base = try num(u32, v);
+        if (environ.get("RUNNER_NATIVE_IDMAPPED_UPPER")) |v| c.native_idmapped_upper = try boolean(v);
         if (environ.get("RUNNER_NATIVE_SUBNET")) |v| c.native_subnet = v;
         if (environ.get("RUNNER_NATIVE_PORT_ADDRESSES")) |v| c.native_port_addresses = v;
         if (environ.get("RUNNER_NATIVE_PORT_RANGE")) |v| c.native_port_range = v;
@@ -601,6 +606,7 @@ pub const Config = struct {
         else if (eq(key, "native-rootless")) c.native_rootless = try boolean(val) //
         else if (eq(key, "native-defer-sync")) c.native_defer_sync = try boolean(val) //
         else if (eq(key, "native-subid-base")) c.native_subid_base = try num(u32, val) //
+        else if (eq(key, "native-idmapped-upper")) c.native_idmapped_upper = try boolean(val) //
         else if (eq(key, "native-subnet")) c.native_subnet = val //
         else if (eq(key, "native-port-addresses")) c.native_port_addresses = val //
         else if (eq(key, "native-port-range")) c.native_port_range = val //
@@ -1096,6 +1102,11 @@ test "the native subnet and ids: defaults, and values that are refused" {
         try std.testing.expectError(error.InvalidNativePortRange, Config.load(&env, &.{"runner"}));
     }
     _ = env.swapRemove("RUNNER_NATIVE_PORT_RANGE");
+    // The idmapped upper: on unless asked off.
+    try std.testing.expect((try Config.load(&env, &.{"runner"})).native_idmapped_upper);
+    try env.put("RUNNER_NATIVE_IDMAPPED_UPPER", "false");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).native_idmapped_upper);
+    _ = env.swapRemove("RUNNER_NATIVE_IDMAPPED_UPPER");
     try env.put("RUNNER_NATIVE_SUBID_BASE", "99999");
     try std.testing.expectError(error.InvalidNativeSubidBase, Config.load(&env, &.{"runner"}));
     try env.put("RUNNER_NATIVE_SUBID_BASE", "100000");

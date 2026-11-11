@@ -100,7 +100,8 @@ pub const Limits = struct {
 
 /// What steps are given (`env`, `full`: `DIGEST TREE` lines, `Exec.tool_trees`) and the line
 /// "Set up job" says.
-pub const Verdict = struct { env: []const u8, full: []const u8, note: []const u8 };
+/// `at_ms` is when the walk that made it began, for a verdict taken from the store (`takeVerdict`).
+pub const Verdict = struct { env: []const u8, full: []const u8, note: []const u8, at_ms: i64 = 0 };
 
 const resolve_no_xdev = 0x01;
 const resolve_no_symlinks = 0x04;
@@ -407,8 +408,9 @@ pub fn checkOnce(
 /// own processes are known dead), walks the trees (`walkIdle`) and keeps the answer in the runner's
 /// store, in a file no step can reach. The next job to open the volume (`takeVerdict`) reads it and
 /// removes it before any step runs, whether or not it trusts it, and takes the answer instead of
-/// walking: nothing wrote to the trees in between, because nothing could. A job that finds no
-/// verdict walks (`checkOnce`), so every doubt below costs a walk and nothing else.
+/// walking: nothing wrote to the trees in between, because nothing could. The jobs of the same
+/// process that open the volume before any step has run in it are told the same (`Epochs`). A job
+/// that finds no verdict walks (`checkOnce`), so every doubt below costs a walk and nothing else.
 ///
 /// What a verdict is trusted for is checked on reading:
 ///  - the boot's id, so one made before a reboot (and any file a crash left) is never used;
@@ -538,7 +540,201 @@ pub fn takeVerdict(
         .env = p.verdict.env,
         .full = p.verdict.full,
         .note = std.fmt.allocPrint(arena, "{s} (as the last job left it)", .{p.verdict.note}) catch return null,
+        .at_ms = p.at_ms,
     };
+}
+
+/// What the jobs of one runner process that open a volume before any step of any of them has run
+/// in it are told alike: the verdict the first took from the store. The first to read a verdict
+/// removes it, so the jobs that open after it would find none and walk, though nothing has been
+/// written either: what stops a job from taking the same answer is not the file but a step. An
+/// epoch of a volume lasts until the first process is started with the volume mounted
+/// (`Epochs.end`, from `Backend.execIn`, before the process exists), or until its last member lets
+/// the volume go. A member uses the verdict only if the epoch still stands when it checks the
+/// trees (`Epochs.valid`), which is before any step of its own: so what it is told is as old as
+/// the walk it would have made then, and no step wrote in between.
+///
+/// A job that opens the volume with a lock file that is not as the epoch's last member left it
+/// (`Epochs.enter`) ends the epoch: something that is not one of this process's jobs opened it.
+/// So does a check (`valid`) that finds the lock file's mtime moved, which is what another
+/// runner's open of the volume does, before or after the member's own. Every open stamps the file
+/// and joins in one critical section (that open's stamp lock on the file), so the process's own opens come in
+/// the order they stamped.
+///
+/// An epoch belongs to the volume's list directory and mount, which are of one scope (trusted or
+/// not, as the volume's path has it), so no job of another scope is ever told of it. It is gone
+/// when its last member lets go, so it never spans a last job out's walk; and a runner that
+/// restarts has none, and drops the store's verdicts before its first job (`dropVerdicts`).
+pub const Epochs = struct {
+    mu: std.Io.Mutex = .init,
+    list: std.ArrayList(*Epoch) = .empty,
+
+    /// What `enter` gives a job that opens the volume.
+    pub const Entered = struct { verdict: ?Verdict = null, epoch: ?*Epoch = null };
+
+    /// A job opened the volume, which it found as `left` and stamped as `stamp`
+    /// (`volumes.openWaiting`, in the same critical section as the stamp). It is given the verdict
+    /// of the epoch it joins, or of one it starts from the store's file (`takeVerdict`: the file is
+    /// removed either way, and by a job that does not `take` the trees). A job that does not take
+    /// is not a member: its steps end the epoch all the same.
+    pub fn enter(
+        es: *Epochs,
+        arena: Allocator,
+        io: std.Io,
+        volume: []const u8,
+        lists: []const u8,
+        mount: []const u8,
+        left: ?Left,
+        stamp: ?Left,
+        take: bool,
+    ) Entered {
+        es.mu.lockUncancelable(io);
+        defer es.mu.unlock(io);
+        const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
+        // An open that cannot tell its stamp from what it found could not be told from a foreign
+        // one by the next: nothing is shared through it, and what stands ends.
+        const known = if (left) |l| if (stamp) |t| !sameLeft(l, t) else false else false;
+        for (es.list.items) |e| {
+            if (e.ended or !std.mem.eql(u8, e.lists, lists) or !std.mem.eql(u8, e.mount, mount)) continue;
+            if (!known or !e.young(now_ms) or !sameLeft(e.last, left.?)) {
+                e.ended = true;
+                continue;
+            }
+            e.last = stamp.?;
+            if (!take) return .{};
+            const v = copyVerdict(arena, e.verdict) orelse return .{};
+            e.members += 1;
+            return .{ .verdict = v, .epoch = e };
+        }
+        const v = takeVerdict(arena, io, lists, mount, left, take) orelse return .{};
+        if (!known) return .{ .verdict = v };
+        const a = std.heap.smp_allocator;
+        const e = a.create(Epoch) catch return .{ .verdict = v };
+        const kept = copyVerdict(a, v);
+        const l = a.dupe(u8, lists) catch null;
+        const m = a.dupe(u8, mount) catch null;
+        const d = a.dupe(u8, volume) catch null;
+        if (kept != null and l != null and m != null and d != null) {
+            e.* = .{
+                .lists = l.?,
+                .mount = m.?,
+                .volume = d.?,
+                .verdict = kept.?,
+                .born_ms = v.at_ms,
+                .last = stamp.?,
+                .members = 1,
+            };
+            if (es.list.append(a, e)) |_| {
+                return .{ .verdict = v, .epoch = e };
+            } else |_| {}
+        }
+        // No memory to keep it: this job is told, as when verdicts were its alone.
+        if (kept) |k| freeVerdict(a, k);
+        if (l) |x| a.free(x);
+        if (m) |x| a.free(x);
+        if (d) |x| a.free(x);
+        a.destroy(e);
+        return .{ .verdict = v };
+    }
+
+    /// Whether `e`'s verdict is still of the volume, whose lock file is `lock`: no step started in
+    /// it since the walk, nothing but this process's jobs has opened it since the last of them
+    /// did, and the walk is not older than a verdict may be.
+    pub fn valid(es: *Epochs, io: std.Io, e: *Epoch, lock: linux.fd_t) bool {
+        es.mu.lockUncancelable(io);
+        defer es.mu.unlock(io);
+        if (e.ended) return false;
+        const now = leftBy(lock) orelse {
+            e.ended = true;
+            return false;
+        };
+        // A difference is a foreign open, or one that has stamped but not joined yet: a walk.
+        if (!sameLeft(now, e.last) or !e.young(std.Io.Clock.real.now(io).toMilliseconds())) {
+            e.ended = true;
+            return false;
+        }
+        return true;
+    }
+
+    /// A process is about to start with the volume at `volume` mounted: the verdicts of it, and of
+    /// any volume inside it or holding it (the step user's tool cache is a directory of the root
+    /// user's: a step of one can write to the other's trees), are of the past.
+    pub fn end(es: *Epochs, io: std.Io, volume: []const u8) void {
+        es.mu.lockUncancelable(io);
+        defer es.mu.unlock(io);
+        for (es.list.items) |e| {
+            if (nests(e.volume, volume) or nests(volume, e.volume)) e.ended = true;
+        }
+    }
+
+    /// A member let the volume go. The epoch goes with its last.
+    pub fn leave(es: *Epochs, io: std.Io, e: *Epoch) void {
+        es.mu.lockUncancelable(io);
+        defer es.mu.unlock(io);
+        e.members -= 1;
+        if (e.members > 0) return;
+        const a = std.heap.smp_allocator;
+        for (es.list.items, 0..) |x, i| if (x == e) {
+            _ = es.list.swapRemove(i);
+            break;
+        };
+        freeVerdict(a, e.verdict);
+        a.free(e.lists);
+        a.free(e.mount);
+        a.free(e.volume);
+        a.destroy(e);
+    }
+};
+
+pub const Epoch = struct {
+    lists: []u8,
+    mount: []u8,
+    /// The volume's directory on the host.
+    volume: []u8,
+    verdict: Verdict,
+    /// When the walk began, the age of the verdict.
+    born_ms: i64,
+    /// The lock file as the last member's open left it.
+    last: Left,
+    members: u32,
+    ended: bool = false,
+
+    fn young(e: Epoch, now_ms: i64) bool {
+        return now_ms >= e.born_ms and now_ms - e.born_ms <= verdict_max_age_ms;
+    }
+};
+
+/// Whether `inner` is `outer` or a path below it.
+fn nests(inner: []const u8, outer: []const u8) bool {
+    if (!std.mem.startsWith(u8, inner, outer)) return false;
+    return inner.len == outer.len or inner[outer.len] == '/';
+}
+
+/// The epochs of this runner's jobs.
+pub var process_epochs: Epochs = .{};
+
+fn sameLeft(a: Left, b: Left) bool {
+    return a.ino == b.ino and a.sec == b.sec and a.nsec == b.nsec;
+}
+
+fn copyVerdict(a: Allocator, v: Verdict) ?Verdict {
+    const env = a.dupe(u8, v.env) catch return null;
+    const full = a.dupe(u8, v.full) catch {
+        a.free(env);
+        return null;
+    };
+    const note = a.dupe(u8, v.note) catch {
+        a.free(env);
+        a.free(full);
+        return null;
+    };
+    return .{ .env = env, .full = full, .note = note, .at_ms = v.at_ms };
+}
+
+fn freeVerdict(a: Allocator, v: Verdict) void {
+    a.free(v.env);
+    a.free(v.full);
+    a.free(v.note);
 }
 
 const Parsed = struct { boot: []const u8, at_ms: i64, left: Left, mount: []const u8, verdict: Verdict };
@@ -2452,4 +2648,132 @@ test "tool trees: numbers are written in a line as fmt writes them" {
         const n8 = putUint(&buf, 0, v, 8);
         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{o}", .{v}), buf[0..n8]);
     }
+}
+
+/// A verdict that a walk made of the fixture, taken by the first job of `es` as it found `left`
+/// and stamped `stamp`, with its walk's age set to `at_ms`. The lock file is a real one, so a
+/// check can read its mtime.
+fn epochFor(arena: Allocator, es: *Epochs, f: Fixture, lock: linux.fd_t, left: Left, stamp: Left, at_ms: i64) !?Epochs.Entered {
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left, idleNow()));
+    const path = try verdictPath(arena, f);
+    const boot = bootId(arena, io) orelse return null;
+    const text = try cwd.readFileAlloc(io, path, arena, .unlimited);
+    const from = try std.fmt.allocPrint(arena, "boot {s}\nat ", .{boot});
+    const start = std.mem.indexOf(u8, text, from).? + from.len;
+    const end = std.mem.indexOfScalarPos(u8, text, start, '\n').?;
+    const changed = try std.fmt.allocPrint(arena, "{s}{d}{s}", .{ text[0..start], at_ms, text[end..] });
+    try cwd.writeFile(io, .{ .sub_path = path, .data = changed });
+    _ = lock;
+    return es.enter(arena, io, f.cache, f.lists, "/t", left, stamp, true);
+}
+
+fn setMtime(fd: linux.fd_t, l: Left) void {
+    const times = [2]linux.timespec{ .{ .sec = 0, .nsec = (1 << 30) - 2 }, .{ .sec = l.sec, .nsec = l.nsec } };
+    _ = linux.utimensat(fd, null, &times, 0);
+}
+
+test "tool trees: an epoch is as old as its walk, not its taking, when it is joined and when it is checked" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    try skipWithoutLeases(arena, f);
+    try tmp.dir.writeFile(io, .{ .sub_path = "lock", .data = "" });
+    const lock = linux.open(try arena.dupeSentinel(u8, try tmp.dir.realPathFileAlloc(io, "lock", arena), 0), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    const fd = std.math.cast(linux.fd_t, lock) orelse return error.TestUnexpectedResult;
+    defer _ = linux.close(fd);
+    const ino = leftBy(fd).?.ino;
+    const first: Left = .{ .ino = ino, .sec = 1_700_000_000, .nsec = 1 };
+    const second: Left = .{ .ino = ino, .sec = 1_700_000_000, .nsec = 2 };
+    const third: Left = .{ .ino = ino, .sec = 1_700_000_000, .nsec = 3 };
+    var es: Epochs = .{};
+    // The walk was 59 minutes and 59.5 seconds ago: taken now, young; in a second, too old.
+    const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
+    const told = (try epochFor(arena, &es, f, fd, first, second, now_ms - verdict_max_age_ms + 500)) orelse return error.SkipZigTest;
+    const e = told.epoch orelse return error.TestUnexpectedResult;
+    setMtime(fd, second);
+    try std.testing.expect(es.valid(io, e, fd));
+    io.sleep(.fromMilliseconds(700), .awake) catch {};
+    // Neither a job that opens now (told nothing, as it finds the epoch ended) nor a check is.
+    const late = es.enter(arena, io, f.cache, f.lists, "/t", second, third, true);
+    try std.testing.expect(late.verdict == null and late.epoch == null);
+    try std.testing.expect(!es.valid(io, e, fd));
+    es.leave(io, e);
+    try std.testing.expectEqual(@as(usize, 0), es.list.items.len);
+}
+
+test "tool trees: an open that cannot tell its stamp from what it found shares nothing" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    try skipWithoutLeases(arena, f);
+    var es: Epochs = .{};
+    // Its own verdict, as on main, but no epoch, for a stamp equal to what it found or not known.
+    for ([_]?Left{ left_now, null }) |stamp| {
+        try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, idleNow()));
+        const alone = es.enter(arena, io, f.cache, f.lists, "/t", left_now, stamp, true);
+        try std.testing.expect(alone.verdict != null and alone.epoch == null);
+        try std.testing.expectEqual(@as(usize, 0), es.list.items.len);
+    }
+}
+
+test "tool trees: checks, ends and leaves from threads at once neither crash nor leak, and no check outlives an end" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try fixture(arena, &tmp);
+    try skipWithoutLeases(arena, f);
+    try tmp.dir.writeFile(io, .{ .sub_path = "lock", .data = "" });
+    const lock = linux.open(try arena.dupeSentinel(u8, try tmp.dir.realPathFileAlloc(io, "lock", arena), 0), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    const fd = std.math.cast(linux.fd_t, lock) orelse return error.TestUnexpectedResult;
+    defer _ = linux.close(fd);
+    const ino = leftBy(fd).?.ino;
+    var es: Epochs = .{};
+    const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
+    var last: Left = .{ .ino = ino, .sec = 1_700_000_000, .nsec = 1 };
+    const told = (try epochFor(arena, &es, f, fd, .{ .ino = ino, .sec = 1_700_000_000, .nsec = 0 }, last, now_ms)) orelse return error.SkipZigTest;
+    const e = told.epoch.?;
+    // Three more members, each opening as the last left it.
+    for (0..3) |_| {
+        const next: Left = .{ .ino = ino, .sec = 1_700_000_000, .nsec = last.nsec + 1 };
+        const j = es.enter(arena, io, f.cache, f.lists, "/t", last, next, true);
+        try std.testing.expect(j.epoch == e);
+        last = next;
+    }
+    setMtime(fd, last);
+    const Member = struct {
+        fn run(x: *Epochs, ep: *Epoch, fdesc: linux.fd_t, ended: *const std.atomic.Value(bool), late: *std.atomic.Value(u32)) void {
+            const i = std.testing.io;
+            var after_end = false;
+            for (0..2000) |_| {
+                const was_ended = ended.load(.acquire);
+                const ok = x.valid(i, ep, fdesc);
+                if (was_ended and ok) after_end = true;
+            }
+            if (after_end) _ = late.fetchAdd(1, .monotonic);
+            x.leave(i, ep);
+        }
+    };
+    var ended: std.atomic.Value(bool) = .init(false);
+    var late: std.atomic.Value(u32) = .init(0);
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Member.run, .{ &es, e, fd, &ended, &late });
+    io.sleep(.fromMilliseconds(1), .awake) catch {};
+    es.end(io, f.cache);
+    ended.store(true, .release);
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(u32, 0), late.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), es.list.items.len);
 }

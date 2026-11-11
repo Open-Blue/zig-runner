@@ -1536,6 +1536,9 @@ test "native eviction: a volume inside another goes with it only when neither is
     run(f.s, io);
     try testing.expect(f.there(outer) and f.there(v.dir));
     v.release(io);
+    // Opening the inner volume counted as a use of the outer one (`volumes.openWaiting` stamps its
+    // lock, so that a root user's epoch sees the open), which is the outer one's age too.
+    try f.age(outer, 30);
     try f.age(v.dir, 30);
     run(f.s, io);
     try testing.expect(!f.there(v.dir));

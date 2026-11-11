@@ -118,7 +118,8 @@ pub fn upMain(
     const subnet = Subnet.parse(subnet_text) catch return fail("a subnet", .INVAL);
     var host = Socket.open() catch return fail("open rtnetlink", .ACCES);
     host.ensureBridge(subnet) catch return fail("make the bridge " ++ bridge, .INVAL);
-    if (!writeSysctl(arena, "/proc/sys/net/ipv6/conf/" ++ bridge ++ "/disable_ipv6", "1"))
+    const bridge_ipv6 = "/proc/sys/net/ipv6/conf/" ++ bridge ++ "/disable_ipv6";
+    if (!sysctlIs(arena, bridge_ipv6, "1") and !writeSysctl(arena, bridge_ipv6, "1"))
         return fail("turn IPv6 off on the bridge", .ACCES);
     const unshared = linux.unshare(linux.CLONE.NEWNET);
     if (linux.errno(unshared) != .SUCCESS) return fail("unshare(net)", linux.errno(unshared));
@@ -141,6 +142,19 @@ pub fn upMain(
     host.addVeth(slot, @intCast(ns)) catch return fail("make the veth pair", .INVAL);
     job.configureJob(subnet, slot) catch return fail("configure the job's network", .INVAL);
     return 0;
+}
+
+/// Whether a sysctl already has `value`: writing it again is a request to the kernel for nothing,
+/// and its IPv6 ones wait for the lock that link changes take.
+fn sysctlIs(arena: Allocator, path: []const u8, value: []const u8) bool {
+    const fd = linux.open(z(arena, path), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return false;
+    const f: linux.fd_t = std.math.cast(linux.fd_t, fd) orelse return false;
+    defer _ = linux.close(f);
+    var buf: [8]u8 = undefined;
+    const n = linux.read(f, &buf, buf.len);
+    if (linux.errno(n) != .SUCCESS) return false;
+    return std.mem.eql(u8, std.mem.trim(u8, buf[0..n], " \n"), value);
 }
 
 /// Writes a sysctl; true when it took, or when the kernel has no such file under an IPv6 that is
@@ -238,6 +252,10 @@ pub const Socket = struct {
     /// Makes the bridge, gives it the gateway's address and brings it up; none of it is an error
     /// when it is there already.
     pub fn ensureBridge(s: *Socket, subnet: Subnet) !void {
+        // Every request below takes the kernel's one lock for link changes, which seven jobs
+        // starting together queue for, so a bridge that is as wanted (the usual case) is only
+        // read, which takes none.
+        if (s.bridgeReady(subnet)) return;
         var m: Message = .init(.RTM_NEWLINK, linux.NLM_F_CREATE | linux.NLM_F_EXCL);
         m.ifinfo(0, 0);
         m.attrString(ifla_ifname, bridge);
@@ -248,6 +266,21 @@ pub const Socket = struct {
         const i = s.index(bridge) orelse return error.NoBridge;
         try s.addAddress(i, subnet.gateway(), subnet.prefix);
         try s.up(i);
+    }
+
+    /// Whether the bridge is up and has the gateway's address with the subnet's prefix.
+    fn bridgeReady(s: *Socket, subnet: Subnet) bool {
+        const siocgifflags = 0x8913;
+        const siocgifaddr = 0x8915;
+        const siocgifnetmask = 0x891b;
+        var req: extern struct { name: [16]u8, data: [24]u8 } = .{ .name = @splat(0), .data = @splat(0) };
+        @memcpy(req.name[0..bridge.len], bridge);
+        if (linux.errno(linux.ioctl(s.ioctl_fd, siocgifflags, @intFromPtr(&req))) != .SUCCESS) return false;
+        if (std.mem.readInt(u16, req.data[0..2], .little) & iff_up == 0) return false;
+        if (linux.errno(linux.ioctl(s.ioctl_fd, siocgifaddr, @intFromPtr(&req))) != .SUCCESS) return false;
+        if (!std.mem.eql(u8, req.data[4..8], &subnet.gateway())) return false;
+        if (linux.errno(linux.ioctl(s.ioctl_fd, siocgifnetmask, @intFromPtr(&req))) != .SUCCESS) return false;
+        return @popCount(std.mem.readInt(u32, req.data[4..8], .big)) == subnet.prefix;
     }
 
     /// Makes the veth pair of slot `n`, its job's end in the namespace `netns` (a file

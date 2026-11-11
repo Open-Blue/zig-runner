@@ -180,6 +180,9 @@ held: std.ArrayList(std.Io.File) = .empty,
 chain: std.ArrayList(std.Io.File) = .empty,
 /// Past this many layers, the stack is merged into one (`flatten`).
 flatten_at: usize = default_flatten_at,
+/// Whether a step's upper may be written through an idmapped mount (`idmappedUpper`): the
+/// config's say, `Config.idmapped_upper`.
+idmapped_upper: bool = true,
 /// `abort` while an exec waits for its key's lock (`Store.lockKey`): the wait ends.
 waiting: std.atomic.Value(bool) = .init(false),
 stop_wait: std.atomic.Value(bool) = .init(false),
@@ -198,6 +201,13 @@ how: Launch,
 /// network namespace's file.
 slot: ?Slot = null,
 netns: ?[]const u8 = null,
+/// The network helper (`jobNetwork`) while it runs beside the job's set-up, until the first use of
+/// the namespace waits for it (`networkPath`). `net_mu` serialises that wait, `net_why` is what
+/// it said when it failed, and `net_ns` the time the job spent on it (starting it, then waiting).
+net_helper: ?NetHelper = null,
+net_mu: std.Io.Mutex = .init,
+net_why: ?[]const u8 = null,
+net_ns: u64 = 0,
 /// On a root runner, the nameservers the job's resolver names (`net.Resolver`), which the jobs'
 /// rules let its DNS through to (`natRulesFor`).
 nameservers: []const [4]u8 = &.{},
@@ -308,6 +318,11 @@ pub const Config = struct {
     store_limits: evict.Limits = .{},
     /// Tests: the stack of layers is flattened past this many (`flatten`).
     flatten_at: usize = default_flatten_at,
+    /// `RUNNER_NATIVE_IDMAPPED_UPPER`: on a root runner a step's upper is written through an
+    /// idmapped mount, so a layer has the canonical ids without a shift afterwards, where the
+    /// kernel and the filesystem allow it (`idmappedUpper`); off, or where they do not, every
+    /// layer is shifted (`Store.unshift`) as before.
+    idmapped_upper: bool = true,
     /// Tests: services' images from a directory filled ahead (`images.find`: `rootfs/` and
     /// `config.json` per reference) instead of P3's pull; "" pulls them, as in production.
     images: []const u8 = "",
@@ -427,6 +442,7 @@ pub fn configFor(
         .vouched = vouched,
         .rootless = cfg.native_rootless,
         .defer_sync = cfg.native_defer_sync,
+        .idmapped_upper = cfg.native_idmapped_upper,
         .subid_base = cfg.native_subid_base,
         .subnet = try net.Subnet.parse(cfg.native_subnet),
         .store_max_bytes = cfg.native_store_max_mb * 1024 * 1024,
@@ -966,6 +982,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .host_paths_unmapped = cfg.host_paths_unmapped,
         .host_paths_closed = cfg.host_paths_closed,
         .flatten_at = @max(2, cfg.flatten_at),
+        .idmapped_upper = cfg.idmapped_upper,
         .gate = cfg.gate,
         .test_seed_script = cfg.test_seed_script,
         .volume_seed_limit_ms = cfg.test_volume_seed_limit_ms orelse volumes.seed_limit_ms,
@@ -1285,33 +1302,67 @@ fn jobNetwork(b: *Backend, cfg: Config, why: *[]const u8) !void {
         return error.JobNetworkFailed;
     }
     t = b.timings.since(arena, .nat, t);
-    defer _ = b.timings.since(arena, .netns, t);
     const path = try std.fmt.allocPrint(arena, "{s}/netns", .{b.dir});
     const slot = try std.fmt.allocPrint(arena, "{d}", .{n});
-    var child = std.process.spawn(b.io, .{
+    const child = std.process.spawn(b.io, .{
         .argv = &.{ cfg.self_exe, net.command, path, slot, subnet },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .pipe,
     }) catch |e| return failed(why, arena, "starting the job's network helper", cfg.self_exe, e);
-    var err: std.ArrayList(u8) = .empty;
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const got = child.stderr.?.readStreaming(b.io, &.{&buf}) catch break;
-        if (got == 0) break;
-        try err.appendSlice(arena, buf[0..got]);
+    // The helper runs while the job's image and caches are set up, which need no network: the
+    // kernel serialises every link change on one lock, so with many jobs starting together each
+    // helper waits for the others' (33-130 ms against 8 on a Pi 5 with seven jobs), time a job
+    // spends elsewhere. The first thing that needs the namespace waits for it (`networkPath`).
+    b.net_helper = .{ .child = child, .path = path };
+    b.net_ns += phases.now() -| t;
+}
+
+/// What `jobNetwork` started, still running.
+const NetHelper = struct {
+    child: std.process.Child,
+    path: []const u8,
+};
+
+/// The job's network namespace's file, once its helper has made it (the wait for it is the
+/// job's `netns` phase); null on a job with no namespace of its own. Fails with
+/// `error.JobNetworkFailed` when the helper did, every time it is asked: nothing runs in a
+/// network that is not there. Every use of `b.netns` outside the teardown asks here.
+pub fn networkPath(b: *Backend) !?[]const u8 {
+    b.net_mu.lockUncancelable(b.io);
+    defer b.net_mu.unlock(b.io);
+    if (b.net_helper) |started| {
+        var h = started;
+        const arena = b.arena;
+        const t = phases.now();
+        b.net_helper = null;
+        b.netns = h.path;
+        var err: std.ArrayList(u8) = .empty;
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const got = h.child.stderr.?.readStreaming(b.io, &.{&buf}) catch break;
+            if (got == 0) break;
+            err.appendSlice(arena, buf[0..got]) catch break;
+        }
+        const term = h.child.wait(b.io) catch |e| {
+            b.net_why = std.fmt.allocPrint(arena, "waiting for the job's network helper {s}: {s}", .{
+                b.self_exe, @errorName(e),
+            }) catch "waiting for the job's network helper";
+            b.timings.add(arena, .netns, b.net_ns + (phases.now() -| t));
+            return error.JobNetworkFailed;
+        };
+        b.net_ns += phases.now() -| t;
+        b.timings.add(arena, .netns, b.net_ns);
+        if (term != .exited or term.exited != 0) {
+            const said = std.mem.trim(u8, err.items, " \n");
+            std.log.warn("native: the job's network: {s}", .{said});
+            b.net_why = std.fmt.allocPrint(arena, "making the job's network {s} ({s} {s}): {s}", .{
+                h.path, b.self_exe, net.command, if (said.len > 0) said else "it failed",
+            }) catch "making the job's network failed";
+        }
     }
-    const term = child.wait(b.io) catch |e|
-        return failed(why, arena, "waiting for the job's network helper", cfg.self_exe, e);
-    b.netns = path;
-    if (term != .exited or term.exited != 0) {
-        const said = std.mem.trim(u8, err.items, " \n");
-        std.log.warn("native: the job's network: {s}", .{said});
-        why.* = try std.fmt.allocPrint(arena, "making the job's network {s} ({s} {s}): {s}", .{
-            path, cfg.self_exe, net.command, if (said.len > 0) said else "it failed",
-        });
-        return error.JobNetworkFailed;
-    }
+    if (b.net_why != null) return error.JobNetworkFailed;
+    return b.netns;
 }
 
 /// The first slot whose lock in `dir` no process holds, locked. The directory is made only
@@ -1408,6 +1459,8 @@ pub fn deinit(b: *Backend) void {
     // slot's next holder never sees: it removes whatever it finds of the slot's veth under the
     // slot's lock, which is let go below (`jobNetwork`). A job with no namespace (its helper
     // failed) may have a veth of its slot all the same, so that one is deleted here.
+    // Its helper first, if one is still running; why it failed is said already.
+    _ = b.networkPath() catch |e| std.log.debug("native: teardown: the job's network: {s}", .{@errorName(e)});
     if (b.netns) |p| {
         detachNetns(arena, p);
     } else if (b.slot) |s| {
@@ -1988,12 +2041,14 @@ fn checkToolTrees(b: *Backend) !void {
     const mount = b.cache_plan.tool_cache.?;
     // What the last job out found when it left the volume, read as this job opened it
     // (`volumes.plan`, `tool_trees.takeVerdict`): no walk then.
-    if (b.cache_plan.tool_verdict) |v| {
+    // Only while no step has started in the volume since the walk, which the epoch it was told
+    // by says (`volumes.Plan.verdictStands`): else this job walks, as one that opened later does.
+    if (b.cache_plan.tool_verdict) |v| if (b.cache_plan.verdictStands(b.io)) {
         b.tool_trees = v.env;
         b.tool_trees_full = v.full;
         try b.notes.append(arena, v.note);
         return;
-    }
+    };
     // In the runner's store beside the volumes, where no step can write: a list a job could
     // forge would pass a changed file (`tool_trees.zig`).
     const lists = try trees_check.listsDir(arena, b.store_cfg.root, volume);
@@ -2010,6 +2065,14 @@ fn checkToolTrees(b: *Backend) !void {
     b.tool_trees = verdict.env;
     b.tool_trees_full = verdict.full;
     try b.notes.append(arena, verdict.note);
+}
+
+/// `binds` without the tool cache's volume, for a script of the runner's own that is run in set-up
+/// and does not use it: a process started with it mounted could write to its trees
+/// (`volumes.endEpochs`), and what is not mounted cannot.
+fn withoutToolCache(b: *Backend, binds: []const sandbox.Spec.Bind) []const sandbox.Spec.Bind {
+    const volume = b.cache_plan.tool_cache_host orelse return binds;
+    return volumes.without(b.arena, binds, volume) catch binds;
 }
 
 /// A job that lets the tool cache's volume go with processes that may be alive in it says so,
@@ -2048,7 +2111,7 @@ fn seedBuiltin(b: *Backend, volume: sandbox.Spec.Bind, as_runner: bool) void {
     const at = "/zig-runner-builtin";
     var beside = volume;
     beside.at = at;
-    b.binds = std.mem.concat(arena, sandbox.Spec.Bind, &.{ saved, &.{beside} }) catch return;
+    b.binds = std.mem.concat(arena, sandbox.Spec.Bind, &.{ b.withoutToolCache(saved), &.{beside} }) catch return;
     const dir = set_up.zigBuiltinDir(arena, as_runner) catch return;
     const script = std.fmt.allocPrint(arena, "set -- {s} {s} ''\n{s}", .{
         at,
@@ -2082,6 +2145,9 @@ fn rollZigLocal(b: *Backend, as_runner: bool) void {
         set_up.zig_local_roll_script,
     }) catch return;
     var out: Captured = .{ .arena = arena };
+    const saved = b.binds;
+    defer b.binds = saved;
+    b.binds = b.withoutToolCache(saved);
     const ended = b.exec(script, &.{"PATH=" ++ image_path}, &.{}, 0, 0, out.output()) catch |e| {
         std.log.warn("native: Zig local cache not rolled: {s}", .{@errorName(e)});
         return;
@@ -2653,15 +2719,42 @@ fn execIn(
         .failure = try std.fmt.allocPrint(arena, "could not flatten the job's {d} layers " ++
             "into one: {s}", .{ b.layers.items.len, @errorName(e) }),
     };
+    // A container with an owner has its own idmaps of the job's directory (`sandbox.jobView`).
+    const owned = if (container) |c| c.owner != null else false;
+    const idmapped = new_layer and !owned and b.idmappedUpper();
+    return b.runIn(argv, env, files, uid, gid, out, container, new_layer, idmapped);
+}
+
+/// `execIn` after its layers are in order: the step run, its upper written through an idmapped
+/// mount when `idmapped` (`Spec.upper_canonical`), whose layer then has the canonical ids already.
+fn runIn(
+    b: *Backend,
+    argv: []const []const u8,
+    env: []const []const u8,
+    files: []const sandbox.Spec.File,
+    uid: u32,
+    gid: u32,
+    out: sandbox.Output,
+    container: ?sandbox.Spec.Container,
+    new_layer: bool,
+    idmapped: bool,
+) !sandbox.Ended {
+    const arena = b.arena;
     const upper = if (new_layer) try b.layerName('L') else "BU";
     const upper_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, upper });
     try std.Io.Dir.cwd().createDirPath(b.io, upper_path);
     const base_id = b.idBase();
+    const netns = b.networkPath() catch return .{
+        .code = 1,
+        .failure = b.net_why orelse "the job's network could not be made",
+    };
     // The upper's root is the overlay's `/`: the job's root's, as the image's `/` is, so a step
     // as root can make files there. Rootless, the runner's own user is the job's root already.
     if (b.how.userns == .mapped) {
         const p = try arena.dupeSentinel(u8, upper_path, 0);
-        _ = std.os.linux.chown(p, base_id, base_id);
+        // Written through the job's ids, the root's own is 0 on disk, as a layer's is.
+        const root_id: u32 = if (idmapped) 0 else base_id;
+        _ = std.os.linux.chown(p, root_id, root_id);
         _ = std.os.linux.chmod(p, 0o755);
     }
     // The job's layers, newest first, then the seeds' and the rootfs: the image's own.
@@ -2675,6 +2768,10 @@ fn execIn(
     }
     @memcpy(lowers[n .. lowers.len - 1], b.seed_layers.items);
     lowers[lowers.len - 1] = b.rootfs;
+    // Before the process exists: from then on a step may write to a tree, and no job is told of
+    // the trees by a verdict again (`tool_trees.Epochs`). Every start with a volume mounted, a
+    // step, an action's pre or post script, a Docker build or a set-up script alike.
+    volumes.endEpochs(b.io, b.binds);
     const ended = try sandbox.run(arena, b.io, b.how.argv_prefix, .{
         .root = b.dir,
         .lowers = lowers,
@@ -2694,18 +2791,69 @@ fn execIn(
         .userns = b.how.userns,
         .id_base = base_id,
         .id_count = ids_per_slot,
-        .netns = b.netns,
+        .netns = netns,
         .mount_points = mount_points,
         .cgroup = if (b.job_cgroup) |j| j.stepsDir() else null,
         .image_layers = @intCast(b.seed_layers.items.len + 1),
         .canonical = canonical,
+        .upper_canonical = idmapped,
         .volume_id_base = volumeIdBase(b.subid_base),
         .container = container,
         .container_opts = b.sandbox_opts,
     }, &b.running, out);
     b.timings.helper(arena, ended.helper, ended.spawned, ended.ended);
-    if (new_layer) try b.layers.append(arena, .{ .name = upper, .path = upper_path });
+    if (new_layer) try b.layers.append(arena, .{ .name = upper, .path = upper_path, .canonical = idmapped });
     return ended;
+}
+
+/// Whether this machine writes a step's upper through an idmapped mount, found once by running
+/// one step that does and looking at what it left on disk, and remembered for the process (a
+/// kernel and its filesystems do not change under it); null in `idmapped_upper` is the question
+/// not yet asked. Where it does not work, or `Config.idmapped_upper` is off, or the runner is
+/// rootless, the answer is no, and each layer is shifted when it is published or flattened.
+var idmapped_upper_known: std.atomic.Value(u8) = .init(0); // 0: not asked yet
+const idmapped_yes = 1;
+const idmapped_no = 2;
+
+fn idmappedUpper(b: *Backend) bool {
+    if (b.how.userns != .mapped or !b.idmapped_upper) return false;
+    switch (idmapped_upper_known.load(.acquire)) {
+        idmapped_yes => return true,
+        idmapped_no => return false,
+        else => {},
+    }
+    const why = b.tryIdmappedUpper();
+    idmapped_upper_known.store(if (why == null) idmapped_yes else idmapped_no, .release);
+    if (why) |w| std.log.info("native: a step's upper is not idmapped on this machine ({s}); " ++
+        "each layer is shifted after its step instead", .{w});
+    return why == null;
+}
+
+/// The script `tryIdmappedUpper` runs: a file given to another user and a set-id one, a
+/// directory, and a deletion that makes the overlay's whiteout (as host root, in its mounter's
+/// own ids).
+const idmapped_trial = "mkdir /idmapped-trial && echo x > /idmapped-trial/f && " ++
+    "chown 1001:1002 /idmapped-trial/f && chmod 4755 /idmapped-trial/f && " ++
+    "rm -f /etc/group";
+
+/// One step with an idmapped upper on the job's own stack, its layer dropped again: null when it
+/// ran and left the ids the job's own on disk, else why not. An upper the kernel did not idmap
+/// (or idmapped another way) would have left the job's host ids.
+fn tryIdmappedUpper(b: *Backend) ?[]const u8 {
+    const arena = b.arena;
+    var out: Captured = .{ .arena = arena };
+    const ended = b.runIn(&.{ "sh", "-c", idmapped_trial }, &.{"PATH=/usr/bin:/bin"}, &.{}, 0, 0, out.output(), null, true, true) catch |e|
+        return @errorName(e);
+    const top = b.layers.pop() orelse return "no layer was made";
+    defer removeTree(arena, b.io, top.path);
+    if (ended.failure.len > 0) return ended.failure;
+    if (ended.code != 0) return std.fmt.allocPrint(arena, "the trial step exited {d}: {s}", .{ ended.code, out.tailLines(4) }) catch "the trial step failed";
+    const p = std.fmt.allocPrintSentinel(arena, "{s}/idmapped-trial/f", .{top.path}, 0) catch return "out of memory";
+    var st: std.os.linux.Statx = undefined;
+    if (std.os.linux.errno(std.os.linux.statx(std.os.linux.AT.FDCWD, p, std.os.linux.AT.SYMLINK_NOFOLLOW, .{ .UID = true, .GID = true, .MODE = true }, &st)) != .SUCCESS)
+        return "the trial's file is missing";
+    if (st.uid == 1001 and st.gid == 1002 and st.mode & 0o7777 == 0o4755) return null;
+    return std.fmt.allocPrint(arena, "the trial's file has ids {d}:{d} mode {o} on disk", .{ st.uid, st.gid, st.mode & 0o7777 }) catch "the trial's ids are wrong";
 }
 
 /// The next layer's name in the job's directory: `L<n>` for a step's upper, `l<n>` for a link to
@@ -3441,8 +3589,13 @@ fn publishPorts(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void {
         err_msg.* = if (why.len > 0) why else @errorName(e);
         return error.BaseContainerFailed;
     };
+    const netns = b.networkPath() catch |e| {
+        b.job_fault = true;
+        err_msg.* = b.net_why orelse @errorName(e);
+        return error.BaseContainerFailed;
+    };
     b.publisher = forward.start(arena, b.io, b.self_exe, .{
-        .netns = b.netns,
+        .netns = netns,
         // The job's nobody: an id of its range, nothing on the host.
         .id = if (b.how.userns == .mapped) b.idBase() + 65534 else null,
         .cgroup = if (b.job_cgroup) |j| j.servicesDir() else null,
@@ -3986,7 +4139,8 @@ const Provision = struct {
         defer b.workdir = workdir;
         var out: Captured = .{ .arena = arena };
         const ended = try b.exec(p.script, p.env, &.{}, 0, 0, out.output());
-        const upper = b.layers.items[b.layers.items.len - 1].path;
+        const top = b.layers.items[b.layers.items.len - 1];
+        const upper = top.path;
         // The step's layer is consumed; the job's other layers, if any, stay.
         defer {
             removeTree(arena, b.io, upper);
@@ -3997,8 +4151,9 @@ const Provision = struct {
             p.why = try std.fmt.allocPrint(arena, "{s}{s} (exit {d})", .{ ended.failure, out.tailLines(8), ended.code });
             return error.ProvisionFailed;
         }
-        // On a root runner the layer belongs to the job's range of ids: back to the image's.
-        const shift: u32 = if (b.how.userns == .mapped) b.idBase() else 0;
+        // On a root runner the layer belongs to the job's range of ids (unless its upper was written
+        // through an idmapped mount, with the image's own already): back to the image's.
+        const shift: u32 = if (b.how.userns == .mapped and !top.canonical) b.idBase() else 0;
         ImageStore.flatten(arena, b.io, p.img.rootfs, .{ .dir = upper, .id_shift = shift }, try std.fmt.allocPrint(arena, "{s}/rootfs", .{dir})) catch |e| {
             p.why = try std.fmt.allocPrint(arena, "its layer could not be flattened: {s}", .{@errorName(e)});
             return e;
@@ -5502,6 +5657,36 @@ test "native tool cache volume: a replayed step that points into it runs again (
     try std.testing.expectEqual(@as(usize, 1), runs(arena, c.shared, "layer"));
 }
 
+test "native tool trees: a job's first step ends the epoch of the tool cache for those that have not checked yet" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    const caches: volumes.Options = .{ .package_caches = true, .trusted = true, .tool_trees = true };
+    const install = testJob(&.{testStep("mkdir -p $RUNNER_TOOL_CACHE/t/1/x64 && echo v1 > $RUNNER_TOOL_CACHE/t/1/x64/bin")});
+    // The first job leaves a tree. Its own walk as the last out saw the files too new to be told
+    // from a later write, so the walk is made again once they are old enough.
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j1" });
+    io.sleep(.fromMilliseconds(2_200), .awake) catch {};
+    var last = try volumes.plan(arena, io, c.cfg.store, caches, "repo", install, dagger.default_image, false, false, null);
+    const idle = last.idleToolCache(arena) orelse return error.TestUnexpectedResult;
+    const lists = try trees_check.listsDir(arena, c.cfg.store, idle.dir);
+    const kept = trees_check.walkIdle(arena, std.testing.allocator, io, idle.dir, lists, last.tool_cache.?, idle.left, trees_check.idle_limits);
+    last.release(io);
+    if (!kept) return error.SkipZigTest; // a filesystem that proves nothing at rest
+    // A job that has opened the volume and not run anything is told it, as is one that opens after.
+    var waiting = try volumes.plan(arena, io, c.cfg.store, caches, "repo", install, dagger.default_image, false, false, null);
+    defer waiting.release(io);
+    try std.testing.expect(waiting.tool_verdict != null);
+    try std.testing.expect(waiting.verdictStands(io));
+    // A whole job runs a step in the volume: from then on the waiting job's verdict is of the past.
+    _ = try runCachedJob(arena, c.cfg, install, caches, .{ .ran = "j2" });
+    try std.testing.expect(!waiting.verdictStands(io));
+}
+
 test "native tool trees: an installing step replays while its tree is held, not once changed" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -6350,12 +6535,32 @@ test "root runner: slots are the host's, so two runners with different stores ne
     defer second.deinit();
     try std.testing.expect(first.slot.?.n != second.slot.?.n);
     try std.testing.expect(first.idBase() != second.idBase());
-    // The second job's set-up left the first's veth alone, and both are on the bridge.
+    // The second job's set-up left the first's veth alone, and both are on the bridge: once each
+    // job's network helper is done, as `init` only starts it.
+    _ = try first.networkPath();
+    _ = try second.networkPath();
     var sock = try net.Socket.open();
     defer sock.close();
     var buf: [16]u8 = undefined;
     try std.testing.expect(sock.index(net.hostLink(&buf, first.slot.?.n)) != null);
     try std.testing.expect(sock.index(net.hostLink(&buf, second.slot.?.n)) != null);
+}
+
+test "root runner: a job whose network helper fails starts, and its first use of the network fails, every time" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    // `false` for the helper: it exits 1 and says nothing.
+    cfg.self_exe = "/usr/bin/false";
+    var b = try init(arena, std.testing.io, std.testing.allocator, cfg);
+    defer b.deinit();
+    try std.testing.expectError(error.JobNetworkFailed, b.networkPath());
+    try std.testing.expect(std.mem.indexOf(u8, b.net_why.?, "making the job's network") != null);
+    try std.testing.expectError(error.JobNetworkFailed, b.networkPath());
 }
 
 test "root runner: a job's veth goes with its namespace, and the next job of the slot never meets it" {
@@ -6380,6 +6585,8 @@ test "root runner: a job's veth goes with its namespace, and the next job of the
         var b = try init(arena, io, std.testing.allocator, cfg);
         if (slot) |n| try std.testing.expectEqual(n, b.slot.?.n);
         slot = b.slot.?.n;
+        // The helper runs beside the set-up: the veth is there once the first use waited for it.
+        try std.testing.expect(try b.networkPath() != null);
         try std.testing.expect(sock.index(net.hostLink(&buf, slot.?)) != null);
         b.deinit();
     }
@@ -8657,6 +8864,138 @@ test "root runner: jobs in different slots share a stored layer, its owners thei
         "setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "test", "-e", found.?,
     } });
     try std.testing.expect(nobody.term == .exited and nobody.term.exited != 0);
+}
+
+/// The steps of the idmapped-upper tests: one that leaves a tree of every kind of entry, owners,
+/// set-id bits, links, and (where the tools are there) an ACL and a file capability; one that
+/// deletes and changes in it, so overlay copies up and makes a whiteout; and one that says what a
+/// later job sees, its lines starting `seen`. A job cannot make what its ids do not reach.
+const idmapped_steps = [_][]const u8{
+    "mkdir -p /w/d/e && echo a > /w/a && echo b > /w/d/e/b && chown 1001:1001 /w/d /w/a && " ++
+        "chown 1002:1003 /w/d/e/b && chmod 4755 /w/a && chmod 2755 /w/d && ln -s /w/a /w/link && " ++
+        "ln /w/d/e/b /w/hard && mkfifo /w/fifo && " ++
+        "if command -v setfacl >/dev/null; then setfacl -m u:1001:rw,g:1002:r /w/d/e/b && " ++
+        "setfacl -d -m g:1002:rx /w/d; fi && " ++
+        "if command -v setcap >/dev/null; then cp /bin/true /w/cap && setcap cap_net_raw+ep /w/cap; fi",
+    "rm /w/d/e/b /w/hard && chown 1002:1002 /w/a && chmod 4755 /w/a && chmod 600 /w/fifo && mkdir /w/d/new && echo c > /w/d/new/c && " ++
+        "rm -rf /w/d/e && mkdir /w/d/e && echo d > /w/d/e/y",
+    "! chown 70000:70000 /w/a && ! mknod /w/null c 1 3 && echo refused-ids-and-devices",
+};
+
+const idmapped_look =
+    "stat -c 'seen %n %u:%g %a %F' /w /w/a /w/d /w/d/e/y /w/d/new/c /w/link /w/fifo; " ++
+    "test ! -e /w/d/e/b && test ! -e /w/hard && echo seen b-and-hard-are-gone; " ++
+    "if command -v getfacl >/dev/null; then getfacl -p /w/d | sed 's/^/seen acl /'; fi; " ++
+    "if command -v getcap >/dev/null; then getcap /w/cap | sed 's/^/seen cap /'; fi; " ++
+    "echo more >> /w/d/e/y && stat -c 'seen copied-up %u:%g' /w/d/e/y";
+
+/// The `seen` lines of a job's log, in order.
+fn seenLines(arena: Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |l| if (std.mem.indexOf(u8, l, "seen ")) |at| {
+        try out.appendSlice(arena, l[at..]);
+        try out.append(arena, '\n');
+    };
+    return out.items;
+}
+
+/// A store's layers: each key with its tree's digest as the job's own ids see it.
+fn layerDigests(arena: Allocator, store: []const u8) !std.StringArrayHashMapUnmanaged(Store.Key) {
+    var out: std.StringArrayHashMapUnmanaged(Store.Key) = .empty;
+    const layers = try std.fmt.allocPrint(arena, "{s}/layers", .{store});
+    var dir = try std.Io.Dir.cwd().openDir(std.testing.io, layers, .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var it = dir.iterate();
+    while (try it.next(std.testing.io)) |e| {
+        const fs = try std.fmt.allocPrint(arena, "{s}/{s}/fs", .{ layers, e.name });
+        const canonical_ids: Store.Ids = .{ .base = 0, .count = ids_per_slot };
+        try out.put(arena, try arena.dupe(u8, e.name), try Store.treeDigest(arena, std.testing.io, fs, .content, canonical_ids));
+    }
+    return out;
+}
+
+/// The owner on disk of the whiteout (a character device 0/0) of `name` in some layer of `store`,
+/// or null when none has one.
+fn whiteoutOwner(arena: Allocator, store: []const u8, name: []const u8) !?u32 {
+    const layers = try std.fmt.allocPrint(arena, "{s}/layers", .{store});
+    var dir = try std.Io.Dir.cwd().openDir(std.testing.io, layers, .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var it = dir.iterate();
+    while (try it.next(std.testing.io)) |e| {
+        const p = try std.fmt.allocPrintSentinel(arena, "{s}/{s}/fs/{s}", .{ layers, e.name, name }, 0);
+        var st: std.os.linux.Statx = undefined;
+        if (std.os.linux.errno(std.os.linux.statx(std.os.linux.AT.FDCWD, p, std.os.linux.AT.SYMLINK_NOFOLLOW, .{ .UID = true, .TYPE = true }, &st)) != .SUCCESS) continue;
+        if (st.mode & std.os.linux.S.IFMT == std.os.linux.S.IFCHR) return st.uid;
+    }
+    return null;
+}
+
+test "root runner: an idmapped upper leaves the layers the shift does, and each reads the other's store" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // One directory of rootfs and binds, so the keys are alike, and a store for each way.
+    var idmapped = try cachedConfig(arena, &tmp);
+    var shifted = idmapped;
+    try tmp.dir.createDirPath(std.testing.io, "store-shifted");
+    shifted.cfg.store = try std.fmt.allocPrint(arena, "{s}/store-shifted", .{try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena)});
+    idmapped.cfg.idmapped_upper = true;
+    shifted.cfg.idmapped_upper = false;
+    var steps: [idmapped_steps.len]job_mod.Step = undefined;
+    for (idmapped_steps, &steps) |s, *o| o.* = testStep(s);
+    const make = testJob(&steps);
+    const first = try runCached(arena, idmapped.cfg, make, "j1");
+    try expectSucceeded(first);
+    try expectLines(first.text, &.{"refused-ids-and-devices"});
+    // Where this kernel or filesystem does not take it, the answer is the shift's: nothing to compare.
+    if (idmapped_upper_known.load(.acquire) != idmapped_yes) {
+        std.debug.print("idmapped upper test skipped: this machine does not take it\n", .{});
+        return error.SkipZigTest;
+    }
+    // The same ran marker, which a layer holds.
+    const second = try runCached(arena, shifted.cfg, make, "j1");
+    try expectSucceeded(second);
+    try expectLines(second.text, &.{"refused-ids-and-devices"});
+
+    // The same layers, key by key, with the same digests: owners, modes, links, ACLs, capabilities.
+    const via_idmap = try layerDigests(arena, idmapped.cfg.store);
+    const via_shift = try layerDigests(arena, shifted.cfg.store);
+    try std.testing.expectEqual(via_shift.count(), via_idmap.count());
+    try std.testing.expect(via_idmap.count() >= 3);
+    for (via_shift.keys(), via_shift.values()) |k, d| {
+        const other = via_idmap.get(k) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualSlices(u8, &d, &other);
+    }
+    // On disk what differs is the whiteout's owner, the overlay's own mounter: the id nothing
+    // owns, where the shift gives the overflow id; both digest as the overflow id.
+    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32) - 1), try whiteoutOwner(arena, idmapped.cfg.store, "w/hard"));
+    try std.testing.expectEqual(@as(?u32, 65534), try whiteoutOwner(arena, shifted.cfg.store, "w/hard"));
+
+    // Each path replays the other's layers, and a step after them sees what it would after its own.
+    var steps_look: [idmapped_steps.len + 1]job_mod.Step = undefined;
+    for (idmapped_steps, steps_look[0..idmapped_steps.len]) |s, *o| o.* = testStep(s);
+    steps_look[idmapped_steps.len] = testStep(idmapped_look);
+    const look = testJob(&steps_look);
+    var shift_reads = shifted.cfg;
+    shift_reads.store = idmapped.cfg.store;
+    var idmap_reads = idmapped.cfg;
+    idmap_reads.store = shifted.cfg.store;
+    const own = try runCached(arena, idmapped.cfg, look, "j3");
+    const reads_idmapped = try runCached(arena, shift_reads, look, "j4");
+    const reads_shifted = try runCached(arena, idmap_reads, look, "j5");
+    for ([_]CachedRun{ own, reads_idmapped, reads_shifted }) |r| try expectSucceeded(r);
+    const seen = try seenLines(arena, own.text);
+    try expectLines(seen, &.{ "seen /w/a 1002:1002 4755", "seen /w/d 1001:1001 2755", "seen b-and-hard-are-gone", "seen copied-up 0:1001" });
+    try std.testing.expectEqualStrings(seen, try seenLines(arena, reads_idmapped.text));
+    try std.testing.expectEqualStrings(seen, try seenLines(arena, reads_shifted.text));
+    // Replayed, not run again: the other store's layers were taken.
+    for ([_]CachedRun{ reads_idmapped, reads_shifted }) |r| {
+        try std.testing.expect(std.mem.count(u8, r.text, dagger.native_reused_note) >= 1);
+    }
 }
 
 test "native step cache: a long job's layers are flattened, files, deletions and replays intact" {

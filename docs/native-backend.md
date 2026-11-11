@@ -229,7 +229,15 @@ On a root runner, each step runs:
   (`IFLA_BRPORT_ISOLATED`), and `FORWARD` drops traffic from `zr0` back to `zr0`. IPv6 is off on the
   job's `eth0` and on the bridge, so no link-local address slips past those IPv4 rules (`lo` keeps
   its ::1). Ports below 1024 and ping work without capabilities on the host's
-  (`ip_unprivileged_port_start=0`, `ping_group_range`, set in the job's namespace only). Its
+  (`ip_unprivileged_port_start=0`, `ping_group_range`, set in the job's namespace only). The
+  namespace is made by a helper (`native-net`) that the job starts and does not wait for: it runs
+  while the job's image and caches are set up, and the first thing that needs the network (a
+  sandbox, a service, a published port) waits for it; the job's `netns` phase is the time it
+  spent starting the helper and that wait. The kernel takes one lock for every link change, so
+  seven jobs starting together queue for it (33-130 ms each on a Pi 5, against 8 ms for one job
+  alone), which the set-up now spends on other work; a bridge that is already up with its address
+  is only read, not changed again, for the same reason. A helper that failed fails that first
+  use, not the job's start. Its
   resolver is a resolv.conf of its own, made from the host's as Docker makes a container's on its
   default bridge (`net.Resolver`): the loopback's nameservers left out (systemd-resolved's
   127.0.0.53 is the host's loopback; its upstream list, `/run/systemd/resolve/resolv.conf`, is
@@ -289,6 +297,9 @@ RUNNER_NATIVE_VOLUMES_MAX_MB=16384                # default; the cache volumes' 
 RUNNER_NATIVE_IMAGES_MAX_MB=8192                  # default; images', rootfs' and seeds' cap, 0 for none ("Eviction")
 RUNNER_NATIVE_MIN_FREE_PCT=10                     # default; the disk's floor, 0 for none ("Eviction")
 RUNNER_NATIVE_ROOTLESS=0                          # default; 1 for a rootless runner
+RUNNER_NATIVE_IDMAPPED_UPPER=true                 # default; false shifts each layer's ids with a
+                                                  # walk instead of writing them through an
+                                                  # idmapped upper ("The canonical ids")
 RUNNER_NATIVE_CGROUP=                             # default: /sys/fs/cgroup/zig-runner as root;
                                                   # `self`, a path, or `none`: no limits at all
 RUNNER_NATIVE_MEMORY_TOTAL_MB=                    # all jobs' together; default a third kept for
@@ -681,7 +692,8 @@ What it covers, as built:
   step that printed more than `dagger.max_recorded_bytes` is not kept, nor a record its kind may
   not have (a step's file commands without their ran marker, a base's or a fetch's not empty),
   nor a layer whose size cannot be counted whole (a directory it cannot read). On a root runner the
-  layer is first given the canonical ids (`Store.unshift`, below). A commit's checkout
+  layer has the canonical ids first: written so through an idmapped upper, or else shifted
+  (`Store.unshift`, below). A commit's checkout
   (a fetch of a full SHA) is a layer like a step's, keyed on its script and never on the token;
   a branch or tag moves, so its fetch always runs, and with `fetch-tags` the key also holds a digest
   of the remote's tags (`ls-remote --tags`, one more sandbox before the fetch), which move where a
@@ -823,11 +835,36 @@ What it covers, as built:
   but does not trust it. A failure ends the job, and the layer is never shifted again, rather than
   leave a layer half one range's or shift it twice. Each step mounts every lower with the canonical ids (the rootfs, the
   seeds, the stored layers, a flattened stack) idmapped onto its job's range
-  (`sandbox.idmapLowers`, `Spec.canonical`), read-only, nosuid and nodev; the step's upper is
-  not idmapped (an idmapped upper is newer and unverified here, and not needed), so what a step
-  writes, copy-ups included, has its slot's ids until it is published. A job's own unpublished
-  uppers keep the slot's ids; flattening gives them the canonical ids first, so the merged layer
-  is one tree with one set of ids. Rootless runners have no slots and shift nothing.
+  (`sandbox.idmapLowers`, `Spec.canonical`), read-only, nosuid and nodev.
+  **The upper is idmapped too where the machine allows it** (`sandbox.canonicalUpper`,
+  `Spec.upper_canonical`, `Backend.idmappedUpper`): the job's directory is cloned at `X` through the
+  same map the lowers use, writable, and the overlay is mounted from the upper and a work directory
+  (`VW`) under it (overlay takes an idmapped upper and work directory from Linux 5.19, both under
+  one mount). The job writes as host ids `base + n`, which the mount stores as `n`: what a step
+  writes, copy-ups, set-id bits, ACLs and file capabilities included, is canonical on disk when it
+  ends, so a layer is published (or flattened) with no walk and no `chown`. The shift cost the Pi
+  3.4 ms at the median for an end-to-end publisher, 22.5 ms for a warm build and 64 ms for a cold
+  build; on the laptop 0.45 ms for a three-file layer and about 570 ms for one of 20,000 files
+  (about 28 us a file). The idmapped upper costs every step, published or not, about 0.8 ms (a
+  second user namespace for the map with the host's root, and the two mounts), so it pays from a
+  layer of some twenty entries upwards and costs a little on the smallest. The kernel does the translation of an ACL's
+  and a capability's ids as it does for any idmapped mount, so nothing is reread or put back. What
+  differs on disk is only the overlay's own whiteouts, which its mounter (the host's root) makes:
+  they are owned by the id nothing owns (4294967294), which `X` maps from the host's root so the
+  mounter can make its work directory, and where the shift would have given the overflow id
+  (65534). A digest reads both as the overflow id, and a whiteout is a character device 0/0 that
+  hides a name, so it is the same layer. `X` is nosuid and nodev, as `jobView`'s is, which keeps
+  an owner-less file there from being the host root's set-id file.
+  It is used when `RUNNER_NATIVE_IDMAPPED_UPPER` (default true) allows it, on a root runner, for a
+  step that makes a layer of its own and is not a Docker action's container with an owner (its
+  `jobView` has its own map), after one trial per process: the first such step runs a script on
+  the job's own stack (a file given to another user, set-id bits, a deletion) with an idmapped
+  upper, and the answer is yes only when it ran and left those ids on disk. Anything else, an
+  older kernel (before 5.19), a filesystem that cannot be idmapped, a trial that fails, a rootless
+  runner, takes the old way: the upper has the slot's ids and `Store.unshift` shifts it when it
+  is published or flattened. The two are mixed freely: a layer says which it is (`Layer.canonical`),
+  a stored layer is the same either way, and each reads the other's (tested). Rootless runners have
+  no slots and shift nothing.
 - **The store is a security boundary, so the runner checks it.** With the canonical ids, a
   job's set-uid-root file or file capability is the host's root's on disk. Whoever can reach the
   store, or replace it or a directory on the way to it, has the host's root. So every start
@@ -1304,13 +1341,79 @@ that shows it is one a failure of costs a walk, never trust:
   that its cancel is seen (`volumes.openWaiting`).
 - A job reads the verdict when it opens the volume (`volumes.plan`), before any step of any job
   can write to it, and removes it, whether or not it checks the trees; a verdict that cannot be
-  removed is not used. So a verdict is read only by jobs that opened before the first removal, and
-  every step of every job runs after that.
+  removed is not used. The file is read once, but its answer is kept in the runner's memory as the
+  volume's "epoch" (`tool_trees.Epochs`), and the jobs of the same process that open the volume
+  while it stands are told the same. The epoch ends before the first process is started with the
+  volume mounted, by any job (`volumes.endEpochs`, called from `execIn` before the sandbox is
+  made, for every volume bind and any volume nested with it, so a step, a pre or post script, a Docker build or a set-up script alike; the runner's own
+  set-up scripts that do not use the volume are run without it mounted), and when its last member
+  lets the volume go, so it never spans a last job out's walk. A job uses the verdict only if the
+  epoch still stands when it checks the trees (`Plan.verdictStands`, in "Set up job", before any
+  step of its own): the answer is then no older than the walk it would have made itself, and no
+  process wrote in between. A job that finds the epoch ended walks (`checkOnce`, as above), as one
+  that opens later does. A job's set-up that fails or is cancelled after it joined only lets go.
 - A verdict is of one boot (`boot_id`), one mount path, and the volume's lock file as its last
   open left it (inode and mtime, which every open sets: an open by anything that does not take
-  verdicts, such as an older runner, and an evicted and recreated volume, are differences).
-  Two jobs that open together are not both told: the second finds the first's open in the mtime and
-  walks (`checkOnce`, as above).
+  verdicts, such as an older runner, and an evicted and recreated volume, are differences). The
+  epoch holds the same for its members: each open reads the lock file's mtime and sets it with an
+  exclusive lock on the file's first byte held (`volumes.stampLock`, an open-file-description
+  lock on the descriptor the open holds, so it excludes other processes as well as other threads
+  and is not the volume's flock), and joins the epoch in the same critical section, so
+  another runner's open cannot come between the read and the stamp and have its own written over.
+  The lock is polled: an open that finds the outer lock (`<img>.lock`, which no job can reach)
+  held never stamps without it. It waits as the shared lock does (`Wait.ms`), sees the job's
+  cancel (`error.Canceled`), and fails with `error.VolumeBusy` only for a holder stuck for that
+  long. The step user's lock (`runner.lock`) is inside the root user's volume, where a root-user
+  step can open it and hold a lock on it (reading is enough): it is waited for 100 ms, and then
+  the open stamps without the lock and says nothing of its stamp, so such a lock can stop
+  sharing, and never stalls or fails an open. Where nobody could share anyway (below) an open
+  stamps without the lock too. The stamp lock is taken by every cache volume `openWaiting` opens,
+  not only the tool cache's. The lock file is opened read-write for it (`Store.lockBeside`); one the runner
+  can only read gets no stamp lock, so shares nothing. A store on NFS or SMB is not shared
+  through: there Linux makes a flock a POSIX lock of the whole file, and the jobs' shared ones
+  would conflict with the stamp lock, so `onNetworkFs` turns it off.
+  The open must find the file as the previous member left it, or the epoch ends. The stamp is an
+  explicit time, now or a nanosecond past what was there, and it counts only if it reads back
+  exactly as asked: on a filesystem that keeps coarser times (whole seconds: ext3, ext4 with
+  128-byte inodes, FAT) it almost never does, so no two opens could be told apart there and none
+  shares. A runner older than this does not take the stamp lock: its open may still fall between
+  a newer one's read and stamp, a window of microseconds that an open had before epochs. An epoch
+  is as old as its walk (`Verdict.at_ms`), checked when it is joined and when it is used. An
+  epoch is of one volume, so one of another trust scope (its own volume) is never told of it, and
+  a runner that restarts has none and drops the store's verdicts before its first job. Two
+  runner processes never share an epoch: the second finds the file removed or the mtime moved,
+  and walks.
+- The step user's tool cache (`evict.nested`, `runner/`) is a directory of the root user's volume
+  and a volume of its own: its own lock (`runner.lock`, inside the root volume), lists, verdict
+  and epoch. The root volume's walk covers it, as the directory it is, so a step user's job
+  that changes it must be seen by the root user's lock, and a root user's job that writes there
+  by the step user's. Each open therefore stamps the other's lock too, under that lock's stamp
+  lock, outer lock (`<img>.lock`, outside any volume) first in every process: an open of the
+  step user's volume stamps the root volume's, and an open of the root user's stamps
+  `runner.lock` if it is a regular file there (opened without following a link, as
+  `evict.innerLock` does). Any epoch of either then ends when the other's volume is opened, in
+  any runner, and in this process also when a process starts with either mounted
+  (`Epochs.end`, in both directions). The stamp is also a use of the outer volume for eviction
+  (`evict.zig` goes by the lock's mtime), so a step user's recent job keeps the root volume, and
+  the `runner/` in it, from being the oldest.
+- The walk of the last job out (`Plan.idleToolCache`) also takes the other user's lock
+  exclusively, without waiting, when that file is there, and makes no verdict if it cannot: a job
+  of the other user in the same directory tree could write to the trees being walked.
+- What sharing does not protect against, plainly:
+  - Upgrade every pool that shares a store together. A runner older than this takes no stamp
+    locks, so its open may fall between a newer one's read and stamp, or write a mtime over its
+    stamp: the window of microseconds that every open had before epochs.
+  - Mixed step users on one store are covered by the stamps of both locks and the walk's two locks
+    above, as far as a lock file a job cannot forge goes (next point).
+  - A rootless runner's jobs run as the runner's own user, so a root-user step can write
+    `runner.lock` and the trees a verdict is of, and forge a chain, as it could the verdict before
+    epochs. Sharing protects against a job's mistakes and against jobs of untrusted scopes (which
+    have volumes of their own), not against a hostile trusted job on a rootless runner.
+  - A store on NFS or SMB shares nothing (Linux makes a flock a POSIX lock of the file there, which
+    the stamp lock would conflict with; `onNetworkFs`). Other filesystems that do the same (9p,
+    some FUSE) are not detected: there a lock held by a job's own flock could keep opens from
+    sharing, or wait them up to `Wait.ms`. A store whose times are coarse (whole seconds) shares
+    nothing either, as two opens cannot be told apart.
 - Host-side changes while no job is in the volume: the runner's first job drops every verdict, and
   one is not used past an hour (`tool_trees.verdict_max_age_ms`) or from the future.
 
