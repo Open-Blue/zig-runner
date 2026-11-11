@@ -741,10 +741,15 @@ What it covers, as built:
   **What it costs another job.** A job that waits for the key (matrix jobs with the same first
   steps) misses the pending layer when it gets the lock, runs the step itself, and its publish
   loses to the entry already there. It then keeps its own upper as a job-private layer under the
-  key (`Backend.publishTop`): the key is derived from what made the layer, so its later steps are
-  keyed and cached exactly as if it were the stored one, nothing else sees it, and it goes with the
-  job's directory. Its later layers are published over it, as any job's are over a parent whose
-  entry another job made. So the cost is one step run twice, not an uncached rest of the job. The
+  key (`Backend.publishTop`, only when the rename lost to an existing entry, `error.PublishLost`):
+  the key is derived from what made the layer, so its later steps are keyed as if it were the
+  stored one, nothing else sees it, and it goes with the job's directory. The private parent is
+  sound under the step cache's hypothesis (`Disciplined`), the same one that replaying a child over
+  a parent run again after an eviction rests on; a step that breaks it can yield a replayed tree no
+  single run produced. Unlike on main, where such children were built on the stored entry's own
+  tree, the children published here were built on this job's copy. A follow-up could publish them
+  only when the private parent and the stored layer have equal `treeDigest`s; it is not built.
+  So the cost is one step run twice, not an uncached rest of the job. The
   layer is available to others once its publisher made it durable: at the publisher's next publish,
   or at its teardown for its last layer (`RUNNER_NATIVE_DEFER_SYNC=false` has none of this).
   **Every publish after a job's first waits for the previous layer's settle**: one `syncfs`, which

@@ -825,7 +825,12 @@ fn publishStaged(
         try arena.dupeSentinel(u8, dir, 0),
         .{ .NOREPLACE = true },
     );
-    if (linux.errno(rc) != .SUCCESS) return error.Publish;
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        // The key has an entry: another job's, which stays.
+        .EXIST, .NOTEMPTY => return error.PublishLost,
+        else => return error.Publish,
+    }
     // The rename is not synced here: an entry whose rename a crash lost is only a miss, made
     // again. The job syncs the layers' directory once, at its end (`syncLayers`), and until then
     // the entry is in its log: one a failed sync leaves in doubt is evicted (`dropUnsynced`).
@@ -3670,7 +3675,7 @@ test "native store: a key published already stays, and the second upper is put b
     var never: std.atomic.Value(bool) = .init(false);
     const kl = try s.lockKey(arena, io, k, &never);
     defer kl.close(io);
-    try std.testing.expectError(error.Publish, s.publish(arena, io, k, .step, again, .{ .log = "b\n", .fc = "::zig-file-command::ran\nj2\n" }));
+    try std.testing.expectError(error.PublishLost, s.publish(arena, io, k, .step, again, .{ .log = "b\n", .fc = "::zig-file-command::ran\nj2\n" }));
     // The upper is back, whole, and nothing of the attempt is left in the store.
     try tmp.dir.access(io, "again/g", .{});
     var layers = try tmp.dir.openDir(io, "store/layers", .{ .iterate = true });

@@ -3227,7 +3227,7 @@ fn settleWarning(b: *Backend) ?[]const u8 {
     if (!l.settle_failed or l.settle_told) return null;
     l.settle_told = true;
     return "##[warning]Writing an earlier step's layer to the disk failed: that layer is not cached, " ++
-        "and the steps that ran over it may have read data that was lost. The steps after this one run uncached.";
+        "and the steps that ran over it may have read data that was lost. The steps after this one are not published (they may still replay).";
 }
 
 /// Makes the key `p` the one its step is known by (`key_diff.writeIndex`).
@@ -3275,7 +3275,7 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec_in: Store.Recor
         // replay it): this job's own upper stays its own layer under the key, which is derived from
         // what made it, so its later steps are keyed and cached as if it were the stored one. Nothing
         // else sees it, and it goes with the job's directory.
-        if (e == error.Publish) top.key = key;
+        if (e == error.PublishLost) top.key = key;
         return;
     };
     b.held.appendAssumeCapacity(layer.lock);

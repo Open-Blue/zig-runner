@@ -195,7 +195,7 @@ fn stress(deferred: bool) !void {
         // cannot be replayed, a lock that cannot be taken are all warnings.
         var lines = std.mem.splitScalar(u8, err_text, '\n');
         while (lines.next()) |l| {
-            if (deferred and std.mem.indexOf(u8, l, "cannot publish a layer to the store: Publish") != null) continue;
+            if (deferred and std.mem.indexOf(u8, l, "cannot publish a layer to the store: PublishLost") != null) continue;
             if (std.mem.indexOf(u8, l, "(err)") != null or std.mem.indexOf(u8, l, "(warn)") != null)
                 try faults.add("worker {d} logged: {s}", .{ i, l });
         }
