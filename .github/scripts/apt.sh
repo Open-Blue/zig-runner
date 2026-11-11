@@ -57,7 +57,11 @@ primary_probe() {
 	fi
 }
 
+# Whether URL answers within seconds. apt itself is slow to give up on a name that does not
+# resolve (minutes, with its retries), so each archive and mirror is asked with curl first. With no
+# curl (a bare container) everything is taken to answer, and apt's own failure decides.
 answers() {
+	command -v curl >/dev/null || return 0
 	curl -fsS -o /dev/null --max-time 10 --retry 2 --retry-delay 1 "$1" 2>/dev/null
 }
 
@@ -79,7 +83,7 @@ mirror_prefix() {
 }
 
 apt_install() {
-	local flags=() arch mirror saved sources
+	local flags=() arch codename mirror saved sources
 	while [[ ${1:-} == -* ]]; do
 		flags+=("$1")
 		shift
@@ -90,15 +94,19 @@ apt_install() {
 	}
 	arch=$(dpkg --print-architecture)
 
-	# One apt-get update and install, with its own timeouts: a host that does not answer fails in
-	# a minute, not in apt's default of several.
+	# One apt-get update and install, each bounded, so a dead archive costs minutes, not the job.
 	attempt() {
-		local opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
-		apt-get update -q --error-on=any "${opts[@]}" &&
-			DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${flags[@]}" "${opts[@]}" "$@"
+		local opts=(-o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+		timeout 300 apt-get update -q --error-on=any "${opts[@]}" &&
+			DEBIAN_FRONTEND=noninteractive timeout 600 apt-get install -y -q "${flags[@]}" "${opts[@]}" "$@"
 	}
 
-	attempt "$@" && return 0
+	codename=$(sed -n 's/^VERSION_CODENAME=//p' /etc/os-release)
+
+	# The sources as configured, when their archive answers.
+	if answers "$(primary_probe "$arch" "$codename")" && attempt "$@"; then
+		return 0
+	fi
 
 	# The originals, kept so each mirror is tried from them, and put back when none works.
 	saved=$(mktemp -d)
@@ -108,6 +116,7 @@ apt_install() {
 		[[ -f $f ]] && cp -p "$f" "$saved/$(echo "$f" | tr / _)"
 	done
 	for mirror in $(mirrors_for "$arch"); do
+		answers "${mirror}dists/$codename/InRelease" || continue
 		echo "::warning::apt failed against the configured sources: trying $mirror"
 		for f in "${sources[@]}"; do
 			[[ -f $f ]] && sed -E "s#$official#$mirror#g" "$saved/$(echo "$f" | tr / _)" >"$f"
