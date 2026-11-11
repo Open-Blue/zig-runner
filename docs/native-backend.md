@@ -289,6 +289,9 @@ RUNNER_NATIVE_VOLUMES_MAX_MB=16384                # default; the cache volumes' 
 RUNNER_NATIVE_IMAGES_MAX_MB=8192                  # default; images', rootfs' and seeds' cap, 0 for none ("Eviction")
 RUNNER_NATIVE_MIN_FREE_PCT=10                     # default; the disk's floor, 0 for none ("Eviction")
 RUNNER_NATIVE_ROOTLESS=0                          # default; 1 for a rootless runner
+RUNNER_NATIVE_IDMAPPED_UPPER=true                 # default; false shifts each layer's ids with a
+                                                  # walk instead of writing them through an
+                                                  # idmapped upper ("The canonical ids")
 RUNNER_NATIVE_CGROUP=                             # default: /sys/fs/cgroup/zig-runner as root;
                                                   # `self`, a path, or `none`: no limits at all
 RUNNER_NATIVE_MEMORY_TOTAL_MB=                    # all jobs' together; default a third kept for
@@ -681,7 +684,8 @@ What it covers, as built:
   step that printed more than `dagger.max_recorded_bytes` is not kept, nor a record its kind may
   not have (a step's file commands without their ran marker, a base's or a fetch's not empty),
   nor a layer whose size cannot be counted whole (a directory it cannot read). On a root runner the
-  layer is first given the canonical ids (`Store.unshift`, below). A commit's checkout
+  layer has the canonical ids first: written so through an idmapped upper, or else shifted
+  (`Store.unshift`, below). A commit's checkout
   (a fetch of a full SHA) is a layer like a step's, keyed on its script and never on the token;
   a branch or tag moves, so its fetch always runs, and with `fetch-tags` the key also holds a digest
   of the remote's tags (`ls-remote --tags`, one more sandbox before the fetch), which move where a
@@ -742,11 +746,36 @@ What it covers, as built:
   but does not trust it. A failure ends the job, and the layer is never shifted again, rather than
   leave a layer half one range's or shift it twice. Each step mounts every lower with the canonical ids (the rootfs, the
   seeds, the stored layers, a flattened stack) idmapped onto its job's range
-  (`sandbox.idmapLowers`, `Spec.canonical`), read-only, nosuid and nodev; the step's upper is
-  not idmapped (an idmapped upper is newer and unverified here, and not needed), so what a step
-  writes, copy-ups included, has its slot's ids until it is published. A job's own unpublished
-  uppers keep the slot's ids; flattening gives them the canonical ids first, so the merged layer
-  is one tree with one set of ids. Rootless runners have no slots and shift nothing.
+  (`sandbox.idmapLowers`, `Spec.canonical`), read-only, nosuid and nodev.
+  **The upper is idmapped too where the machine allows it** (`sandbox.canonicalUpper`,
+  `Spec.upper_canonical`, `Backend.idmappedUpper`): the job's directory is cloned at `X` through the
+  same map the lowers use, writable, and the overlay is mounted from the upper and a work directory
+  (`VW`) under it (overlay takes an idmapped upper and work directory from Linux 5.19, both under
+  one mount). The job writes as host ids `base + n`, which the mount stores as `n`: what a step
+  writes, copy-ups, set-id bits, ACLs and file capabilities included, is canonical on disk when it
+  ends, so a layer is published (or flattened) with no walk and no `chown`. The shift cost the Pi
+  3.4 ms at the median for an end-to-end publisher, 22.5 ms for a warm build and 64 ms for a cold
+  build; on the laptop 0.45 ms for a three-file layer and about 570 ms for one of 20,000 files
+  (about 28 us a file). The idmapped upper costs every step, published or not, about 0.8 ms (a
+  second user namespace for the map with the host's root, and the two mounts), so it pays from a
+  layer of some twenty entries upwards and costs a little on the smallest. The kernel does the translation of an ACL's
+  and a capability's ids as it does for any idmapped mount, so nothing is reread or put back. What
+  differs on disk is only the overlay's own whiteouts, which its mounter (the host's root) makes:
+  they are owned by the id nothing owns (4294967294), which `X` maps from the host's root so the
+  mounter can make its work directory, and where the shift would have given the overflow id
+  (65534). A digest reads both as the overflow id, and a whiteout is a character device 0/0 that
+  hides a name, so it is the same layer. `X` is nosuid and nodev, as `jobView`'s is, which keeps
+  an owner-less file there from being the host root's set-id file.
+  It is used when `RUNNER_NATIVE_IDMAPPED_UPPER` (default true) allows it, on a root runner, for a
+  step that makes a layer of its own and is not a Docker action's container with an owner (its
+  `jobView` has its own map), after one trial per process: the first such step runs a script on
+  the job's own stack (a file given to another user, set-id bits, a deletion) with an idmapped
+  upper, and the answer is yes only when it ran and left those ids on disk. Anything else, an
+  older kernel (before 5.19), a filesystem that cannot be idmapped, a trial that fails, a rootless
+  runner, takes the old way: the upper has the slot's ids and `Store.unshift` shifts it when it
+  is published or flattened. The two are mixed freely: a layer says which it is (`Layer.canonical`),
+  a stored layer is the same either way, and each reads the other's (tested). Rootless runners have
+  no slots and shift nothing.
 - **The store is a security boundary, so the runner checks it.** With the canonical ids, a
   job's set-uid-root file or file capability is the host's root's on disk. Whoever can reach the
   store, or replace it or a directory on the way to it, has the host's root. So every start

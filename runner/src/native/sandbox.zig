@@ -98,6 +98,11 @@ pub const Spec = struct {
     /// are seen through the job's ids as the image's are; the others have the slot's host ids.
     /// Missing entries are false.
     canonical: []const bool = &.{},
+    /// `mapped`: the step's upper is written through a mount idmapped as the lowers are
+    /// (`canonicalUpper`), so what the step writes has the canonical ids on disk, 0 to 65535,
+    /// and needs no shift (`Store.unshift`) afterwards. Not with a container that has an owner
+    /// (`jobView` maps that job's directory its own way).
+    upper_canonical: bool = false,
     /// `mapped`: the first on-disk id of the cache volumes' range (`Bind.volume`), which the job
     /// sees as its 0 onwards.
     volume_id_base: u32 = 0,
@@ -682,6 +687,8 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper, early: []const u
             if (view != null) {
                 job_spec.upper = std.fmt.allocPrint(arena, job_view_dir ++ "/{s}", .{spec.upper}) catch oom();
                 job_spec.work = job_view_dir ++ "/" ++ job_view_work;
+            } else if (spec.upper_canonical) {
+                canonicalUpper(arena, spec, &job_spec);
             }
             mountOverlay(arena, job_spec, lowers, false);
             if (view) |v| {
@@ -1385,6 +1392,32 @@ fn jobView(arena: Allocator, spec: Spec, o: Spec.Container.Owner) JobView {
     if (owned != .SUCCESS) fatal("give the job's root the work directory", @backingInt(owned));
     idmapMount(arena, ".", job_view_dir, slot, false, false);
     return .{ .canonical = canonical, .slot = slot };
+}
+
+/// The job's directory seen through the job's ids at `job_view_dir`, writable, with the upper and
+/// a work directory of its own in it, for `job_spec` to mount the overlay from: what the step
+/// writes, copy-ups included, lands on disk with the canonical ids (`Spec.upper_canonical`), as
+/// the lowers' ids are seen (`idmapLayer`, the same map), so the layer needs no `Store.unshift`.
+/// The host's root, the overlay's mounter that makes its work directory and its whiteouts, is
+/// mapped too (`swapRanges`'s `host_root`), to the id nothing owns (`no_owner`): such a whiteout,
+/// a character device 0/0 that a digest reads as the overflow id like any id outside the range, is
+/// the only thing the layer has that is not the job's. `job_view_dir` is nosuid and nodev
+/// (`idmapMount`), which keeps that harmless. Overlay takes the upper and the work directory
+/// idmapped from Linux 5.19, both under one mount, which is why it is the job's directory.
+fn canonicalUpper(arena: Allocator, spec: Spec, job_spec: *Spec) void {
+    var u: [swap_ranges]Range = undefined;
+    var g: [swap_ranges]Range = undefined;
+    const upper_ns = mappedRanges(
+        swapRanges(0, spec.id_base, spec.id_count, 0, 0, true, &u),
+        swapRanges(0, spec.id_base, spec.id_count, 0, 0, true, &g),
+    );
+    defer _ = linux.close(upper_ns);
+    // On disk the job's root (0), as the upper's root is: root's DAC override reaches it either way.
+    const owned = ownedDirAt(linux.AT.FDCWD, z(arena, job_view_work), 0);
+    if (owned != .SUCCESS) fatal("make the overlay's work directory", @backingInt(owned));
+    idmapMount(arena, ".", job_view_dir, upper_ns, false, false);
+    job_spec.upper = std.fmt.allocPrint(arena, job_view_dir ++ "/{s}", .{spec.upper}) catch oom();
+    job_spec.work = job_view_dir ++ "/" ++ job_view_work;
 }
 
 /// The lower layers with the canonical ids replaced by mounts of them idmapped through `userns`:
