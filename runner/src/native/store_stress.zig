@@ -105,10 +105,11 @@ fn stress(deferred: bool) !void {
     const cfg = try Backend.testConfig(arena, &tmp);
     const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
     var env = try std.testing.environ.createMap(arena);
-    const seconds = if (deferred)
-        (try envInt(&env, "ZIG_TEST_STORE_STRESS_SECONDS", 30) + 1) / 2
-    else
-        try envInt(&env, "ZIG_TEST_STORE_STRESS_SECONDS", 30);
+    // The deferred sync's run gets half the time, but no less than 10 s (or all of it, when that
+    // is less): in 5 s it ran 7 volume jobs, of which only each repository's first found one empty,
+    // so no eviction was seen and the checks below failed (ci's 10 s, #515).
+    const budget = try envInt(&env, "ZIG_TEST_STORE_STRESS_SECONDS", 30);
+    const seconds = if (deferred) @max((budget + 1) / 2, @min(budget, 10)) else budget;
     if (seconds == 0) {
         std.debug.print("native store under load: skipped (ZIG_TEST_STORE_STRESS_SECONDS=0)\n", .{});
         return error.SkipZigTest;
