@@ -244,6 +244,8 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer client.deinit();
     http.shared.store(&client, .release);
+    // Before `client`'s, as defers run: the clients `renew` made in its place.
+    defer http.deinitShared(io);
     // The seeds' tarballs are checked here, once, outside any job (`zig_release.zig`); the tool
     // caches' Zig versions join them as `repo` jobs find them.
     var zig_seeds: zig_release.Registry = .{ .io = io, .gpa = init.gpa, .client = &client };

@@ -28,10 +28,9 @@ var renewed_at_s: std.atomic.Value(i64) = .init(0);
 /// std never moves and cannot safely move while it is in use), so after a process has run for a
 /// while, a certificate issued since it started is "not yet valid" and every new connection to that
 /// host fails. A new client takes the time again and rescans the system's root certificates. The
-/// old one is never freed: a job's live feed holds one of its connections for as long as the job
-/// runs. So one every `renew_every_s` at most: `staleClock` cannot tell a stale clock from a TLS
-/// failure with another cause, and an outage that lasts would otherwise leave a client behind on
-/// every try.
+/// old one is kept (`retire`) while it may be in use: a job's live feed holds one of its
+/// connections for as long as the job runs. So one every `renew_every_s` at most: `staleClock`
+/// cannot tell a stale clock from a TLS failure with another cause.
 pub fn renew(stale: *std.http.Client) void {
     const now = std.Io.Clock.real.now(stale.io).toSeconds();
     const last = renewed_at_s.load(.acquire);
@@ -41,8 +40,84 @@ pub fn renew(stale: *std.http.Client) void {
     const fresh = gpa.create(std.http.Client) catch return;
     fresh.* = .{ .allocator = gpa, .io = stale.io, .write_buffer_size = stale.write_buffer_size };
     if (shared.cmpxchgStrong(stale, fresh, .acq_rel, .acquire) != null) return gpa.destroy(fresh);
+    const stale_owned = shared_owned.swap(true, .acq_rel);
     // Its idle connections close now, and the ones in use as they finish.
-    stale.connection_pool.resize(stale.io, 0) catch return;
+    stale.connection_pool.resize(stale.io, 0) catch |e|
+        std.log.warn("http: the replaced client's idle connections stay open: {t}", .{e});
+    if (stale_owned) retire(stale, now);
+    freeRetired(stale.io, now, false);
+}
+
+/// Whether `shared` is a client `renew` made (and so this file frees), not `main`'s own.
+var shared_owned: std.atomic.Value(bool) = .init(false);
+
+/// The clients `renew` replaced, until each is freed: once no connection of it is in use and it
+/// was replaced at least `retired_for_s` ago, well past any request's deadline, so a thread that
+/// took it from `shared` just before the swap is done with it. They were never freed: each left
+/// its CA bundle behind, and the last one its pool's TLS connections (about 75 KB each), reported as
+/// leaks at exit; one a day, or one every 15 minutes through an outage of TLS.
+const Retired = struct { client: *std.http.Client, at_s: i64 };
+const max_retired = 16;
+const retired_for_s = 60 * 60;
+var retired: [max_retired]Retired = undefined;
+var retired_len: usize = 0;
+var retired_lock: std.Io.Mutex = .init;
+
+fn retire(c: *std.http.Client, now: i64) void {
+    retired_lock.lockUncancelable(c.io);
+    defer retired_lock.unlock(c.io);
+    if (retired_len == max_retired) {
+        // Left as before, never freed: a process that renewed this often has worse problems.
+        std.log.warn("http: {d} replaced clients still in use; one more is not freed", .{max_retired});
+        return;
+    }
+    retired[retired_len] = .{ .client = c, .at_s = now };
+    retired_len += 1;
+}
+
+/// Frees the retired clients that no request uses any more, and that were replaced long enough
+/// ago (`all`: whatever their age, once the process's runners are done).
+fn freeRetired(io: std.Io, now: i64, all: bool) void {
+    retired_lock.lockUncancelable(io);
+    defer retired_lock.unlock(io);
+    var i: usize = 0;
+    while (i < retired_len) {
+        const r = retired[i];
+        if ((all or now - r.at_s >= retired_for_s) and noneInUse(io, r.client)) {
+            free(r.client);
+            retired_len -= 1;
+            retired[i] = retired[retired_len];
+        } else i += 1;
+    }
+}
+
+fn noneInUse(io: std.Io, c: *std.http.Client) bool {
+    c.connection_pool.mutex.lockUncancelable(io);
+    defer c.connection_pool.mutex.unlock(io);
+    return c.connection_pool.used.first == null;
+}
+
+fn free(c: *std.http.Client) void {
+    const gpa = c.allocator;
+    c.deinit();
+    gpa.destroy(c);
+}
+
+/// At the process's end, once its runners are done: frees the retired clients and the shared one
+/// when `renew` made it (`main`'s own is `main`'s to free). One with a connection still in use is
+/// left, and said so, as `Client.deinit` would assert.
+pub fn deinitShared(io: std.Io) void {
+    freeRetired(io, 0, true);
+    if (retired_len != 0) std.log.warn("http: {d} replaced clients still had a connection in use at the end", .{retired_len});
+    if (!shared_owned.load(.acquire)) return;
+    const c = shared.load(.acquire) orelse return;
+    if (!noneInUse(io, c)) {
+        std.log.warn("http: the shared client still had a connection in use at the end", .{});
+        return;
+    }
+    shared.store(null, .release);
+    shared_owned.store(false, .release);
+    free(c);
 }
 
 /// Replaces the shared client once it is `renew_age_s` old, for what no failure shows: its clock
@@ -249,6 +324,7 @@ test "renew replaces the shared client once, however many saw it go stale" {
     defer first.deinit();
     shared.store(&first, .release);
     defer shared.store(null, .release);
+    defer shared_owned.store(false, .release);
     renewed_at_s.store(0, .release);
 
     renew(&first);
@@ -268,6 +344,7 @@ test "renew leaves one client behind at most in its interval, however long TLS k
     defer first.deinit();
     shared.store(&first, .release);
     defer shared.store(null, .release);
+    defer shared_owned.store(false, .release);
     renewed_at_s.store(0, .release);
 
     renew(&first);
@@ -286,6 +363,7 @@ test "a client is replaced at its age with no failure, and its idle connections 
     defer first.deinit();
     shared.store(&first, .release);
     defer shared.store(null, .release);
+    defer shared_owned.store(false, .release);
     renewed_at_s.store(0, .release);
 
     // The first call starts the count, and a young client stays.
@@ -301,6 +379,37 @@ test "a client is replaced at its age with no failure, and its idle connections 
     defer second.deinit();
     try std.testing.expect(second != &first);
     try std.testing.expectEqual(@as(usize, 0), first.connection_pool.free_size);
+}
+
+test "the clients renew replaces are freed once idle and old, and at the end, with main's own left to main" {
+    const gpa = std.testing.allocator; // fails the test on anything left unfreed
+    const io = std.testing.io;
+    var first: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer first.deinit();
+    shared.store(&first, .release);
+    defer shared.store(null, .release);
+    renewed_at_s.store(0, .release);
+
+    // main's own is replaced, and not retired: it is main's to free.
+    renew(&first);
+    const second = shared.load(.acquire).?;
+    try std.testing.expectEqual(@as(usize, 0), retired_len);
+    // The next renewal, an interval on, retires the one renew made.
+    renewed_at_s.store(std.Io.Clock.real.now(io).toSeconds() - renew_every_s, .release);
+    renew(second);
+    const third = shared.load(.acquire).?;
+    try std.testing.expect(third != second);
+    try std.testing.expectEqual(@as(usize, 1), retired_len);
+    // Idle, but replaced just now: kept, as a request may still be about to use it.
+    freeRetired(io, std.Io.Clock.real.now(io).toSeconds(), false);
+    try std.testing.expectEqual(@as(usize, 1), retired_len);
+    // An hour on, idle: freed.
+    freeRetired(io, std.Io.Clock.real.now(io).toSeconds() + retired_for_s, false);
+    try std.testing.expectEqual(@as(usize, 0), retired_len);
+    // At the end the shared one, which renew made, goes too.
+    deinitShared(io);
+    try std.testing.expect(shared.load(.acquire) == null);
+    try std.testing.expect(!shared_owned.load(.acquire));
 }
 
 test "what std makes of a handshake's failure counts as a stale clock" {
