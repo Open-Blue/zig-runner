@@ -50,3 +50,11 @@ runner/tools/regexdiff/reference/obj/
 
 # The release binaries the image build takes (release.yml, the Dockerfile's prebuilt stage).
 runner/prebuilt/
+# What `go build` writes in a Go tool's directory: the command, named after its directory. #503
+# committed yamldiff's (4.9 MB) from a `go build ./...` there.
+runner/tools/exprdiff/exprdiff
+runner/tools/hashfilesdiff/hashfilesdiff
+runner/tools/hpackdiff/hpackdiff
+runner/tools/regexdiff/regexdiff
+runner/tools/rsadiff/rsadiff
+runner/tools/yamldiff/yamldiff

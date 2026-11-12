@@ -236,8 +236,13 @@ On a root runner, each step runs:
   spent starting the helper and that wait. The kernel takes one lock for every link change, so
   seven jobs starting together queue for it (33-130 ms each on a Pi 5, against 8 ms for one job
   alone), which the set-up now spends on other work; a bridge that is already up with its address
-  is only read, not changed again, for the same reason. A helper that failed fails that first
-  use, not the job's start. Its
+  is only read, not changed again, for the same reason. The helper also removes a dead job's veth
+  of the slot (the host's end of a job just ended lingers a moment) before it makes the slot's
+  own, under the slot's lock, which the job holds until the helper has ended: the job's own
+  thread once did, and waited for that lock. The helper ends before it removes or makes anything if its parent is no longer the runner that started it (a runner killed mid set-up has let the lock go, and another job may hold the slot), and the runner's wait for it is not cancelled. Whether a veth is there is read from sysfs, not
+  asked of the kernel by name, which runs `modprobe netdev-<name>` for a link that is not there
+  (5 ms a job, more with seven starting together). The helper starts before the job's cgroup is
+  made. A helper that failed fails that first use, not the job's start. Its
   resolver is a resolv.conf of its own, made from the host's as Docker makes a container's on its
   default bridge (`net.Resolver`): the loopback's nameservers left out (systemd-resolved's
   127.0.0.53 is the host's loopback; its upstream list, `/run/systemd/resolve/resolv.conf`, is
@@ -1339,6 +1344,17 @@ began after each of them arrived. A walk is never handed to a job that was alrea
 began (a file may have been written after the walk passed it), and nothing is kept once nobody
 waits, so a later job walks itself: a directory's mtime does not move when a file's content or mode
 changes, only that file's ctime shows it, so no cheaper memo of the tree is as strong as the walk.
+Taking the walk already in flight was considered for a job that arrives late (it waits for that
+walk to end and then for the next: up to two walks, which is today's cost) and is not sound. What a walk begun before the
+job arrived may have missed is a write, after the walk passed the file, by a step that was running
+in the volume: and the job's own predecessor in a `needs:` chain may be such a step, finished
+before the job started, so its write must be seen. #481's epochs do not give the condition: they
+stand on the exclusive lock of the idle walk, which proves that no process was in the volume when
+the walk began and that every open since is in the stamp chain. An ordinary walk has no such proof,
+since jobs, of this process or another, hold the volume shared and run steps in it while it
+runs, and a step begun before the walk and still running (or finished during it) leaves no trace
+that a count of this process's starts, or the stamp chain, could show. So a late job still waits for
+a walk that began after it arrived; the verdict below is the case where the sharing is sound.
 A walk the job's cancel or the clock cut short is its leader's alone. The key is the volume's host
 directory, its list directory and its mount, so volumes of other scopes never share a walk.
 
@@ -1357,7 +1373,18 @@ one, is as before, and a changed, added, removed or replaced file, link or direc
 digests as it was (`tool trees: a tree that the list spares a reading of is still caught...`).
 
 The walk is made by the last job out, when it can (`tool_trees.walkIdle`, `Backend.walkToolCacheIdle`),
-and the next job is told its answer instead of walking: a "verdict" kept in the runner's store
+on a thread of its own (`tool_trees.IdleWalks`) after the job has let go, so the runner's teardown, and
+its next poll, do not wait for it (0.1 s on the laptop, 0.2-0.6 s on a Pi 5). The job takes the
+volume's exclusive locks as before, then gives the thread duplicates of their descriptors (a lock
+belongs to the open file description, so it outlives the job's own close): between the proof that
+no process is in the volume and the walk nothing comes. A job of this process that opens the volume
+meanwhile waits for the walk (`IdleWalks.wait`, from `volumes.openWaiting`, polled every ms so its
+cancel is seen) and is told the verdict it leaves: no slower than the walk it would make itself, and
+what the teardown's walk gave it before. A job of another process waits for the lock as before. The
+thread owns its memory (the job's arena goes with the job), and a runner that stops, or a local
+replay that ends, asks the walks to end and waits for them without a limit, since the kernel
+releases a lock only when no thread holds its descriptor (`IdleWalks.stopAll`; the verdict is a
+rename, so it is whole or absent). The next job is told the answer instead of walking: a "verdict" kept in the runner's store
 (`tool-trees/<hash>/.verdict`, beside the lists, in no volume a step mounts). Soundness is that no
 step can have written to the trees between that walk and the job that takes it, and each condition
 that shows it is one a failure of costs a walk, never trust:
