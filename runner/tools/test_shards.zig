@@ -43,11 +43,17 @@ fn serial(name: []const u8, root: bool) bool {
 
 /// The tests that take seconds, which start first: the run ends with its last test, so one that
 /// starts late makes the others wait for it. The first is work (6 s alone, an allocation failure at
-/// a time over a whole job), the others wait for a peer, and the last is 30 s of workers on a
-/// store. A test missing here only starts later than it could.
+/// a time over a whole job), the next two wait for a peer, then workers on a store, and the rest
+/// are the root tests that took 10-18 s each in CI (the `slow:` lines a run prints). They are also
+/// shared out among a run's parts on their own (ZIG_TEST_PART), so no part gets most of them, as
+/// every N-th test did: one root part ran 162 s of tests where its other took about 100. A test
+/// missing here only starts later than it could, and is shared out with the others.
 fn slow(name: []const u8) bool {
     const parts = [_][]const u8{
-        "allocation failures", "never answers", "slow to answer", "store under load",
+        "allocation failures",          "never answers",
+        "slow to answer",               "store under load",
+        "a job's own network",          "stay under the limit on their parent",
+        "forks all through the ladder", "a container job's ports",
     };
     for (parts) |part| {
         if (std.mem.indexOf(u8, name, part) != null) return true;
@@ -140,9 +146,23 @@ pub fn main(init: std.process.Init) !u8 {
     var free: std.ArrayList(u32) = .empty;
     var alone: std.ArrayList(u32) = .empty;
     var tsan_skipped: usize = 0;
+    // A part's tests: every N-th of the slow ones, and every N-th of the others, each counted on
+    // its own, so the slow ones are spread over the parts.
+    const in_part = try arena.alloc(bool, names.len);
+    var slow_seen: usize = 0;
+    var other_seen: usize = 0;
+    for (names, in_part) |name, *in| {
+        const p = part orelse {
+            in.* = true;
+            continue;
+        };
+        const seen = if (slow(name)) &slow_seen else &other_seen;
+        in.* = seen.* % p.of == p.index;
+        seen.* += 1;
+    }
     for ([_]bool{ true, false }) |slow_first| {
         for (names, 0..) |name, i| {
-            if (part) |p| if (i % p.of != p.index) continue;
+            if (!in_part[i]) continue;
             if (tsan and skippedUnderTsan(name)) {
                 if (slow_first) {
                     tsan_skipped += 1;
