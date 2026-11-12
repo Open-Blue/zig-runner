@@ -254,6 +254,49 @@ pub fn writeIndex(
     };
 }
 
+/// How many entries the layer a step last published held (`Store.Layer.entries`), kept beside its
+/// index entry as `<id>.n`: what the next run of the step, when its key has changed and it must
+/// run again, uses to choose how its upper is written (`Backend.upperIdmapped`). Null when the
+/// step has none, or it cannot be read.
+pub fn readEntries(arena: Allocator, io: std.Io, root: []const u8, id: []const u8) ?u64 {
+    const path = std.fmt.allocPrint(arena, "{s}/steps/{s}.n", .{ root, id }) catch return null;
+    var buf: [32]u8 = undefined;
+    const text = std.Io.Dir.cwd().readFile(io, path, &buf) catch return null;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, text, " \n"), 10) catch null;
+}
+
+/// `readEntries`' file written, if the number changed. Best effort, like `writeIndex`.
+pub fn writeEntries(arena: Allocator, io: std.Io, root: []const u8, id: []const u8, entries: u64) void {
+    const path = std.fmt.allocPrint(arena, "{s}/steps/{s}.n", .{ root, id }) catch return;
+    const text = std.fmt.allocPrint(arena, "{d}\n", .{entries}) catch return;
+    // Written every time, under a temporary name and renamed as `writeIndex` does: a reader never
+    // sees half, and the file's age is the step's last run (`sweep` drops what nothing refreshed).
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    const tmp = std.fmt.allocPrint(arena, "{s}/steps/.tmp-{s}", .{ root, &std.fmt.bytesToHex(raw, .lower) }) catch return;
+    const cwd = std.Io.Dir.cwd();
+    cwd.writeFile(io, .{ .sub_path = tmp, .data = text }) catch return;
+    cwd.rename(tmp, cwd, path, io) catch |e| {
+        std.log.debug("native: the step's size cannot be written: {s}", .{@errorName(e)});
+        cwd.deleteFile(io, tmp) catch |e2| std.log.debug("native: {s}: {s}", .{ tmp, @errorName(e2) });
+    };
+}
+
+test "a step's last layer size is kept and read back" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "steps");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena);
+    try std.testing.expectEqual(@as(?u64, null), readEntries(arena, std.testing.io, root, "abc"));
+    writeEntries(arena, std.testing.io, root, "abc", 41);
+    try std.testing.expectEqual(@as(?u64, 41), readEntries(arena, std.testing.io, root, "abc"));
+    writeEntries(arena, std.testing.io, root, "abc", 7);
+    try std.testing.expectEqual(@as(?u64, 7), readEntries(arena, std.testing.io, root, "abc"));
+}
+
 /// Removes the index entries (and temporary files) nothing has refreshed for `index_days`.
 pub fn sweep(arena: Allocator, io: std.Io, root: []const u8) void {
     const cwd = std.Io.Dir.cwd();
