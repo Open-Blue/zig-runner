@@ -1,3 +1,3 @@
 kind: Removed
-body: 'TLC and Java are gone from the tooling: SPIN checks every model, its state counts are the reference, and the TLA+ modules stay as documentation'
+body: 'TLC and Java are gone from the tooling: SPIN checks every model, its state counts are the reference, and the TLA+ modules stay as documentation.'
 time: 2026-11-11T19:31:57.779143591-05:00

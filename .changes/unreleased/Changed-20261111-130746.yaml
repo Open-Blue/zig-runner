@@ -1,3 +1,3 @@
 kind: Changed
-body: SPIN checks the store's eviction and the release pipeline models too, with the same states as TLC; TLC no longer runs any of the three modules
+body: SPIN checks the store's eviction and the release pipeline models too, with the same states as TLC; TLC no longer runs any of the three modules.
 time: 2026-11-11T13:07:46.056156384-05:00
