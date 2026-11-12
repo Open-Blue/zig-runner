@@ -23,7 +23,7 @@ CI may cache, split and parallelise for speed. The cost of a cold build is measu
 
 The ruleset for `main` requires these, and each reports on every pull request and in the merge
 queue: "Workflows", "Tests (x86_64)", "Tests (arm64)", "Native tests as root (…)" in two parts
-per architecture, "Database tests (…)" in three parts, "Release builds", "Release builds (arm64)", "End
+per architecture, "Database tests", "Release builds", "Release builds (arm64)", "End
 to end", "Proofs", and `release`'s "Binaries (check)", "Binaries (same as zig build)" and "Image".
 
 On a change that can't affect what a job checks, the job reports without running its steps
@@ -72,8 +72,8 @@ unreported instead, and the merge queue waiting for it.
   (`.github/scripts/zig-test.sh`) rather than `zig build`, which first spends about 100 s compiling
   Zig's build system.
 - **Native tests as root**: the native backend's root-only tests, in two parts per architecture.
-- **Database tests**: against TimescaleDB, every test under ThreadSanitizer, in three parts
-  (`ZIG_TEST_PART`), each with its own database.
+- **Database tests**: against TimescaleDB, every test under ThreadSanitizer but the single-threaded
+  exhaustive ones, which the Tests jobs run (`test_shards.zig`).
 - **Release builds** and **Release builds (arm64)**: the release's own builds for both targets in
   ReleaseSafe, so code that doesn't compile for aarch64 fails here rather than after the tag; on
   arm64 the aarch64 binary is run.
