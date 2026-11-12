@@ -42,7 +42,7 @@ unreported instead, and the merge queue waiting for it.
 | `provisioned image` | pull requests (build only), `main`, by hand | the default job image with the runner's packages installed, both architectures |
 | `version` | daily, or by hand | cuts the release, after approval |
 | `security` | pull requests, weekly | gitleaks and dependency review |
-| `codeql` | pull requests, merge queue, `main`, weekly | CodeQL `security-extended` |
+| `codeql` | pull requests, `main`, weekly (not the merge queue) | CodeQL `security-extended` |
 | `analysis` | nightly; a lighter run on pull requests | fuzzing, Valgrind, ThreadSanitizer, stress, coverage |
 | `compare` | weekly | the comparison tools against the implementations they follow |
 | `mutation` | by hand | mutation testing of one module |
@@ -138,7 +138,10 @@ Neither check is required yet.
 [CodeQL](https://codeql.github.com) with its `security-extended` queries, over what it has a
 language for: the workflows, the Go comparison tools under `runner/tools`, and the Python
 generator, one job per language. It is a checked-in workflow rather than the repository's default
-setup, which must stay off for its uploads to be accepted.
+setup, which must stay off for its uploads to be accepted. The `actions` analysis runs for every
+change; `go` and `python` run only when a change touches Go sources or modules under `runner/tools`,
+a `.py` file, or the workflow itself (`ci-scope.sh codeql-go`, `codeql-python`), and otherwise
+report green after the checkout, skipping their steps. The weekly run analyzes all three.
 
 ### analysis
 

@@ -15,10 +15,10 @@ name: codeql
 on:
   push:
     branches: [main]
+  # Not in the merge queue: it is not a required check, and each pull request and each push to main
+  # is analysed already, so a queue group's run took three runners the queue's required jobs were
+  # waiting for. Making it required would mean adding `merge_group:` back.
   pull_request:
-  # The merge queue tests each pull request on top of main; without this the check never reports
-  # there, and could not be made required without holding the queue.
-  merge_group:
   # Weekly, as default setup did: new queries find old code.
   schedule:
     - cron: "41 6 * * 1"
@@ -31,9 +31,12 @@ concurrency:
   group: codeql-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Every job runs, on every change: an analysis takes a few minutes, and code scanning compares a
-# pull request's results with its base's, so a run left out would show as missing rather than as
-# clean. ci-scope.sh's skips suit Zig's long builds, not this.
+# Every job runs, and reports, on every change, but each language's analysis only when a change
+# could alter its results (ci-scope.sh codeql-LANGUAGE): `actions` reads the workflows, so it runs
+# for every change; `go` for the comparison tools' Go and modules; `python` for any .py file. A
+# language no change touches skips its steps, costing the checkout, and its alerts stay as the last
+# analysis left them (code scanning keeps each language's results by its category, and none is a
+# required check). The weekly run, and a run by hand, analyze all three.
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
@@ -65,11 +68,19 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Whether this change can affect the ${{ matrix.language }} analysis
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          LANGUAGE: ${{ matrix.language }}
+        run: .github/scripts/ci-scope.sh "codeql-$LANGUAGE"
+
       # security-extended: the default suite and the lower-precision security queries besides.
       # There is more for them to read than when default setup was chosen (the e2e harness, the
       # native backend's tooling), and its few extra false positives are cheap to dismiss with a
       # reason. The same suite for all three languages.
       - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        if: steps.scope.outputs.run == 'true'
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -77,5 +88,6 @@ jobs:
 
       # With build-mode autobuild, analyze runs the build itself before it analyzes.
       - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        if: steps.scope.outputs.run == 'true'
         with:
           category: /language:${{ matrix.language }}

@@ -1,0 +1,3 @@
+kind: Changed
+body: Run CodeQL's go and python analyses only when Go or Python files change, and actions on every change; the weekly run analyzes all three, and CodeQL no longer runs in the merge queue, where it is not required and each pull request and push to main is analysed already
+time: 2026-11-11T12:41:32.510066287-05:00
