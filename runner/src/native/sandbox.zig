@@ -103,6 +103,10 @@ pub const Spec = struct {
     /// and needs no shift (`Store.unshift`) afterwards. Not with a container that has an owner
     /// (`jobView` maps that job's directory its own way).
     upper_canonical: bool = false,
+    /// `upper_canonical`: the file, relative to `root`, that keeps the job's user namespace for the
+    /// upper's map (`Backend.keepUserns`), made once for the job; "" or a file that cannot be opened
+    /// makes the same namespace for this step.
+    upper_userns: []const u8 = "",
     /// `mapped`: the first on-disk id of the cache volumes' range (`Bind.volume`), which the job
     /// sees as its 0 onwards.
     volume_id_base: u32 = 0,
@@ -1408,12 +1412,8 @@ fn jobView(arena: Allocator, spec: Spec, o: Spec.Container.Owner) JobView {
 /// (`idmapMount`), which keeps that harmless. Overlay takes the upper and the work directory
 /// idmapped from Linux 5.19, both under one mount, which is why it is the job's directory.
 fn canonicalUpper(arena: Allocator, spec: Spec, job_spec: *Spec) void {
-    var u: [swap_ranges]Range = undefined;
-    var g: [swap_ranges]Range = undefined;
-    const upper_ns = mappedRanges(
-        swapRanges(0, spec.id_base, spec.id_count, 0, 0, true, &u),
-        swapRanges(0, spec.id_base, spec.id_count, 0, 0, true, &g),
-    );
+    const kept: linux.fd_t = if (spec.upper_userns.len == 0) -1 else keptUserns(arena, spec.upper_userns);
+    const upper_ns = if (kept >= 0) kept else upperUserns(spec.id_base, spec.id_count);
     defer _ = linux.close(upper_ns);
     // On disk the job's root (0), as the upper's root is: root's DAC override reaches it either way.
     const owned = ownedDirAt(linux.AT.FDCWD, z(arena, job_view_work), 0);
@@ -1421,6 +1421,57 @@ fn canonicalUpper(arena: Allocator, spec: Spec, job_spec: *Spec) void {
     idmapMount(arena, ".", job_view_dir, upper_ns, false, false);
     job_spec.upper = std.fmt.allocPrint(arena, job_view_dir ++ "/{s}", .{spec.upper}) catch oom();
     job_spec.work = job_view_dir ++ "/" ++ job_view_work;
+}
+
+/// The user namespace the upper's mount is idmapped through: the job's ids, and the host's root
+/// as the id nothing owns (`canonicalUpper`).
+fn upperUserns(id_base: u32, id_count: u32) linux.fd_t {
+    var u: [swap_ranges]Range = undefined;
+    var g: [swap_ranges]Range = undefined;
+    return mappedRanges(
+        swapRanges(0, id_base, id_count, 0, 0, true, &u),
+        swapRanges(0, id_base, id_count, 0, 0, true, &g),
+    );
+}
+
+/// The helper's subcommand that keeps a job's `upperUserns` in a file, so its steps do not each
+/// make the namespace (a process, its two maps and a wait: about 0.6 ms a step):
+/// `zig-runner native-userns <file> <first host id> <ids>`. The namespace is kept as the network
+/// namespace is, by bind-mounting it over the file, which the job's directory holds and
+/// `Backend.teardown` unmounts. A helper of its own, as the runner has threads and the namespace's
+/// maps are written by a process outside it. Exits 0, or 1 with why on stderr.
+pub const userns_command = "native-userns";
+
+pub fn usernsMain(arena: Allocator, path: []const u8, base_text: []const u8, count_text: []const u8) u8 {
+    const base = std.fmt.parseInt(u32, base_text, 10) catch return 1;
+    const count = std.fmt.parseInt(u32, count_text, 10) catch return 1;
+    const ns = upperUserns(base, count);
+    defer _ = linux.close(ns);
+    // A file made here and no other (a link or a file already at the path fails), mounted over
+    // through its descriptor, so what the root bind mount lands on is what was made.
+    const file = linux.open(z(arena, path), .{ .ACCMODE = .RDONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o444);
+    check("make the user namespace's file", file);
+    const made = std.math.cast(linux.fd_t, file) orelse return 1;
+    defer _ = linux.close(made);
+    const from = std.fmt.allocPrintSentinel(arena, "/proc/self/fd/{d}", .{ns}, 0) catch oom();
+    const onto = std.fmt.allocPrintSentinel(arena, "/proc/self/fd/{d}", .{made}, 0) catch oom();
+    check("keep the user namespace", linux.mount(from, onto, null, linux.MS.BIND, 0));
+    return 0;
+}
+
+/// A kept user namespace (`usernsMain`) opened, or -1 when the file cannot be: the step then makes
+/// its own, the same one.
+fn keptUserns(arena: Allocator, path: []const u8) linux.fd_t {
+    const fd = linux.open(z(arena, path), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd) != .SUCCESS) return -1;
+    const kept = std.math.cast(linux.fd_t, fd) orelse return -1;
+    // Only a user namespace will do: with the mount gone (unmounted from outside) the file is a
+    // plain one, which the idmap would refuse and fail the step.
+    const ns_get_nstype = 0xb703;
+    const is_user = linux.ioctl(kept, ns_get_nstype, 0);
+    if (linux.errno(is_user) == .SUCCESS and is_user == linux.CLONE.NEWUSER) return kept;
+    _ = linux.close(kept);
+    return -1;
 }
 
 /// The lower layers with the canonical ids replaced by mounts of them idmapped through `userns`:

@@ -293,6 +293,9 @@ pub const Layer = struct {
     /// The layer's tree, an overlay lower.
     fs: []const u8,
     lock: std.Io.File,
+    /// How many entries (files, directories, anything; a hard link's every name) the tree held when
+    /// it was published: the walk that measured its bytes counted them (`treeSize`).
+    entries: u64 = 0,
 };
 
 /// What made a layer, which says what its record must hold: a step's file commands end with its
@@ -786,7 +789,10 @@ fn publishStaged(
     // Measured once written: a file the kernel is still writing back can show fewer blocks
     // than it takes (a block short, the stress test found, under other publishers' syncfs),
     // and the store would count less than it holds.
-    m.bytes = try treeBytes(arena, io, fs_tmp);
+    // The same walk counts its entries, for the step's next upper (`Layer.entries`): synced or
+    // not, as a deferred sync (`lazy`) walks nothing else.
+    const size = try treeSize(arena, io, fs_tmp);
+    m.bytes = size.bytes;
     m.pending = lazy;
     if (ph) |p| t = p.since(arena, .size, t);
     const meta = try cwd.createFile(io, try join(arena, tmp, "meta"), .{});
@@ -845,7 +851,7 @@ fn publishStaged(
     // the entry is in its log: one a failed sync leaves in doubt is evicted (`dropUnsynced`).
     s.noteRenamed(arena, key, lazy != null);
     if (ph) |p| _ = p.since(arena, .rename, t);
-    return .{ .fs = try join(arena, dir, "fs"), .lock = lock.? };
+    return .{ .fs = try join(arena, dir, "fs"), .lock = lock.?, .entries = size.entries };
 }
 
 /// The job's log told of the layer just renamed in, `pending` if its data is not yet synced.
@@ -1747,22 +1753,35 @@ pub fn openRoot(arena: Allocator, p: []const u8) !linux.fd_t {
 /// any directory of it cannot be read: a count that left part out would let the store pass its
 /// cap, so such a layer is not published.
 pub fn treeBytes(arena: Allocator, io: std.Io, p: []const u8) !u64 {
+    return (try treeSize(arena, io, p)).bytes;
+}
+
+pub const TreeSize = struct {
+    /// Each inode counted once.
+    bytes: u64 = 0,
+    /// Each name: a hard link's every name, as a walk of the tree meets them.
+    entries: u64 = 0,
+};
+
+/// `treeBytes`, and the tree's entries with them, in the one walk.
+pub fn treeSize(arena: Allocator, io: std.Io, p: []const u8) !TreeSize {
     const root = try openRoot(arena, p);
     defer _ = linux.close(root);
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
     var stack: std.ArrayList([]const u8) = .empty;
     try stack.append(arena, "");
-    var total: u64 = 0;
+    var size: TreeSize = .{};
     while (stack.pop()) |rel| {
         const fd = if (rel.len == 0) root else try openRel(arena, root, rel);
         defer if (fd != root) {
             _ = linux.close(fd);
         };
         for (try listDir(arena, io, fd)) |n| {
+            size.entries += 1;
             if (n.st.nlink > 1 and n.kind() != linux.S.IFDIR) {
                 if ((try seen.getOrPut(arena, n.st.ino)).found_existing) continue;
             }
-            total += n.st.blocks * 512;
+            size.bytes += n.st.blocks * 512;
             if (n.kind() != linux.S.IFDIR) continue;
             try stack.append(arena, if (rel.len == 0)
                 try arena.dupe(u8, n.name)
@@ -1770,7 +1789,7 @@ pub fn treeBytes(arena: Allocator, io: std.Io, p: []const u8) !u64 {
                 try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, n.name }));
         }
     }
-    return total;
+    return size;
 }
 
 /// How a job's namespace sees host ids: `base` onwards, `count` of them, as 0 onwards; any other
@@ -2700,6 +2719,38 @@ test "native store: a layers directory that cannot be synced fails the job's lay
 /// A job's store that leaves its layers' data to be synced later, whatever the disk is doing.
 fn lazyStore(arena: Allocator) Store {
     return .{ .root = "", .sync_log = newSyncLog(arena), .defer_sync = true, .sync_load = .{}, .sync_fd = syncCursor(arena, ".") };
+}
+
+test "native store: a published layer counts its entries, its sync deferred or not (#487's step uppers)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    var never: std.atomic.Value(bool) = .init(false);
+    for ([_]bool{ false, true }) |deferred| {
+        var s: Store = if (deferred) lazyStore(arena) else .{ .root = "", .sync_log = newSyncLog(arena) };
+        s.root = try std.fmt.allocPrint(arena, "{s}/store-{}", .{ root, deferred });
+        try prepare(arena, io, s.root, .{ .check_parents = false });
+        // 90 files and a directory holding one more, and a hard link: 93 names.
+        const name = try std.fmt.allocPrint(arena, "tree-{}", .{deferred});
+        try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/d", .{name}));
+        for (0..90) |i| try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/f{d}", .{ name, i }), .data = "x" });
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/d/g", .{name}), .data = "y" });
+        try tmp.dir.hardLink(try std.fmt.allocPrint(arena, "{s}/f0", .{name}), tmp.dir, try std.fmt.allocPrint(arena, "{s}/link", .{name}), io, .{});
+        var kh: KeyHasher = .plain(name);
+        const k = kh.final();
+        const kl = try s.lockKey(arena, io, k, &never);
+        defer kl.close(io);
+        const l = try s.publish(arena, io, k, .fetch, try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, name }), .{ .log = "", .fc = "" });
+        defer l.lock.close(io);
+        try std.testing.expectEqual(@as(u64, 93), l.entries);
+        // Deferred: renamed in pending, so nothing walked it for its sync.
+        try std.testing.expectEqual(deferred, (try metaOf(arena, io, std.fs.path.dirname(l.fs).?)).pending != null);
+    }
 }
 
 test "native store: a deferred publish is renamed in pending, this boot may use it, and settling makes it durable" {

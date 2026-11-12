@@ -33,6 +33,10 @@ MemoryMax=90%
 # The runner needs no files of its own, only the network and the engine's socket (owned by root
 # unless the engine was started otherwise; to run unprivileged, set User= to an account that can
 # open it).
+# Pools on one machine share what they have reserved in /run/zig-runner/memory-budget
+# (RUNNER_SHARED_MEMORY_BUDGET); under ProtectSystem=strict that directory is writable only with:
+# RuntimeDirectory=zig-runner
+# RuntimeDirectoryPreserve=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

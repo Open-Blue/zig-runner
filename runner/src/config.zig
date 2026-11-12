@@ -299,6 +299,9 @@ pub const Config = struct {
     /// Ask for a job only while the machine has the memory for it (`admission.zig`, #126).
     admission: bool = true,
     admission_limits: admission.Limits = .{},
+    /// A root runner's gate counts what the other pools of the machine have reserved
+    /// (`admission.Budget`).
+    shared_memory_budget: bool = true,
     /// The engine container's cgroup directory, whose memory cap the gate holds on too
     /// (`admission.Engine`, #142). Empty: found from `engine_host`'s unix socket; `none`: not
     /// looked for.
@@ -548,6 +551,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_ONCE")) |v| c.once = try boolean(v);
         if (environ.get("RUNNER_COUNT")) |v| c.runners = try count(v);
         if (environ.get("RUNNER_ADMISSION")) |v| c.admission = try boolean(v);
+        if (environ.get("RUNNER_SHARED_MEMORY_BUDGET")) |v| c.shared_memory_budget = try boolean(v);
         const l = &c.admission_limits;
         if (environ.get("RUNNER_MIN_MEM_AVAILABLE_MB")) |v| l.min_available_mb = try num(u32, v);
         if (environ.get("RUNNER_MEM_PER_JOB_MB")) |v| l.per_job_mb = try num(u32, v);
@@ -644,6 +648,7 @@ pub const Config = struct {
         else if (eq(key, "output-keys-days")) c.output_keys_days = try count(val) //
         else if (eq(key, "runners")) c.runners = try count(val) //
         else if (eq(key, "admission")) c.admission = try boolean(val) //
+        else if (eq(key, "shared-memory-budget")) c.shared_memory_budget = try boolean(val) //
         else if (eq(key, "min-mem-available-mb")) l.min_available_mb = try num(u32, val) //
         else if (eq(key, "mem-per-job-mb")) l.per_job_mb = try num(u32, val) //
         else if (eq(key, "native-mem-per-job-mb")) l.native_per_job_mb = try num(u32, val) //
@@ -1334,6 +1339,10 @@ test "the memory gate is on by default, with limits from the environment or flag
     try env.put("RUNNER_ADMISSION", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).admission);
     try std.testing.expect((try Config.load(&env, &.{ "runner", "--admission=true" })).admission);
+    try std.testing.expect(d.shared_memory_budget);
+    try env.put("RUNNER_SHARED_MEMORY_BUDGET", "false");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).shared_memory_budget);
+    try std.testing.expect((try Config.load(&env, &.{ "runner", "--shared-memory-budget=true" })).shared_memory_budget);
 }
 
 test "load: GH_TOKEN or a GitHub App, not both and not neither" {

@@ -895,9 +895,23 @@ What it covers, as built:
   ends, so a layer is published (or flattened) with no walk and no `chown`. The shift cost the Pi
   3.4 ms at the median for an end-to-end publisher, 22.5 ms for a warm build and 64 ms for a cold
   build; on the laptop 0.45 ms for a three-file layer and about 570 ms for one of 20,000 files
-  (about 28 us a file). The idmapped upper costs every step, published or not, about 0.8 ms (a
-  second user namespace for the map with the host's root, and the two mounts), so it pays from a
-  layer of some twenty entries upwards and costs a little on the smallest. The kernel does the translation of an ACL's
+  (about 28 us a file). The idmapped upper's map is a user namespace
+  with the host's root in it, which the job makes once and keeps in a file of its directory
+  (`userns`, bind-mounted by `native-userns` as the network namespace is, unmounted with the job in
+  `teardown` and `sweep`); made by each step it cost 0.26 ms more than the shift's mount phase
+  (release build, a three-file layer). With it kept the idmapped upper is never slower than the
+  shift, mount phase and shift together (laptop, release build, other agents' load: 1 entry 751
+  against 609 us, 4 entries 2075 against 602, 21 entries 2080 against 792, 201 entries 12171
+  against 871). What it costs is the helper that makes the namespace, one process spawn of about
+  2.4 ms for the job, which the shift's 30 us an entry pays back at about 80 entries
+  (`Backend.idmapped_min_entries_default`). So a job starts with the shift and starts using the
+  idmapped upper (`Backend.upperIdmapped`, `chooseUpper`) at the first keyed step expected to make
+  a layer that large, by the size its step's last layer had (`key_diff.readEntries`, kept beside
+  the step's index entry when a layer is published, from the walk that wrote it to disk), else by
+  the largest layer the job's earlier steps made; from then on every keyed step takes it. A step
+  with no key is never published and so never shifted: it keeps the shift's way, which costs it
+  nothing. The kept file is made exclusively and mounted over through its descriptor, and a step
+  that finds it is no longer a user namespace (unmounted from outside) makes its own. The kernel does the translation of an ACL's
   and a capability's ids as it does for any idmapped mount, so nothing is reread or put back. What
   differs on disk is only the overlay's own whiteouts, which its mounter (the host's root) makes:
   they are owned by the id nothing owns (4294967294), which `X` maps from the host's root so the
@@ -1214,6 +1228,36 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
     before: a name's estimate is the most of those runs, so one learned low (a warm `zig build
     test` at 64 MB) still reserves little for a cold one until a heavy run has been seen, restart
     or not.
+  - *Pools share one budget* (`RUNNER_SHARED_MEMORY_BUDGET`, `Admission.budget`, `Budget`). Each
+    gate counted only its own pool's reservations, so two pools on one machine (razorbill's prod,
+    ci and bench) could each admit a job into the same free memory, and a pool's job in its first
+    minutes held the others back as swap growth while none knew what the others were promised.
+    A root runner now keeps one line for each job its pool started less than `ramp_ms` ago (and
+    that is not waiting for room) in `/run/zig-runner/memory-budget`: pool name, pid, the pid's
+    start time (field 22 of `/proc/<pid>/stat`, so a reused pid is not taken for the writer),
+    the runner's slot, MB, and the expiry in wall-clock ms. It is updated whenever a reservation
+    changes (a job handed out, named, native, back on the engine, started from waiting, ended) and
+    emptied when the pool ends; updates hold an exclusive `flock`, reads a shared one, each waiting
+    up to a second. A gate reads the other pools' lines at every check (`Admission.refreshPeers`)
+    and adds them to `reserved` as native MB, which counts against `MemAvailable` and not against
+    the engine's cap. Same rule as the pool's own: a job reserves until it ends or its ramp is
+    over, when its memory is in `MemAvailable`, never both; a line expires at the end of its ramp.
+    A line is ignored (and pruned at the next write) when its process is gone, its start time
+    differs, it expired, or it expires more than two ramps ahead; a crash leaves lines for at most
+    `ramp_ms`. A file that is missing, has another header, damaged lines or cannot be locked counts
+    as no reservations, warned of once: the gate is as before. So a gate is stricter only while
+    another pool has a job ramping up, and neither a poll that would be forced through on an idle
+    pool (`idleFor`) nor the first job in line that would start whatever the room (`firstAlone`) is
+    while one has: they wait for that job to give the room back (a replay of the gate showed an idle
+    pool's first job otherwise going past every other pool's reservation). Pollers are not published (an engine pool's runners alone
+    would reserve more than 8 GB), and a job's lines are written after the gate admits it, so two
+    pools that admit in the same few milliseconds can still both pass; the next check of either
+    sees both. On by default for a root runner, whose `/run/zig-runner` only root writes and which
+    shares the slots with the other pools; off for a runner that is not root, since a per-user
+    file would coordinate only pools of one user while the memory is the machine's, and a file
+    other users can write would let any of them hold every pool. `RUNNER_SHARED_MEMORY_BUDGET=false`
+    turns it off. A unit under `ProtectSystem=strict` needs `RuntimeDirectory=zig-runner` and
+    `RuntimeDirectoryPreserve=yes` (as the slots do) or the pool warns once and counts its own.
   - *How the estimate is sized* (from Autopilot, Borg and HTCondor, and oomd's pause). Four rules
     on top of "the most of the last five runs", none of which changes what is recorded:
     - A **margin** of `RUNNER_MEM_MARGIN_PERCENT` (10) is added when a learned size is reserved
