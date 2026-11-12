@@ -71,7 +71,9 @@ unreported instead, and the merge queue waiting for it.
   own expression test cases. On hosted runners CI calls the compiler directly
   (`.github/scripts/zig-test.sh`) rather than `zig build`, which first spends about 100 s compiling
   Zig's build system.
-- **Native tests as root**: the native backend's root-only tests, in two parts per architecture.
+- **Native tests as root**: the native backend's root-only tests, in two parts per architecture,
+  the slow tests (`test_shards.zig`'s `slow`) shared out among the parts on their own. In ci the
+  store stress test runs for 10 s, where analysis runs it for minutes.
 - **Database tests**: against TimescaleDB, every test under ThreadSanitizer but the single-threaded
   exhaustive ones, which the Tests jobs run (`test_shards.zig`).
 - **Release builds** and **Release builds (arm64)**: the release's own builds for both targets in
