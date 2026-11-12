@@ -498,6 +498,12 @@ test "native store under load: one worker (run only by the test above, in a proc
         }
         try io.sleep(.fromMilliseconds(w.rand.uintLessThan(u32, 30)), .awake);
     }
+    // The last jobs' upkeep, before the process ends, as a stopping runner lets it finish: the
+    // collector's pass and the reaper's deletions use this process's `Io`, which the test runner
+    // tears down once this returns (ThreadSanitizer: a pass's `Io.random` against the teardown).
+    _ = collector.drain(io, null);
+    while (collector.pending(io)) try io.sleep(.fromMilliseconds(5), .awake);
+    reaper.drain(io);
 
     var out: std.Io.Writer.Allocating = .init(arena);
     try out.writer.print("{f}\n{s}", .{ w.stats, w.faults.items });

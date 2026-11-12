@@ -262,14 +262,19 @@ pub fn main(init: std.process.Init) !u8 {
     var sweep: StaleSweep = .{ .gpa = init.gpa, .io = io, .cfg = &cfg, .log = log };
     sweep.start(stale);
     defer sweep.stop();
+    const result = runPool(init, &cfg, log, err, secrets, name, if (store) |*st| st else null);
     // A job's upkeep of the store that its end handed to a thread is let finish: its syncs and the
     // eviction of what a failed one left in doubt without a limit, its collect within one
-    // (`collector.drain`). A second signal ends the wait at once.
-    defer {
-        collector.drainSync(io);
-        _ = collector.drain(io, 5000);
+    // (`collector.drain`). A second signal ends the wait at once. A collect still running then is
+    // cut short by ending the process here, which the store survives as it does a crash: returning
+    // would tear down the `Io` its thread still uses (a race ThreadSanitizer found in the store's
+    // stress workers, which ended the same way).
+    collector.drainSync(io);
+    if (!collector.drain(io, 5000)) {
+        sweep.stop();
+        std.process.exit(result catch 1);
     }
-    return runPool(init, &cfg, log, err, secrets, name, if (store) |*st| st else null);
+    return result;
 }
 
 /// How `nativeRefusal` retries: a failure may be transient (nftables busy, a module not loaded,
