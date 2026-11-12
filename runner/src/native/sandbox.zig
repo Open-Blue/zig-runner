@@ -1292,7 +1292,7 @@ test "a signal waits for a step's own PID 1 to handle it, and goes on once it do
     };
     defer _ = linux.sigaction(.USR2, &dfl, null);
     try std.testing.expect(!Warning.handles(me, .USR2));
-    var w: Warning = .{ .pid1 = me, .born = phases.now(), .held = .USR2 };
+    var w: Warning = .{ .pid1 = me, .held = .USR2 };
     w.tendHeld();
     try std.testing.expect(w.held != null);
     try std.testing.expect(w.busy());
@@ -1634,7 +1634,7 @@ fn makeDirsOpen(arena: Allocator, root: linux.fd_t, path: []const u8) linux.fd_t
 fn superviseStep(pid: linux.pid_t, own_program: bool, early: []const u8) u32 {
     const pidfd_rc = linux.pidfd_open(pid, 0);
     const pidfd: ?linux.fd_t = if (linux.errno(pidfd_rc) == .SUCCESS) @intCast(pidfd_rc) else null;
-    var warning: Warning = .{ .pid1 = if (own_program) pid else null, .born = phases.now() };
+    var warning: Warning = .{ .pid1 = if (own_program) pid else null };
     var stopped = false;
     for (early) |byte| stopped = stopped or !warning.take(byte);
     while (!stopped) {
@@ -1699,8 +1699,6 @@ const Warning = struct {
     pending: ?linux.SIG = null,
     /// A signal for `pid1` that waits for it to have a handler for it (`tend`).
     held: ?linux.SIG = null,
-    /// When the step's PID 1 was forked, on `phases.now`'s clock.
-    born: u64,
     /// The process sending it. Its zombie must be reaped: PID 1 cannot finish exiting while one
     /// of its namespace is left (`zap_pid_ns_processes`), and the step would never end.
     sender: ?linux.pid_t = null,
@@ -1723,20 +1721,19 @@ const Warning = struct {
         return w.pending != null or w.sender != null or w.held != null;
     }
 
-    /// How long a step's own PID 1 may be without a handler for a signal before it is sent anyway.
-    const hold_ns = 2 * std.time.ns_per_s;
-
     /// The signal for `pid1`, sent once it can be heard. The kernel drops a signal sent to a
     /// namespace's PID 1 that has no handler for it, where any other process would have been ended
     /// by it, and a Docker action's command (`sh -c 'trap ... INT; ...'`) installs its handler
     /// some time after its exec, and the runner's own set-up before that: a step stopped within
     /// a moment of its start, as a post step is when the job's limit is already near, would
-    /// never hear it. So it waits for the handler, or for a script that ignores the signal, and
-    /// gives up after `hold_ns`, as a process that has none is not going to get one.
+    /// never hear it. So it waits for the handler, or for a script that ignores the signal, for as
+    /// long as the stage lasts: the next one, or the step's end, drops it (`drop`). Sent sooner, to
+    /// a PID 1 still without one, it would only be dropped by the kernel: a cap of 2 s lost the
+    /// SIGINT of a post step whose `sh` set its trap later, under ThreadSanitizer as root.
     fn tendHeld(w: *Warning) void {
         const sig = w.held orelse return;
         const p = w.pid1.?;
-        if (!handles(p, sig) and phases.now() -| w.born < hold_ns) return;
+        if (!handles(p, sig)) return;
         w.held = null;
         _ = linux.kill(p, sig);
     }
