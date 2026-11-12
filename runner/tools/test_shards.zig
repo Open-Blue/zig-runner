@@ -55,6 +55,22 @@ fn slow(name: []const u8) bool {
     return false;
 }
 
+/// Tests that are single-threaded and exhaustive (every bit of a seed flipped, every allocation
+/// failed in turn): ThreadSanitizer, which reports races between threads, has nothing to find in
+/// them, and slows them about tenfold. Under it (ZIG_TEST_SANITIZE_THREAD=1, zig-test.sh) they
+/// are skipped, saying so; the Tests jobs run them without it. Measured in a database part under
+/// ThreadSanitizer: 69 s, 51 s and 35 s, the rest of the part's tests 20 s.
+const untouched_by_tsan = [_][]const u8{
+    "zstd decoders: every bit of the small seeds flipped",
+    "allocation failures: the job message",
+    "native oci zstd: a stream that is wrong is refused with a reason, never read out of bounds",
+};
+
+fn skippedUnderTsan(name: []const u8) bool {
+    for (untouched_by_tsan) |t| if (std.mem.endsWith(u8, name, t)) return true;
+    return false;
+}
+
 /// Past this the shards only compete with each other: what is left to wait for is the slowest test.
 const max_shards = 32;
 
@@ -75,6 +91,9 @@ const Run = struct {
     passed: std.atomic.Value(usize) = .init(0),
     skipped: std.atomic.Value(usize) = .init(0),
     failed: std.atomic.Value(usize) = .init(0),
+    /// How long each test took, by index: each is run once, by one shard, and read after the
+    /// shards are joined.
+    took_ns: []u64,
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -117,11 +136,20 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     const root = std.os.linux.geteuid() == 0;
+    const tsan = if (init.environ_map.get("ZIG_TEST_SANITIZE_THREAD")) |v| std.mem.eql(u8, v, "1") else false;
     var free: std.ArrayList(u32) = .empty;
     var alone: std.ArrayList(u32) = .empty;
+    var tsan_skipped: usize = 0;
     for ([_]bool{ true, false }) |slow_first| {
         for (names, 0..) |name, i| {
             if (part) |p| if (i % p.of != p.index) continue;
+            if (tsan and skippedUnderTsan(name)) {
+                if (slow_first) {
+                    tsan_skipped += 1;
+                    std.debug.print("{d}/{d} {s}...SKIP (single-threaded: nothing for ThreadSanitizer to find; the Tests jobs run it)\n", .{ i + 1, names.len, name });
+                }
+                continue;
+            }
             if (slow(name) == slow_first)
                 try (if (serial(name, root)) &alone else &free).append(arena, @intCast(i));
         }
@@ -133,7 +161,10 @@ pub fn main(init: std.process.Init) !u8 {
         .names = names,
         .free = free.items,
         .alone = alone.items,
+        .took_ns = try arena.alloc(u64, names.len),
     };
+    _ = run.skipped.fetchAdd(tsan_skipped, .monotonic);
+    @memset(run.took_ns, 0);
     const started = Io.Clock.awake.now(io);
     const threads = try arena.alloc(std.Thread, shards);
     for (threads, 0..) |*t, i|
@@ -143,11 +174,33 @@ pub fn main(init: std.process.Init) !u8 {
     const failed = run.failed.load(.monotonic);
     const took = started.durationTo(Io.Clock.awake.now(io));
     const seconds = @as(f64, @floatFromInt(took.toNanoseconds())) / std.time.ns_per_s;
+    printSlowest(arena, &run);
     std.debug.print("{d} passed; {d} skipped; {d} failed ({d} shards, {d:.1} s).\n", .{
         run.passed.load(.monotonic), run.skipped.load(.monotonic), failed, shards, seconds,
     });
     return if (failed == 0) 0 else 1;
 }
+
+/// The tests that took longest, up to `slowest_shown` of those past `slowest_min_ns`: what holds
+/// a run, or a part of one (ZIG_TEST_PART), back.
+fn printSlowest(arena: std.mem.Allocator, run: *const Run) void {
+    const order = arena.alloc(u32, run.took_ns.len) catch return;
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    std.mem.sort(u32, order, run.took_ns, struct {
+        fn longer(took: []const u64, a: u32, b: u32) bool {
+            return took[a] > took[b];
+        }
+    }.longer);
+    for (order[0..@min(slowest_shown, order.len)]) |i| {
+        const ns = run.took_ns[i];
+        if (ns < slowest_min_ns) break;
+        const seconds = @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
+        std.debug.print("slow: {d:.1} s {s}\n", .{ seconds, run.names[i] });
+    }
+}
+
+const slowest_shown = 5;
+const slowest_min_ns = 2 * std.time.ns_per_s;
 
 const Part = struct {
     /// 0-based: part K of N is index K-1.
@@ -213,6 +266,8 @@ fn runOne(run: *Run, shard: *?Shard, index: u32) void {
         return;
     };
     const s = &shard.*.?;
+    const t0 = Io.Clock.awake.now(run.io);
+    defer run.took_ns[index] = @intCast(t0.durationTo(Io.Clock.awake.now(run.io)).toNanoseconds());
     const results = s.run(index) catch {
         // The shard is gone, from a panic or a signal; what it said last is in its file.
         _ = run.failed.fetchAdd(1, .monotonic);
