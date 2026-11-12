@@ -4,9 +4,8 @@
 One .pml for each configuration of each module ported (MODULES): the .cfg's comment, its
 constants as #defines, its invariants as CHK_ defines and its temporal properties as LTL_ defines
 (with a `spin-ltl:` line naming them, for spin.sh), and, for one that must hold, the number of
-states SPIN must find (the .cfg's `states without symmetry:`, TLC's count, plus SPIN's first
-state, before init has run). The .cfg files stay the configurations' source, so TLC and SPIN
-check the same bounds.
+states SPIN must find (the .cfg's `spin-states:`, the reference count). The .cfg files stay the
+configurations' source, beside the TLA+ modules they configure.
 
     proofs/spin/cfg.py           write them
     proofs/spin/cfg.py --check   fail if one is missing, stale or left over (spin.sh runs this)
@@ -156,18 +155,17 @@ MODULES = {
 
 def render(module, path):
     c = Cfg(path)
-    prose = [l for l in c.comments if not re.match(r"(tlc-seconds|states without (symmetry|the view)):", l)]
+    prose = [l for l in c.comments if not l.startswith("spin-states:")]
     out = ["/* " + prose[0]] + [" * " + l for l in prose[1:]]
     out.append(f" * Written from proofs/tla/{c.name} by proofs/spin/cfg.py: change the .cfg, not this.")
     properties = c.section("PROPERT(?:Y|IES)")
     if properties:
         out.append(" * spin-ltl: " + " ".join(properties))
-    states = [l for l in c.comments if re.match("states without (symmetry|the view):", l)]
+    states = [l for l in c.comments if l.startswith("spin-states:")]
     if states:
-        n = int(re.sub(r"[^0-9]", "", states[0].split("(", 1)[0].split(":", 1)[1]))
-        out.append(f" * spin-states: {n + 1} */")
+        out.append(f" * spin-states: {int(re.sub(r'[^0-9]', '', states[0]))} */")
     elif "must fail:" not in prose[0]:
-        sys.exit(f"{c.name}: must hold, and has no `states without symmetry:` (or `the view:`) line")
+        sys.exit(f"{c.name}: must hold, and has no `spin-states:` line")
     else:
         out[-1] += " */"
     out += MODULES[module](c)

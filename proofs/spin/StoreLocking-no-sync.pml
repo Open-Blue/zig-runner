@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: NoWrongValid. Store.publish without its syncfs (Store.zig:462): a machine
+/* A mutant SPIN must fail: NoWrongValid. Store.publish without its syncfs (Store.zig:462): a machine
  * crash after the rename leaves an entry that validates but whose tree was never written to disk.
  * Written from proofs/tla/StoreLocking-no-sync.cfg by proofs/spin/cfg.py: change the .cfg, not this. */
 #define NP 1

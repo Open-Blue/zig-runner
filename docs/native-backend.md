@@ -824,8 +824,9 @@ What it covers, as built:
   layer it uses until it ends. Every publish, a Dockerfile build layer's too (`layers.zig`), runs
   under its key's lock, which is how `collect` tells a live runner's `.tmp-` entry from a dead
   one's. The protocol (these locks, the renames, `collect`, crashes at any point) is model-checked
-  with TLC: proofs/tla/StoreLocking.tla, proofs/README.md "The store's locking, in TLA+". It
-  found the build layers' unlocked publish and an eviction that renamed away an entry published
+  with SPIN on the Promela port of proofs/tla/StoreLocking.tla, proofs/README.md "The store's
+  locking, in TLA+" (TLC checked it when it was written). It found the build layers' unlocked
+  publish and an eviction that renamed away an entry published
   after the one it locked, both fixed.
 - **GC** (`Store.collect`, after each job): past `RUNNER_NATIVE_STORE_MAX_MB` (default 10240),
   the layers no job holds go, least recently used first (the lock file's mtime is the last use),

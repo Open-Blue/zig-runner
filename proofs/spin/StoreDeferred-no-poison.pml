@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: NoWrongValid. A pending layer any job of the boot may take and a failed settle
+/* A mutant SPIN must fail: NoWrongValid. A pending layer any job of the boot may take and a failed settle
  * that does not refuse it (the first version): a reader holds a layer whose write-back was lost.
  * Written from proofs/tla/StoreDeferred-no-poison.cfg by proofs/spin/cfg.py: change the .cfg, not this. */
 #define NP 2

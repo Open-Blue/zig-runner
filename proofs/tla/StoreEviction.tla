@@ -1,5 +1,10 @@
 ---------------------------- MODULE StoreEviction ----------------------------
 (***************************************************************************)
+(* Documentation, no longer machine-checked: SPIN checks this module's     *)
+(* Promela port, proofs/spin/StoreEvictionModel.pml, action for action,    *)
+(* and the .cfg files' spin-states lines are SPIN's counts, the reference  *)
+(* (proofs/README.md).                                                     *)
+(*                                                                         *)
 (* Eviction beside the layers, at the level of system calls               *)
 (* (runner/src/native/evict.zig, volumes.open, and oci/Store.zig's hold    *)
 (* and ensure; docs/native-backend.md, "Eviction").  StoreLocking.tla is   *)

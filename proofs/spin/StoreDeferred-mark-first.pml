@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: NoWrongValid. The durable mark written before the data's fsyncs: a crash
+/* A mutant SPIN must fail: NoWrongValid. The durable mark written before the data's fsyncs: a crash
  * between them leaves a layer marked durable whose tree never reached the disk.
  * Written from proofs/tla/StoreDeferred-mark-first.cfg by proofs/spin/cfg.py: change the .cfg, not this. */
 #define NP 2

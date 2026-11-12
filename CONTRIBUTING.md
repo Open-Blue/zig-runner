@@ -16,7 +16,7 @@ You need:
 - Docker, for the Dagger backend and the overlayfs test run.
 - Optional, for the hooks when the matching files change: Go (actionlint and the Go tools), python3
   with venv (zizmor), Lean's `lake` from [elan](https://github.com/leanprover/elan) (the proofs),
-  Java (TLC) and `spin` (the store's locking model).
+  and `spin` (the store's and the release pipeline's models).
 
 Build and test:
 
@@ -52,7 +52,7 @@ git config core.hooksPath .githooks
   constructs ratchet. When runner code changed: the tests again on overlayfs (in Docker) and ZLint.
   When the matching files changed: actionlint, zizmor and the check names the release waits for;
   shellcheck and shfmt; hadolint; `gofmt` and `go vet`; the Lean proofs and the `hashFiles()` model;
-  TLC and SPIN. A small change takes under a minute; TLC adds minutes.
+  SPIN. A small change takes under a minute.
 
 CI checks the same things whatever the hooks did. Don't push with `--no-verify`.
 
