@@ -67,11 +67,14 @@ name: analysis
 # Each search costs more than a pull request should wait for, so they run here and not in ci; a
 # failure is a case for an issue (or a fix), not a broken main. Valgrind on the tests a pull request
 # adds or edits, and ZLint's suppressed-errors rule (ci's Lint job), are cheap enough to run on
-# every pull request that could change what they find. Coverage also runs on a pull
-# request that changes the runner's code, so its numbers can be compared with main's nightly ones;
-# it reports only, failing on nothing but a report that did not come out. To hold the total above
-# a floor later, set COVERAGE_MIN (a percentage) on its Coverage step, and make "Coverage" a
-# required check once the floor has held for a while (zig-coverage.sh).
+# every pull request that could change what they find, and so are both ThreadSanitizer jobs, on
+# every change to the runner's code. A pull request that changes this workflow or what it runs sees
+# the rest work, in miniature: Fuzz for 50K runs a target, Stress as one job of 5 rounds, Store
+# stress for 90 seconds a pass; Coverage's merge and its uploads run only at night, and Coverage's
+# parts only for a change to Coverage's own tooling. The night runs everything, at full length. Coverage reports only, failing on nothing
+# but a report that did not come out. To hold the total above a floor later, set COVERAGE_MIN (a
+# percentage) on its Coverage step, and make "Coverage" a required check once the floor has held
+# for a while (zig-coverage.sh).
 
 on:
   schedule:
@@ -83,9 +86,9 @@ on:
         required: false
   # A pull request that changes this workflow or its scripts runs it, so a change to them is seen
   # working before it merges (workflow_dispatch reaches a workflow only once the default branch
-  # has it); one that changes the runner's code runs Coverage, and Store stress and Store crash when that code is
-  # the native store's (ci-scope.sh analysis, store and coverage, in the Scope job). Not a required
-  # check, so the path filter leaves nothing waiting.
+  # has it); one that changes the runner's code runs Valgrind on its changed tests, and Store stress
+  # and Store crash when that code is the native store's (ci-scope.sh analysis, store and coverage,
+  # in the Scope job). Not a required check, so the path filter leaves nothing waiting.
   pull_request:
     paths:
       - .github/workflows/analysis.yml
@@ -99,6 +102,7 @@ on:
       - .github/scripts/zig-stress.sh
       - .github/scripts/store-crash.sh
       - runner/src/**
+      - runner/build.zig
       - .github/scripts/zlint.sh
       - .github/scripts/zlint-suppressed.baseline
   # zig-test.sh and e2e.sh are not listed: ci runs them on every change that touches them, and
@@ -123,17 +127,24 @@ jobs:
     outputs:
       analysis: ${{ steps.analysis.outputs.run }}
       store: ${{ steps.store.outputs.run }}
+      tsan: ${{ steps.tsan.outputs.run }}
       coverage: ${{ steps.coverage.outputs.run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Whether this change can affect Fuzz, Valgrind and ThreadSanitizer
+      - name: Whether this change can affect Fuzz, Valgrind and Stress
         id: analysis
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: .github/scripts/ci-scope.sh analysis
+
+      - name: Whether this change can affect ThreadSanitizer
+        id: tsan
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: .github/scripts/ci-scope.sh tsan
 
       - name: Whether this change can affect Store stress and Store crash
         id: store
@@ -213,12 +224,15 @@ jobs:
       - name: Fuzz
         env:
           TARGET: ${{ matrix.target }}
-          RUNS: ${{ inputs.runs || matrix.runs }}
+          # A pull request fuzzes briefly (50K runs: under two minutes for the slowest target,
+          # after the build); the night keeps each target's own budget.
+          RUNS: ${{ inputs.runs || (github.event_name == 'pull_request' && '50K' || matrix.runs) }}
         run: .github/scripts/zig-fuzz.sh "$TARGET" "$RUNS" 30 "$RUNNER_TEMP/fuzz"
 
-      # Kept whatever happened: what the fuzzer found up to a crash is worth starting from.
+      # Kept whatever happened: what the fuzzer found up to a crash is worth starting from. Not by
+      # a pull request: its entry is private to its ref, and a short run adds little to keep.
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
         with:
           path: runner/.zig-cache/f
           key: ${{ steps.key.outputs.prefix }}${{ github.run_id }}
@@ -231,10 +245,10 @@ jobs:
           if-no-files-found: ignore
 
   # Every test, about 21 minutes on GitHub's runner (the 11-03 night: 20 minutes 54 seconds), nightly
-  # and when a pull request changes what runs them. On any other pull request that adds or edits a
-  # test in runner/src, only those tests (changed-tests.sh): the build and the install, then
-  # seconds a test, about 5 minutes in all; a pull request that changes no test skips the steps and
-  # costs the checkout. A new test is where a hang or a bad read arrives (#324's hung the nightly
+  # and by hand. On a pull request, even one that changes what runs them, only the tests it adds
+  # or edits in runner/src (changed-tests.sh): the build and the install, then seconds a test,
+  # about 5 minutes in all; a pull request that changes no test skips the steps and costs the
+  # checkout. A new test is where a hang or a bad read arrives (#324's hung the nightly
   # until its 45 minute limit, unseen), and the rest of the suite is what the nightly keeps.
   # Either run ends at its own time limit, with the test it was in named (zig-valgrind.sh), well
   # before the job's.
@@ -260,7 +274,9 @@ jobs:
           if [ -n "$BASE" ]; then
             .github/scripts/changed-tests.sh "$BASE" >"$RUNNER_TEMP/valgrind-tests"
           fi
-          if [ "$ANALYSIS" = true ]; then
+          # Every test only where there is no base to compare with: the night and a run by hand.
+          # A pull request runs the tests it adds or edits, whatever else it changes.
+          if [ -z "$BASE" ] && [ "$ANALYSIS" = true ]; then
             echo "mode=all" >>"$GITHUB_OUTPUT"
             echo "Valgrind: every test"
           elif [ -s "$RUNNER_TEMP/valgrind-tests" ]; then
@@ -310,7 +326,7 @@ jobs:
   tsan-native:
     name: ThreadSanitizer, native (${{ matrix.arch }})
     needs: scope
-    if: needs.scope.outputs.analysis == 'true'
+    if: needs.scope.outputs.tsan == 'true'
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 60
     permissions:
@@ -353,10 +369,13 @@ jobs:
   # ThreadSanitizer (`e2e.sh build BIN tsan`), and each pass followed by `e2e.sh races`, which
   # fails on any report in the runner's log or the jobs' logs. The same e2e environment, App and
   # runner-bench workflows; skipped, still reporting, without its key.
+  #
+  # On every pull request that changes the runner's code, with ThreadSanitizer, native: about nine
+  # runner minutes, and a race found before it merges, not the night after.
   tsan-e2e:
     name: ThreadSanitizer, end to end
     needs: scope
-    if: needs.scope.outputs.analysis == 'true'
+    if: needs.scope.outputs.tsan == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     environment: e2e
@@ -476,7 +495,8 @@ jobs:
   # The concurrency-sensitive tests under load. About 11 s a round on an idle runner: 25 rounds a
   # job, on four runners, 100 in all. The rounds are independent runs, each loaded as the
   # runner's own cores size it (stress-ng takes one worker a CPU), so what a round reaches is the
-  # same on four runners as on one; what differs is which machines the 100 land on.
+  # same on four runners as on one; what differs is which machines the 100 land on. A pull request
+  # runs one job of 5 rounds, about a minute of load after the build.
   stress:
     name: Stress (${{ matrix.part }}/4)
     needs: scope
@@ -486,7 +506,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4]
+        part: ${{ fromJSON(github.event_name == 'pull_request' && '[1]' || '[1, 2, 3, 4]') }}
     permissions:
       contents: read # to check out the code
     # The database's tests run too (ci.yml's Database tests job, whose database this is), and fail
@@ -521,7 +541,9 @@ jobs:
         run: .github/scripts/ci-database.sh wait
 
       - name: Tests under load
-        run: .github/scripts/zig-stress.sh 25 "$RUNNER_TEMP/stress"
+        env:
+          ROUNDS: ${{ github.event_name == 'pull_request' && '5' || '25' }}
+        run: .github/scripts/zig-stress.sh "$ROUNDS" "$RUNNER_TEMP/stress"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
@@ -593,8 +615,10 @@ jobs:
             ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" \
             .github/scripts/zig-coverage.sh --part "$RUNNER_TEMP/coverage"
 
-      # One tarball: the kcov reports are thousands of small files (a run of each helper).
+      # One tarball: the kcov reports are thousands of small files (a run of each helper). Not on
+      # a pull request, which merges nothing: it only sees the parts run (about 1 GB a part).
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.event_name != 'pull_request'
         with:
           name: coverage-raw-${{ matrix.part }}
           path: ${{ runner.temp }}/coverage/raw.tar.gz
@@ -606,7 +630,7 @@ jobs:
   coverage:
     name: Coverage
     needs: [scope, coverage-part]
-    if: always() && needs.scope.outputs.coverage == 'true'
+    if: always() && needs.scope.outputs.coverage == 'true' && github.event_name != 'pull_request'
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
@@ -651,7 +675,8 @@ jobs:
             ${{ runner.temp }}/coverage/summary.md
           retention-days: 30
 
-  # About 25 minutes each: two ten-minute passes after the build.
+  # About 25 minutes each: two ten-minute passes after the build; a pull request runs 90 seconds a
+  # pass.
   store-stress:
     name: Store stress (${{ matrix.arch }})
     needs: scope
@@ -680,7 +705,7 @@ jobs:
         env:
           ZIG_RUNNER_REQUIRE_NATIVE: "1"
           ZIG_TEST_FILTER: native store under load
-          ZIG_TEST_STORE_STRESS_SECONDS: "600"
+          ZIG_TEST_STORE_STRESS_SECONDS: ${{ github.event_name == 'pull_request' && '90' || '600' }}
           ZIG_TEST_STORE_STRESS_PROCS: "8"
         run: |
           # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.

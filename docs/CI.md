@@ -43,7 +43,7 @@ unreported instead, and the merge queue waiting for it.
 | `version` | daily, or by hand | cuts the release, after approval |
 | `security` | pull requests, weekly | gitleaks and dependency review |
 | `codeql` | pull requests, merge queue, `main`, weekly | CodeQL `security-extended` |
-| `analysis` | nightly | fuzzing, Valgrind, ThreadSanitizer, stress, coverage |
+| `analysis` | nightly; a lighter run on pull requests | fuzzing, Valgrind, ThreadSanitizer, stress, coverage |
 | `compare` | weekly | the comparison tools against the implementations they follow |
 | `mutation` | by hand | mutation testing of one module |
 | `scorecard` | weekly | [OpenSSF Scorecard](https://scorecard.dev) |
@@ -137,8 +137,16 @@ setup, which must stay off for its uploads to be accepted.
 
 ### analysis
 
-Nightly, for the runner's own code. A pull request that adds or edits a test runs just those tests
-under Valgrind (`.github/scripts/changed-tests.sh`).
+Nightly, at full length, for the runner's own code. A pull request gets a lighter run, because the
+whole suite costs about 6 runner-hours (34 jobs): a pull request that adds or edits a test runs just
+those tests under Valgrind (`.github/scripts/changed-tests.sh`), and one that changes the workflow,
+its scripts or the zstd decoder (`ci-scope.sh analysis`) also runs Fuzz at 50K runs a target, one
+Stress job of 5 rounds; one that changes the runner's code (`ci-scope.sh tsan`) runs both
+ThreadSanitizer jobs, native and end to end; one that changes the native store (`ci-scope.sh
+store`) runs Store stress for 90 seconds a pass, and Store crash. None of these is a required check.
+What a pull request leaves to the night: every test under Valgrind, the full fuzz budgets, 100
+stress rounds, ten-minute store stress passes, and Coverage (a change to Coverage's own tooling
+runs its four parts, uploading and merging nothing).
 
 - **Fuzz** runs each of `runner/src/fuzz.zig`'s targets with Zig's coverage-guided fuzzer
   (`.github/scripts/zig-fuzz.sh`, LLVM-built, for a bounded number of runs): an image layer's tar,
@@ -169,9 +177,9 @@ under Valgrind (`.github/scripts/changed-tests.sh`).
   the runner binary those tests start, merged into one report from four parts. The `coverage`
   artifact holds the HTML report, Cobertura XML and JSON (`summary.json` has the total, and each
   directory's and file's coverage); the job summary lists the security-relevant files,
-  least-covered first. Nothing is sent to a coverage service. It also runs on every pull request
-  that changes `runner/src`, reporting without failing; `COVERAGE_MIN=<percent>` on its step makes
-  it fail below a total. Locally, with kcov installed: `.github/scripts/zig-coverage.sh
+  least-covered first. Nothing is sent to a coverage service. It runs at night, reporting without
+  failing (a pull request would upload about 1 GB of raw reports a part); `COVERAGE_MIN=<percent>`
+  on its step makes it fail below a total. Locally, with kcov installed: `.github/scripts/zig-coverage.sh
   /tmp/coverage`, then open `/tmp/coverage/html/index.html`.
 
 ### compare
