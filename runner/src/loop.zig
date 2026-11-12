@@ -176,6 +176,13 @@ pub fn pool(c: Runner, n: u32) !Exit {
         m.native = c.cfg.backend == .native;
         m.health_interval_ms = c.cfg.health_interval_secs *| std.time.ms_per_s;
         m.engine.source = engineSource(c.cfg);
+        // Only a root runner shares the record: its directory is root's, so no other user can
+        // write the reservations the gates take on trust (`admission.Budget`).
+        if (c.cfg.shared_memory_budget and std.os.linux.geteuid() == 0) m.budget = .open(
+            c.io,
+            admission.Budget.default_path,
+            try poolFileName(c.arena, c.cfg.name_prefix),
+        );
         break :m m;
     } else null;
     if (memory) |m| if (n > 0) {
@@ -209,6 +216,8 @@ pub fn pool(c: Runner, n: u32) !Exit {
     };
     // Writes what is not yet written once the sampling below has ended.
     defer if (memory) |m| m.flush();
+    // And takes this pool's reservations out of the machine's record.
+    defer if (memory) |m| m.release();
     // Measures the jobs running, for what jobs of their names reserve next; ends with the pool.
     var sampling: ?std.Io.Future(void) = if (memory) |m|
         c.io.concurrent(sampleAndReport, .{ c, m }) catch null
