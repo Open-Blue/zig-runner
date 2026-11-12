@@ -1320,7 +1320,8 @@ fn withSlash(arena: Allocator, url: []const u8) ![]const u8 {
 /// Ends the broker session; best effort, on the way out.
 fn deleteSession(c: Runner, base: []const u8, sid: []const u8, token: []const u8) void {
     const url = std.fmt.allocPrint(c.arena, "{s}session?sessionId={s}", .{ base, sid }) catch "";
-    _ = broker.call(c.arena, c.io, .DELETE, url, token, null) catch {};
+    _ = broker.call(c.arena, c.io, .DELETE, url, token, null) catch |e|
+        std.log.warn("runner: its broker session was not deleted: {t}; GitHub drops it when it expires", .{e});
 }
 
 /// `prefix` (`RUNNER_NAME_PREFIX`) as a file name: letters, digits, `_`, `-` and `.` as they are,

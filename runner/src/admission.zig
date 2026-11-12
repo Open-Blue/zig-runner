@@ -52,6 +52,7 @@
 //! that outgrows its estimate meets its `memory.high` (`nativeHighMb`) and is slowed and reclaimed
 //! there, rather than taking memory its neighbours were admitted against; while the host has
 //! memory to spare the limit moves out of its way (`Admission.growHigh`).
+const proc_stats = @import("proc_stats.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -595,6 +596,7 @@ pub const Admission = struct {
         a.health_last_ms = now_ms;
         const engine = if (a.engine.dir) |dir| readEngine(a.io, dir) else null;
         var snap = readHealth(a.io, a.paths);
+        snap.proc = proc_stats.read();
         snap.reserved_mb = a.reserved(now_ms, a.polling, true).mb;
         var jobs: [max_health_jobs]HealthJob = undefined;
         var listed: usize = 0;
@@ -2402,6 +2404,8 @@ pub const HealthSnapshot = struct {
     reserved_mb: u64 = 0,
     running: u32 = 0,
     waiting: u32 = 0,
+    /// The runner process's own (`proc_stats`); null in tests.
+    proc: ?proc_stats.Stats = null,
 };
 
 /// A job running, for the health line.
@@ -2502,6 +2506,18 @@ pub fn writeHealth(
     jobs: []const HealthJob,
     more: u32,
 ) std.Io.Writer.Error!void {
+    try writeHealthMachine(w, h, jobs, more);
+    // The runner process's own, on a line of its own, so the job list keeps its place:
+    // `health: proc rss=63M anon=60M thr=24 fds=71 mounts=29 zombies=0 heap=41M/41200`.
+    if (h.proc) |p| try w.print("\nhealth: proc {f}", .{p});
+}
+
+fn writeHealthMachine(
+    w: *std.Io.Writer,
+    h: HealthSnapshot,
+    jobs: []const HealthJob,
+    more: u32,
+) std.Io.Writer.Error!void {
     try w.print("health: mem_avail={f} swap_free={f} psi_mem={f}/{f} psi_io={f} ", .{
         Mb{ .v = h.available_mb },
         Mb{ .v = h.swap_free_mb },
@@ -2562,6 +2578,26 @@ test "the health line: fixed inputs, exact text" {
         "health: mem_avail=2310M swap_free=1024M psi_mem=0.12/0.00 psi_io=1.50 " ++
             "load=0.52/0.40/10.35 reserved=3072M running=2 waiting=1 " ++
             "jobs=[build@3m12s=812M zig_test@45s=~1843M]",
+        w.buffered(),
+    );
+}
+
+test "the health line: the runner process's own stats follow on a line of their own" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeHealth(&w, .{ .proc = .{
+        .rss_kb = 64 * 1024,
+        .anon_kb = 61 * 1024,
+        .threads = 24,
+        .fds = 71,
+        .mounts = 29,
+        .zombies = 0,
+        .heap_bytes = 41 * 1024 * 1024,
+        .heap_blocks = 41200,
+    } }, &.{}, 0);
+    try std.testing.expectEqualStrings(
+        "health: mem_avail=? swap_free=? psi_mem=?/? psi_io=? load=? reserved=0M running=0 waiting=0\n" ++
+            "health: proc rss=64M anon=61M thr=24 fds=71 mounts=29 zombies=0 heap=41M/41200",
         w.buffered(),
     );
 }

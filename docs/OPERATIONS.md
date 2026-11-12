@@ -267,6 +267,15 @@ jobs running and waiting, and for each running job its name, elapsed time and wo
 `~` when it is the engine's, which every job on it shares). After a machine drops off, the last
 `health:` lines in the journal show what it looked like (`journalctl -u <unit> | grep health:`).
 
+Each `health:` line is followed by the runner process's own, `health: proc rss=… anon=… thr=… fds=…
+mounts=… zombies=… heap=…/blocks`: its resident and anonymous memory, threads, open descriptors,
+mounts in its namespace, children that exited and were never waited for, and what its allocator has
+handed out and not taken back (bytes and blocks). Each job also ends with one `job-end:` line: the
+same figures once its teardown ran, and how they changed while it ran (`dheap`, `dblocks`, `dfds`,
+`dthr`, `dmounts`). Other jobs of the process change them too, so read them as a trend: a heap,
+descriptor count or mount count that only climbs across jobs is a leak
+(`journalctl -u <unit> | grep job-end:`). A zombie child is logged as a warning at the job's end.
+
 ### An engine that stops answering
 
 An engine that stops answering altogether (frozen, deadlocked) would hold a step for good. So a

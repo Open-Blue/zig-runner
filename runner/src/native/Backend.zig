@@ -1552,7 +1552,11 @@ pub fn deinit(b: *Backend) void {
 
 fn detachNetns(arena: Allocator, path: []const u8) void {
     const p = arena.dupeSentinel(u8, path, 0) catch return;
-    _ = std.os.linux.umount2(p, std.os.linux.MNT.DETACH);
+    switch (std.os.linux.errno(std.os.linux.umount2(p, std.os.linux.MNT.DETACH))) {
+        // Not mounted, or not there: nothing to detach (the sweep asks of every job's directory).
+        .SUCCESS, .INVAL, .NOENT => {},
+        else => |e| std.log.warn("native: {s} was not detached: {t}", .{ path, e }),
+    }
 }
 
 pub const removeTree = Store.removeTree;

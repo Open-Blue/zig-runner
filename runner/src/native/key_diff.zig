@@ -249,7 +249,7 @@ pub fn writeIndex(
     const cwd = std.Io.Dir.cwd();
     cwd.writeFile(io, .{ .sub_path = tmp, .data = text }) catch return;
     cwd.rename(tmp, cwd, indexPath(arena, root, id) catch return, io) catch |e| {
-        std.log.debug("native: the step index cannot be written: {s}", .{@errorName(e)});
+        std.log.warn("native: the step index cannot be written: {s}; the step is not cached by its inputs", .{@errorName(e)});
         cwd.deleteFile(io, tmp) catch |e2| std.log.debug("native: {s}: {s}", .{ tmp, @errorName(e2) });
     };
 }
@@ -277,7 +277,7 @@ pub fn writeEntries(arena: Allocator, io: std.Io, root: []const u8, id: []const 
     const cwd = std.Io.Dir.cwd();
     cwd.writeFile(io, .{ .sub_path = tmp, .data = text }) catch return;
     cwd.rename(tmp, cwd, path, io) catch |e| {
-        std.log.debug("native: the step's size cannot be written: {s}", .{@errorName(e)});
+        std.log.warn("native: the step's size cannot be written: {s}; its next upper is chosen without it", .{@errorName(e)});
         cwd.deleteFile(io, tmp) catch |e2| std.log.debug("native: {s}: {s}", .{ tmp, @errorName(e2) });
     };
 }
