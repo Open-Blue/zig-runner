@@ -1,0 +1,3 @@
+kind: Changed
+body: '`RUNNER_NATIVE_DEFER_COLLECT=false` runs a native job''s store upkeep before its end returns, as before (default true: on a thread after it); `native-phases.sh` reads the upkeep''s own log line, which names the jobs it served.'
+time: 2026-11-11T11:05:44.055547125-05:00

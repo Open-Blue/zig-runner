@@ -302,6 +302,7 @@ RUNNER_NATIVE_VOLUMES_MAX_MB=16384                # default; the cache volumes' 
 RUNNER_NATIVE_IMAGES_MAX_MB=8192                  # default; images', rootfs' and seeds' cap, 0 for none ("Eviction")
 RUNNER_NATIVE_MIN_FREE_PCT=10                     # default; the disk's floor, 0 for none ("Eviction")
 RUNNER_NATIVE_ROOTLESS=0                          # default; 1 for a rootless runner
+RUNNER_NATIVE_DEFER_COLLECT=true                  # default; false runs a job's store upkeep before its end returns
 RUNNER_NATIVE_IDMAPPED_UPPER=true                 # default; false shifts each layer's ids with a
                                                   # walk instead of writing them through an
                                                   # idmapped upper ("The canonical ids")
@@ -834,6 +835,29 @@ What it covers, as built:
   whole (by `meta` and their files' lengths, without reading them) go too; so an upgrade across a
   `store_format` bump empties `layers/` at its first job's end, as an older format's meta is not
   whole to it. What is beside the layers is the next section's ("Eviction").
+  The job's end hands this, and the sync of the layers' directory that makes its renames durable,
+  to a thread (`collector.zig`), so the runner polls for its next job without waiting for them (on
+  a Pi 5's SD card they took 12-24 ms of a job's end, and 200-700 ms under load). One thread at a
+  time, and jobs ending while it works are served by one pass, with one `fsync` of the directory
+  for the batch (an error is reported once per descriptor); a new job's set-up does not wait for it
+  (the first job after a boot waits for a pass at most, `checkOncePerBoot`). The cap is held to
+  within a sixteenth of it (at least 64 MiB) by each runner process: it counts what its jobs
+  publish, after the rename, since the last pass (`Store.lagFits`), so with P runner processes on
+  one store the overshoot can be about P margins until the next pass. A job's end that finds its
+  count past the margin, the disk short of its floor, no pass yet since the process began, a job
+  whose sync failed (it drops its layers first), or a full queue, waits for the jobs handed over
+  before it (not for the thread to be idle) and collects before it returns, as it did.
+  `RUNNER_NATIVE_DEFER_COLLECT=false` does that for every job. When #485's deferred sync is merged,
+  its settle, which measures a pending layer's bytes again, must add the difference (new minus
+  old) to `added`. A stopping runner waits without a limit for the syncs and for the eviction of
+  layers in doubt after a failed one, and five seconds for the collect; a pass cut short leaves
+  what a killed `collect` always left (renamed-away layers, swept at the next). A failed directory
+  sync is dealt with on the thread, after the next job may have begun: `dropUnsynced` can meet a
+  layer that job already holds, which stays (its data was synced before its rename; only the
+  rename was in doubt). What a pass evicts is as it was: nothing a job holds, in the order of use
+  the job's end left (`touchChain` still runs before it returns). Its timings are logged as
+  "store upkeep of job(s) IDS", beside the job's `native phases` line, whose `collect` is then the
+  hand-over only (`native-phases.sh` reads both).
 - **Flattening**: before a step on a stack of 100 layers (`default_flatten_at`), the stack is
   merged into one (`Store.flatten`): later entries win, whiteouts are kept (they hide the
   rootfs), opaque directories stay opaque, files are hard links and directories are made with

@@ -8,6 +8,7 @@ const sandbox = @import("native/sandbox.zig");
 const net = @import("native/net.zig");
 const nft = @import("native/nft.zig");
 const key_diff = @import("native/key_diff.zig");
+const collector = @import("native/collector.zig");
 
 const forward = @import("native/forward.zig");
 const tool_trees = @import("native/tool_trees.zig");
@@ -34,6 +35,7 @@ comptime {
     _ = @import("native/Store.zig");
     _ = @import("native/evict.zig");
     _ = @import("native/reaper.zig");
+    _ = @import("native/collector.zig");
     _ = @import("native/sync_choice.zig");
     _ = @import("native/sandbox.zig");
     _ = @import("native/net.zig");
@@ -258,6 +260,13 @@ pub fn main(init: std.process.Init) !u8 {
     var sweep: StaleSweep = .{ .gpa = init.gpa, .io = io, .cfg = &cfg, .log = log };
     sweep.start(stale);
     defer sweep.stop();
+    // A job's upkeep of the store that its end handed to a thread is let finish: its syncs and the
+    // eviction of what a failed one left in doubt without a limit, its collect within one
+    // (`collector.drain`). A second signal ends the wait at once.
+    defer {
+        collector.drainSync(io);
+        _ = collector.drain(io, 5000);
+    }
     return runPool(init, &cfg, log, err, secrets, name, if (store) |*st| st else null);
 }
 

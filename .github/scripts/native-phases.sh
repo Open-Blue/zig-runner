@@ -9,14 +9,16 @@
 #   NATIVE_PHASES_BY_JOB=1 native-phases.sh LOG    one table per job name as well
 #
 # Per phase: how many samples, their median, the 90th percentile and the largest, and the median
-# of each job's total for the phase (what it adds to a job). Then the median job's set-up (store
+# of each job's total for the phase (what it adds to a job). A job's store upkeep that ran after its
+# end returned has its own line ("store upkeep of job(s) IDS"): read here too, its total as `upkeep`,
+# one sample for the pass, which serves every job it names; by job it goes to the jobs it names. Then the median job's set-up (store
 # to base) and teardown (services to collect). The e2e harness prints it after a native pass
 # (e2e.sh check); on razorbill, from the bench instance's journal after a run of the suite.
 set -euo pipefail
 
 order="store sweep dir cgroup resolver slot nat netns image provision caches actions base claim
 spawn namespaces idmap overlay binds root run exit unshift size record sync sync_wb sync_fsync sync_meta syncfs rename flatten
-services cgroup_rm tool_walk veth_rm tree_rm collect_touch collect_syncdir collect_scan collect_evict collect_rest collect"
+services cgroup_rm tool_walk veth_rm tree_rm collect_touch collect_syncdir collect_scan collect_evict collect_rest collect upkeep"
 
 table() {
 	awk -v order="$order" '
@@ -37,29 +39,44 @@ table() {
 	BEGIN { setup = "store sweep dir cgroup resolver slot nat netns image provision caches actions base"
 		teardown = "services cgroup_rm tool_walk veth_rm tree_rm collect" }
 	{
+		# A jobs store upkeep that ran after its end returned (`collector.zig`) has a line of its
+		# own, naming the jobs it served: its parts count as samples like the jobs, its total as
+		# `upkeep` (`collect` is then only the hand-over), once for the line.
+		up = index($0, "store upkeep of job(s) ")
 		at = index($0, "native phases (ms): ")
-		if (at == 0) next
-		jobs++
-		rest = substr($0, at + 20)
+		if (up > 0) {
+			at = index($0, "(ms): ")
+			if (at == 0) next
+			rest = substr($0, at + 6)
+			upkeeps++
+		} else {
+			if (at == 0) next
+			jobs++
+			rest = substr($0, at + 20)
+		}
 		n = split(rest, kv, " ")
 		su = 0; td = 0
 		for (i = 1; i <= n; i++) {
 			eq = index(kv[i], "=")
 			if (eq == 0) continue
 			name = substr(kv[i], 1, eq - 1)
+			if (up > 0 && name == "collect") name = "upkeep"
 			m = split(substr(kv[i], eq + 1), v, ",")
 			total = 0
 			for (k = 1; k <= m; k++) { samples[name] = samples[name] " " v[k]; total += v[k] }
 			totals[name] = totals[name] " " total
 			if (index(" " setup " ", " " name " ")) su += total
-			if (index(" " teardown " ", " " name " ")) td += total
+			if (up == 0 && index(" " teardown " ", " " name " ")) td += total
 		}
+		if (up > 0) next
 		setups = setups " " su
 		teardowns = teardowns " " td
 	}
 	END {
 		if (jobs == 0) { print "no native phases lines"; exit }
-		printf "%d jobs\n", jobs
+		printf "%d jobs", jobs
+		if (upkeeps > 0) printf ", %d upkeep passes off the jobs path", upkeeps
+		printf "\n"
 		printf "%-11s %7s %9s %9s %9s %12s\n", "phase (ms)", "samples", "median", "p90", "max", "per job"
 		n = split(order, names, /[ \n]+/)
 		for (i = 1; i <= n; i++) {
@@ -76,9 +93,18 @@ input=$(cat "$@")
 printf '%s\n' "$input" | table
 if [[ ${NATIVE_PHASES_BY_JOB:-} == 1 ]]; then
 	names=$(printf '%s\n' "$input" | sed -nE "s/.*job [^ ]+ '([^']*)': native phases.*/\1/p" | sort -u)
+	# A name's jobs' upkeep lines too: those that name one of its job ids.
+	upkeep_of() {
+		local ids
+		ids=$(printf '%s\n' "$input" | grep -F "'$1': native phases" | sed -nE "s/.*job ([0-9]+) '.*/\1/p" | paste -sd'|')
+		[[ -n $ids ]] && printf '%s\n' "$input" | grep -E "store upkeep of job\(s\) ([0-9]+,)*($ids)[, ]" || true
+	}
 	while IFS= read -r name; do
 		[[ -n $name ]] || continue
 		printf '\n%s: ' "$name"
-		printf '%s\n' "$input" | grep -F "'$name': native phases" | table
+		{
+			printf '%s\n' "$input" | grep -F "'$name': native phases"
+			upkeep_of "$name"
+		} | table
 	done <<<"$names"
 fi

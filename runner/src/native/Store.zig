@@ -24,6 +24,7 @@
 const Store = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 
 const Allocator = std.mem.Allocator;
@@ -60,6 +61,10 @@ epoch: ?Epoch = null,
 /// Whether an evicted layer's tree is deleted by `reaper`'s thread, after the job's end has
 /// returned, rather than by `collect`. Off in tests that count what is left when it returns.
 defer_delete: bool = false,
+/// Whether a job's end hands its upkeep (the layers' directory synced, `collect`) to `collector`'s
+/// thread, to run once the runner is polling again, instead of running it before it returns. A
+/// store that may be over its cap runs it inline all the same (`lagFits`).
+defer_collect: bool = false,
 
 pub const default_max_bytes: u64 = 10 * 1024 * 1024 * 1024;
 
@@ -831,6 +836,10 @@ fn publishStaged(
         .EXIST, .NOTEMPTY => return error.PublishLost,
         else => return error.Publish,
     }
+    // Counted once the layer is in `layers/`, not before: a pass whose scan began meanwhile would
+    // not see it and would also take what was added so far off (`collectLocked`), leaving it in
+    // neither. Counted after, a pass that does see it only counts it twice, until the next.
+    _ = added.fetchAdd(accounted(m), .monotonic);
     // The rename is not synced here: an entry whose rename a crash lost is only a miss, made
     // again. The job syncs the layers' directory once, at its end (`syncLayers`), and until then
     // the entry is in its log: one a failed sync leaves in doubt is evicted (`dropUnsynced`).
@@ -1075,6 +1084,52 @@ pub fn syncCursor(arena: Allocator, root: []const u8) ?linux.fd_t {
     return openRoot(arena, root) catch null;
 }
 
+/// A copy of this store for `collector`'s thread, all of it in `arena` so that the job's own can go:
+/// the root, and the job's log as it stands (the layers renamed since the last good sync, which the
+/// thread's `syncLayers` makes durable or `dropUnsynced` evicts). Null when `arena` has no room, and
+/// for a job whose sync already failed: that one drops its layers before it returns, as it did.
+pub fn detach(s: Store, arena: Allocator) ?Store {
+    var c = s;
+    c.root = arena.dupe(u8, s.root) catch return null;
+    c.sync_fd = null;
+    c.sync_log = null;
+    if (s.sync_log) |l| {
+        if (l.failed) return null;
+        const copy = arena.create(SyncLog) catch return null;
+        copy.* = .{};
+        for (l.since.items) |name| copy.since.append(arena, arena.dupe(u8, name) catch return null) catch return null;
+        c.sync_log = copy;
+    }
+    return c;
+}
+
+/// The layers' directory of `s` synced once for the jobs whose logs are `logs`: one descriptor, one
+/// `fsync`, since an error is reported once per descriptor and a second job's fresh one would not
+/// see what the first's found. A failure marks every log (`dropUnsynced` then evicts what each
+/// renamed), a success clears them.
+pub fn syncLayersBatch(s: Store, arena: Allocator, logs: []const *SyncLog) void {
+    const p = join(arena, s.root, "layers") catch return markAll(logs);
+    const opened: ?linux.fd_t = if (builtin.is_test and test_dir_fd != null) null else openRoot(arena, p) catch |e| {
+        std.log.warn("native: cannot open {s} to sync it ({s}); the layers just published are in doubt", .{ p, @errorName(e) });
+        return markAll(logs);
+    };
+    defer if (opened) |f| {
+        _ = linux.close(f);
+    };
+    const fd = opened orelse test_dir_fd.?;
+    const e = linux.errno(linux.fsync(fd));
+    if (e == .SUCCESS) {
+        for (logs) |l| l.since.clearRetainingCapacity();
+        return;
+    }
+    std.log.warn("native: cannot sync {s} ({t}); the layers just published are in doubt", .{ p, e });
+    markAll(logs);
+}
+
+fn markAll(logs: []const *SyncLog) void {
+    for (logs) |l| l.failed = true;
+}
+
 pub fn syncLayers(s: Store, arena: Allocator) void {
     const p = join(arena, s.root, "layers") catch return;
     const fd = openRoot(arena, p) catch |e| {
@@ -1251,8 +1306,55 @@ pub fn collectTimed(s: Store, arena: Allocator, io: std.Io, ph: ?*phases.Phases)
     } else s.collectLocked(arena, io, ph, t);
 }
 
+/// What the layers added up to when the last `collect` had evicted what it would (`maxInt` before
+/// any ran in this process), and the bytes published since one began: together what the store
+/// holds, as far as a job's end knows without a scan (`lagFits`). The runner's own: another
+/// process's layers show at its next collect.
+var known_total: std.atomic.Value(u64) = .init(std.math.maxInt(u64));
+var added: std.atomic.Value(u64) = .init(0);
+
+/// How far past its cap the store may be before a job's end collects itself rather than leave it to
+/// `collector`: a sixteenth, and at least 64 MiB, so a store that sits at its cap, as a busy one
+/// does, is not collected inline for each job's layers.
+fn lagMargin(max_bytes: u64) u64 {
+    return @max(max_bytes / 16, 64 * 1024 * 1024);
+}
+
+/// What the store holds as far as a job's end knows (`lagFits`). Tests.
+pub fn knownBytes() u64 {
+    return known_total.load(.monotonic) +| added.load(.monotonic);
+}
+
+/// Tests: the store's total known, at zero, as a pass would leave an empty store. Until a pass has
+/// run in the process it is unknown (the maximum), and what is added to it saturates.
+pub fn testKnownEmpty() void {
+    known_total.store(0, .monotonic);
+    added.store(0, .monotonic);
+}
+
+/// Tests: `collectLocked` holds after its scan while `test_pause_after_scan` is set, and says it is
+/// there in `test_scanned`, so a test can publish or open a layer in the middle of a pass.
+pub var test_pause_after_scan: std.atomic.Value(bool) = .init(false);
+pub var test_scanned: std.atomic.Value(bool) = .init(false);
+/// Tests: the descriptor of the layers' directory that a batch's sync uses instead of opening it.
+pub var test_dir_fd: ?linux.fd_t = null;
+
+fn lagFitsOf(known: u64, extra: u64, max_bytes: u64) bool {
+    return known +| extra <= max_bytes +| lagMargin(max_bytes);
+}
+
+/// Whether a collect may wait for `collector` (a job's end returns first): the store is not known
+/// to be past its cap by more than `lagMargin`, the disk is not short, and a collect has run since
+/// this process began. Collects lagging behind a burst of jobs show here as `added` growing until
+/// it fails, and then the job's end collects, as it did.
+pub fn lagFits(s: Store, arena: Allocator, io: std.Io) bool {
+    if (!lagFitsOf(known_total.load(.monotonic), added.load(.monotonic), s.max_bytes)) return false;
+    return (Eviction.shortOf(arena, io, s) orelse 0) == 0;
+}
+
 fn collectLocked(s: Store, arena: Allocator, io: std.Io, ph: ?*phases.Phases, start: u64) void {
     var t = start;
+    const added_before = added.load(.monotonic);
     const cwd = std.Io.Dir.cwd();
     const layers = join(arena, s.root, "layers") catch return;
     var dir = cwd.openDir(io, layers, .{ .iterate = true }) catch return;
@@ -1305,6 +1407,10 @@ fn collectLocked(s: Store, arena: Allocator, io: std.Io, ph: ?*phases.Phases, st
         }) catch return;
     }
     if (ph) |p| t = p.since(arena, .collect_scan, t);
+    if (builtin.is_test) {
+        test_scanned.store(true, .release);
+        while (test_pause_after_scan.load(.acquire)) io.sleep(.fromMilliseconds(1), .awake) catch break;
+    }
     // The disk's floor counts here first: a layer is the cheapest thing the store has to make
     // again. So under it a layer goes as the rest does (`evict.floor`), sparing recent use, and
     // only past the cap whatever its use.
@@ -1329,6 +1435,9 @@ fn collectLocked(s: Store, arena: Allocator, io: std.Io, ph: ?*phases.Phases, st
         }
     }
     if (ph) |p| t = p.since(arena, .collect_evict, t);
+    // What this pass saw, less what it evicted: layers published after its scan are in `added`.
+    known_total.store(total, .monotonic);
+    _ = added.fetchSub(added_before, .monotonic);
     s.dropKeyLocks(arena, io);
     key_diff.sweep(arena, io, s.root);
     Eviction.run(s, io);
@@ -3410,7 +3519,7 @@ test "native store: a tree's walk has no depth limit, and fails closed on what i
 
 /// A store under `tmp`, and a step's layer published in it under `key` (held: the caller closes
 /// it), with a 5000-byte file in its tree.
-fn testLayer(arena: Allocator, io: std.Io, tmp: std.testing.TmpDir, s: *Store, name: []const u8) !struct { Key, Layer } {
+pub fn testLayer(arena: Allocator, io: std.Io, tmp: std.testing.TmpDir, s: *Store, name: []const u8) !struct { Key, Layer } {
     const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
     if (s.root.len == 0) {
         s.root = try std.fmt.allocPrint(arena, "{s}/store", .{root});
@@ -3575,7 +3684,7 @@ test "native store: under the disk's floor a pass takes what its budget allows o
 }
 
 /// What `layers/` holds, names only.
-fn layerNames(arena: Allocator, io: std.Io, s: Store) ![]const []const u8 {
+pub fn layerNames(arena: Allocator, io: std.Io, s: Store) ![]const []const u8 {
     var names: std.ArrayList([]const u8) = .empty;
     var d = try std.Io.Dir.cwd().openDir(io, try join(arena, s.root, "layers"), .{ .iterate = true });
     defer d.close(io);
@@ -3865,4 +3974,53 @@ test "native store: trees queued while a collect holds the reaper wait for its r
     reaper.release(io);
     reaper.drain(io);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, ".dead-0123456789abcdef", .{}));
+}
+
+test "native store: the cap is held to within the margin, and a collect lagging past it is collected inline" {
+    const gib: u64 = 1024 * 1024 * 1024;
+    // The margin: a sixteenth, at least 64 MiB.
+    try std.testing.expectEqual(@as(u64, 64 * 1024 * 1024), lagMargin(0));
+    try std.testing.expectEqual(@as(u64, gib / 16 * 10), lagMargin(10 * gib));
+    // A store at its cap, as a busy one sits, with a job's layers added, may wait for the thread.
+    try std.testing.expect(lagFitsOf(10 * gib, 100 * 1024 * 1024, 10 * gib));
+    // Burst of jobs while collects lag: `added` grows past the margin and the job's end collects.
+    try std.testing.expect(!lagFitsOf(10 * gib, 10 * gib / 16 + 1, 10 * gib));
+    // Unknown (no collect yet in this process) is never within the cap.
+    try std.testing.expect(!lagFitsOf(std.math.maxInt(u64), 0, 10 * gib));
+}
+
+test "native store: a collect leaves what the store holds known, publishes add to it, and the disk's floor says inline" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s: Store = .{ .root = "" };
+    const k, const l = try testLayer(arena, io, tmp, &s, "up");
+    _ = k;
+    l.lock.close(io);
+    const bytes = accounted(try metaOf(arena, io, std.fs.path.dirname(l.fs).?));
+    s.collect(arena, io);
+    try std.testing.expectEqual(bytes, known_total.load(.monotonic));
+    // The publish just after the scan is counted until the next collect has seen it.
+    const before = added.load(.monotonic);
+    const k2, const l2 = try testLayer(arena, io, tmp, &s, "up2");
+    _ = k2;
+    l2.lock.close(io);
+    try std.testing.expectEqual(bytes, accounted(try metaOf(arena, io, std.fs.path.dirname(l2.fs).?)));
+    try std.testing.expectEqual(before + bytes, added.load(.monotonic));
+    // Known and under its cap, with the disk's room: the thread may have it. Past the margin, no.
+    s.max_bytes = 100 * 1024 * 1024 * 1024;
+    s.limits.min_free_pct = 0;
+    try std.testing.expect(s.lagFits(arena, io));
+    s.max_bytes = 0;
+    _ = added.fetchAdd(lagMargin(0), .monotonic);
+    try std.testing.expect(!s.lagFits(arena, io));
+    _ = added.fetchSub(lagMargin(0), .monotonic);
+    // The disk short by any measure (the floor at 100 percent): inline, whatever the cap says.
+    s.max_bytes = 100 * 1024 * 1024 * 1024;
+    s.limits.min_free_pct = 100;
+    try std.testing.expect(!s.lagFits(arena, io));
+    s.collect(arena, io);
 }
