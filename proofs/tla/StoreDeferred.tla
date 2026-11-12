@@ -1,5 +1,10 @@
 ---------------------------- MODULE StoreDeferred ----------------------------
 (***************************************************************************)
+(* Documentation, no longer machine-checked: SPIN checks this module's     *)
+(* Promela port, proofs/spin/StoreDeferredModel.pml, action for action,    *)
+(* and the .cfg files' spin-states lines are SPIN's counts, the reference  *)
+(* (proofs/README.md).                                                     *)
+(*                                                                         *)
 (* The native layer store's deferred sync (runner/src/native/Store.zig,   *)
 (* `publishTimed`, `settlePending`, `readEntry`; Backend.zig, `deinit`;    *)
 (* docs/native-backend.md, "A job's last layer is made durable after its   *)

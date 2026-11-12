@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: FastFail. wait-for-checks.sh as it was before #408: a check that never
+/* A mutant SPIN must fail: FastFail. wait-for-checks.sh as it was before #408: a check that never
  * started holds the wait to its end, after every run on the commit has finished.
  * Written from proofs/tla/ReleasePipeline-no-fast-fail.cfg by proofs/spin/cfg.py: change the .cfg, not this. */
 #define MAXMERGES 1

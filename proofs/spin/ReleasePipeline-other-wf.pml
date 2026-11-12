@@ -1,4 +1,4 @@
-/* A finding TLC must fail: FastFailOnChecks. The fast fail waits for every run on the commit but
+/* A finding SPIN must fail: FastFailOnChecks. The fast fail waits for every run on the commit but
  * the waiting workflows', so one that reports no check (codeql, scorecard, a scheduled analysis
  * run made at the commit) holds it after ci's and proofs' runs have finished, up to the deadline
  * when it runs longer. By design (85dc4e8): FastFail, its own property, holds.

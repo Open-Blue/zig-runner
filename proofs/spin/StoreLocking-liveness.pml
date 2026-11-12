@@ -1,5 +1,5 @@
 /* Liveness under weak fairness of each runner, and the safety invariants again, without symmetry
- * (TLC's symmetry reduction is unsound for liveness): two runners, a step key and a build key,
+ * (a symmetry reduction is unsound for liveness): two runners, a step key and a build key,
  * one step a job, a process crash and a hand's change. The machine's crash ends every process, so
  * it adds nothing here.
  * Written from proofs/tla/StoreLocking-liveness.cfg by proofs/spin/cfg.py: change the .cfg, not this.

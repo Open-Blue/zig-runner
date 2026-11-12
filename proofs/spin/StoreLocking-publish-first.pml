@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: NoBuildLost. layers.zig's publish as #299 had it, under the key's lock but
+/* A mutant SPIN must fail: NoBuildLost. layers.zig's publish as #299 had it, under the key's lock but
  * publishing first and looking the key up only once the rename was refused: a collect evicts the
  * layer another builder stored, no job holding it, between the refused rename and the lookup, and
  * the build fails with a layer it built and none stored (found by store_stress.zig).

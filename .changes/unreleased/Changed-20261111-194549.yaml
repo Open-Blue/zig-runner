@@ -1,0 +1,3 @@
+kind: Changed
+body: 'The analysis workflow no longer runs on draft pull requests: it runs once a pull request is marked ready, and on each push after, so drafts'' pushes no longer take the hosted runners the merge queue waits for'
+time: 2026-11-11T19:45:49.310544099-05:00

@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: HeldWhole. ensure taking what it made to be there once it holds the lock
+/* A mutant SPIN must fail: HeldWhole. ensure taking what it made to be there once it holds the lock
  * shared: flock gave the exclusive one up first, and an eviction came between.
  * Written from proofs/tla/StoreEviction-no-down-check.cfg by proofs/spin/cfg.py: change the .cfg, not this. */
 #define NP 2

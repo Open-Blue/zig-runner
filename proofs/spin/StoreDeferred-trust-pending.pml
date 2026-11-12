@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: NoWrongValid. A lookup that ignores the boot a pending mark names (and that
+/* A mutant SPIN must fail: NoWrongValid. A lookup that ignores the boot a pending mark names (and that
  * any job may take a pending layer): after a crash it takes a layer whose data never reached the disk.
  * Written from proofs/tla/StoreDeferred-trust-pending.cfg by proofs/spin/cfg.py: change the .cfg, not this. */
 #define NP 2

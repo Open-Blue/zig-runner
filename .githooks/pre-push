@@ -13,9 +13,9 @@
 #     and hadolint, when the Dockerfile did ("Workflows"), and the unsafe constructs ratchet, always;
 #   - gofmt and go vet for the Go tools under runner/tools, when they changed;
 #   - the Lean proofs, and the hashFiles model against glob.zig, when either changed ("Proofs");
-#   - TLC, when the TLA+ specifications or the release pipeline they model changed ("TLC"; it takes
-#     minutes), and SPIN, when the store's locking models changed (TLA+ or their Promela port in
-#     proofs/spin). CI also runs both on changes to the store's code, which the hook leaves to CI.
+#   - SPIN, when the models (proofs/tla, their Promela ports in proofs/spin) or the release pipeline
+#     they model changed ("store model"). CI also runs it on changes to the store's code, which the
+#     hook leaves to CI.
 #
 # CONTRIBUTING.md, "Git hooks".
 set -euo pipefail
@@ -127,15 +127,9 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 		(cd "$tree/proofs" && lake build >/dev/null) || fail "the proofs do not check: run lake build in proofs/"
 		(cd "$tree" && .github/scripts/glob-lean-diff.sh 2000 "$RANDOM" >&2) || fail "glob.zig and the Lean model differ"
 	fi
-	if grep -qE '^proofs/tla/|^\.github/workflows/(version|release|store-model)\.yml$|^\.github/scripts/(next-version|wait-for-checks|check-names|tlc)\.sh$|^\.github/checks-on-main$' <<<"$changed"; then
-		say "TLC, the store's and the release pipeline's models (minutes)"
-		command -v java >/dev/null || fail "the TLA+ models or the release pipeline changed, and TLC needs Java 11 or later (.github/scripts/tlc.sh)"
-		(cd "$tree" && TLC_DIR="${TLC_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/zig-runner-tlc}" .github/scripts/tlc.sh >/dev/null) ||
-			fail "TLC found an error: .github/scripts/tlc.sh shows it"
-	fi
-	if grep -qE '^proofs/(tla|spin)/|^\.github/workflows/store-model\.yml$|^\.github/scripts/spin\.sh$' <<<"$changed"; then
-		say "SPIN, the store's locking (a minute)"
-		command -v spin >/dev/null || fail "the store's locking models changed, and checking them needs SPIN 6.5.2 (.github/scripts/spin.sh)"
+	if grep -qE '^proofs/(tla|spin)/|^\.github/workflows/(version|release|store-model)\.yml$|^\.github/scripts/(next-version|wait-for-checks|check-names|spin)\.sh$|^\.github/checks-on-main$' <<<"$changed"; then
+		say "SPIN, the store's and the release pipeline's models (a minute)"
+		command -v spin >/dev/null || fail "the models or the release pipeline changed, and checking them needs SPIN 6.5.2 (.github/scripts/spin.sh)"
 		(cd "$tree" && SPIN_DIR="${SPIN_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/zig-runner-spin}" .github/scripts/spin.sh >/dev/null) ||
 			fail "SPIN found an error: .github/scripts/spin.sh shows it"
 	fi

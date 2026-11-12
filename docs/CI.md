@@ -142,7 +142,8 @@ setup, which must stay off for its uploads to be accepted.
 
 ### analysis
 
-Nightly, at full length, for the runner's own code. A pull request gets a lighter run, because the
+Nightly, at full length, for the runner's own code. A draft pull request gets none: it runs once the
+pull request is marked ready, and on each push after. A pull request gets a lighter run, because the
 whole suite costs about 6 runner-hours (34 jobs): a pull request that adds or edits a test runs just
 those tests under Valgrind (`.github/scripts/changed-tests.sh`), and one that changes the workflow,
 its scripts or the zstd decoder (`ci-scope.sh analysis`) also runs Fuzz at 50K runs a target, one
@@ -222,9 +223,9 @@ instrument through a clang pass plugin, which Zig can't load.
 `proofs` checks the [Lean proofs](../proofs/README.md) (the step cache, the regex matcher's loops,
 and the `hashFiles()` walk) and compares the walk's model with `runner/src/glob.zig` on random
 cases. `store model` checks the TLA+ models of the native store's locking and eviction and of the
-release pipeline with SPIN, on their Promela ports, which reach the same states as TLC does
-([proofs/README.md](../proofs/README.md)). Each model's mutants must fail. Its TLC jobs check any
-module that has no port yet, and none on `main` now.
+release pipeline with SPIN, on their Promela ports, which reached the same states as TLC in every
+configuration before TLC was removed; SPIN's counts are now the reference, and the TLA+ modules
+the documentation ([proofs/README.md](../proofs/README.md)). Each model's mutants must fail.
 
 ## Hardening
 

@@ -1,8 +1,8 @@
 /*
  * proofs/tla/ReleasePipeline.tla in Promela, for SPIN (proofs/README.md, "The release pipeline, in
- * TLA+"). The TLA+ module is the documented model and this is the same model, action for action,
- * in the way StoreLockingModel.pml is StoreLocking.tla's (its header says how a module becomes
- * Promela with the same states): a change to one is a change to the other.
+ * TLA+"). The TLA+ module is the documented model, no longer machine-checked, and this is the same
+ * model, action for action, in the way StoreLockingModel.pml is StoreLocking.tla's (its header says
+ * how a module becomes Promela with the same states): a change to one is a change to the other.
  *
  * A configuration (ReleasePipeline*.pml, written from the .cfg of the same name by cfg.py) defines
  * the constants, the invariants and the temporal properties it checks, then includes this file:
@@ -12,8 +12,9 @@
  *   CHK_<Invariant>, LTL_<Property>          one for each the .cfg lists
  * and spin.sh defines LIVENESS when it checks the properties (spin -DLIVENESS).
  *
- * SPIN checks the module's own states: there is no VIEW here, so a safety configuration's count is
- * TLC's without its `VIEW LiveView`, and LiveView's soundness is not needed.
+ * SPIN checks the module's own states: there is no VIEW here (a safety configuration's count was
+ * TLC's without its `VIEW LiveView`, plus one, when TLC still checked it), and LiveView's soundness
+ * is not needed.
  *
  * The module's values, encoded:
  *   Commits    1 .. MAXC; main is mainSeq[0 .. mainLen-1]; a set of commits is a bit mask.

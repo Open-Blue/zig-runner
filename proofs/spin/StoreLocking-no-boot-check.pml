@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: NoBadRead. StoreLocking-boot-check.cfg without `checkOncePerBoot`: a job
+/* A mutant SPIN must fail: NoBadRead. StoreLocking-boot-check.cfg without `checkOncePerBoot`: a job
  * after the crash takes an entry whose tree the disk lost.
  * Written from proofs/tla/StoreLocking-no-boot-check.cfg by proofs/spin/cfg.py: change the .cfg, not this. */
 #define NP 2
