@@ -1,3 +1,3 @@
 kind: Fixed
-body: 'The runner''s console no longer races when two jobs log at once: its lock lives outside the log sink, which LogSink copies whole on every line, so no job reads it unlocked; the test of a job waiting for room in memory gives each waiting job its own log, as the runner does, where both shared one (ThreadSanitizer reported 19 races)'
+body: 'The runner''s console no longer races when two jobs log at once: its lock lives outside the log sink, which LogSink copies whole on every line, so no job reads it unlocked; the test of a job waiting for room in memory gives each waiting job its own log, as the runner does, where both shared one (ThreadSanitizer reported 19 races).'
 time: 2026-11-11T16:26:18.5181368-05:00

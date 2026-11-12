@@ -1,3 +1,3 @@
 kind: Fixed
-body: yamldiff stays on go.yaml.in/yaml/v3, the parser nektos/act reads workflows with, and drops a v4 requirement nothing imports; Renovate no longer proposes its major
+body: yamldiff stays on go.yaml.in/yaml/v3, the parser nektos/act reads workflows with, and drops a v4 requirement nothing imports; Renovate no longer proposes its major.
 time: 2026-11-11T16:46:36.68660753-05:00

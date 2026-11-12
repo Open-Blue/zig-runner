@@ -1,3 +1,3 @@
 kind: Changed
-body: Native jobs that open the tool cache together are all told the last job's walk of its trees, until the first process starts with it mounted, instead of all but one walking it themselves
+body: Native jobs that open the tool cache together are all told the last job's walk of its trees, until the first process starts with it mounted, instead of all but one walking it themselves.
 time: 2026-11-10T22:03:00.258755603-05:00

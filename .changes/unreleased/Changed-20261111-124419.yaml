@@ -1,3 +1,3 @@
 kind: Changed
-body: SPIN checks the store's locking liveness too, with the TLA+ module's own fairness; a new mutant shows the fairness forces no crash
+body: SPIN checks the store's locking liveness too, with the TLA+ module's own fairness; a new mutant shows the fairness forces no crash.
 time: 2026-11-11T12:44:19.246431576-05:00
