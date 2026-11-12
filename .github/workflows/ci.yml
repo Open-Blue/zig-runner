@@ -20,14 +20,25 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # The prefix decides the version a merge into main releases (CONTRIBUTING.md, "Versioning").
-  branch:
-    name: Branch name
-    if: github.event_name == 'pull_request'
+  # The workflows themselves: actionlint for mistakes, zizmor for security; the shell scripts
+  # they and the deployment run, with shellcheck and shfmt; and the Dockerfile, with hadolint
+  # (docs/CI.md). Also the checks that each took a runner of their own for seconds, and waited
+  # minutes for it in the merge queue: the branch name, ZLint and the Go tools. Each of those runs
+  # whatever failed before it (`!cancelled()`), so one failure hides none of the others.
+  workflows:
+    name: Workflows
     runs-on: ubuntu-26.04
-    timeout-minutes: 5
+    timeout-minutes: 20
+    permissions:
+      contents: read # to check out the workflows and the code
     steps:
-      - name: Check the prefix
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The prefix decides the version a merge into main releases (CONTRIBUTING.md, "Versioning").
+      - name: Branch name
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         env:
           BRANCH: ${{ github.head_ref }}
         run: |
@@ -40,19 +51,43 @@ jobs:
               ;;
           esac
 
-  # The workflows themselves: actionlint for mistakes, zizmor for security; the shell scripts
-  # they and the deployment run, with shellcheck and shfmt; and the Dockerfile, with hadolint
-  # (docs/CI.md).
-  workflows:
-    name: Workflows
-    runs-on: ubuntu-26.04
-    timeout-minutes: 15
-    permissions:
-      contents: read # to check out the workflows
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      # ZLint over the runner's Zig (.github/scripts/zlint.sh, its rules in runner/zlint.json): CodeQL
+      # and Semgrep read no Zig, so this is the only static analysis of the runner's own code besides
+      # the compiler. A few seconds, with no Zig to install. Skipped on a change that cannot affect
+      # it (ci-scope.sh tests). Its suppressed-errors rule runs here too, against the baseline of the
+      # sites read and meant: the rule cannot be on in runner/zlint.json (zlint.sh says why), and run
+      # only by analysis.yml's nightly it let two `catch {}` sites (#327, #332) merge and fail that
+      # night. The same binary, so about two seconds more.
+      - name: Whether this change can affect the lint
+        id: lint_scope
+        if: ${{ !cancelled() }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh tests
+
+      - name: ZLint
+        if: ${{ !cancelled() && steps.lint_scope.outputs.run == 'true' }}
+        run: .github/scripts/zlint.sh
+
+      - name: ZLint (suppressed-errors)
+        if: ${{ !cancelled() && steps.lint_scope.outputs.run == 'true' }}
+        run: .github/scripts/zlint.sh suppressed-errors
+
+      # The comparison tools' Go (runner/tools/*diff), with go vet, staticcheck and the race
+      # detector (go-lint.sh): they are test oracles, so a bug in one hides one in the runner.
+      # Skipped on a change that cannot affect them (ci-scope.sh go); compare.yml runs it weekly
+      # whatever changed. Go is on GitHub's runner; it fetches the pinned staticcheck and the
+      # toolchain the go.mods name, checked against Go's checksum database.
+      - name: Whether this change can affect the Go tools
+        id: go_scope
+        if: ${{ !cancelled() }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh go
+
+      - name: go vet, staticcheck and the race detector
+        if: ${{ !cancelled() && steps.go_scope.outputs.run == 'true' }}
+        run: .github/scripts/go-lint.sh
 
       # Go's module proxy and checksum database verify what this downloads.
       - name: actionlint
@@ -173,79 +208,29 @@ jobs:
             sleep $((attempt * 15))
           done
 
-  # ZLint over the runner's Zig (.github/scripts/zlint.sh, its rules in runner/zlint.json): CodeQL
-  # and Semgrep read no Zig, so this is the only static analysis of the runner's own code besides
-  # the compiler. A few seconds, with no Zig to install. Skipped, still reporting, on a change that
-  # cannot affect it (ci-scope.sh tests). Its suppressed-errors rule runs here too, against the
-  # baseline of the sites read and meant: the rule cannot be on in runner/zlint.json (zlint.sh says
-  # why), and run only by analysis.yml's nightly it let two `catch {}` sites (#327, #332) merge
-  # and fail that night. The same binary, so about two seconds more.
-  lint:
-    name: Lint (ZLint)
-    runs-on: ubuntu-26.04
-    timeout-minutes: 10
-    permissions:
-      contents: read # to check out the code
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Whether this change can affect the lint
-        id: scope
-        env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
-        run: .github/scripts/ci-scope.sh tests
-
-      - name: ZLint
-        if: steps.scope.outputs.run == 'true'
-        run: .github/scripts/zlint.sh
-
-      - name: ZLint (suppressed-errors)
-        if: steps.scope.outputs.run == 'true'
-        run: .github/scripts/zlint.sh suppressed-errors
-
-  # The comparison tools' Go (runner/tools/*diff), with go vet, staticcheck and the race detector
-  # (go-lint.sh): they are test oracles, so a bug in one hides one in the runner. Skipped, still
-  # reporting, on a change that cannot affect them (ci-scope.sh go); compare.yml runs it weekly
-  # whatever changed.
-  go:
-    name: Go tools
-    runs-on: ubuntu-26.04
-    timeout-minutes: 15
-    permissions:
-      contents: read # to check out the code
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Whether this change can affect the Go tools
-        id: scope
-        env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
-        run: .github/scripts/ci-scope.sh go
-
-      # Go is on GitHub's runner; it fetches the pinned staticcheck and the toolchain the go.mods
-      # name, checked against Go's checksum database.
-      - name: go vet, staticcheck and the race detector
-        if: steps.scope.outputs.run == 'true'
-        run: .github/scripts/go-lint.sh
-
   # The database tests, which skip themselves without a database: here against TimescaleDB, as
   # deployments use, and required to run (ZIG_TEST_REQUIRE_DB), so this job cannot pass by skipping
   # them. On GitHub's runner. Every test runs here, so here they run under ThreadSanitizer, which
   # fails them on a data race. The database is started by a step, not as a service container, which
   # GitHub would start (about 25 s) before the first step: so it comes up while the tests compile,
   # and is waited for just before they run (ci-database.sh). Skipped, still reporting, on a change
-  # that cannot affect the tests (ci-scope.sh).
+  # that cannot affect the tests (ci-scope.sh). In two parts (ZIG_TEST_PART=K/N, every N-th test,
+  # as `native-root`), each with its own database: in one, at about 280 s, it was the longest job
+  # of a merge-queue run. Each part is a required check of its own (the "main and release
+  # branches" ruleset) and in .github/checks-on-main.
   database:
-    name: Database tests
+    name: Database tests (${{ matrix.part }}/2)
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       contents: read # to check out the code
+    strategy:
+      # Every part reports: one failing does not hide what the other finds.
+      fail-fast: false
+      matrix:
+        part: [1, 2]
     env:
+      ZIG_TEST_PART: ${{ matrix.part }}/2
       PGHOST: 127.0.0.1
       PGPORT: "5432"
       PGUSER: postgres

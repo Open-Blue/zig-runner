@@ -2,7 +2,7 @@
 # Lints the comparison tools' Go: every module under runner/tools (each *diff directory has a
 # go.mod of its own), with `go vet` and staticcheck, and Go's race detector. They are test oracles,
 # so a bug in one hides a bug in the runner. CI runs this on a pull request that changes them
-# (ci.yml, "Go tools") and weekly (compare.yml). A finding fails; one that is wrong for this code is
+# (ci.yml, the "Workflows" job) and weekly (compare.yml). A finding fails; one that is wrong for this code is
 # silenced where it is, with `//lint:ignore <check> <reason>` on the line before.
 #
 #   go-lint.sh          go vet, staticcheck and the race detector

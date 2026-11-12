@@ -5,6 +5,7 @@
 # to these names still waits for the current ones. check-names.sh fails CI on a name here that is
 # not a job run on a push to main.
 Tests (x86_64)
-Database tests
+Database tests (1/2)
+Database tests (2/2)
 Workflows
 Proofs

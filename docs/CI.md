@@ -22,9 +22,9 @@ CI may cache, split and parallelise for speed. The cost of a cold build is measu
 ## Required checks
 
 The ruleset for `main` requires these, and each reports on every pull request and in the merge
-queue: "Branch name", "Workflows", "Tests (x86_64)", "Tests (arm64)", "Native tests as root (…)" in
-two parts per architecture, "Database tests", "Release builds", "Release builds (arm64)", "End to
-end", "Proofs", and `release`'s "Binaries (check)", "Binaries (same as zig build)" and "Image".
+queue: "Workflows", "Tests (x86_64)", "Tests (arm64)", "Native tests as root (…)" in two parts
+per architecture, "Database tests (…)" in two parts, "Release builds", "Release builds (arm64)", "End
+to end", "Proofs", and `release`'s "Binaries (check)", "Binaries (same as zig build)" and "Image".
 
 On a change that can't affect what a job checks, the job reports without running its steps
 (`.github/scripts/ci-scope.sh tests|binaries|proofs|packaging`, each with the files that can). The
@@ -52,26 +52,31 @@ unreported instead, and the merge queue waiting for it.
 
 ### ci
 
-- **Branch name**: the prefix that decides the version ([CONTRIBUTING.md](../CONTRIBUTING.md),
-  "Versioning").
 - **Workflows**: actionlint and [zizmor](https://docs.zizmor.sh), shellcheck and shfmt, hadolint,
   the busybox pin, the check names the release waits for (`check-names.sh`), and the unsafe
-  constructs ratchet.
+  constructs ratchet. Also, as steps, the checks that each took a runner of their own for seconds
+  and waited minutes for it in the merge queue:
+  - **Branch name**: the prefix that decides the version ([CONTRIBUTING.md](../CONTRIBUTING.md),
+    "Versioning").
+  - **ZLint**: [ZLint](https://github.com/DonIsaac/zlint), pinned and checked against its
+    release's checksum, with the rules that find bugs (`runner/zlint.json`; the script says why
+    each other rule is off), and its suppressed-errors rule against a baseline of `catch {}` sites
+    that were read and meant. CodeQL and Semgrep read no Zig, so this is the runner's static
+    analysis.
+  - **Go tools**: `go vet`, staticcheck and the race detector, on a change to `runner/tools`.
+
+  Each runs whatever failed before it, so one failure hides none of the others.
 - **Tests (x86_64)** and **Tests (arm64)**: format, build and tests, natively on each architecture
   as on prod; on x86_64 also the tests on overlayfs, in Docker ("Test, on overlayfs"), and GitHub's
   own expression test cases. On hosted runners CI calls the compiler directly
   (`.github/scripts/zig-test.sh`) rather than `zig build`, which first spends about 100 s compiling
   Zig's build system.
 - **Native tests as root**: the native backend's root-only tests, in two parts per architecture.
-- **Database tests**: against TimescaleDB, every test under ThreadSanitizer.
+- **Database tests**: against TimescaleDB, every test under ThreadSanitizer, in two parts
+  (`ZIG_TEST_PART`), each with its own database.
 - **Release builds** and **Release builds (arm64)**: the release's own builds for both targets in
   ReleaseSafe, so code that doesn't compile for aarch64 fails here rather than after the tag; on
   arm64 the aarch64 binary is run.
-- **Lint (ZLint)**: [ZLint](https://github.com/DonIsaac/zlint), pinned and checked against its
-  release's checksum, with the rules that find bugs (`runner/zlint.json`; the script says why each
-  other rule is off), and its suppressed-errors rule against a baseline of `catch {}` sites that
-  were read and meant. CodeQL and Semgrep read no Zig, so this is the runner's static analysis.
-- **Go tools**: `go vet`, staticcheck and the race detector, on a change to `runner/tools`.
 
 The GitHub client's tests run over real connections to a local server
 (`src/github/testserver.zig`), so how it handles redirects and tokens is tested, not described.
