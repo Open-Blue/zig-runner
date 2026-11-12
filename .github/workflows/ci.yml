@@ -214,12 +214,13 @@ jobs:
   # fails them on a data race. The database is started by a step, not as a service container, which
   # GitHub would start (about 25 s) before the first step: so it comes up while the tests compile,
   # and is waited for just before they run (ci-database.sh). Skipped, still reporting, on a change
-  # that cannot affect the tests (ci-scope.sh). In two parts (ZIG_TEST_PART=K/N, every N-th test,
-  # as `native-root`), each with its own database: in one, at about 280 s, it was the longest job
-  # of a merge-queue run. Each part is a required check of its own (the "main and release
-  # branches" ruleset) and in .github/checks-on-main.
+  # that cannot affect the tests (ci-scope.sh). In three parts (ZIG_TEST_PART=K/N, every N-th
+  # test, as `native-root`), each with its own database: in one, at about 280 s, it was the longest
+  # job of a merge-queue run, and of two parts one ran its tests for 129 s, the other for 21 s.
+  # Each part is a required check of its own (the "main and release branches" ruleset) and in
+  # .github/checks-on-main.
   database:
-    name: Database tests (${{ matrix.part }}/2)
+    name: Database tests (${{ matrix.part }}/3)
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
@@ -228,9 +229,9 @@ jobs:
       # Every part reports: one failing does not hide what the other finds.
       fail-fast: false
       matrix:
-        part: [1, 2]
+        part: [1, 2, 3]
     env:
-      ZIG_TEST_PART: ${{ matrix.part }}/2
+      ZIG_TEST_PART: ${{ matrix.part }}/3
       PGHOST: 127.0.0.1
       PGPORT: "5432"
       PGUSER: postgres
