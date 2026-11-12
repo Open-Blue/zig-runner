@@ -15,10 +15,10 @@ name: codeql
 on:
   push:
     branches: [main]
+  # Not in the merge queue: it is not a required check, and each pull request and each push to main
+  # is analysed already, so a queue group's run took three runners the queue's required jobs were
+  # waiting for. Making it required would mean adding `merge_group:` back.
   pull_request:
-  # The merge queue tests each pull request on top of main; without this the check never reports
-  # there, and could not be made required without holding the queue.
-  merge_group:
   # Weekly, as default setup did: new queries find old code.
   schedule:
     - cron: "41 6 * * 1"

@@ -42,7 +42,7 @@ unreported instead, and the merge queue waiting for it.
 | `provisioned image` | pull requests (build only), `main`, by hand | the default job image with the runner's packages installed, both architectures |
 | `version` | daily, or by hand | cuts the release, after approval |
 | `security` | pull requests, weekly | gitleaks and dependency review |
-| `codeql` | pull requests, merge queue, `main`, weekly | CodeQL `security-extended` |
+| `codeql` | pull requests, `main`, weekly (not the merge queue) | CodeQL `security-extended` |
 | `analysis` | nightly; a lighter run on pull requests | fuzzing, Valgrind, ThreadSanitizer, stress, coverage |
 | `compare` | weekly | the comparison tools against the implementations they follow |
 | `mutation` | by hand | mutation testing of one module |
