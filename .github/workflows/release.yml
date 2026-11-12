@@ -43,7 +43,7 @@ env:
   PUBLISH: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
   # Images by digest; the tag says which release each is (Renovate follows them, renovate.json).
   # Trivy's own;
-  TRIVY_IMAGE: aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+  TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
   # BuildKit, which builds the image (setup-buildx-action would take buildx-stable-1, a moving tag);
   BUILDKIT_IMAGE: moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
   # and the scanner that writes the image's SBOM (BuildKit would take stable-1, a moving tag).
@@ -424,7 +424,7 @@ jobs:
           echo "LATEST=$([[ $newest == "$TAG" ]] && echo true || echo false)" >> "$GITHUB_ENV"
 
       - name: Log in to the registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
