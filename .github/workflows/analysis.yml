@@ -88,8 +88,12 @@ on:
   # working before it merges (workflow_dispatch reaches a workflow only once the default branch
   # has it); one that changes the runner's code runs Valgrind on its changed tests, and Store stress
   # and Store crash when that code is the native store's (ci-scope.sh analysis, store and coverage,
-  # in the Scope job). Not a required check, so the path filter leaves nothing waiting.
+  # in the Scope job). Not a required check, so the path filter leaves nothing waiting. Not while
+  # the pull request is a draft (the Scope job's `if:`): its pushes ran the whole set each, on the
+  # runners the merge queue waits for. It runs once the pull request is marked ready
+  # (`ready_for_review`), and on each push after.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - .github/workflows/analysis.yml
       - .github/scripts/ci-scope.sh
@@ -120,6 +124,8 @@ jobs:
   # required check, so a job its `if:` leaves out holds nothing up.
   scope:
     name: Scope
+    # Every job needs this one, so a draft pull request runs none of them.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
