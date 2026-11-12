@@ -13,6 +13,7 @@
 const Backend = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Sha256 = @import("../sha256.zig").Sha256;
 const job_mod = @import("../job.zig");
 const config = @import("../config.zig");
@@ -30,6 +31,7 @@ const docker = @import("../dagger/docker.zig");
 const cgroup = @import("cgroup.zig");
 const evict = @import("evict.zig");
 const reaper = @import("reaper.zig");
+const collector = @import("collector.zig");
 const volumes = @import("volumes.zig");
 const trees_check = @import("tool_trees.zig");
 const admission = @import("../admission.zig");
@@ -159,6 +161,8 @@ published: bool = false,
 /// What a step is across runs, without its place in the job (`stepIdent`): the cache scope, the
 /// repository, the workflow, the job and its display name. Set in `base`.
 ident: [5][]const u8 = .{ "", "", "", "", "" },
+/// GitHub's id of the job (`check_run_id`), 0 when unknown: what its store upkeep's log line names.
+check_run_id: u64 = 0,
 /// The base's key parts (`below`), which stand where a step's parent layer does in its components.
 below_parts: []const key_diff.Component = &.{},
 /// The components of the key `keyFor` made last, for `claimKey` to compare and `publishTop` to
@@ -277,6 +281,9 @@ pub const Config = struct {
     /// `_apt`, `chown` to other users and `tar` with owners fail, and steps share the host's
     /// network. Off: a rootless runner sends every job to Dagger.
     rootless: bool = false,
+    /// Whether a job's last layer is made durable after its result is reported
+    /// (`RUNNER_NATIVE_DEFER_SYNC`, `Store.defer_sync`).
+    defer_sync: bool = true,
     /// The first host id of the jobs' ranges on a root runner (`RUNNER_NATIVE_SUBID_BASE`): slot
     /// n's 65536 ids start at `subid_base + n * 65536`.
     subid_base: u32 = default_subid_base,
@@ -320,6 +327,9 @@ pub const Config = struct {
     /// kernel and the filesystem allow it (`idmappedUpper`); off, or where they do not, every
     /// layer is shifted (`Store.unshift`) as before.
     idmapped_upper: bool = true,
+    /// Whether a job's store upkeep runs on a thread after its end returns
+    /// (`RUNNER_NATIVE_DEFER_COLLECT`, `Store.defer_collect`).
+    defer_collect: bool = true,
     /// Tests: services' images from a directory filled ahead (`images.find`: `rootfs/` and
     /// `config.json` per reference) instead of P3's pull; "" pulls them, as in production.
     images: []const u8 = "",
@@ -438,7 +448,9 @@ pub fn configFor(
         .self_exe_replaced = exe.replaced,
         .vouched = vouched,
         .rootless = cfg.native_rootless,
+        .defer_sync = cfg.native_defer_sync,
         .idmapped_upper = cfg.native_idmapped_upper,
+        .defer_collect = cfg.native_defer_collect,
         .subid_base = cfg.native_subid_base,
         .subnet = try net.Subnet.parse(cfg.native_subnet),
         .store_max_bytes = cfg.native_store_max_mb * 1024 * 1024,
@@ -966,7 +978,9 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
             .limits = cfg.store_limits,
             .sync_fd = Store.syncCursor(arena, cfg.store),
             .sync_log = Store.newSyncLog(arena),
+            .defer_sync = cfg.defer_sync,
             .defer_delete = true,
+            .defer_collect = cfg.defer_collect,
         },
         .vouched = cfg.vouched,
         .port_addresses = cfg.port_addresses,
@@ -996,11 +1010,16 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         cfg.self_exe,
     }));
     t = phases.now();
-    try b.jobCgroup(cfg, cg_parent, &id, why);
-    t = b.timings.since(arena, .cgroup, t);
     b.binds = try b.jobBinds(cfg, why);
-    _ = b.timings.since(arena, .resolver, t);
+    t = b.timings.since(arena, .resolver, t);
+    try b.jobLimitsOrRefuse(cfg, cg_parent, why);
+    // The network's helper first of what is left, so that it runs beside the cgroup's set-up and
+    // the image's and caches': it needs the resolver's nameservers (the NAT rules) and nothing of
+    // the cgroup. A job refused for want of limits is refused before (`jobLimitsOrRefuse`).
     if (b.how.userns == .mapped) try b.jobNetwork(cfg, why);
+    t = phases.now();
+    try b.jobCgroup(cfg, cg_parent, &id, why);
+    _ = b.timings.since(arena, .cgroup, t);
     return b;
 }
 
@@ -1010,6 +1029,24 @@ fn failed(why: *[]const u8, arena: Allocator, what: []const u8, path: []const u8
     why.* = std.fmt.allocPrint(arena, "{s} {s}: {s}", .{ what, path, @errorName(e) }) catch
         @errorName(e);
     return e;
+}
+
+const untrusted_limits_why = "native steps run a job this runner does not vouch for only within " ++
+    "a cgroup of its own with memory and process limits, which could not be made for it";
+
+/// The job's limits (`b.limits`), and the refusal of a job the runner does not vouch for that has
+/// none (`untrustedRefusal`, decided on `Config.job_limits`): it does not run natively. Before
+/// the job takes a slot or makes a network, so that a refusal is never masked by their errors.
+fn jobLimitsOrRefuse(b: *Backend, cfg: Config, parent: cgroup.Parent, why_out: *[]const u8) !void {
+    b.limits = cgroup.Limits.of(b.io, cfg.cgroup, switch (parent) {
+        .dir => |d| d,
+        .none => null,
+    });
+    const limited = b.limits.memory_max != null and b.limits.pids_max != null;
+    if (!cfg.vouched and !limited) {
+        why_out.* = untrusted_limits_why;
+        return error.NoJobLimits;
+    }
 }
 
 /// The job's cgroup under `parent`, named as its directory is, with its limits, and all jobs'
@@ -1028,19 +1065,6 @@ fn jobCgroup(
     why_out: *[]const u8,
 ) !void {
     const arena = b.arena;
-    b.limits = cgroup.Limits.of(b.io, cfg.cgroup, switch (parent) {
-        .dir => |d| d,
-        .none => null,
-    });
-    const untrusted_why = "native steps run a job this runner does not vouch for only within a " ++
-        "cgroup of its own with memory and process limits, which could not be made for it";
-    // A job the runner does not vouch for runs natively only within limits of its own
-    // (`untrustedRefusal`, decided on `Config.job_limits`): without them it does not run.
-    const limited = b.limits.memory_max != null and b.limits.pids_max != null;
-    if (!cfg.vouched and !limited) {
-        why_out.* = untrusted_why;
-        return error.NoJobLimits;
-    }
     const why: []const u8 = switch (parent) {
         .none => |w| w,
         .dir => |dir| if (cgroup.Job.make(arena, b.io, dir, name, b.limits)) |j| {
@@ -1048,7 +1072,7 @@ fn jobCgroup(
             // a job with no cgroup, for one the runner does not vouch for.
             if (!cfg.vouched and (j.all.memory == null or j.all.pids == null)) {
                 j.remove(arena, b.io);
-                why_out.* = untrusted_why;
+                why_out.* = untrusted_limits_why;
                 return error.NoJobLimits;
             }
             b.job_cgroup = j;
@@ -1110,7 +1134,7 @@ fn jobCgroup(
         }),
     };
     if (!cfg.vouched) {
-        why_out.* = untrusted_why;
+        why_out.* = untrusted_limits_why;
         return error.NoJobLimits;
     }
     if (!std.mem.eql(u8, cfg.cgroup.parent, "none")) {
@@ -1281,11 +1305,6 @@ fn jobNetwork(b: *Backend, cfg: Config, why: *[]const u8) !void {
     b.slot = lockSlot(arena, b.io, net.slots_dir) catch |e|
         return failed(why, arena, "taking a slot in", net.slots_dir, e);
     const n = b.slot.?.n;
-    // A veth of this slot is a dead job's: its runner let the lock go, by ending or dying. Only
-    // the slot's holder removes it, so a live job's network is never touched.
-    var sock = net.Socket.open() catch |e| return failed(why, arena, "opening", "a netlink socket", e);
-    sock.deleteVeth(n);
-    sock.close();
     t = b.timings.since(arena, .slot, t);
     const subnet = try std.fmt.allocPrint(arena, "{f}", .{cfg.subnet});
     // The host's uplinks and its resolver may have changed since the probe made their rules.
@@ -1299,12 +1318,19 @@ fn jobNetwork(b: *Backend, cfg: Config, why: *[]const u8) !void {
     t = b.timings.since(arena, .nat, t);
     const path = try std.fmt.allocPrint(arena, "{s}/netns", .{b.dir});
     const slot = try std.fmt.allocPrint(arena, "{d}", .{n});
+    const runner_pid = try std.fmt.allocPrint(arena, "{d}", .{std.os.linux.getpid()});
     const child = std.process.spawn(b.io, .{
-        .argv = &.{ cfg.self_exe, net.command, path, slot, subnet },
+        .argv = &.{ cfg.self_exe, net.command, path, slot, subnet, runner_pid },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .pipe,
     }) catch |e| return failed(why, arena, "starting the job's network helper", cfg.self_exe, e);
+    // A veth of this slot is a dead job's: its runner let the lock go, by ending or dying. Only
+    // the slot's holder removes it, so a live job's network is never touched: its helper does,
+    // which runs while this runner holds the lock (`networkPath` waits for it, and the teardown
+    // does before it lets the lock go). The job's own thread once did, in its `slot` phase, and
+    // waited there for the kernel's lock for link changes, which the namespaces of the jobs just
+    // ended were still being taken down under (20-30 ms with seven jobs starting together).
     // The helper runs while the job's image and caches are set up, which need no network: the
     // kernel serialises every link change on one lock, so with many jobs starting together each
     // helper waits for the others' (33-130 ms against 8 on a Pi 5 with seven jobs), time a job
@@ -1332,6 +1358,11 @@ pub fn networkPath(b: *Backend) !?[]const u8 {
         const t = phases.now();
         b.net_helper = null;
         b.netns = h.path;
+        // Not cancelled: a cancel here would drop the helper still running, and the teardown
+        // would let the slot's lock go under it, where another job's helper may remove the
+        // slot's veth and the late one make its own (`net.upMain`). Its run is bounded.
+        const protection = b.io.swapCancelProtection(.blocked);
+        defer _ = b.io.swapCancelProtection(protection);
         var err: std.ArrayList(u8) = .empty;
         var buf: [4096]u8 = undefined;
         while (true) {
@@ -1360,9 +1391,9 @@ pub fn networkPath(b: *Backend) !?[]const u8 {
     return b.netns;
 }
 
-/// The first slot whose lock in `dir` no process holds, locked. The directory is made only
-/// root's, so no other user can take a slot's lock. A lock file removed and made again while it
-/// was being taken is not trusted: the lock is taken only on the file the path names.
+/// The first slot whose lock in `dir` no process holds, locked. The directory is made only root's,
+/// so no other user can take a slot's lock. A lock file removed and made again while it was being
+/// taken is not trusted: the lock is taken only on the file the path names.
 fn lockSlot(arena: Allocator, io: std.Io, dir: []const u8) !Slot {
     const linux = std.os.linux;
     const cwd = std.Io.Dir.cwd();
@@ -1468,6 +1499,12 @@ pub fn deinit(b: *Backend) void {
     t = b.timings.since(arena, .veth_rm, t);
     removeJobDir(arena, b.io, b.dir);
     t = b.timings.since(arena, .tree_rm, t);
+    // The job's last layer was renamed in with its data not yet on disk, so that the job's result did
+    // not wait for it (`Store.settlePending`): now, while the job still holds it and before the runner
+    // polls again, so the next job never shares the disk with it. A failure was logged, and marks the
+    // job: `dropUnsynced`, below, evicts the layer.
+    b.store_cfg.settlePending(arena, b.io, &b.timings) catch |e| std.log.debug("native: the job's last layer is not durable: {t}", .{e});
+    t = phases.now();
     // Before the layers are let go: ancestors end up the more recently used (`Store.touchChain`).
     const whole = t;
     Store.touchChain(b.io, b.chain.items);
@@ -1475,6 +1512,20 @@ pub fn deinit(b: *Backend) void {
     if (b.slot) |s| s.lock.close(b.io);
     b.lock.close(b.io);
     t = b.timings.since(arena, .collect_touch, t);
+    // The rest of the upkeep is off the way to the runner's next job (`collector`): the layers'
+    // directory synced and the store kept under its cap. Not when the job's sync failed (its layers
+    // are dropped before it returns), or the store may be past its cap, which is then collected
+    // here, after the thread's own pass, so the cap holds however many jobs end at once.
+    if (b.store_cfg.defer_collect and b.store_cfg.root.len > 0) {
+        if (b.store_cfg.lagFits(arena, b.io) and collector.submit(b.io, b.store_cfg, b.published, b.check_run_id)) {
+            _ = b.timings.since(arena, .collect, whole);
+            if (b.store_cfg.sync_fd) |fd| _ = std.os.linux.close(fd);
+            // Tests read the store when a job returns, as they did; the thread has tests of its own.
+            if (builtin.is_test and collector.test_wait) _ = collector.drain(b.io, null);
+            return;
+        }
+        _ = collector.drain(b.io, null);
+    }
     if (b.published) b.store_cfg.syncLayers(arena);
     // After a failed sync, what this job renamed since the last good one is evicted.
     b.store_cfg.dropUnsynced(arena, b.io);
@@ -1588,6 +1639,7 @@ pub fn base(
     }
     b.repository = ev.job.github.repository;
     b.scope = try set_up.packageCacheScope(arena, ev, b.repository, b.vouched);
+    b.check_run_id = ev.job.check_run_id;
     b.ident = .{ b.scope, b.repository, ev.job.github.workflow, ev.job.job_id, ev.job.display_name };
     const event = try ev.eventJson();
     const event_in_env = plan.step_cache and event.len <= set_up.max_event_env;
@@ -1833,6 +1885,7 @@ pub fn execScript(
         };
         defer claim.release(b.io);
         if (claim.why) |line| x.sh.append(num, line);
+        if (b.settleWarning()) |line| x.sh.append(num, line);
         if (claim.hit) |rec| {
             const data = try recordAnswer(arena, rec);
             // A record that points into the tool cache's volume, which is in no layer: the volume
@@ -2080,13 +2133,30 @@ fn noteProcessesMayRemain(b: *Backend) void {
 /// run a step in it, and any other job's processes were gone when it let go), and the job checks
 /// the trees at all. A walk that was not whole, or saw a racy file, leaves no verdict, and the next
 /// job walks as it always did.
+///
+/// The walk runs on a thread of its own, holding the locks this takes (`tool_trees.IdleWalks`), so
+/// the teardown, and the runner's next poll, do not wait for it. If the thread cannot be had the
+/// walk is made here, as it was.
 fn walkToolCacheIdle(b: *Backend) void {
     if (!b.caches.tool_trees) return;
     const mount = b.cache_plan.tool_cache orelse return;
     const arena = b.arena;
     const idle = b.cache_plan.idleToolCache(arena) orelse return;
     const lists = trees_check.listsDir(arena, b.store_cfg.root, idle.dir) catch return;
-    _ = trees_check.walkIdle(arena, b.gpa, b.io, idle.dir, lists, mount, idle.left, trees_check.idle_limits);
+    if (b.cache_plan.idleHandoff()) |held| {
+        const started = trees_check.process_idle_walks.start(b.io, .{
+            .dir = idle.dir,
+            .lists = lists,
+            .mount = mount,
+            .left = idle.left,
+            .lock = held.lock,
+            .other = held.other,
+        });
+        if (started) return;
+        _ = std.os.linux.close(held.lock);
+        if (held.other) |fd| _ = std.os.linux.close(fd);
+    }
+    _ = trees_check.walkIdle(arena, b.gpa, b.io, idle.dir, lists, mount, idle.left, trees_check.idle_limits, null);
 }
 
 /// `set_up.zig_builtin_seed_script` on the `builtin.zig` volume, bound beside the seed's own `b/`
@@ -3208,6 +3278,16 @@ fn claimKey(
     return .{ .key = k, .lock = lock, .hit = hit.rec };
 }
 
+/// What to tell the job once a deferred layer's sync failed mid-job: the steps after it ran over a
+/// layer whose data may be lost, and this is otherwise seen only in the runner's log at the job's end.
+fn settleWarning(b: *Backend) ?[]const u8 {
+    const l = b.store_cfg.sync_log orelse return null;
+    if (!l.settle_failed or l.settle_told) return null;
+    l.settle_told = true;
+    return "##[warning]Writing an earlier step's layer to the disk failed: that layer is not cached, " ++
+        "and the steps that ran over it may have read data that was lost. The steps after this one are not published (they may still replay).";
+}
+
 /// Makes the key `p` the one its step is known by (`key_diff.writeIndex`).
 fn remember(b: *Backend, p: Pending) void {
     const s = b.store orelse return;
@@ -3249,6 +3329,11 @@ fn publishTop(b: *Backend, key: Store.Key, kind: Store.Kind, rec_in: Store.Recor
         // A failed sync was logged with its errno, once, by the store.
         if (e != error.Sync) std.log.warn("native: cannot publish a layer to the store: {s}", .{@errorName(e)});
         cwd.deleteFile(b.io, link) catch {};
+        // The key has an entry already (another job's, perhaps not yet durable, so this job could not
+        // replay it): this job's own upper stays its own layer under the key, which is derived from
+        // what made it, so its later steps are keyed and cached as if it were the stored one. Nothing
+        // else sees it, and it goes with the job's directory.
+        if (e == error.PublishLost) top.key = key;
         return;
     };
     b.held.appendAssumeCapacity(layer.lock);
@@ -5663,7 +5748,7 @@ test "native tool trees: a job's first step ends the epoch of the tool cache for
     var last = try volumes.plan(arena, io, c.cfg.store, caches, "repo", install, dagger.default_image, false, false, null);
     const idle = last.idleToolCache(arena) orelse return error.TestUnexpectedResult;
     const lists = try trees_check.listsDir(arena, c.cfg.store, idle.dir);
-    const kept = trees_check.walkIdle(arena, std.testing.allocator, io, idle.dir, lists, last.tool_cache.?, idle.left, trees_check.idle_limits);
+    const kept = trees_check.walkIdle(arena, std.testing.allocator, io, idle.dir, lists, last.tool_cache.?, idle.left, trees_check.idle_limits, null);
     last.release(io);
     if (!kept) return error.SkipZigTest; // a filesystem that proves nothing at rest
     // A job that has opened the volume and not run anything is told it, as is one that opens after.
@@ -6555,8 +6640,8 @@ test "root runner: a job whose network helper fails starts, and its first use of
 test "root runner: a job's veth goes with its namespace, and the next job of the slot never meets it" {
     // `deinit` deletes no veth: the namespace's mount goes and the kernel takes the veth down
     // after, in a batch. A job that comes up in the slot at once finds the host's end (named for
-    // the slot) still there or not, and `jobNetwork` removes it under the slot's lock, so
-    // `addVeth`'s exclusive create never meets it.
+    // the slot) still there or not, and the helper `jobNetwork` starts removes it under the
+    // slot's lock, so `addVeth`'s exclusive create never meets it.
     try requireRoot();
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -6584,6 +6669,87 @@ test "root runner: a job's veth goes with its namespace, and the next job of the
     while (sock.index(net.hostLink(&buf, slot.?)) != null and waited < 5000) : (waited += 10)
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     try std.testing.expect(sock.index(net.hostLink(&buf, slot.?)) == null);
+}
+
+test "root runner: the network helper removes a dead job's veth of its slot before it makes its own" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const subnet = try std.fmt.allocPrint(arena, "{f}", .{cfg.subnet});
+    // A slot no job of these tests takes. The first namespace stays mounted, so its veth stays,
+    // as a dead job's does until the kernel is done with its namespace: the second helper finds it.
+    const slot = try std.fmt.allocPrint(arena, "{d}", .{net.max_slots - 1});
+    const runner_pid = try std.fmt.allocPrint(arena, "{d}", .{std.os.linux.getpid()});
+    var sock = try net.Socket.open();
+    defer sock.close();
+    var buf: [16]u8 = undefined;
+    // Both namespaces are let go at the end only: the first's veth is the dead job's until then.
+    var paths: [2][]const u8 = undefined;
+    defer for (paths) |p| if (p.len > 0) detachNetns(arena, p);
+    @memset(&paths, "");
+    for (&paths, 0..) |*path, i| {
+        path.* = try std.fmt.allocPrint(arena, "{s}/netns-{d}", .{ root, i });
+        const ran = try std.process.run(arena, io, .{ .argv = &.{ cfg.self_exe, net.command, path.*, slot, subnet, runner_pid } });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, ran.term);
+        try std.testing.expectEqualStrings("", ran.stderr);
+        try std.testing.expect(sock.index(net.hostLink(&buf, net.max_slots - 1)) != null);
+    }
+}
+
+test "root runner: a network helper whose runner is not its parent makes and removes nothing" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const subnet = try std.fmt.allocPrint(arena, "{f}", .{cfg.subnet});
+    const slot = try std.fmt.allocPrint(arena, "{d}", .{net.max_slots - 2});
+    const path = try std.fmt.allocPrint(arena, "{s}/netns", .{root});
+    defer detachNetns(arena, path);
+    // Another pid than the helper's parent: as when its runner died and another job holds the slot.
+    const other = try std.fmt.allocPrint(arena, "{d}", .{std.os.linux.getpid() + 1});
+    const ran = try std.process.run(arena, io, .{ .argv = &.{ cfg.self_exe, net.command, path, slot, subnet, other } });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, ran.term);
+    var sock = try net.Socket.open();
+    defer sock.close();
+    var buf: [16]u8 = undefined;
+    try std.testing.expect(sock.index(net.hostLink(&buf, net.max_slots - 2)) == null);
+}
+
+test "root runner: a cancelled wait for the network helper still waits for it" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var b = try init(arena, io, std.testing.allocator, cfg);
+    defer b.deinit();
+    const Wait = struct {
+        fn run(bb: *Backend) void {
+            _ = bb.networkPath() catch {};
+        }
+    };
+    var waiting = try io.concurrent(Wait.run, .{&b});
+    waiting.cancel(io);
+    // The helper has ended, so its veth is there: the cancel did not drop it still running.
+    var sock = try net.Socket.open();
+    defer sock.close();
+    var buf: [16]u8 = undefined;
+    try std.testing.expect(b.net_helper == null);
+    try std.testing.expect(sock.index(net.hostLink(&buf, b.slot.?.n)) != null);
 }
 
 test "native sweep: a job's directory its runner is removing is left to it; a dead runner's goes" {
@@ -8730,7 +8896,10 @@ test "native step cache: two jobs with one key at once run it once; the other re
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const c = try cachedConfig(arena, &tmp);
+    var c = try cachedConfig(arena, &tmp);
+    // Synced before it is published: a layer left pending is the publishing job's alone, and the
+    // job waiting for the key would run the step again (`Store.defer_sync`).
+    c.cfg.defer_sync = false;
     // A file of its own each time: the other job's root may be another host id.
     const job = testJob(&.{testStep("sleep 1; mktemp /shared/slow.XXXXXX")});
     const Other = struct {
@@ -8762,6 +8931,57 @@ test "native step cache: two jobs with one key at once run it once; the other re
     const notes = std.mem.count(u8, mine.text, dagger.native_reused_note) +
         std.mem.count(u8, other_text, dagger.native_reused_note);
     try std.testing.expectEqual(@as(usize, 1), notes);
+}
+
+/// The files in `shared` whose names start with `prefix`: one for each run of a step that makes one.
+fn madeBy(io: std.Io, shared: []const u8, prefix: []const u8) usize {
+    var dir = std.Io.Dir.cwd().openDir(io, shared, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    var n: usize = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| n += @intFromBool(std.mem.startsWith(u8, e.name, prefix));
+    return n;
+}
+
+test "native step cache: with the deferred sync, a job that lost a key to another's pending layer keeps caching its later steps" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const c = try cachedConfig(arena, &tmp);
+    // The first step is the same in both jobs, and the other waits for its key: the first job's layer
+    // is pending when it gets the lock, so it runs the step too, and its publish loses. Its second
+    // step is then keyed over its own layer, and a third run replays both from the store.
+    const job = testJob(&.{ testStep("sleep 1; mktemp /shared/first.XXXXXX"), testStep("mktemp /shared/second.XXXXXX") });
+    const Other = struct {
+        fn run(cfg: Config, j: job_mod.Job, ok: *bool) void {
+            var b: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            const r = runCached(b.allocator(), cfg, j, "j2") catch {
+                b.deinit();
+                return;
+            };
+            ok.* = r.res.succeeded;
+            b.deinit();
+        }
+    };
+    var other_ok = false;
+    var other = try io.concurrent(Other.run, .{ c.cfg, job, &other_ok });
+    const mine = try runCached(arena, c.cfg, job, "j1");
+    other.await(io);
+    try expectSucceeded(mine);
+    try std.testing.expect(other_ok);
+    const before_first = madeBy(io, c.shared, "first.");
+    const before_second = madeBy(io, c.shared, "second.");
+    try std.testing.expect(before_first >= 1 and before_first <= 2);
+    try std.testing.expect(before_second >= 1 and before_second <= 2);
+    // Both jobs ended, so every layer is durable and a later job replays everything.
+    const third = try runCached(arena, c.cfg, job, "j3");
+    try expectSucceeded(third);
+    try std.testing.expectEqual(before_first, madeBy(io, c.shared, "first."));
+    try std.testing.expectEqual(before_second, madeBy(io, c.shared, "second."));
+    try std.testing.expect(std.mem.count(u8, third.text, dagger.native_reused_note) >= 2);
 }
 
 /// The first host id of the job's range, from "Set up job" ("ids 0-65535 are host ids N-...").
@@ -9126,6 +9346,40 @@ test "native phases: where a cached job's time goes, cold and replayed" {
                 r.res.native_phases orelse "",
             });
         }
+    }
+}
+
+test "native phases: where the set-up goes when jobs start together" {
+    // A measurement, not a check: ZIG_RUNNER_NATIVE_BURST=<jobs> starts that many jobs at once on
+    // one store, as a burst of a workflow's jobs does, and prints each job's phases as the runner
+    // logs them (`.github/scripts/native-phases.sh`). As root, so that each job has its own
+    // cgroup, slot and network.
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env = try std.testing.environ.createMap(arena);
+    const n_text = env.get("ZIG_RUNNER_NATIVE_BURST") orelse return error.SkipZigTest;
+    const n = std.fmt.parseInt(u32, n_text, 10) catch return error.SkipZigTest;
+    try requireRoot();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const Run = struct {
+        fn one(cfg_: Config, out: *[]const u8) void {
+            var ar: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            const r = runNativeJob(ar.allocator(), cfg_, testJob(&.{testStep("true")}), .root) catch return;
+            out.* = std.heap.page_allocator.dupe(u8, r.res.native_phases orelse "") catch "";
+        }
+    };
+    const rounds = 3;
+    for (0..rounds) |round| {
+        const lines = try arena.alloc([]const u8, n);
+        @memset(lines, "");
+        const futures = try arena.alloc(std.Io.Future(void), n);
+        for (futures, lines) |*f, *l| f.* = try io.concurrent(Run.one, .{ cfg, l });
+        for (futures) |*f| f.await(io);
+        for (lines) |l| std.debug.print("job {d} 'burst {d}': native phases (ms): {s}\n", .{ round, n, l });
     }
 }
 

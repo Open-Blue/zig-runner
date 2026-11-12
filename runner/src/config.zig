@@ -145,6 +145,10 @@ pub const Config = struct {
     /// Native steps on a runner that is not root (`RUNNER_NATIVE_ROOTLESS`), with only root
     /// mapped inside (`Backend.Config.rootless`); off, such a runner sends every job to Dagger.
     native_rootless: bool = false,
+    /// Whether a native job's last layer is renamed into the store before its data is on disk and
+    /// made durable in the job's teardown (`RUNNER_NATIVE_DEFER_SYNC`, `Store.defer_sync`); off,
+    /// every layer is synced before it is published.
+    native_defer_sync: bool = true,
     /// The first host id of the native jobs' ranges on a root runner
     /// (`RUNNER_NATIVE_SUBID_BASE`, `Backend.Config.subid_base`): at least
     /// `NativeBackend.min_subid_base`.
@@ -153,6 +157,10 @@ pub const Config = struct {
     /// (`RUNNER_NATIVE_IDMAPPED_UPPER`, `Backend.Config.idmapped_upper`); off, each layer's ids are
     /// shifted after its step.
     native_idmapped_upper: bool = true,
+    /// A native job's store upkeep run on a thread after its end returns
+    /// (`RUNNER_NATIVE_DEFER_COLLECT`, `Backend.Config.defer_collect`); off, the job's end runs it
+    /// before it returns, as it did.
+    native_defer_collect: bool = true,
     /// The native jobs' network on a root runner (`RUNNER_NATIVE_SUBNET`, `net.Subnet.parse`).
     native_subnet: []const u8 = native_net.Subnet.default_text,
     /// The host addresses a native job container's `ports:` may be published on, colon- or
@@ -500,8 +508,10 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_ROOTFS")) |v| c.native_rootfs = v;
         if (environ.get("RUNNER_NATIVE_STORE")) |v| c.native_store = v;
         if (environ.get("RUNNER_NATIVE_ROOTLESS")) |v| c.native_rootless = try boolean(v);
+        if (environ.get("RUNNER_NATIVE_DEFER_SYNC")) |v| c.native_defer_sync = try boolean(v);
         if (environ.get("RUNNER_NATIVE_SUBID_BASE")) |v| c.native_subid_base = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_IDMAPPED_UPPER")) |v| c.native_idmapped_upper = try boolean(v);
+        if (environ.get("RUNNER_NATIVE_DEFER_COLLECT")) |v| c.native_defer_collect = try boolean(v);
         if (environ.get("RUNNER_NATIVE_SUBNET")) |v| c.native_subnet = v;
         if (environ.get("RUNNER_NATIVE_PORT_ADDRESSES")) |v| c.native_port_addresses = v;
         if (environ.get("RUNNER_NATIVE_PORT_RANGE")) |v| c.native_port_range = v;
@@ -599,8 +609,10 @@ pub const Config = struct {
         else if (eq(key, "native-rootfs")) c.native_rootfs = val //
         else if (eq(key, "native-store")) c.native_store = val //
         else if (eq(key, "native-rootless")) c.native_rootless = try boolean(val) //
+        else if (eq(key, "native-defer-sync")) c.native_defer_sync = try boolean(val) //
         else if (eq(key, "native-subid-base")) c.native_subid_base = try num(u32, val) //
         else if (eq(key, "native-idmapped-upper")) c.native_idmapped_upper = try boolean(val) //
+        else if (eq(key, "native-defer-collect")) c.native_defer_collect = try boolean(val) //
         else if (eq(key, "native-subnet")) c.native_subnet = val //
         else if (eq(key, "native-port-addresses")) c.native_port_addresses = val //
         else if (eq(key, "native-port-range")) c.native_port_range = val //
@@ -1101,6 +1113,13 @@ test "the native subnet and ids: defaults, and values that are refused" {
     try env.put("RUNNER_NATIVE_IDMAPPED_UPPER", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).native_idmapped_upper);
     _ = env.swapRemove("RUNNER_NATIVE_IDMAPPED_UPPER");
+    // The store's upkeep after a job's end: on unless asked off, and a value that is no boolean fails.
+    try std.testing.expect((try Config.load(&env, &.{"runner"})).native_defer_collect);
+    try env.put("RUNNER_NATIVE_DEFER_COLLECT", "false");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).native_defer_collect);
+    try env.put("RUNNER_NATIVE_DEFER_COLLECT", "maybe");
+    try std.testing.expectError(error.InvalidBool, Config.load(&env, &.{"runner"}));
+    _ = env.swapRemove("RUNNER_NATIVE_DEFER_COLLECT");
     try env.put("RUNNER_NATIVE_SUBID_BASE", "99999");
     try std.testing.expectError(error.InvalidNativeSubidBase, Config.load(&env, &.{"runner"}));
     try env.put("RUNNER_NATIVE_SUBID_BASE", "100000");

@@ -84,8 +84,11 @@ just-in-time runners on the private `Open-Blue/runner-bench` under a label of th
 dispatches that repository's `e2e.yml` and `e2e-cancel.yml`, and checks the jobs, steps and logs
 through GitHub's API: a script installing into the tool cache, a service, a `docker://` step, a
 JavaScript action, the file commands, a masked secret, a cancelled run, and a rerun replayed from
-the step cache. It runs on Dagger and with `RUNNER_BACKEND=native`, and leaves both backends' queue
-and run times in the `e2e-timings` artifact.
+the step cache. On a pull request and in the merge queue it runs with `RUNNER_BACKEND=native` only
+(the engine is still started, since native hands some jobs to Dagger); the Dagger pass, which is
+reported rather than a gate, is not run there. The nightly `analysis` run's "ThreadSanitizer, end to
+end" runs the same suite on both backends. Each pass leaves its queue and run times in the
+`e2e-timings` artifact.
 
 Everything on runner-bench is done as the GitHub App `zig-runner-e2e`, whose key is the `e2e`
 environment's secret. A pull request from a fork doesn't get it, so the job skips its steps and

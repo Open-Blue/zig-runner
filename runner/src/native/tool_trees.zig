@@ -840,7 +840,8 @@ pub const idle_limits: Limits = .{
 
 /// A walk of the trees under `cache` for the next job, kept as a verdict if it was `clean`. The
 /// caller holds the volume exclusively and knows that no process of any job is left in it. `left`
-/// is the volume's lock file as the last open of it left it. Whether a verdict was kept.
+/// is the volume's lock file as the last open of it left it. `cancel` cuts the walk short, and a
+/// walk that was cut short keeps nothing (`Walked.clean`). Whether a verdict was kept.
 pub fn walkIdle(
     arena: Allocator,
     gpa: Allocator,
@@ -850,6 +851,7 @@ pub fn walkIdle(
     mount: []const u8,
     left: Left,
     limits: Limits,
+    cancel: ?*const dagger.Cancel,
 ) bool {
     // Whatever stands there is of an older state, and is no longer to be read.
     if (!dropVerdict(arena, io, lists)) return false;
@@ -860,10 +862,192 @@ pub fn walkIdle(
     }
     // The age counts from when the walk began: a write it had not seen yet is no younger.
     const at_ms = std.Io.Clock.real.now(io).toMilliseconds();
-    const w = walk(arena, gpa, io, cache, lists, mount, limits, null) catch return false;
+    const w = walk(arena, gpa, io, cache, lists, mount, limits, cancel) catch return false;
     if (!w.clean) return false;
     return writeVerdict(arena, io, lists, w.verdict, mount, left, at_ms);
 }
+
+/// The last job out's walks (`walkIdle`) that run on a thread of their own, after the job has let
+/// go of everything and its runner has gone back to polling. A walk is 0.1 s on a laptop and
+/// 0.2-0.6 s on a Pi 5, which the job's teardown spent before its runner could take the next job.
+///
+/// A walk is handed the exclusive locks that the job took with `Plan.idleToolCache` (the
+/// volume's, and the other user's) as duplicates of their descriptors: a lock belongs to the
+/// open file description, so it stays while a duplicate is open, and the job's own letting go does
+/// not release it. Nothing then comes between the proof that no process is in the volume (the
+/// job's cgroup was removed, the lock taken) and the walk: a job that opens the volume meanwhile
+/// waits for the lock, as it did while the walk ran in the teardown, and is told the verdict. A
+/// job of this process waits for the walk itself (`wait`, from `volumes.openWaiting`), polled
+/// every ms and so cancellable, which is no slower for it than the walk it would otherwise make.
+///
+/// Everything a walk uses is its own, on the heap: the job's arena goes with the job. `stopAll` is
+/// for a runner that stops: the walks are asked to end, which their next look at the cancel sees,
+/// and waited for, so no thread still uses a descriptor, and so a lock, when the process ends. A
+/// verdict is a rename, so one is whole or not there whenever the walk ends.
+pub const IdleWalks = struct {
+    mu: std.Io.Mutex = .init,
+    list: std.ArrayList(*Idle) = .empty,
+    /// Walks started, whether or not one kept a verdict (what the tests count).
+    started: u64 = 0,
+    /// Tests: `start` finds no thread to run the walk on.
+    no_thread: bool = false,
+
+    /// What `start` takes: strings it copies, and descriptors it owns once it returns true.
+    pub const Handoff = struct {
+        /// The volume's directory on the host.
+        dir: []const u8,
+        lists: []const u8,
+        mount: []const u8,
+        left: Left,
+        /// Duplicates of the locks' descriptors, close-on-exec (`volumes.Plan.idleHandoff`).
+        lock: linux.fd_t,
+        other: ?linux.fd_t = null,
+        limits: Limits = idle_limits,
+        /// Tests: the walk does not begin while this is set, or until it is asked to stop.
+        hold: ?*const std.atomic.Value(bool) = null,
+    };
+
+    const Idle = struct {
+        h: Handoff,
+        io: std.Io,
+        is: *IdleWalks,
+        cancel: dagger.Cancel = .{},
+
+        fn free(w: *Idle) void {
+            const a = std.heap.smp_allocator;
+            a.free(w.h.dir);
+            a.free(w.h.lists);
+            a.free(w.h.mount);
+            a.destroy(w);
+        }
+
+        fn run(w: *Idle) void {
+            if (w.h.hold) |h| while (h.load(.acquire) and !w.cancel.requested.load(.acquire)) w.io.sleep(.fromMilliseconds(1), .awake) catch break;
+            var arena: std.heap.ArenaAllocator = .init(std.heap.smp_allocator);
+            defer arena.deinit();
+            _ = walkIdle(
+                arena.allocator(),
+                std.heap.smp_allocator,
+                w.io,
+                w.h.dir,
+                w.h.lists,
+                w.h.mount,
+                w.h.left,
+                w.h.limits,
+                &w.cancel,
+            );
+            // Locks let go, and only then is the walk gone from the list that a job waits on.
+            _ = linux.close(w.h.lock);
+            if (w.h.other) |fd| _ = linux.close(fd);
+            w.is.finish(w.io, w);
+        }
+    };
+
+    /// Begins a walk on a thread of its own. False when it could not (no memory, no thread): the
+    /// descriptors are then still the caller's, and it walks itself or lets go.
+    pub fn start(is: *IdleWalks, io: std.Io, h: Handoff) bool {
+        if (is.no_thread) return false;
+        const a = std.heap.smp_allocator;
+        const w = a.create(Idle) catch return false;
+        const dir = a.dupe(u8, h.dir) catch {
+            a.destroy(w);
+            return false;
+        };
+        const lists = a.dupe(u8, h.lists) catch {
+            a.free(dir);
+            a.destroy(w);
+            return false;
+        };
+        const mount = a.dupe(u8, h.mount) catch {
+            a.free(dir);
+            a.free(lists);
+            a.destroy(w);
+            return false;
+        };
+        w.* = .{ .h = h, .io = io, .is = is };
+        w.h.dir = dir;
+        w.h.lists = lists;
+        w.h.mount = mount;
+        is.mu.lockUncancelable(io);
+        defer is.mu.unlock(io);
+        is.list.append(a, w) catch {
+            w.free();
+            return false;
+        };
+        // The default stack: the walk keeps path buffers on it.
+        const t = std.Thread.spawn(.{}, Idle.run, .{w}) catch {
+            _ = is.list.pop();
+            w.free();
+            return false;
+        };
+        t.detach();
+        is.started += 1;
+        return true;
+    }
+
+    /// A job is about to open the volume at `dir`: it waits, until the walk of it (or of one nested
+    /// with it) has let go of its locks and left its verdict, as it waited for the lock when the walk
+    /// ran in the teardown. Waiting is never slower for the job than the whole walk it would make
+    /// itself instead, and ends with the verdict, which that walk would have been. Polled every ms,
+    /// so the job's `cancel` is seen, and `error.VolumeBusy` past `limit_ms`.
+    pub fn wait(
+        is: *IdleWalks,
+        io: std.Io,
+        dir: []const u8,
+        cancel: ?*const std.atomic.Value(bool),
+        limit_ms: u64,
+    ) error{ Canceled, VolumeBusy }!void {
+        var waited_ms: u64 = 0;
+        while (is.present(io, dir)) : (waited_ms += 1) {
+            if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
+            if (waited_ms >= limit_ms) return error.VolumeBusy;
+            io.sleep(.fromMilliseconds(1), .awake) catch return error.Canceled;
+        }
+    }
+
+    /// A runner that stops: every walk is asked to end, and waited for without a limit, since the
+    /// kernel releases a lock only when no thread still holds its descriptor. A walk looks at its
+    /// cancel at every 64th entry and every block it reads, so this takes a block's read.
+    pub fn stopAll(is: *IdleWalks, io: std.Io) void {
+        while (is.ask(io)) io.sleep(.fromMilliseconds(1), .awake) catch return;
+    }
+
+    /// Asks every walk to stop; whether any is still there.
+    fn ask(is: *IdleWalks, io: std.Io) bool {
+        is.mu.lockUncancelable(io);
+        defer is.mu.unlock(io);
+        for (is.list.items) |w| w.cancel.requested.store(true, .release);
+        return is.list.items.len > 0;
+    }
+
+    /// Whether a walk of `dir`, or of a volume nested with it, is there.
+    fn present(is: *IdleWalks, io: std.Io, dir: []const u8) bool {
+        is.mu.lockUncancelable(io);
+        defer is.mu.unlock(io);
+        for (is.list.items) |w| if (nests(dir, w.h.dir) or nests(w.h.dir, dir)) return true;
+        return false;
+    }
+
+    /// Whether a walk is running or waiting to begin.
+    pub fn busy(is: *IdleWalks, io: std.Io) bool {
+        is.mu.lockUncancelable(io);
+        defer is.mu.unlock(io);
+        return is.list.items.len > 0;
+    }
+
+    fn finish(is: *IdleWalks, io: std.Io, w: *Idle) void {
+        is.mu.lockUncancelable(io);
+        defer is.mu.unlock(io);
+        for (is.list.items, 0..) |x, i| if (x == w) {
+            _ = is.list.swapRemove(i);
+            break;
+        };
+        w.free();
+    }
+};
+
+/// The walks of this process's jobs.
+pub var process_idle_walks: IdleWalks = .{};
 
 fn appendCapped(
     arena: Allocator,
@@ -2430,7 +2614,7 @@ test "tool trees: an idle walk leaves a verdict that the next job takes, once, a
     const f = try fixture(arena, &tmp);
     try skipWithoutLeases(arena, f);
     const cwd = std.Io.Dir.cwd();
-    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, idleNow()));
+    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, idleNow(), null));
     try cwd.access(io, try verdictPath(arena, f), .{});
     const walked = try checkWith(arena, f, .{ .racy_s = 0 }, null);
     const taken = takeVerdict(arena, io, f.lists, "/t", left_now, true) orelse return error.TestUnexpectedResult;
@@ -2466,7 +2650,7 @@ test "tool trees: a verdict is not used for another boot, mount, last open, age,
         .{ .from = "lock 7 1700000000 123", .to = "lock 7 1700000000 124" },
     };
     for (cases) |c| {
-        try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim));
+        try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim, null));
         const text = try cwd.readFileAlloc(io, path, arena, .unlimited);
         const at = std.mem.indexOf(u8, text, c.from) orelse return error.TestUnexpectedResult;
         const changed = try std.mem.concat(arena, u8, &.{ text[0..at], c.to, text[at + c.from.len ..] });
@@ -2475,22 +2659,22 @@ test "tool trees: a verdict is not used for another boot, mount, last open, age,
         try std.testing.expectError(error.FileNotFound, cwd.access(io, path, .{}));
     }
     // What the volume's last open was: any other open of it, or a volume made again.
-    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim));
+    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim, null));
     for ([_]Left{
         .{ .ino = 7, .sec = left_now.sec + 1, .nsec = 123 },
         .{ .ino = 9, .sec = left_now.sec, .nsec = 123 },
     }) |other| {
         try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", other, true));
-        try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim));
+        try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim, null));
     }
     try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", null, true));
     // A job that does not check the trees takes nothing, and the verdict is gone for the next.
-    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim));
+    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim, null));
     try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", left_now, false));
     try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", left_now, true));
     // Age: past the limit, and from the future (a clock set back).
     for ([_]i64{ now_ms - verdict_max_age_ms - 5_000, now_ms + 60_000 }) |at_ms| {
-        try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim));
+        try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim, null));
         const text = try cwd.readFileAlloc(io, path, arena, .unlimited);
         const from = try std.fmt.allocPrint(arena, "boot {s}\nat ", .{boot});
         const start = std.mem.indexOf(u8, text, from).? + from.len;
@@ -2500,7 +2684,7 @@ test "tool trees: a verdict is not used for another boot, mount, last open, age,
         try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", left_now, true));
     }
     // Not whole (cut short, or corrupted): nothing is taken from it.
-    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim));
+    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, lim, null));
     const text = try cwd.readFileAlloc(io, path, arena, .unlimited);
     try cwd.writeFile(io, .{ .sub_path = path, .data = text[0 .. text.len - 6] });
     try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", left_now, true));
@@ -2521,24 +2705,24 @@ test "tool trees: no verdict from a walk with racy files, one cut short, or a tr
     // Everything was written within the hour: all of it is racy.
     var racy = idleNow();
     racy.racy_s = 3600;
-    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, racy));
+    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, racy, null));
     try std.testing.expectError(error.FileNotFound, cwd.access(io, path, .{}));
     // A tree that gives up (here, for too many files) is left out: the next job's walk says so.
     var small = idleNow();
     small.tree_files = 1;
-    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, small));
+    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, small, null));
     // Out of time at the first look.
     var late = idleNow();
     late.time_ms = -1_000_000;
-    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, late));
+    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, late, null));
     try std.testing.expectError(error.FileNotFound, cwd.access(io, path, .{}));
     // And the older verdict a failed walk finds is gone, not left to be read.
-    try std.testing.expect(walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, idleNow()));
-    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, racy));
+    try std.testing.expect(walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, idleNow(), null));
+    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, racy, null));
     try std.testing.expectError(error.FileNotFound, cwd.access(io, path, .{}));
     // A verdict that cannot be removed is not read (here, a directory where it is).
     try cwd.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/in", .{path}));
-    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, idleNow()));
+    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, f.lists, "/t", left_now, idleNow(), null));
     try std.testing.expectEqual(@as(?Verdict, null), takeVerdict(arena, io, f.lists, "/t", left_now, true));
 }
 
@@ -2557,14 +2741,14 @@ test "tool trees: a job that let go with processes that may remain stops verdict
     const store = try std.fmt.allocPrint(arena, "{s}/store", .{root});
     const one = try std.fmt.allocPrint(arena, "{s}/tool-trees/aa", .{store});
     try std.testing.expect(markUnproven(arena, io, one));
-    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, one, "/t", left_now, idleNow()));
+    try std.testing.expect(!walkIdle(arena, gpa, io, f.cache, one, "/t", left_now, idleNow(), null));
     try std.testing.expectError(error.FileNotFound, cwd.access(io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ one, verdict_name }), .{}));
     try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ one, verdict_name }), .data = "x" });
     dropVerdicts(arena, io, store);
     try std.testing.expectError(error.FileNotFound, cwd.access(io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ one, verdict_name }), .{}));
     try std.testing.expectError(error.FileNotFound, cwd.access(io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ one, unproven_name }), .{}));
     // With the mark gone the walk is kept again.
-    try std.testing.expect(walkIdle(arena, gpa, io, f.cache, one, "/t", left_now, idleNow()));
+    try std.testing.expect(walkIdle(arena, gpa, io, f.cache, one, "/t", left_now, idleNow(), null));
 }
 
 test "tool trees: the digests are the same from a list, kept untouched, as from a cold walk" {
@@ -2656,7 +2840,7 @@ test "tool trees: numbers are written in a line as fmt writes them" {
 fn epochFor(arena: Allocator, es: *Epochs, f: Fixture, lock: linux.fd_t, left: Left, stamp: Left, at_ms: i64) !?Epochs.Entered {
     const io = std.testing.io;
     const cwd = std.Io.Dir.cwd();
-    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left, idleNow()));
+    try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left, idleNow(), null));
     const path = try verdictPath(arena, f);
     const boot = bootId(arena, io) orelse return null;
     const text = try cwd.readFileAlloc(io, path, arena, .unlimited);
@@ -2719,7 +2903,7 @@ test "tool trees: an open that cannot tell its stamp from what it found shares n
     var es: Epochs = .{};
     // Its own verdict, as on main, but no epoch, for a stamp equal to what it found or not known.
     for ([_]?Left{ left_now, null }) |stamp| {
-        try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, idleNow()));
+        try std.testing.expect(walkIdle(arena, std.testing.allocator, io, f.cache, f.lists, "/t", left_now, idleNow(), null));
         const alone = es.enter(arena, io, f.cache, f.lists, "/t", left_now, stamp, true);
         try std.testing.expect(alone.verdict != null and alone.epoch == null);
         try std.testing.expectEqual(@as(usize, 0), es.list.items.len);

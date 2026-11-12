@@ -7,9 +7,10 @@
 # service, a docker:// step, a JavaScript action, the file commands, a masked secret, a cancelled
 # run, and a rerun replayed from the step cache. Each job's queue and run times go to
 # $E2E_OUT/timings.tsv, with the backend it ran on, so one harness also compares Dagger and native.
-# In CI the Dagger pass comes first, on an engine just started: its times include the pulls and
-# the pre-warm. The native pass's jobs that native hands to Dagger (ran_on dagger) then find the
-# engine warm, so compare them with a Dagger job run again, not with the first pass.
+# In CI the Dagger pass (where it runs: not on a pull request) comes first, on an engine just
+# started: its times include the pulls and the pre-warm. The native pass's jobs that native hands
+# to Dagger (ran_on dagger) then find the engine warm, so compare them with a Dagger job run
+# again, not with the first pass; without the Dagger pass, those jobs find it cold.
 #
 #   e2e.sh check LABEL [BACKEND]    the suite, on the runners already serving LABEL
 #

@@ -127,12 +127,30 @@ def release_pipeline(c):
     })
 
 
+def store_deferred(c):
+    return [
+        f"#define NP {c.size('Procs')}",
+        f"#define NR {c.size('Readers')}",
+        f"#define NS {c.value('Steps')}",
+        f"#define MC {c.value('MachineCrashes')}",
+        f"#define MAXRCRASH {c.value('MaxRunnerCrashes')}",
+        f"#define MAXWERR {c.value('MaxWriteErrors')}",
+    ] + c.flags({
+        "SyncBeforeMark": "SYNCBEFORE",
+        "CheckBoot": "CHECKBOOT",
+        "OwnerOnly": "OWNERONLY",
+        "PoisonOnFail": "POISON",
+        "SettleAtEnd": "SETTLEEND",
+    })
+
+
 # The modules ported to Promela (proofs/spin/<Module>Model.pml), and how a configuration's
 # constants become its #defines.
 MODULES = {
     "StoreLocking": store_locking,
     "StoreEviction": store_eviction,
     "ReleasePipeline": release_pipeline,
+    "StoreDeferred": store_deferred,
 }
 
 
