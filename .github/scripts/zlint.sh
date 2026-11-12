@@ -40,7 +40,7 @@
 # reads this repository's Zig 0.17 sources without a parse error; a newer Zig whose syntax it
 # cannot read fails here, loudly, as a parse error.
 #
-#   zlint.sh                              the rules above, as CI's "Lint (ZLint)" job runs them
+#   zlint.sh                              the rules above, as CI's "Workflows" job runs them
 #   zlint.sh suppressed-errors            that rule alone, against zlint-suppressed.baseline
 #   zlint.sh suppressed-errors --update   the baseline rewritten from what it finds now
 #
