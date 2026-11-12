@@ -280,7 +280,7 @@ jobs:
     name: Tests (x86_64)
     runs-on: ${{ fromJSON(github.event_name == 'push' && (vars.PROD_RUNNER || '"ubuntu-26.04"') || (vars.PREPROD_RUNNER || '"ubuntu-26.04"')) }}
     timeout-minutes: 30
-    # The store stress test's workers for 10 s (5 s with the deferred sync) where it defaults to 30:
+    # The store stress test's workers for 10 s, and 10 s more with the deferred sync, where it defaults to 30 and 15:
     # analysis.yml runs it for minutes on every change to the store and nightly, and here it was 46 s
     # of a Tests job and 31 s of the longest root part.
     env:
@@ -408,7 +408,7 @@ jobs:
     if: github.event_name != 'push'
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
     timeout-minutes: 30
-    # The store stress test's workers for 10 s (5 s with the deferred sync) where it defaults to 30:
+    # The store stress test's workers for 10 s, and 10 s more with the deferred sync, where it defaults to 30 and 15:
     # analysis.yml runs it for minutes on every change to the store and nightly, and here it was 46 s
     # of a Tests job and 31 s of the longest root part.
     env:
@@ -541,7 +541,7 @@ jobs:
     if: github.event_name != 'push'
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 30
-    # The store stress test's workers for 10 s (5 s with the deferred sync) where it defaults to 30:
+    # The store stress test's workers for 10 s, and 10 s more with the deferred sync, where it defaults to 30 and 15:
     # analysis.yml runs it for minutes on every change to the store and nightly, and here it was 46 s
     # of a Tests job and 31 s of the longest root part.
     env:

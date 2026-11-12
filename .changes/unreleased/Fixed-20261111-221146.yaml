@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The store stress test''s run with the deferred sync is no shorter than 10 s (or all of the budget, when that is less): at ci''s 10 s budget it ran 5 s, too few jobs to see a volume evicted, and failed its own check that one was'
+time: 2026-11-11T22:11:46.816316644-05:00
