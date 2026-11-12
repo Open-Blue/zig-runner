@@ -1,0 +1,3 @@
+kind: Changed
+body: 'CI takes fewer hosted runners: the branch name, ZLint and Go tools checks are steps of the Workflows job, not jobs of their own, and Database tests run in three parts, Database tests (1/3), (2/3) and (3/3), each with its own database; the required checks are Workflows and the three parts, where they were Branch name and Database tests'
+time: 2026-11-11T19:48:02.468284799-05:00

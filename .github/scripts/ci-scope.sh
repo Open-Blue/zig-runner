@@ -2,12 +2,12 @@
 # Whether a pull request or a merge group can change what a group of CI's checks checks:
 #
 #   ci-scope.sh tests        Tests (x86_64), Tests (arm64), Native tests as root; Database tests;
-#                            Lint (ci.yml)
+#                            Workflows' ZLint steps (ci.yml)
 #   ci-scope.sh binaries     Release builds; Release builds (arm64) (ci.yml)
 #   ci-scope.sh e2e          End to end (ci.yml)
 #   ci-scope.sh proofs       Proofs (proofs.yml)
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)
-#   ci-scope.sh go           Go tools (ci.yml)
+#   ci-scope.sh go           Workflows' Go tools steps (ci.yml)
 #   ci-scope.sh analysis     Fuzz, Valgrind, Stress, ZLint (suppressed-errors) (analysis.yml)
 #   ci-scope.sh tsan         ThreadSanitizer, native; ThreadSanitizer, end to end (analysis.yml)
 #   ci-scope.sh store        Store stress, Store crash (analysis.yml)
