@@ -8,6 +8,7 @@
 #   ci-scope.sh proofs       Proofs (proofs.yml)
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)
 #   ci-scope.sh go           Workflows' Go tools steps (ci.yml)
+#   ci-scope.sh apt          Workflows' apt mirror fallback step (ci.yml)
 #   ci-scope.sh analysis     Fuzz, Valgrind, Stress, ZLint (suppressed-errors) (analysis.yml)
 #   ci-scope.sh tsan         ThreadSanitizer, native; ThreadSanitizer, end to end (analysis.yml)
 #   ci-scope.sh store        Store stress, Store crash (analysis.yml)
@@ -131,6 +132,14 @@ needed() {
 		*) return 1 ;;
 		esac
 		;;
+	apt)
+		# apt-test.sh runs apt.sh's mirror fallback in a container, against the real mirrors.
+		case $1 in
+		.github/scripts/apt.sh | .github/scripts/apt-test.sh | .github/workflows/ci.yml | \
+			.github/scripts/ci-scope.sh) return 0 ;;
+		*) return 1 ;;
+		esac
+		;;
 	analysis)
 		# Only the searches themselves, on a pull request: a change to the runner's code is the
 		# nightly run's to search, not every pull request's (each costs minutes per target).
@@ -209,10 +218,10 @@ needed() {
 }
 
 case $scope in
-tests | binaries | e2e | proofs | packaging | go | analysis | tsan | store | coverage | \
+tests | binaries | e2e | proofs | packaging | go | apt | analysis | tsan | store | coverage | \
 	codeql-actions | codeql-go | codeql-python) ;;
 *)
-	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|analysis|tsan|store|coverage|codeql-actions|codeql-go|codeql-python" >&2
+	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|apt|analysis|tsan|store|coverage|codeql-actions|codeql-go|codeql-python" >&2
 	exit 2
 	;;
 esac

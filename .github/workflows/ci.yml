@@ -127,8 +127,17 @@ jobs:
         run: .github/scripts/tool-trees-test.sh
 
       # apt.sh's fallback to a mirror, in a container whose route to Ubuntu's archive is cut: the
-      # install still works, with apt's keyrings unchanged. Uses the real mirrors.
+      # install still works, with apt's keyrings unchanged. Uses the real mirrors, 44 s, so only on
+      # a change to apt.sh or its test (ci-scope.sh apt).
+      - name: Whether this change can affect apt.sh
+        id: apt_scope
+        if: ${{ !cancelled() }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh apt
+
       - name: apt mirror fallback
+        if: ${{ !cancelled() && steps.apt_scope.outputs.run == 'true' }}
         run: .github/scripts/apt-test.sh
 
       # The changie the release installs, against its pinned checksum: a new version (Renovate's)
@@ -277,6 +286,11 @@ jobs:
     name: Tests (x86_64)
     runs-on: ${{ fromJSON(github.event_name == 'push' && (vars.PROD_RUNNER || '"ubuntu-26.04"') || (vars.PREPROD_RUNNER || '"ubuntu-26.04"')) }}
     timeout-minutes: 30
+    # The store stress test's workers for 10 s (5 s with the deferred sync) where it defaults to 30:
+    # analysis.yml runs it for minutes on every change to the store and nightly, and here it was 46 s
+    # of a Tests job and 31 s of the longest root part.
+    env:
+      ZIG_TEST_STORE_STRESS_SECONDS: "10"
     permissions:
       contents: read # to check out the code
     steps:
@@ -400,6 +414,11 @@ jobs:
     if: github.event_name != 'push'
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
     timeout-minutes: 30
+    # The store stress test's workers for 10 s (5 s with the deferred sync) where it defaults to 30:
+    # analysis.yml runs it for minutes on every change to the store and nightly, and here it was 46 s
+    # of a Tests job and 31 s of the longest root part.
+    env:
+      ZIG_TEST_STORE_STRESS_SECONDS: "10"
     permissions:
       contents: read # to check out the code
     strategy:
@@ -528,6 +547,11 @@ jobs:
     if: github.event_name != 'push'
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 30
+    # The store stress test's workers for 10 s (5 s with the deferred sync) where it defaults to 30:
+    # analysis.yml runs it for minutes on every change to the store and nightly, and here it was 46 s
+    # of a Tests job and 31 s of the longest root part.
+    env:
+      ZIG_TEST_STORE_STRESS_SECONDS: "10"
     permissions:
       contents: read # to check out the code
     steps:
