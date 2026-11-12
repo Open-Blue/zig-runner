@@ -8,6 +8,7 @@ const sandbox = @import("native/sandbox.zig");
 const net = @import("native/net.zig");
 const nft = @import("native/nft.zig");
 const key_diff = @import("native/key_diff.zig");
+const proc_stats = @import("proc_stats.zig");
 const collector = @import("native/collector.zig");
 
 const forward = @import("native/forward.zig");
@@ -36,6 +37,7 @@ comptime {
     _ = @import("native/evict.zig");
     _ = @import("native/reaper.zig");
     _ = @import("native/collector.zig");
+    _ = @import("proc_stats.zig");
     _ = @import("native/sync_choice.zig");
     _ = @import("native/sandbox.zig");
     _ = @import("native/net.zig");
@@ -110,7 +112,11 @@ comptime {
 
 const Exit = loop.Exit;
 
-pub fn main(init: std.process.Init) !u8 {
+pub fn main(process_init: std.process.Init) !u8 {
+    // Every allocation of the runner's, counted (`proc_stats.heap`), for the health and job-end
+    // lines: a leak then shows as a heap that grows, not only at exit.
+    var init = process_init;
+    init.gpa = proc_stats.heap.allocator(process_init.gpa);
     const arena = init.arena.allocator();
     const io = init.io;
 

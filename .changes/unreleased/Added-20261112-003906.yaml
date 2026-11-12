@@ -1,0 +1,3 @@
+kind: Added
+body: 'The runner logs its own resources: a health: proc line after each health: line, and a job-end: line per job, with its memory (resident, anonymous, and what its allocator holds, in bytes and blocks), threads, open descriptors, mounts and unwaited children, and how they changed during the job, so a leak shows as a trend instead of only at exit. A zombie child is a warning, as are failures that were silent: deleting the broker session, a job''s veth or its namespace mounts, and writing a step''s index or size.'
+time: 2026-11-12T00:39:06.327376856-05:00
