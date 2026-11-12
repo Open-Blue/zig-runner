@@ -209,9 +209,10 @@ needed() {
 }
 
 case $scope in
-tests | binaries | e2e | proofs | packaging | go | analysis | tsan | store | coverage) ;;
+tests | binaries | e2e | proofs | packaging | go | analysis | tsan | store | coverage | \
+	codeql-actions | codeql-go | codeql-python) ;;
 *)
-	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|analysis|tsan|store|coverage" >&2
+	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|analysis|tsan|store|coverage|codeql-actions|codeql-go|codeql-python" >&2
 	exit 2
 	;;
 esac
