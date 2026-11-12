@@ -1,11 +1,12 @@
 name: store model
 
-# The TLA+ models: the native store's locking protocols (proofs/tla/StoreLocking.tla,
-# StoreDeferred.tla and StoreEviction.tla, proofs/README.md "The store's locking, in TLA+") and the release pipeline
-# (ReleasePipeline.tla, "The release pipeline, in TLA+"), checked with SPIN on their Promela ports
-# (proofs/spin, "The store's locking, in SPIN"), and with TLC any module that has none. Their safety
-# and liveness must hold, and each mutant (the code with one guard taken away) and finding must fail.
-# tla2tools.jar is pinned with its sha256 in tlc.sh, SPIN as Ubuntu's package below. On pull requests and pushes to main that touch the store, its callers,
+# The models of the native store's locking protocols (proofs/tla/StoreLocking.tla, StoreDeferred.tla
+# and StoreEviction.tla, proofs/README.md "The store's locking, in TLA+") and of the release
+# pipeline (ReleasePipeline.tla, "The release pipeline, in TLA+"), checked with SPIN on their
+# Promela ports (proofs/spin, "The store's locking, in SPIN"); the TLA+ modules are their
+# documentation. Their safety and liveness must hold, and each mutant (the code with one guard
+# taken away) and finding must fail. SPIN is Ubuntu's package, pinned below. On pull requests and
+# pushes to main that touch the store, its callers,
 # the release's workflows and scripts, or the models, and weekly with the proofs. Not a required
 # check, so a path filter is enough (proofs.yml needs ci-scope.sh because it is one), and the merge
 # queue does not run it.
@@ -29,7 +30,6 @@ on:
       - .github/scripts/check-names.sh
       - .github/checks-on-main
       - .github/workflows/store-model.yml
-      - .github/scripts/tlc.sh
       - .github/scripts/spin.sh
   pull_request:
     paths:
@@ -48,7 +48,6 @@ on:
       - .github/scripts/check-names.sh
       - .github/checks-on-main
       - .github/workflows/store-model.yml
-      - .github/scripts/tlc.sh
       - .github/scripts/spin.sh
   schedule:
     - cron: "41 5 * * 1" # Mondays, 05:41 UTC, with proofs.yml
@@ -61,34 +60,6 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # In three parts side by side (tlc.sh, TLC_PART), by the times the configurations note. With
-  # every module SPIN's, TLC has nothing to check here unless TLC_ALL is set.
-  tlc:
-    name: TLC (${{ matrix.part }}/3)
-    runs-on: ubuntu-26.04
-    timeout-minutes: 30
-    permissions:
-      contents: read # to check out the code
-    strategy:
-      # Every part reports: one failing does not hide what the others find.
-      fail-fast: false
-      matrix:
-        part: [1, 2, 3]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
-        with:
-          distribution: temurin
-          java-version: "21"
-
-      - name: Check the store's locking and the release pipeline
-        env:
-          TLC_PART: ${{ matrix.part }}/3
-        run: .github/scripts/tlc.sh
-
   # Every module's configurations and mutants, safety and liveness (proofs/spin, the Promela ports
   # of the modules under proofs/tla), side by side on the runner's cores.
   spin:

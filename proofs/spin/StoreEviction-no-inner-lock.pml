@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: HeldWhole. An eviction that takes a volume's lock and not the lock of the
+/* A mutant SPIN must fail: HeldWhole. An eviction that takes a volume's lock and not the lock of the
  * volume inside it: the job holding the inner one loses it.
  * Written from proofs/tla/StoreEviction-no-inner-lock.cfg by proofs/spin/cfg.py: change the .cfg, not this. */
 #define NP 2

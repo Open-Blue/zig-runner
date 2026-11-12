@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: HeldWhole. An eviction that goes by the last use alone, without the entry's
+/* A mutant SPIN must fail: HeldWhole. An eviction that goes by the last use alone, without the entry's
  * lock: it takes a volume a job is using.
  * Written from proofs/tla/StoreEviction-no-lock.cfg by proofs/spin/cfg.py: change the .cfg, not this. */
 #define NP 2

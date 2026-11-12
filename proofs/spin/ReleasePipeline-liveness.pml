@@ -1,8 +1,7 @@
 /* Liveness under the fairness of GitHub's and the jobs' steps (not of merges, new runs or the
  * maintainer's approval), and the safety invariants again: a merge, two version runs, a push run
  * reporting no check, a lost run, a failure. TagJobEnds here, DeployEnds in -liveness-deploy.cfg,
- * the same model: TLC checks each in half the time of both (a tableau of two branches, not four),
- * and the two run in different parts.
+ * the same model, so that spin.sh checks the two side by side.
  * Written from proofs/tla/ReleasePipeline-liveness.cfg by proofs/spin/cfg.py: change the .cfg, not this.
  * spin-ltl: TagJobEnds
  * spin-states: 373472 */

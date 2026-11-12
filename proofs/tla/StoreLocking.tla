@@ -1,5 +1,10 @@
 ---------------------------- MODULE StoreLocking ----------------------------
 (***************************************************************************)
+(* Documentation, no longer machine-checked: SPIN checks this module's     *)
+(* Promela port, proofs/spin/StoreLockingModel.pml, action for action, and *)
+(* the .cfg files' spin-states lines are SPIN's counts, the reference      *)
+(* (proofs/README.md).                                                     *)
+(*                                                                         *)
 (* The native layer store's locking protocol at the level of system calls *)
 (* (runner/src/native/Store.zig, its callers in Backend.zig and layers.zig; *)
 (* docs/native-backend.md, P2).  proofs/Runner/Native.lean treats a store  *)

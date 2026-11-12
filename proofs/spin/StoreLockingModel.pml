@@ -1,7 +1,7 @@
 /*
  * proofs/tla/StoreLocking.tla in Promela, for SPIN (proofs/README.md, "The store's locking, in
- * SPIN"). The TLA+ module is the documented model and this is the same model, action for action:
- * a change to one is a change to the other. Each TLA+ action is one atomic step of SPIN's here,
+ * SPIN"). The TLA+ module is the documented model, no longer machine-checked, and this is the same
+ * model, action for action, which SPIN checks: a change to one is a change to the other. Each TLA+ action is one atomic step of SPIN's here,
  * under the action's name; what it stands for in the code is said in the module, not again here.
  *
  * A configuration (StoreLocking*.pml, written from the .cfg of the same name by cfg.py) defines
@@ -767,7 +767,7 @@ inline crash(q) {
 
 /* Crash, MachineCrash, Corrupt, and Next's step of a terminated system, which changes nothing.
  * Env is always at an end label and the runners never are, so a state with no step is an invalid
- * end state to SPIN exactly when it is a deadlock to TLC. */
+ * end state to SPIN exactly when it is a deadlock of the module: no step, and not ended. */
 proctype Env() {
 end:
 	do
