@@ -2,12 +2,12 @@
 # Before a push: the checks CI runs on a pull request, on exactly the commits being pushed (each is
 # checked out in a temporary worktree, so uncommitted changes neither help nor hurt):
 #
-#   - the branch name's prefix (CI's "Branch name"; it decides the release, CONTRIBUTING.md "Versioning");
+#   - the branch name's prefix (CI's "Workflows"; it decides the release, CONTRIBUTING.md "Versioning");
 #   - zig fmt, GitHub's expression cases, and the build and tests ("Tests (x86_64)");
 #     the database tests run too when PG* or ZIG_TEST_PG_URL point at a database; when the
 #     runner's code changed, the tests again on overlayfs, in Docker ("Test, on overlayfs":
 #     #332 passed every pull request and failed on main), and ZLint with its suppressed-errors
-#     check ("Lint (ZLint)": #327's and #332's `catch {}` reached the nightly first);
+#     check (CI's "Workflows": #327's and #332's `catch {}` reached the nightly first);
 #   - actionlint and zizmor, and the check names the release waits for (check-names.sh), when
 #     workflows changed, shellcheck and shfmt, when shell scripts did,
 #     and hadolint, when the Dockerfile did ("Workflows"), and the unsafe constructs ratchet, always;

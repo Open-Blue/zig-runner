@@ -91,7 +91,7 @@ jobs:
         run: echo "tag=$(.github/scripts/next-version.sh)" >> "$GITHUB_OUTPUT"
 
       # On the commit checked out, which the release commit goes on top of: what ci.yml and
-      # proofs.yml run on a push to main (not "Branch name" or "Release builds", pull requests'
+      # proofs.yml run on a push to main (not "Release builds", pull requests'
       # only). Usually long done; a merge just before may still be running them.
       - name: Wait for main's checks
         if: steps.next.outputs.tag && !inputs.skip_main_checks
