@@ -34,6 +34,11 @@ pub const Scope = union(enum) {
 };
 
 pub const JsRuntime = enum { bun, node };
+/// The forge whose jobs this process takes: GitHub through its runner protocol (`github/`), or a
+/// Gitea or Forgejo instance through theirs (`gitea/`). One per process for now (#520). Gitea and
+/// Forgejo share the transport and differ in the fields of a few messages (`gitea/client.zig`);
+/// the setting names which, not a probe of the instance, so what is sent never depends on a guess.
+pub const Platform = enum { github, gitea, forgejo };
 /// Who steps run as in the default image: `runner` (uid 1001, passwordless sudo), as on GitHub's
 /// hosted runners, or root.
 pub const StepUser = enum { runner, root };
@@ -80,6 +85,20 @@ pub const Config = struct {
     /// takes its token from here when set (`jitconfig`).
     app_auth: ?*app.Auth = null,
     labels: []const u8 = "self-hosted,linux,zig",
+    platform: Platform = .github,
+    /// With `platform` gitea: the instance's address (`https://gitea.example.com`, no path), and the
+    /// registration token it gave (`RUNNER_GITEA_REGISTRATION_TOKEN`), needed only until the runner
+    /// is registered: the state file keeps the runner's own credentials after that.
+    gitea_url: []const u8 = "",
+    gitea_registration_token: []const u8 = "",
+    /// Seconds between two `FetchTask` calls of a runner that finds nothing, and the longest the
+    /// wait grows to while it keeps finding nothing (`gitea/poller.zig`): `act_runner`'s
+    /// `fetch_interval` and `fetch_interval_max`.
+    gitea_fetch_interval_secs: u32 = 2,
+    gitea_fetch_interval_max_secs: u32 = 60,
+    /// Where the runner keeps what must survive a restart: a Gitea runner's registration
+    /// (`gitea/state.zig`). Empty: `/var/lib/zig-runner` for root, else the user's state directory.
+    state_dir: []const u8 = "",
     runner_group_id: u64 = 1,
     name_prefix: []const u8 = "zig",
     /// Absent means "log to stdout only" (StdoutSink).
@@ -331,6 +350,9 @@ pub const Config = struct {
         InvalidScope,
         InvalidNumber,
         InvalidJsRuntime,
+        InvalidPlatform,
+        MissingGiteaUrl,
+        InvalidGiteaUrl,
         InvalidStepUser,
         InvalidBackend,
         InvalidNativeRootfs,
@@ -378,6 +400,11 @@ pub const Config = struct {
             error.MissingGhToken => "No GitHub credentials: set GH_TOKEN, or a GitHub App with " ++
                 "GH_APP_ID and GH_APP_PRIVATE_KEY_FILE (or GH_APP_PRIVATE_KEY) " ++
                 "(deploy/runner.env.example).",
+            error.InvalidPlatform => "RUNNER_PLATFORM is github, gitea or forgejo.",
+            error.MissingGiteaUrl => "RUNNER_PLATFORM=gitea or forgejo needs RUNNER_GITEA_URL, the " ++
+                "instance's address (https://gitea.example.com).",
+            error.InvalidGiteaUrl => "RUNNER_GITEA_URL is the instance's address, http:// or " ++
+                "https:// and a host, with no path (https://gitea.example.com).",
             error.GhTokenAndApp => "Both GH_TOKEN and a GitHub App (GH_APP_*) are set: the " ++
                 "runner uses one or the other. Remove GH_TOKEN to use the App.",
             error.MissingGhAppId => "GH_APP_* is set but GH_APP_ID is not: set it to the App's " ++
@@ -435,6 +462,17 @@ pub const Config = struct {
             !std.mem.eql(u8, c.native_cgroup, "none") and !native_cgroup.within(c.native_cgroup))
             return error.InvalidNativeCgroup;
 
+        if (c.platform != .github) {
+            // The runner's own credentials come from the state file once it has registered; the
+            // registration token is asked for then, not here (`gitea/state.zig`).
+            if (c.gitea_url.len == 0) return error.MissingGiteaUrl;
+            if (!validGiteaUrl(c.gitea_url)) return error.InvalidGiteaUrl;
+            if (c.gitea_fetch_interval_secs == 0 or
+                c.gitea_fetch_interval_max_secs < c.gitea_fetch_interval_secs)
+                return error.InvalidNumber;
+            c.scope = .{ .org = "gitea" };
+            return c;
+        }
         if (c.exec_job != null or c.db_check) {
             // Offline mode: no GitHub credentials needed.
             c.gh_token = creds.token orelse "";
@@ -484,6 +522,13 @@ pub const Config = struct {
     /// Every setting the environment can give (SPEC.md §2's table).
     fn fromEnviron(c: *Config, environ: *const std.process.Environ.Map) Error!void {
         if (environ.get("RUNNER_LABELS")) |v| c.labels = v;
+        if (environ.get("RUNNER_PLATFORM")) |v| c.platform = try parsePlatform(v);
+        if (environ.get("RUNNER_GITEA_URL")) |v| c.gitea_url = v;
+        if (environ.get("RUNNER_GITEA_REGISTRATION_TOKEN")) |v| c.gitea_registration_token = v;
+        if (environ.get("RUNNER_GITEA_FETCH_INTERVAL")) |v| c.gitea_fetch_interval_secs = try secs(v);
+        if (environ.get("RUNNER_GITEA_FETCH_INTERVAL_MAX")) |v|
+            c.gitea_fetch_interval_max_secs = try secs(v);
+        if (environ.get("RUNNER_STATE_DIR")) |v| c.state_dir = v;
         if (environ.get("RUNNER_GROUP_ID")) |v| c.runner_group_id = try num(u64, v);
         if (environ.get("RUNNER_NAME_PREFIX")) |v| c.name_prefix = v;
         if (environ.get("DATABASE_URL")) |v| c.database_url = v;
@@ -590,6 +635,12 @@ pub const Config = struct {
         else if (eq(key, "scope")) creds.scope = val //
         else if (eq(key, "exec-job")) c.exec_job = val //
         else if (eq(key, "labels")) c.labels = val //
+        else if (eq(key, "platform")) c.platform = try parsePlatform(val) //
+        else if (eq(key, "gitea-url")) c.gitea_url = val //
+        else if (eq(key, "gitea-registration-token")) c.gitea_registration_token = val //
+        else if (eq(key, "gitea-fetch-interval")) c.gitea_fetch_interval_secs = try secs(val) //
+        else if (eq(key, "gitea-fetch-interval-max")) c.gitea_fetch_interval_max_secs = try secs(val) //
+        else if (eq(key, "state-dir")) c.state_dir = val //
         else if (eq(key, "group-id")) c.runner_group_id = try num(u64, val) //
         else if (eq(key, "name-prefix")) c.name_prefix = val //
         else if (eq(key, "database-url")) c.database_url = val //
@@ -675,14 +726,48 @@ pub const Config = struct {
     }
 
     /// Secrets that must never appear in output (SPEC §9).
-    pub fn secrets(c: *const Config, buf: *[2][]const u8) []const []const u8 {
+    pub fn secrets(c: *const Config, buf: *[3][]const u8) []const []const u8 {
         buf[0] = c.gh_token;
         var n: usize = 1;
         if (c.database_url) |u| {
-            buf[1] = u;
-            n = 2;
+            buf[n] = u;
+            n += 1;
+        }
+        if (c.gitea_registration_token.len > 0) {
+            buf[n] = c.gitea_registration_token;
+            n += 1;
         }
         return buf[0..n];
+    }
+
+    /// Where the runner's persistent state lives: `state_dir`, else under /var/lib for root and the
+    /// user's state directory otherwise.
+    pub fn stateDir(
+        c: *const Config,
+        arena: std.mem.Allocator,
+        environ: *const std.process.Environ.Map,
+    ) ![]const u8 {
+        if (c.state_dir.len > 0) return c.state_dir;
+        if (std.os.linux.geteuid() == 0) return "/var/lib/zig-runner";
+        if (environ.get("XDG_STATE_HOME")) |d| if (d.len > 0)
+            return std.fmt.allocPrint(arena, "{s}/zig-runner", .{d});
+        const home = environ.get("HOME") orelse "/tmp";
+        return std.fmt.allocPrint(arena, "{s}/.local/state/zig-runner", .{home});
+    }
+
+    fn parsePlatform(s: []const u8) error{InvalidPlatform}!Platform {
+        return std.meta.stringToEnum(Platform, s) orelse error.InvalidPlatform;
+    }
+
+    /// `http://` or `https://`, a host, and no path: the RPC paths are appended to it.
+    fn validGiteaUrl(u: []const u8) bool {
+        const rest = if (std.mem.startsWith(u8, u, "https://"))
+            u["https://".len..]
+        else if (std.mem.startsWith(u8, u, "http://"))
+            u["http://".len..]
+        else
+            return false;
+        return rest.len > 0 and std.mem.indexOfAny(u8, rest, "/?# ") == null;
     }
 
     fn engineMode(s: []const u8) error{InvalidEngine}!EngineMode {
@@ -1381,4 +1466,36 @@ test "load: GH_TOKEN or a GitHub App, not both and not neither" {
     try std.testing.expectError(error.InvalidGhAppId, Config.load(&env, &.{"runner"}));
     try env.put("GH_APP_ID", "");
     try std.testing.expectError(error.MissingGhAppId, Config.load(&env, &.{"runner"}));
+}
+
+test "RUNNER_PLATFORM=gitea needs the instance's address, and no GitHub credentials" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("RUNNER_PLATFORM", "gitea");
+    try std.testing.expectError(error.MissingGiteaUrl, Config.load(&env, &.{"runner"}));
+    try env.put("RUNNER_GITEA_URL", "gitea.example.com");
+    try std.testing.expectError(error.InvalidGiteaUrl, Config.load(&env, &.{"runner"}));
+    try env.put("RUNNER_GITEA_URL", "https://gitea.example.com/sub");
+    try std.testing.expectError(error.InvalidGiteaUrl, Config.load(&env, &.{"runner"}));
+    try env.put("RUNNER_GITEA_URL", "http://127.0.0.1:3300");
+    try env.put("RUNNER_GITEA_REGISTRATION_TOKEN", "reg-secret");
+    try env.put("RUNNER_GITEA_FETCH_INTERVAL", "5");
+    try env.put("RUNNER_GITEA_FETCH_INTERVAL_MAX", "4");
+    try std.testing.expectError(error.InvalidNumber, Config.load(&env, &.{"runner"}));
+    try env.put("RUNNER_GITEA_FETCH_INTERVAL_MAX", "30");
+    const c = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqual(Platform.gitea, c.platform);
+    try env.put("RUNNER_PLATFORM", "forgejo");
+    try std.testing.expectEqual(Platform.forgejo, (try Config.load(&env, &.{"runner"})).platform);
+    try env.put("RUNNER_PLATFORM", "gitea");
+    try std.testing.expectEqual(@as(u32, 5), c.gitea_fetch_interval_secs);
+    try std.testing.expectEqualStrings("http://127.0.0.1:3300", c.gitea_url);
+    // The registration token is redacted wherever the runner writes.
+    var buf: [3][]const u8 = undefined;
+    try std.testing.expectEqualStrings("reg-secret", c.secrets(&buf)[1]);
+    // Flags override, and GitHub stays the default.
+    const flag = [_][:0]const u8{ "runner", "--platform=github", "--token=t", "--scope=o/r" };
+    try std.testing.expectEqual(Platform.github, (try Config.load(&env, &flag)).platform);
+    try env.put("RUNNER_PLATFORM", "gitlab");
+    try std.testing.expectError(error.InvalidPlatform, Config.load(&env, &.{"runner"}));
 }
