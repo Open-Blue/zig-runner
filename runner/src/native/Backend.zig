@@ -13,6 +13,7 @@
 const Backend = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Sha256 = @import("../sha256.zig").Sha256;
 const job_mod = @import("../job.zig");
 const config = @import("../config.zig");
@@ -30,6 +31,7 @@ const docker = @import("../dagger/docker.zig");
 const cgroup = @import("cgroup.zig");
 const evict = @import("evict.zig");
 const reaper = @import("reaper.zig");
+const collector = @import("collector.zig");
 const volumes = @import("volumes.zig");
 const trees_check = @import("tool_trees.zig");
 const admission = @import("../admission.zig");
@@ -159,6 +161,8 @@ published: bool = false,
 /// What a step is across runs, without its place in the job (`stepIdent`): the cache scope, the
 /// repository, the workflow, the job and its display name. Set in `base`.
 ident: [5][]const u8 = .{ "", "", "", "", "" },
+/// GitHub's id of the job (`check_run_id`), 0 when unknown: what its store upkeep's log line names.
+check_run_id: u64 = 0,
 /// The base's key parts (`below`), which stand where a step's parent layer does in its components.
 below_parts: []const key_diff.Component = &.{},
 /// The components of the key `keyFor` made last, for `claimKey` to compare and `publishTop` to
@@ -334,6 +338,9 @@ pub const Config = struct {
     /// A step's upper is idmapped only when its layer is expected to hold this many entries
     /// (`upperIdmapped`); 0 for every step, which the tests that compare the two ways ask for.
     idmapped_min_entries: u64 = idmapped_min_entries_default,
+    /// Whether a job's store upkeep runs on a thread after its end returns
+    /// (`RUNNER_NATIVE_DEFER_COLLECT`, `Store.defer_collect`).
+    defer_collect: bool = true,
     /// Tests: services' images from a directory filled ahead (`images.find`: `rootfs/` and
     /// `config.json` per reference) instead of P3's pull; "" pulls them, as in production.
     images: []const u8 = "",
@@ -454,6 +461,7 @@ pub fn configFor(
         .rootless = cfg.native_rootless,
         .defer_sync = cfg.native_defer_sync,
         .idmapped_upper = cfg.native_idmapped_upper,
+        .defer_collect = cfg.native_defer_collect,
         .subid_base = cfg.native_subid_base,
         .subnet = try net.Subnet.parse(cfg.native_subnet),
         .store_max_bytes = cfg.native_store_max_mb * 1024 * 1024,
@@ -983,6 +991,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
             .sync_log = Store.newSyncLog(arena),
             .defer_sync = cfg.defer_sync,
             .defer_delete = true,
+            .defer_collect = cfg.defer_collect,
         },
         .vouched = cfg.vouched,
         .port_addresses = cfg.port_addresses,
@@ -1516,6 +1525,20 @@ pub fn deinit(b: *Backend) void {
     if (b.slot) |s| s.lock.close(b.io);
     b.lock.close(b.io);
     t = b.timings.since(arena, .collect_touch, t);
+    // The rest of the upkeep is off the way to the runner's next job (`collector`): the layers'
+    // directory synced and the store kept under its cap. Not when the job's sync failed (its layers
+    // are dropped before it returns), or the store may be past its cap, which is then collected
+    // here, after the thread's own pass, so the cap holds however many jobs end at once.
+    if (b.store_cfg.defer_collect and b.store_cfg.root.len > 0) {
+        if (b.store_cfg.lagFits(arena, b.io) and collector.submit(b.io, b.store_cfg, b.published, b.check_run_id)) {
+            _ = b.timings.since(arena, .collect, whole);
+            if (b.store_cfg.sync_fd) |fd| _ = std.os.linux.close(fd);
+            // Tests read the store when a job returns, as they did; the thread has tests of its own.
+            if (builtin.is_test and collector.test_wait) _ = collector.drain(b.io, null);
+            return;
+        }
+        _ = collector.drain(b.io, null);
+    }
     if (b.published) b.store_cfg.syncLayers(arena);
     // After a failed sync, what this job renamed since the last good one is evicted.
     b.store_cfg.dropUnsynced(arena, b.io);
@@ -1630,6 +1653,7 @@ pub fn base(
     }
     b.repository = ev.job.github.repository;
     b.scope = try set_up.packageCacheScope(arena, ev, b.repository, b.vouched);
+    b.check_run_id = ev.job.check_run_id;
     b.ident = .{ b.scope, b.repository, ev.job.github.workflow, ev.job.job_id, ev.job.display_name };
     const event = try ev.eventJson();
     const event_in_env = plan.step_cache and event.len <= set_up.max_event_env;

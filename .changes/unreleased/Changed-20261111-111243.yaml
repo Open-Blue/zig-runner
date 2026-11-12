@@ -1,0 +1,3 @@
+kind: Changed
+body: 'A native job''s end no longer waits for the store''s upkeep: the sync of the layers'' directory and the eviction pass (`Store.collect`) run on a thread once the runner is polling again, one pass at a time, serving every job that ended meanwhile. On a Pi 5''s SD card they took 12-24 ms of a job''s end and 200-700 ms under load. A job''s end still collects before it returns when the store may be past its cap by more than a sixteenth (at least 64 MiB, per runner process), when the disk is short of its floor, for the first job of a process, or after a failed sync; a stopping runner waits for the syncs without a limit and for the collect for five seconds.'
+time: 2026-11-11T11:12:43.123372786-05:00

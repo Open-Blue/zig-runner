@@ -653,7 +653,7 @@ jobs:
         run: .github/scripts/e2e.sh build "$RUNNER_TEMP/zig-runner"
 
       # The native pass's rootfs (apt in a container, about a minute), in the background: done
-      # while the Dagger pass runs, before the native one, which waits for it.
+      # while the Dagger pass runs (when it does), before the native one, which waits for it.
       - name: Make the native rootfs
         if: steps.go.outputs.run == 'true'
         run: nohup .github/scripts/e2e.sh rootfs "$RUNNER_TEMP/zig-runner" >"$RUNNER_TEMP/e2e/rootfs.log" 2>&1 &
@@ -679,11 +679,16 @@ jobs:
 
       - name: End to end on Dagger
         id: e2e_dagger
-        if: steps.go.outputs.run == 'true'
+        # Not on a pull request or in the merge queue, where it cost a pass of about four runner
+        # minutes for a result that gated nothing; the native pass is the check there. This job
+        # does not run on a push to main or on a schedule either, so the step runs only if one of
+        # those events is ever added to it; the Dagger backend is run end to end every night by
+        # analysis.yml's "ThreadSanitizer, end to end" (the same suite, a ThreadSanitizer build).
+        if: ${{ steps.go.outputs.run == 'true' && github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
         # Reported, not a gate: on GitHub's runner the engine is slow enough that the cancel check and
         # the suite's limit fail jobs that are right (#484 and #481 left the merge queue so, with the
-        # native pass green and main green). The default backend is still Dagger, so it keeps running
-        # and its result shows on every push; it goes with the Dagger backend.
+        # native pass green and main green). The default backend is still Dagger, so it keeps being
+        # run; it goes with the Dagger backend.
         continue-on-error: true
         # Worst case: the engine's wait 180 s, the suite 300 s and the reads after it 90 s, stop 35 s.
         timeout-minutes: 11
@@ -699,7 +704,8 @@ jobs:
           .github/scripts/e2e.sh stop
           exit "$status"
 
-      # Run whatever Dagger's pass found, so one push shows both.
+      # Run whatever Dagger's pass found, when it ran, so one run shows both. The engine is still
+      # started: the native backend hands some jobs to Dagger.
       - name: End to end, native
         if: ${{ !cancelled() && steps.go.outputs.run == 'true' }}
         # Worst case: the rootfs's wait 240 s, the suite 300 s and the reads after it 90 s, stop 35 s.
