@@ -1,3 +1,0 @@
-kind: Changed
-body: 'Make the analysis workflow lighter on pull requests: Valgrind runs only the changed tests, Fuzz 50K runs a target, Stress one job of 5 rounds, Store stress 90 seconds a pass, and Coverage runs only at night; both ThreadSanitizer jobs, native and end to end, run on every pull request that changes the runner''s code; the nightly run is unchanged.'
-time: 2026-11-11T12:40:04.1788238-05:00

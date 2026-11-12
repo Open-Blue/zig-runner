@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A native Docker action''s PID 1 that sets its signal handler late, as a post step''s sh under load does, still hears the step''s SIGINT: the helper holds the signal until PID 1 has a handler for as long as the stop''s stage lasts, where it gave up after 2 s and sent it to be dropped.'
-time: 2026-11-11T19:39:20.377488498-05:00

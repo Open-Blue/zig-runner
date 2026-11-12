@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The nightly analysis passes again: the OCI layer fuzz test no longer fails on a race in the test''s own thread pool, and Valgrind no longer reports the stack probe of a publish or fails on a signal test it cannot run.'
-time: 2026-11-11T08:58:24.757624062-05:00

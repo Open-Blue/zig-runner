@@ -1,3 +1,0 @@
-kind: Changed
-body: 'CI''s longest jobs are shorter: the store stress test runs for 10 s in ci (analysis still runs it for minutes on every store change and nightly), a run split into parts shares its slow tests out among the parts on their own, and the Workflows job runs apt.sh''s mirror fallback test only when apt.sh or its test changes.'
-time: 2026-11-11T21:40:52.490763636-05:00

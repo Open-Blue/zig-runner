@@ -1,3 +1,0 @@
-kind: Fixed
-body: When CI falls back to another Ubuntu mirror while building a container (the provisioned image, the end-to-end rootfs), the container's apt sources are put back afterwards, so an image built during an outage of Ubuntu's archive ships the same sources as one built without it.
-time: 2026-11-11T12:18:42.364635442-05:00

@@ -1,3 +1,0 @@
-kind: Changed
-body: 'CI takes fewer hosted runners: the branch name, ZLint and Go tools checks are steps of the Workflows job, not jobs of their own, and "Branch name" is no longer a required check.'
-time: 2026-11-11T19:48:02.468284799-05:00

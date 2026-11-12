@@ -1,3 +1,0 @@
-kind: Added
-body: 'Runner pools on one machine now share one memory budget: a root runner''s gate counts the jobs the other pools started less than 2 minutes ago and have not yet used the memory of (recorded in /run/zig-runner/memory-budget), as it counts its own pool''s, so two pools no longer admit a job each into the same free memory. A gate is stricter only while another pool has such a job. RUNNER_SHARED_MEMORY_BUDGET=false turns it off; a unit under ProtectSystem=strict needs RuntimeDirectory=zig-runner with RuntimeDirectoryPreserve=yes.'
-time: 2026-11-10T08:40:08.893110576-05:00

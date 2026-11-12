@@ -1,3 +1,0 @@
-kind: Changed
-body: 'A native job''s set-up spends less where jobs start together: it no longer asks the kernel for a link that is not there by name (which made it run `modprobe netdev-zrhN`: 5 ms a job in the `slot` phase, more in a burst), a dead job''s veth of the slot is removed by the job''s network helper, beside the rest of the set-up, instead of by the job itself waiting on the kernel''s lock for link changes (20-30 ms with seven jobs starting together), the helper starts before the cgroup is made, and the image store''s directories are not chmod-ed when they are already 0700. The slot''s lock, the job''s limits, rules and ids are as they were.'
-time: 2026-11-11T10:27:07.565243426-05:00

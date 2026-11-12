@@ -1,3 +1,0 @@
-kind: Changed
-body: 'CI''s End to end runs only its native pass on pull requests and in the merge queue: on GitHub''s runner the Dagger engine was slow enough to fail jobs that were right, which took pull requests out of the queue while the native pass and main were green. The Dagger backend is still run end to end every night, and under ThreadSanitizer on every change to the runner''s code.'
-time: 2026-11-11T00:51:14.967547003-05:00

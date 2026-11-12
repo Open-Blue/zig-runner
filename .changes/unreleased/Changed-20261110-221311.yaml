@@ -1,3 +1,0 @@
-kind: Changed
-body: 'The native backend makes a job''s network namespace beside the job''s image and caches instead of before them, and no longer asks the kernel to change a bridge that is already as wanted: with seven jobs starting together on a Raspberry Pi 5 the `netns` phase (33-130 ms each, 8 ms for one job) is off the job''s critical path.'
-time: 2026-11-10T22:13:11.126409864-05:00

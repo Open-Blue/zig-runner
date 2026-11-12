@@ -1,3 +1,0 @@
-kind: Changed
-body: 'CI''s apt steps fall back to other Ubuntu mirrors when Ubuntu''s own archive is unreachable: `.github/scripts/apt.sh` retries against kernel.org and Leaseweb (amd64) or Berkeley and Chemnitz (arm64), keeping apt''s signature checks, and the provisioned image and end-to-end rootfs builds do the same when the archive does not answer.'
-time: 2026-11-11T10:59:03.033904236-05:00

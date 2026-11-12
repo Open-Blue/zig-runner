@@ -1,3 +1,0 @@
-kind: Changed
-body: A native step on a root runner now writes its upper through an idmapped mount where the kernel allows it, so its layer has the canonical ids on disk when the step ends and publishing it no longer walks and chowns every entry (a 20,000-file layer took about 570 ms to shift, a cold build's 64 ms on the Pi). Each step pays about 0.8 ms for the mount, and any machine or filesystem that cannot do it, and RUNNER_NATIVE_IDMAPPED_UPPER=false, keeps the shift as before; the layers and the store are the same either way.
-time: 2026-11-10T23:08:14.156978095-05:00

@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A native job''s Docker action that starts while the job''s limit is already near no longer loses its SIGINT: the helper holds the signal until the action''s first process has a handler for it, as the kernel drops a signal to a namespace''s PID 1 that has none, and the ThreadSanitizer job''s test of each post script hearing its own SIGINT failed on it.'
-time: 2026-11-10T15:17:17.537128041-05:00

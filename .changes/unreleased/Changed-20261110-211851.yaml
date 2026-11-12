@@ -1,3 +1,0 @@
-kind: Changed
-body: 'A native job''s tool cache walk is cheaper when no file has to be read: the paths are joined and the digests'' lines written without formatting, the entries are sorted by key, and a list whose every line was kept is not made again. The same two digests come out (a changed, added, removed or replaced file, link or directory is still caught), and the walk of Zig''s 19,505 files takes 82 ms on the laptop instead of 118.'
-time: 2026-11-10T21:18:51.824793819-05:00

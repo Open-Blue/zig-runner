@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The eviction test of names a job planted under a dead tree waits up to 120 s for the removal instead of 300 passes of 15 ms, which a loaded machine ran past: it needs about 170 passes alone and 256 under ThreadSanitizer.'
-time: 2026-11-11T16:44:55.400900617-05:00
