@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: NotPinned. An eviction that stops at what a job left at the inner lock's name:
+/* A mutant SPIN must fail: NotPinned. An eviction that stops at what a job left at the inner lock's name:
  * a symlink there keeps the volume for good.
  * Written from proofs/tla/StoreEviction-planted.cfg by proofs/spin/cfg.py: change the .cfg, not this. */
 #define NP 3

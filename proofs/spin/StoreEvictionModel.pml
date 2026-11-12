@@ -1,8 +1,9 @@
 /*
  * proofs/tla/StoreEviction.tla in Promela, for SPIN (proofs/README.md, "Eviction beside the
- * layers"). The TLA+ module is the documented model and this is the same model, action for
- * action, in the way StoreLockingModel.pml is StoreLocking.tla's (its header says how a module
- * becomes Promela with the same states): a change to one is a change to the other.
+ * layers"). The TLA+ module is the documented model, no longer machine-checked, and this is the
+ * same model, action for action, in the way StoreLockingModel.pml is StoreLocking.tla's (its header
+ * says how a module becomes Promela with the same states): a change to one is a change to the
+ * other.
  *
  * A configuration (StoreEviction*.pml, written from the .cfg of the same name by cfg.py) defines
  * the constants, the invariants and the temporal properties it checks, then includes this file:

@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: NamedWhole. An eviction that deletes before its rename is on disk, on a
+/* A mutant SPIN must fail: NamedWhole. An eviction that deletes before its rename is on disk, on a
  * filesystem that keeps the deletes and loses the rename: the name comes back on a tree half gone.
  * Written from proofs/tla/StoreEviction-no-rename-sync.cfg by proofs/spin/cfg.py: change the .cfg, not this. */
 #define NP 1

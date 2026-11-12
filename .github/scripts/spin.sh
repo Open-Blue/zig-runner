@@ -8,8 +8,8 @@
 # Each proofs/spin/<Module>*.pml but <Module>Model.pml is a configuration written from the proofs/tla
 # .cfg of the same name (proofs/spin/cfg.py; a stale one fails the job). A configuration of the
 # protocol as the code has it must hold, and must reach exactly the states its `spin-states:` line
-# says: TLC's count without symmetry, and SPIN's first state. A different count means the two models
-# have drifted apart. A configuration with temporal properties (its `spin-ltl:` line) then checks
+# says, the reference (cfg.py copies it from the .cfg). A different count means the Promela changed
+# in a way the TLA+ module, its documentation, does not say: change both, and the count with them. A configuration with temporal properties (its `spin-ltl:` line) then checks
 # each of them alone, with SPIN's weak fairness (pan -a -f), on the model built with LIVENESS. A
 # mutant, the code with one guard taken away, says "must fail: <property>" in its first line and must
 # fail with that invariant's assertion, or, for a temporal property, with that property's claim.
@@ -37,7 +37,7 @@ python3 -I "$here/cfg.py" --check
 # build <name> safety|liveness: spin -a and gcc in the current directory, pan-<kind> the verifier.
 # The safety one has no never claim; the liveness one has the stutter of LIVENESS and the claims.
 # A variable no step reads (a ghost a mutant does not check) stays in the state (-o2), as it is in
-# TLC's.
+# the TLA+ module's.
 build() {
 	local name=$1 kind=$2
 	if [[ $kind == safety ]]; then

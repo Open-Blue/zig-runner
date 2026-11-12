@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: NoLostPublish. A job's end without `syncLayers`: a crash loses the rename
+/* A mutant SPIN must fail: NoLostPublish. A job's end without `syncLayers`: a crash loses the rename
  * of a layer whose job had finished.
  * Written from proofs/tla/StoreLocking-no-dir-sync.cfg by proofs/spin/cfg.py: change the .cfg, not this. */
 #define NP 1

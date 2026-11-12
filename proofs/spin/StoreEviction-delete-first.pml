@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: NamedWhole. An eviction that deletes before it renames: a crash between
+/* A mutant SPIN must fail: NamedWhole. An eviction that deletes before it renames: a crash between
  * leaves the name on a tree half gone.
  * Written from proofs/tla/StoreEviction-delete-first.cfg by proofs/spin/cfg.py: change the .cfg, not this. */
 #define NP 1

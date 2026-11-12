@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: PassGoesOn. A pass that ends at a dead tree it cannot remove: a job that can
+/* A mutant SPIN must fail: PassGoesOn. A pass that ends at a dead tree it cannot remove: a job that can
  * make one stops eviction in every area.
  * Written from proofs/tla/StoreEviction-stuck-stops.cfg by proofs/spin/cfg.py: change the .cfg, not this. */
 #define NP 3

@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: FastFail. wait-for-checks.sh as #408 had it before 85dc4e8, counting every
+/* A mutant SPIN must fail: FastFail. wait-for-checks.sh as #408 had it before 85dc4e8, counting every
  * workflow run on the commit, the waiting job's own among them: the fast fail never fired in the
  * deploy job (release.yml's run is on the tag commit), nor in a tag job on the commit its version
  * run was made at, so a check that never started held the wait to its end. Found by this model.

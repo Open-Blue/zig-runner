@@ -1,5 +1,10 @@
 --------------------------- MODULE ReleasePipeline ---------------------------
 (***************************************************************************)
+(* Documentation, no longer machine-checked: SPIN checks this module's     *)
+(* Promela port, proofs/spin/ReleasePipelineModel.pml, action for action,  *)
+(* and the .cfg files' spin-states lines are SPIN's counts, the reference  *)
+(* (proofs/README.md).                                                     *)
+(*                                                                         *)
 (* The release pipeline, at the level of GitHub's runs and jobs, as #408   *)
 (* has it (proofs/README.md, "The release pipeline, in TLA+"):             *)
 (* .github/workflows/version.yml (a scheduled or dispatched run in the     *)

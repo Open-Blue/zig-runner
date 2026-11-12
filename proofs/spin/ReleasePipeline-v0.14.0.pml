@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: DeployEnds. The deploy job's `if:` as v0.14.0 had it, the implicit
+/* A mutant SPIN must fail: DeployEnds. The deploy job's `if:` as v0.14.0 had it, the implicit
  * success(): Binaries (check) is skipped on a tag, so the deploy is skipped, and the release run
  * ends green without deploying.
  * Written from proofs/tla/ReleasePipeline-v0.14.0.cfg by proofs/spin/cfg.py: change the .cfg, not this.

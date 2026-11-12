@@ -1,4 +1,4 @@
-/* A mutant TLC must fail: NoLostPublish. A job's end that leaves its last layer pending: a layer a
+/* A mutant SPIN must fail: NoLostPublish. A job's end that leaves its last layer pending: a layer a
  * finished job published is refused after a crash.
  * Written from proofs/tla/StoreDeferred-no-end-sync.cfg by proofs/spin/cfg.py: change the .cfg, not this. */
 #define NP 2
