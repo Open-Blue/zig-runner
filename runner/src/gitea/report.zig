@@ -419,7 +419,8 @@ pub const Reporter = struct {
     }
 
     fn noteFailure(r: *Reporter, method: []const u8, said: *bool, e: anyerror) void {
-        if (said.*) return;
+        // The pump ending cancels the report in flight: not a failure of the instance's.
+        if (e == error.Canceled or said.*) return;
         said.* = true;
         var buf: [256]u8 = undefined;
         const text = std.fmt.bufPrint(
@@ -628,9 +629,11 @@ pub const Reporter = struct {
         var failure: Failure = .{};
         r.client.updateStepSummary(arena, r.io, r.task_id, list.items, &failure) catch |e| {
             var buf: [200]u8 = undefined;
-            const text = std.fmt.bufPrint(&buf, "gitea: task {d}: step summaries not reported ({s})", .{
+            const text = std.fmt.bufPrint(&buf, "gitea: task {d}: step summaries not reported ({s}{s}{s})", .{
                 r.task_id,
                 @errorName(e),
+                if (failure.message.len > 0) ": " else "",
+                failure.message,
             }) catch return;
             r.log.say(text) catch |le| std.log.warn("gitea: log: {s}", .{@errorName(le)});
         };

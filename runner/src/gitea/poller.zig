@@ -74,7 +74,12 @@ const Shared = struct {
             var failure: Failure = .{};
             const sent = sh.tasks_version.load(.acquire);
             if (sh.client.fetchTask(arena, c.io, sent, &failure)) |f| {
-                sh.seen(f.tasks_version);
+                // A fetch that took a task does not say the instance has no other: it answers a
+                // version equal to the sender's with no assignment at all, so a version learned
+                // from a task would leave the next task of the same burst (a matrix's second
+                // job) unassigned until something else bumped it. Only an empty answer advances
+                // the version, as it did, and a task is followed by a fetch with the old one.
+                if (f.task == null) sh.seen(f.tasks_version);
                 if (f.additional > 0) slot.tell(arena, "runner {d}: the instance also sent {d} " ++
                     "additional task(s), which are not used (one task is asked for)", .{ index, f.additional });
                 if (f.task) |t| {
