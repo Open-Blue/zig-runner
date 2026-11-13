@@ -54,6 +54,8 @@ needed() {
 		runner/* | db/* | .github/workflows/ci.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/install-zig.sh | .github/scripts/ci-database.sh | \
 			.github/scripts/zig-test.sh | .github/scripts/zig-modules.sh | \
+			.github/scripts/cargo-test.sh | .github/scripts/pg-tls-fixture.sh | .github/scripts/build-zr-net.sh | \
+			.github/scripts/zig-cc.sh | .github/scripts/install-rust.sh | \
 			.github/scripts/expr-conformance.sh | .github/scripts/zlint.sh | \
 			.github/scripts/zlint-suppressed.baseline | \
 			.github/scripts/native-service-images.sh) return 0 ;;
@@ -109,7 +111,7 @@ needed() {
 		;;
 	packaging)
 		# How the release is built, not what: build-binaries.sh compiles runner/src through the module
-		# graph zig-modules.sh gives the compiler, from the packages build.zig.zon pins (a tls bump
+		# graph zig-modules.sh gives the compiler, from the packages build.zig.zon pins (none now; a tls bump
 		# skipped these checks before it was listed, #107), and checked against build.zig's and for
 		# their hardening (checksec.sh); sbom.sh reads build.zig.zon too. The image is the Dockerfile's, from a context .dockerignore trims,
 		# scanned with .trivyignore.yaml's exceptions. deploy/, which runs the image (compose.yaml)
@@ -156,7 +158,8 @@ needed() {
 			.github/scripts/zig-race-tests.sh | .github/scripts/zig-stress.sh | \
 			.github/scripts/zlint.sh | .github/scripts/zlint-suppressed.baseline | \
 			runner/src/native/oci/zstd.zig | runner/src/fuzz_corpus/zstd/* | \
-			runner/src/zr_net.zig | runner/rust/* | .github/scripts/build-zr-net.sh | \
+			runner/src/zr_net.zig | runner/src/tls_stream.zig | runner/src/fuzz_corpus/tls/* | runner/rust/* | \
+			.github/scripts/build-zr-net.sh | \
 			.github/scripts/zig-cc.sh | .github/scripts/install-rust.sh | \
 			.github/valgrind.supp) return 0 ;;
 		*) return 1 ;;

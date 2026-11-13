@@ -1,6 +1,6 @@
 [package]
 name = "zr-net"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -12,6 +12,10 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 # One runtime, owned by the process (src/runtime.rs). R1 needs no more than the scheduler.
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time"] }
+# TLS for Postgres (src/tls.rs): rustls with ring, no I/O of its own (the sans-IO API), TLS 1.2 and 1.3.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Roots: the system's, honouring SSL_CERT_FILE and SSL_CERT_DIR (src/roots.rs).
+rustls-native-certs = "0.8"
 
 [profile.release]
 opt-level = "s"
@@ -20,3 +24,7 @@ codegen-units = 1
 strip = true
 # A panic must not unwind into Zig: the process ends instead.
 panic = "abort"
+
+[dev-dependencies]
+# Certificates for the tests of src/tls.rs: a CA, servers for other names, a CA used as a leaf.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }

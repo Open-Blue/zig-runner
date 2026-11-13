@@ -309,6 +309,12 @@ jobs:
         working-directory: runner
         run: zig fmt --check build.zig build.zig.zon src tools
 
+      # The network library's own tests (runner/rust/zr-net), which the Zig tests below reach only
+      # through the C ABI: TLS against an in-process server, the roots, malformed input.
+      - name: Rust tests
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/cargo-test.sh
+
       # runner/src/expr.zig against GitHub's own expression test cases (actions/languageservices):
       # fails on a case that broke, or on one that now passes and is still listed as failing.
       - name: Expressions against GitHub's test cases

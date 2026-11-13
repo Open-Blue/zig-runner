@@ -256,26 +256,42 @@ Alternative considered: `hyper::upgrade` yielding the raw IO and keeping framing
 with real hooks and fewer lines of protocol in Zig; the decision is cheap to revisit in R6 if `tokio-tungstenite` adds more than
 ~150 KB.
 
-## Postgres TLS (R2)
+## Postgres TLS (R2, as built)
 
-Zig keeps the socket, the `SSLRequest` exchange (8 bytes, the `S`/`N` answer) and `std.Io` cancellation. After the `S`, the
-Zig side creates a `Tls` handle (the study's sans-IO shim: no I/O, no threads, no tokio, 10 functions) and swaps `pg.zig`'s
-reader and writer for ones that call `take_cipher`/`give_cipher`: exactly what `tls.Connection.Reader/Writer` do now, so the
-protocol code is untouched. Only `startTls` changes. Consequences:
+Zig keeps the socket, the `SSLRequest` exchange and `std.Io` cancellation (`pg.zig`, `startTls`). After the `S`, `runner/src/tls_stream.zig` opens a `Stream` over
+the sans-IO handle (`rust/zr-net/src/tls.rs`: no I/O, no threads, no tokio; `zr_net_tls_*`, 12 functions) and gives `pg.zig` an `Io.Reader` and `Io.Writer` that
+call `take_cipher`/`give_cipher`, so the protocol code is untouched. The handshake runs inside `open`, on the caller's thread, so a timeout or cancel of the
+connect (`http.withinClosing`) ends it where it blocks. Errors come back with a kind (`unknown_issuer`, `name_mismatch`, `expired`, `certificate`, `alert`,
+`protocol`, `eof`, `config`) and the library's text, logged as `pg: TLS to <host>: TLS unknown_issuer: invalid peer certificate: UnknownIssuer`.
 
-- **Client certificates** (Tiger Data): PEM chain + key, ECDSA and RSA (PKCS#8, SEC1, PKCS#1 through `rustls-pemfile`); tested in the study
-  against a `RequireAndVerifyClientCert` server. R2 adds RSA to the matrix and the `sslmode=verify-full`/client-cert
-  tests of `pg.zig` against a local TLS server (the existing database tests stay as they are).
-- **Roots** from the same loader (`SSL_CERT_FILE`, system store) in place of `std.crypto.Certificate.Bundle`'s scan in `pg.zig` (which also
-  needed `now` and a rescan per connect).
-- **Difference to know about (private CAs).** rustls-webpki is stricter than std and tls.zig: it **rejects an end-entity certificate with the CA
-  flag set** (`CaUsedAsEndEntity`, observed in the study), which openssl's `-x509` self-signed leaf shortcuts produce; it is also known to
-  insist on a subjectAltName for name checks (to be verified with R2's matrix: CN-only certificates, keyUsage, serials). A database that works today with a
-  hand-made certificate may stop working with a precise message. `sslmode=no-verify` (exists) is unaffected. R2's changelog entry and
-  `docs/OPERATIONS.md` say so, with the openssl recipe that yields an acceptable certificate. Proof in the study: the Go-server test with a CA-flagged
-  leaf failed with `CaUsedAsEndEntity` where std accepted.
-- **Cost removed:** `tls.zig` (pinned git dependency, `build.zig.zon` entry, the hash dance in `zig-modules.sh`: `zig_package_hash` and its fetch
-  of the package go away too), ~1.3 MB of toolchain-free code traded for ~1.3 MB of Rust, no net binary-size change for R2 alone.
+- **Configuration** (libpq's names): `sslmode=require` (checks chain and name, as before; also `verify-full` and `verify-ca`), `no-verify`, `disable`;
+  `sslrootcert`, `sslcert`, `sslkey` in the URL, or `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`. Without `sslkey` the key is looked for in `sslcert`'s file.
+- **Client certificates**: PEM chain and key, read by Zig and handed over whole. Tested live against a Postgres that demands them: ECDSA (PKCS#8 and SEC1) and RSA
+  (PKCS#8 and PKCS#1) keys; no certificate at all is refused by the server and reported. Before R2 the client could not send one: it answered a request with an empty
+  Certificate message, which Tiger Data accepts. It still does when none is configured.
+- **Roots**: the system's, loaded once per process and again after an hour (`rustls-native-certs`: `SSL_CERT_FILE` or `SSL_CERT_DIR` if set, else the usual
+  system paths), shared by every connection; `sslrootcert` replaces them (a private CA's file). `std.crypto.Certificate.Bundle`, its rescan and its clock
+  (`now`) are gone from `pg.zig`.
+- **Differences to know about (private CAs).** rustls-webpki is stricter than std and tls.zig. Measured here (cargo tests against an in-process server and
+  the live server): a **CA certificate presented as the server's own** (`CaUsedAsEndEntity`, what openssl's `-x509` one-liners make) is refused as `certificate`;
+  a certificate with the name **in the subject only and no subjectAltName** is refused as `name_mismatch`; a wrong CA is `unknown_issuer`; a name that is
+  an IP address needs an IP SAN. A database that works today with such a hand-made certificate stops working with that message; `sslmode=no-verify` is unaffected and
+  `.github/scripts/pg-tls-fixture.sh` shows an acceptable CA, server and client set (an `openssl req -x509` with `-addext subjectAltName=...` and `basicConstraints=CA:FALSE`
+  for the leaf).
+- **Memory.** The sans-IO state is small (about 40 KB of Rust heap per connection with TLS 1.3, none after `close`: a test connects and closes 50 times and the Rust heap
+  is within 16 KiB of where it started). Rust's allocator is counted (`zr_net_heap_bytes`) and shown as `rust=` in `health: proc` and the job-end stats.
+- **Removed:** `tls.zig` (the dependency, its `build.zig.zon` entry, `zig_package_hash` and the fetch of it in `zig-modules.sh`, the renovate entries, the SBOM entry; the SBOM now
+  lists the crates of `Cargo.lock`, musl and libunwind). `build.zig.zon` has no dependencies.
+- **The old client as an oracle: not practical.** The point of R2 is that tls.zig leaves the build, and a test-only dependency would keep the fetch, the hash check
+  and the package in every build. The comparison is against external clients instead: the same server and certificates were checked with `openssl s_client -starttls postgres`
+  (ECDSA and RSA client certificates, TLS 1.2 and 1.3), the in-process rustls server of the cargo tests, and Postgres itself (`pg_stat_ssl` says `ssl` is on, `current_user`
+  is the certificate's user).
+- **Validation brought by R2**: the live TLS tests (7, in `pg.zig`, run by the Database tests job against a container started by `ci-database.sh` with
+  `pg-tls-fixture.sh`'s CA and users; they skip locally unless `ZIG_TEST_PG_TLS_DIR` is set, and fail without it where `ZIG_TEST_REQUIRE_DB` is); 8 cargo tests (`cargo-test.sh`, now a CI step:
+  the TLS state machine, kinds of failure, bad input, `SSL_CERT_FILE`, garbage from a server); the fuzz target `fuzz: TLS records` (what a TLS server sends, in any chunks, held to
+  no panic and bounded memory, seeded with real first flights for TLS 1.3 and 1.2; 300K runs clean locally; in the nightly matrix and in the analysis scope of `ci-scope.sh`:
+  `runner/rust/*`, `tls_stream.zig`, the corpus); the allocation counter above; Valgrind over the live tests (clean after one suppression, in `.github/valgrind.supp`, for ring's
+  ECDSA nonce code, with why); the whole suite under TSan in the Database job (the TLS side is single-threaded: no Rust thread is involved).
 
 ## Build
 
@@ -368,7 +384,7 @@ Each PR brings its own checks; none is left to "later".
 | PR | Brings | Deletes | Version | Checks it brings |
 |---|---|---|---|---|
 | **R1** (this) | `runner/rust/zr-net` skeleton, `build.zig` `addZrNet`, `build-zr-net.sh`, `zig-cc.sh`, `install-rust.sh`, `zig-modules.sh` link inputs, `zr_net.zig` + test, cargo-deny, this document | nothing | minor | Zig test, `cargo test`, Valgrind, byte-identical builds, checksec, cargo-deny |
-| **R2** | `src/tls.rs` sans-IO rustls, `pg.zig` on it, client certs, roots loader, allocation counter, cargo cache in CI | `tls.zig` dependency, `build.zig.zon` tls entry, `zig_package_hash` and the tls fetch in `zig-modules.sh`, `ca_bundle` in `pg.zig` | minor | TLS fuzz target, pg client-cert and private-CA tests, Pi measurement of the 1 GB install |
+| **R2** | `src/tls.rs` sans-IO rustls, `tls_stream.zig`, `pg.zig` on it, client certs (`sslcert`, `sslkey`, `sslrootcert`), roots loader, allocation counter, `cargo test` in CI | `tls.zig` dependency, `build.zig.zon` tls entry, `zig_package_hash` and the tls fetch in `zig-modules.sh`, `ca_bundle` in `pg.zig` | minor | TLS fuzz target, live pg client-cert and private-CA tests, in-process rustls tests |
 | **R3** | the client API (`Client`, `Request`, timings, pool, proxy, redirects, h1), `request:` lines (from #530), `auth.zig`, `app.zig`, `jitconfig.zig` fetches on it; oracle harness | `net_hooks.zig` wiring for those call sites, `http.staleClock` uses in them | minor | oracle against `testserver.zig`, HTTP head fuzz, phase-delay test, cgroup-of-threads test, TSan suppressions |
 | **R4** | streaming bodies; `zig_release.zig` download, `results.zig` uploads, `native/oci/registry.zig` (redirect privacy tests) | `registry.zig`'s hand-written redirect/authorization workaround, `zig_release`'s std path | minor | streamed oracle cases, memory bound test, Pi disk-streaming benchmark vs std |
 | **R5** | `runservice.zig`, `broker.zig` long-poll (cancel, keepalive, #100's dead-connection test), `gitea/client.zig` | `http.within`'s client coupling, `http.keepAlive` | minor | long-poll oracle and kill-the-network test, Gitea job diff tool |

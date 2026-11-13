@@ -7,6 +7,17 @@ extern fn zr_net_version() [*:0]const u8;
 extern fn zr_net_runtime_start(threads: u32) i32;
 extern fn zr_net_selftest(n: u32) i64;
 extern fn zr_net_runtime_stop() void;
+extern fn zr_net_heap_bytes() usize;
+extern fn zr_net_heap_peak() usize;
+extern fn zr_net_heap_allocations() u64;
+
+/// What Rust holds of the process's memory (`proc_stats.heap` counts Zig's allocator only): bytes
+/// in use now, the most there were, and the allocations made.
+pub const Heap = struct { bytes: usize, peak: usize, allocations: u64 };
+
+pub fn heap() Heap {
+    return .{ .bytes = zr_net_heap_bytes(), .peak = zr_net_heap_peak(), .allocations = zr_net_heap_allocations() };
+}
 
 /// The library's version, as `Cargo.toml` names it.
 pub fn version() []const u8 {
@@ -31,11 +42,15 @@ pub fn stop() void {
     zr_net_runtime_stop();
 }
 
+/// The version `Cargo.toml` names, which the archive linked in must have: a stale archive is a build
+/// mistake that should stop the runner, not misbehave. Read by `main`.
+pub const expected_version = "0.2.0";
+
 test "the runtime starts, runs a task through the ABI and stops" {
     // ThreadSanitizer does not see the Rust side's synchronisation (docs/rust-net.md, "Validation"):
     // it reports the hand-over of memory between this thread and the runtime's as races in `free`.
     if (builtin.sanitize_thread) return error.SkipZigTest;
-    try std.testing.expectEqualStrings("0.1.0", version());
+    try std.testing.expectEqualStrings(expected_version, version());
     try std.testing.expectError(error.RuntimeStopped, selftest(1));
     try start(2);
     try start(2);

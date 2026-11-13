@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Writes the release's SBOM (SPDX 2.3, JSON) to stdout: the release binaries listed in SHA256SUMS
-# with their digests, and what is compiled into them: the packages runner/build.zig.zon pins, and
-# Zig's standard library, from the Zig on PATH that built them. The runner links no libc and
-# nothing else, so that is everything. release.yml attests it for each binary and attaches it to
+# with their digests, and what is compiled into them: the Rust crates runner/rust/zr-net/Cargo.lock pins,
+# musl and libunwind (Zig's bundled copies), and Zig's standard library, from the Zig on PATH that built them.
+# The runner links nothing else, so that is everything. release.yml attests it for each binary and attaches it to
 # the release.
 #
 #   .github/scripts/sbom.sh v0.12.0 dist/SHA256SUMS > zig-runner.spdx.json
@@ -13,19 +13,15 @@ set -euo pipefail
 tag=${1:?usage: sbom.sh TAG SHA256SUMS}
 sums=${2:?usage: sbom.sh TAG SHA256SUMS}
 repo=${GITHUB_REPOSITORY:-Open-Blue/zig-runner}
-zon="$(dirname "$0")/../../runner/build.zig.zon"
+lock="$(dirname "$0")/../../runner/rust/zr-net/Cargo.lock"
 
-declare -A licenses=([tls]=MIT)
-
-# build.zig.zon's dependencies as "name url hash" lines.
-deps=$(awk '
-	/^    \.dependencies = \.\{/ { in_deps = 1; next }
-	in_deps && /^    \},/ { exit }
-	in_deps && /^        \.[A-Za-z0-9_]+ = \.\{/ { name = $1; sub(/^\./, "", name); url = ""; hash = "" }
-	in_deps && /\.url = "/ { url = $0; sub(/.*\.url = "/, "", url); sub(/".*/, "", url) }
-	in_deps && /\.hash = "/ { hash = $0; sub(/.*\.hash = "/, "", hash); sub(/".*/, "", hash) }
-	in_deps && /^        \},/ { print name, url, hash }
-' "$zon")
+# Cargo.lock's crates as "name version checksum" lines (the runner's own crate has no checksum).
+crates=$(awk '
+	/^\[\[package\]\]/ { name = ""; version = ""; sum = "" }
+	/^name = / { name = $3; gsub(/"/, "", name) }
+	/^version = / { version = $3; gsub(/"/, "", version) }
+	/^checksum = / { sum = $3; gsub(/"/, "", sum); print name, version, sum }
+' "$lock")
 zig_version=$(zig version)
 
 {
@@ -38,16 +34,28 @@ zig_version=$(zig version)
 			filesAnalyzed: false, licenseConcluded: "MIT", licenseDeclared: "MIT", copyrightText: "NOASSERTION"
 		}'
 	done <"$sums"
-	while read -r name url hash; do
+	while read -r name version sum; do
 		[[ -n $name ]] || continue
-		jq -n --arg name "$name" --arg url "$url" --arg hash "$hash" --arg license "${licenses[$name]:-NOASSERTION}" '{
-			kind: "dep", SPDXID: ("SPDXRef-Zig-" + ($name | gsub("[^A-Za-z0-9.-]"; "-"))), name: $name,
-			versionInfo: ($url | capture("/(?<v>[^/]+)\\.tar\\.gz$").v // "NOASSERTION"),
-			downloadLocation: $url, primaryPackagePurpose: "LIBRARY",
-			comment: ("Zig package hash " + $hash + " (runner/build.zig.zon)"),
-			filesAnalyzed: false, licenseConcluded: $license, licenseDeclared: $license, copyrightText: "NOASSERTION"
+		jq -n --arg name "$name" --arg version "$version" --arg sum "$sum" '{
+			kind: "dep", SPDXID: ("SPDXRef-Crate-" + ($name | gsub("[^A-Za-z0-9.-]"; "-")) + "-" + ($version | gsub("[^A-Za-z0-9.-]"; "-"))), name: $name,
+			versionInfo: $version, downloadLocation: ("https://crates.io/crates/" + $name + "/" + $version),
+			primaryPackagePurpose: "LIBRARY", checksums: [{algorithm: "SHA256", checksumValue: $sum}],
+			comment: "Rust crate (runner/rust/zr-net/Cargo.lock); the license is in the crate",
+			filesAnalyzed: false, licenseConcluded: "NOASSERTION", licenseDeclared: "NOASSERTION", copyrightText: "NOASSERTION"
 		}'
-	done <<<"$deps"
+	done <<<"$crates"
+	jq -n '{
+		kind: "dep", SPDXID: "SPDXRef-musl", name: "musl", versionInfo: "bundled with Zig",
+		downloadLocation: "https://musl.libc.org", primaryPackagePurpose: "LIBRARY",
+		comment: "The libc Rust and the runner link, built by the Zig that built the binaries.",
+		filesAnalyzed: false, licenseConcluded: "MIT", licenseDeclared: "MIT", copyrightText: "NOASSERTION"
+	}'
+	jq -n '{
+		kind: "dep", SPDXID: "SPDXRef-libunwind", name: "libunwind", versionInfo: "bundled with Zig",
+		downloadLocation: "https://github.com/llvm/llvm-project", primaryPackagePurpose: "LIBRARY",
+		comment: "LLVMs unwinder, which Rust standard library references.",
+		filesAnalyzed: false, licenseConcluded: "Apache-2.0 WITH LLVM-exception", licenseDeclared: "Apache-2.0 WITH LLVM-exception", copyrightText: "NOASSERTION"
+	}'
 	jq -n --arg v "$zig_version" '{
 		kind: "dep", SPDXID: "SPDXRef-Zig-std", name: "zig", versionInfo: $v,
 		downloadLocation: ("https://ziglang.org/download/" + $v + "/"), primaryPackagePurpose: "LIBRARY",

@@ -41,14 +41,6 @@
       "groupName": "lean"
     },
     {
-      "description": "tls.zig, pinned by commit in runner/build.zig.zon's URL: its own pull request for each new commit on its main branch (commits have no release dates, so no week's wait). The zon's .hash must follow, which Renovate cannot compute: it is updated by hand (`zig fetch` the new URL), which CI enforces by failing until it is (zig-modules.sh compares it with the fetched commit's, as `zig build` does), as for Zig's checksums.",
-      "matchDepNames": [
-        "https://github.com/ianic/tls.zig"
-      ],
-      "groupName": "tls.zig",
-      "minimumReleaseAge": null
-    },
-    {
       "description": "GitHub's expression test cases (actions/languageservices), pinned by commit in expr-conformance.sh: their own pull request (commits have no release dates, so no week's wait). A case the runner newly fails, or a listed one it now passes, fails CI until runner/tools/exprcorpus-failing.txt is updated (`expr-conformance.sh --update`, after a look at what changed).",
       "matchDepNames": [
         "https://github.com/actions/languageservices"
@@ -323,19 +315,6 @@
         "\"(?<depName>(?:oven/bun|node)):(?<currentValue>[A-Za-z0-9._-]+)\"\\s*\\+\\+\\s*\"@(?<currentDigest>sha256:[a-f0-9]{64})\""
       ],
       "datasourceTemplate": "docker"
-    },
-    {
-      "description": "tls.zig, the runner's one Zig dependency: the commit its GitHub archive URL names in runner/build.zig.zon, followed on its main branch.",
-      "customType": "regex",
-      "managerFilePatterns": [
-        "/^runner/build\\.zig\\.zon$/"
-      ],
-      "matchStrings": [
-        "\\.url = \"https://github\\.com/ianic/tls\\.zig/archive/(?<currentDigest>[0-9a-f]{40})\\.tar\\.gz\""
-      ],
-      "depNameTemplate": "https://github.com/ianic/tls.zig",
-      "currentValueTemplate": "main",
-      "datasourceTemplate": "git-refs"
     },
     {
       "description": "GitHub's expression test cases: LANGUAGESERVICES_REV in expr-conformance.sh, followed on actions/languageservices' main branch.",

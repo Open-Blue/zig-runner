@@ -50,12 +50,6 @@ jobs:
       - name: Install Zig
         run: .github/scripts/install-zig.sh
 
-      # The tls package build.zig.zon pins, unpacked into runner/zig-pkg, which the module graph
-      # imports (this compiles Zig's build system first, about 100 s with an empty cache).
-      - name: Fetch dependencies
-        working-directory: runner
-        run: zig build --fetch
-
       # expr's mutants also meet GitHub's own expression cases, at expr-conformance.sh's commit.
       - name: GitHub's expression cases
         if: ${{ matrix.module == 'expr' }}
