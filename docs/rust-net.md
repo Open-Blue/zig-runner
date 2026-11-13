@@ -378,10 +378,8 @@ main's own CI (self-hosted overlayfs/arm64 job), not only the PR's.
 
 ## Open items found while building R1
 
-- **`runner/Dockerfile`'s `build` stage** (`docker build runner/`, the from-source image; the release's image is `prebuilt` and unaffected) cannot build the
-  runner any more: its context holds only `runner/`, not `.github/scripts/build-zr-net.sh`, and it installs Zig on Alpine, where Rust's glibc host
-  toolchain does not run. Options for the user: drop the source stage and keep only `prebuilt` (the release does not use it; the build-from-source path is the
-  documented `zig build`), or give it the scripts and an Alpine-hosted Rust. Not done in R1; hadolint still passes.
+- **`runner/Dockerfile` has no from-source stage any more** (decided with R1): the image is built from the release's binaries (`prebuilt`), and `deploy/compose.yaml`
+  pulls the published image (`ZIG_RUNNER_IMAGE` overrides) instead of building `../runner`.
 - **The root native tests** (`Native tests as root`, `Native tests as root (in a container)`...) are the real check of the raw `clone`/`unshare` paths on the libc build:
   they cannot run on this laptop (user namespaces are refused by AppArmor for the test process), so R1's CI run is their first result.
 - **`zig_target_arch` and `modules=`** in `zig-modules.sh` are also in #533's diff; the second PR to merge resolves a small textual conflict.
