@@ -10,6 +10,14 @@ Versions up to v0.2.0 were released from
 runner was developed; their entries below are written from those releases' notes.
 
 
+## v0.34.0 - 2026-11-13
+### Added
+* The runner logs its own resources: a health: proc line after each health: line, and a job-end: line per job, with its memory (resident, anonymous, and what its allocator holds, in bytes and blocks), threads, open descriptors, mounts and unwaited children, and how they changed during the job, so a leak shows as a trend instead of only at exit. A zombie child is a warning, as are failures that were silent: deleting the broker session, a job's veth or its namespace mounts, and writing a step's index or size.
+* A Gitea or Forgejo front end, first step: RUNNER_PLATFORM=gitea or forgejo with RUNNER_GITEA_URL and RUNNER_GITEA_REGISTRATION_TOKEN registers a runner (kept in RUNNER_STATE_DIR) and fetches tasks over their Connect JSON protocol. Tasks are logged by name and not run yet.
+* Gitea and Forgejo tasks become the same job GitHub's job message makes (#520, G3): runner/src/gitea/job.zig reads a task's workflow YAML, context, secrets, vars and needs into a job.Job, with expressions kept as templates by GitHub's rules, and reports what the backends cannot run. It is compared with Gitea's own workflow model over 79 real tasks (runner/tools/gitea-jobdiff, run weekly by compare.yml).
+### Fixed
+* The runner frees the HTTP clients it replaces to renew its view of certificates: each was left behind with its CA bundle (about 160 KB), once a day or every 15 minutes through a TLS outage, and the last one's pooled connections (about 75 KB each) were reported as leaks when the runner stopped. A replaced client is freed once none of its connections is in use and it was replaced an hour ago, and the rest when the runner stops.
+
 ## v0.33.0 - 2026-11-12
 ### Added
 * Runner pools on one machine now share one memory budget: a root runner's gate counts the jobs the other pools started less than 2 minutes ago and have not yet used the memory of (recorded in /run/zig-runner/memory-budget), as it counts its own pool's, so two pools no longer admit a job each into the same free memory. A gate is stricter only while another pool has such a job. RUNNER_SHARED_MEMORY_BUDGET=false turns it off; a unit under ProtectSystem=strict needs RuntimeDirectory=zig-runner with RuntimeDirectoryPreserve=yes.
