@@ -9,6 +9,7 @@
 #   impl-bench.sh apply BLOB EMPTY_DIR [0|1]
 #   impl-bench.sh redact LOG SECRETS [ROUNDS]
 set -euo pipefail
+here=$PWD
 cd "$(dirname "$0")/../../runner"
 # shellcheck source=.github/scripts/zig-modules.sh
 . ../.github/scripts/zig-modules.sh
@@ -23,4 +24,6 @@ if [[ ! -x $bin ]]; then
 		"${libzstd_args[@]}" -femit-bin="$bin"
 fi
 echo "load: $(cut -d' ' -f1-3 /proc/loadavg)"
+# From where it was called from, so the files named on the command line are found.
+cd "$here"
 "$bin" "$@"
