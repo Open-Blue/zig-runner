@@ -5,7 +5,6 @@
 //! Each request logs one `request:` line (`github/request_line.zig`) with the library's own,
 //! exact, DNS, connect, TLS and first-byte times. Whole bodies: streaming is for R4.
 const std = @import("std");
-const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const http = @import("github/http.zig");
