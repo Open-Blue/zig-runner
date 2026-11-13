@@ -269,6 +269,18 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/zig-test.sh
 
+      # The old TLS client (tls.zig, a lazy dependency only this step fetches) against the one the
+      # runner has, on the same servers: the database of this job, which serves TLS with client
+      # certificates (ZIG_TEST_PG_TLS_DIR), and `openssl s_server` for the certificates Postgres
+      # does not have. It fails if either client does something other than runner/tls_oracle.zig
+      # says (docs/rust-net.md, "The old TLS client as an oracle"). Through `zig build`, as the
+      # lazy dependency needs, so this is where its build system is compiled (about 100 s on an
+      # empty cache); the tests job's binary is not rebuilt for it.
+      - name: TLS oracle (the old client against the new one)
+        if: steps.scope.outputs.run == 'true'
+        working-directory: runner
+        run: zig build test-tls-oracle -Dtls-oracle
+
   # A push to main runs on prod, this project's own runner, so every merge exercises it; pull
   # requests and the merge queue run on GitHub's runner on purpose, cold every time, the worst case
   # for a build (docs/OPERATIONS.md, "Environments"). The repository variables PROD_RUNNER and PREPROD_RUNNER
@@ -307,7 +319,7 @@ jobs:
       - name: Format check
         if: steps.scope.outputs.run == 'true'
         working-directory: runner
-        run: zig fmt --check build.zig build.zig.zon src tools
+        run: zig fmt --check build.zig build.zig.zon tls_oracle.zig src tools
 
       # The network library's own tests (runner/rust/zr-net), which the Zig tests below reach only
       # through the C ABI: TLS against an in-process server, the roots, malformed input.

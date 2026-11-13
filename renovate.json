@@ -41,6 +41,14 @@
       "groupName": "lean"
     },
     {
+      "description": "tls.zig, the old TLS client's library, pinned by commit in runner/build.zig.zon's URL for the TLS oracle (`zig build test-tls-oracle -Dtls-oracle`): its own pull request for each new commit on its main branch (commits have no release dates, so no week's wait). The zon's .hash must follow, which Renovate cannot compute: it is updated by hand (`zig fetch` the new URL), and the Database tests job's oracle step fails until it is (`zig build` compares the hash with the fetched commit's), as for Zig's checksums.",
+      "matchDepNames": [
+        "https://github.com/ianic/tls.zig"
+      ],
+      "groupName": "tls.zig",
+      "minimumReleaseAge": null
+    },
+    {
       "description": "GitHub's expression test cases (actions/languageservices), pinned by commit in expr-conformance.sh: their own pull request (commits have no release dates, so no week's wait). A case the runner newly fails, or a listed one it now passes, fails CI until runner/tools/exprcorpus-failing.txt is updated (`expr-conformance.sh --update`, after a look at what changed).",
       "matchDepNames": [
         "https://github.com/actions/languageservices"
@@ -315,6 +323,19 @@
         "\"(?<depName>(?:oven/bun|node)):(?<currentValue>[A-Za-z0-9._-]+)\"\\s*\\+\\+\\s*\"@(?<currentDigest>sha256:[a-f0-9]{64})\""
       ],
       "datasourceTemplate": "docker"
+    },
+    {
+      "description": "tls.zig, a lazy dependency only the TLS oracle uses: the commit its GitHub archive URL names in runner/build.zig.zon, followed on its main branch.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^runner/build\\.zig\\.zon$/"
+      ],
+      "matchStrings": [
+        "\\.url = \"https://github\\.com/ianic/tls\\.zig/archive/(?<currentDigest>[0-9a-f]{40})\\.tar\\.gz\""
+      ],
+      "depNameTemplate": "https://github.com/ianic/tls.zig",
+      "currentValueTemplate": "main",
+      "datasourceTemplate": "git-refs"
     },
     {
       "description": "GitHub's expression test cases: LANGUAGESERVICES_REV in expr-conformance.sh, followed on actions/languageservices' main branch.",
