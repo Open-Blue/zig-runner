@@ -60,3 +60,4 @@ runner/tools/regexdiff/regexdiff
 runner/tools/rsadiff/rsadiff
 runner/tools/yamldiff/yamldiff
 runner/rust/target/
+runner/rust/zr-net/target/
