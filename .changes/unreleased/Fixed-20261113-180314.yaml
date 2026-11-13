@@ -1,0 +1,3 @@
+kind: Fixed
+body: ThreadSanitizer builds link the network library instrumented (a pinned nightly Rust with -Zsanitizer=thread and -Zbuild-std) instead of suppressing every report with a Rust frame, so a race in or across Rust is reported; the sharded test runner now fails a test that printed a ThreadSanitizer report, and a shard that ends with a failing status, which it ignored before (it found a race in a test fake, fixed)
+time: 2026-11-13T18:03:14.407539659-05:00

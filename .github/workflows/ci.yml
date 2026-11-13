@@ -263,6 +263,13 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
+      # The network library's own tests under ThreadSanitizer (the pinned nightly, -Zbuild-std): the
+      # races among its own threads, which Zig's TSan only sees through the archive below, linked
+      # instrumented too (docs/rust-net.md, "ThreadSanitizer").
+      - name: Rust tests, under ThreadSanitizer
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/cargo-test.sh tsan
+
       # Without `zig build`, whose first step here would be compiling Zig's build system (about
       # 100 s): this job's cache always starts empty (zig-test.sh).
       - name: Test, with the database

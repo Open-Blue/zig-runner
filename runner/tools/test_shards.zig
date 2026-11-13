@@ -260,7 +260,7 @@ fn shardCount(environ_map: *const std.process.Environ.Map) !usize {
 /// them all, one after another, and then joins the others.
 fn work(run: *Run, started: ?Shard) void {
     var shard: ?Shard = started;
-    defer if (shard) |*s| s.stop(run.io);
+    defer if (shard) |*s| s.finish(run);
     while (true) {
         const index: u32 = i: {
             if (run.next_alone.load(.monotonic) < run.alone.len and run.alone_lock.tryLock()) {
@@ -301,12 +301,17 @@ fn runOne(run: *Run, shard: *?Shard, index: u32) void {
     defer run.gpa.free(text);
     const flags = results.flags;
     // As the build system counts them: an error logged or memory leaked fails a test that passed.
-    if (flags.status == .fail or flags.log_err_count != 0 or flags.leak_count != 0) {
+    // So does a ThreadSanitizer report, which the sanitizer only prints (the process would end
+    // with a status that `finish` checks, but a report belongs to the test that ran).
+    const raced = std.mem.indexOf(u8, text, race_report) != null;
+    if (flags.status == .fail or flags.log_err_count != 0 or flags.leak_count != 0 or raced) {
         _ = run.failed.fetchAdd(1, .monotonic);
-        say(run, index, "{s}{s}{s}", .{
+        s.raced = s.raced or raced;
+        say(run, index, "{s}{s}{s}{s}", .{
             text,
             if (flags.log_err_count != 0) "error(s) were logged\n" else "",
             if (flags.leak_count != 0) "memory leaked\n" else "",
+            if (raced) "a data race was reported\n" else "",
         });
     } else if (flags.status == .skip) {
         _ = run.skipped.fetchAdd(1, .monotonic);
@@ -326,6 +331,9 @@ fn runOne(run: *Run, shard: *?Shard, index: u32) void {
     } else _ = run.passed.fetchAdd(1, .monotonic);
 }
 
+/// What ThreadSanitizer prints for a race, on the shard's stderr.
+const race_report = "WARNING: ThreadSanitizer";
+
 /// A failed test: its place in the run and its name, as the stock runner says them, then `what`.
 fn say(run: *Run, index: u32, comptime what: []const u8, args: anytype) void {
     run.say_lock.lockUncancelable(run.io);
@@ -340,6 +348,8 @@ const Shard = struct {
     child: std.process.Child,
     err: Io.File,
     err_at: u64 = 0,
+    /// A test of this shard failed on a race report, which the process's own status repeats.
+    raced: bool = false,
     reader: *Io.File.Reader,
     writer: *Io.File.Writer,
 
@@ -434,6 +444,30 @@ const Shard = struct {
             .signal => "killed by a signal",
             else => "stopped",
         };
+    }
+
+    /// Ends a shard that the run is done with, and fails the run if the process did not end well:
+    /// ThreadSanitizer reports found after the last test (a thread still running, an exit-time
+    /// check) leave it with a status, and its text is on stderr, unread until now.
+    fn finish(s: *Shard, job: *Run) void {
+        s.writer.interface.writeStruct(Request{ .tag = .exit, .bytes_len = 0 }, .little) catch {};
+        s.writer.interface.flush() catch {};
+        s.child.stdin.?.close(job.io);
+        s.child.stdin = null;
+        const term = s.child.wait(job.io) catch null;
+        const ok = if (term) |t| switch (t) {
+            .exited => |code| code == 0,
+            else => false,
+        } else false;
+        if (!ok and !s.raced) {
+            _ = job.failed.fetchAdd(1, .monotonic);
+            const rest = s.output(job.gpa, job.io) catch "";
+            defer if (rest.len > 0) job.gpa.free(rest);
+            job.say_lock.lockUncancelable(job.io);
+            defer job.say_lock.unlock(job.io);
+            std.debug.print("a test binary ended with a failing status after its last test\n{s}", .{rest});
+        }
+        s.err.close(job.io);
     }
 
     fn stop(s: *Shard, io: Io) void {

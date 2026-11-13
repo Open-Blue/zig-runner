@@ -3010,7 +3010,8 @@ const FakeWarn = struct {
         const f: *FakeWarn = @ptrCast(@alignCast(ptr));
         if (!f.fake.in_flight) return .nothing;
         f.sent[f.n] = sig;
-        f.n += 1;
+        // Stored for a test that polls `n` from another thread (the one that stops a stuck log).
+        @atomicStore(usize, &f.n, f.n + 1, .release);
         return if (f.waiting) .ended else .warned;
     }
     fn abort(ptr: *anyopaque) bool {
@@ -3277,7 +3278,7 @@ test "a stuck log does not hold the watch's lock, so the step's end is not held 
     var ticking = try io.concurrent(Tick.run, .{&w});
     defer ticking.cancel(io);
     for (0..500) |_| {
-        if (f.n > 0) break;
+        if (@atomicLoad(usize, &f.n, .acquire) > 0) break;
         try io.sleep(.fromMilliseconds(10), .awake);
     }
     try std.testing.expectEqual(@as(usize, 1), f.n);

@@ -177,7 +177,10 @@ runs its four parts, uploading and merging nothing).
   (`ZIG_TEST_SANITIZE_THREAD=1`). **ThreadSanitizer, end to end** runs the end-to-end suite on both
   backends with a runner built under it (`e2e.sh build BIN tsan`), failing on any report in the
   runner's log or the jobs'. TSan's runtime needs glibc's dynamic loader, so these builds are
-  dynamically linked PIEs, not the release's static PIE.
+  dynamically linked PIEs, not the release's static PIE, and the network library (`runner/rust/zr-net`)
+  is built into them instrumented, by a pinned nightly Rust with `-Zsanitizer=thread -Zbuild-std`
+  (`build-zr-net.sh ... tsan`; docs/rust-net.md, "ThreadSanitizer"). The Database tests job also
+  runs the library's own tests under it (`cargo-test.sh tsan`).
 - **Stress** runs the concurrency-sensitive tests (cancels, deadlines, the memory gate, the native
   store's locks, the database, the broker's long-poll, log uploads;
   `.github/scripts/zig-race-tests.sh` names them) 100 times under stress-ng's CPU and memory load,

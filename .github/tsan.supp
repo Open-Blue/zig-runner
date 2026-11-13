@@ -1,15 +1,14 @@
-# ThreadSanitizer suppressions for the runner's tests and e2e runs (zig-test.sh, e2e.sh). Only what
-# the network library (runner/rust/zr-net, docs/rust-net.md) makes TSan report falsely belongs here,
-# each with why; a report in Zig code that has no Rust frame in either stack is not suppressed.
+# ThreadSanitizer suppressions for the runner's tests and e2e runs (zig-test.sh, e2e.sh).
 #
-# Zig's ThreadSanitizer instruments Zig code only. The library's tokio workers hand memory to and
-# from the Zig threads through Rust's own synchronisation (futexes, atomics, channels), which TSan
-# cannot see: the bytes a Zig thread gave the library are read by a worker with no happens-before
-# edge in TSan's model, and the other way round, and TSan reports a race at the `memcpy`, `send`,
-# `recv` or `free` of the one thread against the other's earlier write. A report matches when any
-# frame of either stack is a Rust one (demangled: `tokio::`, `hyper::`, ...). Races inside Rust are
-# searched for by Rust's own tools (`cargo test`, and nightly `-Zsanitizer=thread` and loom, in
-# docs/rust-net.md, "Validation"), not here.
-# Rust frames, demangled, are the only ones whose names have `::` (Zig's have dots): any frame of
-# either stack with one matches. This also covers a frame like `<socket2::socket::Socket>::send`.
-race:*::*
+# The Rust side is instrumented (build-zr-net.sh `tsan`: nightly Rust, -Zsanitizer=thread
+# -Zbuild-std; docs/rust-net.md, "ThreadSanitizer"), so a race in or across it is reported like
+# one in Zig. One report is not a race, and is suppressed by the frame that makes it:
+#
+# tokio registers a socket with epoll and hands the kernel a pointer to the socket's ScheduledIo as
+# the event's data (`RegistrationSet::allocate` writes the struct, then mio's epoll_ctl(ADD)). The
+# driver thread gets the pointer back from epoll_wait and reads the struct (`Driver::turn`,
+# `ScheduledIo::wake`). The kernel orders the two, which TSan cannot see: epoll_ctl to epoll_wait
+# is no happens-before edge to it. Reported, every time a socket is registered while the driver
+# runs, as a write in `allocate` (a `__tsan_memcpy`) against a read or write in `turn`/`wake`.
+# Matching on `allocate` alone keeps it narrow: only a race whose one side is that initial write.
+race:tokio::runtime::io::registration_set::RegistrationSet>::allocate

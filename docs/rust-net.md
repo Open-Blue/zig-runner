@@ -277,7 +277,7 @@ documents (DNS approximate, TLS inferred) go away with the wrapper.
   Also: the request line's figures for a plain request, and the deadline and cancel behaviour.
 - **Validation of R3**: 18 cargo tests (client against in-process plain and TLS servers: keep-alive and reuse, redirects and credentials, CA/name errors by kind, the phases, socket options, limits and timeouts, proxies, the proxy
   table); the oracle; a fuzz target `fuzz: HTTP responses` (what a server answers, byte for byte; in the nightly matrix and in the analysis scope; seeded with normal, chunked, redirecting, malformed and non-HTTP answers);
-  TSan: Rust's synchronisation is invisible to it, so `.github/tsan.supp` suppresses any report with a Rust frame (`race:*::*`; Zig frames have no `::`), loaded by `zig-test.sh` and `e2e.sh`; Valgrind over the new tests.
+  TSan: the Rust archive is built instrumented for TSan builds ("ThreadSanitizer" below), so there is no blanket suppression; `.github/tsan.supp` holds the one report that is not a race; Valgrind over the new tests.
 - **Not in R3**: the std client's other users (registry, release downloads, uploads: R4; run service, broker, Gitea: R5; the feed: R6), `http.zig`'s renew/retire machinery (still needed by those), HTTP/2, streaming.
 
 ## The WebSocket feed (R6)
@@ -394,20 +394,28 @@ Each PR brings its own checks; none is left to "later".
    use-after-free of Rust allocations); Zig-side buffers handed to Rust (body chunks, `read` targets) are fully checked. Rust's heap is covered by
    the allocation counter from "libc" (leak at runtime stop is an assertion in the tests: bytes in use is 0 after `stop`) and
    by `cargo test` under Miri on the pure functions (proxy matching, redirect policy, URL handling).
-4. **ThreadSanitizer: what it does and does not cover.** Zig's TSan instruments the Zig code only. The Rust side is uninstrumented, so TSan
-   cannot see its synchronisation, so a Zig test that crosses into tokio reports **false races in `free`/`malloc` between Zig and tokio
-   threads**: measured in R1, the runtime test under `-fsanitize-thread` gives 6-7 warnings, so it **skips itself under TSan**
-   (`builtin.sanitize_thread`). TSan's runtime also needs glibc's loader (`zig-test.sh`: static musl PIE crashes at startup), so TSan builds
-   are the one place that takes glibc: `zig-modules.sh` and `build.zig` (`-Dsanitize-thread`) then build the Rust archive for
-   `<arch>-unknown-linux-gnu` (`build-zr-net.sh ... gnu`), never a musl archive in a glibc binary. (R1's first CI run found this: the Database tests job,
-   which runs everything under TSan, died at startup with a musl build.)
-   Therefore: (a) the TSan job's test list (`race_filters` in `zig-race-tests.sh`) does not contain the runtime tests, and tests that
-   match its filters (`timeout`, `cancel`...) by name once they use the network get a narrow suppression for those frames in `.github/tsan.supp`, each with its reason, in the PR that needs it (R3);
-   (b) races **inside Rust** are covered by Rust's own tools: `cargo test` on `zr-net` (always), the same under `-Zsanitizer=thread` with `-Zbuild-std`
-   on nightly (a nightly job in `analysis.yml`, about 3-4 minutes: a nightly toolchain pin and the std rebuild are the cost), and `loom` for the few lock-free
-   structures we write ourselves (the request-state machine and the wake path: small, modelled, the ones a race could actually live in);
-   (c) the Zig side of the ABI (a handle used from two threads) is exercised by the existing stress job with network tests.
-   Race-freedom of hyper/tokio themselves is not re-proved here: they are widely tested; what is ours is the glue, which is small and modelled.
+4. **ThreadSanitizer (as built after R3's review).** An uninstrumented Rust archive in a TSan binary is invisible to TSan: it reported
+   false races at the hand-over of memory between Zig and tokio threads, and (the reason R3's first answer, a blanket `race:*::*`, was
+   wrong) it also could not report a real race in or across Rust. Measured with a deliberate race (a `static mut` counter incremented by two
+   Rust threads, and a word written by a Zig thread and a Rust thread): the uninstrumented archive reported neither; the instrumented one
+   reported both, with both stacks. So TSan builds link an **instrumented** archive: `build-zr-net.sh ... tsan` builds the gnu target
+   (TSan's runtime needs glibc's loader; musl is the release's) with a pinned nightly (`install-rust-nightly.sh`: 2026-11-10, rustc
+   1.102.0-nightly, dated tarballs with checked SHA-256, rust-src included; no rustup) and `-Zsanitizer=thread -Zbuild-std=std,panic_abort`, so
+   std's atomics and locks, tokio's and ours are all seen. `zig-modules.sh` (CI's tests, e2e) and `build.zig` (`-Dsanitize-thread`) choose it
+   whenever the Zig side is built with `-fsanitize-thread`. Not instrumented: the C of ring (assembly and C routines that work on
+   buffers the caller owns); a race inside them would be missed. Cost: a 36-45 s cold build of the std and the crates (about 2 min more for the one-time
+   nightly install on a runner with an empty tool cache); `cargo-test.sh tsan` runs the crate's tests under it too (the Database tests job; 17 of
+   18 tests: the one asserting wall-clock bounds on each phase is not run, `getaddrinfo` took 262 ms once under TSan against a bound of 50).
+   With the archive visible, the whole suite showed what the blanket suppression had been hiding, and what the sharded runner had never
+   shown (`test_shards.zig` ignored a shard's stderr and exit status, so a TSan report in a passing test was lost; it now fails the test
+   that printed it and any shard that exits with a failing status): a race in a test fake (`dagger.zig`'s `FakeWarn.n`, polled by the test
+   thread while the watch thread wrote it; fixed with an atomic) and one pattern in tokio: a socket's `ScheduledIo` is written by
+   `RegistrationSet::allocate` and registered with epoll with a pointer as the event's data; the driver thread receives that pointer from
+   `epoll_wait` and reads the struct. The kernel orders the two and TSan cannot model epoll_ctl to epoll_wait, so it reports a race at every
+   registration. That one frame is suppressed (`.github/tsan.supp`, with this reason), and nothing else. The whole suite passes under it
+   (1042 passed, 0 failed), and `cargo test` too.
+   What is still not covered: `loom` for the lock-free structures we write ourselves (small: none yet), and the Zig side of the ABI
+   exercised by the stress job. Race-freedom of hyper and tokio themselves is not re-proved here beyond what TSan sees running our tests.
 5. **Existing tooling, now over Rust too**: coverage (`cargo llvm-cov` for the crate in `analysis.yml`, reported next to Zig's, from R3),
    mutation testing on the glue (`cargo mutants` scoped to `src/proxy.rs` and the redirect policy, a manual job first), `cargo clippy -D warnings` and `cargo fmt --check`
    in the Zig-less "Workflows"-style job (R2), `cargo deny` (R1), and the e2e job (a real runner job over the new stack) plus the pre-release smoke test on the laptop pool.

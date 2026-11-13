@@ -33,9 +33,8 @@ plain=("${modules[@]}")
 tests=("${plain[@]}")
 runner=("${plain[@]}")
 if [[ ${ZIG_TEST_SANITIZE_THREAD:-} == 1 ]]; then
-	# What the Rust side of the network library makes TSan report falsely (.github/tsan.supp).
-	tsan_supp=$(realpath ../.github/tsan.supp)
-	export TSAN_OPTIONS="suppressions=$tsan_supp ${TSAN_OPTIONS:-}"
+	# The one report that is not a race (.github/tsan.supp: tokio's epoll hand-over).
+	export TSAN_OPTIONS="suppressions=$(realpath ../.github/tsan.supp) ${TSAN_OPTIONS:-}"
 	zig_modules "$scratch" "$scratch/version" -fsanitize-thread
 	tests=("${modules[@]}")
 	runner=("${modules[@]}")
