@@ -41,7 +41,6 @@ extern fn zng_inflateEnd(strm: *Stream) i32;
 const z_ok = 0;
 const z_stream_end = 1;
 const z_buf_error = -5;
-const z_mem_error = -4;
 
 /// `windowBits` of 15 for the largest window, plus 16 for a gzip header and trailer, and nothing
 /// else (a zlib stream or raw deflate is refused).
