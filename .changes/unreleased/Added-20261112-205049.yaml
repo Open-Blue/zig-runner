@@ -1,3 +1,0 @@
-kind: Added
-body: 'Gitea and Forgejo tasks become the same job GitHub''s job message makes (#520, G3): runner/src/gitea/job.zig reads a task''s workflow YAML, context, secrets, vars and needs into a job.Job, with expressions kept as templates by GitHub''s rules, and reports what the backends cannot run. It is compared with Gitea''s own workflow model over 79 real tasks (runner/tools/gitea-jobdiff, run weekly by compare.yml).'
-time: 2026-11-12T20:50:49.472648138-05:00

@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The runner frees the HTTP clients it replaces to renew its view of certificates: each was left behind with its CA bundle (about 160 KB), once a day or every 15 minutes through a TLS outage, and the last one''s pooled connections (about 75 KB each) were reported as leaks when the runner stopped. A replaced client is freed once none of its connections is in use and it was replaced an hour ago, and the rest when the runner stops.'
-time: 2026-11-12T00:29:52.669173547-05:00
