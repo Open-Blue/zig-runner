@@ -1553,7 +1553,7 @@ fn tlsRecords(_: void, smith: *Smith) !void {
         const p = tls_stream.Probe.init(.{
             .host = "db.example",
             .verify = verify,
-            .roots_pem = @embedFile("fuzz_corpus/tls/ca.pem"),
+            .roots_pem = @embedFile("fuzz_corpus/tls/ca.crt"),
         }) orelse return error.TlsProbeNotCreated;
         defer p.deinit();
         _ = p.drain();

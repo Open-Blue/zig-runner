@@ -114,7 +114,6 @@ src/native/services.zig	ee65620980ca9c0f	}) catch {};
 src/native/volumes.zig	2cc7a6cdbb6ccea9	errdefer cwd.deleteTree(io, new) catch {};
 src/native/volumes.zig	36424f223a6bcd32	cwd.deleteTree(io, new) catch {};
 src/native/volumes.zig	86fa7cc2dba4c420	cwd.deleteFile(io, lock) catch {};
-src/pg.zig	09b7e06fd138ef12	if (c.tls) |*t| t.close() catch {};
 src/pg.zig	19af4b66513e36c9	c.sendMessage('X', "") catch {};
 src/pg.zig	4228b417d4e649b0	sel.concurrent(.timeout, sleep, .{ io, cfg.connect_timeout }) catch {};
 src/pg.zig	86a262728eced8b2	io.sleep(d, .awake) catch {};

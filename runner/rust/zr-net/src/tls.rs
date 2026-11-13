@@ -496,7 +496,7 @@ mod tests {
                 s.write_tls(&mut flight).unwrap();
             }
             std::fs::write(format!("{dir}/{name}.bin"), &flight).unwrap();
-            std::fs::write(format!("{dir}/ca.pem"), ca.cert.pem()).unwrap();
+            std::fs::write(format!("{dir}/ca.crt"), ca.cert.pem()).unwrap();
             // An alert record: handshake_failure.
             std::fs::write(format!("{dir}/alert.bin"), [21u8, 3, 3, 0, 2, 2, 40]).unwrap();
         }
