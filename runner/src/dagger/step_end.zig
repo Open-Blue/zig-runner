@@ -202,32 +202,37 @@ pub const Meter = struct {
         };
     }
 
+    /// The observer's `ptr` is the meter: the one place the erased pointer is given back its type.
+    fn self(ptr: *anyopaque) *Meter {
+        return @ptrCast(@alignCast(ptr));
+    }
+
     fn started(ptr: *anyopaque, number: u32, name: []const u8, started_ms: i64) void {
-        const m: *Meter = @ptrCast(@alignCast(ptr));
+        const m = self(ptr);
         m.begin();
         if (m.inner) |i| i.startedFn(i.ptr, number, name, started_ms);
     }
 
     fn finished(ptr: *anyopaque, number: u32, res: dagger.StepResult) void {
-        const m: *Meter = @ptrCast(@alignCast(ptr));
+        const m = self(ptr);
         m.end(number, res);
         if (m.inner) |i| i.finishedFn(i.ptr, number, res);
     }
 
     fn extraStarted(ptr: *anyopaque, kind: dagger.ExtraKind, log_step: u32, name: []const u8, started_ms: i64) void {
-        const m: *Meter = @ptrCast(@alignCast(ptr));
+        const m = self(ptr);
         const i = m.inner.?;
         i.extraStartedFn.?(i.ptr, kind, log_step, name, started_ms);
     }
 
     fn extraFinished(ptr: *anyopaque, e: dagger.ExtraStep) void {
-        const m: *Meter = @ptrCast(@alignCast(ptr));
+        const m = self(ptr);
         const i = m.inner.?;
         i.extraFinishedFn.?(i.ptr, e);
     }
 
     fn posts(ptr: *anyopaque, n: u32, stop: bool) void {
-        const m: *Meter = @ptrCast(@alignCast(ptr));
+        const m = self(ptr);
         const i = m.inner.?;
         i.postsFn.?(i.ptr, n, stop);
     }
