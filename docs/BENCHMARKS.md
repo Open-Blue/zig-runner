@@ -297,3 +297,30 @@ What was measured and left out, on the same laptop:
 | Inode order before a cold walk (30000 files, caches dropped through a cgroup) | 257 against 249 ms, 646 against 634 reads | The same inode-table blocks are read either way; a warm walk costs more |
 | Reading a Zig tree ahead of a compile | 5.65 s and 254 MiB against 4.87 s and 90 MiB, cold | A compile reads a third of the tree; warm, the pass adds 136 ms for nothing |
 | Zig's caches on tmpfs (`zig build test`, 5 rounds) | 132.9 against 124.5 s, no trend between pairs | 198 MiB stays in the cache, all of it written once on either disk: nothing is saved unless it is thrown away |
+
+## Secret masking: a filter on the first two bytes
+
+*2026-11-12, laptop (Ryzen 5 PRO 4650U), balanced power, load average 7-10 from other work, so
+read the ratios, not the figures.* Every line a step logs goes through `redact.Set.write`, which
+tried each position of the line against a trie of the job's secrets in every form the runner masks
+(a secret is 10 masks: base64 at each offset, URL-encoded, per line...). A position costs a hash
+lookup whenever its byte begins any mask, and base64 masks begin with any letter or digit. Now a
+position is first tested against one bit of a 64 Kibit table of the first two bytes any mask can
+start with, in a loop of its own (`Set.nextStart`).
+
+Throughput over 2.4 MB of text (the repository's docs and sources), line by line, no secret in it
+(`runner/tools/redactbench.zig`; the output is byte for byte the same, and the tests compare it
+with the plain list on random text):
+
+| Secrets (masks) | Before | After | Rust `aho-corasick` 1.1, DFA, leftmost-longest |
+| --- | --- | --- | --- |
+| 5 (50) | 200 MB/s | 958 MB/s | not run |
+| 20 (200) | 170 MB/s | 937 MB/s | 359 MB/s |
+| 100 (1,000) | 104 MB/s | 641 MB/s | not run |
+
+So 4.7 to 6 times faster, and faster than the Aho-Corasick library the Rust ecosystem offers
+(whose NFA does 163 MB/s on the same masks), with no dependency. Hyperscan or Vectorscan would
+probably be faster again and was not tried: a C++ library, built with Ragel and Boost, to mask a
+log that is a few megabytes at the most. In a job the difference is small: a step that logs 10 MB
+spent 50-60 ms masking it before and 11 ms now. Only a step with logs of hundreds of megabytes
+would show it.
