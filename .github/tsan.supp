@@ -12,3 +12,11 @@
 # runs, as a write in `allocate` (a `__tsan_memcpy`) against a read or write in `turn`/`wake`.
 # Matching on `allocate` alone keeps it narrow: only a race whose one side is that initial write.
 race:tokio::runtime::io::registration_set::RegistrationSet>::allocate
+
+# A thread that finished and was not joined, reported once at the process's end. The runtime lives as
+# long as the process (docs/rust-net.md, "Threading and the runtime"): tokio's blocking pool (the
+# getaddrinfo threads) keeps the handle of a thread that has gone idle for
+# its 10 s and left, to join it at the next spawn or at shutdown, and a test process ends with the
+# runtime still started. Not a race, and not a leak that grows: the pool's size is capped.
+# (A `thread:` entry matches the stack that created the thread.)
+thread:tokio::runtime::blocking::pool::Spawner>::spawn_thread

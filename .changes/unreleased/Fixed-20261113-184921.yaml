@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The network library''s HTTP client writes its request: lines through the same code and the same RUNNER_LOG_REQUESTS switch as the other requests (it had a copy of that code, and a switch main did not set)'
+time: 2026-11-13T18:49:21.519691961-05:00

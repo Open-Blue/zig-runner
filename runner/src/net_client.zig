@@ -2,13 +2,13 @@
 //! behind `fetch`. A request is handed to the library, which runs it on its runtime, and this file
 //! waits for it through std.Io on a descriptor the library makes readable when it has finished, so
 //! a deadline or a cancel ends the wait where it blocks and drops the request (and its connection).
-//! Each request logs one `request:` line (`github/request_line.zig`) with the library's own,
+//! Each request logs one `request:` line (`github/request_log.zig`) with the library's own,
 //! exact, DNS, connect, TLS and first-byte times. Whole bodies: streaming is for R4.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const http = @import("github/http.zig");
-const request_line = @import("github/request_line.zig");
+const request_log = @import("github/request_log.zig");
 const build_version = @import("version.zig");
 
 const Handle = opaque {};
@@ -227,7 +227,7 @@ const Probe = struct {
         p.started = Io.Clock.awake.now(io);
     }
 
-    fn finish(p: *Probe, outcome: request_line.Status) void {
+    fn finish(p: *Probe, outcome: request_log.Status) void {
         if (p.logged) return;
         p.logged = true;
         const uri = std.Uri.parse(p.opts.url) catch std.Uri{ .scheme = "" };
@@ -235,9 +235,9 @@ const Probe = struct {
         const host = if (uri.host) |h| (h.toRaw(&host_buf) catch "?") else "?";
         var path_buf: [256]u8 = undefined;
         var raw_path_buf: [512]u8 = undefined;
-        const path = request_line.redactPath(&path_buf, if (uri.path.toRaw(&raw_path_buf)) |s| s else |_| "");
+        const path = request_log.redactPath(&path_buf, if (uri.path.toRaw(&raw_path_buf)) |s| s else |_| "");
         const total: u64 = std.math.lossyCast(u64, p.started.durationTo(Io.Clock.awake.now(p.io)).toNanoseconds());
-        var l: request_line.Line = .{
+        var l: request_log.Line = .{
             .host = host,
             .method = @tagName(p.opts.method),
             .path = path,
@@ -256,7 +256,7 @@ const Probe = struct {
         l.rl_limit = parseU64(rl.header("x-ratelimit-limit"));
         l.rl_reset = parseU64(rl.header("x-ratelimit-reset"));
         l.rl_resource = rl.header("x-ratelimit-resource") orelse "";
-        request_line.emit(p.io, l, rl.header("retry-after") orelse "");
+        request_log.emit(p.io, l, rl.header("retry-after") orelse "");
     }
 };
 

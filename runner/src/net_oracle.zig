@@ -7,7 +7,7 @@ const std = @import("std");
 const Io = std.Io;
 const http = @import("github/http.zig");
 const net_client = @import("net_client.zig");
-const request_line = @import("github/request_line.zig");
+const request_log = @import("github/request_log.zig");
 const testserver = @import("github/testserver.zig");
 
 const Case = struct {
@@ -122,11 +122,11 @@ test "oracle: the library's request line has every figure it measured, for a pla
     try server.start();
     defer server.stop();
     var captured: Io.Writer.Allocating = .init(arena);
-    request_line.capture = &captured;
-    request_line.enabled.store(true, .monotonic);
+    request_log.capture = &captured;
+    request_log.enabled.store(true, .monotonic);
     defer {
-        request_line.enabled.store(false, .monotonic);
-        request_line.capture = null;
+        request_log.enabled.store(false, .monotonic);
+        request_log.capture = null;
     }
     var url_buf: [128]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/unavailable/x?x=y", .{server.port});
@@ -141,6 +141,28 @@ test "oracle: the library's request line has every figure it measured, for a pla
     for ([_][]const u8{ " dns_ms=?", " connect_ms=?", " ttfb_ms=?", " total_ms=?" }) |unknown|
         try std.testing.expect(std.mem.indexOf(u8, line, unknown) == null);
     try std.testing.expect(std.mem.endsWith(u8, line, " rl_remaining=? rl_limit=? rl_reset=? rl_resource=?\n"));
+}
+
+test "oracle: the library's requests are logged by the same switch as the others' (RUNNER_LOG_REQUESTS)" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    var captured: Io.Writer.Allocating = .init(arena);
+    request_log.capture = &captured;
+    defer request_log.capture = null;
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/unavailable/x", .{server.port});
+    // `main` stores `config.log_requests` there; tests start with it off.
+    request_log.enabled.store(false, .monotonic);
+    _ = try net_client.fetch(arena, std.testing.io, .{ .url = url });
+    try std.testing.expectEqual(@as(usize, 0), captured.written().len);
+    request_log.enabled.store(true, .monotonic);
+    defer request_log.enabled.store(false, .monotonic);
+    _ = try net_client.fetch(arena, std.testing.io, .{ .url = url });
+    try std.testing.expect(std.mem.startsWith(u8, captured.written(), "request: host=127.0.0.1 "));
 }
 
 test "oracle: a request nobody answers is given up at its deadline, and cancelling one ends it at once" {
