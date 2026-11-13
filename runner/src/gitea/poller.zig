@@ -1,9 +1,10 @@
 //! The Gitea and Forgejo side of the pool: register once (or find the saved registration), then
 //! every runner of the pool asks the instance for a task of its own, as `act_runner`'s `capacity`
-//! does: one registration, `RUNNER_COUNT` pollers.
+//! does: one registration, `RUNNER_COUNT` pollers. A task it is handed is run and reported
+//! (`run.zig`) before the runner asks again, so a runner has one task at a time.
 //!
-//! This is as far as a task goes for now (#520, G2). A fetched task is read and described in the
-//! log and not run: turning it into a job is G3, reporting it G4. See `hold`.
+//! The pool is GitHub's (`loop.poolWith`): the trust notice, the memory gate, the log spool and the
+//! pre-warm are the same, and only what each runner does is this file's.
 const std = @import("std");
 const Config = @import("../config.zig").Config;
 const loop = @import("../loop.zig");
@@ -12,6 +13,7 @@ const redact = @import("../redact.zig");
 const build_version = @import("../version.zig");
 const client_mod = @import("client.zig");
 const state_mod = @import("state.zig");
+const run = @import("run.zig");
 
 const Allocator = std.mem.Allocator;
 const Client = client_mod.Client;
@@ -39,7 +41,6 @@ pub const Pace = struct {
 /// version, which a runner that sees a newer one tells the others of (they would otherwise each
 /// ask what the last answer already said).
 const Shared = struct {
-    c: loop.Runner,
     client: Client,
     pace: Pace,
     tasks_version: std.atomic.Value(i64) = .init(0),
@@ -48,46 +49,47 @@ const Shared = struct {
         var cur = sh.tasks_version.load(.acquire);
         while (version > cur) cur = sh.tasks_version.cmpxchgWeak(cur, version, .acq_rel, .acquire) orelse return;
     }
-};
 
-const Slot = struct {
-    shared: *Shared,
-    index: usize,
-    exit: loop.Exit = .done,
-
-    fn main(s: *Slot) void {
-        s.exit = s.run();
-    }
-
-    /// One runner: asks for a task until it gets one or a stop is requested. Between asks it waits
-    /// the pace's interval, longer while there is nothing (or the instance is failing), so a quiet
+    /// One runner of the pool (`loop.poolWith` calls this in its task): asks for a task until it
+    /// gets one, runs it, and asks again, until a stop is requested. Between asks it waits the
+    /// pace's interval, longer while there is nothing (or the instance is failing), so a quiet
     /// instance is not asked every 2 s by every runner for ever. A stop is noticed between calls
     /// (a call in flight ends within `Client.deadline`, 10 s at the most); one in flight is not
     /// cut, because the instance may already have given it a task, which the answer would lose.
-    fn run(s: *Slot) loop.Exit {
-        const sh = s.shared;
-        const c = sh.c;
+    /// A task running when the stop comes gets `RUNNER_STOP_GRACE_SECS` and is then cancelled
+    /// (`jobs.StopDeadline`).
+    pub fn run(sh: *Shared, c: loop.Runner, index: usize) loop.Exit {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
+        var slot: Slot = .{ .shared = sh, .c = c, .index = index };
+        defer if (c.gate) |g| g.leave(false);
         var streak: u32 = 0;
         while (!loop.stopRequested()) {
+            // The memory gate: ask for a task only once the machine has the memory for one more.
+            if (c.gate) |g| if (loop.checkGate(c, g)) |hold| {
+                if (!(loop.admit(c, g, hold) catch false)) return .done;
+            };
             _ = arena_state.reset(.retain_capacity);
             const arena = arena_state.allocator();
             var failure: Failure = .{};
             const sent = sh.tasks_version.load(.acquire);
             if (sh.client.fetchTask(arena, c.io, sent, &failure)) |f| {
                 sh.seen(f.tasks_version);
-                if (f.additional > 0) s.tell(arena, "runner {d}: the instance also sent {d} " ++
-                    "additional task(s), which are not used (one task is asked for)", .{ s.index, f.additional });
-                if (f.task) |t| return s.hold(arena, t);
+                if (f.additional > 0) slot.tell(arena, "runner {d}: the instance also sent {d} " ++
+                    "additional task(s), which are not used (one task is asked for)", .{ index, f.additional });
+                if (f.task) |t| {
+                    slot.runTask(arena, t);
+                    streak = 0;
+                    continue;
+                }
                 // A newer version means tasks may have been made: ask again soon.
                 streak = if (f.tasks_version > sent) 0 else streak +| 1;
             } else |e| switch (e) {
                 error.Unauthenticated => {
-                    s.tell(arena, "runner {d}: the instance does not know this runner any more " ++
+                    slot.tell(arena, "runner {d}: the instance does not know this runner any more " ++
                         "(HTTP {d} {s}: {s}); remove its saved registration and register again " ++
                         "with RUNNER_GITEA_REGISTRATION_TOKEN", .{
-                        s.index,
+                        index,
                         @backingInt(failure.status),
                         failure.code,
                         failure.message,
@@ -96,8 +98,8 @@ const Slot = struct {
                 },
                 else => {
                     streak +|= 1;
-                    s.tell(arena, "runner {d}: FetchTask failed ({s}{s}{s}); trying again in {d} ms", .{
-                        s.index,
+                    slot.tell(arena, "runner {d}: FetchTask failed ({s}{s}{s}); trying again in {d} ms", .{
+                        index,
                         @errorName(e),
                         if (failure.message.len > 0) ": " else "",
                         failure.message,
@@ -111,27 +113,30 @@ const Slot = struct {
         }
         return .done;
     }
+};
 
-    /// What becomes of a task this build fetches but cannot run. The instance has already given
-    /// it to this runner, and nothing here can report it (G4), so it is left to the instance's
-    /// zombie timeout, which fails it. The runner takes no second one: each further fetch would
-    /// strand another job of someone's, and a queue of them would all fail one after another. It
-    /// waits for the stop without asking again.
-    fn hold(s: *Slot, arena: Allocator, t: client_mod.Task) loop.Exit {
-        const c = s.shared.c;
+const Slot = struct {
+    shared: *Shared,
+    c: loop.Runner,
+    index: usize,
+
+    /// Runs the task the instance handed this runner, and reports it (`run.task`). Its end frees
+    /// the memory gate's reservation, as a GitHub job's does.
+    fn runTask(s: *Slot, arena: Allocator, t: client_mod.Task) void {
+        const c = s.c;
         const what = t.describe(arena) catch |e| std.fmt.allocPrint(arena, "task {d} ({s})", .{ t.id, @errorName(e) }) catch "a task";
         s.tell(arena, "runner {d}: fetched {s}", .{ s.index, what });
-        s.tell(arena, "WARNING: runner {d}: task {d} is NOT RUN and not reported (this build only " ++
-            "fetches): this runner asks for no more tasks until it is restarted, and the instance " ++
-            "fails the task after its zombie timeout", .{ s.index, t.id });
-        while (!loop.stopRequested()) sleepOrStop(c.io, 1000);
-        return .done;
+        run.task(c, s.shared.client, t);
+        if (c.gate) |g| {
+            g.leave(false);
+            _ = g.ended();
+        }
     }
 
     /// A line in the log; one that cannot be written is no reason to stop fetching.
     fn tell(s: *Slot, arena: Allocator, comptime fmt: []const u8, args: anytype) void {
         const text = std.fmt.allocPrint(arena, fmt, args) catch return;
-        s.shared.c.log.say(text) catch |e| std.log.warn("gitea: log: {s}", .{@errorName(e)});
+        s.c.log.say(text) catch |e| std.log.warn("gitea: log: {s}", .{@errorName(e)});
     }
 };
 
@@ -143,11 +148,6 @@ pub fn pool(c: loop.Runner, n: u32) !loop.Exit {
         "{s}: {s}, {d} runner(s) asking for tasks every {d} s, up to {d} s when there are none",
         .{ @tagName(cfg.platform), cfg.gitea_url, n, cfg.gitea_fetch_interval_secs, cfg.gitea_fetch_interval_max_secs },
     ));
-    try c.log.say(
-        "WARNING: this runner fetches Gitea tasks but does not run them yet (#520): a task it " ++
-            "takes is logged, left unreported, and failed by the instance after its zombie " ++
-            "timeout. Do not point it at an instance whose jobs matter.",
-    );
     const creds = switch (try connect(c)) {
         .ok => |st| st,
         .exit => |code| return code,
@@ -157,31 +157,18 @@ pub fn pool(c: loop.Runner, n: u32) !loop.Exit {
     try all.appendSlice(c.arena, c.secrets);
     try all.append(c.arena, creds.token);
     c.log.setSecrets(try redact.expand(c.arena, all.items));
+    // The jobs' logs redact them too, with the job's own (`run.task`).
+    var pooled = c;
+    pooled.secrets = all.items;
 
     var shared: Shared = .{
-        .c = c,
         .client = .{ .url = cfg.gitea_url, .flavor = flavorOf(cfg), .uuid = creds.uuid, .token = creds.token },
         .pace = .{
             .interval_ms = cfg.gitea_fetch_interval_secs *| 1000,
             .max_ms = cfg.gitea_fetch_interval_max_secs *| 1000,
         },
     };
-    const slots = try c.arena.alloc(Slot, n);
-    var group: std.Io.Group = .init;
-    for (slots, 0..) |*s, i| {
-        s.* = .{ .shared = &shared, .index = i };
-        group.concurrent(c.io, Slot.main, .{s}) catch |e| {
-            try c.err.print("could not start {d} runners: {s}\n", .{ n, @errorName(e) });
-            group.cancel(c.io);
-            return .config;
-        };
-    }
-    group.await(c.io) catch |e| std.log.warn("gitea: {s}", .{@errorName(e)});
-    var worst: loop.Exit = .done;
-    for (slots) |s| if (@backingInt(s.exit) > @backingInt(worst)) {
-        worst = s.exit;
-    };
-    return worst;
+    return loop.poolWith(pooled, n, &shared);
 }
 
 /// The runner's credentials: the saved registration, declared again (labels and version may have

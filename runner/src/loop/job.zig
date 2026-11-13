@@ -1,6 +1,14 @@
 //! One job, from acquire to completejob: the job's log and spool, its run through Dagger, the
 //! run state in the database, and what watches it meanwhile (the hold renewer, the cancel watch
 //! and the stop deadline).
+//!
+//! Two parts of it are not GitHub's. What a job needs once it is parsed (a place at the memory
+//! gate, its log and spool, the trust decision, the backend and its steps, what the memory gate
+//! learns) is `Admitted`, `openSpool`, `awaitRoom`, `unrunnable`, `execute` and `reportCacheAndKeys`,
+//! and the Gitea and Forgejo runner (`gitea/run.zig`) calls them for its own jobs. What is GitHub's
+//! alone is `handleJob`'s acquire, its renewer, its cancel watch, the live feed and the uploads of
+//! its results service, completejob and the run-state database; a platform supplies its own around
+//! the shared part, through the step observer and the log's listener.
 
 const std = @import("std");
 const Config = @import("../config.zig").Config;
@@ -172,7 +180,7 @@ fn nonEmpty(s: []const u8) ?[]const u8 {
     return if (s.len == 0) null else s;
 }
 
-fn jobName(job: job_mod.Job) []const u8 {
+pub fn jobName(job: job_mod.Job) []const u8 {
     if (job.display_name.len > 0) return job.display_name;
     if (job.github.job.len > 0) return job.github.job;
     return "job";
@@ -245,6 +253,40 @@ fn gateKey(c: Runner, job: job_mod.Job, name: []const u8) u64 {
     return admission.jobKeyIn(trusted, g.repository, g.workflow_ref, name);
 }
 
+/// A job's place at the memory gate from the moment it is named to its end: it reserves what jobs
+/// of its name took (`admission.Learned`), and what it took is learned and said when it ends.
+pub const Admitted = struct {
+    c: Runner,
+    name: []const u8,
+
+    pub fn begin(c: Runner, job: job_mod.Job) Admitted {
+        const name = if (job.display_name.len > 0) job.display_name else job.github.job;
+        if (c.gate) |gate| {
+            gate.assigned(gateKey(c, job, name));
+            gate.named(name);
+        }
+        return .{ .c = c, .name = name };
+    }
+
+    pub fn end(a: Admitted) void {
+        const gate = a.c.gate orelse return;
+        const learned = gate.ended() orelse return;
+        sayUnallocated(
+            a.c,
+            "job '{s}' {s} {f} at most ({s}); reserving {f} for it while it starts",
+            .{
+                a.name,
+                if (learned.native) "took" else "raised the engine's memory by",
+                admission.gb(learned.seen_mb),
+                if (learned.native)
+                    "natively, in its own cgroup"
+                else if (learned.alone) "alone" else "beside other jobs",
+                admission.gb(learned.estimate_mb),
+            },
+        );
+    }
+};
+
 /// One job from its broker message `body` to completejob: acquire it, run it, upload what GitHub
 /// shows, and say how the cycle ended.
 pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
@@ -258,24 +300,8 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     const job = job_mod.parse(c.arena, acq.body) catch |e| return fail(c, "parse job", e);
     // Known by name now: it reserves what jobs of its name took (`admission.Learned`), and what it
     // takes is learned when it ends.
-    const job_name = if (job.display_name.len > 0) job.display_name else job.github.job;
-    if (c.gate) |gate| {
-        gate.assigned(gateKey(c, job, job_name));
-        gate.named(job_name);
-    }
-    defer if (c.gate) |gate| if (gate.ended()) |learned| sayUnallocated(
-        c,
-        "job '{s}' {s} {f} at most ({s}); reserving {f} for it while it starts",
-        .{
-            job_name,
-            if (learned.native) "took" else "raised the engine's memory by",
-            admission.gb(learned.seen_mb),
-            if (learned.native)
-                "natively, in its own cgroup"
-            else if (learned.alone) "alone" else "beside other jobs",
-            admission.gb(learned.estimate_mb),
-        },
-    );
+    const admitted = Admitted.begin(c, job);
+    defer admitted.end();
 
     // GitHub cancels a job (in its UI, or at the job's timeout-minutes) through the runner's
     // session.
@@ -400,7 +426,7 @@ const room_step_ms = 50;
 /// `Admission.recheck` otherwise. GitHub cancelling the job ends the wait: what runs then is the
 /// steps that survive a cancel. A runner told to stop keeps waiting, for `StopDeadline` to cancel
 /// the job once its grace has passed. Said in the job's own log when it waits and when it stops.
-fn awaitRoom(
+pub fn awaitRoom(
     c: Runner,
     gate: *admission.Gate,
     log: *sink.LogSink,
@@ -453,7 +479,7 @@ fn awaitRoom(
 }
 
 /// A line in the job's log, under its "Set up job" step, as `std.fmt` writes it.
-fn sayJob(
+pub fn sayJob(
     log: *sink.LogSink,
     arena: Allocator,
     job: job_mod.Job,
@@ -538,19 +564,19 @@ fn jobConclusion(result: dagger.Result) runservice.Conclusion {
 /// cycle's arena so the collector can be pointed at it here, where it cannot be forgotten: the
 /// first extraction of handleJob dropped that one line, and only an unused-parameter error caught
 /// it.
-const JobSpool = struct {
+pub const JobSpool = struct {
     spool: sink.Spool,
     dir: std.Io.Dir,
     /// The file's name in `dir`.
     name: []const u8,
 
-    fn close(sp: *JobSpool, io: std.Io) void {
+    pub fn close(sp: *JobSpool, io: std.Io) void {
         sp.spool.file.close(io);
         sp.dir.deleteFile(io, sp.name) catch {};
     }
 };
 
-fn openSpool(c: Runner, job: job_mod.Job, collect: *sink.LogSink) !?*JobSpool {
+pub fn openSpool(c: Runner, job: job_mod.Job, collect: *sink.LogSink) !?*JobSpool {
     const sd = c.spool_dir orelse return null;
     const name = std.fmt.allocPrint(c.arena, "zig-runner-job-{d}.log", .{job.check_run_id}) catch
         return null;
@@ -652,9 +678,7 @@ fn startReporter(c: Runner, job: job_mod.Job, job_started_ms: i64) !?Reporter {
     return reporter;
 }
 
-/// The steps, through Dagger — or failed up front: a job this runner does not trust
-/// (`trust.zig`), or one whose `container:` or `services:` it does not support, rather than run
-/// in ways that would fail confusingly without them.
+/// The steps, through Dagger — or failed up front (`unrunnable`).
 fn runJobSteps(
     c: Runner,
     job: job_mod.Job,
@@ -665,17 +689,40 @@ fn runJobSteps(
     step_logs: *upload.StepLogs,
     reporter: ?*Reporter,
 ) !dagger.Result {
+    if (try unrunnable(c, job, log)) |failed| return failed;
+    return execute(c, job, log, cancel, observer: {
+        live.next = if (reporter) |r| r.observer() else null;
+        break :observer step_logs.observer();
+    });
+}
+
+/// The result of a job this runner does not run: one it does not trust (`trust.zig`), or whose
+/// `container:` or `services:` it does not support, failed in "Set up job" rather than run in ways
+/// that would fail confusingly without them. Null when the job may run.
+pub fn unrunnable(c: Runner, job: job_mod.Job, log: *sink.LogSink) !?dagger.Result {
     const cfg = c.cfg;
     const refused = try trust.refusal(c.arena, cfg.trusted_refs, cfg.trusted_events, job.github);
     if (refused) |why| try c.err.print("job refused: {s}\n", .{why});
     const unsupported: ?[]const u8 = refused orelse job.container_error orelse job.services_error;
-    if (unsupported) |why| {
-        // Nothing of it ran: not learned from, whatever name it has (the reservation is released
-        // when the job ends, as for any job).
-        if (c.gate) |gate| gate.replayed();
-        try log.append(job.check_run_id, 0, .stderr, why);
-        return failedInSetUp(c.arena, job.steps.len);
-    }
+    const why = unsupported orelse return null;
+    // Nothing of it ran: not learned from, whatever name it has (the reservation is released
+    // when the job ends, as for any job).
+    if (c.gate) |gate| gate.replayed();
+    try log.append(job.check_run_id, 0, .stderr, why);
+    return try failedInSetUp(c.arena, job.steps.len);
+}
+
+/// The steps of a job that may run, on the backend the runner is set up for, told to `observer` as
+/// each starts and ends. The result carries the native teardown not run yet (`defer_teardown`): the
+/// caller runs it once it has reported, as `handleJob` does.
+pub fn execute(
+    c: Runner,
+    job: job_mod.Job,
+    log: *sink.LogSink,
+    cancel: *dagger.Cancel,
+    observer: ?dagger.Observer,
+) !dagger.Result {
+    const cfg = c.cfg;
     const zig_seeds: zig_release.Resolved = if (cfg.zig_seed_registry) |r|
         try r.forJob(c.arena)
     else
@@ -715,10 +762,7 @@ fn runJobSteps(
         .output_keys = c.cfg.output_keys and !slowOutputs(c, job.github.repository),
         .output_keys_days = c.cfg.output_keys_days,
         .cancel = cancel,
-        .observer = observer: {
-            live.next = if (reporter) |r| r.observer() else null;
-            break :observer step_logs.observer();
-        },
+        .observer = observer,
         .sink_job_id = job.check_run_id,
         .runner_name = c.name,
         .native = native,
@@ -874,7 +918,7 @@ fn logCompleteJob(
 /// On the runner's own console: how many steps the engine served from cache, as the step logs say
 /// (`dagger.reused_note`) — what step caching saved this job, next to what output keys cost it. A
 /// job with a step replayed is not learned from by the memory gate (`admission.Gate.replayed`).
-fn reportCacheAndKeys(
+pub fn reportCacheAndKeys(
     c: Runner,
     job: job_mod.Job,
     log: *sink.LogSink,
@@ -1127,7 +1171,7 @@ const Renewer = struct {
 /// cancelled and when the job reaches its `timeout-minutes` (GitHub enforces that limit itself; the
 /// job definition does not carry it). The timeout is the grace period for what still runs after the
 /// cancel (`if: always()` steps, post scripts); past it, the job's queries are ended too.
-const CancelWatch = struct {
+pub const CancelWatch = struct {
     fn init(c: Runner, session: Listening, job: job_mod.Job, cancel: *dagger.Cancel) CancelWatch {
         return .{
             .c = c,
@@ -1207,12 +1251,12 @@ const CancelWatch = struct {
     /// What of GitHub's `timeout` this runner uses, as its `WorkerDispatcher.Cancel` does
     /// (`JobDispatcher.cs`, 1280-1285): at least 60 s, so a small one still gets a full ladder,
     /// less 15 s, in which the job's end reports before GitHub closes the job.
-    fn cancelLimitMs(grace_ms: i64) i64 {
+    pub fn cancelLimitMs(grace_ms: i64) i64 {
         return @max(grace_ms, 60 * std.time.ms_per_s) - 15 * std.time.ms_per_s;
     }
 
     /// GitHub's default `cancel-timeout-minutes`.
-    const default_grace_ms = 5 * 60 * 1000;
+    pub const default_grace_ms = 5 * 60 * 1000;
 };
 
 /// Cancels the job once the runner has been asked to stop (SIGTERM from systemd, Docker or a
@@ -1221,13 +1265,13 @@ const CancelWatch = struct {
 /// unit's `TimeoutStopSec`, and the engine ran its step all that time (#127). The cancel is
 /// GitHub's: the running step is stopped, `if: always()` steps and post scripts get
 /// `stop_cancel_ms`, and the job is reported cancelled.
-const StopDeadline = struct {
+pub const StopDeadline = struct {
     c: Runner,
     cancel: *dagger.Cancel,
     log_job: u64,
     stop: std.atomic.Value(bool) = .init(false),
 
-    fn run(s: *StopDeadline) void {
+    pub fn run(s: *StopDeadline) void {
         // In short steps, as `waitForStop` does: the job's end waits for this to see `stop`.
         while (!stopRequested()) {
             if (s.stop.load(.acquire)) return;
