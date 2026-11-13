@@ -296,8 +296,9 @@ protocol code is untouched. Only `startTls` changes. Consequences:
   and the toolchain's version). If an offline build is needed (the image build, the provisioned image), `cargo vendor` is run in that build
   from the lock and not stored. Revisit at R3 when the dependency count is real (about 90 crates for hyper + rustls + tungstenite).
 - **Toolchain without rustup.** `install-rust.sh`: cargo, rustc and rust-std (host plus both musl targets) tarballs from
-  static.rust-lang.org, each SHA-256 pinned from the release manifest (`channel-rust-1.99.1.toml`), unpacked to `RUNNER_TOOL_CACHE` (or
-  `~/.cache/zig-runner-rust`), once per version. `build-zr-net.sh` calls it itself when the machine's `cargo` is not 1.99.1, so
+  static.rust-lang.org, each SHA-256 pinned from the release manifest (`channel-rust-1.99.1.toml`), unpacked to `RUNNER_TOOL_CACHE/rust/1.99.1/<arch>` (or
+  `~/.cache/zig-runner-rust`), once per version, and **the tree is checked against a pinned digest of its 292 files** every run (0.7 s), as `install-zig.sh` does for Zig, so a job that wrote
+  the tool cache cannot swap the compiler. Nothing else is cached there on purpose: a shared `target/` or `CARGO_HOME/registry/src` is not verified by cargo and would let one job's bytes into another's release. `build-zr-net.sh` calls it itself when the machine's `cargo` is not 1.99.1, so
   no workflow job had to change (every job that builds the runner already goes through `zig-modules.sh`). A developer with rustup gets the
   same version from `rust-toolchain.toml` (`targets = [...]`). Cost, measured here: **45 s and 969 MB on disk** on first use per
   machine. GitHub's hosted runners have rustup; the script does not use it so that hosted and self-hosted builds are the same bytes.
