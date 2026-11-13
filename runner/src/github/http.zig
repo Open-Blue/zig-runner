@@ -3,6 +3,7 @@
 //! waiting runner only frees after its next job, so idle runners grew by hundreds of KB per poll.
 const std = @import("std");
 const builtin = @import("builtin");
+const request_log = @import("request_log.zig");
 
 /// Set by `main` for the runner (its allocator must be thread-safe: runners share it). Unset in
 /// tests and one-off commands, where each request gets its own client. `renew` replaces it.
@@ -175,7 +176,23 @@ pub fn fetch(
     var cl = c;
     var renewed = false;
     while (true) : (attempt += 1) {
-        const r = try within(cl.io, request_deadline, fetchOnce, .{ cl, options });
+        // The `request:` line: only what a whole `fetch` shows (its status and time), since the
+        // client's connection and response are out of reach here.
+        var probe = request_log.Probe.init(cl.io, true, options.method orelse
+            (if (options.payload != null) .POST else .GET), switch (options.location) {
+            .uri => |u| u,
+            .url => |u| std.Uri.parse(u) catch .{ .scheme = "" },
+        }, attempt);
+        const r = within(cl.io, request_deadline, fetchOnce, .{ cl, options }) catch |e| {
+            probe.finishOuter(false);
+            return e;
+        };
+        if (r) |done| {
+            if (done) |ok| {
+                probe.status = @backingInt(ok.status);
+                probe.finish(null);
+            } else |err| probe.finish(err);
+        } else probe.finishOuter(true);
         return (r orelse return error.Timeout) catch |err| switch (err) {
             error.HttpConnectionClosing => if (attempt < staleRetries(cl)) continue else err,
             else => if (!renewed and staleClock(err) and shared.load(.acquire) == cl) {

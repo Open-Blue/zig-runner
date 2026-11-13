@@ -276,6 +276,55 @@ same figures once its teardown ran, and how they changed while it ran (`dheap`, 
 descriptor count or mount count that only climbs across jobs is a leak
 (`journalctl -u <unit> | grep job-end:`). A zombie child is logged as a warning at the job's end.
 
+### The step-end and request lines
+
+Two more kinds of line say where a job's time and resources go (`journalctl -u <unit> | grep
+step-end:`). Both are `key=value`, space separated; sizes are in bytes, times in milliseconds to a
+tenth, and `?` is a figure that could not be read.
+
+Each step ends with one `step-end:` line, logged with the job's `native phases`:
+
+```
+step-end: job=<check_run_id> step=<n> name='<display name>' result=<success|failure|cancelled|skipped> wall_ms=.. cpu_ms=.. mem_peak=.. io_read=.. io_write=.. majflt=.. minflt=.. spawn_ms=.. namespaces_ms=.. overlay_ms=.. binds_ms=.. root_ms=.. exit_ms=..
+```
+
+A native step's figures are what its cgroup gained between the step's start and its end:
+`cpu.stat`'s `usage_usec` (`cpu_ms`), `memory.peak` (`mem_peak`), `io.stat`'s `rbytes` and `wbytes`
+(`io_read`, `io_write`), and `memory.stat`'s `pgmajfault` and `pgfault` (`majflt`, `minflt`).
+`memory.peak` is reset when the step starts where the kernel allows it (Linux 6.12 and later);
+elsewhere it is the peak since the job started and the line ends with `peak_scope=job`. `io_read`
+and `io_write` are `?` where the cgroup has no io controller. The six `*_ms` fields are the step's
+samples of the same phases `native phases` shows (its helper's start, namespaces, overlay, binds,
+root and exit); a step replayed from the store has none, so they are 0.0. A step run by Dagger has
+its `wall_ms` and `result` only. A step skipped has `wall_ms=0.0` and `?` for the rest. A quote in
+the name is shown as `"` and a control character as a space.
+
+Each HTTP request to GitHub, Gitea or Forgejo (not the Dagger engine's) makes one `request:` line,
+written when it ends:
+
+```
+request: host=<host> method=<GET|POST|..> path=<path> status=<code|error name> dns_ms=.. connect_ms=.. tls_ms=.. ttfb_ms=.. total_ms=.. bytes_in=.. retry=<n> reused=<0|1> rl_remaining=.. rl_limit=.. rl_reset=<unix s> rl_resource=..
+```
+
+`host` has the port when it is not the scheme's. `status` is the HTTP status, or the error that ended
+the request (`Timeout`, `ConnectionRefused`, ...). `dns_ms`, `connect_ms` (the TCP connect) and
+`tls_ms` are of a new connection and 0.0 for a reused one (`reused=1`); `ttfb_ms` runs from the
+request being written to its response's head, which for the broker's long poll is the wait for a
+message; `total_ms` is the whole request to the last byte. `bytes_in` is the body, decompressed.
+`retry` is 0 for the first attempt, then 1, 2, ... for each time the runner sent the request
+again (a connection the server had closed, a timeout, a stale certificate clock). A redirect's
+every hop is a request. `rl_*` are the `x-ratelimit-*` headers, `?` when absent. A 403 or 429 also
+logs a warning with the response's `retry-after`. The calls that go through `fetch` (the GitHub
+App's and the OAuth token's) have `?` for everything but the status and `total_ms`.
+
+The line never holds a token, a query string or a body: the path is cut at its `?`, and each
+segment that could be a secret is shown as `*`. A segment stays when it is at most 40 bytes of
+letters, digits, `.`, `_`, `-` and `~` and does not look like a credential: it is replaced when it
+holds anything else, starts as a token does (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`,
+`eyJ`, `glpat-`), or is 20 bytes or more of letters and digits holding both, without a `.`, unless
+it is a UUID. Numbers, names, UUIDs and endpoint names (`generate-jitconfig`) stay.
+`RUNNER_LOG_REQUESTS=0` turns the lines off (on by default).
+
 ### An engine that stops answering
 
 An engine that stops answering altogether (frozen, deadlocked) would hold a step for good. So a

@@ -317,6 +317,9 @@ pub const Config = struct {
     runners: u32 = 1,
     /// Ask for a job only while the machine has the memory for it (`admission.zig`, #126).
     admission: bool = true,
+    /// One `request:` line per HTTP request to GitHub, Gitea or Forgejo (`RUNNER_LOG_REQUESTS`,
+    /// `github/request_log.zig`).
+    log_requests: bool = true,
     admission_limits: admission.Limits = .{},
     /// A root runner's gate counts what the other pools of the machine have reserved
     /// (`admission.Budget`).
@@ -596,6 +599,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_ONCE")) |v| c.once = try boolean(v);
         if (environ.get("RUNNER_COUNT")) |v| c.runners = try count(v);
         if (environ.get("RUNNER_ADMISSION")) |v| c.admission = try boolean(v);
+        if (environ.get("RUNNER_LOG_REQUESTS")) |v| c.log_requests = try boolean(v);
         if (environ.get("RUNNER_SHARED_MEMORY_BUDGET")) |v| c.shared_memory_budget = try boolean(v);
         const l = &c.admission_limits;
         if (environ.get("RUNNER_MIN_MEM_AVAILABLE_MB")) |v| l.min_available_mb = try num(u32, v);
@@ -1428,6 +1432,9 @@ test "the memory gate is on by default, with limits from the environment or flag
     try env.put("RUNNER_SHARED_MEMORY_BUDGET", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).shared_memory_budget);
     try std.testing.expect((try Config.load(&env, &.{ "runner", "--shared-memory-budget=true" })).shared_memory_budget);
+    try std.testing.expect(d.log_requests);
+    try env.put("RUNNER_LOG_REQUESTS", "0");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).log_requests);
 }
 
 test "load: GH_TOKEN or a GitHub App, not both and not neither" {

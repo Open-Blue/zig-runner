@@ -337,7 +337,11 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
 
     const job_started_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
     var reporter = try startReporter(c, job, job_started_ms);
-    const result = try runJobSteps(c, job, log, &cancel, &live, &step_logs, if (reporter) |*r| r else null);
+    // Each step's `step-end:` line, made as it ends, logged with the job's `native phases`.
+    var step_ends: std.Io.Writer.Allocating = .init(c.arena);
+    var step_ends_said = false;
+    defer if (!step_ends_said) sayStepEnds(c, &step_ends);
+    const result = try runJobSteps(c, job, log, &cancel, &live, &step_logs, if (reporter) |*r| r else null, &step_ends);
     // A native job's teardown (its eviction of the store, its network, its cgroup) comes after its
     // result is reported to GitHub, not before: the result does not depend on it. It runs on every
     // path out of here, and before the gate lets go of the job (`gate.ended`, deferred above), so
@@ -385,6 +389,8 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     // The result is with GitHub: the job's hold needs no more renewing, and the teardown can go.
     renewer.stop.store(true, .release);
     if (result.teardown) |t| phases = t.run();
+    step_ends_said = true;
+    sayStepEnds(c, &step_ends);
     if (phases) |p| try c.err.print("job {d} '{s}': native phases (ms): {s}\n", .{
         job.check_run_id,
         jobName(job),
@@ -393,6 +399,11 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     sayJobEnd(c, job, stats_before);
     if (failed) |f| return f;
     return .{ .job = result.succeeded };
+}
+
+/// The `step-end:` lines the job's steps made (`dagger/step_end.zig`).
+fn sayStepEnds(c: Runner, lines: *std.Io.Writer.Allocating) void {
+    c.err.writeAll(lines.written()) catch return;
 }
 
 /// One line per job, once its teardown ran: the runner process's resources and what changed while
@@ -684,6 +695,7 @@ fn runJobSteps(
     /// Told of the steps first; passes them on to `live`.
     step_logs: *upload.StepLogs,
     reporter: ?*Reporter,
+    step_ends: ?*std.Io.Writer.Allocating,
 ) !dagger.Result {
     const cfg = c.cfg;
     const refused = try trust.refusal(c.arena, cfg.trusted_refs, cfg.trusted_events, job.github);
@@ -742,6 +754,7 @@ fn runJobSteps(
         .sink_job_id = job.check_run_id,
         .runner_name = c.name,
         .native = native,
+        .step_ends = step_ends,
         // Reported first, torn down after (`handleJob`).
         .defer_teardown = true,
     }, job, log);
@@ -845,7 +858,7 @@ test "the gate learns a job in its trust scope, and not at all from one the runn
     pool.slots[0].peak_mb = 5000;
     var cancel: dagger.Cancel = .{};
     var log: sink.LogSink = .{ .collect = .{ .arena = arena, .io = std.testing.io, .inner = &stdout_log } };
-    const result = try runJobSteps(runner, job, &log, &cancel, undefined, undefined, null);
+    const result = try runJobSteps(runner, job, &log, &cancel, undefined, undefined, null, null);
     try std.testing.expect(result.set_up_failed);
     try std.testing.expect(gate.ended() == null);
     try std.testing.expectEqual(@as(usize, 0), pool.learned.len);
