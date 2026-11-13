@@ -152,6 +152,17 @@ pub const Registry = struct {
     /// Taken from `pending` by a job verifying them.
     inflight: std.ArrayList([]const u8) = .empty,
 
+    /// Frees what the registry holds in its own allocator, at the pool's end: its lists and the
+    /// versions `discover` queued. The seeds' own strings are `resolve`'s arena's.
+    pub fn deinit(r: *Registry) void {
+        for (r.pending.items) |v| r.gpa.free(v);
+        for (r.inflight.items) |v| r.gpa.free(v);
+        r.seeds.deinit(r.gpa);
+        r.unverified.deinit(r.gpa);
+        r.pending.deinit(r.gpa);
+        r.inflight.deinit(r.gpa);
+    }
+
     fn known(r: *Registry) usize {
         return r.seeds.items.len + r.unverified.items.len + r.pending.items.len +
             r.inflight.items.len;
@@ -245,6 +256,15 @@ fn fetchInto(
     return res.status;
 }
 
+test "a registry frees what it holds: its lists and the versions it queued" {
+    var r: Registry = .{ .io = std.testing.io, .gpa = std.testing.allocator, .client = null };
+    defer r.deinit();
+    const seeds = [_]config.ZigSeed{.{ .version = "0.17.0", .sha256 = "" }};
+    try r.add(.{ .seeds = &seeds, .unverified = &.{"0.16.0"} });
+    r.discover("/tc", "d /tc/zig/0.15.2/x\nd /tc/zig/0.14.1/y");
+    try std.testing.expectEqual(@as(usize, 1), r.pending.items.len);
+}
+
 test "versions: each once, in order, at most three, nothing that is not a version" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -301,7 +321,7 @@ test "Registry: tool cache versions are queued once each, within the cap, and on
         "d " ++ tc ++ "/zig/0.15.2/zig-x86_64-linux-0.15.2\n" ++
         "d " ++ tc ++ "/zig/0.14.1/zig-x86_64-linux-0.14.1\n" ++
         "d /elsewhere/zig/0.13.0/x");
-    try std.testing.expectEqual(@as(usize, 2), r.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 1), r.pending.items.len);
     try std.testing.expectEqualStrings("0.16.0", r.pending.items[0]);
     try std.testing.expectEqualStrings("0.15.2", r.pending.items[1]);
     // Without a client nothing is verified, so nothing pending is seeded.

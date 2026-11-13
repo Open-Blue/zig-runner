@@ -110,9 +110,11 @@ pub fn apply(
     defer if (lock) |fd| {
         _ = linux.close(fd);
     };
+    var merged_buf: [max_shared]net.Reach = undefined;
+    const merged = mergedReach(reach, &merged_buf);
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
-        const e = sock.replace(subnet, uplinks, dns, reach) catch |err| return @errorName(err);
+        const e = sock.replace(subnet, uplinks, dns, merged) catch |err| return @errorName(err);
         switch (e) {
             .SUCCESS => return null,
             // A rule removed or a chain made under us: read again.
@@ -124,6 +126,97 @@ pub fn apply(
         }
         return explain(e);
     }
+}
+
+/// Where the processes of one host record which instances their jobs may reach (`net.allow`), one
+/// line each, `<pid> <IPv4> <port>`, so that the rules one makes (`apply` replaces the table
+/// whole) carry what the others' jobs need too. A line of a process that is gone is dropped. Read
+/// and written under `lock_path`. Without the directory (no /run/zig-runner) nothing is shared.
+pub var reach_path: [:0]const u8 = "/run/zig-runner/reach";
+
+const max_shared = 32;
+
+/// `own` recorded as this process's (`pid`), and every dead process's and `pid`'s old lines
+/// dropped: what `net.allow` calls, and the process's end with none.
+pub fn publishReach(pid: linux.pid_t, own: []const net.Reach) void {
+    const lock = takeLock();
+    defer if (lock) |fd| {
+        _ = linux.close(fd);
+    };
+    var lines: [max_shared]SharedReach = undefined;
+    var n = readShared(&lines, pid);
+    for (own) |r| {
+        if (n == lines.len) break;
+        lines[n] = .{ .pid = pid, .reach = r };
+        n += 1;
+    }
+    writeShared(lines[0..n]);
+}
+
+const SharedReach = struct { pid: linux.pid_t, reach: net.Reach };
+
+/// The lines of live processes other than `except`, from `reach_path`.
+fn readShared(out: *[max_shared]SharedReach, except: linux.pid_t) usize {
+    const rc = linux.open(reach_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return 0;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return 0;
+    defer _ = linux.close(fd);
+    var buf: [4096]u8 = undefined;
+    const got = linux.read(fd, &buf, buf.len);
+    if (linux.errno(got) != .SUCCESS) return 0;
+    var n: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, buf[0..got], '\n');
+    while (it.next()) |line| {
+        var f = std.mem.tokenizeScalar(u8, line, ' ');
+        const pid = std.fmt.parseInt(linux.pid_t, f.next() orelse continue, 10) catch continue;
+        const addr = net.parseIp4(f.next() orelse continue) orelse continue;
+        const port = std.fmt.parseInt(u16, f.next() orelse continue, 10) catch continue;
+        if (pid == except or !alive(pid) or n == out.len) continue;
+        out[n] = .{ .pid = pid, .reach = .{ .addr = addr, .port = port } };
+        n += 1;
+    }
+    return n;
+}
+
+/// Whether a process `pid` exists (one that is not ours answers EPERM).
+fn alive(pid: linux.pid_t) bool {
+    if (pid <= 0) return false;
+    return linux.errno(linux.kill(pid, @fromBackingInt(@intCast(0)))) != .SRCH;
+}
+
+fn writeShared(lines: []const SharedReach) void {
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    for (lines) |l| w.print("{d} {d}.{d}.{d}.{d} {d}\n", .{
+        l.pid, l.reach.addr[0], l.reach.addr[1], l.reach.addr[2], l.reach.addr[3], l.reach.port,
+    }) catch return;
+    _ = linux.mkdir("/run/zig-runner", 0o755);
+    const rc = linux.open(reach_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(rc) != .SUCCESS) return;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return;
+    defer _ = linux.close(fd);
+    _ = linux.write(fd, w.buffered().ptr, w.buffered().len);
+}
+
+/// `own` and every live process's recorded instances, each once, in `out`: what the rules are made
+/// for. Called with `lock_path` held.
+fn mergedReach(own: []const net.Reach, out: *[max_shared]net.Reach) []const net.Reach {
+    var shared: [max_shared]SharedReach = undefined;
+    const m = readShared(&shared, 0);
+    var n: usize = 0;
+    for (own) |r| if (n < out.len) {
+        out[n] = r;
+        n += 1;
+    };
+    for (shared[0..m]) |l| {
+        var seen = false;
+        for (out[0..n]) |have| seen = seen or std.meta.eql(have, l.reach);
+        if (!seen and n < out.len) {
+            out[n] = l.reach;
+            n += 1;
+        }
+    }
+    return out[0..n];
 }
 
 /// `lock_path` opened and locked, or null when it could not be.
@@ -990,6 +1083,46 @@ test "the instances jobs may reach add one accept each, the loopback's in input 
         .{ .addr = .{ 127, 0, 0, 1 }, .port = 3300 },
         .{ .addr = .{ 10, 0, 0, 43 }, .port = 3300 },
     }));
+}
+
+test "each process's instances are kept by the others' rules, and a dead process's are dropped" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(std.testing.io, &path_buf)];
+    var file_buf: [std.fs.max_path_bytes + 8]u8 = undefined;
+    const text = try std.fmt.bufPrint(&file_buf, "{s}/reach", .{dir});
+    file_buf[text.len] = 0;
+    const file: [:0]const u8 = file_buf[0..text.len :0];
+    const saved = reach_path;
+    reach_path = file;
+    defer reach_path = saved;
+    const gitea: net.Reach = .{ .addr = .{ 127, 0, 0, 1 }, .port = 3300 };
+    const forgejo: net.Reach = .{ .addr = .{ 10, 0, 0, 43 }, .port = 3400 };
+    const dead: net.Reach = .{ .addr = .{ 10, 0, 0, 9 }, .port = 22 };
+    // Two live processes (this one, and init) and one that is gone.
+    const me = linux.getpid();
+    var lines: [3]SharedReach = .{
+        .{ .pid = 1, .reach = forgejo },
+        .{ .pid = 2147483000, .reach = dead },
+        .{ .pid = me, .reach = gitea },
+    };
+    writeShared(&lines);
+    // This process makes rules for its own set: the other live process's is in them too.
+    var merged_buf: [max_shared]net.Reach = undefined;
+    const merged = mergedReach(&.{gitea}, &merged_buf);
+    try std.testing.expectEqual(@as(usize, 2), merged.len);
+    try std.testing.expect(std.meta.eql(merged[0], gitea) and std.meta.eql(merged[1], forgejo));
+    // And the other's rules (its own set is the other's alone) keep this process's.
+    var other_buf: [max_shared]net.Reach = undefined;
+    const other = mergedReach(&.{forgejo}, &other_buf);
+    try std.testing.expectEqual(@as(usize, 2), other.len);
+    // Publishing drops the dead process's line, and an end with none drops this one's.
+    publishReach(me, &.{gitea});
+    var after: [max_shared]SharedReach = undefined;
+    try std.testing.expectEqual(@as(usize, 2), readShared(&after, 0));
+    publishReach(me, &.{});
+    try std.testing.expectEqual(@as(usize, 1), readShared(&after, 0));
 }
 
 /// What `contendedApply` found: how many `apply`s failed, and the first one's reason.

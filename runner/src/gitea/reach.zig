@@ -77,7 +77,15 @@ pub fn allow(arena: Allocator, io: std.Io, subnet: net.Subnet, url: []const u8) 
     for (addrs) |a| {
         if (!net.allow(.{ .addr = a, .port = t.port }))
             return std.fmt.allocPrint(arena, "jobs cannot reach {s}: too many instances", .{t.host}) catch null;
-        if (a[0] == 127) startForward(io, subnet.gateway(), t.port);
+        if (a[0] == 127) {
+            // The bridge exists from now, not from the first job: the forwarder can bind at once.
+            if (net.Socket.open()) |opened| {
+                var sock = opened;
+                defer sock.close();
+                sock.ensureBridge(subnet) catch |e| std.log.warn("gitea: bridge: {s}", .{@errorName(e)});
+            } else |e| std.log.warn("gitea: bridge: {s}", .{@errorName(e)});
+            startForward(io, subnet.gateway(), t.port);
+        }
     }
     return null;
 }
