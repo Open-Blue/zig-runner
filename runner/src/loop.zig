@@ -10,17 +10,19 @@ const engine = @import("engine.zig");
 const dagger = @import("dagger.zig");
 const db = @import("db.zig");
 const sink = @import("sink.zig");
-const redact = @import("redact.zig");
 const admission = @import("admission.zig");
 const handleJob = @import("loop/job.zig").handleJob;
 const SpoolDir = @import("loop/job.zig").SpoolDir;
 const say = @import("loop/exchange.zig").say;
+const sayLine = @import("loop/exchange.zig").sayLine;
+const masked = @import("loop/exchange.zig").masked;
 const fail = @import("loop/exchange.zig").fail;
 const failHttp = @import("loop/exchange.zig").failHttp;
 const failBody = @import("loop/exchange.zig").failBody;
 const mintToken = @import("loop/exchange.zig").mintToken;
 const jsonString = @import("loop/exchange.zig").jsonString;
 const trust = @import("trust.zig");
+const logfmt = @import("logfmt.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -145,10 +147,8 @@ pub fn poolWith(c: Runner, n: u32, serving: anytype) !Exit {
     // trusts every ref runs pull requests, so neither may go unnoticed (#105).
     const refs = c.cfg.trusted_refs;
     try c.log.say(try trust.mode(c.arena, refs, c.cfg.trusted_events));
-    if (trust.everything(refs) and trust.prodLabel(c.cfg.labels)) try c.log.say(
-        "WARNING: this runner carries the prod label and trusts every ref " ++
-            "(RUNNER_TRUSTED_REFS=*): a pull request that names prod in runs-on runs here",
-    );
+    if (trust.everything(refs) and trust.prodLabel(c.cfg.labels))
+        sayLine(c, .warn, "prod_trusts_every_ref", "label=prod trusted_refs=*", .{});
     // Nesting is control of the host, so whether it is on is said beside the trust it rides on.
     try c.log.say(if (c.cfg.dagger_nesting)
         "Dagger in steps: on, in jobs this runner vouches for (RUNNER_DAGGER_NESTING=true)"
@@ -167,10 +167,7 @@ pub fn poolWith(c: Runner, n: u32, serving: anytype) !Exit {
     const base = c.cfg.log_spool_dir;
     var spool_dir: ?SpoolDir = null;
     if (base.len > 0) spool_dir = SpoolDir.open(c.arena, c.io, base) catch |e| d: {
-        try c.err.print(
-            "no log spool in {s} ({s}); job logs are kept in memory\n",
-            .{ base, @errorName(e) },
-        );
+        try logfmt.line(c.err, .warn, "log_spool_unusable", "dir={f} err={t} log=memory", .{ logfmt.q(base), e });
         break :d null;
     };
     defer if (spool_dir) |sd| sd.close(c.io);
@@ -186,6 +183,7 @@ pub fn poolWith(c: Runner, n: u32, serving: anytype) !Exit {
         m.* = .init(c.io, c.cfg.admission_limits, entries);
         m.native = c.cfg.backend == .native;
         m.health_interval_ms = c.cfg.health_interval_secs *| std.time.ms_per_s;
+        m.health_idle_interval_ms = c.cfg.health_idle_interval_secs *| std.time.ms_per_s;
         m.engine.source = engineSource(c.cfg);
         // Only a root runner shares the record: its directory is root's, so no other user can
         // write the reservations the gates take on trust (`admission.Budget`).
@@ -200,7 +198,10 @@ pub fn poolWith(c: Runner, n: u32, serving: anytype) !Exit {
         // A reservation that could never fit holds every runner for ever, saying only that it holds
         // (#406): refuse to start instead, naming the settings.
         if (m.misfit()) |bad| {
-            try c.err.print("memory gate: {f}\n", .{bad});
+            var bad_buf: [512]u8 = undefined;
+            try logfmt.line(c.err, .err, "memory_gate_misfit", "detail={f}", .{
+                logfmt.q(std.fmt.bufPrint(&bad_buf, "{f}", .{bad}) catch &bad_buf),
+            });
             return .config;
         }
         // What jobs took on earlier runs, so a restart does not reserve the worst case again (#407).
@@ -217,12 +218,9 @@ pub fn poolWith(c: Runner, n: u32, serving: anytype) !Exit {
                 "memory gate: {d} learned job sizes loaded from {s}",
                 .{ count, path },
             ),
-            .ignored => |why| try say(
-                c,
-                "WARNING: memory gate: the learned job sizes in {s} are not used: {s}; " ++
-                    "they start again, and the file is replaced",
-                .{ path, why },
-            ),
+            .ignored => |why| sayLine(c, .warn, "memory_gate_file_ignored", "path={f} why={f}", .{
+                logfmt.q(path), logfmt.q(why),
+            }),
         }
     };
     // Writes what is not yet written once the sampling below has ended.
@@ -255,7 +253,7 @@ pub fn poolWith(c: Runner, n: u32, serving: anytype) !Exit {
             s.c.gate = &s.gate;
         }
         group.concurrent(c.io, Slot.main, .{s}) catch |e| {
-            try c.err.print("could not start {d} runners: {s}\n", .{ n, @errorName(e) });
+            try logfmt.line(c.err, .err, "runners_not_started", "n={d} err={t}", .{ n, e });
             group.cancel(c.io);
             return .config;
         };
@@ -285,7 +283,7 @@ fn SlotOf(comptime Serving: type) type {
             var c = s.c;
             c.err = &err_w.interface;
             s.exit = if (Serving == void) serve(c) catch |e| blk: {
-                c.err.print("runner stopped: {s}\n", .{@errorName(e)}) catch {};
+                logfmt.line(c.err, .err, "runner_stopped", "err={t}", .{e}) catch |we| std.log.debug("log: {t}", .{we});
                 break :blk .github;
             } else s.serving.run(c, s.index);
             err_w.interface.flush() catch {};
@@ -360,10 +358,7 @@ pub fn serve(c: Runner) !Exit {
                 if (!f.retry) return f.exit;
                 failures += 1;
                 const wait = backoffSecs(failures);
-                try c.err.print(
-                    "trying again in {d}s ({d} failed attempt(s) in a row)\n",
-                    .{ wait, failures },
-                );
+                try logfmt.line(c.err, .warn, "runner_retry", "wait_s={d} failures={d}", .{ wait, failures });
                 try c.err.flush();
                 // In steps, so a stop is not kept waiting.
                 var waited: u32 = 0;
@@ -437,7 +432,7 @@ fn sampleAndReport(c: Runner, m: *admission.Admission) void {
         m.tick();
         var buf: [2048]u8 = undefined;
         if (m.heartbeat(&buf)) |line| c.log.say(line) catch |e|
-            std.log.warn("health line not written: {s}", .{@errorName(e)});
+            logfmt.warn("health_not_written", "err={t}", .{e});
     }
 }
 
@@ -550,7 +545,7 @@ pub const Warmer = struct {
         // warm, and what a native pool with one warms beside the engine's.
         const native = dagger.Backend.configFor(c.arena, c.io, c.environ, c.cfg, true) catch |e| n: {
             try c.log.say("pre-warm: the native backend is not configured, so its store is not warmed");
-            std.log.warn("native pre-warm: {s}", .{@errorName(e)});
+            logfmt.warn("native_prewarm_not_configured", "err={t}", .{e});
             break :n null;
         };
         const engine_why: ?[]const u8 = if (c.cfg.engineless())
@@ -1105,12 +1100,9 @@ fn removeRegistration(c: Runner, id: u64, name: []const u8) void {
     }
     // Through the log, not `c.err`: this can run in the background while the runner's next cycle
     // writes to its own buffer.
-    say(
-        c,
-        "could not remove runner registration '{s}' (id {d}): {s}; " ++
-            "delete it in the repository's runner settings",
-        .{ name, id, last },
-    ) catch {};
+    sayLine(c, .warn, "registration_not_removed", "name={f} id={d} err={f}", .{
+        logfmt.q(name), id, logfmt.q(last),
+    });
 }
 
 /// What a cycle leaves behind: its registration and, once it had one, its broker session.
@@ -1306,19 +1298,20 @@ fn registrationFailed(
 ) !Cycle {
     // The slot was cancelled (`serve`'s pool): not a failure to retry.
     if (e == error.Canceled) return error.Canceled;
-    try c.err.writeAll("github error: ");
-    try redact.write(c.err, @errorName(e), c.secrets);
-    try c.err.print(" (HTTP {d})", .{@backingInt(status)});
-    if (message.len > 0) {
-        try c.err.writeAll(": ");
-        try redact.write(c.err, message, c.secrets);
-    }
+    var err_buf: [128]u8 = undefined;
+    var msg_buf: [1024]u8 = undefined;
+    try logfmt.line(c.err, .err, "github_registration", "err={f} http={d} message={f}", .{
+        logfmt.q(masked(c, &err_buf, @errorName(e))),
+        @backingInt(status),
+        logfmt.q(masked(c, &msg_buf, message)),
+    });
     if (@backingInt(status) == 403 or @backingInt(status) == 404)
-        try c.err.writeAll("\n  GH_TOKEN, or the GitHub App, must be able to manage " ++
-            "self-hosted runners of GH_SCOPE: \"Administration: read and write\" on the " ++
-            "repository (\"Self-hosted runners: read and write\" for an organization), " ++
-            "or a classic token with repo (admin:org)");
-    try c.err.writeByte('\n');
+        try logfmt.line(c.err, .err, "github_registration_hint", "hint={f}", .{logfmt.q(
+            "GH_TOKEN, or the GitHub App, must be able to manage " ++
+                "self-hosted runners of GH_SCOPE: \"Administration: read and write\" on the " ++
+                "repository (\"Self-hosted runners: read and write\" for an organization), " ++
+                "or a classic token with repo (admin:org)",
+        )});
     const fatal = switch (@backingInt(status)) {
         401, 403, 404, 422 => true,
         else => false,
@@ -1336,7 +1329,7 @@ fn withSlash(arena: Allocator, url: []const u8) ![]const u8 {
 fn deleteSession(c: Runner, base: []const u8, sid: []const u8, token: []const u8) void {
     const url = std.fmt.allocPrint(c.arena, "{s}session?sessionId={s}", .{ base, sid }) catch "";
     _ = broker.call(c.arena, c.io, .DELETE, url, token, null) catch |e|
-        std.log.warn("runner: its broker session was not deleted: {t}; GitHub drops it when it expires", .{e});
+        logfmt.warn("broker_session_not_deleted", "err={t}", .{e});
 }
 
 /// `prefix` (`RUNNER_NAME_PREFIX`) as a file name: letters, digits, `_`, `-` and `.` as they are,
@@ -1825,7 +1818,7 @@ test "the pool logs what it trusts once at startup, and warns when prod trusts e
     cfg.labels = "self-hosted,linux,zig,prod";
     _ = try pool(c, 0);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "trusting every ref") != null);
-    const warning = "WARNING: this runner carries the prod label and trusts every ref";
+    const warning = "warn: kind=prod_trusts_every_ref label=prod trusted_refs=*";
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), warning) != null);
 }
 

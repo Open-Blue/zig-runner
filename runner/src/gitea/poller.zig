@@ -10,6 +10,7 @@ const Config = @import("../config.zig").Config;
 const loop = @import("../loop.zig");
 const sink = @import("../sink.zig");
 const redact = @import("../redact.zig");
+const logfmt = @import("../logfmt.zig");
 const build_version = @import("../version.zig");
 const client_mod = @import("client.zig");
 const state_mod = @import("state.zig");
@@ -93,23 +94,22 @@ const Shared = struct {
                 streak = if (f.tasks_version > sent) 0 else streak +| 1;
             } else |e| switch (e) {
                 error.Unauthenticated => {
-                    slot.tell(arena, "runner {d}: the instance does not know this runner any more " ++
-                        "(HTTP {d} {s}: {s}); remove its saved registration and register again " ++
-                        "with RUNNER_GITEA_REGISTRATION_TOKEN", .{
+                    slot.tell(arena, "error: kind=gitea_runner_unknown runner={d} http={d} code={f} message={f} " ++
+                        "action=\"remove its saved registration and register again with " ++
+                        "RUNNER_GITEA_REGISTRATION_TOKEN\"", .{
                         index,
                         @backingInt(failure.status),
-                        failure.code,
-                        failure.message,
+                        logfmt.q(failure.code),
+                        logfmt.q(failure.message),
                     });
                     return .github;
                 },
                 else => {
                     streak +|= 1;
-                    slot.tell(arena, "runner {d}: FetchTask failed ({s}{s}{s}); trying again in {d} ms", .{
+                    slot.tell(arena, "warn: kind=gitea_fetch_failed runner={d} err={s} message={f} retry_ms={d}", .{
                         index,
                         @errorName(e),
-                        if (failure.message.len > 0) ": " else "",
-                        failure.message,
+                        logfmt.q(failure.message),
                         sh.pace.waitMs(streak, 0),
                     });
                 },
@@ -205,10 +205,9 @@ fn connect(c: loop.Runner) !Connected {
     var failure: Failure = .{};
 
     const saved = state_mod.load(c.arena, c.io, dir, file) catch |e| {
-        try c.err.print(
-            "config error: {s}/{s} is not a saved registration ({s}); remove it to register again\n",
-            .{ dir, file, @errorName(e) },
-        );
+        try logfmt.line(c.err, .err, "config", "what=saved_registration_unreadable path={f}/{f} err={t}", .{
+            logfmt.q(dir), logfmt.q(file), e,
+        });
         return .{ .exit = .config };
     };
     if (saved) |st| if (std.mem.eql(u8, st.url, cfg.gitea_url)) {
@@ -233,11 +232,9 @@ fn connect(c: loop.Runner) !Connected {
         client.token = "";
     };
     if (cfg.gitea_registration_token.len == 0) {
-        try c.err.print(
-            "config error: no saved registration in {s}/{s}, and RUNNER_GITEA_REGISTRATION_TOKEN " ++
-                "is not set (Gitea: Site administration, Actions, Runners, Create new runner)\n",
-            .{ dir, file },
-        );
+        try logfmt.line(c.err, .err, "config", "what=no_registration path={f}/{f} missing=RUNNER_GITEA_REGISTRATION_TOKEN", .{
+            logfmt.q(dir), logfmt.q(file),
+        });
         return .{ .exit = .config };
     }
     const r = client.register(c.arena, c.io, .{
@@ -255,11 +252,10 @@ fn connect(c: loop.Runner) !Connected {
     };
     state_mod.save(c.arena, c.io, dir, file, st) catch |e| {
         // Not fatal: the runner works, and registers again at its next start.
-        try c.log.say(try std.fmt.allocPrint(
-            c.arena,
-            "WARNING: could not save the registration in {s}/{s} ({s}); a restart registers again",
-            .{ dir, file, @errorName(e) },
-        ));
+        var buf: [512]u8 = undefined;
+        try c.log.say(logfmt.bufLine(&buf, .warn, "gitea_registration_not_saved", "path={f}/{f} err={t}", .{
+            logfmt.q(dir), logfmt.q(file), e,
+        }));
     };
     try c.log.say(try std.fmt.allocPrint(
         c.arena,
@@ -274,11 +270,12 @@ fn connect(c: loop.Runner) !Connected {
 /// refusing is the exit code GitHub's refusals have.
 fn explain(c: loop.Runner, what: []const u8, e: anyerror, failure: Failure) !Connected {
     switch (e) {
-        error.Unauthenticated, error.Rejected => try c.err.print(
-            "gitea error: {s}: HTTP {d} {s}: {s}\n",
-            .{ what, @backingInt(failure.status), failure.code, failure.message },
-        ),
-        else => try c.err.print("gitea error: {s} at {s}: {s}\n", .{ what, c.cfg.gitea_url, @errorName(e) }),
+        error.Unauthenticated, error.Rejected => try logfmt.line(c.err, .err, "gitea_call_failed", "what={f} http={d} code={f} message={f}", .{
+            logfmt.q(what), @backingInt(failure.status), logfmt.q(failure.code), logfmt.q(failure.message),
+        }),
+        else => try logfmt.line(c.err, .err, "gitea_call_failed", "what={f} url={f} err={t}", .{
+            logfmt.q(what), logfmt.q(c.cfg.gitea_url), e,
+        }),
     }
     try c.err.flush();
     return .{ .exit = .github };
@@ -413,7 +410,7 @@ test "a pool registers once, keeps the registration, fetches, runs the task and 
     try std.testing.expect(s.count("FetchTask") >= 4);
     const log = r.out.written();
     try std.testing.expect(std.mem.indexOf(u8, log, "registered runner 'zig-ab' (id 7)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, log, "FetchTask failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "kind=gitea_fetch_failed") != null);
     try std.testing.expect(std.mem.indexOf(u8, log, "fetched task 1: workflow \"probe\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, log, "NOT RUN") == null);
     const last = s.nth("UpdateTask", s.count("UpdateTask") - 1).body;
@@ -450,7 +447,7 @@ test "a runner the instance has forgotten stops the pool with the instance's rea
     try s.reply("Register", "200 OK", "{\"runner\":{\"id\":\"7\",\"uuid\":\"uuid-x\",\"token\":\"runner-token-x\",\"name\":\"zig-ab\"}}");
     try s.reply("FetchTask", "401 Unauthorized", "{\"code\":\"unauthenticated\",\"message\":\"unregistered runner\"}");
     try std.testing.expectEqual(loop.Exit.github, try r.runUntil(1));
-    try std.testing.expect(std.mem.indexOf(u8, r.out.written(), "does not know this runner any more") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out.written(), "kind=gitea_runner_unknown") != null);
     // Forgejo is sent no capabilities.
     try std.testing.expect(std.mem.indexOf(u8, s.nth("Register", 0).body, "capabilities") == null);
 }
