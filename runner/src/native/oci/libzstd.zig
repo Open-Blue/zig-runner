@@ -44,22 +44,22 @@ const reader_bytes = 64 * 1024;
 /// 16 bytes is the alignment libzstd assumes of `malloc` (it asks for 64 where it needs more).
 const header = 16;
 
-export fn runner_zstd_malloc(n: usize) callconv(.c) ?*anyopaque {
+export fn runner_zstd_malloc(n: usize) callconv(.c) ?[*]u8 {
     const total = std.math.add(usize, n, header) catch return null;
     const raw = std.heap.smp_allocator.rawAlloc(total, .@"16", @returnAddress()) orelse return null;
     std.mem.writeInt(usize, raw[0..@sizeOf(usize)], total, .little);
     return raw + header;
 }
 
-export fn runner_zstd_calloc(count: usize, size: usize) callconv(.c) ?*anyopaque {
+export fn runner_zstd_calloc(count: usize, size: usize) callconv(.c) ?[*]u8 {
     const n = std.math.mul(usize, count, size) catch return null;
-    const p: [*]u8 = @ptrCast(runner_zstd_malloc(n) orelse return null);
+    const p = runner_zstd_malloc(n) orelse return null;
     @memset(p[0..n], 0);
     return p;
 }
 
-export fn runner_zstd_free(ptr: ?*anyopaque) callconv(.c) void {
-    const p: [*]u8 = @ptrCast(ptr orelse return);
+export fn runner_zstd_free(ptr: ?[*]u8) callconv(.c) void {
+    const p = ptr orelse return;
     const raw = p - header;
     const total = std.mem.readInt(usize, raw[0..@sizeOf(usize)], .little);
     std.heap.smp_allocator.rawFree(raw[0..total], .@"16", @returnAddress());
