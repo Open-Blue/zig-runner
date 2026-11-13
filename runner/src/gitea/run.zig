@@ -71,7 +71,7 @@ pub const JobTimeout = struct {
                 "({d} s for what still runs)",
             .{ w.task_id, w.minutes, @divTrunc(w.grace_ms, 1000) },
         ) catch return;
-        w.log.say(text) catch {};
+        w.log.say(text) catch |e| std.log.warn("gitea: log: {s}", .{@errorName(e)});
     }
 };
 
@@ -167,6 +167,8 @@ fn runJob(
     const t_id = reporter.task_id;
     // Known by name now: it reserves what jobs of its name took at the memory gate, and what it
     // takes is learned when it ends.
+    // The process's resources as the job starts, for its `job-end:` line.
+    const stats_before = jobs.proc_stats.read();
     const admitted = jobs.Admitted.begin(c, job);
     defer admitted.end();
 
@@ -236,6 +238,13 @@ fn runJob(
     const outcome = report.jobResult(result);
     try reporter.finish(c.arena, outcome, result, result.summaries);
     loop.sayUnallocated(c, "gitea: task {d} '{s}' {s}", .{ t_id, jobs.jobName(job), @tagName(outcome) });
+    // The result is with the instance: the teardown can go, and the job's end is told.
+    if (result.teardown) |td| if (td.run()) |p| try c.err.print("job {d} '{s}': native phases (ms): {s}\n", .{
+        job.check_run_id,
+        jobs.jobName(job),
+        p,
+    });
+    jobs.sayJobEnd(c, job, stats_before);
 }
 
 /// A workflow the runner cannot read: the task fails with the reason, which is all the log holds.
@@ -258,4 +267,52 @@ test "a job's timeout is its whole minutes, and 360 when it says none or nonsens
     try std.testing.expectEqual(@as(i64, 360), timeoutMinutes("soon"));
     try std.testing.expectEqual(@as(i64, 360), timeoutMinutes("nan"));
     try std.testing.expectEqual(@as(i64, 366 * 24 * 60), timeoutMinutes("1e12"));
+}
+
+test "a job past its timeout is cancelled as a timeout, with a grace; one that ended first is not" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out.writer } };
+    var cancel: dagger.Cancel = .{};
+    var w: JobTimeout = .{ .io = std.testing.io, .log = &log, .cancel = &cancel, .task_id = 3, .minutes = 30, .unit_ms = 1 };
+    w.run();
+    try std.testing.expect(cancel.requested.load(.acquire));
+    try std.testing.expectEqual(dagger.Cancel.Why.job_timeout, cancel.why.load(.acquire));
+    try std.testing.expect(cancel.hard_deadline_ms.load(.acquire) > std.Io.Clock.real.now(std.testing.io).toMilliseconds());
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "ran past its timeout of 30 minute(s)") != null);
+
+    var other: dagger.Cancel = .{};
+    var done: JobTimeout = .{ .io = std.testing.io, .log = &log, .cancel = &other, .task_id = 4, .minutes = 60, .unit_ms = 60_000 };
+    done.stop.store(true, .release);
+    done.run();
+    try std.testing.expect(!other.requested.load(.acquire));
+}
+
+test "a cancel from the instance reaches a running job through the pump's heartbeat" {
+    const testserver = @import("testserver.zig");
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    server.echo_acks = true;
+    try server.reply("UpdateTask", "200 OK", "{\"state\":{}}");
+    try server.reply("UpdateTask", "200 OK", "{\"state\":{\"result\":\"RESULT_CANCELLED\"}}");
+    try server.replyAlways("UpdateTask", "200 OK", "{\"state\":{\"result\":\"RESULT_CANCELLED\"}}");
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out.writer } };
+    var cancel: dagger.Cancel = .{};
+    var buf: [64]u8 = undefined;
+    const client: client_mod.Client = .{ .url = server.url(&buf), .deadline = .fromSeconds(5) };
+    var r = try Reporter.init(std.testing.allocator, std.testing.io, client, 9, &log, &.{}, &cancel, &.{});
+    defer r.deinit();
+    r.interval_ms = 50;
+    var pumping = try std.testing.io.concurrent(Reporter.pump, .{&r});
+    var waited: u32 = 0;
+    while (!cancel.requested.load(.acquire) and waited < 200) : (waited += 1)
+        try std.testing.io.sleep(.fromMilliseconds(25), .awake);
+    r.stop.store(true, .release);
+    pumping.cancel(std.testing.io);
+    try std.testing.expect(cancel.requested.load(.acquire));
+    // No result was sent while the job ran: the heartbeat carries none.
+    try std.testing.expect(std.mem.indexOf(u8, server.nth("UpdateTask", 0).body, "\"result\"") == null);
 }

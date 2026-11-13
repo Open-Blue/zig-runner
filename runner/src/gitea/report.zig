@@ -179,13 +179,16 @@ pub const Reporter = struct {
         };
     }
 
-    /// A line the job logged, redacted already by the sink. Under the step that is running, as the
-    /// instance wants the log: the number the line came with is not used, since a line for a step
-    /// that has ended (a backend's late note) would land outside its range.
-    fn onLine(ptr: *anyopaque, _: u32, _: u64, text: []const u8) void {
+    /// A line the job logged, redacted already by the sink. It goes under the step it was logged
+    /// for when that step is the running one or a later one (a step's header is logged just
+    /// before the backend says the step began, and must not land in the step before it); a line
+    /// for a step already passed, or one this does not know, goes under the running step, as the
+    /// instance wants rows in order and a backend's late note must not fall outside its range.
+    fn onLine(ptr: *anyopaque, step: u32, _: u64, text: []const u8) void {
         const r = Reporter.of(ptr);
         r.mu.lockUncancelable(r.io);
         defer r.mu.unlock(r.io);
+        if (r.indexOfLogStep(step)) |i| if (i > r.current) r.enter(i, now(r.io));
         r.appendLocked(text);
     }
 
@@ -430,7 +433,7 @@ pub const Reporter = struct {
                 r.refusal[0..r.refusal_len],
             },
         ) catch return;
-        r.log.say(text) catch {};
+        r.log.say(text) catch |le| std.log.warn("gitea: log: {s}", .{@errorName(le)});
     }
 
     /// Sends the rows not acknowledged, up to `noMore` and the end of them when `all`: the instance's
@@ -516,7 +519,7 @@ pub const Reporter = struct {
                     "({d} s for what still runs)",
                 .{ r.task_id, @tagName(answer.result), @divTrunc(limit_ms, 1000) },
             ) catch return;
-            r.log.say(text) catch {};
+            r.log.say(text) catch |e| std.log.warn("gitea: log: {s}", .{@errorName(e)});
         }
         if (result != .unspecified) for (r.outputs.items) |o| if (!o.sent) return error.OutputsNotAccepted;
     }
@@ -588,7 +591,8 @@ pub const Reporter = struct {
         while (attempt < 10) : (attempt += 1) {
             if (attempt > 0) {
                 const wait_ms: u64 = (@as(u64, 100) << attempt) / 2;
-                r.io.sleep(.fromMilliseconds(std.math.cast(i64, @min(wait_ms, 10_000)) orelse 10_000), .awake) catch {};
+                const wait = std.math.cast(i64, @min(wait_ms, 10_000)) orelse 10_000;
+                r.io.sleep(.fromMilliseconds(wait), .awake) catch break;
             }
             failure = null;
             r.flushLog(arena, true) catch |e| {
@@ -616,7 +620,8 @@ pub const Reporter = struct {
         for (r.steps.items) |s| {
             if (s.stage != .main or s.log_step == 0 or s.log_step > summaries.len) continue;
             const text = summaries[s.log_step - 1];
-            if (text.len > 0) list.append(arena, .{ .step = s.number, .content = text }) catch {};
+            if (text.len > 0) list.append(arena, .{ .step = s.number, .content = text }) catch |e|
+                std.log.warn("gitea: summary: {s}", .{@errorName(e)});
         }
         r.mu.unlock(r.io);
         if (list.items.len == 0) return;
@@ -627,7 +632,7 @@ pub const Reporter = struct {
                 r.task_id,
                 @errorName(e),
             }) catch return;
-            r.log.say(text) catch {};
+            r.log.say(text) catch |le| std.log.warn("gitea: log: {s}", .{@errorName(le)});
         };
     }
 
@@ -702,4 +707,240 @@ fn stepResult(res: dagger.StepResult, job_cancelled: bool) Result {
 pub fn jobResult(run: dagger.Result) Result {
     if (run.cancelled) return .cancelled;
     return if (run.succeeded) .success else .failure;
+}
+
+// --- tests ------------------------------------------------------------------------------------------
+
+const testserver = @import("testserver.zig");
+
+/// A reporter against the fake instance, for the tests below.
+const Rig = struct {
+    server: testserver.Server = undefined,
+    out: std.Io.Writer.Allocating,
+    log: sink.LogSink = undefined,
+    cancel: dagger.Cancel = .{},
+    arena: std.heap.ArenaAllocator,
+    buf: [64]u8 = undefined,
+
+    fn init(rig: *Rig, flavor: client_mod.Flavor, names: []const []const u8, secrets: []const []const u8) !Reporter {
+        rig.out = .init(std.testing.allocator);
+        rig.arena = .init(std.testing.allocator);
+        rig.cancel = .{};
+        try rig.server.start();
+        rig.server.echo_acks = true;
+        try rig.server.replyAlways("UpdateTask", "200 OK", "{\"state\":{}}");
+        rig.log = .{ .stdout = .{ .writer = &rig.out.writer } };
+        const client: Client = .{
+            .flavor = flavor,
+            .url = rig.server.url(&rig.buf),
+            .uuid = "u",
+            .token = "t",
+            .deadline = .fromSeconds(5),
+        };
+        return .init(std.testing.allocator, std.testing.io, client, 7, &rig.log, secrets, &rig.cancel, names);
+    }
+
+    fn deinit(rig: *Rig, r: *Reporter) void {
+        r.deinit();
+        rig.server.stop();
+        rig.arena.deinit();
+        rig.out.deinit();
+    }
+
+    fn lastTask(rig: *Rig) []const u8 {
+        return rig.server.nth("UpdateTask", rig.server.count("UpdateTask") - 1).body;
+    }
+};
+
+fn has(text: []const u8, needle: []const u8) bool {
+    return std.mem.indexOf(u8, text, needle) != null;
+}
+
+test "a job's steps, rows and result are reported to Gitea with their ranges" {
+    var rig: Rig = undefined;
+    var r = try rig.init(.gitea, &.{ "first", "second" }, &.{"s3cr3t"});
+    defer rig.deinit(&r);
+    const o = r.observer();
+    const l = r.listener();
+    l.onLine(l.ptr, 0, 1, "setting up");
+    o.startedFn(o.ptr, 1, "first", 1_000);
+    l.onLine(l.ptr, 1, 1, "one\ntwo");
+    o.finishedFn(o.ptr, 1, .{ .name = "first", .outcome = .success, .started_ms = 1_000, .completed_ms = 2_000 });
+    o.startedFn(o.ptr, 2, "second", 2_000);
+    l.onLine(l.ptr, 2, 1, "boom");
+    o.finishedFn(o.ptr, 2, .{ .name = "second", .outcome = .failure, .started_ms = 2_000, .completed_ms = 3_000 });
+    r.beginComplete(3, 3_000);
+    r.say("Cleaning up");
+    try r.setOutputs(&.{ .{ .name = "v", .value = "1" }, .{ .name = "leak", .value = "x s3cr3t y" } });
+    const steps = [_]dagger.StepResult{
+        .{ .name = "first", .outcome = .success, .started_ms = 1_000, .completed_ms = 2_000 },
+        .{ .name = "second", .outcome = .failure, .started_ms = 2_000, .completed_ms = 3_000 },
+    };
+    try rig.server.reply("UpdateTask", "200 OK", "{\"state\":{},\"sentOutputs\":[\"v\"]}");
+    try r.finish(rig.arena.allocator(), .failure, .{ .steps = @constCast(&steps), .engine_error = null, .succeeded = false }, &.{});
+
+    const body = rig.lastTask();
+    try std.testing.expect(has(body, "\"result\":\"RESULT_FAILURE\",\"startedAt\""));
+    try std.testing.expect(has(body, "\"outputs\":{\"v\":\"1\"}"));
+    try std.testing.expect(!has(body, "leak"));
+    // Gitea's reported steps: setup, the two main steps, cleanup, with their rows.
+    try std.testing.expect(has(body, "\"name\":\"Set up job\",\"stage\":\"STEP_STAGE_SETUP\""));
+    try std.testing.expect(has(body, "\"logIndex\":\"1\",\"logLength\":\"2\",\"name\":\"first\",\"stage\":\"STEP_STAGE_MAIN\""));
+    try std.testing.expect(has(body, "\"result\":\"RESULT_FAILURE\",\"startedAt\":\"1970-01-01T00:00:02.000Z\",\"stoppedAt\":\"1970-01-01T00:00:03.000Z\",\"logIndex\":\"3\",\"logLength\":\"1\",\"name\":\"second\""));
+    try std.testing.expect(has(body, "\"stage\":\"STEP_STAGE_CLEANUP\""));
+    // By the workflow's index too, for the instances that derive the steps from the file.
+    try std.testing.expect(has(body, "\"steps\":[{\"id\":\"0\",\"result\":\"RESULT_SUCCESS\""));
+    // The rows, in order, split by line, the leaked output said and not sent.
+    const logs = try rig.server.bodies("UpdateLog");
+    defer {
+        for (logs) |b| std.testing.allocator.free(b);
+        std.testing.allocator.free(logs);
+    }
+    const final = logs[logs.len - 1];
+    try std.testing.expect(has(final, "\"noMore\":true"));
+    const all = try std.mem.join(std.testing.allocator, "", logs);
+    defer std.testing.allocator.free(all);
+    try std.testing.expect(has(all, "\"content\":\"setting up\""));
+    try std.testing.expect(has(all, "\"content\":\"one\"") and has(all, "\"content\":\"two\""));
+    try std.testing.expect(has(all, "ignore output leak because it may contain a secret"));
+    try std.testing.expect(!has(all, "s3cr3t"));
+}
+
+test "Forgejo is sent the steps by workflow index only, and the summaries" {
+    var rig: Rig = undefined;
+    var r = try rig.init(.forgejo, &.{"only"}, &.{});
+    defer rig.deinit(&r);
+    try rig.server.reply("UpdateStepSummary", "200 OK", "{}");
+    const steps = [_]dagger.StepResult{.{ .name = "only", .outcome = .success, .started_ms = 1_000, .completed_ms = 2_000 }};
+    const summaries = [_][]const u8{"# done"};
+    try r.finish(rig.arena.allocator(), .success, .{ .steps = @constCast(&steps), .engine_error = null, .succeeded = true }, &summaries);
+    const body = rig.lastTask();
+    try std.testing.expect(!has(body, "reportedSteps"));
+    try std.testing.expect(!has(body, "STEP_STAGE"));
+    try std.testing.expect(has(body, "\"result\":\"RESULT_SUCCESS\""));
+    try std.testing.expectEqualStrings(
+        "{\"taskId\":\"7\",\"summaries\":[{\"stepNumber\":\"0\",\"content\":\"# done\"}]}",
+        rig.server.nth("UpdateStepSummary", 0).body,
+    );
+}
+
+test "rows the instance did not acknowledge are sent again from its ackIndex" {
+    var rig: Rig = undefined;
+    var r = try rig.init(.gitea, &.{}, &.{});
+    defer rig.deinit(&r);
+    r.say("a\nb\nc");
+    // It takes one of three.
+    try rig.server.reply("UpdateLog", "200 OK", "{\"ackIndex\":\"1\"}");
+    try r.flushLog(rig.arena.allocator(), false);
+    try std.testing.expectEqual(@as(i64, 1), r.offset);
+    try std.testing.expectEqual(@as(usize, 2), r.rows.items.len);
+    // The next call starts at 1 with the two left, and the instance takes them.
+    try r.flushLog(rig.arena.allocator(), false);
+    try std.testing.expectEqual(@as(i64, 3), r.offset);
+    try std.testing.expectEqual(@as(usize, 0), r.rows.items.len);
+    const logs = try rig.server.bodies("UpdateLog");
+    defer {
+        for (logs) |b| std.testing.allocator.free(b);
+        std.testing.allocator.free(logs);
+    }
+    try std.testing.expect(!has(logs[0], "\"index\""));
+    try std.testing.expect(has(logs[1], "\"index\":\"1\""));
+    try std.testing.expect(!has(logs[1], "\"content\":\"a\""));
+    // An ack before what was already acknowledged is a log the instance lost.
+    r.say("d");
+    try rig.server.reply("UpdateLog", "200 OK", "{\"ackIndex\":\"0\"}");
+    try std.testing.expectError(error.LogsLost, r.flushLog(rig.arena.allocator(), false));
+}
+
+test "the instance ending the task cancels the job, once, through the ladder" {
+    var rig: Rig = undefined;
+    var r = try rig.init(.gitea, &.{}, &.{});
+    defer rig.deinit(&r);
+    try rig.server.reply("UpdateTask", "200 OK", "{\"state\":{\"id\":\"7\",\"result\":\"RESULT_CANCELLED\"}}");
+    try std.testing.expect(!rig.cancel.requested.load(.acquire));
+    try r.reportState(rig.arena.allocator(), .unspecified);
+    try std.testing.expect(rig.cancel.requested.load(.acquire));
+    try std.testing.expectEqual(dagger.Cancel.Why.github, rig.cancel.why.load(.acquire));
+    try std.testing.expect(rig.cancel.hard_deadline_ms.load(.acquire) > 0);
+    try std.testing.expect(has(rig.out.written(), "the instance ended the task (cancelled)"));
+    try std.testing.expectEqual(Result.cancelled, r.server_result);
+}
+
+test "an output the instance has not accepted keeps the end from finishing, until it has" {
+    var rig: Rig = undefined;
+    var r = try rig.init(.gitea, &.{}, &.{});
+    defer rig.deinit(&r);
+    try r.setOutputs(&.{.{ .name = "k", .value = "v" }});
+    try rig.server.reply("UpdateTask", "200 OK", "{\"state\":{}}");
+    try rig.server.reply("UpdateTask", "200 OK", "{\"state\":{},\"sentOutputs\":[\"k\"]}");
+    try std.testing.expectError(error.OutputsNotAccepted, r.reportState(rig.arena.allocator(), .success));
+    try r.reportState(rig.arena.allocator(), .success);
+    // Sent while it was not accepted, and not again once it was.
+    try std.testing.expect(has(rig.server.nth("UpdateTask", 1).body, "\"outputs\":{\"k\":\"v\"}"));
+    try r.reportState(rig.arena.allocator(), .success);
+    try std.testing.expect(!has(rig.lastTask(), "outputs"));
+}
+
+test "steps are given results the way the instances want them" {
+    const cancelled = true;
+    try std.testing.expectEqual(Result.success, stepResult(.{ .outcome = .success }, false));
+    try std.testing.expectEqual(Result.failure, stepResult(.{ .outcome = .failure }, false));
+    // A failure `continue-on-error` allowed is GitHub's conclusion: a success.
+    try std.testing.expectEqual(Result.success, stepResult(.{ .outcome = .failure, .continued = true }, false));
+    try std.testing.expectEqual(Result.cancelled, stepResult(.{ .outcome = .cancelled }, false));
+    try std.testing.expectEqual(Result.skipped, stepResult(.{ .outcome = .skipped }, cancelled));
+    try std.testing.expectEqual(Result.skipped, stepResult(.{ .outcome = .not_run }, false));
+    try std.testing.expectEqual(Result.cancelled, stepResult(.{ .outcome = .not_run }, cancelled));
+    const none: []dagger.StepResult = &.{};
+    try std.testing.expectEqual(Result.success, jobResult(.{ .steps = none, .engine_error = null, .succeeded = true }));
+    try std.testing.expectEqual(Result.failure, jobResult(.{ .steps = none, .engine_error = null, .succeeded = false }));
+    // Cancelled wins, whatever the steps did before it.
+    try std.testing.expectEqual(Result.cancelled, jobResult(.{ .steps = none, .engine_error = null, .succeeded = true, .cancelled = true }));
+}
+
+test "pre and post steps are listed where the instance wants them, and a step never run is skipped" {
+    var rig: Rig = undefined;
+    var r = try rig.init(.gitea, &.{ "act", "skipped" }, &.{});
+    defer rig.deinit(&r);
+    const o = r.observer();
+    o.extraStartedFn.?(o.ptr, .pre, 3, "Pre act", 500);
+    o.startedFn(o.ptr, 1, "act", 1_000);
+    o.extraStartedFn.?(o.ptr, .post, 4, "Post act", 2_000);
+    const extra = [_]dagger.ExtraStep{
+        .{ .kind = .pre, .name = "Pre act", .log_step = 3, .outcome = .success, .started_ms = 500, .completed_ms = 600 },
+        .{ .kind = .post, .name = "Post act", .log_step = 4, .outcome = .success, .started_ms = 2_000, .completed_ms = 2_100 },
+    };
+    const steps = [_]dagger.StepResult{
+        .{ .name = "act", .outcome = .success, .started_ms = 1_000, .completed_ms = 1_500 },
+        .{ .outcome = .skipped },
+    };
+    r.beginComplete(5, 2_200);
+    try r.finish(rig.arena.allocator(), .success, .{ .steps = @constCast(&steps), .engine_error = null, .succeeded = true, .extra = &extra }, &.{});
+    const body = rig.lastTask();
+    const pre = std.mem.indexOf(u8, body, "\"name\":\"Pre act\"").?;
+    const main = std.mem.indexOf(u8, body, "\"name\":\"act\"").?;
+    const post = std.mem.indexOf(u8, body, "\"name\":\"Post act\"").?;
+    const done = std.mem.indexOf(u8, body, "STEP_STAGE_CLEANUP").?;
+    try std.testing.expect(pre < main and main < post and post < done);
+    // The post step belongs to step 0, and the step that never ran is skipped, not left open.
+    try std.testing.expect(has(body, "\"stage\":\"STEP_STAGE_POST\""));
+    try std.testing.expect(has(body, "\"id\":\"1\",\"result\":\"RESULT_SKIPPED\""));
+}
+
+test "a step's header, logged just before the backend says it began, is the step's own row" {
+    var rig: Rig = undefined;
+    var r = try rig.init(.gitea, &.{ "one", "two" }, &.{});
+    defer rig.deinit(&r);
+    const o = r.observer();
+    const l = r.listener();
+    o.startedFn(o.ptr, 1, "one", 1_000);
+    l.onLine(l.ptr, 1, 1, "out of one");
+    // Step 2's header comes first, and a late line of the setup after it.
+    l.onLine(l.ptr, 2, 1, "##[group]Run two");
+    o.startedFn(o.ptr, 2, "two", 1_100);
+    l.onLine(l.ptr, 0, 9, "late setup note");
+    try std.testing.expectEqual(@as(i64, 1), r.steps.items[1].log_length);
+    try std.testing.expectEqual(@as(i64, 2), r.steps.items[2].log_length);
+    try std.testing.expectEqual(@as(i64, 1), r.steps.items[2].log_index);
+    try std.testing.expectEqual(@as(i64, 0), r.steps.items[0].log_length);
 }

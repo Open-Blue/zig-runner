@@ -15,7 +15,7 @@ const Config = @import("../config.zig").Config;
 const auth = @import("../github/auth.zig");
 const broker = @import("../github/broker.zig");
 const runservice = @import("../github/runservice.zig");
-const proc_stats = @import("../proc_stats.zig");
+pub const proc_stats = @import("../proc_stats.zig");
 const job_mod = @import("../job.zig");
 const trust = @import("../trust.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
@@ -425,7 +425,7 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
 /// the job ran (`proc_stats`), so a leak shows as a trend across jobs (other jobs of the process
 /// change them too: a trend, not a charge). A child left unwaited for is a warning: each is a
 /// process the runner lost track of.
-fn sayJobEnd(c: Runner, job: job_mod.Job, before: proc_stats.Stats) void {
+pub fn sayJobEnd(c: Runner, job: job_mod.Job, before: proc_stats.Stats) void {
     const after = proc_stats.read();
     c.err.print("job-end: job={d} name='{s}' {f} {f}\n", .{
         job.check_run_id,

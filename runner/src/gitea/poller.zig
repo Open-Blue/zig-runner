@@ -126,7 +126,13 @@ const Slot = struct {
         const c = s.c;
         const what = t.describe(arena) catch |e| std.fmt.allocPrint(arena, "task {d} ({s})", .{ t.id, @errorName(e) }) catch "a task";
         s.tell(arena, "runner {d}: fetched {s}", .{ s.index, what });
+        // The instance has handed it a job: it stops polling for the gate, which reserves the
+        // job's memory from here (`Gate.leave`, `Admitted.begin`).
+        if (c.gate) |g| g.leave(true);
         run.task(c, s.shared.client, t);
+        // What the job's end said on the slot's own writer (native phases, `job-end:`) is not left
+        // for the buffer to fill: `serve` flushes it after each cycle too.
+        c.err.flush() catch |e| std.log.warn("gitea: stderr: {s}", .{@errorName(e)});
         if (c.gate) |g| {
             g.leave(false);
             _ = g.ended();
@@ -319,12 +325,17 @@ const Rig = struct {
         r.arena = .init(std.testing.allocator);
         r.dir = std.testing.tmpDir(.{});
         try r.server.start();
+        r.server.echo_acks = true;
+        try r.server.replyAlways("UpdateTask", "200 OK", "{\"state\":{}}");
         const state = try r.dir.dir.realPathFileAlloc(std.testing.io, ".", r.arena.allocator());
         try r.env.put("RUNNER_PLATFORM", platform);
         try r.env.put("RUNNER_GITEA_URL", r.server.url(&r.url_buf));
         try r.env.put("RUNNER_GITEA_REGISTRATION_TOKEN", "registration-secret");
         try r.env.put("RUNNER_GITEA_FETCH_INTERVAL", "1");
         try r.env.put("RUNNER_STATE_DIR", state);
+        // The pool's memory gate and pre-warm are GitHub's tests' business, not the machine's.
+        try r.env.put("RUNNER_ADMISSION", "false");
+        try r.env.put("RUNNER_PREWARM", "false");
         r.cfg = try Config.load(&r.env, &.{"runner"});
         r.log = .{ .stdout = .{ .writer = &r.out.writer } };
     }
@@ -368,7 +379,7 @@ const Rig = struct {
 
 const testserver = @import("testserver.zig");
 
-test "a pool registers once, keeps the registration, fetches, and holds the task it cannot run" {
+test "a pool registers once, keeps the registration, fetches, runs the task and reports it" {
     var r: Rig = undefined;
     try r.init("gitea");
     defer r.deinit();
@@ -380,16 +391,21 @@ test "a pool registers once, keeps the registration, fetches, and holds the task
     try s.reply("FetchTask", "200 OK", "{\"tasksVersion\":\"1\"}");
     try s.reply("FetchTask", "500 Internal Server Error", "{\"code\":\"internal\",\"message\":\"db is busy\"}");
     try s.reply("FetchTask", "200 OK", @embedFile("testdata/fetch-task.json"));
-    try s.reply("FetchTask", "200 OK", @embedFile("testdata/fetch-task.json"));
-    try std.testing.expectEqual(loop.Exit.done, try r.runUntil(3));
+    try s.reply("FetchTask", "200 OK", "{\"tasksVersion\":\"1\"}");
+    try std.testing.expectEqual(loop.Exit.done, try r.runUntil(4));
 
-    // The task is described by names, and held: no fourth fetch.
-    try std.testing.expectEqual(@as(usize, 3), s.count("FetchTask"));
+    // The task is described by names, run (here it fails: no engine) and reported before the
+    // runner asks again.
+    try std.testing.expect(s.count("FetchTask") >= 4);
     const log = r.out.written();
     try std.testing.expect(std.mem.indexOf(u8, log, "registered runner 'zig-ab' (id 7)") != null);
     try std.testing.expect(std.mem.indexOf(u8, log, "FetchTask failed") != null);
     try std.testing.expect(std.mem.indexOf(u8, log, "fetched task 1: workflow \"probe\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, log, "NOT RUN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "NOT RUN") == null);
+    const last = s.nth("UpdateTask", s.count("UpdateTask") - 1).body;
+    try std.testing.expect(std.mem.indexOf(u8, last, "\"result\":\"RESULT_FAILURE\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last, "\"stoppedAt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.nth("UpdateLog", s.count("UpdateLog") - 1).body, "\"noMore\":true") != null);
     // No credential, the runner's or the instance's, and no secret value, reaches the log.
     for ([_][]const u8{ "registration-secret", "runner-token-7", "uuid-7" }) |secret| {
         try std.testing.expect(std.mem.indexOf(u8, log, secret) == null);
