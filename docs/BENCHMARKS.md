@@ -297,3 +297,32 @@ What was measured and left out, on the same laptop:
 | Inode order before a cold walk (30000 files, caches dropped through a cgroup) | 257 against 249 ms, 646 against 634 reads | The same inode-table blocks are read either way; a warm walk costs more |
 | Reading a Zig tree ahead of a compile | 5.65 s and 254 MiB against 4.87 s and 90 MiB, cold | A compile reads a third of the tree; warm, the pass adds 136 ms for nothing |
 | Zig's caches on tmpfs (`zig build test`, 5 rounds) | 132.9 against 124.5 s, no trend between pairs | 198 MiB stays in the cache, all of it written once on either disk: nothing is saved unless it is thrown away |
+
+## zstd layers: libzstd against the runner's own decoder
+
+*2026-11-12, laptop (Ryzen 5 PRO 4650U), balanced power, load average 2-6 from other work.* The
+runner decoded zstd layers with its own decoder (`oci/zstd.zig`). Compared on real layers: ubuntu
+24.04's (80.7 MB of tar, one gzip blob from Docker Hub recompressed with `zstd -3` and `-19`) and
+Zig 0.17's toolchain as a layer (390 MB of tar, `zstd -3`). Throughput is output bytes a second,
+the median of 5-9 rounds, ReleaseSafe for x86_64-linux-musl as the release builds it, to a
+discarding writer (`runner/src/implbench.zig`):
+
+| Decoder | ubuntu, `-3` | ubuntu, `-19` | zig toolchain, `-3` |
+| --- | --- | --- | --- |
+| the runner's own (`zstd.zig`) | 266 MB/s | 246 MB/s | 301 MB/s |
+| libzstd 1.5.7, the system's, built by gcc | 1,023 MB/s | 759 MB/s | 1,217 MB/s |
+| libzstd 1.5.7 vendored, built by Zig without a libc, no assembly | 986 MB/s | not measured | 1,077 MB/s |
+| the same with the x86_64 assembly (`huf_decompress_amd64.S`) | 929 MB/s | not measured | 1,016 MB/s |
+| the same with Zig's undefined-behaviour checks left on in the C | 781 MB/s | not measured | n/a |
+
+So libzstd decodes **3.7 times faster** (3.6 on the toolchain), the assembly gained nothing and is
+left out (one source for both targets), and Zig's trapping checks cost the C a fifth, so they are
+off for it (`-fno-sanitize=undefined`, in `build.zig` and `zig-modules.sh` alike).
+
+In a layer's whole unpacking (`layer.apply`, pipelined as a job runs it, onto ext4) the wall time
+barely moves on this laptop, because writing the files is the longer half: the toolchain layer took
+3.2-3.7 s with libzstd against 3.3-4.6 s with the old decoder under the same load. What changes is
+the CPU: **0.92-1.36 s of user time against 1.86-2.80 s**, about a second of a core saved per
+400 MB layer. A machine whose cores are busy with the job, or slower (the Pi), is where that shows.
+
+The binary grows by 132 KB (x86_64, 4.44 to 4.58 MB) and 78 KB (aarch64, 3.80 to 3.88 MB).

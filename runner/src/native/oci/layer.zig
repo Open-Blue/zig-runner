@@ -23,7 +23,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const sandbox = @import("../sandbox.zig");
-const zstd = @import("zstd.zig");
+const zstd = @import("libzstd.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = @import("../../sha256.zig").Sha256;

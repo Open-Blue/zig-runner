@@ -143,15 +143,17 @@ needed() {
 	analysis)
 		# Only the searches themselves, on a pull request: a change to the runner's code is the
 		# nightly run's to search, not every pull request's (each costs minutes per target).
-		# The zstd decoder is the exception, with its corpus: it reads every layer a registry
-		# sends, so a change to it is fuzzed before it merges.
+		# The zstd decoders (libzstd, which reads every layer a registry sends, and the Zig one it
+		# is held to) are the exception, with their corpus: a change to them is fuzzed before it
+		# merges.
 		case $1 in
 		.github/workflows/analysis.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/zig-fuzz.sh | .github/scripts/zig-valgrind.sh | \
 			.github/scripts/changed-tests.sh | \
 			.github/scripts/zig-race-tests.sh | .github/scripts/zig-stress.sh | \
 			.github/scripts/zlint.sh | .github/scripts/zlint-suppressed.baseline | \
-			runner/src/native/oci/zstd.zig | runner/src/fuzz_corpus/zstd/* | \
+			runner/src/native/oci/zstd.zig | runner/src/native/oci/libzstd.zig | \
+			runner/src/vendor/zstd/* | runner/src/fuzz_corpus/zstd/* | \
 			.github/valgrind.supp) return 0 ;;
 		*) return 1 ;;
 		esac

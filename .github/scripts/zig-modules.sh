@@ -45,9 +45,28 @@ zig_modules() {
 			return 1
 		fi
 	fi
-	# shellcheck disable=SC2034 # for the caller
-	modules=(-fPIE "$@" --dep build_version --dep tls -Mroot=src/main.zig
+	zig_libzstd_args
+	# shellcheck disable=SC2034,SC2154 # for the caller; libzstd_args is set above
+	modules=(-fPIE "$@" --dep build_version --dep tls -Mroot=src/main.zig "${libzstd_args[@]}"
 		"$@" -Mbuild_version="$version" "$@" -Mtls="$scratch/tls/src/root.zig")
+}
+
+# zig_libzstd_args: sets `libzstd_args` to the arguments that add libzstd's decompressor to the
+# module before them: runner/build.zig's `addLibzstd`, the same files and flags ("Binaries (same as
+# zig build)" compares the two builds byte for byte). From runner/.
+#
+# `-fno-sanitize=undefined`: Zig's trapping checks cost libzstd a fifth of its speed. No
+# coverage instrumentation: Zig's fuzzer asks for it of C code too and then cannot link it (or
+# panics at start when the counters and the pc table disagree).
+zig_libzstd_args() {
+	local zstd=src/vendor/zstd
+	# shellcheck disable=SC2034 # for the caller
+	libzstd_args=(-cflags -O3 -ffreestanding -fno-sanitize=undefined
+		-fno-sanitize-coverage=edge,trace-pc-guard,inline-8bit-counters,pc-table,trace-cmp,trace-div,trace-gep
+		-DDEBUGLEVEL=0 -DZSTD_LEGACY_SUPPORT=0 -DZSTD_DISABLE_ASM -DXXH_NAMESPACE=ZSTD_
+		-Isrc/vendor/shim -I"$zstd" -I"$zstd"/common --
+		"$zstd"/common/{debug,entropy_common,error_private,fse_decompress,xxhash,zstd_common}.c
+		"$zstd"/decompress/{huf_decompress,zstd_ddict,zstd_decompress,zstd_decompress_block}.c)
 }
 
 # zig_package_hash DIR: the hash `zig fetch` gives the package checked out in DIR, as Zig 0.17

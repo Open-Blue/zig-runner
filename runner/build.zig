@@ -35,6 +35,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    addLibzstd(exe.root_module);
     exe.pie = pie;
     b.installArtifact(exe);
 
@@ -111,4 +112,45 @@ fn versionFile(b: *std.Build) std.Build.LazyPath {
     const git = b.addSystemCommand(&.{ "git", "describe", "--tags", "--always", "--dirty", "--abbrev=8" });
     git.has_side_effects = true;
     return git.captureStdOut(.{ .basename = "version" });
+}
+
+/// libzstd's decompressor (`src/vendor/zstd`, 1.5.7) for the layer path (`src/native/oci/libzstd.zig`),
+/// compiled without a libc, as the runner links none. The files and flags are
+/// `.github/scripts/zig-modules.sh`'s too: "Binaries (same as zig build)" compares the two builds
+/// byte for byte.
+///
+/// `-fno-sanitize=undefined`: Zig's trapping checks cost libzstd a fifth of its speed. `-O3` and not
+/// the optimize mode's, so the two builds and every mode compile it alike. No assembly
+/// (`ZSTD_DISABLE_ASM`): the x86_64-only Huffman routine gained nothing measurable, and the same
+/// source then builds for aarch64.
+fn addLibzstd(module: *std.Build.Module) void {
+    const b = module.owner;
+    module.addCSourceFiles(.{
+        .root = b.path("src/vendor/zstd"),
+        .files = &.{
+            "common/debug.c",
+            "common/entropy_common.c",
+            "common/error_private.c",
+            "common/fse_decompress.c",
+            "common/xxhash.c",
+            "common/zstd_common.c",
+            "decompress/huf_decompress.c",
+            "decompress/zstd_ddict.c",
+            "decompress/zstd_decompress.c",
+            "decompress/zstd_decompress_block.c",
+        },
+        .flags = &.{
+            "-O3",
+            "-ffreestanding",
+            "-fno-sanitize=undefined",
+            "-fno-sanitize-coverage=edge,trace-pc-guard,inline-8bit-counters,pc-table,trace-cmp,trace-div,trace-gep",
+            "-DDEBUGLEVEL=0",
+            "-DZSTD_LEGACY_SUPPORT=0",
+            "-DZSTD_DISABLE_ASM",
+            "-DXXH_NAMESPACE=ZSTD_",
+        },
+    });
+    module.addIncludePath(b.path("src/vendor/shim"));
+    module.addIncludePath(b.path("src/vendor/zstd"));
+    module.addIncludePath(b.path("src/vendor/zstd/common"));
 }

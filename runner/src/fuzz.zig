@@ -28,6 +28,7 @@ const yaml = @import("yaml.zig");
 const image = @import("native/oci/image.zig");
 const layer = @import("native/oci/layer.zig");
 const zstd = @import("native/oci/zstd.zig");
+const libzstd = @import("native/oci/libzstd.zig");
 const registry = @import("native/oci/registry.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
@@ -901,6 +902,70 @@ fn zstdAgrees(input: []const u8) !void {
     if (mine != .capped) try std.testing.expect(mine_len <= (input.len / 4 + 1) * std.compress.zstd.block_size_max);
     const took = started.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
     try std.testing.expect(took < zstd_seconds * std.time.ns_per_s);
+}
+
+// --- libzstd ---
+
+// "fuzz: libzstd" holds libzstd (`oci/libzstd.zig`, which reads every zstd layer) to the runner's
+// own decoder (`oci/zstd.zig`), which it replaced and which was itself held to std's. The same
+// frames go to both, to the same window limit and the same output cap, and they must agree: both
+// fail, or both give the same bytes (or the same first `zstd_output` of them). A failure has a
+// reason, and reading on after one fails again, never out of bounds.
+test "fuzz: libzstd" {
+    try std.testing.fuzz({}, libzstdFrames, .{ .corpus = zstd_seeds });
+}
+
+fn libzstdFrames(_: void, smith: *Smith) !void {
+    var buf: [zstd_input]u8 = undefined;
+    try libzstdAgrees(take(smith, &buf));
+}
+
+test "libzstd and the Zig decoder: every bit of the small seeds flipped" {
+    var buf: [400]u8 = undefined;
+    const stride: usize = if (std.valgrind.runningOnValgrind() != 0) 37 else 1;
+    inline for (zstd_files) |name| {
+        const frame = @embedFile("fuzz_corpus/zstd/" ++ name ++ ".zst");
+        if (comptime frame.len <= buf.len) {
+            var bit: usize = 0;
+            while (bit < frame.len * 8) : (bit += stride) {
+                @memcpy(buf[0..frame.len], frame);
+                buf[bit / 8] ^= std.math.shl(u8, 1, bit % 8);
+                libzstdAgrees(buf[0..frame.len]) catch |e| {
+                    std.debug.print("SEED {s} bit {d} {x}\n", .{ name, bit, buf[0..frame.len] });
+                    return e;
+                };
+            }
+        }
+    }
+}
+
+fn libzstdAgrees(input: []const u8) !void {
+    var in: std.Io.Reader = .fixed(input);
+    const c = try libzstd.Decompress.create(std.testing.allocator, &in);
+    defer c.destroy();
+    c.limitWindow(20);
+    const theirs, const theirs_len = zstdRead(&c.reader, &zstd_oracle_out);
+
+    zstd_budget.live = 0;
+    const heap: std.mem.Allocator = .{ .ptr = &zstd_budget, .vtable = &zstd_budget_vtable };
+    var zin: std.Io.Reader = .fixed(input);
+    const z = try zstd.Decompress.create(heap, &zin);
+    defer z.destroy();
+    z.window_limit = zstd_window;
+    const mine, const mine_len = zstdRead(&z.reader, &zstd_ours_out);
+
+    if (theirs == .failed) try std.testing.expect(c.err != null);
+    var more: [64]u8 = undefined;
+    if (c.reader.readSliceShort(&more)) |_| {} else |_| {}
+
+    if (mine != theirs) {
+        std.debug.print("libzstd: {s} (libzstd: {s}, Zig: {?s}), {d} input bytes\n", .{
+            "the decoders end differently", @tagName(theirs), if (z.err) |e| @errorName(e) else null, input.len,
+        });
+        if (c.err) |e| std.debug.print("  libzstd: {s}\n", .{e});
+        return error.ZstdDisagreement;
+    }
+    if (mine != .failed) try std.testing.expectEqualSlices(u8, zstd_ours_out[0..mine_len], zstd_oracle_out[0..theirs_len]);
 }
 
 fn zstdDisagree(input: []const u8, what: []const u8, ours: ?zstd.Error, theirs: ?std.compress.zstd.Decompress.Error) error{ZstdDisagreement} {
