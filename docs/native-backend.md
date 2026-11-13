@@ -225,7 +225,21 @@ On a root runner, each step runs:
   service on any of its addresses (the bridge's included), since `INPUT` drops whatever comes from
   `zr0` and is not a reply. Nor does anything reach the job that it did not ask for: `OUTPUT` and
   `FORWARD` drop what goes to `zr0` and is not a reply (added in P6, when services began to listen
-  there). Jobs cannot reach each other: each veth is an isolated bridge port
+  there). One exception for a runner that serves a Gitea or Forgejo instance (`RUNNER_PLATFORM`
+  gitea or forgejo): the instance's address and port, and those its tasks name
+  (`github.server_url`, which may be another name for the same host, a tailnet's), are open to
+  TCP from the bridge in `forward` and `input`, out of whichever interface leads there, so a
+  checkout works; no other port of that address, and no other address, is. An instance on the
+  host's own loopback cannot be reached as it is named, since the job's 127.0.0.1 is its own, and
+  the kernel cannot redirect to it (a reply from 127.0.0.1 may not leave by the bridge): the runner
+  listens on the bridge's address at the same port (bound to that address alone, tried again each
+  second until the first job has made the bridge) and forwards each connection to 127.0.0.1,
+  `input` accepts that port at the bridge's address, and the job's checkout fetches from
+  `http://<bridge address>:<port>`. The host's own INPUT (ufw's, whose policy drops) is given the
+  same `-i zr0 -j ACCEPT` as its FORWARD, leaving the deciding to the runner's table. What the
+  workflow reads (`github.server_url` in expressions, `GITHUB_SERVER_URL`) still says 127.0.0.1.
+  The table is the runner's alone and replaced whole, so runners of one host that serve
+  different instances must be one pool: the last to make the rules decides. Jobs cannot reach each other: each veth is an isolated bridge port
   (`IFLA_BRPORT_ISOLATED`), and `FORWARD` drops traffic from `zr0` back to `zr0`. IPv6 is off on the
   job's `eth0` and on the bridge, so no link-local address slips past those IPv4 rules (`lo` keeps
   its ::1). Ports below 1024 and ping work without capabilities on the host's
@@ -1053,10 +1067,20 @@ What it does not do yet (debt, with the phase that pays it):
   and a large file's writeback is started as it is written (`sync_file_range`, advisory) so the
   `syncfs` before the rename has little left to write. The publish order is unchanged: nothing is
   durable by the early writeback, only by that `syncfs`.
-- **zstd is the runner's own decoder** (`oci/zstd.zig`), because std's took 19 s for a 500 MB layer
-  (one bit at a time through the Huffman tree) and this one 1 s; std's decoder is its test
-  oracle. Frame checksums are not checked; the blob's digest is checked before and the diff id
-  after, which covers it. Dictionaries are refused, and so is a window over 128 MiB.
+- **gzip is zlib-ng's inflater** (`oci/zlibng.zig`, 2.3.3 vendored in `src/vendor/zlib-ng`, compiled
+  without a libc and without runtime CPU detection, the baseline SIMD of each architecture), which
+  inflates 3 times faster than `std.compress.flate` (188 against 566 MB/s on ubuntu's layer;
+  docs/BENCHMARKS.md). std's inflater is the oracle `fuzz: zlib-ng` holds it to. It reads the first
+  gzip member and ignores what follows, as std does, and refuses what std lets through: a reserved
+  header flag, a wrong CRC-32 or length in the trailer, a wrong header checksum.
+- **zstd is libzstd** (`oci/libzstd.zig`, 1.5.7 vendored in `src/vendor/zstd`, the decompressor
+  only, compiled without a libc), which decodes 3.7 times faster than the runner's own decoder
+  (`oci/zstd.zig`, 266 MB/s on ubuntu's layer, 986 MB/s libzstd; docs/BENCHMARKS.md). The own
+  decoder came first, because std's took 19 s for a 500 MB layer (one bit at a time through the
+  Huffman tree); it stays as the oracle libzstd is fuzzed against (`fuzz: libzstd`), with std's
+  its oracle in turn. Frame checksums are not checked (libzstd is told to skip them); the blob's
+  digest is checked before and the diff id after, which covers it. Dictionaries are refused (none
+  is loaded), and so is a window over 128 MiB.
 - **Rootless** (tests, the laptop): only root is mapped, so every file is the runner's,
   directories keep their owner's write bit, an image whose `USER` is not root cannot run a Docker action, and the
   default image cannot be provisioned (dpkg gives files to other ids, `root:adm`, which fails with

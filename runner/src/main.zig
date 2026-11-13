@@ -47,6 +47,9 @@ comptime {
     _ = @import("native/key_diff.zig");
     _ = @import("native/oci/layer.zig");
     _ = @import("native/oci/zstd.zig");
+    _ = @import("c_alloc.zig");
+    _ = @import("native/oci/libzstd.zig");
+    _ = @import("native/oci/zlibng.zig");
     _ = @import("native/oci/registry.zig");
     _ = @import("native/oci/Store.zig");
     _ = @import("native/oci/image.zig");
@@ -80,6 +83,9 @@ comptime {
     _ = @import("gitea/job_oracle.zig");
     _ = @import("gitea/client.zig");
     _ = @import("gitea/poller.zig");
+    _ = @import("gitea/report.zig");
+    _ = @import("gitea/run.zig");
+    _ = @import("gitea/reach.zig");
     _ = @import("github/jitconfig.zig");
     _ = @import("github/rsa_sign.zig");
     _ = @import("github/auth.zig");
@@ -206,10 +212,13 @@ pub fn main(process_init: std.process.Init) !u8 {
     var log: *sink.LogSink = &console;
     var store: ?db.Store = null;
     const live = !cfg.dry_run and !cfg.inspect and cfg.exec_job == null and !cfg.db_check;
-    if (pg_cfg) |dbcfg| if (live) {
+    if (pg_cfg) |dbcfg| if (live and cfg.platform == .github) {
         try openDatabase(init, dbcfg, &cfg, &console, secrets, err, &db_sink, &store);
         log = &db_sink;
-    };
+    } else if (live) try console.say(
+        "the database is not used for Gitea and Forgejo jobs: their task ids would collide with " ++
+            "GitHub's job ids in a shared store (#520), so their logs go to the console only",
+    );
     defer if (store != null) {
         log.close();
         store.?.close();
@@ -232,23 +241,7 @@ pub fn main(process_init: std.process.Init) !u8 {
     if (cfg.platform != .github) return giteaMain(init, &cfg, log, err, secrets, name);
     if (cfg.inspect) return inspect.run(arena, io, &cfg, name, &stdout.interface);
 
-    // With no engine a job native cannot run fails, so a machine that cannot run native steps
-    // would fail every job: found now, before registering, not per job.
-    if (cfg.engineless()) {
-        const native = dagger.Backend.configFor(arena, io, init.environ_map, &cfg, true) catch |e| {
-            try err.print("config error: RUNNER_ENGINE=none, and the native backend is not " ++
-                "configured: {s}\n", .{@errorName(e)});
-            return @backingInt(Exit.config);
-        };
-        if (nativeRefusal(&cfg, arena, io, init.gpa, native, dagger.Backend.reprobe, .{})) |why| {
-            // May pass later (nftables busy, no network yet for the image): a code systemd and
-            // compose restart on, after the retries.
-            try err.print("native error: RUNNER_ENGINE=none, and native steps cannot run here: " ++
-                "{s}\n  (exiting {d}: systemd restarts the runner, which refuses again until " ++
-                "the machine can)\n", .{ why, @backingInt(Exit.native) });
-            return @backingInt(Exit.native);
-        }
-    }
+    if (try refuseNativeWithoutEngine(arena, io, init, &cfg, err)) |code| return code;
 
     // One HTTP client for every runner (see `github/http.zig`).
     var client: std.http.Client = .{
@@ -260,18 +253,8 @@ pub fn main(process_init: std.process.Init) !u8 {
     http.shared.store(&client, .release);
     // Before `client`'s, as defers run: the clients `renew` made in its place.
     defer http.deinitShared(io);
-    // The seeds' tarballs are checked here, once, outside any job (`zig_release.zig`); the tool
-    // caches' Zig versions join them as `repo` jobs find them.
-    var zig_seeds: zig_release.Registry = .{ .io = io, .gpa = init.gpa, .client = &client };
-    if (cfg.zig_seed) |*s| {
-        cfg.zig_seeds = s[0..1];
-    } else if (cfg.package_caches) {
-        const r = try zig_release.resolve(arena, init.gpa, &client, cfg.zig_seed_versions);
-        cfg.zig_seeds = r.seeds;
-        cfg.zig_seeds_unverified = r.unverified;
-        try zig_seeds.add(r);
-        cfg.zig_seed_registry = &zig_seeds;
-    }
+    var zig_seeds: zig_release.Registry = undefined;
+    try resolveZigSeeds(arena, init, &cfg, &client, &zig_seeds);
     const stale = try settleRegistrations(arena, io, &cfg, log);
     installStopSignals();
     // Removed while the runners start, not before: that wait was 60 s every restart that found any.
@@ -293,17 +276,67 @@ pub fn main(process_init: std.process.Init) !u8 {
     return result;
 }
 
-/// A Gitea or Forgejo pool (`gitea/poller.zig`): none of the GitHub set-up above applies (App,
-/// registrations to settle, stale sweep), and the Zig seeds and engine checks wait for G3, which
-/// runs the tasks. Fetching only, so this needs the HTTP client and the stop signals.
-fn giteaMain(
+/// With no engine a job native cannot run fails, so a machine that cannot run native steps would
+/// fail every job: found now, before registering, not per job. The exit code to stop with, or null.
+fn refuseNativeWithoutEngine(
+    arena: std.mem.Allocator,
+    io: std.Io,
     init: std.process.Init,
     cfg: *const Config,
+    err: *std.Io.Writer,
+) !?u8 {
+    if (!cfg.engineless()) return null;
+    const native = dagger.Backend.configFor(arena, io, init.environ_map, cfg, true) catch |e| {
+        try err.print("config error: RUNNER_ENGINE=none, and the native backend is not " ++
+            "configured: {s}\n", .{@errorName(e)});
+        return @backingInt(Exit.config);
+    };
+    if (nativeRefusal(cfg, arena, io, init.gpa, native, dagger.Backend.reprobe, .{})) |why| {
+        // May pass later (nftables busy, no network yet for the image): a code systemd and
+        // compose restart on, after the retries.
+        try err.print("native error: RUNNER_ENGINE=none, and native steps cannot run here: " ++
+            "{s}\n  (exiting {d}: systemd restarts the runner, which refuses again until " ++
+            "the machine can)\n", .{ why, @backingInt(Exit.native) });
+        return @backingInt(Exit.native);
+    }
+    return null;
+}
+
+/// The Zig seeds' tarballs are checked once, outside any job (`zig_release.zig`); the tool caches'
+/// Zig versions join them as `repo` jobs find them. `zig_seeds` is the caller's, and must outlive
+/// the pool.
+fn resolveZigSeeds(
+    arena: std.mem.Allocator,
+    init: std.process.Init,
+    cfg: *Config,
+    client: *std.http.Client,
+    zig_seeds: *zig_release.Registry,
+) !void {
+    zig_seeds.* = .{ .io = init.io, .gpa = init.gpa, .client = client };
+    if (cfg.zig_seed) |*s| {
+        cfg.zig_seeds = s[0..1];
+    } else if (cfg.package_caches) {
+        const r = try zig_release.resolve(arena, init.gpa, client, cfg.zig_seed_versions);
+        cfg.zig_seeds = r.seeds;
+        cfg.zig_seeds_unverified = r.unverified;
+        try zig_seeds.add(r);
+        cfg.zig_seed_registry = zig_seeds;
+    }
+}
+
+/// A Gitea or Forgejo pool (`gitea/poller.zig`): none of the GitHub set-up above applies (App,
+/// registrations to settle, stale sweep, database). The engine and Zig seed checks, the HTTP
+/// client and the end's wait for the native store's upkeep are the jobs' own, as GitHub's.
+fn giteaMain(
+    init: std.process.Init,
+    cfg: *Config,
     log: *sink.LogSink,
     err: *std.Io.Writer,
     secrets: []const []const u8,
     name: []const u8,
 ) !u8 {
+    const arena = init.arena.allocator();
+    if (try refuseNativeWithoutEngine(arena, init.io, init, cfg, err)) |code| return code;
     var client: std.http.Client = .{
         .allocator = init.gpa,
         .io = init.io,
@@ -311,9 +344,14 @@ fn giteaMain(
     };
     defer client.deinit();
     http.shared.store(&client, .release);
+    defer http.deinitShared(init.io);
+    var zig_seeds: zig_release.Registry = undefined;
+    try resolveZigSeeds(arena, init, cfg, &client, &zig_seeds);
     installStopSignals();
-    return @backingInt(try gitea_poller.pool(.{
-        .arena = init.arena.allocator(),
+    // The last job out's tool-cache walks, on threads of their own, end before the process does.
+    defer tool_trees.process_idle_walks.stopAll(init.io);
+    const result = gitea_poller.pool(.{
+        .arena = arena,
         .gpa = init.gpa,
         .io = init.io,
         .environ = init.environ_map,
@@ -322,7 +360,13 @@ fn giteaMain(
         .err = err,
         .secrets = secrets,
         .name = name,
-    }, cfg.runners));
+    }, cfg.runners);
+    // As after a GitHub pool: a job's upkeep of the store that its end handed to a thread is let
+    // finish before the process ends.
+    collector.drainSync(init.io);
+    const code: u8 = @backingInt(try result);
+    if (!collector.drain(init.io, 5000)) std.process.exit(code);
+    return code;
 }
 
 /// How `nativeRefusal` retries: a failure may be transient (nftables busy, a module not loaded,

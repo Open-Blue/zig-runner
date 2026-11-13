@@ -298,6 +298,66 @@ What was measured and left out, on the same laptop:
 | Reading a Zig tree ahead of a compile | 5.65 s and 254 MiB against 4.87 s and 90 MiB, cold | A compile reads a third of the tree; warm, the pass adds 136 ms for nothing |
 | Zig's caches on tmpfs (`zig build test`, 5 rounds) | 132.9 against 124.5 s, no trend between pairs | 198 MiB stays in the cache, all of it written once on either disk: nothing is saved unless it is thrown away |
 
+## zstd layers: libzstd against the runner's own decoder
+
+*2026-11-12, laptop (Ryzen 5 PRO 4650U), balanced power, load average 2-6 from other work.* The
+runner decoded zstd layers with its own decoder (`oci/zstd.zig`). Compared on real layers: ubuntu
+24.04's (80.7 MB of tar, one gzip blob from Docker Hub recompressed with `zstd -3` and `-19`) and
+Zig 0.17's toolchain as a layer (390 MB of tar, `zstd -3`). Throughput is output bytes a second,
+the median of 5-9 rounds, ReleaseSafe for x86_64-linux-musl as the release builds it, to a
+discarding writer (`runner/src/implbench.zig`):
+
+| Decoder | ubuntu, `-3` | ubuntu, `-19` | zig toolchain, `-3` |
+| --- | --- | --- | --- |
+| the runner's own (`zstd.zig`) | 266 MB/s | 246 MB/s | 301 MB/s |
+| libzstd 1.5.7, the system's, built by gcc | 1,023 MB/s | 759 MB/s | 1,217 MB/s |
+| libzstd 1.5.7 vendored, built by Zig without a libc, no assembly | 986 MB/s | not measured | 1,077 MB/s |
+| the same with the x86_64 assembly (`huf_decompress_amd64.S`) | 929 MB/s | not measured | 1,016 MB/s |
+| the same with Zig's undefined-behaviour checks left on in the C | 781 MB/s | not measured | n/a |
+
+So libzstd decodes **3.7 times faster** (3.6 on the toolchain), the assembly gained nothing and is
+left out (one source for both targets), and Zig's trapping checks cost the C a fifth, so they are
+off for it (`-fno-sanitize=undefined`, in `build.zig` and `zig-modules.sh` alike).
+
+In a layer's whole unpacking (`layer.apply`, pipelined as a job runs it, onto ext4) the wall time
+barely moves on this laptop, because writing the files is the longer half: the toolchain layer took
+3.2-3.7 s with libzstd against 3.3-4.6 s with the old decoder under the same load. What changes is
+the CPU: **0.92-1.36 s of user time against 1.86-2.80 s**, about a second of a core saved per
+400 MB layer. A machine whose cores are busy with the job, or slower (the Pi), is where that shows.
+
+The binary grows by 132 KB (x86_64, 4.44 to 4.58 MB) and 78 KB (aarch64, 3.80 to 3.88 MB).
+
+## gzip layers: zlib-ng against std's inflater
+
+*2026-11-13, laptop (Ryzen 5 PRO 4650U), balanced power, load average 4-6 from other work.* The
+same layers as above, as Docker Hub serves ubuntu's (29.8 MB of gzip, 80.7 MB of tar) and the Zig
+toolchain as `gzip -6` (90 MB, 390 MB of tar). Output bytes a second, the median of 5-9 rounds,
+to a discarding writer:
+
+| Inflater | ubuntu | zig toolchain |
+| --- | --- | --- |
+| `std.compress.flate` (what the runner used) | 188-192 MB/s | 250-281 MB/s |
+| zlib 1.3.1, the system's, one call | 337 MB/s | 454 MB/s |
+| zlib-ng 2.3.3, built by gcc, runtime CPU detection | 381 MB/s | 559 MB/s |
+| zlib-ng 2.3.3, built by gcc, SSE2 only (no detection) | 590 MB/s | 795 MB/s |
+| zlib-ng 2.3.3 vendored, built by Zig without a libc, SSE2 only, streaming as the runner uses it | **566 MB/s** | **765 MB/s** |
+| libdeflate 1.26, one call into one buffer | 820 MB/s | 1,194 MB/s |
+
+zlib-ng is 3.0 times std's, streams through a window as the layer pipeline needs, and checks the
+member's CRC-32. libdeflate is faster still but takes the whole input and a buffer for the whole
+output at once (a layer is up to gigabytes, and its unpacking runs beside its inflating), so it is
+not an option here. The runtime-detection build of zlib-ng was slower than the baseline one on this
+CPU (its AVX2 paths), so detection is left out: one binary for every CPU of an architecture, and
+nothing to detect. The output of both inflaters on the two layers has the same SHA-256, which is
+also the tar's.
+
+In a layer's whole unpacking onto ext4 (`layer.apply`, pipelined as a job runs it) the toolchain
+layer took 3.2-3.7 s of wall time with either inflater (writing the files is the longer half, as
+with zstd), and **1.1-1.3 s of user CPU against 1.9-2.1 s** with zlib-ng.
+
+The binary grows by 62 KB (x86_64, 4,577,344 to 4,639,424 bytes) and 52 KB (aarch64, 3,876,960 to
+3,929,440), on top of libzstd's.
+
 ## Compute hot paths: where C, Rust or assembly beat Zig
 
 *2026-11-12 and 13, laptop (Ryzen 5 PRO 4650U: SHA-NI and AVX2), balanced power, load average 2-10

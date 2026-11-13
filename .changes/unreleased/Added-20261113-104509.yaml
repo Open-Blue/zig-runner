@@ -1,0 +1,3 @@
+kind: Added
+body: 'Native jobs of a Gitea or Forgejo runner reach the instance they came from, so actions/checkout works: the instance''s address and port (and the one its tasks name) are opened to the job''s network, and nothing else of the host''s. An instance on the host''s loopback is served at the bridge''s address by a forwarder in the runner (docs/native-backend.md).'
+time: 2026-11-13T10:45:09.501032485-05:00
