@@ -73,7 +73,8 @@ needed() {
 		case $1 in
 		runner/src/* | runner/build.zig | runner/build.zig.zon | .github/workflows/ci.yml | \
 			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
-			.github/scripts/build-binaries.sh | .github/scripts/zig-modules.sh | \
+			.github/scripts/build-binaries.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
+			.github/scripts/install-rust.sh | runner/rust/* | \
 			.github/scripts/checksec.sh) return 0 ;;
 		*) return 1 ;;
 		esac
@@ -85,7 +86,8 @@ needed() {
 		case $1 in
 		runner/src/* | runner/build.zig | runner/build.zig.zon | deploy/engine.json | \
 			.github/workflows/ci.yml | .github/scripts/ci-scope.sh | \
-			.github/scripts/install-zig.sh | .github/scripts/zig-modules.sh | \
+			.github/scripts/install-zig.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
+			.github/scripts/install-rust.sh | runner/rust/* | \
 			.github/scripts/e2e.sh) return 0 ;;
 		*) return 1 ;;
 		esac
@@ -118,7 +120,8 @@ needed() {
 		runner/build.zig | runner/build.zig.zon | runner/Dockerfile | runner/.dockerignore | \
 			deploy/* | .trivyignore.yaml | .github/workflows/release.yml | \
 			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
-			.github/scripts/build-binaries.sh | .github/scripts/zig-modules.sh | \
+			.github/scripts/build-binaries.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
+			.github/scripts/install-rust.sh | runner/rust/* | \
 			.github/scripts/sbom.sh | .github/scripts/checksec.sh) return 0 ;;
 		*) return 1 ;;
 		esac
@@ -144,7 +147,8 @@ needed() {
 		# Only the searches themselves, on a pull request: a change to the runner's code is the
 		# nightly run's to search, not every pull request's (each costs minutes per target).
 		# The zstd decoder is the exception, with its corpus: it reads every layer a registry
-		# sends, so a change to it is fuzzed before it merges.
+		# sends, so a change to it is fuzzed before it merges. The same for the network library
+		# (docs/rust-net.md): it reads what servers send, and its tests run under Valgrind.
 		case $1 in
 		.github/workflows/analysis.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/zig-fuzz.sh | .github/scripts/zig-valgrind.sh | \
@@ -152,6 +156,8 @@ needed() {
 			.github/scripts/zig-race-tests.sh | .github/scripts/zig-stress.sh | \
 			.github/scripts/zlint.sh | .github/scripts/zlint-suppressed.baseline | \
 			runner/src/native/oci/zstd.zig | runner/src/fuzz_corpus/zstd/* | \
+			runner/src/zr_net.zig | runner/rust/* | .github/scripts/build-zr-net.sh | \
+			.github/scripts/zig-cc.sh | .github/scripts/install-rust.sh | \
 			.github/valgrind.supp) return 0 ;;
 		*) return 1 ;;
 		esac
@@ -177,7 +183,8 @@ needed() {
 			.github/scripts/zig-test.sh | runner/src/native/store_crash.zig | \
 			runner/src/native/oci/Store.zig | runner/src/native/volumes.zig | \
 			runner/src/native/evict.zig | \
-			.github/scripts/store-crash.sh | .github/scripts/zig-modules.sh) return 0 ;;
+			.github/scripts/store-crash.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
+			.github/scripts/install-rust.sh | runner/rust/*) return 0 ;;
 		*) return 1 ;;
 		esac
 		;;
@@ -209,7 +216,8 @@ needed() {
 		case $1 in
 		.github/workflows/analysis.yml | \
 			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
-			.github/scripts/zig-modules.sh | .github/scripts/zig-coverage.sh | \
+			.github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
+			.github/scripts/install-rust.sh | runner/rust/* | .github/scripts/zig-coverage.sh | \
 			.github/scripts/native-service-images.sh) return 0 ;;
 		*) return 1 ;;
 		esac

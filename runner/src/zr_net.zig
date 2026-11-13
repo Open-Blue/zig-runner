@@ -1,0 +1,46 @@
+//! The network library (`rust/zr-net`, docs/rust-net.md) behind its C ABI. R1: the version and the
+//! runtime's lifetime; the HTTP, WebSocket and TLS calls arrive with R2 to R6.
+const std = @import("std");
+
+extern fn zr_net_version() [*:0]const u8;
+extern fn zr_net_runtime_start(threads: u32) i32;
+extern fn zr_net_selftest(n: u32) i64;
+extern fn zr_net_runtime_stop() void;
+
+/// The library's version, as `Cargo.toml` names it.
+pub fn version() []const u8 {
+    return std.mem.span(zr_net_version());
+}
+
+pub const Error = error{ RuntimeStart, RuntimeStopped };
+
+/// Starts the runtime if it is not running (idempotent); `threads` 0 is the default.
+pub fn start(threads: u32) Error!void {
+    if (zr_net_runtime_start(threads) < 0) return error.RuntimeStart;
+}
+
+/// A task's round trip through the runtime's workers: `n + 1`.
+pub fn selftest(n: u32) Error!i64 {
+    const r = zr_net_selftest(n);
+    if (r < 0) return error.RuntimeStopped;
+    return r;
+}
+
+pub fn stop() void {
+    zr_net_runtime_stop();
+}
+
+test "the runtime starts, runs a task through the ABI and stops" {
+    try std.testing.expectEqualStrings("0.1.0", version());
+    try std.testing.expectError(error.RuntimeStopped, selftest(1));
+    try start(2);
+    try start(2);
+    try std.testing.expectEqual(@as(i64, 42), try selftest(41));
+    stop();
+    stop();
+    try std.testing.expectError(error.RuntimeStopped, selftest(1));
+    // Again: a stopped runtime starts anew.
+    try start(0);
+    try std.testing.expectEqual(@as(i64, 1), try selftest(0));
+    stop();
+}

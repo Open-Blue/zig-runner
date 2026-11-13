@@ -1,7 +1,9 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // musl, as the release is, whatever the machine's libc: the network library is built for musl and
+    // two libcs in one process is a crash (zig-modules.sh has the same default).
+    const target = b.standardTargetOptions(.{ .default_target = .{ .abi = .musl } });
     const optimize = b.standardOptimizeOption(.{});
     // Release builds for deployment drop debug info (`zig build -Doptimize=ReleaseSafe -Dstrip`).
     const strip = b.option(bool, "strip", "Omit debug information") orelse null;
@@ -35,6 +37,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    addZrNet(exe.root_module, target.result.cpu.arch);
     exe.pie = pie;
     b.installArtifact(exe);
 
@@ -111,4 +114,21 @@ fn versionFile(b: *std.Build) std.Build.LazyPath {
     const git = b.addSystemCommand(&.{ "git", "describe", "--tags", "--always", "--dirty", "--abbrev=8" });
     git.has_side_effects = true;
     return git.captureStdOut(.{ .basename = "version" });
+}
+
+/// The network library (`rust/zr-net`, docs/rust-net.md): cargo builds it as a static archive for
+/// the target with `zig cc` (`.github/scripts/build-zr-net.sh`, which the release runs too), and the
+/// module links it. Rust's standard library is built on libc, so this is where the runner starts
+/// linking musl (Zig's own), and Rust's unwinder (Zig's bundled libunwind) for the symbols std
+/// references even with `panic = "abort"`. The step runs on every build, as the version's does:
+/// cargo has its own cache and a clean tree costs it about a second; the Zig compilation after it
+/// repeats only when the archive's bytes change.
+fn addZrNet(module: *std.Build.Module, arch: std.Target.Cpu.Arch) void {
+    const b = module.owner;
+    const cargo = b.addSystemCommand(&.{ "../.github/scripts/build-zr-net.sh", @tagName(arch) });
+    const archive = cargo.addOutputFileArg("libzr_net.a");
+    cargo.has_side_effects = true;
+    module.addObjectFile(archive);
+    module.link_libc = true;
+    module.linkSystemLibrary("unwind", .{});
 }
