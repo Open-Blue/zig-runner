@@ -321,7 +321,7 @@ test "Registry: tool cache versions are queued once each, within the cap, and on
         "d " ++ tc ++ "/zig/0.15.2/zig-x86_64-linux-0.15.2\n" ++
         "d " ++ tc ++ "/zig/0.14.1/zig-x86_64-linux-0.14.1\n" ++
         "d /elsewhere/zig/0.13.0/x");
-    try std.testing.expectEqual(@as(usize, 1), r.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 2), r.pending.items.len);
     try std.testing.expectEqualStrings("0.16.0", r.pending.items[0]);
     try std.testing.expectEqualStrings("0.15.2", r.pending.items[1]);
     // Without a client nothing is verified, so nothing pending is seeded.

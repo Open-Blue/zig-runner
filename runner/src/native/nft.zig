@@ -178,10 +178,14 @@ fn readShared(out: *[max_shared]SharedReach, except: linux.pid_t) usize {
     return n;
 }
 
-/// Whether a process `pid` exists (one that is not ours answers EPERM).
+/// Whether a process `pid` exists: its /proc entry is there.
 fn alive(pid: linux.pid_t) bool {
     if (pid <= 0) return false;
-    return linux.errno(linux.kill(pid, @fromBackingInt(@intCast(0)))) != .SRCH;
+    var buf: [32]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "/proc/{d}", .{pid}) catch return false;
+    buf[text.len] = 0;
+    const path: [:0]const u8 = buf[0..text.len :0];
+    return linux.errno(linux.access(path, 0)) == .SUCCESS;
 }
 
 fn writeShared(lines: []const SharedReach) void {
