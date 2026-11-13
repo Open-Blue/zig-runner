@@ -23,6 +23,7 @@ const jobs = @import("../loop/job.zig");
 const client_mod = @import("client.zig");
 const convert = @import("job.zig");
 const report = @import("report.zig");
+const reach = @import("reach.zig");
 
 const Allocator = std.mem.Allocator;
 const Reporter = report.Reporter;
@@ -163,8 +164,15 @@ fn runJob(
     cancel: *dagger.Cancel,
     pumping: *?std.Io.Future(void),
 ) !void {
-    const job = converted.job;
+    var job = converted.job;
     const t_id = reporter.task_id;
+    // A native job reaches the instance its task names (its ROOT_URL, which may not be the address
+    // the runner was given), and fetches through the bridge when that is the host's loopback.
+    if (c.cfg.backend == .native) {
+        const subnet = try @import("../native/net.zig").Subnet.parse(c.cfg.native_subnet);
+        if (reach.allow(c.arena, c.io, subnet, job.github.server_url)) |why| loop.sayUnallocated(c, "gitea: task {d}: {s}", .{ t_id, why });
+        job = try reach.viewed(c.arena, c.io, subnet, job);
+    }
     // Known by name now: it reserves what jobs of its name took at the memory gate, and what it
     // takes is learned when it ends.
     // The process's resources as the job starts, for its `job-end:` line.

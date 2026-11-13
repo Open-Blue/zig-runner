@@ -82,6 +82,7 @@ comptime {
     _ = @import("gitea/poller.zig");
     _ = @import("gitea/report.zig");
     _ = @import("gitea/run.zig");
+    _ = @import("gitea/reach.zig");
     _ = @import("github/jitconfig.zig");
     _ = @import("github/rsa_sign.zig");
     _ = @import("github/auth.zig");

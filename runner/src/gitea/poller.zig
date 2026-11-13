@@ -14,6 +14,8 @@ const build_version = @import("../version.zig");
 const client_mod = @import("client.zig");
 const state_mod = @import("state.zig");
 const run = @import("run.zig");
+const reach = @import("reach.zig");
+const net = @import("../native/net.zig");
 
 const Allocator = std.mem.Allocator;
 const Client = client_mod.Client;
@@ -163,6 +165,13 @@ pub fn pool(c: loop.Runner, n: u32) !loop.Exit {
         .ok => |st| st,
         .exit => |code| return code,
     };
+    // A native job's network reaches nothing of the host's: the instance's address is opened to it.
+    if (cfg.backend == .native) {
+        const subnet = net.Subnet.parse(cfg.native_subnet) catch net.Subnet.default;
+        if (reach.allow(c.arena, c.io, subnet, cfg.gitea_url)) |why| try c.log.say(why) else try c.log.say(
+            "native jobs may reach the instance's address and port, and no other service of the host's",
+        );
+    }
     // Redacted in everything the runner writes from here on.
     var all: std.ArrayList([]const u8) = .empty;
     try all.appendSlice(c.arena, c.secrets);
