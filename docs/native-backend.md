@@ -1067,10 +1067,20 @@ What it does not do yet (debt, with the phase that pays it):
   and a large file's writeback is started as it is written (`sync_file_range`, advisory) so the
   `syncfs` before the rename has little left to write. The publish order is unchanged: nothing is
   durable by the early writeback, only by that `syncfs`.
-- **zstd is the runner's own decoder** (`oci/zstd.zig`), because std's took 19 s for a 500 MB layer
-  (one bit at a time through the Huffman tree) and this one 1 s; std's decoder is its test
-  oracle. Frame checksums are not checked; the blob's digest is checked before and the diff id
-  after, which covers it. Dictionaries are refused, and so is a window over 128 MiB.
+- **gzip is zlib-ng's inflater** (`oci/zlibng.zig`, 2.3.3 vendored in `src/vendor/zlib-ng`, compiled
+  without a libc and without runtime CPU detection, the baseline SIMD of each architecture), which
+  inflates 3 times faster than `std.compress.flate` (188 against 566 MB/s on ubuntu's layer;
+  docs/BENCHMARKS.md). std's inflater is the oracle `fuzz: zlib-ng` holds it to. It reads the first
+  gzip member and ignores what follows, as std does, and refuses what std lets through: a reserved
+  header flag, a wrong CRC-32 or length in the trailer, a wrong header checksum.
+- **zstd is libzstd** (`oci/libzstd.zig`, 1.5.7 vendored in `src/vendor/zstd`, the decompressor
+  only, compiled without a libc), which decodes 3.7 times faster than the runner's own decoder
+  (`oci/zstd.zig`, 266 MB/s on ubuntu's layer, 986 MB/s libzstd; docs/BENCHMARKS.md). The own
+  decoder came first, because std's took 19 s for a 500 MB layer (one bit at a time through the
+  Huffman tree); it stays as the oracle libzstd is fuzzed against (`fuzz: libzstd`), with std's
+  its oracle in turn. Frame checksums are not checked (libzstd is told to skip them); the blob's
+  digest is checked before and the diff id after, which covers it. Dictionaries are refused (none
+  is loaded), and so is a window over 128 MiB.
 - **Rootless** (tests, the laptop): only root is mapped, so every file is the runner's,
   directories keep their owner's write bit, an image whose `USER` is not root cannot run a Docker action, and the
   default image cannot be provisioned (dpkg gives files to other ids, `root:adm`, which fails with

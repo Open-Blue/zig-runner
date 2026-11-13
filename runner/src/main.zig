@@ -47,6 +47,9 @@ comptime {
     _ = @import("native/key_diff.zig");
     _ = @import("native/oci/layer.zig");
     _ = @import("native/oci/zstd.zig");
+    _ = @import("c_alloc.zig");
+    _ = @import("native/oci/libzstd.zig");
+    _ = @import("native/oci/zlibng.zig");
     _ = @import("native/oci/registry.zig");
     _ = @import("native/oci/Store.zig");
     _ = @import("native/oci/image.zig");

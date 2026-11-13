@@ -35,6 +35,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    addLibzstd(exe.root_module);
+    addLibzlibng(exe.root_module, target.result.cpu.arch);
     exe.pie = pie;
     b.installArtifact(exe);
 
@@ -111,4 +113,101 @@ fn versionFile(b: *std.Build) std.Build.LazyPath {
     const git = b.addSystemCommand(&.{ "git", "describe", "--tags", "--always", "--dirty", "--abbrev=8" });
     git.has_side_effects = true;
     return git.captureStdOut(.{ .basename = "version" });
+}
+
+/// libzstd's decompressor (`src/vendor/zstd`, 1.5.7) for the layer path (`src/native/oci/libzstd.zig`),
+/// compiled without a libc, as the runner links none. The files and flags are
+/// `.github/scripts/zig-modules.sh`'s too: "Binaries (same as zig build)" compares the two builds
+/// byte for byte.
+///
+/// `-fno-sanitize=undefined`: Zig's trapping checks cost libzstd a fifth of its speed. `-O3` and not
+/// the optimize mode's, so the two builds and every mode compile it alike. No assembly
+/// (`ZSTD_DISABLE_ASM`): the x86_64-only Huffman routine gained nothing measurable, and the same
+/// source then builds for aarch64.
+fn addLibzstd(module: *std.Build.Module) void {
+    const b = module.owner;
+    module.addCSourceFiles(.{
+        .root = b.path("src/vendor/zstd"),
+        .files = &.{
+            "common/debug.c",
+            "common/entropy_common.c",
+            "common/error_private.c",
+            "common/fse_decompress.c",
+            "common/xxhash.c",
+            "common/zstd_common.c",
+            "decompress/huf_decompress.c",
+            "decompress/zstd_ddict.c",
+            "decompress/zstd_decompress.c",
+            "decompress/zstd_decompress_block.c",
+        },
+        .flags = &.{
+            "-O3",
+            "-ffreestanding",
+            "-fno-sanitize=undefined",
+            "-fno-sanitize-coverage=edge,trace-pc-guard,inline-8bit-counters,pc-table,trace-cmp,trace-div,trace-gep",
+            "-DDEBUGLEVEL=0",
+            "-DZSTD_LEGACY_SUPPORT=0",
+            "-DZSTD_DISABLE_ASM",
+            "-DXXH_NAMESPACE=ZSTD_",
+        },
+    });
+    module.addIncludePath(b.path("src/vendor/shim"));
+    module.addIncludePath(b.path("src/vendor/zstd"));
+    module.addIncludePath(b.path("src/vendor/zstd/common"));
+}
+
+/// zlib-ng's inflater (`src/vendor/zlib-ng`, 2.3.3) for gzip layers (`src/native/oci/zlibng.zig`),
+/// built like libzstd above (`.github/scripts/zig-modules.sh`, `zig_libzlibng_args`, has the same
+/// files and flags). Without runtime CPU detection: the SIMD each architecture's baseline has
+/// (SSE2, NEON) is compiled in, which a release binary may rely on and which measured 3 times
+/// std's inflater; the AVX2 and other newer code zlib-ng would choose at run time is left out
+/// (`-DDISABLE_RUNTIME_CPU_DETECTION`, and the files that hold it are not vendored).
+fn addLibzlibng(module: *std.Build.Module, arch: std.Target.Cpu.Arch) void {
+    const b = module.owner;
+    const common: []const []const u8 = &.{
+        "adler32.c",
+        "crc32_braid_comb.c",
+        "crc32.c",
+        "functable.c",
+        "inflate.c",
+        "inftrees.c",
+        "zutil.c",
+        "arch/generic/adler32_c.c",
+        "arch/generic/adler32_fold_c.c",
+        "arch/generic/crc32_braid_c.c",
+        "arch/generic/crc32_chorba_c.c",
+        "arch/generic/crc32_fold_c.c",
+    };
+    const base_flags: []const []const u8 = &.{
+        "-O3",
+        "-ffreestanding",
+        "-fno-sanitize=undefined",
+        "-fno-sanitize-coverage=edge,trace-pc-guard,inline-8bit-counters,pc-table,trace-cmp,trace-div,trace-gep",
+        "-DNDEBUG",
+        "-DZLIBNG_NATIVE_API",
+        "-DDISABLE_RUNTIME_CPU_DETECTION",
+        "-DWITH_OPTIM",
+        "-DHAVE_ATTRIBUTE_ALIGNED",
+        "-DHAVE_BUILTIN_ASSUME_ALIGNED",
+        "-DHAVE_BUILTIN_CTZ",
+        "-DHAVE_BUILTIN_CTZLL",
+        "-DHAVE_VISIBILITY_HIDDEN",
+    };
+    // What the architecture's files are for, and which of them `functable.c` binds: every file
+    // gets the flags, as zlib-ng's own build gives them.
+    const flags: []const []const u8, const arch_files: []const []const u8 = switch (arch) {
+        .x86_64 => .{
+            base_flags ++ &[_][]const u8{ "-DX86_FEATURES", "-DX86_SSE2" },
+            &.{ "arch/x86/chunkset_sse2.c", "arch/x86/chorba_sse2.c" },
+        },
+        .aarch64 => .{
+            base_flags ++ &[_][]const u8{ "-DARM_FEATURES", "-DARM_NEON", "-DARM_NEON_HASLD4" },
+            &.{ "arch/arm/chunkset_neon.c", "arch/arm/adler32_neon.c" },
+        },
+        else => @panic("zlib-ng is vendored for x86_64 and aarch64"),
+    };
+    const root = b.path("src/vendor/zlib-ng");
+    module.addCSourceFiles(.{ .root = root, .files = common, .flags = flags });
+    module.addCSourceFiles(.{ .root = root, .files = arch_files, .flags = flags });
+    module.addIncludePath(b.path("src/vendor/zlib-ng"));
 }

@@ -184,6 +184,33 @@ jobs:
             sleep $((attempt * 15))
           done
 
+      # The libzstd vendored under runner/src/vendor/zstd, which decompresses zstd layers: checked
+      # to be the files of the release vendor-zstd.sh pins, byte for byte. Fetched from GitHub's
+      # release assets; only a fetch that fails (exit 75) is tried again, twice, after a pause.
+      - name: vendored libzstd
+        run: |
+          for attempt in 1 2 3; do
+            status=0
+            .github/scripts/vendor-zstd.sh --check || status=$?
+            ((status == 75 && attempt < 3)) || exit "$status"
+            echo "::warning::vendor-zstd.sh could not fetch zstd (attempt $attempt of 3): trying again"
+            sleep $((attempt * 15))
+          done
+
+      # The zlib-ng vendored under runner/src/vendor/zlib-ng, which inflates gzip layers: checked
+      # to be the files of the commit vendor-zlib-ng.sh pins (and the three headers its CMake would
+      # generate), byte for byte. Fetched from GitHub; only a fetch that fails (exit 75) is tried
+      # again, twice, after a pause.
+      - name: vendored zlib-ng
+        run: |
+          for attempt in 1 2 3; do
+            status=0
+            .github/scripts/vendor-zlib-ng.sh --check || status=$?
+            ((status == 75 && attempt < 3)) || exit "$status"
+            echo "::warning::vendor-zlib-ng.sh could not fetch zlib-ng (attempt $attempt of 3): trying again"
+            sleep $((attempt * 15))
+          done
+
       # The provisioned images (runner/src/dagger/provisioned_pin.zig), pinned by digest once the
       # "provisioned image" workflow published them: checked to be indexes for amd64 and arm64
       # whose images are labelled with the fingerprint the pin says, so a pin of a missing or
