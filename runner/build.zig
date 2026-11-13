@@ -1,14 +1,15 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    // `zig build test -Dsanitize-thread`: ThreadSanitizer reports data races the tests run into.
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Build with ThreadSanitizer") orelse null;
     // musl, as the release is, whatever the machine's libc: the network library is built for musl and
-    // two libcs in one process is a crash (zig-modules.sh has the same default).
-    const target = b.standardTargetOptions(.{ .default_target = .{ .abi = .musl } });
+    // two libcs in one process is a crash (zig-modules.sh has the same default). ThreadSanitizer's
+    // runtime needs glibc's loader (.github/scripts/zig-test.sh), so its builds take glibc.
+    const target = b.standardTargetOptions(.{ .default_target = .{ .abi = if (sanitize_thread == true) .gnu else .musl } });
     const optimize = b.standardOptimizeOption(.{});
     // Release builds for deployment drop debug info (`zig build -Doptimize=ReleaseSafe -Dstrip`).
     const strip = b.option(bool, "strip", "Omit debug information") orelse null;
-    // `zig build test -Dsanitize-thread`: ThreadSanitizer reports data races the tests run into.
-    const sanitize_thread = b.option(bool, "sanitize-thread", "Build with ThreadSanitizer") orelse null;
     // A position-independent executable, static still: the kernel loads it at a random address, so
     // its code is not where an exploit of the runner (root on prod, reading untrusted input) knows
     // to find it. On by default, so the release (build-binaries.sh, zig-modules.sh's -fPIE), the
@@ -37,7 +38,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    addZrNet(exe.root_module, target.result.cpu.arch);
+    addZrNet(exe.root_module, target.result.cpu.arch, target.result.abi);
     exe.pie = pie;
     b.installArtifact(exe);
 
@@ -123,10 +124,11 @@ fn versionFile(b: *std.Build) std.Build.LazyPath {
 /// references even with `panic = "abort"`. The step runs on every build, as the version's does:
 /// cargo has its own cache and a clean tree costs it about a second; the Zig compilation after it
 /// repeats only when the archive's bytes change.
-fn addZrNet(module: *std.Build.Module, arch: std.Target.Cpu.Arch) void {
+fn addZrNet(module: *std.Build.Module, arch: std.Target.Cpu.Arch, abi: std.Target.Abi) void {
     const b = module.owner;
     const cargo = b.addSystemCommand(&.{ "../.github/scripts/build-zr-net.sh", @tagName(arch) });
     const archive = cargo.addOutputFileArg("libzr_net.a");
+    cargo.addArg(if (abi.isMusl()) "musl" else "gnu");
     cargo.has_side_effects = true;
     module.addObjectFile(archive);
     module.link_libc = true;

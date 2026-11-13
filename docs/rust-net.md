@@ -342,10 +342,12 @@ Each PR brings its own checks; none is left to "later".
    the allocation counter from "libc" (leak at runtime stop is an assertion in the tests: bytes in use is 0 after `stop`) and
    by `cargo test` under Miri on the pure functions (proxy matching, redirect policy, URL handling).
 4. **ThreadSanitizer: what it does and does not cover.** Zig's TSan instruments the Zig code only. The Rust side is uninstrumented, so TSan
-   cannot see its synchronisation, so a Zig test that crosses into tokio can report **false races in `free`/`malloc` between Zig and tokio
-   threads**. R1's runtime test under `-fsanitize-thread` on musl reports nothing (checked once; its Zig side is one thread). The first run, on
-   a *glibc* test binary with the musl-built archive linked into it, gave 7 such warnings: that mix is invalid anyway (see "libc",
-   tests are now musl too), but it shows what the Rust side looks like to TSan once more threads touch shared memory.
+   cannot see its synchronisation, so a Zig test that crosses into tokio reports **false races in `free`/`malloc` between Zig and tokio
+   threads**: measured in R1, the runtime test under `-fsanitize-thread` gives 6-7 warnings, so it **skips itself under TSan**
+   (`builtin.sanitize_thread`). TSan's runtime also needs glibc's loader (`zig-test.sh`: static musl PIE crashes at startup), so TSan builds
+   are the one place that takes glibc: `zig-modules.sh` and `build.zig` (`-Dsanitize-thread`) then build the Rust archive for
+   `<arch>-unknown-linux-gnu` (`build-zr-net.sh ... gnu`), never a musl archive in a glibc binary. (R1's first CI run found this: the Database tests job,
+   which runs everything under TSan, died at startup with a musl build.)
    Therefore: (a) the TSan job's test list (`race_filters` in `zig-race-tests.sh`) does not contain the runtime tests, and tests that
    match its filters (`timeout`, `cancel`...) by name once they use the network get a narrow suppression for those frames in `.github/tsan.supp`, each with its reason, in the PR that needs it (R3);
    (b) races **inside Rust** are covered by Rust's own tools: `cargo test` on `zr-net` (always), the same under `-Zsanitizer=thread` with `-Zbuild-std`

@@ -1,6 +1,7 @@
 //! The network library (`rust/zr-net`, docs/rust-net.md) behind its C ABI. R1: the version and the
 //! runtime's lifetime; the HTTP, WebSocket and TLS calls arrive with R2 to R6.
 const std = @import("std");
+const builtin = @import("builtin");
 
 extern fn zr_net_version() [*:0]const u8;
 extern fn zr_net_runtime_start(threads: u32) i32;
@@ -31,6 +32,9 @@ pub fn stop() void {
 }
 
 test "the runtime starts, runs a task through the ABI and stops" {
+    // ThreadSanitizer does not see the Rust side's synchronisation (docs/rust-net.md, "Validation"):
+    // it reports the hand-over of memory between this thread and the runtime's as races in `free`.
+    if (builtin.sanitize_thread) return error.SkipZigTest;
     try std.testing.expectEqualStrings("0.1.0", version());
     try std.testing.expectError(error.RuntimeStopped, selftest(1));
     try start(2);

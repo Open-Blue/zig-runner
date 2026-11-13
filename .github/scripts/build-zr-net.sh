@@ -3,7 +3,9 @@
 # architecture, built with cargo and `zig cc` (zig-cc.sh) for the musl targets. runner/build.zig's
 # `addZrNet` runs this same script, and the release (build-binaries.sh) too, so the three agree.
 #
-#   build-zr-net.sh x86_64|aarch64 OUT.a
+#   build-zr-net.sh x86_64|aarch64 OUT.a [musl|gnu]
+#
+# gnu only for the ThreadSanitizer builds, whose runtime needs glibc (zig-test.sh); everything else musl.
 #
 # Cargo.lock is committed and `--locked` makes a stale one an error. CARGO_TARGET_DIR defaults to
 # runner/rust/target (gitignored), so cargo's own cache serves every build on the machine.
@@ -25,9 +27,17 @@ x86_64 | aarch64) ;;
 	exit 1
 	;;
 esac
-triple=$arch-unknown-linux-musl
+libc=${3:-musl}
+case $libc in
+musl | gnu) ;;
+*)
+	echo "build-zr-net.sh: musl or gnu, not $libc" >&2
+	exit 1
+	;;
+esac
+triple=$arch-unknown-linux-$libc
 upper=$(tr a-z- A-Z_ <<<"$triple")
-export ZR_ZIG_TARGET=$arch-linux-musl
+export ZR_ZIG_TARGET=$arch-linux-$libc
 export "CC_${triple//-/_}=$here/zig-cc.sh"
 export "AR_${triple//-/_}=${AR_ZIG:-ar}"
 export "CARGO_TARGET_${upper}_LINKER=$here/zig-cc.sh"
