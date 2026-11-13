@@ -159,6 +159,7 @@ needed() {
 			.github/scripts/zlint.sh | .github/scripts/zlint-suppressed.baseline | \
 			runner/src/native/oci/zstd.zig | runner/src/fuzz_corpus/zstd/* | \
 			runner/src/zr_net.zig | runner/src/tls_stream.zig | runner/src/net_client.zig | runner/src/net_oracle.zig | runner/src/fuzz_corpus/tls/* | runner/rust/* | \
+			runner/tls_oracle.zig | runner/tools/tls_oracle/* | .github/scripts/pg-tls-fixture.sh | \
 			.github/scripts/build-zr-net.sh | \
 			.github/scripts/zig-cc.sh | .github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | \
 			.github/valgrind.supp) return 0 ;;

@@ -1,7 +1,15 @@
 .{
     .name = .zig_actions_runner,
     .version = "0.34.0",
-    .dependencies = .{},
+    // tls.zig, the database's TLS before the network library, only for `zig build test-tls-oracle
+    // -Dtls-oracle` (tls_oracle.zig): lazy, so no other build fetches it. Pinned by commit.
+    .dependencies = .{
+        .tls = .{
+            .url = "https://github.com/ianic/tls.zig/archive/bd22bcb73f423389441a1de80bf031ef1b623cce.tar.gz",
+            .hash = "tls-0.1.0-ER2e0l6qBgDEYo6RBkVZw5UrxOqtI6-OqLwyFJvEr3RK",
+            .lazy = true,
+        },
+    },
     .minimum_zig_version = "0.17.0",
     .paths = .{ "build.zig", "build.zig.zon", "src" },
     .fingerprint = 0x15d4f5868ecf3135,

@@ -12,7 +12,7 @@ time. The project's own license is in [LICENSE](../LICENSE).
 
 ## Dependencies
 
-No Zig packages: `runner/build.zig.zon` lists none (the database's TLS was [ianic/tls.zig](https://github.com/ianic/tls.zig) until the network library's rustls replaced it).
+One Zig package, never in a build of the runner: [ianic/tls.zig](https://github.com/ianic/tls.zig) (MIT), the database's TLS until the network library's rustls replaced it, is a lazy dependency in `runner/build.zig.zon` that only `zig build test-tls-oracle -Dtls-oracle` fetches, to compare the old client with the new one (`runner/tls_oracle.zig`, docs/rust-net.md). Nothing of it is in the runner binary or the SBOM.
 
 ### Rust crates and libc (from the network library, `runner/rust/zr-net`, docs/rust-net.md)
 

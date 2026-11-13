@@ -2,7 +2,8 @@
 # The files for a Postgres that requires TLS and client certificates, for pg.zig's TLS tests
 # (docs/rust-net.md, R2): a private CA, a server certificate for localhost and 127.0.0.1 (ECDSA),
 # client certificates for two users, one with an ECDSA key (`pgecdsa`) and one with an RSA key
-# (`pgrsa`, in PKCS#8 and in PKCS#1 form), a second, unrelated CA, and an init script for the
+# (`pgrsa`, in PKCS#8 and in PKCS#1 form), a second, unrelated CA, the two certificates rustls refuses
+# (a CA used as a leaf, a name only in the subject), and an init script for the
 # container that installs them and makes the server demand them. Nothing here is secret: the keys
 # exist for the test only and are generated afresh each time.
 #
@@ -42,9 +43,18 @@ leaf client-rsa pgrsa "extendedKeyUsage=clientAuth" rsa:2048
 openssl rsa -in client-rsa-key.pem -traditional -out client-rsa-pkcs1-key.pem 2>/dev/null
 # The ECDSA key in SEC1 form ("BEGIN EC PRIVATE KEY").
 openssl ec -in client-ecdsa-key.pem -out client-ecdsa-sec1-key.pem 2>/dev/null
-# A certificate for a CA used as a leaf: what rustls refuses and the old client accepted.
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days $days -subj "/CN=localhost" \
-	-addext "subjectAltName=DNS:localhost" -keyout ca-leaf-key.pem -out ca-leaf.pem 2>/dev/null
+# A server certificate with the name only in the subject (no subjectAltName): rustls refuses it, the
+# old client accepted it (the TLS oracle, runner/tls_oracle.zig).
+leaf subject-only localhost "extendedKeyUsage=serverAuth" ec -pkeyopt ec_paramgen_curve:prime256v1
+# A certificate for a CA used as a leaf (basicConstraints CA:TRUE, signed by the CA, for localhost): what
+# rustls refuses and the old client accepted.
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj "/CN=localhost" \
+	-keyout ca-leaf-key.pem -out ca-leaf.csr 2>/dev/null
+printf '%s\n' "basicConstraints=critical,CA:TRUE" "keyUsage=critical,digitalSignature,keyCertSign" \
+	"subjectAltName=DNS:localhost,IP:127.0.0.1" >ca-leaf.ext
+openssl x509 -req -in ca-leaf.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -days $days -extfile ca-leaf.ext \
+	-out ca-leaf.pem 2>/dev/null
+rm -f ca-leaf.csr ca-leaf.ext
 chmod 644 ./*.pem
 
 # For the container: the files go into PGDATA (the key must be the server's own, mode 0600), the

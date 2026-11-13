@@ -5,7 +5,8 @@
 # build-binaries.sh (the release's binaries), from runner/.
 #
 # The graph must match build.zig's: src/main.zig as the root; build_version, a file holding the
-# version. (No packages: build.zig.zon has none since the database's TLS moved to the network
+# version. (No packages: build.zig.zon's one, tls.zig, is lazy and only the TLS oracle's, `zig build
+# test-tls-oracle -Dtls-oracle`, since the database's TLS moved to the network
 # library, runner/rust/zr-net.) And the executable is a position-independent
 # one (-fPIE, build.zig's `pie`, on by default): static, it loads at a random address (README,
 # "Hardening"). "Binaries (same as zig build)" in release.yml,

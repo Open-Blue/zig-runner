@@ -75,7 +75,9 @@ unreported instead, and the merge queue waiting for it.
   the slow tests (`test_shards.zig`'s `slow`) shared out among the parts on their own. In ci the
   store stress test runs for 10 s, where analysis runs it for minutes.
 - **Database tests**: against TimescaleDB, every test under ThreadSanitizer but the single-threaded
-  exhaustive ones, which the Tests jobs run (`test_shards.zig`).
+  exhaustive ones, which the Tests jobs run (`test_shards.zig`); then the TLS oracle, the database's
+  old TLS client (tls.zig, a lazy dependency fetched by this step alone) against the new one on the
+  same servers (`zig build test-tls-oracle -Dtls-oracle`, docs/rust-net.md).
 - **Release builds** and **Release builds (arm64)**: the release's own builds for both targets in
   ReleaseSafe, so code that doesn't compile for aarch64 fails here rather than after the tag; on
   arm64 the aarch64 binary is run.
@@ -130,7 +132,7 @@ Neither check is required yet.
   severity or worse, or on a license outside the permissive ones an MIT project can take in (the
   list and its one exception are in `security.yml`). It reads GitHub's dependency graph, which sees
   the Go tools' modules under `runner/tools/` and the actions the workflows use. It doesn't see
-  `runner/build.zig.zon` (no packages now) but sees `runner/rust/zr-net/Cargo.lock`, which
+  `runner/build.zig.zon` (its one package is the TLS oracle's, lazy) but sees `runner/rust/zr-net/Cargo.lock`, which
   `cargo-deny` checks too (listed in [docs/THIRD_PARTY.md](THIRD_PARTY.md)), the images the Dockerfile, Compose
   file and scripts pin (Trivy scans the release's image), or the .NET reference program, which has
   no packages.
