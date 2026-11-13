@@ -1,0 +1,3 @@
+kind: Added
+body: 'A Gitea or Forgejo front end, first step: RUNNER_PLATFORM=gitea or forgejo with RUNNER_GITEA_URL and RUNNER_GITEA_REGISTRATION_TOKEN registers a runner (kept in RUNNER_STATE_DIR) and fetches tasks over their Connect JSON protocol. Tasks are logged by name and not run yet.'
+time: 2026-11-12T09:38:12.040193607-05:00

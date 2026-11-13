@@ -24,6 +24,7 @@ const http = @import("github/http.zig");
 const zig_release = @import("zig_release.zig");
 const broker = @import("github/broker.zig");
 const jitconfig = @import("github/jitconfig.zig");
+const gitea_poller = @import("gitea/poller.zig");
 const app = @import("github/app.zig");
 const engine = @import("engine.zig");
 const build_version = @import("version.zig");
@@ -73,6 +74,10 @@ comptime {
     _ = @import("config.zig");
     _ = @import("admission.zig");
     _ = @import("github/http.zig");
+    _ = @import("gitea/state.zig");
+    _ = @import("gitea/task.zig");
+    _ = @import("gitea/client.zig");
+    _ = @import("gitea/poller.zig");
     _ = @import("github/jitconfig.zig");
     _ = @import("github/rsa_sign.zig");
     _ = @import("github/auth.zig");
@@ -222,6 +227,7 @@ pub fn main(process_init: std.process.Init) !u8 {
         };
         cfg.app_auth = &app_auth;
     }
+    if (cfg.platform != .github) return giteaMain(init, &cfg, log, err, secrets, name);
     if (cfg.inspect) return inspect.run(arena, io, &cfg, name, &stdout.interface);
 
     // With no engine a job native cannot run fails, so a machine that cannot run native steps
@@ -283,6 +289,38 @@ pub fn main(process_init: std.process.Init) !u8 {
         std.process.exit(result catch 1);
     }
     return result;
+}
+
+/// A Gitea or Forgejo pool (`gitea/poller.zig`): none of the GitHub set-up above applies (App,
+/// registrations to settle, stale sweep), and the Zig seeds and engine checks wait for G3, which
+/// runs the tasks. Fetching only, so this needs the HTTP client and the stop signals.
+fn giteaMain(
+    init: std.process.Init,
+    cfg: *const Config,
+    log: *sink.LogSink,
+    err: *std.Io.Writer,
+    secrets: []const []const u8,
+    name: []const u8,
+) !u8 {
+    var client: std.http.Client = .{
+        .allocator = init.gpa,
+        .io = init.io,
+        .write_buffer_size = http.write_buffer_size,
+    };
+    defer client.deinit();
+    http.shared.store(&client, .release);
+    installStopSignals();
+    return @backingInt(try gitea_poller.pool(.{
+        .arena = init.arena.allocator(),
+        .gpa = init.gpa,
+        .io = init.io,
+        .environ = init.environ_map,
+        .cfg = cfg,
+        .log = log,
+        .err = err,
+        .secrets = secrets,
+        .name = name,
+    }, cfg.runners));
 }
 
 /// How `nativeRefusal` retries: a failure may be transient (nftables busy, a module not loaded,
@@ -494,7 +532,7 @@ fn allSecrets(
     cfg: *const Config,
     pg_cfg: ?pg.Config,
 ) ![]const []const u8 {
-    var secret_buf: [2][]const u8 = undefined;
+    var secret_buf: [3][]const u8 = undefined;
     var list: std.ArrayList([]const u8) = .empty;
     try list.appendSlice(arena, cfg.secrets(&secret_buf));
     if (pg_cfg) |p| if (p.password.len > 0) try list.append(arena, p.password);
