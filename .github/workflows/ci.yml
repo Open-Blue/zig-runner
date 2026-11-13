@@ -494,9 +494,18 @@ jobs:
           .github/scripts/checksec.sh "$RUNNER_TEMP/dist/zig-runner-linux-x86_64" "$RUNNER_TEMP/dist/zig-runner-linux-aarch64"
           "$RUNNER_TEMP/dist/zig-runner-linux-x86_64" --version
 
+      # The arm64 job runs the aarch64 binary where it runs, from this build rather than a second one
+      # (the same compiler, the same sources, both targets: the same bytes, whichever host built them).
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.scope.outputs.run == 'true'
+        with:
+          name: release-builds
+          path: ${{ runner.temp }}/dist/
+          retention-days: 1
+
   # The aarch64 release binary, run where it runs: on GitHub's arm64 runner, as on razorbill (a Pi,
   # prod), which would otherwise be the first machine ever to execute it. The release's builds
-  # (build-binaries.sh, both targets, so the same commands as Release builds and the tag), checked
+  # (Release builds' own, both targets, as the tag's), checked
   # for their hardening (checksec.sh: static PIE, full RELRO, NX, W^X), the aarch64 binary run once
   # (a static PIE relocates itself at startup, before anything else), then the tests natively on
   # arm64 as the hosted test job runs them on x86_64: rootless, then the native backend's as root.
@@ -504,6 +513,9 @@ jobs:
   # tests (ci-scope.sh binaries and tests); not on main, as Release builds.
   arm64-builds:
     name: Release builds (arm64)
+    # After Release builds, whose binaries it checks and runs: a second build would take as long again
+    # (about 110 s on a runner of its own) for the same bytes.
+    needs: binaries
     if: github.event_name != 'push'
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 30
@@ -520,17 +532,16 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: .github/scripts/ci-scope.sh binaries
 
-      - name: Install Zig
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: steps.scope.outputs.run == 'true'
-        run: .github/scripts/install-zig.sh
-
-      - name: Build for x86_64 and aarch64
-        if: steps.scope.outputs.run == 'true'
-        run: .github/scripts/build-binaries.sh v0.0.0-ci "$RUNNER_TEMP/dist"
+        with:
+          name: release-builds
+          path: ${{ runner.temp }}/dist
 
       - name: Hardening, and the aarch64 binary run
         if: steps.scope.outputs.run == 'true'
         run: |
+          chmod +x "$RUNNER_TEMP"/dist/zig-runner-linux-*
           .github/scripts/checksec.sh "$RUNNER_TEMP/dist/zig-runner-linux-aarch64" "$RUNNER_TEMP/dist/zig-runner-linux-x86_64"
           "$RUNNER_TEMP/dist/zig-runner-linux-aarch64" --version
 
