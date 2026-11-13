@@ -34,6 +34,13 @@
       "separateMinorPatch": true
     },
     {
+      "description": "libzstd, vendored in runner/src/vendor/zstd and pinned by version and tarball SHA-256 in vendor-zstd.sh: its own pull request. Renovate moves the version; the SHA-256 and the vendored files follow by hand (the script says how), which CI enforces by failing until they do (the Workflows job runs vendor-zstd.sh --check), as for Zig's checksums.",
+      "matchDepNames": [
+        "facebook/zstd"
+      ],
+      "groupName": "libzstd"
+    },
+    {
       "description": "A new Lean: its own pull request. proofs/lean-toolchain and install-lean.sh move together, and install-lean.sh's checksums are updated by hand from the release's assets, which CI enforces by failing until they are.",
       "matchDepNames": [
         "leanprover/lean4"
@@ -241,6 +248,19 @@
         "(?:TRIVY|BUILDKIT|SBOM_SCANNER)_IMAGE: (?<depName>[a-z0-9./-]+):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
       ],
       "datasourceTemplate": "docker"
+    },
+    {
+      "description": "libzstd: `version=` in vendor-zstd.sh (releases of facebook/zstd). The tarball's SHA-256 and the vendored files are updated by hand, which CI enforces by failing until they are (vendor-zstd.sh --check, in the Workflows job).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/scripts/vendor-zstd\\.sh$/"
+      ],
+      "matchStrings": [
+        "\\nversion=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "facebook/zstd",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
     },
     {
       "description": "Lean: install-lean.sh and proofs/lean-toolchain (versions are releases of leanprover/lean4).",
