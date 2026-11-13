@@ -208,6 +208,9 @@ jobs:
           # What a TLS server sends the network library's rustls (the database's TLS, docs/rust-net.md):
           # the runs set below are a first guess, to be set from the first run's timing as zstd's was.
           - { target: TLS records, runs: 300K }
+          # What an HTTP server answers the network library's client with (hyper's parsing and our
+          # redirect, header and body handling), one loopback server per run.
+          - { target: HTTP responses, runs: 100K }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

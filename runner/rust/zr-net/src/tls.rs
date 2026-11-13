@@ -122,7 +122,7 @@ pub unsafe fn new(cfg: &Config) -> Result<Tls, (Kind, String)> {
     Ok(Tls { conn, kind: Kind::None, message: String::new() })
 }
 
-fn classify(e: &Error) -> Kind {
+pub fn classify(e: &Error) -> Kind {
     match e {
         Error::InvalidCertificate(CertificateError::UnknownIssuer) => Kind::UnknownIssuer,
         Error::InvalidCertificate(CertificateError::Expired | CertificateError::NotValidYet) => Kind::Expired,

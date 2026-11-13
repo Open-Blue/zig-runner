@@ -32,6 +32,9 @@ const build_version = @import("version.zig");
 comptime {
     _ = @import("sha256.zig");
     _ = @import("zr_net.zig");
+    _ = @import("net_client.zig");
+    _ = @import("net_oracle.zig");
+    _ = @import("github/request_line.zig");
     _ = @import("sink.zig");
     _ = @import("native/Backend.zig");
     _ = @import("native/cgroup.zig");

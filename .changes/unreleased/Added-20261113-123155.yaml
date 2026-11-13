@@ -1,0 +1,3 @@
+kind: Added
+body: 'The runner''s GitHub App, OAuth and registration calls (auth, app, jitconfig) go through the network library''s HTTP client (rustls over hyper) instead of std''s, which sets TCP_NODELAY, drops credentials on a redirect to another origin, reads HTTPS_PROXY, HTTP_PROXY and NO_PROXY and SSL_CERT_FILE, and logs one request: line per call with exact DNS, connect, TLS and first-byte times'
+time: 2026-11-13T12:31:55.180528054-05:00

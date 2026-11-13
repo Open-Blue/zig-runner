@@ -202,7 +202,7 @@ start() {
 	# the memory gate is off, so how fast the jobs start depends on GitHub, not on a reservation.
 	# The Zig cache seed is not built: it costs 104 s of one core, and only the tool cache job runs
 	# Zig. Only the dispatches of the workflows' ref are trusted; jobs from anywhere else fail.
-	nohup sudo env GH_SCOPE="$repo" GH_APP_ID="$GH_APP_ID" \
+	nohup sudo env TSAN_OPTIONS="suppressions=$PWD/.github/tsan.supp" GH_SCOPE="$repo" GH_APP_ID="$GH_APP_ID" \
 		GH_APP_PRIVATE_KEY_FILE="$GH_APP_PRIVATE_KEY_FILE" \
 		RUNNER_LABELS="self-hosted,linux,zig,$label" RUNNER_NAME_PREFIX="e2e-$backend" \
 		RUNNER_COUNT=8 RUNNER_ADMISSION=false RUNNER_ZIG_SEED_VERSIONS= \

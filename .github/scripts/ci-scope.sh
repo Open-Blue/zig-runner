@@ -158,7 +158,7 @@ needed() {
 			.github/scripts/zig-race-tests.sh | .github/scripts/zig-stress.sh | \
 			.github/scripts/zlint.sh | .github/scripts/zlint-suppressed.baseline | \
 			runner/src/native/oci/zstd.zig | runner/src/fuzz_corpus/zstd/* | \
-			runner/src/zr_net.zig | runner/src/tls_stream.zig | runner/src/fuzz_corpus/tls/* | runner/rust/* | \
+			runner/src/zr_net.zig | runner/src/tls_stream.zig | runner/src/net_client.zig | runner/src/net_oracle.zig | runner/src/fuzz_corpus/tls/* | runner/rust/* | \
 			.github/scripts/build-zr-net.sh | \
 			.github/scripts/zig-cc.sh | .github/scripts/install-rust.sh | \
 			.github/valgrind.supp) return 0 ;;
