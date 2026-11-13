@@ -133,7 +133,7 @@ fn connection(io: std.Io, client: std.Io.net.Stream, port: u16) void {
     var back: std.Io.Group = .init;
     back.concurrent(io, pump, .{ io, instance, client }) catch return;
     pump(io, client, instance);
-    back.await(io) catch {};
+    back.await(io) catch |e| std.log.debug("gitea: forward: {s}", .{@errorName(e)});
 }
 
 /// Copies `from` to `to` to the end, then tells `to` there is no more.

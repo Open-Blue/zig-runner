@@ -713,7 +713,7 @@ const Socket = struct {
         // An instance on the loopback is served at the bridge's address, which is the host's own:
         // its packets go through the host's INPUT (ufw's, whose policy drops), which must accept
         // the bridge's too, leaving the deciding to the runner's table as in FORWARD.
-        if (hostOwn(reach)) if (try s.chain("filter", "INPUT") != null) accept.appendBounded("INPUT") catch {};
+        if (hostOwn(reach)) if (try s.chain("filter", "INPUT") != null) accept.appendBounded("INPUT") catch return error.TooManyRules;
         const scanned = [_][2][]const u8{
             .{ "filter", "FORWARD" }, .{ "filter", "DOCKER-USER" },
             .{ "filter", "INPUT" },   .{ "nat", "POSTROUTING" },
