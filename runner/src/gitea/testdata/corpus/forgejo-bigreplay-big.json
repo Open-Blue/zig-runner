@@ -1,0 +1,57 @@
+{
+ "task": {
+  "id": "8",
+  "workflowPayload": "bmFtZTogYmlncmVwbGF5CiJvbiI6CiAgICB3b3JrZmxvd19kaXNwYXRjaDoKICAgICAgICBpbnB1dHM6CiAgICAgICAgICAgIG5vbmNlOgogICAgICAgICAgICAgICAgZGVzY3JpcHRpb246IEtleSBmb3IgdGhlIGNhY2hlYWJsZSBzdGVwcwogICAgICAgICAgICAgICAgcmVxdWlyZWQ6IHRydWUKam9iczoKICAgIGJpZzoKICAgICAgICBuYW1lOiBiaWcKICAgICAgICBydW5zLW9uOgogICAgICAgICAgICAtIHNlbGYtaG9zdGVkCiAgICAgICAgICAgIC0gbGFwdG9wCiAgICAgICAgZW52OgogICAgICAgICAgICBST1VORDogJHt7IGlucHV0cy5ub25jZSB9fQogICAgICAgIHN0ZXBzOgogICAgICAgICAgICAtIGlkOiBiaWcKICAgICAgICAgICAgICBuYW1lOiBiaWcgb3V0cHV0CiAgICAgICAgICAgICAgcnVuOiB8CiAgICAgICAgICAgICAgICBlY2hvICJyb3VuZCAkUk9VTkQgZmlyc3QiCiAgICAgICAgICAgICAgICBzZXEgLWYgJ2JpZyBsaW5lICUwOGcgLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uJyAxIDEwMDAwMAogICAgICAgICAgICAgICAgZWNobyAiYmlnPW9rIiA+PiAiJEdJVEhVQl9PVVRQVVQiCiAgICAgICAgICAgICAgICBlY2hvICJyb3VuZCAkUk9VTkQgbGFzdCIKICAgICAgICAgICAgLSBuYW1lOiBzbWFsbCBhZnRlcgogICAgICAgICAgICAgIHJ1bjogfAogICAgICAgICAgICAgICAgZWNobyAicm91bmQgJFJPVU5EIHNtYWxsIgogICAgICAgICAgICAgICAgZWNobyAiYmlnIG91dHB1dCBzYWlkICR7eyBzdGVwcy5iaWcub3V0cHV0cy5iaWcgfX0iCg==",
+  "context": {
+   "action": "",
+   "action_path": "",
+   "action_ref": "",
+   "action_repository": "",
+   "action_status": "",
+   "actor": "zradmin",
+   "api_url": "http://127.0.0.1:3400/api/v1",
+   "base_ref": "",
+   "env": "",
+   "event": {
+    "inputs": {
+     "nonce": "x1"
+    }
+   },
+   "event_name": "workflow_dispatch",
+   "event_path": "",
+   "gitea_default_actions_url": "https://data.forgejo.org",
+   "gitea_runtime_token": "ctx-gitea_runtime_token",
+   "graphql_url": "",
+   "head_ref": "",
+   "job": "big",
+   "job_name": "",
+   "path": "",
+   "ref": "refs/heads/main",
+   "ref_name": "main",
+   "ref_protected": false,
+   "ref_type": "branch",
+   "repository": "zradmin/probe",
+   "repositoryUrl": "http://127.0.0.1:3400/zradmin/probe",
+   "repository_owner": "zradmin",
+   "retention_days": "",
+   "run_attempt": "1",
+   "run_id": "27",
+   "run_number": "27",
+   "runner_perflog": "",
+   "runner_tracking_id": "",
+   "secret_source": "Actions",
+   "server_url": "http://127.0.0.1:3400/",
+   "sha": "234a85ed2e40e4364cf475773ffd15f19c2566d0",
+   "token": "ctx-token",
+   "triggering_actor": "",
+   "workflow": "bigreplay.yml",
+   "workspace": ""
+  },
+  "secrets": {
+   "FORGEJO_TOKEN": "ci-secret-FORGEJO_TOKEN",
+   "GITEA_TOKEN": "ci-secret-GITEA_TOKEN",
+   "GITHUB_TOKEN": "ci-secret-GITHUB_TOKEN"
+  }
+ },
+ "tasksVersion": "46"
+}

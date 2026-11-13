@@ -1,0 +1,60 @@
+{
+ "task": {
+  "id": "36",
+  "workflowPayload": "bmFtZTogZTJlCiJvbiI6CiAgICB3b3JrZmxvd19kaXNwYXRjaDoKICAgICAgICBpbnB1dHM6CiAgICAgICAgICAgIGxhYmVsOgogICAgICAgICAgICAgICAgZGVzY3JpcHRpb246IFRoZSBydW5uZXIgbGFiZWwgdG8gcnVuIG9uIChlMmUuc2ggZ2l2ZXMgZWFjaCBydW4gaXRzIG93bikKICAgICAgICAgICAgICAgIHJlcXVpcmVkOiB0cnVlCiAgICAgICAgICAgIHRhZzoKICAgICAgICAgICAgICAgIGRlc2NyaXB0aW9uOiBVbmlxdWUgbmFtZSBmb3IgdGhpcyBydW4gKHRoZSBoYXJuZXNzIGZpbmRzIHRoZSBydW4gYnkgaXQpCiAgICAgICAgICAgICAgICByZXF1aXJlZDogdHJ1ZQogICAgICAgICAgICBub25jZToKICAgICAgICAgICAgICAgIGRlc2NyaXB0aW9uOiBEaWZmZXJzIHBlciBydW4sIHNvIG5vIHN0ZXAgaXMgcmVwbGF5ZWQgZnJvbSBhbiBlYXJsaWVyIHJ1biAoYSByZXJ1biBrZWVwcyBpdCkKICAgICAgICAgICAgICAgIHJlcXVpcmVkOiB0cnVlCiAgICAgICAgICAgIHppZ19ydW5uZXJfcmVmOgogICAgICAgICAgICAgICAgZGVzY3JpcHRpb246IFRoZSB6aWctcnVubmVyIGNvbW1pdCB3aG9zZSBpbnN0YWxsLXppZy5zaCB0aGUgdG9vbGNhY2hlIGpvYiBydW5zCiAgICAgICAgICAgICAgICByZXF1aXJlZDogdHJ1ZQogICAgICAgICAgICAgICAgZGVmYXVsdDogbWFpbgplbnY6CiAgICBFMkVfTk9OQ0U6ICR7eyBpbnB1dHMubm9uY2UgfX0Kam9iczoKICAgIGRvY2tlcjoKICAgICAgICBuYW1lOiBkb2NrZXIKICAgICAgICBydW5zLW9uOgogICAgICAgICAgICAtIHNlbGYtaG9zdGVkCiAgICAgICAgICAgIC0gZTJlCiAgICAgICAgc3RlcHM6CiAgICAgICAgICAgIC0gaWQ6IGQKICAgICAgICAgICAgICBuYW1lOiBBIGRvY2tlcjovLyBzdGVwCiAgICAgICAgICAgICAgdXNlczogZG9ja2VyOi8vYWxwaW5lOjMuMjJAc2hhMjU2OjJlMGI4MWQ2MDU5N2Y0NDliYWE1NmRjMjVkMzU1MzY3ODY5ZDJkY2E0Y2Q1N2U4NjZmMWUyYjUyYWYzZWI1NWYKICAgICAgICAgICAgICB3aXRoOgogICAgICAgICAgICAgICAgYXJnczogLWMgImVjaG8gZG9ja2VyLXN0ZXAtb2sgb24gYWxwaW5lICQoY2F0IC9ldGMvYWxwaW5lLXJlbGVhc2UpOyBlY2hvIGZyb21fZG9ja2VyPXllcyA+PiAkR0lUSFVCX09VVFBVVCIKICAgICAgICAgICAgICAgIGVudHJ5cG9pbnQ6IC9iaW4vc2gKICAgICAgICAgICAgLSBuYW1lOiBJdHMgb3V0cHV0CiAgICAgICAgICAgICAgcnVuOiB8CiAgICAgICAgICAgICAgICBlY2hvICJub25jZSAkRTJFX05PTkNFIgogICAgICAgICAgICAgICAgdGVzdCAiJEZST01fRE9DS0VSIiA9IHllcwogICAgICAgICAgICAgICAgZWNobyAiZTJlIiItb2sgZG9ja2VyIgogICAgICAgICAgICAgIGVudjoKICAgICAgICAgICAgICAgIEZST01fRE9DS0VSOiAke3sgc3RlcHMuZC5vdXRwdXRzLmZyb21fZG9ja2VyIH19CiAgICAgICAgdGltZW91dC1taW51dGVzOiAiMTAiCg==",
+  "context": {
+   "action": "",
+   "action_path": "",
+   "action_ref": "",
+   "action_repository": "",
+   "action_status": "",
+   "actor": "zradmin",
+   "api_url": "http://127.0.0.1:3400/api/v1",
+   "base_ref": "",
+   "env": "",
+   "event": {
+    "inputs": {
+     "label": "e2e",
+     "nonce": "n2",
+     "tag": "x2",
+     "zig_runner_ref": "main"
+    }
+   },
+   "event_name": "workflow_dispatch",
+   "event_path": "",
+   "gitea_default_actions_url": "https://data.forgejo.org",
+   "gitea_runtime_token": "ctx-gitea_runtime_token",
+   "graphql_url": "",
+   "head_ref": "",
+   "job": "docker",
+   "job_name": "",
+   "path": "",
+   "ref": "refs/heads/main",
+   "ref_name": "main",
+   "ref_protected": false,
+   "ref_type": "branch",
+   "repository": "zradmin/probe",
+   "repositoryUrl": "http://127.0.0.1:3400/zradmin/probe",
+   "repository_owner": "zradmin",
+   "retention_days": "",
+   "run_attempt": "1",
+   "run_id": "53",
+   "run_number": "53",
+   "runner_perflog": "",
+   "runner_tracking_id": "",
+   "secret_source": "Actions",
+   "server_url": "http://127.0.0.1:3400/",
+   "sha": "0c9e00d1b852a9d98b02c633ddbbb1fc7f0b436f",
+   "token": "ctx-token",
+   "triggering_actor": "",
+   "workflow": "e2e.yml",
+   "workspace": ""
+  },
+  "secrets": {
+   "FORGEJO_TOKEN": "ci-secret-FORGEJO_TOKEN",
+   "GITEA_TOKEN": "ci-secret-GITEA_TOKEN",
+   "GITHUB_TOKEN": "ci-secret-GITHUB_TOKEN"
+  }
+ },
+ "tasksVersion": "53"
+}

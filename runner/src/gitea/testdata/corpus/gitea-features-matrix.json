@@ -1,0 +1,57 @@
+{
+ "task": {
+  "id": "90",
+  "workflowPayload": "bmFtZTogZmVhdHVyZXMKJ29uJzoKICB3b3JrZmxvd19kaXNwYXRjaDoKICAgIGlucHV0czoKICAgICAgd2hvOgogICAgICAgIGRlc2NyaXB0aW9uOiBXaG9tIHRvIGdyZWV0CiAgICAgICAgcmVxdWlyZWQ6IHRydWUKICAgICAgICBkZWZhdWx0OiB3b3JsZAplbnY6CiAgV09SS0ZMT1dfTEVWRUw6ICR7eyBnaXRodWIucmVwb3NpdG9yeSB9fQogIFFVT1RFRDogaXQncyB7YnJhY2VkfQpqb2JzOgogIG1hdHJpeDoKICAgIG5hbWU6IG1hdHJpeCAoZmFsc2UsIHRydWUsIDIwLCBsaW51eCwgMy4xMCwgMS41KQogICAgcnVucy1vbjoKICAgICAgLSBzZWxmLWhvc3RlZAogICAgICAtIGUyZQogICAgaWY6IGFsd2F5cygpCiAgICBzdGVwczoKICAgICAgLSBpZjogbWF0cml4LmV4cGVyaW1lbnRhbCA9PSBmYWxzZQogICAgICAgIHJ1bjogZWNobyAiJHt7IG1hdHJpeC5vcyB9fSAke3sgbWF0cml4LnB5dGhvbiB9fSAke3sgbWF0cml4LmV4cGVyaW1lbnRhbCB9fSAke3sgbWF0cml4LnZlcnNpb24gfX0gJHt7IG1hdHJpeC5ub2RlIH19IgogICAgICAtIHJ1bjogZWNobyAiJHt7IHN0cmF0ZWd5LmpvYi10b3RhbCB9fSAke3sgc3RyYXRlZ3kuZmFpbC1mYXN0IH19IgogICAgY29udGludWUtb24tZXJyb3I6IGZhbHNlCiAgICBzdHJhdGVneToKICAgICAgZmFpbC1mYXN0OiAiZmFsc2UiCiAgICAgIG1heC1wYXJhbGxlbDogIjIiCiAgICAgIG1hdHJpeDoKICAgICAgICBleHBlcmltZW50YWw6CiAgICAgICAgICAtIGZhbHNlCiAgICAgICAgZXh0cmE6CiAgICAgICAgICAtIHRydWUKICAgICAgICBub2RlOgogICAgICAgICAgLSAyMAogICAgICAgIG9zOgogICAgICAgICAgLSBsaW51eAogICAgICAgIHB5dGhvbjoKICAgICAgICAgIC0gIjMuMTAiCiAgICAgICAgdmVyc2lvbjoKICAgICAgICAgIC0gMS41CiAgICAgIGpvYi10b3RhbDogMQpkZWZhdWx0czoKICBydW46CiAgICBzaGVsbDogYmFzaAogICAgd29ya2luZy1kaXJlY3Rvcnk6IC90bXAK",
+  "context": {
+   "action": "",
+   "action_path": "",
+   "action_ref": "",
+   "action_repository": "",
+   "action_status": "",
+   "actor": "zradmin",
+   "actor_id": "1",
+   "api_url": "http://127.0.0.1:3300/api/v1",
+   "base_ref": "",
+   "env": "",
+   "event": {
+    "inputs": {
+     "who": "world"
+    }
+   },
+   "event_name": "workflow_dispatch",
+   "event_path": "",
+   "gitea_default_actions_url": "https://github.com",
+   "gitea_runtime_token": "ctx-gitea_runtime_token",
+   "graphql_url": "",
+   "head_ref": "",
+   "job": "matrix",
+   "path": "",
+   "ref": "refs/heads/main",
+   "ref_name": "main",
+   "ref_protected": false,
+   "ref_type": "branch",
+   "repository": "zradmin/probe",
+   "repositoryUrl": "http://127.0.0.1:3300/zradmin/probe",
+   "repository_id": "1",
+   "repository_owner": "zradmin",
+   "repository_owner_id": "1",
+   "retention_days": "90",
+   "run_attempt": "1",
+   "run_id": "48",
+   "run_number": "48",
+   "secret_source": "Actions",
+   "server_url": "http://127.0.0.1:3300/",
+   "sha": "9b5697c6de857cb108b0d95eaca8ace7902bad9e",
+   "token": "ctx-token",
+   "triggering_actor": "zradmin",
+   "workflow": "features.yml",
+   "workflow_sha": "9b5697c6de857cb108b0d95eaca8ace7902bad9e",
+   "workspace": ""
+  },
+  "secrets": {
+   "GITEA_TOKEN": "ci-secret-GITEA_TOKEN",
+   "GITHUB_TOKEN": "ci-secret-GITHUB_TOKEN"
+  }
+ },
+ "tasksVersion": "53"
+}

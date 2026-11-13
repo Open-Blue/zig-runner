@@ -1514,7 +1514,7 @@ fn countTemplatePiece(counted: *usize, text: []const u8, scope: Scope, arena: Al
 }
 
 /// Index of the `}}` that ends the expression starting at `from`, skipping 'quoted' strings.
-fn expressionEnd(text: []const u8, from: usize) ?usize {
+pub fn expressionEnd(text: []const u8, from: usize) ?usize {
     var i = from;
     var in_str = false;
     while (i < text.len) : (i += 1) {

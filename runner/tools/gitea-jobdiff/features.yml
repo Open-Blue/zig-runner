@@ -1,0 +1,111 @@
+# Everything the conversion of a Gitea or Forgejo task reads that the e2e suite's workflows do not
+# use: a job container, services, defaults at both levels, matrix values of every type, step
+# conditions, continue-on-error and timeouts as expressions, `with`, the `uses` forms, and
+# expressions with quotes and braces around them.
+name: features
+on:
+  workflow_dispatch:
+    inputs:
+      who:
+        description: Whom to greet
+        required: true
+        default: world
+env:
+  WORKFLOW_LEVEL: ${{ github.repository }}
+  QUOTED: it's {braced}
+defaults:
+  run:
+    shell: bash
+    working-directory: /tmp
+jobs:
+  container:
+    name: container ${{ inputs.who }}
+    runs-on: [self-hosted, e2e]
+    timeout-minutes: 20
+    container:
+      image: node:22-bookworm
+      env:
+        FROM_CONTAINER: ${{ github.sha }}
+      options: --cpus 1
+      credentials:
+        username: someone
+        password: ${{ secrets.REGISTRY_PASSWORD }}
+      volumes:
+        - /tmp/a:/tmp/b
+    services:
+      db:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready
+      cache: redis:7
+    env:
+      JOB_LEVEL: ${{ inputs.who }} says 'hi'
+      NUM: 12
+    defaults:
+      run:
+        working-directory: /work
+    outputs:
+      greeting: ${{ steps.say.outputs.greeting }}
+      fixed: constant
+    steps:
+      - name: Say
+        id: say
+        run: |
+          echo "greeting=hello ${{ inputs.who }}" >> "$GITHUB_OUTPUT"
+        working-directory: ${{ github.workspace }}
+      - name: Conditional ${{ github.ref_name }}
+        if: github.event_name == 'workflow_dispatch' && !cancelled()
+        run: echo "it's ${{ github.ref }} {not} }} braces"
+        shell: sh
+      - if: ${{ failure() }}
+        run: echo failed
+        continue-on-error: ${{ github.event_name == 'push' }}
+        timeout-minutes: ${{ fromJSON('3') }}
+      - run: print(1)
+        shell: python
+        env:
+          A: 1
+          B: ${{ secrets.TOKEN }}-${{ vars.X }}
+      - uses: docker://alpine:3.22
+        with:
+          entrypoint: /bin/sh
+          args: -c "echo ${{ github.actor }}"
+      - uses: ./.gitea/actions/mine
+        with:
+          who: ${{ inputs.who }}
+          count: 3
+          flag: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+        timeout-minutes: 5
+      - uses: actions/upload-artifact/sub/dir@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          fetch-depth: 0
+  matrix:
+    runs-on: [self-hosted, e2e]
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [linux]
+        python: ['3.10', "3.12"]
+        experimental: [false]
+        version: [1.5]
+        node: [20]
+        include:
+          - os: linux
+            extra: true
+        exclude:
+          - python: '3.12'
+    continue-on-error: ${{ matrix.experimental }}
+    steps:
+      - run: echo "${{ matrix.os }} ${{ matrix.python }} ${{ matrix.experimental }} ${{ matrix.version }} ${{ matrix.node }}"
+        if: matrix.experimental == false
+      - run: echo "${{ strategy.job-total }} ${{ strategy.fail-fast }}"

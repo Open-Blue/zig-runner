@@ -1,0 +1,57 @@
+{
+ "task": {
+  "id": "11",
+  "workflowPayload": "bmFtZTogZ2Fwc3RlcHMKIm9uIjoKICAgIHdvcmtmbG93X2Rpc3BhdGNoOgogICAgICAgIGlucHV0czoKICAgICAgICAgICAgc2xvdHM6CiAgICAgICAgICAgICAgICBkZXNjcmlwdGlvbjogSlNPTiBsaXN0LCBvbmUgam9iIHBlciBlbnRyeQogICAgICAgICAgICAgICAgcmVxdWlyZWQ6IHRydWUKICAgICAgICAgICAgICAgIGRlZmF1bHQ6ICJbMSwyLDMsNCw1LDYsNyw4XSIKam9iczoKICAgIHN0ZXBzOgogICAgICAgIG5hbWU6ICdqb2IgJwogICAgICAgIHJ1bnMtb246CiAgICAgICAgICAgIC0gc2VsZi1ob3N0ZWQKICAgICAgICAgICAgLSBsYXB0b3AKICAgICAgICBlbnY6CiAgICAgICAgICAgIEJFTkNIX05PTkNFOiAke3sgZ2l0aHViLnJ1bl9pZCB9fS0ke3sgZ2l0aHViLnJ1bl9hdHRlbXB0IH19LSR7eyBtYXRyaXguc2xvdCB9fQogICAgICAgIHN0ZXBzOgogICAgICAgICAgICAtIG5hbWU6IHN0ZXAgMQogICAgICAgICAgICAgIHJ1bjogZm9yIGkgaW4gJChzZXEgMSAzMCk7IGRvIGVjaG8gInN0ZXAgMSBsaW5lICRpICRCRU5DSF9OT05DRSI7IGRvbmU7IHNsZWVwIDIKICAgICAgICAgICAgLSBuYW1lOiBzdGVwIDIKICAgICAgICAgICAgICBydW46IGZvciBpIGluICQoc2VxIDEgMzApOyBkbyBlY2hvICJzdGVwIDIgbGluZSAkaSAkQkVOQ0hfTk9OQ0UiOyBkb25lOyBzbGVlcCAyCiAgICAgICAgICAgIC0gbmFtZTogc3RlcCAzCiAgICAgICAgICAgICAgcnVuOiBmb3IgaSBpbiAkKHNlcSAxIDMwKTsgZG8gZWNobyAic3RlcCAzIGxpbmUgJGkgJEJFTkNIX05PTkNFIjsgZG9uZTsgc2xlZXAgMgogICAgICAgICAgICAtIG5hbWU6IHN0ZXAgNAogICAgICAgICAgICAgIHJ1bjogZm9yIGkgaW4gJChzZXEgMSAzMCk7IGRvIGVjaG8gInN0ZXAgNCBsaW5lICRpICRCRU5DSF9OT05DRSI7IGRvbmU7IHNsZWVwIDIKICAgICAgICAgICAgLSBuYW1lOiBzdGVwIDUKICAgICAgICAgICAgICBydW46IGZvciBpIGluICQoc2VxIDEgMzApOyBkbyBlY2hvICJzdGVwIDUgbGluZSAkaSAkQkVOQ0hfTk9OQ0UiOyBkb25lOyBlY2hvICI6Om5vdGljZTo6ZG9uZSAkQkVOQ0hfTk9OQ0UiCiAgICAgICAgc3RyYXRlZ3k6CiAgICAgICAgICAgIGZhaWwtZmFzdDogImZhbHNlIgo=",
+  "context": {
+   "action": "",
+   "action_path": "",
+   "action_ref": "",
+   "action_repository": "",
+   "action_status": "",
+   "actor": "zradmin",
+   "api_url": "http://127.0.0.1:3400/api/v1",
+   "base_ref": "",
+   "env": "",
+   "event": {
+    "inputs": {
+     "slots": "[1,2,3,4,5,6,7,8]"
+    }
+   },
+   "event_name": "workflow_dispatch",
+   "event_path": "",
+   "gitea_default_actions_url": "https://data.forgejo.org",
+   "gitea_runtime_token": "ctx-gitea_runtime_token",
+   "graphql_url": "",
+   "head_ref": "",
+   "job": "steps",
+   "job_name": "",
+   "path": "",
+   "ref": "refs/heads/main",
+   "ref_name": "main",
+   "ref_protected": false,
+   "ref_type": "branch",
+   "repository": "zradmin/probe",
+   "repositoryUrl": "http://127.0.0.1:3400/zradmin/probe",
+   "repository_owner": "zradmin",
+   "retention_days": "",
+   "run_attempt": "1",
+   "run_id": "33",
+   "run_number": "33",
+   "runner_perflog": "",
+   "runner_tracking_id": "",
+   "secret_source": "Actions",
+   "server_url": "http://127.0.0.1:3400/",
+   "sha": "234a85ed2e40e4364cf475773ffd15f19c2566d0",
+   "token": "ctx-token",
+   "triggering_actor": "",
+   "workflow": "gapsteps.yml",
+   "workspace": ""
+  },
+  "secrets": {
+   "FORGEJO_TOKEN": "ci-secret-FORGEJO_TOKEN",
+   "GITEA_TOKEN": "ci-secret-GITEA_TOKEN",
+   "GITHUB_TOKEN": "ci-secret-GITHUB_TOKEN"
+  }
+ },
+ "tasksVersion": "46"
+}

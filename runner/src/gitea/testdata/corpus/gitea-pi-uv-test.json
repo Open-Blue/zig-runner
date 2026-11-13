@@ -1,0 +1,58 @@
+{
+ "task": {
+  "id": "81",
+  "workflowPayload": "bmFtZTogcGktdXYKJ29uJzoKICB3b3JrZmxvd19kaXNwYXRjaDoKICAgIGlucHV0czoKICAgICAgc2xvdHM6CiAgICAgICAgZGVzY3JpcHRpb246IEpTT04gbGlzdCwgb25lIGpvYiBwZXIgZW50cnkgKGUuZy4gWzEsMiwzLDRdKQogICAgICAgIHJlcXVpcmVkOiB0cnVlCiAgICAgICAgZGVmYXVsdDogIlsxXSIKICAgICAgdGFnOgogICAgICAgIGRlc2NyaXB0aW9uOiBVbmlxdWUgbmFtZSBmb3IgdGhpcyBydW4gKHRoZSBoYXJuZXNzIGZpbmRzIHRoZSBydW4gYnkgaXQpCiAgICAgICAgcmVxdWlyZWQ6IHRydWUKICAgICAgICBkZWZhdWx0OiBtYW51YWwKam9iczoKICB0ZXN0OgogICAgbmFtZTogdXYgMQogICAgcnVucy1vbjoKICAgICAgLSBzZWxmLWhvc3RlZAogICAgICAtIHBpLWJlbmNoCiAgICBlbnY6CiAgICAgIEJFTkNIX05PTkNFOiAke3sgZ2l0aHViLnJ1bl9pZCB9fS0ke3sgZ2l0aHViLnJ1bl9hdHRlbXB0IH19LSR7eyBtYXRyaXguc2xvdCB9fQogICAgICBVVl9QWVRIT05fRE9XTkxPQURTOiBuZXZlcgogICAgaWY6IGFsd2F5cygpCiAgICBzdGVwczoKICAgICAgLSB1c2VzOiBhY3Rpb25zL2NoZWNrb3V0QDExZDU5NjBhMzI2NzUwZDU4MzgwNzhlMzZjZjM4Yjg1YWY2NzcyNjIKICAgICAgICB3aXRoOgogICAgICAgICAgcGVyc2lzdC1jcmVkZW50aWFsczogZmFsc2UKICAgICAgLSB1c2VzOiBhc3RyYWwtc2gvc2V0dXAtdXZAMDdhMDQ3ZTYwOGRiODRiM2Q4YzA2Y2Q5YTdjN2RjYzljMzU1YzE4ZQogICAgICAgIHdpdGg6CiAgICAgICAgICB2ZXJzaW9uOiAiMC4xMy41IgogICAgICAgICAgZW5hYmxlLWNhY2hlOiBmYWxzZQogICAgICAtIG5hbWU6IFN5bmMKICAgICAgICBydW46IHV2IHN5bmMgLS1sb2NrZWQKICAgICAgICB3b3JraW5nLWRpcmVjdG9yeTogdG9vbHMvcGkvdXZwcm9qCiAgICAgIC0gbmFtZTogVGVzdAogICAgICAgIHJ1bjogdXYgcnVuIC0tZnJvemVuIHB5dGVzdCAtcQogICAgICAgIHdvcmtpbmctZGlyZWN0b3J5OiB0b29scy9waS91dnByb2oKICAgIHRpbWVvdXQtbWludXRlczogIjE1IgogICAgc3RyYXRlZ3k6CiAgICAgIGZhaWwtZmFzdDogImZhbHNlIgogICAgICBtYXRyaXg6CiAgICAgICAgc2xvdDoKICAgICAgICAgIC0gMQogICAgICBqb2ItdG90YWw6IDEKICAgIHBlcm1pc3Npb25zOgogICAgICBjb250ZW50czogcmVhZApwZXJtaXNzaW9uczoge30K",
+  "context": {
+   "action": "",
+   "action_path": "",
+   "action_ref": "",
+   "action_repository": "",
+   "action_status": "",
+   "actor": "zradmin",
+   "actor_id": "1",
+   "api_url": "http://127.0.0.1:3300/api/v1",
+   "base_ref": "",
+   "env": "",
+   "event": {
+    "inputs": {
+     "slots": "[1]",
+     "tag": "manual"
+    }
+   },
+   "event_name": "workflow_dispatch",
+   "event_path": "",
+   "gitea_default_actions_url": "https://github.com",
+   "gitea_runtime_token": "ctx-gitea_runtime_token",
+   "graphql_url": "",
+   "head_ref": "",
+   "job": "test",
+   "path": "",
+   "ref": "refs/heads/main",
+   "ref_name": "main",
+   "ref_protected": false,
+   "ref_type": "branch",
+   "repository": "zradmin/probe",
+   "repositoryUrl": "http://127.0.0.1:3300/zradmin/probe",
+   "repository_id": "1",
+   "repository_owner": "zradmin",
+   "repository_owner_id": "1",
+   "retention_days": "90",
+   "run_attempt": "1",
+   "run_id": "41",
+   "run_number": "41",
+   "secret_source": "Actions",
+   "server_url": "http://127.0.0.1:3300/",
+   "sha": "f61e59bd01f502c47ba87271d08d99a8bf18d290",
+   "token": "ctx-token",
+   "triggering_actor": "zradmin",
+   "workflow": "pi-uv.yml",
+   "workflow_sha": "f61e59bd01f502c47ba87271d08d99a8bf18d290",
+   "workspace": ""
+  },
+  "secrets": {
+   "GITEA_TOKEN": "ci-secret-GITEA_TOKEN",
+   "GITHUB_TOKEN": "ci-secret-GITHUB_TOKEN"
+  }
+ },
+ "tasksVersion": "51"
+}

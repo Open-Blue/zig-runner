@@ -1,0 +1,58 @@
+{
+ "task": {
+  "id": "59",
+  "workflowPayload": "bmFtZTogZTJlLWNhbmNlbAonb24nOgogIHdvcmtmbG93X2Rpc3BhdGNoOgogICAgaW5wdXRzOgogICAgICBsYWJlbDoKICAgICAgICBkZXNjcmlwdGlvbjogVGhlIHJ1bm5lciBsYWJlbCB0byBydW4gb24gKGUyZS5zaCBnaXZlcyBlYWNoIHJ1biBpdHMgb3duKQogICAgICAgIHJlcXVpcmVkOiB0cnVlCiAgICAgIHRhZzoKICAgICAgICBkZXNjcmlwdGlvbjogVW5pcXVlIG5hbWUgZm9yIHRoaXMgcnVuICh0aGUgaGFybmVzcyBmaW5kcyB0aGUgcnVuIGJ5IGl0KQogICAgICAgIHJlcXVpcmVkOiB0cnVlCmpvYnM6CiAgaG9nOgogICAgbmFtZTogaG9nCiAgICBydW5zLW9uOgogICAgICAtIHNlbGYtaG9zdGVkCiAgICAgIC0gZTJlCiAgICBpZjogYWx3YXlzKCkKICAgIHN0ZXBzOgogICAgICAtIG5hbWU6IEhvZwogICAgICAgIHJ1bjogfAogICAgICAgICAgZWNobyAiZTJlIiItaG9nIHN0YXJ0ZWQiCiAgICAgICAgICB5ZXMgZTJlLWNhbmNlbC1ob2cgPi9kZXYvbnVsbCAmCiAgICAgICAgICBzbGVlcCA2MDAKICAgICAgLSBuYW1lOiBBZnRlcgogICAgICAgIHJ1bjogZWNobyAiZTJlIiItYWZ0ZXIgcmFuIgogICAgICAtIGlmOiBhbHdheXMoKQogICAgICAgIG5hbWU6IEFsd2F5cwogICAgICAgIHJ1bjogZWNobyAiZTJlIiItYWx3YXlzIHJhbiIKICAgICAgLSBpZjogY2FuY2VsbGVkKCkKICAgICAgICBuYW1lOiBPbiBjYW5jZWwKICAgICAgICBydW46IGVjaG8gImUyZSIiLWNhbmNlbGxlZCByYW4iCiAgICB0aW1lb3V0LW1pbnV0ZXM6ICIxMCIKICAgIHBlcm1pc3Npb25zOiB7fQpwZXJtaXNzaW9uczoge30K",
+  "context": {
+   "action": "",
+   "action_path": "",
+   "action_ref": "",
+   "action_repository": "",
+   "action_status": "",
+   "actor": "zradmin",
+   "actor_id": "1",
+   "api_url": "http://127.0.0.1:3300/api/v1",
+   "base_ref": "",
+   "env": "",
+   "event": {
+    "inputs": {
+     "label": "e2e",
+     "tag": "x1"
+    }
+   },
+   "event_name": "workflow_dispatch",
+   "event_path": "",
+   "gitea_default_actions_url": "https://github.com",
+   "gitea_runtime_token": "ctx-gitea_runtime_token",
+   "graphql_url": "",
+   "head_ref": "",
+   "job": "hog",
+   "path": "",
+   "ref": "refs/heads/main",
+   "ref_name": "main",
+   "ref_protected": false,
+   "ref_type": "branch",
+   "repository": "zradmin/probe",
+   "repositoryUrl": "http://127.0.0.1:3300/zradmin/probe",
+   "repository_id": "1",
+   "repository_owner": "zradmin",
+   "repository_owner_id": "1",
+   "retention_days": "90",
+   "run_attempt": "1",
+   "run_id": "31",
+   "run_number": "31",
+   "secret_source": "Actions",
+   "server_url": "http://127.0.0.1:3300/",
+   "sha": "f61e59bd01f502c47ba87271d08d99a8bf18d290",
+   "token": "ctx-token",
+   "triggering_actor": "zradmin",
+   "workflow": "e2e-cancel.yml",
+   "workflow_sha": "f61e59bd01f502c47ba87271d08d99a8bf18d290",
+   "workspace": ""
+  },
+  "secrets": {
+   "GITEA_TOKEN": "ci-secret-GITEA_TOKEN",
+   "GITHUB_TOKEN": "ci-secret-GITHUB_TOKEN"
+  }
+ },
+ "tasksVersion": "51"
+}
