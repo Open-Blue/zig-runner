@@ -131,4 +131,7 @@ tools/rsacorpus.zig	79bdabb2a1be65b6	defer out.flush() catch {};
 tools/test_shards.zig	4fa12925106b3fd1	s.writer.interface.flush() catch {};
 tools/test_shards.zig	e0e1e9558ea2b364	Io.Dir.cwd().deleteFile(io, path) catch {};
 tools/test_shards.zig	e4721abd8d76a5bc	_ = s.child.wait(io) catch {};
+tools/tls_oracle/pg_old.zig	09b7e06fd138ef12	if (c.tls) |*t| t.close() catch {};
+tools/tls_oracle/pg_old.zig	19af4b66513e36c9	c.sendMessage('X', "") catch {};
+tools/tls_oracle/pg_old.zig	9e4591313a0c9cfd	c.flush() catch {};
 tools/yamlcorpus.zig	79bdabb2a1be65b6	defer out.flush() catch {};
