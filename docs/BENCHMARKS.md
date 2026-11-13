@@ -310,13 +310,13 @@ libc) or, for the libraries that cannot, with the system's compiler, which favou
 
 | Stage | Share of a job | Zig now | Candidates | Result |
 | --- | --- | --- | --- | --- |
-| zstd layer inflating | 0.3-1.4 s of CPU per 80-400 MB layer, on a pull | own decoder 266 MB/s | libzstd 1.5.7: 986 MB/s as vendored, 1,023 as the system's | **adopted, #532**: 3.7 times |
+| zstd layer inflating | 0.3-1.3 s of CPU per 80-390 MB layer, on a pull | own decoder 266 MB/s | libzstd 1.5.7: 986 MB/s as vendored, 1,023 as the system's | **adopted, #532**: 3.7 times |
 | gzip layer inflating | 0.4-1.6 s of CPU per 80-390 MB layer | std flate 188-281 MB/s | zlib 337-454, zlib-ng 566-765 (vendored; 590-795 by gcc), libdeflate 820-1,194 (one buffer, no streaming) | **adopted, #533**: zlib-ng, 3.0 times |
 | secret masking | 50 ms per 10 MB of log with 5 secrets | trie 200 MB/s | Zig pair filter 958 MB/s; Rust `aho-corasick` DFA 359 MB/s | **Zig change adopted, #531**: 4.7-6 times, no dependency |
 | SHA-256, CPU with SHA-2 instructions | 45 ms per 80 MB, twice (blob and diff id) | 1,790 MB/s (#476) | OpenSSL 1,964; Rust `sha2` (asm) 1,823; `ring` 1,940 | none: within 10%, which a C or Rust dependency would not repay |
 | SHA-256, CPU without them (Broadwell, Pi 4) | 260 ms per 80 MB, twice | std's baseline 309 MB/s | OpenSSL 324 (AVX2 and BMI2, SHA-NI masked off), 287 (no AVX2 either); Rust `sha2` software 287 | none measured to win here (+5% on Zen 2); **needs the Xeon** |
-| tar unpacking | 0.30 s per 80 MB, of which 0.28 s is system time | | | not compute: system calls and the disk (the other study's) |
-| JSON, YAML, expressions | 0.11 s of runner CPU in a whole 249 s job (BENCHMARKS.md, top); a workflow's YAML parses in 0.2 ms, an expression in 18 us | | | under 0.05%: left alone |
+| tar unpacking | 0.30 s per 80 MB (0.10 s of user time, 0.28 s of system time) | | | not compute: system calls and the disk (the other study's) |
+| JSON, YAML, expressions | 0.11 s of runner CPU in a whole 249 s job (BENCHMARKS.md, top); a workflow's YAML parses in 0.2 ms, an expression in 18 µs | | | under 0.05%: left alone |
 
 **SHA-256.** On the laptop (which has SHA-NI, so the runner's dispatch picks it) the dispatch is
 1,790 MB/s and std's baseline, which a CPU without the instructions runs and what the laptop runs
@@ -324,7 +324,7 @@ with the dispatch bypassed (`impl-bench.sh sha-baseline`), 309 MB/s. OpenSSL 4.1
 `OPENSSL_ia32cap=:~0x20000000` (SHA-NI hidden, so it takes its AVX2 and BMI2 path) does 324 MB/s,
 and 287 MB/s with AVX2 hidden too. Rust's `sha2` 0.10.9 with `force-soft` does 287. Zen 2 runs
 256-bit instructions as two 128-bit ones, so these figures say little about Broadwell, whose AVX2
-is full width, where OpenSSL's code is documented to gain more over scalar; that is the one
+is full width, where OpenSSL's code may gain more over scalar; that is the one
 measurement left, for the Xeon E5-2697 v4 when it is here:
 
 ```sh
@@ -352,7 +352,7 @@ and each lost to or tied with what was already there. *libzstd's x86_64 assembly
 slower than its baseline build on this CPU (381 against 590 MB/s on ubuntu's layer).
 
 **What the two C libraries cost.** The binaries grow by 194 KB (x86_64, 4.44 to 4.64 MB) and 131 KB
-(aarch64, 3.80 to 3.93 MB). The release builds gain 22 C files in the same `zig build-exe`, no new
+(aarch64, 3.80 to 3.93 MB). The release builds gain 24 C files in the same `zig build-exe`, no new
 tool and no new step; CI gains two small steps, `vendor-zstd.sh --check` and
 `vendor-zlib-ng.sh --check`, which fetch the pinned sources and compare them with the vendored
 copies. Licences: BSD-3-Clause (libzstd) and zlib (zlib-ng), in `THIRD_PARTY.md` with their texts.
