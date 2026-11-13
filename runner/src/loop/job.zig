@@ -25,6 +25,7 @@ const zig_release = @import("../zig_release.zig");
 const db = @import("../db.zig");
 const sink = @import("../sink.zig");
 const redact = @import("../redact.zig");
+const logfmt = @import("../logfmt.zig");
 const timefmt = @import("../timefmt.zig");
 const Live = @import("../live.zig").Live;
 const admission = @import("../admission.zig");
@@ -434,7 +435,7 @@ pub fn sayJobEnd(c: Runner, job: job_mod.Job, before: proc_stats.Stats) void {
         proc_stats.Delta{ .before = before, .after = after },
     }) catch return;
     if (after.zombies) |z| if (z > 0)
-        std.log.warn("runner: {d} child process(es) exited and were not waited for (after job {d})", .{ z, job.check_run_id });
+        logfmt.warn("zombie_children", "job={d} count={d}", .{ job.check_run_id, z });
 }
 
 /// How often a job waiting for room looks for a cancel, or a reservation that dropped.
@@ -520,10 +521,9 @@ fn finishReporter(
     const ended_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
     recordFinished(r, job, c.name, result, job_started_ms, ended_ms);
     const failed = r.failures();
-    if (failed > 0) try c.err.print(
-        "run state: {d} database write(s) failed while this job ran (last: {s})\n",
-        .{ failed, r.store.lastError(c.arena) },
-    );
+    if (failed > 0) try logfmt.line(c.err, .warn, "run_state_writes_failed", "job={d} failed={d} last={f}", .{
+        job.check_run_id, failed, logfmt.q(r.store.lastError(c.arena)),
+    });
 }
 
 /// The job's end in the run-state database: its conclusion, and "Set up job" failed when the job
@@ -608,10 +608,9 @@ pub fn openSpool(c: Runner, job: job_mod.Job, collect: *sink.LogSink) !?*JobSpoo
         .exclusive = true,
         .permissions = .fromMode(0o600),
     }) catch |e| {
-        try c.err.print(
-            "job {d}: no log spool in {s} ({s}); the job's log is kept in memory\n",
-            .{ job.check_run_id, sd.path, @errorName(e) },
-        );
+        try logfmt.line(c.err, .warn, "log_spool_unusable", "job={d} dir={f} err={t} log=memory", .{
+            job.check_run_id, logfmt.q(sd.path), e,
+        });
         return null;
     };
     const js = try c.arena.create(JobSpool);
@@ -683,7 +682,7 @@ fn startReporter(c: Runner, job: job_mod.Job, job_started_ms: i64) !?Reporter {
     const st = c.store orelse return null;
     const run_id = std.fmt.parseInt(u64, job.github.run_id, 10) catch 0;
     if (run_id == 0 or job.check_run_id == 0) {
-        try c.err.writeAll("run state not recorded: the job has no run id or job id\n");
+        try logfmt.line(c.err, .warn, "run_state_not_recorded", "job={d} reason=no_run_id", .{job.check_run_id});
         return null;
     }
     var reporter: Reporter = .{
@@ -722,7 +721,7 @@ fn runJobSteps(
 pub fn unrunnable(c: Runner, job: job_mod.Job, log: *sink.LogSink) !?dagger.Result {
     const cfg = c.cfg;
     const refused = try trust.refusal(c.arena, cfg.trusted_refs, cfg.trusted_events, job.github);
-    if (refused) |why| try c.err.print("job refused: {s}\n", .{why});
+    if (refused) |why| try logfmt.line(c.err, .warn, "job_refused", "job={d} why={f}", .{ job.check_run_id, logfmt.q(why) });
     const unsupported: ?[]const u8 = refused orelse job.container_error orelse job.services_error;
     const why = unsupported orelse return null;
     // Nothing of it ran: not learned from, whatever name it has (the reservation is released
@@ -1031,11 +1030,9 @@ fn completeJobWithRetry(
     ) catch |e|
         return try fail(c, "completejob", e);
     if (done.status.class() != .success) {
-        try c.err.print(
-            "completejob with step results and annotations failed (HTTP {d}: {s}); retrying " ++
-                "without them\n",
-            .{ @backingInt(done.status), done.body[0..@min(done.body.len, 200)] },
-        );
+        try logfmt.line(c.err, .warn, "completejob_failed", "http={d} body={f} retry=without_annotations", .{
+            @backingInt(done.status), logfmt.q(done.body[0..@min(done.body.len, 200)]),
+        });
         done = completeJob(
             c,
             jr,
@@ -1084,14 +1081,10 @@ fn completeJob(
         const retry = if (r) |resp| resp.status.class() == .server_error else |_| true;
         if (!retry or attempt == delays.len) return r;
         if (r) |resp| {
-            try c.err.print(
-                "completejob: HTTP {d}; trying again in {d}s\n",
-                .{ @backingInt(resp.status), delays[attempt] },
-            );
-        } else |e| try c.err.print(
-            "completejob: {s}; trying again in {d}s\n",
-            .{ @errorName(e), delays[attempt] },
-        );
+            try logfmt.line(c.err, .warn, "completejob_retry", "http={d} wait_s={d}", .{
+                @backingInt(resp.status), delays[attempt],
+            });
+        } else |e| try logfmt.line(c.err, .warn, "completejob_retry", "err={t} wait_s={d}", .{ e, delays[attempt] });
         c.io.sleep(.fromSeconds(delays[attempt]), .awake) catch {};
     }
 }
@@ -1455,9 +1448,9 @@ test "a link planted at the spool's name is not written through (#106)" {
     var collect: sink.LogSink = .{ .collect = .{ .arena = arena, .io = io, .inner = &inner } };
     try std.testing.expect((try openSpool(c, spool_test_job, &collect)) == null);
     try std.testing.expect(collect.collect.spool == null);
-    try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "no log spool in") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "kind=log_spool_unusable job=") != null);
     try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "PathAlreadyExists") != null);
-    try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "kept in memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "log=memory") != null);
     try collect.append(7, 1, .stdout, "in memory");
     try std.testing.expectEqual(@as(usize, 1), collect.collect.lines.items.len);
 

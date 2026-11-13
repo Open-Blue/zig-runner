@@ -9,6 +9,7 @@
 //! netlink (`natRules`, `nft.zig`), with no `iptables`.
 
 const std = @import("std");
+const logfmt = @import("../logfmt.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const nft = @import("nft.zig");
@@ -350,7 +351,7 @@ pub const Socket = struct {
         switch (s.request(&m)) {
             // Gone meanwhile: what was wanted.
             .SUCCESS, .NODEV => {},
-            else => |e| std.log.warn("native: slot {d}'s veth was not deleted: {t}", .{ slot, e }),
+            else => |e| logfmt.warn("veth_not_deleted", "slot={d} err={t}", .{ slot, e }),
         }
     }
 
@@ -529,7 +530,15 @@ pub fn allow(r: Reach) bool {
     if (reach_len == max_reach) return false;
     reach_list[reach_len] = r;
     reach_len += 1;
+    // Recorded for the host's other processes, whose rules would otherwise leave it out.
+    nft.publishReach(linux.getpid(), reach_list[0..reach_len]);
     return true;
+}
+
+/// This process's instances forgotten by the others: at its end (a pid that is gone is ignored
+/// anyway).
+pub fn forget() void {
+    nft.publishReach(linux.getpid(), &.{});
 }
 
 /// What `allow` was told, copied into `buf`.
