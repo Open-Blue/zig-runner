@@ -1,0 +1,3 @@
+kind: Changed
+body: 'Masking secrets in a step''s log is 5 to 6 times faster: a position of a line is tested against the first two bytes any mask can start with before the trie is walked (the result is the same)'
+time: 2026-11-13T10:09:57.063783672-05:00
