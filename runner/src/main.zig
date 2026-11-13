@@ -28,6 +28,10 @@ const gitea_poller = @import("gitea/poller.zig");
 const app = @import("github/app.zig");
 const engine = @import("engine.zig");
 const build_version = @import("version.zig");
+const logfmt = @import("logfmt.zig");
+
+/// Warnings and errors in one format (`logfmt`).
+pub const std_options: std.Options = .{ .logFn = logfmt.logFn };
 
 comptime {
     _ = @import("sha256.zig");
@@ -100,6 +104,7 @@ comptime {
     _ = @import("loop/job.zig");
     _ = @import("loop/exchange.zig");
     _ = @import("loop/upload.zig");
+    _ = @import("logfmt.zig");
     _ = @import("timefmt.zig");
     _ = @import("expr.zig");
     _ = @import("glob.zig");
@@ -147,7 +152,7 @@ pub fn main(process_init: std.process.Init) !u8 {
     if (try printProvisionIfAsked(io, args)) return @backingInt(Exit.done);
 
     var cfg = Config.load(init.environ_map, args) catch |e| {
-        try err.print("config error: {s}\n", .{Config.explain(e) orelse @errorName(e)});
+        try logfmt.line(err, .err, "config", "detail={f}", .{logfmt.q(Config.explain(e) orelse @errorName(e))});
         return @backingInt(Exit.config);
     };
     // `RUNNER_ENGINE=cli` runs `dagger run ... sh -c ...` and `cat` for every job. The release image
@@ -155,7 +160,7 @@ pub fn main(process_init: std.process.Init) !u8 {
     // job" instead of the pool not starting.
     if (cfg.engine == .cli and !cfg.dry_run and !cfg.inspect and !cfg.db_check) {
         if (try dagger.missingCliPrograms(arena, io, init.environ_map.get("PATH"), cfg.dagger_cmd)) |m| {
-            try err.print("config error: {s}\n", .{m});
+            try logfmt.line(err, .err, "config", "detail={f}", .{logfmt.q(m)});
             return @backingInt(Exit.config);
         }
     }
@@ -166,16 +171,17 @@ pub fn main(process_init: std.process.Init) !u8 {
         // A rootless runner's job root is the runner's own user on the host, with no idmapping:
         // what it wrote there would be the runner's, and it could change the runner's files.
         if (std.os.linux.geteuid() != 0) {
-            try err.print("config error: RUNNER_NATIVE_HOST_PATHS: host paths need a root " ++
-                "runner (a rootless runner's jobs are its own user on the host); unset it\n", .{});
+            try logfmt.line(err, .err, "config", "setting=RUNNER_NATIVE_HOST_PATHS detail={f}", .{logfmt.q(
+                "host paths need a root runner (a rootless runner's jobs are its own user on the host); unset it",
+            )});
             return @backingInt(Exit.config);
         }
         var refusal: dagger.Backend.HostPathRefusal = .{};
         cfg.native_host_allowed = dagger.Backend.hostPathsOf(arena, io, init.environ_map, &cfg, &refusal) catch |e| {
-            try err.print("config error: RUNNER_NATIVE_HOST_PATHS: `{s}` {s} ({s})\n", .{
-                refusal.entry,
-                refusal.why,
-                @errorName(e),
+            try logfmt.line(err, .err, "config", "setting=RUNNER_NATIVE_HOST_PATHS entry={f} why={f} err={t}", .{
+                logfmt.q(refusal.entry),
+                logfmt.q(refusal.why),
+                e,
             });
             return @backingInt(Exit.config);
         };
@@ -183,7 +189,7 @@ pub fn main(process_init: std.process.Init) !u8 {
 
     // Where logs and run state go: DATABASE_URL / PG* when set, else stdout only.
     const pg_cfg = cfg.pgConfig(arena, init.environ_map) catch |e| {
-        try err.print("config error: invalid database settings ({s})\n", .{@errorName(e)});
+        try logfmt.line(err, .err, "config", "setting=database err={t}", .{e});
         return @backingInt(Exit.config);
     };
     const secrets = try allSecrets(arena, &cfg, pg_cfg);
@@ -236,16 +242,16 @@ pub fn main(process_init: std.process.Init) !u8 {
     // would fail every job: found now, before registering, not per job.
     if (cfg.engineless()) {
         const native = dagger.Backend.configFor(arena, io, init.environ_map, &cfg, true) catch |e| {
-            try err.print("config error: RUNNER_ENGINE=none, and the native backend is not " ++
-                "configured: {s}\n", .{@errorName(e)});
+            try logfmt.line(err, .err, "config", "setting=RUNNER_ENGINE=none detail=\"the native backend is not configured\" err={t}", .{e});
             return @backingInt(Exit.config);
         };
         if (nativeRefusal(&cfg, arena, io, init.gpa, native, dagger.Backend.reprobe, .{})) |why| {
             // May pass later (nftables busy, no network yet for the image): a code systemd and
             // compose restart on, after the retries.
-            try err.print("native error: RUNNER_ENGINE=none, and native steps cannot run here: " ++
-                "{s}\n  (exiting {d}: systemd restarts the runner, which refuses again until " ++
-                "the machine can)\n", .{ why, @backingInt(Exit.native) });
+            try logfmt.line(err, .err, "native_unusable", "setting=RUNNER_ENGINE=none why={f} exit={d} " ++
+                "effect=\"systemd restarts the runner, which refuses again until the machine can\"", .{
+                logfmt.q(why), @backingInt(Exit.native),
+            });
             return @backingInt(Exit.native);
         }
     }
@@ -352,7 +358,7 @@ fn nativeRefusal(
     while (attempt < retry.attempts) : (attempt += 1) {
         why = probe(arena, io, gpa, n) orelse return null;
         if (loop.stopRequested() or attempt + 1 == retry.attempts) break;
-        std.log.warn("native: not usable yet ({s}); trying again in {d} ms", .{ why.?, wait_ms });
+        logfmt.warn("native_not_usable", "why={f} retry_ms={d}", .{ logfmt.q(why.?), wait_ms });
         io.sleep(.fromMilliseconds(wait_ms), .awake) catch break;
         wait_ms *|= 2;
     }
@@ -409,26 +415,24 @@ fn startApp(
 ) !app.Auth {
     var a = app.Auth.init(arena, io, settings, scope) catch |e| {
         switch (settings.key) {
-            .file => |path| try err.print(
-                "config error: GH_APP_PRIVATE_KEY_FILE {s}: {s}\n",
-                .{ path, @errorName(e) },
-            ),
-            .pem => try err.print("config error: GH_APP_PRIVATE_KEY: {s}\n", .{@errorName(e)}),
+            .file => |path| try logfmt.line(err, .err, "config", "setting=GH_APP_PRIVATE_KEY_FILE path={f} err={t}", .{
+                logfmt.q(path), e,
+            }),
+            .pem => try logfmt.line(err, .err, "config", "setting=GH_APP_PRIVATE_KEY err={t}", .{e}),
         }
         return error.AppConfig;
     };
     var status: std.http.Status = .ok;
     var message: []const u8 = "";
     _ = a.token(arena, io, &status, &message) catch |e| {
-        try err.print("github error: GitHub App {s}: {s} (HTTP {d})", .{
-            settings.id,
-            @errorName(e),
-            @backingInt(status),
+        try logfmt.line(err, .err, "github_app", "app={f} err={t} http={d} message={f}", .{
+            logfmt.q(settings.id), e, @backingInt(status), logfmt.q(message),
         });
-        if (message.len > 0) try err.print(": {s}", .{message});
-        try err.writeAll("\n  The App must be installed on GH_SCOPE with \"Administration: read " ++
-            "and write\" (a repository) or \"Self-hosted runners: read and write\" (an " ++
-            "organization).\n");
+        try logfmt.line(err, .err, "github_app_hint", "hint={f}", .{logfmt.q(
+            "The App must be installed on GH_SCOPE with \"Administration: read " ++
+                "and write\" (a repository) or \"Self-hosted runners: read and write\" (an " ++
+                "organization).",
+        )});
         return error.AppRejected;
     };
     try log.say(try std.fmt.allocPrint(
@@ -515,7 +519,7 @@ fn printProvisionIfAsked(io: std.Io, args: []const [:0]const u8) !bool {
             provisioned.Variant,
             if (std.mem.indexOfScalar(u8, arg, '=')) |at| arg[at + 1 ..] else "runner",
         ) orelse {
-            std.log.err("{s}: the variant is root or runner", .{arg});
+            logfmt.err("bad_argument", "arg={f} expected=root|runner", .{logfmt.q(arg)});
             return error.InvalidArgument;
         };
         var out_buf: [256]u8 = undefined;
@@ -560,9 +564,10 @@ fn openDatabase(
 ) !void {
     const io = init.io;
     store.* = db.Store.open(init.gpa, io, dbcfg, null) catch |e| lazy: {
-        try err.writeAll("database unavailable, logging to the console and retrying: ");
-        try redact.write(err, @errorName(e), secrets);
-        try err.writeByte('\n');
+        var e_buf: [128]u8 = undefined;
+        var e_w: std.Io.Writer = .fixed(&e_buf);
+        redact.write(&e_w, @errorName(e), secrets) catch {};
+        try logfmt.line(err, .warn, "database_unavailable", "err={f} action=console_logging_and_retry", .{logfmt.q(e_w.buffered())});
         // Flushed here, not left to the `defer`: this is the first message the runner writes
         // that is followed by the process *continuing*, and without the flush it sat in the
         // buffer for the life of the pool. A warning nobody can read is the silent failure the
@@ -785,14 +790,15 @@ fn dbCheck(
     defer out.flush() catch {};
 
     const cfg = pg_cfg orelse {
-        try err.writeAll("no database configured: set DATABASE_URL or PGHOST/PGUSER/PGDATABASE " ++
-            "(and PGPASSWORD, PGSSLMODE)\n");
+        try logfmt.line(err, .err, "config", "setting=database detail=\"no database configured: set DATABASE_URL or " ++
+            "PGHOST/PGUSER/PGDATABASE (and PGPASSWORD, PGSSLMODE)\"", .{});
         return @backingInt(Exit.config);
     };
     const c = pg.Client.connect(init.gpa, io, cfg) catch |e| {
-        try err.writeAll("database unavailable: ");
-        try redact.write(err, @errorName(e), secrets);
-        try err.writeByte('\n');
+        var e_buf: [128]u8 = undefined;
+        var e_w: std.Io.Writer = .fixed(&e_buf);
+        redact.write(&e_w, @errorName(e), secrets) catch {};
+        try logfmt.line(err, .err, "database_unavailable", "err={f}", .{logfmt.q(e_w.buffered())});
         return @backingInt(Exit.db);
     };
     defer c.close();

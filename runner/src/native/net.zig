@@ -9,6 +9,7 @@
 //! netlink (`natRules`, `nft.zig`), with no `iptables`.
 
 const std = @import("std");
+const logfmt = @import("../logfmt.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const nft = @import("nft.zig");
@@ -350,7 +351,7 @@ pub const Socket = struct {
         switch (s.request(&m)) {
             // Gone meanwhile: what was wanted.
             .SUCCESS, .NODEV => {},
-            else => |e| std.log.warn("native: slot {d}'s veth was not deleted: {t}", .{ slot, e }),
+            else => |e| logfmt.warn("veth_not_deleted", "slot={d} err={t}", .{ slot, e }),
         }
     }
 

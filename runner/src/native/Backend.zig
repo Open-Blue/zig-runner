@@ -13,6 +13,7 @@
 const Backend = @This();
 
 const std = @import("std");
+const logfmt = @import("../logfmt.zig");
 const builtin = @import("builtin");
 const Sha256 = @import("../sha256.zig").Sha256;
 const job_mod = @import("../job.zig");
@@ -1555,7 +1556,7 @@ fn detachNetns(arena: Allocator, path: []const u8) void {
     switch (std.os.linux.errno(std.os.linux.umount2(p, std.os.linux.MNT.DETACH))) {
         // Not mounted, or not there: nothing to detach (the sweep asks of every job's directory).
         .SUCCESS, .INVAL, .NOENT => {},
-        else => |e| std.log.warn("native: {s} was not detached: {t}", .{ path, e }),
+        else => |e| logfmt.warn("netns_not_detached", "path={f} err={t}", .{ logfmt.q(path), e }),
     }
 }
 

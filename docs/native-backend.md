@@ -2047,7 +2047,7 @@ host directory only when the operator allows it, and only on a root runner:
 - **`RUNNER_NATIVE_HOST_PATHS`** (`--native-host-paths`): colon- or comma-separated absolute
   directories; empty, the default, allows none. A job may bind one of them or a directory below
   one. Each is canonicalised with `realpath` when the runner starts, and **the runner refuses to
-  start** (`config error: RUNNER_NATIVE_HOST_PATHS: ...`, naming the entry) when one does not
+  start** (`error: kind=config setting=RUNNER_NATIVE_HOST_PATHS ...`, naming the entry) when one does not
   exist, is not a directory, is `/`, resolves under `/proc`, `/sys`, `/dev` or `/run` (the Docker
   and systemd sockets live there), is, holds or lies inside one of the runner's own paths
   (`RUNNER_NATIVE_STORE`, which holds every job's layers and volumes, `RUNNER_NATIVE_ROOTFS`, the
