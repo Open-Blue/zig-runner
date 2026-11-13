@@ -32,7 +32,8 @@ tsan)
 	export RUSTFLAGS="${RUSTFLAGS:-} -Zsanitizer=thread"
 	# Optimised: the handshakes of the TLS tests are slow enough at -O0 with TSan's slowdown on top.
 	export CARGO_PROFILE_DEV_OPT_LEVEL=2
-	export TSAN_OPTIONS="suppressions=$(realpath ../../../.github/tsan.supp) ${TSAN_OPTIONS:-}"
+	tsan_supp=$(realpath ../../../.github/tsan.supp)
+	export TSAN_OPTIONS="suppressions=$tsan_supp ${TSAN_OPTIONS:-}"
 	# The test profile, not release: release is panic=abort, which the test harness cannot be. Not
 	# the doctests (rustdoc would need the same flag, and the crate has none).
 	# Skipped: the one test that asserts wall-clock bounds on each phase of a request (getaddrinfo of
