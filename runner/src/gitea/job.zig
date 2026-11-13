@@ -616,6 +616,11 @@ fn githubOf(arena: Allocator, context: Value, job_key: []const u8) Allocator.Err
     g.event_name = contextString(context, "event_name");
     g.ref_name = contextString(context, "ref_name");
     g.workflow_ref = contextString(context, "workflow_ref");
+    // Gitea's context has none, and the trust decision reads the ref a workflow came from
+    // (`trust.verdict`): empty, no list of refs would ever match. The instance reads a workflow at
+    // the ref the run is for, so that is the ref.
+    if (g.workflow_ref.len == 0 and g.ref.len > 0)
+        g.workflow_ref = try std.fmt.allocPrint(arena, "{s}/{s}@{s}", .{ g.repository, g.workflow, g.ref });
     const server = contextString(context, "server_url");
     if (server.len > 0) g.server_url = server;
     g.job = contextString(context, "job");
@@ -1482,4 +1487,29 @@ test "a run step whose script has an expression is named from the text as writte
         \\          echo two
     );
     try testing.expectEqualStrings("Run echo ${{ github.sha }}", c.job.steps[0].name);
+}
+
+test "the built-in checkout fetches from the instance with the task's own GITHUB_TOKEN" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const t = try fixtureTask(arena, @embedFile("testdata/fetch-task.json"));
+    var why: []const u8 = "";
+    const j = (try fromTask(arena, t, &why)).job;
+    // The checkout reads the server and the repository from the context, as for GitHub, and the
+    // token from the secrets (`Exec.gitAuth`): the instance's per-task token, which `act_runner`'s
+    // checkout also uses (`github.token`, the same value).
+    var token: []const u8 = "";
+    for (j.secret_vars) |sv| if (std.mem.eql(u8, sv.name, "GITHUB_TOKEN")) {
+        token = sv.value;
+    };
+    try testing.expect(token.len > 0);
+    const q = try @import("../dagger/checkout.zig").query(arena, j, .{}, "SECRET-REF");
+    try testing.expect(std.mem.indexOf(u8, q.doc, "git(url:\"http://127.0.0.1:3300/zradmin/probe.git\",httpAuthUsername:\"x-access-token\",httpAuthToken:\"SECRET-REF\"") != null);
+    // The ref the run is for, and the trust decision's workflow ref made from it.
+    try testing.expect(std.mem.indexOf(u8, q.doc, "commit(id:\"7e8c64e8651e05a3bad79436212252b686f34c82\")") != null);
+    try testing.expectEqualStrings("zradmin/probe/probe.yml@refs/heads/main", j.github.workflow_ref);
+    const trust = @import("../trust.zig");
+    try testing.expect((try trust.refusal(arena, "refs/heads/main", "push", j.github)) == null);
+    try testing.expect((try trust.refusal(arena, "refs/heads/release", "push", j.github)) != null);
 }

@@ -792,15 +792,19 @@ fn natRulesFor(
 ) !?[]const u8 {
     const ups = try net.uplinks(arena, io);
     if (ups.len == 0 and !probing) return null;
+    var reach_buf: [net.max_reach]net.Reach = undefined;
+    const reach = net.allowed(&reach_buf);
     const joined = try std.mem.concat(arena, u8, &.{
         try std.mem.join(arena, "\x00", ups),
         "\x01",
         std.mem.sliceAsBytes(dns),
+        "\x02",
+        std.mem.sliceAsBytes(reach),
     });
     rules_mu.lockUncancelable(io);
     defer rules_mu.unlock(io);
     if (ups.len > 0 and std.mem.eql(u8, joined, rules_for[0..rules_len])) return null;
-    if (try net.natRules(arena, io, subnet, ups, dns)) |why| return why;
+    if (try net.natRules(arena, io, subnet, ups, dns, reach)) |why| return why;
     // Too long to keep: the rules are made again next time.
     rules_len = if (joined.len <= rules_for.len) joined.len else 0;
     @memcpy(rules_for[0..rules_len], joined[0..rules_len]);

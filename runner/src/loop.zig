@@ -133,6 +133,17 @@ pub const Cycle = union(enum) {
 /// They share the configuration, the log sinks and the database connection (all safe to share).
 /// Returns once every runner has stopped: the most severe exit code among them.
 pub fn pool(c: Runner, n: u32) !Exit {
+    return poolWith(c, n, {});
+}
+
+/// `pool`, with each runner's task running `serving.run(runner, index)` in place of `serve`, for a
+/// platform that does not take its jobs from GitHub's broker (Gitea and Forgejo fetch their tasks,
+/// `gitea/poller.zig`). Everything else of the pool is the same for every platform: the trust
+/// notice, the memory gate and its sampling, the log spool, the pre-warm, and what the runners
+/// share. `run` is given the runner as the pool made it (its gate, spool directory and error
+/// writer) and its place in the pool, and answers the exit code. `{}` is GitHub's `serve`.
+pub fn poolWith(c: Runner, n: u32, serving: anytype) !Exit {
+    const Slot = SlotOf(@TypeOf(serving));
     // What this runner trusts, once: a runner that trusts no ref fails every job, and one that
     // trusts every ref runs pull requests, so neither may go unnoticed (#105).
     const refs = c.cfg.trusted_refs;
@@ -234,7 +245,7 @@ pub fn pool(c: Runner, n: u32) !Exit {
     if (warmer) |w| w.start();
     var group: std.Io.Group = .init;
     for (slots, 0..) |*s, i| {
-        s.* = .{ .c = c };
+        s.* = .{ .c = c, .index = i, .serving = serving };
         s.c.warmer = warmer;
         s.c.slow_outputs = slow;
         if (spool_dir) |*sd| s.c.spool_dir = sd;
@@ -259,23 +270,27 @@ pub fn pool(c: Runner, n: u32) !Exit {
 
 /// One runner of a pool. Its error messages go through its own buffer, flushed a cycle at a time,
 /// so runners' messages do not interleave mid-line.
-const Slot = struct {
-    c: Runner,
-    exit: Exit = .done,
-    gate: admission.Gate = undefined,
-    err_buf: [4096]u8 = undefined,
+fn SlotOf(comptime Serving: type) type {
+    return struct {
+        c: Runner,
+        index: usize = 0,
+        serving: Serving,
+        exit: Exit = .done,
+        gate: admission.Gate = undefined,
+        err_buf: [4096]u8 = undefined,
 
-    fn main(s: *Slot) void {
-        var err_w: std.Io.File.Writer = .initStreaming(.stderr(), s.c.io, &s.err_buf);
-        var c = s.c;
-        c.err = &err_w.interface;
-        s.exit = serve(c) catch |e| blk: {
-            logfmt.line(c.err, .err, "runner_stopped", "err={t}", .{e}) catch {};
-            break :blk .github;
-        };
-        err_w.interface.flush() catch {};
-    }
-};
+        fn main(s: *@This()) void {
+            var err_w: std.Io.File.Writer = .initStreaming(.stderr(), s.c.io, &s.err_buf);
+            var c = s.c;
+            c.err = &err_w.interface;
+            s.exit = if (Serving == void) serve(c) catch |e| blk: {
+                logfmt.line(c.err, .err, "runner_stopped", "err={t}", .{e}) catch {};
+                break :blk .github;
+            } else s.serving.run(c, s.index);
+            err_w.interface.flush() catch {};
+        }
+    };
+}
 
 /// Runs jobs one after another: each cycle registers a fresh JIT runner (GitHub gives a JIT runner
 /// a single job), waits for a job, runs it, and frees everything the cycle allocated before the
@@ -366,7 +381,7 @@ const hold_step_ms = 50;
 /// Waits, held at the memory gate for `hold`, until the machine has the memory for one more job:
 /// true then, false if a stop is requested first. The hold and its end are each logged once, not
 /// at every look.
-fn admit(c: Runner, g: *admission.Gate, hold: admission.Hold) !bool {
+pub fn admit(c: Runner, g: *admission.Gate, hold: admission.Hold) !bool {
     holdingBack(c, g, hold);
     // Read before each look, so that a change between the look and the wait is not missed.
     var seen = g.pool.changes();
@@ -389,7 +404,7 @@ fn admit(c: Runner, g: *admission.Gate, hold: admission.Hold) !bool {
 
 /// `Gate.check`, and what it learned about the engine's cgroup when that changed: found at start,
 /// or not and why, which tells an operator whether the engine's cap is being watched.
-fn checkGate(c: Runner, g: *admission.Gate) ?admission.Hold {
+pub fn checkGate(c: Runner, g: *admission.Gate) ?admission.Hold {
     const hold = g.check();
     if (g.forced) |h| {
         if (!g.forced_told) sayUnallocated(c, "'{s}' takes jobs although the machine has not the " ++
