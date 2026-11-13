@@ -968,7 +968,7 @@ fn numberTemplate(arena: Allocator, v: Value) Allocator.Error!?Template {
     return tokenTemplate(v);
 }
 
-fn displayName(
+pub fn displayName(
     arena: Allocator,
     name: []const u8,
     script: []const u8,
@@ -1095,7 +1095,7 @@ fn endpoints(root: Value) []const Value {
     return if (eps == .array) eps.array.items else &.{};
 }
 
-const fixture =
+pub const fixture =
     \\{"plan":{"planId":"plan-1"},"jobId":"job-1","jobContainer":null,"jobOutputs":{"type":2,"map":[{"Key":{"type":0,"lit":"version"},"Value":{"type":3,"expr":"steps.v.outputs.version"}},{"Key":{"type":0,"lit":"literal"},"Value":{"type":0,"lit":"fixed"}}]},
     \\ "variables":{"system.github.token.permissions":{"value":"{\"Contents\":\"read\"}"},"system.runnerGroupName":{"value":"Default"},"github_token":{"value":"ghs_secret","isSecret":true},"TIGER_HOST":{"value":"db.example","isSecret":true},"system.github.token":{"value":"ghs_secret","isSecret":true},"plain":{"value":"x"},"system.github.results_endpoint":{"value":"https://results.test/"},"actions_uses_cache_service_v2":{"value":"True"}},
     \\ "contextData":{"job":{"t":2,"d":[{"k":"status","v":"success"},{"k":"check_run_id","v":777}]},"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"sha","v":"0123456789012345678901234567890123456789"},{"k":"ref","v":"refs/heads/x"},{"k":"event_name","v":"push"}]}},

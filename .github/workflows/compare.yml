@@ -13,6 +13,8 @@ name: compare
 #   hpack-diff.sh      runner/src/hpack.zig against golang.org/x/net/http2/hpack, on random connections
 #                      (dynamic table, size updates, evictions) and broken blocks
 #   rsa-diff.sh        runner/src/github/rsa_sign.zig against Go's crypto/rsa, signatures byte for byte
+#   gitea-job-diff.sh  the job.Job runner/src/gitea/job.zig builds from a Gitea or Forgejo task against
+#                      what Gitea's workflow model (actionslib) reads from it, on a committed corpus
 #
 # The seed is the run number (or the one given), and is printed: a failure reproduces locally with
 # the same script and seed.
@@ -41,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tool: [expr-diff, yaml-diff, hashfiles-diff, regex-diff, hpack-diff, rsa-diff]
+        tool: [expr-diff, yaml-diff, hashfiles-diff, regex-diff, hpack-diff, rsa-diff, gitea-job-diff]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -65,6 +67,7 @@ jobs:
             regex-diff) .github/scripts/regex-diff.sh 2000 "$SEED" ;;
             hpack-diff) .github/scripts/hpack-diff.sh 3000 "$SEED" ;;
             rsa-diff) .github/scripts/rsa-diff.sh 2000 "$SEED" ;;
+            gitea-job-diff) .github/scripts/gitea-job-diff.sh ;;
           esac
 
   # The tools' own Go, linted (go-lint.sh) as on a pull request that changes them, so a new

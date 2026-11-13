@@ -1,0 +1,57 @@
+{
+ "task": {
+  "id": "56",
+  "workflowPayload": "bmFtZTogYmlncmVwbGF5Cidvbic6CiAgd29ya2Zsb3dfZGlzcGF0Y2g6CiAgICBpbnB1dHM6CiAgICAgIG5vbmNlOgogICAgICAgIGRlc2NyaXB0aW9uOiBLZXkgZm9yIHRoZSBjYWNoZWFibGUgc3RlcHMKICAgICAgICByZXF1aXJlZDogdHJ1ZQpqb2JzOgogIGJpZzoKICAgIG5hbWU6IGJpZwogICAgcnVucy1vbjoKICAgICAgLSBzZWxmLWhvc3RlZAogICAgICAtIGxhcHRvcAogICAgZW52OgogICAgICBST1VORDogJHt7IGlucHV0cy5ub25jZSB9fQogICAgaWY6IGFsd2F5cygpCiAgICBzdGVwczoKICAgICAgLSBpZDogYmlnCiAgICAgICAgbmFtZTogYmlnIG91dHB1dAogICAgICAgIHJ1bjogfAogICAgICAgICAgZWNobyAicm91bmQgJFJPVU5EIGZpcnN0IgogICAgICAgICAgc2VxIC1mICdiaWcgbGluZSAlMDhnIC4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLicgMSAxMDAwMDAKICAgICAgICAgIGVjaG8gImJpZz1vayIgPj4gIiRHSVRIVUJfT1VUUFVUIgogICAgICAgICAgZWNobyAicm91bmQgJFJPVU5EIGxhc3QiCiAgICAgIC0gbmFtZTogc21hbGwgYWZ0ZXIKICAgICAgICBydW46IHwKICAgICAgICAgIGVjaG8gInJvdW5kICRST1VORCBzbWFsbCIKICAgICAgICAgIGVjaG8gImJpZyBvdXRwdXQgc2FpZCAke3sgc3RlcHMuYmlnLm91dHB1dHMuYmlnIH19IgogICAgcGVybWlzc2lvbnM6IHt9CnBlcm1pc3Npb25zOiB7fQo=",
+  "context": {
+   "action": "",
+   "action_path": "",
+   "action_ref": "",
+   "action_repository": "",
+   "action_status": "",
+   "actor": "zradmin",
+   "actor_id": "1",
+   "api_url": "http://127.0.0.1:3300/api/v1",
+   "base_ref": "",
+   "env": "",
+   "event": {
+    "inputs": {
+     "nonce": "x1"
+    }
+   },
+   "event_name": "workflow_dispatch",
+   "event_path": "",
+   "gitea_default_actions_url": "https://github.com",
+   "gitea_runtime_token": "ctx-gitea_runtime_token",
+   "graphql_url": "",
+   "head_ref": "",
+   "job": "big",
+   "path": "",
+   "ref": "refs/heads/main",
+   "ref_name": "main",
+   "ref_protected": false,
+   "ref_type": "branch",
+   "repository": "zradmin/probe",
+   "repositoryUrl": "http://127.0.0.1:3300/zradmin/probe",
+   "repository_id": "1",
+   "repository_owner": "zradmin",
+   "repository_owner_id": "1",
+   "retention_days": "90",
+   "run_attempt": "1",
+   "run_id": "28",
+   "run_number": "28",
+   "secret_source": "Actions",
+   "server_url": "http://127.0.0.1:3300/",
+   "sha": "f61e59bd01f502c47ba87271d08d99a8bf18d290",
+   "token": "ctx-token",
+   "triggering_actor": "zradmin",
+   "workflow": "bigreplay.yml",
+   "workflow_sha": "f61e59bd01f502c47ba87271d08d99a8bf18d290",
+   "workspace": ""
+  },
+  "secrets": {
+   "GITEA_TOKEN": "ci-secret-GITEA_TOKEN",
+   "GITHUB_TOKEN": "ci-secret-GITHUB_TOKEN"
+  }
+ },
+ "tasksVersion": "51"
+}

@@ -1,0 +1,58 @@
+{
+ "task": {
+  "id": "32",
+  "workflowPayload": "bmFtZTogY2FuY2VsCiJvbiI6CiAgICB3b3JrZmxvd19kaXNwYXRjaDoKICAgICAgICBpbnB1dHM6CiAgICAgICAgICAgIHRhZzoKICAgICAgICAgICAgICAgIGRlc2NyaXB0aW9uOiBVbmlxdWUgbmFtZSBmb3IgdGhpcyBydW4gKHRoZSBoYXJuZXNzIGZpbmRzIHRoZSBydW4gYnkgaXQpCiAgICAgICAgICAgICAgICByZXF1aXJlZDogdHJ1ZQogICAgICAgICAgICAgICAgZGVmYXVsdDogbWFudWFsCiAgICAgICAgICAgIGxhYmVsOgogICAgICAgICAgICAgICAgZGVzY3JpcHRpb246IFRoZSBydW5uZXIgbGFiZWwgdG8gcnVuIG9uCiAgICAgICAgICAgICAgICByZXF1aXJlZDogdHJ1ZQogICAgICAgICAgICAgICAgZGVmYXVsdDogbGFwdG9wCmpvYnM6CiAgICBob2c6CiAgICAgICAgbmFtZTogaG9nCiAgICAgICAgcnVucy1vbjoKICAgICAgICAgICAgLSBzZWxmLWhvc3RlZAogICAgICAgICAgICAtIGUyZQogICAgICAgIGVudjoKICAgICAgICAgICAgQkVOQ0hfTk9OQ0U6ICR7eyBnaXRodWIucnVuX2lkIH19LSR7eyBnaXRodWIucnVuX2F0dGVtcHQgfX0KICAgICAgICBzdGVwczoKICAgICAgICAgICAgLSBuYW1lOiBIb2cKICAgICAgICAgICAgICBydW46IHwKICAgICAgICAgICAgICAgIGVjaG8gImhvZyAkQkVOQ0hfTk9OQ0UiCiAgICAgICAgICAgICAgICB5ZXMgY2FuY2VsLWhvZyA+IC9kZXYvbnVsbCAmCiAgICAgICAgICAgICAgICBzbGVlcCA2MDAKICAgICAgICAgICAgLSBuYW1lOiBBZnRlciAoc2tpcHBlZCBvbiBjYW5jZWwpCiAgICAgICAgICAgICAgcnVuOiBlY2hvICJhZnRlciAkQkVOQ0hfTk9OQ0UiCiAgICAgICAgICAgIC0gaWY6IGFsd2F5cygpCiAgICAgICAgICAgICAgbmFtZTogQWx3YXlzCiAgICAgICAgICAgICAgcnVuOiBlY2hvICJhbHdheXMgcmFuICRCRU5DSF9OT05DRSIKICAgICAgICAgICAgLSBpZjogY2FuY2VsbGVkKCkKICAgICAgICAgICAgICBuYW1lOiBPbiBjYW5jZWwKICAgICAgICAgICAgICBydW46IGVjaG8gImNhbmNlbGxlZCgpIHJhbiAkQkVOQ0hfTk9OQ0UiCiAgICAgICAgdGltZW91dC1taW51dGVzOiAiMzAiCg==",
+  "context": {
+   "action": "",
+   "action_path": "",
+   "action_ref": "",
+   "action_repository": "",
+   "action_status": "",
+   "actor": "zradmin",
+   "api_url": "http://127.0.0.1:3400/api/v1",
+   "base_ref": "",
+   "env": "",
+   "event": {
+    "inputs": {
+     "label": "e2e",
+     "tag": "x2"
+    }
+   },
+   "event_name": "workflow_dispatch",
+   "event_path": "",
+   "gitea_default_actions_url": "https://data.forgejo.org",
+   "gitea_runtime_token": "ctx-gitea_runtime_token",
+   "graphql_url": "",
+   "head_ref": "",
+   "job": "hog",
+   "job_name": "",
+   "path": "",
+   "ref": "refs/heads/main",
+   "ref_name": "main",
+   "ref_protected": false,
+   "ref_type": "branch",
+   "repository": "zradmin/probe",
+   "repositoryUrl": "http://127.0.0.1:3400/zradmin/probe",
+   "repository_owner": "zradmin",
+   "retention_days": "",
+   "run_attempt": "1",
+   "run_id": "51",
+   "run_number": "51",
+   "runner_perflog": "",
+   "runner_tracking_id": "",
+   "secret_source": "Actions",
+   "server_url": "http://127.0.0.1:3400/",
+   "sha": "0c9e00d1b852a9d98b02c633ddbbb1fc7f0b436f",
+   "token": "ctx-token",
+   "triggering_actor": "",
+   "workflow": "cancel.yml",
+   "workspace": ""
+  },
+  "secrets": {
+   "FORGEJO_TOKEN": "ci-secret-FORGEJO_TOKEN",
+   "GITEA_TOKEN": "ci-secret-GITEA_TOKEN",
+   "GITHUB_TOKEN": "ci-secret-GITHUB_TOKEN"
+  }
+ },
+ "tasksVersion": "53"
+}

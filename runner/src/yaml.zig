@@ -26,6 +26,10 @@ pub const Error = error{ InvalidYaml, UnsupportedYaml, OutOfMemory };
 pub const Node = union(enum) {
     null,
     string: []const u8,
+    /// Only from `parseTyped`: a plain `true` or `false`.
+    boolean: bool,
+    /// Only from `parseTyped`: a plain number, as written (`1`, `-3`, `2.5`, `1e3`).
+    number: []const u8,
     seq: []const Node,
     map: []const Entry,
 
@@ -42,12 +46,34 @@ pub const Node = union(enum) {
     pub fn text(n: Node) ?[]const u8 {
         return if (n == .string) n.string else null;
     }
+
+    /// The scalar as text, whatever its type (`true`, `1`); null for null and collections.
+    pub fn scalarText(n: Node) ?[]const u8 {
+        return switch (n) {
+            .string, .number => |s| s,
+            .boolean => |b| if (b) "true" else "false",
+            else => null,
+        };
+    }
 };
 
 /// Where and why parsing failed.
 pub const Diag = struct { line: usize = 0, message: []const u8 = "" };
 
 pub fn parse(arena: Allocator, source_in: []const u8, diag: ?*Diag) Error!Node {
+    return parseWith(arena, source_in, diag, false);
+}
+
+/// `parse`, but a plain scalar that go-yaml's resolver would make a bool or a number is a
+/// `.boolean` or a `.number`, and a quoted one stays a `.string`, as a workflow's matrix keeps
+/// `python: ['3.10']` apart from `python: 3.10`. Decimal integers and floats are recognised, and
+/// `true` and `false` in the three spellings go-yaml takes; what else go-yaml resolves to a number
+/// (`0x1F`, `1_000`, `.inf`) stays a string here.
+pub fn parseTyped(arena: Allocator, source: []const u8, diag: ?*Diag) Error!Node {
+    return parseWith(arena, source, diag, true);
+}
+
+fn parseWith(arena: Allocator, source_in: []const u8, diag: ?*Diag, typed: bool) Error!Node {
     // A byte order mark at the start says the encoding (only UTF-8 is read) and is not content.
     const source = if (std.mem.startsWith(u8, source_in, "\u{feff}")) source_in[3..] else source_in;
     try checkCharacters(source, diag);
@@ -73,7 +99,7 @@ pub fn parse(arena: Allocator, source_in: []const u8, diag: ?*Diag) Error!Node {
     // A last line break ends the last line; it does not start another.
     const final_break = std.mem.endsWith(u8, source, "\n");
     if (final_break) _ = lines.pop();
-    var p: Parser = .{ .arena = arena, .lines = lines.items, .diag = diag, .final_break = final_break };
+    var p: Parser = .{ .arena = arena, .lines = lines.items, .diag = diag, .final_break = final_break, .typed = typed };
     const root = p.document() catch |e| {
         // A tab where the block structure is read is the likelier cause.
         if (e != error.OutOfMemory) if (p.bareTab()) |l|
@@ -85,6 +111,51 @@ pub fn parse(arena: Allocator, source_in: []const u8, diag: ?*Diag) Error!Node {
 }
 
 const tab_message = "tabs are not allowed for indentation";
+
+/// A plain scalar's node: a string, or in typed mode a bool or a number where it reads as one.
+fn plainNode(typed: bool, s: []const u8) Node {
+    if (typed) {
+        if (isBoolWord(s)) return .{ .boolean = s[0] == 't' or s[0] == 'T' };
+        if (isDecimalNumber(s)) return .{ .number = s };
+    }
+    return .{ .string = s };
+}
+
+fn isBoolWord(s: []const u8) bool {
+    for ([_][]const u8{ "true", "True", "TRUE", "false", "False", "FALSE" }) |w|
+        if (std.mem.eql(u8, s, w)) return true;
+    return false;
+}
+
+/// `[-+]?` digits, optionally with a fraction and an exponent, or a fraction alone (`.5`).
+fn isDecimalNumber(s: []const u8) bool {
+    var i: usize = 0;
+    if (i < s.len and (s[i] == '-' or s[i] == '+')) i += 1;
+    const int_start = i;
+    while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+    const int_digits = i - int_start;
+    var frac_digits: usize = 0;
+    var is_float = false;
+    if (i < s.len and s[i] == '.') {
+        is_float = true;
+        i += 1;
+        const f = i;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+        frac_digits = i - f;
+    }
+    if (int_digits == 0 and frac_digits == 0) return false;
+    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+        is_float = true;
+        i += 1;
+        if (i < s.len and (s[i] == '-' or s[i] == '+')) i += 1;
+        const e = i;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+        if (i == e) return false;
+    }
+    // A leading zero (`0123`, `012.5`) is octal or a string to go-yaml, not a decimal.
+    if (!is_float and int_digits > 1 and s[int_start] == '0') return false;
+    return i == s.len;
+}
 
 /// The source is UTF-8 holding only the characters YAML allows (as go-yaml checks): no control
 /// characters but tab, line feed and carriage return. Next line (U+0085) and the line and paragraph
@@ -173,6 +244,8 @@ const Parser = struct {
     /// Reading an explicit key (`? null`), whose plain text stays as it is: the null words are null
     /// only as values.
     raw_null: bool = false,
+    /// Plain scalars that are booleans or numbers are read as such (`parseTyped`).
+    typed: bool = false,
     /// The source ends with a line break.
     final_break: bool,
     /// Block collections open around the one being read. Each `- ` or `? ` on a line is a level
@@ -186,6 +259,10 @@ const Parser = struct {
     fn enter(p: *Parser, l: Line) Error!void {
         if (p.depth >= max_block_depth) return p.unsupported(l, "block collections nested over 1000 deep");
         p.depth += 1;
+    }
+
+    fn plain(p: *Parser, s: []const u8) Node {
+        return plainNode(p.typed, s);
     }
 
     fn invalid(p: *Parser, l: Line, msg: []const u8) Error {
@@ -474,7 +551,7 @@ const Parser = struct {
         }
         const s = buf.items;
         if (!p.raw_null and isNullWord(s)) return .null;
-        return .{ .string = s };
+        return if (p.raw_null) .{ .string = s } else p.plain(s);
     }
 
     /// The quoted scalar that starts at `c`, which is left just past its closing quote. It may run
@@ -836,7 +913,7 @@ const Flow = struct {
                 if (ch == '-' and f.c.blankAt(1)) return f.unexpected();
                 const s = try f.plain();
                 item.text = s;
-                item.node = if (isNullWord(s)) .null else .{ .string = s };
+                item.node = if (isNullWord(s)) .null else f.p.plain(s);
             },
         }
         return item;
@@ -1744,4 +1821,51 @@ fn refusedDeep(indicator: []const u8) !void {
     var diag: Diag = .{};
     try std.testing.expectError(error.UnsupportedYaml, parse(ar, deep.items, &diag));
     try std.testing.expectEqualStrings("block collections nested over 1000 deep", diag.message);
+}
+
+test "parseTyped: plain booleans and numbers are typed, quoted ones and the rest stay strings" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const src =
+        \\b: [true, False, FALSE, 'true', "false", yes]
+        \\n: [1, -3, +4, 0, 2.5, -0.5, .5, 1e3, 1.5E-2, '3.10', "7"]
+        \\s: [0123, 1_000, 0x1F, 1.2.3, 1e, -, "", ~, v1]
+        \\block: 42
+        \\flag: true
+        \\text: |
+        \\  12
+        \\
+    ;
+    const n = try parseTyped(arena, src, null);
+    const b = n.get("b").?.seq;
+    try std.testing.expectEqual(true, b[0].boolean);
+    try std.testing.expectEqual(false, b[1].boolean);
+    try std.testing.expectEqual(false, b[2].boolean);
+    try std.testing.expectEqualStrings("true", b[3].string);
+    try std.testing.expectEqualStrings("false", b[4].string);
+    try std.testing.expectEqualStrings("yes", b[5].string);
+    const nums = n.get("n").?.seq;
+    for ([_][]const u8{ "1", "-3", "+4", "0", "2.5", "-0.5", ".5", "1e3", "1.5E-2" }, nums[0..9]) |want, got|
+        try std.testing.expectEqualStrings(want, got.number);
+    try std.testing.expectEqualStrings("3.10", nums[9].string);
+    try std.testing.expectEqualStrings("7", nums[10].string);
+    const strs = n.get("s").?.seq;
+    for (strs[0..5]) |s| try std.testing.expect(s == .string);
+    try std.testing.expectEqualStrings("0123", strs[0].string);
+    try std.testing.expect(strs[7] == .null);
+    try std.testing.expectEqualStrings("42", n.get("block").?.number);
+    try std.testing.expectEqual(true, n.get("flag").?.boolean);
+    try std.testing.expectEqualStrings("12\n", n.get("text").?.string);
+    try std.testing.expectEqualStrings("true", n.get("flag").?.scalarText().?);
+    try std.testing.expectEqualStrings("42", n.get("block").?.scalarText().?);
+    // `parse` still reads every scalar as a string.
+    const plain = try parse(arena, src, null);
+    try std.testing.expectEqualStrings("true", plain.get("flag").?.string);
+    try std.testing.expectEqualStrings("42", plain.get("block").?.string);
+    // A key is text whatever it looks like.
+    const keys = try parseTyped(arena, "1: a\ntrue: b\nf: {2: c}\n", null);
+    try std.testing.expectEqualStrings("a", keys.get("1").?.string);
+    try std.testing.expectEqualStrings("b", keys.get("true").?.string);
+    try std.testing.expectEqualStrings("c", keys.get("f").?.get("2").?.string);
 }

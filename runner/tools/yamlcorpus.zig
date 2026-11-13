@@ -120,6 +120,7 @@ fn show(arena: std.mem.Allocator, n: yaml.Node) ![]const u8 {
     return switch (n) {
         .null => "null",
         .string => |s| std.fmt.allocPrint(arena, "\"{s}\"", .{s}),
+        .boolean, .number => "a typed scalar",
         .seq => "a sequence",
         .map => "a mapping",
     };

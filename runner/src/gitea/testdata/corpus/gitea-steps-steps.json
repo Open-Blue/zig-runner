@@ -1,0 +1,55 @@
+{
+ "task": {
+  "id": "85",
+  "workflowPayload": "bmFtZTogc3RlcHMKJ29uJzoKICB3b3JrZmxvd19kaXNwYXRjaDoKam9iczoKICBzdGVwczoKICAgIG5hbWU6IHN0ZXBzCiAgICBydW5zLW9uOgogICAgICAtIHNlbGYtaG9zdGVkCiAgICAgIC0gbGFwdG9wCiAgICBlbnY6CiAgICAgIEJFTkNIX05PTkNFOiAke3sgZ2l0aHViLnJ1bl9pZCB9fS0ke3sgZ2l0aHViLnJ1bl9hdHRlbXB0IH19CiAgICBpZjogYWx3YXlzKCkKICAgIHN0ZXBzOgogICAgICAtIHJ1bjogZWNobyBzdGVwIDEgJEJFTkNIX05PTkNFCiAgICAgIC0gcnVuOiBlY2hvIHN0ZXAgMiAkQkVOQ0hfTk9OQ0UKICAgICAgLSBydW46IGVjaG8gc3RlcCAzICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDQgJEJFTkNIX05PTkNFCiAgICAgIC0gcnVuOiBlY2hvIHN0ZXAgNSAkQkVOQ0hfTk9OQ0UKICAgICAgLSBydW46IGVjaG8gc3RlcCA2ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDcgJEJFTkNIX05PTkNFCiAgICAgIC0gcnVuOiBlY2hvIHN0ZXAgOCAkQkVOQ0hfTk9OQ0UKICAgICAgLSBydW46IGVjaG8gc3RlcCA5ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDEwICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDExICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDEyICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDEzICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDE0ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDE1ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDE2ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDE3ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDE4ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDE5ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDIwICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDIxICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDIyICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDIzICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDI0ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDI1ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDI2ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDI3ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDI4ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDI5ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDMwICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDMxICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDMyICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDMzICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDM0ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDM1ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDM2ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDM3ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDM4ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDM5ICRCRU5DSF9OT05DRQogICAgICAtIHJ1bjogZWNobyBzdGVwIDQwICRCRU5DSF9OT05DRQogICAgcGVybWlzc2lvbnM6IHt9CnBlcm1pc3Npb25zOiB7fQo=",
+  "context": {
+   "action": "",
+   "action_path": "",
+   "action_ref": "",
+   "action_repository": "",
+   "action_status": "",
+   "actor": "zradmin",
+   "actor_id": "1",
+   "api_url": "http://127.0.0.1:3300/api/v1",
+   "base_ref": "",
+   "env": "",
+   "event": {
+    "inputs": {}
+   },
+   "event_name": "workflow_dispatch",
+   "event_path": "",
+   "gitea_default_actions_url": "https://github.com",
+   "gitea_runtime_token": "ctx-gitea_runtime_token",
+   "graphql_url": "",
+   "head_ref": "",
+   "job": "steps",
+   "path": "",
+   "ref": "refs/heads/main",
+   "ref_name": "main",
+   "ref_protected": false,
+   "ref_type": "branch",
+   "repository": "zradmin/probe",
+   "repositoryUrl": "http://127.0.0.1:3300/zradmin/probe",
+   "repository_id": "1",
+   "repository_owner": "zradmin",
+   "repository_owner_id": "1",
+   "retention_days": "90",
+   "run_attempt": "1",
+   "run_id": "45",
+   "run_number": "45",
+   "secret_source": "Actions",
+   "server_url": "http://127.0.0.1:3300/",
+   "sha": "f61e59bd01f502c47ba87271d08d99a8bf18d290",
+   "token": "ctx-token",
+   "triggering_actor": "zradmin",
+   "workflow": "steps.yml",
+   "workflow_sha": "f61e59bd01f502c47ba87271d08d99a8bf18d290",
+   "workspace": ""
+  },
+  "secrets": {
+   "GITEA_TOKEN": "ci-secret-GITEA_TOKEN",
+   "GITHUB_TOKEN": "ci-secret-GITHUB_TOKEN"
+  }
+ },
+ "tasksVersion": "51"
+}

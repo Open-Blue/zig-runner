@@ -1,0 +1,53 @@
+{
+ "task": {
+  "id": "6",
+  "workflowPayload": "bmFtZTogcHJvYmUKJ29uJzogW3B1c2hdCmpvYnM6CiAgaGVsbG86CiAgICBuYW1lOiBoZWxsbyAoMikKICAgIHJ1bnMtb246IHVidW50dS1sYXRlc3QKICAgIGVudjoKICAgICAgR1JFRVRJTkc6IGhpCiAgICBpZjogYWx3YXlzKCkKICAgIHN0ZXBzOgogICAgICAtIHVzZXM6IGFjdGlvbnMvY2hlY2tvdXRAdjQKICAgICAgLSBuYW1lOiBTYXkKICAgICAgICBydW46IGVjaG8gIiRHUkVFVElORyAke3sgbWF0cml4Lm4gfX0gJHt7IGdpdGh1Yi5yZXBvc2l0b3J5IH19ICR7eyBzZWNyZXRzLlRPS0VOX1ggfX0iCiAgICAgIC0gaWQ6IG91dAogICAgICAgIHJ1bjogZWNobyAidj0xIiA+PiAiJEdJVEhVQl9PVVRQVVQiCiAgICBzdHJhdGVneToKICAgICAgbWF0cml4OgogICAgICAgICduJzoKICAgICAgICAgIC0gMgogICAgICBqb2ItaW5kZXg6IDEKICAgICAgam9iLXRvdGFsOiAyCiAgICBvdXRwdXRzOgogICAgICB2OiAke3sgc3RlcHMub3V0Lm91dHB1dHMudiB9fQo=",
+  "context": {
+   "action": "",
+   "action_path": "",
+   "action_ref": "",
+   "action_repository": "",
+   "action_status": "",
+   "actor": "zradmin",
+   "actor_id": "1",
+   "api_url": "http://127.0.0.1:3300/api/v1",
+   "base_ref": "",
+   "env": "",
+   "event": {},
+   "event_name": "push",
+   "event_path": "",
+   "gitea_default_actions_url": "https://github.com",
+   "gitea_runtime_token": "ctx-gitea_runtime_token",
+   "graphql_url": "",
+   "head_ref": "",
+   "job": "hello",
+   "path": "",
+   "ref": "refs/heads/main",
+   "ref_name": "main",
+   "ref_protected": false,
+   "ref_type": "branch",
+   "repository": "zradmin/probe",
+   "repositoryUrl": "http://127.0.0.1:3300/zradmin/probe",
+   "repository_id": "1",
+   "repository_owner": "zradmin",
+   "repository_owner_id": "1",
+   "retention_days": "90",
+   "run_attempt": "1",
+   "run_id": "3",
+   "run_number": "3",
+   "secret_source": "Actions",
+   "server_url": "http://127.0.0.1:3300/",
+   "sha": "67a6e8fa94c75fae7398498b97a6478f7f54c879",
+   "token": "ctx-token",
+   "triggering_actor": "zradmin",
+   "workflow": "probe.yml",
+   "workflow_sha": "67a6e8fa94c75fae7398498b97a6478f7f54c879",
+   "workspace": ""
+  },
+  "secrets": {
+   "GITEA_TOKEN": "ci-secret-GITEA_TOKEN",
+   "GITHUB_TOKEN": "ci-secret-GITHUB_TOKEN"
+  }
+ },
+ "tasksVersion": "51"
+}

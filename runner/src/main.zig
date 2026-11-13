@@ -74,6 +74,8 @@ comptime {
     _ = @import("github/http.zig");
     _ = @import("gitea/state.zig");
     _ = @import("gitea/task.zig");
+    _ = @import("gitea/job.zig");
+    _ = @import("gitea/job_oracle.zig");
     _ = @import("gitea/client.zig");
     _ = @import("gitea/poller.zig");
     _ = @import("github/jitconfig.zig");

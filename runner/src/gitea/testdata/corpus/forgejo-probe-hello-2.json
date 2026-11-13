@@ -1,0 +1,53 @@
+{
+ "task": {
+  "id": "5",
+  "workflowPayload": "bmFtZTogcHJvYmUKIm9uIjogW3B1c2hdCmpvYnM6CiAgICBoZWxsbzoKICAgICAgICBuYW1lOiBoZWxsbyAoMikKICAgICAgICBydW5zLW9uOiB1YnVudHUtbGF0ZXN0CiAgICAgICAgc3RlcHM6CiAgICAgICAgICAgIC0gdXNlczogYWN0aW9ucy9jaGVja291dEB2NAogICAgICAgICAgICAtIHJ1bjogZWNobyAiJHt7IG1hdHJpeC5uIH19ICR7eyBnaXRodWIucmVwb3NpdG9yeSB9fSIKICAgICAgICAgICAgLSBydW46IGVjaG8gIiMjIHN1bW1hcnkiID4+ICIkR0lUSFVCX1NURVBfU1VNTUFSWSIKICAgICAgICBzdHJhdGVneToKICAgICAgICAgICAgbWF0cml4OgogICAgICAgICAgICAgICAgIm4iOgogICAgICAgICAgICAgICAgICAgIC0gMgo=",
+  "context": {
+   "action": "",
+   "action_path": "",
+   "action_ref": "",
+   "action_repository": "",
+   "action_status": "",
+   "actor": "zradmin",
+   "api_url": "http://127.0.0.1:3400/api/v1",
+   "base_ref": "",
+   "env": "",
+   "event": {},
+   "event_name": "push",
+   "event_path": "",
+   "gitea_default_actions_url": "https://data.forgejo.org",
+   "gitea_runtime_token": "ctx-gitea_runtime_token",
+   "graphql_url": "",
+   "head_ref": "",
+   "job": "hello",
+   "job_name": "",
+   "path": "",
+   "ref": "refs/heads/main",
+   "ref_name": "main",
+   "ref_protected": false,
+   "ref_type": "branch",
+   "repository": "zradmin/probe",
+   "repositoryUrl": "http://127.0.0.1:3400/zradmin/probe",
+   "repository_owner": "zradmin",
+   "retention_days": "",
+   "run_attempt": "1",
+   "run_id": "24",
+   "run_number": "24",
+   "runner_perflog": "",
+   "runner_tracking_id": "",
+   "secret_source": "Actions",
+   "server_url": "http://127.0.0.1:3400/",
+   "sha": "234a85ed2e40e4364cf475773ffd15f19c2566d0",
+   "token": "ctx-token",
+   "triggering_actor": "",
+   "workflow": "probe.yml",
+   "workspace": ""
+  },
+  "secrets": {
+   "FORGEJO_TOKEN": "ci-secret-FORGEJO_TOKEN",
+   "GITEA_TOKEN": "ci-secret-GITEA_TOKEN",
+   "GITHUB_TOKEN": "ci-secret-GITHUB_TOKEN"
+  }
+ },
+ "tasksVersion": "46"
+}

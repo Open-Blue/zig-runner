@@ -1,0 +1,55 @@
+{
+ "task": {
+  "id": "28",
+  "workflowPayload": "bmFtZTogc3RlcHMKIm9uIjoKICAgIHdvcmtmbG93X2Rpc3BhdGNoOgpqb2JzOgogICAgc3RlcHM6CiAgICAgICAgbmFtZTogc3RlcHMKICAgICAgICBydW5zLW9uOgogICAgICAgICAgICAtIHNlbGYtaG9zdGVkCiAgICAgICAgICAgIC0gbGFwdG9wCiAgICAgICAgZW52OgogICAgICAgICAgICBCRU5DSF9OT05DRTogJHt7IGdpdGh1Yi5ydW5faWQgfX0tJHt7IGdpdGh1Yi5ydW5fYXR0ZW1wdCB9fQogICAgICAgIHN0ZXBzOgogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDEgJEJFTkNIX05PTkNFCiAgICAgICAgICAgIC0gcnVuOiBlY2hvIHN0ZXAgMiAkQkVOQ0hfTk9OQ0UKICAgICAgICAgICAgLSBydW46IGVjaG8gc3RlcCAzICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDQgJEJFTkNIX05PTkNFCiAgICAgICAgICAgIC0gcnVuOiBlY2hvIHN0ZXAgNSAkQkVOQ0hfTk9OQ0UKICAgICAgICAgICAgLSBydW46IGVjaG8gc3RlcCA2ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDcgJEJFTkNIX05PTkNFCiAgICAgICAgICAgIC0gcnVuOiBlY2hvIHN0ZXAgOCAkQkVOQ0hfTk9OQ0UKICAgICAgICAgICAgLSBydW46IGVjaG8gc3RlcCA5ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDEwICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDExICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDEyICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDEzICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDE0ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDE1ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDE2ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDE3ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDE4ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDE5ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDIwICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDIxICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDIyICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDIzICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDI0ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDI1ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDI2ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDI3ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDI4ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDI5ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDMwICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDMxICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDMyICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDMzICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDM0ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDM1ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDM2ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDM3ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDM4ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDM5ICRCRU5DSF9OT05DRQogICAgICAgICAgICAtIHJ1bjogZWNobyBzdGVwIDQwICRCRU5DSF9OT05DRQo=",
+  "context": {
+   "action": "",
+   "action_path": "",
+   "action_ref": "",
+   "action_repository": "",
+   "action_status": "",
+   "actor": "zradmin",
+   "api_url": "http://127.0.0.1:3400/api/v1",
+   "base_ref": "",
+   "env": "",
+   "event": {
+    "inputs": {}
+   },
+   "event_name": "workflow_dispatch",
+   "event_path": "",
+   "gitea_default_actions_url": "https://data.forgejo.org",
+   "gitea_runtime_token": "ctx-gitea_runtime_token",
+   "graphql_url": "",
+   "head_ref": "",
+   "job": "steps",
+   "job_name": "",
+   "path": "",
+   "ref": "refs/heads/main",
+   "ref_name": "main",
+   "ref_protected": false,
+   "ref_type": "branch",
+   "repository": "zradmin/probe",
+   "repositoryUrl": "http://127.0.0.1:3400/zradmin/probe",
+   "repository_owner": "zradmin",
+   "retention_days": "",
+   "run_attempt": "1",
+   "run_id": "44",
+   "run_number": "44",
+   "runner_perflog": "",
+   "runner_tracking_id": "",
+   "secret_source": "Actions",
+   "server_url": "http://127.0.0.1:3400/",
+   "sha": "234a85ed2e40e4364cf475773ffd15f19c2566d0",
+   "token": "ctx-token",
+   "triggering_actor": "",
+   "workflow": "steps.yml",
+   "workspace": ""
+  },
+  "secrets": {
+   "FORGEJO_TOKEN": "ci-secret-FORGEJO_TOKEN",
+   "GITEA_TOKEN": "ci-secret-GITEA_TOKEN",
+   "GITHUB_TOKEN": "ci-secret-GITHUB_TOKEN"
+  }
+ },
+ "tasksVersion": "46"
+}

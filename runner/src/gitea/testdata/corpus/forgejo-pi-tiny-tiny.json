@@ -1,0 +1,58 @@
+{
+ "task": {
+  "id": "23",
+  "workflowPayload": "bmFtZTogcGktdGlueQoib24iOgogICAgd29ya2Zsb3dfZGlzcGF0Y2g6CiAgICAgICAgaW5wdXRzOgogICAgICAgICAgICBzbG90czoKICAgICAgICAgICAgICAgIGRlc2NyaXB0aW9uOiBKU09OIGxpc3QsIG9uZSBqb2IgcGVyIGVudHJ5CiAgICAgICAgICAgICAgICByZXF1aXJlZDogdHJ1ZQogICAgICAgICAgICAgICAgZGVmYXVsdDogIlsxXSIKICAgICAgICAgICAgdGFnOgogICAgICAgICAgICAgICAgZGVzY3JpcHRpb246IFVuaXF1ZSBuYW1lIGZvciB0aGlzIHJ1biAodGhlIGhhcm5lc3MgZmluZHMgdGhlIHJ1biBieSBpdCkKICAgICAgICAgICAgICAgIHJlcXVpcmVkOiB0cnVlCiAgICAgICAgICAgICAgICBkZWZhdWx0OiBtYW51YWwKam9iczoKICAgIHRpbnk6CiAgICAgICAgbmFtZTogJ3RpbnkgJwogICAgICAgIHJ1bnMtb246CiAgICAgICAgICAgIC0gc2VsZi1ob3N0ZWQKICAgICAgICAgICAgLSBwaS1iZW5jaAogICAgICAgIHN0ZXBzOgogICAgICAgICAgICAtIG5hbWU6IHRpbnkKICAgICAgICAgICAgICBydW46IGVjaG8gInRpbnkgJEJFTkNIX05PTkNFIgogICAgICAgICAgICAgIGVudjoKICAgICAgICAgICAgICAgIEJFTkNIX05PTkNFOiAke3sgZ2l0aHViLnJ1bl9pZCB9fS0ke3sgZ2l0aHViLnJ1bl9hdHRlbXB0IH19LSR7eyBtYXRyaXguc2xvdCB9fQogICAgICAgIHRpbWVvdXQtbWludXRlczogIjUiCiAgICAgICAgc3RyYXRlZ3k6CiAgICAgICAgICAgIGZhaWwtZmFzdDogImZhbHNlIgo=",
+  "context": {
+   "action": "",
+   "action_path": "",
+   "action_ref": "",
+   "action_repository": "",
+   "action_status": "",
+   "actor": "zradmin",
+   "api_url": "http://127.0.0.1:3400/api/v1",
+   "base_ref": "",
+   "env": "",
+   "event": {
+    "inputs": {
+     "slots": "[1]",
+     "tag": "manual"
+    }
+   },
+   "event_name": "workflow_dispatch",
+   "event_path": "",
+   "gitea_default_actions_url": "https://data.forgejo.org",
+   "gitea_runtime_token": "ctx-gitea_runtime_token",
+   "graphql_url": "",
+   "head_ref": "",
+   "job": "tiny",
+   "job_name": "",
+   "path": "",
+   "ref": "refs/heads/main",
+   "ref_name": "main",
+   "ref_protected": false,
+   "ref_type": "branch",
+   "repository": "zradmin/probe",
+   "repositoryUrl": "http://127.0.0.1:3400/zradmin/probe",
+   "repository_owner": "zradmin",
+   "retention_days": "",
+   "run_attempt": "1",
+   "run_id": "39",
+   "run_number": "39",
+   "runner_perflog": "",
+   "runner_tracking_id": "",
+   "secret_source": "Actions",
+   "server_url": "http://127.0.0.1:3400/",
+   "sha": "234a85ed2e40e4364cf475773ffd15f19c2566d0",
+   "token": "ctx-token",
+   "triggering_actor": "",
+   "workflow": "pi-tiny.yml",
+   "workspace": ""
+  },
+  "secrets": {
+   "FORGEJO_TOKEN": "ci-secret-FORGEJO_TOKEN",
+   "GITEA_TOKEN": "ci-secret-GITEA_TOKEN",
+   "GITHUB_TOKEN": "ci-secret-GITHUB_TOKEN"
+  }
+ },
+ "tasksVersion": "46"
+}
