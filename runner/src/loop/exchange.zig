@@ -20,7 +20,7 @@ pub fn say(c: Runner, comptime fmt: []const u8, args: anytype) !void {
 /// the arena cannot grow; a line longer than the buffer is cut.
 pub fn sayLine(c: Runner, comptime level: logfmt.Level, comptime kind: []const u8, comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
-    c.log.say(logfmt.bufLine(&buf, level, kind, fmt, args)) catch {};
+    c.log.say(logfmt.bufLine(&buf, level, kind, fmt, args)) catch |e| std.log.debug("log: {t}", .{e});
 }
 
 /// `text` with the job's secrets masked, in `buf` (cut if it does not fit), for a value of a line.

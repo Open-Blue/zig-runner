@@ -283,7 +283,7 @@ fn SlotOf(comptime Serving: type) type {
             var c = s.c;
             c.err = &err_w.interface;
             s.exit = if (Serving == void) serve(c) catch |e| blk: {
-                logfmt.line(c.err, .err, "runner_stopped", "err={t}", .{e}) catch {};
+                logfmt.line(c.err, .err, "runner_stopped", "err={t}", .{e}) catch |we| std.log.debug("log: {t}", .{we});
                 break :blk .github;
             } else s.serving.run(c, s.index);
             err_w.interface.flush() catch {};
