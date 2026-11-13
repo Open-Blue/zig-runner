@@ -255,6 +255,7 @@ pub fn main(process_init: std.process.Init) !u8 {
     defer http.deinitShared(io);
     var zig_seeds: zig_release.Registry = undefined;
     try resolveZigSeeds(arena, init, &cfg, &client, &zig_seeds);
+    defer zig_seeds.deinit();
     const stale = try settleRegistrations(arena, io, &cfg, log);
     installStopSignals();
     // Removed while the runners start, not before: that wait was 60 s every restart that found any.
@@ -347,6 +348,9 @@ fn giteaMain(
     defer http.deinitShared(init.io);
     var zig_seeds: zig_release.Registry = undefined;
     try resolveZigSeeds(arena, init, cfg, &client, &zig_seeds);
+    defer zig_seeds.deinit();
+    // The instances this process let its jobs reach are forgotten by the others' rules.
+    defer net.forget();
     installStopSignals();
     // The last job out's tool-cache walks, on threads of their own, end before the process does.
     defer tool_trees.process_idle_walks.stopAll(init.io);

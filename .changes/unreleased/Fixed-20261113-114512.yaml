@@ -1,0 +1,3 @@
+kind: Fixed
+body: Runners of one host keep each other's instance reach rules (each process records its instances under /run/zig-runner/reach, and every nft apply merges the live ones), the Gitea loopback forwarder binds when the pool starts, and the Zig seed registry is freed at exit.
+time: 2026-11-13T11:45:12.140054553-05:00
