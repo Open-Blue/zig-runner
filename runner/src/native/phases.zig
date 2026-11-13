@@ -155,6 +155,15 @@ pub const Phases = struct {
         }
     }
 
+    /// What `p` sampled since `from` (`mark`) added up, in microseconds.
+    pub fn sinceMark(ps: *const Phases, from: Mark, p: Phase) u64 {
+        const i = @backingInt(p);
+        if (ps.samples[i].items.len <= from[i]) return 0;
+        var us: u64 = 0;
+        for (ps.samples[i].items[from[i]..]) |v| us += v;
+        return us;
+    }
+
     /// The latest sample of `p`, in milliseconds; 0 when it has none.
     pub fn lastMs(ps: *const Phases, p: Phase) u64 {
         const s = ps.samples[@backingInt(p)].getLastOrNull() orelse return 0;

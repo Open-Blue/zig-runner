@@ -388,6 +388,9 @@ fn ensure(arena: Allocator, dir: []const u8) !void {
 
 /// The memory and pids controllers given to `dir`'s children.
 fn enable(arena: Allocator, dir: []const u8) !void {
+    // The io controller too, for the steps' `io.stat` (`dagger/step_end.zig`), where the parent
+    // has it to give: nothing depends on it, so a refusal is no failure.
+    _ = write(arena, dir, "cgroup.subtree_control", "+io");
     if (try hasControllers(arena, dir, "cgroup.subtree_control")) return;
     switch (write(arena, dir, "cgroup.subtree_control", "+memory +pids")) {
         .SUCCESS => {},
@@ -594,6 +597,9 @@ pub const Job = struct {
             return j.unsplit(arena, false);
         if (write(arena, steps, "memory.oom.group", "1") != .SUCCESS)
             return j.unsplit(arena, true);
+        // The io controller for `io.stat` (`dagger/step_end.zig`), last, so that nothing above has
+        // to give it back: nothing depends on it.
+        _ = write(arena, j.dir, "cgroup.subtree_control", "+io");
         var split_job = j;
         split_job.steps_dir = steps;
         split_job.services_dir = services;
