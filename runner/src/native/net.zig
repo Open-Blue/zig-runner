@@ -347,7 +347,11 @@ pub const Socket = struct {
         const i = s.index(hostLink(&buf, slot)) orelse return;
         var m: Message = .init(.RTM_DELLINK, 0);
         m.ifinfo(i, 0);
-        _ = s.request(&m);
+        switch (s.request(&m)) {
+            // Gone meanwhile: what was wanted.
+            .SUCCESS, .NODEV => {},
+            else => |e| std.log.warn("native: slot {d}'s veth was not deleted: {t}", .{ slot, e }),
+        }
     }
 
     /// Inside a job's namespace: `lo` and `eth0` up, `eth0` with slot `n`'s address, and the

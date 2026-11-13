@@ -15,6 +15,7 @@ const Config = @import("../config.zig").Config;
 const auth = @import("../github/auth.zig");
 const broker = @import("../github/broker.zig");
 const runservice = @import("../github/runservice.zig");
+const proc_stats = @import("../proc_stats.zig");
 const job_mod = @import("../job.zig");
 const trust = @import("../trust.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
@@ -290,6 +291,8 @@ pub const Admitted = struct {
 /// One job from its broker message `body` to completejob: acquire it, run it, upload what GitHub
 /// shows, and say how the cycle ended.
 pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
+    // The process's resources as the job starts, for its `job-end:` line.
+    const stats_before = proc_stats.read();
     const runner_token = session.token;
     const jr = runservice.parseJobRequest(c.arena, body) catch |e| return fail(c, "job request", e);
     const acq = acquire(c, jr, runner_token, &acquire_retry_ms) catch |e|
@@ -413,8 +416,25 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
         jobName(job),
         p,
     });
+    sayJobEnd(c, job, stats_before);
     if (failed) |f| return f;
     return .{ .job = result.succeeded };
+}
+
+/// One line per job, once its teardown ran: the runner process's resources and what changed while
+/// the job ran (`proc_stats`), so a leak shows as a trend across jobs (other jobs of the process
+/// change them too: a trend, not a charge). A child left unwaited for is a warning: each is a
+/// process the runner lost track of.
+fn sayJobEnd(c: Runner, job: job_mod.Job, before: proc_stats.Stats) void {
+    const after = proc_stats.read();
+    c.err.print("job-end: job={d} name='{s}' {f} {f}\n", .{
+        job.check_run_id,
+        jobName(job),
+        after,
+        proc_stats.Delta{ .before = before, .after = after },
+    }) catch return;
+    if (after.zombies) |z| if (z > 0)
+        std.log.warn("runner: {d} child process(es) exited and were not waited for (after job {d})", .{ z, job.check_run_id });
 }
 
 /// How often a job waiting for room looks for a cancel, or a reservation that dropped.
