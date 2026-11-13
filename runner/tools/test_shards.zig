@@ -450,11 +450,7 @@ const Shard = struct {
     /// ThreadSanitizer reports found after the last test (a thread still running, an exit-time
     /// check) leave it with a status, and its text is on stderr, unread until now.
     fn finish(s: *Shard, job: *Run) void {
-        s.writer.interface.writeStruct(Request{ .tag = .exit, .bytes_len = 0 }, .little) catch {};
-        s.writer.interface.flush() catch {};
-        s.child.stdin.?.close(job.io);
-        s.child.stdin = null;
-        const term = s.child.wait(job.io) catch null;
+        const term = s.end(job.io);
         const ok = if (term) |t| switch (t) {
             .exited => |code| code == 0,
             else => false,
@@ -470,12 +466,17 @@ const Shard = struct {
         s.err.close(job.io);
     }
 
-    fn stop(s: *Shard, io: Io) void {
+    /// Asks the shard to exit and waits for it.
+    fn end(s: *Shard, io: Io) ?std.process.Child.Term {
         s.writer.interface.writeStruct(Request{ .tag = .exit, .bytes_len = 0 }, .little) catch {};
         s.writer.interface.flush() catch {};
         s.child.stdin.?.close(io);
         s.child.stdin = null;
-        _ = s.child.wait(io) catch {};
+        return s.child.wait(io) catch null;
+    }
+
+    fn stop(s: *Shard, io: Io) void {
+        _ = s.end(io);
         s.err.close(io);
     }
 };
