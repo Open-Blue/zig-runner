@@ -411,12 +411,16 @@ pub const Cancel = struct {
         github,
         runner_stopping,
         job_lost,
+        /// The job ran past its `timeout-minutes` (Gitea and Forgejo leave that to the runner;
+        /// GitHub enforces it itself, and cancels through the session).
+        job_timeout,
 
         fn text(why: Why) []const u8 {
             return switch (why) {
                 .none, .github => "The job was cancelled",
                 .runner_stopping => "The runner is stopping",
                 .job_lost => "GitHub no longer has the job",
+                .job_timeout => "The job exceeded its maximum execution time",
             };
         }
     };

@@ -184,6 +184,33 @@ jobs:
             sleep $((attempt * 15))
           done
 
+      # The libzstd vendored under runner/src/vendor/zstd, which decompresses zstd layers: checked
+      # to be the files of the release vendor-zstd.sh pins, byte for byte. Fetched from GitHub's
+      # release assets; only a fetch that fails (exit 75) is tried again, twice, after a pause.
+      - name: vendored libzstd
+        run: |
+          for attempt in 1 2 3; do
+            status=0
+            .github/scripts/vendor-zstd.sh --check || status=$?
+            ((status == 75 && attempt < 3)) || exit "$status"
+            echo "::warning::vendor-zstd.sh could not fetch zstd (attempt $attempt of 3): trying again"
+            sleep $((attempt * 15))
+          done
+
+      # The zlib-ng vendored under runner/src/vendor/zlib-ng, which inflates gzip layers: checked
+      # to be the files of the commit vendor-zlib-ng.sh pins (and the three headers its CMake would
+      # generate), byte for byte. Fetched from GitHub; only a fetch that fails (exit 75) is tried
+      # again, twice, after a pause.
+      - name: vendored zlib-ng
+        run: |
+          for attempt in 1 2 3; do
+            status=0
+            .github/scripts/vendor-zlib-ng.sh --check || status=$?
+            ((status == 75 && attempt < 3)) || exit "$status"
+            echo "::warning::vendor-zlib-ng.sh could not fetch zlib-ng (attempt $attempt of 3): trying again"
+            sleep $((attempt * 15))
+          done
+
       # The provisioned images (runner/src/dagger/provisioned_pin.zig), pinned by digest once the
       # "provisioned image" workflow published them: checked to be indexes for amd64 and arm64
       # whose images are labelled with the fingerprint the pin says, so a pin of a missing or
@@ -494,9 +521,18 @@ jobs:
           .github/scripts/checksec.sh "$RUNNER_TEMP/dist/zig-runner-linux-x86_64" "$RUNNER_TEMP/dist/zig-runner-linux-aarch64"
           "$RUNNER_TEMP/dist/zig-runner-linux-x86_64" --version
 
+      # The arm64 job runs the aarch64 binary where it runs, from this build rather than a second one
+      # (the same compiler, the same sources, both targets: the same bytes, whichever host built them).
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.scope.outputs.run == 'true'
+        with:
+          name: release-builds
+          path: ${{ runner.temp }}/dist/
+          retention-days: 1
+
   # The aarch64 release binary, run where it runs: on GitHub's arm64 runner, as on razorbill (a Pi,
   # prod), which would otherwise be the first machine ever to execute it. The release's builds
-  # (build-binaries.sh, both targets, so the same commands as Release builds and the tag), checked
+  # (Release builds' own, both targets, as the tag's), checked
   # for their hardening (checksec.sh: static PIE, full RELRO, NX, W^X), the aarch64 binary run once
   # (a static PIE relocates itself at startup, before anything else), then the tests natively on
   # arm64 as the hosted test job runs them on x86_64: rootless, then the native backend's as root.
@@ -504,6 +540,9 @@ jobs:
   # tests (ci-scope.sh binaries and tests); not on main, as Release builds.
   arm64-builds:
     name: Release builds (arm64)
+    # After Release builds, whose binaries it checks and runs: a second build would take as long again
+    # (about 110 s on a runner of its own) for the same bytes.
+    needs: binaries
     if: github.event_name != 'push'
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 30
@@ -520,17 +559,16 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: .github/scripts/ci-scope.sh binaries
 
-      - name: Install Zig
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: steps.scope.outputs.run == 'true'
-        run: .github/scripts/install-zig.sh
-
-      - name: Build for x86_64 and aarch64
-        if: steps.scope.outputs.run == 'true'
-        run: .github/scripts/build-binaries.sh v0.0.0-ci "$RUNNER_TEMP/dist"
+        with:
+          name: release-builds
+          path: ${{ runner.temp }}/dist
 
       - name: Hardening, and the aarch64 binary run
         if: steps.scope.outputs.run == 'true'
         run: |
+          chmod +x "$RUNNER_TEMP"/dist/zig-runner-linux-*
           .github/scripts/checksec.sh "$RUNNER_TEMP/dist/zig-runner-linux-aarch64" "$RUNNER_TEMP/dist/zig-runner-linux-x86_64"
           "$RUNNER_TEMP/dist/zig-runner-linux-aarch64" --version
 

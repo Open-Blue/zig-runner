@@ -1,0 +1,3 @@
+kind: Changed
+body: Renovate proposes new libzstd releases (vendor-zstd.sh's version); the tarball's SHA-256 and the vendored files then follow by hand, which CI's vendored-libzstd check enforces by failing, with the new hash in its message
+time: 2026-11-13T10:47:42.410107835-05:00

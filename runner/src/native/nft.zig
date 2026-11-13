@@ -15,6 +15,14 @@
 //!   addresses), out of whichever interface the host routes them by, so a resolver behind
 //!   Tailscale (MagicDNS's 100.100.100.100 through `tailscale0`) or on another network of the
 //!   host's answers a job, and nothing else there is reached.
+//! - The instances jobs may reach (`net.Reach`, a Gitea or Forgejo the runner serves): in `forward`
+//!   and `input`, TCP from the bridge to that address and port, out of whichever interface leads
+//!   there (a LAN, Tailscale) or to the host's own address. On the host's loopback an instance
+//!   cannot be reached as it is named (the job's 127.0.0.1 is its own), and cannot be redirected
+//!   to by the kernel (a reply from 127.0.0.1 may not leave by the bridge), so the runner listens
+//!   on the bridge's address at the same port and forwards to it (`gitea/reach.zig`); `input`
+//!   accepts that port at the bridge's address. A job reaches that one port and no other service
+//!   of the host's.
 //! - `output` (filter): to the bridge, replies only. No process of the host's reaches a job, its
 //!   services' ports included (P6's `not_asked`).
 //!
@@ -53,8 +61,15 @@ pub fn main(args: []const []const u8) u8 {
     var ups: std.ArrayList([]const u8) = .initBuffer(&ups_buf);
     var dns_buf: [net.max_nameservers][4]u8 = undefined;
     var dns: std.ArrayList([4]u8) = .initBuffer(&dns_buf);
+    var reach_buf: [net.max_reach]net.Reach = undefined;
+    var reach: std.ArrayList(net.Reach) = .initBuffer(&reach_buf);
     for (args[1..]) |arg| {
-        if (std.mem.cutPrefix(u8, arg, "dns=")) |addr| {
+        if (std.mem.cutPrefix(u8, arg, "reach=")) |text| {
+            const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return fail("native nft: reach=<IPv4>:<port>");
+            const a = net.parseIp4(text[0..colon]) orelse return fail("native nft: a reach address");
+            const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return fail("native nft: a reach port");
+            reach.appendBounded(.{ .addr = a, .port = port }) catch return fail("native nft: too many instances");
+        } else if (std.mem.cutPrefix(u8, arg, "dns=")) |addr| {
             const a = net.parseIp4(addr) orelse return fail("native nft: a nameserver");
             dns.appendBounded(a) catch return fail("native nft: too many nameservers");
         } else {
@@ -62,7 +77,7 @@ pub fn main(args: []const []const u8) u8 {
             ups.appendBounded(arg) catch return fail("native nft: too many uplinks");
         }
     }
-    if (apply(subnet, ups.items, dns.items)) |why| {
+    if (apply(subnet, ups.items, dns.items, reach.items)) |why| {
         var buf: [512]u8 = undefined;
         return fail(std.fmt.bufPrint(&buf, "native nft: {s}", .{why}) catch "native nft: failed");
     }
@@ -82,7 +97,12 @@ fn fail(msg: []const u8) u8 {
 /// runners of one host take turns (`lock_path`): each removes the rules the others read, and
 /// eight of them starting together lost the rules to each other three times running, which
 /// sent a native job to Dagger.
-pub fn apply(subnet: net.Subnet, uplinks: []const []const u8, dns: []const [4]u8) ?[]const u8 {
+pub fn apply(
+    subnet: net.Subnet,
+    uplinks: []const []const u8,
+    dns: []const [4]u8,
+    reach: []const net.Reach,
+) ?[]const u8 {
     var sock = Socket.open() catch return "cannot open an nftables netlink socket";
     defer sock.close();
     // Held until `apply` returns. Without one (no /run, say), the retries are what is left.
@@ -90,9 +110,11 @@ pub fn apply(subnet: net.Subnet, uplinks: []const []const u8, dns: []const [4]u8
     defer if (lock) |fd| {
         _ = linux.close(fd);
     };
+    var merged_buf: [max_shared]net.Reach = undefined;
+    const merged = mergedReach(reach, &merged_buf);
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
-        const e = sock.replace(subnet, uplinks, dns) catch |err| return @errorName(err);
+        const e = sock.replace(subnet, uplinks, dns, merged) catch |err| return @errorName(err);
         switch (e) {
             .SUCCESS => return null,
             // A rule removed or a chain made under us: read again.
@@ -104,6 +126,101 @@ pub fn apply(subnet: net.Subnet, uplinks: []const []const u8, dns: []const [4]u8
         }
         return explain(e);
     }
+}
+
+/// Where the processes of one host record which instances their jobs may reach (`net.allow`), one
+/// line each, `<pid> <IPv4> <port>`, so that the rules one makes (`apply` replaces the table
+/// whole) carry what the others' jobs need too. A line of a process that is gone is dropped. Read
+/// and written under `lock_path`. Without the directory (no /run/zig-runner) nothing is shared.
+pub var reach_path: [:0]const u8 = "/run/zig-runner/reach";
+
+const max_shared = 32;
+
+/// `own` recorded as this process's (`pid`), and every dead process's and `pid`'s old lines
+/// dropped: what `net.allow` calls, and the process's end with none.
+pub fn publishReach(pid: linux.pid_t, own: []const net.Reach) void {
+    const lock = takeLock();
+    defer if (lock) |fd| {
+        _ = linux.close(fd);
+    };
+    var lines: [max_shared]SharedReach = undefined;
+    var n = readShared(&lines, pid);
+    for (own) |r| {
+        if (n == lines.len) break;
+        lines[n] = .{ .pid = pid, .reach = r };
+        n += 1;
+    }
+    writeShared(lines[0..n]);
+}
+
+const SharedReach = struct { pid: linux.pid_t, reach: net.Reach };
+
+/// The lines of live processes other than `except`, from `reach_path`.
+fn readShared(out: *[max_shared]SharedReach, except: linux.pid_t) usize {
+    const rc = linux.open(reach_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return 0;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return 0;
+    defer _ = linux.close(fd);
+    var buf: [4096]u8 = undefined;
+    const got = linux.read(fd, &buf, buf.len);
+    if (linux.errno(got) != .SUCCESS) return 0;
+    var n: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, buf[0..got], '\n');
+    while (it.next()) |line| {
+        var f = std.mem.tokenizeScalar(u8, line, ' ');
+        const pid = std.fmt.parseInt(linux.pid_t, f.next() orelse continue, 10) catch continue;
+        const addr = net.parseIp4(f.next() orelse continue) orelse continue;
+        const port = std.fmt.parseInt(u16, f.next() orelse continue, 10) catch continue;
+        if (pid == except or !alive(pid) or n == out.len) continue;
+        out[n] = .{ .pid = pid, .reach = .{ .addr = addr, .port = port } };
+        n += 1;
+    }
+    return n;
+}
+
+/// Whether a process `pid` exists: its /proc entry is there.
+fn alive(pid: linux.pid_t) bool {
+    if (pid <= 0) return false;
+    var buf: [32]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "/proc/{d}", .{pid}) catch return false;
+    buf[text.len] = 0;
+    const path: [:0]const u8 = buf[0..text.len :0];
+    return linux.errno(linux.access(path, 0)) == .SUCCESS;
+}
+
+fn writeShared(lines: []const SharedReach) void {
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    for (lines) |l| w.print("{d} {d}.{d}.{d}.{d} {d}\n", .{
+        l.pid, l.reach.addr[0], l.reach.addr[1], l.reach.addr[2], l.reach.addr[3], l.reach.port,
+    }) catch return;
+    _ = linux.mkdir("/run/zig-runner", 0o755);
+    const rc = linux.open(reach_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(rc) != .SUCCESS) return;
+    const fd = std.math.cast(linux.fd_t, rc) orelse return;
+    defer _ = linux.close(fd);
+    _ = linux.write(fd, w.buffered().ptr, w.buffered().len);
+}
+
+/// `own` and every live process's recorded instances, each once, in `out`: what the rules are made
+/// for. Called with `lock_path` held.
+fn mergedReach(own: []const net.Reach, out: *[max_shared]net.Reach) []const net.Reach {
+    var shared: [max_shared]SharedReach = undefined;
+    const m = readShared(&shared, 0);
+    var n: usize = 0;
+    for (own) |r| if (n < out.len) {
+        out[n] = r;
+        n += 1;
+    };
+    for (shared[0..m]) |l| {
+        var seen = false;
+        for (out[0..n]) |have| seen = seen or std.meta.eql(have, l.reach);
+        if (!seen and n < out.len) {
+            out[n] = l.reach;
+            n += 1;
+        }
+    }
+    return out[0..n];
 }
 
 /// `lock_path` opened and locked, or null when it could not be.
@@ -178,6 +295,7 @@ fn ruleBatch(
     subnet: net.Subnet,
     uplinks: []const []const u8,
     dns: []const [4]u8,
+    reach: []const net.Reach,
     host: HostChains,
 ) void {
     // Made if missing, then removed and made afresh: one batch is one transaction, so no packet
@@ -202,6 +320,7 @@ fn ruleBatch(
         b.endRule(r);
     }
     dnsRules(b, "forward", dns);
+    reachRules(b, "forward", reach, subnet);
     var r = b.rule(table, "forward", linux.NLM_F_APPEND);
     b.ifname(.iif, .eq, bridge_name);
     b.verdict(nf_drop);
@@ -223,6 +342,7 @@ fn ruleBatch(
     b.verdict(nf_accept);
     b.endRule(r);
     dnsRules(b, "input", dns);
+    reachRules(b, "input", reach, subnet);
     r = b.rule(table, "input", linux.NLM_F_APPEND);
     b.ifname(.iif, .eq, bridge_name);
     b.verdict(nf_drop);
@@ -250,6 +370,8 @@ fn ruleBatch(
     // The host's iptables-nft chains: the runner's old rules out, its accepts in at the head.
     for (host.stale) |s| b.deleteRule(s.table, s.chain, s.handle);
     for (host.accept_in) |chain| for ([_]Iface{ .oif, .iif }) |dir| {
+        // Nothing of the host's own is sent to the bridge here but replies (our `output`).
+        if (dir == .oif and std.mem.eql(u8, chain, "INPUT")) continue;
         // Iptables' own form for `-i zr0 -j ACCEPT`: meta, cmp, a counter, an immediate.
         const h = b.rule("filter", chain, 0);
         b.ifname(dir, .eq, bridge_name);
@@ -270,6 +392,32 @@ fn dnsRules(b: *Batch, chain: []const u8, dns: []const [4]u8) void {
         b.verdict(nf_accept);
         b.endRule(r);
     };
+}
+
+/// Whether any of `reach` is served at the bridge's address, the host's own.
+fn hostOwn(reach: []const net.Reach) bool {
+    for (reach) |r| if (r.loopback()) return true;
+    return false;
+}
+
+/// In `chain`: from the bridge, TCP to the port of each instance `reach` names accepted, at its
+/// address; for one on the loopback, at the bridge's address (the runner forwards it), in `input`
+/// only, since that address is the host's own.
+fn reachRules(b: *Batch, chain: []const u8, reach: []const net.Reach, subnet: net.Subnet) void {
+    for (reach) |inst| {
+        const own = inst.loopback();
+        if (own and !std.mem.eql(u8, chain, "input")) continue;
+        const addr: [4]u8 = if (own) subnet.gateway() else inst.addr;
+        const port: [2]u8 = std.mem.toBytes(std.mem.nativeToBig(u16, inst.port));
+        const r = b.rule(table, chain, linux.NLM_F_APPEND);
+        b.ifname(.iif, .eq, bridge_name);
+        b.payloadEq(nft_payload_network_header, 16, &addr);
+        b.l4proto(ipproto_tcp);
+        b.payloadEq(nft_payload_transport_header, 2, &port);
+        b.counter();
+        b.verdict(nf_accept);
+        b.endRule(r);
+    }
 }
 
 /// The host's iptables-nft chains the batch touches: those to accept the jobs' traffic in, and
@@ -648,16 +796,21 @@ const Socket = struct {
         subnet: net.Subnet,
         uplinks: []const []const u8,
         dns: []const [4]u8,
+        reach: []const net.Reach,
     ) !linux.E {
         var stale_buf: [64]Stale = undefined;
         var stale: std.ArrayList(Stale) = .initBuffer(&stale_buf);
-        var accept_buf: [2][]const u8 = undefined;
+        var accept_buf: [3][]const u8 = undefined;
         var accept: std.ArrayList([]const u8) = .initBuffer(&accept_buf);
         // The iptables-nft chains to accept the jobs' traffic in, where the host has them, and
         // the runner's rules in them and in the chains where P1 put its own.
         for ([_][]const u8{ "FORWARD", "DOCKER-USER" }) |name| {
             if (try s.chain("filter", name) != null) accept.appendBounded(name) catch {};
         }
+        // An instance on the loopback is served at the bridge's address, which is the host's own:
+        // its packets go through the host's INPUT (ufw's, whose policy drops), which must accept
+        // the bridge's too, leaving the deciding to the runner's table as in FORWARD.
+        if (hostOwn(reach)) if (try s.chain("filter", "INPUT") != null) accept.appendBounded("INPUT") catch return error.TooManyRules;
         const scanned = [_][2][]const u8{
             .{ "filter", "FORWARD" }, .{ "filter", "DOCKER-USER" },
             .{ "filter", "INPUT" },   .{ "nat", "POSTROUTING" },
@@ -665,7 +818,7 @@ const Socket = struct {
         for (scanned) |tc| try s.bridgeRules(tc[0], tc[1], &stale);
         var buf: [32 * 1024]u8 align(4) = undefined;
         var b: Batch = .init(&buf, s.seq);
-        ruleBatch(&b, subnet, uplinks, dns, .{ .accept_in = accept.items, .stale = stale.items });
+        ruleBatch(&b, subnet, uplinks, dns, reach, .{ .accept_in = accept.items, .stale = stale.items });
         const bytes = b.finish();
         if (b.overflow) return error.TooManyRules;
         s.seq = b.seq + 1;
@@ -895,7 +1048,7 @@ test "the batch: begin, every message acknowledged, end, within its buffer" {
     var b: Batch = .init(&buf, 100);
     const stale = [_]Stale{.{ .table = "filter", .chain = "FORWARD", .handle = 7 }};
     const dns = [_][4]u8{ .{ 100, 100, 100, 100 }, .{ 192, 168, 1, 1 } };
-    ruleBatch(&b, net.Subnet.default, &.{ "eth0", "wlp0s20f3" }, &dns, .{
+    ruleBatch(&b, net.Subnet.default, &.{ "eth0", "wlp0s20f3" }, &dns, &.{}, .{
         .accept_in = &.{ "FORWARD", "DOCKER-USER" },
         .stale = &stale,
     });
@@ -911,6 +1064,69 @@ test "the batch: begin, every message acknowledged, end, within its buffer" {
     // nameservers in forward and input, 1 removal, and 2 accepts in each of the host's 2 chains.
     try std.testing.expectEqual(@as(u32, 3 + 4 + 10 + 2 * 2 * 2 + 1 + 4), b.acks);
     try std.testing.expectEqual(@as(usize, b.acks + 2), types.items.len);
+}
+
+test "the instances jobs may reach add one accept each, the loopback's in input alone" {
+    const count = struct {
+        fn acks(reach: []const net.Reach) u32 {
+            var buf: [32 * 1024]u8 align(4) = undefined;
+            var b: Batch = .init(&buf, 100);
+            ruleBatch(&b, net.Subnet.default, &.{"eth0"}, &.{}, reach, .{ .accept_in = &.{}, .stale = &.{} });
+            _ = b.finish();
+            std.testing.expect(!b.overflow) catch @panic("the batch overflowed");
+            return b.acks;
+        }
+    }.acks;
+    const none = count(&.{});
+    // On another address: one accept in forward and one in input.
+    try std.testing.expectEqual(none + 2, count(&.{.{ .addr = .{ 100, 64, 0, 5 }, .port = 3000 }}));
+    // On the loopback: one accept in input, at the bridge's address.
+    try std.testing.expectEqual(none + 1, count(&.{.{ .addr = .{ 127, 0, 0, 1 }, .port = 3300 }}));
+    // Both an address and the loopback: they add up.
+    try std.testing.expectEqual(none + 3, count(&.{
+        .{ .addr = .{ 127, 0, 0, 1 }, .port = 3300 },
+        .{ .addr = .{ 10, 0, 0, 43 }, .port = 3300 },
+    }));
+}
+
+test "each process's instances are kept by the others' rules, and a dead process's are dropped" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(std.testing.io, &path_buf)];
+    var file_buf: [std.fs.max_path_bytes + 8]u8 = undefined;
+    const text = try std.fmt.bufPrint(&file_buf, "{s}/reach", .{dir});
+    file_buf[text.len] = 0;
+    const file: [:0]const u8 = file_buf[0..text.len :0];
+    const saved = reach_path;
+    reach_path = file;
+    defer reach_path = saved;
+    const gitea: net.Reach = .{ .addr = .{ 127, 0, 0, 1 }, .port = 3300 };
+    const forgejo: net.Reach = .{ .addr = .{ 10, 0, 0, 43 }, .port = 3400 };
+    const dead: net.Reach = .{ .addr = .{ 10, 0, 0, 9 }, .port = 22 };
+    // Two live processes (this one, and init) and one that is gone.
+    const me = linux.getpid();
+    var lines: [3]SharedReach = .{
+        .{ .pid = 1, .reach = forgejo },
+        .{ .pid = 2147483000, .reach = dead },
+        .{ .pid = me, .reach = gitea },
+    };
+    writeShared(&lines);
+    // This process makes rules for its own set: the other live process's is in them too.
+    var merged_buf: [max_shared]net.Reach = undefined;
+    const merged = mergedReach(&.{gitea}, &merged_buf);
+    try std.testing.expectEqual(@as(usize, 2), merged.len);
+    try std.testing.expect(std.meta.eql(merged[0], gitea) and std.meta.eql(merged[1], forgejo));
+    // And the other's rules (its own set is the other's alone) keep this process's.
+    var other_buf: [max_shared]net.Reach = undefined;
+    const other = mergedReach(&.{forgejo}, &other_buf);
+    try std.testing.expectEqual(@as(usize, 2), other.len);
+    // Publishing drops the dead process's line, and an end with none drops this one's.
+    publishReach(me, &.{gitea});
+    var after: [max_shared]SharedReach = undefined;
+    try std.testing.expectEqual(@as(usize, 2), readShared(&after, 0));
+    publishReach(me, &.{});
+    try std.testing.expectEqual(@as(usize, 1), readShared(&after, 0));
 }
 
 /// What `contendedApply` found: how many `apply`s failed, and the first one's reason.
@@ -961,7 +1177,7 @@ fn contendedApply(c: *Contended) void {
 
 fn applyRounds(c: *Contended) void {
     for (0..applies) |_| {
-        const why = apply(net.Subnet.default, &.{"eth0"}, &.{}) orelse continue;
+        const why = apply(net.Subnet.default, &.{"eth0"}, &.{}, &.{}) orelse continue;
         _ = c.failures.fetchAdd(1, .monotonic);
         while (!c.mu.tryLock()) std.atomic.spinLoopHint();
         defer c.mu.unlock();
