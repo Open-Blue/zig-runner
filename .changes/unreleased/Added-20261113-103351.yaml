@@ -1,0 +1,3 @@
+kind: Added
+body: 'docs/BENCHMARKS.md: a study of the runner''s compute-bound stages against C and Rust implementations (zstd and gzip inflating, SHA-256, secret masking, tar, parsing), with what was adopted, what was rejected and the one measurement the Xeon is needed for'
+time: 2026-11-13T10:33:51.106949647-05:00
