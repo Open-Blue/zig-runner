@@ -51,6 +51,8 @@ test "the runtime starts, runs a task through the ABI and stops" {
     // it reports the hand-over of memory between this thread and the runtime's as races in `free`.
     if (builtin.sanitize_thread) return error.SkipZigTest;
     try std.testing.expectEqualStrings(expected_version, version());
+    // Another test of this process may have started it (the first network call does).
+    stop();
     try std.testing.expectError(error.RuntimeStopped, selftest(1));
     try start(2);
     try start(2);
