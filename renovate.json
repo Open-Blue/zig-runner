@@ -41,6 +41,13 @@
       "groupName": "libzstd"
     },
     {
+      "description": "zlib-ng, vendored in runner/src/vendor/zlib-ng and pinned by tag and commit in vendor-zlib-ng.sh: its own pull request. Renovate moves the tag; the commit and the vendored files follow by hand (the script says how), which CI enforces by failing until they do (the Workflows job runs vendor-zlib-ng.sh --check), as for Zig's checksums.",
+      "matchDepNames": [
+        "zlib-ng/zlib-ng"
+      ],
+      "groupName": "zlib-ng"
+    },
+    {
       "description": "A new Lean: its own pull request. proofs/lean-toolchain and install-lean.sh move together, and install-lean.sh's checksums are updated by hand from the release's assets, which CI enforces by failing until they are.",
       "matchDepNames": [
         "leanprover/lean4"
@@ -261,6 +268,18 @@
       "depNameTemplate": "facebook/zstd",
       "datasourceTemplate": "github-releases",
       "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "description": "zlib-ng: `tag=` in vendor-zlib-ng.sh (tags of zlib-ng/zlib-ng). The commit it names and the vendored files are updated by hand, which CI enforces by failing until they are (vendor-zlib-ng.sh --check, in the Workflows job).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/scripts/vendor-zlib-ng\\.sh$/"
+      ],
+      "matchStrings": [
+        "\\ntag=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "zlib-ng/zlib-ng",
+      "datasourceTemplate": "github-tags"
     },
     {
       "description": "Lean: install-lean.sh and proofs/lean-toolchain (versions are releases of leanprover/lean4).",

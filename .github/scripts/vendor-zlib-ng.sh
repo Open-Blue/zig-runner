@@ -9,8 +9,9 @@
 #   vendor-zlib-ng.sh           replaces runner/src/vendor/zlib-ng with the pinned release's files
 #   vendor-zlib-ng.sh --check   fails when the vendored files differ from it (CI's "Workflows" job)
 #
-# To update: change `tag` and `commit` (`git ls-remote https://github.com/zlib-ng/zlib-ng 2.3.3`),
-# run this, and build both targets (zig-modules.sh and runner/build.zig list the C files, which
+# To update (Renovate moves `tag`, and this check then fails until `commit` follows, as for the
+# other pins Renovate cannot compute): set `commit` to what `git ls-remote
+# https://github.com/zlib-ng/zlib-ng <tag>` says, run this, and build both targets (zig-modules.sh and runner/build.zig list the C files, which
 # arch_functions.h and functable.c may change). A fetch that fails exits 75 (EX_TEMPFAIL), which
 # the CI step tries again.
 set -euo pipefail
@@ -35,6 +36,18 @@ files=(
 	inflate_p.h inftrees.c inftrees.h insert_string_tpl.h LICENSE.md match_tpl.h trees_emit.h trees.h
 	trees_tbl.h zbuild.h zendian.h zmemory.h zutil.c zutil.h zutil_p.h
 )
+
+# The tag must still name the pinned commit: a Renovate pull request that moves `tag` fails here,
+# with the commit to pin in its message.
+named=$(git ls-remote https://github.com/zlib-ng/zlib-ng "refs/tags/$tag" "refs/tags/$tag^{}" | tail -n1 | cut -f1) || {
+	echo "vendor-zlib-ng: could not look up zlib-ng $tag" >&2
+	exit 75
+}
+if [[ $named != "$commit" ]]; then
+	echo "vendor-zlib-ng: zlib-ng $tag is commit ${named:-(no such tag)}, not the $commit pinned here:" \
+		"if Renovate moved \`tag\`, set \`commit\` to it, run this script without --check, and build both targets" >&2
+	exit 1
+fi
 
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT

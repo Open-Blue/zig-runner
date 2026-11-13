@@ -1,0 +1,3 @@
+kind: Changed
+body: Renovate proposes new zlib-ng tags (vendor-zlib-ng.sh's tag); the commit it names and the vendored files then follow by hand, which CI's vendored-zlib-ng check enforces by failing, with the commit to pin in its message
+time: 2026-11-13T10:49:09.215100602-05:00
