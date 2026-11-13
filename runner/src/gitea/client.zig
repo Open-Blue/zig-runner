@@ -8,6 +8,7 @@
 //! call after `register` carries the runner's uuid and token as headers.
 const std = @import("std");
 const broker = @import("../github/broker.zig");
+const timefmt = @import("../timefmt.zig");
 const task_mod = @import("task.zig");
 
 const Allocator = std.mem.Allocator;
@@ -160,7 +161,261 @@ pub const Client = struct {
             .additional = parsed.additionalTasks.len,
         };
     }
+
+    /// Reports the task's state (`UpdateTask`): its steps, and once it has one its result, and the
+    /// outputs the instance has not accepted yet. The answer's result is the instance's own: a
+    /// result the runner did not send means the instance has ended the task (a cancel).
+    pub fn updateTask(
+        c: Client,
+        arena: Allocator,
+        io: std.Io,
+        report: TaskReport,
+        failure: *Failure,
+    ) !Updated {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        const w = &out.writer;
+        try w.writeAll("{\"state\":");
+        try c.writeState(w, report.state);
+        if (report.outputs.len > 0) {
+            try w.writeAll(",\"outputs\":{");
+            for (report.outputs, 0..) |o, i| {
+                if (i > 0) try w.writeByte(',');
+                try std.json.Stringify.value(o.name, .{}, w);
+                try w.writeByte(':');
+                try std.json.Stringify.value(o.value, .{}, w);
+            }
+            try w.writeByte('}');
+        }
+        try w.writeByte('}');
+        const text = try c.call(arena, io, "UpdateTask", out.written(), failure);
+        const parsed = std.json.parseFromSliceLeaky(
+            struct {
+                state: ?struct { result: ?Result = null } = null,
+                sentOutputs: []const []const u8 = &.{},
+            },
+            arena,
+            text,
+            .{ .ignore_unknown_fields = true },
+        ) catch return error.BadResponse;
+        return .{
+            .result = if (parsed.state) |st| st.result orelse .unspecified else .unspecified,
+            .sent_outputs = parsed.sentOutputs,
+        };
+    }
+
+    /// Sends log rows that start at `index` (`UpdateLog`) and returns the index the instance
+    /// acknowledges: all of them when it is `index + rows.len`, and what to send again otherwise.
+    pub fn updateLog(
+        c: Client,
+        arena: Allocator,
+        io: std.Io,
+        task_id: i64,
+        index: i64,
+        rows: []const Row,
+        no_more: bool,
+        failure: *Failure,
+    ) !i64 {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        const w = &out.writer;
+        try w.print("{{\"taskId\":\"{d}\"", .{task_id});
+        if (index != 0) try w.print(",\"index\":\"{d}\"", .{index});
+        if (rows.len > 0) {
+            try w.writeAll(",\"rows\":[");
+            for (rows, 0..) |r, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.print("{{\"time\":\"{s}\",\"content\":", .{try timefmt.isoTime(arena, @max(r.time_ms, 0))});
+                try std.json.Stringify.value(r.content, .{}, w);
+                try w.writeByte('}');
+            }
+            try w.writeByte(']');
+        }
+        if (no_more) try w.writeAll(",\"noMore\":true");
+        try w.writeByte('}');
+        const text = try c.call(arena, io, "UpdateLog", out.written(), failure);
+        const parsed = std.json.parseFromSliceLeaky(
+            struct { ackIndex: task_mod.Int64 = .{} },
+            arena,
+            text,
+            .{ .ignore_unknown_fields = true },
+        ) catch return error.BadResponse;
+        return parsed.ackIndex.value;
+    }
+
+    /// Forgejo only: the markdown of each step's `GITHUB_STEP_SUMMARY` (`UpdateStepSummary`), the
+    /// whole current content of each step that changed. Gitea has no such call.
+    pub fn updateStepSummary(
+        c: Client,
+        arena: Allocator,
+        io: std.Io,
+        task_id: i64,
+        summaries: []const Summary,
+        failure: *Failure,
+    ) !void {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        const w = &out.writer;
+        try w.print("{{\"taskId\":\"{d}\",\"summaries\":[", .{task_id});
+        for (summaries, 0..) |sm, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.print("{{\"stepNumber\":\"{d}\",\"content\":", .{sm.step});
+            try std.json.Stringify.value(sm.content, .{}, w);
+            try w.writeByte('}');
+        }
+        try w.writeAll("]}");
+        _ = try c.call(arena, io, "UpdateStepSummary", out.written(), failure);
+    }
+
+    /// `TaskState` as protobuf's JSON. Forgejo has no `reportedSteps`, and a field its message does
+    /// not know would be refused, so none is sent to it.
+    fn writeState(c: Client, w: *std.Io.Writer, st: TaskState) !void {
+        try w.print("{{\"id\":\"{d}\"", .{st.id});
+        if (st.result != .unspecified) try w.print(",\"result\":\"{s}\"", .{st.result.wire()});
+        try writeTime(w, "startedAt", st.started_ms);
+        try writeTime(w, "stoppedAt", st.stopped_ms);
+        try w.writeAll(",\"steps\":[");
+        for (st.steps, 0..) |step, i| {
+            if (i > 0) try w.writeByte(',');
+            try writeStep(w, step, false);
+        }
+        try w.writeByte(']');
+        if (c.flavor == .gitea and st.reported_steps.len > 0) {
+            try w.writeAll(",\"reportedSteps\":[");
+            for (st.reported_steps, 0..) |step, i| {
+                if (i > 0) try w.writeByte(',');
+                try writeStep(w, step, true);
+            }
+            try w.writeByte(']');
+        }
+        try w.writeByte('}');
+    }
 };
+
+/// A result as the instance names it (`Result` in `messages.proto`).
+pub const Result = enum {
+    unspecified,
+    success,
+    failure,
+    cancelled,
+    skipped,
+
+    fn wire(r: Result) []const u8 {
+        return switch (r) {
+            .unspecified => "RESULT_UNSPECIFIED",
+            .success => "RESULT_SUCCESS",
+            .failure => "RESULT_FAILURE",
+            .cancelled => "RESULT_CANCELLED",
+            .skipped => "RESULT_SKIPPED",
+        };
+    }
+
+    /// The name, or protobuf's number for it, which Connect's JSON may use instead.
+    pub fn jsonParse(a: Allocator, source: anytype, options: std.json.ParseOptions) !Result {
+        const v = try std.json.innerParse(std.json.Value, a, source, options);
+        const n: i64 = switch (v) {
+            .integer => |i| i,
+            .string => |t| {
+                for (std.enums.values(Result)) |r| if (std.mem.eql(u8, t, r.wire())) return r;
+                return error.InvalidEnumTag;
+            },
+            else => return error.UnexpectedToken,
+        };
+        return std.enums.fromInt(Result, n) orelse error.InvalidEnumTag;
+    }
+};
+
+/// What a reported step is, in Gitea's `reportedSteps` (`StepStage`).
+pub const Stage = enum(u8) {
+    unspecified,
+    setup,
+    init_containers,
+    pre,
+    main,
+    post,
+    stop_containers,
+    cleanup,
+
+    fn wire(s: Stage) []const u8 {
+        return switch (s) {
+            .unspecified => "STEP_STAGE_UNSPECIFIED",
+            .setup => "STEP_STAGE_SETUP",
+            .init_containers => "STEP_STAGE_INIT_CONTAINERS",
+            .pre => "STEP_STAGE_PRE",
+            .main => "STEP_STAGE_MAIN",
+            .post => "STEP_STAGE_POST",
+            .stop_containers => "STEP_STAGE_STOP_CONTAINERS",
+            .cleanup => "STEP_STAGE_CLEANUP",
+        };
+    }
+};
+
+/// `StepState`. Times are milliseconds since the epoch, 0 for not yet. `name`, `stage` and `number`
+/// are for `reported_steps` only.
+pub const StepState = struct {
+    id: i64,
+    result: Result = .unspecified,
+    started_ms: i64 = 0,
+    stopped_ms: i64 = 0,
+    log_index: i64 = 0,
+    log_length: i64 = 0,
+    name: []const u8 = "",
+    stage: Stage = .unspecified,
+    number: i64 = 0,
+};
+
+/// `TaskState`: `steps` are the workflow file's, by index (both instances), `reported_steps` the
+/// steps as the runner ran them, in display order (Gitea only).
+pub const TaskState = struct {
+    id: i64,
+    result: Result = .unspecified,
+    started_ms: i64 = 0,
+    stopped_ms: i64 = 0,
+    steps: []const StepState = &.{},
+    reported_steps: []const StepState = &.{},
+};
+
+pub const TaskReport = struct {
+    state: TaskState,
+    /// Outputs not yet accepted (the instance's `sentOutputs` says which were).
+    outputs: []const task_mod.Pair = &.{},
+};
+
+/// What `updateTask` is answered.
+pub const Updated = struct {
+    /// Not `unspecified` when the instance has ended the task itself, a cancel.
+    result: Result,
+    sent_outputs: []const []const u8,
+};
+
+/// A log line on its way to the instance (`LogRow`).
+pub const Row = struct { time_ms: i64, content: []const u8 };
+
+pub const Summary = struct { step: i64, content: []const u8 };
+
+fn writeTime(w: *std.Io.Writer, comptime name: []const u8, ms: i64) !void {
+    if (ms <= 0) return;
+    var buf: [40]u8 = undefined;
+    // Milliseconds, as `isoTime` writes them: the log blobs' seven digits are GitHub's.
+    const iso = timefmt.isoTime7Buf(&buf, ms);
+    if (iso.len < 5) return;
+    try w.print(",\"" ++ name ++ "\":\"{s}Z\"", .{iso[0 .. iso.len - 5]});
+}
+
+fn writeStep(w: *std.Io.Writer, st: StepState, reported: bool) !void {
+    try w.print("{{\"id\":\"{d}\"", .{st.id});
+    if (st.result != .unspecified) try w.print(",\"result\":\"{s}\"", .{st.result.wire()});
+    try writeTime(w, "startedAt", st.started_ms);
+    try writeTime(w, "stoppedAt", st.stopped_ms);
+    if (st.log_index != 0) try w.print(",\"logIndex\":\"{d}\"", .{st.log_index});
+    if (st.log_length != 0) try w.print(",\"logLength\":\"{d}\"", .{st.log_length});
+    if (reported) {
+        if (st.name.len > 0) {
+            try w.writeAll(",\"name\":");
+            try std.json.Stringify.value(st.name, .{}, w);
+        }
+        if (st.stage != .unspecified) try w.print(",\"stage\":\"{s}\"", .{st.stage.wire()});
+        if (st.number != 0) try w.print(",\"number\":\"{d}\"", .{st.number});
+    }
+    try w.writeByte('}');
+}
 
 pub const RegisterRequest = struct {
     name: []const u8,

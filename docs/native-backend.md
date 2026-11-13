@@ -225,7 +225,21 @@ On a root runner, each step runs:
   service on any of its addresses (the bridge's included), since `INPUT` drops whatever comes from
   `zr0` and is not a reply. Nor does anything reach the job that it did not ask for: `OUTPUT` and
   `FORWARD` drop what goes to `zr0` and is not a reply (added in P6, when services began to listen
-  there). Jobs cannot reach each other: each veth is an isolated bridge port
+  there). One exception for a runner that serves a Gitea or Forgejo instance (`RUNNER_PLATFORM`
+  gitea or forgejo): the instance's address and port, and those its tasks name
+  (`github.server_url`, which may be another name for the same host, a tailnet's), are open to
+  TCP from the bridge in `forward` and `input`, out of whichever interface leads there, so a
+  checkout works; no other port of that address, and no other address, is. An instance on the
+  host's own loopback cannot be reached as it is named, since the job's 127.0.0.1 is its own, and
+  the kernel cannot redirect to it (a reply from 127.0.0.1 may not leave by the bridge): the runner
+  listens on the bridge's address at the same port (bound to that address alone, tried again each
+  second until the first job has made the bridge) and forwards each connection to 127.0.0.1,
+  `input` accepts that port at the bridge's address, and the job's checkout fetches from
+  `http://<bridge address>:<port>`. The host's own INPUT (ufw's, whose policy drops) is given the
+  same `-i zr0 -j ACCEPT` as its FORWARD, leaving the deciding to the runner's table. What the
+  workflow reads (`github.server_url` in expressions, `GITHUB_SERVER_URL`) still says 127.0.0.1.
+  The table is the runner's alone and replaced whole, so runners of one host that serve
+  different instances must be one pool: the last to make the rules decides. Jobs cannot reach each other: each veth is an isolated bridge port
   (`IFLA_BRPORT_ISOLATED`), and `FORWARD` drops traffic from `zr0` back to `zr0`. IPv6 is off on the
   job's `eth0` and on the bridge, so no link-local address slips past those IPv4 rules (`lo` keeps
   its ::1). Ports below 1024 and ping work without capabilities on the host's
