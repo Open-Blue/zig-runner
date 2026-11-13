@@ -29,6 +29,7 @@ const image = @import("native/oci/image.zig");
 const layer = @import("native/oci/layer.zig");
 const zstd = @import("native/oci/zstd.zig");
 const libzstd = @import("native/oci/libzstd.zig");
+const zlibng = @import("native/oci/zlibng.zig");
 const registry = @import("native/oci/registry.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
@@ -966,6 +967,93 @@ fn libzstdAgrees(input: []const u8) !void {
         return error.ZstdDisagreement;
     }
     if (mine != .failed) try std.testing.expectEqualSlices(u8, zstd_ours_out[0..mine_len], zstd_oracle_out[0..theirs_len]);
+}
+
+// --- zlib-ng ---
+
+// "fuzz: zlib-ng" holds zlib-ng's inflater (`oci/zlibng.zig`, which reads every gzip layer) to std's
+// (`std.compress.flate`), which it replaced. The same bytes go to both, and they must agree: both
+// fail, or both give the same bytes (or the same first `zstd_output` of them), except where
+// `zlibngStricter` says. A failure has a reason, and reading on after one fails again, never out of
+// bounds.
+const gzip_files = [_][]const u8{
+    "empty",      "text-l1",     "text-l6",       "text-l9",    "text-fixed", "stored",
+    "random3k",   "skew4k",      "huffman-only",  "rle",        "zeros20k",   "header-fields",
+    "header-crc", "two-members", "trailing-junk", "long-match", "far-match",
+};
+
+const gzip_seeds = gzip_seeds: {
+    var out: [gzip_files.len][]const u8 = undefined;
+    for (gzip_files, 0..) |name, i| out[i] = seed(&.{@embedFile("fuzz_corpus/gzip/" ++ name ++ ".gz")});
+    const final = out;
+    break :gzip_seeds &final;
+};
+
+test "fuzz: zlib-ng" {
+    try std.testing.fuzz({}, zlibngStreams, .{ .corpus = gzip_seeds });
+}
+
+fn zlibngStreams(_: void, smith: *Smith) !void {
+    var buf: [zstd_input]u8 = undefined;
+    try zlibngAgrees(take(smith, &buf));
+}
+
+test "zlib-ng and std's inflater: every bit of the small seeds flipped" {
+    var buf: [400]u8 = undefined;
+    const stride: usize = if (std.valgrind.runningOnValgrind() != 0) 37 else 1;
+    inline for (gzip_files) |name| {
+        const member = @embedFile("fuzz_corpus/gzip/" ++ name ++ ".gz");
+        if (comptime member.len <= buf.len) {
+            var bit: usize = 0;
+            while (bit < member.len * 8) : (bit += stride) {
+                @memcpy(buf[0..member.len], member);
+                buf[bit / 8] ^= std.math.shl(u8, 1, bit % 8);
+                zlibngAgrees(buf[0..member.len]) catch |e| {
+                    std.debug.print("SEED {s} bit {d} {x}\n", .{ name, bit, buf[0..member.len] });
+                    return e;
+                };
+            }
+        }
+    }
+}
+
+fn zlibngAgrees(input: []const u8) !void {
+    var in: std.Io.Reader = .fixed(input);
+    const z = try zlibng.Decompress.create(std.testing.allocator, &in);
+    defer z.destroy();
+    const theirs, const theirs_len = zstdRead(&z.reader, &zstd_oracle_out);
+
+    var oracle_in: std.Io.Reader = .fixed(input);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var oracle: std.compress.flate.Decompress = .init(&oracle_in, .gzip, &window);
+    const mine, const mine_len = zstdRead(&oracle.reader, &zstd_ours_out);
+
+    if (theirs == .failed) try std.testing.expect(z.err != null);
+    var more: [64]u8 = undefined;
+    if (z.reader.readSliceShort(&more)) |_| {} else |_| {}
+
+    if (mine != theirs) {
+        // What zlib-ng refuses and std takes: see `zlibngStricter`.
+        if (theirs == .failed and mine != .failed and zlibngStricter(input, z.err.?)) return;
+        std.debug.print("zlib-ng: the inflaters end differently (zlib-ng: {s} {?s}, std: {s} {?s}), {d} input bytes\n", .{
+            @tagName(theirs), z.err, @tagName(mine), if (oracle.err) |e| @errorName(e) else null, input.len,
+        });
+        return error.GzipDisagreement;
+    }
+    if (mine != .failed) try std.testing.expectEqualSlices(u8, zstd_ours_out[0..mine_len], zstd_oracle_out[0..theirs_len]);
+}
+
+/// Streams zlib-ng refuses and std takes, each found by this target and checked against `gzip -d`.
+fn zlibngStricter(input: []const u8, why: []const u8) bool {
+    // A header with a reserved flag bit set (RFC 1952: bits 5 to 7 must be zero): std skips the
+    // bit, zlib-ng and `gzip -d` refuse the member.
+    if (std.mem.eql(u8, why, "unknown header flags set")) return input.len > 3 and input[3] & 0xe0 != 0;
+    // A member's trailer that is not its data's CRC-32 and length (std reads the trailer and
+    // checks neither), and a header checksum that is not the header's.
+    for ([_][]const u8{ "incorrect data check", "incorrect length check", "header crc mismatch" }) |stricter| {
+        if (std.mem.eql(u8, why, stricter)) return true;
+    }
+    return false;
 }
 
 fn zstdDisagree(input: []const u8, what: []const u8, ours: ?zstd.Error, theirs: ?std.compress.zstd.Decompress.Error) error{ZstdDisagreement} {

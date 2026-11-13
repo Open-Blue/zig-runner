@@ -24,6 +24,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const sandbox = @import("../sandbox.zig");
 const zstd = @import("libzstd.zig");
+const gzip = @import("zlibng.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = @import("../../sha256.zig").Sha256;
@@ -87,9 +88,8 @@ pub fn apply(
         error.ReadFailed => return error.ReadFailed,
     };
     if (std.mem.startsWith(u8, magic, "\x1f\x8b")) {
-        const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
-        defer gpa.free(window);
-        var d: std.compress.flate.Decompress = .init(in, .gzip, window);
+        const d = try gzip.Decompress.create(gpa, in);
+        defer d.destroy();
         try applyDecompressed(gpa, io, root, &d.reader, diff_id, opts, totals);
     } else if (std.mem.startsWith(u8, magic, "\x28\xb5\x2f\xfd")) {
         // Not its frame checksum: the blob's digest is checked before, and the diff id after.

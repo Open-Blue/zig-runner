@@ -326,3 +326,34 @@ the CPU: **0.92-1.36 s of user time against 1.86-2.80 s**, about a second of a c
 400 MB layer. A machine whose cores are busy with the job, or slower (the Pi), is where that shows.
 
 The binary grows by 132 KB (x86_64, 4.44 to 4.58 MB) and 78 KB (aarch64, 3.80 to 3.88 MB).
+
+## gzip layers: zlib-ng against std's inflater
+
+*2026-11-13, laptop (Ryzen 5 PRO 4650U), balanced power, load average 4-6 from other work.* The
+same layers as above, as Docker Hub serves ubuntu's (29.8 MB of gzip, 80.7 MB of tar) and the Zig
+toolchain as `gzip -6` (90 MB, 390 MB of tar). Output bytes a second, the median of 5-9 rounds,
+to a discarding writer:
+
+| Inflater | ubuntu | zig toolchain |
+| --- | --- | --- |
+| `std.compress.flate` (what the runner used) | 188-192 MB/s | 250-281 MB/s |
+| zlib 1.3.1, the system's, one call | 337 MB/s | 454 MB/s |
+| zlib-ng 2.3.3, built by gcc, runtime CPU detection | 381 MB/s | 559 MB/s |
+| zlib-ng 2.3.3, built by gcc, SSE2 only (no detection) | 590 MB/s | 795 MB/s |
+| zlib-ng 2.3.3 vendored, built by Zig without a libc, SSE2 only, streaming as the runner uses it | **566 MB/s** | **765 MB/s** |
+| libdeflate 1.26, one call into one buffer | 820 MB/s | 1,194 MB/s |
+
+zlib-ng is 3.0 times std's, streams through a window as the layer pipeline needs, and checks the
+member's CRC-32. libdeflate is faster still but takes the whole input and a buffer for the whole
+output at once (a layer is up to gigabytes, and its unpacking runs beside its inflating), so it is
+not an option here. The runtime-detection build of zlib-ng was slower than the baseline one on this
+CPU (its AVX2 paths), so detection is left out: one binary for every CPU of an architecture, and
+nothing to detect. The output of both inflaters on the two layers has the same SHA-256, which is
+also the tar's.
+
+In a layer's whole unpacking onto ext4 (`layer.apply`, pipelined as a job runs it) the toolchain
+layer took 3.2-3.7 s of wall time with either inflater (writing the files is the longer half, as
+with zstd), and **1.1-1.3 s of user CPU against 1.9-2.1 s** with zlib-ng.
+
+The binary grows by 62 KB (x86_64, 4,577,344 to 4,639,424 bytes) and 52 KB (aarch64, 3,876,960 to
+3,929,440), on top of libzstd's.

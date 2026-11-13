@@ -4,9 +4,9 @@
 //! as the oracle: the tests and "fuzz: libzstd" hold this one to it, byte for byte.
 //!
 //! libzstd 1.5.7 is vendored in `src/vendor/zstd` (`.github/scripts/vendor-zstd.sh`) and compiled
-//! without a libc, as the runner links none: its allocations come here (`runner_zstd_malloc`,
-//! through `src/vendor/shim/stdlib.h`) and `memcpy` and its kin from the compiler's runtime. Only
-//! the decompressor is built.
+//! without a libc, as the runner links none: its allocations come from `c_alloc.zig` (through
+//! `src/vendor/shim/stdlib.h`) and `memcpy` and its kin from the compiler's runtime. Only the
+//! decompressor is built.
 //!
 //! As the Zig decoder does, it skips the frame's checksum (the blob's digest is checked by whoever
 //! fetched it and the layer's diff id by whoever unpacks it), refuses dictionaries (a frame that
@@ -39,31 +39,6 @@ const force_ignore_checksum = 1002;
 /// libzstd's recommended output size, `ZSTD_DStreamOutSize()`: one block.
 const out_bytes = 128 * 1024;
 const reader_bytes = 64 * 1024;
-
-/// libzstd's allocations, from the runner's shared allocator, with the size in front to free by.
-/// 16 bytes is the alignment libzstd assumes of `malloc` (it asks for 64 where it needs more).
-const header = 16;
-
-export fn runner_zstd_malloc(n: usize) callconv(.c) ?[*]u8 {
-    const total = std.math.add(usize, n, header) catch return null;
-    const raw = std.heap.smp_allocator.rawAlloc(total, .@"16", @returnAddress()) orelse return null;
-    std.mem.writeInt(usize, raw[0..@sizeOf(usize)], total, .little);
-    return raw + header;
-}
-
-export fn runner_zstd_calloc(count: usize, size: usize) callconv(.c) ?[*]u8 {
-    const n = std.math.mul(usize, count, size) catch return null;
-    const p = runner_zstd_malloc(n) orelse return null;
-    @memset(p[0..n], 0);
-    return p;
-}
-
-export fn runner_zstd_free(ptr: ?[*]u8) callconv(.c) void {
-    const p = ptr orelse return;
-    const raw = p - header;
-    const total = std.mem.readInt(usize, raw[0..@sizeOf(usize)], .little);
-    std.heap.smp_allocator.rawFree(raw[0..total], .@"16", @returnAddress());
-}
 
 /// Both parameters the decoder sets exist in the vendored version and take the values given, so
 /// libzstd cannot refuse them.

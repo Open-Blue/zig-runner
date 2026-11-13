@@ -9,7 +9,8 @@ name: analysis
 #                  that guard secrets and a job's environment (masking, file commands, the
 #                  broker's messages, HTTP/2 framing) held to GitHub's runner, and the runner's own
 #                  zstd decoder held to std's, and libzstd, which reads the layers, to that decoder,
-#                  on every input (an image layer from any registry).
+#                  and zlib-ng's inflater held to std's, on every input (an image layer from any
+#                  registry).
 #                  The corpus each finds
 #                  is kept from night to night in the Actions cache; a crash, a failed check, a
 #                  leak or a hang fails the job, named after its target, with the input as an
@@ -208,6 +209,8 @@ jobs:
           # a 2 minute build), so about ten minutes, with room for a corpus that grows.
           - { target: zstd, runs: 500K }
           - { target: libzstd, runs: 500K }
+          # zlib-ng's inflater against std's.
+          - { target: zlib-ng, runs: 500K }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

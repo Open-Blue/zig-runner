@@ -2,7 +2,8 @@
 //! real files, for comparing them with C and Rust candidates (docs/BENCHMARKS.md). Built like the
 //! runner, C sources included (`.github/scripts/impl-bench.sh`). Prints MB/s and the median.
 //!
-//!     implbench sha-dispatch|sha-baseline|zstd|libzstd|gzip <file> [rounds]
+//!     implbench sha-dispatch|sha-baseline|zstd|libzstd|gzip|zlibng <file> [rounds]
+//!     implbench gzip-sha|zlibng-sha <file>      the SHA-256 of the output, to compare the decoders
 //!     implbench apply <layer blob> <empty dir> [0|1: pipelined]
 //!     implbench redact <log file> <secrets> [rounds]
 const std = @import("std");
@@ -10,8 +11,13 @@ const Sha256 = @import("sha256.zig").Sha256;
 const zstd = @import("native/oci/zstd.zig");
 const redact = @import("redact.zig");
 const libzstd = @import("native/oci/libzstd.zig");
+const zlibng = @import("native/oci/zlibng.zig");
 const layer = @import("native/oci/layer.zig");
 const linux = std.os.linux;
+
+comptime {
+    _ = @import("c_alloc.zig"); // the C libraries' allocator
+}
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.arena.allocator();
@@ -90,6 +96,31 @@ pub fn main(init: std.process.Init) !u8 {
             const d = try libzstd.Decompress.create(gpa, &in);
             defer d.destroy();
             bytes = try d.reader.discardRemaining();
+        } else if (std.mem.eql(u8, args[1], "zlibng")) {
+            var in: std.Io.Reader = .fixed(data);
+            const d = try zlibng.Decompress.create(gpa, &in);
+            defer d.destroy();
+            bytes = try d.reader.discardRemaining();
+        } else if (std.mem.eql(u8, args[1], "gzip-sha") or std.mem.eql(u8, args[1], "zlibng-sha")) {
+            // The SHA-256 of what the decoder gives, to compare the two decoders on a real layer.
+            var in: std.Io.Reader = .fixed(data);
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            var buf: [4096]u8 = undefined;
+            var hw = std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256).initHasher(hasher, &buf);
+            if (args[1][0] == 'z') {
+                const d = try zlibng.Decompress.create(gpa, &in);
+                defer d.destroy();
+                bytes = try d.reader.streamRemaining(&hw.writer);
+            } else {
+                const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
+                var d: std.compress.flate.Decompress = .init(&in, .gzip, window);
+                bytes = try d.reader.streamRemaining(&hw.writer);
+            }
+            try hw.writer.flush();
+            hasher = hw.hasher;
+            hasher.final(&digest);
+            std.debug.print("{s} {s}: {d} bytes, sha256 {x}\n", .{ args[1], args[2], bytes, digest });
+            return 0;
         } else if (std.mem.eql(u8, args[1], "gzip")) {
             var in: std.Io.Reader = .fixed(data);
             const window = try gpa.alloc(u8, std.compress.flate.max_window_len);

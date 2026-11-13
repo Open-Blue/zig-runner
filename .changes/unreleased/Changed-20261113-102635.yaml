@@ -1,0 +1,3 @@
+kind: Changed
+body: 'gzip layers are inflated with zlib-ng (vendored, inflater only, built into the static binaries for x86_64 and arm64) instead of Zig''s std: 3 times the speed, and 40% less CPU for a pull. std''s inflater stays as the oracle zlib-ng is fuzzed and tested against. A gzip layer with a reserved header flag or a wrong trailer is now refused, where std let it through'
+time: 2026-11-13T10:26:35.523719544-05:00

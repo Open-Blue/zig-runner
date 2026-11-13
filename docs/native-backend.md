@@ -1053,6 +1053,12 @@ What it does not do yet (debt, with the phase that pays it):
   and a large file's writeback is started as it is written (`sync_file_range`, advisory) so the
   `syncfs` before the rename has little left to write. The publish order is unchanged: nothing is
   durable by the early writeback, only by that `syncfs`.
+- **gzip is zlib-ng's inflater** (`oci/zlibng.zig`, 2.3.3 vendored in `src/vendor/zlib-ng`, compiled
+  without a libc and without runtime CPU detection, the baseline SIMD of each architecture), which
+  inflates 3 times faster than `std.compress.flate` (188 against 566 MB/s on ubuntu's layer;
+  docs/BENCHMARKS.md). std's inflater is the oracle `fuzz: zlib-ng` holds it to. It reads the first
+  gzip member and ignores what follows, as std does, and refuses what std lets through: a reserved
+  header flag, a wrong CRC-32 or length in the trailer, a wrong header checksum.
 - **zstd is libzstd** (`oci/libzstd.zig`, 1.5.7 vendored in `src/vendor/zstd`, the decompressor
   only, compiled without a libc), which decodes 3.7 times faster than the runner's own decoder
   (`oci/zstd.zig`, 266 MB/s on ubuntu's layer, 986 MB/s libzstd; docs/BENCHMARKS.md). The own

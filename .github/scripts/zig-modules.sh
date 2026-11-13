@@ -46,8 +46,9 @@ zig_modules() {
 		fi
 	fi
 	zig_libzstd_args
-	# shellcheck disable=SC2034,SC2154 # for the caller; libzstd_args is set above
-	modules=(-fPIE "$@" --dep build_version --dep tls -Mroot=src/main.zig "${libzstd_args[@]}"
+	zig_libzlibng_args "$(zig_target_arch "$@")"
+	# shellcheck disable=SC2034,SC2154 # for the caller; the C arguments are set above
+	modules=(-fPIE "$@" --dep build_version --dep tls -Mroot=src/main.zig "${libzstd_args[@]}" "${libzlibng_args[@]}"
 		"$@" -Mbuild_version="$version" "$@" -Mtls="$scratch/tls/src/root.zig")
 }
 
@@ -67,6 +68,50 @@ zig_libzstd_args() {
 		-Isrc/vendor/shim -I"$zstd" -I"$zstd"/common --
 		"$zstd"/common/{debug,entropy_common,error_private,fse_decompress,xxhash,zstd_common}.c
 		"$zstd"/decompress/{huf_decompress,zstd_ddict,zstd_decompress,zstd_decompress_block}.c)
+}
+
+# zig_target_arch FLAG...: the architecture the compiler is asked for (`-target x86_64-linux-musl`),
+# or this machine's.
+zig_target_arch() {
+	local prev=""
+	for a in "$@"; do
+		if [[ $prev == -target ]]; then
+			echo "${a%%-*}"
+			return
+		fi
+		prev=$a
+	done
+	uname -m
+}
+
+# zig_libzlibng_args ARCH: sets `libzlibng_args` to the arguments that add zlib-ng's inflater for
+# ARCH (x86_64 or aarch64) to the module before them: runner/build.zig's `addLibzlibng`, the same
+# files and flags. From runner/.
+zig_libzlibng_args() {
+	local z=src/vendor/zlib-ng arch_files arch_flags
+	case $1 in
+	x86_64)
+		arch_files=("$z"/arch/x86/{chunkset_sse2,chorba_sse2}.c)
+		arch_flags=(-DX86_FEATURES -DX86_SSE2)
+		;;
+	aarch64)
+		arch_files=("$z"/arch/arm/{chunkset_neon,adler32_neon}.c)
+		arch_flags=(-DARM_FEATURES -DARM_NEON -DARM_NEON_HASLD4)
+		;;
+	*)
+		echo "zig_libzlibng_args: zlib-ng is vendored for x86_64 and aarch64, not $1" >&2
+		return 1
+		;;
+	esac
+	# shellcheck disable=SC2034 # for the caller
+	libzlibng_args=(-cflags -O3 -ffreestanding -fno-sanitize=undefined
+		-fno-sanitize-coverage=edge,trace-pc-guard,inline-8bit-counters,pc-table,trace-cmp,trace-div,trace-gep
+		-DNDEBUG -DZLIBNG_NATIVE_API -DDISABLE_RUNTIME_CPU_DETECTION -DWITH_OPTIM -DHAVE_ATTRIBUTE_ALIGNED
+		-DHAVE_BUILTIN_ASSUME_ALIGNED -DHAVE_BUILTIN_CTZ -DHAVE_BUILTIN_CTZLL -DHAVE_VISIBILITY_HIDDEN
+		"${arch_flags[@]}" -Isrc/vendor/shim -I"$z" --
+		"$z"/{adler32,crc32_braid_comb,crc32,functable,inflate,inftrees,zutil}.c
+		"$z"/arch/generic/{adler32_c,adler32_fold_c,crc32_braid_c,crc32_chorba_c,crc32_fold_c}.c
+		"${arch_files[@]}")
 }
 
 # zig_package_hash DIR: the hash `zig fetch` gives the package checked out in DIR, as Zig 0.17
