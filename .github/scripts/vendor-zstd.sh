@@ -7,7 +7,8 @@
 #   vendor-zstd.sh           replaces runner/src/vendor/zstd with the pinned release's files
 #   vendor-zstd.sh --check   fails when the vendored files differ from it (CI's "Workflows" job)
 #
-# To update: change `version` and `sha256` (the release's own .sha256 file has it), run this, and
+# To update (Renovate moves `version`, and this check then fails until `sha256` follows, as for the
+# other pins whose checksums it cannot compute): change `sha256` (the release's own .sha256 file has it), run this, and
 # build both targets (zig-modules.sh and runner/build.zig list the C files). A fetch that fails
 # exits 75 (EX_TEMPFAIL), which the CI step tries again.
 set -euo pipefail
@@ -33,10 +34,13 @@ curl -fsSL --retry 2 -o "$scratch/zstd.tar.gz" \
 	echo "vendor-zstd: could not fetch zstd $version" >&2
 	exit 75
 }
-echo "$sha256  $scratch/zstd.tar.gz" | sha256sum -c --quiet - || {
-	echo "vendor-zstd: the zstd $version tarball is not the one pinned here" >&2
+got=$(sha256sum "$scratch/zstd.tar.gz" | cut -d' ' -f1)
+if [[ $got != "$sha256" ]]; then
+	echo "vendor-zstd: the zstd $version tarball hashes to $got, not the $sha256 pinned here:" \
+		"if Renovate moved \`version\`, set \`sha256\` to $got (the release's own .sha256 file says the same)," \
+		"run this script without --check, and build both targets" >&2
 	exit 1
-}
+fi
 tar -xzf "$scratch/zstd.tar.gz" -C "$scratch"
 src=$scratch/zstd-$version
 
