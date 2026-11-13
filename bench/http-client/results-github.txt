@@ -1,0 +1,8 @@
+std cold n=4 p50=178202 p99=188985 mean=164311 wall_ms=657 cpu_ms=21 rss_kb=2628 fails=0
+std+nodelay cold n=4 p50=159205 p99=238168 mean=153682 wall_ms=614 cpu_ms=20 rss_kb=2788 fails=0
+curl cold n=4 p50=93637 p99=121720 mean=87336 wall_ms=349 cpu_ms=89 rss_kb=14848 fails=0 phases_us[dns,tcp,tls,ttfb,total]=6845,34209,63216,85590,85911
+hyper cold n=4 p50=97901 p99=108151 mean=92068 wall_ms=368 cpu_ms=21 rss_kb=5356 fails=4 phases_us[dns,tcp,tls]=22725,23165,24531
+std warm n=5 p50=21475 p99=127005 mean=41771 wall_ms=208 cpu_ms=8 rss_kb=2788 fails=0
+std+nodelay warm n=5 p50=30069 p99=102930 mean=50185 wall_ms=250 cpu_ms=10 rss_kb=2660 fails=0
+curl warm n=5 p50=83723 p99=1143344 mean=294010 wall_ms=1470 cpu_ms=88 rss_kb=14616 fails=0
+hyper warm n=5 p50=86652 p99=93842 mean=82258 wall_ms=411 cpu_ms=21 rss_kb=5604 fails=5

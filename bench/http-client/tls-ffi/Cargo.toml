@@ -1,0 +1,15 @@
+[package]
+name = "zrtls"
+version = "0.1.0"
+edition = "2021"
+[lib]
+crate-type = ["staticlib"]
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,0 +1,9 @@
+bench_std
+bench_curl
+server-bin
+tls_ffi_test-*
+rust/target
+tls-ffi/target
+certs/*.srl
+certs/*.csr
+certs/*key.pem

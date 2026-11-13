@@ -1,0 +1,48 @@
+std warm n=2000 p50=83 p99=164 mean=109 wall_ms=218 cpu_ms=114 rss_kb=2344 fails=0
+std+nodelay warm n=2000 p50=79 p99=190 mean=83 wall_ms=167 cpu_ms=107 rss_kb=2344 fails=0
+curl warm n=2000 p50=114 p99=366 mean=139 wall_ms=280 cpu_ms=159 rss_kb=13728 fails=0
+hyper warm n=2000 p50=146 p99=308 mean=156 wall_ms=314 cpu_ms=218 rss_kb=5228 fails=0
+std cold n=300 p50=45862 p99=47325 mean=45518 wall_ms=13655 cpu_ms=1151 rss_kb=2556 fails=0
+std+nodelay cold n=300 p50=3303 p99=6416 mean=3427 wall_ms=1028 cpu_ms=807 rss_kb=2908 fails=0
+curl cold n=300 p50=2087 p99=19222 mean=3207 wall_ms=962 cpu_ms=801 rss_kb=13780 fails=0 phases_us[dns,tcp,tls,ttfb,total]=32,494,2743,3093,3122
+hyper cold n=300 p50=1083 p99=2075 mean=1158 wall_ms=347 cpu_ms=258 rss_kb=5240 fails=0 phases_us[dns,tcp,tls]=106,145,605
+std conc n=3200 p50=626 p99=2358 mean=907 wall_ms=190 cpu_ms=508 rss_kb=11368 fails=0
+std+nodelay conc n=3200 p50=597 p99=2117 mean=696 wall_ms=148 cpu_ms=482 rss_kb=11432 fails=0
+curl conc n=3200 p50=1120 p99=6686 mean=1731 wall_ms=347 cpu_ms=353 rss_kb=15536 fails=0
+hyper conc n=3200 p50=326 p99=1715 mean=388 wall_ms=79 cpu_ms=160 rss_kb=6404 fails=0
+curl-h2 warm n=2000 p50=488 p99=627 mean=471 wall_ms=945 cpu_ms=501 rss_kb=13712 fails=0
+curl-h2 conc n=3200 p50=1575 p99=2868 mean=1771 wall_ms=355 cpu_ms=361 rss_kb=15884 fails=0
+hyper-h2 warm n=2000 p50=384 p99=516 mean=381 wall_ms=765 cpu_ms=458 rss_kb=5172 fails=0
+hyper-h2 conc n=3200 p50=758 p99=1593 mean=818 wall_ms=164 cpu_ms=194 rss_kb=5820 fails=0
+std warm n=2000 p50=170 p99=329 mean=196 wall_ms=393 cpu_ms=196 rss_kb=2344 fails=0
+std+nodelay warm n=2000 p50=132 p99=304 mean=155 wall_ms=311 cpu_ms=192 rss_kb=2344 fails=0
+curl warm n=2000 p50=221 p99=391 mean=232 wall_ms=466 cpu_ms=266 rss_kb=13600 fails=0
+hyper warm n=2000 p50=200 p99=369 mean=210 wall_ms=421 cpu_ms=288 rss_kb=5184 fails=0
+std cold n=300 p50=46002 p99=60170 mean=46384 wall_ms=13915 cpu_ms=1372 rss_kb=2772 fails=0
+std+nodelay cold n=300 p50=3305 p99=4970 mean=3395 wall_ms=1018 cpu_ms=816 rss_kb=2712 fails=0
+curl cold n=300 p50=2124 p99=3054 mean=2187 wall_ms=656 cpu_ms=559 rss_kb=13872 fails=0 phases_us[dns,tcp,tls,ttfb,total]=24,360,1897,2112,2127
+hyper cold n=300 p50=1087 p99=1927 mean=1125 wall_ms=337 cpu_ms=250 rss_kb=5324 fails=0 phases_us[dns,tcp,tls]=100,145,586
+std conc n=3200 p50=623 p99=3928 mean=1017 wall_ms=213 cpu_ms=487 rss_kb=11432 fails=0
+std+nodelay conc n=3200 p50=624 p99=2887 mean=774 wall_ms=163 cpu_ms=476 rss_kb=11424 fails=0
+curl conc n=3200 p50=1027 p99=6503 mean=1482 wall_ms=298 cpu_ms=302 rss_kb=15344 fails=0
+hyper conc n=3200 p50=350 p99=1299 mean=415 wall_ms=86 cpu_ms=160 rss_kb=6332 fails=0
+curl-h2 warm n=2000 p50=404 p99=619 mean=418 wall_ms=838 cpu_ms=443 rss_kb=13700 fails=0
+curl-h2 conc n=3200 p50=1518 p99=2732 mean=1693 wall_ms=340 cpu_ms=351 rss_kb=15832 fails=0
+hyper-h2 warm n=2000 p50=243 p99=492 mean=269 wall_ms=540 cpu_ms=324 rss_kb=5240 fails=0
+hyper-h2 conc n=3200 p50=724 p99=2064 mean=807 wall_ms=163 cpu_ms=173 rss_kb=5600 fails=0
+std warm n=2000 p50=98 p99=290 mean=130 wall_ms=261 cpu_ms=137 rss_kb=2344 fails=0
+std+nodelay warm n=2000 p50=96 p99=160 mean=100 wall_ms=200 cpu_ms=118 rss_kb=2344 fails=0
+curl warm n=2000 p50=143 p99=294 mean=147 wall_ms=295 cpu_ms=167 rss_kb=13616 fails=0
+hyper warm n=2000 p50=149 p99=416 mean=179 wall_ms=359 cpu_ms=245 rss_kb=5220 fails=0
+std cold n=300 p50=45022 p99=59124 mean=45305 wall_ms=13591 cpu_ms=1127 rss_kb=2792 fails=0
+std+nodelay cold n=300 p50=2205 p99=3916 mean=2358 wall_ms=707 cpu_ms=574 rss_kb=3052 fails=0
+curl cold n=300 p50=1606 p99=3043 mean=1619 wall_ms=486 cpu_ms=389 rss_kb=13804 fails=0 phases_us[dns,tcp,tls,ttfb,total]=18,257,1381,1566,1579
+hyper cold n=300 p50=742 p99=1202 mean=769 wall_ms=231 cpu_ms=173 rss_kb=5076 fails=0 phases_us[dns,tcp,tls]=60,99,413
+std conc n=3200 p50=516 p99=2729 mean=943 wall_ms=202 cpu_ms=456 rss_kb=11556 fails=0
+std+nodelay conc n=3200 p50=519 p99=2681 mean=711 wall_ms=151 cpu_ms=426 rss_kb=11304 fails=0
+curl conc n=3200 p50=892 p99=4497 mean=1210 wall_ms=243 cpu_ms=248 rss_kb=15468 fails=0
+hyper conc n=3200 p50=326 p99=1693 mean=392 wall_ms=80 cpu_ms=154 rss_kb=6028 fails=0
+curl-h2 warm n=2000 p50=258 p99=547 mean=279 wall_ms=559 cpu_ms=295 rss_kb=13876 fails=0
+curl-h2 conc n=3200 p50=1323 p99=2578 mean=1497 wall_ms=300 cpu_ms=300 rss_kb=15796 fails=0
+hyper-h2 warm n=2000 p50=199 p99=445 mean=231 wall_ms=464 cpu_ms=277 rss_kb=5196 fails=0
+hyper-h2 conc n=3200 p50=671 p99=1609 mean=740 wall_ms=149 cpu_ms=159 rss_kb=5692 fails=0

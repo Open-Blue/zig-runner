@@ -1,0 +1,2 @@
+extendedKeyUsage=clientAuth
+basicConstraints=CA:FALSE

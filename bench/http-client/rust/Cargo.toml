@@ -1,0 +1,20 @@
+[package]
+name = "bench_hyper"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+tower-service = "0.3"
+libc = "0.2"
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
