@@ -106,6 +106,7 @@ fn connect(
     const start = now();
     const socket = try inner.?.netConnectIp(userdata, address, options);
     const end = now();
+    noDelay(socket.handle);
     acquire();
     defer lock.unlock();
     // The same descriptor again replaces its old entry: the old connection is closed.
@@ -117,6 +118,20 @@ fn connect(
     connects[at] = .{ .fd = socket.handle, .start = start, .end = end };
     if (at == connects_next % slots) connects_next +%= 1;
     return socket;
+}
+
+var nodelay_failed: std.atomic.Value(bool) = .init(false);
+
+/// TCP_NODELAY on a new connection. Std never sets it, and a TLS connection whose peer then goes
+/// quiet after our Finished waits for Nagle's algorithm and the peer's delayed ACK, about 40 ms
+/// (45 ms against 2.2 ms for a cold request, measured locally). Interim: the HTTP client is
+/// moving to one that sets it itself. A failure is logged once and is never fatal.
+fn noDelay(fd: std.posix.socket_t) void {
+    const on: c_int = 1;
+    std.posix.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&on)) catch |e| {
+        if (!nodelay_failed.swap(true, .monotonic))
+            std.log.warn("http: TCP_NODELAY could not be set on a connection: {t}", .{e});
+    };
 }
 
 /// What a new connection took.
@@ -174,4 +189,17 @@ test "a wrapped Io times the lookup and the connect of a new connection, and no 
     try std.testing.expect(opened.dns_ns != null);
     // Taken once: a second look finds a connection that is no longer new.
     try std.testing.expect(takeOpened(stream.socket.handle, "localhost", t0, now()) == null);
+}
+
+test "a wrapped connect sets TCP_NODELAY on its socket" {
+    const io = wrap(std.testing.io);
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const stream = try listener.socket.address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var got: c_int = 0;
+    var len: linux.socklen_t = @sizeOf(c_int);
+    try std.testing.expectEqual(@as(usize, 0), linux.getsockopt(stream.socket.handle, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&got), &len));
+    try std.testing.expectEqual(@as(c_int, 1), got);
 }
