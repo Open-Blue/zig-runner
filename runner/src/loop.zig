@@ -10,7 +10,6 @@ const engine = @import("engine.zig");
 const dagger = @import("dagger.zig");
 const db = @import("db.zig");
 const sink = @import("sink.zig");
-const redact = @import("redact.zig");
 const admission = @import("admission.zig");
 const handleJob = @import("loop/job.zig").handleJob;
 const SpoolDir = @import("loop/job.zig").SpoolDir;
