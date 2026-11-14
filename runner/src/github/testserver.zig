@@ -66,7 +66,7 @@ pub const Server = struct {
     /// Installation tokens minted so far (/app/installations/...).
     app_tokens: std.atomic.Value(u32),
     /// Requests to /silent-once/... so far.
-    silent_once: u32,
+    silent_once: std.atomic.Value(u32),
     /// Connections left unanswered (/silent, /keep), closed by `stop`; used by the thread only.
     held: [16]Io.net.Stream,
     held_len: usize,
@@ -80,7 +80,7 @@ pub const Server = struct {
         s.polls = .init(0);
         s.accepts = .init(0);
         s.app_tokens = .init(0);
-        s.silent_once = 0;
+        s.silent_once = .init(0);
         s.results = .{};
         s.results_fail = 0;
         s.results_drop = 0;
@@ -231,8 +231,7 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
     if (std.mem.eql(u8, path, "/quit")) return .quit;
     if (std.mem.eql(u8, path, "/silent")) return .hold;
     if (std.mem.startsWith(u8, path, "/silent-once/")) {
-        s.silent_once += 1;
-        if (s.silent_once == 1) return .hold;
+        if (s.silent_once.fetchAdd(1, .acq_rel) == 0) return .hold;
     }
 
     var wb: [1024]u8 = undefined;

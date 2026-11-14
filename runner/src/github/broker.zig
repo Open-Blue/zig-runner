@@ -307,7 +307,7 @@ test "a request never answered is given up at its deadline, and tried once on a 
     try std.testing.expectEqual(std.http.Status.ok, r.status);
     try std.testing.expectEqualStrings("ok", r.body);
     try std.testing.expectEqual(before_again + 2, server.accepts.load(.acquire));
-    server.silent_once = 0;
+    server.silent_once.store(0, .release);
     const before_not = server.accepts.load(.acquire);
     try std.testing.expectError(error.Timeout, request(a, io, .POST, once, "{}", once_only));
     try std.testing.expectEqual(before_not + 1, server.accepts.load(.acquire));
