@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Job priority measurements (#PRIO). Run inside a scope the caller capped (`agent-run NAME -- ...`);
+# Job priority measurements (#549). Run inside a scope the caller capped (`agent-run NAME -- ...`);
 # needs a delegated cgroup with cpu and memory (a systemd user scope), python3, and the harness:
 #   zig build-exe runner/src/priobench.zig -O ReleaseSafe -femit-bin=$PRIOBENCH
 #
