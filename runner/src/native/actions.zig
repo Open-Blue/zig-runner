@@ -845,6 +845,7 @@ test "local actions natively: judged from the job's commit before the job, read 
     try tmp.dir.createDirPath(std.testing.io, "work/r/.github/actions/img");
     try tmp.dir.createDirPath(std.testing.io, "work/r/.github/actions/built");
     try tmp.dir.createDirPath(std.testing.io, "work/r/.github/actions/onbuild");
+    try tmp.dir.createDirPath(std.testing.io, "work/r/.github/actions/built/data");
     const sha = try ownRepo(arena, &tmp, &.{
         .{
             ".github/actions/hello/action.yml",
