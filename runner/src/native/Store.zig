@@ -1444,7 +1444,7 @@ fn collectLocked(s: Store, arena: Allocator, io: std.Io, ph: ?*phases.Phases, st
     // again. So under it a layer goes as the rest does (`evict.floor`), sparing recent use, and
     // only past the cap whatever its use.
     const keep = @min(s.max_bytes, total -| (Eviction.shortOf(arena, io, s) orelse 0));
-    const budget: Eviction.Budget = .init(io, s.limits.budget_ms);
+    const budget: Eviction.Budget = .initAt(io, s.limits.budget_ms, s.limits.budget_clock_ms);
     if (total > keep) {
         std.mem.sort(Entry, entries.items, {}, struct {
             fn lt(_: void, a: Entry, b: Entry) bool {

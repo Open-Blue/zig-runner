@@ -31,6 +31,7 @@
 //! hour (`Limits.recent_s`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const Store = @import("Store.zig");
 const reaper = @import("reaper.zig");
@@ -59,6 +60,10 @@ pub const Limits = struct {
     recent_s: i64 = 60 * 60,
     /// How long one job's end may spend deleting. Each entry costs a measure on top (`measureOne`).
     budget_ms: i64 = 1500,
+    /// Tests: the pass's clock stands still at this reading (ms), so that the budget runs out
+    /// only when `budget_ms` says it is already out, whatever the load does to the time a pass
+    /// takes; null, the awake clock, for a test of the budget itself. Always null outside tests.
+    budget_clock_ms: ?i64 = if (builtin.is_test) 0 else null,
     /// How often a volume in use is walked again: its size only steers eviction, and a walk is
     /// what the eviction must not cost more than. Tests: 0.
     remeasure_s: i64 = 60 * 60,
@@ -154,7 +159,7 @@ pub fn run(s: Store, io: std.Io) void {
     // pass has for deleting, or the worse the disk the less would ever go.
     var synced = syncDead(arena, io, s.root);
     if (!synced) return;
-    var budget: Budget = .init(io, lim.budget_ms);
+    var budget: Budget = .initAt(io, lim.budget_ms, lim.budget_clock_ms);
     for (all_areas) |a| if (!removeDead(arena, io, s.root, a, &budget, lim.stuck_retry_ms)) return;
     const vols = listVolumes(arena, io, s.root) catch return;
     const waited = treesWait(arena, io, s.root);
@@ -231,20 +236,29 @@ fn now(io: std.Io) i64 {
 pub const Budget = struct {
     io: std.Io,
     deadline_ms: i64,
+    /// Tests: the reading the clock stands at, when it does not run.
+    frozen_ms: ?i64 = null,
     /// What removal takes whatever the clock says, so that a pass always frees something.
     least: u32,
 
     /// A deadline `ms` from now. Past it from the start (`ms` negative) it leaves removal nothing.
     pub fn init(io: std.Io, ms: i64) Budget {
-        return .{
-            .io = io,
-            .deadline_ms = std.Io.Clock.awake.now(io).toMilliseconds() + ms,
-            .least = if (ms < 0) 0 else least_removed,
-        };
+        return initAt(io, ms, null);
+    }
+
+    /// As `init`, with the clock standing at `frozen_ms` if given.
+    pub fn initAt(io: std.Io, ms: i64, frozen_ms: ?i64) Budget {
+        var b: Budget = .{ .io = io, .deadline_ms = 0, .frozen_ms = frozen_ms, .least = if (ms < 0) 0 else least_removed };
+        b.deadline_ms = b.reading() + ms;
+        return b;
+    }
+
+    fn reading(b: Budget) i64 {
+        return b.frozen_ms orelse std.Io.Clock.awake.now(b.io).toMilliseconds();
     }
 
     pub fn late(b: Budget) bool {
-        return std.Io.Clock.awake.now(b.io).toMilliseconds() >= b.deadline_ms;
+        return b.reading() >= b.deadline_ms;
     }
 
     /// Whether removal should stop.
@@ -1894,7 +1908,7 @@ test "native eviction: a chain of directories deeper than a pass gets through go
     defer f.deinit();
     try deepChain(f, 30_000);
     const old = try f.volume("old", 6000, 30);
-    f.s.limits = .{ .volumes_max_bytes = 1, .min_free_pct = 0, .budget_ms = 60 };
+    f.s.limits = .{ .volumes_max_bytes = 1, .min_free_pct = 0, .budget_ms = 60, .budget_clock_ms = null };
     var passes: usize = 0;
     while (try f.deadLeft() > 0 and passes < 400) : (passes += 1) run(f.s, testing.io);
     try testing.expectEqual(@as(usize, 0), try f.deadLeft());
@@ -2126,7 +2140,7 @@ test "native eviction: names a job planted under a dead tree do not stop the rem
     _ = linux.close(fd);
     try cwd.rename(Hostile.p(f, "{s}/a", .{build}), cwd, Hostile.p(f, "{s}/a", .{dead}), testing.io);
     const old = try f.volume("old", 6000, 30);
-    f.s.limits = .{ .volumes_max_bytes = 1, .min_free_pct = 0, .budget_ms = 15 };
+    f.s.limits = .{ .volumes_max_bytes = 1, .min_free_pct = 0, .budget_ms = 15, .budget_clock_ms = null };
     // Bounded by time, not by passes: each pass has 15 ms, and a loaded machine (the
     // ThreadSanitizer suite's twelve shards) gets less done in each, so the 170 passes this takes
     // alone, 256 under ThreadSanitizer, ran past a cap of 300. A removal that is stuck still
@@ -2144,7 +2158,7 @@ test "native eviction: a slow sync does not eat what a pass may delete" {
     const dead = Hostile.p(f, "{s}/volumes/.dead-9", .{f.s.root});
     try std.Io.Dir.cwd().createDirPath(testing.io, dead);
     for (0..2000) |i| try Hostile.write(Hostile.p(f, "{s}/f{d}", .{ dead, i }), "x");
-    f.s.limits = .{ .volumes_max_bytes = 0, .min_free_pct = 0, .budget_ms = 300 };
+    f.s.limits = .{ .volumes_max_bytes = 0, .min_free_pct = 0, .budget_ms = 300, .budget_clock_ms = null };
     test_sync_ms = 400;
     defer test_sync_ms = 0;
     // Each pass gets its time after the sync, so a busy machine only takes more of them: a sync
