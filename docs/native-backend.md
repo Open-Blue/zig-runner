@@ -2454,7 +2454,19 @@ the image's filesystem (every path's kind, mode, owner, size and content hash or
 config (env, entrypoint, cmd, working directory, user). They are equal except for what each
 fixture's `differences.txt` lists, which is where the builder does something else on purpose:
 
-DIFFERENCES_PLACEHOLDER
+- A stage's `COPY --from` is keyed by the stage's key, not by a checksum of the files copied, so
+  an unchanged copy is reused without building the stage, and a stage that changes without
+  changing the files copied makes a new layer (BuildKit would reuse it).
+- The same instructions in two stages, or in a stage and in one Dockerfile, are one set of layers.
+- `WORKDIR` makes no (empty) layer when the image has the directory.
+- A file with several matches of a wildcard and a destination that is not a directory is written
+  as BuildKit writes it (the last match wins), though Docker's documentation says it is an error.
+- A fetched action's context has no `.git` (GitHub's copy of the action has none).
+- The layers carry no timestamps of the build.
+
+Open at the time of writing: the comparison was last run before `--chmod` of a created destination
+directory, `adduser`-style RUNs without the tests' host `/usr`, and `ADD` of a URL were settled;
+fixtures whose results are not yet equal list their differences in `differences.txt`.
 
 The `Runner` is the sandbox (`docker_action.BuildRunner`): a `RUN` runs as a container whose
 lowers are the image's layers so far, each idmapped on a root runner, and whose upper is the
