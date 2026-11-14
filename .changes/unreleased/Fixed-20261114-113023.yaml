@@ -1,0 +1,3 @@
+kind: Fixed
+body: The apt mirror fallback test serves its own signed mirror, so it no longer fails when public mirrors time out
+time: 2026-11-14T11:30:23.856443137-05:00

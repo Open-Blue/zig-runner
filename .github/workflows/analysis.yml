@@ -570,6 +570,24 @@ jobs:
           path: ${{ runner.temp }}/stress
           if-no-files-found: ignore
 
+  # Every default mirror of apt.sh carries every pocket (apt-test.sh --real-mirrors): the hermetic
+  # test in ci cannot tell. Needs the internet and a public mirror may be out, so only at night
+  # (a failure is a mirror to look at, not a broken change), never on a pull request.
+  apt-real-mirrors:
+    name: apt default mirrors
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: every pocket on every default mirror
+        run: .github/scripts/apt-test.sh --real-mirrors
+
   # Under a minute: ZLint reads the sources, nothing is compiled.
   zlint-suppressed-errors:
     name: ZLint (suppressed-errors)

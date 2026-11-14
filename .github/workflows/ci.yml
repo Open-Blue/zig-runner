@@ -133,8 +133,8 @@ jobs:
         run: .github/scripts/tool-trees-test.sh
 
       # apt.sh's fallback to a mirror, in a container whose route to Ubuntu's archive is cut: the
-      # install still works, with apt's keyrings unchanged. Uses the real mirrors, 44 s, so only on
-      # a change to apt.sh or its test (ci-scope.sh apt).
+      # install still works, with apt's keyrings unchanged. Serves its own signed mirror (no
+      # internet), about 40 s, so only on a change to apt.sh or its test (ci-scope.sh apt).
       - name: Whether this change can affect apt.sh
         id: apt_scope
         if: ${{ !cancelled() }}
