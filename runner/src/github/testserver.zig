@@ -68,7 +68,7 @@ pub const Server = struct {
     /// Requests to /silent-once/... so far.
     silent_once: u32,
     /// Connections left unanswered (/silent, /keep), closed by `stop`; used by the thread only.
-    held: [8]Io.net.Stream,
+    held: [16]Io.net.Stream,
     held_len: usize,
 
     /// Listens and serves on a thread of its own until `stop`.
