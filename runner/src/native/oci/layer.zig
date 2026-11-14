@@ -1098,7 +1098,7 @@ test "native oci layer: base-256 numbers and checksums in tar headers" {
     try testing.expectError(error.BadTarHeader, tr.next());
 }
 
-test "allocation failures: a layer applied, with PAX headers, whiteouts and gzip" {
+test "allocation failures: a layer applied, with PAX headers, whiteouts, gzip and zstd" {
     var a: std.heap.ArenaAllocator = .init(testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -1135,6 +1135,7 @@ test "allocation failures: a layer applied, with PAX headers, whiteouts and gzip
     const af = @import("../../alloc_failures.zig");
     try af.checkNoLeaks(S.run, .{ root, plain });
     try af.checkNoLeaks(S.run, .{ root, @as([]const u8, &test_gzip) });
+    try af.checkNoLeaks(S.run, .{ root, @as([]const u8, &test_zstd) });
 }
 
 /// The fixtures of the gzip and zstd test (see there).

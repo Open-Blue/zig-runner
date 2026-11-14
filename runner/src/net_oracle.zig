@@ -192,3 +192,36 @@ test "oracle: a request nobody answers is given up at its deadline, and cancelli
     try std.testing.expectError(error.Canceled, f.cancel(io));
     try std.testing.expect(cancelled_at.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 5_000);
 }
+
+test "allocation failures: a request through the network library" {
+    const af = @import("alloc_failures.zig");
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const S = struct {
+        /// The response, or out of memory; a failure of the request itself is the same as without one.
+        fn run(a: std.mem.Allocator, port: u16, path: []const u8, want_status: u16, want_body: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            var url_buf: [128]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ port, path });
+            const r = net_client.fetch(arena.allocator(), std.testing.io, .{
+                .url = url,
+                .headers = &.{ .{ .name = "Authorization", .value = "Bearer t0k" }, .{ .name = "Accept", .value = "*/*" } },
+            }) catch |e| {
+                if (want_status == 0 and e == error.TooManyRedirects) return;
+                return e;
+            };
+            try std.testing.expectEqual(want_status, @as(u16, @backingInt(r.status)));
+            try std.testing.expectEqualStrings(want_body, r.body);
+            // The headers the request log reads, from the same memory.
+            _ = r.header("content-type");
+        }
+    };
+    try af.checkOne(S.run, .{ server.port, "/echo", 200, "GET Bearer t0k" });
+    try af.checkOne(S.run, .{ server.port, "/same", 200, "GET Bearer t0k" });
+    try af.checkOne(S.run, .{ server.port, "/nothing-here", 404, "{\"message\":\"Not Found\"}" });
+    try af.checkOne(S.run, .{ server.port, "/limited/x", 429, "" });
+    // A redirect loop ends in the library's error, not in a swallowed one.
+    try af.checkOne(S.run, .{ server.port, "/loop", 0, "" });
+}
