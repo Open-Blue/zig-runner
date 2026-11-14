@@ -241,7 +241,8 @@ fn job(arena: Allocator, io: std.Io, sp: Spec) !Store {
     try Store.prepare(arena, io, root, .{ .check_parents = false });
     // `sync_load` empty: which way a layer is synced is then its entries' count alone, so `big`
     // takes `syncfs` and the small ones their own files' fsyncs, as the cases below assume.
-    return .{ .root = root, .sync_fd = Store.syncCursor(arena, root), .sync_log = Store.newSyncLog(arena), .sync_load = .{} };
+    const log = Store.newSyncLog(arena);
+    return .{ .root = root, .sync_fd = Store.syncCursor(arena, io, root, log), .sync_log = log, .sync_load = .{} };
 }
 
 fn write(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: Spec) !void {
@@ -929,7 +930,7 @@ fn fail(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, sp: S
         // Another job's data fails to reach the disk while this job runs, and the job that
         // writes it learns so first (its `syncfs`): the error is gone for any descriptor
         // opened after, and is still told to this job's, opened before.
-        other_fd = Store.syncCursor(arena, s.root);
+        other_fd = Store.syncCursor(arena, io, s.root, null);
         try cwd.createDirPath(io, try print(arena, "{s}/other", .{sp.root}));
         const data = try arena.alloc(u8, 1 << 20);
         @memset(data, 0x5a);
