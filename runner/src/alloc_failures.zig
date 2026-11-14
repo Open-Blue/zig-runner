@@ -129,13 +129,13 @@ fn checkEachAllocationFailure(comptime f: anytype, args: anytype) !void {
         var once: FailOnce = .{ .child = std.heap.smp_allocator };
         try @call(.auto, f, .{once.allocator()} ++ args);
         try once.checkFreed();
-        n = once.count;
+        n = once.count.load(.monotonic);
     }
     var i: usize = 0;
     while (i < n) : (i += stride()) {
         var once: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i };
         if (@call(.auto, f, .{once.allocator()} ++ args)) |_| {
-            if (once.failed) {
+            if (once.failed.load(.monotonic)) {
                 // Where that allocation was made, for whoever swallowed its failure.
                 var again: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i, .trace = true };
                 std.debug.print("allocation failures: allocation {d} of {d} failed and the run went on, made at:\n", .{ i, n });
@@ -157,7 +157,7 @@ pub fn checkEach(comptime f: anytype, args: anytype) !void {
         var once: FailOnce = .{ .child = std.heap.smp_allocator };
         try @call(.auto, f, .{once.allocator()} ++ args);
         try once.checkFreed();
-        n = once.count;
+        n = once.count.load(.monotonic);
     }
     var i: usize = 0;
     while (i < n) : (i += stride()) {
@@ -196,55 +196,62 @@ pub fn checkNoLeaks(comptime f: anytype, args: anytype) !void {
     }
 }
 
-/// Fails allocation number `fail_at`, and only that one.
-const FailOnce = struct {
+/// Fails allocation number `fail_at`, and only that one. The counters are atomic, so that
+/// allocations from other threads (the layer fetching tasks') can be failed and counted too.
+pub const FailOnce = struct {
     child: Allocator,
     fail_at: ?usize = null,
     /// Print where the failed allocation was made.
     trace: bool = false,
-    count: usize = 0,
-    failed: bool = false,
+    count: std.atomic.Value(usize) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
     /// Bytes allocated and not yet freed.
-    live: usize = 0,
+    live: std.atomic.Value(usize) = .init(0),
 
-    fn checkFreed(o: *const FailOnce) !void {
-        if (o.live != 0) return error.MemoryLeakDetected;
+    pub fn checkFreed(o: *const FailOnce) !void {
+        if (o.live.load(.monotonic) != 0) return error.MemoryLeakDetected;
     }
 
-    fn allocator(o: *FailOnce) Allocator {
+    pub fn allocator(o: *FailOnce) Allocator {
         return .{ .ptr = o, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const o: *FailOnce = @ptrCast(@alignCast(ctx));
-        defer o.count += 1;
-        if (o.fail_at == o.count) {
-            o.failed = true;
+        if (o.fail_at == o.count.fetchAdd(1, .monotonic)) {
+            o.failed.store(true, .monotonic);
             if (o.trace) std.debug.dumpCurrentStackTrace(.{ .first_address = ra });
             return null;
         }
         const memory = o.child.rawAlloc(len, alignment, ra) orelse return null;
-        o.live += len;
+        _ = o.live.fetchAdd(len, .monotonic);
         return memory;
     }
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
         const o: *FailOnce = @ptrCast(@alignCast(ctx));
         if (!o.child.rawResize(memory, alignment, new_len, ra)) return false;
-        o.live = o.live - memory.len + new_len;
+        o.resized(memory.len, new_len);
         return true;
     }
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
         const o: *FailOnce = @ptrCast(@alignCast(ctx));
         const moved = o.child.rawRemap(memory, alignment, new_len, ra) orelse return null;
-        o.live = o.live - memory.len + new_len;
+        o.resized(memory.len, new_len);
         return moved;
+    }
+
+    fn resized(o: *FailOnce, old_len: usize, new_len: usize) void {
+        if (new_len >= old_len)
+            _ = o.live.fetchAdd(new_len - old_len, .monotonic)
+        else
+            _ = o.live.fetchSub(old_len - new_len, .monotonic);
     }
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const o: *FailOnce = @ptrCast(@alignCast(ctx));
-        o.live -= memory.len;
+        _ = o.live.fetchSub(memory.len, .monotonic);
         o.child.rawFree(memory, alignment, ra);
     }
 };

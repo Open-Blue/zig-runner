@@ -523,7 +523,7 @@ test "allocation failures: a pull through token auth, an index, gzip and zstd la
 
     // The registry client's, the manifests' and the store's memory fail one allocation at a time,
     // in `arena` (`checkOne`: every run must end in `error.OutOfMemory`). The memory the layers'
-    // fetching tasks use (`gpa`) is failed in a second pass, `FailNth`: those tasks run beside the
+    // fetching tasks use (`gpa`) is failed in a second pass, `FailOnce`: those tasks run beside the
     // pull's own thread, so which allocation is number N varies between runs, and a failure may
     // land where it is survived on purpose (a message that cannot be copied is left empty). That
     // pass can only require that a run ends in `error.OutOfMemory` or in a pull, with nothing
@@ -591,66 +591,25 @@ test "allocation failures: a pull through token auth, an index, gzip and zstd la
     };
     try af.checkOne(K.again, .{ known_root, pinned, creds });
 
-    var clean: FailNth = .{ .child = testing.allocator, .fail_at = std.math.maxInt(usize) };
+    var clean: af.FailOnce = .{ .child = std.heap.smp_allocator };
     try S.pullWith(testing.allocator, clean.allocator(), root, reference, creds);
-    try testing.expectEqual(@as(isize, 0), clean.live.load(.monotonic));
+    try clean.checkFreed();
     const n = clean.count.load(.monotonic);
     try testing.expect(n > 0);
     const step: usize = if (std.valgrind.runningOnValgrind() != 0) 13 else 1;
     var i: usize = 0;
     while (i < n) : (i += step) {
-        var once: FailNth = .{ .child = testing.allocator, .fail_at = i };
+        var once: af.FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i };
         S.pullWith(testing.allocator, once.allocator(), root, reference, creds) catch |e| if (e != error.OutOfMemory) {
             std.debug.print("allocation failures: layer tasks' allocation {d} of {d} failing, the pull ended in {s}\n", .{ i, n, @errorName(e) });
             return e;
         };
-        if (once.live.load(.monotonic) != 0) {
+        once.checkFreed() catch |e| {
             std.debug.print("allocation failures: layer tasks' allocation {d} of {d} failing leaked\n", .{ i, n });
-            return error.MemoryLeakDetected;
-        }
+            return e;
+        };
     }
 }
-
-/// Fails the allocation numbered `fail_at` (from any thread: the count is atomic), and counts the
-/// bytes not yet freed.
-const FailNth = struct {
-    child: Allocator,
-    fail_at: usize,
-    count: std.atomic.Value(usize) = .init(0),
-    live: std.atomic.Value(isize) = .init(0),
-
-    fn allocator(o: *FailNth) Allocator {
-        return .{ .ptr = o, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
-    }
-
-    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
-        const o: *FailNth = @ptrCast(@alignCast(ctx));
-        if (o.count.fetchAdd(1, .monotonic) == o.fail_at) return null;
-        const memory = o.child.rawAlloc(len, alignment, ra) orelse return null;
-        _ = o.live.fetchAdd(@intCast(len), .monotonic);
-        return memory;
-    }
-
-    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
-        const o: *FailNth = @ptrCast(@alignCast(ctx));
-        if (!o.child.rawResize(memory, alignment, new_len, ra)) return false;
-        _ = o.live.fetchAdd(@as(isize, @intCast(new_len)) - @as(isize, @intCast(memory.len)), .monotonic);
-        return true;
-    }
-
-    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
-        const o: *FailNth = @ptrCast(@alignCast(ctx));
-        const moved = o.child.rawRemap(memory, alignment, new_len, ra) orelse return null;
-        _ = o.live.fetchAdd(@as(isize, @intCast(new_len)) - @as(isize, @intCast(memory.len)), .monotonic);
-        return moved;
-    }
-
-    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
-        const o: *FailNth = @ptrCast(@alignCast(ctx));
-        _ = o.live.fetchSub(@intCast(memory.len), .monotonic);
-        o.child.rawFree(memory, alignment, ra);
-    }
-};
 
 test "allocation failures: a registry's refusal keeps its status, and running out of memory is not hidden by it" {
     const af = @import("../../alloc_failures.zig");
