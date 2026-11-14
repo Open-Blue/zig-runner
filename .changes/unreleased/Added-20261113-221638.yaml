@@ -1,0 +1,3 @@
+kind: Added
+body: 'Container `options:` `--cpu-shares` (as `cpu.weight`), `--cpuset-cpus` and `--cpuset-mems` (as `cpuset.cpus` and `cpuset.mems`, checked against what the machine allows), `--pids-limit` (lowers `pids.max`, never raises it) and `--memory-swap` (checked as Docker does; a job may not swap) no longer send a native job to Dagger. Deliberate differences from Docker: `--cpus` above the machine''s CPU count is accepted and never throttles, a negative `--cpu-quota` is no quota, and `--cpu-shares` becomes a weight as systemd converts it (1024 shares is the default weight 100; runc''s formula gives 39) so a job that asks for the default competes as an equal.'
+time: 2026-11-13T22:16:38.01377737-05:00

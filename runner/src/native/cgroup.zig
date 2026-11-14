@@ -402,26 +402,72 @@ fn enable(arena: Allocator, dir: []const u8) !void {
     }
 }
 
-/// Whether `dir` gives its children the cpu controller, made so where it does not: `+cpu` in its
-/// `cgroup.subtree_control`, after the same in each ancestor that does not have the controller to
-/// give (the runner's own cgroup sits between the jobs' parent and where it was delegated).
-/// Best effort: a refusal anywhere up the chain is false, and nothing is undone.
-fn giveCpu(arena: Allocator, dir: []const u8) bool {
+/// Whether `dir` gives its children the controller `name` (`cpu`, `cpuset`), made so where it does
+/// not: `+name` in its `cgroup.subtree_control`, after the same in each ancestor that does not
+/// have the controller to give (the runner's own cgroup sits between the jobs' parent and where
+/// it was delegated). Best effort: a refusal anywhere up the chain is false, and nothing is undone.
+fn giveController(arena: Allocator, dir: []const u8, name: []const u8) bool {
     var buf: [512]u8 = undefined;
     const given = readRaw(arena, dir, "cgroup.subtree_control", &buf) orelse return false;
-    if (hasWord(given, "cpu")) return true;
+    if (hasWord(given, name)) return true;
     const available = readRaw(arena, dir, "cgroup.controllers", &buf) orelse return false;
-    if (!hasWord(available, "cpu")) {
+    if (!hasWord(available, name)) {
         if (std.mem.eql(u8, dir, mount_point)) return false;
-        if (!giveCpu(arena, std.fs.path.dirname(dir) orelse return false)) return false;
+        if (!giveController(arena, std.fs.path.dirname(dir) orelse return false, name)) return false;
     }
-    return write(arena, dir, "cgroup.subtree_control", "+cpu") == .SUCCESS;
+    const text = std.fmt.allocPrint(arena, "+{s}", .{name}) catch return false;
+    return write(arena, dir, "cgroup.subtree_control", text) == .SUCCESS;
 }
 
 fn hasWord(text: []const u8, word: []const u8) bool {
     var words = std.mem.tokenizeAny(u8, text, " \n");
     while (words.next()) |w| if (std.mem.eql(u8, w, word)) return true;
     return false;
+}
+
+/// `cpu.weight` for Docker's `--cpu-shares`. systemd's conversion (`CGROUP_CPU_SHARES_TO_WEIGHT`):
+/// `shares * 100 / 1024`, so that the default of 1024 shares is the kernel's default weight of
+/// 100 and a job that asks for the default competes as an equal with the jobs that did not ask.
+/// Shares are first held to what cgroup v1 takes (2 to 262144, the kernel's `MIN_SHARES` and
+/// `MAX_SHARES`) and the weight to v2's 1 to 10000. runc's own conversion (`1 + (shares - 2) *
+/// 9999 / 262142`) gives 1024 shares a weight of 39, so a job that asked for the default would
+/// get a third of what its neighbours get; the runner does not copy that.
+pub fn cpuWeight(shares: u64) u32 {
+    const held = std.math.clamp(shares, 2, 262144);
+    return @intCast(std.math.clamp(held * 100 / 1024, 1, 10000));
+}
+
+const max_cpu_id = 8192;
+
+/// A `cpuset.cpus`-style list (`0-3,5`: numbers and ranges, comma-separated, as Docker's
+/// `parsers.ParseUintList` reads one) as the set of what it names; false when it is not one.
+pub fn expandList(text: []const u8, set: *[max_cpu_id]bool) bool {
+    @memset(set, false);
+    if (text.len == 0) return false;
+    var items = std.mem.splitScalar(u8, text, ',');
+    while (items.next()) |item| {
+        var lo: usize = undefined;
+        var hi: usize = undefined;
+        if (std.mem.indexOfScalar(u8, item, '-')) |dash| {
+            lo = std.fmt.parseInt(usize, item[0..dash], 10) catch return false;
+            hi = std.fmt.parseInt(usize, item[dash + 1 ..], 10) catch return false;
+        } else {
+            lo = std.fmt.parseInt(usize, item, 10) catch return false;
+            hi = lo;
+        }
+        if (lo > hi or hi >= max_cpu_id) return false;
+        for (lo..hi + 1) |i| set[i] = true;
+    }
+    return true;
+}
+
+/// Whether `requested` names only what `available` (the kernel's `cpuset.cpus.effective`) does.
+pub fn listWithin(requested: []const u8, available: []const u8) bool {
+    var want: [max_cpu_id]bool = undefined;
+    var have: [max_cpu_id]bool = undefined;
+    if (!expandList(requested, &want) or !expandList(available, &have)) return false;
+    for (want, have) |w, h| if (w and !h) return false;
+    return true;
 }
 
 fn hasControllers(arena: Allocator, dir: []const u8, file: []const u8) !bool {
@@ -585,7 +631,7 @@ pub const Job = struct {
         var e = write(arena, j.dir, "cpu.max", text);
         if (e == .NOENT) {
             const parent_dir = std.fs.path.dirname(j.dir) orelse return error.CpuControllerUnavailable;
-            _ = giveCpu(arena, parent_dir);
+            _ = giveController(arena, parent_dir, "cpu");
             e = write(arena, j.dir, "cpu.max", text);
         }
         switch (e) {
@@ -593,6 +639,46 @@ pub const Job = struct {
             .NOENT => return error.CpuControllerUnavailable,
             else => return error.CpuLimitFailed,
         }
+    }
+
+    /// `cpu.weight` for the job, from Docker's `--cpu-shares` (`cpuWeight`): the job's share of
+    /// the CPU against the other jobs under its parent, whose weight is the kernel's 100. The
+    /// controller is given as for `limitCpu`.
+    pub fn limitWeight(j: Job, arena: Allocator, weight: u32) !void {
+        const text = try std.fmt.allocPrint(arena, "{d}", .{weight});
+        var e = write(arena, j.dir, "cpu.weight", text);
+        if (e == .NOENT) {
+            _ = giveController(arena, std.fs.path.dirname(j.dir) orelse return error.CpuControllerUnavailable, "cpu");
+            e = write(arena, j.dir, "cpu.weight", text);
+        }
+        switch (e) {
+            .SUCCESS => {},
+            .NOENT => return error.CpuControllerUnavailable,
+            else => return error.CpuLimitFailed,
+        }
+    }
+
+    /// What the cpuset controller allows the job, `cpuset.cpus.effective` or
+    /// `cpuset.mems.effective` (`file`), as the kernel writes it (`0-3,5`), asking for the
+    /// controller as `limitCpu` does. Null when it cannot be had: the machine's kernel has no
+    /// cpuset controller, or it is not delegated.
+    pub fn cpusetAvailable(j: Job, arena: Allocator, file: []const u8) ?[]const u8 {
+        const parent_dir = std.fs.path.dirname(j.dir) orelse return null;
+        if (!giveController(arena, parent_dir, "cpuset")) return null;
+        var buf: [4096]u8 = undefined;
+        const text = readRaw(arena, j.dir, file, &buf) orelse return null;
+        return arena.dupe(u8, std.mem.trim(u8, text, " \n\x00")) catch null;
+    }
+
+    /// `cpuset.cpus` or `cpuset.mems` (`file`) for the job: where its processes may run.
+    pub fn limitCpuset(j: Job, arena: Allocator, file: []const u8, list: []const u8) !void {
+        if (write(arena, j.dir, file, list) != .SUCCESS) return error.CpusetLimitFailed;
+    }
+
+    /// `pids.max` lowered to `n`: never raised, which `Backend.limitPids` sees to.
+    pub fn lowerPids(j: Job, arena: Allocator, n: u64) !void {
+        const text = try std.fmt.allocPrint(arena, "{d}", .{n});
+        if (write(arena, j.dir, "pids.max", text) != .SUCCESS) return error.PidsLimitFailed;
     }
 
     /// Where a service's helper, and the relay, join.
@@ -820,6 +906,26 @@ test "native cgroup: a job container's --cpus is written as the job's cpu.max, a
         "50000 100000",
         std.mem.trim(u8, try tmp.dir.readFile(io, "cpu.max", &buf), "\n\x00"),
     );
+}
+
+test "native cgroup: --cpu-shares as cpu.weight, and cpuset lists" {
+    // The default shares are the default weight; the ends are held to v1's and v2's ranges.
+    try std.testing.expectEqual(@as(u32, 100), cpuWeight(1024));
+    try std.testing.expectEqual(@as(u32, 50), cpuWeight(512));
+    try std.testing.expectEqual(@as(u32, 200), cpuWeight(2048));
+    try std.testing.expectEqual(@as(u32, 1), cpuWeight(1));
+    try std.testing.expectEqual(@as(u32, 1), cpuWeight(2));
+    try std.testing.expectEqual(@as(u32, 10000), cpuWeight(262144));
+    try std.testing.expectEqual(@as(u32, 10000), cpuWeight(1 << 40));
+    try std.testing.expect(listWithin("0", "0-3"));
+    try std.testing.expect(listWithin("1,3", "0-3"));
+    try std.testing.expect(listWithin("0-3", "0-3,8"));
+    try std.testing.expect(listWithin("2-3,0", "0-3"));
+    try std.testing.expect(!listWithin("4", "0-3"));
+    try std.testing.expect(!listWithin("0-4", "0-3"));
+    try std.testing.expect(!listWithin("0", ""));
+    for ([_][]const u8{ "", ",", "0,", ",0", "3-1", "a", "0-", "-1", "1-2-3", "0 1", "9999999" }) |bad|
+        try std.testing.expect(!listWithin(bad, "0-3"));
 }
 
 test "native cgroup: all jobs' limit and each job's leave the machine room, on 8 and 30 GiB" {

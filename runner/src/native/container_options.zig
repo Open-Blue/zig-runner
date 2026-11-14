@@ -11,7 +11,9 @@
 //! too, because the job's own sandbox can carry them out without more power than it has:
 //! `--hostname`, `--add-host` (the job's own hosts file), `--shm-size`, `--tmpfs` (a tmpfs is
 //! nosuid and nodev, as Docker's), `--memory` (within the job's cgroup limit, never above it) and
-//! `--cpus`, `--cpu-quota`, `--cpu-period` (the job's `cpu.max`).
+//! `--cpus`, `--cpu-quota`, `--cpu-period` (the job's `cpu.max`), `--cpu-shares` (`cpu.weight`),
+//! `--cpuset-cpus`, `--cpuset-mems` (`cpuset.cpus`, `cpuset.mems`), `--pids-limit` (`pids.max`,
+//! lowered only) and `--memory-swap` (checked as Docker does; a job may not swap).
 //! Refused, never ignored: `--privileged`, `--cap-add`, `--security-opt`, `--device`,
 //! `--network`, `--pid`, `--ipc`, `--userns` and the rest change the container beyond what the
 //! sandbox grants, so a job that silently lost one would run differently from its workflow. The
@@ -26,6 +28,7 @@ const job_mod = @import("../job.zig");
 const health = @import("health.zig");
 
 const Allocator = std.mem.Allocator;
+const expandList = @import("cgroup.zig").expandList;
 
 /// What a job container's `options:` ask for that the native job carries out.
 pub const Options = struct {
@@ -51,12 +54,23 @@ pub const Options = struct {
     cpu_quota: ?u64 = null,
     /// `--cpu-period`, in microseconds; null when unset or 0 (the kernel's 100000).
     cpu_period: ?u32 = null,
+    /// `--cpu-shares`/`-c`: v1's relative weight, null when unset or 0 (`cgroup.cpuWeight`).
+    cpu_shares: ?u64 = null,
+    /// `--cpuset-cpus` and `--cpuset-mems`: lists such as `0-3,5`, checked against the machine's
+    /// when the job's cgroup is made.
+    cpuset_cpus: ?[]const u8 = null,
+    cpuset_mems: ?[]const u8 = null,
+    /// `--pids-limit`: a limit for the job's cgroup, when it is lower than the runner's own; null
+    /// for unset, 0 and -1 (no limit asked for: the runner's holds).
+    pids_limit: ?u64 = null,
+    /// `--memory-swap`, in bytes (memory plus swap); -1 for unlimited.
+    memory_swap: ?i64 = null,
     /// How many flags were understood and have no effect natively (`--workdir`, `--health-*`,
     /// `--init`), for "Set up job" to say so.
     no_effect: u32 = 0,
 
     /// The job's `cpu.max`, as Docker's runtime makes it (`--cpus` is a quota of that many
-    /// periods of 100000 µs, `oci_linux.go`; `--cpu-quota` alone keeps the kernel's period, and a
+    /// periods of 100000 µs, `getCPUResources`; `--cpu-quota` alone keeps the kernel's period, and a
     /// `--cpu-period` alone limits nothing); null for no limit.
     pub fn cpuMax(o: Options) ?CpuMax {
         if (o.nano_cpus) |n| return .{
@@ -100,6 +114,11 @@ const valued = [_]Flag{
     .{ .long = "--cpus" },
     .{ .long = "--cpu-quota" },
     .{ .long = "--cpu-period" },
+    .{ .long = "--cpu-shares", .short = 'c' },
+    .{ .long = "--cpuset-cpus" },
+    .{ .long = "--cpuset-mems" },
+    .{ .long = "--pids-limit" },
+    .{ .long = "--memory-swap" },
     .{ .long = "--health-cmd" },
     .{ .long = "--health-interval" },
     .{ .long = "--health-timeout" },
@@ -171,14 +190,41 @@ pub fn parse(arena: Allocator, text: []const u8, why: *[]const u8) Error!Options
         } else if (std.mem.eql(u8, name, "--cpu-quota")) {
             const n = std.fmt.parseInt(i64, value, 10) catch
                 return refuse(arena, why, w, "is not a whole number of microseconds");
-            if (n < 0) return refuse(arena, why, w, "is negative");
-            out.cpu_quota = if (n == 0) null else @intCast(n);
+            // Docker's runtime takes a negative quota as "no quota" (runc writes `max`).
+            out.cpu_quota = if (n <= 0) null else @intCast(n);
         } else if (std.mem.eql(u8, name, "--cpu-period")) {
             const n = std.fmt.parseInt(i64, value, 10) catch
                 return refuse(arena, why, w, "is not a whole number of microseconds");
             if (n != 0 and (n < min_cpu_period or n > max_cpu_period)) return refuse(arena, why, w, "is not 0 or " ++
                 "between 1000 and 1000000 microseconds (1 ms to 1 s), as Docker takes");
             out.cpu_period = if (n == 0) null else @intCast(n);
+        } else if (std.mem.eql(u8, name, "--cpu-shares")) {
+            const n = std.fmt.parseInt(i64, value, 10) catch
+                return refuse(arena, why, w, "is not a whole number");
+            // `getCPUResources`: "invalid CPU shares (%d): value must be a positive integer".
+            if (n < 0) return refuse(arena, why, w, "is negative");
+            out.cpu_shares = if (n == 0) null else @intCast(n);
+        } else if (std.mem.eql(u8, name, "--cpuset-cpus") or std.mem.eql(u8, name, "--cpuset-mems")) {
+            var set: [8192]bool = undefined;
+            if (!expandList(value, &set)) return refuse(arena, why, w, "is not a list of numbers " ++
+                "and ranges such as `0-3,5`");
+            if (std.mem.eql(u8, name, "--cpuset-cpus")) out.cpuset_cpus = value else out.cpuset_mems = value;
+        } else if (std.mem.eql(u8, name, "--pids-limit")) {
+            const n = std.fmt.parseInt(i64, value, 10) catch
+                return refuse(arena, why, w, "is not a whole number");
+            // Docker: 0 and negative values unset the limit (`getPidsLimit`).
+            if (n > 0 and n < min_pids_limit) return refuse(arena, why, w, "is below the " ++
+                "16 processes a native step needs for itself and its sandbox");
+            out.pids_limit = if (n <= 0) null else @intCast(n);
+        } else if (std.mem.eql(u8, name, "--memory-swap")) {
+            if (std.mem.eql(u8, value, "-1")) {
+                out.memory_swap = -1;
+            } else {
+                const n = parseSize(value) orelse return refuse(arena, why, w, "is not a size " ++
+                    "Docker reads (a number of bytes, or with b, k, m, g or t), or -1");
+                out.memory_swap = std.math.cast(i64, n) orelse
+                    return refuse(arena, why, w, "is too large");
+            }
         } else if (std.mem.eql(u8, name, "--tmpfs")) {
             try tmpfs_list.append(arena, try parseTmpfs(arena, w, value, why));
         } else if (std.mem.eql(u8, name, "--workdir") or std.mem.eql(u8, name, "--health-cmd")) {
@@ -200,6 +246,15 @@ pub fn parse(arena: Allocator, text: []const u8, why: *[]const u8) Error!Options
     if (out.cpuMax()) |m| if (m.quota < min_cpu_quota) return refuse(arena, why, if (out.nano_cpus != null) "--cpus" else "--cpu-quota", "gives a quota below " ++
         "1 ms per period (Docker: `CPU cfs quota can not be less than 1ms`; 0.01 CPUs at the " ++
         "default period)");
+    if (out.memory_swap) |sw| if (sw > 0) {
+        // `verifyPlatformContainerResources`: "You should always set the Memory limit when using
+        // Memoryswap limit, see usage", and "Minimum memoryswap limit should be larger than
+        // memory limit, see usage".
+        const m = out.memory orelse return refuse(arena, why, "--memory-swap", "needs `--memory`: " ++
+            "Docker refuses a swap limit without a memory limit");
+        if (sw < m) return refuse(arena, why, "--memory-swap", "is below `--memory` (it is memory " ++
+            "plus swap)");
+    };
     out.env = env.items;
     out.add_hosts = add_hosts.items;
     out.tmpfs = tmpfs_list.items;
@@ -208,14 +263,16 @@ pub fn parse(arena: Allocator, text: []const u8, why: *[]const u8) Error!Options
     return out;
 }
 
-/// The kernel's and Docker's bounds (`daemon/daemon_unix.go`, `verifyPlatformContainerResources`:
+/// The kernel's and Docker's bounds (moby `daemon/daemon_unix.go`, `verifyPlatformContainerResources`:
 /// "CPU cfs period can not be less than 1ms (i.e. 1000) or larger than 1s (i.e. 1000000)", "CPU cfs
 /// quota can not be less than 1ms (i.e. 1000)").
 const min_cpu_period: i64 = 1000;
 const max_cpu_period: i64 = 1_000_000;
 const min_cpu_quota: u64 = 1000;
-/// The period Docker gives `--cpus` (`daemon/oci_linux.go`, `getCPUResources`: `period :=
-/// uint64(100 * time.Millisecond / time.Microsecond)`) and the kernel's default for a quota alone.
+/// A step's own processes (its shell, the sandbox's helper) count against `pids.max`.
+const min_pids_limit: i64 = 16;
+/// The period Docker gives `--cpus` (moby `daemon/daemon_unix.go`, `getCPUResources`: `period :=
+/// uint64(100 * time.Millisecond / time.Microsecond)`; `quota := NanoCPUs * period / 1e9`) and the kernel's default for a quota alone.
 pub const default_cpu_period: u32 = 100_000;
 
 /// What the job's `cpu.max` is: `quota` microseconds of CPU time per `period`.
@@ -896,7 +953,7 @@ test "--cpus, --cpu-quota and --cpu-period as Docker reads them" {
     var why: []const u8 = "";
     // `opts.ParseCPUs` (docker/cli, opts/opts.go): `big.Rat.SetString`, times 1e9, whole or "value
     // is too precise". The runtime then makes quota = NanoCPUs * 100000 / 1e9 (moby,
-    // daemon/oci_linux.go, `getCPUResources`).
+    // daemon/daemon_unix.go, `getCPUResources`).
     const cases = [_]struct { text: []const u8, nano: ?u64 }{
         .{ .text = "--cpus 0.5", .nano = 500_000_000 },
         .{ .text = "--cpus=1.5", .nano = 1_500_000_000 },
@@ -943,7 +1000,6 @@ test "--cpus, --cpu-quota and --cpu-period as Docker reads them" {
         "--cpus 1.2.3", "--cpus .",    "--cpus 1e",           "--cpus 0.001", "--cpus 1,5", "--cpus 0x1",
     }) |text| try expectRefused(arena, text, "--cpus");
     try expectRefused(arena, "--cpu-quota 999", "--cpu-quota");
-    try expectRefused(arena, "--cpu-quota -1", "--cpu-quota");
     try expectRefused(arena, "--cpu-quota 1.5", "--cpu-quota");
     try expectRefused(arena, "--cpu-quota", "--cpu-quota");
     try expectRefused(arena, "--cpu-period 999", "--cpu-period");
@@ -954,8 +1010,42 @@ test "--cpus, --cpu-quota and --cpu-period as Docker reads them" {
     try expectRefused(arena, "--cpus", "--cpus");
     try expectRefused(arena, "--cpus=", "--cpus");
     // Not read: the others of the family stay refused.
-    try expectRefused(arena, "--cpu-shares 512", "--cpu-shares");
-    try expectRefused(arena, "--cpuset-cpus 0", "--cpuset-cpus");
+    try expectRefused(arena, "--blkio-weight 500", "--blkio-weight");
+    try expectRefused(arena, "--cpu-rt-runtime 1", "--cpu-rt-runtime");
+}
+
+test "--cpu-shares, --cpuset-*, --pids-limit and --memory-swap as Docker reads them" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var why: []const u8 = "";
+    const o = try parse(arena, "-c 512 --cpuset-cpus=0-1,3 --cpuset-mems 0 --pids-limit 64 -m 1g --memory-swap 2g", &why);
+    try std.testing.expectEqual(@as(?u64, 512), o.cpu_shares);
+    try std.testing.expectEqualStrings("0-1,3", o.cpuset_cpus.?);
+    try std.testing.expectEqualStrings("0", o.cpuset_mems.?);
+    try std.testing.expectEqual(@as(?u64, 64), o.pids_limit);
+    try std.testing.expectEqual(@as(?i64, 2 << 30), o.memory_swap);
+    // 0 is unset (getCPUResources only reads a non-zero value), and 0 and below unsets the pids
+    // limit (`getPidsLimit`): the runner's own limit holds. A negative quota is runc's `max`.
+    try std.testing.expectEqual(@as(?u64, null), (try parse(arena, "--cpu-shares 0", &why)).cpu_shares);
+    try std.testing.expectEqual(@as(?u64, null), (try parse(arena, "--pids-limit -1", &why)).pids_limit);
+    try std.testing.expectEqual(@as(?u64, null), (try parse(arena, "--pids-limit 0", &why)).pids_limit);
+    try std.testing.expect((try parse(arena, "--cpu-quota -1", &why)).cpuMax() == null);
+    try std.testing.expectEqual(@as(?i64, -1), (try parse(arena, "--memory-swap -1", &why)).memory_swap);
+    try std.testing.expectEqual(@as(?i64, -1), (try parse(arena, "-m 1g --memory-swap=-1", &why)).memory_swap);
+    // Refused: "invalid CPU shares (%d): value must be a positive integer", a list that
+    // `ParseUintList` does not read, a swap limit with no memory limit, or below it.
+    try expectRefused(arena, "--cpu-shares -2", "--cpu-shares");
+    try expectRefused(arena, "--cpu-shares many", "--cpu-shares");
+    try expectRefused(arena, "--cpuset-cpus 3-1", "--cpuset-cpus");
+    try expectRefused(arena, "--cpuset-cpus 0,", "--cpuset-cpus");
+    try expectRefused(arena, "--cpuset-cpus a", "--cpuset-cpus");
+    try expectRefused(arena, "--cpuset-mems 0-", "--cpuset-mems");
+    try expectRefused(arena, "--pids-limit 8", "--pids-limit");
+    try expectRefused(arena, "--pids-limit x", "--pids-limit");
+    try expectRefused(arena, "--memory-swap 1g", "--memory-swap");
+    try expectRefused(arena, "-m 1g --memory-swap 512m", "--memory-swap");
+    try expectRefused(arena, "-m 1g --memory-swap lots", "--memory-swap");
 }
 
 test "options refused, never ignored: what the sandbox does not carry out" {
@@ -963,14 +1053,14 @@ test "options refused, never ignored: what the sandbox does not carry out" {
     defer a.deinit();
     const arena = a.allocator();
     for ([_][]const u8{
-        "--cpu-shares",   "--memory-swap",      "--privileged", "--cap-add",   "--device",
-        "--security-opt", "--cap-drop",         "--ulimit",     "--network",   "--net",
-        "--uts",          "--cpuset-cpus",      "--tty",        "-t",          "-i",
-        "--volume",       "-v",                 "--publish",    "-p",          "--entrypoint",
-        "--name",         "--env-file",         "--label",      "--group-add", "--pid",
-        "--ipc",          "--gpus",             "--platform",   "--read-only", "--dns",
-        "--sysctl",       "--oom-kill-disable", "--mount",      "--pull",      "--userns",
-        "--cgroupns",     "--cgroup-parent",    "--pids-limit", "--restart",   "--runtime",
+        "--blkio-weight", "--memory-reservation", "--privileged",    "--cap-add",   "--device",
+        "--security-opt", "--cap-drop",           "--ulimit",        "--network",   "--net",
+        "--uts",          "--oom-score-adj",      "--tty",           "-t",          "-i",
+        "--volume",       "-v",                   "--publish",       "-p",          "--entrypoint",
+        "--name",         "--env-file",           "--label",         "--group-add", "--pid",
+        "--ipc",          "--gpus",               "--platform",      "--read-only", "--dns",
+        "--sysctl",       "--oom-kill-disable",   "--mount",         "--pull",      "--userns",
+        "--cgroupns",     "--cgroup-parent",      "--cpu-rt-period", "--restart",   "--runtime",
     }) |flag| {
         // With a value and without, and among honoured flags: the flag is what is named.
         try expectRefused(arena, try std.fmt.allocPrint(arena, "{s} 1", .{flag}), flag);
@@ -978,7 +1068,7 @@ test "options refused, never ignored: what the sandbox does not carry out" {
         try expectRefused(arena, try std.fmt.allocPrint(arena, "{s}=1", .{flag}), flag);
     }
     // One refused flag among honoured ones refuses the lot.
-    try expectRefused(arena, "--user 1001 --cpu-shares 1 --env A=1", "--cpu-shares");
+    try expectRefused(arena, "--user 1001 --blkio-weight 1 --env A=1", "--blkio-weight");
     // Not an option at all.
     try expectRefused(arena, "--user 1001 stray", "stray");
     // A bare `-e NAME` would copy the runner's variable.
@@ -1020,7 +1110,7 @@ test "unsupported: ports and volumes fall back, options by what they hold" {
     for ([_][]const u8{
         "--privileged",   "--cap-add SYS_ADMIN", "--security-opt seccomp=unconfined", "--device /dev/kvm",
         "--network host", "--net=host",          "--pid=host",                        "--ipc host",
-        "--userns host",  "--cpu-shares 2",
+        "--userns host",  "--blkio-weight 2",
     }) |flag| {
         jc.options = .{ .lit = flag };
         const why = unsupported(jc, false, &.{}).?;
