@@ -1919,26 +1919,28 @@ test "fuzz: Dockerfile builder" {
 /// A plan's images and context, which are not there: every image is the same one, a source's
 /// digest is its names', and a download is a name.
 const FuzzWorld = struct {
-    fn bases() dockerfile.Bases {
-        return .{ .ptr = undefined, .resolveFn = resolve };
+    var bases_iface: dockerfile.Bases = .{ .resolveFn = resolve };
+    var context_iface: dockerfile.Context = .{ .digestFn = digest, .fetchFn = fetch };
+    fn bases() *dockerfile.Bases {
+        return &bases_iface;
     }
-    fn resolve(_: *anyopaque, _: std.mem.Allocator, ref: []const u8, why: *[]const u8) anyerror!?dockerfile.BaseImage {
+    fn resolve(_: *dockerfile.Bases, _: std.mem.Allocator, ref: []const u8, why: *[]const u8) anyerror!?dockerfile.BaseImage {
         if (std.mem.startsWith(u8, ref, "x")) {
             why.* = "no such image";
             return null;
         }
         return .{ .config = .{ .rootfs = "/rootfs", .env = &.{"PATH=/bin"}, .workdir = "/w" }, .id = "id" };
     }
-    fn context() dockerfile.Context {
-        return .{ .ptr = undefined, .digestFn = digest, .fetchFn = fetch };
+    fn context() *dockerfile.Context {
+        return &context_iface;
     }
-    fn digest(_: *anyopaque, _: std.mem.Allocator, sources: []const []const u8) anyerror![64]u8 {
+    fn digest(_: *dockerfile.Context, _: std.mem.Allocator, sources: []const []const u8) anyerror![64]u8 {
         var h: std.crypto.hash.sha2.Sha256 = .init(.{});
         for (sources) |s| h.update(s);
         return std.fmt.bytesToHex(h.finalResult(), .lower);
     }
-    fn fetch(_: *anyopaque, _: std.mem.Allocator, url: []const u8) anyerror!dockerfile.Fetched {
-        return .{ .file = "/f", .digest = try digest(undefined, undefined, &.{url}) };
+    fn fetch(_: *dockerfile.Context, _: std.mem.Allocator, url: []const u8) anyerror!dockerfile.Fetched {
+        return .{ .file = "/f", .digest = try digest(&context_iface, undefined, &.{url}) };
     }
 };
 

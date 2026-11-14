@@ -256,7 +256,7 @@ fn openAt(parent: linux.fd_t, name: [*:0]const u8) ?linux.fd_t {
         .NOFOLLOW = true,
         .CLOEXEC = true,
     }, 0);
-    return if (linux.errno(rc) == .SUCCESS) @intCast(rc) else null;
+    return if (linux.errno(rc) == .SUCCESS) std.math.cast(linux.fd_t, rc) else null;
 }
 
 // --- tests ---

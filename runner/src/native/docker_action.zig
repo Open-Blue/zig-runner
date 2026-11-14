@@ -415,13 +415,15 @@ const Planning = struct {
     /// The context to read the sources' content from; null when `digests` is not wanted.
     context: ?*layer_view.View,
     digests: bool,
+    bases_iface: dockerfile.Bases = .{ .resolveFn = resolve },
+    context_iface: dockerfile.Context = .{ .digestFn = digest, .fetchFn = fetch },
 
-    fn bases(p: *Planning) dockerfile.Bases {
-        return .{ .ptr = p, .resolveFn = resolve };
+    fn bases(p: *Planning) *dockerfile.Bases {
+        return &p.bases_iface;
     }
 
-    fn resolve(ptr: *anyopaque, arena: Allocator, ref: []const u8, why: *[]const u8) anyerror!?dockerfile.BaseImage {
-        const p: *Planning = @ptrCast(@alignCast(ptr));
+    fn resolve(iface: *dockerfile.Bases, arena: Allocator, ref: []const u8, why: *[]const u8) anyerror!?dockerfile.BaseImage {
+        const p: *Planning = @fieldParentPtr("bases_iface", iface);
         const b = p.b;
         switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, ref, &b.held)) {
             .image => |i| return .{ .config = i, .id = if (p.digests) try baseId(arena, b.io, i) else "" },
@@ -432,19 +434,19 @@ const Planning = struct {
         }
     }
 
-    fn ctx(p: *Planning) dockerfile.Context {
-        return .{ .ptr = p, .digestFn = digest, .fetchFn = fetch };
+    fn ctx(p: *Planning) *dockerfile.Context {
+        return &p.context_iface;
     }
 
-    fn digest(ptr: *anyopaque, arena: Allocator, sources: []const []const u8) anyerror![64]u8 {
-        const p: *Planning = @ptrCast(@alignCast(ptr));
+    fn digest(i: *dockerfile.Context, arena: Allocator, sources: []const []const u8) anyerror![64]u8 {
+        const p: *Planning = @fieldParentPtr("context_iface", i);
         if (!p.digests) return @splat('0');
         return dockerfile.contextDigest(arena, p.context.?, sources);
     }
 
     /// An `ADD`'s URL downloaded into the job's directory, whole, by the runner's own client.
-    fn fetch(ptr: *anyopaque, arena: Allocator, url: []const u8) anyerror!dockerfile.Fetched {
-        const p: *Planning = @ptrCast(@alignCast(ptr));
+    fn fetch(i: *dockerfile.Context, arena: Allocator, url: []const u8) anyerror!dockerfile.Fetched {
+        const p: *Planning = @fieldParentPtr("context_iface", i);
         if (!p.digests) return .{ .file = "", .digest = @splat('0') };
         const res = try net_client.fetch(arena, p.b.io, .{ .url = url, .max_response = max_add_bytes });
         if (res.status != .ok) return error.BadStatus;
