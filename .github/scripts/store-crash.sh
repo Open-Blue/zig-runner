@@ -57,9 +57,10 @@ build() {
 	git init -q "$out/fstests"
 	local url fetched=false
 	for url in "${fstests_urls[@]}"; do
-		# Give up on a mirror that stalls (under 1 KB/s for 30 s), not after the system's TCP timeout.
-		if git -C "$out/fstests" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
-			fetch -q --depth 1 "$url" "$fstests_rev"; then
+		# Give up on a mirror after 60 s in all: git has no connect timeout (a dead host waits out the
+		# kernel's, ~130 s), and http.lowSpeed* only ends a transfer that has started and then stalls.
+		if GIT_TERMINAL_PROMPT=0 timeout -k 5 60 git -C "$out/fstests" -c http.lowSpeedLimit=1000 \
+			-c http.lowSpeedTime=30 fetch -q --depth 1 "$url" "$fstests_rev"; then
 			fetched=true
 			break
 		fi
