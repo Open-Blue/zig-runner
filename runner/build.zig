@@ -83,6 +83,14 @@ pub fn build(b: *std.Build) void {
     run_tests.step.dependOn(&native_exe.step);
     run_tests.setEnvironmentVariable("ZIG_RUNNER_TEST_EXE", ".zig-cache/native-step/runner");
     test_step.dependOn(&run_tests.step);
+    // The shard runner's own tests (its leak check): they work in directories of their own.
+    const shards_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/test_shards.zig"),
+        .target = target,
+    }), .filters = test_filters });
+    const run_shards_tests = b.addRunArtifact(shards_tests);
+    run_shards_tests.has_side_effects = true;
+    test_step.dependOn(&run_shards_tests.step);
     // The runner itself too. Zig compiles only what is reached, and the tests never reach the
     // runner's main loop (`loop.cycle`): a type error there passed `zig build test`, and CI with
     // it, and turned up only when the release image was built.

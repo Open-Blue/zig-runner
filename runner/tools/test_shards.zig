@@ -143,8 +143,8 @@ pub fn main(init: std.process.Init) !u8 {
     const wanted = try shardCount(init.environ_map);
     const part = try partOf(init.environ_map);
     const age_s = ageOf(init.environ_map);
-    sweepStale(arena, io, age_s);
-    const kept = tmpNames(arena, io);
+    sweepStale(arena, io, tmp_path, age_s);
+    const kept = tmpNames(arena, io, tmp_path);
     const listening = try std.mem.concat(arena, []const u8, &.{
         args[1..2], &.{"--listen=-"}, args[2..],
     });
@@ -208,7 +208,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (threads, 0..) |*t, i|
         t.* = try std.Thread.spawn(.{}, work, .{ &run, if (i == 0) first else null });
     for (threads) |t| t.join();
-    leakCheck(arena, &run, kept);
+    leakCheck(arena, &run, tmp_path, kept);
 
     const failed = run.failed.load(.monotonic);
     const took = started.durationTo(Io.Clock.awake.now(io));
@@ -516,10 +516,10 @@ fn ageOf(environ_map: *const std.process.Environ.Map) i64 {
     return std.fmt.parseInt(i64, text, 10) catch 1800;
 }
 
-/// The names in `.zig-cache/tmp`; none when it is not there.
-fn tmpNames(arena: std.mem.Allocator, io: Io) []const []const u8 {
+/// The names in `tmp` (`tmp_path`, or a directory of a test's own); none when it is not there.
+fn tmpNames(arena: std.mem.Allocator, io: Io, tmp: []const u8) []const []const u8 {
     var names: std.ArrayList([]const u8) = .empty;
-    var dir = Io.Dir.cwd().openDir(io, tmp_path, .{ .iterate = true }) catch return &.{};
+    var dir = Io.Dir.cwd().openDir(io, tmp, .{ .iterate = true }) catch return &.{};
     defer dir.close(io);
     var it = dir.iterate();
     while (it.next(io) catch null) |e| {
@@ -594,31 +594,43 @@ fn openDirAt(parent: linux.fd_t, name: [*:0]const u8) ?linux.fd_t {
 }
 
 /// Directories an earlier run left, older than `age_s`, removed: a run killed in the middle (a
-/// timeout, the OOM killer) could not remove its own.
-fn sweepStale(arena: std.mem.Allocator, io: Io, age_s: i64) void {
-    var tmp = Io.Dir.cwd().openDir(io, tmp_path, .{ .iterate = true }) catch return;
+/// timeout, the OOM killer) could not remove its own. Not one a process holds open (or may: see
+/// `heldOpen`): a long test of another run is no leftover.
+fn sweepStale(arena: std.mem.Allocator, io: Io, tmp_dir: []const u8, age_s: i64) void {
+    var tmp = Io.Dir.cwd().openDir(io, tmp_dir, .{ .iterate = true }) catch return;
     defer tmp.close(io);
     const now_s = Io.Clock.real.now(io).toSeconds();
-    for (tmpNames(arena, io)) |name| {
+    for (tmpNames(arena, io, tmp_dir)) |name| {
         const st = tmp.statFile(io, name, .{ .follow_symlinks = false }) catch continue;
         if (now_s - st.mtime.toSeconds() < age_s) continue;
+        if (heldOpen(arena, io, tmp_dir, name) != .no) continue;
         var found: Found = .{};
         const z = arena.dupeSentinel(u8, name, 0) catch continue;
         wipe(arena, io, tmp.handle, z, &found);
-        std.debug.print("test_shards: removed {s}/{s}, left by an earlier run (depth {d})\n", .{ tmp_path, name, found.depth });
+        std.debug.print("test_shards: removed {s}/{s}, left by an earlier run (depth {d})\n", .{ tmp_dir, name, found.depth });
     }
 }
 
 /// What the run left in `.zig-cache/tmp` beyond what was there at its start (`kept`): reported, its
 /// owner among the tests that ran then named, and removed. The run fails.
-fn leakCheck(arena: std.mem.Allocator, run: *Run, kept: []const []const u8) void {
+fn leakCheck(arena: std.mem.Allocator, run: *Run, tmp_dir: []const u8, kept: []const []const u8) void {
     const io = run.io;
-    var tmp = Io.Dir.cwd().openDir(io, tmp_path, .{ .iterate = true }) catch return;
+    var tmp = Io.Dir.cwd().openDir(io, tmp_dir, .{ .iterate = true }) catch return;
     defer tmp.close(io);
-    for (tmpNames(arena, io)) |name| {
+    for (tmpNames(arena, io, tmp_dir)) |name| {
         if (inList(kept, name)) continue;
-        // Another run's, in this directory at the same time, has a process holding it open.
-        if (heldOpen(arena, io, name)) continue;
+        // Another run's, in this directory at the same time, has a process holding it open. One
+        // that may have (`heldOpen`: a test of another user, which /proc hides) is not this run's
+        // to report either: whatever is new here was made after this run began, so nothing tells
+        // whose it is. The check is then blind to that directory, which is said, not failed.
+        switch (heldOpen(arena, io, tmp_dir, name)) {
+            .yes => continue,
+            .maybe => {
+                std.debug.print("test_shards: {s}/{s} is new, and a test of another user may hold it: not checked\n", .{ tmp_dir, name });
+                continue;
+            },
+            .no => {},
+        }
         const z = arena.dupeSentinel(u8, name, 0) catch continue;
         // When it was made: the tests running then, one of which left it.
         var born_ns: i128 = 0;
@@ -646,7 +658,7 @@ fn leakCheck(arena: std.mem.Allocator, run: *Run, kept: []const []const u8) void
         }
         if (allowed) continue;
         _ = run.failed.fetchAdd(1, .monotonic);
-        std.debug.print("LEAK {s}/{s}: left in the tests' temporary directory (depth {d}); removed. ", .{ tmp_path, name, found.depth });
+        std.debug.print("LEAK {s}/{s}: left in the tests' temporary directory (depth {d}); removed. ", .{ tmp_dir, name, found.depth });
         if (owners.items.len == 0) {
             std.debug.print("No test was running when it was made.\n", .{});
         } else {
@@ -659,24 +671,147 @@ fn leakCheck(arena: std.mem.Allocator, run: *Run, kept: []const []const u8) void
     }
 }
 
-/// Whether a process has `.zig-cache/tmp/<name>` open (or a directory in it): a test running, in
-/// another run that shares this directory.
-fn heldOpen(arena: std.mem.Allocator, io: Io, name: []const u8) bool {
-    const needle = std.fmt.allocPrint(arena, "{s}/{s}", .{ tmp_path, name }) catch return true;
-    var proc = Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch return false;
+const Held = enum { no, yes, maybe };
+
+/// Whether a process has `<tmp_dir>/<name>` open (or a directory in it): a test running, in
+/// another run that shares this directory. `maybe` when a process whose fds /proc hides from this
+/// one (another user's: a root container's tests) looks like a test run (`looksLikeTests`) and none
+/// that can be read holds it.
+fn heldOpen(arena: std.mem.Allocator, io: Io, tmp_dir: []const u8, name: []const u8) Held {
+    const needle = std.fmt.allocPrint(arena, "{s}/{s}", .{ tmp_dir, name }) catch return .yes;
+    var proc = Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch return .no;
     defer proc.close(io);
+    var hidden = false;
     var pids = proc.iterate();
     while (pids.next(io) catch null) |p| {
         _ = std.fmt.parseInt(u32, p.name, 10) catch continue;
-        const fd_path = std.fmt.allocPrint(arena, "/proc/{s}/fd", .{p.name}) catch return true;
-        var fds = Io.Dir.cwd().openDir(io, fd_path, .{ .iterate = true }) catch continue;
+        const fd_path = std.fmt.allocPrint(arena, "/proc/{s}/fd", .{p.name}) catch return .yes;
+        var fds = Io.Dir.cwd().openDir(io, fd_path, .{ .iterate = true }) catch |e| {
+            if (e == error.AccessDenied or e == error.PermissionDenied) {
+                const cmd_path = std.fmt.allocPrint(arena, "/proc/{s}/cmdline", .{p.name}) catch return .yes;
+                var buf: [4096]u8 = undefined;
+                const cmd = Io.Dir.cwd().readFile(io, cmd_path, &buf) catch continue;
+                if (looksLikeTests(cmd)) hidden = true;
+            }
+            continue;
+        };
         defer fds.close(io);
         var it = fds.iterate();
         while (it.next(io) catch null) |e| {
             var buf: [std.fs.max_path_bytes]u8 = undefined;
             const n = fds.readLink(io, e.name, &buf) catch continue;
-            if (std.mem.indexOf(u8, buf[0..n], needle) != null) return true;
+            if (std.mem.indexOf(u8, buf[0..n], needle) != null) return .yes;
         }
     }
-    return false;
+    return if (hidden) .maybe else .no;
+}
+
+/// Whether a command line (NUL-separated arguments) is a test run: the shard runner, or a test
+/// binary of the build cache.
+fn looksLikeTests(cmdline: []const u8) bool {
+    return std.mem.indexOf(u8, cmdline, "test_shards") != null or
+        std.mem.indexOf(u8, cmdline, ".zig-cache") != null or
+        std.mem.indexOf(u8, cmdline, "--listen=-") != null;
+}
+
+// Tests. Each works in a directory of its own under `.zig-cache/tmp` (`std.testing.tmpDir`), named
+// to the functions above as the tests' temporary directory.
+
+fn testRun(arena: std.mem.Allocator) Run {
+    return .{
+        .io = std.testing.io,
+        .gpa = std.testing.allocator,
+        .argv = &.{},
+        .names = &.{},
+        .free = &.{},
+        .alone = &.{},
+        .took_ns = arena.alloc(u64, 0) catch unreachable,
+        .began_ns = arena.alloc(i128, 0) catch unreachable,
+        .ended_ns = arena.alloc(i128, 0) catch unreachable,
+    };
+}
+
+/// `depth` nested directories "a" in `parent`'s directory `name`, made by names relative to a
+/// descriptor (the path is too long to name).
+fn makeChain(parent: linux.fd_t, name: [:0]const u8, depth: usize) !void {
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdirat(parent, name, 0o755)));
+    var cur = openDirAt(parent, name) orelse return error.TestUnexpectedResult;
+    for (0..depth) |_| {
+        // A filesystem that will not make a chain so deep (overlayfs) skips the test.
+        if (linux.errno(linux.mkdirat(cur, "a", 0o755)) != .SUCCESS) return error.SkipZigTest;
+        const down = openDirAt(cur, "a") orelse return error.TestUnexpectedResult;
+        _ = linux.close(cur);
+        cur = down;
+    }
+    _ = linux.close(cur);
+}
+
+test "wipe removes a chain of directories too deep to name" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try makeChain(tmp.dir.handle, "deep", 5000);
+    var found: Found = .{};
+    wipe(a.allocator(), std.testing.io, tmp.dir.handle, "deep", &found);
+    try std.testing.expectEqual(@as(usize, 5000), found.depth);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "deep", .{}));
+}
+
+test "leakCheck flags a directory the tests left, names it, removes it, and fails the run" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const where = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    try tmp.dir.createDir(std.testing.io, "kept", .default_dir);
+    const kept = tmpNames(arena, std.testing.io, where);
+    try tmp.dir.createDir(std.testing.io, "leaked", .default_dir);
+    try makeChain(tmp.dir.handle, "leaked-deep", 300);
+    var run = testRun(arena);
+    leakCheck(arena, &run, where, kept);
+    // The two new ones are leaks (with no test running when they were made); `kept` is not.
+    try std.testing.expectEqual(@as(usize, 2), run.failed.load(.monotonic));
+    try tmp.dir.access(std.testing.io, "kept", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "leaked", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "leaked-deep", .{}));
+    // Nothing new, nothing reported.
+    leakCheck(arena, &run, where, tmpNames(arena, std.testing.io, where));
+    try std.testing.expectEqual(@as(usize, 2), run.failed.load(.monotonic));
+}
+
+test "heldOpen sees a directory a process has open, and sweepStale and leakCheck leave it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const where = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const kept = tmpNames(arena, io, where);
+    try tmp.dir.createDir(io, "busy", .default_dir);
+    try tmp.dir.createDir(io, "idle", .default_dir);
+    // This process holds `busy`; the answer for `idle` is no (or maybe, where a process hidden
+    // from this one looks like a test run: never yes).
+    var busy = try tmp.dir.openDir(io, "busy", .{});
+    try std.testing.expectEqual(Held.yes, heldOpen(arena, io, where, "busy"));
+    try std.testing.expect(heldOpen(arena, io, where, "idle") != .yes);
+    // Both are "old" at age 0, but the one held is left alone.
+    sweepStale(arena, io, where, 0);
+    try tmp.dir.access(io, "busy", .{});
+    var run = testRun(arena);
+    leakCheck(arena, &run, where, kept);
+    try tmp.dir.access(io, "busy", .{});
+    try std.testing.expectEqual(@as(usize, 0), run.failed.load(.monotonic));
+    busy.close(io);
+    // Closed, it is a leftover as any other.
+    sweepStale(arena, io, where, 0);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "busy", .{}));
+}
+
+test "a command line that is a test run, and one that is not" {
+    try std.testing.expect(looksLikeTests("/w/.zig-cache/o/abc/test\x00--listen=-\x00"));
+    try std.testing.expect(looksLikeTests("test_shards\x00/w/t"));
+    try std.testing.expect(!looksLikeTests("/usr/bin/firefox\x00--new-tab\x00"));
 }
