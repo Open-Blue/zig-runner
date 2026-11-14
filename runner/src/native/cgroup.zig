@@ -789,6 +789,13 @@ pub const Job = struct {
         const pids = if (limits.pids_max) |p| try std.fmt.allocPrint(arena, "{d}", .{p}) else "max";
         if (write(arena, dir, "pids.max", pids) != .SUCCESS) return error.PidsLimitFailed;
         j = try j.split(arena);
+        // A directory left by a runner that died may be frozen (`Admission.govern`): its steps
+        // would never run. Reset in the job and in its steps; a kernel without the freezer has no
+        // file, which is no error.
+        for ([_][]const u8{ j.dir, j.stepsDir() }) |d| switch (write(arena, d, "cgroup.freeze", "0")) {
+            .SUCCESS, .NOENT => {},
+            else => return error.FreezeResetFailed,
+        };
         return j;
     }
 
@@ -1581,4 +1588,51 @@ test "native cgroup: under pressure the lower job's steps are frozen and use no 
     try std.testing.expect(try busyTicks(arena, io, spin[1].id.?) > lo_before);
     // The job's own cgroup was never frozen, nor was anything outside the steps.
     try std.testing.expect(std.mem.indexOf(u8, try readIn(io, lo.dir, "cgroup.events", &buf), "frozen 0") != null);
+}
+
+test "native cgroup: a job's directory left frozen is thawed when it is made again" {
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    const top = try std.fmt.allocPrint(arena, "{s}/zig-runner-test-{s}", .{ mount_point, &hex });
+    defer (Job{ .dir = top }).remove(arena, io);
+    ensure(arena, top) catch return error.SkipZigTest;
+    const set: Limits = .{ .memory_max = 1 << 30, .pids_max = 64, .memory_total = 1 << 30 };
+    const first = try Job.make(arena, io, top, "left", set);
+    // A runner that died while the job was paused leaves its steps frozen (and the job's own).
+    try std.testing.expect(write(arena, first.stepsDir(), "cgroup.freeze", "1") == .SUCCESS);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("1\n", try readIn(io, first.stepsDir(), "cgroup.freeze", &buf));
+    // The next job under that name reuses the directory, and finds it thawed.
+    const second = try Job.make(arena, io, top, "left", set);
+    try std.testing.expectEqualStrings("0\n", try readIn(io, second.stepsDir(), "cgroup.freeze", &buf));
+    try std.testing.expectEqualStrings("0\n", try readIn(io, second.dir, "cgroup.freeze", &buf));
+}
+
+test "native cgroup: an explicit --cpu-shares weight is written after the priority's, and so wins" {
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    const top = try std.fmt.allocPrint(arena, "{s}/zig-runner-test-{s}", .{ mount_point, &hex });
+    defer (Job{ .dir = top }).remove(arena, io);
+    ensure(arena, top) catch return error.SkipZigTest;
+    const set: Limits = .{ .memory_max = 1 << 30, .pids_max = 64, .memory_total = 1 << 30 };
+    const j = try Job.make(arena, io, top, "weighted", set);
+    // The level's default weight first (set-up, `Backend.prioritize`), then the job's own flag
+    // (`readContainerOptions`): 512 shares are weight 50, whatever the level.
+    try std.testing.expect(j.limitPriority(arena, priority.high, 0).cpu);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("300\n", try readIn(io, j.dir, "cpu.weight", &buf));
+    try j.limitWeight(arena, cpuWeight(512));
+    try std.testing.expectEqualStrings("50\n", try readIn(io, j.dir, "cpu.weight", &buf));
 }
