@@ -402,6 +402,28 @@ fn enable(arena: Allocator, dir: []const u8) !void {
     }
 }
 
+/// Whether `dir` gives its children the cpu controller, made so where it does not: `+cpu` in its
+/// `cgroup.subtree_control`, after the same in each ancestor that does not have the controller to
+/// give (the runner's own cgroup sits between the jobs' parent and where it was delegated).
+/// Best effort: a refusal anywhere up the chain is false, and nothing is undone.
+fn giveCpu(arena: Allocator, dir: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    const given = readRaw(arena, dir, "cgroup.subtree_control", &buf) orelse return false;
+    if (hasWord(given, "cpu")) return true;
+    const available = readRaw(arena, dir, "cgroup.controllers", &buf) orelse return false;
+    if (!hasWord(available, "cpu")) {
+        if (std.mem.eql(u8, dir, mount_point)) return false;
+        if (!giveCpu(arena, std.fs.path.dirname(dir) orelse return false)) return false;
+    }
+    return write(arena, dir, "cgroup.subtree_control", "+cpu") == .SUCCESS;
+}
+
+fn hasWord(text: []const u8, word: []const u8) bool {
+    var words = std.mem.tokenizeAny(u8, text, " \n");
+    while (words.next()) |w| if (std.mem.eql(u8, w, word)) return true;
+    return false;
+}
+
 fn hasControllers(arena: Allocator, dir: []const u8, file: []const u8) !bool {
     var buf: [512]u8 = undefined;
     const text = readRaw(arena, dir, file, &buf) orelse return error.NotACgroup;
@@ -550,6 +572,27 @@ pub const Job = struct {
     pub fn lowerMemory(j: Job, arena: Allocator, bytes: u64) !void {
         const text = try std.fmt.allocPrint(arena, "{d}", .{bytes});
         if (write(arena, j.dir, "memory.max", text) != .SUCCESS) return error.MemoryLimitFailed;
+    }
+
+    /// `cpu.max` for the job, `quota` microseconds of CPU time in each `period`, as Docker sets it
+    /// for `--cpus`. The file is there when the job's parent gives its children the cpu
+    /// controller, which it is asked once to do when it does not (the runner's own cgroup, or a
+    /// delegated one: not every delegation includes cpu, as a user's systemd manager gives
+    /// memory and pids alone). `error.CpuControllerUnavailable` when it does not: the limit is
+    /// not set, and the caller must not run the job as if it were.
+    pub fn limitCpu(j: Job, arena: Allocator, quota: u64, period: u32) !void {
+        const text = try std.fmt.allocPrint(arena, "{d} {d}", .{ quota, period });
+        var e = write(arena, j.dir, "cpu.max", text);
+        if (e == .NOENT) {
+            const parent_dir = std.fs.path.dirname(j.dir) orelse return error.CpuControllerUnavailable;
+            _ = giveCpu(arena, parent_dir);
+            e = write(arena, j.dir, "cpu.max", text);
+        }
+        switch (e) {
+            .SUCCESS => {},
+            .NOENT => return error.CpuControllerUnavailable,
+            else => return error.CpuLimitFailed,
+        }
     }
 
     /// Where a service's helper, and the relay, join.
@@ -759,6 +802,25 @@ fn readIn(io: std.Io, dir: []const u8, name: []const u8, buf: []u8) ![]u8 {
 }
 
 const gib: u64 = 1 << 30;
+
+test "native cgroup: a job container's --cpus is written as the job's cpu.max, and no cpu controller is an error" {
+    const io = std.testing.io;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const job: Job = .{ .dir = try tmp.dir.realPathFileAlloc(io, ".", arena) };
+    // A parent that does not give its children the controller: no `cpu.max` there.
+    try std.testing.expectError(error.CpuControllerUnavailable, job.limitCpu(arena, 50_000, 100_000));
+    try tmp.dir.writeFile(io, .{ .sub_path = "cpu.max", .data = "max 100000\n" });
+    try job.limitCpu(arena, 50_000, 100_000);
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "50000 100000",
+        std.mem.trim(u8, try tmp.dir.readFile(io, "cpu.max", &buf), "\n\x00"),
+    );
+}
 
 test "native cgroup: all jobs' limit and each job's leave the machine room, on 8 and 30 GiB" {
     // A Pi: a third kept, and razorbill's build (2.4 GB of anonymous memory) well inside a job's.
