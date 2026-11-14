@@ -1,0 +1,3 @@
+kind: Added
+body: 'With RUNNER_ENGINE=none, a local `uses: ./path` action that is not in the job''s commit (made by an earlier step, or in another repository''s checkout) is read from the workspace when its step runs, instead of the job being refused before any step'
+time: 2026-11-13T20:39:17.774041344-05:00

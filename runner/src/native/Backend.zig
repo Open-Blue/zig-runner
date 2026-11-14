@@ -115,6 +115,9 @@ notes: std.ArrayList([]const u8) = .empty,
 actions: std.StringHashMapUnmanaged(Exec.LoadResult) = .empty,
 /// The JavaScript runtime JavaScript actions run with (`Options.js_runtime`, `actions.preload`).
 js_runtime: config.JsRuntime = .bun,
+/// This runner has no Dagger engine to send a job to (`Options.engineless`): what native cannot
+/// know before the job it finds out in the job, instead of sending the job somewhere that is not there.
+engineless: bool = false,
 /// Set when the job is cancelled, which ends a `hashFiles()` in the middle of a file; the runner's
 /// (`dagger.runNative` hands it over).
 cancel: ?*dagger.Cancel = null,

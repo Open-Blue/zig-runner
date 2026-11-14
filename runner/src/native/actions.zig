@@ -158,8 +158,14 @@ fn localReason(b: *Backend, job: job_mod.Job, path: []const u8, depth: u32) anye
     const label = try std.fmt.allocPrint(arena, "./{s}", .{path});
     const not_known = try std.fmt.allocPrint(arena, "the local action {s} is not in {s} at " ++
         "{s}, so what it is cannot be known before the job", .{ label, job.github.repository, job.github.sha });
-    if (job.github.repository.len == 0 or job.github.sha.len == 0) return not_known;
-    const text = (try readOwn(b, job, path)) orelse return not_known;
+    if (job.github.repository.len == 0 or job.github.sha.len == 0) return if (b.engineless) null else not_known;
+    const text = (try readOwn(b, job, path)) orelse {
+        // With an engine, Dagger is where such a job goes. With none, nowhere is: the step reads
+        // the action from the workspace when it runs, as it does for one that is in the commit, and
+        // fails saying what native cannot run there (a Dockerfile in the workspace, say).
+        if (b.engineless) return null;
+        return not_known;
+    };
     const meta = switch (try action.parse(arena, text)) {
         .ok => |m| m,
         // The step reads it again and fails with why, as on Dagger.
@@ -890,4 +896,42 @@ test "local actions natively: judged from the job's commit before the job, read 
         errdefer std.debug.print("got: {?s}\n", .{why});
         try std.testing.expect(std.mem.indexOf(u8, why orelse "", c.why) != null);
     }
+}
+
+test "no engine: a local action no commit holds is read from the workspace when its step runs, not refused" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testActions(arena, &tmp);
+    // An earlier step makes the action, as a checkout of another repository would.
+    var make = testStep("mkdir -p \"$GITHUB_WORKSPACE/made\" && printf 'runs:\\n  using: composite\\n  steps:\\n" ++
+        "    - shell: bash\\n      run: echo made-by-an-earlier-step\\n' > \"$GITHUB_WORKSPACE/made/action.yml\"");
+    make.name = "make";
+    var use = testStep("");
+    use.action = .{ .uses = .{ .owner = "", .name = "", .path = "made", .ref = "", .local = true } };
+    var job = testJob(&.{ make, use });
+    job.github.server_url = "file:///srv/git";
+
+    // With an engine to go to, it goes there (`preload` says so); with none, it runs.
+    var b = try Backend.init(arena, std.testing.io, std.testing.allocator, cfg);
+    defer b.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, (try preload(&b, job, .bun)) orelse "", "is not in o/r at") != null);
+    b.engineless = true;
+    try std.testing.expect((try preload(&b, job, .bun)) == null);
+
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .engineless = true,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    errdefer std.debug.print("{s}\n", .{w.written()});
+    try std.testing.expect(res.succeeded);
+    try std.testing.expect(std.mem.indexOf(u8, w.written(), "made-by-an-earlier-step") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.written(), "needs the Dagger engine") == null);
 }
