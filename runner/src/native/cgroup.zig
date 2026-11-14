@@ -46,6 +46,7 @@ const std = @import("std");
 const logfmt = @import("../logfmt.zig");
 const linux = std.os.linux;
 const admission = @import("../admission.zig");
+const priority = @import("../priority.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -703,6 +704,31 @@ pub const Job = struct {
             else => return error.CpuLimitFailed,
         }
     }
+
+    /// What a job's priority gives it (`priority.zig`, #544): `cpu.weight` and `io.weight` by level,
+    /// and for a high one a `memory.low` of `protect_bytes`, which the kernel honours only as far as
+    /// the parent's own is set (`Admission.syncProtection`). Each is best effort and reported
+    /// in the result: a controller that is not delegated, or an I/O scheduler that ignores
+    /// weights, must not fail the job, which runs as it would without a priority.
+    pub fn limitPriority(j: Job, arena: Allocator, level: u8, protect_bytes: u64) Applied {
+        var done: Applied = .{};
+        const parent_dir = std.fs.path.dirname(j.dir);
+        const weight = priority.cpuWeight(level);
+        if (weight != 100) {
+            j.limitWeight(arena, weight) catch return done;
+        }
+        done.cpu = true;
+        if (parent_dir) |p| _ = giveController(arena, p, "io");
+        const io_text = std.fmt.allocPrint(arena, "default {d}", .{priority.ioWeight(level)}) catch return done;
+        done.io = write(arena, j.dir, "io.weight", io_text) == .SUCCESS;
+        if (protect_bytes > 0) {
+            const text = std.fmt.allocPrint(arena, "{d}", .{protect_bytes}) catch return done;
+            done.memory = write(arena, j.dir, "memory.low", text) == .SUCCESS;
+        }
+        return done;
+    }
+
+    pub const Applied = struct { cpu: bool = false, io: bool = false, memory: bool = false };
 
     /// What the cpuset controller allows the job, `cpuset.cpus.effective` or
     /// `cpuset.mems.effective` (`file`), as the kernel writes it (`0-3,5`), asking for the
@@ -1463,4 +1489,96 @@ test "native cgroup: none is none, and the answer is kept per setting" {
     try std.testing.expectEqualStrings("RUNNER_NATIVE_CGROUP=none", p.none);
     const bad = parent(a.allocator(), std.testing.io, "/etc");
     try std.testing.expect(bad == .none);
+}
+
+test "native cgroup: a job's priority is its cpu.weight, io.weight and memory.low" {
+    const io = std.testing.io;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "cpu.weight", "io.weight", "memory.low" }) |f|
+        try tmp.dir.writeFile(io, .{ .sub_path = f, .data = "0\n\n\n\n\n\n\n" });
+    const job: Job = .{ .dir = try tmp.dir.realPathFileAlloc(io, ".", arena) };
+    const done = job.limitPriority(arena, priority.high, 300 << 20);
+    try std.testing.expect(done.cpu and done.io and done.memory);
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("300", std.mem.trim(u8, try tmp.dir.readFile(io, "cpu.weight", &buf), "\n\x00"));
+    try std.testing.expectEqualStrings("default 300", std.mem.trim(u8, try tmp.dir.readFile(io, "io.weight", &buf), "\n\x00"));
+    try std.testing.expectEqualStrings("314572800", std.mem.trim(u8, try tmp.dir.readFile(io, "memory.low", &buf), "\n\x00"));
+}
+
+fn busyTicks(arena: Allocator, io: std.Io, pid: std.posix.pid_t) !u64 {
+    const path = try std.fmt.allocPrint(arena, "/proc/{d}/stat", .{pid});
+    var buf: [1024]u8 = undefined;
+    const text = try std.Io.Dir.cwd().readFile(io, path, &buf);
+    // utime is the 14th field, counted after the `)` that ends the command's name.
+    var it = std.mem.tokenizeScalar(u8, text[std.mem.lastIndexOfScalar(u8, text, ')').? + 1 ..], ' ');
+    var n: usize = 0;
+    while (it.next()) |f| : (n += 1) if (n == 11) return try std.fmt.parseInt(u64, f, 10);
+    return error.TestUnexpectedResult;
+}
+
+test "native cgroup: under pressure the lower job's steps are frozen and use no CPU, the higher job's go on, and the pause ends" {
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var raw: [8]u8 = undefined;
+    io.random(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    const top = try std.fmt.allocPrint(arena, "{s}/zig-runner-test-{s}", .{ mount_point, &hex });
+    defer (Job{ .dir = top }).remove(arena, io);
+    ensure(arena, top) catch return error.SkipZigTest;
+    const set: Limits = .{ .memory_max = 1 << 30, .pids_max = 64, .memory_total = 1 << 30 };
+    const hi = try Job.make(arena, io, top, "hi", set);
+    const lo = try Job.make(arena, io, top, "lo", set);
+    const lo_done = lo.limitPriority(arena, priority.low, 0);
+    const hi_done = hi.limitPriority(arena, priority.high, 64 << 20);
+    // The cpu controller is the one that must be there; io depends on the host's scheduler.
+    try std.testing.expect(lo_done.cpu and hi_done.cpu);
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("300\n", try readIn(io, hi.dir, "cpu.weight", &buf));
+    try std.testing.expectEqualStrings("35\n", try readIn(io, lo.dir, "cpu.weight", &buf));
+    var slots: [2]admission.Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "pressure", .data = "some avg10=50.00 avg60=0.00 avg300=0.00 total=0\n" });
+    const pressure = try std.fmt.allocPrint(arena, "{s}/pressure", .{try tmp.dir.realPathFileAlloc(io, ".", arena)});
+    var pool: admission.Admission = .init(io, .{ .priority = .{ .freeze = true } }, &slots);
+    pool.native = true;
+    pool.paths.pressure = pressure;
+    const now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+    for (&slots, [_]Job{ hi, lo }, [_]u8{ priority.high, priority.low }) |*s, j, level| {
+        s.* = .{ .started_ms = now_ms, .native = true, .level = level, .est_mb = 64 };
+        @memcpy(s.cgroup_buf[0..j.dir.len], j.dir);
+        s.cgroup_len = j.dir.len;
+    }
+    var spin: [2]std.process.Child = undefined;
+    for (&spin, [_]Job{ hi, lo }) |*c, j| {
+        c.* = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", "while :; do :; done" } });
+        const pid = try std.fmt.allocPrint(arena, "{d}", .{c.id.?});
+        try std.testing.expect(write(arena, j.stepsDir(), "cgroup.procs", pid) == .SUCCESS);
+    }
+    defer for (&spin) |*c| c.kill(io);
+    // The tick freezes the lower job's steps.
+    pool.tick();
+    try std.testing.expect(slots[1].paused and !slots[0].paused);
+    io.sleep(.fromMilliseconds(300), .awake) catch {};
+    try std.testing.expect(std.mem.indexOf(u8, try readIn(io, lo.stepsDir(), "cgroup.events", &buf), "frozen 1") != null);
+    const lo_before = try busyTicks(arena, io, spin[1].id.?);
+    const hi_before = try busyTicks(arena, io, spin[0].id.?);
+    io.sleep(.fromMilliseconds(600), .awake) catch {};
+    try std.testing.expectEqual(lo_before, try busyTicks(arena, io, spin[1].id.?));
+    try std.testing.expect(try busyTicks(arena, io, spin[0].id.?) > hi_before);
+    // Calm again: it goes on and runs.
+    try tmp.dir.writeFile(io, .{ .sub_path = "pressure", .data = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n" });
+    pool.tick();
+    try std.testing.expect(!slots[1].paused);
+    io.sleep(.fromMilliseconds(600), .awake) catch {};
+    try std.testing.expect(try busyTicks(arena, io, spin[1].id.?) > lo_before);
+    // The job's own cgroup was never frozen, nor was anything outside the steps.
+    try std.testing.expect(std.mem.indexOf(u8, try readIn(io, lo.dir, "cgroup.events", &buf), "frozen 0") != null);
 }

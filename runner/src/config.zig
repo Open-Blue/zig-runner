@@ -324,6 +324,9 @@ pub const Config = struct {
     /// `github/request_log.zig`).
     log_requests: bool = true,
     admission_limits: admission.Limits = .{},
+    /// A file of priority rules (`priority.Policy`, `RUNNER_PRIORITY_POLICY`); empty for none. Read
+    /// once at start: a rule that does not parse stops the runner, saying which.
+    priority_policy: []const u8 = "",
     /// A root runner's gate counts what the other pools of the machine have reserved
     /// (`admission.Budget`).
     shared_memory_budget: bool = true,
@@ -615,6 +618,14 @@ pub const Config = struct {
         if (environ.get("RUNNER_MAX_SWAP_GROWTH_MB")) |v| l.max_swap_growth_mb = try num(u32, v);
         if (environ.get("RUNNER_MIN_ENGINE_HEADROOM_MB")) |v|
             l.min_engine_headroom_mb = try num(u32, v);
+        const pr = &l.priority;
+        if (environ.get("RUNNER_PRIORITY_POLICY")) |v| c.priority_policy = v;
+        if (environ.get("RUNNER_PRIORITY_DEFAULT")) |v| pr.default = try level(v);
+        if (environ.get("RUNNER_PRIORITY_ENV_MAX")) |v| pr.env_max = try level(v);
+        if (environ.get("RUNNER_PRIORITY_AGE_SECS")) |v| pr.age_step_ms = try secs(v) *| std.time.ms_per_s;
+        if (environ.get("RUNNER_PRIORITY_FREEZE")) |v| pr.freeze = try boolean(v);
+        if (environ.get("RUNNER_PRIORITY_FREEZE_PRESSURE")) |v| pr.freeze_pressure = try percent(v) * 100;
+        if (environ.get("RUNNER_PRIORITY_FREEZE_MAX_SECS")) |v| pr.freeze_max_ms = try secs(v) *| std.time.ms_per_s;
         if (environ.get("RUNNER_ENGINE_CGROUP")) |v| c.engine_cgroup = v;
         if (environ.get("RUNNER_STOP_GRACE_SECS")) |v| c.stop_grace_secs = try secs(v);
         if (environ.get("RUNNER_TRUSTED_REFS")) |v| c.trusted_refs = v;
@@ -716,6 +727,13 @@ pub const Config = struct {
         else if (eq(key, "max-mem-pressure")) l.max_pressure = try percent(val) //
         else if (eq(key, "max-swap-growth-mb")) l.max_swap_growth_mb = try num(u32, val) //
         else if (eq(key, "min-engine-headroom-mb")) l.min_engine_headroom_mb = try num(u32, val) //
+        else if (eq(key, "priority-policy")) c.priority_policy = val //
+        else if (eq(key, "priority-default")) l.priority.default = try level(val) //
+        else if (eq(key, "priority-env-max")) l.priority.env_max = try level(val) //
+        else if (eq(key, "priority-age-secs")) l.priority.age_step_ms = try secs(val) *| std.time.ms_per_s //
+        else if (eq(key, "priority-freeze")) l.priority.freeze = try boolean(val) //
+        else if (eq(key, "priority-freeze-pressure")) l.priority.freeze_pressure = try percent(val) * 100 //
+        else if (eq(key, "priority-freeze-max-secs")) l.priority.freeze_max_ms = try secs(val) *| std.time.ms_per_s //
         else if (eq(key, "engine-cgroup")) c.engine_cgroup = val //
         else if (eq(key, "stop-grace-secs")) c.stop_grace_secs = try secs(val) //
         else if (eq(key, "trusted-refs")) c.trusted_refs = val //
@@ -878,6 +896,11 @@ pub const Config = struct {
         const n = try num(u32, s);
         if (n > std.time.s_per_day) return error.InvalidNumber;
         return n;
+    }
+
+    /// A priority level: `low`, `normal`, `high` or a digit 0 to 9 (`priority.parseLevel`).
+    fn level(s: []const u8) error{InvalidNumber}!u8 {
+        return @import("priority.zig").parseLevel(s) orelse error.InvalidNumber;
     }
 
     /// A count (of runners, of days): 1 to 1024.
@@ -1526,4 +1549,32 @@ test "RUNNER_PLATFORM=gitea needs the instance's address, and no GitHub credenti
     try std.testing.expectEqual(Platform.github, (try Config.load(&env, &flag)).platform);
     try env.put("RUNNER_PLATFORM", "gitlab");
     try std.testing.expectError(error.InvalidPlatform, Config.load(&env, &.{"runner"}));
+}
+
+test "priority settings from the environment and flags" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    const d = try Config.load(&env, &.{"runner"});
+    const defaults: admission.Limits = .{};
+    try std.testing.expectEqual(defaults.priority, d.admission_limits.priority);
+    try std.testing.expectEqualStrings("", d.priority_policy);
+    try env.put("RUNNER_PRIORITY_POLICY", "/etc/zig-runner/priority");
+    try env.put("RUNNER_PRIORITY_DEFAULT", "low");
+    try env.put("RUNNER_PRIORITY_ENV_MAX", "8");
+    try env.put("RUNNER_PRIORITY_AGE_SECS", "30");
+    try env.put("RUNNER_PRIORITY_FREEZE", "true");
+    try env.put("RUNNER_PRIORITY_FREEZE_PRESSURE", "15");
+    try env.put("RUNNER_PRIORITY_FREEZE_MAX_SECS", "45");
+    const c = try Config.load(&env, &.{ "runner", "--priority-age-secs=0" });
+    try std.testing.expectEqualStrings("/etc/zig-runner/priority", c.priority_policy);
+    try std.testing.expectEqual(@as(u8, 1), c.admission_limits.priority.default);
+    try std.testing.expectEqual(@as(u8, 8), c.admission_limits.priority.env_max);
+    try std.testing.expectEqual(@as(u32, 0), c.admission_limits.priority.age_step_ms);
+    try std.testing.expect(c.admission_limits.priority.freeze);
+    try std.testing.expectEqual(@as(u32, 1500), c.admission_limits.priority.freeze_pressure);
+    try std.testing.expectEqual(@as(u32, 45_000), c.admission_limits.priority.freeze_max_ms);
+    try env.put("RUNNER_PRIORITY_DEFAULT", "urgent");
+    try std.testing.expectError(error.InvalidNumber, Config.load(&env, &.{"runner"}));
 }
