@@ -214,11 +214,24 @@ fn expectedBlob(n: u64) Hash {
     return h;
 }
 
+/// For the benchmarks over TLS (`ZIG_RUNNER_BENCH_URL`, `ZIG_RUNNER_BENCH_CA`): the PEM roots the
+/// library trusts, and std's client given the same file.
+var bench_roots: []const u8 = "";
+var bench_ca_path: []const u8 = "";
+
+fn benchTrust(client: *std.http.Client, io: Io) !void {
+    if (bench_ca_path.len == 0) return;
+    const now = Io.Clock.real.now(io);
+    try client.ca_bundle.addCertsFromFilePathAbsolute(client.allocator, io, now, bench_ca_path);
+    client.now = now;
+}
+
 const Download = struct { status: u16, hash: Hash, peak: usize = 0 };
 
 fn downloadViaStd(arena: std.mem.Allocator, io: Io, url: []const u8, token: ?[]const u8) !Download {
     var local: std.http.Client = .{ .allocator = arena, .io = io };
     defer local.deinit();
+    try benchTrust(&local, io);
     var resp: Io.Writer.Allocating = .init(arena);
     const r = try http.fetch(&local, .{
         .location = .{ .url = url },
@@ -235,6 +248,7 @@ fn downloadViaLibrary(arena: std.mem.Allocator, io: Io, url: []const u8, token: 
         .url = url,
         .headers = if (token) |a| &.{.{ .name = "Authorization", .value = a }} else &.{},
         .max_response = 1 << 30,
+        .roots_pem = bench_roots,
     });
     defer s.close();
     var h: Hash = .{};
@@ -503,23 +517,54 @@ fn benchReport(io: Io, what: []const u8, mib: u64, start: Usage) void {
     });
 }
 
+/// Where a benchmark downloads from: the in-process server, or the URL in `ZIG_RUNNER_BENCH_URL` (an
+/// external server, so that its CPU is not the process's; `ZIG_RUNNER_BENCH_CA` its CA's PEM file, for
+/// https, which both clients are given).
+const BenchTarget = struct {
+    server: testserver.Server,
+    external: bool,
+    url: []const u8,
+
+    fn init(t: *BenchTarget, arena: std.mem.Allocator, mib: u64) !void {
+        const env = try std.testing.environ.createMap(arena);
+        if (env.get("ZIG_RUNNER_BENCH_URL")) |u| {
+            t.external = true;
+            t.url = u;
+            if (env.get("ZIG_RUNNER_BENCH_CA")) |ca| {
+                bench_ca_path = ca;
+                bench_roots = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, ca, arena, .limited(1 << 20));
+            }
+            return;
+        }
+        t.external = false;
+        try t.server.start();
+        t.url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/blob/{d}", .{ t.server.port, mib << 20 });
+    }
+
+    fn deinit(t: *BenchTarget) void {
+        if (!t.external) t.server.stop();
+        bench_roots = "";
+        bench_ca_path = "";
+    }
+};
+
 test "bench: download, std (the whole body in memory, as zig_release's download was)" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const mib = (try benchSizeMib(arena, "download-std")) orelse return error.SkipZigTest;
-    var server: testserver.Server = undefined;
-    try server.start();
-    defer server.stop();
+    var target: BenchTarget = undefined;
+    try target.init(arena, mib);
+    defer target.deinit();
     const io = std.testing.io;
-    var url_buf: [96]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/blob/{d}", .{ server.port, mib << 20 });
+    const url = target.url;
     const start = Usage.now(io);
     var local: std.http.Client = .{ .allocator = arena, .io = io };
     defer local.deinit();
+    try benchTrust(&local, io);
     var resp: Io.Writer.Allocating = .init(std.heap.page_allocator);
     defer resp.deinit();
-    const r = try http.fetch(&local, .{ .location = .{ .url = url }, .response_writer = &resp.writer });
+    const r = try local.fetch(.{ .location = .{ .url = url }, .response_writer = &resp.writer });
     var h: Hash = .{};
     h.add(resp.written());
     try std.testing.expectEqual(std.http.Status.ok, r.status);
@@ -531,12 +576,11 @@ test "bench: download, library (a stream, hashed as it arrives)" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const mib = (try benchSizeMib(arena, "download-library")) orelse return error.SkipZigTest;
-    var server: testserver.Server = undefined;
-    try server.start();
-    defer server.stop();
+    var target: BenchTarget = undefined;
+    try target.init(arena, mib);
+    defer target.deinit();
     const io = std.testing.io;
-    var url_buf: [96]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/blob/{d}", .{ server.port, mib << 20 });
+    const url = target.url;
     const start = Usage.now(io);
     const d = try downloadViaLibrary(arena, io, url, null, 64 * 1024);
     try std.testing.expectEqual(@as(u16, 200), d.status);
@@ -548,6 +592,7 @@ test "bench: download, library (a stream, hashed as it arrives)" {
 fn blobViaStd(io: Io, url: []const u8, file: Io.File, gpa: std.mem.Allocator) !u64 {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
+    try benchTrust(&client, io);
     var req = try client.request(.GET, try std.Uri.parse(url), .{
         .headers = .{ .accept_encoding = .omit },
         .redirect_behavior = .unhandled,
@@ -580,16 +625,15 @@ test "bench: registry blob, std (the old client's streaming into a file)" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const mib = (try benchSizeMib(arena, "blob-std")) orelse return error.SkipZigTest;
-    var server: testserver.Server = undefined;
-    try server.start();
-    defer server.stop();
+    var target: BenchTarget = undefined;
+    try target.init(arena, mib);
+    defer target.deinit();
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "blob", .{});
     defer file.close(io);
-    var url_buf: [96]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/blob/{d}", .{ server.port, mib << 20 });
+    const url = target.url;
     const start = Usage.now(io);
     try std.testing.expectEqual(mib << 20, try blobViaStd(io, url, file, std.testing.allocator));
     benchReport(io, "registry blob, std", mib, start);
@@ -600,22 +644,21 @@ test "bench: registry blob, library (registry.Client.blob)" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const mib = (try benchSizeMib(arena, "blob-library")) orelse return error.SkipZigTest;
-    var server: testserver.Server = undefined;
-    try server.start();
-    defer server.stop();
+    var target: BenchTarget = undefined;
+    try target.init(arena, mib);
+    defer target.deinit();
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "blob", .{});
     defer file.close(io);
-    var url_buf: [96]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/blob/{d}", .{ server.port, mib << 20 });
+    const url = target.url;
     var stream_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer stream_arena.deinit();
     const start = Usage.now(io);
     // `Client.blob` asks /v2/<repo>/blobs/<digest>; the bench server answers /blob/<n>, so the body is
     // taken the way `blob` takes it: the library's stream, hashed and written to the file as it arrives.
-    var s = try net_client.open(stream_arena.allocator(), io, .{ .url = url, .max_response = 1 << 40, .read_idle = .fromSeconds(60) });
+    var s = try net_client.open(stream_arena.allocator(), io, .{ .url = url, .max_response = 1 << 40, .read_idle = .fromSeconds(60), .roots_pem = bench_roots });
     defer s.close();
     var body: bench_registry.Body = .{ .file = .{ .file = file, .limit = mib << 20 } };
     try body.take(&s);
