@@ -26,7 +26,7 @@ n=int(sys.argv[1])
 x=0
 for i in range(n): x+=i*i
 '
-# hi re-reads a 200 MB file 25 times; lo streams a 1.5 GB file for ever.
+# hi re-reads a 200 MB file 300 times; lo streams a 1.5 GB file for ever.
 reader='
 import sys
 f=open(sys.argv[1],"rb"); passes=int(sys.argv[2])
@@ -76,11 +76,11 @@ run_cache() { # variant
   # The governor reads the pressure of the cgroup both jobs share, and freezes in `lo/steps`.
   mkdir -p "$hi/steps" "$lo/steps"
   "$bench" govern "$P/memory.pressure" $mode "$hi:7:260" "$lo:1:300" & local gp=$!
-  sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+  sync
   start_in "$lo/steps" python3 -c "$reader" "$work/big" 100000; local lp=$PID
   sleep 2
   local t0; t0=$(now)
-  start_in "$hi/steps" python3 -c "$reader" "$work/small" 25; local hp=$PID
+  start_in "$hi/steps" python3 -c "$reader" "$work/small" 300; local hp=$PID
   wait "$hp"; local t1; t1=$(now)
   echo 0 > "$lo/steps/cgroup.freeze" 2>/dev/null || true
   kill "$lp" "$gp" 2>/dev/null || true; wait "$lp" "$gp" 2>/dev/null || true
