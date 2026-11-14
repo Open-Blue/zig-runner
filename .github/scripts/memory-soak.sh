@@ -32,74 +32,95 @@ set -euo pipefail
 # must not change the run (bash reads a script as it executes it).
 main() {
 
-jobs=500 warmup=20 mem=6g own=0 shapes=
-bin=$(cd "$(dirname "$0")/../.." && pwd)/runner/zig-out/bin/runner
-dir=${ZR_SOAK_DIR:-$HOME/.cache/zr-soak}
-out=""
-while (($#)); do
-	case $1 in
-	--jobs) jobs=$2; shift 2 ;;
-	--warmup) warmup=$2; shift 2 ;;
-	--mem) mem=$2; shift 2 ;;
-	--bin) bin=$2; shift 2 ;;
-	--out) out=$2; shift 2 ;;
-	--shapes) shapes=$2; shift 2 ;;
-	--own-instance) own=1; shift ;;
-	--locked) shift ;;
-	*) sed -n '2,/^set -e/p' "$0" | sed 's/^# \{0,1\}//' | head -n -1 && exit 2 ;;
-	esac
-done
-out=${out:-$dir/run-$(date +%Y%m%d-%H%M%S)}
-url=${ZR_SOAK_URL:-http://127.0.0.1:3300}
-token_file=${ZR_SOAK_TOKEN_FILE:-$HOME/.cache/zr-forge-tokens/gitea.token}
-forge=${ZR_SOAK_GITEA_CONTAINER:-zr-gitea}
-lock=${ZR_SOAK_LOCK:-$HOME/.cache/zig-runner-locks/root-tests.lock}
-name=zr-soak
-script_dir=$(cd "$(dirname "$0")" && pwd)
-
-# Under the root tests' lock, for the whole run.
-own_flag=()
-((!own)) || own_flag=(--own-instance)
-if [[ ${ZR_SOAK_LOCKED:-} != 1 ]]; then
-	mkdir -p "$(dirname "$lock")"
-	ZR_SOAK_LOCKED=1 exec flock "$lock" "$0" --jobs "$jobs" --warmup "$warmup" --mem "$mem" --bin "$bin" --out "$out" --shapes "$shapes" \
-		"${own_flag[@]}"
-fi
-
-[[ -x $bin ]] || { echo "no runner at $bin (zig build -Doptimize=ReleaseSafe in runner/)" >&2 && exit 1; }
-mkdir -p "$out" "$dir"
-cleanup() {
-	docker rm -f "$name" zr-soak-gitea >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-cleanup
-
-if ((own)); then
-	image=${ZR_SOAK_GITEA_IMAGE:-gitea/gitea@sha256:8967bf9deaf3c5c4adae13519436dc1b20c646ac83fe37ae810c933a1045227d}
-	url=http://127.0.0.1:3399 forge=zr-soak-gitea token_file=$dir/own-token
-	docker run -d --name "$forge" -p 127.0.0.1:3399:3000 -e GITEA__security__INSTALL_LOCK=true \
-		-e GITEA__actions__ENABLED=true -e GITEA__server__ROOT_URL="$url/" "$image" >/dev/null
-	for _ in $(seq 120); do
-		if curl -fsS -o /dev/null "$url/api/v1/version" 2>/dev/null; then break; fi
-		sleep 1
+	jobs=500 warmup=20 mem=6g own=0 shapes=
+	bin=$(cd "$(dirname "$0")/../.." && pwd)/runner/zig-out/bin/runner
+	dir=${ZR_SOAK_DIR:-$HOME/.cache/zr-soak}
+	out=""
+	while (($#)); do
+		case $1 in
+		--jobs)
+			jobs=$2
+			shift 2
+			;;
+		--warmup)
+			warmup=$2
+			shift 2
+			;;
+		--mem)
+			mem=$2
+			shift 2
+			;;
+		--bin)
+			bin=$2
+			shift 2
+			;;
+		--out)
+			out=$2
+			shift 2
+			;;
+		--shapes)
+			shapes=$2
+			shift 2
+			;;
+		--own-instance)
+			own=1
+			shift
+			;;
+		--locked) shift ;;
+		*) sed -n '2,/^set -e/p' "$0" | sed 's/^# \{0,1\}//' | head -n -1 && exit 2 ;;
+		esac
 	done
-	docker exec -u git "$forge" gitea admin user create --admin --username zradmin --email zr@localhost \
-		--password "$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')" --must-change-password=false >/dev/null
+	out=${out:-$dir/run-$(date +%Y%m%d-%H%M%S)}
+	url=${ZR_SOAK_URL:-http://127.0.0.1:3300}
+	token_file=${ZR_SOAK_TOKEN_FILE:-$HOME/.cache/zr-forge-tokens/gitea.token}
+	forge=${ZR_SOAK_GITEA_CONTAINER:-zr-gitea}
+	lock=${ZR_SOAK_LOCK:-$HOME/.cache/zig-runner-locks/root-tests.lock}
+	name=zr-soak
+	script_dir=$(cd "$(dirname "$0")" && pwd)
+
+	# Under the root tests' lock, for the whole run.
+	own_flag=()
+	((! own)) || own_flag=(--own-instance)
+	if [[ ${ZR_SOAK_LOCKED:-} != 1 ]]; then
+		mkdir -p "$(dirname "$lock")"
+		ZR_SOAK_LOCKED=1 exec flock "$lock" "$0" --jobs "$jobs" --warmup "$warmup" --mem "$mem" --bin "$bin" --out "$out" --shapes "$shapes" \
+			"${own_flag[@]}"
+	fi
+
+	[[ -x $bin ]] || { echo "no runner at $bin (zig build -Doptimize=ReleaseSafe in runner/)" >&2 && exit 1; }
+	mkdir -p "$out" "$dir"
+	cleanup() {
+		docker rm -f "$name" zr-soak-gitea >/dev/null 2>&1 || true
+	}
+	trap cleanup EXIT
+	cleanup
+
+	if ((own)); then
+		image=${ZR_SOAK_GITEA_IMAGE:-gitea/gitea@sha256:8967bf9deaf3c5c4adae13519436dc1b20c646ac83fe37ae810c933a1045227d}
+		url=http://127.0.0.1:3399 forge=zr-soak-gitea token_file=$dir/own-token
+		docker run -d --name "$forge" -p 127.0.0.1:3399:3000 -e GITEA__security__INSTALL_LOCK=true \
+			-e GITEA__actions__ENABLED=true -e GITEA__server__ROOT_URL="$url/" "$image" >/dev/null
+		for _ in $(seq 120); do
+			if curl -fsS -o /dev/null "$url/api/v1/version" 2>/dev/null; then break; fi
+			sleep 1
+		done
+		docker exec -u git "$forge" gitea admin user create --admin --username zradmin --email zr@localhost \
+			--password "$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')" --must-change-password=false >/dev/null
+		umask 077
+		docker exec -u git "$forge" gitea admin user generate-access-token --username zradmin --scopes all --raw >"$token_file"
+		umask 022
+	fi
+
+	# The repo, and a registration token for the runner (kept in a file only the container reads).
+	api() { curl -fsS -H "Authorization: token $(<"$token_file")" -H 'Content-Type: application/json' "$@"; }
+	if ! api -o /dev/null "$url/api/v1/repos/zradmin/soak" 2>/dev/null; then
+		api -X POST -d '{"name":"soak","auto_init":true,"default_branch":"main"}' -o /dev/null "$url/api/v1/user/repos"
+	fi
 	umask 077
-	docker exec -u git "$forge" gitea admin user generate-access-token --username zradmin --scopes all --raw >"$token_file"
+	docker exec -u git "$forge" gitea actions generate-runner-token | tail -n1 >"$dir/reg-token"
 	umask 022
-fi
 
-# The repo, and a registration token for the runner (kept in a file only the container reads).
-api() { curl -fsS -H "Authorization: token $(<"$token_file")" -H 'Content-Type: application/json' "$@"; }
-if ! api -o /dev/null "$url/api/v1/repos/zradmin/soak" 2>/dev/null; then
-	api -X POST -d '{"name":"soak","auto_init":true,"default_branch":"main"}' -o /dev/null "$url/api/v1/user/repos"
-fi
-umask 077
-docker exec -u git "$forge" gitea actions generate-runner-token | tail -n1 >"$dir/reg-token"
-umask 022
-
-cat >"$dir/inner.sh" <<'EOF'
+	cat >"$dir/inner.sh" <<'EOF'
 #!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -123,39 +144,39 @@ export RUNNER_STATE_DIR=/store/state RUNNER_NATIVE_STORE=/store/native RUNNER_NA
 export RUNNER_NATIVE_CGROUP=/sys/fs/cgroup/zr.slice RUNNER_HEALTH_IDLE_INTERVAL=2 RUNNER_HEALTH_INTERVAL=3600
 exec /soak/runner
 EOF
-chmod 755 "$dir/inner.sh"
-cp "$bin" "$dir/runner"
+	chmod 755 "$dir/inner.sh"
+	cp "$bin" "$dir/runner"
 
-# The container's cgroup namespace is its own, so the runner's jobs sit under the memory cap.
-docker run -d --name "$name" --privileged --network host --cgroupns private --memory "$mem" --memory-swap "$mem" \
-	-e SOAK_URL="$url" -v "$dir:/soak:ro" -v "$out:/out" -v zr-soak-store:/store ubuntu:24.04 \
-	bash -c '/soak/inner.sh >>/out/runner.log 2>&1' >/dev/null
-pid=$(docker inspect -f '{{.State.Pid}}' "$name")
-# `bash -c` is the container's first process, and runs the script as a child: the runner is the
-# newest descendant, so find it (its pid is what /proc is read for).
-for _ in $(seq 120); do
-	rpid=$(docker top "$name" -eo pid,comm 2>/dev/null | awk '$2 == "runner" { print $1; exit }') || true
-	[[ -n ${rpid:-} ]] && break
-	sleep 1
-done
-[[ -n ${rpid:-} ]] || { echo "the runner did not start; its log:" >&2 && tail -n 20 "$out/runner.log" >&2 && exit 1; }
-echo "runner pid $rpid (container main pid $pid), log $out/runner.log, results $out"
+	# The container's cgroup namespace is its own, so the runner's jobs sit under the memory cap.
+	docker run -d --name "$name" --privileged --network host --cgroupns private --memory "$mem" --memory-swap "$mem" \
+		-e SOAK_URL="$url" -v "$dir:/soak:ro" -v "$out:/out" -v zr-soak-store:/store ubuntu:24.04 \
+		bash -c '/soak/inner.sh >>/out/runner.log 2>&1' >/dev/null
+	pid=$(docker inspect -f '{{.State.Pid}}' "$name")
+	# `bash -c` is the container's first process, and runs the script as a child: the runner is the
+	# newest descendant, so find it (its pid is what /proc is read for).
+	for _ in $(seq 120); do
+		rpid=$(docker top "$name" -eo pid,comm 2>/dev/null | awk '$2 == "runner" { print $1; exit }') || true
+		[[ -n ${rpid:-} ]] && break
+		sleep 1
+	done
+	[[ -n ${rpid:-} ]] || { echo "the runner did not start; its log:" >&2 && tail -n 20 "$out/runner.log" >&2 && exit 1; }
+	echo "runner pid $rpid (container main pid $pid), log $out/runner.log, results $out"
 
-# The runner's mappings before and after, to say where a growth is (ZR_SOAK_SMAPS=1).
-smaps() {
-	[[ ${ZR_SOAK_SMAPS:-} == 1 ]] || return 0
-	docker exec "$name" sh -c 'cat /proc/$(pgrep -o -x runner)/smaps' >"$out/smaps-$1.txt" || true
-}
-smaps before
-rc=0
-python3 -I "$script_dir/memory_soak.py" run --url "$url" --token-file "$token_file" --log "$out/runner.log" \
-	--pid "$rpid" --out "$out" --jobs "$jobs" ${shapes:+--shapes "$shapes"} \
-	${ZR_SOAK_SMAPS_AT:+--smaps-at "$ZR_SOAK_SMAPS_AT"} || rc=$?
-smaps after
-# Whatever was sampled is judged, even when the run itself broke off.
-python3 -I "$script_dir/memory_soak.py" analyze "$out/samples.csv" --warmup "$warmup" \
-	--allow-anon-kb "${ZR_SOAK_ALLOW_ANON_KB:-0}" | tee "$out/verdict.txt" || ((rc)) || rc=$?
-exit "$rc"
+	# The runner's mappings before and after, to say where a growth is (ZR_SOAK_SMAPS=1).
+	smaps() {
+		[[ ${ZR_SOAK_SMAPS:-} == 1 ]] || return 0
+		docker exec "$name" sh -c 'cat /proc/$(pgrep -o -x runner)/smaps' >"$out/smaps-$1.txt" || true
+	}
+	smaps before
+	rc=0
+	python3 -I "$script_dir/memory_soak.py" run --url "$url" --token-file "$token_file" --log "$out/runner.log" \
+		--pid "$rpid" --out "$out" --jobs "$jobs" ${shapes:+--shapes "$shapes"} \
+		${ZR_SOAK_SMAPS_AT:+--smaps-at "$ZR_SOAK_SMAPS_AT"} || rc=$?
+	smaps after
+	# Whatever was sampled is judged, even when the run itself broke off.
+	python3 -I "$script_dir/memory_soak.py" analyze "$out/samples.csv" --warmup "$warmup" \
+		--allow-anon-kb "${ZR_SOAK_ALLOW_ANON_KB:-0}" | tee "$out/verdict.txt" || ((rc)) || rc=$?
+	exit "$rc"
 }
 main "$@"
 # shellcheck disable=SC2317
