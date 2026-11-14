@@ -2791,7 +2791,7 @@ test "allocation failures: a Dockerfile parsed, substituted and planned" {
         \\USER 0
         \\ENTRYPOINT ["/opt/tool/bin/entrypoint.sh"]
     ;
-    for ([_][]const u8{ docker, "FROM a\nSHELL [\"bash\"]", "RUN true", "FROM a\nRUN <<EOF\ntrue\nEOF" }) |text| {
+    for ([_][]const u8{ docker, "FROM a\nCOPY --chmod=644 [\"a b\", \"/d/\"]", "FROM a\nSHELL [\"bash\"]", "RUN true", "FROM a\nRUN <<EOF\ntrue\nEOF" }) |text| {
         try af.checkOne(S.parseOnly, .{text});
         try af.checkOne(S.planned, .{text});
     }
