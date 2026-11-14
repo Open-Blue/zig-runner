@@ -5279,7 +5279,7 @@ fn cancelOnce(cancel: *dagger.Cancel, plan: CancelPlan, at: *std.atomic.Value(i6
         const s = &g.pool.slots[g.slot];
         s.paused = g.pool.setFrozen(s, true);
         g.pool.mu.unlock(io);
-        io.sleep(.fromMilliseconds(300), .awake) catch {};
+        io.sleep(.fromMilliseconds(300), .awake) catch return;
     }
     at.store(std.Io.Clock.awake.now(io).toMilliseconds(), .release);
     cancel.requestBecause(std.Io.Clock.real.now(io).toMilliseconds() + plan.grace_ms, plan.why);
