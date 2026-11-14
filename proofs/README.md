@@ -477,6 +477,24 @@ to the end with `TypeOK` alone, 1,851, 109, 4,123, 4,555 and 2,559 (`-mark-first
 `-no-poison`, `-shared-pending`, `-trust-pending`), each one more in SPIN; each fails with the
 invariant it names in both.
 
+**The shared settle** (#521, `Store.settleEnd`): the jobs' ends may share one `syncfs`. A job's end
+joins the batch being gathered (`JoinBatch`), the batch's `syncfs` begins for those that joined
+(`BatchStart`, one at a time; a job that comes while it runs joins the next) and ends (`BatchEnd`): it
+fails if any layer of the batch lost its data or the disk fails it, and every live job of the batch
+then poisons its layer as `SettleD`'s failure does; it succeeds only with every layer's data on disk,
+and each job then commits its own durable meta. The model's `syncfs` reports what each job's own
+descriptor would, which is what the settle descriptor's rule in `Store.end_batch` gives (it took the
+superblock's error state no later than any job of the batch, and keeps when it last failed), as
+`SettleD` relies on the job's descriptor. `StoreDeferred.cfg` and `-owner-only` have it on
+(`BatchAtEnd`), with 50,066 and 47,725 states; `StoreDeferred-unbatched.cfg`, the same bounds with
+each end syncing alone (`RUNNER_NATIVE_SETTLE_WINDOW_MS=0`, the model as it was before), reaches the
+36,662 states `StoreDeferred.cfg` had, so the port's other actions are unchanged. The mutants above
+keep the per-job settle, which the job's next publish still uses. `-batch-mark-first`
+(`BatchSyncFirst = FALSE`: a job's end that joins a batch and marks its layer durable before the
+batch's `syncfs`) must fail `NoWrongValid`. Two more were checked by hand and not kept, as the
+model's own guards: a failure that poisons only one job of the batch, and a success that looks at
+only one job's tree; both fail `NoWrongValid`.
+
 **Bounds** (the processes run one job each; a job's steps pick their keys freely):
 
 | Configuration | Runners | Keys | Steps a job | Process crashes | Machine crashes | Hand's changes | Sync errors | Checks |

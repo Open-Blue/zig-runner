@@ -12,6 +12,8 @@
 #define OWNERONLY 1
 #define POISON 1
 #define SETTLEEND 1
+#define BATCHEND 0
+#define BATCHFIRST 1
 #define CHK_TypeOK
 #define CHK_NoWrongValid
 #include "StoreDeferredModel.pml"

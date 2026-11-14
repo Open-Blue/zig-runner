@@ -293,6 +293,10 @@ pub const Config = struct {
     /// Whether a job's last layer is made durable after its result is reported
     /// (`RUNNER_NATIVE_DEFER_SYNC`, `Store.defer_sync`).
     defer_sync: bool = true,
+    /// How long the first of the jobs ending together waits for the others' settles of their last
+    /// layers, to share one `syncfs` (`RUNNER_NATIVE_SETTLE_WINDOW_MS`, `Store.settleEnd`); 0: each
+    /// job's end settles its own.
+    settle_window_ms: u32 = default_settle_window_ms,
     /// The first host id of the jobs' ranges on a root runner (`RUNNER_NATIVE_SUBID_BASE`): slot
     /// n's 65536 ids start at `subid_base + n * 65536`.
     subid_base: u32 = default_subid_base,
@@ -396,6 +400,10 @@ pub const Layer = struct {
 /// 524288 to 1879048191) end below it, and its foreign range (2147352576 onwards) starts above
 /// the last slot's ids (1916383999), which stay below 2^31 for tools that take ids as signed.
 pub const default_subid_base: u32 = 1_900_000_000;
+/// `Config.settle_window_ms`'s default: a few teardowns' worth on the Pi, where one `syncfs` beside
+/// a writer took 5-8 s and the jobs of a burst end within a second or so of each other. Only waited
+/// while another job's end is on its way (`Store.announceSettle`): a job ending alone waits none.
+pub const default_settle_window_ms: u32 = 100;
 /// Every id below it may be a host user's or group's (`useradd` gives up to 60000, and LDAP or
 /// SSSD ranges commonly start at 10000 or 100000).
 pub const min_subid_base: u32 = 100_000;
@@ -461,6 +469,7 @@ pub fn configFor(
         .vouched = vouched,
         .rootless = cfg.native_rootless,
         .defer_sync = cfg.native_defer_sync,
+        .settle_window_ms = cfg.native_settle_window_ms,
         .idmapped_upper = cfg.native_idmapped_upper,
         .defer_collect = cfg.native_defer_collect,
         .subid_base = cfg.native_subid_base,
@@ -973,6 +982,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         return failed(why, arena, "renaming", paths, e);
     };
     t = ph.since(arena, .dir, t);
+    const sync_log = Store.newSyncLog(arena);
     var b: Backend = .{
         .timings = ph,
         .arena = arena,
@@ -992,11 +1002,12 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
             .root = cfg.store,
             .max_bytes = cfg.store_max_bytes,
             .limits = cfg.store_limits,
-            .sync_fd = Store.syncCursor(arena, cfg.store),
-            .sync_log = Store.newSyncLog(arena),
+            .sync_fd = Store.syncCursor(arena, io, cfg.store, sync_log),
+            .sync_log = sync_log,
             .defer_sync = cfg.defer_sync,
             .defer_delete = true,
             .defer_collect = cfg.defer_collect,
+            .settle_window_ms = cfg.settle_window_ms,
         },
         .vouched = cfg.vouched,
         .port_addresses = cfg.port_addresses,
@@ -1478,6 +1489,8 @@ pub fn deinit(b: *Backend) void {
     defer _ = b.io.swapCancelProtection(protection);
     const arena = b.arena;
     var t = phases.now();
+    // A batch of the settles of jobs ending now waits for this one's (`Store.settleEnd`, below).
+    b.store_cfg.announceSettle(b.io);
     // First: their helpers hold the job's directory and network, and are in its cgroup. The
     // published ports go with their relay.
     if (b.publisher) |*p| p.stop(b.io);
@@ -1519,9 +1532,10 @@ pub fn deinit(b: *Backend) void {
     t = b.timings.since(arena, .tree_rm, t);
     // The job's last layer was renamed in with its data not yet on disk, so that the job's result did
     // not wait for it (`Store.settlePending`): now, while the job still holds it and before the runner
-    // polls again, so the next job never shares the disk with it. A failure was logged, and marks the
-    // job: `dropUnsynced`, below, evicts the layer.
-    b.store_cfg.settlePending(arena, b.io, &b.timings) catch |e| std.log.debug("native: the job's last layer is not durable: {t}", .{e});
+    // polls again, so the next job never shares the disk with it, and with one `syncfs` for the jobs
+    // of this process ending together (`Store.settleEnd`). A failure was logged, and marks the job:
+    // `dropUnsynced`, below, evicts the layer.
+    b.store_cfg.settleEnd(arena, b.io, &b.timings) catch |e| std.log.debug("native: the job's last layer is not durable: {t}", .{e});
     t = phases.now();
     // Before the layers are let go: ancestors end up the more recently used (`Store.touchChain`).
     const whole = t;

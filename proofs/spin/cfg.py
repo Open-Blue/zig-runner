@@ -140,6 +140,8 @@ def store_deferred(c):
         "OwnerOnly": "OWNERONLY",
         "PoisonOnFail": "POISON",
         "SettleAtEnd": "SETTLEEND",
+        "BatchAtEnd": "BATCHEND",
+        "BatchSyncFirst": "BATCHFIRST",
     })
 
 
