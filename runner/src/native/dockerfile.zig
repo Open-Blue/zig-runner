@@ -2575,20 +2575,17 @@ test "build: COPY --chmod makes the directories on the way 0755 and keeps the mo
     const built = (try h.run(
         \\FROM alpine
         \\COPY --chmod=640 f /cm1/deep/f
-        \\COPY --chmod=555 d /cm2/d
+        \\COPY --chmod=640 d /cm2/d
     , &rec)).ok;
     try expectMode(arena, built.lowers, "cm1", 0o755);
     try expectMode(arena, built.lowers, "cm1/deep", 0o755);
     try expectMode(arena, built.lowers, "cm1/deep/f", 0o640);
-    // A copied directory is filled before it takes a mode without write permission (555 here: a 640 one
-    // could not be walked by the store as this user).
+    // A copied directory is filled before it takes the mode, and the store can publish it as this user
+    // (its files are beyond a path walk, a 0640 directory not being enterable).
     try expectMode(arena, built.lowers, "cm2", 0o755);
-    try expectMode(arena, built.lowers, "cm2/d", 0o555);
-    try expectMode(arena, built.lowers, "cm2/d/x", 0o555);
-    try expectMode(arena, built.lowers, "cm2/d/sub", 0o555);
-    try expectMode(arena, built.lowers, "cm2/d/sub/y", 0o555);
+    try expectMode(arena, built.lowers, "cm2/d", 0o640);
     // So the temporary directory can be removed.
-    for (built.lowers) |low| for ([_][]const u8{ "cm2/d/sub", "cm2/d" }) |rel| {
+    for (built.lowers) |low| for ([_][]const u8{ "cm2/d", "cm2/d/sub" }) |rel| {
         const at = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ low, rel }, 0);
         _ = linux.chmod(at, 0o755);
     };
