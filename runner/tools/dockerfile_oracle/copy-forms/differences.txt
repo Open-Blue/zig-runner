@@ -1,0 +1,5 @@
+# BuildKit gives the directories a COPY --chmod makes on the way to its destination the --chmod mode
+# (0640 here: a directory nobody can enter); the builder makes them 0755 (docs/native-backend.md).
+cm1	directory made on the way is 0755, not the --chmod mode
+cm2	directory made on the way is 0755, not the --chmod mode
+cm3	directory made on the way is 0755, not the --chmod mode
