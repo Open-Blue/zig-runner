@@ -214,7 +214,7 @@ fn runJob(
     const result = if (try jobs.unrunnable(c, job, log)) |failed|
         failed
     else
-        try jobs.execute(c, job, log, cancel, reporter.observer());
+        try jobs.execute(c, job, log, cancel, reporter.observer(), null);
     // A native job's teardown comes after its result is reported, as for GitHub, and on every
     // path out of here, before the gate lets go of the job.
     defer if (result.teardown) |td| {

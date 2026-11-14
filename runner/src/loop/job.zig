@@ -724,7 +724,7 @@ fn runJobSteps(
     return execute(c, job, log, cancel, observer: {
         live.next = if (reporter) |r| r.observer() else null;
         break :observer step_logs.observer();
-    });
+    }, step_ends);
 }
 
 /// The result of a job this runner does not run: one it does not trust (`trust.zig`), or whose
@@ -745,13 +745,15 @@ pub fn unrunnable(c: Runner, job: job_mod.Job, log: *sink.LogSink) !?dagger.Resu
 
 /// The steps of a job that may run, on the backend the runner is set up for, told to `observer` as
 /// each starts and ends. The result carries the native teardown not run yet (`defer_teardown`): the
-/// caller runs it once it has reported, as `handleJob` does.
+/// caller runs it once it has reported, as `handleJob` does. `step_ends` collects each step's
+/// `step-end:` line (`dagger/step_end.zig`), or null for none.
 pub fn execute(
     c: Runner,
     job: job_mod.Job,
     log: *sink.LogSink,
     cancel: *dagger.Cancel,
     observer: ?dagger.Observer,
+    step_ends: ?*std.Io.Writer.Allocating,
 ) !dagger.Result {
     const cfg = c.cfg;
     const zig_seeds: zig_release.Resolved = if (cfg.zig_seed_registry) |r|
