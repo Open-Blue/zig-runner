@@ -51,6 +51,8 @@ pub const Server = struct {
     results_fail: u32,
     results_fail_on: []const u8,
     results_fail_status: []const u8,
+    /// Header lines (each ending in CRLF) added to those answers, such as `Retry-After: 1\r\n`.
+    results_fail_headers: []const u8 = "",
     /// Installation tokens minted so far (/app/installations/...).
     app_tokens: std.atomic.Value(u32),
     /// Requests to /silent-once/... so far.
@@ -73,6 +75,7 @@ pub const Server = struct {
         s.results_fail = 0;
         s.results_fail_on = "";
         s.results_fail_status = "503 Service Unavailable";
+        s.results_fail_headers = "";
         s.held_len = 0;
         s.thread = try std.Thread.spawn(.{}, serve, .{s});
     }
@@ -199,7 +202,10 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
         const failing = s.results_fail > 0 and std.mem.indexOf(u8, path, s.results_fail_on) != null;
         if (failing) s.results_fail -= 1;
         if (failing) {
-            respond(out, s.results_fail_status, null, "{\"message\":\"try later\"}");
+            const body = "{\"message\":\"try later\"}";
+            out.print("HTTP/1.1 {s}\r\nContent-Length: {d}\r\nConnection: close\r\n{s}\r\n{s}", .{
+                s.results_fail_status, body.len, s.results_fail_headers, body,
+            }) catch return .close;
         } else if (std.mem.eql(u8, path, "/results-blob")) {
             s.results.puts += 1;
             s.results.put_bytes = body_len;

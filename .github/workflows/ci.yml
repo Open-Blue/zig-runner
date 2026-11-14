@@ -436,13 +436,28 @@ jobs:
           else
             stop="tests-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
             echo "::stop-commands::$stop" >&2
+            log="$(mktemp)"
             status=0
+            set -o pipefail
             if [ "$RUNNER_ARCH" = ARM64 ]; then
-              zig build test -j1 --summary all || status=$?
+              zig build test -j1 --summary all 2>&1 | tee "$log" >&2 || status=$?
             else
-              zig build test --summary all || status=$?
+              zig build test --summary all 2>&1 | tee "$log" >&2 || status=$?
             fi
             echo "::$stop::" >&2
+            # A floor on the tests that passed (as the overlayfs step's, ZIG_TEST_MIN_PASSED): the
+            # native backend's tests skip, not fail, on a runner that cannot make their sandboxes
+            # (REQUIRE_NATIVE cannot be demanded here: the prod runner's jobs may run where the
+            # namespaces are refused), so a mistake that skips them, or most tests, would stay
+            # green on a push to main. 1086 pass with the native and database tests skipped (a
+            # machine that cannot make sandboxes, 2026-11-13; 1234 in all); 900 leaves room for
+            # tests that differ by architecture.
+            passed="$(sed -n 's/^\([0-9][0-9]*\) passed;.*/\1/p' "$log" | tail -n 1)"
+            rm -f "$log"
+            if [ "$status" = 0 ] && [ "${passed:-0}" -lt 900 ]; then
+              echo "${passed:-0} tests passed, fewer than the 900 expected: tests that should run are skipping" >&2
+              exit 1
+            fi
             exit "$status"
           fi
 
@@ -703,7 +718,7 @@ jobs:
   # and the suite dispatches and reads the workflows with one of its installation tokens. The key
   # is the e2e environment's secret, which pull requests from forks do not get: without it (or its
   # App ID, the environment's variable), the job skips its steps, still reporting, as it does on a
-  # change that cannot affect the runner (ci-scope.sh e2e). Not a required check yet; not on main,
+  # change that cannot affect the runner (ci-scope.sh e2e). A required check (the "main and release branches" ruleset); not on main,
   # whose commits the merge queue checked.
   e2e:
     name: End to end
