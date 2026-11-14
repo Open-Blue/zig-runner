@@ -1763,6 +1763,48 @@ test "a poll that is never answered is given up after its timeout" {
     try std.testing.expect(took >= 300 and took < 5000);
 }
 
+test "a stop signal ends a long poll in flight on the library, promptly, and the connection is not left in use" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const io = std.testing.io;
+    // The broker's /silent: the request is read and never answered, as a long poll that finds no job.
+    var server: @import("github/testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    var url_buf: [64]u8 = undefined;
+    const url = server.url(&url_buf, "127.0.0.1", "/silent");
+
+    var out_buf: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+    const c = testRunner(a.allocator(), &log, &err, &cfg);
+
+    stop_signals.store(0, .release);
+    defer stop_signals.store(0, .release);
+    const Signal = struct {
+        fn after(i: std.Io, ms: i64) void {
+            i.sleep(.fromMilliseconds(ms), .awake) catch return;
+            stop_signals.store(1, .release);
+        }
+    };
+    var signalling = try io.concurrent(Signal.after, .{ io, 500 });
+    defer signalling.cancel(io);
+    const started = std.Io.Clock.awake.now(io).toMilliseconds();
+    // A timeout that would be waited for 60 s if the stop did not end the poll.
+    const r = try poll(c, url, "token", .fromSeconds(60));
+    const took = std.Io.Clock.awake.now(io).toMilliseconds() - started;
+    try std.testing.expect(r == .stop);
+    // The signal came at 500 ms; the watcher looks every 200 ms.
+    try std.testing.expect(took >= 500 and took < 3000);
+    // The poll's connection was dropped with it: the next request gets one of its own and is answered.
+    stop_signals.store(0, .release);
+    const echo = try broker.request(c.arena, io, .GET, server.url(&url_buf, "127.0.0.1", "/echo"), null, .{ .token = "t", .deadline = .fromSeconds(5) });
+    try std.testing.expectEqual(std.http.Status.ok, echo.status);
+}
+
 test "a repository whose output keys run over the limit is remembered once" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
