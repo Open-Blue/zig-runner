@@ -251,3 +251,21 @@ test "zlib-ng: a member ends where it should, and nowhere else" {
     var not_gzip: Reader = .fixed("\x78\x9c\x03\x00\x00\x00\x00\x01"); // a zlib stream
     try testing.expect(try decode(testing.allocator, &not_gzip) == null);
 }
+
+test "allocation failures: zlib-ng's reader, its state and its buffers" {
+    const af = @import("../../alloc_failures.zig");
+    const S = struct {
+        fn run(gpa: Allocator, compressed: []const u8) !void {
+            var in: Reader = .fixed(compressed);
+            const got = (try decode(gpa, &in)).?;
+            gpa.free(got);
+        }
+        fn cut(gpa: Allocator, compressed: []const u8) !void {
+            var in: Reader = .fixed(compressed);
+            try testing.expect(try decode(gpa, &in) == null);
+        }
+    };
+    // zlib-ng's own allocations go to `c_alloc`, which cannot be made to fail from here.
+    try af.checkOne(S.run, .{@as([]const u8, &layer.test_gzip)});
+    try af.checkOne(S.cut, .{@as([]const u8, layer.test_gzip[0 .. layer.test_gzip.len / 2])});
+}

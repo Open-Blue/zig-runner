@@ -267,7 +267,7 @@ pub fn lockKey(
     while (true) {
         const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
         if (flock(f, lock_ex | lock_nb)) {
-            if (sameFile(arena, f, path)) return f;
+            if (sameFile(f, path)) return f;
             f.close(io);
             continue;
         }
@@ -278,10 +278,12 @@ pub fn lockKey(
 }
 
 /// Whether some process holds the key's lock (`lockKey`): this one's own holder too, as a lock
-/// taken through another open of the file conflicts with it.
-fn keyLocked(s: Store, arena: Allocator, io: std.Io, key: Key) bool {
-    const path = std.fmt.allocPrint(arena, "{s}/keys/{s}.lock", .{ s.root, &hex(key) }) catch
-        return false;
+/// taken through another open of the file conflicts with it. The path is made on the stack: a
+/// failed allocation answered "no one holds it", and the publish refused with `KeyNotLocked` for
+/// memory it had run out of; a path too long for the stack names no lock file.
+fn keyLocked(s: Store, io: std.Io, key: Key) bool {
+    var buf: [linux.PATH_MAX]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/keys/{s}.lock", .{ s.root, &hex(key) }) catch return false;
     const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
     defer f.close(io);
     return !flock(f, lock_ex | lock_nb);
@@ -314,7 +316,7 @@ pub fn open(s: Store, arena: Allocator, io: std.Io, key: Key) !?Hit {
     const lock_path = try join(arena, dir, "lock");
     const f = std.Io.Dir.cwd().openFile(io, lock_path, .{}) catch return null;
     // Waits out an eviction under way, which then leaves the path naming nothing.
-    if (!flock(f, lock_sh) or !sameFile(arena, f, lock_path)) {
+    if (!flock(f, lock_sh) or !sameFile(f, lock_path)) {
         f.close(io);
         return null;
     }
@@ -322,6 +324,8 @@ pub fn open(s: Store, arena: Allocator, io: std.Io, key: Key) !?Hit {
         f.close(io);
         // Another job's layer not yet durable is a miss, and is that job's to make durable or poison.
         if (e == error.PendingOfAnotherJob) return null;
+        // Out of memory says nothing of the entry: a whole layer was evicted for it.
+        if (e == error.OutOfMemory) return e;
         if (s.evict(arena, io, &hex(key))) return null;
         return error.Invalid;
     };
@@ -399,9 +403,10 @@ pub const Epoch = struct {
 
 /// The epoch of the filesystem `path` is on, or null when the boot id or the mount's unique id
 /// (Linux 6.8) cannot be read: a publish then syncs before it renames.
-noinline fn epochOf(arena: Allocator, io: std.Io, path: []const u8) ?Epoch {
+noinline fn epochOf(io: std.Io, path: []const u8) ?Epoch {
     const boot = bootId(io) orelse return null;
-    const z = arena.dupeSentinel(u8, path, 0) catch return null;
+    var buf: [linux.PATH_MAX]u8 = undefined;
+    const z = cPath(&buf, path) orelse return null;
     var st: linux.Statx = undefined;
     const rc = linux.statx(linux.AT.FDCWD, z, 0, .{ .MNT_ID_UNIQUE = true }, &st);
     if (linux.errno(rc) != .SUCCESS or !st.mask.MNT_ID_UNIQUE) return null;
@@ -417,8 +422,18 @@ noinline fn bootId(io: std.Io) ?BootId {
     return if (id.len == boot_id_len) id[0..boot_id_len].* else null;
 }
 
-fn inThisBoot(s: Store, arena: Allocator, io: std.Io, e: Epoch) bool {
-    const now = s.epoch orelse epochOf(arena, io, join(arena, s.root, "layers") catch return false) orelse return false;
+/// The epoch of the layers directory now, or null when it cannot be told. Made on the stack, as an
+/// allocation that failed answered null, which `inThisBoot` read as another boot (and `open`
+/// evicted the layer for it) and `deferEpoch` as a filesystem with no epoch.
+fn nowEpoch(s: Store, io: std.Io) ?Epoch {
+    if (s.epoch) |e| return e;
+    var buf: [linux.PATH_MAX]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/layers", .{s.root}) catch return null;
+    return epochOf(io, path);
+}
+
+fn inThisBoot(s: Store, io: std.Io, e: Epoch) bool {
+    const now = s.nowEpoch(io) orelse return false;
     return now.mnt == e.mnt and std.mem.eql(u8, &now.boot, &e.boot);
 }
 
@@ -508,10 +523,10 @@ fn readEntry(s: Store, arena: Allocator, io: std.Io, dir: []const u8) !Record {
     // Another job of this boot gets a miss, not the layer, until it is durable: nothing vouches for
     // the page cache of a job that may fail its sync or be killed (`settlePending`).
     if (m.pending) |e| {
-        if (!s.inThisBoot(arena, io, e)) return error.PendingOfAnotherBoot;
+        if (!s.inThisBoot(io, e)) return error.PendingOfAnotherBoot;
         if (!s.owns(dir)) return error.PendingOfAnotherJob;
     }
-    if (!isDir(arena, try join(arena, dir, "fs"))) return error.NoTree;
+    if (!isDir(try join(arena, dir, "fs"))) return error.NoTree;
     const cwd = std.Io.Dir.cwd();
     const limit: std.Io.Limit = .limited(max_record_bytes + 1);
     const rec: Record = .{
@@ -538,11 +553,11 @@ pub fn checkEntry(s: Store, arena: Allocator, io: std.Io, name: []const u8) !?u6
     const lock_path = try join(arena, dir, "lock");
     const f = std.Io.Dir.cwd().openFile(io, lock_path, .{}) catch |e| {
         // Published whole, so with its lock: gone since the listing, or broken.
-        if (e == error.FileNotFound and !isDir(arena, dir)) return null;
+        if (e == error.FileNotFound and !isDir(dir)) return null;
         return e;
     };
     defer f.close(io);
-    if (!flock(f, lock_sh) or !sameFile(arena, f, lock_path)) return null;
+    if (!flock(f, lock_sh) or !sameFile(f, lock_path)) return null;
     const m = try metaOf(arena, io, dir);
     // A layer whose data is not yet synced counts what the page cache will take (`settle` counts it again).
     if (m.pending != null) return m.bytes;
@@ -588,7 +603,8 @@ pub fn checkOncePerBoot(s: Store, arena: Allocator, io: std.Io) void {
         defer pass.deinit();
         const a = pass.allocator();
         const full = join(a, layers, e.name) catch return;
-        if (s.treeAsCounted(a, io, full)) continue;
+        // Out of memory ends the check, unmarked: the next job does it. It said nothing of the tree.
+        if (s.treeAsCounted(a, io, full) catch return) continue;
         std.log.warn("native: layer {s}'s tree is not what was published; evicted", .{e.name});
         _ = s.evict(a, io, e.name);
     }
@@ -607,13 +623,13 @@ fn checkedIn(arena: Allocator, io: std.Io, mark: []const u8, boot: []const u8) b
     return std.mem.eql(u8, text, boot);
 }
 
-fn treeAsCounted(s: Store, arena: Allocator, io: std.Io, dir: []const u8) bool {
-    const m = metaOf(arena, io, dir) catch return false;
+fn treeAsCounted(s: Store, arena: Allocator, io: std.Io, dir: []const u8) error{OutOfMemory}!bool {
+    const m = metaOf(arena, io, dir) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else false;
     // Pending: this boot's is a job's still being synced, its blocks not yet counted; another's is
     // evicted, which is what its mark is for.
-    if (m.pending) |e| return s.inThisBoot(arena, io, e);
-    const fs = join(arena, dir, "fs") catch return false;
-    return m.bytes == (treeBytes(arena, io, fs) catch return false);
+    if (m.pending) |e| return s.inThisBoot(io, e);
+    const fs = try join(arena, dir, "fs");
+    return m.bytes == (treeBytes(arena, io, fs) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else false);
 }
 
 fn metaOf(arena: Allocator, io: std.Io, dir: []const u8) !Meta {
@@ -623,12 +639,13 @@ fn metaOf(arena: Allocator, io: std.Io, dir: []const u8) !Meta {
 
 /// The cheap half of `readEntry`, for `collect`, which looks at every entry after every job: the
 /// meta, the tree, and the record's files' lengths, without reading them.
-fn entryLooksWhole(arena: Allocator, io: std.Io, dir: []const u8) ?Meta {
-    const m = metaOf(arena, io, dir) catch return null;
-    if (!isDir(arena, join(arena, dir, "fs") catch return null)) return null;
+/// Null for one that does not, which `collect` evicts; out of memory is an error, not a null: it
+/// said nothing of the entry, and a whole layer was evicted for it.
+fn entryLooksWhole(arena: Allocator, io: std.Io, dir: []const u8) error{OutOfMemory}!?Meta {
+    const m = metaOf(arena, io, dir) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else null;
+    if (!isDir(try join(arena, dir, "fs"))) return null;
     for ([_]struct { []const u8, u64 }{ .{ "log", m.log_len }, .{ "fc", m.fc_len } }) |part| {
-        const p = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ dir, part[0] }, 0) catch
-            return null;
+        const p = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ dir, part[0] }, 0);
         var st: linux.Statx = undefined;
         const mask: linux.STATX = .{ .TYPE = true, .SIZE = true };
         if (linux.errno(linux.statx(linux.AT.FDCWD, p, linux.AT.SYMLINK_NOFOLLOW, mask, &st)) !=
@@ -640,8 +657,11 @@ fn entryLooksWhole(arena: Allocator, io: std.Io, dir: []const u8) ?Meta {
     return m;
 }
 
-fn isDir(arena: Allocator, p: []const u8) bool {
-    const z = arena.dupeSentinel(u8, p, 0) catch return false;
+/// Whether `p` is a directory (not a symlink to one). Allocates nothing: its callers take "no" for
+/// a stray to delete or an entry to evict, and an allocation that failed said "no".
+pub fn isDir(p: []const u8) bool {
+    var buf: [linux.PATH_MAX]u8 = undefined;
+    const z = cPath(&buf, p) orelse return false;
     var st: linux.Statx = undefined;
     const rc = linux.statx(linux.AT.FDCWD, z, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &st);
     return linux.errno(rc) == .SUCCESS and st.mode & linux.S.IFMT == linux.S.IFDIR;
@@ -705,7 +725,7 @@ fn publishStaged(
     ph: ?*phases.Phases,
 ) !Layer {
     if (recordFault(kind, rec)) |e| return e;
-    if (!s.keyLocked(arena, io, key)) return error.KeyNotLocked;
+    if (!s.keyLocked(io, key)) return error.KeyNotLocked;
     // After a failed sync nothing more is published by this job (`SyncLog`), before anything moves.
     if (s.sync_log) |l| if (l.failed) return error.Sync;
     // The job's previous layer, which this publish may not leave behind it unsynced: only the last
@@ -767,7 +787,7 @@ fn publishStaged(
     // boot id (`Meta.pending`): after a crash nothing returns it.
     // Needs the job's descriptor, so the settle's `syncfs` reports a write error the page cache
     // lost track of (the superblock's, which outlives an evicted inode).
-    const lazy = s.deferEpoch(arena, io);
+    const lazy = s.deferEpoch(io);
     const entry = try openRoot(arena, tmp);
     defer _ = linux.close(entry);
     var whole_disk = false;
@@ -828,6 +848,9 @@ fn publishStaged(
         t = phases.now();
     }
     const dir = try s.layerDir(arena, key);
+    // Made before the rename: an error after it would give back an upper that is no longer there,
+    // the layer being published, and `errdefer` could not put it back.
+    const published: Layer = .{ .fs = try join(arena, dir, "fs"), .lock = lock.?, .entries = size.entries };
     // One rename that never replaces: a layer published meanwhile stays, and this one is not.
     const rc = linux.renameat2(
         linux.AT.FDCWD,
@@ -851,7 +874,7 @@ fn publishStaged(
     // the entry is in its log: one a failed sync leaves in doubt is evicted (`dropUnsynced`).
     s.noteRenamed(arena, key, lazy != null);
     if (ph) |p| _ = p.since(arena, .rename, t);
-    return .{ .fs = try join(arena, dir, "fs"), .lock = lock.?, .entries = size.entries };
+    return published;
 }
 
 /// The job's log told of the layer just renamed in, `pending` if its data is not yet synced.
@@ -866,9 +889,9 @@ fn noteRenamed(s: Store, arena: Allocator, key: Key, pending: bool) void {
 }
 
 /// Where a publish beginning now may leave its layer's data unsynced (`defer_sync`), or null.
-fn deferEpoch(s: Store, arena: Allocator, io: std.Io) ?Epoch {
+fn deferEpoch(s: Store, io: std.Io) ?Epoch {
     if (!s.defer_sync or s.sync_log == null or s.sync_fd == null) return null;
-    return s.epoch orelse epochOf(arena, io, join(arena, s.root, "layers") catch return null);
+    return s.nowEpoch(io);
 }
 
 /// The most entries a layer may have for its own files to be synced one by one, for a sync beginning
@@ -1389,7 +1412,7 @@ fn collectLocked(s: Store, arena: Allocator, io: std.Io, ph: ?*phases.Phases, st
             continue;
         }
         // An entry that cannot be replayed would only take room (`open` evicts it too).
-        const meta = entryLooksWhole(arena, io, full) orelse {
+        const meta = (entryLooksWhole(arena, io, full) catch return) orelse {
             _ = s.evict(arena, io, e.name);
             continue;
         };
@@ -1479,7 +1502,7 @@ fn evictOpened(s: Store, arena: Allocator, io: std.Io, name: []const u8, lock: ?
     const full = std.fmt.allocPrint(arena, "{s}/layers/{s}", .{ s.root, name }) catch return false;
     if (lock) |l| {
         if (!flock(l, lock_ex | lock_nb)) return false;
-        if (!sameFile(arena, l, join(arena, full, "lock") catch return false)) return false;
+        if (!sameFile(l, join(arena, full, "lock") catch return false)) return false;
     }
     var raw: [8]u8 = undefined;
     io.random(&raw);
@@ -1588,11 +1611,25 @@ pub fn lockBeside(arena: Allocator, io: std.Io, path: []const u8) !std.Io.File {
     return error.Locked;
 }
 
-/// Whether `f` is the file `path` names now.
-pub fn sameFile(arena: Allocator, f: std.Io.File, p: []const u8) bool {
+/// `p` as a C string in `buf`, or null when it is too long for the kernel: it names nothing.
+/// The paths of the checks that answer yes or no go here and not to an arena, whose failure was
+/// read as a no (see `sameFile`, `isDir`).
+pub fn cPath(buf: *[linux.PATH_MAX]u8, p: []const u8) ?[:0]const u8 {
+    if (p.len >= buf.len) return null;
+    @memcpy(buf[0..p.len], p);
+    buf[p.len] = 0;
+    return buf[0..p.len :0];
+}
+
+/// Whether `f` is the file `path` names now. The path is copied to the stack, not an arena: this
+/// is asked in loops that go round again on "no" (`lockKey`, `oci.Store.lockDir`), and a "no" made
+/// by an allocation that failed went round for ever, spinning. A path too long for the kernel
+/// names nothing.
+pub fn sameFile(f: std.Io.File, p: []const u8) bool {
     var held: linux.Statx = undefined;
     var named: linux.Statx = undefined;
-    const z = arena.dupeSentinel(u8, p, 0) catch return false;
+    var buf: [linux.PATH_MAX]u8 = undefined;
+    const z = cPath(&buf, p) orelse return false;
     const mask: linux.STATX = .{ .INO = true };
     if (linux.errno(linux.statx(f.handle, "", linux.AT.EMPTY_PATH, mask, &held)) != .SUCCESS)
         return false;
@@ -2760,7 +2797,7 @@ test "native store: a published layer counts its entries, its sync deferred or n
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
     const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
     var never: std.atomic.Value(bool) = .init(false);
     for ([_]bool{ false, true }) |deferred| {
@@ -2792,7 +2829,7 @@ test "native store: a deferred publish is renamed in pending, this boot may use 
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
     var s = lazyStore(arena);
     const k, const l = try testLayer(arena, io, tmp, &s, "up");
     const dir = std.fs.path.dirname(l.fs).?;
@@ -2822,7 +2859,7 @@ test "native store: a pending layer of another boot is refused and evicted, and 
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
     var s = lazyStore(arena);
     const k, const l = try testLayer(arena, io, tmp, &s, "up");
     l.lock.close(io);
@@ -2834,10 +2871,10 @@ test "native store: a pending layer of another boot is refused and evicted, and 
     const at = std.mem.indexOf(u8, other, pending_line).? + pending_line.len;
     other[at] = if (other[at] == '0') '1' else '0';
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = meta_path, .data = other });
-    try std.testing.expect(!s.treeAsCounted(arena, io, dir));
+    try std.testing.expect(!try s.treeAsCounted(arena, io, dir));
     try std.testing.expect(try s.open(arena, io, k) == null);
     try tmp.dir.access(io, "store/layers", .{});
-    try std.testing.expect(!isDir(arena, dir));
+    try std.testing.expect(!isDir(dir));
     // The meta of a pending layer cut short at any length is never taken for a durable one's.
     for (0..good.len) |n| {
         const m = Meta.parse(good[0..n]) catch continue;
@@ -2854,7 +2891,7 @@ test "native store: the next publish settles the job's previous layer, and a fai
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
     var s = lazyStore(arena);
     // A quiet disk: past a few dozen entries a layer is synced with `syncfs`.
     s.sync_load = .{ .io_some = 0, .dirty_kib = 0 };
@@ -2906,7 +2943,7 @@ test "native store: another job gets a miss for a pending layer, and a layer who
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
     var s = lazyStore(arena);
     const key, const l = try testLayer(arena, io, tmp, &s, "bad");
     const dir = std.fs.path.dirname(l.fs).?;
@@ -2939,7 +2976,7 @@ test "native store: a job already failed poisons the pending layer it never sett
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
     var s = lazyStore(arena);
     const key, const l = try testLayer(arena, io, tmp, &s, "up");
     // As after the note of the rename ran out of memory: failed, with a layer pending.
@@ -2957,15 +2994,15 @@ test "native store: collect evicts a pending layer no job holds, a killed job's,
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
     var s = lazyStore(arena);
     const key, const l = try testLayer(arena, io, tmp, &s, "up");
     const other: Store = .{ .root = s.root };
     other.collect(arena, io);
-    try std.testing.expect(isDir(arena, std.fs.path.dirname(l.fs).?));
+    try std.testing.expect(isDir(std.fs.path.dirname(l.fs).?));
     l.lock.close(io);
     other.collect(arena, io);
-    try std.testing.expect(!isDir(arena, std.fs.path.dirname(l.fs).?));
+    try std.testing.expect(!isDir(std.fs.path.dirname(l.fs).?));
     try std.testing.expect(try other.open(arena, io, key) == null);
 }
 
@@ -2976,7 +3013,7 @@ test "native store: a pending layer of another mount of this boot is refused, an
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const here = epochOf(arena, io, ".") orelse return error.SkipZigTest;
+    const here = epochOf(io, ".") orelse return error.SkipZigTest;
     var s = lazyStore(arena);
     s.epoch = here;
     const key, const l = try testLayer(arena, io, tmp, &s, "up");
@@ -4027,13 +4064,13 @@ test "native store: sameFile tells the file a path names from another on the sam
     const f = try tmp.dir.openFile(io, "one", .{});
     defer f.close(io);
     const one = try std.fmt.allocPrint(arena, "{s}/one", .{root});
-    try std.testing.expect(sameFile(arena, f, one));
-    try std.testing.expect(!sameFile(arena, f, try std.fmt.allocPrint(arena, "{s}/two", .{root})));
-    try std.testing.expect(!sameFile(arena, f, try std.fmt.allocPrint(arena, "{s}/none", .{root})));
+    try std.testing.expect(sameFile(f, one));
+    try std.testing.expect(!sameFile(f, try std.fmt.allocPrint(arena, "{s}/two", .{root})));
+    try std.testing.expect(!sameFile(f, try std.fmt.allocPrint(arena, "{s}/none", .{root})));
     // Replaced under the same name, as an eviction leaves it: no longer the file held.
     try tmp.dir.deleteFile(io, "one");
     try tmp.dir.writeFile(io, .{ .sub_path = "one", .data = "1" });
-    try std.testing.expect(!sameFile(arena, f, one));
+    try std.testing.expect(!sameFile(f, one));
 }
 
 test "native store: trees queued while a collect holds the reaper wait for its release" {
@@ -4106,4 +4143,203 @@ test "native store: a collect leaves what the store holds known, publishes add t
     s.limits.min_free_pct = 100;
     try std.testing.expect(!s.lagFits(arena, io));
     s.collect(arena, io);
+}
+
+test "allocation failures: a key's lock" {
+    const af = @import("../alloc_failures.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try tmp.dir.createDirPath(std.testing.io, "keys");
+    const S = struct {
+        /// Out of memory is an error to the caller, never a lock that is not the file's and is
+        /// asked for again: that went round for ever.
+        fn run(a: Allocator, root_: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            const s: Store = .{ .root = root_ };
+            var never: std.atomic.Value(bool) = .init(false);
+            var kh: KeyHasher = .plain("alloc");
+            const held = try s.lockKey(arena.allocator(), std.testing.io, kh.final(), &never);
+            held.close(std.testing.io);
+        }
+    };
+    try af.checkOne(S.run, .{root});
+}
+
+/// A tree for the allocation-failure tests: `f`, `d/g`, a hard link, a symlink.
+fn failureTree(io: std.Io, base: []const u8, name: []const u8, arena: Allocator) ![]const u8 {
+    const upper = try std.fmt.allocPrint(arena, "{s}/{s}", .{ base, name });
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/d", .{upper}));
+    try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/f", .{upper}), .data = "x" });
+    try cwd.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/d/g", .{upper}), .data = "y" });
+    try cwd.symLink(io, "d/g", try std.fmt.allocPrint(arena, "{s}/link", .{upper}), .{});
+    try cwd.hardLink(try std.fmt.allocPrint(arena, "{s}/f", .{upper}), cwd, try std.fmt.allocPrint(arena, "{s}/hard", .{upper}), io, .{});
+    return upper;
+}
+
+test "allocation failures: a layer published, found and settled" {
+    const af = @import("../alloc_failures.zig");
+    const io = std.testing.io;
+    var setup: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer setup.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", setup.allocator());
+    const S = struct {
+        var runs: usize = 0;
+
+        /// The publish fails with `OutOfMemory`, the upper where it was and nothing under the key,
+        /// or it is whole: found, replayable, and settled when it was deferred.
+        fn run(a: Allocator, root_: []const u8, deferred: bool) !void {
+            runs += 1;
+            var made: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer made.deinit();
+            const ma = made.allocator();
+            const base = try std.fmt.allocPrint(ma, "{s}/run{d}", .{ root_, runs });
+            var s: Store = if (deferred) lazyStore(ma) else .{ .root = "", .sync_log = newSyncLog(ma) };
+            defer if (s.sync_fd) |fd| {
+                _ = linux.close(fd);
+            };
+            s.root = try std.fmt.allocPrint(ma, "{s}/store", .{base});
+            try prepare(ma, io, s.root, .{ .check_parents = false });
+            const upper = try failureTree(io, base, "upper", ma);
+            var kh: KeyHasher = .plain("failures");
+            const key = kh.final();
+
+            var scratch: af.Scratch = .init(a);
+            defer scratch.deinit();
+            const arena = scratch.allocator();
+            var never: std.atomic.Value(bool) = .init(false);
+            const key_lock = try s.lockKey(arena, io, key, &never);
+            defer key_lock.close(io);
+            const layer = s.publish(arena, io, key, .step, upper, .{ .log = "a log\n", .fc = "::zig-file-command::ran\nj1\n" }) catch |e| {
+                if (e == error.OutOfMemory) {
+                    try std.Io.Dir.cwd().access(io, try std.fmt.allocPrint(ma, "{s}/f", .{upper}), .{});
+                    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, try std.fmt.allocPrint(ma, "{s}/layers/{s}", .{ s.root, &hex(key) }), .{}));
+                }
+                return e;
+            };
+            layer.lock.close(io);
+            const hit = (try s.open(arena, io, key)) orelse return error.TestUnexpectedResult;
+            hit.layer.lock.close(io);
+            try std.testing.expectEqualStrings("a log\n", hit.rec.log);
+            // The boot's check of the tree counts what was published, or has no answer: a false
+            // "the tree differs" evicted the layer.
+            try std.testing.expect(try s.treeAsCounted(arena, io, std.fs.path.dirname(hit.layer.fs).?));
+            s.settlePending(arena, io, null) catch |e| {
+                // A layer the log could not note is refused at the settle, the job being failed.
+                if (e == error.Sync and s.sync_log.?.failed) return;
+                return e;
+            };
+            const again = (try s.open(arena, io, key)) orelse return error.TestUnexpectedResult;
+            again.layer.lock.close(io);
+        }
+    };
+    // Each allocation failing alone: the publish notes a layer it cannot track (`noteRenamed`) by
+    // publishing no more, on purpose, so a failure is not always an error to its caller.
+    try af.checkEach(S.run, .{ root, false });
+    try af.checkEach(S.run, .{ root, true });
+}
+
+test "allocation failures: a collect over the cap evicts, under it keeps" {
+    const af = @import("../alloc_failures.zig");
+    const io = std.testing.io;
+    var setup: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer setup.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", setup.allocator());
+    const S = struct {
+        var runs: usize = 0;
+
+        /// A collect that cannot allocate does less: what it evicts is what it was told to, and
+        /// what it did not is evicted by the next one. Never a layer under the cap.
+        fn run(a: Allocator, root_: []const u8, over: bool) !void {
+            runs += 1;
+            var made: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer made.deinit();
+            const ma = made.allocator();
+            var s: Store = .{ .root = try std.fmt.allocPrint(ma, "{s}/run{d}/store", .{ root_, runs }) };
+            try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(s.root).?);
+            try prepare(ma, io, s.root, .{ .check_parents = false });
+            const upper = try failureTree(io, std.fs.path.dirname(s.root).?, "upper", ma);
+            var kh: KeyHasher = .plain("collect");
+            const key = kh.final();
+            var never: std.atomic.Value(bool) = .init(false);
+            {
+                const key_lock = try s.lockKey(ma, io, key, &never);
+                defer key_lock.close(io);
+                const l = try s.publish(ma, io, key, .step, upper, .{ .log = "a log\n", .fc = "::zig-file-command::ran\nj1\n" });
+                l.lock.close(io);
+            }
+            s.max_bytes = if (over) 1 else default_max_bytes;
+
+            var scratch: af.Scratch = .init(a);
+            defer scratch.deinit();
+            s.collect(scratch.allocator(), io);
+            if (!over) {
+                const hit = (try s.open(ma, io, key)) orelse return error.EvictedUnderTheCap;
+                hit.layer.lock.close(io);
+                return;
+            }
+            // Whatever the failed pass left, the next one evicts.
+            s.collect(ma, io);
+            try std.testing.expect(try s.open(ma, io, key) == null);
+        }
+    };
+    try af.checkEach(S.run, .{ root, true });
+    try af.checkEach(S.run, .{ root, false });
+}
+
+test "allocation failures: a tree's size and digest, its ids shifted, layers flattened" {
+    const af = @import("../alloc_failures.zig");
+    const io = std.testing.io;
+    var setup: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer setup.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", setup.allocator());
+    const S = struct {
+        var runs: usize = 0;
+
+        /// Each answers as it does with memory, or runs out of it.
+        fn run(a: Allocator, root_: []const u8) !void {
+            runs += 1;
+            var made: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer made.deinit();
+            const ma = made.allocator();
+            const base = try std.fmt.allocPrint(ma, "{s}/run{d}", .{ root_, runs });
+            try std.Io.Dir.cwd().createDirPath(io, base);
+            const lower = try failureTree(io, base, "lower", ma);
+            const upper = try failureTree(io, base, "upper", ma);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(ma, "{s}/extra", .{upper}), .data = "z" });
+            const want_size = try treeSize(ma, io, upper);
+            const want_digest = try treeDigest(ma, io, upper, .content, Ids.host);
+            const want_meta = try treeDigest(ma, io, upper, .metadata, Ids.host);
+
+            var scratch: af.Scratch = .init(a);
+            defer scratch.deinit();
+            const arena = scratch.allocator();
+            const size = try treeSize(arena, io, upper);
+            try std.testing.expectEqual(want_size, size);
+            try std.testing.expectEqualSlices(u8, &want_digest, &(try treeDigest(arena, io, upper, .content, Ids.host)));
+            try std.testing.expectEqualSlices(u8, &want_meta, &(try treeDigest(arena, io, upper, .metadata, Ids.host)));
+            // The ids as they are: nothing changes, the digest included.
+            try unshift(arena, io, upper, Ids.host);
+            try std.testing.expectEqualSlices(u8, &want_digest, &(try treeDigest(ma, io, upper, .content, Ids.host)));
+            const out = try std.fmt.allocPrint(ma, "{s}/out", .{base});
+            const layers = [_][]const u8{ lower, upper };
+            flatten(arena, io, &layers, out, "user.overlay.opaque") catch |e| {
+                // Nothing half made is left for the next try to trip on.
+                if (e == error.OutOfMemory) std.Io.Dir.cwd().deleteTree(io, out) catch {};
+                return e;
+            };
+            try std.testing.expectEqualSlices(u8, &want_digest, &(try treeDigest(ma, io, out, .content, Ids.host)));
+        }
+    };
+    try af.checkOne(S.run, .{root});
 }

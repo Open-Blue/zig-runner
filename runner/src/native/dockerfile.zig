@@ -84,7 +84,7 @@ pub fn parse(arena: Allocator, text: []const u8) !Parsed {
             .line = first_line,
             .why = try std.fmt.allocPrint(arena, "`{s}` is not native yet", .{word}),
         } };
-        try out.append(arena, .{ .kind = kind, .text = rest, .json = jsonForm(arena, rest), .line = first_line });
+        try out.append(arena, .{ .kind = kind, .text = rest, .json = try jsonForm(arena, rest), .line = first_line });
     }
     if (out.items.len == 0 or out.items[0].kind != .from and out.items[0].kind != .arg)
         return .{ .refused = .{ .line = 1, .why = "a Dockerfile starts with FROM (after ARG)" } };
@@ -112,10 +112,15 @@ fn kindOf(word: []const u8) ?Kind {
     return null;
 }
 
-/// The words of a JSON array of strings; null for anything else, which is the shell form.
-fn jsonForm(arena: Allocator, text: []const u8) ?[]const []const u8 {
+/// The words of a JSON array of strings; null for anything else, which is the shell form. Out of
+/// memory is an error, not null: `ENTRYPOINT ["/run.sh"]` read as shell text runs `["/run.sh"]`
+/// through `sh -c`, which is no entrypoint at all.
+fn jsonForm(arena: Allocator, text: []const u8) Allocator.Error!?[]const []const u8 {
     if (!std.mem.startsWith(u8, text, "[")) return null;
-    return std.json.parseFromSliceLeaky([]const []const u8, arena, text, .{}) catch null;
+    return std.json.parseFromSliceLeaky([]const []const u8, arena, text, .{}) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
 }
 
 /// Docker's substitution in `text` from `vars` (later entries win): `$NAME`, `${NAME}`,
@@ -1031,4 +1036,55 @@ test "build: COPY into its layer, RUN through the runner, and a second build tak
     const failed = (try build(arena, io, bad, rootfs, ctx, store, rec.runner())).failed;
     try std.testing.expectEqual(@as(i32, 3), failed.code);
     try std.testing.expect(try store.get(arena, io, &bad.steps[0].key) == null);
+}
+
+test "allocation failures: a Dockerfile parsed, substituted and planned" {
+    const af = @import("../alloc_failures.zig");
+    const S = struct {
+        fn parseOnly(a: Allocator, text: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            _ = try parse(arena.allocator(), text);
+        }
+        fn substituteOnly(a: Allocator, text: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            const vars = [_]Var{ .{ .name = "A", .value = "x" }, .{ .name = "E", .value = "" } };
+            _ = try substitute(arena.allocator(), text, &vars);
+        }
+        /// Plans what parses; a Dockerfile that refuses does so with or without memory.
+        fn planned(a: Allocator, text: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            const ar = arena.allocator();
+            const ins = switch (try parse(ar, text)) {
+                .ok => |ok| ok,
+                .refused => return,
+            };
+            const base: images.Image = .{ .rootfs = "", .env = &.{"PATH=/usr/bin:/bin"}, .cmd = &.{"/bin/sh"} };
+            var ctx: Fixed = .{};
+            _ = try plan(ar, ins, base, "base", &.{}, ctx.context());
+        }
+    };
+    const docker =
+        \\# syntax=docker/dockerfile:1
+        \\ARG BASE=alpine:3.22
+        \\FROM ${BASE}
+        \\ARG VERSION=1
+        \\ENV TOOL_HOME=/opt/tool PATH="/opt/tool/bin:$PATH"
+        \\WORKDIR /opt
+        \\run apk add --no-cache \
+        \\    curl \
+        \\    jq
+        \\COPY --chmod=755 entrypoint.sh bin/
+        \\LABEL maintainer="me"
+        \\USER 0
+        \\ENTRYPOINT ["/opt/tool/bin/entrypoint.sh"]
+    ;
+    for ([_][]const u8{ docker, "FROM a\nSHELL [\"bash\"]", "RUN true", "FROM a\nRUN <<EOF\ntrue\nEOF" }) |text| {
+        try af.checkOne(S.parseOnly, .{text});
+        try af.checkOne(S.planned, .{text});
+    }
+    for ([_][]const u8{ "$A ${A}- ${E:-z} ${A:+w} ${E:+no}- \\$A $", "${A:-${E:-deep}}", "${unclosed" }) |text|
+        try af.checkOne(S.substituteOnly, .{text});
 }
