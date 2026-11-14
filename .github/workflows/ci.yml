@@ -323,6 +323,18 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/zig-test.sh
 
+      # Nothing may be left under the tests' temporary directory, nor a chain of directories deeper
+      # than 32 levels there (tools/test_shards.zig checks each run, naming the tests).
+      - name: Test leftovers
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/tmp-leaks.sh
+
+      # A test killed in the middle leaves its directory, a deep chain in it; the next run must
+      # remove it (leak-kill-test.sh). The deep-chain eviction test only, killed and run again.
+      - name: A killed test's leftovers
+        if: steps.scope.outputs.run == 'true'
+        run: ZIG_TEST_KILL_CHECK=1 .github/scripts/zig-test.sh
+
   # The old TLS client (tls.zig, a lazy dependency only this job fetches) against the one the
   # runner has, on the same servers: the database of the Database tests job (the same script starts
   # it), which serves TLS with client certificates (ZIG_TEST_PG_TLS_DIR), and `openssl s_server`
@@ -475,6 +487,12 @@ jobs:
             exit "$status"
           fi
 
+      # Nothing may be left under the tests' temporary directory, nor a chain of directories deeper
+      # than 32 levels there (tools/test_shards.zig checks each run, naming the tests).
+      - name: Test leftovers
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/tmp-leaks.sh
+
       # The same tests in a Docker container, where the working directory is overlayfs, as on the
       # project's own runner (a push to main): pull requests and the merge queue otherwise test on
       # the VM's ext4, which agrees with overlayfs on nearly everything and not on all (#332's test
@@ -495,6 +513,12 @@ jobs:
           ZIG_TEST_IN_CONTAINER: "1"
           ZIG_TEST_MIN_PASSED: "500"
         run: ../.github/scripts/zig-test.sh
+
+      # Nothing may be left under the tests' temporary directory, nor a chain of directories deeper
+      # than 32 levels there (tools/test_shards.zig checks each run, naming the tests).
+      - name: Test leftovers
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/tmp-leaks.sh
 
       # Eviction's floor on a disk that is really full: a 64 MiB tmpfs in a mount namespace of the
       # test's own (bubblewrap, no root), filled until a write fails (full-disk-test.sh, #357). The
@@ -577,6 +601,12 @@ jobs:
           ../.github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
           ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 ZIG_TEST_PART="$PART" \
             ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" ../.github/scripts/zig-test.sh
+
+      # Nothing may be left under the tests' temporary directory, nor a chain of directories deeper
+      # than 32 levels there (tools/test_shards.zig checks each run, naming the tests).
+      - name: Test leftovers
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/tmp-leaks.sh
 
   # The release's own builds, both targets in ReleaseSafe (build-binaries.sh), which nothing else
   # compiles before the tag: the tests build x86_64 in Debug, and release.yml's checks run only for
@@ -716,6 +746,12 @@ jobs:
           # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
           sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
           ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/zig-test.sh
+
+      # Nothing may be left under the tests' temporary directory, nor a chain of directories deeper
+      # than 32 levels there (tools/test_shards.zig checks each run, naming the tests).
+      - name: Test leftovers
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/tmp-leaks.sh
 
   # The end-to-end suite (.github/scripts/e2e.sh): the runner built from this change serves
   # runner-bench's e2e workflows (Open-Blue/runner-bench, e2e.yml and e2e-cancel.yml) on GitHub's

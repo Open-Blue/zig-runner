@@ -69,6 +69,7 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 		fi
 		grep "passed;" "$log" | tail -1 | sed "s/^/$hook: /" >&2
 		rm -f "$log"
+		../.github/scripts/tmp-leaks.sh || fail "the tests left files under runner/.zig-cache/tmp (above; removed)"
 		say "every test file is compiled"
 		../.github/scripts/test-files.sh >"$quiet" || fail "a file's tests are not in the test binary: ../.github/scripts/test-files.sh shows which"
 		if grep -qE '^runner/|^db/|^\.github/scripts/(zig-test|zig-modules|zlint)\.sh$|^\.github/scripts/zlint-suppressed\.baseline$' <<<"$changed"; then
@@ -85,6 +86,7 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 			fi
 			grep "passed;" "$log" | tail -1 | sed "s/^/$hook: on overlayfs: /" >&2
 			rm -f "$log"
+			../.github/scripts/tmp-leaks.sh || fail "the tests on overlayfs left files under runner/.zig-cache/tmp (above; removed)"
 			say "ZLint, and its suppressed-errors check"
 			../.github/scripts/zlint.sh >"$quiet" || fail "ZLint found problems: ../.github/scripts/zlint.sh shows them"
 			../.github/scripts/zlint.sh suppressed-errors >"$quiet" ||
