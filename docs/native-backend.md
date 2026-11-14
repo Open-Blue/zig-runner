@@ -373,7 +373,8 @@ parent, with no setting and no host tuning, and each job under a limit of its ow
   `RUNNER_NATIVE_SWAP=true` lets jobs *ask* for swap, as a kernel without swap accounting gives it
   ("Set up job" says which): every native job with a cgroup has its own `memory.swap.max` at 0, and
   only a container job's `--memory-swap` raises it (see its row), so with it on, a job that does not
-  ask still cannot swap, and has no `memory.high` (nothing to reclaim into). The memory limits hold
+  ask still cannot swap, and has no `memory.high` (nothing to reclaim into); a job that asks and gets swap
+  (on a machine that has some) gets its `memory.high` from the gate's estimate, grown as before. The memory limits hold
   either way.
 - **`memory.high` goes with swap.** With nothing to reclaim anonymous memory into, `memory.high`
   does not slow a job, it stops it, and nothing kills it: at a 50 MiB `memory.high` under a 300 MiB
