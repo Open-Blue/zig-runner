@@ -227,11 +227,13 @@ test "takeOpened gives the lookup that ended before the connect, inside the wind
         }
     };
     // A lookup before the window, another host's, and one that ended after the connect: none is
-    // this connection's. The one of 30 ns, and the later of two that fit, is.
+    // this connection's. Of the two that fit, the one that ended last (30 ns) is, though the other
+    // (20 ns) was noted after it.
     note.lookup("unit.test", 100, 200);
     note.lookup("other.test", 1_000, 1_010);
     note.lookup("unit.test", 1_000, 1_900);
     note.lookup("unit.test", 1_000, 1_030);
+    note.lookup("unit.test", 1_005, 1_025);
     note.connect(fd, 1_040, 1_100);
     const opened = takeOpened(fd, "UNIT.test", 500, 1_500).?;
     try std.testing.expectEqual(@as(?u64, 30), opened.dns_ns);
@@ -241,6 +243,11 @@ test "takeOpened gives the lookup that ended before the connect, inside the wind
     // A connection that ended before the window was open already.
     note.connect(fd, 10, 20);
     try std.testing.expect(takeOpened(fd, "unit.test", 500, 1_500) == null);
+    // A lookup that ended at the very moment the connect did fits; one a nanosecond later does not.
+    note.lookup("unit.test", 2_900, 3_100);
+    note.lookup("unit.test", 2_950, 3_101);
+    note.connect(fd, 3_000, 3_100);
+    try std.testing.expectEqual(@as(?u64, 200), takeOpened(fd, "unit.test", 2_800, 3_200).?.dns_ns);
     // And no lookup at all in the window: the connection is new, the lookup is not known.
     note.connect(fd, 2_000, 2_100);
     try std.testing.expectEqual(@as(?u64, null), takeOpened(fd, "unit.test", 1_950, 2_200).?.dns_ns);
