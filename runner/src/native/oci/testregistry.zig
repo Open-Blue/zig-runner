@@ -524,13 +524,11 @@ test "allocation failures: a pull through token auth, an index, gzip and zstd la
             var scratch: af.Scratch = .init(a_);
             defer scratch.deinit();
             const arena_ = scratch.allocator();
-            var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
-            defer client.deinit();
             run_count += 1;
             // Each run its own store: a layer already in it would not be fetched.
             const store: Store = .{ .root = try std.fmt.allocPrint(arena_, "{s}/store{d}", .{ root_, run_count }) };
             var why: []const u8 = "";
-            const got = try image.pull(arena_, gpa_, testing.io, &client, store, .{
+            const got = try image.pull(arena_, gpa_, testing.io, store, .{
                 .image = reference_,
                 .creds = creds,
                 .owners = false,
@@ -548,10 +546,8 @@ test "allocation failures: a pull through token auth, an index, gzip and zstd la
     const known_root = try std.fmt.allocPrint(arena, "{s}/known", .{root});
     const pinned = try server.image(arena, try std.fmt.allocPrint(arena, "test/img@{s}", .{img.index}));
     {
-        var client: std.http.Client = .{ .allocator = testing.allocator, .io = io };
-        defer client.deinit();
         var why: []const u8 = "";
-        const first = try image.pull(arena, testing.allocator, io, &client, .{ .root = known_root }, .{
+        const first = try image.pull(arena, testing.allocator, io, .{ .root = known_root }, .{
             .image = pinned,
             .creds = creds,
             .owners = false,
@@ -562,10 +558,8 @@ test "allocation failures: a pull through token auth, an index, gzip and zstd la
         fn again(a_: Allocator, root_: []const u8, reference_: []const u8, creds_: ?@import("registry.zig").Credentials) !void {
             var scratch: af.Scratch = .init(a_);
             defer scratch.deinit();
-            var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
-            defer client.deinit();
             var why: []const u8 = "";
-            const got = try image.pull(scratch.allocator(), testing.allocator, testing.io, &client, .{ .root = root_ }, .{
+            const got = try image.pull(scratch.allocator(), testing.allocator, testing.io, .{ .root = root_ }, .{
                 .image = reference_,
                 .creds = creds_,
                 .owners = false,
@@ -616,10 +610,8 @@ test "allocation failures: a registry's refusal keeps its status, and running ou
         fn missing(a_: Allocator, root_: []const u8, reference_: []const u8) !void {
             var scratch: af.Scratch = .init(a_);
             defer scratch.deinit();
-            var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
-            defer client.deinit();
             var why: []const u8 = "";
-            const got = image.pull(scratch.allocator(), testing.allocator, testing.io, &client, .{ .root = root_ }, .{
+            const got = image.pull(scratch.allocator(), testing.allocator, testing.io, .{ .root = root_ }, .{
                 .image = reference_,
                 .owners = false,
             }, &why);
@@ -635,4 +627,50 @@ test "allocation failures: a registry's refusal keeps its status, and running ou
         }
     };
     try af.checkOne(S.missing, .{ root, reference });
+}
+
+test "bench: a cold image pull (ZIG_RUNNER_BENCH_PULL=<image>; ZIG_RUNNER_BENCH_POLICY=new|fixed; ZIG_RUNNER_BENCH_BUSY=<other jobs running>)" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const env = try testing.environ.createMap(arena);
+    const image_name = env.get("ZIG_RUNNER_BENCH_PULL") orelse return error.SkipZigTest;
+    const admission = @import("../../admission.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(io, ".", arena) };
+    // The pool's gate, with `busy` of its other runners shown as running a job: the policy's input.
+    var slots: [64]admission.Admission.Slot = undefined;
+    for (&slots) |*s| s.* = .{};
+    var pool: admission.Admission = .init(io, .{}, &slots);
+    const busy = std.fmt.parseInt(usize, env.get("ZIG_RUNNER_BENCH_BUSY") orelse "0", 10) catch 0;
+    for (slots[1..][0..busy]) |*s| s.started_ms = 1;
+    var gate: admission.Gate = .{ .pool = &pool, .slot = 0 };
+    const new_policy = std.mem.eql(u8, env.get("ZIG_RUNNER_BENCH_POLICY") orelse "new", "new");
+    var why: []const u8 = "";
+    {
+        // What the policy chooses for these layers now, as `Prefetch.start` asks it.
+        var w: []const u8 = "";
+        std.debug.print("bench pull: the policy would fetch {d} of 11 layers at a time ({s})\n", .{ gate.fetchConcurrency(11, @import("../../zr_net.zig").cores(), 8, &w), w });
+    }
+    var ru0: std.os.linux.rusage = undefined;
+    _ = std.os.linux.getrusage(0, &ru0);
+    const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
+    const got = image.pull(arena, testing.allocator, io, store, .{
+        .image = image_name,
+        .owners = false,
+        .gate = if (new_policy) &gate else null,
+    }, &why) catch |e| {
+        std.debug.print("pull: {s}\n", .{why});
+        return e;
+    };
+    const ms = std.Io.Clock.awake.now(io).toMilliseconds() - t0;
+    var ru: std.os.linux.rusage = undefined;
+    _ = std.os.linux.getrusage(0, &ru);
+    const cpu_ms = (ru.utime.sec - ru0.utime.sec) * 1000 + @divTrunc(ru.utime.usec - ru0.utime.usec, 1000) +
+        (ru.stime.sec - ru0.stime.sec) * 1000 + @divTrunc(ru.stime.usec - ru0.stime.usec, 1000);
+    std.debug.print("\nbench pull: {s} policy {s} busy {d}: {d} ms, cpu {d} ms, peak RSS {d} kB, {d} layers, {d} bytes\n", .{
+        image_name, if (new_policy) "new" else "fixed", busy, ms, cpu_ms, ru.maxrss, got.pulled.?.layers, got.pulled.?.bytes,
+    });
 }

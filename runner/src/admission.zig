@@ -973,6 +973,33 @@ pub const Gate = struct {
         return hold;
     }
 
+    /// Memory one layer download in flight takes: the write buffer (1 MiB), the receive queue (up to
+    /// 1.5 MiB) and the connection's buffers (`docs/rust-net.md`).
+    pub const fetch_mb = 4;
+
+    /// How many layers of an image the job downloads at once, chosen when the pull starts: as many as
+    /// there are layers still to fetch and cores left by the pool's other running jobs (each counted
+    /// as using one), at least 2 (a download waits on the network as much as it computes) and at
+    /// most `cap`, then fewer while the gate's own signals (memory available, pressure, swap growth:
+    /// `decide`) say the machine has not the room for that many at `fetch_mb` each, down to 1.
+    /// `why` names what limited it, for the log.
+    pub fn fetchConcurrency(g: *Gate, layers: usize, cores: u32, cap: u32, why: *[]const u8) u32 {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        var others: u32 = 0;
+        for (a.slots, 0..) |*s, i| {
+            if (i != g.slot and s.running()) others += 1;
+        }
+        const free = cores -| others;
+        var n: u32 = @intCast(@min(layers, @as(usize, @max(2, @min(free, cap)))));
+        why.* = if (n == layers) "layers" else if (free < cap) "cores left by other jobs" else "cap";
+        const signal = a.signals(std.Io.Clock.awake.now(a.io).toMilliseconds());
+        while (n > 1 and decide(a.limits, signal, .{ .jobs = 0, .mb = @as(u64, n) * fetch_mb }, false) != null) n -= 1;
+        if (n == 1 and layers > 1) why.* = "memory or pressure at the gate";
+        return @max(1, n);
+    }
+
     /// How a job named on a native pool fares at the gate (`Gate.start`).
     pub const Start = union(enum) {
         /// It may run: it reserves its estimate from now, for `ramp_ms` or until it ends.
@@ -5465,4 +5492,41 @@ test "a kill for memory holds big jobs back for a while when others run, and nev
     gates[2].leave(true);
     gates[2].assigned(burst_heavy);
     try std.testing.expectEqual(StartTag.wait, std.meta.activeTag(gates[2].start()));
+}
+
+test "an image pull's downloads at once: the layers, the cores the other jobs leave, the cap, and the room at the gate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var mem_buf: [256]u8 = undefined;
+    const meminfo = try std.fmt.bufPrint(&mem_buf, ".zig-cache/tmp/{s}/meminfo", .{tmp.sub_path});
+    var slots: [12]Admission.Slot = undefined;
+    for (&slots) |*s| s.* = .{};
+    var pool: Admission = .init(io, .{ .min_available_mb = 1000, .margin_percent = 0 }, &slots);
+    pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
+    var gate: Gate = .{ .pool = &pool, .slot = 0 };
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 8388608 kB\n" });
+    var why: []const u8 = "";
+    // An idle machine: as many as there are layers, then the cap.
+    try std.testing.expectEqual(@as(u32, 5), gate.fetchConcurrency(5, 12, 8, &why));
+    try std.testing.expectEqualStrings("layers", why);
+    try std.testing.expectEqual(@as(u32, 8), gate.fetchConcurrency(40, 12, 8, &why));
+    try std.testing.expectEqualStrings("cap", why);
+    // Nine other jobs running on 12 cores leave 3.
+    for (slots[1..10]) |*s| s.started_ms = 1;
+    try std.testing.expectEqual(@as(u32, 3), gate.fetchConcurrency(40, 12, 8, &why));
+    try std.testing.expectEqualStrings("cores left by other jobs", why);
+    // Every core taken: two still (a download waits on the network), never none.
+    for (slots[10..]) |*s| s.started_ms = 1;
+    try std.testing.expectEqual(@as(u32, 2), gate.fetchConcurrency(40, 4, 8, &why));
+    // Little room: with 1010 MB available over a 1000 MB floor, 4 MB a download leaves two; with 1003,
+    // one; with 2000, all eight.
+    for (&slots) |*s| s.started_ms = std.math.minInt(i64);
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 2048000 kB\n" });
+    try std.testing.expectEqual(@as(u32, 8), gate.fetchConcurrency(40, 12, 8, &why));
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 1034240 kB\n" });
+    try std.testing.expectEqual(@as(u32, 2), gate.fetchConcurrency(40, 12, 8, &why));
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 1027072 kB\n" });
+    try std.testing.expectEqual(@as(u32, 1), gate.fetchConcurrency(40, 12, 8, &why));
+    try std.testing.expectEqualStrings("memory or pressure at the gate", why);
 }

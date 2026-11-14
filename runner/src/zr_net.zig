@@ -25,6 +25,13 @@ pub fn version() []const u8 {
 
 pub const Error = error{ RuntimeStart, RuntimeStopped };
 
+extern fn zr_net_cores() u32;
+
+/// The cores the process may use (affinity and cgroup quota), as the library counts them.
+pub fn cores() u32 {
+    return @max(1, zr_net_cores());
+}
+
 /// Starts the runtime if it is not running (idempotent); `threads` 0 is the default.
 pub fn start(threads: u32) Error!void {
     if (zr_net_runtime_start(threads) < 0) return error.RuntimeStart;

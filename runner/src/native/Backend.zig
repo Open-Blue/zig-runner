@@ -4342,7 +4342,7 @@ fn pullBefore(
     deadline: std.Io.Duration,
     why: *[]const u8,
 ) !oci.Image {
-    const img = try pullWithin(b.arena, b.gpa, b.io, b.store_cfg.root, b.how.userns == .mapped, image, creds, deadline, why);
+    const img = try pullWithin(b.arena, b.gpa, b.io, b.store_cfg.root, b.how.userns == .mapped, image, creds, deadline, b.gate, why);
     errdefer img.lock.close(b.io);
     // Held to the job's end, as its layers are: eviction leaves it alone (`evict.zig`).
     try b.held.append(b.arena, img.lock);
@@ -4362,7 +4362,7 @@ pub fn pullAt(
     creds: ?registry.Credentials,
     why: *[]const u8,
 ) !oci.Image {
-    return pullWithin(arena, gpa, io, root, owners, image, creds, pull_deadline, why);
+    return pullWithin(arena, gpa, io, root, owners, image, creds, pull_deadline, null, why);
 }
 
 fn pullWithin(
@@ -4374,10 +4374,11 @@ fn pullWithin(
     image: []const u8,
     creds: ?registry.Credentials,
     deadline: std.Io.Duration,
+    gate: ?*admission.Gate,
     why: *[]const u8,
 ) !oci.Image {
     const store: ImageStore = .{ .root = root };
-    const req: oci.Request = .{ .image = image, .creds = creds, .owners = owners };
+    const req: oci.Request = .{ .image = image, .creds = creds, .owners = owners, .gate = gate };
     const r = try http.within(io, deadline, pullInto, .{
         arena, gpa, io, store, req, why,
     });
