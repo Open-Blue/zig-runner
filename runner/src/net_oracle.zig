@@ -911,7 +911,7 @@ const PollServer = struct {
         const io = std.testing.io;
         s.stopping.store(true, .release);
         // Wakes the accept: a connection that is closed at once.
-        const addr = Io.net.IpAddress.parse("127.0.0.1", s.port) catch unreachable;
+        const addr = s.listener.socket.address;
         if (addr.connect(io, .{ .mode = .stream })) |c| c.close(io) else |_| {}
         s.thread.join();
         s.listener.deinit(io);
@@ -948,7 +948,7 @@ fn benchIdle(which: []const u8, comptime impl: type) !void {
     const arena = arena_state.allocator();
     const env = try std.testing.environ.createMap(arena);
     if (!std.mem.eql(u8, env.get("ZIG_RUNNER_BENCH") orelse "", which)) return error.SkipZigTest;
-    const secs = std.fmt.parseInt(u64, env.get("ZIG_RUNNER_BENCH_SECS") orelse "600", 10) catch 600;
+    const secs = std.fmt.parseInt(i64, env.get("ZIG_RUNNER_BENCH_SECS") orelse "600", 10) catch 600;
     const hold = std.fmt.parseInt(u64, env.get("ZIG_RUNNER_BENCH_HOLD_S") orelse "50", 10) catch 50;
     var server: PollServer = undefined;
     try server.start(hold * 1000);
@@ -968,7 +968,7 @@ fn benchIdle(which: []const u8, comptime impl: type) !void {
     _ = std.os.linux.getrusage(0, &ru0);
     var polls: u32 = 0;
     // As `loop.poll` asks: a token, the poll's own deadline.
-    while (Io.Clock.awake.now(io).toMilliseconds() - start.wall_ms < @as(i64, @intCast(secs * 1000))) {
+    while (Io.Clock.awake.now(io).toMilliseconds() - start.wall_ms < secs * 1000) {
         var poll_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer poll_arena.deinit();
         const r = try impl.request(poll_arena.allocator(), io, .GET, url, null, .{ .token = "t0k", .deadline = .fromSeconds(90) });
