@@ -626,15 +626,19 @@ fn leakCheck(arena: std.mem.Allocator, run: *Run, kept: []const []const u8) void
         if (linux.errno(linux.statx(tmp.handle, z, linux.AT.SYMLINK_NOFOLLOW, .{ .BTIME = true }, &sx)) == .SUCCESS)
             born_ns = @as(i128, sx.btime.sec) * std.time.ns_per_s + sx.btime.nsec;
         var owners: std.ArrayList(u32) = .empty;
+        // Set when memory ran out while listing them: the report then says its list is incomplete.
+        var owners_short = false;
         for (0..run.names.len) |i| {
             if (run.began_ns[i] == 0) continue;
             // A creation time is the kernel's coarse clock, a few milliseconds behind this one.
-            if (run.began_ns[i] - coarse_ns <= born_ns and born_ns <= run.ended_ns[i]) owners.append(arena, @intCast(i)) catch {};
+            if (run.began_ns[i] - coarse_ns <= born_ns and born_ns <= run.ended_ns[i]) owners.append(arena, @intCast(i)) catch {
+                owners_short = true;
+            };
         }
         var found: Found = .{};
         wipe(arena, io, tmp.handle, z, &found);
         // A test that leaves its directory on purpose, and nothing else running then.
-        var allowed = owners.items.len > 0;
+        var allowed = owners.items.len > 0 and !owners_short;
         for (owners.items) |i| {
             var listed = false;
             for (leaves_state) |t| listed = listed or std.mem.endsWith(u8, run.names[i], t);
@@ -648,6 +652,7 @@ fn leakCheck(arena: std.mem.Allocator, run: *Run, kept: []const []const u8) void
         } else {
             std.debug.print("Made while {s}: ", .{if (owners.items.len == 1) "this ran" else "these ran, one left it"});
             for (owners.items) |i| std.debug.print("\n  {s}", .{run.names[i]});
+            if (owners_short) std.debug.print("\n  (more, not listed: out of memory)", .{});
             std.debug.print("\n", .{});
         }
         for (found.paths.items) |p| std.debug.print("  {s}/{s}\n", .{ name, p });
