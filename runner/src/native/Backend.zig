@@ -3708,9 +3708,7 @@ fn readContainerOptions(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void
     if (o.cpuset_cpus) |l| try more.print(b.arena, ", `--cpuset-cpus` {s}{s}", .{ l, try b.limitCpuset("cpuset.cpus", "--cpuset-cpus", l, err_msg) });
     if (o.cpuset_mems) |l| try more.print(b.arena, ", `--cpuset-mems` {s}{s}", .{ l, try b.limitCpuset("cpuset.mems", "--cpuset-mems", l, err_msg) });
     if (o.pids_limit) |n| try more.print(b.arena, ", `--pids-limit` {d}{s}", .{ n, try b.limitPids(n, err_msg) });
-    if (o.memory_swap) |n| try more.print(b.arena, ", `--memory-swap` {s}", .{
-        if (n == -1) "-1 (a job may not swap: its memory limit holds)" else "(a job may not swap: its memory limit holds)",
-    });
+    try b.limitSwap(o, &more, err_msg);
     try b.setUpSandboxOptions(o);
     try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Container options: {d} " ++
         "`--env`{s}{s}{s}; {d} understood and without effect natively (`--workdir`, " ++
@@ -3787,6 +3785,29 @@ fn limitCpu(b: *Backend, m: container_options.CpuMax, err_msg: *[]const u8) ![]c
         return try std.fmt.allocPrint(b.arena, " (more than this machine's {d} CPUs: it never " ++
             "throttles)", .{cpus});
     return "";
+}
+
+/// The job's own `memory.swap.max`, as Docker reads `--memory-swap` (`Options.swapMax`), whenever
+/// the job has a cgroup: 0 without the flag, up to what the runner allows (`RUNNER_NATIVE_SWAP`
+/// and a kernel that accounts for it); a flag asking for more is capped to 0, and "Set up job"
+/// says so.
+fn limitSwap(b: *Backend, o: container_options.Options, more: *std.ArrayList(u8), err_msg: *[]const u8) !void {
+    const j = b.job_cgroup orelse return;
+    const allowed = j.all.accounted and j.all.swap;
+    const set = o.swapMax(allowed);
+    var buf: [24]u8 = undefined;
+    const text = set.text(&buf);
+    j.setSwap(b.arena, text) catch {
+        err_msg.* = "the job container's `--memory-swap` could not be set on the job's cgroup";
+        return error.BaseContainerFailed;
+    };
+    const asked = o.swapMax(true);
+    const capped = !allowed and std.meta.activeTag(asked) != .none;
+    if (o.memory_swap != null or capped) try more.print(b.arena, ", `--memory-swap` {d}: memory.swap.max {s}{s}", .{
+        o.memory_swap orelse 0,
+        text,
+        if (capped) " (capped: jobs may not swap here, RUNNER_NATIVE_SWAP is off or the kernel does not account for swap)" else "",
+    });
 }
 
 /// `--cpu-shares` as the job's `cpu.weight` (`cgroup.cpuWeight`).
@@ -7532,6 +7553,20 @@ test "root runner: a container job's --cpuset-cpus and --cpuset-mems confine its
     const text = try runOptionsJob(arena, cfg, "--cpuset-cpus 0 --cpuset-mems 0 --memory-swap -1 -m 512m", "echo \"cpuset.cpus=$(cat $cg/cpuset.cpus)\"; " ++
         "echo \"cpuset.mems=$(cat $cg/cpuset.mems)\"; grep Cpus_allowed_list /proc/self/status");
     try expectLines(text, &.{ "cpuset.cpus=0", "cpuset.mems=0", "Cpus_allowed_list:\t0", "`--cpuset-cpus` 0" });
+}
+
+test "root runner: a container job's --memory-swap is capped to 0 where the runner does not let jobs swap" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    // RUNNER_NATIVE_SWAP is off in the test config: the flag asks for 512 MiB of swap, the job gets 0.
+    const text = try runOptionsJob(arena, cfg, "-m 512m --memory-swap 1g", "echo \"swap=$(cat $cg/memory.swap.max)\"");
+    try expectLines(text, &.{ "swap=0", "`--memory-swap` 1073741824: memory.swap.max 0 (capped" });
 }
 
 test "a container job's volumes on the native backend: directories of the job, there for every step" {

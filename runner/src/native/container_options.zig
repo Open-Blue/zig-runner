@@ -13,7 +13,8 @@
 //! nosuid and nodev, as Docker's), `--memory` (within the job's cgroup limit, never above it) and
 //! `--cpus`, `--cpu-quota`, `--cpu-period` (the job's `cpu.max`), `--cpu-shares` (`cpu.weight`),
 //! `--cpuset-cpus`, `--cpuset-mems` (`cpuset.cpus`, `cpuset.mems`), `--pids-limit` (`pids.max`,
-//! lowered only) and `--memory-swap` (checked as Docker does; a job may not swap).
+//! lowered only) and `--memory-swap` (the job's own `memory.swap.max`, as Docker reads it, up to what the
+//! runner allows: `swapMax`).
 //! Refused, never ignored: `--privileged`, `--cap-add`, `--security-opt`, `--device`,
 //! `--network`, `--pid`, `--ipc`, `--userns` and the rest change the container beyond what the
 //! sandbox grants, so a job that silently lost one would run differently from its workflow. The
@@ -28,7 +29,7 @@ const job_mod = @import("../job.zig");
 const health = @import("health.zig");
 
 const Allocator = std.mem.Allocator;
-const expandList = @import("cgroup.zig").expandList;
+const checkList = @import("cgroup.zig").checkList;
 
 /// What a job container's `options:` ask for that the native job carries out.
 pub const Options = struct {
@@ -69,6 +70,19 @@ pub const Options = struct {
     /// `--init`), for "Set up job" to say so.
     no_effect: u32 = 0,
 
+    /// The job's own `memory.swap.max` for `--memory-swap`, as Docker reads it: the flag is memory
+    /// plus swap, so swap is the difference. No flag, 0, or a value equal to `--memory` is no swap
+    /// at all; -1 is unlimited. `allowed` is whether the runner lets jobs swap
+    /// (`RUNNER_NATIVE_SWAP` and a kernel that accounts for it): when not, 0 whatever the flag says.
+    pub fn swapMax(o: Options, allowed: bool) SwapMax {
+        if (!allowed) return .none;
+        const sw = o.memory_swap orelse return .none;
+        if (sw < 0) return .unlimited;
+        const m = o.memory orelse return .none;
+        const asked: u64 = @intCast(sw);
+        return if (asked > m) .{ .bytes = asked - m } else .none;
+    }
+
     /// The job's `cpu.max`, as Docker's runtime makes it (`--cpus` is a quota of that many
     /// periods of 100000 µs, `getCPUResources`; `--cpu-quota` alone keeps the kernel's period, and a
     /// `--cpu-period` alone limits nothing); null for no limit.
@@ -80,6 +94,22 @@ pub const Options = struct {
         };
         const q = o.cpu_quota orelse return null;
         return .{ .quota = q, .period = o.cpu_period orelse default_cpu_period };
+    }
+};
+
+/// What a job's `memory.swap.max` is (`Options.swapMax`).
+pub const SwapMax = union(enum) {
+    none,
+    bytes: u64,
+    unlimited,
+
+    /// The file's text.
+    pub fn text(s: SwapMax, buf: *[24]u8) []const u8 {
+        return switch (s) {
+            .none => "0",
+            .unlimited => "max",
+            .bytes => |n| std.fmt.bufPrint(buf, "{d}", .{n}) catch "0",
+        };
     }
 };
 
@@ -205,9 +235,11 @@ pub fn parse(arena: Allocator, text: []const u8, why: *[]const u8) Error!Options
             if (n < 0) return refuse(arena, why, w, "is negative");
             out.cpu_shares = if (n == 0) null else std.math.cast(u64, n);
         } else if (std.mem.eql(u8, name, "--cpuset-cpus") or std.mem.eql(u8, name, "--cpuset-mems")) {
-            var set: [8192]bool = undefined;
-            if (!expandList(value, &set)) return refuse(arena, why, w, "is not a list of numbers " ++
-                "and ranges such as `0-3,5`");
+            checkList(value) catch |e| return switch (e) {
+                error.Malformed => refuse(arena, why, w, "is not a list of numbers and ranges such as `0-3,5`"),
+                error.TooLarge => refuse(arena, why, w, "names an id of a million or more, past any " ++
+                    "machine's CPUs or memory nodes"),
+            };
             if (std.mem.eql(u8, name, "--cpuset-cpus")) out.cpuset_cpus = value else out.cpuset_mems = value;
         } else if (std.mem.eql(u8, name, "--pids-limit")) {
             const n = std.fmt.parseInt(i64, value, 10) catch
@@ -243,6 +275,9 @@ pub fn parse(arena: Allocator, text: []const u8, why: *[]const u8) Error!Options
         return refuse(arena, why, "--cpus", "cannot be combined with `--cpu-period`");
     if (out.nano_cpus != null and out.cpu_quota != null)
         return refuse(arena, why, "--cpus", "cannot be combined with `--cpu-quota`");
+    if (out.cpuMax()) |m| if (m.quota > max_cpu_quota) return refuse(arena, why, if (out.nano_cpus != null) "--cpus" else "--cpu-quota", "gives a quota above " ++
+        "what the kernel takes (2^44 - 1 microseconds per period, `MAX_BW`: about 176 million CPUs " ++
+        "at the default period)");
     if (out.cpuMax()) |m| if (m.quota < min_cpu_quota) return refuse(arena, why, if (out.nano_cpus != null) "--cpus" else "--cpu-quota", "gives a quota below " ++
         "1 ms per period (Docker: `CPU cfs quota can not be less than 1ms`; 0.01 CPUs at the " ++
         "default period)");
@@ -269,6 +304,9 @@ pub fn parse(arena: Allocator, text: []const u8, why: *[]const u8) Error!Options
 const min_cpu_period: i64 = 1000;
 const max_cpu_period: i64 = 1_000_000;
 const min_cpu_quota: u64 = 1000;
+/// The kernel's largest `cpu.max` quota, in microseconds (`MAX_BW = (1 << 44) - 1`, kernel/sched/core.c,
+/// `tg_set_cfs_bandwidth`: larger is EINVAL).
+const max_cpu_quota: u64 = (1 << 44) - 1;
 /// A step's own processes (its shell, the sandbox's helper) count against `pids.max`.
 const min_pids_limit: i64 = 16;
 /// The period Docker gives `--cpus` (moby `daemon/daemon_unix.go`, `getCPUResources`: `period :=
@@ -1046,6 +1084,43 @@ test "--cpu-shares, --cpuset-*, --pids-limit and --memory-swap as Docker reads t
     try expectRefused(arena, "--memory-swap 1g", "--memory-swap");
     try expectRefused(arena, "-m 1g --memory-swap 512m", "--memory-swap");
     try expectRefused(arena, "-m 1g --memory-swap lots", "--memory-swap");
+}
+
+test "--memory-swap as the job's memory.swap.max: Docker's semantics, up to what the runner allows" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var why: []const u8 = "";
+    var buf: [24]u8 = undefined;
+    const Case = struct { flags: []const u8, allowed: bool, text: []const u8 };
+    for ([_]Case{
+        .{ .flags = "", .allowed = true, .text = "0" },
+        .{ .flags = "-m 1g", .allowed = true, .text = "0" },
+        .{ .flags = "-m 1g --memory-swap 1g", .allowed = true, .text = "0" },
+        .{ .flags = "-m 1g --memory-swap 0", .allowed = true, .text = "0" },
+        .{ .flags = "-m 1g --memory-swap 3g", .allowed = true, .text = "2147483648" },
+        .{ .flags = "-m 1g --memory-swap -1", .allowed = true, .text = "max" },
+        .{ .flags = "--memory-swap -1", .allowed = true, .text = "max" },
+        // The runner does not let jobs swap: 0 whatever the flag says.
+        .{ .flags = "-m 1g --memory-swap 3g", .allowed = false, .text = "0" },
+        .{ .flags = "-m 1g --memory-swap -1", .allowed = false, .text = "0" },
+    }) |c| {
+        const o = try parse(arena, c.flags, &why);
+        try std.testing.expectEqualStrings(c.text, o.swapMax(c.allowed).text(&buf));
+    }
+}
+
+test "a --cpus or --cpu-quota above the kernel's maximum, and cpuset lists on big machines" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var why: []const u8 = "";
+    try expectRefused(arena, "--cpus 1e9", "--cpus");
+    try expectRefused(arena, "--cpu-quota 17592186044416", "--cpu-quota");
+    try std.testing.expectEqual(@as(u64, 17592186044415), (try parse(arena, "--cpu-quota 17592186044415", &why)).cpuMax().?.quota);
+    // A machine with more than 8192 CPUs: such a list is valid, one past the bound is refused.
+    try std.testing.expectEqualStrings("0-9000,16000", (try parse(arena, "--cpuset-cpus 0-9000,16000", &why)).cpuset_cpus.?);
+    try expectRefused(arena, "--cpuset-cpus 0-2000000", "--cpuset-cpus");
 }
 
 test "options refused, never ignored: what the sandbox does not carry out" {

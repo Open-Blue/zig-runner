@@ -437,36 +437,66 @@ pub fn cpuWeight(shares: u64) u32 {
     return std.math.cast(u32, std.math.clamp(held * 100 / 1024, 1, 10000)) orelse 10000;
 }
 
-const max_cpu_id = 8192;
+/// The largest id a `cpuset` list may name. The kernel's own is its possible-CPU count
+/// (`/sys/devices/system/cpu/possible`, at most 8192 on x86 and 4096 on arm64 today), which a
+/// list is checked against when the job's cgroup is made (`cpusetAvailable`); this is only a
+/// generous bound so that a list never costs more than its text, with no table to outgrow.
+pub const max_list_id: usize = 1 << 20;
 
-/// A `cpuset.cpus`-style list (`0-3,5`: numbers and ranges, comma-separated, as Docker's
-/// `parsers.ParseUintList` reads one) as the set of what it names; false when it is not one.
-pub fn expandList(text: []const u8, set: *[max_cpu_id]bool) bool {
-    @memset(set, false);
-    if (text.len == 0) return false;
-    var items = std.mem.splitScalar(u8, text, ',');
-    while (items.next()) |item| {
-        var lo: usize = undefined;
-        var hi: usize = undefined;
-        if (std.mem.indexOfScalar(u8, item, '-')) |dash| {
-            lo = std.fmt.parseInt(usize, item[0..dash], 10) catch return false;
-            hi = std.fmt.parseInt(usize, item[dash + 1 ..], 10) catch return false;
-        } else {
-            lo = std.fmt.parseInt(usize, item, 10) catch return false;
-            hi = lo;
-        }
-        if (lo > hi or hi >= max_cpu_id) return false;
-        for (lo..hi + 1) |i| set[i] = true;
+const IdRange = struct { lo: usize, hi: usize };
+
+/// The ranges of a `cpuset.cpus`-style list (`0-3,5`: numbers and ranges, comma-separated, as
+/// Docker's `parsers.ParseUintList` reads one), one at a time.
+const ListIterator = struct {
+    items: std.mem.SplitIterator(u8, .scalar),
+
+    fn init(text: []const u8) ListIterator {
+        return .{ .items = std.mem.splitScalar(u8, text, ',') };
     }
-    return true;
+
+    /// Null at the end; `error.Malformed` for what is not a list, `error.TooLarge` past `max_list_id`.
+    fn next(it: *ListIterator) error{ Malformed, TooLarge }!?IdRange {
+        const item = it.items.next() orelse return null;
+        var r: IdRange = undefined;
+        if (std.mem.indexOfScalar(u8, item, '-')) |dash| {
+            r.lo = std.fmt.parseInt(usize, item[0..dash], 10) catch return error.Malformed;
+            r.hi = std.fmt.parseInt(usize, item[dash + 1 ..], 10) catch return error.Malformed;
+        } else {
+            r.lo = std.fmt.parseInt(usize, item, 10) catch return error.Malformed;
+            r.hi = r.lo;
+        }
+        if (r.lo > r.hi) return error.Malformed;
+        if (r.hi >= max_list_id) return error.TooLarge;
+        return r;
+    }
+};
+
+pub const ListError = error{ Malformed, TooLarge };
+
+/// Whether `text` is a list of numbers and ranges, naming no id from `max_list_id` up.
+pub fn checkList(text: []const u8) ListError!void {
+    if (text.len == 0) return error.Malformed;
+    var it = ListIterator.init(text);
+    while (try it.next()) |_| {}
 }
 
 /// Whether `requested` names only what `available` (the kernel's `cpuset.cpus.effective`) does.
 pub fn listWithin(requested: []const u8, available: []const u8) bool {
-    var want: [max_cpu_id]bool = undefined;
-    var have: [max_cpu_id]bool = undefined;
-    if (!expandList(requested, &want) or !expandList(available, &have)) return false;
-    for (want, have) |w, h| if (w and !h) return false;
+    checkList(requested) catch return false;
+    checkList(available) catch return false;
+    var want = ListIterator.init(requested);
+    while (want.next() catch return false) |r| {
+        // Walk up the range, hopping over each available range that covers its next id.
+        var x = r.lo;
+        while (x <= r.hi) {
+            var have = ListIterator.init(available);
+            var covered_to: ?usize = null;
+            while (have.next() catch return false) |h| {
+                if (h.lo <= x and x <= h.hi) covered_to = @max(covered_to orelse 0, h.hi);
+            }
+            x = (covered_to orelse return false) + 1;
+        }
+    }
     return true;
 }
 
@@ -673,6 +703,15 @@ pub const Job = struct {
     /// `cpuset.cpus` or `cpuset.mems` (`file`) for the job: where its processes may run.
     pub fn limitCpuset(j: Job, arena: Allocator, file: []const u8, list: []const u8) !void {
         if (write(arena, j.dir, file, list) != .SUCCESS) return error.CpusetLimitFailed;
+    }
+
+    /// The job's own `memory.swap.max`, from `Options.swapMax` (text: `0`, a number of bytes or `max`).
+    /// A kernel that does not account for swap has no file, and nothing to set: that is no error.
+    pub fn setSwap(j: Job, arena: Allocator, text: []const u8) !void {
+        switch (write(arena, j.dir, "memory.swap.max", text)) {
+            .SUCCESS, .NOENT => {},
+            else => return error.SwapLimitFailed,
+        }
     }
 
     /// `pids.max` lowered to `n`: never raised, which `Backend.limitPids` sees to.
@@ -924,6 +963,9 @@ test "native cgroup: --cpu-shares as cpu.weight, and cpuset lists" {
     try std.testing.expect(!listWithin("4", "0-3"));
     try std.testing.expect(!listWithin("0-4", "0-3"));
     try std.testing.expect(!listWithin("0", ""));
+    try std.testing.expect(listWithin("8000-9000", "0-10000"));
+    try std.testing.expect(listWithin("0-9000", "0-3,4-10000"));
+    try std.testing.expect(!listWithin("0-9000", "0-3,5-10000"));
     for ([_][]const u8{ "", ",", "0,", ",0", "3-1", "a", "0-", "-1", "1-2-3", "0 1", "9999999" }) |bad|
         try std.testing.expect(!listWithin(bad, "0-3"));
 }
