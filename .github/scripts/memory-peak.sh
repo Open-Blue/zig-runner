@@ -48,7 +48,8 @@ elif [[ -r /proc/self/cgroup ]]; then
 	fi
 fi
 
-if [[ -n $file ]] && { exec 3<>"$file"; } 2>/dev/null; then
+# perl reads the peak back (below); without it, the cgroup path would lose the number, so use time.
+if [[ -n $file ]] && command -v perl >/dev/null && { exec 3<>"$file"; } 2>/dev/null; then
 	source=cgroup-total
 	# A write that works makes fd 3's peak count from here. Its answer is read from fd 3 again
 	# (reading the file by name would open a new watermark, the whole cgroup's).
