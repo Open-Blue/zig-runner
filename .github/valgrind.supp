@@ -32,3 +32,19 @@
    Memcheck:Addr4
    fun:native.Store.publishStaged
 }
+
+# An ECDSA signature the network library's TLS (rustls with ring) sends in a handshake: Memcheck
+# says the bytes handed to sendmsg derive from an undefined stack slot in ring's nonce code
+# (`ecdsa::signing::NonceRandom::fill_impl`), which ring fills by its P-256 assembly (ADX and BMI2
+# instructions, whose definedness Memcheck tracks imprecisely) and the system's random source. The
+# server verifies that signature and the handshake succeeds, which a signature of undefined bits
+# would not; reported once, for the first ECDSA client certificate (the RSA ones, and the server's
+# signatures the client only verifies, report nothing). Narrow: only this call chain, into the
+# socket write of `tls_stream.zig`.
+{
+   ring-ecdsa-signature-bytes-through-tls-stream-sendcipher
+   Memcheck:Param
+   sendmsg(msg.msg_iov[0])
+   ...
+   fun:*sendCipher*
+}

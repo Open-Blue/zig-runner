@@ -76,6 +76,11 @@ unreported instead, and the merge queue waiting for it.
   store stress test runs for 10 s, where analysis runs it for minutes.
 - **Database tests**: against TimescaleDB, every test under ThreadSanitizer but the single-threaded
   exhaustive ones, which the Tests jobs run (`test_shards.zig`).
+- **TLS oracle**: the database's old TLS client (tls.zig, a lazy dependency fetched by this job
+  alone) against the new one on the same servers, the Database tests job's database started by the
+  same script (`zig build test-tls-oracle -Dtls-oracle`, docs/rust-net.md). A job of its own so that
+  its compile of Zig's build system runs beside the database tests, not after them. Not a required
+  check, nor one a release waits for.
 - **Release builds** and **Release builds (arm64)**: the release's own builds for both targets in
   ReleaseSafe, so code that doesn't compile for aarch64 fails here rather than after the tag; on
   arm64 the aarch64 binary is run.
@@ -130,8 +135,8 @@ Neither check is required yet.
   severity or worse, or on a license outside the permissive ones an MIT project can take in (the
   list and its one exception are in `security.yml`). It reads GitHub's dependency graph, which sees
   the Go tools' modules under `runner/tools/` and the actions the workflows use. It doesn't see
-  `runner/build.zig.zon` (tls.zig, the one dependency compiled into the runner, is followed by
-  Renovate and listed in [docs/THIRD_PARTY.md](THIRD_PARTY.md)), the images the Dockerfile, Compose
+  `runner/build.zig.zon` (its one package is the TLS oracle's, lazy) but sees `runner/rust/zr-net/Cargo.lock`, which
+  `cargo-deny` checks too (listed in [docs/THIRD_PARTY.md](THIRD_PARTY.md)), the images the Dockerfile, Compose
   file and scripts pin (Trivy scans the release's image), or the .NET reference program, which has
   no packages.
 
@@ -254,9 +259,8 @@ The workflows are written to be hard to turn against the repository.
   runner's own script, signed and by digest, instead of installing the packages (22-45 s, and
   Ubuntu's mirrors) on every new machine and empty store. A pull that fails provisions as before,
   and `RUNNER_PROVISIONED_IMAGE=false` never pulls it. zizmor is installed
-  from PyPI by hash. tls.zig and GitHub's expression test cases are pinned by commit. Zig, changie,
-  checksec and gitleaks are checked against pinned checksums before they run, tls.zig against its
-  `.hash` too; a Renovate pull request for a new one fails until its checksums are updated.
+  from PyPI by hash. GitHub's expression test cases are pinned by commit, the Rust crates by `Cargo.lock`'s checksums. Zig, changie,
+  checksec, gitleaks and the Rust toolchain are checked against pinned checksums before they run; a Renovate pull request for a new one fails until its checksums are updated.
   [Renovate](https://docs.renovatebot.com) proposes updates a week after their release. The one
   exception is the Dagger engine in `deploy/compose.yaml`, pinned by tag and held on purpose: the
   runner speaks one engine version's protocol, and a new engine starts with an empty cache.
@@ -272,7 +276,7 @@ The workflows are written to be hard to turn against the repository.
 
   Check the image the same way (`oci://ghcr.io/open-blue/zig-runner:<tag>`); an image rebuilt by
   hand was built from `main`, so its `--source-ref` is `refs/heads/main`. The release also carries
-  its SBOM (`zig-runner.spdx.json`: tls.zig and Zig's standard library, the only code compiled in
+  its SBOM (`zig-runner.spdx.json`: the Rust crates of `Cargo.lock`, musl, libunwind and Zig's standard library, the only code compiled in
   besides the runner's own), attested too, and both attestations' bundles for checking offline
   (`--bundle zig-runner.provenance.intoto.jsonl`; `zig-runner.provenance.jsonl` up to v0.28.1). A
   release is published only once all of it is attached.

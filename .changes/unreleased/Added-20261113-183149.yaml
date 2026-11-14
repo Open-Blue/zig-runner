@@ -1,0 +1,3 @@
+kind: Added
+body: 'A step compares the database''s old TLS client (tls.zig, now a lazy dependency only the step fetches) with the rustls one on the same servers: `zig build test-tls-oracle -Dtls-oracle`, run by a job of its own, "TLS oracle"; the differences left (a CA certificate as the server''s own, a name only in the subject, client certificates) are written down in docs/rust-net.md'
+time: 2026-11-13T18:31:49.320904556-05:00

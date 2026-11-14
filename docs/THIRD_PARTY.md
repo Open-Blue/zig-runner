@@ -14,11 +14,7 @@ time. The project's own license is in [LICENSE](../LICENSE).
 
 ## Dependencies
 
-Fetched at build time from `runner/build.zig.zon`, pinned there by commit (the archive URL names it) and by Zig's package hash (`.hash`), and compiled into the runner. `zig build` checks both; CI's tests and the release's binaries, which call the compiler directly, fetch the commit with git and check the hash themselves (`.github/scripts/zig-modules.sh`):
-
-| Package | Used for | License |
-|---|---|---|
-| [ianic/tls.zig](https://github.com/ianic/tls.zig) | TLS to the database (`runner/src/pg.zig`): unlike std's client, it answers a server that asks for a client certificate, which Tiger Data does | MIT |
+One Zig package, never in a build of the runner: [ianic/tls.zig](https://github.com/ianic/tls.zig) (MIT), the database's TLS until the network library's rustls replaced it, is a lazy dependency in `runner/build.zig.zon` that only `zig build test-tls-oracle -Dtls-oracle` fetches, to compare the old client with the new one (`runner/tls_oracle.zig`, docs/rust-net.md). Nothing of it is in the runner binary or the SBOM.
 
 ### Rust crates and libc (from the network library, `runner/rust/zr-net`, docs/rust-net.md)
 
@@ -26,7 +22,9 @@ Fetched by cargo at build time from crates.io, pinned by `runner/rust/zr-net/Car
 
 | Crate | Used for | License |
 |---|---|---|
-| [tokio](https://github.com/tokio-rs/tokio) | the runtime that will run the runner's HTTP, WebSocket and database TLS (R1: the runtime only) | MIT |
+| [tokio](https://github.com/tokio-rs/tokio) | the runtime that will run the runner's HTTP and WebSocket (R1: the runtime only) | MIT |
+| [rustls](https://github.com/rustls/rustls) | TLS to the database (`runner/src/pg.zig`, through `runner/src/tls_stream.zig`), with the `ring` crypto provider and rustls-webpki certificate checks | Apache-2.0 OR ISC OR MIT |
+| [rustls-native-certs](https://github.com/rustls/rustls-native-certs) | the system's root certificates, honouring `SSL_CERT_FILE` and `SSL_CERT_DIR` | Apache-2.0 OR ISC OR MIT |
 
 The lock file lists the others (all permissive; the tokio skeleton adds `pin-project-lite`, MIT or Apache-2.0). The runner now also links Zig's bundled copies of [musl libc](https://musl.libc.org) (MIT) and LLVM's libunwind (Apache-2.0 WITH LLVM-exception), which Rust's standard library needs.
 

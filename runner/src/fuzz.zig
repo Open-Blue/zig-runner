@@ -30,6 +30,7 @@ const layer = @import("native/oci/layer.zig");
 const zstd = @import("native/oci/zstd.zig");
 const libzstd = @import("native/oci/libzstd.zig");
 const zlibng = @import("native/oci/zlibng.zig");
+const tls_stream = @import("tls_stream.zig");
 const registry = @import("native/oci/registry.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
@@ -1671,6 +1672,58 @@ fn jobMessages(_: void, smith: *Smith) !void {
         try std.testing.expectEqualStrings("j", job.job_id);
         try std.testing.expectEqual(@as(usize, 1), job.steps.len);
     }
+}
+
+// --- TLS records (the network library's rustls, behind the C ABI) ---
+
+test "fuzz: TLS records" {
+    const flight13 = @embedFile("fuzz_corpus/tls/flight13.bin");
+    const flight12 = @embedFile("fuzz_corpus/tls/flight12.bin");
+    try std.testing.fuzz({}, tlsRecords, .{
+        .corpus = comptime seeds(&.{
+            // The server's first flight, in one piece and in two (verifying, then not).
+            &.{ "\x01", flight13 },
+            &.{ "\x00", flight13[0..90], flight13[90..] },
+            &.{ "\x01", flight12 },
+            &.{ "\x00", flight12[0..60], flight12[60..400], flight12[400..] },
+            // An alert, and records of the wrong version and length.
+            &.{ "\x01", "\x15\x03\x03\x00\x02\x02\x28" },
+            &.{ "\x01", "\x16\x03\x01\x00\x04\x02\x00\x00\x00", "\x17\x03\x03\xff\xff" },
+        }),
+    });
+}
+
+/// What the server of one TLS connection sends, in chunks of any size and content: the library
+/// returns an error or goes on, never panics (which would end the process: `panic = "abort"`), and
+/// never holds more than it was given. Input: a string of flags (bit 0: check the server's
+/// certificate), then the server's chunks.
+fn tlsRecords(_: void, smith: *Smith) !void {
+    var flags_buf: [8]u8 = undefined;
+    const flags = take(smith, &flags_buf);
+    const verify = flags.len > 0 and flags[0] & 1 != 0;
+    const before = @import("zr_net.zig").heap().bytes;
+    {
+        const p = tls_stream.Probe.init(.{
+            .host = "db.example",
+            .verify = verify,
+            .roots_pem = @embedFile("fuzz_corpus/tls/ca.crt"),
+        }) orelse return error.TlsProbeNotCreated;
+        defer p.deinit();
+        _ = p.drain();
+        var total: usize = 0;
+        var chunk: [20000]u8 = undefined;
+        while (!smith.eos()) {
+            const bytes = take(smith, &chunk);
+            total += bytes.len;
+            if (!p.feed(bytes)) break;
+        }
+        // What the library holds for one connection is bounded by its buffers (rustls limits what it
+        // keeps unread to 64 KiB of plaintext and about as much of ciphertext), however much it was fed.
+        const during = @import("zr_net.zig").heap().bytes;
+        try std.testing.expect(during <= before + 512 * 1024 + total / 8);
+    }
+    // And all of it is returned when the connection is.
+    try std.testing.expect(@import("zr_net.zig").heap().bytes <= before + 64 * 1024);
 }
 
 // --- HTTP/2 framing ---

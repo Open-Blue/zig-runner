@@ -1,0 +1,3 @@
+kind: Added
+body: 'The database connection''s TLS is rustls (the network library) instead of tls.zig, which is gone: it takes a client certificate and a private CA (sslcert, sslkey, sslrootcert in the URL or PGSSLCERT, PGSSLKEY, PGSSLROOTCERT), reads the system roots from SSL_CERT_FILE or SSL_CERT_DIR, and checks certificates more strictly (a CA certificate used as the server''s, or a name only in the subject, is refused: see deploy/runner.env.example)'
+time: 2026-11-13T12:09:40.314888012-05:00
