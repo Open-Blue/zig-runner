@@ -123,9 +123,17 @@ SCRIPT
 	chmod +x "$scratch/in-container"
 	run+=(--test-cmd "$scratch/in-container" --test-cmd "$image" --test-cmd "$scratch")
 fi
-# The tests run in several processes (tools/test_shards.zig), which this starts; the same program
-# `zig build test` runs. ZIG_TEST_SHARDS=1 runs the test binary itself.
-run+=(--test-cmd "$scratch/test_shards" --test-cmd-bin)
+# ZIG_TEST_KILL_CHECK=1: not the tests, but leak-kill-test.sh, which kills the deep-chain eviction
+# test in the middle and checks that the next run removes what it left.
+if [[ ${ZIG_TEST_KILL_CHECK:-} == 1 ]]; then
+	filter=(--test-filter "a chain of directories deeper than a pass gets through")
+	run+=(--test-cmd "$PWD/../.github/scripts/leak-kill-test.sh" --test-cmd "$scratch/test_shards" --test-cmd-bin)
+else
+	# The tests run in several processes (tools/test_shards.zig), which this starts; the same program
+	# `zig build test` runs. ZIG_TEST_SHARDS=1 runs the test binary through it too: it checks what the
+	# tests leave in .zig-cache/tmp.
+	run+=(--test-cmd "$scratch/test_shards" --test-cmd-bin)
+fi
 zig test "${tests[@]}" "${filter[@]}" "${run[@]}"
 wait "$exe"
 exit "$(cat "$scratch/runner.rc")"

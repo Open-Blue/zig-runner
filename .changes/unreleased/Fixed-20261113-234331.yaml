@@ -1,0 +1,3 @@
+kind: Fixed
+body: The test runner checks what the tests leave in .zig-cache/tmp, fails the run naming the tests, and removes a killed run's leftovers (chains of directories too deep to name included) at the next one; CI and the pre-push hook check the directory too (#548)
+time: 2026-11-13T23:43:31.791682345-05:00
