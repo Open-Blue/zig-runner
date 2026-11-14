@@ -55,7 +55,7 @@
       "groupName": "lean"
     },
     {
-      "description": "tls.zig, the old TLS client's library, pinned by commit in runner/build.zig.zon's URL for the TLS oracle (`zig build test-tls-oracle -Dtls-oracle`): its own pull request for each new commit on its main branch (commits have no release dates, so no week's wait). The zon's .hash must follow, which Renovate cannot compute: it is updated by hand (`zig fetch` the new URL), and the Database tests job's oracle step fails until it is (`zig build` compares the hash with the fetched commit's), as for Zig's checksums.",
+      "description": "tls.zig, the old TLS client's library, pinned by commit in runner/build.zig.zon's URL for the TLS oracle (`zig build test-tls-oracle -Dtls-oracle`): its own pull request for each new commit on its main branch (commits have no release dates, so no week's wait). The zon's .hash must follow, which Renovate cannot compute: it is updated by hand (`zig fetch` the new URL), and the TLS oracle job fails until it is (`zig build` compares the hash with the fetched commit's), as for Zig's checksums.",
       "matchDepNames": [
         "https://github.com/ianic/tls.zig"
       ],
