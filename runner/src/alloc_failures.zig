@@ -104,6 +104,8 @@ pub fn checkOne(comptime f: anytype, args: anytype) !void {
     const fmt = if (@TypeOf(args[0]) == []const u8) "\"{s}\"" else "{any}";
     if (stride() == 1) check(gpa, f, args) catch |e| {
         std.debug.print("allocation failures: failed for input " ++ fmt ++ "\n", .{args[0]});
+        // A failure that was swallowed: failing them one at a time says which allocation it was.
+        if (e == error.SwallowedOutOfMemoryError) checkEachAllocationFailure(f, args) catch {};
         return e;
     };
     checkEachAllocationFailure(f, args) catch |e| {

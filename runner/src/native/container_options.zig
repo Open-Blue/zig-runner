@@ -1125,3 +1125,42 @@ test "without a job cgroup: an unsized tmpfs is refused, and sizes are capped" {
     const edge = try parse(arena, "--tmpfs /a:size=512m --shm-size 512m", &why);
     try std.testing.expect(withoutCgroup(edge) == null);
 }
+
+test "allocation failures: a container's options, ports and volumes" {
+    const af = @import("../alloc_failures.zig");
+    // A refusal says why in the arena, and says it in words of its own when that fails: the job
+    // is refused all the same (it goes to Dagger), on purpose. So a run may end in `Refused` where
+    // another ends in out of memory: `checkNoLeaks` allows an answer, and nothing else.
+    const S = struct {
+        /// The options as read, `Refused` as it is without a failure, or out of memory.
+        fn options(a: Allocator, text: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            var why: []const u8 = "";
+            _ = parse(arena.allocator(), text, &why) catch |e| if (e == error.Refused) return else return e;
+        }
+        fn port(a: Allocator, text: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            var why: []const u8 = "";
+            _ = parsePort(arena.allocator(), text, &why) catch |e| if (e == error.Refused) return else return e;
+        }
+        fn volume(a: Allocator, text: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            var why: []const u8 = "";
+            _ = parseVolume(arena.allocator(), text, &why) catch |e| if (e == error.Refused) return else return e;
+        }
+    };
+    for ([_][]const u8{
+        "--env A=1 -e B=2 --env=C=3 -eD=4 -e E=\"two words\" --user 1001:50 --hostname h --add-host a:10.0.0.1 --shm-size 64m",
+        "--tmpfs /run:size=10m,mode=1777 --memory 512m --init --health-cmd 'true'",
+        "-e HOME=/x --workdir /w --privileged",
+        "--env",
+        "-e A='unterminated",
+    }) |text| try af.checkNoLeaks(S.options, .{text});
+    for ([_][]const u8{ "80", "127.0.0.1:8080:80/tcp", "0.0.0.0::53/UDP", "99999:1", "a:b:c:d" }) |text|
+        try af.checkNoLeaks(S.port, .{text});
+    for ([_][]const u8{ "/data", "cache:/cache:ro", "/srv/data:/data", "v:/a//b/./c/", "x:/y:bogus:z", "" }) |text|
+        try af.checkNoLeaks(S.volume, .{text});
+}
