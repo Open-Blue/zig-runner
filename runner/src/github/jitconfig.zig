@@ -63,6 +63,8 @@ fn manage(
         const r = try broker.request(arena, io, method, url, null, .{
             .token = t,
             .extra_headers = &.{api_version_header},
+            // A list or a delete: the same answer the second time (404 for a delete that was done).
+            .resend = .once_more,
         });
         if (r.status != .unauthorized or attempt > 0) return r;
         const a = cfg.app_auth orelse return r;

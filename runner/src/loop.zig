@@ -1010,7 +1010,7 @@ fn openSession(c: Runner, jit: jitconfig.Jit) ?Session {
     const base = withSlash(c.arena, settings.broker_url) catch return null;
     const url = std.fmt.allocPrint(c.arena, "{s}session", .{base}) catch return null;
     const body = broker.sessionBody(c.arena, settings, "zig-runner") catch return null;
-    const created = broker.call(c.arena, c.io, .POST, url, token, body) catch return null;
+    const created = broker.call(c.arena, c.io, .POST, url, token, body, .never) catch return null;
     if (created.status.class() != .success) return null;
     const sid = (jsonString(c.arena, created.body, "sessionId") catch return null) orelse return null;
     return .{ .base = base, .sid = sid, .token = token, .token_at = token_at };
@@ -1065,7 +1065,7 @@ fn pollOnce(
     token: []const u8,
 ) anyerror!broker.Response {
     // No deadline of its own: `poll`'s timer is it.
-    return broker.request(arena, io, .GET, url, null, .{ .token = token, .deadline = null });
+    return broker.request(arena, io, .GET, url, null, .{ .token = token, .deadline = null, .resend = .once_more });
 }
 
 var stop_announced: std.atomic.Value(bool) = .init(false);
@@ -1217,7 +1217,7 @@ pub fn cycle(c: Runner) !Cycle {
         base = try withSlash(c.arena, settings.broker_url);
         const session_url = try std.fmt.allocPrint(c.arena, "{s}session", .{base});
         const session_body = try broker.sessionBody(c.arena, settings, "zig-runner");
-        const created = broker.call(c.arena, c.io, .POST, session_url, token, session_body) catch |e|
+        const created = broker.call(c.arena, c.io, .POST, session_url, token, session_body, .never) catch |e|
             return fail(c, "create session", e);
         if (created.status.class() != .success) return failBody(c, "create session", created);
         sid = (try jsonString(c.arena, created.body, "sessionId")) orelse
@@ -1328,7 +1328,7 @@ fn withSlash(arena: Allocator, url: []const u8) ![]const u8 {
 /// Ends the broker session; best effort, on the way out.
 fn deleteSession(c: Runner, base: []const u8, sid: []const u8, token: []const u8) void {
     const url = std.fmt.allocPrint(c.arena, "{s}session?sessionId={s}", .{ base, sid }) catch "";
-    _ = broker.call(c.arena, c.io, .DELETE, url, token, null) catch |e|
+    _ = broker.call(c.arena, c.io, .DELETE, url, token, null, .once_more) catch |e|
         logfmt.warn("broker_session_not_deleted", "err={t}", .{e});
 }
 
@@ -1801,7 +1801,7 @@ test "a stop signal ends a long poll in flight on the library, promptly, and the
     try std.testing.expect(took >= 500 and took < 3000);
     // The poll's connection was dropped with it: the next request gets one of its own and is answered.
     stop_signals.store(0, .release);
-    const echo = try broker.request(c.arena, io, .GET, server.url(&url_buf, "127.0.0.1", "/echo"), null, .{ .token = "t", .deadline = .fromSeconds(5) });
+    const echo = try broker.request(c.arena, io, .GET, server.url(&url_buf, "127.0.0.1", "/echo"), null, .{ .token = "t", .deadline = .fromSeconds(5), .resend = .never });
     try std.testing.expectEqual(std.http.Status.ok, echo.status);
 }
 

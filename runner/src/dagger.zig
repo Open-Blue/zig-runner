@@ -851,6 +851,8 @@ const HttpTransport = struct {
             .max_body = limit,
             // The engine is on this machine, not GitHub: no `request:` line.
             .log = false,
+            // A query may run a step: its outcome unknown, it is not run again.
+            .resend = .never,
         });
         // GraphQL errors can arrive with a non-2xx status; the body says what was wrong.
         if (r.status.class() != .success and r.body.len == 0) return error.DaggerSessionHttpError;

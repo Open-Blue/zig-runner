@@ -44,6 +44,21 @@ pub const Response = struct {
     wait_ms: i64 = 0,
 };
 
+/// What may be done when a request may have reached the server and no answer came (the deadline
+/// passed, a read failed, a connection died under it), chosen by each call's author, never from the
+/// method alone.
+pub const Resend = enum {
+    /// Once more on a connection made for the request. For a call that does the same when it
+    /// arrives twice: a GET, a DELETE, and the POSTs the server answers the same for the same job
+    /// (see `runservice.zig`, `gitea/client.zig`).
+    once_more,
+    /// Not again: the first may have been done, and a second would do it twice (a session or a
+    /// runner created, a task taken). The caller decides what an unknown outcome means. A
+    /// connection that was closed before anything was sent is replaced by the network library
+    /// whatever this says: nothing was processed, so that is always safe.
+    never,
+};
+
 pub fn call(
     arena: Allocator,
     io: std.Io,
@@ -51,11 +66,14 @@ pub fn call(
     url: []const u8,
     token: []const u8,
     payload: ?[]const u8,
+    resend: Resend,
 ) !Response {
-    return request(arena, io, method, url, payload, .{ .token = token });
+    return request(arena, io, method, url, payload, .{ .token = token, .resend = resend });
 }
 
 pub const RequestOptions = struct {
+    /// What to do about an unknown outcome (`Resend`). No default: every call site says.
+    resend: Resend,
     /// Sent as `Authorization: Bearer`. Leave null for signed URLs (blob storage rejects extra
     /// auth).
     token: ?[]const u8 = null,
@@ -84,8 +102,9 @@ pub const Body = net_client.Body;
 /// the CA bundle once, follows up to three redirects (dropping the token at another origin) and
 /// replaces a kept connection that turns out closed before anything was sent. What it cannot see is
 /// a connection that died under the request without a word (no answer by the deadline, a read that
-/// failed, a streamed body it could not take back): once more, on a connection made for the
-/// request, so not another of the pool's from the same time. A log upload read such a connection
+/// failed, a streamed body it could not take back): for a call that says `Resend.once_more`, once more,
+/// on a connection made for the request, so not another of the pool's from the same time; for
+/// `Resend.never`, the error. A log upload read such a connection
 /// for 17 minutes and then failed (#100).
 pub fn request(
     arena: Allocator,
@@ -119,7 +138,7 @@ pub fn request(
             .log = opts.log,
             .retry = attempt,
         }) catch |err| {
-            if (!fresh and deadConnection(err)) {
+            if (!fresh and opts.resend == .once_more and deadConnection(err)) {
                 fresh = true;
                 continue;
             }
@@ -188,7 +207,7 @@ test "over real connections: the token stays on its host, and redirects are foll
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const io = std.testing.io;
-    const t: RequestOptions = .{ .token = "t0k" };
+    const t: RequestOptions = .{ .token = "t0k", .resend = .never };
     var buf: [64]u8 = undefined;
 
     // Sent without a redirect, kept on one to the same host (absolute or relative).
@@ -256,7 +275,9 @@ test "a request never answered is given up at its deadline, and tried once on a 
     const a = arena_state.allocator();
     const io = std.testing.io;
     var buf: [64]u8 = undefined;
-    const quick: RequestOptions = .{ .deadline = .fromMilliseconds(200) };
+    const quick: RequestOptions = .{ .deadline = .fromMilliseconds(200), .resend = .once_more };
+    var once_only = quick;
+    once_only.resend = .never;
 
     // A blob upload, as `results.putBlob` makes it, to a server that never answers.
     const started = std.Io.Clock.awake.now(io);
@@ -269,12 +290,27 @@ test "a request never answered is given up at its deadline, and tried once on a 
     try std.testing.expect(took >= 400 and took < 10_000);
     try std.testing.expectEqual(@as(u32, 2), server.accepts.load(.acquire));
 
-    // Never answered the first time, answered the second: the retry succeeds.
+    // The same request from a call that says `.never` is not sent again: the first may have been
+    // done, and a session or a runner would be made twice. One attempt, the deadline's error.
+    const before_never = server.accepts.load(.acquire);
+    try std.testing.expectError(
+        error.Timeout,
+        request(a, io, .POST, server.url(&buf, "127.0.0.1", "/silent"), "{}", once_only),
+    );
+    try std.testing.expectEqual(before_never + 1, server.accepts.load(.acquire));
+
+    // Never answered the first time, answered the second: a call that may be sent again succeeds
+    // (two connections), one that may not fails and leaves the second request unsent (one).
     const once = server.url(&buf, "127.0.0.1", "/silent-once/x");
+    const before_again = server.accepts.load(.acquire);
     const r = try request(a, io, .POST, once, "{}", quick);
     try std.testing.expectEqual(std.http.Status.ok, r.status);
     try std.testing.expectEqualStrings("ok", r.body);
-    try std.testing.expectEqual(@as(u32, 4), server.accepts.load(.acquire));
+    try std.testing.expectEqual(before_again + 2, server.accepts.load(.acquire));
+    server.silent_once = 0;
+    const before_not = server.accepts.load(.acquire);
+    try std.testing.expectError(error.Timeout, request(a, io, .POST, once, "{}", once_only));
+    try std.testing.expectEqual(before_not + 1, server.accepts.load(.acquire));
 }
 
 test "a kept-alive connection that went silent is dropped, and the request tried on a new one" {
@@ -287,7 +323,7 @@ test "a kept-alive connection that went silent is dropped, and the request tried
     const a = arena_state.allocator();
     const io = std.testing.io;
     var buf: [64]u8 = undefined;
-    const quick: RequestOptions = .{ .deadline = .fromMilliseconds(500) };
+    const quick: RequestOptions = .{ .deadline = .fromMilliseconds(500), .resend = .once_more };
 
     for ([_][]const u8{ "/keep", "/keep-close" }, 0..) |path, i| {
         const kept = try request(a, io, .GET, server.url(&buf, "127.0.0.1", path), null, quick);
@@ -326,7 +362,7 @@ test "request lines: timed, without the query or a token, and a 429's rate limit
         request_log.enabled.store(false, .monotonic);
     }
     var buf: [128]u8 = undefined;
-    const t: RequestOptions = .{ .token = "t0k-secret" };
+    const t: RequestOptions = .{ .token = "t0k-secret", .resend = .never };
 
     // A new connection to "localhost", so that its lookup, connect and (no) TLS are timed.
     _ = try request(a, std.testing.io, .GET, server.url(&buf, "localhost", "/broker/message?sig=SECRET&sessionId=x"), null, t);

@@ -1288,6 +1288,7 @@ pub const CancelWatch = struct {
             const m = broker.request(cc.arena, cc.io, .GET, w.session.url, null, .{
                 .token = token,
                 .deadline = poll_timeout,
+                .resend = .once_more,
             }) catch |e| {
                 if (e == error.Canceled or w.stop.load(.acquire)) return;
                 cc.io.sleep(.fromSeconds(5), .awake) catch return;
