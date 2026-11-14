@@ -39,6 +39,7 @@ unreported instead, and the merge queue waiting for it.
 | `proofs` | pull requests, merge queue, `main`, weekly | the Lean proofs, and the `hashFiles()` model against `glob.zig` |
 | `store model` | changes to the store or release pipeline, weekly | the TLA+ models, with SPIN on their Promela ports |
 | `release` | tags; pull requests touching the packaging | binaries, image, provenance, deploy |
+| `candidate` | `main`; tags `vX.Y.Z-rcN` | the release's binaries as a pre-release, attested, for the `main` and `rc` channels (OPERATIONS.md, "Channels") |
 | `provisioned image` | pull requests (build only), `main`, by hand | the default job image with the runner's packages installed, both architectures |
 | `version` | daily, or by hand | cuts the release, after approval |
 | `security` | pull requests, weekly | gitleaks and dependency review |
@@ -52,7 +53,8 @@ unreported instead, and the merge queue waiting for it.
 
 ### ci
 
-- **Workflows**: actionlint and [zizmor](https://docs.zizmor.sh), shellcheck and shfmt, hadolint,
+- **Workflows**: actionlint and [zizmor](https://docs.zizmor.sh), shellcheck and shfmt, the deploy
+  agent's channels against fake release feeds (`deploy-test.sh`), hadolint,
   the busybox pin, the check names the release waits for (`check-names.sh`), and the unsafe
   constructs ratchet. Also, as steps, the checks that each took a runner of their own for seconds
   and waited minutes for it in the merge queue:

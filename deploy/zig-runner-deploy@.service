@@ -1,0 +1,29 @@
+# Installs the zig-runner a channel offers to the runners that follow it, one agent per instance
+# (docs/OPERATIONS.md, "Channels"): `zig-runner-deploy@qa` reads /etc/zig-runner-deploy-qa.env, where
+# CHANNEL=main, BIN=/usr/local/bin/zig-runner-qa and UNITS=zig-runner@qa.service say what it
+# follows, where it installs, and what it restarts. It does not replace zig-runner-deploy.service,
+# which keeps the machine's own binary on the releases. Install:
+#
+#   sudo cp zig-runner-deploy@.service zig-runner-deploy@.timer /etc/systemd/system/
+#   sudo install -m 0600 zig-runner-deploy.env.example /etc/zig-runner-deploy-qa.env   # then edit
+#   sudo systemctl daemon-reload && sudo systemctl enable --now zig-runner-deploy@qa.timer
+[Unit]
+Description=Install the zig-runner of the channel %i follows
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/zig-runner-deploy-%i.env
+ExecStart=/usr/local/bin/zig-runner-deploy
+# No limit for the whole run, as in zig-runner-deploy.service: a restart waits for running jobs.
+TimeoutStartSec=infinity
+# Each instance counts its tries and remembers its channel and rejected candidates apart
+# (STATE_DIRECTORY is /var/lib/zig-runner-deploy/%i).
+StateDirectory=zig-runner-deploy/%i
+Environment=HOME=/var/lib/zig-runner-deploy/%i
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/usr/local/bin
+ProtectHome=yes
+PrivateTmp=yes

@@ -163,6 +163,90 @@ sudo cp deploy/zig-runner-deploy.service deploy/zig-runner-deploy.timer /etc/sys
 sudo systemctl daemon-reload && sudo systemctl enable --now zig-runner-deploy.timer
 ```
 
+## Channels
+
+A machine follows a channel: which builds its runner binary comes from. The release is the unit of
+trust for production (every merge since the last, built once, attested, deployed after CI passed on
+it), but a change should run somewhere real before it is one. Channels (#550) put it there without
+touching what stable machines get.
+
+| Channel | Installs | Built by | Feed |
+| --- | --- | --- | --- |
+| `stable` (default) | releases only | `release.yml`, at the tag | the `razorbill` deployment, as above |
+| `rc` | release candidates `vX.Y.Z-rcN`, and releases, the newest by version | `candidate.yml` at the tag; `release.yml` for a release | GitHub's releases |
+| `main` | the candidate built from each commit on `main` | `candidate.yml`, at `main` | GitHub's releases |
+
+**Candidates.** `candidate` builds the release's binaries, both architectures, with the same
+script, hardening check and attested provenance and SBOM as a release, on every push to `main` and
+every tag `vX.Y.Z-rcN`, and publishes them as a pre-release. A main candidate is the release
+`main-N-SHA12` (N is the workflow's run number, so it only grows) whose binaries say
+`vX.Y.Z-main.N+SHA12`, X.Y.Z being the latest release with its patch raised by one. It is never
+"latest", so nothing that follows the latest release sees it, and `release` ignores any tag with a
+hyphen. The newest 20 main candidates are kept, the rest deleted with their tags; release
+candidates stay. Release tags are created only by the version workflow's deploy key (the "release
+tags" ruleset), so an `-rc` tag is too. Why releases and not workflow artifacts or one rolling
+`channel-main` release: a release is public, so the agent needs no more access than for a release,
+and each candidate is immutable with its own checksum and attestation (the repository's releases are
+immutable), where artifacts expire and need a token that reads Actions, and a rolling release would
+be overwritten under a machine that was reading it.
+
+**The agent.** `CHANNEL` in the agent's env file picks the channel (`stable` if unset, which is
+everything described under "The deploy agent", unchanged). On `rc` and `main` it reads the releases
+feed instead of deployments, picks the newest candidate of its channel and runs the same checks:
+the binary against `SHA256SUMS`, then provenance (`gh attestation verify`) from the right workflow
+at the right ref, and the binary says the version the candidate is named for:
+
+- `release`: `release.yml`, `refs/tags/<tag>`, as on `stable`;
+- `rc`: `candidate.yml`, `refs/tags/<tag>`;
+- `main`: `candidate.yml`, `refs/heads/main`, and the commit the tag points at.
+
+The version is monotonic within a channel: a main candidate with a number no higher than the
+installed one, or an rc or release older than the installed one, is not installed (logged, not a
+failure; `ALLOW_DOWNGRADE` is `stable`'s). Installing, restarting, the health check and the
+`$BIN.prev` rollback are the same. A `stable` machine never installs a candidate: it takes a
+deployment's ref only if it is `vX.Y.Z`, and checks it against `release.yml`, so a candidate in a
+deployment is refused and a candidate in the feed is never read. A channel has no deployment to
+report to (any number of machines read the feed): outcomes are in the agent's journal. A candidate
+that fails a check is written to `rejected` in the agent's state directory and not fetched again;
+a newer one is tried as usual. A fetch that fails for the moment is retried every minute.
+
+**Switching.** Changing `CHANNEL` is a decision made on the machine, so the first install after
+it replaces the binary whatever its version, and logs `channel switch: stable -> main`; the order is
+checked again from then on. The channel is recorded in the state directory after a successful
+install. Moving back to `stable` installs the newest deployment that went well, though it is
+handled.
+
+**One binary has one channel.** Every instance on a machine runs `/usr/local/bin/zig-runner`, so a
+pool on another channel gets its own binary and its own agent: `zig-runner-deploy@<name>.timer`
+reads `/etc/zig-runner-deploy-<name>.env` and keeps its own state. The pool's runner unit runs
+that binary (a drop-in with `ExecStart=` and the path). Name the stable agent's `UNITS` (left empty it
+restarts every `zig-runner@*.service`) and keep the pool's instance out of it, or the stable agent
+restarts it onto the stable binary.
+
+```sh
+# A pool "qa" on main candidates, beside the stable pools:
+sudo install -m 0755 deploy/zig-runner-deploy /usr/local/bin/
+sudo cp deploy/zig-runner-deploy@.service deploy/zig-runner-deploy@.timer /etc/systemd/system/
+sudo install -m 0600 deploy/zig-runner-deploy.env.example /etc/zig-runner-deploy-qa.env
+# edit it: GH_TOKEN (Contents and Attestations read; no Deployments needed),
+#   CHANNEL=main  BIN=/usr/local/bin/zig-runner-qa  UNITS=zig-runner@qa.service
+sudo systemctl edit zig-runner@qa.service   # [Service] ExecStart= / ExecStart=/usr/local/bin/zig-runner-qa
+sudo systemctl daemon-reload && sudo systemctl enable --now zig-runner-deploy@qa.timer
+```
+
+To see what an agent would do without installing: `DRY_RUN=1 CHANNEL=main BIN=/tmp/zr
+STATE_DIR=/tmp/zr-state UNITS=<any loaded unit> GH_TOKEN=... deploy/zig-runner-deploy`. To put a
+pool on `rc`, the same with `CHANNEL=rc`; to take it off, set `CHANNEL=stable` (or remove the
+line) and let the stable agent's unit own the binary again.
+
+**Progressive environments (#550).** Channels are the ground for the rings: a razorbill `qa` pool on
+`main` runs every main commit's own build before it is a release; the bench pool on `rc` runs the
+release candidate (and then the release itself) before stable pools, which get the release only
+once it is deployed. Cutting a release candidate, the QA verdict that gates a release, and health
+checks are later pieces. The `rc` channel takes a release as soon as it is published, a few minutes
+before `release` records its deployment (which waits for CI on the tagged commit): the canary is
+the first ring, not the last check.
+
 ## A fresh install
 
 `.github/scripts/fresh-install.sh` tests what the README says on a machine with nothing of ours on

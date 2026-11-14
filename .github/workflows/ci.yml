@@ -111,6 +111,12 @@ jobs:
       - name: shfmt
         run: .github/scripts/shfmt.sh
 
+      # deploy/zig-runner-deploy's channels against fake release feeds: a stable machine never
+      # installs a candidate; main and rc install their newer candidates; provenance from the wrong
+      # workflow, ref or commit is refused; the version is monotonic within a channel.
+      - name: Deploy agent channels
+        run: .github/scripts/deploy-test.sh
+
       - name: hadolint
         run: .github/scripts/hadolint.sh
 

@@ -8,6 +8,16 @@
 # is not older than the one installed (ALLOW_DOWNGRADE). If an instance does not come back
 # listening for jobs, the previous binary is put back and the deployment is reported failed.
 #
+# CHANNEL says what this machine follows (docs/OPERATIONS.md, "Channels"). `stable`, the default,
+# is everything above: releases only. `rc` and `main` follow the releases feed instead of
+# deployments: `rc` the newest of the release candidates (vX.Y.Z-rcN) and releases, `main` the
+# newest main candidate (main-N-SHA), both built by candidate.yml (a release by release.yml) and
+# checked as strictly: checksum, provenance from that workflow at that ref and commit, and a
+# version not older than the installed one of the same kind. Nothing is reported to GitHub there
+# (a feed is read by any number of machines); a candidate that fails a check is remembered in
+# STATE_DIR and not tried again. Changing CHANNEL is the explicit act that lets the first install
+# after it replace a binary of another channel, whatever its version; it is logged.
+#
 # Fetching the release can fail for reasons of the moment: no network, GitHub's rate limit, a
 # timeout, Sigstore's TUF CDN. Such a failure reports nothing and exits; the timer tries again a
 # minute later, and only after ATTEMPTS tries of the same deployment is it reported failed (the
@@ -18,7 +28,10 @@
 # Settings, from /etc/zig-runner-deploy.env (deploy/zig-runner-deploy.env.example):
 #   GH_TOKEN      fine-grained token: Deployments read/write, Attestations and Contents read
 #   REPO          the repository releases come from (Open-Blue/zig-runner)
-#   ENVIRONMENT   the GitHub environment this machine deploys (razorbill)
+#   ENVIRONMENT   the GitHub environment this machine deploys (razorbill); stable only
+#   CHANNEL       stable (releases, the default), rc (release candidates and releases) or main
+#                 (main candidates). One binary has one channel: run another agent, with its own
+#                 env file, BIN, UNITS and STATE_DIR, for a pool on another (zig-runner-deploy@.service)
 #   UNITS         the instances to restart; empty for every zig-runner.service and
 #                 zig-runner@*.service here
 #   BIN           the installed binary (/usr/local/bin/zig-runner)
@@ -28,13 +41,14 @@
 #   STATE_DIR     where the tries are counted (systemd's STATE_DIRECTORY, else
 #                 /var/lib/zig-runner-deploy)
 #   ALLOW_DOWNGRADE  the one older version tag that may replace the installed one (v1.2.3), for a
-#                 rollback on purpose; anything older is refused otherwise
+#                 rollback on purpose; anything older is refused otherwise (stable only)
 #   DRY_RUN       set to check a deployment without reporting, installing, restarting or counting
 set -euo pipefail
 
 : "${GH_TOKEN:?GH_TOKEN must be set}"
 REPO=${REPO:-Open-Blue/zig-runner}
 ENVIRONMENT=${ENVIRONMENT:-razorbill}
+CHANNEL=${CHANNEL:-stable}
 UNITS=${UNITS:-}
 BIN=${BIN:-/usr/local/bin/zig-runner}
 DRY_RUN=${DRY_RUN:-}
@@ -56,8 +70,13 @@ gh() { timeout "$GH_TIMEOUT" "$GH" "$@"; }
 log() { echo "zig-runner-deploy: $*" >&2; }
 
 # A deployment's new state, with a description GitHub shows (140 characters at most).
+# A channel's candidate has no deployment (id empty): it is only logged.
 report() {
 	local id=$1 state=$2 description=$3
+	if [[ -z $id ]]; then
+		log "$CHANNEL: $state: $description"
+		return 0
+	fi
 	log "deployment $id: $state: $description"
 	[[ -n $DRY_RUN ]] && return 0
 	gh api -X POST "repos/$REPO/deployments/$id/statuses" \
@@ -148,18 +167,25 @@ finish() {
 	fi
 	down=$(restart_all "$@")
 	if [[ -z $down ]]; then
+		record_channel
 		report "$id" success "running $tag on $(hostname): $*"
 		exit 0
 	fi
-	if [[ -x $BIN.prev && $(version_of "$BIN.prev") != "$tag" ]] && put "$BIN.prev"; then
+	if [[ -x $BIN.prev ]] && ! is_tag_version "$BIN.prev" && put "$BIN.prev"; then
 		again=$(restart_all "${units[@]}")
 		fail "$tag did not come up on $down; back on $(version_of "$BIN")${again:+, $again down}"
 	fi
 	fail "$tag did not come up on $down, and there is no other binary to go back to"
 }
 
+# A candidate that failed a check is remembered (a channel has no deployment to report failed), so
+# the timer does not fetch and check it again every minute; a newer candidate is tried as usual.
+# Only once its own checks began (judged): a machine's own fault is not the candidate's.
 fail() {
 	report "$id" failure "$1"
+	if [[ -z $id && -n ${judged:-} && -z $DRY_RUN ]]; then
+		echo "$tag" >>"$STATE_DIR/rejected" || log "could not remember that $tag was rejected"
+	fi
 	exit 1
 }
 
@@ -169,6 +195,11 @@ transient() {
 	local tries=1 last_id last_tries
 	if read -r last_id last_tries 2>/dev/null <"$STATE_DIR/tries" && [[ $last_id == "$id" ]]; then
 		tries=$((last_tries + 1))
+	fi
+	# A channel has no deployment to give up on: the next minute tries again, for as long as it takes.
+	if [[ -z $id ]]; then
+		log "$CHANNEL: $1; trying again next time"
+		exit 0
 	fi
 	((tries < ATTEMPTS)) || fail "gave up after $tries tries: $1"
 	if [[ -z $DRY_RUN ]]; then
@@ -193,13 +224,74 @@ fetch() {
 	esac
 }
 
-# Whether version tag $1 is older than version tag $2.
-older() { [[ $1 != "$2" && $(printf '%s\n' "$1" "$2" | sort -V | head -n1) == "$1" ]]; }
+# Whether the version $1 is older than $2 (vX.Y.Z, vX.Y.Z-rcN or vX.Y.Z-main.N+SHA), by semver's
+# precedence: a pre-release is older than its release, and the build metadata (+SHA) is ignored.
+older() {
+	local a=${1#v} b=${2#v} core_a core_b pre_a='' pre_b=''
+	a=${a%%+*} b=${b%%+*}
+	core_a=${a%%-*} core_b=${b%%-*}
+	[[ $a == *-* ]] && pre_a=${a#*-}
+	[[ $b == *-* ]] && pre_b=${b#*-}
+	if [[ $core_a != "$core_b" ]]; then
+		[[ $(printf '%s\n' "$core_a" "$core_b" | sort -V | head -n1) == "$core_a" ]]
+		return
+	fi
+	[[ $pre_a == "$pre_b" ]] && return 1
+	[[ -z $pre_b ]] && return 0
+	[[ -z $pre_a ]] && return 1
+	[[ $(printf '%s\n' "$pre_a" "$pre_b" | sort -V | head -n1) == "$pre_a" ]]
+}
+
+stable_re='^v[0-9]+\.[0-9]+\.[0-9]+$'
+rc_re='^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$'
+main_tag_re='^main-([0-9]+)-([0-9a-f]{12})$'
+main_version_re='^v[0-9]+\.[0-9]+\.[0-9]+-main\.([0-9]+)\+([0-9a-f]{12})$'
+
+# Whether the binary $1 says it is the candidate chosen (tag): a release's or release candidate's
+# version is its tag; a main candidate's is vX.Y.Z-main.N+SHA for the tag main-N-SHA.
+is_tag_version() {
+	local version
+	version=$(version_of "$1" || true)
+	if [[ $kind == main ]]; then
+		[[ $version =~ $main_version_re && ${BASH_REMATCH[1]} == "$tag_n" && ${BASH_REMATCH[2]} == "$tag_sha12" ]]
+	else
+		[[ $version == "$tag" ]]
+	fi
+}
+
+# What channel the installed binary came from: recorded after each install, `stable` before any.
+recorded_channel() { cat "$STATE_DIR/channel" 2>/dev/null || echo stable; }
+record_channel() {
+	[[ -n $DRY_RUN ]] && return 0
+	if ! { mkdir -p "$STATE_DIR" && echo "$CHANNEL" >"$STATE_DIR/channel"; }; then
+		log "could not record the channel in $STATE_DIR/channel"
+	fi
+}
+
+# The newest candidate of the channel in the releases feed (tag and whether it is a pre-release,
+# tab-separated, on stdin) that was not rejected: for `main` the highest N; for `rc` the newest
+# version of the release candidates and releases. A tag whose pre-release flag disagrees with its
+# form is not a candidate of any channel (a release candidate published as latest, say).
+newest_candidate() {
+	local tag pre n best='' best_n=-1
+	while IFS=$'\t' read -r tag pre; do
+		! grep -qxF -- "$tag" "$STATE_DIR/rejected" 2>/dev/null || continue
+		if [[ $CHANNEL == main ]]; then
+			[[ $pre == true && $tag =~ $main_tag_re ]] || continue
+			n=$((10#${BASH_REMATCH[1]}))
+			if ((n > best_n)); then best=$tag best_n=$n; fi
+		else
+			[[ ($pre == true && $tag =~ $rc_re) || ($pre == false && $tag =~ $stable_re) ]] || continue
+			if [[ -z $best ]] || older "$best" "$tag"; then best=$tag; fi
+		fi
+	done
+	echo "$best"
+}
 
 # What this machine needs is checked before any deployment is touched: a deployment reported failed
 # for a missing tool would never be tried again, so this exits and the timer tries next minute.
 attestation_help=$(gh attestation verify --help 2>&1) || true
-for flag in --signer-workflow --source-ref --deny-self-hosted-runners --custom-trusted-root; do
+for flag in --signer-workflow --source-ref --source-digest --deny-self-hosted-runners --custom-trusted-root; do
 	if [[ $attestation_help != *"$flag"* ]]; then
 		log "$(gh --version | head -n1) cannot verify provenance (gh attestation verify $flag):" \
 			"install gh 2.68 or later from https://cli.github.com (Debian's package is too old)"
@@ -207,38 +299,98 @@ for flag in --signer-workflow --source-ref --deny-self-hosted-runners --custom-t
 	fi
 done
 
-mapfile -t ids < <(
-	gh api "repos/$REPO/deployments?environment=$ENVIRONMENT&per_page=10" --jq '.[].id'
-)
-((${#ids[@]} > 0)) || exit 0
-id=${ids[0]}
-handled "$(latest_state "$id")" && exit 0
+case $CHANNEL in
+stable | rc | main) ;;
+*)
+	log "CHANNEL=$CHANNEL: not stable, rc or main"
+	exit 1
+	;;
+esac
+mkdir -p "$STATE_DIR" 2>/dev/null || true
 
-tag=$(gh api "repos/$REPO/deployments/$id" --jq .ref)
-log "deployment $id: $tag"
-# Older deployments nobody got to: this newer one replaces them.
-for old in "${ids[@]:1}"; do
-	handled "$(latest_state "$old")" || report "$old" inactive "superseded by $tag"
-done
+# What to install, as `tag` and `kind` (release, rc or main), and `id`, the deployment to report to
+# (none on a channel).
+id=''
+kind=release
+switching=''
+previous_channel=$(recorded_channel)
+[[ $previous_channel == "$CHANNEL" ]] || switching=1
 
-[[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "not a version tag: $tag"
+if [[ $CHANNEL == stable ]]; then
+	mapfile -t ids < <(
+		gh api "repos/$REPO/deployments?environment=$ENVIRONMENT&per_page=10" --jq '.[].id'
+	)
+	((${#ids[@]} > 0)) || exit 0
+	id=${ids[0]}
+	state=$(latest_state "$id")
+	# A machine moved back to stable takes the newest deployment that went well, though it is
+	# handled: nothing else would ever install it again.
+	if handled "$state" && ! [[ -n $switching && $state == success ]]; then exit 0; fi
+
+	tag=$(gh api "repos/$REPO/deployments/$id" --jq .ref)
+	log "deployment $id: $tag"
+	# Older deployments nobody got to: this newer one replaces them.
+	for old in "${ids[@]:1}"; do
+		handled "$(latest_state "$old")" || report "$old" inactive "superseded by $tag"
+	done
+
+	# Only a release: a candidate, however it got into a deployment, is refused here.
+	[[ $tag =~ $stable_re ]] || fail "not a version tag: $tag"
+else
+	feed=$(gh api "repos/$REPO/releases?per_page=100" --jq '.[] | select(.draft | not) | [.tag_name, .prerelease] | @tsv') ||
+		transient "could not list $REPO's releases"
+	tag=$(newest_candidate <<<"$feed")
+	[[ -n $tag ]] || exit 0
+	if [[ $tag =~ $main_tag_re ]]; then
+		kind=main
+	elif [[ $tag =~ $rc_re ]]; then
+		kind=rc
+	fi
+	log "$CHANNEL: newest candidate $tag"
+fi
+tag_n='' tag_sha12=''
+if [[ $kind == main ]]; then
+	[[ $tag =~ $main_tag_re ]]
+	tag_n=$((10#${BASH_REMATCH[1]}))
+	tag_sha12=${BASH_REMATCH[2]}
+fi
+
 mapfile -t units < <(instances)
-((${#units[@]} > 0)) || fail "no zig-runner instances on $(hostname)"
+if ((${#units[@]} == 0)); then
+	fail "no zig-runner instances on $(hostname)"
+fi
 mapfile -t unknown < <(unknown_units "${units[@]}")
 ((${#unknown[@]} == 0)) || fail "no unit ${unknown[*]} on $(hostname) (UNITS); nothing installed"
 
 current=$(version_of "$BIN" || true)
-# Anyone who can create a deployment could otherwise put back an older release, attested as
-# genuinely as any, with the bugs since fixed.
-if [[ $current =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && older "$tag" "$current" && [[ $ALLOW_DOWNGRADE != "$tag" ]]; then
-	fail "$tag is older than the installed $current: refused (ALLOW_DOWNGRADE=$tag on $(hostname) allows it)"
+# Moving a machine to another channel is a decision made on the machine (CHANNEL), so the first
+# install after it replaces what is there whatever its version; logged, and recorded once it is in.
+if [[ -n $switching ]]; then
+	log "channel switch: $previous_channel -> $CHANNEL (installed: ${current:-none}); the version order is not checked for this install"
+elif [[ $CHANNEL == stable ]]; then
+	# Anyone who can create a deployment could otherwise put back an older release, attested as
+	# genuinely as any, with the bugs since fixed.
+	if [[ $current =~ $stable_re ]] && older "$tag" "$current" && [[ $ALLOW_DOWNGRADE != "$tag" ]]; then
+		fail "$tag is older than the installed $current: refused (ALLOW_DOWNGRADE=$tag on $(hostname) allows it)"
+	fi
+elif [[ $kind == main ]]; then
+	# The candidate's number is its order: the same number from another commit is not newer either.
+	if [[ $current =~ $main_version_re ]] && ! is_tag_version "$BIN" && ((10#${BASH_REMATCH[1]} >= tag_n)); then
+		log "main: $tag is not newer than the installed $current; nothing to do"
+		exit 0
+	fi
+elif [[ $current =~ $stable_re || $current =~ $rc_re ]] && older "$tag" "$current"; then
+	# The newest the feed offers is older than what is installed: nothing to install, not a failure.
+	log "$CHANNEL: $tag is older than the installed $current; nothing to do"
+	exit 0
 fi
 
 # Installed already: done if every instance runs it; otherwise restart those that do not.
-if [[ $current == "$tag" ]]; then
+if is_tag_version "$BIN"; then
 	stale=()
 	for unit in "${units[@]}"; do runs_installed "$unit" || stale+=("$unit"); done
 	if ((${#stale[@]} == 0)); then
+		record_channel
 		report "$id" success "already running $tag"
 		exit 0
 	fi
@@ -246,14 +398,29 @@ if [[ $current == "$tag" ]]; then
 	finish "${stale[@]}"
 fi
 
+# From here the candidate's own checks run: one that fails is its fault.
+judged=1
 report "$id" in_progress "installing $tag on $(hostname) (was ${current:-none})"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 asset="zig-runner-linux-$(uname -m)"
+# What built it, from which ref: a release, by release.yml from its tag; a release candidate, by
+# candidate.yml from its tag; a main candidate, by candidate.yml from main, at the commit its tag names.
+signer=release.yml
+source_ref="refs/tags/$tag"
+digest_args=()
+cd "$work"
+if [[ $kind != release ]]; then signer=candidate.yml; fi
+if [[ $kind == main ]]; then
+	source_ref=refs/heads/main
+	fetch "could not read the commit of $tag" api "repos/$REPO/git/ref/tags/$tag" --jq .object.sha >"$work/commit"
+	commit=$(<"$work/commit")
+	[[ $commit =~ ^[0-9a-f]{40}$ && $commit == "$tag_sha12"* ]] || fail "$tag does not point at the commit its name says"
+	digest_args=(--source-digest "$commit")
+fi
 # Each check runs offline, on what was fetched before it, into $work (gh attestation download
 # writes there): the binary and SHA256SUMS, then the attestations of the binary's digest and
 # Sigstore's trust root.
-cd "$work"
 fetch "could not download $tag's $asset" release download "$tag" -R "$REPO" -D "$work" -p "$asset" -p SHA256SUMS
 grep -q "  $asset\$" SHA256SUMS || fail "$asset is not in $tag's SHA256SUMS"
 sha256sum --check --ignore-missing --quiet SHA256SUMS ||
@@ -263,11 +430,11 @@ fetch "could not fetch $asset's attestations" attestation download "$asset" -R "
 fetch "could not fetch Sigstore's trust root" attestation trusted-root >"$work/trusted_root.jsonl"
 gh attestation verify "$work/$asset" --repo "$REPO" \
 	--bundle "$work/sha256:$digest.jsonl" --custom-trusted-root "$work/trusted_root.jsonl" \
-	--signer-workflow "$REPO/.github/workflows/release.yml" \
-	--source-ref "refs/tags/$tag" --deny-self-hosted-runners >/dev/null ||
-	fail "$asset has no provenance from release.yml at $tag"
+	--signer-workflow "$REPO/.github/workflows/$signer" \
+	--source-ref "$source_ref" "${digest_args[@]}" --deny-self-hosted-runners >/dev/null ||
+	fail "$asset has no provenance from $signer at $source_ref for $tag"
 chmod 0755 "$work/$asset"
-[[ $(version_of "$work/$asset") == "$tag" ]] || fail "$asset does not say it is $tag"
+is_tag_version "$work/$asset" || fail "$asset does not say it is $tag"
 
 if [[ -z $DRY_RUN ]]; then
 	if [[ -e $BIN ]]; then cp -p "$BIN" "$BIN.prev" || fail "could not keep the previous binary"; fi
