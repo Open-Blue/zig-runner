@@ -2547,7 +2547,10 @@ one commit by git in the job's image (the job's token, as the checkout's), and o
 `action.yml` read (`git cat-file`), and its Dockerfile when it has one (a second look, for what
 the builder asks of the text: its context is not anywhere yet), then the look's layer dropped,
 so no unkeyed layer is left below the base (`Backend.dropTop`). One that is not there (made by a
-step, another repository checked out there) sends the job to Dagger. At run time the step reads
+step, another repository checked out there) sends the job to Dagger, and with `RUNNER_ENGINE=none`
+(no engine to send it to) is not judged: the step reads it from the workspace when it runs, as for
+any local action, and fails saying what native cannot run there (a `docker://` image or a JavaScript
+runtime is pulled when the step needs it, as it always was). At run time the step reads
 the workspace, as on Dagger (`actions.loadLocal`, through `Backend.readFile`); a Dockerfile action
 is built from the job's own layers: the build context is a `layer_view.View` of the job's layers
 (`Backend.jobLayers`) at the action's directory in the workspace, as the steps before left it, so
