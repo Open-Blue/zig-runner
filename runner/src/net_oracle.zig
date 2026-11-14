@@ -433,3 +433,169 @@ test "oracle: a stream closed before its end gives up its connection and still l
     const again = try net_client.fetch(arena, std.testing.io, .{ .url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/echo", .{server.port}) });
     try std.testing.expectEqual(std.http.Status.ok, again.status);
 }
+
+// --- R4's benchmarks (skipped unless ZIG_RUNNER_BENCH names one; run one at a time, each in its own process) ---
+//
+//   zig build test -Doptimize=ReleaseSafe -Dtest-filter="bench:" builds them; the test binary then runs with
+//   ZIG_RUNNER_BENCH=<name> and ZIG_RUNNER_BENCH_MIB=1024 (names at `benchSizeMib`). Each prints
+//   wall time, the process's CPU (user + system, the loopback server's thread included: the same in each),
+//   and its peak resident size.
+
+const bench_registry = @import("native/oci/registry.zig");
+
+/// `ZIG_RUNNER_BENCH` names the one benchmark to run: `download-std`, `download-library`,
+/// `blob-std` or `blob-library`.
+fn benchSizeMib(arena: std.mem.Allocator, which: []const u8) !?u64 {
+    const env = try std.testing.environ.createMap(arena);
+    if (!std.mem.eql(u8, env.get("ZIG_RUNNER_BENCH") orelse "", which)) return null;
+    return std.fmt.parseInt(u64, env.get("ZIG_RUNNER_BENCH_MIB") orelse "512", 10) catch 512;
+}
+
+const Usage = struct {
+    wall_ms: i64,
+    cpu_ms: i64,
+
+    fn now(io: Io) Usage {
+        var ru: std.os.linux.rusage = undefined;
+        _ = std.os.linux.getrusage(0, &ru);
+        return .{
+            .wall_ms = Io.Clock.awake.now(io).toMilliseconds(),
+            .cpu_ms = ru.utime.sec * 1000 + @divTrunc(ru.utime.usec, 1000) + ru.stime.sec * 1000 + @divTrunc(ru.stime.usec, 1000),
+        };
+    }
+};
+
+fn benchReport(io: Io, what: []const u8, mib: u64, start: Usage) void {
+    const end = Usage.now(io);
+    var buf: [4096]u8 = undefined;
+    const status = std.Io.Dir.cwd().readFile(io, "/proc/self/status", &buf) catch "";
+    var hwm_kb: []const u8 = "?";
+    var lines = std.mem.splitScalar(u8, status, '\n');
+    while (lines.next()) |l| if (std.mem.startsWith(u8, l, "VmHWM:")) {
+        hwm_kb = std.mem.trim(u8, l["VmHWM:".len..], " kB\t");
+    };
+    const wall = end.wall_ms - start.wall_ms;
+    std.debug.print("\nbench {s}: {d} MiB in {d} ms ({d} MiB/s), cpu {d} ms, peak RSS {s} kB\n", .{
+        what, mib, wall, @divTrunc(mib * 1000, @max(wall, 1)), end.cpu_ms - start.cpu_ms, hwm_kb,
+    });
+}
+
+test "bench: download, std (the whole body in memory, as zig_release's download was)" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const mib = (try benchSizeMib(arena, "download-std")) orelse return error.SkipZigTest;
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/blob/{d}", .{ server.port, mib << 20 });
+    const start = Usage.now(io);
+    var local: std.http.Client = .{ .allocator = arena, .io = io };
+    defer local.deinit();
+    var resp: Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer resp.deinit();
+    const r = try http.fetch(&local, .{ .location = .{ .url = url }, .response_writer = &resp.writer });
+    var h: Hash = .{};
+    h.add(resp.written());
+    try std.testing.expectEqual(std.http.Status.ok, r.status);
+    benchReport(io, "download, std", mib, start);
+}
+
+test "bench: download, library (a stream, hashed as it arrives)" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const mib = (try benchSizeMib(arena, "download-library")) orelse return error.SkipZigTest;
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/blob/{d}", .{ server.port, mib << 20 });
+    const start = Usage.now(io);
+    const d = try downloadViaLibrary(arena, io, url, null, 64 * 1024);
+    try std.testing.expectEqual(@as(u16, 200), d.status);
+    benchReport(io, "download, library", mib, start);
+}
+
+/// The old registry's way of taking a blob: std's request, its body reader, 64 KiB at a time into a
+/// file and a hash (registry.zig before R4, `onceAt` and `Body.take`).
+fn blobViaStd(io: Io, url: []const u8, file: Io.File, gpa: std.mem.Allocator) !u64 {
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+    var req = try client.request(.GET, try std.Uri.parse(url), .{
+        .headers = .{ .accept_encoding = .omit },
+        .redirect_behavior = .unhandled,
+    });
+    defer req.deinit();
+    try req.sendBodiless();
+    var res = try req.receiveHead(&.{});
+    var transfer: [64]u8 = undefined;
+    const r = res.reader(&transfer);
+    var buf: [64 * 1024]u8 = undefined;
+    var total: u64 = 0;
+    // The digest the registry takes (`registry.Body`), so both sides do the same work.
+    var h = @import("sha256.zig").Sha256.init(.{});
+    while (true) {
+        const n = try r.readSliceShort(&buf);
+        if (n == 0) return total;
+        h.update(buf[0..n]);
+        var rest: []const u8 = buf[0..n];
+        while (rest.len > 0) {
+            const rc = std.os.linux.write(file.handle, rest.ptr, rest.len);
+            if (std.os.linux.errno(rc) != .SUCCESS) return error.WriteFailed;
+            rest = rest[rc..];
+        }
+        total += n;
+    }
+}
+
+test "bench: registry blob, std (the old client's streaming into a file)" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const mib = (try benchSizeMib(arena, "blob-std")) orelse return error.SkipZigTest;
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "blob", .{});
+    defer file.close(io);
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/blob/{d}", .{ server.port, mib << 20 });
+    const start = Usage.now(io);
+    try std.testing.expectEqual(mib << 20, try blobViaStd(io, url, file, std.testing.allocator));
+    benchReport(io, "registry blob, std", mib, start);
+}
+
+test "bench: registry blob, library (registry.Client.blob)" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const mib = (try benchSizeMib(arena, "blob-library")) orelse return error.SkipZigTest;
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "blob", .{});
+    defer file.close(io);
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/blob/{d}", .{ server.port, mib << 20 });
+    var stream_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer stream_arena.deinit();
+    const start = Usage.now(io);
+    // `Client.blob` asks /v2/<repo>/blobs/<digest>; the bench server answers /blob/<n>, so the body is
+    // taken the way `blob` takes it: the library's stream, hashed and written to the file as it arrives.
+    var s = try net_client.open(stream_arena.allocator(), io, .{ .url = url, .max_response = 1 << 40, .read_idle = .fromSeconds(60) });
+    defer s.close();
+    var body: bench_registry.Body = .{ .file = .{ .file = file, .limit = mib << 20 } };
+    try body.take(&s);
+    try std.testing.expectEqual(mib << 20, body.file.written);
+    benchReport(io, "registry blob, library", mib, start);
+}

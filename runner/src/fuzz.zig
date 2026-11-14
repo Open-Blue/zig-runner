@@ -1744,6 +1744,53 @@ test "fuzz: HTTP responses" {
     });
 }
 
+/// A loopback server that answers each request's head with `bytes` and closes: what the HTTP
+/// targets fuzz the library's client against.
+const AnswerServer = struct {
+    listener: std.Io.net.Server,
+    stop_flag: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+    bytes: []const u8,
+
+    fn start(s: *AnswerServer, io: std.Io) !void {
+        var addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        s.listener = try addr.listen(io, .{ .reuse_address = true });
+        s.thread = try std.Thread.spawn(.{}, run, .{s});
+    }
+
+    fn port(s: *const AnswerServer) u16 {
+        return s.listener.socket.address.getPort();
+    }
+
+    fn run(s: *AnswerServer) void {
+        while (!s.stop_flag.load(.acquire)) {
+            const conn = s.listener.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
+            if (s.stop_flag.load(.acquire)) return;
+            var rb: [2048]u8 = undefined;
+            var r = conn.reader(std.testing.io, &rb);
+            // The request's head, then the answer, then the connection closes.
+            while (true) {
+                const line = r.interface.takeDelimiterInclusive('\n') catch break;
+                if (line.len <= 2) break;
+            }
+            var wb: [512]u8 = undefined;
+            var w = conn.writer(std.testing.io, &wb);
+            w.interface.writeAll(s.bytes) catch return;
+            w.interface.flush() catch return;
+        }
+    }
+
+    /// Ends the server: the next accept is the last.
+    fn finish(s: *AnswerServer, io: std.Io) void {
+        s.stop_flag.store(true, .release);
+        const last = std.Io.net.IpAddress.parse("127.0.0.1", s.port()) catch unreachable;
+        if (last.connect(io, .{ .mode = .stream })) |c| c.close(io) else |_| {}
+        s.thread.join();
+        s.listener.deinit(io);
+    }
+};
+
 /// What a server answers a request with, byte for byte, whatever it is: the library's answer (or
 /// error) comes back and the process lives (a Rust panic aborts it), within the deadline, with at
 /// most `max_response` bytes of body. Input: the bytes sent in answer to each request, and any
@@ -1755,34 +1802,11 @@ fn httpResponses(_: void, smith: *Smith) !void {
     defer threaded.deinit();
     const io = threaded.io();
     var buf: [4096]u8 = undefined;
-    const answer = take(smith, &buf);
-    var addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var listener = try addr.listen(io, .{ .reuse_address = true });
-    defer listener.deinit(io);
-    const Server = struct {
-        fn run(l: *std.Io.net.Server, bytes: []const u8, stop: *std.atomic.Value(bool)) void {
-            while (!stop.load(.acquire)) {
-                const conn = l.accept(std.testing.io) catch return;
-                defer conn.close(std.testing.io);
-                if (stop.load(.acquire)) return;
-                var rb: [2048]u8 = undefined;
-                var r = conn.reader(std.testing.io, &rb);
-                // The request's head, then the answer, then the connection closes.
-                while (true) {
-                    const line = r.interface.takeDelimiterInclusive('\n') catch break;
-                    if (line.len <= 2) break;
-                }
-                var wb: [512]u8 = undefined;
-                var w = conn.writer(std.testing.io, &wb);
-                w.interface.writeAll(bytes) catch return;
-                w.interface.flush() catch return;
-            }
-        }
-    };
-    var stop: std.atomic.Value(bool) = .init(false);
-    const t = try std.Thread.spawn(.{}, Server.run, .{ &listener, answer, &stop });
+    var server: AnswerServer = .{ .listener = undefined, .bytes = take(smith, &buf) };
+    try server.start(io);
+    defer server.finish(io);
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{listener.socket.address.getPort()});
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{server.port()});
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     if (net_client.fetch(arena.allocator(), io, .{
@@ -1793,11 +1817,80 @@ fn httpResponses(_: void, smith: *Smith) !void {
     })) |r| {
         try std.testing.expect(r.body.len <= 1 << 16);
     } else |_| {}
-    // Ends the server: the next accept is the last.
-    stop.store(true, .release);
-    const last = try std.Io.net.IpAddress.parse("127.0.0.1", listener.socket.address.getPort());
-    if (last.connect(io, .{ .mode = .stream })) |c| c.close(io) else |_| {}
-    t.join();
+}
+
+// --- HTTP streams (R4: the same answers, read as a stream; and an upload into them) ---
+
+test "fuzz: HTTP streams" {
+    try std.testing.fuzz({}, httpStreams, .{
+        .corpus = comptime seeds(&.{
+            &.{"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"},
+            &.{"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"},
+            &.{"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffff\r\nx"},
+            &.{"HTTP/1.1 302 Found\r\nLocation: /x\r\nContent-Length: 0\r\n\r\n"},
+            &.{"HTTP/1.1 200 OK\r\nContent-Length: 99999999999\r\n\r\nshort"},
+            &.{"HTTP/1.1 413 Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"},
+            &.{"HTTP/1.0 200 OK\r\n\r\nuntil the connection closes"},
+            &.{"\x16\x03\x01\x02\x00\x01\x00\x01\xfc"},
+        }),
+    });
+}
+
+const FuzzBody = struct {
+    len: usize,
+
+    fn write(ptr: *const anyopaque, w: *std.Io.Writer) anyerror!void {
+        const b: *const FuzzBody = @ptrCast(@alignCast(ptr));
+        var chunk: [1000]u8 = @splat('u');
+        var left = b.len;
+        while (left > 0) {
+            const n = @min(left, chunk.len);
+            try w.writeAll(chunk[0..n]);
+            left -= n;
+        }
+    }
+};
+
+/// What a server answers a streamed request with, read in pieces of any size, and a request body
+/// of any size written into a server that may answer before it is sent and close: the stream ends
+/// with an error or its end, within the deadline, never more than `max_response` bytes, and the
+/// process lives. Input: the answer, then how the read and the upload go (a read size, whether and
+/// how much to upload).
+fn httpStreams(_: void, smith: *Smith) !void {
+    var threaded: std.Io.Threaded = .init(std.heap.smp_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var buf: [4096]u8 = undefined;
+    var server: AnswerServer = .{ .listener = undefined, .bytes = take(smith, &buf) };
+    const read_size = @as(usize, smith.value(u16)) % 3000 + 1;
+    const upload_len: ?usize = if (smith.value(bool)) smith.value(u16) else null;
+    try server.start(io);
+    defer server.finish(io);
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{server.port()});
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const body: FuzzBody = .{ .len = upload_len orelse 0 };
+    var s = net_client.open(arena.allocator(), io, .{
+        .method = if (upload_len != null) .PUT else .GET,
+        .url = url,
+        .upload = if (upload_len != null) .{ .len = body.len, .ptr = &body, .writeFn = FuzzBody.write } else null,
+        .deadline = .fromMilliseconds(400),
+        .total = .fromMilliseconds(800),
+        .read_idle = .fromMilliseconds(300),
+        .max_redirects = 2,
+        .max_response = 1 << 16,
+    }) catch return;
+    defer s.close();
+    var out: [3000]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = s.read(out[0..read_size]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    try std.testing.expect(total <= 1 << 16);
+    try std.testing.expect(s.queuePeak() < (1 << 20) + (1 << 19));
 }
 
 // --- HTTP/2 framing ---

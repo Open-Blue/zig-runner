@@ -254,7 +254,7 @@ documents (DNS approximate, TLS inferred) go away with the wrapper.
   closed its end first costs nothing). Zig waits with `Io.File.readStreaming` on it: the wait is std.Io's, so the deadline (`http.within`, 30 s) and cancellation
   apply where it blocks, and both free the call, which drops the request and closes its connection (tested: a request to a server that never answers ends at its
   deadline, and a cancel ends it at once). `zr_net_call_result` fills a struct (status, error code, timings, lengths); `zr_net_call_copy` copies headers, body or the error text.
-  Whole bodies up to `max_response`; streaming is R4.
+  Whole bodies up to `max_response`; streaming is R4 (below).
 - **Pool and connections.** hyper's `http1` connection API under our own pool (per scheme, host, port and proxy; 8 idle per host, 90 s): a kept connection that turns out to be
   closed is replaced silently when nothing had been sent (what `HttpConnectionClosing` retries did). HTTP/1.1 only, as decided; HTTP/2 is per call site later.
 - **Exact phases.** DNS is timed around `getaddrinfo` (an address needs none), connect around the TCP connect (each address in turn, 10 s each), TLS around the handshake,
@@ -279,7 +279,42 @@ documents (DNS approximate, TLS inferred) go away with the wrapper.
 - **Validation of R3**: 18 cargo tests (client against in-process plain and TLS servers: keep-alive and reuse, redirects and credentials, CA/name errors by kind, the phases, socket options, limits and timeouts, proxies, the proxy
   table); the oracle; a fuzz target `fuzz: HTTP responses` (what a server answers, byte for byte; in the nightly matrix and in the analysis scope; seeded with normal, chunked, redirecting, malformed and non-HTTP answers);
   TSan: the Rust archive is built instrumented for TSan builds ("ThreadSanitizer" below), so there is no blanket suppression; `.github/tsan.supp` holds the one report that is not a race; Valgrind over the new tests.
-- **Not in R3**: the std client's other users (registry, release downloads, uploads: R4; run service, broker, Gitea: R5; the feed: R6), `http.zig`'s renew/retire machinery (still needed by those), HTTP/2, streaming.
+- **Not in R3**: the std client's other users (registry, release downloads, uploads: R4, below; run service, broker, Gitea: R5; the feed: R6), `http.zig`'s renew/retire machinery (still needed by those), HTTP/2, streaming.
+
+## Streaming: downloads, uploads, the registry (R4, as built)
+
+- **What moved.** `zig_release.zig` (the Zig tarballs), `github/results.zig`'s blob upload (`putBlob`: the step and job logs) and `native/oci/registry.zig` (manifests, blobs, the token service; `image.zig` and `Backend.zig` lose
+  the std client they carried). No other std client user is in R4's scope: tool and action downloads happen inside the Dagger engine or the jobs' own steps, not in the runner, and the artifact and cache uploads are
+  the jobs' actions' own. What is left for std: `broker.zig` (the run service, the broker's long poll, the Dagger engine's queries, whose `Body` type is now `net_client.Body`) and `gitea/` (R5), `feed.zig` (R6),
+  and `http.zig`'s renew/retire machinery with them.
+- **The library's side** (`rust/zr-net/src/body.rs`, `call.rs`): two bounded queues, 1 MiB each (`QUEUE_LIMIT`; a chunk more may be in flight, at most one read of hyper's, about 400 KiB). *Response*: `FLAG_STREAM_RESPONSE` makes the call
+  finish when the head is there; the task goes on reading the body into a queue and waits while it is full (so TCP's window stops the server), the caller takes bytes with `zr_net_body_read`, which says "data", "pending" (wait on
+  the call's descriptor, as for the head), "end" or a `Code`. `Wake` writes one byte to the descriptor when a queue goes from empty to non-empty (or, for a request body, half empty), at an end, or on an error; a
+  descriptor full of unread wakes loses nothing (`MSG_DONTWAIT`). *Request*: `FLAG_STREAM_REQUEST` and `body_len`: the caller writes with `zr_net_body_write` ("took n", "full", "over": the call has answered or failed, stop writing)
+  and hyper takes chunks from the queue (`ReqBody`); Content-Length is the declared length (a short or failing writer ends the call with `UploadFailed`, never a hung request). Both are cancelled by `zr_net_call_free`
+  (the connection is dropped). `total_ms` bounds the whole call, body included, `read_idle_ms` a body that stops, `first_byte_ms` the head.
+- **Connections.** A response read to its end puts its connection back in the pool (before the end is announced, so the next request finds it); one not read to its end is dropped. A kept connection found closed or reset
+  before an answer is replaced by a new one (bytes bodies and GETs: unseen by the caller, the library's; a streamed body cannot be taken back from hyper, so that call fails with `Stale` and the caller writes it again with
+  `fresh`, which `putBlob` does, as `broker.request` did for #100). A GET (or HEAD) that met a closed connection, new or kept, is sent once more. Redirects follow the R3 rules for credentials and methods; a streamed request body
+  cannot be repeated, so a 307 or 308 for it is an error (`Protocol`), and a 301, 302 or 303 turns it into a GET as before.
+- **`net_client.zig`.** `open(arena, io, options)` returns a `Stream` (status, headers, `read`, `discard`, `close`, `timings`): the head wait is `http.withinClosing`'s (a deadline or cancel frees the call), each wait inside `read` is
+  std.Io's readiness wait on the descriptor, which cancels. `Options.upload` (a `Body`: a length and a writer, the shape `broker.Body` had) writes through the queue from the caller's thread; `fetch` takes the same option, so
+  the results upload still gets its small answer whole. One `request:` line per stream, when the body ends or the stream is closed, with the whole body's `bytes_in` and the final total (the head's figures stay exact).
+- **Zig seeds.** `zig_release.download` streams the tarball into BLAKE2b-512 (for `minisign.verifyDigest`) and SHA-256 (the digest handed to the seed build) and keeps neither the tarball nor a copy: the ~50 MB per version no longer
+  exist in the runner's memory at startup.
+- **Registry.** `registry.Client` has an `io` where it had the std client; a request is `net_client.open` with up to five redirects done by the library (which drops `Authorization` at another origin: the hand-written
+  `sameOrigin` and redirect loop are deleted), 60 s for a head and for a silence in a body; the token request is `fetch` without redirects. `Body.take` reads the stream into the blob's file and its hash as before. A 401's small
+  body is read so that its connection serves the token request and the retry.
+- **Differences from std**, each in `net_oracle.zig`: a redirect to another host takes the token away (std keeps it, the R3 difference; seen on downloads too: a CDN's signed URL refuses it with 403 from std);
+  the User-Agent is `zig-runner/<version>` where the registry's was `zig-runner`; a token service that redirects is an error (`TooManyRedirects`, with 0 redirects allowed) where std handed back the 3xx, and the pull says
+  "the token service: TooManyRedirects" instead of "answered HTTP 302"; the registry's stale-connection retry counts (`staleRetries + 1` tries) become the library's one repeat; errors are `net_client.Error`'s names (a registry that closes every
+  connection unanswered is `NetworkIo`, not `HttpConnectionClosing`).
+- **Validation.** Cargo: 7 new tests through the C ABI as Zig drives it (48 MiB streamed plain and chunked with a slow reader and the queue's peak asserted below 1.5 MiB, reuse after a stream, a cancel halfway closes the
+  connection at the server, a stalled body and a call over its total each have their own error, a 24 MiB upload through a slow server with the writer made to wait, a server that answers a 512 MiB upload at once stops the writer,
+  303 and 307 for a streamed body, the token left behind at a redirect), and queue unit tests. Zig: the oracle's download (five sizes up to 24 MiB, three read sizes, hashed on both sides), redirect, upload
+  (std's `broker.request` against the library), short and failing writers, request line and early close cases; `fuzz: HTTP streams` (the HTTP responses' seeds, read in pieces of any size, and an upload of any size
+  into a server that may answer before it and close; nightly matrix and analysis scope, as `HTTP responses`); the registry's tests (token auth, CDN redirect without the token, digest mismatch, stale and reset) on the
+  library. TSan (cargo and the whole Zig suite) and Valgrind clean.
 
 ## The WebSocket feed (R6)
 
@@ -451,7 +486,7 @@ Each PR brings its own checks; none is left to "later".
 | **R1** (this) | `runner/rust/zr-net` skeleton, `build.zig` `addZrNet`, `build-zr-net.sh`, `zig-cc.sh`, `install-rust.sh`, `zig-modules.sh` link inputs, `zr_net.zig` + test, cargo-deny, this document | nothing | minor | Zig test, `cargo test`, Valgrind, byte-identical builds, checksec, cargo-deny |
 | **R2** | `src/tls.rs` sans-IO rustls, `tls_stream.zig`, `pg.zig` on it, client certs (`sslcert`, `sslkey`, `sslrootcert`), roots loader, allocation counter, `cargo test` in CI | `tls.zig` dependency, `build.zig.zon` tls entry, `zig_package_hash` and the tls fetch in `zig-modules.sh`, `ca_bundle` in `pg.zig` | minor | TLS fuzz target, live pg client-cert and private-CA tests, in-process rustls tests |
 | **R3** | the client API (`net_client.zig`; pool, proxy, redirects, h1, exact timings), `request:` lines through #530's `request_log.zig`, `auth.zig`, `app.zig`, `jitconfig.zig` fetches on it; oracle harness | their std client use (`http.fetch` there) | minor | oracle against `testserver.zig`, HTTP head fuzz, phase-delay test, cgroup-of-threads test, TSan suppressions |
-| **R4** | streaming bodies; `zig_release.zig` download, `results.zig` uploads, `native/oci/registry.zig` (redirect privacy tests) | `registry.zig`'s hand-written redirect/authorization workaround, `zig_release`'s std path | minor | streamed oracle cases, memory bound test, Pi disk-streaming benchmark vs std |
+| **R4** (built: "Streaming", above) | streaming bodies; `zig_release.zig` download, `results.zig` uploads, `native/oci/registry.zig` (redirect privacy tests) | `registry.zig`'s hand-written redirect/authorization workaround, `zig_release`'s std path | minor | streamed oracle cases, memory bound test; the Pi disk-streaming benchmark vs std is not run yet (laptop numbers in the PR) |
 | **R5** | `runservice.zig`, `broker.zig` long-poll (cancel, keepalive, #100's dead-connection test), `gitea/client.zig` | `http.within`'s client coupling, `http.keepAlive` | minor | long-poll oracle and kill-the-network test, Gitea job diff tool |
 | **R6** | `feed.zig` on tokio-tungstenite | std client use everywhere, `net_hooks.zig`, `http.zig`'s retired list and `renew`, the oracle harness, feed framing | minor | WebSocket fuzz target, feed oracle until deleted |
 

@@ -368,7 +368,7 @@ fn basic(arena: Allocator, cr: Credentials) ![]const u8 {
 }
 
 /// Where a response's body goes: memory up to a limit, or a file, hashed, up to the blob's size.
-const Body = union(enum) {
+pub const Body = union(enum) {
     memory: struct { arena: Allocator, limit: usize, bytes: std.ArrayList(u8) = .empty },
     file: struct { file: std.Io.File, limit: u64, written: u64 = 0, hash: Sha256 = .init(.{}) },
 
@@ -380,7 +380,7 @@ const Body = union(enum) {
         };
     }
 
-    fn take(b: *Body, stream: *net_client.Stream) !void {
+    pub fn take(b: *Body, stream: *net_client.Stream) !void {
         var buf: [64 * 1024]u8 = undefined;
         while (true) {
             const n = stream.read(&buf) catch |e| switch (e) {
