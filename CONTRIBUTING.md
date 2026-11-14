@@ -139,3 +139,8 @@ For now, each pull request gets an automated review, and what reaches `main` is 
 Approving the release is the human check (#104). `automerge` turns on auto-merge for every pull
 request from a branch of this repository based on `main`, so it joins the merge queue once its
 checks pass. Workflows from outside contributors' pull requests wait for approval before they run.
+
+`main` keeps a linear history: the merge queue rebases each pull request's commits onto `main`, and
+the branch ruleset refuses merge commits. To bring a branch up to date, rebase it (`git rebase
+origin/main`, then `git push --force-with-lease`); don't merge `main` into it. A pull request
+stacked on another is rebased onto its base the same way (`git rebase --onto`).
