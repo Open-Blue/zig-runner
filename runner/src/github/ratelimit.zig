@@ -36,7 +36,7 @@ fn retryAfter(value: []const u8, now_ms: i64) ?i64 {
     const v = std.mem.trim(u8, value, " ");
     if (v.len > 0 and std.mem.indexOfNone(u8, v, "0123456789") == null) {
         const s = std.fmt.parseInt(u64, v, 10) catch return max_wait_ms;
-        const secs: i64 = @intCast(@min(s, max_wait_ms / std.time.ms_per_s));
+        const secs: i64 = @min(s, max_wait_ms / std.time.ms_per_s);
         return secs * std.time.ms_per_s;
     }
     const at = httpDate(v) orelse return null;
