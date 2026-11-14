@@ -163,8 +163,12 @@ mirror-prefix)
 mirror-suffix)
 	mirror_suffix /etc/apt
 	;;
+mirror-list)
+	# The default mirrors of ARCH, one per line (apt-test.sh --real-mirrors probes them).
+	APT_MIRRORS= mirrors_for "${2:?ARCH}" | tr ' ' '\n'
+	;;
 *)
-	echo "usage: apt.sh install [apt-get options] PACKAGE... | apt.sh mirror-prefix ARCH CODENAME" >&2
+	echo "usage: apt.sh install [apt-get options] PACKAGE... | apt.sh mirror-prefix ARCH CODENAME | apt.sh mirror-list ARCH" >&2
 	exit 2
 	;;
 esac
