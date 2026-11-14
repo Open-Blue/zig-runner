@@ -4,6 +4,7 @@ const std = @import("std");
 const auth = @import("../github/auth.zig");
 const broker = @import("../github/broker.zig");
 const redact = @import("../redact.zig");
+const logfmt = @import("../logfmt.zig");
 const Runner = @import("../loop.zig").Runner;
 const Cycle = @import("../loop.zig").Cycle;
 
@@ -13,6 +14,20 @@ const Allocator = std.mem.Allocator;
 pub fn say(c: Runner, comptime fmt: []const u8, args: anytype) !void {
     const text = try std.fmt.allocPrint(c.arena, fmt, args);
     try c.log.say(text);
+}
+
+/// A warning or an error to the log, in `logfmt`'s format. On the stack, so it can be said when
+/// the arena cannot grow; a line longer than the buffer is cut.
+pub fn sayLine(c: Runner, comptime level: logfmt.Level, comptime kind: []const u8, comptime fmt: []const u8, args: anytype) void {
+    var buf: [1024]u8 = undefined;
+    c.log.say(logfmt.bufLine(&buf, level, kind, fmt, args)) catch |e| std.log.debug("log: {t}", .{e});
+}
+
+/// `text` with the job's secrets masked, in `buf` (cut if it does not fit), for a value of a line.
+pub fn masked(c: Runner, buf: []u8, text: []const u8) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    redact.write(&w, text, c.secrets) catch {};
+    return w.buffered();
 }
 
 /// A fresh access token for the runner's credentials (a JWT exchanged at the OAuth endpoint).
@@ -45,27 +60,27 @@ const github_failure: Cycle = .{ .failed = .{ .exit = .github } };
 
 /// Reports a failed exchange to stderr (the error's name, redacted) and returns the cycle's ending.
 pub fn fail(c: Runner, what: []const u8, e: anyerror) !Cycle {
-    try c.err.print("error during {s}: ", .{what});
-    try redact.write(c.err, @errorName(e), c.secrets);
-    try c.err.writeByte('\n');
+    var buf: [128]u8 = undefined;
+    try logfmt.line(c.err, .err, "exchange_failed", "what={f} err={f}", .{
+        logfmt.q(what),
+        logfmt.q(masked(c, &buf, @errorName(e))),
+    });
     return github_failure;
 }
 
 /// `fail` for a failed token request, which also has the HTTP status.
 pub fn failHttp(c: Runner, what: []const u8, e: anyerror, status: std.http.Status) !Cycle {
-    try c.err.print(
-        "error during {s}: {s} (HTTP {d})\n",
-        .{ what, @errorName(e), @backingInt(status) },
-    );
+    try logfmt.line(c.err, .err, "exchange_failed", "what={f} err={t} http={d}", .{
+        logfmt.q(what), e, @backingInt(status),
+    });
     return github_failure;
 }
 
 /// `fail` for a response GitHub answered with a non-success status.
 pub fn failBody(c: Runner, what: []const u8, r: broker.Response) !Cycle {
     // Error bodies are short JSON documents without credentials.
-    try c.err.print(
-        "error during {s}: HTTP {d}: {s}\n",
-        .{ what, @backingInt(r.status), r.body[0..@min(r.body.len, 400)] },
-    );
+    try logfmt.line(c.err, .err, "exchange_failed", "what={f} http={d} body={f}", .{
+        logfmt.q(what), @backingInt(r.status), logfmt.q(r.body[0..@min(r.body.len, 400)]),
+    });
     return github_failure;
 }
