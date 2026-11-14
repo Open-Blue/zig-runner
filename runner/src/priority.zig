@@ -59,16 +59,16 @@ pub const Config = struct {
 pub fn effective(base: Level, waited_ms: i64, step_ms: u32) Level {
     const b = @min(base, max_level);
     if (step_ms == 0 or waited_ms <= 0) return b;
-    const risen = @divFloor(@as(u64, @intCast(waited_ms)), step_ms);
-    return @intCast(@min(@as(u64, max_level), b + risen));
+    const risen = @divFloor(waited_ms, step_ms);
+    return std.math.cast(Level, @min(@as(i64, max_level), b + risen)) orelse max_level;
 }
 
 /// How long a job of level `base` waits at the most for its rank to reach `max_level`, from which
 /// only jobs that came before it rank ahead: the time no job of any level can be kept behind
 /// later arrivals, whatever their level. Null with aging off (no bound).
-pub fn starvationBoundMs(base: Level, step_ms: u32) ?u64 {
+pub fn starvationBoundMs(base: Level, step_ms: u32) ?i64 {
     if (step_ms == 0) return null;
-    return @as(u64, max_level -| @min(base, max_level)) * step_ms;
+    return @as(i64, max_level -| @min(base, max_level)) * step_ms;
 }
 
 /// `cpu.weight` for a level: the kernel's default of 100 at `normal`, a factor of about 1.45 for
@@ -270,18 +270,19 @@ test "aging: one level per step, capped, and a bound on the wait" {
     try std.testing.expectEqual(@as(Level, 9), effective(9, 1 << 40, step));
     try std.testing.expectEqual(@as(Level, 1), effective(1, 1 << 40, 0));
     try std.testing.expectEqual(@as(Level, 1), effective(1, -5, step));
-    try std.testing.expectEqual(@as(?u64, 8 * step), starvationBoundMs(1, step));
-    try std.testing.expectEqual(@as(?u64, 0), starvationBoundMs(9, step));
-    try std.testing.expectEqual(@as(?u64, null), starvationBoundMs(1, 0));
+    try std.testing.expectEqual(@as(?i64, 8 * step), starvationBoundMs(1, step));
+    try std.testing.expectEqual(@as(?i64, 0), starvationBoundMs(9, step));
+    try std.testing.expectEqual(@as(?i64, null), starvationBoundMs(1, 0));
     // At the bound the level is the top one: from there only earlier arrivals rank ahead.
-    try std.testing.expectEqual(max_level, effective(1, @intCast(starvationBoundMs(1, step).?), step));
+    try std.testing.expectEqual(max_level, effective(1, starvationBoundMs(1, step).?, step));
 }
 
 test "the weights rise with the level and are the kernel's defaults at normal" {
     try std.testing.expectEqual(@as(u32, 100), cpuWeight(normal));
     var last: u32 = 0;
-    for (0..10) |l| {
-        const w = cpuWeight(@intCast(l));
+    var l: Level = 0;
+    while (l <= max_level) : (l += 1) {
+        const w = cpuWeight(l);
         try std.testing.expect(w > last and w >= 1 and w <= 10000);
         last = w;
     }
