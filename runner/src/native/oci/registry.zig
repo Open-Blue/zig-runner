@@ -367,17 +367,7 @@ pub const Client = struct {
             c.why = try std.fmt.allocPrint(c.arena, "{f}: the registry's token realm is not HTTPS", .{c.ref});
             return error.Unauthorized;
         }
-        var url: std.Io.Writer.Allocating = .init(c.arena);
-        try url.writer.writeAll(ch.realm);
-        try url.writer.writeByte(if (std.mem.indexOfScalar(u8, ch.realm, '?') == null) '?' else '&');
-        if (ch.service) |s| {
-            try url.writer.writeAll("service=");
-            try std.Uri.Component.percentEncode(&url.writer, s, isQueryChar);
-            try url.writer.writeByte('&');
-        }
-        const scope = try std.fmt.allocPrint(c.arena, "repository:{s}:pull", .{c.ref.repository});
-        try url.writer.writeAll("scope=");
-        try std.Uri.Component.percentEncode(&url.writer, scope, isQueryChar);
+        const url = try tokenUrl(c.arena, ch, c.ref.repository);
         const auth: ?[]const u8 = if (c.creds) |cr| try basic(c.arena, cr) else null;
         var body: std.Io.Writer.Allocating = .init(c.arena);
         // No redirect is followed: the credentials would go with it (see `onceAt`). Sent again on
@@ -388,7 +378,7 @@ pub const Client = struct {
         var stale: u32 = 0;
         const res = while (true) {
             break http.fetch(c.http, .{
-                .location = .{ .url = url.written() },
+                .location = .{ .url = url },
                 .headers = .{
                     .user_agent = .{ .override = "zig-runner" },
                     .authorization = if (auth) |a| .{ .override = a } else .omit,
@@ -396,6 +386,8 @@ pub const Client = struct {
                 .redirect_behavior = .unhandled,
                 .response_writer = &body.writer,
             }) catch |e| {
+                // `body` is the only writer: its failing is the arena's.
+                if (e == error.WriteFailed or e == error.OutOfMemory) return error.OutOfMemory;
                 if (e == error.ReadFailed and stale < http.staleRetries(c.http)) {
                     stale += 1;
                     body.clearRetainingCapacity();
@@ -420,7 +412,7 @@ pub const Client = struct {
         const T = struct { token: ?[]const u8 = null, access_token: ?[]const u8 = null };
         const t = std.json.parseFromSliceLeaky(T, c.arena, body.written(), .{
             .ignore_unknown_fields = true,
-        }) catch return error.Unauthorized;
+        }) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Unauthorized;
         return t.token orelse t.access_token orelse error.Unauthorized;
     }
 };
@@ -438,6 +430,28 @@ fn sameOrigin(uri: std.Uri, ref: Ref) bool {
     else
         null;
     return uri.port == want_port;
+}
+
+/// The URL a token is asked at: the challenge's realm with the service and the scope for pulling
+/// `repository`.
+fn tokenUrl(arena: Allocator, ch: Challenge, repository: []const u8) Allocator.Error![]const u8 {
+    var url: std.Io.Writer.Allocating = .init(arena);
+    // Only `url` is written to, and a writer that allocates fails for one reason.
+    writeTokenUrl(&url.writer, arena, ch, repository) catch return error.OutOfMemory;
+    return url.written();
+}
+
+fn writeTokenUrl(w: *std.Io.Writer, arena: Allocator, ch: Challenge, repository: []const u8) !void {
+    try w.writeAll(ch.realm);
+    try w.writeByte(if (std.mem.indexOfScalar(u8, ch.realm, '?') == null) '?' else '&');
+    if (ch.service) |s| {
+        try w.writeAll("service=");
+        try std.Uri.Component.percentEncode(w, s, isQueryChar);
+        try w.writeByte('&');
+    }
+    const scope = try std.fmt.allocPrint(arena, "repository:{s}:pull", .{repository});
+    try w.writeAll("scope=");
+    try std.Uri.Component.percentEncode(w, scope, isQueryChar);
 }
 
 fn isQueryChar(ch: u8) bool {

@@ -500,3 +500,50 @@ test "native oci pull of the default image from Docker Hub (ZIG_RUNNER_TEST_PULL
     };
     std.debug.print("after 70 s idle: {s}\n", .{idle.digest});
 }
+
+test "allocation failures: a pull through token auth, an index, gzip and zstd layers and a redirect" {
+    const af = @import("../../alloc_failures.zig");
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+
+    var t: layer.TestTar = .{ .a = arena };
+    try t.add(.{ .path = "etc/", .kind = .directory, .mode = 0o755 });
+    try t.add(.{ .path = "etc/marker", .body = "from the image\n" });
+    const base = try t.finish();
+    const img = try testImage(arena, "test/img", "1", &.{base}, "\"A=b\"", true);
+    var server: Server = .{ .routes = img.routes, .private = true };
+    try server.start();
+    defer server.stop();
+    const reference = try server.image(arena, "test/img:1");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+
+    // The registry client's, the manifests' and the store's memory fail one allocation at a time,
+    // in `arena`. The memory the layers' fetching tasks use (`gpa`) is not failed: they run
+    // beside the pull's own thread, so which allocation is number N would vary between runs.
+    const S = struct {
+        var run_count: usize = 0;
+        fn pull(a_: Allocator, root_: []const u8, reference_: []const u8, creds: ?@import("registry.zig").Credentials) !void {
+            var scratch: af.Scratch = .init(a_);
+            defer scratch.deinit();
+            const arena_ = scratch.allocator();
+            var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+            defer client.deinit();
+            run_count += 1;
+            // Each run its own store: a layer already in it would not be fetched.
+            const store: Store = .{ .root = try std.fmt.allocPrint(arena_, "{s}/store{d}", .{ root_, run_count }) };
+            var why: []const u8 = "";
+            const got = try image.pull(arena_, testing.allocator, testing.io, &client, store, .{
+                .image = reference_,
+                .creds = creds,
+                .owners = false,
+            }, &why);
+            got.lock.close(testing.io);
+            try testing.expectEqual(@as(usize, 1), got.env.len);
+        }
+    };
+    try af.checkOne(S.pull, .{ root, reference, @as(?@import("registry.zig").Credentials, .{ .username = "user", .password = "pass" }) });
+}
