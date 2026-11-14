@@ -260,7 +260,7 @@ documents (DNS approximate, TLS inferred) go away with the wrapper.
   closed its end first costs nothing). Zig waits with `Io.File.readStreaming` on it: the wait is std.Io's, so the deadline (`http.within`, 30 s) and cancellation
   apply where it blocks, and both free the call, which drops the request and closes its connection (tested: a request to a server that never answers ends at its
   deadline, and a cancel ends it at once). `zr_net_call_result` fills a struct (status, error code, timings, lengths); `zr_net_call_copy` copies headers, body or the error text.
-  Whole bodies up to `max_response`; streaming is R4 (below).
+  Whole bodies up to `max_response`, as given: 0 allows no body, `usize::MAX` (what Zig passes for a download without a limit) none; streaming is R4 (below).
 - **Pool and connections.** hyper's `http1` connection API under our own pool (per scheme, host, port and proxy; 8 idle per host, 90 s): a kept connection that turns out to be
   closed is replaced silently when nothing had been sent (what `HttpConnectionClosing` retries did). HTTP/1.1 only, as decided; HTTP/2 is per call site later.
 - **Exact phases.** DNS is timed around `getaddrinfo` (an address needs none), connect around the TCP connect (each address in turn, 10 s each), TLS around the handshake,
@@ -299,9 +299,11 @@ documents (DNS approximate, TLS inferred) go away with the wrapper.
   descriptor full of unread wakes loses nothing (`MSG_DONTWAIT`). *Request*: `FLAG_STREAM_REQUEST` and `body_len`: the caller writes with `zr_net_body_write` ("took n", "full", "over": the call has answered or failed, stop writing)
   and hyper takes chunks from the queue (`ReqBody`); Content-Length is the declared length (a short or failing writer ends the call with `UploadFailed`, never a hung request). Both are cancelled by `zr_net_call_free`
   (the connection is dropped). `total_ms` bounds the whole call, body included, `read_idle_ms` a body that stops, `first_byte_ms` the head.
-- **Connections.** A response read to its end puts its connection back in the pool (before the end is announced, so the next request finds it); one not read to its end is dropped. A kept connection found closed or reset
-  before an answer is replaced by a new one (bytes bodies and GETs: unseen by the caller, the library's; a streamed body cannot be taken back from hyper, so that call fails with `Stale` and the caller writes it again with
-  `fresh`, which `putBlob` does, as `broker.request` did for #100). A GET (or HEAD) that met a closed connection, new or kept, is sent once more. Redirects follow the R3 rules for credentials and methods; a streamed request body
+- **Connections.** A response read to its end puts its connection back in the pool (before the end is announced, so the next request finds it); one not read to its end is dropped. A kept connection found closed (hyper's
+  `is_closed`: the request never left) before an answer is replaced by a new one for any method (bytes bodies: unseen by the caller, the library's; a streamed body cannot be taken back from hyper, so that call fails with `Stale` and the caller writes
+  it again with `fresh`, which `putBlob` does, as `broker.request` did for #100). A connection that was closed or reset after the request was written, or ended mid-answer, does not say whether the server acted on it: only an
+  idempotent method's request (GET, HEAD, PUT, DELETE, OPTIONS, TRACE, RFC 9110) is sent once more then, on a kept connection or a new one; a POST or PATCH fails with `Io` and the caller decides (a Twirp or artifact POST is never sent twice
+  by the library). A streamed body of an idempotent method on a kept connection is `Stale`, as above. Redirects follow the R3 rules for credentials and methods; a streamed request body
   cannot be repeated, so a 307 or 308 for it is an error (`Protocol`), and a 301, 302 or 303 turns it into a GET as before.
 - **`net_client.zig`.** `open(arena, io, options)` returns a `Stream` (status, headers, `read`, `discard`, `close`, `timings`): the head wait is `http.withinClosing`'s (a deadline or cancel frees the call), each wait inside `read` is
   std.Io's readiness wait on the descriptor, which cancels. `Options.upload` (a `Body`: a length and a writer, the shape `broker.Body` had) writes through the queue from the caller's thread; `fetch` takes the same option, so

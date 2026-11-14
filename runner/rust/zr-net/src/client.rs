@@ -211,11 +211,14 @@ fn resolve(base: &Target, location: &str) -> Result<String, Fail> {
     Ok(format!("{scheme}://{}{path}", base.authority()))
 }
 
+/// The methods RFC 9110 (9.2.2) defines as idempotent: sending one twice has the effect of once.
 fn idempotent(m: &Method) -> bool {
-    matches!(*m, Method::GET | Method::HEAD | Method::OPTIONS)
+    matches!(*m, Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE)
 }
 
-/// A request that failed because the connection was closed or reset, not because of anything it said.
+/// A request that failed because the connection was closed or reset, not because of anything it
+/// said. The server may have read, and acted on, the request before that: only an idempotent
+/// method's may be sent again on this evidence (`retry_after`).
 fn is_dead(e: &hyper::Error) -> bool {
     if e.is_closed() || e.is_incomplete_message() {
         return true;
@@ -228,6 +231,20 @@ fn is_dead(e: &hyper::Error) -> bool {
         src = x.source();
     }
     false
+}
+
+/// Whether a request that failed with `e` may be sent again on a connection made now, once.
+/// `e.is_closed()` on a kept connection means the request was never written to it, so any method
+/// may be sent again. The other signs of a dead connection (closed or reset after the request was
+/// written, no complete answer) do not say whether the server acted on it before it went: a POST
+/// could be done twice. Those allow only an idempotent method's (RFC 9110), on a kept connection
+/// or a new one, and not a body the caller writes and the library cannot take back, which is
+/// told to the caller as `Stale` (`once`).
+fn retry_after(e: &hyper::Error, method: &Method, reused: bool, sent: Duration) -> bool {
+    if sent >= Duration::from_millis(200) {
+        return false;
+    }
+    (reused && e.is_closed()) || (is_dead(e) && idempotent(method))
 }
 
 fn tls_kind(e: &std::io::Error) -> Code {
@@ -432,8 +449,8 @@ impl Client {
         let resp = match resp {
             Ok(r) => r,
             // A connection that was closed, or is gone, when the request reached it, so that no
-            // answer came: a kept one (`reused`), or a new one of a GET, which may be sent again, once.
-            Err(e) if !again && is_dead(&e) && sent.elapsed() < Duration::from_millis(200) && (reused || (idempotent(method) && !body.is_stream())) => {
+            // answer came: sent again once, on a new connection, as `retry_after` allows.
+            Err(e) if !again && retry_after(&e, method, reused, sent.elapsed()) && (reused || !body.is_stream()) => {
                 // A body the caller writes has been taken from it, perhaps: it sends it again.
                 if body.is_stream() {
                     return Err((Code::Stale, format!("a kept connection was closed: {e}")));
@@ -647,6 +664,7 @@ mod tests {
     struct Server {
         port: u16,
         accepts: Arc<AtomicU32>,
+        hits: Arc<AtomicU32>,
         /// Delays before the TLS handshake starts and before a response, for the timing tests.
         ca_pem: String,
     }
@@ -656,10 +674,13 @@ mod tests {
         tls_delay: Duration,
         reply_delay: Duration,
         names: Vec<&'static str>,
+        /// Requests to /drop so far: each is read to its end and the connection closed unanswered,
+        /// as a server that did the work and went away.
+        hits: Arc<AtomicU32>,
     }
 
     fn opts() -> Opts {
-        Opts { tls: false, tls_delay: Duration::ZERO, reply_delay: Duration::ZERO, names: vec!["localhost", "127.0.0.1"] }
+        Opts { tls: false, tls_delay: Duration::ZERO, reply_delay: Duration::ZERO, names: vec!["localhost", "127.0.0.1"], hits: Arc::new(AtomicU32::new(0)) }
     }
 
     fn tls_acceptor(names: &[&str]) -> (tokio_rustls::TlsAcceptor, String) {
@@ -734,6 +755,10 @@ mod tests {
                 "/big" => ("200 OK", String::new(), vec![b'x'; 100_000]),
                 "/close" => ("200 OK", "Connection: close\r\n".into(), b"bye".to_vec()),
                 "/nothing" => ("204 No Content", String::new(), vec![]),
+                "/drop" => {
+                    o.hits.fetch_add(1, Ordering::SeqCst);
+                    break;
+                }
                 _ => ("404 Not Found", String::new(), b"{\"message\":\"Not Found\"}".to_vec()),
             };
             let head = format!("HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nX-Test: a\r\n\r\n", body.len());
@@ -756,6 +781,7 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         let accepts = Arc::new(AtomicU32::new(0));
         let (acceptor, ca_pem) = tls_acceptor(&o.names);
+        let hits = o.hits.clone();
         let o = Arc::new(o);
         let n = accepts.clone();
         tokio::spawn(async move {
@@ -780,7 +806,7 @@ mod tests {
                 });
             }
         });
-        Server { port, accepts, ca_pem }
+        Server { port, accepts, hits, ca_pem }
     }
 
     fn client(roots: &str, proxy: Proxy) -> Client {
@@ -832,6 +858,40 @@ mod tests {
         let d = c.run(spec(Method::GET, url("/echo"))).await.ok().unwrap();
         assert!(!d.timings.reused);
         assert_eq!(s.accepts.load(Ordering::SeqCst), 2);
+    }
+
+    /// A kept connection whose server reads a request and closes it without a word: the server may
+    /// have done what the request asked. Only a method that may be repeated is sent again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_the_server_may_have_acted_on_is_sent_again_only_if_its_method_is_idempotent() {
+        let url = |s: &Server, p: &str| format!("http://127.0.0.1:{}{p}", s.port);
+        for (method, again) in [(Method::POST, false), (Method::PATCH, false), (Method::GET, true), (Method::PUT, true), (Method::DELETE, true)] {
+            let s = server(opts()).await;
+            let c = client("", Proxy::default());
+            // The first request leaves a kept connection, which the second one rides.
+            c.run(spec(Method::GET, url(&s, "/echo"))).await.ok().unwrap();
+            let mut sp = spec(method.clone(), url(&s, "/drop"));
+            sp.body = Payload::Bytes(Bytes::from_static(b"create"));
+            let r = c.run(sp).await;
+            assert!(r.is_err(), "{method}: the server never answers");
+            let (hits, accepts) = (s.hits.load(Ordering::SeqCst), s.accepts.load(Ordering::SeqCst));
+            // Sent again once, on a new connection, or not at all.
+            assert_eq!((hits, accepts), if again { (2, 2) } else { (1, 1) }, "{method}");
+        }
+    }
+
+    /// A limit of 0 is no body at all, not no limit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_response_limit_of_zero_allows_no_body() {
+        let s = server(opts()).await;
+        let c = client("", Proxy::default());
+        let url = |p: &str| format!("http://127.0.0.1:{}{p}", s.port);
+        let mut sp = spec(Method::GET, url("/echo"));
+        sp.max_response = 0;
+        assert_eq!(c.run(sp).await.err().map(|e| e.0 .0), Some(Code::BodyTooLarge));
+        let mut sp = spec(Method::GET, url("/nothing"));
+        sp.max_response = 0;
+        assert_eq!(c.run(sp).await.ok().unwrap().status, 204);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

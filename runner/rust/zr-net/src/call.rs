@@ -44,6 +44,8 @@ pub struct RequestSpec {
     pub body: *const u8,
     pub body_len: usize,
     pub max_redirects: u32,
+    /// The most of a response body read, as the call is told: 0 allows no body at all, and
+    /// `usize::MAX` (what a streamed download without a limit passes) is no limit.
     pub max_response: usize,
     /// 0: no limit of its own.
     pub first_byte_ms: u32,
@@ -225,7 +227,7 @@ pub unsafe extern "C" fn zr_net_call_start(c: *mut Arc<Client>, spec: *const Req
         headers,
         body: Payload::Bytes(if up_stream { Bytes::new() } else { Bytes::copy_from_slice(bytes(s.body, s.body_len)) }),
         max_redirects: s.max_redirects,
-        max_response: if s.max_response == 0 { if s.flags & FLAG_STREAM_RESPONSE != 0 { usize::MAX } else { 16 << 20 } } else { s.max_response },
+        max_response: s.max_response,
         first_byte: (s.first_byte_ms != 0).then(|| Duration::from_millis(s.first_byte_ms as u64)),
         read_idle: (s.read_idle_ms != 0).then(|| Duration::from_millis(s.read_idle_ms as u64)),
         fresh: s.flags & FLAG_FRESH != 0,
@@ -482,7 +484,7 @@ mod tests {
             body: std::ptr::null(),
             body_len,
             max_redirects: 3,
-            max_response: 0,
+            max_response: usize::MAX,
             first_byte_ms,
             read_idle_ms,
             flags,
