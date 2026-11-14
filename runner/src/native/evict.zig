@@ -339,10 +339,10 @@ fn listTrees(arena: Allocator, io: std.Io, root: []const u8, budget: *Budget) ![
                 dropUnfinished(arena, io, full, try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir_path, n[0..at] }), budget);
             } else if (std.mem.endsWith(u8, n, ".lock")) {
                 const entry = full[0 .. full.len - ".lock".len];
-                if (!isDir(arena, entry)) dropStray(arena, io, entry);
+                if (!isDir(entry)) dropStray(arena, io, entry);
             } else if (std.mem.endsWith(u8, n, ".size")) {
-                if (!isDir(arena, full[0 .. full.len - ".size".len])) std.Io.Dir.cwd().deleteFile(io, full) catch {};
-            } else if (isDir(arena, full) and isFile(arena, try std.fmt.allocPrint(arena, "{s}.lock", .{full}))) {
+                if (!isDir(full[0 .. full.len - ".size".len])) std.Io.Dir.cwd().deleteFile(io, full) catch {};
+            } else if (isDir(full) and isFile(try std.fmt.allocPrint(arena, "{s}.lock", .{full}))) {
                 if (out.items.len >= max_entries) return out.items;
                 var e = try entryOf(arena, io, full, a, false, false);
                 if (std.mem.eql(u8, a, "oci/images")) e.rank_s += image_grace_s;
@@ -435,7 +435,7 @@ fn treesWait(arena: Allocator, io: std.Io, root: []const u8) bool {
 pub fn isDirEntry(arena: Allocator, parent: []const u8, e: std.Io.Dir.Entry) bool {
     return switch (if (test_unknown_kinds) .unknown else e.kind) {
         .directory => true,
-        .unknown => isDir(arena, std.fmt.allocPrint(arena, "{s}/{s}", .{ parent, e.name }) catch return true),
+        .unknown => isDir(std.fmt.allocPrint(arena, "{s}/{s}", .{ parent, e.name }) catch return true),
         else => false,
     };
 }
@@ -462,7 +462,7 @@ fn jobsInTheWay(arena: Allocator, io: std.Io, root: []const u8) ?Wait {
         seen += 1;
         if (seen > max_jobs) return .too_many_jobs;
         const mark = std.fmt.allocPrint(arena, "{s}/{s}/{s}", .{ jobs, e.name, job_mark }) catch return .job_unreadable;
-        if (isFile(arena, mark)) continue;
+        if (isFile(mark)) continue;
         const path = std.fmt.allocPrint(arena, "{s}/{s}/lock", .{ jobs, e.name }) catch return .job_unreadable;
         const lock = cwd.openFile(io, path, .{}) catch |err| {
             if (err == error.FileNotFound) continue;
@@ -489,7 +489,7 @@ fn dropRefs(arena: Allocator, io: std.Io, root: []const u8) void {
         const hex = manifest["sha256:".len..];
         const base = std.fmt.allocPrint(arena, "{s}/oci/images/{s}", .{ root, hex }) catch return;
         const rootless = std.fmt.allocPrint(arena, "{s}.rootless", .{base}) catch return;
-        if (!isDir(arena, base) and !isDir(arena, rootless)) std.Io.Dir.cwd().deleteFile(io, p) catch {};
+        if (!isDir(base) and !isDir(rootless)) std.Io.Dir.cwd().deleteFile(io, p) catch {};
     }
 }
 
@@ -518,18 +518,18 @@ fn walkKeys(arena: Allocator, io: std.Io, dir: []const u8, out: *std.ArrayList(E
         if (depth == max_key_depth and !std.mem.startsWith(u8, n, nested)) continue;
         const full = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, n });
         // By what it is: a repository may be named `x.lock`.
-        if (!isDir(arena, full)) {
+        if (!isDir(full)) {
             if (std.mem.endsWith(u8, n, ".lock")) {
                 const v = full[0 .. full.len - ".lock".len];
-                if (!isDir(arena, v)) dropStray(arena, io, v);
+                if (!isDir(v)) dropStray(arena, io, v);
             } else if (std.mem.endsWith(u8, n, ".size")) {
                 // A crash between the two removals of `forget`.
-                if (!isDir(arena, full[0 .. full.len - ".size".len])) std.Io.Dir.cwd().deleteFile(io, full) catch {};
+                if (!isDir(full[0 .. full.len - ".size".len])) std.Io.Dir.cwd().deleteFile(io, full) catch {};
             }
             continue;
         }
-        if (!isFile(arena, try std.fmt.allocPrint(arena, "{s}.lock", .{full}))) {
-            if (runners(arena, full)) {
+        if (!isFile(try std.fmt.allocPrint(arena, "{s}.lock", .{full}))) {
+            if (runners(full)) {
                 // The scope is the key's third part: the directory listed at depth 2.
                 const in_untrusted = untrusted or (depth == 2 and std.mem.eql(u8, n, untrusted_scope));
                 try walkKeys(arena, io, full, out, depth + 1, in_untrusted);
@@ -544,7 +544,7 @@ fn walkKeys(arena: Allocator, io: std.Io, dir: []const u8, out: *std.ArrayList(E
 }
 
 fn entryOf(arena: Allocator, io: std.Io, dir: []const u8, area: []const u8, volume: bool, private: bool) !Entry {
-    const used_s = mtime(arena, try std.fmt.allocPrint(arena, "{s}.lock", .{dir})) orelse 0;
+    const used_s = mtime(try std.fmt.allocPrint(arena, "{s}.lock", .{dir})) orelse 0;
     var e: Entry = .{
         .dir = dir,
         .area = area,
@@ -554,7 +554,7 @@ fn entryOf(arena: Allocator, io: std.Io, dir: []const u8, area: []const u8, volu
         .private = private,
     };
     const size = try std.fmt.allocPrint(arena, "{s}.size", .{dir});
-    e.measured_s = mtime(arena, size) orelse 0;
+    e.measured_s = mtime(size) orelse 0;
     if (e.measured_s == 0) return e;
     const f = Store.openPlain(arena, size) orelse return e;
     defer f.close(io);
@@ -582,30 +582,30 @@ fn entryOf(arena: Allocator, io: std.Io, dir: []const u8, area: []const u8, volu
 }
 
 /// Whether `p` is the runner's own: a volume's root is the volumes' range on a root runner.
-fn runners(arena: Allocator, p: []const u8) bool {
+fn runners(p: []const u8) bool {
     var st: linux.Statx = undefined;
-    return lstat(arena, p, &st) and st.uid == linux.geteuid();
+    return lstat(p, &st) and st.uid == linux.geteuid();
 }
 
-fn lstat(arena: Allocator, p: []const u8, st: *linux.Statx) bool {
-    const z = arena.dupeSentinel(u8, p, 0) catch return false;
+/// Allocates nothing: `isDir` and `isFile` are asked whether to delete a stray, and an allocation
+/// that failed said "no".
+fn lstat(p: []const u8, st: *linux.Statx) bool {
+    var buf: [linux.PATH_MAX]u8 = undefined;
+    const z = Store.cPath(&buf, p) orelse return false;
     const mask: linux.STATX = .{ .TYPE = true, .MTIME = true, .UID = true };
     return linux.errno(linux.statx(linux.AT.FDCWD, z, linux.AT.SYMLINK_NOFOLLOW, mask, st)) == .SUCCESS;
 }
 
-fn isDir(arena: Allocator, p: []const u8) bool {
+const isDir = Store.isDir;
+
+fn isFile(p: []const u8) bool {
     var st: linux.Statx = undefined;
-    return lstat(arena, p, &st) and st.mode & linux.S.IFMT == linux.S.IFDIR;
+    return lstat(p, &st) and st.mode & linux.S.IFMT == linux.S.IFREG;
 }
 
-fn isFile(arena: Allocator, p: []const u8) bool {
+fn mtime(p: []const u8) ?i64 {
     var st: linux.Statx = undefined;
-    return lstat(arena, p, &st) and st.mode & linux.S.IFMT == linux.S.IFREG;
-}
-
-fn mtime(arena: Allocator, p: []const u8) ?i64 {
-    var st: linux.Statx = undefined;
-    return if (lstat(arena, p, &st)) st.mtime.sec else null;
+    return if (lstat(p, &st)) st.mtime.sec else null;
 }
 
 /// A lock file whose directory is gone, removed so `volumes/` does not keep every key it ever
@@ -615,7 +615,7 @@ fn dropStray(arena: Allocator, io: std.Io, dir: []const u8) void {
     defer lock.close(io);
     if (!flock(lock, lock_ex | lock_nb)) return;
     const path = std.fmt.allocPrint(arena, "{s}.lock", .{dir}) catch return;
-    if (!Store.sameFile(lock, path) or isDir(arena, dir)) return;
+    if (!Store.sameFile(lock, path) or isDir(dir)) return;
     forget(arena, io, dir);
 }
 
@@ -1263,8 +1263,8 @@ const Fixture = struct {
         try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.utimensat(linux.AT.FDCWD, p, &t, 0)));
     }
 
-    fn there(f: *Fixture, dir: []const u8) bool {
-        return isDir(f.arena(), dir);
+    fn there(_: *Fixture, dir: []const u8) bool {
+        return isDir(dir);
     }
 
     fn deadLeft(f: *Fixture) !usize {
@@ -1798,7 +1798,7 @@ test "native eviction: a job's symlink at runner.lock neither pins its volume no
     f.s.limits = .{ .volumes_max_bytes = 1000, .min_free_pct = 0 };
     run(f.s, testing.io);
     try testing.expect(!f.there(dir));
-    try testing.expect(!isFile(f.arena(), Hostile.p(f, "{s}/new-file", .{outside})));
+    try testing.expect(!isFile(Hostile.p(f, "{s}/new-file", .{outside})));
 }
 
 test "native eviction: sizes a job wrote count for nothing, however large" {
@@ -1965,7 +1965,7 @@ test "native eviction: a job planting something where a volume's lock goes does 
     try Hostile.mkfifo(f, Hostile.p(f, "{s}/runner.lock", .{outer}));
     const v = try volumes.open(f.arena(), io, f.s.root, &key, .shared, null);
     v.release(io);
-    try testing.expect(isFile(f.arena(), Hostile.p(f, "{s}/runner.lock", .{outer})));
+    try testing.expect(isFile(Hostile.p(f, "{s}/runner.lock", .{outer})));
 }
 
 test "native eviction: a volume's path that a job turned into a symlink is not followed" {
@@ -1998,7 +1998,7 @@ test "native eviction: a key's part named like a lock is no sibling's lock" {
     const twin = [_][]const u8{ "o", "r", "repo", "toolcache", "foo.lock" };
     const w = try volumes.open(arena, testing.io, f.s.root, &twin, .shared, null);
     w.release(testing.io);
-    try testing.expect(isFile(arena, Hostile.p(f, "{s}.lock", .{v.dir})));
+    try testing.expect(isFile(Hostile.p(f, "{s}.lock", .{v.dir})));
     const again = try volumes.open(arena, testing.io, f.s.root, &key, .shared, null);
     again.release(testing.io);
     for ([_][]const u8{ "x.size", ".dead-1", "y.private-0123456789abcdef" }) |bad| {
@@ -2039,14 +2039,13 @@ test "native eviction: a directory with no lock beside it is walked only as a ke
 test "native eviction: a symlink swapped into a key's part does not reach another repository" {
     const f = try Fixture.init();
     defer f.deinit();
-    const arena = f.arena();
     const cwd = std.Io.Dir.cwd();
     const other = try f.volume("npm", 10, 30);
     const job = Hostile.p(f, "{s}/volumes/o/mine/repo/name", .{f.s.root});
     try cwd.createDirPath(testing.io, job);
     try cwd.symLink(testing.io, std.fs.path.dirname(other).?, Hostile.p(f, "{s}/sub", .{job}), .{});
     // What the walk would have seen before the swap.
-    const used_s = mtime(arena, Hostile.p(f, "{s}.lock", .{other})).?;
+    const used_s = mtime(Hostile.p(f, "{s}.lock", .{other})).?;
     const e: Entry = .{
         .dir = Hostile.p(f, "{s}/sub/npm", .{job}),
         .area = "volumes",
@@ -2244,7 +2243,7 @@ test "native eviction: past its deadline the floor measures nothing more" {
     var synced = true;
     var budget: Budget = .init(testing.io, -1);
     try testing.expect(!floor(arena, testing.io, f.s.root, try listVolumes(arena, testing.io, f.s.root), &left, f.s.limits, &budget, &synced));
-    for (dirs) |d| try testing.expect(!isFile(arena, Hostile.p(f, "{s}.size", .{d})));
+    for (dirs) |d| try testing.expect(!isFile(Hostile.p(f, "{s}.size", .{d})));
 }
 
 const OciStore = @import("oci/Store.zig");
@@ -2558,7 +2557,7 @@ test "native eviction: a late floor passes over a volume never measured for one 
     var budget: Budget = .init(testing.io, -1);
     try testing.expect(floor(arena, testing.io, f.s.root, try listVolumes(arena, testing.io, f.s.root), &left, f.s.limits, &budget, &synced));
     try testing.expect(f.there(unknown) and !f.there(known));
-    try testing.expect(!isFile(arena, Hostile.p(f, "{s}.size", .{unknown})));
+    try testing.expect(!isFile(Hostile.p(f, "{s}.size", .{unknown})));
 }
 
 test "native eviction: repositories whose names were rewritten do not share a volume" {

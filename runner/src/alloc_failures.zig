@@ -143,6 +143,31 @@ fn checkEachAllocationFailure(comptime f: anytype, args: anytype) !void {
     }
 }
 
+/// For code whose failure to allocate is no error to its caller, but a step it does not take
+/// (`Store.collect`, which evicts what it can): `f` runs once per allocation with that one failing,
+/// and must find for itself what it expects after. Only an error other than `error.OutOfMemory`,
+/// or memory not freed, fails here.
+pub fn checkEach(comptime f: anytype, args: anytype) !void {
+    var n: usize = 0;
+    {
+        var once: FailOnce = .{ .child = std.heap.smp_allocator };
+        try @call(.auto, f, .{once.allocator()} ++ args);
+        try once.checkFreed();
+        n = once.count;
+    }
+    var i: usize = 0;
+    while (i < n) : (i += stride()) {
+        var once: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i };
+        @call(.auto, f, .{once.allocator()} ++ args) catch |e| if (e != error.OutOfMemory) {
+            std.debug.print("allocation failures: allocation {d} of {d} failing, the run failed, made at:\n", .{ i, n });
+            var again: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i, .trace = true };
+            _ = @call(.auto, f, .{again.allocator()} ++ args) catch {};
+            return e;
+        };
+        try once.checkFreed();
+    }
+}
+
 /// `checkAllAllocationFailures` for code that falls back when an allocation fails, on purpose:
 /// an arena reset with `.retain_capacity` tries one larger block and keeps what it has when that
 /// fails. Every failure from one on must end in `error.OutOfMemory` or in an answer, never in
