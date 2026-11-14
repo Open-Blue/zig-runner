@@ -49,6 +49,12 @@ export "CC_${triple//-/_}=$here/zig-cc.sh"
 export "AR_${triple//-/_}=${AR_ZIG:-ar}"
 export "CARGO_TARGET_${upper}_LINKER=$here/zig-cc.sh"
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PWD/target}
+# In a job, cargo's registry and crate cache go in the job's own temp directory: a self-hosted
+# runner's $HOME/.cargo can belong to another user (main's first Rust build failed there with
+# "Permission denied"), and one job's downloaded crates are not meant to reach another's build.
+if [[ -n ${RUNNER_TEMP:-} && -z ${CARGO_HOME:-} ]]; then
+	export CARGO_HOME=$RUNNER_TEMP/cargo-home
+fi
 if [[ $libc == tsan ]]; then
 	# With --target, RUSTFLAGS reach the target's crates and not the build scripts (host tools), and
 	# -Zbuild-std rebuilds std, core and alloc with the sanitizer: an uninstrumented std would hide
