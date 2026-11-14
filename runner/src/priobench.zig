@@ -1,4 +1,4 @@
-//! The measurement harness for job priority (#PRIO, `tools/priority-bench.sh`): runs the pool's real
+//! The measurement harness for job priority (#549, `tools/priority-bench.sh`): runs the pool's real
 //! priority code against cgroups the script made, so that what is measured is what the runner does.
 //!
 //!     priobench weights <job cgroup> <level> [protect MB]    cpu.weight, io.weight, memory.low

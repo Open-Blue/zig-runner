@@ -5709,7 +5709,7 @@ test "an image pull's downloads at once: the layers, the cores the other jobs le
     try std.testing.expectEqualStrings("memory or pressure at the gate", why);
 }
 
-// ---- Job priority (#544) ----
+// ---- Job priority (#549) ----
 
 test "priority: the job waiting longest is no longer first when a higher one waits; equal levels keep arrival order" {
     var slots: [6]Admission.Slot = undefined;

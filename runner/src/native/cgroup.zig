@@ -705,7 +705,7 @@ pub const Job = struct {
         }
     }
 
-    /// What a job's priority gives it (`priority.zig`, #544): `cpu.weight` and `io.weight` by level,
+    /// What a job's priority gives it (`priority.zig`, #549): `cpu.weight` and `io.weight` by level,
     /// and for a high one a `memory.low` of `protect_bytes`, which the kernel honours only as far as
     /// the parent's own is set (`Admission.syncProtection`). Each is best effort and reported
     /// in the result: a controller that is not delegated, or an I/O scheduler that ignores

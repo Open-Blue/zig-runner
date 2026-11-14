@@ -1,4 +1,4 @@
-//! Job priority, a zig-runner extension GitHub Actions does not have (#544).
+//! Job priority, a zig-runner extension GitHub Actions does not have (#549).
 //!
 //! GitHub's broker hands a runner jobs in its own order and the runner cannot change it. Inside a
 //! pool, though, jobs already handed out wait for room at the memory gate (`admission.zig`) and then
