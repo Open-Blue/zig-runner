@@ -79,7 +79,7 @@ pub const Options = struct {
         const sw = o.memory_swap orelse return .none;
         if (sw < 0) return .unlimited;
         const m = o.memory orelse return .none;
-        const asked: u64 = @intCast(sw);
+        const asked = std.math.cast(u64, sw) orelse return .none;
         return if (asked > m) .{ .bytes = asked - m } else .none;
     }
 
