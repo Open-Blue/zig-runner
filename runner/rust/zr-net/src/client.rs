@@ -2,13 +2,15 @@
 //! pool, connector and timers, so the figures of the `request:` line are exact: DNS is timed around
 //! the resolver, connect around the TCP connect (`TCP_NODELAY`, keepalive and `TCP_USER_TIMEOUT` set
 //! there), TLS around the handshake, first byte from the request being handed to the connection to
-//! the response's head. Whole bodies in R3 (streaming is R4). Redirects are followed here, and the
-//! credentials stay behind when one leaves the origin.
+//! the response's head. Bodies are read whole (`run`) or streamed (`open` and `pump`, R4, through
+//! `body.rs`'s bounded queues). Redirects are followed here, and the credentials stay behind when
+//! one leaves the origin.
+use crate::body::{DownStream, Payload, ReqBody};
 use crate::proxy::Proxy;
 use crate::roots;
 use http::{header, HeaderName, HeaderValue, Method, Uri};
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
+use http_body_util::BodyExt;
+use hyper::body::{Bytes, Incoming};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
@@ -45,6 +47,9 @@ pub enum Code {
     Proxy = 16,
     Io = 17,
     Config = 18,
+    /// A kept connection that turned out to be closed after part of a streamed body had been taken
+    /// from the caller: the body cannot be repeated here, the caller sends it again.
+    Stale = 19,
 }
 
 pub type Fail = (Code, String);
@@ -92,7 +97,7 @@ struct Key {
 }
 
 struct Idle {
-    sender: http1::SendRequest<Full<Bytes>>,
+    sender: http1::SendRequest<ReqBody>,
     since: Instant,
     dns: u64,
     connect: u64,
@@ -108,11 +113,23 @@ pub struct Spec {
     pub method: Method,
     pub url: String,
     pub headers: Vec<(HeaderName, HeaderValue)>,
-    pub body: Bytes,
+    pub body: Payload,
     pub max_redirects: u32,
     pub max_response: usize,
     pub first_byte: Option<Duration>,
     pub read_idle: Option<Duration>,
+    /// A connection made for this request, not one the pool kept (a streamed body sent again after a
+    /// kept connection turned out to be dead).
+    pub fresh: bool,
+}
+
+/// A response whose head has been read: its body is still on the connection.
+pub struct Head {
+    pub parts: http::response::Parts,
+    pub incoming: Incoming,
+    pub minor: u8,
+    key: Key,
+    idle: Idle,
 }
 
 pub struct Done {
@@ -189,6 +206,25 @@ fn resolve(base: &Target, location: &str) -> Result<String, Fail> {
         format!("{dir}{location}")
     };
     Ok(format!("{scheme}://{}{path}", base.authority()))
+}
+
+fn idempotent(m: &Method) -> bool {
+    matches!(*m, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
+/// A request that failed because the connection was closed or reset, not because of anything it said.
+fn is_dead(e: &hyper::Error) -> bool {
+    if e.is_closed() || e.is_incomplete_message() {
+        return true;
+    }
+    let mut src = std::error::Error::source(e);
+    while let Some(x) = src {
+        if let Some(io) = x.downcast_ref::<std::io::Error>() {
+            return matches!(io.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionAborted);
+        }
+        src = x.source();
+    }
+    false
 }
 
 fn tls_kind(e: &std::io::Error) -> Code {
@@ -311,7 +347,7 @@ impl Client {
             tls_ns = ns(started.elapsed());
             stream = Box::new(tls);
         }
-        let (sender, conn) = http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
+        let (sender, conn) = http1::handshake::<_, ReqBody>(TokioIo::new(stream))
             .await
             .map_err(|e| (Code::Protocol, format!("HTTP/1.1 handshake: {e}")))?;
         tokio::spawn(async move {
@@ -340,12 +376,13 @@ impl Client {
         }
     }
 
-    /// One request to one origin, no redirects.
+    /// One request to one origin, no redirects: the response's head, its body still unread.
     #[allow(clippy::too_many_arguments)]
-    async fn once(&self, target: &Target, method: &Method, headers: &[(HeaderName, HeaderValue)], body: &Bytes, spec: &Spec, t: &mut Timings) -> Result<(http::response::Parts, Vec<u8>, u8), Fail> {
+    async fn once(&self, target: &Target, method: &Method, headers: &[(HeaderName, HeaderValue)], body: &Payload, spec: &Spec, t: &mut Timings, again: bool) -> Result<Head, Fail> {
         let via = self.settings.proxy.for_url(target.https, &target.host, target.port).cloned();
         let key = Key { https: target.https, host: target.host.clone(), port: target.port, proxy: via.as_ref().map(|p| (p.host.clone(), p.port)) };
-        let (mut idle, reused) = match self.take(&key) {
+        let kept = if spec.fresh { None } else { self.take(&key) };
+        let (mut idle, reused) = match kept {
             Some(i) => (i, true),
             None => self.connect(target, via.as_ref()).await?,
         };
@@ -370,13 +407,13 @@ impl Client {
         if !body.is_empty() || matches!(*method, Method::POST | Method::PUT | Method::PATCH) {
             h.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
         }
-        let req = req.body(Full::new(body.clone())).map_err(|e| (Code::Protocol, e.to_string()))?;
+        let req = req.body(body.body()).map_err(|e| (Code::Protocol, e.to_string()))?;
 
         let sent = Instant::now();
         let ready = idle.sender.ready().await;
         if ready.is_err() && reused {
             // The kept connection was closed since: nothing was sent, so a new one is no repeat.
-            return self.fresh(target, via.as_ref(), method, headers, body, spec, t).await;
+            return self.fresh(target, via.as_ref(), method, headers, body, spec, t, again).await;
         }
         ready.map_err(|e| (Code::Io, format!("connection: {e}")))?;
         let send = idle.sender.send_request(req);
@@ -386,18 +423,100 @@ impl Client {
         };
         let resp = match resp {
             Ok(r) => r,
-            Err(e) if reused && e.is_closed() && sent.elapsed() < Duration::from_millis(200) => {
-                // A kept connection that turns out to be closed: the request never reached anyone.
-                return self.fresh(target, via.as_ref(), method, headers, body, spec, t).await;
+            // A connection that was closed, or is gone, when the request reached it, so that no
+            // answer came: a kept one (`reused`), or a new one of a GET, which may be sent again, once.
+            Err(e) if !again && is_dead(&e) && sent.elapsed() < Duration::from_millis(200) && (reused || (idempotent(method) && !body.is_stream())) => {
+                // A body the caller writes has been taken from it, perhaps: it sends it again.
+                if body.is_stream() {
+                    return Err((Code::Stale, format!("a kept connection was closed: {e}")));
+                }
+                return self.fresh(target, via.as_ref(), method, headers, body, spec, t, again).await;
             }
             Err(e) => return Err((Code::Io, format!("{e}"))),
         };
         t.ttfb = ns(sent.elapsed());
-        let (parts, mut incoming) = resp.into_parts();
+        let (parts, incoming) = resp.into_parts();
         let minor = if parts.version == http::Version::HTTP_10 { 0 } else { 1 };
+        Ok(Head { parts, incoming, minor, key, idle })
+    }
+
+    /// The same request on a connection made now, after a kept one turned out to be closed.
+    #[allow(clippy::too_many_arguments)]
+    fn fresh<'a>(&'a self, target: &'a Target, via: Option<&'a crate::proxy::Target>, method: &'a Method, headers: &'a [(HeaderName, HeaderValue)], body: &'a Payload, spec: &'a Spec, t: &'a mut Timings, _again: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Head, Fail>> + Send + 'a>> {
+        Box::pin(async move {
+        // The pool entry for this key is dropped with the dead connection; a new one is made by
+        // taking nothing: `once` with an empty pool would loop, so connect here and put it in.
+        let key = Key { https: target.https, host: target.host.clone(), port: target.port, proxy: via.map(|p| (p.host.clone(), p.port)) };
+        self.pool.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        self.once(target, method, headers, body, spec, t, true).await
+        })
+    }
+
+    /// Gives the connection of a response whose body was read to its end back to the pool, unless
+    /// it is one that should not be reused.
+    fn recycle(&self, head: Head) {
+        let keep = head.parts.version != http::Version::HTTP_10
+            && !head.parts.headers.get(header::CONNECTION).is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"close"))
+            && !head.idle.sender.is_closed();
+        if keep {
+            self.put(head.key, head.idle);
+        }
+    }
+
+    /// The whole body of `incoming`, at most `limit` bytes.
+    async fn drain(incoming: &mut Incoming, limit: usize, read_idle: Option<Duration>) -> Result<Vec<u8>, Fail> {
         let mut out = Vec::new();
         loop {
             let next = incoming.frame();
+            let frame = match read_idle {
+                Some(d) => tokio::time::timeout(d, next).await.map_err(|_| (Code::Timeout, format!("the body stopped for {d:?}")))?,
+                None => next.await,
+            };
+            match frame {
+                None => return Ok(out),
+                Some(Err(e)) => return Err((Code::Io, format!("body: {e}"))),
+                Some(Ok(f)) => {
+                    if let Some(d) = f.data_ref() {
+                        if out.len() + d.len() > limit {
+                            return Err((Code::BodyTooLarge, format!("the response is over {limit} bytes")));
+                        }
+                        out.extend_from_slice(d);
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn run(&self, spec: Spec) -> Result<Done, (Fail, Timings)> {
+        let started = Instant::now();
+        let mut t = Timings::default();
+        let r = async {
+            let mut head = self.follow(&spec, &mut t).await?;
+            let body = Self::drain(&mut head.incoming, spec.max_response, spec.read_idle).await?;
+            t.bytes_in += body.len() as u64;
+            let (parts, minor) = (head.parts.clone(), head.minor);
+            self.recycle(head);
+            Ok::<_, Fail>((parts, body, minor))
+        }
+        .await;
+        t.total = ns(started.elapsed());
+        match r {
+            Ok((parts, body, minor)) => Ok(Done { status: parts.status.as_u16(), headers: header_lines(&parts), body, minor, timings: t }),
+            Err(f) => Err((f, t)),
+        }
+    }
+
+    /// A request answered with its head, redirects followed: the body is read by `pump`.
+    pub async fn open(&self, spec: &Spec, t: &mut Timings) -> Result<Head, Fail> {
+        self.follow(spec, t).await
+    }
+
+    /// Reads the body of `head` into `down` as it arrives, at most `spec.max_response` bytes (a
+    /// `usize::MAX` for none), waiting while the caller has not taken what is queued. The
+    /// connection goes back to the pool when the body ended cleanly.
+    pub async fn pump(&self, mut head: Head, spec: &Spec, down: &DownStream, t: &mut Timings) -> Result<(), Fail> {
+        loop {
+            let next = head.incoming.frame();
             let frame = match spec.read_idle {
                 Some(d) => tokio::time::timeout(d, next).await.map_err(|_| (Code::Timeout, format!("the body stopped for {d:?}")))?,
                 None => next.await,
@@ -406,72 +525,38 @@ impl Client {
                 None => break,
                 Some(Err(e)) => return Err((Code::Io, format!("body: {e}"))),
                 Some(Ok(f)) => {
-                    if let Some(d) = f.data_ref() {
-                        if out.len() + d.len() > spec.max_response {
+                    if let Ok(d) = f.into_data() {
+                        if d.is_empty() {
+                            continue;
+                        }
+                        t.bytes_in += d.len() as u64;
+                        if t.bytes_in > spec.max_response as u64 {
                             return Err((Code::BodyTooLarge, format!("the response is over {} bytes", spec.max_response)));
                         }
-                        out.extend_from_slice(d);
+                        down.push(d).await;
                     }
                 }
             }
         }
-        t.bytes_in += out.len() as u64;
-        let keep = parts.version != http::Version::HTTP_10
-            && !parts.headers.get(header::CONNECTION).is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"close"))
-            && !idle.sender.is_closed();
-        if keep {
-            self.put(key, idle);
-        }
-        Ok((parts, out, minor))
+        self.recycle(head);
+        Ok(())
     }
 
-    /// The same request on a connection made now, after a kept one turned out to be closed.
-    #[allow(clippy::too_many_arguments)]
-    fn fresh<'a>(&'a self, target: &'a Target, via: Option<&'a crate::proxy::Target>, method: &'a Method, headers: &'a [(HeaderName, HeaderValue)], body: &'a Bytes, spec: &'a Spec, t: &'a mut Timings) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(http::response::Parts, Vec<u8>, u8), Fail>> + Send + 'a>> {
-        Box::pin(async move {
-        // The pool entry for this key is dropped with the dead connection; a new one is made by
-        // taking nothing: `once` with an empty pool would loop, so connect here and put it in.
-        let key = Key { https: target.https, host: target.host.clone(), port: target.port, proxy: via.map(|p| (p.host.clone(), p.port)) };
-        self.pool.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
-        self.once(target, method, headers, body, spec, t).await
-        })
-    }
-
-    pub async fn run(&self, spec: Spec) -> Result<Done, (Fail, Timings)> {
-        let started = Instant::now();
-        let mut t = Timings::default();
-        let r = self.follow(&spec, &mut t).await;
-        t.total = ns(started.elapsed());
-        match r {
-            Ok((parts, body, minor)) => {
-                let mut headers = Vec::new();
-                for (n, v) in parts.headers.iter() {
-                    headers.extend_from_slice(n.as_str().as_bytes());
-                    headers.extend_from_slice(b": ");
-                    headers.extend_from_slice(v.as_bytes());
-                    headers.push(b'\n');
-                }
-                Ok(Done { status: parts.status.as_u16(), headers, body, minor, timings: t })
-            }
-            Err(f) => Err((f, t)),
-        }
-    }
-
-    async fn follow(&self, spec: &Spec, t: &mut Timings) -> Result<(http::response::Parts, Vec<u8>, u8), Fail> {
+    async fn follow(&self, spec: &Spec, t: &mut Timings) -> Result<Head, Fail> {
         let mut target = parse_url(&spec.url)?;
         let mut method = spec.method.clone();
         let mut headers = spec.headers.clone();
         let mut body = spec.body.clone();
         loop {
-            let (parts, out, minor) = self.once(&target, &method, &headers, &body, spec, t).await?;
-            let status = parts.status.as_u16();
-            let Some(location) = parts.headers.get(header::LOCATION).and_then(|v| v.to_str().ok()).filter(|_| is_redirect(status)) else {
-                return Ok((parts, out, minor));
+            let mut head = self.once(&target, &method, &headers, &body, spec, t, false).await?;
+            let status = head.parts.status.as_u16();
+            let Some(location) = head.parts.headers.get(header::LOCATION).and_then(|v| v.to_str().ok()).filter(|_| is_redirect(status)).map(str::to_string) else {
+                return Ok(head);
             };
             if t.redirects >= spec.max_redirects {
                 return Err((Code::TooManyRedirects, format!("more than {} redirects", spec.max_redirects)));
             }
-            let next = parse_url(&resolve(&target, location)?)?;
+            let next = parse_url(&resolve(&target, &location)?)?;
             if target.https && !next.https {
                 return Err((Code::Protocol, "a redirect from https to http is refused".into()));
             }
@@ -487,13 +572,31 @@ impl Client {
                 if method != Method::HEAD {
                     method = Method::GET;
                 }
-                body = Bytes::new();
+                body = Payload::Bytes(Bytes::new());
                 headers.retain(|(h, _)| *h != header::CONTENT_TYPE && *h != header::CONTENT_LENGTH);
+            } else if body.is_stream() {
+                return Err((Code::Protocol, format!("a {status} redirect would send a streamed body again")));
+            }
+            // The redirect's own body is read (a little of it) so that its connection can be reused.
+            if let Ok(_small) = Self::drain(&mut head.incoming, 64 * 1024, spec.read_idle).await {
+                self.recycle(head);
             }
             target = next;
             t.redirects += 1;
         }
     }
+}
+
+/// The headers of a response as `name: value\n` lines, names lower-case.
+pub fn header_lines(parts: &http::response::Parts) -> Vec<u8> {
+    let mut headers = Vec::new();
+    for (n, v) in parts.headers.iter() {
+        headers.extend_from_slice(n.as_str().as_bytes());
+        headers.extend_from_slice(b": ");
+        headers.extend_from_slice(v.as_bytes());
+        headers.push(b'\n');
+    }
+    headers
 }
 
 /// Header lines `Name: value\n...` as the caller sends them.
@@ -664,7 +767,7 @@ mod tests {
     }
 
     fn spec(method: Method, url: String) -> Spec {
-        Spec { method, url, headers: vec![], body: Bytes::new(), max_redirects: 3, max_response: 1 << 20, first_byte: None, read_idle: None }
+        Spec { method, url, headers: vec![], body: Payload::Bytes(Bytes::new()), max_redirects: 3, max_response: 1 << 20, first_byte: None, read_idle: None, fresh: false }
     }
 
     fn auth() -> Vec<(HeaderName, HeaderValue)> {
@@ -687,7 +790,7 @@ mod tests {
         // The second request rides the first one's connection, which has no DNS or connect of its own.
         let mut sp = spec(Method::POST, url("/echo"));
         sp.headers = auth();
-        sp.body = Bytes::from_static(b"payload");
+        sp.body = Payload::Bytes(Bytes::from_static(b"payload"));
         let d = c.run(sp).await.ok().unwrap();
         assert_eq!(text(&d), "POST Bearer t0k payload ua=zr-test/1");
         assert!(d.timings.reused && d.timings.connect == UNKNOWN && d.timings.dns == UNKNOWN);
@@ -721,10 +824,10 @@ mod tests {
         assert_eq!(d.timings.redirects, 1);
         // 303 makes a POST a GET without its body; 307 keeps both.
         let mut sp = spec(Method::POST, url("127.0.0.1", "/see-other"));
-        sp.body = Bytes::from_static(b"data");
+        sp.body = Payload::Bytes(Bytes::from_static(b"data"));
         assert_eq!(text(&c.run(sp).await.ok().unwrap()), "GET -  ua=zr-test/1");
         let mut sp = spec(Method::POST, url("127.0.0.1", "/temporary"));
-        sp.body = Bytes::from_static(b"data");
+        sp.body = Payload::Bytes(Bytes::from_static(b"data"));
         assert_eq!(text(&c.run(sp).await.ok().unwrap()), "POST - data ua=zr-test/1");
         // A loop ends at the limit, with its own error; 0 redirects returns the 302 itself.
         let Err(((code, _), t)) = c.run(spec(Method::GET, url("127.0.0.1", "/loop"))).await else { panic!() };

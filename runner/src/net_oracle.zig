@@ -1,10 +1,12 @@
 //! The std client as the oracle of the network library's (docs/rust-net.md, "Validation"): the same
 //! requests against `github/testserver.zig` through both, and the same status and body, and the
 //! headers that mean something, from each. Kept until the std client's last use goes (R6); every
-//! later PR extends the script with its call sites' shapes. Where the two must differ, the case says
+//! later PR extends the script with its call sites' shapes (R4: streamed downloads and uploads, and
+//! the registry's pull flow). Where the two must differ, the case says
 //! so and what each does: a difference nobody wrote down fails.
 const std = @import("std");
 const Io = std.Io;
+const broker = @import("github/broker.zig");
 const http = @import("github/http.zig");
 const net_client = @import("net_client.zig");
 const request_log = @import("github/request_log.zig");
@@ -191,4 +193,243 @@ test "oracle: a request nobody answers is given up at its deadline, and cancelli
     const cancelled_at = Io.Clock.awake.now(io);
     try std.testing.expectError(error.Canceled, f.cancel(io));
     try std.testing.expect(cancelled_at.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 5_000);
+}
+
+// --- R4: downloads, uploads, the registry ---
+
+/// FNV-1a of a download's bytes, taken as they arrive: what is compared, so that neither side needs
+/// the whole body in memory to be checked (the std side holds it, being the oracle).
+const Hash = testserver.Sink;
+
+fn expectedBlob(n: u64) Hash {
+    var h: Hash = .{};
+    var chunk: [4096]u8 = undefined;
+    var at: u64 = 0;
+    while (at < n) {
+        const len: usize = @intCast(@min(n - at, chunk.len));
+        for (chunk[0..len], 0..) |*c, i| c.* = testserver.blobByte(at + i);
+        h.add(chunk[0..len]);
+        at += len;
+    }
+    return h;
+}
+
+const Download = struct { status: u16, hash: Hash, peak: usize = 0 };
+
+fn downloadViaStd(arena: std.mem.Allocator, io: Io, url: []const u8, token: ?[]const u8) !Download {
+    var local: std.http.Client = .{ .allocator = arena, .io = io };
+    defer local.deinit();
+    var resp: Io.Writer.Allocating = .init(arena);
+    const r = try http.fetch(&local, .{
+        .location = .{ .url = url },
+        .headers = if (token) |a| .{ .authorization = .{ .override = a } } else .{},
+        .response_writer = &resp.writer,
+    });
+    var h: Hash = .{};
+    h.add(resp.written());
+    return .{ .status = @backingInt(r.status), .hash = h };
+}
+
+fn downloadViaLibrary(arena: std.mem.Allocator, io: Io, url: []const u8, token: ?[]const u8, read_size: usize) !Download {
+    var s = try net_client.open(arena, io, .{
+        .url = url,
+        .headers = if (token) |a| &.{.{ .name = "Authorization", .value = a }} else &.{},
+        .max_response = 1 << 30,
+    });
+    defer s.close();
+    var h: Hash = .{};
+    const buf = try arena.alloc(u8, read_size);
+    while (true) {
+        const n = try s.read(buf);
+        if (n == 0) break;
+        h.add(buf[0..n]);
+    }
+    return .{ .status = @backingInt(s.status), .hash = h, .peak = s.queuePeak() };
+}
+
+test "oracle: a download is the same bytes through std's client and the library's stream, in bounded memory" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    const sizes = [_]u64{ 0, 1, 4095, 70_000, 24 << 20 };
+    for (sizes) |n| {
+        errdefer std.debug.print("size: {d}\n", .{n});
+        var url_buf: [96]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/blob/{d}", .{ server.port, n });
+        const want = expectedBlob(n);
+        const old = try downloadViaStd(arena, io, url, null);
+        // Reads of 1 byte-ish sizes, a page, and a big one: the same bytes whatever the reader asks.
+        for ([_]usize{ 1000, 64 * 1024, 1 << 20 }) |rs| {
+            const lib = try downloadViaLibrary(arena, io, url, null, rs);
+            try std.testing.expectEqual(@as(u16, 200), lib.status);
+            try std.testing.expectEqual(want.bytes, lib.hash.bytes);
+            try std.testing.expectEqual(want.hash, lib.hash.hash);
+            // The memory a download costs does not depend on its size: the queue's bound (1 MiB and
+            // one read of hyper's), where std's client was handed a writer that held all of it.
+            try std.testing.expect(lib.peak < (1 << 20) + 512 * 1024);
+        }
+        try std.testing.expectEqual(@as(u16, 200), old.status);
+        try std.testing.expectEqual(want.hash, old.hash.hash);
+        try std.testing.expectEqual(want.bytes, old.hash.bytes);
+    }
+}
+
+test "oracle: a download redirected to another host: the library takes the token away, std keeps it" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/to-cdn/5000", .{server.port});
+    const want = expectedBlob(5000);
+    // With the token: the CDN (a signed URL) refuses a token it was not made for. The library does not
+    // send it; std 0.17 does (the difference "a redirect to another host name takes the token away"
+    // found in R3, now on a download), which registry.zig worked around by following redirects by hand.
+    const lib = try downloadViaLibrary(arena, io, url, "Bearer t0k", 65536);
+    try std.testing.expectEqual(@as(u16, 200), lib.status);
+    try std.testing.expectEqual(want.hash, lib.hash.hash);
+    const old = try downloadViaStd(arena, io, url, "Bearer t0k");
+    try std.testing.expectEqual(@as(u16, 403), old.status);
+    // Without one, both are the same.
+    const lib2 = try downloadViaLibrary(arena, io, url, null, 65536);
+    const old2 = try downloadViaStd(arena, io, url, null);
+    try std.testing.expectEqual(old2.status, lib2.status);
+    try std.testing.expectEqual(old2.hash.hash, lib2.hash.hash);
+}
+
+const Pattern = struct {
+    len: usize,
+
+    fn write(ptr: *const anyopaque, w: *Io.Writer) anyerror!void {
+        const p: *const Pattern = @ptrCast(@alignCast(ptr));
+        var chunk: [7000]u8 = undefined;
+        var at: usize = 0;
+        while (at < p.len) {
+            const len = @min(p.len - at, chunk.len);
+            for (chunk[0..len], 0..) |*c, i| c.* = testserver.blobByte(at + i);
+            try w.writeAll(chunk[0..len]);
+            at += len;
+        }
+    }
+};
+
+test "oracle: an upload written as it is sent arrives as the same bytes through std's client and the library's" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/sink", .{server.port});
+    for ([_]usize{ 0, 1, 1000, 70_000, 5 << 20 }) |n| {
+        errdefer std.debug.print("size: {d}\n", .{n});
+        var expect_buf: [64]u8 = undefined;
+        const want = expectedBlob(n);
+        const expect = try std.fmt.bufPrint(&expect_buf, "{d} {x:0>16}", .{ want.bytes, want.hash });
+        const pattern: Pattern = .{ .len = n };
+        const body: net_client.Body = .{ .len = n, .ptr = &pattern, .writeFn = Pattern.write };
+        const lib = try net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = body, .headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }} });
+        try std.testing.expectEqual(std.http.Status.ok, lib.status);
+        try std.testing.expectEqualStrings(expect, lib.body);
+        const old = try broker.request(arena, io, .PUT, url, null, .{ .body = body, .content_type = "text/plain" });
+        try std.testing.expectEqual(std.http.Status.ok, old.status);
+        try std.testing.expectEqualStrings(expect, old.body);
+    }
+    // A body held in memory, as the other calls send it, the same.
+    const held = try arena.alloc(u8, 3 << 20);
+    for (held, 0..) |*c, i| c.* = testserver.blobByte(i);
+    const lib = try net_client.fetch(arena, io, .{ .method = .POST, .url = url, .payload = held });
+    var want: Hash = .{};
+    want.add(held);
+    var expect_buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect_buf, "{d} {x:0>16}", .{ want.bytes, want.hash }), lib.body);
+}
+
+test "oracle: an upload whose writer stops short or fails is an error, not a hung request" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/sink", .{server.port});
+    const Short = struct {
+        fn write(_: *const anyopaque, w: *Io.Writer) anyerror!void {
+            try w.writeAll("only this");
+        }
+        fn fail(_: *const anyopaque, w: *Io.Writer) anyerror!void {
+            try w.writeAll("this much");
+            return error.LogChangedWhileUploaded;
+        }
+    };
+    var unused: u8 = 0;
+    const short: net_client.Body = .{ .len = 100, .ptr = &unused, .writeFn = Short.write };
+    try std.testing.expectError(error.UploadFailed, net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = short, .deadline = .fromSeconds(5) }));
+    const failing: net_client.Body = .{ .len = 100, .ptr = &unused, .writeFn = Short.fail };
+    try std.testing.expectError(error.UploadFailed, net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = failing, .deadline = .fromSeconds(5) }));
+}
+
+test "oracle: a streamed download's request line has the whole body's bytes and the final figures" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    var captured: Io.Writer.Allocating = .init(arena);
+    request_log.capture = &captured;
+    request_log.enabled.store(true, .monotonic);
+    defer {
+        request_log.enabled.store(false, .monotonic);
+        request_log.capture = null;
+    }
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/blob/300000?sig=secret", .{server.port});
+    _ = try downloadViaLibrary(arena, std.testing.io, url, "Bearer secret-token", 4096);
+    const line = captured.written();
+    errdefer std.debug.print("line: {s}\n", .{line});
+    // One line, written when the body ended, with its size; nothing of the query or the token.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "request: "));
+    try std.testing.expect(std.mem.startsWith(u8, line, "request: host=127.0.0.1 method=GET path=/blob/300000 status=200 "));
+    try std.testing.expect(std.mem.indexOf(u8, line, " bytes_in=300000 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "secret") == null);
+}
+
+test "oracle: a stream closed before its end gives up its connection and still logs its line" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    var captured: Io.Writer.Allocating = .init(arena);
+    request_log.capture = &captured;
+    request_log.enabled.store(true, .monotonic);
+    defer {
+        request_log.enabled.store(false, .monotonic);
+        request_log.capture = null;
+    }
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/blob/{d}", .{ server.port, 8 << 20 });
+    var s = try net_client.open(arena, std.testing.io, .{ .url = url, .max_response = 1 << 30 });
+    var buf: [1000]u8 = undefined;
+    try std.testing.expect((try s.read(&buf)) > 0);
+    s.close();
+    s.close();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, captured.written(), "request: "));
+    try std.testing.expect(std.mem.indexOf(u8, captured.written(), "status=200") != null);
+    // The server's thread is still serving: a next request is answered.
+    const again = try net_client.fetch(arena, std.testing.io, .{ .url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/echo", .{server.port}) });
+    try std.testing.expectEqual(std.http.Status.ok, again.status);
 }

@@ -269,17 +269,15 @@ test "native oci pull: token auth with credentials, an index, gzip and zstd laye
     var server: Server = .{ .routes = img.routes, .private = true };
     try server.start();
     defer server.stop();
-    var client: std.http.Client = .{ .allocator = testing.allocator, .io = io };
-    defer client.deinit();
     const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(io, ".", arena) };
 
     // Without credentials: refused, saying why.
     var why: []const u8 = "";
-    try testing.expectError(error.Unauthorized, image.pull(arena, testing.allocator, io, &client, store, .{ .image = try server.image(arena, "test/img:1"), .owners = false }, &why));
+    try testing.expectError(error.Unauthorized, image.pull(arena, testing.allocator, io, store, .{ .image = try server.image(arena, "test/img:1"), .owners = false }, &why));
     try testing.expect(std.mem.indexOf(u8, why, "credentials") != null);
 
     why = "";
-    const got = image.pull(arena, testing.allocator, io, &client, store, .{
+    const got = image.pull(arena, testing.allocator, io, store, .{
         .image = try server.image(arena, "test/img:1"),
         .creds = .{ .username = "user", .password = "pass" },
         .owners = false,
@@ -309,7 +307,7 @@ test "native oci pull: token auth with credentials, an index, gzip and zstd laye
 
     // By tag again: the manifest is asked for (a tag moves), the blobs and rootfs are not.
     const before = server.requests.load(.acquire);
-    const again = try image.pull(arena, testing.allocator, io, &client, store, .{
+    const again = try image.pull(arena, testing.allocator, io, store, .{
         .image = try server.image(arena, "test/img:1"),
         .creds = .{ .username = "user", .password = "pass" },
         .owners = false,
@@ -319,9 +317,9 @@ test "native oci pull: token auth with credentials, an index, gzip and zstd laye
     try testing.expect(server.requests.load(.acquire) - before <= 4);
     // Pinned by the index's digest, once seen: no request at all.
     const pinned = try std.fmt.allocPrint(arena, "{s}@{s}", .{ try server.image(arena, "test/img:1"), img.index });
-    _ = try image.pull(arena, testing.allocator, io, &client, store, .{ .image = pinned, .creds = .{ .username = "user", .password = "pass" }, .owners = false }, &why);
+    _ = try image.pull(arena, testing.allocator, io, store, .{ .image = pinned, .creds = .{ .username = "user", .password = "pass" }, .owners = false }, &why);
     const seen = server.requests.load(.acquire);
-    const cached = try image.pull(arena, testing.allocator, io, &client, store, .{ .image = pinned, .owners = false }, &why);
+    const cached = try image.pull(arena, testing.allocator, io, store, .{ .image = pinned, .owners = false }, &why);
     try testing.expectEqual(seen, server.requests.load(.acquire));
     try testing.expectEqualStrings(got.rootfs, cached.rootfs);
 }
@@ -344,11 +342,9 @@ test "native oci pull: a blob that does not match its digest is refused and not 
     var server: Server = .{ .routes = routes };
     try server.start();
     defer server.stop();
-    var client: std.http.Client = .{ .allocator = testing.allocator, .io = io };
-    defer client.deinit();
     const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(io, ".", arena) };
     var why: []const u8 = "";
-    try testing.expectError(error.DigestMismatch, image.pull(arena, testing.allocator, io, &client, store, .{ .image = try server.image(arena, "test/bad:1"), .owners = false }, &why));
+    try testing.expectError(error.DigestMismatch, image.pull(arena, testing.allocator, io, store, .{ .image = try server.image(arena, "test/bad:1"), .owners = false }, &why));
     try testing.expect(std.mem.indexOf(u8, why, "hashing to") != null);
     var blobs = try tmp.dir.openDir(io, "oci/blobs/sha256", .{ .iterate = true });
     defer blobs.close(io);
@@ -377,10 +373,8 @@ test "native oci pull: a kept-alive connection the registry closed is replaced; 
     var server: Server = .{ .routes = img.routes, .private = true, .stale = true };
     try server.start();
     defer server.stop();
-    var client: std.http.Client = .{ .allocator = testing.allocator, .io = io };
-    defer client.deinit();
     var why: []const u8 = "";
-    const got = image.pull(arena, testing.allocator, io, &client, store, .{
+    const got = image.pull(arena, testing.allocator, io, store, .{
         .image = try server.image(arena, "test/stale:1"),
         .creds = creds,
         .owners = false,
@@ -394,18 +388,17 @@ test "native oci pull: a kept-alive connection the registry closed is replaced; 
     try testing.expect(server.requests.load(.acquire) >= 6);
 
     // A registry that closes every connection unanswered is no stale connection: the pull fails
-    // with the error, once every kept connection the pool could hold has been tried.
+    // with the error, after the one repeat the library makes of a GET that met a closed connection.
     var mute: Server = .{ .routes = img.routes, .mute = true };
     try mute.start();
     defer mute.stop();
     why = "";
-    try testing.expectError(error.HttpConnectionClosing, image.pull(arena, testing.allocator, io, &client, store, .{
+    try testing.expectError(error.NetworkIo, image.pull(arena, testing.allocator, io, store, .{
         .image = try mute.image(arena, "test/stale:2"),
         .owners = false,
     }, &why));
-    try testing.expect(std.mem.indexOf(u8, why, "could not fetch its manifest: HttpConnectionClosing") != null);
-    const tries = mute.requests.load(.acquire);
-    try testing.expectEqual(@import("../../github/http.zig").staleRetries(&client) + 1, tries);
+    try testing.expect(std.mem.indexOf(u8, why, "could not fetch its manifest: NetworkIo") != null);
+    try testing.expectEqual(@as(u32, 2), mute.requests.load(.acquire));
 }
 
 test "native oci pull: a token request reset is sent again, a bounded number of times" {
@@ -420,14 +413,12 @@ test "native oci pull: a token request reset is sent again, a bounded number of 
     const img = try testImage(arena, "test/reset", "1", &.{try t.finish()}, "", false);
     const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(io, ".", arena) };
     const creds: @import("registry.zig").Credentials = .{ .username = "user", .password = "pass" };
-    var client: std.http.Client = .{ .allocator = testing.allocator, .io = io };
-    defer client.deinit();
 
     var server: Server = .{ .routes = img.routes, .private = true, .resets = .init(1) };
     try server.start();
     defer server.stop();
     var why: []const u8 = "";
-    const got = image.pull(arena, testing.allocator, io, &client, store, .{
+    const got = image.pull(arena, testing.allocator, io, store, .{
         .image = try server.image(arena, "test/reset:1"),
         .creds = creds,
         .owners = false,
@@ -438,19 +429,17 @@ test "native oci pull: a token request reset is sent again, a bounded number of 
     try testing.expectEqualStrings(img.manifest, got.manifest);
     try testing.expectEqual(@as(u32, 0), server.resets.load(.acquire));
 
-    // Reset every time: the error stands, once the kept connections could all have been tried.
-    const http = @import("../../github/http.zig");
-    const tries = http.staleRetries(&client) + 1;
-    var always: Server = .{ .routes = img.routes, .private = true, .resets = .init(tries + 5) };
+    // Reset every time: the error stands, after the one repeat the library makes.
+    var always: Server = .{ .routes = img.routes, .private = true, .resets = .init(7) };
     try always.start();
     defer always.stop();
     why = "";
-    try testing.expectError(error.Unauthorized, image.pull(arena, testing.allocator, io, &client, store, .{
+    try testing.expectError(error.Unauthorized, image.pull(arena, testing.allocator, io, store, .{
         .image = try always.image(arena, "test/reset:2"),
         .creds = creds,
         .owners = false,
     }, &why));
-    try testing.expect(std.mem.indexOf(u8, why, "the token service: ReadFailed") != null);
+    try testing.expect(std.mem.indexOf(u8, why, "the token service: NetworkIo") != null);
     try testing.expectEqual(@as(u32, 5), always.resets.load(.acquire));
 }
 
@@ -463,13 +452,11 @@ test "native oci pull of the default image from Docker Hub (ZIG_RUNNER_TEST_PULL
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
-    var client: std.http.Client = .{ .allocator = testing.allocator, .io = io, .write_buffer_size = 16 * 1024 };
-    defer client.deinit();
     const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(io, ".", arena) };
     const dagger = @import("../../dagger.zig");
     var why: []const u8 = "";
     const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
-    const got = image.pull(arena, testing.allocator, io, &client, store, .{
+    const got = image.pull(arena, testing.allocator, io, store, .{
         .image = env.get("ZIG_RUNNER_TEST_PULL_IMAGE") orelse dagger.default_image,
         .owners = std.os.linux.geteuid() == 0,
     }, &why) catch |e| {
@@ -484,14 +471,14 @@ test "native oci pull of the default image from Docker Hub (ZIG_RUNNER_TEST_PULL
     const osr = try root.readFileAlloc(io, "usr/lib/os-release", arena, .limited(4096));
     try testing.expect(std.mem.indexOf(u8, osr, "Ubuntu") != null);
     const t1 = std.Io.Clock.awake.now(io).toMilliseconds();
-    const warm = try image.pull(arena, testing.allocator, io, &client, store, .{ .image = dagger.default_image, .owners = std.os.linux.geteuid() == 0 }, &why);
+    const warm = try image.pull(arena, testing.allocator, io, store, .{ .image = dagger.default_image, .owners = std.os.linux.geteuid() == 0 }, &why);
     std.debug.print("warm (pinned, in the store): {d} ms\n", .{std.Io.Clock.awake.now(io).toMilliseconds() - t1});
     try testing.expect(warm.pulled == null);
     // A pull by tag, so it asks the registry, after the client's kept connections have sat idle
     // past Docker Hub's minute: they are closed, and the pull goes on new ones (razorbill failed
     // here with HttpConnectionClosing). The same client, as the runner's is the process's.
     try io.sleep(.fromSeconds(70), .awake);
-    const idle = image.pull(arena, testing.allocator, io, &client, store, .{
+    const idle = image.pull(arena, testing.allocator, io, store, .{
         .image = "alpine:3.22",
         .owners = std.os.linux.geteuid() == 0,
     }, &why) catch |e| {

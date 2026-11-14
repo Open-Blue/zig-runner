@@ -5,14 +5,16 @@
 //! Auth is the registry's challenge, answered once per pull: a request without credentials, a
 //! `401` naming a `Bearer` realm (a token service, Docker Hub's `auth.docker.io`) or `Basic`, then
 //! the token (asked for with the credentials, as Basic, when there are any) or the credentials
-//! themselves on every request after. Authorization is a privileged header: std's client drops it
-//! on a redirect to another domain (a blob's CDN), as Docker does.
+//! themselves on every request after. Authorization is a privileged header: the network library
+//! (`net_client`, docs/rust-net.md) drops it on a redirect to another origin (a blob's CDN), as
+//! Docker does. Blobs stream: the body is hashed and written to its file as it arrives, through the
+//! library's queue of a fixed size, so a layer of any size costs the same memory.
 //!
 //! Plain HTTP only to a registry on the loopback (`localhost`, `127.0.0.1`, `[::1]`), as Docker
 //! allows by default; a token realm elsewhere must be HTTPS, since the credentials go to it.
 
 const std = @import("std");
-const http = @import("../../github/http.zig");
+const net_client = @import("../../net_client.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = @import("../../sha256.zig").Sha256;
@@ -147,7 +149,7 @@ pub const max_manifest = 4 << 20;
 /// One pull's conversation with a registry: the auth it was asked for, kept for the next request.
 pub const Client = struct {
     arena: Allocator,
-    http: *std.http.Client,
+    io: std.Io,
     ref: Ref,
     creds: ?Credentials,
     /// `Bearer <token>` or `Basic <base64>`, once the registry asked for it.
@@ -233,111 +235,59 @@ pub const Client = struct {
         }
     }
 
-    /// One request, following redirects itself. A 401 sets `challenge` (its `WWW-Authenticate`)
-    /// and returns. The authorization goes to the registry's own host only: never to where a
-    /// redirect leads (a blob's CDN, with a signed URL of its own).
+    /// One request, its redirects followed by the network library (up to `max_redirects`, which
+    /// keeps `Authorization` for the registry's own origin only: never for where a redirect leads, a
+    /// blob's CDN with a signed URL of its own). A 401 sets `challenge` (its `WWW-Authenticate`)
+    /// and returns. The response's content type.
     ///
-    /// A request that meets a kept-alive connection the server has closed is sent again on
-    /// another, up to `http.staleRetries` times (one more than the idle connections the pool
-    /// keeps). Docker Hub closes a connection idle for about a minute, and the runner's client
-    /// is the process's (`http.client`), so its next pull, minutes or hours later, took the dead
-    /// connection from the pool and failed with `HttpConnectionClosing` (razorbill, 2026-11-01).
-    /// Nothing came back on it, so nothing was read into `body`; every other error stands.
+    /// A kept-alive connection the server closed (Docker Hub does, after about a minute idle: the
+    /// runner's next pull, minutes or hours later, found it dead, razorbill 2026-11-01) is replaced
+    /// by the library before anything is sent, or the request sent again on a new one when it was
+    /// refused at once, so there is nothing to retry here.
     fn once(c: *Client, url: []const u8, accept: []const u8, body: *Body, challenge: *?[]const u8) ![]const u8 {
-        var uri = try std.Uri.parse(url);
-        var redirects: u32 = 0;
-        var stale: u32 = 0;
-        while (true) {
-            if (redirects > max_redirects) {
-                c.why = try std.fmt.allocPrint(c.arena, "{s}: too many redirects", .{url});
-                return error.TooManyRedirects;
-            }
-            const next = c.onceAt(uri, accept, body, challenge) catch |e| switch (e) {
-                error.HttpConnectionClosing, error.ResetBeforeHead => if (stale < http.staleRetries(c.http)) {
-                    stale += 1;
-                    continue;
-                } else return if (e == error.ResetBeforeHead) error.ReadFailed else e,
-                else => return e,
-            };
-            uri = next orelse return c.content_type;
-            redirects += 1;
-        }
-    }
-
-    const max_redirects = 5;
-
-    /// One request to `uri`: null when it was answered (its content type in `content_type`), or
-    /// where it redirects to (in the arena).
-    fn onceAt(c: *Client, uri: std.Uri, accept: []const u8, body: *Body, challenge: *?[]const u8) !?std.Uri {
-        // std 0.17's client never sends `privileged_headers`, and keeps `headers.authorization`
-        // across a redirect to another host: redirects are followed here, and the header is
-        // given only to the registry.
-        const own = c.authorization != null and sameOrigin(uri, c.ref);
-        var req = try c.http.request(.GET, uri, .{
-            .headers = .{
-                .accept_encoding = .omit,
-                .user_agent = .{ .override = "zig-runner" },
-                .authorization = if (own) .{ .override = c.authorization.? } else .omit,
-            },
-            .extra_headers = &.{.{ .name = "accept", .value = accept }},
-            .redirect_behavior = .unhandled,
-        });
-        defer req.deinit();
-        errdefer if (req.connection) |conn| {
-            conn.closing = true;
+        const headers = try c.arena.alloc(std.http.Header, if (c.authorization != null) 2 else 1);
+        headers[0] = .{ .name = "Accept", .value = accept };
+        if (c.authorization) |a| headers[1] = .{ .name = "Authorization", .value = a };
+        var stream = net_client.open(c.arena, c.io, .{
+            .url = url,
+            .headers = headers,
+            .max_redirects = max_redirects,
+            .max_response = body.limit(),
+            .deadline = head_deadline,
+            .read_idle = read_idle,
+        }) catch |e| {
+            if (e == error.TooManyRedirects) c.why = try std.fmt.allocPrint(c.arena, "{s}: too many redirects", .{url});
+            return e;
         };
-        try req.sendBodiless();
-        // A kept connection the server closed can also answer with a reset, not an end of
-        // stream: the request reached a socket already gone (seen on arm64 CI, in the stale
-        // test). No head came back, so nothing was read: `once` tries it again too.
-        var res = req.receiveHead(&.{}) catch |e| return switch (e) {
-            error.ReadFailed => error.ResetBeforeHead,
-            else => e,
-        };
-        const status = res.head.status;
+        defer stream.close();
+        const status = stream.status;
         c.content_type = "";
-        var it = res.head.iterateHeaders();
-        var location: ?[]const u8 = null;
-        while (it.next()) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, "www-authenticate") and status == .unauthorized)
-                challenge.* = try c.arena.dupe(u8, h.value);
-            if (std.ascii.eqlIgnoreCase(h.name, "content-type"))
-                c.content_type = try c.arena.dupe(u8, std.mem.trim(u8, h.value[0 .. std.mem.indexOfScalar(u8, h.value, ';') orelse h.value.len], " "));
-            if (std.ascii.eqlIgnoreCase(h.name, "location")) location = try c.arena.dupe(u8, h.value);
+        if (stream.header("content-type")) |ct| {
+            c.content_type = try c.arena.dupe(u8, std.mem.trim(u8, ct[0 .. std.mem.indexOfScalar(u8, ct, ';') orelse ct.len], " "));
         }
-        var transfer: [64]u8 = undefined;
-        const r = res.reader(&transfer);
-        if (status.class() == .redirect) if (location) |loc| {
-            _ = r.discardRemaining() catch {
-                req.connection.?.closing = true;
-            };
-            // Relative to the request's URL.
-            var buf = try c.arena.alloc(u8, loc.len + 2048);
-            @memcpy(buf[0..loc.len], loc);
-            var aux: []u8 = buf;
-            const next = uri.resolveInPlace(loc.len, &aux) catch return error.HttpRedirectLocationInvalid;
-            if (!std.mem.eql(u8, next.scheme, "https") and !std.mem.eql(u8, next.scheme, "http"))
-                return error.HttpRedirectLocationInvalid;
-            return next;
+        if (status == .unauthorized) if (stream.header("www-authenticate")) |ch| {
+            challenge.* = try c.arena.dupe(u8, ch);
+            // Its small body is read, so that the connection is kept for the next request.
+            _ = stream.discard(64 * 1024);
+            return c.content_type;
         };
-        if (status == .unauthorized and challenge.* != null) {
-            _ = r.discardRemaining() catch {};
-            return null;
-        }
         if (status != .ok) {
             var err_body: Body = .{ .memory = .{ .arena = c.arena, .limit = 4096 } };
-            err_body.take(r) catch {};
+            err_body.take(&stream) catch {};
             c.why = try std.fmt.allocPrint(c.arena, "{f}: HTTP {d} {s}", .{
                 c.ref, @backingInt(status), std.mem.trim(u8, err_body.memory.bytes.items, " \n"),
             });
             return if (status == .not_found) error.NotFound else error.HttpStatus;
         }
-        body.take(r) catch |e| switch (e) {
-            error.ReadFailed => return res.bodyErr() orelse e,
-            else => return e,
-        };
-        return null;
+        try body.take(&stream);
+        return c.content_type;
     }
+
+    const max_redirects = 5;
+    /// The head of a response, and a silence in a body: a registry that says nothing for this long
+    /// is not going to (the pull's own deadline bounds the whole: `Backend.pull_deadline`).
+    const head_deadline: std.Io.Duration = .fromSeconds(60);
+    const read_idle: std.Io.Duration = .fromSeconds(60);
 
     /// Sets `authorization` from a 401's challenge.
     fn answer(c: *Client, challenge: []const u8) !void {
@@ -379,35 +329,16 @@ pub const Client = struct {
         try url.writer.writeAll("scope=");
         try std.Uri.Component.percentEncode(&url.writer, scope, isQueryChar);
         const auth: ?[]const u8 = if (c.creds) |cr| try basic(c.arena, cr) else null;
-        var body: std.Io.Writer.Allocating = .init(c.arena);
-        // No redirect is followed: the credentials would go with it (see `onceAt`). Sent again on
-        // a kept-alive connection the token service had closed, as the registry's are (`once`):
-        // `http.fetch` does when it read an end of stream, and here when it read a reset, as a
-        // request reaching a socket closed unread does. `http.fetch` leaves that to its callers
-        // because a POST may have been processed; this GET may be sent again whatever came back.
-        var stale: u32 = 0;
-        const res = while (true) {
-            break http.fetch(c.http, .{
-                .location = .{ .url = url.written() },
-                .headers = .{
-                    .user_agent = .{ .override = "zig-runner" },
-                    .authorization = if (auth) |a| .{ .override = a } else .omit,
-                },
-                .redirect_behavior = .unhandled,
-                .response_writer = &body.writer,
-            }) catch |e| {
-                if (e == error.ReadFailed and stale < http.staleRetries(c.http)) {
-                    stale += 1;
-                    body.clearRetainingCapacity();
-                    continue;
-                }
-                c.why = try std.fmt.allocPrint(c.arena, "{f}: the token service: {s} (sent {d} times)", .{
-                    c.ref,
-                    @errorName(e),
-                    stale + 1,
-                });
-                return error.Unauthorized;
-            };
+        // No redirect is followed: the credentials would go with it (see `once`). The library
+        // replaces a kept connection the token service had closed by itself.
+        const res = net_client.fetch(c.arena, c.io, .{
+            .url = url.written(),
+            .headers = if (auth) |a| &.{.{ .name = "Authorization", .value = a }} else &.{},
+            .max_redirects = 0,
+            .max_response = 1 << 20,
+        }) catch |e| {
+            c.why = try std.fmt.allocPrint(c.arena, "{f}: the token service: {s}", .{ c.ref, @errorName(e) });
+            return error.Unauthorized;
         };
         if (res.status != .ok) {
             c.why = try std.fmt.allocPrint(c.arena, "{f}: the token service answered HTTP {d}{s}", .{
@@ -418,27 +349,12 @@ pub const Client = struct {
             return error.Unauthorized;
         }
         const T = struct { token: ?[]const u8 = null, access_token: ?[]const u8 = null };
-        const t = std.json.parseFromSliceLeaky(T, c.arena, body.written(), .{
+        const t = std.json.parseFromSliceLeaky(T, c.arena, res.body, .{
             .ignore_unknown_fields = true,
         }) catch return error.Unauthorized;
         return t.token orelse t.access_token orelse error.Unauthorized;
     }
 };
-
-/// Whether `uri` is the registry's own scheme, host and port.
-fn sameOrigin(uri: std.Uri, ref: Ref) bool {
-    if (!std.mem.eql(u8, uri.scheme, ref.scheme())) return false;
-    var buf: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = std.Io.net.HostName.fromUri(uri, &buf) catch return false;
-    const want_host = hostOnly(ref.host);
-    const bare = std.mem.trim(u8, want_host, "[]");
-    if (!std.ascii.eqlIgnoreCase(host.bytes, bare) and !std.ascii.eqlIgnoreCase(host.bytes, want_host)) return false;
-    const want_port: ?u16 = if (std.mem.lastIndexOfScalar(u8, ref.host, ':')) |i|
-        (if (i > (std.mem.lastIndexOfScalar(u8, ref.host, ']') orelse 0)) std.fmt.parseInt(u16, ref.host[i + 1 ..], 10) catch null else null)
-    else
-        null;
-    return uri.port == want_port;
-}
 
 fn isQueryChar(ch: u8) bool {
     return std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '.' or ch == '_' or ch == '~';
@@ -456,10 +372,22 @@ const Body = union(enum) {
     memory: struct { arena: Allocator, limit: usize, bytes: std.ArrayList(u8) = .empty },
     file: struct { file: std.Io.File, limit: u64, written: u64 = 0, hash: Sha256 = .init(.{}) },
 
-    fn take(b: *Body, r: *std.Io.Reader) !void {
+    /// The most the body may have: the network library cuts a response off there.
+    fn limit(b: Body) usize {
+        return switch (b) {
+            .memory => |m| m.limit,
+            .file => |f| std.math.lossyCast(usize, f.limit),
+        };
+    }
+
+    fn take(b: *Body, stream: *net_client.Stream) !void {
         var buf: [64 * 1024]u8 = undefined;
         while (true) {
-            const n = try r.readSliceShort(&buf);
+            const n = stream.read(&buf) catch |e| switch (e) {
+                // The library's limit is this one: the same error as before.
+                error.BodyTooLarge => return error.ResponseTooLarge,
+                else => return e,
+            };
             if (n == 0) return;
             switch (b.*) {
                 .memory => |*m| {

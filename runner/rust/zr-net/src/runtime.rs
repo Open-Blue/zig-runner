@@ -52,9 +52,18 @@ pub fn stop() {
 }
 
 #[cfg(test)]
+pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: Mutex<()> = Mutex::new(());
+    L.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn start_selftest_stop() {
+        // Tests that use the process's runtime (call.rs) take the same lock: this one stops it.
+        let _g = super::test_lock();
+        super::stop();
         assert_eq!(super::selftest(1), -1);
         assert_eq!(super::start(1), 0);
         assert_eq!(super::start(1), 0);

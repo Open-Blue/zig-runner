@@ -30,6 +30,13 @@ pub const Error = error{ InvalidSignature, UnsupportedAlgorithm, WrongKey, BadSi
 /// Checks a `.minisig` file's signature of `content`, and its trusted comment's, against `pk`.
 /// Returns the trusted comment (a slice of `minisig`).
 pub fn verify(pk: PublicKey, content: []const u8, minisig: []const u8) Error![]const u8 {
+    var digest: [Blake2b512.digest_length]u8 = undefined;
+    Blake2b512.hash(content, &digest, .{});
+    return verifyDigest(pk, digest, minisig);
+}
+
+/// `verify` of content whose BLAKE2b-512 `digest` has been taken already (as it streamed in).
+pub fn verifyDigest(pk: PublicKey, digest: [Blake2b512.digest_length]u8, minisig: []const u8) Error![]const u8 {
     var lines = std.mem.splitScalar(u8, minisig, '\n');
     const untrusted = lines.next() orelse return error.InvalidSignature;
     if (!std.mem.startsWith(u8, untrusted, "untrusted comment: ")) return error.InvalidSignature;
@@ -45,8 +52,6 @@ pub fn verify(pk: PublicKey, content: []const u8, minisig: []const u8) Error![]c
     if (!std.mem.eql(u8, sig_raw[0..2], "ED")) return error.UnsupportedAlgorithm;
     if (!std.mem.eql(u8, sig_raw[2..10], &pk.key_id)) return error.WrongKey;
     const sig = sig_raw[10..74].*;
-    var digest: [Blake2b512.digest_length]u8 = undefined;
-    Blake2b512.hash(content, &digest, .{});
     Ed25519.Signature.fromBytes(sig).verify(&digest, pk.key) catch return error.BadSignature;
     // The global signature covers the signature and the trusted comment, so neither can be
     // swapped for another file's.

@@ -4205,16 +4205,10 @@ fn pullWithin(
     deadline: std.Io.Duration,
     why: *[]const u8,
 ) !oci.Image {
-    var local: std.http.Client = .{
-        .allocator = gpa,
-        .io = io,
-        .write_buffer_size = http.write_buffer_size,
-    };
-    defer local.deinit();
     const store: ImageStore = .{ .root = root };
     const req: oci.Request = .{ .image = image, .creds = creds, .owners = owners };
     const r = try http.within(io, deadline, pullInto, .{
-        arena, gpa, io, http.client(&local), store, req, why,
+        arena, gpa, io, store, req, why,
     });
     return (r orelse {
         why.* = try std.fmt.allocPrint(arena, "it took longer than {d} minutes", .{@divTrunc(deadline.toSeconds(), 60)});
@@ -4246,12 +4240,11 @@ fn pullInto(
     arena: Allocator,
     gpa: Allocator,
     io: std.Io,
-    client: *std.http.Client,
     store: ImageStore,
     req: oci.Request,
     why: *[]const u8,
 ) anyerror!oci.Image {
-    return oci.pull(arena, gpa, io, client, store, req, why);
+    return oci.pull(arena, gpa, io, store, req, why);
 }
 
 /// The default image provisioned (`set_up.provision_script`, or `provision_runner_script` when

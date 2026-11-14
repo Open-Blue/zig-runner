@@ -72,12 +72,9 @@ pub const RequestOptions = struct {
     log: bool = true,
 };
 
-/// A body of `len` bytes that `writeFn` writes, as many times as the request is sent.
-pub const Body = struct {
-    len: usize,
-    ptr: *const anyopaque,
-    writeFn: *const fn (ptr: *const anyopaque, w: *std.Io.Writer) anyerror!void,
-};
+/// A body of `len` bytes that `writeFn` writes, as many times as the request is sent (the network
+/// library's: `net_client.Body`).
+pub const Body = @import("../net_client.zig").Body;
 
 pub fn request(
     arena: Allocator,

@@ -270,7 +270,7 @@ pub fn main(process_init: std.process.Init) !u8 {
     // Before `client`'s, as defers run: the clients `renew` made in its place.
     defer http.deinitShared(io);
     var zig_seeds: zig_release.Registry = undefined;
-    try resolveZigSeeds(arena, init, &cfg, &client, &zig_seeds);
+    try resolveZigSeeds(arena, init, &cfg, &zig_seeds);
     defer zig_seeds.deinit();
     const stale = try settleRegistrations(arena, io, &cfg, log);
     installStopSignals();
@@ -326,14 +326,13 @@ fn resolveZigSeeds(
     arena: std.mem.Allocator,
     init: std.process.Init,
     cfg: *Config,
-    client: *std.http.Client,
     zig_seeds: *zig_release.Registry,
 ) !void {
-    zig_seeds.* = .{ .io = init.io, .gpa = init.gpa, .client = client };
+    zig_seeds.* = .{ .io = init.io, .gpa = init.gpa, .online = true };
     if (cfg.zig_seed) |*s| {
         cfg.zig_seeds = s[0..1];
     } else if (cfg.package_caches) {
-        const r = try zig_release.resolve(arena, init.gpa, client, cfg.zig_seed_versions);
+        const r = try zig_release.resolve(arena, init.gpa, init.io, cfg.zig_seed_versions);
         cfg.zig_seeds = r.seeds;
         cfg.zig_seeds_unverified = r.unverified;
         try zig_seeds.add(r);
@@ -363,7 +362,7 @@ fn giteaMain(
     http.shared.store(&client, .release);
     defer http.deinitShared(init.io);
     var zig_seeds: zig_release.Registry = undefined;
-    try resolveZigSeeds(arena, init, cfg, &client, &zig_seeds);
+    try resolveZigSeeds(arena, init, cfg, &zig_seeds);
     defer zig_seeds.deinit();
     // The instances this process let its jobs reach are forgotten by the others' rules.
     defer net.forget();
