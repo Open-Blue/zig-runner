@@ -242,7 +242,7 @@ fn acquire(
                 @backingInt(r.status),
             });
             // At least what GitHub asked (`Retry-After`, a rate limit's reset).
-            c.io.sleep(.fromMilliseconds(@intCast(ratelimit.wait(c.io, @intCast(retry_ms[attempt]), r.wait_ms))), .awake) catch {};
+            try c.io.sleep(.fromMilliseconds(@intCast(ratelimit.wait(c.io, @intCast(retry_ms[attempt]), r.wait_ms))), .awake);
             continue;
         } else |e| {
             if (last or e == error.OutOfMemory) return e;
@@ -1112,7 +1112,7 @@ fn completeJob(
                 @backingInt(resp.status), delays[attempt],
             });
         } else |e| try logfmt.line(c.err, .warn, "completejob_retry", "err={t} wait_s={d}", .{ e, delays[attempt] });
-        c.io.sleep(.fromMilliseconds(@intCast(wait_ms)), .awake) catch {};
+        try c.io.sleep(.fromMilliseconds(@intCast(wait_ms)), .awake);
     }
 }
 
