@@ -42,14 +42,37 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 # xfstests' replay-log, by commit (a fetch of one commit checks it: git names it by its hash).
-fstests_url=https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git
+# Mirrors in order: kernel.org is sometimes unreachable from CI (2026-11-14: 135 s, then exit 128
+# on PR #554); the commit is the same everywhere, and its hash is checked after the fetch.
+fstests_urls=(
+	https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git
+	https://kernel.googlesource.com/pub/scm/fs/xfs/xfstests-dev
+	https://github.com/kdave/xfstests.git
+)
 fstests_rev=22348afe338c0f6d540c0d7ef0db749eaa51b218
 
 build() {
 	local out=$1
 	mkdir -p "$out"
 	git init -q "$out/fstests"
-	git -C "$out/fstests" fetch -q --depth 1 "$fstests_url" "$fstests_rev"
+	local url fetched=false
+	for url in "${fstests_urls[@]}"; do
+		# Give up on a mirror that stalls (under 1 KB/s for 30 s), not after the system's TCP timeout.
+		if git -C "$out/fstests" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+			fetch -q --depth 1 "$url" "$fstests_rev"; then
+			fetched=true
+			break
+		fi
+		echo "store-crash: could not fetch xfstests $fstests_rev from $url; trying the next mirror" >&2
+	done
+	$fetched || {
+		echo "store-crash: no mirror had xfstests $fstests_rev" >&2
+		return 1
+	}
+	[[ $(git -C "$out/fstests" rev-parse FETCH_HEAD) == "$fstests_rev" ]] || {
+		echo "store-crash: the fetched xfstests is not $fstests_rev" >&2
+		return 1
+	}
 	git -C "$out/fstests" checkout -q FETCH_HEAD
 	local src=$out/fstests/src/log-writes
 	gcc -O2 -Wall -D_FILE_OFFSET_BITS=64 -o "$out/replay-log" "$src/replay-log.c" "$src/log-writes.c"

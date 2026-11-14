@@ -1,0 +1,3 @@
+kind: Fixed
+body: CI's Store crash job fetches the pinned xfstests commit from kernel.org, then kernel.googlesource.com, then GitHub's mirror, giving up on a stalled one after 30 s and checking the commit's hash, so one unreachable host no longer fails the job.
+time: 2026-11-14T18:32:42.860229117-05:00
