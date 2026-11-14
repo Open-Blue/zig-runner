@@ -526,11 +526,13 @@ impl Client {
         loop {
             let mut next = std::pin::pin!(head.incoming.frame());
             let waiting = async {
-                // Data the reader has not been woken for waits up to a millisecond for company.
+                // Data the reader has not been woken for is announced when the connection has
+                // nothing more at once (the poll below finds nothing), not before: a wake is a
+                // thread switch, and a download that outruns its reader sends many frames at a time.
                 if down.has_unannounced() {
-                    tokio::select! {
-                        f = &mut next => f,
-                        _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                    match std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(next.as_mut(), cx))).await {
+                        std::task::Poll::Ready(f) => f,
+                        std::task::Poll::Pending => {
                             down.announce();
                             next.await
                         }

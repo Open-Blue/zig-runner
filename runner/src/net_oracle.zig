@@ -474,6 +474,29 @@ fn benchReport(io: Io, what: []const u8, mib: u64, start: Usage) void {
     while (lines.next()) |l| if (std.mem.startsWith(u8, l, "VmHWM:")) {
         hwm_kb = std.mem.trim(u8, l["VmHWM:".len..], " kB\t");
     };
+    // Where the CPU went, by thread (`/proc/self/task/*/stat`: name, utime, stime in ticks of 10 ms).
+    if (std.Io.Dir.cwd().openDir(io, "/proc/self/task", .{ .iterate = true })) |d| {
+        var dir = d;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch null) |e| {
+            var p: [64]u8 = undefined;
+            var sb: [512]u8 = undefined;
+            const path = std.fmt.bufPrint(&p, "/proc/self/task/{s}/stat", .{e.name}) catch continue;
+            const st = std.Io.Dir.cwd().readFile(io, path, &sb) catch continue;
+            const close = std.mem.lastIndexOfScalar(u8, st, ')') orelse continue;
+            var f = std.mem.tokenizeScalar(u8, st[close + 2 ..], ' ');
+            var i: usize = 0;
+            var ut: []const u8 = "0";
+            var stt: []const u8 = "0";
+            while (f.next()) |x| : (i += 1) {
+                if (i == 11) ut = x;
+                if (i == 12) stt = x;
+            }
+            const open_p = std.mem.indexOfScalar(u8, st, '(') orelse continue;
+            std.debug.print("  thread {s} user {s} sys {s} ticks\n", .{ st[open_p + 1 .. close], ut, stt });
+        }
+    } else |_| {}
     const wall = end.wall_ms - start.wall_ms;
     std.debug.print("\nbench {s}: {d} MiB in {d} ms ({d} MiB/s), cpu {d} ms, peak RSS {s} kB\n", .{
         what, mib, wall, @divTrunc(mib * 1000, @max(wall, 1)), end.cpu_ms - start.cpu_ms, hwm_kb,
