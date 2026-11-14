@@ -2463,7 +2463,12 @@ fixture's `differences.txt` lists, which is where the builder does something els
   as BuildKit writes it (the last match wins), though Docker's documentation says it is an error.
 - A fetched action's context has no `.git` (GitHub's copy of the action has none).
 - The layers carry no timestamps of the build.
-
+- `COPY --chmod` and `ADD --chmod` make the directories they create on the way to the destination
+  (`COPY --chmod=640 f /a/b/f` makes `/a` and `/a/b`) 0755. BuildKit gives them the `--chmod` mode
+  too, so with `--chmod=640` they are directories nobody but root can enter, and the files in them
+  cannot be reached. The mode applies to what `--chmod` names: the files, and a copied directory
+  tree (the destination directory of a directory copy and the directories inside it keep the
+  `--chmod` mode, as in BuildKit). Directories the image already has keep their mode and owner.
 
 The `Runner` is the sandbox (`docker_action.BuildRunner`): a `RUN` runs as a container whose
 lowers are the image's layers so far, each idmapped on a root runner, and whose upper is the
