@@ -455,8 +455,14 @@ const OpenHow = extern struct { flags: u64, mode: u64, resolve: u64 };
 
 /// Tries of an `openat2` the kernel gave up on. A `..` on the way fails with EAGAIN when any rename
 /// or mount on the machine races it, as it cannot tell the race from an escape, and it says to
-/// try again: another job publishing a layer is enough.
-const open_tries = 64;
+/// try again: another job publishing a layer is enough. The first `open_spins` retries only give
+/// up the CPU (the racer is usually done by then); after that each waits `open_wait_ns`, so a
+/// loaded host, where the racer may not get a CPU for a few slices, still ends the race before the
+/// tries run out. A storm that outlasts all of it ends in an error after about
+/// `(open_tries - open_spins) * open_wait_ns` (about 0.25 s) plus the yields.
+const open_tries = 256;
+const open_spins = 16;
+const open_wait_ns = 1 * std.time.ns_per_ms;
 
 /// Opens `path` under `root`, resolved inside it (see the file's comment). A file descriptor, or
 /// the errno.
@@ -474,7 +480,7 @@ pub fn openIn(
         .mode = mode,
         .resolve = resolve | resolve_in_root | resolve_no_magiclinks,
     };
-    for (0..open_tries) |_| {
+    for (0..open_tries) |try_no| {
         const rc = linux.syscall4(
             .openat2,
             @as(usize, @bitCast(@as(isize, root))),
@@ -483,7 +489,14 @@ pub fn openIn(
             @sizeOf(OpenHow),
         );
         const e = linux.errno(rc);
-        if (e == .AGAIN) continue;
+        if (e == .AGAIN) {
+            if (try_no < open_spins) {
+                if (std.Thread.yield()) {} else |_| std.atomic.spinLoopHint();
+            } else {
+                _ = linux.nanosleep(&.{ .sec = 0, .nsec = open_wait_ns }, null);
+            }
+            continue;
+        }
         return if (e == .SUCCESS) .{ .fd = @intCast(rc) } else .{ .err = e };
     }
     return .{ .err = .AGAIN };
@@ -2442,16 +2455,11 @@ test "homeOf reads the home directory of a uid from /etc/passwd" {
     try std.testing.expect(homeOf("garbage", 0) == null);
 }
 
-/// Renames a file back and forth in `dir` until `stop`, to race what follows a `..`. Each pair
-/// gives up the CPU if another thread is waiting for it: on an idle machine that changes nothing,
-/// on a busy one it keeps a storm that spins on its own cores from starving the opener it races
-/// (openIn gives up after `open_tries` EAGAINs in a row, which only a renamer that is running
-/// while the opener is not can bring about).
+/// Renames a file back and forth in `dir` until `stop`, to race what follows a `..`.
 fn renameUntil(dir: linux.fd_t, stop: *std.atomic.Value(bool)) void {
     while (!stop.load(.monotonic)) {
         _ = linux.renameat(dir, "a", dir, "b");
         _ = linux.renameat(dir, "b", dir, "a");
-        if (std.Thread.yield()) {} else |_| std.atomic.spinLoopHint();
     }
 }
 
