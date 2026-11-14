@@ -75,9 +75,12 @@ unreported instead, and the merge queue waiting for it.
   the slow tests (`test_shards.zig`'s `slow`) shared out among the parts on their own. In ci the
   store stress test runs for 10 s, where analysis runs it for minutes.
 - **Database tests**: against TimescaleDB, every test under ThreadSanitizer but the single-threaded
-  exhaustive ones, which the Tests jobs run (`test_shards.zig`); then the TLS oracle, the database's
-  old TLS client (tls.zig, a lazy dependency fetched by this step alone) against the new one on the
-  same servers (`zig build test-tls-oracle -Dtls-oracle`, docs/rust-net.md).
+  exhaustive ones, which the Tests jobs run (`test_shards.zig`).
+- **TLS oracle**: the database's old TLS client (tls.zig, a lazy dependency fetched by this job
+  alone) against the new one on the same servers, the Database tests job's database started by the
+  same script (`zig build test-tls-oracle -Dtls-oracle`, docs/rust-net.md). A job of its own so that
+  its compile of Zig's build system runs beside the database tests, not after them. Not a required
+  check, nor one a release waits for.
 - **Release builds** and **Release builds (arm64)**: the release's own builds for both targets in
   ReleaseSafe, so code that doesn't compile for aarch64 fails here rather than after the tag; on
   arm64 the aarch64 binary is run.

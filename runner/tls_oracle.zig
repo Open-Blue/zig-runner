@@ -4,7 +4,7 @@
 //! servers, case by case, and the test compares what each does: the handshake's outcome, the
 //! results of the same statements, and the class of the errors.
 //!
-//! The servers are the Postgres of the Database tests job, which `pg-tls-fixture.sh` makes serve
+//! The servers are the Postgres of the Database tests job (the TLS oracle job starts the same one), which `pg-tls-fixture.sh` makes serve
 //! TLS (private CA, client certificates), and, for the certificates Postgres does not have, a TLS
 //! endpoint of the test's own: it answers the SSLRequest with `S` and hands the socket to
 //! `openssl s_server -inetd`, so the client's TLS meets a real TLS server with the certificate the

@@ -296,13 +296,52 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/zig-test.sh
 
-      # The old TLS client (tls.zig, a lazy dependency only this step fetches) against the one the
-      # runner has, on the same servers: the database of this job, which serves TLS with client
-      # certificates (ZIG_TEST_PG_TLS_DIR), and `openssl s_server` for the certificates Postgres
-      # does not have. It fails if either client does something other than runner/tls_oracle.zig
-      # says (docs/rust-net.md, "The old TLS client as an oracle"). Through `zig build`, as the
-      # lazy dependency needs, so this is where its build system is compiled (about 100 s on an
-      # empty cache); the tests job's binary is not rebuilt for it.
+  # The old TLS client (tls.zig, a lazy dependency only this job fetches) against the one the
+  # runner has, on the same servers: the database of the Database tests job (the same script starts
+  # it), which serves TLS with client certificates (ZIG_TEST_PG_TLS_DIR), and `openssl s_server`
+  # for the certificates Postgres does not have. It fails if either client does something other
+  # than runner/tls_oracle.zig says (docs/rust-net.md, "The old TLS client as an oracle"). A job of
+  # its own, in parallel with the database tests: as a step of theirs it added about 209 s (most of
+  # it compiling Zig's build system, which the lazy dependency needs, on an empty cache). Not a
+  # required check, and not one a release waits for (.github/checks-on-main): a difference between
+  # the clients is for a pull request to read, and the oracle goes with the old client at R6.
+  tls-oracle:
+    name: TLS oracle
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      contents: read # to check out the code
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: ci-only
+      PGDATABASE: tsdb
+      PGSSLMODE: disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether this change can affect the tests
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh tests
+
+      - name: Start the database
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/ci-database.sh start
+
+      - name: Install Zig
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/install-zig.sh
+
+      # The database starts in the background (about 25 s): wait for it only now, with Zig installed.
+      - name: Wait for the database
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/ci-database.sh wait
+
       - name: TLS oracle (the old client against the new one)
         if: steps.scope.outputs.run == 'true'
         working-directory: runner
