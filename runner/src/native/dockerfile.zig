@@ -794,9 +794,17 @@ const Planner = struct {
             const end = std.mem.indexOfAny(u8, text, " \t") orelse text.len;
             const flag = try substitute(arena, text[0..end], scope);
             text = std.mem.trimStart(u8, text[end..], " \t");
-            if (std.mem.startsWith(u8, flag, "--chown=")) chown = flag["--chown=".len..] //
-            else if (std.mem.startsWith(u8, flag, "--chmod=")) chmod = std.fmt.parseInt(u32, flag["--chmod=".len..], 8) catch
-                return p.refuse(ins.line, "`--chmod` takes an octal mode") //
+            if (std.mem.startsWith(u8, flag, "--chown=")) {
+                chown = flag["--chown=".len..];
+                // What BuildKit makes of `:group` is not checked here: the engine decides.
+                if (std.mem.startsWith(u8, chown, ":")) return p.refuse(ins.line, "`--chown` with no user is not native yet");
+            } else if (std.mem.startsWith(u8, flag, "--chmod=")) {
+                const mode = flag["--chmod=".len..];
+                // Octal digits only (no sign), within the permission bits and setuid, setgid and sticky.
+                const ok = mode.len > 0 and std.ascii.isDigit(mode[0]);
+                chmod = if (ok) std.fmt.parseInt(u32, mode, 8) catch null else null;
+                if (chmod == null or chmod.? > 0o7777) return p.refuse(ins.line, "`--chmod` takes an octal mode of at most 7777");
+            } //
             else if (std.mem.startsWith(u8, flag, "--from=")) {
                 if (ins.kind == .add) return p.refuse(ins.line, "`ADD --from` is not a Docker instruction");
                 from_name = flag["--from=".len..];
@@ -1544,8 +1552,16 @@ const Copier = struct {
         defer to.close(c.io);
         const base = std.fs.path.basenamePosix(target_path);
         const m = c.op.chmod orelse mode;
-        try to.writeFile(c.io, .{ .sub_path = base, .data = data, .flags = .{ .permissions = .fromMode(m) } });
-        c.finish(to, base, m, null);
+        // What an earlier source put there is replaced, never written through: a link planted in the
+        // layer (a tree keeps its links) would lead out of it. `exclusive` is `O_EXCL`, which refuses
+        // to follow a link at the name; the mode and owner are set on the descriptor.
+        to.deleteFile(c.io, base) catch |err| if (err != error.FileNotFound) return err;
+        const f = try to.createFile(c.io, base, .{ .exclusive = true, .permissions = .fromMode(m) });
+        defer f.close(c.io);
+        try f.writeStreamingAll(c.io, data);
+        _ = linux.fchmod(f.handle, m);
+        const o = c.idsOf(null);
+        _ = linux.fchown(f.handle, o.uid, o.gid);
     }
 
     fn download(c: *Copier, name: []const u8, path: []const u8, into: bool, dest: []const u8) !void {
@@ -1947,6 +1963,10 @@ test "plan: what a Dockerfile does not do natively is refused, with the line's r
         .{ "FROM missing", "could not be pulled" },
         .{ "FROM a\nCOPY --from=missing /x /y", "could not be pulled" },
         .{ "FROM a\nCOPY --chmod=u+x a /b", "octal" },
+        .{ "FROM a\nCOPY --chmod=17777 a /b", "octal" },
+        .{ "FROM a\nCOPY --chmod=+7 a /b", "octal" },
+        .{ "FROM a\nCOPY --chmod=-1 a /b", "octal" },
+        .{ "FROM a\nCOPY --chown=:5 a /b", "no user" },
     }) |b| {
         const why = try refusedWhy(arena, b[0]);
         errdefer std.debug.print("{s}\n  -> {s}\n", .{ b[0], why });
@@ -2598,6 +2618,34 @@ test "build: COPY --chmod makes the directories on the way 0755 and keeps the mo
         const at = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ low, rel }, 0);
         _ = linux.chmod(at, 0o755);
     };
+}
+
+test "build: a heredoc or a download written where an earlier source of the same COPY put a link does not reach through it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var held: std.ArrayList(std.Io.File) = .empty;
+    defer for (held.items) |f| f.close(io);
+    var h = try Harness.init(arena, &tmp, &held);
+    try tmp.dir.writeFile(io, .{ .sub_path = "victim", .data = "untouched", .flags = .{ .permissions = .fromMode(0o644) } });
+    const victim = try std.fmt.allocPrint(arena, "{s}/victim", .{h.root});
+    try plant(&tmp, "ctx", &.{.{ "d/link", try std.fmt.allocPrint(arena, "->{s}", .{victim}) }});
+    var rec: Recorder = .{ .arena = arena };
+    const built = (try h.run(
+        \\FROM alpine
+        \\COPY --chmod=755 d/ <<link /x/
+        \\planted
+        \\link
+    , &rec)).ok;
+    try expectFile(arena, built.lowers, "x/link", "planted\n");
+    try expectMode(arena, built.lowers, "x/link", 0o755);
+    const after = try tmp.dir.readFileAlloc(io, "victim", arena, .limited(64));
+    try std.testing.expectEqualStrings("untouched", after);
+    const st = try tmp.dir.statFile(io, "victim", .{});
+    try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(st.permissions.toMode() & 0o7777)));
 }
 
 test "Ignore: .dockerignore as Docker reads it" {
