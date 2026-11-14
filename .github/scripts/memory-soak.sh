@@ -11,7 +11,7 @@
 # root runs meanwhile); the container is removed when the script ends.
 #
 #   memory-soak.sh [--jobs N] [--warmup N] [--mem SIZE] [--bin PATH] [--out DIR]
-#       --jobs     500 (the long run: about 2 hours); 50 is the short one (about 12 minutes)
+#       --jobs     500 (the long run: 2 to 3 hours, 3 on the laptop's first); 50 is the short one (about 12 minutes)
 #       --warmup   the samples left out of the fit (20)
 #       --mem      the container's memory limit (6g)
 #       --bin      the runner (runner/zig-out/bin/runner, a static musl build)
@@ -26,7 +26,9 @@
 # native store is the docker volume zr-soak-store, root's as the native backend requires: `docker
 # volume rm zr-soak-store` forgets the pulled images), ZR_SOAK_LOCK (~/.cache/zig-runner-locks/root-tests.lock), ZR_SOAK_ALLOW_ANON_KB
 # (a flat allowance for memory a library keeps in a bounded cache, 0). The repo zradmin/soak is
-# made if it is missing. Exit status 1 when a counter grew past its margin.
+# made if it is missing. Exit status 1 when a counter grew past its margin, or a shape of job did not
+# end as it should (and an idle sample) in 90% of its jobs. The runner's registration (a user-scope
+# token, for zradmin) is deleted from the instance and the token files are removed when it ends.
 set -euo pipefail
 # All of it in a function, read before any of it runs: editing this file while a run is under way
 # must not change the run (bash reads a script as it executes it).
@@ -89,11 +91,24 @@ main() {
 
 	[[ -x $bin ]] || { echo "no runner at $bin (zig build -Doptimize=ReleaseSafe in runner/)" >&2 && exit 1; }
 	mkdir -p "$out" "$dir"
+	# The runner's container first (nothing registers again), then its registrations are deleted
+	# from the instance (a persistent one would collect one per run), then the throwaway Gitea, and
+	# the token files.
+	# shellcheck disable=SC2329 # run by the trap
 	cleanup() {
-		docker rm -f "$name" zr-soak-gitea >/dev/null 2>&1 || true
+		trap - EXIT INT TERM
+		docker rm -f "$name" >/dev/null 2>&1 || true
+		if [[ -f ${token_file:-/nonexistent} ]] && curl -fsS -o /dev/null --max-time 5 "$url/api/v1/version" 2>/dev/null; then
+			python3 -I "$script_dir/memory_soak.py" unregister --url "$url" --token-file "$token_file" ||
+				echo "memory-soak: could not unregister the soak runner from $url" >&2
+		fi
+		docker rm -f zr-soak-gitea >/dev/null 2>&1 || true
+		rm -f "$dir/reg-token" "$dir/own-token"
 	}
 	trap cleanup EXIT
-	cleanup
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	docker rm -f "$name" zr-soak-gitea >/dev/null 2>&1 || true
 
 	if ((own)); then
 		image=${ZR_SOAK_GITEA_IMAGE:-gitea/gitea@sha256:8967bf9deaf3c5c4adae13519436dc1b20c646ac83fe37ae810c933a1045227d}
@@ -117,7 +132,7 @@ main() {
 		api -X POST -d '{"name":"soak","auto_init":true,"default_branch":"main"}' -o /dev/null "$url/api/v1/user/repos"
 	fi
 	umask 077
-	docker exec -u git "$forge" gitea actions generate-runner-token | tail -n1 >"$dir/reg-token"
+	docker exec -u git "$forge" gitea actions generate-runner-token --scope zradmin | tail -n1 >"$dir/reg-token"
 	umask 022
 
 	cat >"$dir/inner.sh" <<'EOF'
@@ -146,6 +161,10 @@ exec /soak/runner
 EOF
 	chmod 755 "$dir/inner.sh"
 	cp "$bin" "$dir/runner"
+
+	# A registration the runner saved in the store by an earlier run is forgotten, so this run
+	# registers its own (user scope, with the token above) and deletes it at the end.
+	docker run --rm -v zr-soak-store:/store ubuntu:24.04 rm -f /store/state/gitea-runner-soak.json
 
 	# The container's cgroup namespace is its own, so the runner's jobs sit under the memory cap.
 	docker run -d --name "$name" --privileged --network host --cgroupns private --memory "$mem" --memory-swap "$mem" \

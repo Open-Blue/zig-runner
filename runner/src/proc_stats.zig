@@ -25,13 +25,14 @@ pub const Stats = struct {
     /// What the network library (Rust, `zr_net.zig`) holds: its own allocator, not Zig's `heap`.
     rust_bytes: u64 = 0,
 
-    /// ` rss=63M anon=60M thr=24 fds=71 mounts=29 zombies=0 heap=41M/41200 rust=310K`, each `?` when
-    /// it could not be read.
+    /// ` rss=63M anon=60M thr=24 fds=71 mounts=29 zombies=0 heap=41200K/41200 rust=310K`, each `?`
+    /// when it could not be read. rss and anon are rounded to whole MiB from 10 MiB up; the heap's
+    /// and the network library's sizes are always exact KiB (the memory soak resolves 64 KiB).
     pub fn format(s: Stats, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("rss={f} anon={f} thr={f} fds={f} mounts={f} zombies={f} heap={f}/{d} rust={f}", .{
-            Kb{ .v = s.rss_kb },            Kb{ .v = s.anon_kb },    Count{ .v = s.threads },        Count{ .v = s.fds },
-            Count{ .v = s.mounts },         Count{ .v = s.zombies }, Kb{ .v = s.heap_bytes / 1024 }, s.heap_blocks,
-            Kb{ .v = s.rust_bytes / 1024 },
+            Kb{ .v = s.rss_kb },                 Kb{ .v = s.anon_kb },    Count{ .v = s.threads },             Count{ .v = s.fds },
+            Count{ .v = s.mounts },              Count{ .v = s.zombies }, ExactKb{ .v = s.heap_bytes / 1024 }, s.heap_blocks,
+            ExactKb{ .v = s.rust_bytes / 1024 },
         });
     }
 };
@@ -68,6 +69,14 @@ const Kb = struct {
         const v = k.v orelse return w.writeAll("?");
         if (v >= 10 * 1024) return w.print("{d}M", .{v / 1024});
         try w.print("{d}K", .{v});
+    }
+};
+
+/// KiB as they are, never rounded to MiB.
+const ExactKb = struct {
+    v: u64,
+    pub fn format(k: ExactKb, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{d}K", .{k.v});
     }
 };
 
@@ -304,4 +313,8 @@ test "the process's stats read, a child left unwaited counts as a zombie, and a 
     var w: std.Io.Writer = .fixed(&buf);
     try w.print("{f}", .{Delta{ .before = .{ .fds = 10, .heap_bytes = 4096 }, .after = .{ .fds = 8, .heap_bytes = 8192 } }});
     try std.testing.expectEqualStrings("dheap=+4K dblocks=+0 dfds=-2 dthr=? dmounts=?", w.buffered());
+
+    w = .fixed(&buf);
+    try w.print("{f}", .{Stats{ .rss_kb = 64 * 1024, .heap_bytes = 41 * 1024 * 1024 + 3072, .heap_blocks = 7, .rust_bytes = 4096 }});
+    try std.testing.expectEqualStrings("rss=64M anon=? thr=? fds=? mounts=? zombies=? heap=41987K/7 rust=4K", w.buffered());
 }

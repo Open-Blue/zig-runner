@@ -10,19 +10,25 @@ runner has been idle for `--settle` seconds, then takes a sample:
   - the runner's own `health: proc rss=.. anon=.. thr=.. fds=.. mounts=.. zombies=.. heap=../N
     rust=..` line (`runner/src/proc_stats.zig`), the first one printed after the settle time (the
     runner says it every `RUNNER_HEALTH_IDLE_INTERVAL` seconds while idle). Its sizes are rounded
-    to whole MiB from 10 MiB up, so the exact heap block count (`N`) is the heap's leak signal, and
+    to whole MiB from 10 MiB up, except the heap's and `rust=`, which are exact KiB (`heap=510K/9`),
+    so the heap's bytes and its block count (`N`) are the leak signals of what the runner's counted
+    allocator sees, and
   - /proc/<pid>/status of the runner, for exact VmRSS and RssAnon (`--pid`).
 
 The jobs are a fixed cycle of shapes (`SHAPES`): run steps, checkout, a container job, a failing
 job, a cancelled job, a large log, a step that times out. The first `--warmup` samples are
 excluded (caches fill, the first job of each shape pulls and compiles things); the rest are fitted
-with a line per counter, and the run fails when a counter grows by more than its margin (`LIMITS`).
+with a line per counter, and the run fails when a counter grows by more than its margin (`LIMITS`),
+or when a shape of job did not do what it should: each shape must end as expected (`SHAPES`) with
+an idle sample, in at least 90% of its jobs, so a shape that tested nothing (every container job
+refused by Docker Hub's rate limit, say) is named, with the cause the runner's log gave.
 
   memory_soak.py run      (samples only; `analyze` judges them) --url URL --token-file F --log runner.log --pid PID --out DIR [--jobs N]
   memory_soak.py analyze  DIR/samples.csv [--warmup N] [--allow-anon-kb K]
-  memory_soak.py selftest
+  memory_soak.py unregister --url URL --token-file F   (deletes the user's runners named soak*, which the runner registered)
+  memory_soak.py selftest   (the judging, on made-up series: noise passes, a 1 KiB/job leak in the counted heap fails)
 """
-import argparse, base64, csv, json, os, re, statistics, subprocess, sys, time, urllib.error, urllib.request
+import argparse, base64, collections, csv, json, math, os, re, statistics, subprocess, sys, time, urllib.error, urllib.request
 
 # --- the jobs ------------------------------------------------------------------------------------
 
@@ -112,15 +118,23 @@ assert len(CYCLE) == 25
 #   - The thread count rises by one or two when the pool first needs another thread, in the first
 #     jobs (13 by job 14 in the mixed run, 10 to 11 after job 20 in a run of `run` jobs): 2 allowed.
 #   - The page-sized noise: samples move in steps of 4 KiB.
-#   - Counts, the heap's block count and the network library's bytes did not move at all (they
-#     are exact), so their margins are as tight as can be written: none for handles, mounts
-#     and zombies; 8 blocks / 512 KiB / 64 KiB for the heap and `rust=` as room for a
-#     cache that fills once.
+#   - Counts, the heap's block count and its bytes did not move at all (they are exact, KiB
+#     as the runner prints them), so their margins are tight: none for handles, mounts and zombies;
+#     8 blocks / 512 KiB for the heap as room for a cache that fills once, and 0.5 KiB/job, which
+#     is half of the smallest leak the selftest pins (1 KiB/job in the counted heap must fail).
+#     `rust=` was 0K throughout: the network library is a skeleton on main and takes no part in
+#     the jobs, so its margin (0.5 KiB/job, 64 KiB) has never been measured; it means something
+#     once the library's allocator is in use (R4/R5 merged).
+#   - What the counters cannot see: memory from allocators outside the counted heap (`smp_allocator`
+#     and `page_allocator` used directly) shows only in resident and anonymous memory, whose
+#     explained growth is 0.87 KiB/job and whose margin is 2.0 KiB/job. A leak there below that
+#     margin cannot be told from the explained growth, and one below the 2048 KiB end-minus-start
+#     allowance is lost in the thread-stack steps.
 LIMITS = {
     "proc_rss_kb": ("KiB", "bytes", 2.0, 2048),
     "proc_anon_kb": ("KiB", "bytes", 2.0, 2048),
     "heap_blocks": ("blocks", "count", 0.01, 8),
-    "heap_kb": ("KiB", "bytes", 1.0, 512),
+    "heap_kb": ("KiB", "bytes", 0.5, 512),
     "rust_kb": ("KiB", "bytes", 0.5, 64),
     "threads": ("threads", "count", 0.0, 2),
     "fds": ("fds", "count", 0.0, 0),
@@ -137,11 +151,18 @@ HEALTH = re.compile(r"health: proc rss=(\S+) anon=(\S+) thr=(\S+) fds=(\S+) moun
                     r"heap=(\S+)/(\d+) rust=(\S+)")
 
 
+UNITS = {"K": 1, "M": 1024, "G": 1024 * 1024}
+
+
 def kb(text):
-    """`310K` or `63M` as KiB, None for `?`."""
+    """A size the runner prints (`310K`, `63M`, `1.5G`, decimals allowed) as KiB, None for `?`;
+    anything else is an error (a format the runner changed must not be read as a number)."""
     if text == "?":
         return None
-    return int(text[:-1]) * (1024 if text[-1] == "M" else 1)
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([KMG])", text)
+    if not m:
+        raise ValueError(f"not a size: {text!r}")
+    return round(float(m.group(1)) * UNITS[m.group(2)])
 
 
 def num(text):
@@ -153,9 +174,8 @@ def parse_health(line):
     if not m:
         return None
     g = m.groups()
-    heap = g[6].rstrip("0123456789")  # "41M"
     return {"log_rss_kb": kb(g[0]), "log_anon_kb": kb(g[1]), "threads": num(g[2]), "fds": num(g[3]),
-            "mounts": num(g[4]), "zombies": num(g[5]), "heap_kb": kb(heap), "heap_blocks": int(g[7]),
+            "mounts": num(g[4]), "zombies": num(g[5]), "heap_kb": kb(g[6]), "heap_blocks": int(g[7]),
             "rust_kb": kb(g[8])}
 
 
@@ -226,6 +246,29 @@ def judge(rows, warmup, allow_cache_kb=0, window=20):
     return out
 
 
+def judge_shapes(rows, share=0.9):
+    """Whether each shape of job did what it should: at least `share` of its jobs ended as the
+    shape says (`SHAPES`) and left an idle sample. A shape that tested nothing fails, by name, with
+    the cause the runner's log gave. Returns (shape, ok, text) per shape that was run."""
+    out = []
+    for shape, (_, _, want) in SHAPES.items():
+        mine = [r for r in rows if r.get("shape") == shape]
+        if not mine:
+            continue
+        wrong = collections.Counter(r["conclusion"] for r in mine if r["conclusion"] != want)
+        unsampled = sum(1 for r in mine if r.get("heap_blocks") is None)
+        good = sum(1 for r in mine if r["conclusion"] == want and r.get("heap_blocks") is not None)
+        need = math.ceil(share * len(mine))
+        ok = good >= need
+        text = f"{'ok' if ok else 'FAIL'}: {good} of {len(mine)} jobs ended {want!r} with an idle sample"
+        if not ok:
+            seen = [r["cause"] for r in mine if r.get("cause")]
+            text += (f" (need {need}); ended otherwise: {dict(wrong) or 'none'}, no idle sample: {unsampled}"
+                     f"; cause seen: {seen[-1] if seen else 'none in the runner log'}")
+        out.append((shape, ok, text))
+    return out
+
+
 # --- the instance --------------------------------------------------------------------------------
 
 class Instance:
@@ -287,6 +330,7 @@ class Tail:
         self.f.seek(0, os.SEEK_END)
         self.partial = ""
         self.job_ends = 0
+        self.recent = collections.deque(maxlen=400)  # the lines of the job in hand, for `cause`
 
     def poll(self):
         out = []
@@ -295,8 +339,21 @@ class Tail:
             *lines, self.partial = (self.partial + data).split("\n")
             now = time.time()
             out = [(now, l) for l in lines]
+            self.recent.extend(lines)
             self.job_ends += sum(1 for _, l in out if "job-end: " in l)
         return out
+
+
+CAUSE = re.compile(r"429|too ?many ?requests|rate.?limit|denied|unauthorized|no space|timed out|"
+                   r"error|failed|panic", re.I)
+
+
+def cause(tail):
+    """The last line of the runner's log, for the job in hand, that looks like a reason."""
+    for line in reversed(tail.recent):
+        if "health: proc" not in line and CAUSE.search(line):
+            return re.sub(r"\s+", " ", line).strip()[:160]
+    return ""
 
 
 def wait_idle_sample(tail, pid, settle, patience=90):
@@ -324,7 +381,7 @@ def drive(args):
         inst.put_file(f"{folder}/soak-{name}.yml", text)
     tail = Tail(args.log)
     os.makedirs(args.out, exist_ok=True)
-    fields = ["job", "shape", "conclusion", "seconds"] + list(LIMITS) + ["log_rss_kb", "log_anon_kb"]
+    fields = ["job", "shape", "conclusion", "seconds", "cause"] + list(LIMITS) + ["log_rss_kb", "log_anon_kb"]
     out = open(os.path.join(args.out, "samples.csv"), "w", newline="")
     w = csv.DictWriter(out, fieldnames=fields)
     w.writeheader()
@@ -333,6 +390,8 @@ def drive(args):
     for i in range(args.jobs):
         shape = cycle[(i + args.shape_offset) % len(cycle)]
         _, limit, want = SHAPES[shape]
+        tail.poll()
+        tail.recent.clear()
         t0 = time.time()
         rid = inst.dispatch(f"soak-{shape}.yml")
         cancelled = False
@@ -350,13 +409,18 @@ def drive(args):
         if got != want:
             print(f"job {i} ({shape}, run {rid}): ended {got!r}, expected {want!r}", file=sys.stderr)
         sample = wait_idle_sample(tail, args.pid, args.settle)
+        why = cause(tail) if got != want or sample is None else ""
         if sample is None:
             print(f"job {i} ({shape}): no idle sample", file=sys.stderr)
+            # The row says so: the shape's verdict counts it, the counters' fits leave it out.
+            w.writerow({"job": i, "shape": shape, "conclusion": got, "seconds": round(time.time() - t0, 1),
+                        "cause": why or "no idle sample"})
+            out.flush()
             continue
         if i == args.smaps_at:
             subprocess.run(["docker", "exec", "zr-soak", "sh", "-c", "cat /proc/$(pgrep -o -x runner)/smaps"],
                            stdout=open(os.path.join(args.out, "smaps-mid.txt"), "w"), check=False)
-        row = {"job": i, "shape": shape, "conclusion": got, "seconds": round(time.time() - t0, 1), **sample}
+        row = {"job": i, "shape": shape, "conclusion": got, "seconds": round(time.time() - t0, 1), "cause": why, **sample}
         w.writerow(row)
         out.flush()
         print(f"{i:4d} {shape:9s} {got:9s} {row['seconds']:6.1f}s rss={row['proc_rss_kb']} anon={row['proc_anon_kb']} "
@@ -364,19 +428,38 @@ def drive(args):
               f"heap={row['heap_kb']}K/{row['heap_blocks']} rust={row['rust_kb']}K", flush=True)
 
 
+def unregister(args):
+    """Deletes the runners the soak registered (names start with `soak`, user scope) from the
+    instance, so a persistent one does not collect a registration per run."""
+    inst = Instance(args.url, open(args.token_file).read().strip(), "")
+    status, d = inst.call("GET", "/user/actions/runners")
+    if status != 200:
+        print(f"unregister: cannot list runners ({status})", file=sys.stderr)
+        return 1
+    failed = 0
+    for r in d.get("runners", []):
+        if r.get("name", "").startswith("soak"):
+            status, _ = inst.call("DELETE", f"/user/actions/runners/{r['id']}")
+            print(f"unregister: runner {r['id']} {r['name']}: {status}")
+            failed += status not in (200, 204)
+    return 1 if failed else 0
+
+
 def analyze(args):
     with open(args.csv) as f:
-        rows = [{k: (int(v) if re.fullmatch(r"-?\d+", v or "") else v) for k, v in r.items()} for r in csv.DictReader(f)]
-    print(f"{len(rows)} samples, first {args.warmup} excluded")
+        rows = [{k: (int(v) if re.fullmatch(r"-?\d+", v or "") else (v or None)) for k, v in r.items()}
+                for r in csv.DictReader(f)]
+    print(f"{len(rows)} jobs, first {args.warmup} excluded from the fits")
     bad = 0
+    if not rows:
+        print("  FAIL: no jobs were run")
+        return 1
+    for shape, ok, text in judge_shapes(rows):
+        print(f"  shape {shape:9s} {text}")
+        bad += not ok
     for name, ok, text in judge(rows, args.warmup, args.allow_anon_kb):
         print(f"  {name:14s} {text}")
         bad += not ok
-    shapes = {}
-    for r in rows:
-        shapes.setdefault((r["shape"], r["conclusion"]), 0)
-        shapes[(r["shape"], r["conclusion"])] += 1
-    print("  shapes:", ", ".join(f"{s}/{c} x{n}" for (s, c), n in sorted(shapes.items())))
     return 1 if bad else 0
 
 
@@ -393,8 +476,40 @@ def selftest():
     step = [dict(r, proc_rss_kb=r["proc_rss_kb"] + (6000 if i > 50 else 0)) for i, r in enumerate(flat)]
     assert not dict((n, ok) for n, ok, _ in judge(step, 20))["proc_rss_kb"], "a step is a rise"
     assert dict((n, ok) for n, ok, _ in judge(step, 20, allow_cache_kb=8192))["proc_rss_kb"], "a cache's allowance"
-    assert parse_health("x health: proc rss=63M anon=60M thr=24 fds=71 mounts=29 zombies=0 heap=41M/41200 rust=310K")[
-        "heap_blocks"] == 41200
+    line = "x health: proc rss=63M anon=60M thr=24 fds=71 mounts=29 zombies=0 heap=41987K/41200 rust=310K"
+    h = parse_health(line)
+    assert (h["heap_blocks"], h["heap_kb"], h["rust_kb"], h["log_rss_kb"]) == (41200, 41987, 310, 63 * 1024), h
+    assert (kb("1.5M"), kb("2G"), kb("510K"), kb("?")) == (1536, 2 * 1024 * 1024, 510, None)
+    for bad_size in ("12", "5T", "M", ""):
+        try:
+            kb(bad_size)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad_size!r} must not parse")
+    # The detection limit. The counted heap is exact, so a leak of 1 KiB/job in it (a leaked block
+    # per job, with the blocks counter flat to isolate the bytes) fails, however long the run ...
+    exact = [dict(r, heap_kb=510) for r in flat]
+    one_kib = [dict(r, heap_kb=510 + i) for i, r in enumerate(exact)]
+    assert {n for n, ok, _ in judge(one_kib, 20) if not ok} == {"heap_kb"}, "1 KiB/job in the heap must fail"
+    assert all(ok for _, ok, _ in judge([dict(r, heap_kb=510 + i // 4) for i, r in enumerate(exact)], 20)), \
+        "0.25 KiB/job is under the heap's margin"
+    # ... and a leak outside the counted allocators is seen only in resident and anonymous memory,
+    # where 1.5 KiB/job is the explained growth's neighbour and passes, 3 KiB/job does not.
+    uncounted = lambda per: [dict(r, proc_anon_kb=r["proc_anon_kb"] + int(i * per)) for i, r in enumerate(flat)]
+    assert all(ok for _, ok, _ in judge(uncounted(1.5), 20)), "an uncounted 1.5 KiB/job is not told from the explained growth"
+    assert {n for n, ok, _ in judge(uncounted(3), 20) if not ok} == {"proc_anon_kb"}
+    # The shapes: every one must have done its job, or the run fails and says which and why.
+    jobs = [{"shape": "run", "conclusion": "success", "heap_blocks": 5, "cause": None} for _ in range(10)] + \
+           [{"shape": "container", "conclusion": "failure", "heap_blocks": 5,
+             "cause": "pull alpine:3.20: HTTP 429 toomanyrequests"} for _ in range(3)]
+    verdicts = {s: (ok, t) for s, ok, t in judge_shapes(jobs)}
+    assert verdicts["run"][0] and not verdicts["container"][0], verdicts
+    assert "429" in verdicts["container"][1] and "'failure'" in verdicts["container"][1], verdicts
+    nine = [{"shape": "run", "conclusion": "success", "heap_blocks": 5, "cause": None}] * 9 + \
+           [{"shape": "run", "conclusion": "failure", "heap_blocks": 5, "cause": "x"}]
+    assert judge_shapes(nine)[0][1], "9 of 10 is the share that passes"
+    assert not judge_shapes(nine[1:] + [dict(nine[0], heap_blocks=None, cause="no idle sample")] * 2)[0][1], \
+        "a missing idle sample counts against its shape"
     print("selftest ok")
 
 
@@ -418,8 +533,13 @@ def main():
     a.add_argument("csv")
     a.add_argument("--warmup", type=int, default=20)
     a.add_argument("--allow-anon-kb", type=int, default=0)
+    u = sub.add_parser("unregister")
+    u.add_argument("--url", required=True)
+    u.add_argument("--token-file", required=True)
     sub.add_parser("selftest")
     args = p.parse_args()
+    if args.cmd == "unregister":
+        return unregister(args)
     if args.cmd == "selftest":
         return selftest()
     if args.cmd == "analyze":

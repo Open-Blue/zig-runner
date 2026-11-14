@@ -294,14 +294,19 @@ for the first idle `health: proc` line four seconds later, and reads the runner'
 it fails when the fitted line and the robust (Theil-Sen) slope of the run's second half are both
 above its per-job margin, or when the median of its last 20 samples is above the median of its
 first 20 by more than its total margin. Handles, threads, mounts and zombies must not rise at all.
-The margins are `LIMITS` in `.github/scripts/memory_soak.py`.
+The margins are `LIMITS` in `.github/scripts/memory_soak.py`. Each shape of job must also have done
+its job: at least 90% of its jobs must end as the shape says (success, failure or cancelled) and
+leave an idle sample, or the run fails, naming the shape and the cause the runner's log gave (a
+container job refused by Docker Hub's rate limit is "container: 0 of 3 jobs ended 'success' ...
+HTTP 429"), so a run in which a shape tested nothing is not a pass.
 
-    .github/scripts/memory-soak.sh --jobs 500      # about 3 hours: the long run, for a machine of one's own
+    .github/scripts/memory-soak.sh --jobs 500      # 2 to 3 hours (3 on the laptop, below): the long run, for a machine of one's own
     .github/scripts/memory-soak.sh --jobs 50 --own-instance   # the nightly analysis job's: about 20 minutes
 
 The first 500-job run (laptop, x86_64, native, 2026-11-14, 3 hours) ended with the heap at 510 KiB in
-9 blocks, `rust=` at 0K (the network library is a skeleton on main, and takes no part in these
-jobs), and 11 descriptors, 13 threads, 14 mounts and no zombies, all exactly as at job 20; resident
+9 blocks, `rust=` at 0K (the network library is a skeleton on main and takes no part in these
+jobs, so `rust=` covers nothing today; it becomes meaningful once the library's allocator is in use,
+when R4 and R5 merge, and its margins in `LIMITS` are unmeasured until then), and 11 descriptors, 13 threads, 14 mounts and no zombies, all exactly as at job 20; resident
 and anonymous memory rose from 7.8 and 2.6 MiB to 9.3 and 4.1 MiB, in steps at first use (threads
 touching their stacks) and then 0.87 KiB a job, which the margins of `memory_soak.py` allow and
 explain. The container shape asks Docker Hub about its image on every job, and Docker Hub's
@@ -310,11 +315,24 @@ unauthenticated limit is 100 pulls in 6 hours from one address: after that those
 shapes, `ZR_SOAK_SMAPS=1` saves the runner's `/proc/<pid>/smaps` before and after (`ZR_SOAK_SMAPS_AT=N`
 after job N as well), to say which mappings grew.
 
+What the soak can tell. The runner's counted heap (its health line's `heap=` bytes and blocks, exact
+KiB) is resolved to under 1 KiB a job: `memory_soak.py selftest` pins that a synthetic leak of 1 KiB
+a job in the counted heap fails, and that 0.25 KiB a job (under the margin) does not. Memory that
+the counted heap does not see (`smp_allocator`, `page_allocator`, a C library's) shows only in
+resident and anonymous memory, which grow 0.87 KiB a job unexplained (not attributed); an uncounted
+leak below the 2.0 KiB a job margin, or below the 2048 KiB end-minus-start allowance, cannot be told
+from that growth, and the selftest pins that too (1.5 KiB a job passes, 3 KiB a job fails). A runner
+older than this check prints the heap rounded to MiB from 10 MiB up, which cannot resolve its margin.
+
+The script removes its token files and deletes the runner's registration from the instance when it
+ends (the registration is user-scope, for `zradmin`, so a persistent Gitea does not collect one per
+run). `memory_soak.py selftest` also runs in ci on a change to the soak's files.
+
 `ZR_SOAK_ALLOW_ANON_KB` is a flat allowance for memory a library keeps in a bounded cache that the
 `rust=` counter does not count (the network library's block cache, up to 8 MiB once it lands): it
 raises the end-minus-start margin of `rss` and `anon`, not the per-job one. `memory_soak.py
-selftest` checks the judging on made-up series (noise passes, a leak, a rising handle count and
-a step are caught).
+selftest` checks the judging on made-up series (noise passes; a leak, a rising handle count, a step
+and a shape that did nothing are caught).
 
 ### The runner's warnings and errors
 
