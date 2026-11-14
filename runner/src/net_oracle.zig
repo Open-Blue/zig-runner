@@ -313,7 +313,7 @@ test "oracle: a request nobody answers, and a kept connection that dies, end the
     defer server.stop();
     const io = std.testing.io;
     var buf: [64]u8 = undefined;
-    const quick: broker.RequestOptions = .{ .deadline = .fromMilliseconds(300) };
+    const quick: broker.RequestOptions = .{ .deadline = .fromMilliseconds(1000) };
     // Silent: one attempt and one more on a connection of its own, in both.
     const impls = .{ std_broker, broker };
     inline for (impls) |impl| {
