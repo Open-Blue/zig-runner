@@ -9,9 +9,9 @@
  * the constants and the invariants it checks, then includes this file:
  *   NP NR NS MC MAXRCRASH MAXWERR      |Procs|, |Readers|, Steps, MachineCrashes,
  *                                      MaxRunnerCrashes, MaxWriteErrors
- *   SYNCBEFORE CHECKBOOT OWNERONLY POISON SETTLEEND
+ *   SYNCBEFORE CHECKBOOT OWNERONLY POISON SETTLEEND BATCHEND BATCHFIRST
  *                                      SyncBeforeMark, CheckBoot, OwnerOnly, PoisonOnFail,
- *                                      SettleAtEnd: 0 or 1
+ *                                      SettleAtEnd, BatchAtEnd, BatchSyncFirst: 0 or 1
  *   CHK_<Invariant>                    one for each invariant the .cfg lists
  *
  * The module's values, encoded:
@@ -19,10 +19,12 @@
  *   Ents       <<q, i>> is the index q*NS + i-1; a set of entries (held, evicted, promised) a bit
  *              mask. cur[q] is the index plus 1, 0 for <<>>.
  *   strings    pc, meta and tree are the numbers below ("whole" 0, "broken" 1).
+ *   inb, flying  sets of Procs, bit masks.
  *
  * The module's Spec has no fairness and no temporal property, so the processes only group the
  * actions: runner q's are Proc(q) (RunnerCrash among them, as the module has it), Env's the rest
- * (WbLoss, CollectOrphan, the readers', MachineCrash, and Next's step of an ended system). As in
+ * (WbLoss, CollectOrphan, the readers', BatchStart, BatchEnd, MachineCrash, and Next's step of an
+ * ended system). As in
  * the other ports, a process's loop is one atomic: an if whose options are the actions, then
  * check() once; the choices MachineCrash makes are in cb and cm, 0 in every stored state, and the
  * temporaries are hidden. SPIN's states are the module's and one more, its first.
@@ -39,6 +41,7 @@
 #define SETTLE_C 3
 #define DIRSYNC 4
 #define DONE 5
+#define BATCH 6
 /* meta */
 #define M_NONE 0
 #define M_PENDING 1
@@ -62,6 +65,8 @@ byte rcrashes;
 bit badHold;
 byte evicted;
 byte promised;
+byte inb;
+byte flying;
 
 /* MachineCrash's choices (lost, kept) and the entry it is at; 0 in every stored state. */
 byte cb, cm, cd;
@@ -85,11 +90,16 @@ HIDDEN byte TypeOK, NoWrongValid, NoLostPublish, MarkedHasData;
 #define USABLE(e) (vis[e] && !poisoned[e] && (meta[e] == M_DURABLE || \
                    (meta[e] == M_PENDING && (!CHECKBOOT || pboot[e] == boot))))
 #define TERMINATED (pc[0] == DONE && (NP < 2 || pc[NP - 1] == DONE))
+/* BatchEnd's: every live runner of the batch waits for it; a runner of it whose layer's tree is broken. */
+#define ATBATCH(q) (!HAS(flying, q) || !alive[q] || pc[q] == BATCH)
+#define ALLATBATCH (ATBATCH(0) && (NP < 2 || ATBATCH(NP - 1)))
+#define BRK(q) (HAS(flying, q) && broken[cur[q] - 1])
+#define ANYBROKEN (BRK(0) || (NP > 1 && BRK(NP - 1)))
 
 inline check() {
 #ifdef CHK_TypeOK
 	TypeOK = 1;
-	for (ix : 0 .. NP - 1) { TypeOK = TypeOK && pc[ix] <= DONE }
+	for (ix : 0 .. NP - 1) { TypeOK = TypeOK && pc[ix] <= BATCH }
 	for (ix : 0 .. NE - 1) { TypeOK = TypeOK && meta[ix] <= M_DURABLE }
 	assert(TypeOK);
 #endif
@@ -135,7 +145,11 @@ proctype Runner() {
 			/* publishTimed: the entry renamed in, pending, naming this boot */
 			dx = ME * NS + cn;
 			vis[dx] = 1; meta[dx] = M_PENDING; pboot[dx] = boot; cur[ME] = dx + 1
-		:: else -> pc[ME] = (cur[ME] != 0 && SETTLEEND -> SETTLING : DIRSYNC)
+		:: cn >= NS && cur[ME] != 0 && SETTLEEND && BATCHEND ->
+			/* JoinBatch: the end's settle waits for a batch's syncfs (or, the mutant, marks first) */
+			inb = inb | BIT(ME); pc[ME] = (BATCHFIRST -> BATCH : SETTLE_M)
+		:: cn >= NS && !(cur[ME] != 0 && SETTLEEND && BATCHEND) ->
+			pc[ME] = (cur[ME] != 0 && SETTLEEND -> SETTLING : DIRSYNC)
 		fi }
 	/* SettleD: the data synced */
 	:: d_step { pc[ME] == SETTLE_D && alive[ME] && !broken[E] ->
@@ -166,7 +180,8 @@ proctype Runner() {
 	:: d_step { pc[ME] == SETTLE_C && alive[ME] ->
 		mcommit[E] = 1;
 		if
-		:: SYNCBEFORE -> pc[ME] = STEP; cur[ME] = 0
+		:: SYNCBEFORE && HAS(inb | flying, ME) -> pc[ME] = BATCH
+		:: SYNCBEFORE && !HAS(inb | flying, ME) -> pc[ME] = STEP; cur[ME] = 0
 		:: else -> pc[ME] = SETTLE_D
 		fi }
 	/* DirSync */
@@ -210,6 +225,46 @@ end:
 	ENT(0) ENT(1) ENT(2) ENT(3)
 	READ(0, 0) READ(0, 1) READ(0, 2) READ(0, 3)
 	READ(1, 0) READ(1, 1) READ(1, 2) READ(1, 3)
+	/* BatchStart: the batch's syncfs begins, for the runners that joined it. */
+	:: d_step { flying == 0 && inb != 0 -> flying = inb; inb = 0 }
+	/* BatchEnd: the syncfs succeeds, every layer of the batch's data on disk. */
+	:: d_step { flying != 0 && ALLATBATCH && !ANYBROKEN ->
+		for (ix : 0 .. NP - 1) {
+			if
+			:: HAS(flying, ix) ->
+				ddata[cur[ix] - 1] = 1;
+				if
+				:: alive[ix] && BATCHFIRST -> pc[ix] = SETTLE_M
+				:: alive[ix] && !BATCHFIRST -> pc[ix] = STEP; cur[ix] = 0
+				:: else
+				fi
+			:: else
+			fi
+		}
+		flying = 0;
+		ix = 0 }
+	/* BatchEnd: the syncfs fails, and every live runner of the batch poisons its layer. */
+	:: d_step { flying != 0 && ALLATBATCH && (ANYBROKEN || werrors < MAXWERR) ->
+		if
+		:: !ANYBROKEN -> werrors++
+		:: else
+		fi;
+		for (ix : 0 .. NP - 1) {
+			if
+			:: HAS(flying, ix) && alive[ix] ->
+				dx = cur[ix] - 1;
+				poisoned[dx] = POISON || poisoned[dx];
+				vis[dx] = HELDBY(dx);
+				if
+				:: !HELDBY(dx) -> evicted = evicted | BIT(dx)
+				:: else
+				fi;
+				cur[ix] = 0; pc[ix] = STEP
+			:: else
+			fi
+		}
+		flying = 0;
+		ix = 0 }
 	/* MachineCrash: cb := lost, cm := kept, one entry at a time. */
 	:: boot < MC ->
 		do
@@ -236,6 +291,7 @@ end:
 				mcommit[ix] = mcommit[ix] || meta[ix] == M_DURABLE
 			}
 			for (ix : 0 .. NP - 1) { pc[ix] = DONE; cur[ix] = 0; alive[ix] = 0 }
+			inb = 0; flying = 0;
 			for (ix : 0 .. NR - 1) { held[ix] = 0 }
 			ix = 0 /* a d_step may not end in a loop, whose exit is a jump out of it */
 		}
