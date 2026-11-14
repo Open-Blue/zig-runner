@@ -488,3 +488,27 @@ test "parseUses" {
     try std.testing.expect(parseUses("o/r@") == null);
     try std.testing.expect(parseUses("o/r/../x@v1") == null);
 }
+
+test "allocation failures: action metadata, valid and not" {
+    const af = @import("alloc_failures.zig");
+    const S = struct {
+        /// Whatever the text is, the parse answers or runs out of memory: what it says of an
+        /// invalid file is made in the same memory.
+        fn run(a: Allocator, text: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            _ = try parse(arena.allocator(), text);
+        }
+    };
+    for ([_][]const u8{
+        "name: x\ninputs:\n  a:\n    default: ${{ github.token }}\n    required: true\noutputs:\n  o:\n    value: ${{ steps.s.outputs.v }}\n" ++
+            "runs:\n  using: Composite\n  steps:\n    - shell: bash\n      run: echo hi\n    - id: s\n      if: always()\n      uses: actions/checkout@v6\n" ++
+            "      with:\n        fetch-depth: 0\n      env:\n        K: v\n",
+        "outputs:\n  r:\n    description: d\nruns:\n  using: node24\n  main: dist/index.js\n  post: dist/post.js\n  post-if: success()\n",
+        "runs:\n  using: docker\n  image: docker://alpine:3\n  entrypoint: /bin/echo\n  args:\n    - a\n    - b\n  env:\n    K: v\n",
+        "runs:\n  using: composite\n  steps:\n    - run: echo\n",
+        "runs:\n  using: composite\n  steps:\n    - uses: a/b@v1\n      bogus: 1\n",
+        "a: &x 1\n",
+        "- a\n",
+    }) |text| try af.checkOne(S.run, .{text});
+}

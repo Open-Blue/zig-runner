@@ -131,7 +131,13 @@ fn checkEachAllocationFailure(comptime f: anytype, args: anytype) !void {
     while (i < n) : (i += stride()) {
         var once: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i };
         if (@call(.auto, f, .{once.allocator()} ++ args)) |_| {
-            if (once.failed) return error.SwallowedOutOfMemoryError;
+            if (once.failed) {
+                // Where that allocation was made, for whoever swallowed its failure.
+                var again: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i, .trace = true };
+                std.debug.print("allocation failures: allocation {d} of {d} failed and the run went on, made at:\n", .{ i, n });
+                _ = @call(.auto, f, .{again.allocator()} ++ args) catch {};
+                return error.SwallowedOutOfMemoryError;
+            }
         } else |e| if (e != error.OutOfMemory) return e;
         try once.checkFreed();
     }
@@ -165,6 +171,8 @@ pub fn checkNoLeaks(comptime f: anytype, args: anytype) !void {
 const FailOnce = struct {
     child: Allocator,
     fail_at: ?usize = null,
+    /// Print where the failed allocation was made.
+    trace: bool = false,
     count: usize = 0,
     failed: bool = false,
     /// Bytes allocated and not yet freed.
@@ -183,6 +191,7 @@ const FailOnce = struct {
         defer o.count += 1;
         if (o.fail_at == o.count) {
             o.failed = true;
+            if (o.trace) std.debug.dumpCurrentStackTrace(.{ .first_address = ra });
             return null;
         }
         const memory = o.child.rawAlloc(len, alignment, ra) orelse return null;

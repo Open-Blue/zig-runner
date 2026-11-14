@@ -244,3 +244,26 @@ test "libzstd: a window over the limit is refused" {
     try testing.expectError(error.ReadFailed, d.reader.readSliceShort(&buf));
     try testing.expect(d.err != null);
 }
+
+test "allocation failures: libzstd's reader, its state and its buffers" {
+    const af = @import("../../alloc_failures.zig");
+    const S = struct {
+        fn run(gpa: Allocator, compressed: []const u8) !void {
+            var in: Reader = .fixed(compressed);
+            var out: std.Io.Writer.Allocating = .init(gpa);
+            defer out.deinit();
+            try testing.expectEqual(null, try decodeAll(gpa, &in, &out));
+        }
+        /// A stream cut off: libzstd's words for it, or `OutOfMemory`, never a leak.
+        fn cut(gpa: Allocator, compressed: []const u8) !void {
+            var in: Reader = .fixed(compressed);
+            var out: std.Io.Writer.Allocating = .init(gpa);
+            defer out.deinit();
+            try testing.expect(try decodeAll(gpa, &in, &out) != null);
+        }
+    };
+    // `libzstd`'s own allocations go to `c_alloc`, which cannot be made to fail from here:
+    // what is checked is this file's, created and destroyed on every path.
+    try af.checkOne(S.run, .{@as([]const u8, &layer.test_zstd)});
+    try af.checkOne(S.cut, .{@as([]const u8, layer.test_zstd[0 .. layer.test_zstd.len / 2])});
+}

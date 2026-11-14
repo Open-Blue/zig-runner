@@ -815,7 +815,8 @@ fn decompressAll(gpa: Allocator, compressed: []const u8) ![]u8 {
     errdefer out.deinit();
     _ = d.reader.streamRemaining(&out.writer) catch |e| {
         if (d.err) |why| return why;
-        return e;
+        // The only writer here is `out`, whose failure is an allocation's.
+        return if (e == error.WriteFailed) error.OutOfMemory else e;
     };
     return out.toOwnedSlice();
 }
@@ -1022,4 +1023,28 @@ test "native oci zstd: a window over the limit is refused, and a failed stream s
     // Reading on does not decode what follows the refused header.
     try testing.expectError(error.ReadFailed, d.reader.readSliceAll(&out));
     try testing.expectEqual(error.WindowTooLarge, d.err.?);
+}
+
+test "allocation failures: the Zig zstd decoder, from its state to a window grown for a frame" {
+    const af = @import("../../alloc_failures.zig");
+    const S = struct {
+        fn run(gpa: Allocator, compressed: []const u8) !void {
+            const got = try decompressAll(gpa, compressed);
+            gpa.free(got);
+        }
+        /// Fails on what is wrong with the stream, as it does without a failure.
+        fn broken(gpa: Allocator, compressed: []const u8) !void {
+            const got = decompressAll(gpa, compressed) catch |e| {
+                if (e == error.OutOfMemory) return e;
+                return;
+            };
+            gpa.free(got);
+        }
+    };
+    try af.checkOne(S.run, .{level3});
+    try af.checkOne(S.run, .{level19});
+    // Two frames, so the second finds a window that is there already.
+    try af.checkOne(S.run, .{level3 ++ level19});
+    // A frame cut off, after its window has been made.
+    try af.checkOne(S.broken, .{level3[0 .. level3.len / 2]});
 }
