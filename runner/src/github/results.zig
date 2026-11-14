@@ -8,8 +8,8 @@
 const std = @import("std");
 const broker = @import("broker.zig");
 const http = @import("http.zig");
-const ratelimit = @import("ratelimit.zig");
 const net_client = @import("../net_client.zig");
+const ratelimit = @import("ratelimit.zig");
 const job_mod = @import("../job.zig");
 const sink = @import("../sink.zig");
 const timefmt = @import("../timefmt.zig");
@@ -461,7 +461,15 @@ fn putBlob(arena: Allocator, io: std.Io, url: []const u8, blob: Blob) !broker.Re
             error.StaleConnection, error.Timeout, error.NetworkIo => if (attempt == 0) continue else return e,
             else => return e,
         };
-        return .{ .status = r.status, .body = r.body };
+        // What the blob store asked to wait (a 429's `Retry-After`), as `broker.request` reads it.
+        const wait_ms = ratelimit.parse(
+            r.status,
+            r.header("retry-after"),
+            r.header("x-ratelimit-remaining"),
+            r.header("x-ratelimit-reset"),
+            std.Io.Clock.real.now(io).toMilliseconds(),
+        );
+        return .{ .status = r.status, .body = r.body, .wait_ms = wait_ms };
     }
 }
 
@@ -816,6 +824,21 @@ test "a 429 with Retry-After is waited out before the next try, not retried at o
     const took = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - started;
     try std.testing.expect(r.ok);
     // The backoff was 1 ms; the server asked for a second.
+    try std.testing.expect(took >= 1000 * std.time.ns_per_ms);
+}
+
+test "a 429 with Retry-After from the blob store itself is waited out too" {
+    var server: @import("testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    server.results_fail = 1;
+    server.results_fail_on = "/results-blob";
+    server.results_fail_status = "429 Too Many Requests";
+    server.results_fail_headers = "Retry-After: 1\r\n";
+    const started = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+    const r = testUpload(&server, .job, quick);
+    const took = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - started;
+    try std.testing.expect(r.ok);
     try std.testing.expect(took >= 1000 * std.time.ns_per_ms);
 }
 

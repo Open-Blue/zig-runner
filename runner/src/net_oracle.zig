@@ -206,7 +206,7 @@ fn expectedBlob(n: u64) Hash {
     var chunk: [4096]u8 = undefined;
     var at: u64 = 0;
     while (at < n) {
-        const len: usize = @intCast(@min(n - at, chunk.len));
+        const len: usize = @min(n - at, chunk.len);
         for (chunk[0..len], 0..) |*c, i| c.* = testserver.blobByte(at + i);
         h.add(chunk[0..len]);
         at += len;
@@ -318,22 +318,6 @@ test "oracle: a download redirected to another host: the library takes the token
     try std.testing.expectEqual(old2.hash.hash, lib2.hash.hash);
 }
 
-const Pattern = struct {
-    len: usize,
-
-    fn write(ptr: *const anyopaque, w: *Io.Writer) anyerror!void {
-        const p: *const Pattern = @ptrCast(@alignCast(ptr));
-        var chunk: [7000]u8 = undefined;
-        var at: usize = 0;
-        while (at < p.len) {
-            const len = @min(p.len - at, chunk.len);
-            for (chunk[0..len], 0..) |*c, i| c.* = testserver.blobByte(at + i);
-            try w.writeAll(chunk[0..len]);
-            at += len;
-        }
-    }
-};
-
 test "oracle: an upload written as it is sent arrives as the same bytes through std's client and the library's" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
@@ -349,8 +333,8 @@ test "oracle: an upload written as it is sent arrives as the same bytes through 
         var expect_buf: [64]u8 = undefined;
         const want = expectedBlob(n);
         const expect = try std.fmt.bufPrint(&expect_buf, "{d} {x:0>16}", .{ want.bytes, want.hash });
-        const pattern: Pattern = .{ .len = n };
-        const body: net_client.Body = .{ .len = n, .ptr = &pattern, .writeFn = Pattern.write };
+        const pattern: testserver.PatternBody = .{ .len = n };
+        const body: net_client.Body = .{ .len = n, .ptr = &pattern, .writeFn = testserver.PatternBody.write };
         const lib = try net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = body, .headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }} });
         try std.testing.expectEqual(std.http.Status.ok, lib.status);
         try std.testing.expectEqualStrings(expect, lib.body);
