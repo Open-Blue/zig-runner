@@ -711,9 +711,10 @@ test "preload: a JavaScript action, a local one, or an image not in the store se
     const cfg = try testActions(arena, &tmp);
     try testRepo(arena, &tmp, "js", &.{.{ "action.yml", "runs:\n  using: node20\n  main: index.js\n" }});
     try testRepo(arena, &tmp, "far", &.{.{ "action.yml", "runs:\n  using: docker\n  image: docker://zr-test/other:1\n" }});
+    // Multi-stage builds are native now; an archive in `ADD` is still not.
     try testRepo(arena, &tmp, "multi", &.{
         .{ "action.yml", "runs:\n  using: docker\n  image: Dockerfile\n" },
-        .{ "Dockerfile", "FROM zr-test/base:1 AS build\nFROM zr-test/base:1\n" },
+        .{ "Dockerfile", "FROM scratch\nADD app.tar.gz /\n" },
     });
     const Case = struct { step: job_mod.Step, why: ?[]const u8 };
     var local = testStep("");
@@ -726,7 +727,7 @@ test "preload: a JavaScript action, a local one, or an image not in the store se
         .{ .step = usesStep("j", "o", "js", "v1", &.{}), .why = "o/js@v1 is a JavaScript action" },
         .{ .step = local, .why = "is not in o/r at" },
         .{ .step = usesStep("f", "o", "far", "v1", &.{}), .why = "zr-test/other:1 is not in the tests' images directory" },
-        .{ .step = usesStep("m", "o", "multi", "v1", &.{}), .why = "line 1: multi-stage" },
+        .{ .step = usesStep("m", "o", "multi", "v1", &.{}), .why = "line 2: ADD of an archive" },
         // One that cannot be fetched is not a reason: native "Set up job" fails with it.
         .{ .step = usesStep("n", "o", "nope", "v1", &.{}), .why = null },
     }) |c| {
