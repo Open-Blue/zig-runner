@@ -220,7 +220,8 @@ fn idempotent(m: &Method) -> bool {
 /// said. The server may have read, and acted on, the request before that: only an idempotent
 /// method's may be sent again on this evidence (`retry_after`).
 fn is_dead(e: &hyper::Error) -> bool {
-    if e.is_closed() || e.is_incomplete_message() {
+    // `is_canceled`: hyper gives the request back unwritten when the connection closed under it (it logs "operation was canceled"); nothing was sent, which is what makes a resend safe for any method.
+    if e.is_closed() || e.is_incomplete_message() || e.is_canceled() {
         return true;
     }
     let mut src = std::error::Error::source(e);
