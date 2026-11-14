@@ -1132,28 +1132,14 @@ fn jobCgroup(
                 std.log.warn("native: {s}", .{said});
             }
             // memory.high from what the gate reserves for the job; under memory.max, which stays
-            // the hard cap. Only where it can slow a job, not stop it (`cgroup.canSwap`): the job's
-            // own swap is 0 here (above), whatever the parent allows, so it is never set at
-            // set-up; a job that asks for swap later (`limitSwap`) has none either.
+            // the hard cap. Only where it can slow a job, not stop it: the job's own swap is 0
+            // here (above), so none is set; a job that asks for swap (`limitSwap`) gets it then.
             const g = b.gate orelse return;
-            const high_mb = g.native(j.dir) orelse return;
-            if (!cgroup.canSwap(.{ .swap = false }, b.io)) {
-                g.noHigh(if (b.limits.memory_max) |m| m >> 20 else null);
-                try b.notes.append(arena, "Native steps: no memory.high: with no swap it would " ++
-                    "stop a job past it instead of slowing it. memory.max ends one that takes " ++
-                    "too much.");
-                return;
-            }
-            const high = j.setHigh(arena, b.io, @as(u64, high_mb) << 20) catch |e| {
-                try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: the " ++
-                    "job's memory.high could not be set ({s}).", .{@errorName(e)}));
-                return;
-            };
-            try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: memory.high " ++
-                "{f}, from what the memory gate reserves for the job: past it the kernel " ++
-                "reclaims and slows the job instead of letting it take its neighbours' memory.", .{
-                Limit.memory(high),
-            }));
+            _ = g.native(j.dir) orelse return;
+            g.noHigh(if (b.limits.memory_max) |m| m >> 20 else null);
+            try b.notes.append(arena, "Native steps: no memory.high: with no swap it would " ++
+                "stop a job past it instead of slowing it. memory.max ends one that takes " ++
+                "too much.");
             return;
         } else |e| try std.fmt.allocPrint(arena, "it could not be made under {s}: {s}", .{
             dir,
@@ -3797,6 +3783,26 @@ fn limitCpu(b: *Backend, m: container_options.CpuMax, err_msg: *[]const u8) ![]c
     return "";
 }
 
+/// A job that has swap gets `memory.high` after all, from what the gate reserves for it, where it
+/// can slow the job (`cgroup.canSwap`: the machine has swap to reclaim into): past it the kernel
+/// reclaims and slows the job instead of letting it take its neighbours' memory. The gate takes
+/// back the estimate `noHigh` replaced (`Gate.restoreHigh`), and grows the limit as it does for
+/// any job with one (`Admission.growHigh`).
+fn highForSwap(b: *Backend, j: cgroup.Job) !void {
+    const g = b.gate orelse return;
+    if (!cgroup.canSwap(j.all, b.io)) return;
+    const high_mb = g.restoreHigh() orelse return;
+    const high = j.setHigh(b.arena, b.io, @as(u64, high_mb) << 20) catch |e| {
+        g.noHigh(if (b.limits.memory_max) |m| m >> 20 else null);
+        try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Native steps: the " ++
+            "job's memory.high could not be set ({s}).", .{@errorName(e)}));
+        return;
+    };
+    try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Native steps: memory.high " ++
+        "{f}, as the job has swap: past it the kernel reclaims and slows the job instead of " ++
+        "letting it take its neighbours' memory.", .{Limit.memory(high)}));
+}
+
 /// The job's own `memory.swap.max`, as Docker reads `--memory-swap` (`Options.swapMax`), whenever
 /// the job has a cgroup: 0 without the flag, up to what the runner allows (`RUNNER_NATIVE_SWAP`
 /// and a kernel that accounts for it); a flag asking for more is capped to 0, and "Set up job"
@@ -3811,6 +3817,7 @@ fn limitSwap(b: *Backend, o: container_options.Options, more: *std.ArrayList(u8)
         err_msg.* = "the job container's `--memory-swap` could not be set on the job's cgroup";
         return error.BaseContainerFailed;
     };
+    if (std.meta.activeTag(set) != .none) try b.highForSwap(j);
     const asked = o.swapMax(true);
     const capped = !allowed and std.meta.activeTag(asked) != .none;
     if (o.memory_swap != null or capped) try more.print(b.arena, ", `--memory-swap` {d}: memory.swap.max {s}{s}", .{
@@ -10828,6 +10835,39 @@ test "root runner: a native job with no options has memory.swap.max 0 and no mem
     if (!r.res.succeeded) std.debug.print("{s}\n", .{r.text});
     try expectLines(r.text, &.{ "swap=0", "high=max", "Native steps: no memory.high", "each job's own memory.swap.max is 0 unless" });
     try std.testing.expectEqual(@as(?u32, null), slots[0].high_mb);
+    _ = gate.ended();
+}
+
+test "root runner: a job that asks for swap with --memory-swap gets memory.high, and the gate reserves for it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    // The machine must have swap to reclaim into (`cgroup.canSwap`), and the kernel account for it.
+    if (!cgroup.canSwap(.{ .swap = true }, io)) return error.SkipZigTest;
+    var probe_buf: [8]u8 = undefined;
+    _ = std.Io.Dir.cwd().readFile(io, try std.fmt.allocPrint(arena, "{s}/memory.swap.max", .{parent.dir}), &probe_buf) catch return error.SkipZigTest;
+    cfg.cgroup.swap = true;
+    var slots: [1]admission.Admission.Slot = undefined;
+    var pool: admission.Admission = .init(io, .{ .margin_percent = 0 }, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    pool.native = true;
+    var gate: admission.Gate = .{ .pool = &pool };
+    var gated = cfg;
+    gated.gate = &gate;
+    gate.leave(true);
+    gate.assigned(admission.jobKey("o/r", "ci.yml", "asks for swap"));
+    const show = "echo \"swap=$(cat $cg/memory.swap.max)\"; echo \"high=$(cat $cg/memory.high)\"";
+    // 1 GiB of memory plus swap over 512 MiB of memory: 512 MiB of swap, and the gate's memory.high
+    // (twice the 256 MB a job not learned yet reserves, and 512 MB of headroom).
+    const text = try runOptionsJob(arena, gated, "-m 512m --memory-swap 1g", show);
+    try expectLines(text, &.{ "swap=536870912", "high=1073741824", "Native steps: memory.high 1.0 GB", "as the job has swap" });
+    try std.testing.expectEqual(@as(?u32, 1024), slots[0].high_mb);
     _ = gate.ended();
 }
 

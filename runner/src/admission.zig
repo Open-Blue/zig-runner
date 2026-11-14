@@ -1180,6 +1180,24 @@ pub const Gate = struct {
         s.est_mb = if (limit_mb) |l| @min(worst, l) else worst;
     }
 
+    /// The job's swap turned out above 0 (`--memory-swap`, `Backend.limitSwap`) after `noHigh` took
+    /// its `memory.high` away: what it reserves goes back to its estimate, and `memory.high` is
+    /// what the estimate gives (`nativeHighMb`), which is returned for the caller to set. Null
+    /// when the job has no estimate to give one (`native_per_job_mb` 0), or is not running.
+    pub fn restoreHigh(g: *Gate) ?u32 {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        defer a.changed();
+        const s = &a.slots[g.slot];
+        if (!s.running() or !s.native) return null;
+        const est = a.nativeEstimate(s.key);
+        s.est_mb = est;
+        if (est == 0) return null;
+        s.high_mb = nativeHighMb(est);
+        return s.high_mb;
+    }
+
     /// The job runs on the Dagger engine after all: a native pool's job that the native backend
     /// cannot run, or one whose native set-up (`native`) found it cannot run there. It takes the
     /// engine's cap again, reserves what it took on the engine (or the engine's worst case), and is
@@ -3910,6 +3928,40 @@ test "a native job that cannot swap gets no memory.high, and the gate raises non
     var buf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("max\n", try tmp.dir.readFile(io, "job/memory.high", &buf));
     try std.testing.expectEqual(@as(?u32, null), pool.slots[0].high_mb);
+    _ = gate.ended();
+}
+
+test "the gate's estimate for a job with swap 0 (no memory.high) and one that asked for swap (memory.high restored)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var meminfo_buf: [256]u8 = undefined;
+    const meminfo = try std.fmt.bufPrint(&meminfo_buf, ".zig-cache/tmp/{s}/meminfo", .{tmp.sub_path});
+    var job_buf: [256]u8 = undefined;
+    const job = try std.fmt.bufPrint(&job_buf, ".zig-cache/tmp/{s}/job", .{tmp.sub_path});
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 6144000 kB\n" });
+    var slots: [1]Admission.Slot = undefined;
+    var pool: Admission = .init(io, no_margin, &slots);
+    pool.paths = .{ .meminfo = meminfo, .pressure = "/nonexistent" };
+    var gate: Gate = .{ .pool = &pool };
+    try writeCgroup(tmp.dir, "job", "max", 0, .{}, null);
+    // Swap 0: `noHigh`, no memory.high, and it reserves the worst case while it is not learned.
+    gate.leave(true);
+    gate.assigned(jobKey("o/r", "o/r/.github/workflows/ci.yml", "no swap"));
+    try std.testing.expectEqual(@as(?u32, 1024), gate.native(job));
+    const own_est = pool.slots[0].est_mb.?;
+    gate.noHigh(null);
+    try std.testing.expectEqual(@as(?u32, null), pool.slots[0].high_mb);
+    _ = gate.ended();
+    // It asked for swap: the estimate and the limit go back to what a job with swap has.
+    gate.leave(true);
+    gate.assigned(jobKey("o/r", "o/r/.github/workflows/ci.yml", "swap"));
+    try std.testing.expectEqual(@as(?u32, 1024), gate.native(job));
+    gate.noHigh(null);
+    pool.slots[0].est_mb = 99_999;
+    try std.testing.expectEqual(@as(?u32, 1024), gate.restoreHigh());
+    try std.testing.expectEqual(@as(?u32, 1024), pool.slots[0].high_mb);
+    try std.testing.expectEqual(@as(?u32, own_est), pool.slots[0].est_mb);
     _ = gate.ended();
 }
 
