@@ -2820,6 +2820,8 @@ fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8, limit: usize) anyerr
 /// another job running the same key (`claimKey`).
 fn abort(ptr: *anyopaque) bool {
     const b: *Backend = @ptrCast(@alignCast(ptr));
+    // A paused (frozen) job takes no signal until it is thawed: thawed first (`Gate.thaw`).
+    if (b.gate) |g| g.thaw();
     if (b.running.kill(b.io)) return true;
     if (!b.waiting.load(.acquire)) return false;
     b.stop_wait.store(true, .release);
@@ -2830,6 +2832,8 @@ fn abort(ptr: *anyopaque) bool {
 /// key's lock has nothing to warn, and stops as `abort` stops it.
 fn warn(ptr: *anyopaque, sig: std.os.linux.SIG) dagger.Transport.Warned {
     const b: *Backend = @ptrCast(@alignCast(ptr));
+    // Thawed before the first signal of the ladder, or its stages wait in a frozen cgroup.
+    if (b.gate) |g| g.thaw();
     if (b.running.warn(b.io, sig)) return .warned;
     return if (abort(ptr)) .ended else .nothing;
 }
@@ -3797,7 +3801,15 @@ fn readContainerOptions(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void
         n,
         cgroup.cpuWeight(n),
     });
-    if (o.cpu_shares) |n| try b.limitWeight(cgroup.cpuWeight(n), err_msg);
+    if (o.cpu_shares) |n| {
+        try b.limitWeight(cgroup.cpuWeight(n), err_msg);
+        // The job's own flag wins over the weight its priority gave it (`prioritize`).
+        if (b.gate) |g| if (g.standing().level != priority.normal) try b.notes.append(b.arena, try std.fmt.allocPrint(
+            b.arena,
+            "Native steps: `--cpu-shares` {d} sets cpu.weight {d}, over the job's priority weight.",
+            .{ n, cgroup.cpuWeight(n) },
+        ));
+    }
     if (o.cpuset_cpus) |l| try more.print(b.arena, ", `--cpuset-cpus` {s}{s}", .{ l, try b.limitCpuset("cpuset.cpus", "--cpuset-cpus", l, err_msg) });
     if (o.cpuset_mems) |l| try more.print(b.arena, ", `--cpuset-mems` {s}{s}", .{ l, try b.limitCpuset("cpuset.mems", "--cpuset-mems", l, err_msg) });
     if (o.pids_limit) |n| try more.print(b.arena, ", `--pids-limit` {d}{s}", .{ n, try b.limitPids(n, err_msg) });
@@ -3880,6 +3892,29 @@ fn limitCpu(b: *Backend, m: container_options.CpuMax, err_msg: *[]const u8) ![]c
     return "";
 }
 
+/// The job's priority (`priority.zig`) as its cgroup's weights and memory protection. Nothing is
+/// written for the default level, so a pool with no priorities touches no extra file. This runs
+/// at the job's cgroup set-up, before the container's options (`readContainerOptions`): a
+/// `--cpu-shares` of the job's own is written after, and wins over the level's `cpu.weight`.
+fn prioritize(b: *Backend, arena: Allocator, j: cgroup.Job, g: *admission.Gate) !void {
+    const st = g.standing();
+    if (st.level == priority.normal) return;
+    const protect: u64 = if (priority.protectsMemory(st.level)) @as(u64, st.est_mb) << 20 else 0;
+    const done = j.limitPriority(arena, st.level, protect);
+    if (!done.cpu or !done.io or (protect > 0 and !done.memory)) logfmt.warn("priority_not_applied", "dir={f} level={d} cpu={} io={} memory_low={}", .{
+        logfmt.q(j.dir), st.level, done.cpu, done.io, done.memory or protect == 0,
+    });
+    try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: priority {d}: cpu.weight " ++
+        "{d}{s}, io.weight {d}{s}{s}.", .{
+        st.level,
+        priority.cpuWeight(st.level),
+        if (done.cpu) "" else " (not set: no cpu controller)",
+        priority.ioWeight(st.level),
+        if (done.io) "" else " (not set: no io controller)",
+        if (protect == 0) "" else if (done.memory) ", memory.low set" else ", memory.low not set",
+    }));
+}
+
 /// A job that has swap gets `memory.high` after all, from what the gate reserves for it, where it
 /// can slow the job (`cgroup.canSwap`: the machine has swap to reclaim into): past it the kernel
 /// reclaims and slows the job instead of letting it take its neighbours' memory. The gate takes
@@ -3933,24 +3968,6 @@ fn limitSwap(b: *Backend, o: container_options.Options, more: *std.ArrayList(u8)
         text,
         if (capped) " (capped: jobs may not swap here, RUNNER_NATIVE_SWAP is off or the kernel does not account for swap)" else "",
     });
-}
-
-/// The job's priority (`priority.zig`) as its cgroup's weights and memory protection. Nothing is
-/// written for the default level, so a pool with no priorities touches no extra file.
-fn prioritize(b: *Backend, arena: Allocator, j: cgroup.Job, g: *admission.Gate) !void {
-    const st = g.standing();
-    if (st.level == priority.normal) return;
-    const protect: u64 = if (priority.protectsMemory(st.level)) @as(u64, st.est_mb) << 20 else 0;
-    const done = j.limitPriority(arena, st.level, protect);
-    try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: priority {d}: cpu.weight " ++
-        "{d}{s}, io.weight {d}{s}{s}.", .{
-        st.level,
-        priority.cpuWeight(st.level),
-        if (done.cpu) "" else " (not set: no cpu controller)",
-        priority.ioWeight(st.level),
-        if (done.io) "" else " (not set: no io controller)",
-        if (protect == 0) "" else if (done.memory) ", memory.low set" else ", memory.low not set",
-    }));
 }
 
 /// `--cpu-shares` as the job's `cpu.weight` (`cgroup.cpuWeight`).
@@ -5035,6 +5052,67 @@ test "a cancel stops a native step, and every process it started, well inside th
     try std.testing.expect(!processRuns("613.70"));
 }
 
+test "root runner: a cancel of a job whose steps are frozen thaws them first, and ends promptly" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    var slots: [1]admission.Admission.Slot = undefined;
+    var pool: admission.Admission = .init(io, .{ .margin_percent = 0, .priority = .{ .freeze = true } }, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    pool.native = true;
+    var gate: admission.Gate = .{ .pool = &pool };
+    var gated = cfg;
+    gated.gate = &gate;
+    gate.leave(true);
+    gate.assigned(admission.jobKey("o/r", "ci.yml", "cancel while frozen"));
+    var s1 = testStep("trap 'echo cleaned-up' INT\nsleep 613.80\necho not\"\"-this");
+    s1.name = "frozen";
+    // Frozen, SIGINT would wait in the cgroup until the pause was over (90 s): thawed, it is heard.
+    const r = try runCancelled(arena, gated, testJob(&.{s1}), .{ .when = "613.80", .freeze = &gate });
+    errdefer std.debug.print("took {d} ms:\n{s}\n", .{ r.took_ms, r.text });
+    try std.testing.expectEqual(dagger.Outcome.cancelled, r.res.steps[0].outcome);
+    try expectLines(r.text, &.{"cleaned-up"});
+    try std.testing.expect(r.took_ms < 5_000);
+    try std.testing.expect(!processRuns("613.80"));
+}
+
+test "root runner: a job's own --cpu-shares wins over the weight its priority gives it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    var slots: [1]admission.Admission.Slot = undefined;
+    var pool: admission.Admission = .init(io, .{ .margin_percent = 0 }, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    pool.native = true;
+    var gate: admission.Gate = .{ .pool = &pool };
+    var gated = cfg;
+    gated.gate = &gate;
+    gate.leave(true);
+    gate.assigned(admission.jobKey("o/r", "ci.yml", "shares over priority"));
+    gate.prioritize(priority.high);
+    const show = "echo \"weight=$(cat $cg/cpu.weight)\"";
+    // High is weight 300; 512 shares are 50, and the job asked for them.
+    const with = try runOptionsJob(arena, gated, "--cpu-shares 512", show);
+    try expectLines(with, &.{ "weight=50", "priority 7: cpu.weight 300", "over the job's priority weight" });
+    // Without the flag, the level's weight stands.
+    gate.assigned(admission.jobKey("o/r", "ci.yml", "priority alone"));
+    gate.prioritize(priority.high);
+    const alone = try runOptionsJob(arena, gated, "--hostname h", show);
+    try expectLines(alone, &.{"weight=300"});
+}
+
 test "a cancel's SIGINT reaches a native step's foreground child, and the step's trap then runs" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -5241,6 +5319,8 @@ pub const CancelPlan = struct {
     why: dagger.Cancel.Why = .github,
     /// The job uses the layer store, shared with later jobs.
     step_cache: bool = false,
+    /// The job's steps are frozen, as the priority governor does it, just before the cancel.
+    freeze: ?*admission.Gate = null,
 };
 
 /// `job` on the native backend, cancelled as `plan` says; `took_ms` runs from the cancel to the
@@ -5276,6 +5356,13 @@ pub fn runCancelled(arena: Allocator, cfg: Config, job: job_mod.Job, plan: Cance
 fn cancelOnce(cancel: *dagger.Cancel, plan: CancelPlan, at: *std.atomic.Value(i64)) void {
     const io = std.testing.io;
     waitForProcess(plan.when) catch return;
+    if (plan.freeze) |g| {
+        g.pool.mu.lockUncancelable(io);
+        const s = &g.pool.slots[g.slot];
+        s.paused = g.pool.setFrozen(s, true);
+        g.pool.mu.unlock(io);
+        io.sleep(.fromMilliseconds(300), .awake) catch {};
+    }
     at.store(std.Io.Clock.awake.now(io).toMilliseconds(), .release);
     cancel.requestBecause(std.Io.Clock.real.now(io).toMilliseconds() + plan.grace_ms, plan.why);
 }

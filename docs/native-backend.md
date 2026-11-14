@@ -2326,6 +2326,16 @@ side by side, each with its own contents, and a host path inside the named volum
 both. All three in one job (root): a published port that serves what a host path (`:ro`) and a
 named volume hold, each reported in "Set up job", and the port gone with the job.
 
+### Job priority (#549)
+
+A job has a level 0 to 9 (`low` 1, `normal` 4, `high` 7; a policy file, or `ZIG_RUNNER_PRIORITY` in the job's `env:` up to `RUNNER_PRIORITY_ENV_MAX`). Waiting jobs start in order of the level they have risen to (one per `RUNNER_PRIORITY_AGE_SECS`), and a native job's cgroup gets `cpu.weight`, `io.weight` and, for a high one, `memory.low` from its level (nothing is written for `normal`). Where a controller is not available (no cpu or io controller delegated, no memory estimate for `memory.low`) the job runs without that part, and "Set up job" and the runner's log (`kind=priority_not_applied`) say which.
+
+- **A job's own `--cpu-shares` wins** over the level's `cpu.weight`: the level is written at set-up, the container's options after, and "Set up job" says so.
+- **Freezing** (`RUNNER_PRIORITY_FREEZE`): under memory pressure a lower job's steps cgroup is frozen for a higher one. **Freeze time counts against `timeout-minutes`**: the step timeout and the job's connections run on while the steps are frozen, so a pause is bounded by `RUNNER_PRIORITY_FREEZE_MAX_SECS` (90 s), after which the job is not paused again for as long.
+- **Cancel, timeout and shutdown thaw first.** Every stage of the cancel ladder (SIGINT, SIGTERM, SIGKILL) and the job's end thaw the steps before they signal, and mark the job unpaused; a frozen process takes no signal. A thaw that fails (logged as `job_thaw_failed`) leaves the job marked paused and is tried again at each tick (once a second).
+- **No pause behind a lock (priority inversion).** A job is never paused while a process of its steps holds a file lock (`flock` or `fcntl`: the step store's key lock, the volumes' locks, zig's cache locks, a package manager's) that another process waits for (`/proc/locks`), which could be a higher job's; a job that is paused and comes to hold one is thawed, and not paused again for 5 s. A lock that `/proc/locks` does not show (a pidfile, a protocol of a tool's own) is not seen: such a pause ends at `RUNNER_PRIORITY_FREEZE_MAX_SECS` at the latest.
+- **A stale freeze is cleared.** A job's directory left by a runner that died may be frozen; the next job made there writes 0 to its `cgroup.freeze`, in the job and in its steps.
+
 ### P7: Docker actions
 
 - Image-based actions as a run in their image with an entrypoint, on the P3 image store.

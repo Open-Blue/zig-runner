@@ -271,6 +271,8 @@ pub const Admission = struct {
         queued_ms: i64 = 0,
         /// The job's steps are paused (`Admission.govern`), since when, and not again before.
         paused: bool = false,
+        /// The last attempt to thaw it failed: it stays `paused`, and the next tick tries again.
+        thaw_failed: bool = false,
         paused_since_ms: i64 = 0,
         pause_ok_ms: i64 = std.math.minInt(i64),
         /// The job started although it did not fit beside the first in line, because it is
@@ -737,6 +739,16 @@ pub const Admission = struct {
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
         const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
+        // A thaw that failed is tried again; and a paused job that holds a lock another process
+        // waits for goes on (`holdsContendedLock`), so a job is never held up behind one paused.
+        for (a.slots) |*s| {
+            if (!s.running() or !s.paused) continue;
+            if (s.thaw_failed) {
+                _ = a.thaw(s, "retry");
+            } else if (s.cgroup() != null and a.holdsContendedLock(s)) {
+                if (a.thaw(s, "lock")) s.pause_ok_ms = now_ms + lock_pause_backoff_ms;
+            }
+        }
         var cands: [64]priority.Candidate = undefined;
         var idx: [64]usize = undefined;
         var n: usize = 0;
@@ -768,6 +780,11 @@ pub const Admission = struct {
             .none => {},
             .pause => |k| {
                 const s = &a.slots[idx[k]];
+                // Not one that holds a lock another process waits for: it would hold that one up.
+                if (a.holdsContendedLock(s)) {
+                    s.pause_ok_ms = now_ms + lock_pause_backoff_ms;
+                    return;
+                }
                 if (!a.setFrozen(s, true)) return;
                 s.paused = true;
                 s.paused_since_ms = now_ms;
@@ -777,14 +794,51 @@ pub const Admission = struct {
             },
             .resume_job => |r| {
                 const s = &a.slots[idx[r.i]];
-                _ = a.setFrozen(s, false);
-                s.paused = false;
+                // A thaw that fails leaves it paused, and is tried again at the next tick.
+                if (!a.thaw(s, if (r.expired) "expired" else "calm")) return;
                 if (r.expired) s.pause_ok_ms = now_ms + cfg.freeze_max_ms;
-                logfmt.warn("job_resumed", "job={f} level={d} paused_ms={d} expired={}", .{
-                    logfmt.q(s.name_buf[0..s.name_len]), s.level, now_ms - s.paused_since_ms, r.expired,
-                });
             },
         }
+    }
+
+    /// Thaws the job's steps (`setFrozen`) and marks the slot unpaused, with the lock held. A
+    /// thaw that fails is logged and leaves the slot paused with `thaw_failed`, which `govern`
+    /// retries at its next tick. True when the slot is not paused any more.
+    fn thaw(a: *Admission, s: *Slot, why: []const u8) bool {
+        if (!s.paused) return true;
+        if (!a.setFrozen(s, false)) {
+            if (!s.thaw_failed) logfmt.warn("job_thaw_failed", "job={f} level={d} why={s}", .{
+                logfmt.q(s.name_buf[0..s.name_len]), s.level, why,
+            });
+            s.thaw_failed = true;
+            return false;
+        }
+        const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
+        logfmt.warn("job_resumed", "job={f} level={d} paused_ms={d} why={s}", .{
+            logfmt.q(s.name_buf[0..s.name_len]), s.level, now_ms - s.paused_since_ms, why,
+        });
+        s.paused = false;
+        s.thaw_failed = false;
+        return true;
+    }
+
+    /// Whether a process of the job's steps holds a file lock (`flock`, `fcntl`: the step store's
+    /// key and volume locks, zig's cache locks, a package manager's) that another process waits for
+    /// (`/proc/locks`: a waiter is listed with `->` under the lock's number). Paused, it would
+    /// hold the waiter, which may be a higher job, up for as long as the pause (priority inversion):
+    /// so such a job is not paused, and a paused one that comes to hold such a lock is thawed.
+    /// A lock the kernel does not list (a pidfile, a lock a Docker pull takes by its own protocol)
+    /// is not seen; the pause is bounded by `freeze_max_ms` all the same.
+    fn holdsContendedLock(a: *Admission, s: *const Slot) bool {
+        const dir = s.cgroup() orelse return false;
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const steps = std.fmt.bufPrint(&path_buf, "{s}/steps", .{dir}) catch return false;
+        var procs_buf: [16384]u8 = undefined;
+        const procs = readIn(a.io, steps, "cgroup.procs", &procs_buf) catch
+            readIn(a.io, dir, "cgroup.procs", &procs_buf) catch return false;
+        var locks_buf: [65536]u8 = undefined;
+        const locks = std.Io.Dir.cwd().readFile(a.io, "/proc/locks", &locks_buf) catch return false;
+        return contendedLockHeld(locks, procs);
     }
 
     /// The jobs' parent's `memory.low`: the estimates of the running native jobs that are
@@ -1059,6 +1113,46 @@ pub const Admission = struct {
         b.publish(a.io, std.Io.Clock.real.now(a.io).toMilliseconds(), &.{});
     }
 };
+
+/// How long a job that holds a contended lock is let alone for, ms, before `govern` looks at it again.
+const lock_pause_backoff_ms = 5 * std.time.ms_per_s;
+
+/// Whether one of `procs` (a `cgroup.procs`: one pid a line) holds a lock in `locks` (`/proc/locks`)
+/// that a waiter is listed under. A line is `<n>: <TYPE> <ADVISORY|MANDATORY> <READ|WRITE> <pid>
+/// <dev:inode> <start> <end>`; a waiter's is `<n>: -> <TYPE> ...`, with the number of the lock it waits for.
+fn contendedLockHeld(locks: []const u8, procs: []const u8) bool {
+    var held: [64]u64 = undefined;
+    var n_held: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, locks, '\n');
+    while (lines.next()) |line| {
+        var f = std.mem.tokenizeScalar(u8, line, ' ');
+        const id_text = f.next() orelse continue;
+        const id = std.fmt.parseInt(u64, std.mem.trimEnd(u8, id_text, ":"), 10) catch continue;
+        const kind = f.next() orelse continue;
+        if (std.mem.eql(u8, kind, "->")) continue;
+        _ = f.next(); // ADVISORY
+        _ = f.next(); // READ or WRITE
+        const pid = f.next() orelse continue;
+        var ps = std.mem.tokenizeScalar(u8, procs, '\n');
+        const mine = while (ps.next()) |p| {
+            if (std.mem.eql(u8, p, pid)) break true;
+        } else false;
+        if (mine and n_held < held.len) {
+            held[n_held] = id;
+            n_held += 1;
+        }
+    }
+    if (n_held == 0) return false;
+    lines = std.mem.tokenizeScalar(u8, locks, '\n');
+    while (lines.next()) |line| {
+        var f = std.mem.tokenizeScalar(u8, line, ' ');
+        const id_text = f.next() orelse continue;
+        const id = std.fmt.parseInt(u64, std.mem.trimEnd(u8, id_text, ":"), 10) catch continue;
+        if (!std.mem.eql(u8, f.next() orelse continue, "->")) continue;
+        if (std.mem.indexOfScalar(u64, held[0..n_held], id) != null) return true;
+    }
+    return false;
+}
 
 /// One runner's place at the gate. The runner is counted in `Admission.polling` from the check that
 /// lets it through until it leaves: when it takes a job, or its cycle ends.
@@ -1435,6 +1529,10 @@ pub const Gate = struct {
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
         const s = &a.slots[g.slot];
+        // Its processes are about to be removed with the cgroup, which a frozen one would hold up.
+        _ = a.thaw(s, "ended");
+        s.paused = false;
+        s.thaw_failed = false;
         if (s.cgroup()) |dir| {
             if (workingSetMb(a.io, dir)) |mb| s.peak_mb = @max(s.peak_mb, mb);
             var buf: [512]u8 = undefined;
@@ -1460,6 +1558,17 @@ pub const Gate = struct {
         a.slots[g.slot].replayed = true;
     }
 
+    /// The runner's job is to be signalled, or is over (cancel, timeout, shutdown, its end): its
+    /// steps must not be frozen then, or the signals wait in a frozen cgroup until `freeze_max_ms`
+    /// lets it go. A failed thaw is logged and the caller goes on: the kernel's `cgroup.kill`
+    /// ends a frozen cgroup anyway.
+    pub fn thaw(g: *Gate) void {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        _ = a.thaw(&a.slots[g.slot], "signal");
+    }
+
     /// The runner's job is over: its memory is no longer reserved. Without this a job reserved its
     /// memory for the whole `ramp_ms` however short it was, so a burst of short jobs went through
     /// at most (available - floor) / per-job every two minutes: 1.5 jobs a minute on razorbill.
@@ -1470,6 +1579,7 @@ pub const Gate = struct {
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
         defer a.changed();
+        _ = a.thaw(&a.slots[g.slot], "ended");
         const s = a.slots[g.slot];
         a.slots[g.slot] = .{};
         const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
@@ -5827,4 +5937,75 @@ test "priority: under pressure the lower job's steps are frozen, and thawed when
     pool.govern();
     try std.testing.expectEqualStrings("0", try tmp.dir.readFile(std.testing.io, "lo/steps/cgroup.freeze", &out));
     try std.testing.expect(!slots[1].paused);
+}
+
+/// Two jobs' steps as directories of `tmp`, frozen, the lower one paused in `slots`.
+fn frozenPair(tmp: *std.testing.TmpDir, slots: []Admission.Slot) !void {
+    for ([_][]const u8{ "hi", "lo" }, 0..) |name, i| {
+        try tmp.dir.createDirPath(std.testing.io, name);
+        var steps: [16]u8 = undefined;
+        try tmp.dir.createDirPath(std.testing.io, try std.fmt.bufPrint(&steps, "{s}/steps", .{name}));
+        const path = try std.fmt.bufPrint(&slots[i].cgroup_buf, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+        slots[i].cgroup_len = path.len;
+        slots[i].started_ms = 1;
+        slots[i].native = true;
+        slots[i].level = if (i == 0) priority.high else priority.low;
+    }
+    slots[1].paused = true;
+    slots[1].paused_since_ms = 1;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "lo/steps/cgroup.freeze", .data = "1" });
+}
+
+test "priority: a cancel or shutdown thaws a frozen job before it signals it, and marks it unpaused" {
+    var slots: [2]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool: Admission = .init(std.testing.io, .{ .priority = .{ .freeze = true } }, &slots);
+    try frozenPair(&tmp, &slots);
+    var gate: Gate = .{ .pool = &pool, .slot = 1 };
+    gate.thaw();
+    var out: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("0", try tmp.dir.readFile(std.testing.io, "lo/steps/cgroup.freeze", &out));
+    try std.testing.expect(!slots[1].paused);
+    // Not paused: nothing is written.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "lo/steps/cgroup.freeze", .data = "1" });
+    gate.thaw();
+    try std.testing.expectEqualStrings("1", try tmp.dir.readFile(std.testing.io, "lo/steps/cgroup.freeze", &out));
+    // The job's end thaws too, so the removal of its cgroup is not held up by frozen processes.
+    slots[1].paused = true;
+    _ = gate.ended();
+    try std.testing.expectEqualStrings("0", try tmp.dir.readFile(std.testing.io, "lo/steps/cgroup.freeze", &out));
+}
+
+test "priority: a thaw that fails keeps the job paused, and the next tick tries again" {
+    var slots: [2]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool: Admission = .init(std.testing.io, .{ .priority = .{ .freeze = true } }, &slots);
+    try frozenPair(&tmp, &slots);
+    var path_buf: [256]u8 = undefined;
+    pool.paths.pressure = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/pressure", .{tmp.sub_path});
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pressure", .data = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n" });
+    // Its cgroup is gone for now: the thaw cannot be written.
+    try tmp.dir.rename("lo", tmp.dir, "away", std.testing.io);
+    pool.govern();
+    try std.testing.expect(slots[1].paused and slots[1].thaw_failed);
+    // Back: the next tick thaws it.
+    try tmp.dir.rename("away", tmp.dir, "lo", std.testing.io);
+    pool.govern();
+    var out: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("0", try tmp.dir.readFile(std.testing.io, "lo/steps/cgroup.freeze", &out));
+    try std.testing.expect(!slots[1].paused and !slots[1].thaw_failed);
+}
+
+test "priority: a job holding a lock another process waits for is not paused, and is thawed if it comes to hold one" {
+    const locks =
+        "1: FLOCK  ADVISORY  WRITE 111 08:01:131 0 EOF\n" ++
+        "2: POSIX  ADVISORY  READ  222 08:01:132 0 EOF\n" ++
+        "2: -> POSIX  ADVISORY  WRITE 333 08:01:132 0 EOF\n";
+    // 111 holds a lock nobody waits for; 222 holds one that 333 waits for.
+    try std.testing.expect(!contendedLockHeld(locks, "111\n"));
+    try std.testing.expect(contendedLockHeld(locks, "100\n222\n"));
+    try std.testing.expect(!contendedLockHeld(locks, "333\n"));
+    try std.testing.expect(!contendedLockHeld("", "222\n"));
 }
