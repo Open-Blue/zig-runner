@@ -10,9 +10,11 @@
 #
 # Where the chain cannot be made (overlayfs refuses it, and the test skips), there is nothing to kill.
 set -euo pipefail
-shards=$1
-bin=$2
-scratch=$(mktemp -d)
+shards=$(realpath "$1")
+bin=$(realpath "$2")
+# On the disk of the build, not /tmp: a tmpfs makes the chain in a blink, before it can be killed.
+mkdir -p .zig-cache
+scratch=$(mktemp -d "$PWD/.zig-cache/kill-test.XXXXXX")
 pid=
 cleanup() {
 	[[ -z $pid ]] || kill -9 "$pid" 2>/dev/null || true
@@ -28,6 +30,7 @@ pid=$!
 tries=0
 until [[ -n $(find .zig-cache/tmp -mindepth 300 -maxdepth 300 -type d -print -quit 2>/dev/null) ]]; do
 	if ! kill -0 "$pid" 2>/dev/null; then
+		cat "$scratch/first.log" >&2
 		echo "leak-kill-test: the test ended before its chain was deep (skipped here?); nothing to kill" >&2
 		pid=
 		exit 0
