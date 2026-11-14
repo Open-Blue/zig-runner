@@ -346,6 +346,7 @@ pub fn runFor(
             .dir = act.dir,
             .context = std.fs.path.dirnamePosix(rel) orelse ".",
             .dockerfile = std.fs.path.basenamePosix(rel),
+            .path = act.path,
         } };
     };
     return .{

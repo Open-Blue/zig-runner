@@ -13,6 +13,8 @@ name: compare
 #   hpack-diff.sh      runner/src/hpack.zig against golang.org/x/net/http2/hpack, on random connections
 #                      (dynamic table, size updates, evictions) and broken blocks
 #   rsa-diff.sh        runner/src/github/rsa_sign.zig against Go's crypto/rsa, signatures byte for byte
+#   dockerfile-diff.sh the native Dockerfile builder against BuildKit: the filesystem and the image
+#                      config each builds from the same Dockerfiles (runner/tools/dockerfile_oracle)
 #   gitea-job-diff.sh  the job.Job runner/src/gitea/job.zig builds from a Gitea or Forgejo task against
 #                      what Gitea's workflow model (actionslib) reads from it, on a committed corpus
 #
@@ -43,7 +45,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tool: [expr-diff, yaml-diff, hashfiles-diff, regex-diff, hpack-diff, rsa-diff, gitea-job-diff]
+        tool: [expr-diff, yaml-diff, hashfiles-diff, regex-diff, hpack-diff, rsa-diff, gitea-job-diff, dockerfile-diff]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -68,6 +70,7 @@ jobs:
             hpack-diff) .github/scripts/hpack-diff.sh 3000 "$SEED" ;;
             rsa-diff) .github/scripts/rsa-diff.sh 2000 "$SEED" ;;
             gitea-job-diff) .github/scripts/gitea-job-diff.sh ;;
+            dockerfile-diff) .github/scripts/dockerfile-diff.sh ;;
           esac
 
   # The tools' own Go, linted (go-lint.sh) as on a pull request that changes them, so a new

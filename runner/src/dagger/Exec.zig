@@ -237,8 +237,10 @@ pub const DockerRun = struct {
     pub const Image = union(enum) {
         pull: []const u8,
         /// Built from `dockerfile` with `context` as the build context, both paths in the
-        /// Directory `dir`.
-        build: struct { dir: []const u8, context: []const u8, dockerfile: []const u8 },
+        /// Directory `dir`. `path` is the action's own directory as the job sees it: for a local
+        /// action, where its files are in the job's layers (the native backend, whose `dir` is
+        /// no host directory then, builds from them there).
+        build: struct { dir: []const u8, context: []const u8, dockerfile: []const u8, path: []const u8 = "" },
     };
 };
 

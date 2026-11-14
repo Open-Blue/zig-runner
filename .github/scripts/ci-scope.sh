@@ -160,7 +160,9 @@ needed() {
 		# The decoders (libzstd and zlib-ng, which read every layer a registry sends, and the Zig
 		# decoders they are held to) are the exception, with their corpora: a change to them is
 		# fuzzed before it merges. The same for the network library (docs/rust-net.md): it reads
-		# what servers send, and its tests run under Valgrind.
+		# what servers send, and its tests run under Valgrind, and for the Dockerfile builder's
+		# parser and planner and the fuzz targets themselves: they read what an action's author
+		# wrote, before the job's first step.
 		case $1 in
 		.github/workflows/analysis.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/zig-fuzz.sh | .github/scripts/zig-valgrind.sh | \
@@ -171,6 +173,7 @@ needed() {
 			runner/src/vendor/zstd/* | runner/src/fuzz_corpus/zstd/* | \
 			runner/src/native/oci/zlibng.zig | runner/src/vendor/zlib-ng/* | \
 			runner/src/fuzz_corpus/gzip/* | \
+			runner/src/native/dockerfile.zig | runner/src/native/layer_view.zig | runner/src/fuzz.zig | \
 			runner/src/zr_net.zig | runner/src/tls_stream.zig | runner/src/net_client.zig | runner/src/net_oracle.zig | runner/src/fuzz_corpus/tls/* | runner/rust/* | \
 			runner/tls_oracle.zig | runner/tools/tls_oracle/* | .github/scripts/pg-tls-fixture.sh | \
 			.github/scripts/build-zr-net.sh | \
