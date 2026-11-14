@@ -34,9 +34,14 @@ pub fn load(arena: Allocator, io: std.Io, dir: []const u8, file: []const u8) Err
     const path = try std.fs.path.join(arena, &.{ dir, file });
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 * 1024)) catch |e| switch (e) {
         error.FileNotFound => return null,
+        // Out of memory is no word on the file: BadState tells the operator it is not state.
+        error.OutOfMemory => return error.OutOfMemory,
         else => return error.BadState,
     };
-    return std.json.parseFromSliceLeaky(State, arena, text, .{}) catch error.BadState;
+    return std.json.parseFromSliceLeaky(State, arena, text, .{}) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadState,
+    };
 }
 
 /// Writes `state` (mode 0600), replacing the file.
@@ -54,8 +59,9 @@ pub fn save(
     io.random(&suffix);
     const tmp = try std.fmt.allocPrint(arena, "{s}.{x}.tmp", .{ file, suffix });
     var body: std.Io.Writer.Allocating = .init(arena);
-    try std.json.Stringify.value(state, .{ .whitespace = .indent_2 }, &body.writer);
-    try body.writer.writeByte('\n');
+    // A writer that allocates fails for one reason.
+    std.json.Stringify.value(state, .{ .whitespace = .indent_2 }, &body.writer) catch return error.OutOfMemory;
+    body.writer.writeByte('\n') catch return error.OutOfMemory;
     // Created, never opened: nothing already at the name is written through.
     var f = try dir.createFile(io, tmp, .{ .exclusive = true, .permissions = .fromMode(0o600) });
     errdefer dir.deleteFile(io, tmp) catch |e| std.log.warn("state: {s} left behind: {s}", .{ tmp, @errorName(e) });
@@ -107,4 +113,30 @@ test "a state file that is not state is refused, not registered over" {
     try tmp.dir.writeFile(io, .{ .sub_path = "r.json", .data = "{\"url\":" });
     const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
     try std.testing.expectError(error.BadState, load(arena, io, dir, "r.json"));
+}
+
+test "allocation failures: the state saved and loaded" {
+    const af = @import("../alloc_failures.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const S = struct {
+        var runs: usize = 0;
+        /// Never `BadState` for a file that is whole: that says the operator's file is not state.
+        fn run(a: Allocator, root_: []const u8) !void {
+            runs += 1;
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            const ar = arena.allocator();
+            const dir = try std.fmt.allocPrint(ar, "{s}/run{d}", .{ root_, runs });
+            const s: State = .{ .url = "http://g", .id = 7, .uuid = "u-1", .token = "t-1", .name = "zig-ab" };
+            try save(ar, std.testing.io, dir, "r.json", s);
+            const got = (try load(ar, std.testing.io, dir, "r.json")).?;
+            try std.testing.expectEqualStrings("t-1", got.token);
+            try std.testing.expectEqual(@as(i64, 7), got.id);
+        }
+    };
+    try af.checkOne(S.run, .{root});
 }
