@@ -31,6 +31,12 @@ pub extern "C" fn zr_net_runtime_start(threads: u32) -> i32 {
     runtime::start(threads)
 }
 
+/// The cores this process may use (affinity and cgroup quota), for sizing what Zig runs at once.
+#[no_mangle]
+pub extern "C" fn zr_net_cores() -> u32 {
+    runtime::cores() as u32
+}
+
 /// Runs `n` as a task on the runtime and returns `n + 1`, proving that the worker threads and the
 /// ABI work end to end. Negative when the runtime is not running.
 #[no_mangle]

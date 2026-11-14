@@ -11,6 +11,8 @@ const builtin = @import("builtin");
 const registry = @import("registry.zig");
 const layer = @import("layer.zig");
 const Store = @import("Store.zig");
+const admission = @import("../../admission.zig");
+const zr_net = @import("../../zr_net.zig");
 const linux = std.os.linux;
 
 const Allocator = std.mem.Allocator;
@@ -40,6 +42,9 @@ pub const Request = struct {
     /// Give files the image's owners (a root runner; `layer.Options.owners`).
     owners: bool,
     platform: ?Platform = null,
+    /// The runner's place at the memory gate, for sizing the layer downloads (`Prefetch.start`);
+    /// without it, `Prefetch.default_fetchers`.
+    gate: ?*admission.Gate = null,
 };
 
 /// A pulled image: its rootfs and what its config says steps start with.
@@ -130,6 +135,7 @@ pub fn pull(
         .store = store,
         .doc = doc,
         .owners = req.owners,
+        .gate = req.gate,
         .image = req.image,
     };
     const made = store.ensure(arena, io, "oci/images", try imageKey(arena, man.digest, req.owners), .{
@@ -315,6 +321,7 @@ const Unpack = struct {
     store: Store,
     doc: Manifest,
     owners: bool,
+    gate: ?*admission.Gate = null,
     image: []const u8,
     bytes: u64 = 0,
     totals: layer.Totals = .{},
@@ -394,7 +401,13 @@ const Prefetch = struct {
     /// How many fetch tasks run. Without any, `wait` fetches in the caller.
     running: usize = 0,
 
-    const fetchers = 3;
+    /// Downloads at once when there is no gate to ask (tests, `pullAt`): what it was before the pull
+    /// chose them.
+    const default_fetchers = 3;
+    /// The most downloads at once. Measured on a 12-thread laptop against loopback servers (docs/rust-net.md,
+    /// "Workers and concurrent pulls"): 8 streams as fast with 8 workers as with 12. Where a pull's
+    /// layers unpack more slowly than they download, wider does nothing more.
+    const max_fetchers = 8;
 
     const Slot = struct {
         done: std.Io.Event = .unset,
@@ -411,6 +424,13 @@ const Prefetch = struct {
         const slots = try u.arena.alloc(Slot, layers.len);
         for (slots, layers) |*s, l| s.* = .{ .path = try u.store.blobPath(u.arena, l.digest) };
         p.* = .{ .u = u, .layers = layers, .slots = slots };
+        var why: []const u8 = "no gate";
+        const fetchers: u32 = if (u.gate) |g|
+            g.fetchConcurrency(layers.len, zr_net.cores(), max_fetchers, &why)
+        else
+            default_fetchers;
+        // Once per pull, for the jobs' logs (P9, the server runs): what was chosen and what limited it.
+        std.log.info("native: {s}: {d} layers, fetching {d} at a time ({s}; {d} cores)", .{ u.image, layers.len, fetchers, why, zr_net.cores() });
         for (0..@min(fetchers, layers.len)) |_| {
             p.group.concurrent(u.io, run, .{p}) catch break;
             p.running += 1;

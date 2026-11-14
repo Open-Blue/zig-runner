@@ -4,12 +4,32 @@ use tokio::runtime::{Builder, Runtime};
 
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 
+/// The most workers the default starts. Measured on a 12-thread laptop (docs/rust-net.md, "Workers and
+/// concurrent pulls"): 8 streams finished in 208 ms with 8 workers and 212 ms with 12, 32 streams in 190 and
+/// 198 ms; 4 workers took 286 and 229 ms. A machine with many more cores has not been measured (the
+/// 36-thread server is to be): `RUNNER_NET_THREADS` overrides it.
+pub const WORKER_CAP: usize = 8;
+
+/// The cores this process may use, as std reads them: the affinity mask and, on Linux, the cgroup's
+/// `cpu.max` quota.
+pub fn cores() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| n.get())
+}
+
+/// One worker per core it may use, up to `WORKER_CAP`. Parked workers cost nothing (docs/rust-net.md).
+pub fn default_workers() -> usize {
+    if let Some(n) = std::env::var("RUNNER_NET_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0) {
+        return n;
+    }
+    cores().clamp(1, WORKER_CAP)
+}
+
 pub fn start(threads: u32) -> i32 {
     let mut slot = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
     if slot.is_some() {
         return 0;
     }
-    let workers = if threads == 0 { 2 } else { threads as usize };
+    let workers = if threads == 0 { default_workers() } else { threads as usize };
     match Builder::new_multi_thread()
         .worker_threads(workers)
         .thread_name("zr-net")
