@@ -1095,6 +1095,7 @@ test "--memory-swap as the job's memory.swap.max: Docker's semantics, up to what
     const Case = struct { flags: []const u8, allowed: bool, text: []const u8 };
     for ([_]Case{
         .{ .flags = "", .allowed = true, .text = "0" },
+        .{ .flags = "--hostname h", .allowed = true, .text = "0" },
         .{ .flags = "-m 1g", .allowed = true, .text = "0" },
         .{ .flags = "-m 1g --memory-swap 1g", .allowed = true, .text = "0" },
         .{ .flags = "-m 1g --memory-swap 0", .allowed = true, .text = "0" },
@@ -1108,6 +1109,13 @@ test "--memory-swap as the job's memory.swap.max: Docker's semantics, up to what
         const o = try parse(arena, c.flags, &why);
         try std.testing.expectEqualStrings(c.text, o.swapMax(c.allowed).text(&buf));
     }
+}
+
+test "no swap unless asked: a job with no options at all, or none about swap, gets 0" {
+    var buf: [24]u8 = undefined;
+    try std.testing.expectEqualStrings("0", (Options{}).swapMax(true).text(&buf));
+    try std.testing.expect((Options{}).swapMax(true) == .none);
+    try std.testing.expect((Options{ .memory = 1 << 30 }).swapMax(true) == .none);
 }
 
 test "a --cpus or --cpu-quota above the kernel's maximum, and cpuset lists on big machines" {
