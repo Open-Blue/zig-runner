@@ -709,17 +709,18 @@ test "tries stop at the budget, however many delays are left" {
     defer server.stop();
     server.results_fail = 100;
     server.results_fail_on = "SignedBlobURL";
+    // No clock in the numbers: the first delay is far inside the budget and each later one is far
+    // past it, however long the tries take on a busy machine (a try would have to take 9 s for the
+    // first delay to fall outside the budget). So there are exactly two tries, and the second
+    // delay, a minute, is never slept: the budget ends the retrying, not the delays running out
+    // (the test would otherwise take 2 minutes, not return).
     const slow: Retry = .{
-        .delays_ms = &.{ 100, 100, 100, 100 },
-        .budget = .fromMilliseconds(150),
+        .delays_ms = &.{ 1, 60_000, 60_000, 60_000 },
+        .budget = .fromSeconds(10),
     };
-    const started = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
     const r = testUpload(&server, .job, slow);
-    const took = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - started;
     try std.testing.expect(!r.ok and r.transient);
-    // The second try, 100 ms in, is the last: a third would start at 200 ms, past the 150.
-    try std.testing.expect(100 - server.results_fail <= 2);
-    try std.testing.expect(took < 400 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 98), server.results_fail);
 }
 
 test "what is worth trying again" {
