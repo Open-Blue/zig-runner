@@ -790,10 +790,19 @@ fn publishStaged(
     const lazy = s.deferEpoch(io);
     const entry = try openRoot(arena, tmp);
     defer _ = linux.close(entry);
+    // Directories its user cannot enter (`enter`), made enterable for the walks and put back before
+    // the layer is published, or on any error.
+    var entered: []const Entered = &.{};
+    defer leave(arena, entry, entered);
     var whole_disk = false;
     var syncfs_ns: ?u64 = null;
     const todo = if (lazy != null) &.{} else writeBack(arena, io, entry, s.syncLimit(io)) catch |e| switch (e) {
         error.Unreadable, error.TooLarge => no: {
+            whole_disk = true;
+            break :no &.{};
+        },
+        error.Stat, error.OpenDir => no: {
+            entered = try enter(arena, io, entry);
             whole_disk = true;
             break :no &.{};
         },
@@ -811,7 +820,19 @@ fn publishStaged(
     // and the store would count less than it holds.
     // The same walk counts its entries, for the step's next upper (`Layer.entries`): synced or
     // not, as a deferred sync (`lazy`) walks nothing else.
-    const size = try treeSize(arena, io, fs_tmp);
+    const size = treeSize(arena, io, fs_tmp) catch |e| switch (e) {
+        error.Stat, error.OpenDir => no: {
+            if (entered.len == 0) entered = try enter(arena, io, entry);
+            break :no try treeSize(arena, io, fs_tmp);
+        },
+        else => return e,
+    };
+    if (entered.len > 0) {
+        // Their modes back, and on disk with the rest: a crash must not leave the entered ones.
+        leave(arena, entry, entered);
+        entered = &.{};
+        if (lazy == null) try s.syncDisk(lock.?);
+    }
     m.bytes = size.bytes;
     m.pending = lazy;
     if (ph) |p| t = p.since(arena, .size, t);
@@ -1770,6 +1791,50 @@ fn listDir(arena: Allocator, io: std.Io, fd: linux.fd_t) ![]Node {
     return out.items;
 }
 
+/// A directory `enter` made searchable, and the mode it had.
+const Entered = struct { rel: []const u8, mode: u32 };
+
+/// Gives every directory under `root` that its owner could not search (a `COPY --chmod=640` of a
+/// directory, a step's `chmod 000`) u+rx, so a walk can read it, and returns what it changed in the
+/// order it did (parents first). `leave` puts the modes back. A directory the caller does not own
+/// is left as it is, and the walk fails there as it did.
+fn enter(arena: Allocator, io: std.Io, root: linux.fd_t) ![]const Entered {
+    var done: std.ArrayList(Entered) = .empty;
+    errdefer leave(arena, root, done.items);
+    var rst: linux.Statx = undefined;
+    if (linux.errno(linux.statx(root, "", linux.AT.EMPTY_PATH, stat_mask, &rst)) != .SUCCESS) return error.Stat;
+    if (rst.mode & 0o500 != 0o500 and linux.errno(linux.fchmod(root, (rst.mode & 0o7777) | 0o500)) == .SUCCESS)
+        try done.append(arena, .{ .rel = "", .mode = rst.mode & 0o7777 });
+    var stack: std.ArrayList([]const u8) = .empty;
+    try stack.append(arena, "");
+    while (stack.pop()) |rel| {
+        // The root again from its start: a listing is read once from a descriptor.
+        const fd = try openRel(arena, root, if (rel.len == 0) "." else rel);
+        defer _ = linux.close(fd);
+        for (try listDir(arena, io, fd)) |n| {
+            if (n.kind() != linux.S.IFDIR) continue;
+            const sub = if (rel.len == 0) try arena.dupe(u8, n.name) else try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, n.name });
+            const mode = n.st.mode & 0o7777;
+            // From the parent: a 0000 directory cannot be opened to be changed through its own descriptor.
+            if (mode & 0o500 != 0o500 and linux.errno(linux.fchmodat(fd, n.name, mode | 0o500)) == .SUCCESS)
+                try done.append(arena, .{ .rel = sub, .mode = mode });
+            try stack.append(arena, sub);
+        }
+    }
+    return done.items;
+}
+
+/// The modes `enter` changed, put back exactly, children before parents.
+fn leave(arena: Allocator, root: linux.fd_t, done: []const Entered) void {
+    var i = done.len;
+    while (i > 0) {
+        i -= 1;
+        const fd = if (done[i].rel.len == 0) root else openRel(arena, root, done[i].rel) catch continue;
+        _ = linux.fchmod(fd, done[i].mode);
+        if (fd != root) _ = linux.close(fd);
+    }
+}
+
 pub fn openDirAt(fd: linux.fd_t, name: [*:0]const u8) !linux.fd_t {
     const flags: linux.O = .{
         .ACCMODE = .RDONLY,
@@ -2063,10 +2128,24 @@ pub fn treeDigestTo(
 ) !Key {
     const fd = try openRoot(arena, p);
     defer _ = linux.close(fd);
-    var h: KeyHasher = .{ .h = .init(.{}), .bytes = bytes };
-    h.field("tree");
-    try digestIn(arena, io, &h, fd, "", depth, ids, 0);
-    return h.final();
+    // A directory its user cannot enter is made enterable for the walk (`enter`), its own mode hashed.
+    var fixed: []const Entered = &.{};
+    defer leave(arena, fd, fixed);
+    while (true) {
+        var h: KeyHasher = .{ .h = .init(.{}), .bytes = bytes };
+        h.field("tree");
+        const top = try openDirAt(fd, ".");
+        defer _ = linux.close(top);
+        digestIn(arena, io, &h, top, "", depth, ids, 0, fixed) catch |e| switch (e) {
+            error.Stat, error.OpenDir => if (fixed.len == 0) {
+                fixed = try enter(arena, io, fd);
+                if (fixed.len > 0) continue;
+                return e;
+            } else return e,
+            else => return e,
+        };
+        return h.final();
+    }
 }
 
 fn digestIn(
@@ -2078,12 +2157,16 @@ fn digestIn(
     depth: Depth,
     ids: Ids,
     level: u32,
+    fixed: []const Entered,
 ) !void {
     if (level > max_depth) return error.TooDeep;
     for (try listDir(arena, io, fd)) |n| {
         const sub_rel = try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, n.name });
         h.field(sub_rel);
-        h.int(n.st.mode);
+        h.int(for (fixed) |f| {
+            // The mode `enter` found, not the one it gave for the walk.
+            if (std.mem.eql(u8, f.rel, sub_rel[1..])) break (n.st.mode & ~@as(u32, 0o7777)) | f.mode;
+        } else n.st.mode);
         h.int(ids.inside(n.st.uid));
         h.int(ids.inside(n.st.gid));
         try digestXattrs(arena, h, fd, n);
@@ -2135,7 +2218,7 @@ fn digestIn(
             linux.S.IFDIR => {
                 const sub = try openDirAt(fd, n.name);
                 defer _ = linux.close(sub);
-                try digestIn(arena, io, h, sub, sub_rel, depth, ids, level + 1);
+                try digestIn(arena, io, h, sub, sub_rel, depth, ids, level + 1, fixed);
                 h.field("..");
             },
             else => {},
@@ -3187,6 +3270,66 @@ test "native store: a publish syncs the entry's own tree, and a file it cannot o
         try treeBytes(arena, io, hit.layer.fs),
     );
     _ = linux.chmod(try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/a/secret", .{hit.layer.fs}), 0), 0o600);
+}
+
+/// `d` and `d/sub` under `base` back to 0700, in the order a walk needs, so a test's directory can be
+/// removed by the user that made it.
+fn unlockForCleanup(arena: Allocator, base: []const u8) void {
+    for ([_][]const u8{ "d", "d/sub" }) |rel| {
+        const at = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ base, rel }, 0) catch return;
+        _ = linux.chmod(at, 0o700);
+    }
+}
+
+test "native store: a tree with directories its user cannot enter (0640, 0000) publishes and digests with its modes unchanged" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const tree = try std.fmt.allocPrint(arena, "{s}/t", .{root});
+    try tmp.dir.createDirPath(io, "t/d/sub/deep");
+    try tmp.dir.writeFile(io, .{ .sub_path = "t/d/f", .data = "f" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "t/d/sub/deep/g", .data = "g" });
+    const modes = [_]struct { rel: []const u8, mode: u32 }{ .{ .rel = "d/sub", .mode = 0 }, .{ .rel = "d", .mode = 0o640 } };
+    defer unlockForCleanup(arena, tree);
+    // Inside out, as a user's `COPY --chmod` leaves them.
+    for (modes) |m| {
+        const at = try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/{s}", .{ tree, m.rel }), 0);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(at, m.mode)));
+    }
+    const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}) };
+    try prepare(arena, io, s.root, .{ .check_parents = false });
+    var kh: KeyHasher = .plain("unenterable");
+    const k = kh.final();
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, k, &never);
+    defer kl.close(io);
+    const before = try treeDigest(arena, io, tree, .content, .{});
+    const l = try s.publish(arena, io, k, .fetch, tree, .{ .log = "", .fc = "" });
+    l.lock.close(io);
+    const hit = (try s.open(arena, io, k)).?;
+    hit.layer.lock.close(io);
+    defer unlockForCleanup(arena, hit.layer.fs);
+    // d/sub is beyond a path walk while d is 0640: d is looked at, then opened up to look at d/sub.
+    for ([_]usize{ 1, 0 }) |at_mode| {
+        const m = modes[at_mode];
+        if (at_mode == 0) _ = linux.chmod(try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/d", .{hit.layer.fs}), 0), 0o700);
+        var st: linux.Statx = undefined;
+        const at = try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/{s}", .{ hit.layer.fs, m.rel }), 0);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, at, 0, stat_mask, &st)));
+        errdefer std.debug.print("{s}: mode {o}\n", .{ m.rel, st.mode & 0o7777 });
+        try std.testing.expectEqual(m.mode, st.mode & 0o7777);
+    }
+    _ = linux.chmod(try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/d", .{hit.layer.fs}), 0), 0o640);
+    // The digest of what was published is the digest of what was walked before, modes and all.
+    try std.testing.expectEqual(before, try treeDigest(arena, io, hit.layer.fs, .content, .{}));
+    var again: linux.Statx = undefined;
+    const d0 = try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/d", .{hit.layer.fs}), 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, d0, 0, stat_mask, &again)));
+    try std.testing.expectEqual(@as(u32, 0o640), again.mode & 0o7777);
 }
 
 test "native store: a published layer is found and held; eviction keeps under the cap, never a held one" {

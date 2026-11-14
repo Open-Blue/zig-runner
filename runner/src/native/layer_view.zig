@@ -18,7 +18,6 @@ const Allocator = std.mem.Allocator;
 
 /// Links followed in one path before it counts as a loop (Linux's `MAXSYMLINKS`).
 const max_links = 40;
-const max_depth = 128;
 
 pub const Kind = enum { file, symlink, dir, other };
 
