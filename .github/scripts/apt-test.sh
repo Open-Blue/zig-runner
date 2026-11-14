@@ -206,8 +206,8 @@ IN
 # host, standing in for it); with it down (the probe pointed at a closed port) a rewrite, which a
 # container's `sh -c` runs before its script.
 echo "== prefix, archive up"
-test -z "$(APT_PRIMARY_PROBE=${mirror}dists/$codename/InRelease APT_MIRRORS=$mirror .github/scripts/apt.sh mirror-prefix $arch $codename)"
-prefix=$(APT_PRIMARY_PROBE=http://127.0.0.1:9/InRelease APT_MIRRORS=$mirror .github/scripts/apt.sh mirror-prefix $arch $codename)
+test -z "$(APT_PRIMARY_PROBE=${mirror}dists/$codename/InRelease APT_MIRRORS=$mirror .github/scripts/apt.sh mirror-prefix "$arch" "$codename")"
+prefix=$(APT_PRIMARY_PROBE=http://127.0.0.1:9/InRelease APT_MIRRORS=$mirror .github/scripts/apt.sh mirror-prefix "$arch" "$codename")
 test -n "$prefix"
 echo "== prefix, archive down"
 suffix=$(.github/scripts/apt.sh mirror-suffix)
