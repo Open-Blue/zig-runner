@@ -1289,8 +1289,8 @@ test "native eviction: the volumes unused longest go, down to the cap, and leave
     try testing.expect(f.there(old) and f.there(newer));
     try testing.expectEqual(@as(usize, 0), try f.deadLeft());
     // Its lock and size went with it: a key no job uses again leaves no trace.
-    try testing.expect(mtime(f.arena(), try std.fmt.allocPrint(f.arena(), "{s}.lock", .{oldest})) == null);
-    try testing.expect(mtime(f.arena(), try std.fmt.allocPrint(f.arena(), "{s}.size", .{oldest})) == null);
+    try testing.expect(mtime(try std.fmt.allocPrint(f.arena(), "{s}.lock", .{oldest})) == null);
+    try testing.expect(mtime(try std.fmt.allocPrint(f.arena(), "{s}.size", .{oldest})) == null);
 }
 
 test "native eviction: untrusted volumes go before a repository's, however long that one has been idle" {
