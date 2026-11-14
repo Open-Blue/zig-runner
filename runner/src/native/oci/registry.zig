@@ -274,7 +274,10 @@ pub const Client = struct {
         if (status != .ok) {
             var err_body: Body = .{ .memory = .{ .arena = c.arena, .limit = 4096 } };
             // What cannot be read of the body is left out of the message; running out of memory is not.
-            err_body.take(&stream) catch |e| if (e == error.OutOfMemory) return e;
+            err_body.take(&stream) catch |e| {
+                if (e == error.OutOfMemory) return e;
+                std.log.debug("registry: the error body was cut short: {t}", .{e});
+            };
             c.why = try std.fmt.allocPrint(c.arena, "{f}: HTTP {d} {s}", .{
                 c.ref, @backingInt(status), std.mem.trim(u8, err_body.memory.bytes.items, " \n"),
             });
