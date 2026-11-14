@@ -104,6 +104,9 @@ pub const Error = error{
     StaleConnection,
     /// The writer of a request body failed (`Body.writeFn`) or wrote less than its length.
     UploadFailed,
+    /// The writer of a request body wrote more than the `len` it declared; what it wrote past
+    /// that was not sent.
+    BodyLongerThanDeclared,
 } || Allocator.Error || Io.Cancelable;
 
 fn errorOf(code: i32) Error {
@@ -330,7 +333,7 @@ const Live = struct {
             .body = payload.ptr,
             .body_len = if (opts.upload) |u| u.len else payload.len,
             .max_redirects = opts.max_redirects,
-            .max_response = if (stream and opts.max_response == std.math.maxInt(usize)) 0 else opts.max_response,
+            .max_response = opts.max_response,
             .first_byte_ms = ms(opts.first_byte),
             .read_idle_ms = ms(opts.read_idle),
             .flags = flags,
@@ -379,18 +382,21 @@ const Live = struct {
     /// body did (the server answered, or the call failed): its result says how.
     fn upload(l: Live, body: Body) Error!void {
         var buf: [16 * 1024]u8 = undefined;
-        var u: Uploader = .{ .live = l, .interface = .{ .vtable = &.{ .drain = Uploader.drain }, .buffer = &buf, .end = 0 } };
+        var u: Uploader = .{ .live = l, .len = body.len, .interface = .{ .vtable = &.{ .drain = Uploader.drain }, .buffer = &buf, .end = 0 } };
         body.writeFn(body.ptr, &u.interface) catch |e| {
             if (u.err) |c| return c;
+            if (u.overrun) return error.BodyLongerThanDeclared;
             if (u.over) return;
             std.log.warn("net: the request body could not be written: {t}", .{e});
             return error.UploadFailed;
         };
         u.interface.flush() catch {
             if (u.err) |c| return c;
+            if (u.overrun) return error.BodyLongerThanDeclared;
             if (u.over) return;
             return error.UploadFailed;
         };
+        if (u.overrun) return error.BodyLongerThanDeclared;
         if (!u.over and u.sent != body.len) return error.UploadFailed;
     }
 
@@ -411,8 +417,13 @@ const Live = struct {
 const Uploader = struct {
     live: Live,
     interface: Io.Writer,
+    /// The body's declared length.
+    len: usize,
     sent: usize = 0,
+    /// The library refused more: the call is over, or the body is complete.
     over: bool = false,
+    /// More was written once all `len` bytes had been taken: the writer is wrong, not the call.
+    overrun: bool = false,
     err: ?Error = null,
 
     fn writeAll(u: *Uploader, bytes: []const u8) Io.Writer.Error!void {
@@ -430,6 +441,7 @@ const Uploader = struct {
                 },
                 else => {
                     u.over = true;
+                    u.overrun = u.sent >= u.len;
                     return error.WriteFailed;
                 },
             }

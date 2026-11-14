@@ -715,6 +715,49 @@ test "a failed registration is made again without sending the blob again" {
     try std.testing.expectEqual(@as(u32, 1), server.results.metas);
 }
 
+test "a blob upload the server took and dropped is written again from its start, and the server gets the same bytes" {
+    const testserver = @import("testserver.zig");
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Counting = struct {
+        len: usize,
+        runs: usize = 0,
+        fn write(ptr: *const anyopaque, w: *std.Io.Writer) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.runs += 1;
+            var piece: [1000]u8 = undefined;
+            var at: usize = 0;
+            while (at < self.len) {
+                const n = @min(self.len - at, piece.len);
+                for (piece[0..n], 0..) |*c, i| c.* = testserver.blobByte(at + i);
+                try w.writeAll(piece[0..n]);
+                at += n;
+            }
+        }
+    };
+    var want: testserver.Sink = .{};
+    for (0..300_000) |i| want.add(&.{testserver.blobByte(i)});
+    var body: Counting = .{ .len = 300_000 };
+    // The first put is read to its end, then its connection closed without an answer.
+    server.results_drop = 1;
+    var url_buf: [64]u8 = undefined;
+    const url = server.url(&url_buf, "127.0.0.1", "/results-blob");
+    const r = try putBlob(arena, std.testing.io, url, .{
+        .line_count = 0,
+        .stream = .{ .len = body.len, .ptr = &body, .writeFn = Counting.write },
+    });
+    try std.testing.expectEqual(std.http.Status.created, r.status);
+    try std.testing.expectEqual(@as(usize, 2), body.runs);
+    try std.testing.expectEqual(@as(u32, 2), server.results.puts);
+    try std.testing.expectEqual(@as(usize, 300_000), server.results.put_bytes);
+    try std.testing.expectEqual(want.hash, server.results.put_hashes[0]);
+    try std.testing.expectEqual(want.hash, server.results.put_hashes[1]);
+}
+
 test "a failure of the request itself is not tried again" {
     var server: @import("testserver.zig").Server = undefined;
     try server.start();
