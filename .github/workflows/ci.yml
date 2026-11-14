@@ -712,7 +712,7 @@ jobs:
   # and the suite dispatches and reads the workflows with one of its installation tokens. The key
   # is the e2e environment's secret, which pull requests from forks do not get: without it (or its
   # App ID, the environment's variable), the job skips its steps, still reporting, as it does on a
-  # change that cannot affect the runner (ci-scope.sh e2e). Not a required check yet; not on main,
+  # change that cannot affect the runner (ci-scope.sh e2e). A required check (the "main and release branches" ruleset); not on main,
   # whose commits the merge queue checked.
   e2e:
     name: End to end
