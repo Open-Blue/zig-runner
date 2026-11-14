@@ -2485,7 +2485,11 @@ repository at the job's commit, which is what a checkout of it gives: a blobless
 one commit by git in the job's image (the job's token, as the checkout's), and only its
 `action.yml` read (`git cat-file`), then the look's layer dropped, so no unkeyed layer is left
 below the base (`Backend.dropTop`). One that is not there (made by a step, another
-repository checked out there) sends the job to Dagger. At run time the step reads the workspace,
+repository checked out there) sends the job to Dagger, and with `RUNNER_ENGINE=none` (no engine
+to send it to) is not judged: the step reads it from the workspace when it runs, as for any local
+action, and fails saying what native cannot run there (a Dockerfile in the workspace, whose
+build context is in the job's layers, not in a host directory; a `docker://` image or a JavaScript
+runtime is pulled when the step needs it, as it always was). At run time the step reads the workspace,
 as on Dagger (`actions.loadLocal`, through `Backend.readFile`).
 
 **For P3 and P2, what to swap when they land:**
