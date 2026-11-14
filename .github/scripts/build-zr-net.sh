@@ -42,6 +42,12 @@ export "CC_${triple//-/_}=$here/zig-cc.sh"
 export "AR_${triple//-/_}=${AR_ZIG:-ar}"
 export "CARGO_TARGET_${upper}_LINKER=$here/zig-cc.sh"
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PWD/target}
+# In a job, cargo's registry and crate cache go in the job's own temp directory: a self-hosted
+# runner's $HOME/.cargo can belong to another user (main's first Rust build failed there with
+# "Permission denied"), and one job's downloaded crates are not meant to reach another's build.
+if [[ -n ${RUNNER_TEMP:-} && -z ${CARGO_HOME:-} ]]; then
+	export CARGO_HOME=$RUNNER_TEMP/cargo-home
+fi
 cargo build --release --locked --manifest-path zr-net/Cargo.toml --target "$triple" >&2
 mkdir -p "$(dirname "$out")"
 cp "$CARGO_TARGET_DIR/$triple/release/libzr_net.a" "$out"
