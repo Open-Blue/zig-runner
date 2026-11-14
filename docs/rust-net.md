@@ -315,17 +315,19 @@ documents (DNS approximate, TLS inferred) go away with the wrapper.
   the User-Agent is `zig-runner/<version>` where the registry's was `zig-runner`; a token service that redirects is an error (`TooManyRedirects`, with 0 redirects allowed) where std handed back the 3xx, and the pull says
   "the token service: TooManyRedirects" instead of "answered HTTP 302"; the registry's stale-connection retry counts (`staleRetries + 1` tries) become the library's one repeat; errors are `net_client.Error`'s names (a registry that closes every
   connection unanswered is `NetworkIo`, not `HttpConnectionClosing`).
-- **Measured** (cowbird, loopback server in the same process, 512 MiB, ReleaseSafe, `net_oracle.zig`'s `bench:` tests, three alternating runs; load average 2.8 for the last set, 6-8 for the first):
+- **Measured** (cowbird, loopback server in the same process, 512 MiB, ReleaseSafe, `net_oracle.zig`'s `bench:` tests, three alternating runs, load average 2.3-3.0; each row is the range of the final set):
   | | wall | CPU (process, server thread included) | peak RSS |
   |---|---|---|---|
-  | tarball, std, whole body in memory (the old `zig_release`) | 445-527 ms (970-1150 MiB/s) | 0.82-0.96 s | 526 MB |
-  | tarball, library stream, hashed as it arrives | 478-540 ms (950-1070 MiB/s) | 0.99-1.10 s | 3.9 MB |
-  | blob into a file and SHA-256, std (the old registry) | 590-603 ms (850-870 MiB/s) | 1.06-1.10 s | 1.8 MB |
-  | blob, library stream (the new registry's `Body.take`) | 586-693 ms (740-870 MiB/s) | 1.49-1.73 s | 4.9 MB |
-  So: equal wall time within noise on a 1 GiB/s loopback, 100-250 ms (tarball) and 400-600 ms (blob) more CPU per 512 MiB, and 500 MB less memory for a tarball. The CPU is the hop between
-  the runtime's thread and the caller's (one wake and one read per burst of the connection). The first run was twice as slow: hyper's adaptive read buffer allocates a block of hundreds of KiB per read and musl maps and
-  unmaps each one, so the connection now reads into a fixed 64 KiB (`READ_BUF`) and `alloc.rs` keeps up to 16 freed blocks of 32-512 KiB for reuse (CPU 2.2-2.5 s before, 1.5-1.7 s after, for the blob). Not measured: the
-  Raspberry Pi (disk streaming vs std; planned in the R4 row below), a real registry or ziglang.org (network-bound; the loopback isolates the client), HTTP/2 (the client is h1 only; no gain was shown to justify it).
+  | tarball, std, whole body in memory (the old `zig_release`) | 557-609 ms | 0.99-1.09 s | 526 MB |
+  | tarball, library stream, hashed as it arrives | 579-619 ms | 1.07-1.20 s | 4-6 MB |
+  | blob into a file and SHA-256, std (the old registry) | 579-599 ms | 1.13-1.17 s | 1.7 MB |
+  | blob, library stream (the new registry's `Body.take`) | 590-635 ms | 1.36-1.57 s | 5-7 MB |
+  Where the CPU goes (per-thread ticks printed by the bench): the caller's thread and the server's are the same as with std (0.57 s against 0.58 s for the caller); the difference is the runtime's two
+  threads, 0.3 s of it system time: per arrival of data tokio does an epoll wait and a read where a blocking read of std's does one call (about 60,000 calls against 25,000 for the blob). Four changes made along the way:
+  the connection reads into a fixed buffer (`READ_BUF`; hyper's adaptive one allocates hundreds of KiB per read and musl maps and unmaps each), `alloc.rs` keeps up to 16 freed blocks of 32-512 KiB (together CPU 2.2-2.5 s -> 1.5-1.7 s),
+  the reader is woken after 128 KiB or when the connection has nothing more at once (not per chunk), and the connection is woken when half the queue is free (not at every read): those two cut the tarball's CPU to
+  within 10% of std's and the blob's wakeups, but the epoll-and-read pair remains, so the blob is still about 25% above std in CPU and equal in wall time. Not measured: the Raspberry Pi (disk streaming vs std), a real
+  registry or ziglang.org (network-bound), HTTP/2 (h1 only; no gain was shown). One runtime worker instead of two was tried and made no clear difference.
 - **Validation.** Cargo: 7 new tests through the C ABI as Zig drives it (48 MiB streamed plain and chunked with a slow reader and the queue's peak asserted below 1.5 MiB, reuse after a stream, a cancel halfway closes the
   connection at the server, a stalled body and a call over its total each have their own error, a 24 MiB upload through a slow server with the writer made to wait, a server that answers a 512 MiB upload at once stops the writer,
   303 and 307 for a streamed body, the token left behind at a redirect), and queue unit tests. Zig: the oracle's download (five sizes up to 24 MiB, three read sizes, hashed on both sides), redirect, upload
