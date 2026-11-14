@@ -139,7 +139,7 @@ fn checkEachAllocationFailure(comptime f: anytype, args: anytype) !void {
                 // Where that allocation was made, for whoever swallowed its failure.
                 var again: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i, .trace = true };
                 std.debug.print("allocation failures: allocation {d} of {d} failed and the run went on, made at:\n", .{ i, n });
-                _ = @call(.auto, f, .{again.allocator()} ++ args) catch {};
+                _ = @call(.auto, f, .{again.allocator()} ++ args) catch |rerun| std.debug.print("  (the rerun ended in {s})\n", .{@errorName(rerun)});
                 return error.SwallowedOutOfMemoryError;
             }
         } else |e| if (e != error.OutOfMemory) return e;
@@ -165,7 +165,7 @@ pub fn checkEach(comptime f: anytype, args: anytype) !void {
         @call(.auto, f, .{once.allocator()} ++ args) catch |e| if (e != error.OutOfMemory) {
             std.debug.print("allocation failures: allocation {d} of {d} failing, the run failed, made at:\n", .{ i, n });
             var again: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i, .trace = true };
-            _ = @call(.auto, f, .{again.allocator()} ++ args) catch {};
+            _ = @call(.auto, f, .{again.allocator()} ++ args) catch |rerun| std.debug.print("  (the rerun ended in {s})\n", .{@errorName(rerun)});
             return e;
         };
         try once.checkFreed();
