@@ -17,6 +17,9 @@ use tokio::sync::Notify;
 /// chunk is at most one read of hyper's (its buffer is at most about 400 KiB).
 pub const QUEUE_LIMIT: usize = 1 << 20;
 
+/// Bytes queued before the reader is woken for them, if the connection goes on delivering.
+const ANNOUNCE: usize = 128 * 1024;
+
 /// The Zig side's end of the call's descriptor.
 pub struct Wake(pub socket2::Socket);
 
@@ -199,6 +202,10 @@ struct DownInner {
     end: bool,
     err: Option<Fail>,
     peak: usize,
+    /// Bytes queued since the reader was last woken.
+    unannounced: usize,
+    /// `push` is waiting for the queue to empty to half (`read` tells it).
+    pusher_waiting: bool,
 }
 
 /// A response body that the connection fills (`push`) and the caller reads (`read`).
@@ -219,7 +226,7 @@ pub enum Read {
 
 impl DownStream {
     pub fn new(wake: Arc<Wake>) -> DownStream {
-        DownStream { wake, space: Notify::new(), inner: Mutex::new(DownInner { q: VecDeque::new(), queued: 0, front: 0, end: false, err: None, peak: 0 }) }
+        DownStream { wake, space: Notify::new(), inner: Mutex::new(DownInner { q: VecDeque::new(), queued: 0, front: 0, end: false, err: None, peak: 0, unannounced: 0, pusher_waiting: false }) }
     }
 
     /// Queues a chunk, waiting while the queue is full.
@@ -228,20 +235,42 @@ impl DownStream {
             {
                 let mut g = lock(&self.inner);
                 if g.queued < QUEUE_LIMIT {
-                    let was_empty = g.q.is_empty();
                     g.queued += b.len();
                     g.peak = g.peak.max(g.queued);
+                    g.unannounced += b.len();
                     g.q.push_back(b);
+                    // A wake is a system call here and a thread switch there: one per `ANNOUNCE`
+                    // bytes, or when the connection has nothing more for the moment (`announce`).
+                    let wake = g.unannounced >= ANNOUNCE;
+                    if wake {
+                        g.unannounced = 0;
+                    }
                     drop(g);
-                    if was_empty {
+                    if wake {
                         self.wake.ping();
                     }
                     return;
                 }
+                // Set under the lock `read` takes, so its notice cannot be missed.
+                g.pusher_waiting = true;
             }
             // A permit stored by a read between the check and here is not lost.
             self.space.notified().await;
         }
+    }
+
+    /// Wakes the reader for what is queued and it has not been told of.
+    pub fn announce(&self) {
+        let mut g = lock(&self.inner);
+        if g.unannounced > 0 {
+            g.unannounced = 0;
+            drop(g);
+            self.wake.ping();
+        }
+    }
+
+    pub fn has_unannounced(&self) -> bool {
+        lock(&self.inner).unannounced > 0
     }
 
     pub fn finish(&self) {
@@ -283,8 +312,19 @@ impl DownStream {
             }
         }
         g.queued -= n;
+        if g.q.is_empty() {
+            g.unannounced = 0;
+        }
+        // The connection is woken when half the queue is free, not at every read: a wake per read
+        // was a thread switch per 64 KiB of a download that outran its reader.
+        let wake_pusher = g.pusher_waiting && g.queued <= QUEUE_LIMIT / 2;
+        if wake_pusher {
+            g.pusher_waiting = false;
+        }
         drop(g);
-        self.space.notify_one();
+        if wake_pusher {
+            self.space.notify_one();
+        }
         Read::Data(n)
     }
 }

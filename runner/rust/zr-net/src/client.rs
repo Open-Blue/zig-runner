@@ -22,7 +22,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// The size of the buffer a connection reads into (see `connect`).
-const READ_BUF: usize = 64 * 1024;
+const READ_BUF: usize = 256 * 1024;
 
 /// A figure that was not measured.
 pub const UNKNOWN: u64 = u64::MAX;
@@ -524,10 +524,24 @@ impl Client {
     /// connection goes back to the pool when the body ended cleanly.
     pub async fn pump(&self, mut head: Head, spec: &Spec, down: &DownStream, t: &mut Timings) -> Result<(), Fail> {
         loop {
-            let next = head.incoming.frame();
+            let mut next = std::pin::pin!(head.incoming.frame());
+            let waiting = async {
+                // Data the reader has not been woken for waits up to a millisecond for company.
+                if down.has_unannounced() {
+                    tokio::select! {
+                        f = &mut next => f,
+                        _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                            down.announce();
+                            next.await
+                        }
+                    }
+                } else {
+                    next.await
+                }
+            };
             let frame = match spec.read_idle {
-                Some(d) => tokio::time::timeout(d, next).await.map_err(|_| (Code::Timeout, format!("the body stopped for {d:?}")))?,
-                None => next.await,
+                Some(d) => tokio::time::timeout(d, waiting).await.map_err(|_| (Code::Timeout, format!("the body stopped for {d:?}")))?,
+                None => waiting.await,
             };
             match frame {
                 None => break,
