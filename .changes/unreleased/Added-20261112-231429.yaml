@@ -1,0 +1,3 @@
+kind: Added
+body: 'A step-end: line for every step (its time and, for native steps, its cgroup''s CPU, peak memory, I/O and page faults, and its sandbox''s set-up phases) and a request: line for every HTTP request to GitHub, Gitea or Forgejo (DNS, connect, TLS and first-byte times, rate limit headers, retries), for finding where a job''s time and resources go. RUNNER_LOG_REQUESTS=0 turns the request lines off. See docs/OPERATIONS.md.'
+time: 2026-11-12T23:14:29.961257005-05:00

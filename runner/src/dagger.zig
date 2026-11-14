@@ -34,6 +34,7 @@ const package_cache_dirs = @import("dagger/set_up.zig").package_cache_dirs;
 const warmBase = @import("dagger/set_up.zig").warm;
 pub const Warmed = @import("dagger/set_up.zig").Warmed;
 const JobLog = @import("dagger/JobLog.zig");
+const StepMeter = @import("dagger/step_end.zig").Meter;
 pub const Marker = @import("dagger/JobLog.zig").Marker;
 pub const Scan = @import("dagger/JobLog.zig").Scan;
 pub const scan = @import("dagger/JobLog.zig").scan;
@@ -678,6 +679,9 @@ pub const Observer = struct {
 /// step.
 pub const Options = struct {
     observer: ?Observer = null,
+    /// Where each step's `step-end:` line is written as the step ends (`dagger/step_end.zig`); the
+    /// caller logs them. Null: none.
+    step_ends: ?*std.Io.Writer.Allocating = null,
     /// The `dagger` command. In the tests, one that is never there: a job they did not mean for
     /// Dagger (a native job whose set-up failed, `setUpFallback`) fails to start a session
     /// instead of starting a real engine on the machine running them.
@@ -845,6 +849,8 @@ const HttpTransport = struct {
             // A query runs as long as what it runs (a step's exec); the job's cancel ends it.
             .deadline = null,
             .max_body = limit,
+            // The engine is on this machine, not GitHub: no `request:` line.
+            .log = false,
         });
         // GraphQL errors can arrive with a non-2xx status; the body says what was wrong.
         if (r.status.class() != .success and r.body.len == 0) return error.DaggerSessionHttpError;
@@ -2265,7 +2271,7 @@ fn appendCheckoutPost(x: *Exec, num: u32, name: []const u8) !void {
 fn runSteps(
     arena: Allocator,
     io: std.Io,
-    opts: Options,
+    opts_in: Options,
     job: job_mod.Job,
     sh: *JobLog,
     results: []StepResult,
@@ -2274,6 +2280,20 @@ fn runSteps(
     /// goes there (`Exec.execScript`).
     native: ?*Backend,
 ) !Result {
+    // Each step's `step-end:` line (`dagger/step_end.zig`), made as the step finishes.
+    var opts = opts_in;
+    var meter: StepMeter = undefined;
+    if (opts_in.step_ends) |out| {
+        meter = .{
+            .inner = opts_in.observer,
+            .io = io,
+            .out = out,
+            .job = opts_in.sink_job_id,
+            .timings = if (native) |b| &b.timings else null,
+            .cgroup = if (native) |b| if (b.job_cgroup) |j| j.stepsDir() else null else null,
+        };
+        opts.observer = meter.observer();
+    }
     var ev = try Evaluator.init(arena, &job);
     ev.runner_name = opts.runner_name;
     ev.runner_debug = sh.step_debug;
@@ -3014,7 +3034,8 @@ const FakeWarn = struct {
         const f: *FakeWarn = @ptrCast(@alignCast(ptr));
         if (!f.fake.in_flight) return .nothing;
         f.sent[f.n] = sig;
-        f.n += 1;
+        // Stored for a test that polls `n` from another thread (the one that stops a stuck log).
+        @atomicStore(usize, &f.n, f.n + 1, .release);
         return if (f.waiting) .ended else .warned;
     }
     fn abort(ptr: *anyopaque) bool {
@@ -3281,7 +3302,7 @@ test "a stuck log does not hold the watch's lock, so the step's end is not held 
     var ticking = try io.concurrent(Tick.run, .{&w});
     defer ticking.cancel(io);
     for (0..500) |_| {
-        if (f.n > 0) break;
+        if (@atomicLoad(usize, &f.n, .acquire) > 0) break;
         try io.sleep(.fromMilliseconds(10), .awake);
     }
     try std.testing.expectEqual(@as(usize, 1), f.n);
@@ -4168,6 +4189,7 @@ test "the observer sees each step start and finish, including skipped and failed
     const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "a\\n"), try exec(arena, "C2", 1, "b\\n") };
     var fake: FakeSession = .{ .answers = &answers, .arena = arena };
     var rec: Recorder = .{ .arena = arena };
+    var step_ends: std.Io.Writer.Allocating = .init(arena);
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
@@ -4176,7 +4198,22 @@ test "the observer sees each step start and finish, including skipped and failed
         .test_session_argv = &.{ "sh", "-c", fake_child },
         .test_transport = fake.transport(),
         .observer = .{ .ptr = &rec, .startedFn = Recorder.started, .finishedFn = Recorder.finished },
+        .step_ends = &step_ends,
+        .sink_job_id = 55,
     }, testJob(&steps), &log);
+
+    // A Dagger step's `step-end:` line has its time and result; the rest is `?`.
+    var lines = std.mem.splitScalar(u8, step_ends.written(), '\n');
+    const tail = " cpu_ms=? mem_peak=? io_read=? io_write=? majflt=? minflt=? spawn_ms=? " ++
+        "namespaces_ms=? overlay_ms=? binds_ms=? root_ms=? exit_ms=?";
+    const first = lines.next().?;
+    try std.testing.expect(std.mem.startsWith(u8, first, "step-end: job=55 step=1 name='n' result=success wall_ms="));
+    try std.testing.expect(std.mem.endsWith(u8, first, tail));
+    for ([_][]const u8{
+        "step-end: job=55 step=2 name='n' result=skipped wall_ms=0.0" ++ tail,
+        "step-end: job=55 step=3 name='n' result=failure wall_ms=0.0" ++ tail,
+        "step-end: job=55 step=4 name='n' result=skipped wall_ms=0.0" ++ tail,
+    }) |expected| try std.testing.expectEqualStrings(expected, lines.next().?);
 
     const want = [_][]const u8{
         "start 1 n t", // the step has begun, with a start time

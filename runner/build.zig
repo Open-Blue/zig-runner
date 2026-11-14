@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
     });
     addLibzstd(exe.root_module);
     addLibzlibng(exe.root_module, target.result.cpu.arch);
-    addZrNet(exe.root_module, target.result.cpu.arch, target.result.abi);
+    addZrNet(exe.root_module, target.result.cpu.arch, target.result.abi, sanitize_thread == true);
     exe.pie = pie;
     b.installArtifact(exe);
 
@@ -105,7 +105,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "tls", .module = tls.module("tls") }},
             }) });
             oracle.pie = pie;
-            addZrNet(oracle.root_module, target.result.cpu.arch, target.result.abi);
+            addZrNet(oracle.root_module, target.result.cpu.arch, target.result.abi, sanitize_thread == true);
             const run_oracle = b.addRunArtifact(oracle);
             // Which servers it finds depends on the environment (PG*, ZIG_TEST_PG_TLS_DIR).
             run_oracle.has_side_effects = true;
@@ -246,11 +246,12 @@ fn addLibzlibng(module: *std.Build.Module, arch: std.Target.Cpu.Arch) void {
 /// references even with `panic = "abort"`. The step runs on every build, as the version's does:
 /// cargo has its own cache and a clean tree costs it about a second; the Zig compilation after it
 /// repeats only when the archive's bytes change.
-fn addZrNet(module: *std.Build.Module, arch: std.Target.Cpu.Arch, abi: std.Target.Abi) void {
+fn addZrNet(module: *std.Build.Module, arch: std.Target.Cpu.Arch, abi: std.Target.Abi, sanitize_thread: bool) void {
     const b = module.owner;
     const cargo = b.addSystemCommand(&.{ "../.github/scripts/build-zr-net.sh", @tagName(arch) });
     const archive = cargo.addOutputFileArg("libzr_net.a");
-    cargo.addArg(if (abi.isMusl()) "musl" else "gnu");
+    // Under ThreadSanitizer the archive is built instrumented too (nightly Rust, `-Zsanitizer=thread`).
+    cargo.addArg(if (sanitize_thread) "tsan" else if (abi.isMusl()) "musl" else "gnu");
     cargo.has_side_effects = true;
     module.addObjectFile(archive);
     module.link_libc = true;

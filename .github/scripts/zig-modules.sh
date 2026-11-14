@@ -24,9 +24,10 @@ zig_modules() {
 	# glibc test binary with a musl-built Rust archive in it is two libcs in one process (it failed
 	# `Thread.spawn` with EINVAL in 36 tests). `native` keeps the machine's CPU and OS. Except
 	# under ThreadSanitizer, whose runtime needs glibc's dynamic loader (zig-test.sh): there the
-	# archive is built for glibc, to match.
+	# archive is built for glibc, to match, and instrumented too (`tsan`: nightly Rust with
+	# -Zsanitizer=thread, build-zr-net.sh), so TSan sees the library's synchronisation.
 	local libc=musl a
-	for a in "$@"; do [[ $a == -fsanitize-thread ]] && libc=gnu; done
+	for a in "$@"; do [[ $a == -fsanitize-thread ]] && libc=tsan; done
 	if [[ $(zig_target_arch "$@") == native && $libc == musl ]]; then set -- "$@" -target native-native-musl; fi
 	local arch
 	arch=$(zig_target_arch "$@")
@@ -40,7 +41,7 @@ zig_modules() {
 }
 
 # zig_zr_net_args SCRATCH ARCH LIBC: sets `zr_net_args` to the link inputs of the network library
-# (runner/rust/zr-net) for ARCH and LIBC (musl; gnu for the ThreadSanitizer builds): runner/build.zig's
+# (runner/rust/zr-net) for ARCH and LIBC (musl; tsan for the ThreadSanitizer builds): runner/build.zig's
 # `addZrNet`, the same archive from the same script, and libc and libunwind, which Rust's standard library needs (Zig's bundled musl and
 # libunwind; docs/rust-net.md). The archive is built once per SCRATCH and architecture. From runner/.
 zig_zr_net_args() {

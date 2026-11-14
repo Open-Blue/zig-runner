@@ -51,11 +51,11 @@ needed() {
 	tests)
 		case $1 in
 		# What the build and the tests read (db/: the database tests' migrations), and what runs them.
-		runner/* | db/* | .github/workflows/ci.yml | .github/scripts/ci-scope.sh | \
+		runner/* | db/* | .github/workflows/ci.yml | .github/scripts/ci-scope.sh | .github/tsan.supp | \
 			.github/scripts/install-zig.sh | .github/scripts/ci-database.sh | \
 			.github/scripts/zig-test.sh | .github/scripts/zig-modules.sh | \
 			.github/scripts/cargo-test.sh | .github/scripts/pg-tls-fixture.sh | .github/scripts/build-zr-net.sh | \
-			.github/scripts/zig-cc.sh | .github/scripts/install-rust.sh | \
+			.github/scripts/zig-cc.sh | .github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | \
 			.github/scripts/expr-conformance.sh | .github/scripts/zlint.sh | \
 			.github/scripts/zlint-suppressed.baseline | \
 			.github/scripts/native-service-images.sh) return 0 ;;
@@ -76,7 +76,7 @@ needed() {
 		runner/src/* | runner/build.zig | runner/build.zig.zon | .github/workflows/ci.yml | \
 			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
 			.github/scripts/build-binaries.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
-			.github/scripts/install-rust.sh | runner/rust/* | \
+			.github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | runner/rust/* | \
 			.github/scripts/checksec.sh) return 0 ;;
 		*) return 1 ;;
 		esac
@@ -89,7 +89,7 @@ needed() {
 		runner/src/* | runner/build.zig | runner/build.zig.zon | deploy/engine.json | \
 			.github/workflows/ci.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/install-zig.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
-			.github/scripts/install-rust.sh | runner/rust/* | \
+			.github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | runner/rust/* | \
 			.github/scripts/e2e.sh) return 0 ;;
 		*) return 1 ;;
 		esac
@@ -123,7 +123,7 @@ needed() {
 			deploy/* | .trivyignore.yaml | .github/workflows/release.yml | \
 			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
 			.github/scripts/build-binaries.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
-			.github/scripts/install-rust.sh | runner/rust/* | \
+			.github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | runner/rust/* | \
 			.github/scripts/sbom.sh | .github/scripts/checksec.sh) return 0 ;;
 		*) return 1 ;;
 		esac
@@ -162,10 +162,10 @@ needed() {
 			runner/src/vendor/zstd/* | runner/src/fuzz_corpus/zstd/* | \
 			runner/src/native/oci/zlibng.zig | runner/src/vendor/zlib-ng/* | \
 			runner/src/fuzz_corpus/gzip/* | \
-			runner/src/zr_net.zig | runner/src/tls_stream.zig | runner/src/fuzz_corpus/tls/* | runner/rust/* | \
+			runner/src/zr_net.zig | runner/src/tls_stream.zig | runner/src/net_client.zig | runner/src/net_oracle.zig | runner/src/fuzz_corpus/tls/* | runner/rust/* | \
 			runner/tls_oracle.zig | runner/tools/tls_oracle/* | .github/scripts/pg-tls-fixture.sh | \
 			.github/scripts/build-zr-net.sh | \
-			.github/scripts/zig-cc.sh | .github/scripts/install-rust.sh | \
+			.github/scripts/zig-cc.sh | .github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | \
 			.github/valgrind.supp) return 0 ;;
 		*) return 1 ;;
 		esac
@@ -175,7 +175,9 @@ needed() {
 		# test that changed has to name, and the night is too late to learn of one.
 		case $1 in
 		runner/src/* | runner/build.zig | .github/workflows/analysis.yml | \
-			.github/scripts/ci-scope.sh) return 0 ;;
+			.github/scripts/ci-scope.sh | runner/rust/* | .github/tsan.supp | \
+			.github/scripts/build-zr-net.sh | .github/scripts/install-rust-nightly.sh | \
+			.github/scripts/zig-modules.sh) return 0 ;;
 		*) return 1 ;;
 		esac
 		;;
@@ -192,7 +194,7 @@ needed() {
 			runner/src/native/oci/Store.zig | runner/src/native/volumes.zig | \
 			runner/src/native/evict.zig | \
 			.github/scripts/store-crash.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
-			.github/scripts/install-rust.sh | runner/rust/*) return 0 ;;
+			.github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | runner/rust/*) return 0 ;;
 		*) return 1 ;;
 		esac
 		;;
@@ -225,7 +227,7 @@ needed() {
 		.github/workflows/analysis.yml | \
 			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
 			.github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
-			.github/scripts/install-rust.sh | runner/rust/* | .github/scripts/zig-coverage.sh | \
+			.github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | runner/rust/* | .github/scripts/zig-coverage.sh | \
 			.github/scripts/native-service-images.sh) return 0 ;;
 		*) return 1 ;;
 		esac

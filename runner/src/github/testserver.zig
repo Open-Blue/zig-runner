@@ -11,6 +11,8 @@
 //!   /see-other   303 to /echo
 //!   /loop        302 to /loop
 //!   /unavailable/...  503
+//!   /limited/...  429 with `Retry-After: 7` and GitHub's `X-RateLimit-*` headers (remaining 0 of
+//!                5000, resetting at 1700000000, resource `core`)
 //!   /broker/message?...  200, a `RunnerJobRequest` whose run service is /nowhere (so acquirejob
 //!                answers 404); each one counted in `Server.polls`
 //!   /silent      never answered: the connection stays open, as one to a peer that went away
@@ -179,6 +181,10 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
         respond(out, "302 Found", "/loop", "");
     } else if (std.mem.startsWith(u8, path, "/unavailable/")) {
         respond(out, "503 Service Unavailable", null, "");
+    } else if (std.mem.startsWith(u8, path, "/limited/")) {
+        out.writeAll("HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n" ++
+            "Retry-After: 7\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Limit: 5000\r\n" ++
+            "X-RateLimit-Reset: 1700000000\r\nX-RateLimit-Resource: core\r\n\r\n") catch return .close;
     } else if (std.mem.startsWith(u8, path, "/broker/message?")) {
         _ = s.polls.fetchAdd(1, .acq_rel);
         var body_buf: [256]u8 = undefined;

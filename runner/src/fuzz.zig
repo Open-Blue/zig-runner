@@ -31,6 +31,7 @@ const zstd = @import("native/oci/zstd.zig");
 const libzstd = @import("native/oci/libzstd.zig");
 const zlibng = @import("native/oci/zlibng.zig");
 const tls_stream = @import("tls_stream.zig");
+const net_client = @import("net_client.zig");
 const registry = @import("native/oci/registry.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
@@ -1725,6 +1726,91 @@ fn tlsRecords(_: void, smith: *Smith) !void {
     // And all of it is returned when the connection is.
     try std.testing.expect(@import("zr_net.zig").heap().bytes <= before + 64 * 1024);
 }
+
+// --- HTTP responses (the network library's hyper, behind the C ABI) ---
+
+test "fuzz: HTTP responses" {
+    try std.testing.fuzz({}, httpResponses, .{
+        .corpus = comptime seeds(&.{
+            &.{"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Ratelimit-Remaining: 4999\r\n\r\nok"},
+            &.{"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"},
+            &.{"HTTP/1.1 302 Found\r\nLocation: /echo\r\nContent-Length: 0\r\n\r\n"},
+            &.{"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n"},
+            &.{"HTTP/1.0 200 OK\r\n\r\nuntil the connection closes"},
+            &.{"HTTP/1.1 200 OK\r\nContent-Length: 99999999999\r\n\r\nshort"},
+            &.{"HTTP/1.1 301 Moved\r\nLocation: http://[::1\r\n\r\n"},
+            &.{"\x16\x03\x01\x02\x00\x01\x00\x01\xfc"},
+        }),
+    });
+}
+
+/// What a server answers a request with, byte for byte, whatever it is: the library's answer (or
+/// error) comes back and the process lives (a Rust panic aborts it), within the deadline, with at
+/// most `max_response` bytes of body. Input: the bytes sent in answer to each request, and any
+/// redirect they ask for is followed (up to two) into the same server.
+fn httpResponses(_: void, smith: *Smith) !void {
+    // Not `std.testing.io`: its threads free their tasks after the awaiting thread was woken, and a
+    // leak check that runs in between reports them (see "fuzz: OCI layer").
+    var threaded: std.Io.Threaded = .init(std.heap.smp_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var buf: [4096]u8 = undefined;
+    const answer = take(smith, &buf);
+    // One listener for the whole run, not one per input: a new port 0 listener each time, with the
+    // server closing first, left tens of thousands of TIME_WAIT sockets on fresh ports until bind
+    // found none free (AddressInUse, CI run 43541758435). Each input's server thread still starts
+    // and stops below; only the socket is shared. It outlives `threaded`, so it uses the testing Io.
+    const listener = &http_responses_listener;
+    if (listener.* == null) {
+        var addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        listener.* = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    }
+    const server = &listener.*.?;
+    const Server = struct {
+        fn run(l: *std.Io.net.Server, bytes: []const u8, stop: *std.atomic.Value(bool)) void {
+            while (!stop.load(.acquire)) {
+                const conn = l.accept(std.testing.io) catch return;
+                defer conn.close(std.testing.io);
+                if (stop.load(.acquire)) return;
+                var rb: [2048]u8 = undefined;
+                var r = conn.reader(std.testing.io, &rb);
+                // The request's head, then the answer, then the connection closes.
+                while (true) {
+                    const line = r.interface.takeDelimiterInclusive('\n') catch break;
+                    if (line.len <= 2) break;
+                }
+                var wb: [512]u8 = undefined;
+                var w = conn.writer(std.testing.io, &wb);
+                // A connection left over from the input before (its wake-up, or a request the
+                // client gave up on) is gone by now: skip it rather than end this input's server.
+                w.interface.writeAll(bytes) catch continue;
+                w.interface.flush() catch continue;
+            }
+        }
+    };
+    var stop: std.atomic.Value(bool) = .init(false);
+    const t = try std.Thread.spawn(.{}, Server.run, .{ server, answer, &stop });
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{server.socket.address.getPort()});
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    if (net_client.fetch(arena.allocator(), io, .{
+        .url = url,
+        .deadline = .fromMilliseconds(400),
+        .max_redirects = 2,
+        .max_response = 1 << 16,
+    })) |r| {
+        try std.testing.expect(r.body.len <= 1 << 16);
+    } else |_| {}
+    // Ends the server: the next accept is the last.
+    stop.store(true, .release);
+    const last = try std.Io.net.IpAddress.parse("127.0.0.1", server.socket.address.getPort());
+    if (last.connect(io, .{ .mode = .stream })) |c| c.close(io) else |_| {}
+    t.join();
+}
+
+/// The listener "fuzz: HTTP responses" shares across inputs (see there).
+var http_responses_listener: ?std.Io.net.Server = null;
 
 // --- HTTP/2 framing ---
 

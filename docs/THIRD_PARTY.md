@@ -22,8 +22,11 @@ Fetched by cargo at build time from crates.io, pinned by `runner/rust/zr-net/Car
 
 | Crate | Used for | License |
 |---|---|---|
-| [tokio](https://github.com/tokio-rs/tokio) | the runtime that will run the runner's HTTP and WebSocket (R1: the runtime only) | MIT |
+| [tokio](https://github.com/tokio-rs/tokio) | the runtime of the network library: the HTTP client's connections and requests | MIT |
 | [rustls](https://github.com/rustls/rustls) | TLS to the database (`runner/src/pg.zig`, through `runner/src/tls_stream.zig`), with the `ring` crypto provider and rustls-webpki certificate checks | Apache-2.0 OR ISC OR MIT |
+| [hyper](https://github.com/hyperium/hyper), [hyper-util](https://github.com/hyperium/hyper-util), [http](https://github.com/hyperium/http), [http-body-util](https://github.com/hyperium/http-body) | the HTTP/1.1 client (`runner/src/net_client.zig`): messages, framing and the connection state machine | MIT |
+| [tokio-rustls](https://github.com/rustls/tokio-rustls) | TLS over the client's sockets | Apache-2.0 OR MIT |
+| [socket2](https://github.com/rust-lang/socket2) | `TCP_USER_TIMEOUT`, keepalive and the call's socket pair | MIT OR Apache-2.0 |
 | [rustls-native-certs](https://github.com/rustls/rustls-native-certs) | the system's root certificates, honouring `SSL_CERT_FILE` and `SSL_CERT_DIR` | Apache-2.0 OR ISC OR MIT |
 
 The lock file lists the others (all permissive; the tokio skeleton adds `pin-project-lite`, MIT or Apache-2.0). The runner now also links Zig's bundled copies of [musl libc](https://musl.libc.org) (MIT) and LLVM's libunwind (Apache-2.0 WITH LLVM-exception), which Rust's standard library needs.

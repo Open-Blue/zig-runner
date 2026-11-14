@@ -9,7 +9,7 @@ const std = @import("std");
 const Scope = @import("../config.zig").Scope;
 const GhApp = @import("../config.zig").GhApp;
 const auth = @import("auth.zig");
-const http = @import("http.zig");
+const net_client = @import("../net_client.zig");
 const jitconfig = @import("jitconfig.zig");
 const rsa_sign = @import("rsa_sign.zig");
 
@@ -22,7 +22,7 @@ pub const Error = error{
     /// `message_out`.
     AppRejected,
     BadResponse,
-} || Allocator.Error || http.FetchError || rsa_sign.Error || std.Io.Cancelable;
+} || Allocator.Error || net_client.Error || std.Io.Writer.Error || rsa_sign.Error || std.Io.Cancelable;
 
 /// The App's installation tokens for one scope, shared by every runner of the process: one token
 /// at a time, minted when the last is near its end or GitHub refused it.
@@ -175,29 +175,22 @@ fn call(
     status_out: *std.http.Status,
     message_out: *[]const u8,
 ) Error![]const u8 {
-    var local: std.http.Client = .{ .allocator = arena, .io = io };
-    defer local.deinit();
-    const client = http.client(&local);
-    var resp: std.Io.Writer.Allocating = .init(arena);
-    const result = try http.fetch(client, .{
-        .location = .{ .url = url },
+    const result = try net_client.fetch(arena, io, .{
+        .url = url,
         .method = method,
         .payload = if (method == .POST) "" else null,
-        .headers = .{
-            .authorization = .{ .override = try std.fmt.allocPrint(arena, "Bearer {s}", .{jwt}) },
-        },
-        .extra_headers = &.{
+        .headers = &.{
+            .{ .name = "Authorization", .value = try std.fmt.allocPrint(arena, "Bearer {s}", .{jwt}) },
             .{ .name = "Accept", .value = "application/vnd.github+json" },
             .{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" },
         },
-        .response_writer = &resp.writer,
     });
     status_out.* = result.status;
     if (result.status.class() != .success) {
-        message_out.* = jitconfig.errorMessage(arena, resp.written());
+        message_out.* = jitconfig.errorMessage(arena, result.body);
         return error.AppRejected;
     }
-    return resp.written();
+    return result.body;
 }
 
 /// The key in a PEM: PKCS#1 (`BEGIN RSA PRIVATE KEY`, what GitHub's "Generate a private key"

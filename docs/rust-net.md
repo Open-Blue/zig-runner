@@ -200,7 +200,7 @@ a custom connector gives all of them, as the study's bench showed (60 lines):
 | `bytes` in/out, `status`, `http` version | from the response and the body wrapper's counters |
 
 The same function formats the line from a `Timings` struct that Rust fills (`zr_net_request_timings`); #530's formatting
-stays in Zig so the line is identical byte for byte (R3 has a golden test of the format against #530's, and a server that
+stays in Zig so the line is identical byte for byte (R3 shares #530's golden test of the format, and a server that
 delays each phase by a known amount, asserting each reported phase within 20% of the delay). The approximations #530
 documents (DNS approximate, TLS inferred) go away with the wrapper.
 
@@ -243,6 +243,43 @@ documents (DNS approximate, TLS inferred) go away with the wrapper.
 - **Compression.** `Accept-Encoding` is not set unless the call asks (blob downloads must see the compressed bytes: layers
   are already compressed). No automatic decompression.
 - **Cookies, auth, retries.** None in the client. Retries stay where they are (call sites know what is idempotent).
+
+## The HTTP client (R3, as built)
+
+`runner/src/net_client.zig` is the Zig side (`fetch(arena, io, options)`), `rust/zr-net/src/client.rs`, `proxy.rs` and `call.rs` the library's.
+
+- **API.** `zr_net_client_new` makes the process's client (user agent `zig-runner/<version>`, proxies from the environment, the pool); `zr_net_call_start`
+  takes a request (method, URL, header lines, body, redirect limit, response limit, first-byte and idle limits), copies it, starts it on the runtime and returns a call
+  and a descriptor (the Zig end of a socket pair; the library keeps the other and writes one byte with `MSG_NOSIGNAL` when the call has finished, so a caller that
+  closed its end first costs nothing). Zig waits with `Io.File.readStreaming` on it: the wait is std.Io's, so the deadline (`http.within`, 30 s) and cancellation
+  apply where it blocks, and both free the call, which drops the request and closes its connection (tested: a request to a server that never answers ends at its
+  deadline, and a cancel ends it at once). `zr_net_call_result` fills a struct (status, error code, timings, lengths); `zr_net_call_copy` copies headers, body or the error text.
+  Whole bodies up to `max_response`; streaming is R4.
+- **Pool and connections.** hyper's `http1` connection API under our own pool (per scheme, host, port and proxy; 8 idle per host, 90 s): a kept connection that turns out to be
+  closed is replaced silently when nothing had been sent (what `HttpConnectionClosing` retries did). HTTP/1.1 only, as decided; HTTP/2 is per call site later.
+- **Exact phases.** DNS is timed around `getaddrinfo` (an address needs none), connect around the TCP connect (each address in turn, 10 s each), TLS around the handshake,
+  first byte from handing the request to the connection until its head is parsed, total around everything. A reused connection reports no DNS, connect or TLS of its own.
+  With redirects the phases are the last hop's and the total is the whole. `TCP_NODELAY`, keepalive (60 s idle, 10 s apart, 3 probes) and `TCP_USER_TIMEOUT` (90 s) are set on
+  every socket the library connects (tested). The cargo test `each_phase_is_measured_where_it_happens` has a server that waits 150 ms before its handshake and 100 ms before
+  answering and asserts the TLS time is 150-400 ms and the first byte 100-300 ms, DNS and connect small, and the total consistent.
+- **The `request:` line**: one implementation, `github/request_log.zig` (#530's: format, redaction `redactPath` with its query cut and secret-shaped segments `*`, rate-limit fields, the
+  golden tests of the line and of the redaction). R3 first carried a copy of it (`request_line.zig`) so that the bytes could not drift while #530 was open; this PR includes #530 (merged into the branch), the copy
+  is gone, and `net_client.zig` writes through `request_log.Line` and `emit` as `broker.zig` and `http.zig` do (through its `Probe`, which measures std's client by wrapping its Io and approximates; the library's figures
+  are exact). `RUNNER_LOG_REQUESTS` is now the one switch for both (before, the copy had a switch of its own that `main` did not set). Emitted by every `net_client.fetch`.
+- **Proxies** (`proxy.rs`, pure and tested table): `HTTPS_PROXY`/`HTTP_PROXY` (lower case wins), `NO_PROXY` as curl documents it (names with subdomains, `*`, IPs, CIDR, ports; loopback
+  never proxied), `http://user:pass@host:port` proxies with Basic `Proxy-Authorization`; https targets are tunnelled with CONNECT and TLS runs inside it, http targets use the
+  absolute form. Tested against in-process proxies, including one that refuses CONNECT (its own error). No SOCKS, no https proxies.
+- **Roots**: `roots::native()` (`SSL_CERT_FILE`, `SSL_CERT_DIR`, system paths), shared with the database's TLS; a PEM in the client's settings replaces them (tests).
+- **Redirects**: up to `max_redirects` (3 for the moved call sites); `Authorization`, `Cookie` and `Proxy-Authorization` are dropped when the origin (scheme, host, port) changes; 303 (and 301/302 for a POST)
+  turn the request into a GET without its body, 307/308 keep both; https to http is refused.
+- **Moved to it**: `auth.zig` (the OAuth token), `app.zig` (the App's installation and token calls), `jitconfig.zig` (generate-jitconfig). Their tests run through it against `testserver.zig`.
+- **The oracle** (`net_oracle.zig`): 12 cases against `testserver.zig` through std's client and the library: status and body must match, except where a case writes the difference down. It found two,
+  both now documented in the cases: std keeps `Authorization` across a redirect to another host (the library drops it), and std hands a 303 for a POST back instead of following it (the library follows it as a GET).
+  Also: the request line's figures for a plain request, and the deadline and cancel behaviour.
+- **Validation of R3**: 18 cargo tests (client against in-process plain and TLS servers: keep-alive and reuse, redirects and credentials, CA/name errors by kind, the phases, socket options, limits and timeouts, proxies, the proxy
+  table); the oracle; a fuzz target `fuzz: HTTP responses` (what a server answers, byte for byte; in the nightly matrix and in the analysis scope; seeded with normal, chunked, redirecting, malformed and non-HTTP answers);
+  TSan: the Rust archive is built instrumented for TSan builds ("ThreadSanitizer" below), so there is no blanket suppression; `.github/tsan.supp` holds the one report that is not a race; Valgrind over the new tests.
+- **Not in R3**: the std client's other users (registry, release downloads, uploads: R4; run service, broker, Gitea: R5; the feed: R6), `http.zig`'s renew/retire machinery (still needed by those), HTTP/2, streaming.
 
 ## The WebSocket feed (R6)
 
@@ -378,20 +415,28 @@ Each PR brings its own checks; none is left to "later".
    use-after-free of Rust allocations); Zig-side buffers handed to Rust (body chunks, `read` targets) are fully checked. Rust's heap is covered by
    the allocation counter from "libc" (leak at runtime stop is an assertion in the tests: bytes in use is 0 after `stop`) and
    by `cargo test` under Miri on the pure functions (proxy matching, redirect policy, URL handling).
-4. **ThreadSanitizer: what it does and does not cover.** Zig's TSan instruments the Zig code only. The Rust side is uninstrumented, so TSan
-   cannot see its synchronisation, so a Zig test that crosses into tokio reports **false races in `free`/`malloc` between Zig and tokio
-   threads**: measured in R1, the runtime test under `-fsanitize-thread` gives 6-7 warnings, so it **skips itself under TSan**
-   (`builtin.sanitize_thread`). TSan's runtime also needs glibc's loader (`zig-test.sh`: static musl PIE crashes at startup), so TSan builds
-   are the one place that takes glibc: `zig-modules.sh` and `build.zig` (`-Dsanitize-thread`) then build the Rust archive for
-   `<arch>-unknown-linux-gnu` (`build-zr-net.sh ... gnu`), never a musl archive in a glibc binary. (R1's first CI run found this: the Database tests job,
-   which runs everything under TSan, died at startup with a musl build.)
-   Therefore: (a) the TSan job's test list (`race_filters` in `zig-race-tests.sh`) does not contain the runtime tests, and tests that
-   match its filters (`timeout`, `cancel`...) by name once they use the network get a narrow suppression for those frames in `.github/tsan.supp`, each with its reason, in the PR that needs it (R3);
-   (b) races **inside Rust** are covered by Rust's own tools: `cargo test` on `zr-net` (always), the same under `-Zsanitizer=thread` with `-Zbuild-std`
-   on nightly (a nightly job in `analysis.yml`, about 3-4 minutes: a nightly toolchain pin and the std rebuild are the cost), and `loom` for the few lock-free
-   structures we write ourselves (the request-state machine and the wake path: small, modelled, the ones a race could actually live in);
-   (c) the Zig side of the ABI (a handle used from two threads) is exercised by the existing stress job with network tests.
-   Race-freedom of hyper/tokio themselves is not re-proved here: they are widely tested; what is ours is the glue, which is small and modelled.
+4. **ThreadSanitizer (as built after R3's review).** An uninstrumented Rust archive in a TSan binary is invisible to TSan: it reported
+   false races at the hand-over of memory between Zig and tokio threads, and (the reason R3's first answer, a blanket `race:*::*`, was
+   wrong) it also could not report a real race in or across Rust. Measured with a deliberate race (a `static mut` counter incremented by two
+   Rust threads, and a word written by a Zig thread and a Rust thread): the uninstrumented archive reported neither; the instrumented one
+   reported both, with both stacks. So TSan builds link an **instrumented** archive: `build-zr-net.sh ... tsan` builds the gnu target
+   (TSan's runtime needs glibc's loader; musl is the release's) with a pinned nightly (`install-rust-nightly.sh`: 2026-11-10, rustc
+   1.102.0-nightly, dated tarballs with checked SHA-256, rust-src included; no rustup) and `-Zsanitizer=thread -Zbuild-std=std,panic_abort`, so
+   std's atomics and locks, tokio's and ours are all seen. `zig-modules.sh` (CI's tests, e2e) and `build.zig` (`-Dsanitize-thread`) choose it
+   whenever the Zig side is built with `-fsanitize-thread`. Not instrumented: the C of ring (assembly and C routines that work on
+   buffers the caller owns); a race inside them would be missed. Cost: a 36-45 s cold build of the std and the crates (about 2 min more for the one-time
+   nightly install on a runner with an empty tool cache); `cargo-test.sh tsan` runs the crate's tests under it too (the Database tests job; 17 of
+   18 tests: the one asserting wall-clock bounds on each phase is not run, `getaddrinfo` took 262 ms once under TSan against a bound of 50).
+   With the archive visible, the whole suite showed what the blanket suppression had been hiding, and what the sharded runner had never
+   shown (`test_shards.zig` ignored a shard's stderr and exit status, so a TSan report in a passing test was lost; it now fails the test
+   that printed it and any shard that exits with a failing status): a race in a test fake (`dagger.zig`'s `FakeWarn.n`, polled by the test
+   thread while the watch thread wrote it; fixed with an atomic) and one pattern in tokio: a socket's `ScheduledIo` is written by
+   `RegistrationSet::allocate` and registered with epoll with a pointer as the event's data; the driver thread receives that pointer from
+   `epoll_wait` and reads the struct. The kernel orders the two and TSan cannot model epoll_ctl to epoll_wait, so it reports a race at every
+   registration. That one frame is suppressed (`.github/tsan.supp`, with this reason); and a thread-leak report at a test process's end for a tokio blocking-pool thread (the `getaddrinfo` ones) that went idle and left before the process ended, its handle held by a runtime that lives as long as the process (suppressed by the stack that created the thread, with its reason). Nothing else. The whole suite passes under it
+   (1042 passed, 0 failed), and `cargo test` too.
+   What is still not covered: `loom` for the lock-free structures we write ourselves (small: none yet), and the Zig side of the ABI
+   exercised by the stress job. Race-freedom of hyper and tokio themselves is not re-proved here beyond what TSan sees running our tests.
 5. **Existing tooling, now over Rust too**: coverage (`cargo llvm-cov` for the crate in `analysis.yml`, reported next to Zig's, from R3),
    mutation testing on the glue (`cargo mutants` scoped to `src/proxy.rs` and the redirect policy, a manual job first), `cargo clippy -D warnings` and `cargo fmt --check`
    in the Zig-less "Workflows"-style job (R2), `cargo deny` (R1), and the e2e job (a real runner job over the new stack) plus the pre-release smoke test on the laptop pool.
@@ -405,7 +450,7 @@ Each PR brings its own checks; none is left to "later".
 |---|---|---|---|---|
 | **R1** (this) | `runner/rust/zr-net` skeleton, `build.zig` `addZrNet`, `build-zr-net.sh`, `zig-cc.sh`, `install-rust.sh`, `zig-modules.sh` link inputs, `zr_net.zig` + test, cargo-deny, this document | nothing | minor | Zig test, `cargo test`, Valgrind, byte-identical builds, checksec, cargo-deny |
 | **R2** | `src/tls.rs` sans-IO rustls, `tls_stream.zig`, `pg.zig` on it, client certs (`sslcert`, `sslkey`, `sslrootcert`), roots loader, allocation counter, `cargo test` in CI | `tls.zig` dependency, `build.zig.zon` tls entry, `zig_package_hash` and the tls fetch in `zig-modules.sh`, `ca_bundle` in `pg.zig` | minor | TLS fuzz target, live pg client-cert and private-CA tests, in-process rustls tests |
-| **R3** | the client API (`Client`, `Request`, timings, pool, proxy, redirects, h1), `request:` lines (from #530), `auth.zig`, `app.zig`, `jitconfig.zig` fetches on it; oracle harness | `net_hooks.zig` wiring for those call sites, `http.staleClock` uses in them | minor | oracle against `testserver.zig`, HTTP head fuzz, phase-delay test, cgroup-of-threads test, TSan suppressions |
+| **R3** | the client API (`net_client.zig`; pool, proxy, redirects, h1, exact timings), `request:` lines through #530's `request_log.zig`, `auth.zig`, `app.zig`, `jitconfig.zig` fetches on it; oracle harness | their std client use (`http.fetch` there) | minor | oracle against `testserver.zig`, HTTP head fuzz, phase-delay test, cgroup-of-threads test, TSan suppressions |
 | **R4** | streaming bodies; `zig_release.zig` download, `results.zig` uploads, `native/oci/registry.zig` (redirect privacy tests) | `registry.zig`'s hand-written redirect/authorization workaround, `zig_release`'s std path | minor | streamed oracle cases, memory bound test, Pi disk-streaming benchmark vs std |
 | **R5** | `runservice.zig`, `broker.zig` long-poll (cancel, keepalive, #100's dead-connection test), `gitea/client.zig` | `http.within`'s client coupling, `http.keepAlive` | minor | long-poll oracle and kill-the-network test, Gitea job diff tool |
 | **R6** | `feed.zig` on tokio-tungstenite | std client use everywhere, `net_hooks.zig`, `http.zig`'s retired list and `renew`, the oracle harness, feed framing | minor | WebSocket fuzz target, feed oracle until deleted |
