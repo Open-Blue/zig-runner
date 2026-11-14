@@ -8,6 +8,7 @@
 const std = @import("std");
 const broker = @import("broker.zig");
 const http = @import("http.zig");
+const ratelimit = @import("ratelimit.zig");
 const job_mod = @import("../job.zig");
 const sink = @import("../sink.zig");
 const timefmt = @import("../timefmt.zig");
@@ -135,6 +136,8 @@ pub const Result = struct {
     detail: []const u8,
     /// A failure that another try may get past (`transientError`, `transientStatus`).
     transient: bool = false,
+    /// How long GitHub asked to wait before another try (`broker.Response.wait_ms`), in milliseconds.
+    wait_ms: u64 = 0,
 };
 
 /// What every call answers for a job that names no results service.
@@ -227,7 +230,10 @@ fn retrying(io: std.Io, retry: Retry, comptime try_fn: anytype, args: anytype) R
     while (true) : (attempt += 1) {
         const r = tryOnce(try_fn, args);
         if (r.ok or !r.transient or attempt == retry.delays_ms.len) return r;
-        const delay_ns = retry.delays_ms[attempt] * std.time.ns_per_ms;
+        // At least what GitHub asked (`Retry-After`, the rate limit's reset), unless the budget
+        // runs out first: then this gives up now, not after sleeping to the end of it.
+        const delay_ms = ratelimit.wait(io, @intCast(retry.delays_ms[attempt]), r.wait_ms);
+        const delay_ns = @as(i96, @intCast(delay_ms)) * std.time.ns_per_ms;
         const elapsed = std.Io.Clock.awake.now(io).toNanoseconds() - started;
         if (elapsed + delay_ns >= retry.budget.nanoseconds) return r;
         io.sleep(.fromNanoseconds(delay_ns), .awake) catch return r;
@@ -447,7 +453,8 @@ pub const blob_deadline_max: std.Io.Duration = .fromSeconds(5 * 60);
 fn failed(arena: Allocator, what: []const u8, r: broker.Response) !Result {
     return .{
         .ok = false,
-        .transient = transientStatus(r.status),
+        .transient = transientStatus(r.status) or (r.status == .forbidden and r.wait_ms > 0),
+        .wait_ms = r.wait_ms,
         .detail = try std.fmt.allocPrint(arena, "{s}: HTTP {d}: {s}", .{
             what,
             @backingInt(r.status),
@@ -718,4 +725,56 @@ test "what is worth trying again" {
     try std.testing.expect(transientStatus(.bad_gateway));
     try std.testing.expect(!transientStatus(.forbidden));
     try std.testing.expect(!transientStatus(.not_found));
+}
+
+test "a 429 with Retry-After is waited out before the next try, not retried at once" {
+    var server: @import("testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    server.results_fail = 1;
+    server.results_fail_on = "SignedBlobURL";
+    server.results_fail_status = "429 Too Many Requests";
+    server.results_fail_headers = "Retry-After: 1\r\n";
+    const started = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+    const r = testUpload(&server, .job, quick);
+    const took = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - started;
+    try std.testing.expect(r.ok);
+    // The backoff was 1 ms; the server asked for a second.
+    try std.testing.expect(took >= 1000 * std.time.ns_per_ms);
+}
+
+test "a 403 with x-ratelimit-remaining 0 waits for the reset" {
+    var server: @import("testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    server.results_fail = 1;
+    server.results_fail_on = "SignedBlobURL";
+    server.results_fail_status = "403 Forbidden";
+    var hdr: [96]u8 = undefined;
+    const now_s = @divFloor(std.Io.Clock.real.now(std.testing.io).toMilliseconds(), 1000);
+    server.results_fail_headers = std.fmt.bufPrint(&hdr, "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {d}\r\n", .{now_s + 2}) catch unreachable;
+    const started = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+    const r = testUpload(&server, .job, quick);
+    const took = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - started;
+    try std.testing.expect(r.ok);
+    // Two seconds after the second the clock was read in: more than one full second from now.
+    try std.testing.expect(took >= 1000 * std.time.ns_per_ms);
+}
+
+test "a Retry-After longer than the budget gives up at once, not after the wait" {
+    var server: @import("testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    server.results_fail = 100;
+    server.results_fail_on = "SignedBlobURL";
+    server.results_fail_status = "429 Too Many Requests";
+    server.results_fail_headers = "Retry-After: 30\r\n";
+    const short: Retry = .{ .delays_ms = &.{ 1, 1 }, .budget = .fromMilliseconds(500) };
+    const started = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+    const r = testUpload(&server, .job, short);
+    const took = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - started;
+    try std.testing.expect(!r.ok and r.transient);
+    try std.testing.expect(took < 400 * std.time.ns_per_ms);
+    // Asked once; the second try would have started after the wait.
+    try std.testing.expectEqual(@as(u32, 99), server.results_fail);
 }

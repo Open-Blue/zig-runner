@@ -4,6 +4,7 @@ const std = @import("std");
 const jitconfig = @import("jitconfig.zig");
 const auth = @import("auth.zig");
 const http = @import("http.zig");
+const ratelimit = @import("ratelimit.zig");
 const request_log = @import("request_log.zig");
 const net_hooks = @import("net_hooks.zig");
 
@@ -38,7 +39,24 @@ pub fn parseSettings(arena: Allocator, files: []const jitconfig.File) !Settings 
 pub const Response = struct {
     status: std.http.Status,
     body: []const u8,
+    /// How long GitHub asked to wait before asking again, in milliseconds (`ratelimit.parse`: a
+    /// 429, a 503, or a secondary rate limit's 403); 0 for no request.
+    wait_ms: u64 = 0,
 };
+
+/// What `head` asks a retry to wait.
+fn askedWait(io: std.Io, head: std.http.Client.Response.Head) u64 {
+    var retry_after: ?[]const u8 = null;
+    var remaining: ?[]const u8 = null;
+    var reset: ?[]const u8 = null;
+    var it = head.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) retry_after = h.value;
+        if (std.ascii.eqlIgnoreCase(h.name, "x-ratelimit-remaining")) remaining = h.value;
+        if (std.ascii.eqlIgnoreCase(h.name, "x-ratelimit-reset")) reset = h.value;
+    }
+    return ratelimit.parse(head.status, retry_after, remaining, reset, std.Io.Clock.real.now(io).toMilliseconds());
+}
 
 pub fn call(
     arena: Allocator,
@@ -290,6 +308,8 @@ fn exchangeProbed(probe: *request_log.Probe, x: Exchange) !Exchanged {
 
     var response = req.receiveHead(&.{}) catch |e| return canceledOr(&req, e);
     probe.head(response.head);
+    // Before the body is read: that overwrites the head's bytes.
+    const asked_ms = askedWait(probe.io, response.head);
     if (trace) std.debug.print("trace: head status={d} content_length={?d} chunked={}\n", .{
         @backingInt(response.head.status),
         response.head.content_length,
@@ -318,14 +338,18 @@ fn exchangeProbed(probe: *request_log.Probe, x: Exchange) !Exchanged {
     if (response.head.status == .no_content or response.head.status == .not_modified) {
         req.connection.?.closing = true;
         probe.bytes_in = 0;
-        return .{ .done = .{ .status = response.head.status, .body = "" } };
+        return .{ .done = .{ .status = response.head.status, .body = "", .wait_ms = asked_ms } };
     }
 
     const body = readBody(x.scratch, &response, x.max_body) catch |e|
         return canceledOr(&req, e);
     probe.bytes_in = body.len;
     if (trace) std.debug.print("trace: body {d} bytes\n", .{body.len});
-    return .{ .done = .{ .status = response.head.status, .body = try x.arena.dupe(u8, body) } };
+    return .{ .done = .{
+        .status = response.head.status,
+        .body = try x.arena.dupe(u8, body),
+        .wait_ms = asked_ms,
+    } };
 }
 
 /// `error.Canceled` when that is what failed the connection's read or write under `err`: the client
@@ -597,6 +621,8 @@ test "request lines: timed, without the query or a token, and a 429's rate limit
     _ = try request(a, std.testing.io, .GET, server.url(&buf, "localhost", "/broker/message?sig=SECRET&sessionId=x"), null, t);
     const limited = try request(a, std.testing.io, .GET, server.url(&buf, "127.0.0.1", "/limited/ghs" ++ "_16C7e42F292c6912E7710c838347Ae178B4a"), null, t);
     try std.testing.expectEqual(std.http.Status.too_many_requests, limited.status);
+    // The server's Retry-After: 7 reaches the caller, who retries by it.
+    try std.testing.expectEqual(@as(u64, 7000), limited.wait_ms);
 
     const text = lines.written();
     try std.testing.expect(std.mem.indexOf(u8, text, "SECRET") == null);

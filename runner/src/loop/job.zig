@@ -34,6 +34,7 @@ const Runner = @import("../loop.zig").Runner;
 const Cycle = @import("../loop.zig").Cycle;
 const Registering = @import("../loop.zig").Registering;
 const stopRequested = @import("../loop.zig").stopRequested;
+const ratelimit = @import("../github/ratelimit.zig");
 const stop_signals = &@import("../loop.zig").stop_signals;
 const say = @import("exchange.zig").say;
 const sayUnallocated = @import("../loop.zig").sayUnallocated;
@@ -213,6 +214,12 @@ fn slowOutputs(c: Runner, repo: []const u8) bool {
     return so.spent(repo) != null;
 }
 
+/// Whether an answer may pass with time: 5xx, 429, or a 403 that names a rate limit.
+fn retryable(r: broker.Response) bool {
+    return r.status.class() == .server_error or r.status == .too_many_requests or
+        (r.status == .forbidden and r.wait_ms > 0);
+}
+
 /// Waits before each further acquire, in milliseconds: 15.5 s in all.
 const acquire_retry_ms = [_]i64{ 500, 1000, 2000, 4000, 8000 };
 
@@ -229,11 +236,14 @@ fn acquire(
     while (true) : (attempt += 1) {
         const last = attempt == retry_ms.len or stopRequested();
         if (runservice.acquire(c.arena, c.io, jr, token)) |r| {
-            if (last or r.status.class() != .server_error) return r;
+            if (last or !retryable(r)) return r;
             try say(c, "'{s}': acquirejob answered HTTP {d}; trying again", .{
                 c.name,
                 @backingInt(r.status),
             });
+            // At least what GitHub asked (`Retry-After`, a rate limit's reset).
+            c.io.sleep(.fromMilliseconds(@intCast(ratelimit.wait(c.io, @intCast(retry_ms[attempt]), r.wait_ms))), .awake) catch {};
+            continue;
         } else |e| {
             if (last or e == error.OutOfMemory) return e;
             try say(c, "'{s}': acquirejob failed ({s}); trying again", .{ c.name, @errorName(e) });
@@ -1093,14 +1103,16 @@ fn completeJob(
             annotations_json,
             environment_url,
         );
-        const retry = if (r) |resp| resp.status.class() == .server_error else |_| true;
+        const retry = if (r) |resp| retryable(resp) else |_| true;
         if (!retry or attempt == delays.len) return r;
+        const asked: u64 = if (r) |resp| resp.wait_ms else |_| 0;
+        const wait_ms = ratelimit.wait(c.io, @intCast(delays[attempt] * std.time.ms_per_s), asked);
         if (r) |resp| {
             try logfmt.line(c.err, .warn, "completejob_retry", "http={d} wait_s={d}", .{
                 @backingInt(resp.status), delays[attempt],
             });
         } else |e| try logfmt.line(c.err, .warn, "completejob_retry", "err={t} wait_s={d}", .{ e, delays[attempt] });
-        c.io.sleep(.fromSeconds(delays[attempt]), .awake) catch {};
+        c.io.sleep(.fromMilliseconds(@intCast(wait_ms)), .awake) catch {};
     }
 }
 
