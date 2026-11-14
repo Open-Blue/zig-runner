@@ -27,7 +27,14 @@ pub const Socket = struct {
     /// Connects (`wss://` is HTTPS with an `Upgrade`), within `http.request_deadline`. The Socket
     /// must not move afterwards.
     pub fn open(s: *Socket, gpa: Allocator, io: std.Io, url: []const u8, token: []const u8) !void {
-        s.* = try openWithin(gpa, io, url, token, http.request_deadline);
+        // The feed is the last user of the std client (R6 moves it): the other calls no longer
+        // renew it, so a client that is a day old, or whose clock judged a certificate wrong, is
+        // replaced here (`http.renew`).
+        http.keepFresh(io);
+        s.* = openWithin(gpa, io, url, token, http.request_deadline) catch |e| {
+            if (http.staleClock(e)) if (http.shared.load(.acquire)) |c| http.renew(c);
+            return e;
+        };
     }
 
     /// `connect`, given up at `limit` (`error.Timeout`), as `http.within` does. A feed endpoint that

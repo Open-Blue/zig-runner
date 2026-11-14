@@ -21,6 +21,7 @@ const pg = @import("pg.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
 const http = @import("github/http.zig");
+const net_client = @import("net_client.zig");
 const net_hooks = @import("github/net_hooks.zig");
 const request_log = @import("github/request_log.zig");
 const zig_release = @import("zig_release.zig");
@@ -260,7 +261,10 @@ pub fn main(process_init: std.process.Init) !u8 {
 
     if (try refuseNativeWithoutEngine(arena, io, init, &cfg, err)) |code| return code;
 
-    // One HTTP client for every runner (see `github/http.zig`).
+    // The network library's client, which every call but the live feed's uses, is made on first use
+    // and freed here, once the runners are done (`net_client.zig`).
+    defer net_client.deinit();
+    // One std HTTP client for every runner's live feed, the last of its users (see `github/http.zig`).
     // Its connects are timed for the `request:` lines (`github/net_hooks.zig`).
     var client: std.http.Client = .{
         .allocator = init.gpa,
@@ -355,14 +359,9 @@ fn giteaMain(
 ) !u8 {
     const arena = init.arena.allocator();
     if (try refuseNativeWithoutEngine(arena, init.io, init, cfg, err)) |code| return code;
-    var client: std.http.Client = .{
-        .allocator = init.gpa,
-        .io = init.io,
-        .write_buffer_size = http.write_buffer_size,
-    };
-    defer client.deinit();
-    http.shared.store(&client, .release);
-    defer http.deinitShared(init.io);
+    // The network library's process-wide client (the instance's calls go through it), freed once
+    // the runners are done.
+    defer net_client.deinit();
     var zig_seeds: zig_release.Registry = undefined;
     try resolveZigSeeds(arena, init, cfg, &zig_seeds);
     defer zig_seeds.deinit();

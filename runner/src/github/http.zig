@@ -1,3 +1,5 @@
+//! The std HTTP client, now only the live feed's (`feed.zig`, until R6 moves it to the network library)
+//! and the oracle's (`net_oracle.zig`, `std_broker.zig`): every other call goes through `net_client.zig`.
 //! The process's HTTP client. One client loads the CA bundle once and keeps connections alive; a
 //! client per request (what the runner did before) loaded the bundle every time, into memory that a
 //! waiting runner only frees after its next job, so idle runners grew by hundreds of KB per poll.

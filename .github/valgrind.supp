@@ -25,6 +25,15 @@
    fun:config.Config.fromEnviron
 }
 
+# The same probe at the start of `net_client.open`, whose frame in a debug build is about 6 KiB (a
+# `Stream`, the call's options and the probe's copies of them): it reports in a test that starts
+# on a shallow stack, where the page below has not been touched yet. Seen from the oracle's stream test.
+{
+   zig-stack-probe-net-client-open
+   Memcheck:Addr4
+   fun:net_client.open
+}
+
 # The same probe at the start of `Store.publishStaged`, whose frame in a debug build is about 8 KiB
 # (many error unions and format argument tuples, one slot each).
 {

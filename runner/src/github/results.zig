@@ -621,8 +621,8 @@ test "a kept log's blobs are read as they go up, as formatBlob makes them, throu
     defer server.stop();
     var url_buf: [64]u8 = undefined;
     const url = server.url(&url_buf, "127.0.0.1", "/same");
-    const put = try broker.request(arena, io, .PUT, url, null, .{ .body = stream });
-    try std.testing.expectEqual(std.http.Status.found, put.status);
+    // A redirect of a streamed body would send it again: the library refuses (std handed the 302 back).
+    try std.testing.expectError(error.ProtocolError, broker.request(arena, io, .PUT, url, null, .{ .body = stream }));
 }
 
 test "a blob upload's deadline grows with its size, up to a cap" {

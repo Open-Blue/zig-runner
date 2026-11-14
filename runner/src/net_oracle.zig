@@ -7,6 +7,7 @@
 const std = @import("std");
 const Io = std.Io;
 const broker = @import("github/broker.zig");
+const std_broker = @import("std_broker.zig");
 const http = @import("github/http.zig");
 const net_client = @import("net_client.zig");
 const request_log = @import("github/request_log.zig");
@@ -135,7 +136,8 @@ test "oracle: the library's request line has every figure it measured, for a pla
     _ = try net_client.fetch(arena, std.testing.io, .{ .url = url, .headers = &.{.{ .name = "Authorization", .value = "Bearer secret-token" }} });
     const line = captured.written();
     errdefer std.debug.print("line: {s}\n", .{line});
-    try std.testing.expect(std.mem.startsWith(u8, line, "request: host=127.0.0.1 method=GET path=/unavailable/x status=503 dns_ms="));
+    var want: [96]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, line, try std.fmt.bufPrint(&want, "request: host=127.0.0.1:{d} method=GET path=/unavailable/x status=503 dns_ms=", .{server.port})));
     // Nothing of the query or the token; a plain http request has no TLS to time; a new connection.
     try std.testing.expect(std.mem.indexOf(u8, line, "secret") == null and std.mem.indexOf(u8, line, "x=y") == null);
     try std.testing.expect(std.mem.indexOf(u8, line, " tls_ms=? ") != null);
@@ -164,7 +166,7 @@ test "oracle: the library's requests are logged by the same switch as the others
     request_log.enabled.store(true, .monotonic);
     defer request_log.enabled.store(false, .monotonic);
     _ = try net_client.fetch(arena, std.testing.io, .{ .url = url });
-    try std.testing.expect(std.mem.startsWith(u8, captured.written(), "request: host=127.0.0.1 "));
+    try std.testing.expect(std.mem.startsWith(u8, captured.written(), "request: host=127.0.0.1:"));
 }
 
 test "oracle: a request nobody answers is given up at its deadline, and cancelling one ends it at once" {
@@ -193,6 +195,174 @@ test "oracle: a request nobody answers is given up at its deadline, and cancelli
     const cancelled_at = Io.Clock.awake.now(io);
     try std.testing.expectError(error.Canceled, f.cancel(io));
     try std.testing.expect(cancelled_at.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 5_000);
+}
+
+// --- R5: the broker, the run service, Gitea and Forgejo (`broker.request`) ---
+
+const BrokerCase = struct {
+    name: []const u8,
+    method: std.http.Method = .GET,
+    path: []const u8,
+    token: ?[]const u8 = null,
+    payload: ?[]const u8 = null,
+    extra: []const std.http.Header = &.{},
+    max_body: usize = std.math.maxInt(usize),
+    status: u16 = 0,
+    body: []const u8 = "",
+    /// Both fail, with these errors (std's and the library's).
+    std_error: ?anyerror = null,
+    error_name: ?anyerror = null,
+    /// A difference of std's, written down.
+    std_status: ?u16 = null,
+    std_body: ?[]const u8 = null,
+    why: []const u8 = "",
+};
+
+const connect_headers = [_]std.http.Header{
+    .{ .name = "Connect-Protocol-Version", .value = "1" },
+    .{ .name = "x-runner-uuid", .value = "u-1" },
+    .{ .name = "x-runner-token", .value = "tk-2" },
+};
+
+const text_body: []const u8 = &@as([3000]u8, @splat('x'));
+
+const broker_cases = [_]BrokerCase{
+    .{ .name = "a GET with a token", .path = "/echo", .token = "t0k", .status = 200, .body = "GET Bearer t0k" },
+    .{ .name = "a POST of the run service: Accept, Content-Type and the bearer", .method = .POST, .path = "/headers", .token = "t0k", .payload = "{}", .status = 200, .body = "POST Bearer t0k accept=application/json content-type=application/json x-runner-token=- connect=-" },
+    .{ .name = "a Gitea RPC: Connect's headers, no bearer", .method = .POST, .path = "/headers", .payload = "{}", .extra = &connect_headers, .status = 200, .body = "POST - accept=application/json content-type=application/json x-runner-token=tk-2 connect=1" },
+    .{ .name = "a GET sends no Content-Type", .path = "/headers", .status = 200, .body = "GET - accept=application/json content-type=- x-runner-token=- connect=-" },
+    .{ .name = "a 404", .path = "/nothing-here", .token = "t0k", .status = 404, .body = "{\"message\":\"Not Found\"}" },
+    .{ .name = "a 503 with no body", .path = "/unavailable/x", .status = 503, .body = "" },
+    .{ .name = "a 204", .method = .POST, .path = "/no-content", .payload = "{}", .status = 204, .body = "" },
+    .{ .name = "a body of three thousand bytes", .path = "/text-body", .status = 200, .body = text_body },
+    .{ .name = "a body over max_body", .path = "/text-body", .max_body = 100, .std_error = error.ResponseTooLarge, .error_name = error.ResponseTooLarge },
+    .{ .name = "a redirect to the same host keeps the token", .path = "/same", .token = "t0k", .status = 200, .body = "GET Bearer t0k" },
+    .{ .name = "a relative redirect", .path = "/relative", .token = "t0k", .status = 200, .body = "GET Bearer t0k" },
+    .{ .name = "a redirect to another host drops the token", .path = "/other", .token = "t0k", .status = 200, .body = "GET -" },
+    .{ .name = "a 303 for a DELETE is a GET", .method = .DELETE, .path = "/see-other", .token = "t0k", .status = 200, .body = "GET Bearer t0k" },
+    .{
+        .name = "a redirect of a POST with a body",
+        .method = .POST,
+        .path = "/same",
+        .token = "t0k",
+        .payload = "{}",
+        .status = 200,
+        .body = "GET Bearer t0k",
+        .std_status = 302,
+        .std_body = "",
+        .why = "std hands the 302 of a request with a body back, and the caller took it for a failure; the library follows it as a GET (a 307 or 308 repeats the request), as curl does. The Gitea RPCs and the run service's calls are not redirected in practice",
+    },
+    .{ .name = "a loop of redirects", .path = "/loop", .token = "t0k", .std_error = error.TooManyHttpRedirects, .error_name = error.TooManyRedirects },
+};
+
+fn brokerOpts(c: BrokerCase) broker.RequestOptions {
+    return .{ .token = c.token, .extra_headers = c.extra, .max_body = c.max_body };
+}
+
+test "oracle: broker.request answers what the std version did, the differences written down" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    for (broker_cases) |c| {
+        errdefer std.debug.print("case: {s}\n", .{c.name});
+        var url_buf: [128]u8 = undefined;
+        const url = server.url(&url_buf, "127.0.0.1", c.path);
+        const old = std_broker.request(arena, io, c.method, url, c.payload, brokerOpts(c));
+        const new = broker.request(arena, io, c.method, url, c.payload, brokerOpts(c));
+        if (c.error_name) |e| {
+            try std.testing.expectError(c.std_error.?, old);
+            try std.testing.expectError(e, new);
+            continue;
+        }
+        const o = try old;
+        const n = try new;
+        try std.testing.expectEqual(c.status, @as(u16, @backingInt(n.status)));
+        try std.testing.expectEqualStrings(c.body, n.body);
+        try std.testing.expectEqual(c.std_status orelse c.status, @as(u16, @backingInt(o.status)));
+        try std.testing.expectEqualStrings(c.std_body orelse c.body, o.body);
+    }
+}
+
+test "oracle: a redirect of a streamed upload: std hands the 302 back, the library refuses to send the body again" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var buf: [64]u8 = undefined;
+    const url = server.url(&buf, "127.0.0.1", "/same");
+    const pattern: Pattern = .{ .len = 1000 };
+    const body: net_client.Body = .{ .len = 1000, .ptr = &pattern, .writeFn = Pattern.write };
+    const old = try std_broker.request(arena, io, .PUT, url, null, .{ .body = body });
+    try std.testing.expectEqual(std.http.Status.found, old.status);
+    try std.testing.expectError(error.ProtocolError, broker.request(arena, io, .PUT, url, null, .{ .body = body }));
+}
+
+test "oracle: a request nobody answers, and a kept connection that dies, end the same way in both" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var buf: [64]u8 = undefined;
+    const quick: broker.RequestOptions = .{ .deadline = .fromMilliseconds(300) };
+    // Silent: one attempt and one more on a connection of its own, in both.
+    const impls = .{ std_broker, broker };
+    inline for (impls) |impl| {
+        const before = server.accepts.load(.acquire);
+        try std.testing.expectError(error.Timeout, impl.request(arena, io, .PUT, server.url(&buf, "127.0.0.1", "/silent"), "log text", quick));
+        try std.testing.expectEqual(before + 2, server.accepts.load(.acquire));
+    }
+    // A kept connection: next time unanswered (/keep) or closed (/keep-close), answered on another.
+    inline for (impls) |impl| {
+        for ([_][]const u8{ "/keep", "/keep-close" }) |path| {
+            const kept = try impl.request(arena, io, .GET, server.url(&buf, "127.0.0.1", path), null, quick);
+            try std.testing.expectEqualStrings("kept", kept.body);
+            const r = try impl.request(arena, io, .GET, server.url(&buf, "127.0.0.1", "/echo"), null, quick);
+            try std.testing.expectEqualStrings("GET -", r.body);
+        }
+    }
+    // Answered the second time (a connection that died under the first).
+    inline for (impls) |impl| {
+        server.silent_once = 0;
+        const r = try impl.request(arena, io, .POST, server.url(&buf, "127.0.0.1", "/silent-once/x"), "{}", quick);
+        try std.testing.expectEqualStrings("ok", r.body);
+    }
+}
+
+test "oracle: a long poll with no deadline waits as long as it is let, and a cancel ends it at once, in both" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var buf: [64]u8 = undefined;
+    const url = server.url(&buf, "127.0.0.1", "/silent");
+    const Poll = struct {
+        fn std_(a: std.mem.Allocator, i: Io, u: []const u8) anyerror!void {
+            _ = try std_broker.request(a, i, .GET, u, null, .{ .token = "t", .deadline = null });
+        }
+        fn lib(a: std.mem.Allocator, i: Io, u: []const u8) anyerror!void {
+            _ = try broker.request(a, i, .GET, u, null, .{ .token = "t", .deadline = null });
+        }
+    };
+    inline for (.{ Poll.std_, Poll.lib }) |run| {
+        var f = try io.concurrent(run, .{ arena, io, url });
+        try io.sleep(.fromMilliseconds(700), .awake);
+        const at = Io.Clock.awake.now(io);
+        try std.testing.expectError(error.Canceled, f.cancel(io));
+        try std.testing.expect(at.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 5_000);
+    }
 }
 
 // --- R4: downloads, uploads, the registry ---
@@ -337,7 +507,7 @@ test "oracle: an upload written as it is sent arrives as the same bytes through 
         const lib = try net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = &body.body, .headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }} });
         try std.testing.expectEqual(std.http.Status.ok, lib.status);
         try std.testing.expectEqualStrings(expect, lib.body);
-        const old = try broker.request(arena, io, .PUT, url, null, .{ .body = &body.body, .content_type = "text/plain" });
+        const old = try std_broker.request(arena, io, .PUT, url, null, .{ .body = &body.body, .content_type = "text/plain" });
         try std.testing.expectEqual(std.http.Status.ok, old.status);
         try std.testing.expectEqualStrings(expect, old.body);
     }
@@ -463,7 +633,8 @@ test "oracle: a streamed download's request line has the whole body's bytes and 
     errdefer std.debug.print("line: {s}\n", .{line});
     // One line, written when the body ended, with its size; nothing of the query or the token.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "request: "));
-    try std.testing.expect(std.mem.startsWith(u8, line, "request: host=127.0.0.1 method=GET path=/blob/300000 status=200 "));
+    try std.testing.expect(std.mem.startsWith(u8, line, "request: host=127.0.0.1:"));
+    try std.testing.expect(std.mem.indexOf(u8, line, " method=GET path=/blob/300000 status=200 ") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, " bytes_in=300000 ") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "secret") == null);
 }
@@ -712,6 +883,110 @@ test "bench: registry blob, library (registry.Client.blob)" {
     try body.take(&s);
     try std.testing.expectEqual(mib << 20, body.file.written);
     benchReport(io, "registry blob, library", mib, start);
+}
+
+// --- R5: what a waiting runner costs ---
+
+/// A server for the idle benchmark: one connection at a time, kept alive; each request is held for
+/// `hold_ms` (a broker long poll that finds no job) and answered 202 with no body, then the next
+/// one on the same connection is read.
+const PollServer = struct {
+    listener: Io.net.Server,
+    port: u16,
+    thread: std.Thread,
+    stopping: std.atomic.Value(bool) = .init(false),
+    hold_ms: u64,
+
+    fn start(s: *PollServer, hold_ms: u64) !void {
+        const io = std.testing.io;
+        s.hold_ms = hold_ms;
+        s.stopping = .init(false);
+        const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+        s.listener = try addr.listen(io, .{ .reuse_address = true });
+        s.port = s.listener.socket.address.getPort();
+        s.thread = try std.Thread.spawn(.{}, serve, .{s});
+    }
+
+    fn stop(s: *PollServer) void {
+        const io = std.testing.io;
+        s.stopping.store(true, .release);
+        // Wakes the accept: a connection that is closed at once.
+        const addr = Io.net.IpAddress.parse("127.0.0.1", s.port) catch unreachable;
+        if (addr.connect(io, .{ .mode = .stream })) |c| c.close(io) else |_| {}
+        s.thread.join();
+        s.listener.deinit(io);
+    }
+
+    fn serve(s: *PollServer) void {
+        const io = std.testing.io;
+        while (!s.stopping.load(.acquire)) {
+            const conn = s.listener.accept(io) catch return;
+            defer conn.close(io);
+            var rb: [4096]u8 = undefined;
+            var r = conn.reader(io, &rb);
+            var wb: [256]u8 = undefined;
+            var w = conn.writer(io, &wb);
+            while (!s.stopping.load(.acquire)) {
+                // The request's head, up to its empty line.
+                while (true) {
+                    const line = r.interface.takeDelimiterInclusive('\n') catch break;
+                    if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
+                } else break;
+                var held: u64 = 0;
+                while (held < s.hold_ms and !s.stopping.load(.acquire)) : (held += 100)
+                    io.sleep(.fromMilliseconds(100), .awake) catch return;
+                w.interface.writeAll("HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n") catch break;
+                w.interface.flush() catch break;
+            }
+        }
+    }
+};
+
+fn benchIdle(which: []const u8, comptime impl: type) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const env = try std.testing.environ.createMap(arena);
+    if (!std.mem.eql(u8, env.get("ZIG_RUNNER_BENCH") orelse "", which)) return error.SkipZigTest;
+    const secs = std.fmt.parseInt(u64, env.get("ZIG_RUNNER_BENCH_SECS") orelse "600", 10) catch 600;
+    const hold = std.fmt.parseInt(u64, env.get("ZIG_RUNNER_BENCH_HOLD_S") orelse "50", 10) catch 50;
+    var server: PollServer = undefined;
+    try server.start(hold * 1000);
+    defer server.stop();
+    const io = std.testing.io;
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/broker/message?sessionId=x", .{server.port});
+    // The runner's one std client, as `main` makes it, so that the old path keeps its connection.
+    var std_client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = io, .write_buffer_size = http.write_buffer_size };
+    defer std_client.deinit();
+    if (impl == std_broker) http.shared.store(&std_client, .release);
+    defer http.shared.store(null, .release);
+    // The library's pool keeps its connection until the client goes, and the server waits on it.
+    defer if (impl == broker) net_client.deinit();
+    const start = Usage.now(io);
+    var ru0: std.os.linux.rusage = undefined;
+    _ = std.os.linux.getrusage(0, &ru0);
+    var polls: u32 = 0;
+    // As `loop.poll` asks: a token, the poll's own deadline.
+    while (Io.Clock.awake.now(io).toMilliseconds() - start.wall_ms < @as(i64, @intCast(secs * 1000))) {
+        var poll_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer poll_arena.deinit();
+        const r = try impl.request(poll_arena.allocator(), io, .GET, url, null, .{ .token = "t0k", .deadline = .fromSeconds(90) });
+        try std.testing.expectEqual(std.http.Status.accepted, r.status);
+        polls += 1;
+    }
+    var ru1: std.os.linux.rusage = undefined;
+    _ = std.os.linux.getrusage(0, &ru1);
+    std.debug.print("\nidle {s}: {d} polls in {d} s; context switches: {d} voluntary, {d} involuntary\n", .{ which, polls, secs, ru1.nvcsw - ru0.nvcsw, ru1.nivcsw - ru0.nivcsw });
+    benchReport(io, which, 0, start);
+}
+
+test "bench: a runner waiting for jobs, std (broker.request as it was)" {
+    try benchIdle("idle-std", std_broker);
+}
+
+test "bench: a runner waiting for jobs, library (broker.request on net_client)" {
+    try benchIdle("idle-library", broker);
 }
 
 test "allocation failures: a request through the network library" {

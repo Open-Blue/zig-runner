@@ -6,7 +6,7 @@ const auth = @import("auth.zig");
 const http = @import("http.zig");
 const ratelimit = @import("ratelimit.zig");
 const request_log = @import("request_log.zig");
-const net_hooks = @import("net_hooks.zig");
+const net_client = @import("../net_client.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -44,20 +44,6 @@ pub const Response = struct {
     wait_ms: i64 = 0,
 };
 
-/// What `head` asks a retry to wait.
-fn askedWait(io: std.Io, head: std.http.Client.Response.Head) i64 {
-    var retry_after: ?[]const u8 = null;
-    var remaining: ?[]const u8 = null;
-    var reset: ?[]const u8 = null;
-    var it = head.iterateHeaders();
-    while (it.next()) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) retry_after = h.value;
-        if (std.ascii.eqlIgnoreCase(h.name, "x-ratelimit-remaining")) remaining = h.value;
-        if (std.ascii.eqlIgnoreCase(h.name, "x-ratelimit-reset")) reset = h.value;
-    }
-    return ratelimit.parse(head.status, retry_after, remaining, reset, std.Io.Clock.real.now(io).toMilliseconds());
-}
-
 pub fn call(
     arena: Allocator,
     io: std.Io,
@@ -75,12 +61,12 @@ pub const RequestOptions = struct {
     token: ?[]const u8 = null,
     content_type: []const u8 = "application/json",
     extra_headers: []const std.http.Header = &.{},
-    /// How long one attempt may take (`http.within`); null for none, for a caller that bounds the
-    /// request itself or a request that lasts as long as something else does (a Dagger query runs
-    /// as long as its step).
+    /// How long one attempt may take (`net_client.Options.deadline`); null for none, for a caller
+    /// that bounds the request itself or a request that lasts as long as something else does (a
+    /// Dagger query runs as long as its step, a long poll as long as its poll).
     deadline: ?std.Io.Duration = http.request_deadline,
-    /// The most of the body read, decompressed; past it the request fails with
-    /// `error.ResponseTooLarge` (a Dagger query whose answer is a step's whole output).
+    /// The most of the body read; past it the request fails with `error.ResponseTooLarge` (a
+    /// Dagger query whose answer is a step's whole output).
     max_body: usize = std.math.maxInt(usize),
     /// The request's body written out as it is sent, in place of `payload`: one too big to hold
     /// (a job's log, `results.upload`).
@@ -92,8 +78,15 @@ pub const RequestOptions = struct {
 
 /// A body of `len` bytes that `writeFn` writes, as many times as the request is sent (the network
 /// library's: `net_client.Body`).
-pub const Body = @import("../net_client.zig").Body;
+pub const Body = net_client.Body;
 
+/// One request through the network library (`net_client.fetch`), which keeps the connections, loads
+/// the CA bundle once, follows up to three redirects (dropping the token at another origin) and
+/// replaces a kept connection that turns out closed before anything was sent. What it cannot see is
+/// a connection that died under the request without a word (no answer by the deadline, a read that
+/// failed, a streamed body it could not take back): once more, on a connection made for the
+/// request, so not another of the pool's from the same time. A log upload read such a connection
+/// for 17 minutes and then failed (#100).
 pub fn request(
     arena: Allocator,
     io: std.Io,
@@ -102,324 +95,53 @@ pub fn request(
     payload: ?[]const u8,
     opts: RequestOptions,
 ) !Response {
-    // A kept-alive connection the server had closed while it sat idle (seen on completejob after a
-    // 16-minute step): no byte came back (HttpConnectionClosing), or the request could not even be
-    // written (WriteFailed, seen on log uploads to blob storage), so it was never processed, and
-    // the connection is dropped (see `exchange`). The pool can hold many such connections to the
-    // same host (one per runner that registered at once, a minute later), so try again until a
-    // live or new connection answers (`http.staleRetries`).
-    // A certificate judged by the shared client's stale clock: once, with a new client (`renew`).
-    // A connection that died under the request without a word (no answer by the deadline, a read
-    // or write that failed): once more, on a new connection of a client of its own, so not on
-    // another connection the pool kept from the same time. A log upload read such a connection
-    // for 17 minutes and then failed with ReadFailed (#100).
-    http.keepFresh(io);
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    try headers.append(arena, .{ .name = "Accept", .value = "application/json" });
+    if (opts.token) |t| try headers.append(arena, .{
+        .name = "Authorization",
+        .value = try std.fmt.allocPrint(arena, "Bearer {s}", .{t}),
+    });
+    if (payload != null or opts.body != null)
+        try headers.append(arena, .{ .name = "Content-Type", .value = opts.content_type });
+    try headers.appendSlice(arena, opts.extra_headers);
     var attempt: u32 = 0;
-    var renewed = false;
     var fresh = false;
     while (true) : (attempt += 1) {
-        const used = http.shared.load(.acquire);
-        return requestWithin(arena, io, method, url, payload, opts, fresh, attempt) catch |err| {
-            if (err == error.Canceled) return err;
-            if (!renewed and http.staleClock(err) and used != null) {
-                http.renew(used.?);
-                renewed = true;
+        const r = net_client.fetch(arena, io, .{
+            .method = method,
+            .url = url,
+            .headers = headers.items,
+            .payload = payload,
+            .upload = opts.body,
+            .fresh = fresh,
+            .deadline = opts.deadline,
+            .max_response = opts.max_body,
+            .log = opts.log,
+            .retry = attempt,
+        }) catch |err| {
+            if (!fresh and deadConnection(err)) {
+                fresh = true;
                 continue;
             }
-            if (fresh) return err;
-            const closed = err == error.HttpConnectionClosing or err == error.WriteFailed;
-            if (closed and attempt < http.staleRetries(used)) continue;
-            if (!closed and !deadConnection(err)) return err;
-            fresh = true;
-            continue;
+            return if (err == error.BodyTooLarge) error.ResponseTooLarge else err;
         };
+        // What GitHub asked to wait (a 429's `Retry-After`, a rate limit's reset).
+        const wait_ms = ratelimit.parse(
+            r.status,
+            r.header("retry-after"),
+            r.header("x-ratelimit-remaining"),
+            r.header("x-ratelimit-reset"),
+            std.Io.Clock.real.now(io).toMilliseconds(),
+        );
+        return .{ .status = r.status, .body = r.body, .wait_ms = wait_ms };
     }
 }
 
 /// Errors of a connection that stopped answering, or went away, while it carried the request.
-fn deadConnection(err: anyerror) bool {
+fn deadConnection(err: net_client.Error) bool {
     return switch (err) {
-        error.Timeout,
-        error.ReadFailed,
-        error.ConnectionResetByPeer,
-        error.EndOfStream,
-        error.BrokenPipe,
-        => true,
+        error.Timeout, error.NetworkIo, error.StaleConnection => true,
         else => false,
-    };
-}
-
-/// One attempt, given up at `opts.deadline` (`error.Timeout`).
-fn requestWithin(
-    arena: Allocator,
-    io: std.Io,
-    method: std.http.Method,
-    url: []const u8,
-    payload: ?[]const u8,
-    opts: RequestOptions,
-    fresh: bool,
-    attempt: u32,
-) anyerror!Response {
-    // The request's `request:` line: written by `exchange` when it ends, here when it did not
-    // (it ran out of time, or was cancelled).
-    var probe: request_log.Probe = .init(io, opts.log, method, std.Uri.parse(url) catch .{ .scheme = "" }, attempt);
-    const args = .{ arena, io, method, url, payload, opts, fresh, &probe };
-    const limit = opts.deadline orelse {
-        const r = @call(.auto, requestOnce, args);
-        if (r) |_| {} else |_| probe.finishOuter(false);
-        return r;
-    };
-    const r = http.within(io, limit, requestOnce, args) catch |e| {
-        probe.finishOuter(false);
-        return e;
-    };
-    if (r == null) probe.finishOuter(true);
-    return r orelse error.Timeout;
-}
-
-/// `fresh`: on a client of its own, whose pool is empty, rather than the shared one.
-fn requestOnce(
-    arena: Allocator,
-    io: std.Io,
-    method: std.http.Method,
-    url: []const u8,
-    payload: ?[]const u8,
-    opts: RequestOptions,
-    fresh: bool,
-    probe: *request_log.Probe,
-) anyerror!Response {
-    // What the request needs only while it runs (headers, the decompression window) is freed with
-    // it; only the response body goes to `arena`, which a waiting runner keeps until its next job.
-    const shared = http.shared.load(.acquire);
-    var scratch_state: std.heap.ArenaAllocator = .init(if (shared) |c| c.allocator else arena);
-    defer scratch_state.deinit();
-    const scratch = scratch_state.allocator();
-    var bearer: ?[]const u8 = if (opts.token) |t| try std.fmt.allocPrint(
-        scratch,
-        "Bearer {s}",
-        .{t},
-    ) else null;
-    const headers = try acceptJsonHeaders(scratch, opts.extra_headers);
-    // A fresh client's CA bundle is freed with it, not kept in `arena` (one is rarely needed).
-    var local: std.http.Client = .{
-        .allocator = if (fresh and shared != null) shared.?.allocator else arena,
-        .io = net_hooks.wrap(io),
-        .write_buffer_size = http.write_buffer_size,
-    };
-    defer local.deinit();
-    const client = if (fresh) &local else http.client(&local);
-
-    // Redirects are followed here, not by the client: it would send the token to wherever a
-    // redirect points (it drops only `privileged_headers` across domains, which it never sends at
-    // all). The token goes on only to the same scheme, host and port. GitHub redirects every
-    // request for a renamed or transferred repository, which is how a runner could not remove its
-    // registration while the client had no room for a redirect at all.
-    var target = try std.Uri.parse(url);
-    var current = method;
-    var hops: u32 = 0;
-    while (true) : (hops += 1) {
-        if (hops > 0) probe.hop(target);
-        const next = switch (try exchange(probe, .{
-            .arena = arena,
-            .scratch = scratch,
-            .client = client,
-            .method = current,
-            .uri = target,
-            .payload = payload,
-            .bearer = bearer,
-            .headers = headers,
-            .content_type = opts.content_type,
-            .max_body = opts.max_body,
-            .body = opts.body,
-        })) {
-            .done => |r| return r,
-            .redirect => |r| r,
-        };
-        if (hops == max_redirects) return error.TooManyHttpRedirects;
-        if (!sameOrigin(target, next.uri)) bearer = null;
-        if (next.see_other) current = .GET;
-        target = next.uri;
-    }
-}
-
-/// GitHub's redirects come one at a time; a chain longer than this is a loop.
-const max_redirects = 3;
-
-const Exchange = struct {
-    arena: Allocator,
-    scratch: Allocator,
-    client: *std.http.Client,
-    method: std.http.Method,
-    uri: std.Uri,
-    payload: ?[]const u8,
-    bearer: ?[]const u8,
-    headers: []const std.http.Header,
-    content_type: []const u8,
-    max_body: usize,
-    body: ?*const Body,
-};
-
-const Redirect = struct { uri: std.Uri, see_other: bool };
-
-const Exchanged = union(enum) { done: Response, redirect: Redirect };
-
-/// One request and its answer, or where a redirect points when the request has no body to resend.
-/// A request with a body gets the redirect as it came: its body is already sent.
-fn exchange(probe: *request_log.Probe, x: Exchange) !Exchanged {
-    const r = exchangeProbed(probe, x) catch |e| {
-        if (e != error.Canceled) probe.finish(e);
-        return e;
-    };
-    probe.finish(null);
-    return r;
-}
-
-fn exchangeProbed(probe: *request_log.Probe, x: Exchange) !Exchanged {
-    if (trace) std.debug.print("trace: connecting {s}\n", .{@tagName(x.method)});
-    var req = try x.client.request(x.method, x.uri, .{
-        .headers = .{
-            .authorization = if (x.bearer) |b| .{ .override = b } else .default,
-            .content_type = if (x.payload != null or x.body != null)
-                .{ .override = x.content_type }
-            else
-                .default,
-        },
-        .extra_headers = x.headers,
-        .redirect_behavior = .unhandled,
-    });
-    defer req.deinit();
-    probe.connected(x.client.io, req.connection);
-    if (req.connection) |conn| http.keepAlive(conn.stream_reader.stream.socket.handle);
-    // A connection a request failed on is not given back to the pool: one that failed while writing
-    // (the server had closed it) would otherwise fail every later request to that host, which is
-    // how every log upload of a runner failed from one moment on. One given up at its deadline
-    // (cancelled, `http.within`) fails here too, and the next request would wait on it in turn.
-    errdefer if (req.connection) |conn| {
-        conn.closing = true;
-    };
-
-    if (trace) std.debug.print("trace: connected\n", .{});
-    send(&req, x.payload, x.body) catch |e| return canceledOr(&req, e);
-    probe.sent();
-    if (trace) std.debug.print("trace: request sent\n", .{});
-
-    var response = req.receiveHead(&.{}) catch |e| return canceledOr(&req, e);
-    probe.head(response.head);
-    // Before the body is read: that overwrites the head's bytes.
-    const asked_ms = askedWait(probe.io, response.head);
-    if (trace) std.debug.print("trace: head status={d} content_length={?d} chunked={}\n", .{
-        @backingInt(response.head.status),
-        response.head.content_length,
-        response.head.transfer_encoding == .chunked,
-    });
-
-    if (x.payload == null and x.body == null and response.head.status.class() == .redirect) {
-        if (response.head.location) |location| {
-            // The location is copied out first: reading past the head (the body) overwrites it.
-            const buf = try x.scratch.alloc(u8, redirect_buffer_len);
-            if (location.len > buf.len) return error.HttpRedirectLocationOversize;
-            @memcpy(buf[0..location.len], location);
-            const see_other = response.head.status == .see_other;
-            _ = response.reader(&.{}).discardRemaining() catch {
-                req.connection.?.closing = true;
-            };
-            var aux: []u8 = buf;
-            const next = x.uri.resolveInPlace(location.len, &aux) catch
-                return error.HttpRedirectLocationInvalid;
-            return .{ .redirect = .{ .uri = next, .see_other = see_other } };
-        }
-    }
-
-    // 204/304 carry no body. Without Content-Length, Request.deinit would wait on the socket for
-    // one, so mark the connection closing (deinit then skips draining it).
-    if (response.head.status == .no_content or response.head.status == .not_modified) {
-        req.connection.?.closing = true;
-        probe.bytes_in = 0;
-        return .{ .done = .{ .status = response.head.status, .body = "", .wait_ms = asked_ms } };
-    }
-
-    const body = readBody(x.scratch, &response, x.max_body) catch |e|
-        return canceledOr(&req, e);
-    probe.bytes_in = body.len;
-    if (trace) std.debug.print("trace: body {d} bytes\n", .{body.len});
-    return .{ .done = .{
-        .status = response.head.status,
-        .body = try x.arena.dupe(u8, body),
-        .wait_ms = asked_ms,
-    } };
-}
-
-/// `error.Canceled` when that is what failed the connection's read or write under `err`: the client
-/// reports it as ReadFailed or WriteFailed, and `request` would take that for a dead connection and
-/// try again, on and on past a cancel that is signalled only once (the poll that `loop.poll` gave
-/// up on, a job's end cancelling its uploads).
-fn canceledOr(req: *std.http.Client.Request, err: anyerror) anyerror {
-    const conn = req.connection orelse return err;
-    if (conn.stream_reader.err) |e| if (e == error.Canceled) return e;
-    if (conn.stream_writer.err) |e| if (e == error.Canceled) return e;
-    return err;
-}
-
-/// Whether a redirect stays where the token may go: the same scheme, host and port.
-fn sameOrigin(a: std.Uri, b: std.Uri) bool {
-    if (!std.ascii.eqlIgnoreCase(a.scheme, b.scheme)) return false;
-    var a_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-    var b_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-    const a_host = std.Io.net.HostName.fromUri(a, &a_buf) catch return false;
-    const b_host = std.Io.net.HostName.fromUri(b, &b_buf) catch return false;
-    if (!std.ascii.eqlIgnoreCase(a_host.bytes, b_host.bytes)) return false;
-    return (a.port orelse defaultPort(a.scheme)) == (b.port orelse defaultPort(b.scheme));
-}
-
-fn defaultPort(scheme: []const u8) ?u16 {
-    if (std.ascii.eqlIgnoreCase(scheme, "https")) return 443;
-    if (std.ascii.eqlIgnoreCase(scheme, "http")) return 80;
-    return null;
-}
-
-/// Longer than any location GitHub redirects to (`/repositories/<id>/...` URLs, signed blob
-/// URLs); and the room the resolved location may need.
-const redirect_buffer_len = 8 * 1024;
-
-/// `Accept: application/json` ahead of the caller's headers.
-fn acceptJsonHeaders(scratch: Allocator, extra: []const std.http.Header) ![]std.http.Header {
-    const headers = try scratch.alloc(std.http.Header, extra.len + 1);
-    headers[0] = .{ .name = "Accept", .value = "application/json" };
-    @memcpy(headers[1..], extra);
-    return headers;
-}
-
-/// The request line and headers, then `payload` or `body` as the body when there is one.
-fn send(req: *std.http.Client.Request, payload: ?[]const u8, body_in: ?*const Body) !void {
-    if (body_in) |b| {
-        req.transfer_encoding = .{ .content_length = b.len };
-        var body = try req.sendBodyUnflushed(&.{});
-        // The writer stops short of `len` rather than past it (std's body writer would underflow);
-        // short of it, `end` would trip its assertion and take the process down.
-        try b.writeFn(b, &body.writer);
-        try body.writer.flush();
-        if (body.state.content_length != 0) return error.BodyShorterThanItsLength;
-        try body.end();
-        return req.connection.?.flush();
-    }
-    const p = payload orelse return req.sendBodiless();
-    req.transfer_encoding = .{ .content_length = p.len };
-    var body = try req.sendBodyUnflushed(&.{});
-    try body.writer.writeAll(p);
-    try body.end();
-    try req.connection.?.flush();
-}
-
-/// The whole body, decompressed, on `scratch`; `error.ResponseTooLarge` past `limit` bytes.
-fn readBody(scratch: Allocator, response: *std.http.Client.Response, limit: usize) ![]const u8 {
-    var transfer_buffer: [64]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const decompress_buffer = try scratch.alloc(u8, std.compress.flate.max_window_len);
-    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    return reader.allocRemaining(scratch, .limited(limit)) catch |err| switch (err) {
-        error.ReadFailed => return response.bodyErr().?,
-        error.StreamTooLong => return error.ResponseTooLarge,
-        else => |e| return e,
     };
 }
 
@@ -432,9 +154,6 @@ pub const arch = switch (@import("builtin").cpu.arch) {
     .x86 => "X86",
     else => @compileError("unsupported architecture"),
 };
-
-/// Prints request stages to stderr (never headers or bodies). Set while probing.
-pub var trace = false;
 
 pub fn messageUrl(
     arena: Allocator,
@@ -460,17 +179,7 @@ pub fn sessionBody(arena: Allocator, s: Settings, owner: []const u8) ![]const u8
     );
 }
 
-test "the token goes on only to the same scheme, host and port" {
-    const api = try std.Uri.parse("https://api.github.com/repos/o/r");
-    try std.testing.expect(sameOrigin(api, try std.Uri.parse("https://API.github.com/repositories/1")));
-    try std.testing.expect(sameOrigin(api, try std.Uri.parse("https://api.github.com:443/x")));
-    try std.testing.expect(!sameOrigin(api, try std.Uri.parse("https://objects.githubusercontent.com/x")));
-    try std.testing.expect(!sameOrigin(api, try std.Uri.parse("https://evil.api.github.com/x")));
-    try std.testing.expect(!sameOrigin(api, try std.Uri.parse("http://api.github.com/x")));
-    try std.testing.expect(!sameOrigin(api, try std.Uri.parse("https://api.github.com:8443/x")));
-}
-
-test "over real connections: the token stays on its host, and only bodiless requests follow" {
+test "over real connections: the token stays on its host, and redirects are followed by the library's rules" {
     const TestServer = @import("testserver.zig").Server;
     var server: TestServer = undefined;
     try server.start();
@@ -494,11 +203,13 @@ test "over real connections: the token stays on its host, and only bodiless requ
     // A 303 continues as a GET.
     const seen = try request(a, io, .DELETE, server.url(&buf, "127.0.0.1", "/see-other"), null, t);
     try std.testing.expectEqualStrings("GET Bearer t0k", seen.body);
-    // A request with a body gets the redirect as it came.
+    // A request with a body is redirected too (before R5 the 302 was handed back): a 302 makes it
+    // a GET, and the token stays on the same host.
     const posted = try request(a, io, .POST, server.url(&buf, "127.0.0.1", "/same"), "{}", t);
-    try std.testing.expectEqual(std.http.Status.found, posted.status);
-    // So does one whose body is written as it is sent; one that writes less than it said it would
-    // fails, rather than tripping the body writer's assertion and taking the process down.
+    try std.testing.expectEqual(std.http.Status.ok, posted.status);
+    try std.testing.expectEqualStrings("GET Bearer t0k", posted.body);
+    // The same for one whose body is written as it is sent; one that writes less than it said it
+    // would fails, rather than sending a body of the wrong length.
     const Written = struct {
         body: Body,
         text: []const u8,
@@ -514,17 +225,24 @@ test "over real connections: the token stays on its host, and only bodiless requ
     var streamed = t;
     streamed.body = &whole.body;
     const sent = try request(a, io, .POST, server.url(&buf, "127.0.0.1", "/same"), null, streamed);
-    try std.testing.expectEqual(std.http.Status.found, sent.status);
+    try std.testing.expectEqual(std.http.Status.ok, sent.status);
     const short: Written = .init(2, "{");
     streamed.body = &short.body;
     try std.testing.expectError(
-        error.BodyShorterThanItsLength,
+        error.UploadFailed,
         request(a, io, .POST, server.url(&buf, "127.0.0.1", "/same"), null, streamed),
     );
     // A loop ends.
     try std.testing.expectError(
-        error.TooManyHttpRedirects,
+        error.TooManyRedirects,
         request(a, io, .GET, server.url(&buf, "127.0.0.1", "/loop"), null, t),
+    );
+    // A body past `max_body` is its own error, not the library's.
+    var small = t;
+    small.max_body = 4;
+    try std.testing.expectError(
+        error.ResponseTooLarge,
+        request(a, io, .GET, server.url(&buf, "127.0.0.1", "/echo"), null, small),
     );
 }
 
@@ -569,24 +287,16 @@ test "a kept-alive connection that went silent is dropped, and the request tried
     const a = arena_state.allocator();
     const io = std.testing.io;
     var buf: [64]u8 = undefined;
-    // Connections are pooled only by the shared client.
-    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = io };
-    defer client.deinit();
-    http.shared.store(&client, .release);
-    defer http.shared.store(null, .release);
-    const quick: RequestOptions = .{ .deadline = .fromMilliseconds(200) };
+    const quick: RequestOptions = .{ .deadline = .fromMilliseconds(500) };
 
     for ([_][]const u8{ "/keep", "/keep-close" }, 0..) |path, i| {
         const kept = try request(a, io, .GET, server.url(&buf, "127.0.0.1", path), null, quick);
         try std.testing.expectEqualStrings("kept", kept.body);
-        try std.testing.expectEqual(@as(usize, 1), client.connection_pool.free_len);
         // /keep: the next request on the pooled connection is never answered; /keep-close: it
         // finds the connection closed. Either way it is answered on a new connection.
         const r = try request(a, io, .GET, server.url(&buf, "127.0.0.1", "/echo"), null, quick);
         try std.testing.expectEqualStrings("GET -", r.body);
         try std.testing.expectEqual(@as(u32, @intCast(2 * (i + 1))), server.accepts.load(.acquire));
-        // The connection given up is not back in the pool for the next request to wait on.
-        try std.testing.expectEqual(@as(usize, 0), client.connection_pool.free_len);
     }
 }
 
@@ -634,11 +344,13 @@ test "request lines: timed, without the query or a token, and a 429's rate limit
     const first = it.next().?;
     var want: [160]u8 = undefined;
     try std.testing.expect(std.mem.startsWith(u8, first, try std.fmt.bufPrint(&want, "request: host=localhost:{d} method=GET path=/broker/message status=200 dns_ms=", .{server.port})));
-    try std.testing.expect(std.mem.indexOf(u8, first, " tls_ms=0.0 ") != null);
+    // Plain http: no TLS to time.
+    try std.testing.expect(std.mem.indexOf(u8, first, " tls_ms=? ") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, " bytes_in=") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, " retry=0 reused=0 rl_remaining=? rl_limit=? rl_reset=? rl_resource=?") != null);
-    // Every time of a new connection was measured.
-    try std.testing.expect(std.mem.indexOf(u8, first, "ms=?") == null);
+    // Every time of a new connection that has them was measured.
+    for ([_][]const u8{ " dns_ms=?", " connect_ms=?", " ttfb_ms=?", " total_ms=?" }) |unknown|
+        try std.testing.expect(std.mem.indexOf(u8, first, unknown) == null);
     const second = it.next().?;
     try std.testing.expect(std.mem.indexOf(u8, second, " path=/limited/* status=429 ") != null);
     try std.testing.expect(std.mem.endsWith(u8, second, " retry=0 reused=0 rl_remaining=0 rl_limit=5000 rl_reset=1700000000 rl_resource=core"));
