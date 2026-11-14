@@ -317,6 +317,7 @@ RUNNER_NATIVE_IMAGES_MAX_MB=8192                  # default; images', rootfs' an
 RUNNER_NATIVE_MIN_FREE_PCT=10                     # default; the disk's floor, 0 for none ("Eviction")
 RUNNER_NATIVE_ROOTLESS=0                          # default; 1 for a rootless runner
 RUNNER_NATIVE_DEFER_COLLECT=true                  # default; false runs a job's store upkeep before its end returns
+RUNNER_NATIVE_SETTLE_WINDOW_MS=100                # default; 0 syncs each job's last layer on its own
 RUNNER_NATIVE_IDMAPPED_UPPER=true                 # default; false shifts each layer's ids with a
                                                   # walk instead of writing them through an
                                                   # idmapped upper ("The canonical ids")
@@ -772,6 +773,23 @@ What it covers, as built:
   So the cost is one step run twice, not an uncached rest of the job. The
   layer is available to others once its publisher made it durable: at the publisher's next publish,
   or at its teardown for its last layer (`RUNNER_NATIVE_DEFER_SYNC=false` has none of this).
+  **The ends of jobs ending together share one `syncfs`** (`Store.settleEnd`,
+  `RUNNER_NATIVE_SETTLE_WINDOW_MS`, 100 by default): seven jobs ending in a burst synced the whole
+  filesystem seven times, each 5-8 s beside a writer on the Pi. A job's end announces its settle as
+  its teardown begins; the first to reach its settle waits up to the window for the others announced
+  (none when it ends alone), and those that reach theirs while its `syncfs` runs wait for it and share
+  the next. The `syncfs` goes through the settle descriptor, one a runner process, opened before any
+  job's own, so it took the superblock's error state no later than any job's descriptor did: any
+  write error since a job's descriptor took it is reported to it, at this `syncfs` or an earlier one,
+  whose time it keeps. A failure marks every job of the batch and poisons each one's layer, as a job's
+  own failed settle does, and a job whose descriptor is older than that failure is refused at a later
+  batch too. Each job then commits its own meta. A job whose descriptor is older than the settle
+  descriptor or on another mount (the filesystem mounted again), or past 64 in a batch, syncs its
+  own; so does every job with the window 0. The settle stays in the teardown, before the runner
+  polls again (#489 kept it there): the job holds its layer until it is durable, and the runner's
+  next job, which may want the layer, never finds it pending. It is not in the time a job reports;
+  the window is in the teardown's, and only beside another job's end. The settle at a job's next
+  publish, on its path, is its own as before: waiting there for other jobs would add to its time.
   **Every publish after a job's first waits for the previous layer's settle**: one `syncfs`, which
   on a busy disk waits for other jobs' writes (5-8 s beside a writer on the Pi's SD card); a job of
   many short steps on a busy disk pays it at each. The settle is on the publish's path, not the

@@ -171,6 +171,10 @@ pub const Config = struct {
     /// made durable in the job's teardown (`RUNNER_NATIVE_DEFER_SYNC`, `Store.defer_sync`); off,
     /// every layer is synced before it is published.
     native_defer_sync: bool = true,
+    /// How long the first of the native jobs ending together waits for the others, so that their
+    /// last layers share one `syncfs` (`RUNNER_NATIVE_SETTLE_WINDOW_MS`, `Store.settleEnd`), in ms;
+    /// 0: each job's end syncs its own, as before.
+    native_settle_window_ms: u32 = NativeBackend.default_settle_window_ms,
     /// The first host id of the native jobs' ranges on a root runner
     /// (`RUNNER_NATIVE_SUBID_BASE`, `Backend.Config.subid_base`): at least
     /// `NativeBackend.min_subid_base`.
@@ -561,6 +565,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_STORE")) |v| c.native_store = v;
         if (environ.get("RUNNER_NATIVE_ROOTLESS")) |v| c.native_rootless = try boolean(v);
         if (environ.get("RUNNER_NATIVE_DEFER_SYNC")) |v| c.native_defer_sync = try boolean(v);
+        if (environ.get("RUNNER_NATIVE_SETTLE_WINDOW_MS")) |v| c.native_settle_window_ms = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_SUBID_BASE")) |v| c.native_subid_base = try num(u32, v);
         if (environ.get("RUNNER_NATIVE_IDMAPPED_UPPER")) |v| c.native_idmapped_upper = try boolean(v);
         if (environ.get("RUNNER_NATIVE_DEFER_COLLECT")) |v| c.native_defer_collect = try boolean(v);
@@ -670,6 +675,7 @@ pub const Config = struct {
         else if (eq(key, "native-store")) c.native_store = val //
         else if (eq(key, "native-rootless")) c.native_rootless = try boolean(val) //
         else if (eq(key, "native-defer-sync")) c.native_defer_sync = try boolean(val) //
+        else if (eq(key, "native-settle-window-ms")) c.native_settle_window_ms = try num(u32, val) //
         else if (eq(key, "native-subid-base")) c.native_subid_base = try num(u32, val) //
         else if (eq(key, "native-idmapped-upper")) c.native_idmapped_upper = try boolean(val) //
         else if (eq(key, "native-defer-collect")) c.native_defer_collect = try boolean(val) //
@@ -1231,6 +1237,13 @@ test "the native subnet and ids: defaults, and values that are refused" {
     try env.put("RUNNER_NATIVE_DEFER_COLLECT", "maybe");
     try std.testing.expectError(error.InvalidBool, Config.load(&env, &.{"runner"}));
     _ = env.swapRemove("RUNNER_NATIVE_DEFER_COLLECT");
+    // The window of the shared settle: its default, 0 for none, and a value that is no number fails.
+    try std.testing.expectEqual(NativeBackend.default_settle_window_ms, (try Config.load(&env, &.{"runner"})).native_settle_window_ms);
+    try env.put("RUNNER_NATIVE_SETTLE_WINDOW_MS", "0");
+    try std.testing.expectEqual(@as(u32, 0), (try Config.load(&env, &.{"runner"})).native_settle_window_ms);
+    try env.put("RUNNER_NATIVE_SETTLE_WINDOW_MS", "soon");
+    try std.testing.expectError(error.InvalidNumber, Config.load(&env, &.{"runner"}));
+    _ = env.swapRemove("RUNNER_NATIVE_SETTLE_WINDOW_MS");
     try env.put("RUNNER_NATIVE_SUBID_BASE", "99999");
     try std.testing.expectError(error.InvalidNativeSubidBase, Config.load(&env, &.{"runner"}));
     try env.put("RUNNER_NATIVE_SUBID_BASE", "100000");

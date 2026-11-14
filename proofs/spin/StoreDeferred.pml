@@ -2,9 +2,11 @@
  * two runners and a reader that holds layers, two layers a job, a machine crash, a killed runner, a
  * failed sync and a write-back that loses a pending layer's data within the boot. No other job takes
  * a pending layer, none takes a poisoned one, no lookup after any crash takes a layer whose tree is
- * not whole, and a job whose end finished loses none of its layers.
+ * not whole, and a job whose end finished loses none of its layers. The ends' settles share one
+ * syncfs (BatchAtEnd, RUNNER_NATIVE_SETTLE_WINDOW_MS above 0): a job may join a batch while another
+ * batch's syncfs runs, and a failure poisons every layer of its batch.
  * Written from proofs/tla/StoreDeferred.cfg by proofs/spin/cfg.py: change the .cfg, not this.
- * spin-states: 36662 */
+ * spin-states: 50066 */
 #define NP 2
 #define NR 1
 #define NS 2
@@ -16,6 +18,8 @@
 #define OWNERONLY 1
 #define POISON 1
 #define SETTLEEND 1
+#define BATCHEND 1
+#define BATCHFIRST 1
 #define CHK_TypeOK
 #define CHK_NoWrongValid
 #define CHK_NoLostPublish

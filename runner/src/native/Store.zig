@@ -65,6 +65,9 @@ defer_delete: bool = false,
 /// thread, to run once the runner is polling again, instead of running it before it returns. A
 /// store that may be over its cap runs it inline all the same (`lagFits`).
 defer_collect: bool = false,
+/// How long the first of the jobs ending together waits for the others' settles, so that they
+/// share one `syncfs` (`settleEnd`), in ms; 0: each job's end settles its own (`settlePending`).
+settle_window_ms: u32 = 0,
 
 pub const default_max_bytes: u64 = 10 * 1024 * 1024 * 1024;
 
@@ -880,6 +883,10 @@ fn syncLimit(s: Store, io: std.Io) u64 {
 /// The filesystem's writes on disk, for an entry too large for its own fsyncs: through the
 /// descriptor the job opened at its start (`sync_fd`), or `lock`, a descriptor on the same disk.
 fn syncDisk(s: Store, lock: std.Io.File) !void {
+    // The job's descriptor takes the superblock's error state at this call: before it, then.
+    if (s.sync_fd != null) if (s.sync_log) |l| {
+        l.sampled_ns = phases.now();
+    };
     const e = linux.errno(linux.syncfs(s.sync_fd orelse lock.handle));
     if (e != .SUCCESS) return syncError("syncfs", e);
     // Everything renamed before it is on the disk now; this entry's own rename comes after.
@@ -1085,9 +1092,17 @@ pub const sync_tree_max = sync_choice.mid_limit;
 /// The layers' directory synced, so the renames that published this job's layers outlive a
 /// crash: once a job, at its end, rather than once a publish. A failure is logged: it loses only
 /// entries, which are then misses.
-/// `sync_fd` for a job beginning now; null when the store cannot be opened.
-pub fn syncCursor(arena: Allocator, root: []const u8) ?linux.fd_t {
-    return openRoot(arena, root) catch null;
+/// `sync_fd` for a job beginning now, and when it took the superblock's error state in `log`
+/// (`SyncLog.sampled_ns`); null when the store cannot be opened. The settle descriptor is opened
+/// first, if this process has none on the store's filesystem (`end_batch`).
+pub fn syncCursor(arena: Allocator, io: std.Io, root: []const u8, log: ?*SyncLog) ?linux.fd_t {
+    end_batch.ensure(arena, io, root, null);
+    const t = phases.now();
+    const fd = openRoot(arena, root) catch return null;
+    if (log) |l| l.sampled_ns = t;
+    // A filesystem mounted again since: a settle descriptor on this one, for the jobs after.
+    end_batch.ensure(arena, io, root, mountOf(fd));
+    return fd;
 }
 
 /// A copy of this store for `collector`'s thread, all of it in `arena` so that the job's own can go:
@@ -1177,6 +1192,13 @@ pub const SyncLog = struct {
     /// A deferred layer's settle failed (`settlePending`), and whether the job was told (`Backend`).
     settle_failed: bool = false,
     settle_told: bool = false,
+    /// When `sync_fd` last took the superblock's error state (opened, or a `syncfs` through it
+    /// called), on `phases.now`'s clock: a `syncfs` on it would report any write error since. 0 for
+    /// unknown, and the job's end then settles on its own (`settleEnd`).
+    sampled_ns: u64 = 0,
+    /// The job's end has begun with a layer pending, and its settle is not yet in a batch: counted
+    /// in `end_batch.ending`, which a batch's first job waits for (`announceSettle`).
+    announced: bool = false,
 
     fn renamed(l: *SyncLog, arena: Allocator, key: Key) !void {
         try l.since.append(arena, try arena.dupe(u8, &hex(key)));
@@ -1204,15 +1226,191 @@ pub noinline fn settlePending(s: Store, arena: Allocator, io: std.Io, ph: ?*phas
         return error.Sync;
     }
     const t = phases.now();
-    s.settle(arena, io, key) catch |e| {
-        l.failed = true;
-        l.settle_failed = true;
-        s.poison(arena, io, key);
-        if (e != error.Sync) std.log.warn("native: cannot make a published layer durable: {s}; it is refused from now on, and the job's layers since the last good sync are evicted", .{@errorName(e)});
-        return error.Sync;
-    };
+    s.settle(arena, io, key, false) catch |e| return s.settleFailed(arena, io, key, e);
     if (ph) |p| _ = p.since(arena, .settle, t);
 }
+
+/// A settle that failed with `e`: the job marked, the layer poisoned (`settlePending`).
+fn settleFailed(s: Store, arena: Allocator, io: std.Io, key: Key, e: anyerror) error{Sync} {
+    const l = s.sync_log.?;
+    l.failed = true;
+    l.settle_failed = true;
+    s.poison(arena, io, key);
+    if (e != error.Sync) std.log.warn("native: cannot make a published layer durable: {s}; it is refused from now on, and the job's layers since the last good sync are evicted", .{@errorName(e)});
+    return error.Sync;
+}
+
+/// The job's end has begun with a layer to settle (`settleEnd`): a batch that starts meanwhile
+/// waits for it, within `settle_window_ms`. Once a job, before anything slow of its teardown.
+pub fn announceSettle(s: Store, io: std.Io) void {
+    const l = s.sync_log orelse return;
+    if (s.settle_window_ms == 0 or l.pending == null or l.failed or l.announced) return;
+    end_batch.mu.lockUncancelable(io);
+    defer end_batch.mu.unlock(io);
+    end_batch.ending += 1;
+    l.announced = true;
+}
+
+/// `settlePending` for the job's end, its `syncfs` shared with the other jobs of this process whose
+/// ends settle at the same time: those that come while a batch's first job waits for them (within
+/// `settle_window_ms`, and only while a job has `announceSettle`d and not come), and those that
+/// come while its `syncfs` runs, which wait for it and share the next. One `syncfs` through the
+/// settle descriptor (`end_batch`) serves them all; each job then commits its own meta, as
+/// `settlePending` does after its sync.
+///
+/// A job's descriptor is what makes its sync see a write error the page cache lost track of
+/// (`settle`), and the settle descriptor stands in for each job's as long as it took the
+/// superblock's error state no later than the job's did (`SyncLog.sampled_ns`): any error since the
+/// job's is then one it reports, at this `syncfs` or at an earlier one, whose time it keeps
+/// (`end_batch.failed_ns`). A failure marks every job of the batch, and each poisons its layer as
+/// `settlePending` does, as does an earlier failure the job's descriptor would have reported. A
+/// job whose descriptor is older than the settle descriptor, on another mount, or unknown, or a
+/// full batch, settles on its own.
+pub noinline fn settleEnd(s: Store, arena: Allocator, io: std.Io, ph: ?*phases.Phases) !void {
+    const l = s.sync_log orelse return;
+    defer end_batch.leave(io, l);
+    const key = l.pending orelse return;
+    const t = phases.now();
+    const mnt = if (s.sync_fd) |fd| mountOf(fd) else null;
+    const ok = if (s.settle_window_ms == 0 or l.failed or l.sampled_ns == 0 or mnt == null)
+        null
+    else
+        end_batch.join(io, l, mnt.?, s.settle_window_ms);
+    const covered = ok orelse return s.settlePending(arena, io, ph);
+    l.pending = null;
+    if (!covered) return s.settleFailed(arena, io, key, error.Sync);
+    // As after the job's own `syncfs` (`syncDisk`): everything renamed before it is on disk.
+    l.since.clearRetainingCapacity();
+    s.settle(arena, io, key, true) catch |e| return s.settleFailed(arena, io, key, e);
+    if (ph) |p| _ = p.since(arena, .settle, t);
+}
+
+/// The unique id of the mount `fd` is on (Linux 6.8), or null.
+fn mountOf(fd: linux.fd_t) ?u64 {
+    var st: linux.Statx = undefined;
+    const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .MNT_ID_UNIQUE = true }, &st);
+    if (linux.errno(rc) != .SUCCESS or !st.mask.MNT_ID_UNIQUE) return null;
+    return st.mnt_id;
+}
+
+/// The jobs' end settles of this process that share one `syncfs` (`settleEnd`), and the settle
+/// descriptor it goes through: opened before any job's own (`syncCursor`), on the store's
+/// filesystem, kept for the process. Under `mu`, but `syncs` and the test hooks.
+pub const end_batch = struct {
+    var mu: std.Io.Mutex = .init;
+    var done: std.Io.Condition = .init;
+    var fd: ?linux.fd_t = null;
+    /// The unique id of `fd`'s mount, and when its open had returned.
+    var mnt: u64 = 0;
+    var opened_ns: u64 = 0;
+    /// When the latest `syncfs` through `fd` that failed had returned, 0 for none: a job whose
+    /// descriptor took the error state before it is one that error may concern.
+    pub var failed_ns: u64 = 0;
+    /// The jobs waiting for the next `syncfs`; whether a job leads one (gathering or syncing).
+    var waiting: [max]*Ticket = undefined;
+    var n_waiting: usize = 0;
+    var leading = false;
+    /// Jobs whose end has begun with a layer to settle and that have not joined (`announceSettle`).
+    pub var ending: u32 = 0;
+    /// Tests: the `syncfs` calls of batches, and an error to give in place of the next ones'.
+    pub var syncs: std.atomic.Value(u32) = .init(0);
+    pub var test_errno: ?linux.E = null;
+
+    /// The most jobs one batch serves; one more settles on its own.
+    const max = 64;
+
+    const Ticket = struct {
+        sampled_ns: u64,
+        done: bool = false,
+        ok: bool = false,
+    };
+
+    /// The settle descriptor opened on `root`'s filesystem if there is none, or, with `mnt` (a
+    /// job's descriptor's mount), if it is on another mount and no batch uses it.
+    fn ensure(arena: Allocator, io: std.Io, root: []const u8, job_mnt: ?u64) void {
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        if (fd != null) {
+            const other = job_mnt orelse return;
+            if (other == mnt or leading or n_waiting > 0) return;
+            _ = linux.close(fd.?);
+            fd = null;
+        }
+        const f = openRoot(arena, root) catch return;
+        fd = f;
+        mnt = mountOf(f) orelse 0;
+        opened_ns = phases.now();
+        failed_ns = 0;
+    }
+
+    /// `l` no longer counted as coming (`announceSettle`).
+    fn leave(io: std.Io, l: *SyncLog) void {
+        if (!l.announced) return;
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        leaveLocked(l);
+    }
+
+    fn leaveLocked(l: *SyncLog) void {
+        if (!l.announced) return;
+        l.announced = false;
+        ending -= 1;
+    }
+
+    /// Waits for a `syncfs` through the settle descriptor that began after this call: whether it
+    /// covered `l`'s job with no error the job's descriptor would have reported. Null when it
+    /// cannot stand in for the job's (`settleEnd`): the job then settles on its own.
+    fn join(io: std.Io, l: *SyncLog, job_mnt: u64, window_ms: u32) ?bool {
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
+        leaveLocked(l);
+        if (fd == null or mnt != job_mnt or opened_ns > l.sampled_ns or n_waiting == max) return null;
+        var ticket: Ticket = .{ .sampled_ns = l.sampled_ns };
+        waiting[n_waiting] = &ticket;
+        n_waiting += 1;
+        while (!ticket.done) {
+            if (leading) {
+                done.waitUncancelable(io, &mu);
+                continue;
+            }
+            lead(io, window_ms);
+        }
+        return ticket.ok;
+    }
+
+    /// Under `mu`, which it lets go while it waits and syncs: the jobs that come within the window
+    /// joined while any announced one has not, then one `syncfs` for those waiting, and each told.
+    fn lead(io: std.Io, window_ms: u32) void {
+        leading = true;
+        const start = phases.now();
+        while (ending > 0 and phases.now() -| start < @as(u64, window_ms) * std.time.ns_per_ms) {
+            mu.unlock(io);
+            io.sleep(.fromMilliseconds(1), .awake) catch {};
+            mu.lockUncancelable(io);
+        }
+        var batch: [max]*Ticket = undefined;
+        const n = n_waiting;
+        @memcpy(batch[0..n], waiting[0..n]);
+        n_waiting = 0;
+        const f = fd.?;
+        mu.unlock(io);
+        const t = phases.now();
+        const e = if (builtin.is_test and test_errno != null) test_errno.? else linux.errno(linux.syncfs(f));
+        const after = phases.now();
+        _ = syncs.fetchAdd(1, .monotonic);
+        if (e != .SUCCESS) {
+            std.log.warn("native: syncfs for {d} jobs' last layers failed ({t}); each is refused, and those jobs' layers since their last good sync are evicted", .{ n, e });
+        } else std.log.info("native: one syncfs made {d} jobs' last layers durable: {d} ms", .{ n, (after -| t) / std.time.ns_per_ms });
+        mu.lockUncancelable(io);
+        if (e != .SUCCESS) failed_ns = after;
+        for (batch[0..n]) |b| {
+            b.ok = e == .SUCCESS and failed_ns < b.sampled_ns;
+            b.done = true;
+        }
+        leading = false;
+        done.broadcast(io);
+    }
+};
 
 /// The layer `key` made unreadable to every lookup now, whoever holds it: its meta renamed to
 /// `meta.bad`, so `open` finds a broken entry and evicts it when no job holds it, and `collect`
@@ -1228,19 +1426,23 @@ fn poison(s: Store, arena: Allocator, io: std.Io, key: Key) void {
     };
 }
 
-fn settle(s: Store, arena: Allocator, io: std.Io, key: Key) !void {
+/// `synced`: the filesystem's `syncfs` already done for it, with no error that could concern this
+/// job (`settleEnd`); only the meta is left.
+fn settle(s: Store, arena: Allocator, io: std.Io, key: Key, synced: bool) !void {
     const cwd = std.Io.Dir.cwd();
     const dir = try s.layerDir(arena, key);
     const entry = try openRoot(arena, dir);
     defer _ = linux.close(entry);
     var m = try metaOf(arena, io, dir);
     if (m.pending == null) return;
-    const lock = try cwd.openFile(io, try join(arena, dir, "lock"), .{});
-    defer lock.close(io);
     // Every dirty page of the filesystem, this layer's among them, through the job's descriptor.
     // The per-file way of a publish (`sync_choice`) would use fresh descriptors, which a lost write
     // error can miss (`defer_sync`).
-    try s.syncDisk(lock);
+    if (!synced) {
+        const lock = try cwd.openFile(io, try join(arena, dir, "lock"), .{});
+        defer lock.close(io);
+        try s.syncDisk(lock);
+    }
     // Measured once written, as a publish does: at the rename the blocks of what was only in the
     // page cache were not counted.
     m.bytes = try treeBytes(arena, io, try join(arena, dir, "fs"));
@@ -2750,7 +2952,8 @@ test "native store: a layers directory that cannot be synced fails the job's lay
 
 /// A job's store that leaves its layers' data to be synced later, whatever the disk is doing.
 fn lazyStore(arena: Allocator) Store {
-    return .{ .root = "", .sync_log = newSyncLog(arena), .defer_sync = true, .sync_load = .{}, .sync_fd = syncCursor(arena, ".") };
+    const log = newSyncLog(arena);
+    return .{ .root = "", .sync_log = log, .defer_sync = true, .sync_load = .{}, .sync_fd = syncCursor(arena, std.testing.io, ".", log) };
 }
 
 test "native store: a published layer counts its entries, its sync deferred or not (#487's step uppers)" {
@@ -2930,6 +3133,170 @@ test "native store: another job gets a miss for a pending layer, and a layer who
     held.layer.lock.close(io);
     l.lock.close(io);
     try std.testing.expect(try third.open(arena, io, key) == null);
+}
+
+/// Jobs of one store for the end-settle tests: each with its own log, its own descriptor opened
+/// after the settle descriptor, and a pending layer it holds.
+const EndJob = struct {
+    s: Store,
+    key: Key,
+    layer: Layer,
+    result: anyerror!void = {},
+
+    fn make(arena: Allocator, io: std.Io, tmp: std.testing.TmpDir, root: []const u8, name: []const u8, window_ms: u32) !EndJob {
+        const log = newSyncLog(arena).?;
+        var s: Store = .{ .root = root, .sync_log = log, .defer_sync = true, .sync_load = .{}, .settle_window_ms = window_ms };
+        s.sync_fd = syncCursor(arena, io, root, log);
+        const k, const l = try testLayer(arena, io, tmp, &s, name);
+        try std.testing.expect(log.pending != null);
+        return .{ .s = s, .key = k, .layer = l };
+    }
+
+    /// The job's end, on a thread of its own, after `delay_ms`.
+    fn end(j: *EndJob, io: std.Io, delay_ms: u32) void {
+        if (delay_ms > 0) io.sleep(.fromMilliseconds(delay_ms), .awake) catch {};
+        var a: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        defer a.deinit();
+        j.result = j.s.settleEnd(a.allocator(), io, null);
+    }
+
+    fn durable(j: *const EndJob, arena: Allocator, io: std.Io) !bool {
+        return (try metaOf(arena, io, std.fs.path.dirname(j.layer.fs).?)).pending == null;
+    }
+
+    fn close(j: *EndJob, io: std.Io) void {
+        j.layer.lock.close(io);
+        if (j.s.sync_fd) |fd| _ = linux.close(fd);
+    }
+};
+
+/// The jobs' ends, each on its thread after its delay, all announced first (`announceSettle`).
+fn endAll(io: std.Io, jobs: []EndJob, delays: []const u32) !void {
+    for (jobs) |*j| j.s.announceSettle(io);
+    var threads: [8]std.Thread = undefined;
+    for (jobs, 0..) |*j, i| threads[i] = try std.Thread.spawn(.{}, EndJob.end, .{ j, io, delays[i] });
+    for (threads[0..jobs.len]) |t| t.join();
+}
+
+fn endStore(arena: Allocator, io: std.Io, tmp: std.testing.TmpDir) ![]const u8 {
+    const root = try std.fmt.allocPrint(arena, "{s}/store", .{try tmp.dir.realPathFileAlloc(io, ".", arena)});
+    try prepare(arena, io, root, .{ .check_parents = false });
+    return root;
+}
+
+test "native store: jobs ending together share one syncfs, and each one's last layer is durable" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
+    const root = try endStore(arena, io, tmp);
+    var jobs: [4]EndJob = undefined;
+    for (&jobs, 0..) |*j, i| j.* = try EndJob.make(arena, io, tmp, root, try std.fmt.allocPrint(arena, "j{d}", .{i}), 10_000);
+    defer for (&jobs) |*j| j.close(io);
+    const before = end_batch.syncs.load(.monotonic);
+    // Their ends begin together and reach their settles at different times, within the window.
+    try endAll(io, &jobs, &.{ 0, 5, 20, 40 });
+    try std.testing.expectEqual(before + 1, end_batch.syncs.load(.monotonic));
+    for (&jobs) |*j| {
+        try j.result;
+        try std.testing.expect(try j.durable(arena, io));
+        try std.testing.expect(j.s.sync_log.?.pending == null and !j.s.sync_log.?.failed);
+        try std.testing.expectEqual(@as(usize, 0), j.s.sync_log.?.since.items.len);
+        // Durable: another job takes it now.
+        const other: Store = .{ .root = root };
+        (try other.open(arena, io, j.key)).?.layer.lock.close(io);
+    }
+}
+
+test "native store: a failed shared syncfs poisons every job's layer, and a job's descriptor older than the failure is refused later too" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
+    const root = try endStore(arena, io, tmp);
+    var jobs: [3]EndJob = undefined;
+    for (&jobs, 0..) |*j, i| j.* = try EndJob.make(arena, io, tmp, root, try std.fmt.allocPrint(arena, "f{d}", .{i}), 10_000);
+    defer for (&jobs) |*j| j.close(io);
+    // Began before the failure, ends after it: its own descriptor would report that error.
+    var late = try EndJob.make(arena, io, tmp, root, "late", 10_000);
+    defer late.close(io);
+    const before = end_batch.syncs.load(.monotonic);
+    end_batch.test_errno = .IO;
+    try endAll(io, &jobs, &.{ 0, 5, 10 });
+    end_batch.test_errno = null;
+    defer end_batch.failed_ns = 0;
+    try std.testing.expectEqual(before + 1, end_batch.syncs.load(.monotonic));
+    const other: Store = .{ .root = root };
+    for (&jobs) |*j| {
+        try std.testing.expectError(error.Sync, j.result);
+        const l = j.s.sync_log.?;
+        try std.testing.expect(l.failed and l.settle_failed and l.pending == null);
+        // Poisoned at once, held or not, as `settlePending` does.
+        try std.testing.expectError(error.Invalid, other.open(arena, io, j.key));
+        try std.testing.expectError(error.Invalid, j.s.open(arena, io, j.key));
+    }
+    // The next batch's `syncfs` succeeds, and still the job whose descriptor took the error state
+    // before the failure is refused.
+    try endAll(io, (&late)[0..1], &.{0});
+    try std.testing.expectError(error.Sync, late.result);
+    try std.testing.expectError(error.Invalid, other.open(arena, io, late.key));
+    // One that began after it is not.
+    var fresh = try EndJob.make(arena, io, tmp, root, "fresh", 10_000);
+    defer fresh.close(io);
+    try endAll(io, (&fresh)[0..1], &.{0});
+    try fresh.result;
+    try std.testing.expect(try fresh.durable(arena, io));
+}
+
+test "native store: a job ending after the window starts a batch of its own, as does one past a running syncfs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
+    const root = try endStore(arena, io, tmp);
+    var jobs: [2]EndJob = undefined;
+    for (&jobs, 0..) |*j, i| j.* = try EndJob.make(arena, io, tmp, root, try std.fmt.allocPrint(arena, "w{d}", .{i}), 20);
+    defer for (&jobs) |*j| j.close(io);
+    const before = end_batch.syncs.load(.monotonic);
+    // The second's end is announced but reaches its settle long after the first's window.
+    try endAll(io, &jobs, &.{ 0, 500 });
+    try std.testing.expectEqual(before + 2, end_batch.syncs.load(.monotonic));
+    for (&jobs) |*j| {
+        try j.result;
+        try std.testing.expect(try j.durable(arena, io));
+    }
+    // A job ending alone waits for no window, and the window 0 is a job's own sync, as before.
+    var alone = try EndJob.make(arena, io, tmp, root, "alone", 60_000);
+    defer alone.close(io);
+    const t = phases.now();
+    try endAll(io, (&alone)[0..1], &.{0});
+    try alone.result;
+    try std.testing.expect(phases.now() -| t < 30 * std.time.ns_per_s);
+    try std.testing.expectEqual(before + 3, end_batch.syncs.load(.monotonic));
+    var own = try EndJob.make(arena, io, tmp, root, "own", 0);
+    defer own.close(io);
+    try endAll(io, (&own)[0..1], &.{0});
+    try own.result;
+    try std.testing.expect(try own.durable(arena, io));
+    try std.testing.expectEqual(before + 3, end_batch.syncs.load(.monotonic));
+    // A job whose descriptor is older than the settle descriptor settles on its own.
+    var old = try EndJob.make(arena, io, tmp, root, "old", 10_000);
+    defer old.close(io);
+    old.s.sync_log.?.sampled_ns = 1;
+    try endAll(io, (&old)[0..1], &.{0});
+    try old.result;
+    try std.testing.expect(try old.durable(arena, io));
+    try std.testing.expectEqual(before + 3, end_batch.syncs.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), end_batch.ending);
 }
 
 test "native store: a job already failed poisons the pending layer it never settles" {

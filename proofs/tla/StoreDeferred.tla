@@ -27,6 +27,18 @@
 (* all (OwnerOnly): a runner killed before its settle leaves one nobody    *)
 (* vouches for, and `collect` evicts it when no job holds it.  Readers     *)
 (* are other jobs: they hold what they open.                               *)
+(*                                                                         *)
+(* The ends' settles may share one syncfs (BatchAtEnd; Store.settleEnd):  *)
+(* a job's end joins the batch being gathered (JoinBatch), the batch's     *)
+(* syncfs begins for those that joined (BatchStart, one batch at a time,   *)
+(* and a job may join the next while it runs), and ends (BatchEnd): it     *)
+(* fails if any layer of the batch lost its data or the disk fails it, and *)
+(* then every job of the batch poisons its layer, as SettleD's failure     *)
+(* does; it succeeds only with every layer's data on disk, and each job    *)
+(* then writes its own durable meta (SettleM, SettleC).  That the settle   *)
+(* descriptor reports what each job's own would (it took the superblock's  *)
+(* error state no later than any job's, Store.end_batch) is what the       *)
+(* model's syncfs relies on, as SettleD relies on the job's descriptor.    *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -41,14 +53,16 @@ CONSTANTS
     CheckBoot,      \* a pending mark of another boot or mount is refused
     OwnerOnly,      \* only the publishing job takes its pending layer (the fix)
     PoisonOnFail,   \* a failed settle refuses the layer at once, whoever holds it (the fix)
-    SettleAtEnd     \* the job's end makes its last layer durable
+    SettleAtEnd,    \* the job's end makes its last layer durable
+    BatchAtEnd,     \* the ends' settles share a batch's syncfs
+    BatchSyncFirst  \* a batch's jobs are marked durable after its syncfs (the fix)
 
 ASSUME Steps \in Nat \ {0} /\ MachineCrashes \in 0..1
 
 Ents == Procs \X (1..Steps)
 
 VARIABLES
-    pc,       \* each runner: "step", "settle_d", "settle_m", "settle_c", "dirsync", "done"
+    pc,       \* each runner: "step", "settle_d", "settle_m", "settle_c", "dirsync", "done", "batch"
     cur,      \* the layer of the runner's job not yet durable, <<>> for none
     vis,      \* the entry is renamed into layers/ and not evicted
     linked,   \* its rename is on disk (layers/ was fsynced after it)
@@ -65,14 +79,16 @@ VARIABLES
     rcrashes,
     badHold,  \* ghost: a reader took a layer whose tree was not whole
     evicted,  \* ghost: an entry taken out after a failed sync
-    promised  \* ghost: the entries of jobs whose end has finished
+    promised, \* ghost: the entries of jobs whose end has finished
+    inb,      \* the runners whose ends joined the batch not yet syncing
+    flying    \* the runners of the batch whose syncfs runs
 
 vars == <<pc, cur, vis, linked, meta, pboot, mcommit, ddata, tree, boot, werrors, poisoned, held,
-          alive, rcrashes, badHold, evicted, promised>>
-others == <<poisoned, held, alive, rcrashes, badHold>>
+          alive, rcrashes, badHold, evicted, promised, inb, flying>>
+others == <<poisoned, held, alive, rcrashes, badHold, inb, flying>>
 
 TypeOK ==
-    /\ pc \in [Procs -> {"step", "settle_d", "settle_m", "settle_c", "dirsync", "done"}]
+    /\ pc \in [Procs -> {"step", "settle_d", "settle_m", "settle_c", "dirsync", "done", "batch"}]
     /\ meta \in [Ents -> {"none", "pending", "durable"}]
     /\ tree \in [Ents -> {"whole", "broken"}]
 
@@ -95,6 +111,8 @@ Init ==
     /\ badHold = FALSE
     /\ evicted = {}
     /\ promised = {}
+    /\ inb = {}
+    /\ flying = {}
 
 (* The entries of p's job made so far, by step: the next is Done(p) + 1.   *)
 Done(p) == Cardinality({e \in Ents : e[1] = p /\ meta[e] # "none"})
@@ -116,17 +134,23 @@ Step(p) ==
     /\ IF Done(p) < Steps
        THEN IF cur[p] # <<>>
             THEN /\ pc' = [pc EXCEPT ![p] = Settling]
-                 /\ UNCHANGED <<cur, vis, meta, pboot>>
+                 /\ UNCHANGED <<cur, vis, meta, pboot, inb>>
             ELSE \* publishTimed: the entry renamed in, pending, naming this boot.
                  LET e == <<p, Done(p) + 1>> IN
                  /\ vis' = [vis EXCEPT ![e] = TRUE]
                  /\ meta' = [meta EXCEPT ![e] = "pending"]
                  /\ pboot' = [pboot EXCEPT ![e] = boot]
                  /\ cur' = [cur EXCEPT ![p] = e]
-                 /\ UNCHANGED pc
-       ELSE /\ pc' = [pc EXCEPT ![p] = IF cur[p] # <<>> /\ SettleAtEnd THEN Settling ELSE "dirsync"]
-            /\ UNCHANGED <<cur, vis, meta, pboot>>
-    /\ UNCHANGED <<linked, mcommit, ddata, tree, boot, werrors, evicted, promised, others>>
+                 /\ UNCHANGED <<pc, inb>>
+       ELSE IF cur[p] # <<>> /\ SettleAtEnd /\ BatchAtEnd
+            THEN \* JoinBatch: the end waits for a batch's syncfs (the mutant marks first).
+                 /\ inb' = inb \cup {p}
+                 /\ pc' = [pc EXCEPT ![p] = IF BatchSyncFirst THEN "batch" ELSE "settle_m"]
+                 /\ UNCHANGED <<cur, vis, meta, pboot>>
+            ELSE /\ pc' = [pc EXCEPT ![p] = IF cur[p] # <<>> /\ SettleAtEnd THEN Settling ELSE "dirsync"]
+                 /\ UNCHANGED <<cur, vis, meta, pboot, inb>>
+    /\ UNCHANGED <<linked, mcommit, ddata, tree, boot, werrors, evicted, promised, poisoned, held,
+                    alive, rcrashes, badHold, flying>>
 
 (* The data synced through the job's descriptor, which reports a loss of   *)
 (* the layer's pages (WbLoss) or a failed write.  A failure poisons the    *)
@@ -152,7 +176,8 @@ SettleD(p) ==
           /\ cur' = [cur EXCEPT ![p] = <<>>]
           /\ pc' = [pc EXCEPT ![p] = "step"]
           /\ UNCHANGED ddata
-    /\ UNCHANGED <<linked, meta, pboot, mcommit, tree, boot, promised, held, alive, rcrashes, badHold>>
+    /\ UNCHANGED <<linked, meta, pboot, mcommit, tree, boot, promised, held, alive, rcrashes, badHold,
+                    inb, flying>>
 
 (* meta.new written with `durable`, fsynced, and renamed over meta: in the *)
 (* page cache at once, on disk once the directory is synced (SettleC).     *)
@@ -164,14 +189,56 @@ SettleM(p) ==
     /\ UNCHANGED <<cur, vis, linked, pboot, mcommit, ddata, tree, boot, werrors, evicted, promised, others>>
 
 (* The entry's directory fsynced: the durable meta is on disk.  (The       *)
-(* mutant's data sync comes after.)                                        *)
+(* mutants' data sync comes after: SettleD's, or the batch's.)              *)
 SettleC(p) ==
     /\ pc[p] = "settle_c"
     /\ alive[p]
     /\ mcommit' = [mcommit EXCEPT ![cur[p]] = TRUE]
-    /\ pc' = [pc EXCEPT ![p] = IF SyncBeforeMark THEN "step" ELSE "settle_d"]
-    /\ cur' = IF SyncBeforeMark THEN [cur EXCEPT ![p] = <<>>] ELSE cur
+    /\ LET waits == SyncBeforeMark /\ p \in inb \cup flying IN
+       /\ pc' = [pc EXCEPT ![p] = IF waits THEN "batch" ELSE IF SyncBeforeMark THEN "step" ELSE "settle_d"]
+       /\ cur' = IF SyncBeforeMark /\ ~waits THEN [cur EXCEPT ![p] = <<>>] ELSE cur
     /\ UNCHANGED <<vis, linked, meta, pboot, ddata, tree, boot, werrors, evicted, promised, others>>
+
+(* The batch's syncfs begins, for the runners that joined it: one at a    *)
+(* time, and a runner that joins now waits for the next.                  *)
+BatchStart ==
+    /\ flying = {} /\ inb # {}
+    /\ flying' = inb
+    /\ inb' = {}
+    /\ UNCHANGED <<pc, cur, vis, linked, meta, pboot, mcommit, ddata, tree, boot, werrors, poisoned,
+                    held, alive, rcrashes, badHold, evicted, promised>>
+
+(* The batch's syncfs ends, once every live runner of it waits.  It fails  *)
+(* if any of its layers lost its data, or the disk fails it: then each     *)
+(* live runner of it poisons its layer, as SettleD does.  Or it succeeds,  *)
+(* every layer's data on disk, and each runner writes its durable meta     *)
+(* (the mutant's was written already).  A killed runner's layer stays     *)
+(* pending, its data synced or not.                                        *)
+BatchEnd ==
+    /\ flying # {}
+    /\ \A p \in flying : alive[p] => pc[p] = "batch"
+    /\ LET live == {p \in flying : alive[p]}
+           mine == {cur[p] : p \in flying}
+           lost == \E p \in flying : tree[cur[p]] = "broken"
+           held_by_other(e) == \E r \in Readers : e \in held[r]
+       IN
+       \/ /\ ~lost
+          /\ ddata' = [e \in Ents |-> ddata[e] \/ e \in mine]
+          /\ pc' = [p \in Procs |-> IF p \in live THEN (IF BatchSyncFirst THEN "settle_m" ELSE "step") ELSE pc[p]]
+          /\ cur' = [p \in Procs |-> IF p \in live /\ ~BatchSyncFirst THEN <<>> ELSE cur[p]]
+          /\ UNCHANGED <<vis, evicted, werrors, poisoned>>
+       \/ /\ lost \/ werrors < MaxWriteErrors
+          /\ werrors' = IF lost THEN werrors ELSE werrors + 1
+          /\ LET bad == {cur[p] : p \in live} IN
+             /\ poisoned' = [e \in Ents |-> IF e \in bad THEN PoisonOnFail \/ poisoned[e] ELSE poisoned[e]]
+             /\ vis' = [e \in Ents |-> IF e \in bad THEN held_by_other(e) ELSE vis[e]]
+             /\ evicted' = evicted \cup {e \in bad : ~held_by_other(e)}
+          /\ cur' = [p \in Procs |-> IF p \in live THEN <<>> ELSE cur[p]]
+          /\ pc' = [p \in Procs |-> IF p \in live THEN "step" ELSE pc[p]]
+          /\ UNCHANGED ddata
+    /\ flying' = {}
+    /\ UNCHANGED <<linked, meta, pboot, mcommit, tree, boot, promised, held, alive, rcrashes, badHold,
+                    inb>>
 
 (* syncLayers: layers/ fsynced, every rename so far on disk.  The job's    *)
 (* end has finished: its layers are promised.                              *)
@@ -192,7 +259,7 @@ RunnerCrash(p) ==
     /\ rcrashes' = rcrashes + 1
     /\ pc' = [pc EXCEPT ![p] = "done"]
     /\ UNCHANGED <<cur, vis, linked, meta, pboot, mcommit, ddata, tree, boot, werrors, poisoned,
-                    held, badHold, evicted, promised>>
+                    held, badHold, evicted, promised, inb, flying>>
 
 (* Within a boot, a pending layer's write-back fails and its pages are     *)
 (* dropped clean: later reads come from the disk (zeros).  Only before its *)
@@ -201,7 +268,7 @@ WbLoss(e) ==
     /\ vis[e] /\ meta[e] = "pending" /\ ~ddata[e] /\ tree[e] = "whole"
     /\ tree' = [tree EXCEPT ![e] = "broken"]
     /\ UNCHANGED <<pc, cur, vis, linked, meta, pboot, mcommit, ddata, boot, werrors, poisoned,
-                    held, alive, rcrashes, badHold, evicted, promised>>
+                    held, alive, rcrashes, badHold, evicted, promised, inb, flying>>
 
 (* What another job's lookup takes (`open`): published, not poisoned, and  *)
 (* durable, or pending in this boot (and this mount) where the pending is  *)
@@ -218,13 +285,13 @@ ReaderOpen(r, e) ==
     /\ held' = [held EXCEPT ![r] = @ \cup {e}]
     /\ badHold' = (badHold \/ tree[e] # "whole")
     /\ UNCHANGED <<pc, cur, vis, linked, meta, pboot, mcommit, ddata, tree, boot, werrors, poisoned,
-                    alive, rcrashes, evicted, promised>>
+                    alive, rcrashes, evicted, promised, inb, flying>>
 
 ReaderRelease(r, e) ==
     /\ e \in held[r]
     /\ held' = [held EXCEPT ![r] = @ \ {e}]
     /\ UNCHANGED <<pc, cur, vis, linked, meta, pboot, mcommit, ddata, tree, boot, werrors, poisoned,
-                    alive, rcrashes, badHold, evicted, promised>>
+                    alive, rcrashes, badHold, evicted, promised, inb, flying>>
 
 (* `collect` (and `open`, for a poisoned one): a layer pending or poisoned *)
 (* that no job holds and no live runner owns is taken out.                 *)
@@ -236,7 +303,7 @@ CollectOrphan(e) ==
     /\ vis' = [vis EXCEPT ![e] = FALSE]
     /\ evicted' = evicted \cup {e}
     /\ UNCHANGED <<pc, cur, linked, meta, pboot, mcommit, ddata, tree, boot, werrors, poisoned,
-                    held, alive, rcrashes, badHold, promised>>
+                    held, alive, rcrashes, badHold, promised, inb, flying>>
 
 (* The machine dies.  A rename no directory sync covered may be lost (a    *)
 (* miss).  The tree is what was synced; the meta is the committed one, or  *)
@@ -258,6 +325,8 @@ MachineCrash ==
     /\ cur' = [p \in Procs |-> <<>>]
     /\ held' = [r \in Readers |-> {}]
     /\ alive' = [p \in Procs |-> FALSE]
+    /\ inb' = {}
+    /\ flying' = {}
     /\ UNCHANGED <<linked, pboot, ddata, werrors, poisoned, rcrashes, badHold, evicted, promised>>
 
 Proc(p) == Step(p) \/ SettleD(p) \/ SettleM(p) \/ SettleC(p) \/ DirSync(p) \/ RunnerCrash(p)
@@ -267,6 +336,7 @@ Terminated == \A p \in Procs : pc[p] = "done"
 Next == \/ \E p \in Procs : Proc(p)
         \/ \E e \in Ents : WbLoss(e) \/ CollectOrphan(e)
         \/ \E r \in Readers, e \in Ents : ReaderOpen(r, e) \/ ReaderRelease(r, e)
+        \/ BatchStart \/ BatchEnd
         \/ MachineCrash
         \/ (Terminated /\ boot = MachineCrashes /\ UNCHANGED vars)
 
