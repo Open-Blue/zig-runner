@@ -1,0 +1,22 @@
+[package]
+name = "zr-net"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The runner's network stack (HTTP, WebSocket, TLS for Postgres) behind a small C ABI; see docs/rust-net.md"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# One runtime, owned by the process (src/runtime.rs). R1 needs no more than the scheduler.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+# A panic must not unwind into Zig: the process ends instead.
+panic = "abort"

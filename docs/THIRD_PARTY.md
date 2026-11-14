@@ -20,6 +20,16 @@ Fetched at build time from `runner/build.zig.zon`, pinned there by commit (the a
 |---|---|---|
 | [ianic/tls.zig](https://github.com/ianic/tls.zig) | TLS to the database (`runner/src/pg.zig`): unlike std's client, it answers a server that asks for a client certificate, which Tiger Data does | MIT |
 
+### Rust crates and libc (from the network library, `runner/rust/zr-net`, docs/rust-net.md)
+
+Fetched by cargo at build time from crates.io, pinned by `runner/rust/zr-net/Cargo.lock` (cargo checks each crate's checksum; builds are `--locked`) and compiled into the runner as a static library. `cargo-deny` (`runner/rust/deny.toml`, `.github/scripts/cargo-deny.sh`) fails a build for a license outside MIT, Apache-2.0, ISC, BSD-3-Clause, Unicode-3.0 or Zlib, for an advisory, or for a source other than crates.io.
+
+| Crate | Used for | License |
+|---|---|---|
+| [tokio](https://github.com/tokio-rs/tokio) | the runtime that will run the runner's HTTP, WebSocket and database TLS (R1: the runtime only) | MIT |
+
+The lock file lists the others (all permissive; the tokio skeleton adds `pin-project-lite`, MIT or Apache-2.0). The runner now also links Zig's bundled copies of [musl libc](https://musl.libc.org) (MIT) and LLVM's libunwind (Apache-2.0 WITH LLVM-exception), which Rust's standard library needs.
+
 ## Followed, not copied
 
 - **GitHub Actions' runner protocol** (registration, the broker, the run and results services, the live log feed) is not publicly documented. The runner implements it in new Zig code, based on reading [`actions/runner`](https://github.com/actions/runner) and on running the same workflows on GitHub-hosted runners side by side. A few log messages reproduce `actions/runner`'s wording, so that logs read like GitHub's. `actions/runner` is under the MIT License, Copyright (c) 2019 GitHub, reproduced below.

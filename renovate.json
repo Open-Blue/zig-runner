@@ -26,7 +26,7 @@
       "groupName": "minor and patch updates"
     },
     {
-      "description": "A new Zig changes the language: its own pull request, and its checksums (install-zig.sh, the Dockerfile) are updated by hand from ziglang.org's index.json, which CI enforces by failing until they are.",
+      "description": "A new Zig changes the language: its own pull request, and its checksums (install-zig.sh) are updated by hand from ziglang.org's index.json, which CI enforces by failing until they are.",
       "matchDepNames": [
         "ziglang/zig"
       ],
@@ -169,14 +169,13 @@
   ],
   "customManagers": [
     {
-      "description": "Zig: install-zig.sh and the Dockerfile (versions are tags of ziglang/zig).",
+      "description": "Zig: install-zig.sh (versions are tags of ziglang/zig).",
       "customType": "regex",
       "managerFilePatterns": [
-        "/^\\.github/scripts/install-zig\\.sh$/",
-        "/^runner/Dockerfile$/"
+        "/^\\.github/scripts/install-zig\\.sh$/"
       ],
       "matchStrings": [
-        "(?:\\nversion=|ARG ZIG_VERSION=)(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+        "(?:\\nversion=)(?<currentValue>\\d+\\.\\d+\\.\\d+)"
       ],
       "depNameTemplate": "ziglang/zig",
       "datasourceTemplate": "github-tags"

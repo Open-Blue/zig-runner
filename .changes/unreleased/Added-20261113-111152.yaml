@@ -1,0 +1,3 @@
+kind: Added
+body: The runner links musl libc and a Rust static library (runner/rust/zr-net, a tokio runtime behind a small C ABI) as the first step of moving HTTP, the live feed and the database TLS to hyper and rustls (docs/rust-net.md has the design); the binary grows by 0.6 MB (x86_64) and 0.5 MB (aarch64), tests now build for musl, and cargo-deny checks the crates
+time: 2026-11-13T11:11:52.483365764-05:00

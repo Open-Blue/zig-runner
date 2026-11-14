@@ -1,7 +1,7 @@
 # The runner without the Dagger engine: layer it over compose.yaml for a pool on the native backend
 # (docs/native-backend.md, "Running with no engine").
 #
-#   docker compose -f deploy/compose.yaml -f deploy/compose.engineless.yaml up -d --build
+#   docker compose -f deploy/compose.yaml -f deploy/compose.engineless.yaml up -d
 #
 # Jobs the native backend cannot run fail at once, saying why, instead of waiting for an engine,
 # and a machine that cannot run native steps at all stops the runner at start-up with the reason.
