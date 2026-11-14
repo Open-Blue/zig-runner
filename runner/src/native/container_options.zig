@@ -292,8 +292,7 @@ const dropped = "; Dagger drops a container's `options:`, so it is not applied t
 
 fn refuse(arena: Allocator, why: *[]const u8, word: []const u8, reason: []const u8) Error {
     const fmt = "the job container's option `{s}` {s}" ++ dropped;
-    why.* = std.fmt.allocPrint(arena, fmt, .{ word, reason }) catch
-        "a job container option is not carried out natively";
+    why.* = std.fmt.allocPrint(arena, fmt, .{ word, reason }) catch return error.OutOfMemory;
     return error.Refused;
 }
 
@@ -323,7 +322,7 @@ fn refusePort(arena: Allocator, why: *[]const u8, raw: []const u8, reason: []con
     why.* = std.fmt.allocPrint(arena, "a job container's port `{s}` {s}" ++ dropped_ports, .{
         raw,
         reason,
-    }) catch "a job container's port is not carried out natively" ++ dropped_ports;
+    }) catch return error.OutOfMemory;
     return error.Refused;
 }
 
@@ -442,7 +441,7 @@ fn refuseVolume(arena: Allocator, why: *[]const u8, raw: []const u8, reason: []c
     why.* = std.fmt.allocPrint(arena, "a job container's volume `{s}` {s}" ++ dropped_volumes, .{
         raw,
         reason,
-    }) catch "a job container's volume is not carried out natively" ++ dropped_volumes;
+    }) catch return error.OutOfMemory;
     return error.Refused;
 }
 
@@ -1128,11 +1127,12 @@ test "without a job cgroup: an unsized tmpfs is refused, and sizes are capped" {
 
 test "allocation failures: a container's options, ports and volumes" {
     const af = @import("../alloc_failures.zig");
-    // A refusal says why in the arena, and says it in words of its own when that fails: the job
-    // is refused all the same (it goes to Dagger), on purpose. So a run may end in `Refused` where
-    // another ends in out of memory: `checkNoLeaks` allows an answer, and nothing else.
+    // A refusal says why in the arena, and when that allocation fails the answer is out of memory,
+    // not `Refused` (which would send the job to Dagger over a lack of memory). So a refused input
+    // is `Refused` in every run that is not failed, and `checkOne` fails any run where an allocation
+    // failed and the answer was still `Refused` or a result.
     const S = struct {
-        /// The options as read, `Refused` as it is without a failure, or out of memory.
+        /// The options as read, `Refused` as it is without a failure, or out of memory (never `Refused` in its place).
         fn options(a: Allocator, text: []const u8) !void {
             var arena: af.Scratch = .init(a);
             defer arena.deinit();
@@ -1158,9 +1158,9 @@ test "allocation failures: a container's options, ports and volumes" {
         "-e HOME=/x --workdir /w --privileged",
         "--env",
         "-e A='unterminated",
-    }) |text| try af.checkNoLeaks(S.options, .{text});
+    }) |text| try af.checkOne(S.options, .{text});
     for ([_][]const u8{ "80", "127.0.0.1:8080:80/tcp", "0.0.0.0::53/UDP", "99999:1", "a:b:c:d" }) |text|
-        try af.checkNoLeaks(S.port, .{text});
+        try af.checkOne(S.port, .{text});
     for ([_][]const u8{ "/data", "cache:/cache:ro", "/srv/data:/data", "v:/a//b/./c/", "x:/y:bogus:z", "" }) |text|
-        try af.checkNoLeaks(S.volume, .{text});
+        try af.checkOne(S.volume, .{text});
 }
