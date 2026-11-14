@@ -34,6 +34,7 @@ const libzstd = @import("native/oci/libzstd.zig");
 const zlibng = @import("native/oci/zlibng.zig");
 const tls_stream = @import("tls_stream.zig");
 const net_client = @import("net_client.zig");
+const testserver = @import("github/testserver.zig");
 const registry = @import("native/oci/registry.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
@@ -1849,21 +1850,6 @@ test "fuzz: HTTP streams" {
     });
 }
 
-const FuzzBody = struct {
-    len: usize,
-
-    fn write(ptr: *const anyopaque, w: *std.Io.Writer) anyerror!void {
-        const b: *const FuzzBody = @ptrCast(@alignCast(ptr));
-        var chunk: [1000]u8 = @splat('u');
-        var left = b.len;
-        while (left > 0) {
-            const n = @min(left, chunk.len);
-            try w.writeAll(chunk[0..n]);
-            left -= n;
-        }
-    }
-};
-
 /// What a server answers a streamed request with, read in pieces of any size, and a request body
 /// of any size written into a server that may answer before it is sent and close: the stream ends
 /// with an error or its end, within the deadline, never more than `max_response` bytes, and the
@@ -1883,11 +1869,11 @@ fn httpStreams(_: void, smith: *Smith) !void {
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{server.port()});
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    const body: FuzzBody = .{ .len = upload_len orelse 0 };
+    const body: testserver.PatternBody = .{ .len = upload_len orelse 0 };
     var s = net_client.open(arena.allocator(), io, .{
         .method = if (upload_len != null) .PUT else .GET,
         .url = url,
-        .upload = if (upload_len != null) .{ .len = body.len, .ptr = &body, .writeFn = FuzzBody.write } else null,
+        .upload = if (upload_len != null) .{ .len = body.len, .ptr = &body, .writeFn = testserver.PatternBody.write } else null,
         .deadline = .fromMilliseconds(400),
         .total = .fromMilliseconds(800),
         .read_idle = .fromMilliseconds(300),

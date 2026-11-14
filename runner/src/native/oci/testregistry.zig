@@ -534,6 +534,52 @@ test "native oci pull of the default image from Docker Hub (ZIG_RUNNER_TEST_PULL
     std.debug.print("after 70 s idle: {s}\n", .{idle.digest});
 }
 
+test "bench: a cold image pull (ZIG_RUNNER_BENCH_PULL=<image>; ZIG_RUNNER_BENCH_POLICY=new|fixed; ZIG_RUNNER_BENCH_BUSY=<other jobs running>)" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const env = try testing.environ.createMap(arena);
+    const image_name = env.get("ZIG_RUNNER_BENCH_PULL") orelse return error.SkipZigTest;
+    const admission = @import("../../admission.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(io, ".", arena) };
+    // The pool's gate, with `busy` of its other runners shown as running a job: the policy's input.
+    var slots: [64]admission.Admission.Slot = undefined;
+    for (&slots) |*s| s.* = .{};
+    var pool: admission.Admission = .init(io, .{}, &slots);
+    const busy = std.fmt.parseInt(usize, env.get("ZIG_RUNNER_BENCH_BUSY") orelse "0", 10) catch 0;
+    for (slots[1..][0..busy]) |*s| s.started_ms = 1;
+    var gate: admission.Gate = .{ .pool = &pool, .slot = 0 };
+    const new_policy = std.mem.eql(u8, env.get("ZIG_RUNNER_BENCH_POLICY") orelse "new", "new");
+    var why: []const u8 = "";
+    {
+        // What the policy chooses for these layers now, as `Prefetch.start` asks it.
+        var w: []const u8 = "";
+        std.debug.print("bench pull: the policy would fetch {d} of 11 layers at a time ({s})\n", .{ gate.fetchConcurrency(11, @import("../../zr_net.zig").cores(), 8, &w), w });
+    }
+    var ru0: std.os.linux.rusage = undefined;
+    _ = std.os.linux.getrusage(0, &ru0);
+    const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
+    const got = image.pull(arena, testing.allocator, io, store, .{
+        .image = image_name,
+        .owners = false,
+        .gate = if (new_policy) &gate else null,
+    }, &why) catch |e| {
+        std.debug.print("pull: {s}\n", .{why});
+        return e;
+    };
+    const ms = std.Io.Clock.awake.now(io).toMilliseconds() - t0;
+    var ru: std.os.linux.rusage = undefined;
+    _ = std.os.linux.getrusage(0, &ru);
+    const cpu_ms = (ru.utime.sec - ru0.utime.sec) * 1000 + @divTrunc(ru.utime.usec - ru0.utime.usec, 1000) +
+        (ru.stime.sec - ru0.stime.sec) * 1000 + @divTrunc(ru.stime.usec - ru0.stime.usec, 1000);
+    std.debug.print("\nbench pull: {s} policy {s} busy {d}: {d} ms, cpu {d} ms, peak RSS {d} kB, {d} layers, {d} bytes\n", .{
+        image_name, if (new_policy) "new" else "fixed", busy, ms, cpu_ms, ru.maxrss, got.pulled.?.layers, got.pulled.?.bytes,
+    });
+}
+
 test "allocation failures: a pull through token auth, an index, gzip and zstd layers and a redirect" {
     const af = @import("../../alloc_failures.zig");
     var a: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -673,50 +719,4 @@ test "allocation failures: a registry's refusal keeps its status, and running ou
         }
     };
     try af.checkOne(S.missing, .{ root, reference });
-}
-
-test "bench: a cold image pull (ZIG_RUNNER_BENCH_PULL=<image>; ZIG_RUNNER_BENCH_POLICY=new|fixed; ZIG_RUNNER_BENCH_BUSY=<other jobs running>)" {
-    var a: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer a.deinit();
-    const arena = a.allocator();
-    const env = try testing.environ.createMap(arena);
-    const image_name = env.get("ZIG_RUNNER_BENCH_PULL") orelse return error.SkipZigTest;
-    const admission = @import("../../admission.zig");
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const io = testing.io;
-    const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(io, ".", arena) };
-    // The pool's gate, with `busy` of its other runners shown as running a job: the policy's input.
-    var slots: [64]admission.Admission.Slot = undefined;
-    for (&slots) |*s| s.* = .{};
-    var pool: admission.Admission = .init(io, .{}, &slots);
-    const busy = std.fmt.parseInt(usize, env.get("ZIG_RUNNER_BENCH_BUSY") orelse "0", 10) catch 0;
-    for (slots[1..][0..busy]) |*s| s.started_ms = 1;
-    var gate: admission.Gate = .{ .pool = &pool, .slot = 0 };
-    const new_policy = std.mem.eql(u8, env.get("ZIG_RUNNER_BENCH_POLICY") orelse "new", "new");
-    var why: []const u8 = "";
-    {
-        // What the policy chooses for these layers now, as `Prefetch.start` asks it.
-        var w: []const u8 = "";
-        std.debug.print("bench pull: the policy would fetch {d} of 11 layers at a time ({s})\n", .{ gate.fetchConcurrency(11, @import("../../zr_net.zig").cores(), 8, &w), w });
-    }
-    var ru0: std.os.linux.rusage = undefined;
-    _ = std.os.linux.getrusage(0, &ru0);
-    const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
-    const got = image.pull(arena, testing.allocator, io, store, .{
-        .image = image_name,
-        .owners = false,
-        .gate = if (new_policy) &gate else null,
-    }, &why) catch |e| {
-        std.debug.print("pull: {s}\n", .{why});
-        return e;
-    };
-    const ms = std.Io.Clock.awake.now(io).toMilliseconds() - t0;
-    var ru: std.os.linux.rusage = undefined;
-    _ = std.os.linux.getrusage(0, &ru);
-    const cpu_ms = (ru.utime.sec - ru0.utime.sec) * 1000 + @divTrunc(ru.utime.usec - ru0.utime.usec, 1000) +
-        (ru.stime.sec - ru0.stime.sec) * 1000 + @divTrunc(ru.stime.usec - ru0.stime.usec, 1000);
-    std.debug.print("\nbench pull: {s} policy {s} busy {d}: {d} ms, cpu {d} ms, peak RSS {d} kB, {d} layers, {d} bytes\n", .{
-        image_name, if (new_policy) "new" else "fixed", busy, ms, cpu_ms, ru.maxrss, got.pulled.?.layers, got.pulled.?.bytes,
-    });
 }

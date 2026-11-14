@@ -136,6 +136,24 @@ pub fn blobByte(i: u64) u8 {
     return @truncate((i *% 2654435761) >> 7);
 }
 
+/// A request body of `len` bytes of `blobByte`, for the network client's `Body`: `ptr` is `&self`, `writeFn` is `write`.
+/// The one place the callback's opaque pointer is cast back, for the tests that upload.
+pub const PatternBody = struct {
+    len: usize,
+
+    pub fn write(ptr: *const anyopaque, w: *std.Io.Writer) anyerror!void {
+        const p: *const PatternBody = @ptrCast(@alignCast(ptr));
+        var chunk: [7000]u8 = undefined;
+        var at: usize = 0;
+        while (at < p.len) {
+            const len = @min(p.len - at, chunk.len);
+            for (chunk[0..len], 0..) |*c, i| c.* = blobByte(at + i);
+            try w.writeAll(chunk[0..len]);
+            at += len;
+        }
+    }
+};
+
 /// What /sink received: how much, and its FNV-1a (64).
 pub const Sink = struct {
     bytes: u64 = 0,
@@ -220,7 +238,7 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
             var chunk: [8192]u8 = undefined;
             var at: u64 = 0;
             while (at < n) {
-                const len: usize = @intCast(@min(n - at, chunk.len));
+                const len: usize = @min(n - at, chunk.len);
                 for (chunk[0..len], 0..) |*c, i| c.* = blobByte(at + i);
                 out.writeAll(chunk[0..len]) catch return .close;
                 at += len;
