@@ -62,6 +62,23 @@ jobs:
           fi
           gitleaks git --config .gitleaks.toml --redact --ignore-gitleaks-allow --no-banner --verbose "${range[@]}" .
 
+  # The network library's crates (runner/rust, docs/rust-net.md): licenses, advisories, sources.
+  # Weekly too, for advisories published after a lockfile was merged. Needs no Rust toolchain:
+  # cargo-deny reads Cargo.lock.
+  cargo-deny:
+    name: Rust dependencies
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: cargo-deny
+        run: .github/scripts/cargo-deny.sh
+
   dependency-review:
     name: Dependency review
     if: github.event_name == 'pull_request'

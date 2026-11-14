@@ -2,7 +2,7 @@
 # https://github.com/Lementknight/zig-actions-runner/blob/7641a69/docs/DEPLOY.md).
 #
 #   cp deploy/runner.env.example deploy/runner.env   # then fill it in
-#   docker compose -f deploy/compose.yaml up -d --build
+#   docker compose -f deploy/compose.yaml up -d
 #
 # The runner reaches the engine through a unix socket on a shared volume: no Docker socket is
 # mounted into the runner and no network listener is opened.
@@ -49,8 +49,8 @@ services:
       com.centurylinklabs.watchtower.enable: "false"
 
   runner:
-    build: ../runner
-    image: zig-runner:local
+    # The release's image (runner/Dockerfile's `prebuilt` stage); pin a tag in ZIG_RUNNER_IMAGE to stay on one version.
+    image: ${ZIG_RUNNER_IMAGE:-ghcr.io/open-blue/zig-runner:latest@sha256:de4ff449caab91e53390289268062b522759656b42e7c18aa8a074a8723623d2}
     env_file: runner.env
     environment:
       RUNNER_ENGINE_HOST: unix:///run/dagger/engine.sock

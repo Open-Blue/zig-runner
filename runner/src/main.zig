@@ -35,6 +35,7 @@ pub const std_options: std.Options = .{ .logFn = logfmt.logFn };
 
 comptime {
     _ = @import("sha256.zig");
+    _ = @import("zr_net.zig");
     _ = @import("sink.zig");
     _ = @import("native/Backend.zig");
     _ = @import("native/cgroup.zig");

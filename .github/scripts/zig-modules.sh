@@ -23,6 +23,14 @@
 zig_modules() {
 	local scratch=$1 version=$2
 	shift 2
+	# The libc is musl whatever the machine's: the network library is built for musl (below), and a
+	# glibc test binary with a musl-built Rust archive in it is two libcs in one process (it failed
+	# `Thread.spawn` with EINVAL in 36 tests). `native` keeps the machine's CPU and OS. Except
+	# under ThreadSanitizer, whose runtime needs glibc's dynamic loader (zig-test.sh): there the
+	# archive is built for glibc, to match.
+	local libc=musl a
+	for a in "$@"; do [[ $a == -fsanitize-thread ]] && libc=gnu; done
+	if [[ $(zig_target_arch "$@") == native && $libc == musl ]]; then set -- "$@" -target native-native-musl; fi
 	local url rev want got
 	if [[ ! -d $scratch/tls ]]; then
 		url=$(sed -n 's|^ *\.url = "\(https://github\.com/.*/archive/[0-9a-f]\{40\}\.tar\.gz\)",$|\1|p' build.zig.zon)
@@ -45,11 +53,40 @@ zig_modules() {
 			return 1
 		fi
 	fi
+	local arch
+	arch=$(zig_target_arch "$@")
+	[[ $arch != native ]] || arch=$(uname -m)
 	zig_libzstd_args
-	zig_libzlibng_args "$(zig_target_arch "$@")"
-	# shellcheck disable=SC2034,SC2154 # for the caller; the C arguments are set above
+	zig_libzlibng_args "$arch"
+	zig_zr_net_args "$scratch" "$arch" "$libc"
+	# shellcheck disable=SC2034,SC2154 # for the caller; the C and Rust arguments are set above
 	modules=(-fPIE "$@" --dep build_version --dep tls -Mroot=src/main.zig "${libzstd_args[@]}" "${libzlibng_args[@]}"
-		"$@" -Mbuild_version="$version" "$@" -Mtls="$scratch/tls/src/root.zig")
+		"$@" -Mbuild_version="$version" "$@" -Mtls="$scratch/tls/src/root.zig" "${zr_net_args[@]}")
+}
+
+# zig_zr_net_args SCRATCH ARCH LIBC: sets `zr_net_args` to the link inputs of the network library
+# (runner/rust/zr-net) for ARCH and LIBC (musl; gnu for the ThreadSanitizer builds): runner/build.zig's
+# `addZrNet`, the same archive from the same script, and libc and libunwind, which Rust's standard library needs (Zig's bundled musl and
+# libunwind; docs/rust-net.md). The archive is built once per SCRATCH and architecture. From runner/.
+zig_zr_net_args() {
+	local scratch=$1 arch=$2 libc=$3
+	[[ -f $scratch/libzr_net-$arch-$libc.a ]] || ../.github/scripts/build-zr-net.sh "$arch" "$scratch/libzr_net-$arch-$libc.a" "$libc" || return 1
+	# shellcheck disable=SC2034 # for the caller
+	zr_net_args=(-lc -lunwind "$scratch/libzr_net-$arch-$libc.a")
+}
+
+# zig_target_arch FLAG...: the architecture the compiler is asked for (`-target x86_64-linux-musl`),
+# or `native` when it is not asked for.
+zig_target_arch() {
+	local prev=""
+	for a in "$@"; do
+		if [[ $prev == -target ]]; then
+			if [[ ${a%%-*} == native ]]; then uname -m; else echo "${a%%-*}"; fi
+			return
+		fi
+		prev=$a
+	done
+	echo native
 }
 
 # zig_libzstd_args: sets `libzstd_args` to the arguments that add libzstd's decompressor to the
@@ -68,20 +105,6 @@ zig_libzstd_args() {
 		-Isrc/vendor/shim -I"$zstd" -I"$zstd"/common --
 		"$zstd"/common/{debug,entropy_common,error_private,fse_decompress,xxhash,zstd_common}.c
 		"$zstd"/decompress/{huf_decompress,zstd_ddict,zstd_decompress,zstd_decompress_block}.c)
-}
-
-# zig_target_arch FLAG...: the architecture the compiler is asked for (`-target x86_64-linux-musl`),
-# or this machine's.
-zig_target_arch() {
-	local prev=""
-	for a in "$@"; do
-		if [[ $prev == -target ]]; then
-			echo "${a%%-*}"
-			return
-		fi
-		prev=$a
-	done
-	uname -m
 }
 
 # zig_libzlibng_args ARCH: sets `libzlibng_args` to the arguments that add zlib-ng's inflater for
