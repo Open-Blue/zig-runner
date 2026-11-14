@@ -1,0 +1,315 @@
+# Candidate: the release's binaries (x86_64 and aarch64 Linux), built and attested as release.yml
+# builds them, for a machine that follows a channel rather than the releases (docs/OPERATIONS.md,
+# "Channels", deploy/zig-runner-deploy):
+#
+#   - every push to main: a pre-release named main-N-SHA12, N this workflow's run number, whose
+#     binaries say vX.Y.Z-main.N+SHA12 (candidate-version.sh);
+#   - a tag vX.Y.Z-rcN (a release candidate, which release.yml ignores): a pre-release of that name.
+#
+# A pre-release is never "latest", so nothing that follows the latest release (users, the install
+# docs) sees one. Each carries signed build provenance and an attested SBOM, as a release does; the
+# deploy agent checks them against this workflow and the ref it ran at (refs/heads/main, or the rc
+# tag). A release candidate also gets an image (ghcr.io/.../zig-runner:vX.Y.Z-rcN, and :rc while it is
+# the newest; never :latest and never a release's tag) and a deployment record to the razorbill-rc
+# environment, as a release does to razorbill. A main candidate has neither: one image per merge
+# would fill the registry, and machines on a channel read the releases feed. Candidates are pruned
+# (prune-candidates.sh, and candidate-prune.yml daily): older than the retention window, past the
+# newest few and not deployed. A candidate is published as a draft first and made public once
+# attested and complete, so nothing fetches one that is half there.
+#
+# No concurrency group: GitHub keeps one waiting run per group and drops the others, which would
+# skip main candidates when merges come close together, and every main commit's build is the point.
+# Each run's names are its own, so runs cannot collide.
+name: candidate
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*-rc*"]
+
+# Nothing by default; the job asks for what it needs.
+permissions: {}
+
+env:
+  # The same pins as release.yml (and Renovate follows them there): Trivy, BuildKit, and the scanner
+  # that writes the image's SBOM.
+  TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+  BUILDKIT_IMAGE: moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
+  SBOM_SCANNER_IMAGE: docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315
+  TRIVY_DB: mirror.gcr.io/aquasec/trivy-db:2,ghcr.io/aquasec/trivy-db:2
+
+jobs:
+  candidate:
+    name: Candidate
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: write # to create the pre-release, upload the binaries and prune old candidates
+      id-token: write # to sign the binaries' provenance with Sigstore
+      attestations: write # to store that provenance
+      deployments: read # to see what the pools are deployed from, which pruning keeps
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # What the binaries say they are, and what the release is called.
+      - name: Names
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if [[ $REF_TYPE == tag ]]; then
+            names=$(.github/scripts/candidate-version.sh tag "$REF_NAME")
+          else
+            names=$(.github/scripts/candidate-version.sh main "$RUN_NUMBER" "$GITHUB_SHA")
+          fi
+          read -r version release <<<"$names"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "RELEASE=$release" >> "$GITHUB_ENV"
+          echo "$version, released as $release"
+
+      # A re-run of the whole workflow after it published finds the candidate public, which cannot
+      # be changed (releases are immutable): there is nothing left to do but prune.
+      - name: Whether the candidate is published already
+        id: published
+        run: |
+          if [[ $(gh release view "$RELEASE" --json isDraft --jq .isDraft 2>/dev/null) == false ]]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Zig
+        if: steps.published.outputs.published == 'false'
+        run: .github/scripts/install-zig.sh
+
+      - name: Build
+        if: steps.published.outputs.published == 'false'
+        run: .github/scripts/build-binaries.sh "$VERSION" dist
+
+      # The same hardening as a release (docs/CI.md, "Hardening"): a candidate is what a machine runs.
+      - name: Hardening
+        if: steps.published.outputs.published == 'false'
+        run: .github/scripts/checksec.sh dist/zig-runner-linux-x86_64 dist/zig-runner-linux-aarch64
+
+      # A draft until attested and complete. A draft a failed run left is replaced. A main
+      # candidate's tag (main-N-SHA12) is made at the commit when it is published; a release
+      # candidate's exists.
+      - name: Draft the pre-release
+        if: steps.published.outputs.published == 'false'
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [[ $(gh release view "$RELEASE" --json isDraft --jq .isDraft 2>/dev/null) == true ]]; then
+            gh release delete "$RELEASE" --yes
+          fi
+          if [[ $REF_TYPE == tag ]]; then target=(--verify-tag); else target=(--target "$GITHUB_SHA"); fi
+          gh release create "$RELEASE" --draft --prerelease --latest=false "${target[@]}" \
+            --title "$VERSION" \
+            --notes "Candidate $VERSION, built from $GITHUB_SHA by candidate.yml. Not a release: machines on the main or rc channel install it (docs/OPERATIONS.md, \"Channels\")." \
+            dist/zig-runner-linux-x86_64 dist/zig-runner-linux-aarch64 dist/SHA256SUMS
+
+      - name: Attest the binaries' provenance
+        if: steps.published.outputs.published == 'false'
+        id: provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: SBOM
+        if: steps.published.outputs.published == 'false'
+        run: .github/scripts/sbom.sh "$VERSION" dist/SHA256SUMS > dist/zig-runner.spdx.json
+
+      - name: Attest the SBOM
+        if: steps.published.outputs.published == 'false'
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+          sbom-path: dist/zig-runner.spdx.json
+
+      - name: Attach the SBOM and attestations, and publish
+        if: steps.published.outputs.published == 'false'
+        env:
+          PROVENANCE: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+        run: |
+          cp "$PROVENANCE" dist/zig-runner.provenance.intoto.jsonl
+          cp "$SBOM_BUNDLE" dist/zig-runner.sbom.jsonl
+          gh release upload "$RELEASE" --clobber \
+            dist/zig-runner.spdx.json dist/zig-runner.provenance.intoto.jsonl dist/zig-runner.sbom.jsonl
+          gh release edit "$RELEASE" --draft=false --prerelease --latest=false
+
+      # Past the retention window, not among the newest KEEP of each kind, and not deployed:
+      # repository variables CANDIDATE_RETENTION_DAYS (14) and CANDIDATE_KEEP (20) change them.
+      - name: Prune old candidates
+        env:
+          RETENTION_DAYS: ${{ vars.CANDIDATE_RETENTION_DAYS || '14' }}
+          KEEP: ${{ vars.CANDIDATE_KEEP || '20' }}
+        run: .github/scripts/prune-candidates.sh --days "$RETENTION_DAYS" --keep "$KEEP"
+
+  # A release candidate's image, from the candidate's own binaries (checked against SHA256SUMS and
+  # their candidate.yml provenance), scanned before it is pushed, as release.yml does. Tags: the
+  # candidate's own (vX.Y.Z-rcN), and `rc` while this is the newest release candidate. Never
+  # `latest`, and the tag of a release is never pushed: only an rc tag reaches here.
+  image:
+    name: Image (rc)
+    needs: candidate
+    if: ${{ !cancelled() && needs.candidate.result == 'success' && github.ref_type == 'tag' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    permissions:
+      contents: read # to check out the code, and download the candidate's binaries
+      packages: write # to push the image to ghcr.io
+      id-token: write # to sign the image's provenance with Sigstore
+      attestations: write # to store that provenance
+      artifact-metadata: write # to record the pushed image as the attestation's artifact
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Once more, though the candidate job made the names: this job pushes to the registry.
+      - name: A release candidate's tag
+        run: .github/scripts/candidate-version.sh tag "$TAG"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+
+      - name: The candidate's binaries
+        env:
+          SIGNER_WORKFLOW: candidate.yml
+        run: .github/scripts/release-binaries.sh "$TAG" dist
+
+      - name: Into the build context
+        run: |
+          mkdir -p runner/prebuilt
+          install -m 0755 dist/zig-runner-linux-x86_64 runner/prebuilt/runner-amd64
+          install -m 0755 dist/zig-runner-linux-aarch64 runner/prebuilt/runner-arm64
+
+      - name: Scan the Dockerfile
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src "$TRIVY_IMAGE" config \
+            --exit-code 1 --severity HIGH,CRITICAL --ignorefile .trivyignore.yaml runner/
+
+      - name: Trivy's database
+        run: |
+          mkdir -p "$RUNNER_TEMP/trivy"
+          for attempt in 1 2 3 4 5; do
+            docker run --rm -v "$RUNNER_TEMP/trivy:/cache" "$TRIVY_IMAGE" image --cache-dir /cache \
+              --download-db-only --db-repository "$TRIVY_DB" && exit 0
+            echo "::warning::could not fetch Trivy's database (attempt $attempt of 5)"
+            ((attempt < 5)) && sleep $((attempt * 20))
+          done
+          exit 1
+
+      - name: Build for the scan
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: runner
+          target: prebuilt
+          platforms: linux/amd64
+          load: true
+          tags: zig-runner:scan
+
+      - name: Scan the image
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$RUNNER_TEMP/trivy:/cache" \
+            "$TRIVY_IMAGE" image --cache-dir /cache --skip-db-update \
+            --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed zig-runner:scan
+
+      # Registry names must be lowercase. `rc` is the newest release candidate's image: a re-run
+      # of an older one leaves it where it is.
+      - name: Image name and tags
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          echo "IMAGE=ghcr.io/${OWNER,,}/zig-runner" >> "$GITHUB_ENV"
+          newest=$(gh api --paginate "repos/$GH_REPO/git/matching-refs/tags/v" --jq '.[].ref' |
+            sed -n 's|^refs/tags/\(v[0-9]*\.[0-9]*\.[0-9]*-rc[0-9]*\)$|\1|p' | sort -V | tail -n1)
+          echo "newest release candidate: $newest"
+          echo "NEWEST_RC=$([[ $newest == "$TAG" ]] && echo true || echo false)" >> "$GITHUB_ENV"
+
+      - name: Log in to the registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: runner
+          target: prebuilt
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          attests: type=sbom,generator=${{ env.SBOM_SCANNER_IMAGE }}
+          tags: >-
+            ${{ format('{0}:{1}{2}', env.IMAGE, env.TAG,
+            env.NEWEST_RC == 'true' && format(',{0}:rc', env.IMAGE) || '') }}
+
+      - name: Attest the image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  # The candidate recorded as a deployment to the razorbill-rc environment (one per pool; another
+  # pool is another environment name), as a release's is to razorbill, once CI has passed on the
+  # tagged commit. A machine on the rc channel follows the releases feed and reports nothing to it;
+  # the record is for the pools' history and the gates after it (#550). It is a different
+  # environment from razorbill, whose deployments a stable machine installs, and a stable machine
+  # refuses a ref that is not vX.Y.Z whatever environment it came from.
+  deploy:
+    name: Deploy to razorbill-rc
+    needs: [candidate, image]
+    if: >-
+      ${{ !cancelled() && github.ref_type == 'tag'
+      && needs.candidate.result == 'success' && needs.image.result == 'success' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    permissions:
+      contents: read # to check out the script that waits
+      checks: read # to wait for the tagged commit's checks
+      actions: read # to see whether the commit's workflow runs have all finished
+      deployments: write # to record the deployment
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # This workflow's own run waits too: left out of the count of runs still open on the commit.
+      - name: Wait for the tagged commit's checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WAIT_MINUTES: "40"
+          OWN_WORKFLOWS: version|release|candidate
+        run: |
+          .github/scripts/wait-for-checks.sh "$GITHUB_SHA" \
+            "$GITHUB_REF_NAME is not recorded as deployed (docs/OPERATIONS.md, \"Channels\")"
+
+      - name: Record the deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$ ]]
+          jq -n --arg ref "$TAG" '{
+            ref: $ref, environment: "razorbill-rc", auto_merge: false, required_contexts: [],
+            description: ("zig-runner " + $ref)
+          }' | gh api -X POST "repos/$GITHUB_REPOSITORY/deployments" --input - \
+            --jq '"deployment \(.id): \(.ref) to \(.environment)"'

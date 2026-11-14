@@ -1,0 +1,52 @@
+# Prunes candidate pre-releases (docs/OPERATIONS.md, "Channels"): the ones older than the retention
+# window, other than the newest few of each kind and what a pool is deployed from. candidate.yml
+# prunes after each main candidate; this one is for the days nothing merged, and for a look by
+# hand: a run by hand defaults to a dry run, which deletes nothing and lists what would go.
+#
+# Repository variables (Settings, Secrets and variables, Actions, Variables), both optional:
+#   CANDIDATE_RETENTION_DAYS  days a candidate is kept (14)
+#   CANDIDATE_KEEP            newest candidates of each kind always kept (20)
+name: candidate-prune
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "List what would be pruned, and delete nothing"
+        type: boolean
+        default: true
+
+# Nothing by default; the job asks for what it needs.
+permissions: {}
+
+# Two prunes at once would only race to delete the same releases.
+concurrency:
+  group: candidate-prune
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    name: Prune candidates
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # to delete candidate pre-releases and their tags
+      deployments: read # to see what the pools are deployed from
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RETENTION_DAYS: ${{ vars.CANDIDATE_RETENTION_DAYS || '14' }}
+      KEEP: ${{ vars.CANDIDATE_KEEP || '20' }}
+      # A scheduled run has no input: it deletes. By hand, the input says.
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '--dry-run' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prune
+        run: |
+          # shellcheck disable=SC2086 # DRY_RUN is a flag or empty
+          .github/scripts/prune-candidates.sh $DRY_RUN --days "$RETENTION_DAYS" --keep "$KEEP"

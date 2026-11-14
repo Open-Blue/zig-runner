@@ -17,7 +17,9 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    # Not a tag with a hyphen (v1.2.3-rc1): a release candidate is candidate.yml's, which builds
+    # and attests the same binaries as a pre-release, with no image and no deployment.
+    tags: ["v*", "!v*-*"]
   workflow_dispatch:
     inputs:
       tag:

@@ -163,6 +163,124 @@ sudo cp deploy/zig-runner-deploy.service deploy/zig-runner-deploy.timer /etc/sys
 sudo systemctl daemon-reload && sudo systemctl enable --now zig-runner-deploy.timer
 ```
 
+## Channels
+
+A machine follows a channel: which builds its runner binary comes from. The release is the unit of
+trust for production (every merge since the last, built once, attested, deployed after CI passed on
+it), but a change should run somewhere real before it is one. Channels (#550) put it there without
+touching what stable machines get.
+
+| Channel | Installs | Built by | Feed |
+| --- | --- | --- | --- |
+| `stable` (default) | releases only | `release.yml`, at the tag | the `razorbill` deployment, as above |
+| `rc` | release candidates `vX.Y.Z-rcN`, and releases, the newest by version | `candidate.yml` at the tag; `release.yml` for a release | GitHub's releases |
+| `main` | the candidate built from each commit on `main` | `candidate.yml`, at `main` | GitHub's releases |
+
+**Candidates.** `candidate` builds the release's binaries, both architectures, with the same
+script, hardening check and attested provenance and SBOM as a release, on every push to `main` and
+every tag `vX.Y.Z-rcN`, and publishes them as a pre-release. A main candidate is the release
+`main-N-SHA12` (N is the workflow's run number, so it only grows) whose binaries say
+`vX.Y.Z-main.N+SHA12`, X.Y.Z being the latest release with its patch raised by one. It is never
+"latest", so nothing that follows the latest release sees it, and `release` ignores any tag with a
+hyphen, so a release candidate never takes the release path (stable releases are tagged, built,
+published and signed as before). Release tags are created only by the version workflow's deploy key
+(the "release tags" ruleset), so an `-rc` tag is too. Why releases and not workflow artifacts or one rolling
+`channel-main` release: a release is public, so the agent needs no more access than for a release,
+and each candidate is immutable with its own checksum and attestation (the repository's releases are
+immutable), where artifacts expire and need a token that reads Actions, and a rolling release would
+be overwritten under a machine that was reading it.
+
+**Retention.** Candidates are pre-releases, so they are never "latest", and they are pruned:
+`prune-candidates.sh` deletes a main candidate or release candidate (and its tag) published more
+than `CANDIDATE_RETENTION_DAYS` ago (14), unless it is among the newest `CANDIDATE_KEEP` (20) of its
+kind (main candidates by run number, release candidates by version), the ref of one of the newest
+three deployments of `razorbill-rc` (what the rc pool runs, and what it rolls back to), or named
+with `--protect`. Releases, drafts and anything not named exactly like a candidate are never
+touched. `candidate` runs it after publishing, and `candidate-prune` daily (the days nothing
+merged); a run of the latter by hand defaults to a dry run, which lists what would go and deletes
+nothing (`GH_REPO=... prune-candidates.sh --dry-run --days 14 --keep 20` does the same by hand).
+What a unit on `main` runs is not recorded anywhere GitHub can read, so it is held only by being
+among the newest; keep `CANDIDATE_KEEP` above the number of merges a day times the days a machine
+might be offline. The image of a pruned release candidate stays in the registry.
+
+**The release candidate's image and deployment.** A tag `vX.Y.Z-rcN` also builds, scans (Trivy,
+as a release's) and pushes `ghcr.io/<owner>/zig-runner:vX.Y.Z-rcN` for both architectures, from the
+candidate's own binaries (checked against `SHA256SUMS` and their `candidate.yml` provenance), with
+the image's provenance and SBOM attested, and `:rc` while it is the newest release candidate. It
+never pushes `:latest` or a release's tag (`:vX.Y.Z`), so `latest` and the stable versions are what
+only `release.yml` makes. Once CI has passed on the tagged commit, a deployment is recorded to
+the environment `razorbill-rc` (a release's goes to `razorbill`, whose deployments stable machines
+install): a pool is an environment name, so another pool on `rc` is another environment and a line
+in `candidate.yml`. A main candidate gets neither image nor deployment record: one image per merge
+would fill the registry, and a machine on `main` reads the releases feed anyway.
+
+**To set up (maintainer).** Nothing is needed for the workflows to run. Optional: repository
+variables `CANDIDATE_RETENTION_DAYS` and `CANDIDATE_KEEP`; the `razorbill-rc` environment is created
+by the first deployment (add protection rules to it, or a name for another pool, by hand if wanted);
+if the "release tags" ruleset also restricts deleting tags, pruning an `-rc` tag fails (the release
+is deleted, the tag stays, logged) until the ruleset lets `github-actions` delete tags matching
+`v*-rc*`; GHCR packages may need the repository's Actions access to push (as for releases).
+
+**The agent.** `CHANNEL` in the agent's env file picks the channel (`stable` if unset, which is
+everything described under "The deploy agent", unchanged). On `rc` and `main` it reads the releases
+feed instead of deployments, picks the newest candidate of its channel and runs the same checks:
+the binary against `SHA256SUMS`, then provenance (`gh attestation verify`) from the right workflow
+at the right ref, and the binary says the version the candidate is named for:
+
+- `release`: `release.yml`, `refs/tags/<tag>`, as on `stable`;
+- `rc`: `candidate.yml`, `refs/tags/<tag>`;
+- `main`: `candidate.yml`, `refs/heads/main`, and the commit the tag points at.
+
+The version is monotonic within a channel: a main candidate is ordered by its base version
+(X.Y.Z of its release's name), then its run number N, so a restart of the run numbers under a higher
+base still advances; one that restarts under the same base cannot be ordered, and the agent says so
+in its journal (`kind=main_candidate_stalled`) instead of waiting silently. A main candidate that is not above the
+installed one, or an rc or release older than the installed one, is not installed (logged, not a
+failure; `ALLOW_DOWNGRADE` is `stable`'s). Installing, restarting, the health check and the
+`$BIN.prev` rollback are the same. A `stable` machine never installs a candidate: it takes a
+deployment's ref only if it is `vX.Y.Z`, and checks it against `release.yml`, so a candidate in a
+deployment is refused and a candidate in the feed is never read. A channel has no deployment to
+report to (any number of machines read the feed): outcomes are in the agent's journal. A candidate
+that fails a check is written to `rejected` in the agent's state directory and not fetched again;
+a newer one is tried as usual. A fetch that fails for the moment is retried every minute.
+
+**Switching.** Changing `CHANNEL` is a decision made on the machine, so the first install after
+it replaces the binary whatever its version, and logs `channel switch: stable -> main`; the order is
+checked again from then on. The channel is recorded in the state directory after a successful
+install. Moving back to `stable` installs the newest deployment that went well, though it is
+handled.
+
+**One binary has one channel.** Every instance on a machine runs `/usr/local/bin/zig-runner`, so a
+pool on another channel gets its own binary and its own agent: `zig-runner-deploy@<name>.timer`
+reads `/etc/zig-runner-deploy-<name>.env` and keeps its own state. The pool's runner unit runs
+that binary (a drop-in with `ExecStart=` and the path). Name the stable agent's `UNITS` (left empty it
+restarts every `zig-runner@*.service`) and keep the pool's instance out of it, or the stable agent
+restarts it onto the stable binary.
+
+```sh
+# A pool "qa" on main candidates, beside the stable pools:
+sudo install -m 0755 deploy/zig-runner-deploy /usr/local/bin/
+sudo cp deploy/zig-runner-deploy@.service deploy/zig-runner-deploy@.timer /etc/systemd/system/
+sudo install -m 0600 deploy/zig-runner-deploy.env.example /etc/zig-runner-deploy-qa.env
+# edit it: GH_TOKEN (Contents and Attestations read; no Deployments needed),
+#   CHANNEL=main  BIN=/usr/local/bin/zig-runner-qa  UNITS=zig-runner@qa.service
+sudo systemctl edit zig-runner@qa.service   # [Service] ExecStart= / ExecStart=/usr/local/bin/zig-runner-qa
+sudo systemctl daemon-reload && sudo systemctl enable --now zig-runner-deploy@qa.timer
+```
+
+To see what an agent would do without installing: `DRY_RUN=1 CHANNEL=main BIN=/tmp/zr
+STATE_DIR=/tmp/zr-state UNITS=<any loaded unit> GH_TOKEN=... deploy/zig-runner-deploy`. To put a
+pool on `rc`, the same with `CHANNEL=rc`; to take it off, set `CHANNEL=stable` (or remove the
+line) and let the stable agent's unit own the binary again.
+
+**Progressive environments (#550).** Channels are the ground for the rings: a razorbill `qa` pool on
+`main` runs every main commit's own build before it is a release; the bench pool on `rc` runs the
+release candidate (and then the release itself) before stable pools, which get the release only
+once it is deployed. Cutting a release candidate, the QA verdict that gates a release, and health
+checks are later pieces. The `rc` channel takes a release as soon as it is published, a few minutes
+before `release` records its deployment (which waits for CI on the tagged commit): the canary is
+the first ring, not the last check.
+
 ## A fresh install
 
 `.github/scripts/fresh-install.sh` tests what the README says on a machine with nothing of ours on
