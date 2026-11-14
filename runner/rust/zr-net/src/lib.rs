@@ -5,6 +5,7 @@
 //! and the count of what Rust allocates.
 
 mod alloc;
+mod body;
 mod call;
 mod client;
 mod proxy;
