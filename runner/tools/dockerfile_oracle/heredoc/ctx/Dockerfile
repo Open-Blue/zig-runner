@@ -15,7 +15,6 @@ COPY <<'EOF' /etc/raw
 raw $WHO
 EOF
 COPY --chmod=755 <<EOF /usr/local/bin/script.sh
-#!/bin/sh
 echo script
 EOF
 COPY <<A <<B /docs/
