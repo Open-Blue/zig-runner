@@ -1,0 +1,3 @@
+kind: Added
+body: 'Downloads, the log upload and the image registry go through the Rust network library with streaming bodies (R4 of docs/rust-net.md): a Zig release tarball is hashed as it arrives instead of held (about 50 MB less memory at startup), a layer or a log of any size costs the library''s 1 MiB queue, kept connections are reused per host, and `request:` lines are written for them with the library''s exact figures; the registry''s hand-written redirect workaround and stale-connection retries are gone (the library drops `Authorization` on a redirect to another origin and replaces a closed kept connection itself)'
+time: 2026-11-13T20:15:09.808665322-05:00

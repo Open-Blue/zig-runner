@@ -226,6 +226,9 @@ jobs:
           # No I/O: a run costs microseconds, so many runs fit in the time.
           - { target: Dockerfile builder, runs: 2M }
           - { target: COPY patterns, runs: 3M }
+          # The same answers read as a stream (the queue between the connection and the reader), and
+          # an upload written into a server that may answer before it is sent and close.
+          - { target: HTTP streams, runs: 100K }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

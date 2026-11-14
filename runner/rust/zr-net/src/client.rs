@@ -21,6 +21,9 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// The size of the buffer a connection reads into (see `connect`).
+const READ_BUF: usize = 64 * 1024;
+
 /// A figure that was not measured.
 pub const UNKNOWN: u64 = u64::MAX;
 
@@ -347,7 +350,12 @@ impl Client {
             tls_ns = ns(started.elapsed());
             stream = Box::new(tls);
         }
-        let (sender, conn) = http1::handshake::<_, ReqBody>(TokioIo::new(stream))
+        // A read buffer of one fixed size: hyper's adaptive one grows to hundreds of KiB, and each
+        // chunk of that size is a fresh mapping (musl's malloc maps what is over 128 KiB), faulted in
+        // and returned for every read of a big download; 64 KiB is reused from the heap.
+        let (sender, conn) = http1::Builder::new()
+            .read_buf_exact_size(Some(READ_BUF))
+            .handshake::<_, ReqBody>(TokioIo::new(stream))
             .await
             .map_err(|e| (Code::Protocol, format!("HTTP/1.1 handshake: {e}")))?;
         tokio::spawn(async move {
