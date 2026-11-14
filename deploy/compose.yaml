@@ -50,7 +50,7 @@ services:
 
   runner:
     # The release's image (runner/Dockerfile's `prebuilt` stage); pin a tag in ZIG_RUNNER_IMAGE to stay on one version.
-    image: ${ZIG_RUNNER_IMAGE:-ghcr.io/open-blue/zig-runner:latest}
+    image: ${ZIG_RUNNER_IMAGE:-ghcr.io/open-blue/zig-runner:latest@sha256:de4ff449caab91e53390289268062b522759656b42e7c18aa8a074a8723623d2}
     env_file: runner.env
     environment:
       RUNNER_ENGINE_HOST: unix:///run/dagger/engine.sock
