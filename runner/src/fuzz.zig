@@ -1,7 +1,8 @@
 //! Fuzz tests for the parsers that read what jobs, workflows and servers hand the runner: workflow
 //! commands, problem matchers and their regular expressions, YAML, expressions, hashFiles()
 //! patterns, HPACK, an image's layers (tar, PAX, paths), references, registry challenges and
-//! manifests, minisign signatures and zstd streams (the runner's decoder, held to std's); and
+//! manifests, minisign signatures and zstd streams (the runner's decoder, held to std's), Dockerfiles
+//! (the native builder's parser and planner, and the pattern matcher of its COPY); and
 //! property tests of the text paths that guard secrets and a job's environment: masking (secret masking), file commands and their heredocs (file
 //! commands), the broker's and run service's messages (job messages) and HTTP/2's framing
 //! (HTTP2 frames). A crash in any of them takes the whole runner down, every job on it included,
@@ -27,6 +28,7 @@ const regex = @import("regex.zig");
 const yaml = @import("yaml.zig");
 const image = @import("native/oci/image.zig");
 const layer = @import("native/oci/layer.zig");
+const dockerfile = @import("native/dockerfile.zig");
 const zstd = @import("native/oci/zstd.zig");
 const libzstd = @import("native/oci/libzstd.zig");
 const zlibng = @import("native/oci/zlibng.zig");
@@ -1895,4 +1897,123 @@ fn http2Frames(_: void, smith: *Smith) !void {
         error.OutOfMemory => return e,
         else => {},
     }
+}
+
+// A Dockerfile can be anything an action's author wrote, or a fork's pull request: it is read by
+// the runner before a job's first step, on the runner's own thread, so a crash here is every job's.
+// What must hold of whatever it is: the parser and the planner return, with a plan or a refusal,
+// the plan is the same when made again (the keys are the layers' names in the store), and a plan
+// is well formed: each stage's key is its last step's, a stage starts from or copies from an
+// earlier one only, and the last stage is planned.
+test "fuzz: Dockerfile builder" {
+    try std.testing.fuzz({}, dockerfileBuilder, .{ .corpus = comptime seeds(&.{
+        &.{"FROM alpine:3.22\nRUN apk add --no-cache curl \\\n    jq\nCOPY entrypoint.sh /entrypoint.sh\nENTRYPOINT [\"/entrypoint.sh\"]\n"},
+        &.{"ARG V=1\nFROM golang:$V AS build\nWORKDIR /src\nRUN go build -o /out/app\nFROM scratch\nCOPY --from=build /out/app /app\nCMD [\"/app\"]\n"},
+        &.{"FROM a AS one\nFROM one AS two\nCOPY --from=0 x y\nCOPY --from=one --chown=1:2 --chmod=755 *.sh lib/[a-c]? /d/\n"},
+        &.{"FROM a\nRUN <<EOF\nset -e\necho $HOME\nEOF\nCOPY <<-'X' <<Y /etc/\n\tx\n\tX\ny\nY\nRUN cat <<E > f\nb\nE\n"},
+        &.{"FROM a\nSHELL [\"/bin/bash\", \"-c\"]\nRUN echo $((1<<2)) <<< x\nADD https://example.com/f.bin?x=1 /opt/\nADD g.tar.gz /\n"},
+        &.{"# escape=`\nFROM a\nENV A=1 B=\"x y\" \\\n C=$A\nLABEL k=v\nUSER app:app\nWORKDIR ../..//x\nEXPOSE 80\n"},
+    }) });
+}
+
+/// A plan's images and context, which are not there: every image is the same one, a source's
+/// digest is its names', and a download is a name.
+const FuzzWorld = struct {
+    fn bases() dockerfile.Bases {
+        return .{ .ptr = undefined, .resolveFn = resolve };
+    }
+    fn resolve(_: *anyopaque, _: std.mem.Allocator, ref: []const u8, why: *[]const u8) anyerror!?dockerfile.BaseImage {
+        if (std.mem.startsWith(u8, ref, "x")) {
+            why.* = "no such image";
+            return null;
+        }
+        return .{ .config = .{ .rootfs = "/rootfs", .env = &.{"PATH=/bin"}, .workdir = "/w" }, .id = "id" };
+    }
+    fn context() dockerfile.Context {
+        return .{ .ptr = undefined, .digestFn = digest, .fetchFn = fetch };
+    }
+    fn digest(_: *anyopaque, _: std.mem.Allocator, sources: []const []const u8) anyerror![64]u8 {
+        var h: std.crypto.hash.sha2.Sha256 = .init(.{});
+        for (sources) |s| h.update(s);
+        return std.fmt.bytesToHex(h.finalResult(), .lower);
+    }
+    fn fetch(_: *anyopaque, _: std.mem.Allocator, url: []const u8) anyerror!dockerfile.Fetched {
+        return .{ .file = "/f", .digest = try digest(undefined, undefined, &.{url}) };
+    }
+};
+
+fn dockerfileBuilder(_: void, smith: *Smith) !void {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var buf: [2048]u8 = undefined;
+    const text = take(smith, &buf);
+    const ins = switch (try dockerfile.parse(arena, text)) {
+        .ok => |i| i,
+        .refused => return,
+    };
+    // Every heredoc an instruction names is read, and only for the instructions that take them.
+    for (ins) |x| if (x.heredocs.len > 0) {
+        try std.testing.expect(x.kind == .run or x.kind == .copy or x.kind == .add);
+    };
+    const first = switch (try dockerfile.plan(arena, ins, FuzzWorld.bases(), &.{}, FuzzWorld.context())) {
+        .ok => |p| p,
+        .refused => |r| {
+            try std.testing.expect(r.why.len > 0);
+            return;
+        },
+    };
+    const again = (try dockerfile.plan(arena, ins, FuzzWorld.bases(), &.{}, FuzzWorld.context())).ok;
+    try std.testing.expectEqual(first.stages.len, again.stages.len);
+    try std.testing.expectEqual(first.stages.len - 1, first.final);
+    try std.testing.expect(first.stages[first.final].needed);
+    for (first.stages, again.stages, 0..) |s, t, i| {
+        try std.testing.expectEqualSlices(u8, &s.key, &t.key);
+        if (!s.needed) continue;
+        if (s.steps.len > 0) try std.testing.expectEqualSlices(u8, &s.steps[s.steps.len - 1].key, &s.key);
+        for (s.steps) |st| {
+            for (st.key) |c| try std.testing.expect(std.ascii.isHex(c));
+            switch (st.op) {
+                .copy => |c| {
+                    try std.testing.expect(c.sources.len > 0);
+                    try std.testing.expect(c.dest.len > 0 and c.dest[0] == '/');
+                    switch (c.from) {
+                        .stage => |d| try std.testing.expect(d < i and first.stages[d].needed),
+                        else => {},
+                    }
+                },
+                .run => |r| try std.testing.expect(r.argv.len > 0),
+                .mkdir => |m| try std.testing.expect(m.path.len > 0 and m.path[0] == '/'),
+                .none => {},
+            }
+        }
+        switch (s.base) {
+            .stage => |d| try std.testing.expect(d < i and first.stages[d].needed),
+            else => {},
+        }
+    }
+}
+
+test "fuzz: COPY patterns" {
+    try std.testing.fuzz({}, copyPatterns, .{ .corpus = comptime seeds(&.{
+        &.{ "*.sh", "run.sh" },
+        &.{ "[a-c]x?", "bxy" },
+        &.{ "[^a-c]", "d" },
+        &.{ "a*b*c*", "aXbYcZ" },
+        &.{ "\\*", "*" },
+        &.{ "[", "[" },
+    }) });
+}
+
+fn copyPatterns(_: void, smith: *Smith) !void {
+    var pattern_buf: [64]u8 = undefined;
+    var name_buf: [64]u8 = undefined;
+    const pattern = take(smith, &pattern_buf);
+    const name = take(smith, &name_buf);
+    const hit = dockerfile.globMatch(pattern, name);
+    // `*` matches every name; a name with no wildcard in it matches itself.
+    try std.testing.expect(dockerfile.globMatch("*", name));
+    if (std.mem.indexOfAny(u8, name, "*?[\\") == null) try std.testing.expect(dockerfile.globMatch(name, name));
+    // A pattern that is a literal matches exactly what is equal to it.
+    if (std.mem.indexOfAny(u8, pattern, "*?[\\") == null) try std.testing.expectEqual(std.mem.eql(u8, pattern, name), hit);
 }
