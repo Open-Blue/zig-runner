@@ -1092,6 +1092,13 @@ fn jobCgroup(
                 why_out.* = untrusted_limits_why;
                 return error.NoJobLimits;
             }
+            // No swap unless the job asks (`--memory-swap`, `limitSwap`), and the runner lets it
+            // (`RUNNER_NATIVE_SWAP`): its own `memory.swap.max` is 0 from the start, whatever the parent's.
+            j.setSwap(arena, "0") catch {
+                j.remove(arena, b.io);
+                why_out.* = "the job's memory.swap.max could not be set to 0";
+                return error.NoJobLimits;
+            };
             b.job_cgroup = j;
             b.parent_ooms = j.usage(b.io).parent_ooms;
             // What holds is what the log says, and what a kill is put down to.
@@ -1111,7 +1118,8 @@ fn jobCgroup(
                 if (!j.all.accounted)
                     "may swap: this kernel does not account for swap"
                 else if (j.all.swap)
-                    "may swap (RUNNER_NATIVE_SWAP)"
+                    "may swap (RUNNER_NATIVE_SWAP): each job's own memory.swap.max is 0 unless its " ++
+                        "container options ask for swap (--memory-swap)"
                 else
                     "may not swap",
             }));
@@ -1124,10 +1132,12 @@ fn jobCgroup(
                 std.log.warn("native: {s}", .{said});
             }
             // memory.high from what the gate reserves for the job; under memory.max, which stays
-            // the hard cap. Only where it can slow a job, not stop it (`cgroup.canSwap`).
+            // the hard cap. Only where it can slow a job, not stop it (`cgroup.canSwap`): the job's
+            // own swap is 0 here (above), whatever the parent allows, so it is never set at
+            // set-up; a job that asks for swap later (`limitSwap`) has none either.
             const g = b.gate orelse return;
             const high_mb = g.native(j.dir) orelse return;
-            if (!cgroup.canSwap(j.all, b.io)) {
+            if (!cgroup.canSwap(.{ .swap = false }, b.io)) {
                 g.noHigh(if (b.limits.memory_max) |m| m >> 20 else null);
                 try b.notes.append(arena, "Native steps: no memory.high: with no swap it would " ++
                     "stop a job past it instead of slowing it. memory.max ends one that takes " ++
@@ -10801,7 +10811,7 @@ test "root runner: native gate accuracy, each job's own cgroup against the engin
     try std.testing.expect(seen[2] >= 2 * mb - 20);
 }
 
-test "root runner: a native job's cgroup gets memory.high from what the gate reserves for it" {
+test "root runner: a native job with no options has memory.swap.max 0 and no memory.high, though the runner lets jobs swap" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -10811,9 +10821,9 @@ test "root runner: a native job's cgroup gets memory.high from what the gate res
     var cfg = try testConfig(arena, &tmp);
     const parent = try testCgroup(arena, &cfg);
     defer parent.remove(arena);
-    // On a machine with no swap at all it has no use (`cgroup.canSwap`), and the test below has it.
-    const can = cgroup.canSwap(.{ .swap = true }, io);
-    if (!can) return error.SkipZigTest;
+    // The kernel must account for swap, or there is no file.
+    var swap_file: [8]u8 = undefined;
+    _ = std.Io.Dir.cwd().readFile(io, try std.fmt.allocPrint(arena, "{s}/memory.swap.max", .{parent.dir}), &swap_file) catch return error.SkipZigTest;
     cfg.cgroup.swap = true;
     var slots: [1]admission.Admission.Slot = undefined;
     var pool: admission.Admission = .init(io, .{ .margin_percent = 0 }, &slots);
@@ -10822,50 +10832,14 @@ test "root runner: a native job's cgroup gets memory.high from what the gate res
     var gate: admission.Gate = .{ .pool = &pool };
     var gated = cfg;
     gated.gate = &gate;
-    const key = admission.jobKey("o/r", "ci.yml", "memory.high");
-    const job = testJob(&.{testStep("echo small job")});
-
-    // Not learned yet: `native_per_job_mb` (256 MB), twice that and 512 MB of headroom, as the
-    // kernel holds it (read back from the job's cgroup), beside its memory.max.
     gate.leave(true);
-    gate.assigned(key);
-    const first = try runNativeJob(arena, gated, job, .root);
-    if (!first.res.succeeded) std.debug.print("{s}\n", .{first.text});
-    try std.testing.expect(first.res.succeeded);
-    try std.testing.expectEqual(@as(?u32, 1024), slots[0].high_mb);
-    try expectLines(first.text, &.{
-        "with memory.max ",
-        "Native steps: all native jobs under ",
-        "Native steps: memory.high 1.0 GB, from what the memory gate reserves for the job",
-    });
-    // All jobs' limits are on the parent.
-    const all = cgroup.Limits.of(io, cfg.cgroup, parent.dir);
-    // The kernel rounds it down to a page.
-    const held = admission.readCgroupBytes(io, parent.dir, "memory.max").?;
-    try std.testing.expect(held <= all.memory_total.? and all.memory_total.? - held < 1 << 16);
-    var pids_buf: [32]u8 = undefined;
-    const pids = try std.Io.Dir.cwd().readFile(
-        io,
-        try std.fmt.allocPrint(arena, "{s}/pids.max", .{parent.dir}),
-        &pids_buf,
-    );
-    const pids_held = try std.fmt.parseInt(u32, std.mem.trim(u8, pids, "\n"), 10);
-    try std.testing.expectEqual(all.pids_total.?, pids_held);
-    const learned = gate.ended() orelse return error.TestUnexpectedResult;
-    try std.testing.expect(learned.native and learned.alone);
-    // The job's own few MB (its shell and helper), or the 64 MB floor.
-    try std.testing.expect(learned.estimate_mb < 128);
-
-    // Learned: its next memory.high is from what it took, 640 MB at the floor.
-    gate.leave(true);
-    gate.assigned(key);
-    const second = try runNativeJob(arena, gated, job, .root);
-    try std.testing.expect(second.res.succeeded);
-    const high = admission.nativeHighMb(learned.estimate_mb);
-    try std.testing.expectEqual(@as(?u32, high), slots[0].high_mb);
-    try expectLines(second.text, &.{
-        try std.fmt.allocPrint(arena, "Native steps: memory.high {d} MB, from ", .{high}),
-    });
+    gate.assigned(admission.jobKey("o/r", "ci.yml", "no swap unless asked"));
+    const step = testStep("cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup | sed 's,/steps$,,')\n" ++
+        "echo \"swap=$(cat $cg/memory.swap.max)\"; echo \"high=$(cat $cg/memory.high)\"");
+    const r = try runNativeJob(arena, gated, testJob(&.{step}), .root);
+    if (!r.res.succeeded) std.debug.print("{s}\n", .{r.text});
+    try expectLines(r.text, &.{ "swap=0", "high=max", "Native steps: no memory.high", "each job's own memory.swap.max is 0 unless" });
+    try std.testing.expectEqual(@as(?u32, null), slots[0].high_mb);
     _ = gate.ended();
 }
 

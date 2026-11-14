@@ -81,7 +81,8 @@ pub const Config = struct {
     /// `RUNNER_NATIVE_MEMORY_TOTAL_MB`: all jobs' under the parent together; null for what
     /// `totalOf` leaves, 0 for no limit.
     memory_total_mb: ?u32 = null,
-    /// `RUNNER_NATIVE_SWAP`: whether jobs may swap (`memory.swap.max` on the parent).
+    /// `RUNNER_NATIVE_SWAP`: whether jobs may ask for swap (`memory.swap.max` on the parent). A job's
+    /// own is 0 unless its `--memory-swap` asks.
     swap: bool = false,
     /// `RUNNER_NATIVE_PIDS_MAX`: each job's `pids.max`, and `pids_total_jobs` times it for all
     /// jobs together; 0 for no limit.
