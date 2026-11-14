@@ -926,12 +926,13 @@ const PollServer = struct {
             var r = conn.reader(io, &rb);
             var wb: [256]u8 = undefined;
             var w = conn.writer(io, &wb);
-            while (!s.stopping.load(.acquire)) {
-                // The request's head, up to its empty line.
-                while (true) {
-                    const line = r.interface.takeDelimiterInclusive('\n') catch break;
-                    if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break;
-                } else break;
+            serving: while (!s.stopping.load(.acquire)) {
+                // The request's head, up to its empty line. A connection that ended is not a request:
+                // without this the server held and answered it, and went on, in a loop of its own.
+                head: while (true) {
+                    const line = r.interface.takeDelimiterInclusive('\n') catch break :serving;
+                    if (std.mem.trimEnd(u8, line, "\r\n").len == 0) break :head;
+                }
                 var held: u64 = 0;
                 while (held < s.hold_ms and !s.stopping.load(.acquire)) : (held += 100)
                     io.sleep(.fromMilliseconds(100), .awake) catch return;
