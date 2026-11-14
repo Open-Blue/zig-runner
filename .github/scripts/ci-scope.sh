@@ -139,7 +139,7 @@ needed() {
 		esac
 		;;
 	apt)
-		# apt-test.sh runs apt.sh's mirror fallback in a container, against the real mirrors.
+		# apt-test.sh runs apt.sh's mirror fallback in a container, against a signed repository it serves itself (no internet).
 		case $1 in
 		.github/scripts/apt.sh | .github/scripts/apt-test.sh | .github/workflows/ci.yml | \
 			.github/scripts/ci-scope.sh) return 0 ;;

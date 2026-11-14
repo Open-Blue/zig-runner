@@ -104,6 +104,10 @@ pub fn checkOne(comptime f: anytype, args: anytype) !void {
     const fmt = if (@TypeOf(args[0]) == []const u8) "\"{s}\"" else "{any}";
     if (stride() == 1) check(gpa, f, args) catch |e| {
         std.debug.print("allocation failures: failed for input " ++ fmt ++ "\n", .{args[0]});
+        // A failure that was swallowed: failing them one at a time says which allocation it was.
+        if (e == error.SwallowedOutOfMemoryError) checkEachAllocationFailure(f, args) catch |each| {
+            std.debug.print("allocation failures: failing one at a time: {s}\n", .{@errorName(each)});
+        };
         return e;
     };
     checkEachAllocationFailure(f, args) catch |e| {
@@ -125,14 +129,45 @@ fn checkEachAllocationFailure(comptime f: anytype, args: anytype) !void {
         var once: FailOnce = .{ .child = std.heap.smp_allocator };
         try @call(.auto, f, .{once.allocator()} ++ args);
         try once.checkFreed();
-        n = once.count;
+        n = once.count.load(.monotonic);
     }
     var i: usize = 0;
     while (i < n) : (i += stride()) {
         var once: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i };
         if (@call(.auto, f, .{once.allocator()} ++ args)) |_| {
-            if (once.failed) return error.SwallowedOutOfMemoryError;
+            if (once.failed.load(.monotonic)) {
+                // Where that allocation was made, for whoever swallowed its failure.
+                var again: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i, .trace = true };
+                std.debug.print("allocation failures: allocation {d} of {d} failed and the run went on, made at:\n", .{ i, n });
+                _ = @call(.auto, f, .{again.allocator()} ++ args) catch |rerun| std.debug.print("  (the rerun ended in {s})\n", .{@errorName(rerun)});
+                return error.SwallowedOutOfMemoryError;
+            }
         } else |e| if (e != error.OutOfMemory) return e;
+        try once.checkFreed();
+    }
+}
+
+/// For code whose failure to allocate is no error to its caller, but a step it does not take
+/// (`Store.collect`, which evicts what it can): `f` runs once per allocation with that one failing,
+/// and must find for itself what it expects after. Only an error other than `error.OutOfMemory`,
+/// or memory not freed, fails here.
+pub fn checkEach(comptime f: anytype, args: anytype) !void {
+    var n: usize = 0;
+    {
+        var once: FailOnce = .{ .child = std.heap.smp_allocator };
+        try @call(.auto, f, .{once.allocator()} ++ args);
+        try once.checkFreed();
+        n = once.count.load(.monotonic);
+    }
+    var i: usize = 0;
+    while (i < n) : (i += stride()) {
+        var once: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i };
+        @call(.auto, f, .{once.allocator()} ++ args) catch |e| if (e != error.OutOfMemory) {
+            std.debug.print("allocation failures: allocation {d} of {d} failing, the run failed, made at:\n", .{ i, n });
+            var again: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i, .trace = true };
+            _ = @call(.auto, f, .{again.allocator()} ++ args) catch |rerun| std.debug.print("  (the rerun ended in {s})\n", .{@errorName(rerun)});
+            return e;
+        };
         try once.checkFreed();
     }
 }
@@ -161,52 +196,62 @@ pub fn checkNoLeaks(comptime f: anytype, args: anytype) !void {
     }
 }
 
-/// Fails allocation number `fail_at`, and only that one.
-const FailOnce = struct {
+/// Fails allocation number `fail_at`, and only that one. The counters are atomic, so that
+/// allocations from other threads (the layer fetching tasks') can be failed and counted too.
+pub const FailOnce = struct {
     child: Allocator,
     fail_at: ?usize = null,
-    count: usize = 0,
-    failed: bool = false,
+    /// Print where the failed allocation was made.
+    trace: bool = false,
+    count: std.atomic.Value(usize) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
     /// Bytes allocated and not yet freed.
-    live: usize = 0,
+    live: std.atomic.Value(usize) = .init(0),
 
-    fn checkFreed(o: *const FailOnce) !void {
-        if (o.live != 0) return error.MemoryLeakDetected;
+    pub fn checkFreed(o: *const FailOnce) !void {
+        if (o.live.load(.monotonic) != 0) return error.MemoryLeakDetected;
     }
 
-    fn allocator(o: *FailOnce) Allocator {
+    pub fn allocator(o: *FailOnce) Allocator {
         return .{ .ptr = o, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const o: *FailOnce = @ptrCast(@alignCast(ctx));
-        defer o.count += 1;
-        if (o.fail_at == o.count) {
-            o.failed = true;
+        if (o.fail_at == o.count.fetchAdd(1, .monotonic)) {
+            o.failed.store(true, .monotonic);
+            if (o.trace) std.debug.dumpCurrentStackTrace(.{ .first_address = ra });
             return null;
         }
         const memory = o.child.rawAlloc(len, alignment, ra) orelse return null;
-        o.live += len;
+        _ = o.live.fetchAdd(len, .monotonic);
         return memory;
     }
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
         const o: *FailOnce = @ptrCast(@alignCast(ctx));
         if (!o.child.rawResize(memory, alignment, new_len, ra)) return false;
-        o.live = o.live - memory.len + new_len;
+        o.resized(memory.len, new_len);
         return true;
     }
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
         const o: *FailOnce = @ptrCast(@alignCast(ctx));
         const moved = o.child.rawRemap(memory, alignment, new_len, ra) orelse return null;
-        o.live = o.live - memory.len + new_len;
+        o.resized(memory.len, new_len);
         return moved;
+    }
+
+    fn resized(o: *FailOnce, old_len: usize, new_len: usize) void {
+        if (new_len >= old_len)
+            _ = o.live.fetchAdd(new_len - old_len, .monotonic)
+        else
+            _ = o.live.fetchSub(old_len - new_len, .monotonic);
     }
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const o: *FailOnce = @ptrCast(@alignCast(ctx));
-        o.live -= memory.len;
+        _ = o.live.fetchSub(memory.len, .monotonic);
         o.child.rawFree(memory, alignment, ra);
     }
 };

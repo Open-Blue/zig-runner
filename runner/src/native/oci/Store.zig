@@ -89,7 +89,7 @@ pub fn lockDir(arena: Allocator, io: std.Io, dir: []const u8, how: i32) !std.Io.
         const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
         errdefer f.close(io);
         try flock(f, how);
-        if (LayerStore.sameFile(arena, f, path)) return f;
+        if (LayerStore.sameFile(f, path)) return f;
         f.close(io);
     }
 }
@@ -134,9 +134,9 @@ pub fn ensure(
         if (cwd.access(io, dir, .{})) |_| {} else |_| {
             // A runner that died while making it left this; the lock says no one is making it now.
             const tmp = try std.fmt.allocPrint(arena, "{s}/{s}/.tmp-{s}", .{ s.root, kind, key });
-            removeTree(arena, io, tmp);
+            removeTree(io, tmp);
             try cwd.createDirPath(io, tmp);
-            errdefer removeTree(arena, io, tmp);
+            errdefer removeTree(io, tmp);
             try make.makeFn(make.ptr, tmp);
             try syncFilesystem(arena, tmp);
             try cwd.rename(tmp, cwd, dir, io);
@@ -167,10 +167,21 @@ pub fn syncFilesystem(arena: Allocator, path: []const u8) !void {
 
 /// Removes a tree, giving directories their permissions back first when that is what stops it
 /// (overlay's work directory, a rootless runner's read-only directories).
-pub fn removeTree(arena: Allocator, io: std.Io, path: []const u8) void {
+///
+/// Allocates nothing: a leftover tree it could not remove for want of memory was made into by the
+/// next `ensure` as if it were empty. A path too long for the kernel names nothing.
+pub fn removeTree(io: std.Io, path: []const u8) void {
     const parent = std.fs.path.dirname(path) orelse return;
-    const name = arena.dupeSentinel(u8, std.fs.path.basename(path), 0) catch return;
-    const rc = linux.open(arena.dupeSentinel(u8, parent, 0) catch return, .{
+    const base = std.fs.path.basename(path);
+    var name_buf: [std.Io.Dir.max_name_bytes + 1]u8 = undefined;
+    var parent_buf: [linux.PATH_MAX]u8 = undefined;
+    if (base.len >= name_buf.len or parent.len >= parent_buf.len) return;
+    @memcpy(name_buf[0..base.len], base);
+    name_buf[base.len] = 0;
+    @memcpy(parent_buf[0..parent.len], parent);
+    parent_buf[parent.len] = 0;
+    const name = name_buf[0..base.len :0];
+    const rc = linux.open(parent_buf[0..parent.len :0], .{
         .ACCMODE = .RDONLY,
         .DIRECTORY = true,
         .CLOEXEC = true,
@@ -522,4 +533,64 @@ test "native store: an upper flattened onto its lower, whiteouts and opaque dire
     if (have_opq) try testing.expectError(error.FileNotFound, d.access(io, "out/opq/old", .{}));
     const st = try d.statFile(io, "out/keep/k", .{});
     try testing.expectEqual(@as(u64, 2), st.nlink);
+}
+
+test "allocation failures: a directory's lock file" {
+    const af = @import("../../alloc_failures.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const S = struct {
+        /// Out of memory is an error to the caller, never a lock that is not the file's and is
+        /// asked for again: that went round for ever.
+        fn run(a: Allocator, path: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            const held = try lockDir(arena.allocator(), testing.io, path, lock_sh);
+            held.close(testing.io);
+            const hold_it = (try holdDir(arena.allocator(), testing.io, path)) orelse return;
+            hold_it.close(testing.io);
+        }
+    };
+    try af.checkOne(S.run, .{dir});
+}
+
+test "allocation failures: a directory made where a dead runner left a half-made one" {
+    const af = @import("../../alloc_failures.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const S = struct {
+        var runs: usize = 0;
+        fn make(_: *anyopaque, dir: []const u8) anyerror!void {
+            var d = try std.Io.Dir.cwd().openDir(testing.io, dir, .{});
+            defer d.close(testing.io);
+            // What the dead runner left must not be here.
+            try testing.expectError(error.FileNotFound, d.access(testing.io, "stale", .{}));
+            try d.writeFile(testing.io, .{ .sub_path = "x", .data = "made" });
+        }
+        fn run(a: Allocator, root_: []const u8) !void {
+            runs += 1;
+            var setup: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer setup.deinit();
+            const s: Store = .{ .root = try std.fmt.allocPrint(setup.allocator(), "{s}/run{d}", .{ root_, runs }) };
+            try s.prepare(setup.allocator(), testing.io);
+            const stale = try std.fmt.allocPrint(testing.allocator, "{s}/rootfs/.tmp-k1", .{s.root});
+            defer testing.allocator.free(stale);
+            try std.Io.Dir.cwd().createDirPath(testing.io, stale);
+            const leftover = try std.fmt.allocPrint(testing.allocator, "{s}/stale", .{stale});
+            defer testing.allocator.free(leftover);
+            try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = leftover, .data = "half" });
+
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            var never: u8 = 0;
+            const made = try s.ensure(arena.allocator(), testing.io, "rootfs", "k1", .{ .ptr = &never, .makeFn = make });
+            made.lock.close(testing.io);
+            try testing.expect(made.made);
+        }
+    };
+    try af.checkOne(S.run, .{root});
 }

@@ -2341,3 +2341,73 @@ test "native hashFiles: an ACL on the file and on a directory counts, past the m
     try setMode(f, "l0/ws/d", 0o700);
     try expectFailed("sha256sum: d/a: " ++ denied, try hashAs(f, &.{"l0"}, step, &.{"d/a"}));
 }
+
+/// Passes allocations on, but never resizes or remaps in place: the same calls to `child` on every run.
+const NoResize = struct {
+    child: Allocator,
+
+    fn allocator(n: *NoResize) Allocator {
+        return .{ .ptr = n, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn of(ctx: *anyopaque) *NoResize {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        return of(ctx).child.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        of(ctx).child.rawFree(memory, alignment, ra);
+    }
+};
+
+test "allocation failures: hashFiles over layers, links and exclusions" {
+    const af = @import("../alloc_failures.zig");
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var f = try Fixture.init(a.allocator());
+    defer f.cleanup();
+    try f.put("l0/ws/a.txt", "a0");
+    try f.put("l0/ws/sub/b.txt", "b");
+    try f.put("l0/ws/sub/deep/c.md", "c");
+    try f.put("l1/ws/a.txt", "a1");
+    try f.link("l0/ws/link.txt", "sub/b.txt");
+    const stack = try f.stackOf(&.{ "l1", "l0" }, .{});
+    const want = hashOf(&.{ "a1", "b", "b" });
+    const S = struct {
+        /// The hash, or out of memory: never a `.failed` that blames the tree.
+        fn run(gpa: Allocator, stack_: Stack, args: []const []const u8, expected: []const u8) !void {
+            // `hashFiles` grows an arena over `gpa`, which asks it to resize in place; whether the
+            // page allocator can depends on what is mapped beside the block, so under load the
+            // count of allocations varied between runs (`NondeterministicMemoryUsage`). Refusing
+            // every resize makes the arena take fresh blocks, the same ones each time.
+            var fixed: NoResize = .{ .child = gpa };
+            const wrapped = fixed.allocator();
+            const got = try hashFiles(wrapped, wrapped, std.testing.io, stack_, "/ws", "/home/runner", args);
+            switch (got) {
+                .ok => |h| {
+                    defer wrapped.free(h);
+                    try std.testing.expectEqualStrings(expected, h);
+                },
+                .failed => |why| {
+                    defer wrapped.free(why);
+                    std.debug.print("hashFiles failed: {s}\n", .{why});
+                    return error.TestUnexpectedResult;
+                },
+            }
+        }
+    };
+    // Layer l1's a.txt over l0's, the link as the file it leads to, in GitHub's order.
+    try af.checkOne(S.run, .{ stack, @as([]const []const u8, &.{ "**/*.txt", "!**/deep/**" }), @as([]const u8, &want) });
+    try af.checkOne(S.run, .{ stack, @as([]const []const u8, &.{"nothing/**"}), @as([]const u8, "") });
+}

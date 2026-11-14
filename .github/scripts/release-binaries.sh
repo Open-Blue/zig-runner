@@ -3,7 +3,8 @@
 # deploy/zig-runner-deploy does: each binary against SHA256SUMS, and its provenance, built by
 # release.yml from that tag on GitHub's own runners (gh attestation verify). With --complete, also
 # that the release has every file the binaries job attaches, so a run that finds it published
-# (a re-run) can trust it is whole. Needs gh with GH_TOKEN and GH_REPO.
+# (a re-run) can trust it is whole. SIGNER_WORKFLOW (default release.yml) names the workflow whose
+# provenance counts: candidate.yml for a release candidate's image. Needs gh with GH_TOKEN and GH_REPO.
 #
 #   release-binaries.sh [--complete] <tag> <dir>      e.g. release-binaries.sh v0.14.0 dist
 set -euo pipefail
@@ -36,7 +37,7 @@ gh release download "$tag" -D "$dir" --clobber -p 'zig-runner-linux-*' -p SHA256
 (cd "$dir" && sha256sum --check --strict SHA256SUMS)
 for name in "${binaries[@]}"; do
 	gh attestation verify "$dir/$name" --repo "$GH_REPO" \
-		--signer-workflow "$GH_REPO/.github/workflows/release.yml" \
+		--signer-workflow "$GH_REPO/.github/workflows/${SIGNER_WORKFLOW:-release.yml}" \
 		--source-ref "refs/tags/$tag" --deny-self-hosted-runners >/dev/null
 done
 echo "$tag: ${binaries[*]} match SHA256SUMS and their provenance${complete:+; every file is attached}"

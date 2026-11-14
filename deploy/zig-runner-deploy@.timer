@@ -1,0 +1,11 @@
+# Asks GitHub every minute whether the channel %i follows has something new
+# (zig-runner-deploy@.service). A run still going is not started again.
+[Unit]
+Description=Check the channel %i follows for a new zig-runner
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+
+[Install]
+WantedBy=timers.target

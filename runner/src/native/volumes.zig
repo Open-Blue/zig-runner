@@ -196,7 +196,7 @@ pub fn openWaiting(
             .locked => if (linux.errno(linux.flock(f.handle, lock_ex)) != .SUCCESS) return error.Locked,
             .private => private = linux.errno(linux.flock(f.handle, lock_ex | lock_nb)) != .SUCCESS,
         }
-        if (private or Store.sameFile(arena, f, lock_path)) break f;
+        if (private or Store.sameFile(f, lock_path)) break f;
         f.close(io);
     };
     errdefer lock.close(io);
@@ -506,7 +506,7 @@ pub fn openNamedWaiting(
         // which a shared lock waits for.
         const alone = linux.errno(linux.flock(f.handle, lock_ex | lock_nb)) == .SUCCESS;
         if (!alone) try waitShared(io, f, wait, dir);
-        if (!Store.sameFile(arena, f, lock_path)) {
+        if (!Store.sameFile(f, lock_path)) {
             f.close(io);
             continue;
         }
@@ -617,7 +617,7 @@ pub const Plan = struct {
         if (v.private) return null;
         if (linux.errno(linux.flock(v.lock.handle, lock_ex | lock_nb)) != .SUCCESS) return null;
         const lock_path = std.fmt.allocPrint(arena, "{s}.lock", .{v.dir}) catch return null;
-        if (!Store.sameFile(arena, v.lock, lock_path)) return null;
+        if (!Store.sameFile(v.lock, lock_path)) return null;
         // The other user's volume, which is this one's parent or child directory and has a lock of
         // its own: a job holding it can write here, so no verdict is made while it does.
         if (openBeside(arena, v.dir, std.mem.eql(u8, std.fs.path.basename(v.dir), evict.nested))) |fd| {

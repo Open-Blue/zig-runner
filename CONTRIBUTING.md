@@ -54,6 +54,11 @@ git config core.hooksPath .githooks
   shellcheck and shfmt; hadolint; `gofmt` and `go vet`; the Lean proofs and the `hashFiles()` model;
   SPIN. A small change takes under a minute.
 
+Each pre-push step prints its name and, when it ends, one summary line; a check's own output is
+hidden unless it fails. The long steps name their log as they start (`build and tests (output:
+/tmp/pre-push-tests.…)`), so `tail -f` on that file follows them. `PRE_PUSH_VERBOSE=1 git push`
+shows every check's output as it runs instead.
+
 CI checks the same things whatever the hooks did. Don't push with `--no-verify`.
 
 ## Making a change

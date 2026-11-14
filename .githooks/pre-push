@@ -57,12 +57,12 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 	say "checking $branch at ${local_sha:0:8}"
 	(
 		cd "$tree/runner"
-		zig fmt --check build.zig build.zig.zon src tools >/dev/null || fail "zig fmt: run zig fmt on the files above"
+		zig fmt --check build.zig build.zig.zon src tools >"$quiet" || fail "zig fmt: run zig fmt on the files above"
 		say "GitHub's expression cases"
-		../.github/scripts/expr-conformance.sh >/dev/null || fail "expressions: ../.github/scripts/expr-conformance.sh --report shows what changed"
-		say "build and tests"
-		log=$(mktemp)
-		if ! ../.github/scripts/zig-test.sh >"$log" 2>&1; then
+		../.github/scripts/expr-conformance.sh >"$quiet" || fail "expressions: ../.github/scripts/expr-conformance.sh --report shows what changed"
+		log=$(mktemp -t pre-push-tests.XXXXXX)
+		say "build and tests (output: $log)"
+		if ! logged "$log" ../.github/scripts/zig-test.sh; then
 			grep -E 'FAIL|error|passed;' "$log" | tail -20 >&2
 			rm -f "$log"
 			fail "the build or the tests failed"
@@ -70,14 +70,15 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 		grep "passed;" "$log" | tail -1 | sed "s/^/$hook: /" >&2
 		rm -f "$log"
 		say "every test file is compiled"
-		../.github/scripts/test-files.sh >/dev/null || fail "a file's tests are not in the test binary: ../.github/scripts/test-files.sh shows which"
+		../.github/scripts/test-files.sh >"$quiet" || fail "a file's tests are not in the test binary: ../.github/scripts/test-files.sh shows which"
 		if grep -qE '^runner/|^db/|^\.github/scripts/(zig-test|zig-modules|zlint)\.sh$|^\.github/scripts/zlint-suppressed\.baseline$' <<<"$changed"; then
 			say "the tests on overlayfs, in Docker"
 			if ! command -v docker >/dev/null || ! docker info >/dev/null 2>&1; then
 				fail "the runner's code changed, and its tests on overlayfs need Docker running (CI's \"Test, on overlayfs\")"
 			fi
-			log=$(mktemp)
-			if ! ZIG_TEST_IN_CONTAINER=1 ZIG_TEST_MIN_PASSED=500 ../.github/scripts/zig-test.sh >"$log" 2>&1; then
+			log=$(mktemp -t pre-push-overlayfs.XXXXXX)
+			say "output: $log"
+			if ! ZIG_TEST_IN_CONTAINER=1 ZIG_TEST_MIN_PASSED=500 logged "$log" ../.github/scripts/zig-test.sh; then
 				grep -E 'FAIL|error|passed;|fewer than' "$log" | tail -20 >&2
 				rm -f "$log"
 				fail "the tests failed on overlayfs (ZIG_TEST_IN_CONTAINER=1 ../.github/scripts/zig-test.sh)"
@@ -85,22 +86,22 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 			grep "passed;" "$log" | tail -1 | sed "s/^/$hook: on overlayfs: /" >&2
 			rm -f "$log"
 			say "ZLint, and its suppressed-errors check"
-			../.github/scripts/zlint.sh >/dev/null || fail "ZLint found problems: ../.github/scripts/zlint.sh shows them"
-			../.github/scripts/zlint.sh suppressed-errors >/dev/null ||
+			../.github/scripts/zlint.sh >"$quiet" || fail "ZLint found problems: ../.github/scripts/zlint.sh shows them"
+			../.github/scripts/zlint.sh suppressed-errors >"$quiet" ||
 				fail "a new catch {} or catch unreachable: ../.github/scripts/zlint.sh suppressed-errors shows it"
 		fi
 	)
 	say "unsafe constructs ratchet"
-	(cd "$tree" && .github/scripts/unsafe-ratchet.sh >/dev/null) || fail "more unsafe casts than the baseline: .github/scripts/unsafe-ratchet.sh shows which"
+	(cd "$tree" && .github/scripts/unsafe-ratchet.sh >"$quiet") || fail "more unsafe casts than the baseline: .github/scripts/unsafe-ratchet.sh shows which"
 	if grep -qE '\.sh$|^\.githooks/|^deploy/zig-runner-deploy$' <<<"$changed"; then
 		say "shellcheck"
-		(cd "$tree" && .github/scripts/shellcheck.sh >/dev/null) || fail "shellcheck found problems: .github/scripts/shellcheck.sh shows them"
+		(cd "$tree" && .github/scripts/shellcheck.sh >"$quiet") || fail "shellcheck found problems: .github/scripts/shellcheck.sh shows them"
 		say "shfmt"
-		(cd "$tree" && .github/scripts/shfmt.sh >/dev/null 2>&1) || fail "shell scripts not formatted: .github/scripts/shfmt.sh -w formats them"
+		(cd "$tree" && .github/scripts/shfmt.sh >"$quiet" 2>&1) || fail "shell scripts not formatted: .github/scripts/shfmt.sh -w formats them"
 	fi
 	if grep -qE '(^|/)Dockerfile' <<<"$changed"; then
 		say "hadolint"
-		(cd "$tree" && .github/scripts/hadolint.sh >/dev/null) || fail "hadolint found problems: .github/scripts/hadolint.sh shows them"
+		(cd "$tree" && .github/scripts/hadolint.sh >"$quiet") || fail "hadolint found problems: .github/scripts/hadolint.sh shows them"
 	fi
 	if grep -q '^\.github/workflows/' <<<"$changed"; then
 		say "actionlint and zizmor"
@@ -124,13 +125,13 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 		# elan installs lake in ~/.elan/bin without necessarily putting it on PATH.
 		command -v lake >/dev/null || PATH="$HOME/.elan/bin:$PATH"
 		command -v lake >/dev/null || fail "proofs/ or glob.zig changed, and checking them needs Lean (proofs/README.md)"
-		(cd "$tree/proofs" && lake build >/dev/null) || fail "the proofs do not check: run lake build in proofs/"
+		(cd "$tree/proofs" && lake build >"$quiet") || fail "the proofs do not check: run lake build in proofs/"
 		(cd "$tree" && .github/scripts/glob-lean-diff.sh 2000 "$RANDOM" >&2) || fail "glob.zig and the Lean model differ"
 	fi
 	if grep -qE '^proofs/(tla|spin)/|^\.github/workflows/(version|release|store-model)\.yml$|^\.github/scripts/(next-version|wait-for-checks|check-names|spin)\.sh$|^\.github/checks-on-main$' <<<"$changed"; then
 		say "SPIN, the store's and the release pipeline's models (a minute)"
 		command -v spin >/dev/null || fail "the models or the release pipeline changed, and checking them needs SPIN 6.5.2 (.github/scripts/spin.sh)"
-		(cd "$tree" && SPIN_DIR="${SPIN_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/zig-runner-spin}" .github/scripts/spin.sh >/dev/null) ||
+		(cd "$tree" && SPIN_DIR="${SPIN_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/zig-runner-spin}" .github/scripts/spin.sh >"$quiet") ||
 			fail "SPIN found an error: .github/scripts/spin.sh shows it"
 	fi
 	git worktree remove --force "$tree"

@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Running out of memory is no longer read as an answer: allocation-failure tests of the OCI decoders, registry client, native store, Dockerfile, problem-matcher and Gitea-state code found and fixed a lock loop that spun at 100% CPU, a stale image tree built over, layers evicted and locks removed for want of memory, a Dockerfile JSON instruction read as shell text, and OutOfMemory reported as WriteFailed, Unauthorized or BadState; the Rust network library''s abort on a null malloc is now documented.'
+time: 2026-11-13T23:25:32.225062988-05:00

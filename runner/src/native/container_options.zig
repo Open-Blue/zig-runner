@@ -292,8 +292,7 @@ const dropped = "; Dagger drops a container's `options:`, so it is not applied t
 
 fn refuse(arena: Allocator, why: *[]const u8, word: []const u8, reason: []const u8) Error {
     const fmt = "the job container's option `{s}` {s}" ++ dropped;
-    why.* = std.fmt.allocPrint(arena, fmt, .{ word, reason }) catch
-        "a job container option is not carried out natively";
+    why.* = std.fmt.allocPrint(arena, fmt, .{ word, reason }) catch return error.OutOfMemory;
     return error.Refused;
 }
 
@@ -323,7 +322,7 @@ fn refusePort(arena: Allocator, why: *[]const u8, raw: []const u8, reason: []con
     why.* = std.fmt.allocPrint(arena, "a job container's port `{s}` {s}" ++ dropped_ports, .{
         raw,
         reason,
-    }) catch "a job container's port is not carried out natively" ++ dropped_ports;
+    }) catch return error.OutOfMemory;
     return error.Refused;
 }
 
@@ -442,7 +441,7 @@ fn refuseVolume(arena: Allocator, why: *[]const u8, raw: []const u8, reason: []c
     why.* = std.fmt.allocPrint(arena, "a job container's volume `{s}` {s}" ++ dropped_volumes, .{
         raw,
         reason,
-    }) catch "a job container's volume is not carried out natively" ++ dropped_volumes;
+    }) catch return error.OutOfMemory;
     return error.Refused;
 }
 
@@ -1124,4 +1123,44 @@ test "without a job cgroup: an unsized tmpfs is refused, and sizes are capped" {
     try std.testing.expect(withoutCgroup(big_sum) != null);
     const edge = try parse(arena, "--tmpfs /a:size=512m --shm-size 512m", &why);
     try std.testing.expect(withoutCgroup(edge) == null);
+}
+
+test "allocation failures: a container's options, ports and volumes" {
+    const af = @import("../alloc_failures.zig");
+    // A refusal says why in the arena, and when that allocation fails the answer is out of memory,
+    // not `Refused` (which would send the job to Dagger over a lack of memory). So a refused input
+    // is `Refused` in every run that is not failed, and `checkOne` fails any run where an allocation
+    // failed and the answer was still `Refused` or a result.
+    const S = struct {
+        /// The options as read, `Refused` as it is without a failure, or out of memory (never `Refused` in its place).
+        fn options(a: Allocator, text: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            var why: []const u8 = "";
+            _ = parse(arena.allocator(), text, &why) catch |e| if (e == error.Refused) return else return e;
+        }
+        fn port(a: Allocator, text: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            var why: []const u8 = "";
+            _ = parsePort(arena.allocator(), text, &why) catch |e| if (e == error.Refused) return else return e;
+        }
+        fn volume(a: Allocator, text: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            var why: []const u8 = "";
+            _ = parseVolume(arena.allocator(), text, &why) catch |e| if (e == error.Refused) return else return e;
+        }
+    };
+    for ([_][]const u8{
+        "--env A=1 -e B=2 --env=C=3 -eD=4 -e E=\"two words\" --user 1001:50 --hostname h --add-host a:10.0.0.1 --shm-size 64m",
+        "--tmpfs /run:size=10m,mode=1777 --memory 512m --init --health-cmd 'true'",
+        "-e HOME=/x --workdir /w --privileged",
+        "--env",
+        "-e A='unterminated",
+    }) |text| try af.checkOne(S.options, .{text});
+    for ([_][]const u8{ "80", "127.0.0.1:8080:80/tcp", "0.0.0.0::53/UDP", "99999:1", "a:b:c:d" }) |text|
+        try af.checkOne(S.port, .{text});
+    for ([_][]const u8{ "/data", "cache:/cache:ro", "/srv/data:/data", "v:/a//b/./c/", "x:/y:bogus:z", "" }) |text|
+        try af.checkOne(S.volume, .{text});
 }

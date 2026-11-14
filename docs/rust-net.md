@@ -76,6 +76,12 @@ Behaviour changes to know about, none of which is a deliberate decision of this 
 - **Allocator.** Zig's `smp_allocator` and `page_allocator` are unchanged. Rust allocates with musl's `malloc`
   (mallocng): a second heap. `proc_stats.heap` sees only Zig's, as the study warned. R2 adds a counter for Rust's
   allocations through a `#[global_allocator]` wrapper reporting bytes in use over the ABI, so RSS accounting stays honest.
+  **When `malloc` returns null the process aborts**: Rust's `handle_alloc_error` prints "memory allocation of N bytes
+  failed" and calls `abort()` whatever the panic strategy is, and no export reports it as an error (Zig's allocation
+  failures are `error.OutOfMemory`, the ABI's are not allocation-aware). Only starting the runtime's threads fails
+  softly (`zr_net_runtime_start` returns the errno). On Linux's default overcommit `malloc` rarely returns null before
+  the OOM killer acts, so the difference is mostly theoretical; the bounds that matter are the response cap
+  (`max_response`, 16 MiB by default, which a call's body `Vec` cannot pass) and hyper's own limit on a response's head.
 - **Signals and `abort`.** `panic = "abort"` calls musl's `abort()` (SIGABRT): the runner dies, and its service manager
   restarts it; the job in flight is lost as with any crash, which is the behaviour a Zig panic already has.
 - **TSan**: see "Validation".

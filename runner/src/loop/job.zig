@@ -34,6 +34,7 @@ const Runner = @import("../loop.zig").Runner;
 const Cycle = @import("../loop.zig").Cycle;
 const Registering = @import("../loop.zig").Registering;
 const stopRequested = @import("../loop.zig").stopRequested;
+const ratelimit = @import("../github/ratelimit.zig");
 const stop_signals = &@import("../loop.zig").stop_signals;
 const say = @import("exchange.zig").say;
 const sayUnallocated = @import("../loop.zig").sayUnallocated;
@@ -213,6 +214,12 @@ fn slowOutputs(c: Runner, repo: []const u8) bool {
     return so.spent(repo) != null;
 }
 
+/// Whether an answer may pass with time: 5xx, 429, or a 403 that names a rate limit.
+fn retryable(r: broker.Response) bool {
+    return r.status.class() == .server_error or r.status == .too_many_requests or
+        (r.status == .forbidden and r.wait_ms > 0);
+}
+
 /// Waits before each further acquire, in milliseconds: 15.5 s in all.
 const acquire_retry_ms = [_]i64{ 500, 1000, 2000, 4000, 8000 };
 
@@ -229,17 +236,51 @@ fn acquire(
     while (true) : (attempt += 1) {
         const last = attempt == retry_ms.len or stopRequested();
         if (runservice.acquire(c.arena, c.io, jr, token)) |r| {
-            if (last or r.status.class() != .server_error) return r;
+            if (last or !retryable(r)) return r;
             try say(c, "'{s}': acquirejob answered HTTP {d}; trying again", .{
                 c.name,
                 @backingInt(r.status),
             });
+            // At least what GitHub asked (`Retry-After`, a rate limit's reset); a stop ends the wait.
+            if (try sleepUnlessStopped(c.io, ratelimit.wait(c.io, retry_ms[attempt], r.wait_ms))) return r;
+            continue;
         } else |e| {
             if (last or e == error.OutOfMemory) return e;
             try say(c, "'{s}': acquirejob failed ({s}); trying again", .{ c.name, @errorName(e) });
+            if (try sleepUnlessStopped(c.io, retry_ms[attempt])) return e;
         }
-        c.io.sleep(.fromMilliseconds(retry_ms[attempt]), .awake) catch {};
     }
+}
+
+/// Sleeps `ms`, or until a stop is requested if that comes first; true when it did. A wait on
+/// GitHub's `Retry-After` can be a minute, and a SIGTERM must not wait for it: the sleep and a
+/// watcher run next to each other and whichever ends first cancels the other (as `loop.poll`).
+/// Cancellation of the caller is an error, not a stop.
+fn sleepUnlessStopped(io: std.Io, ms: i64) error{ Canceled, ConcurrencyUnavailable }!bool {
+    const Woke = union(enum) { elapsed: error{Canceled}!void, stopped: void };
+    var buf: [2]Woke = undefined;
+    var sel: std.Io.Select(Woke) = .init(io, &buf);
+    errdefer while (sel.cancel()) |_| {};
+    try sel.concurrent(.elapsed, sleepFor, .{ io, ms });
+    try sel.concurrent(.stopped, sleepUntilStop, .{io});
+    const first = try sel.await();
+    while (sel.cancel()) |_| {}
+    return switch (first) {
+        .stopped => true,
+        .elapsed => |slept| {
+            try slept;
+            return false;
+        },
+    };
+}
+
+fn sleepFor(io: std.Io, ms: i64) error{Canceled}!void {
+    return io.sleep(.fromMilliseconds(ms), .awake);
+}
+
+/// Returns once a stop is requested, or when cancelled. In short steps, as `waitForStop` does.
+fn sleepUntilStop(io: std.Io) void {
+    while (!stopRequested()) io.sleep(.fromMilliseconds(100), .awake) catch return;
 }
 
 /// The job's identity for the memory gate, in the trust scope the backends keep volumes apart by
@@ -1093,14 +1134,19 @@ fn completeJob(
             annotations_json,
             environment_url,
         );
-        const retry = if (r) |resp| resp.status.class() == .server_error else |_| true;
+        const retry = if (r) |resp| retryable(resp) else |_| true;
         if (!retry or attempt == delays.len) return r;
+        const asked: i64 = if (r) |resp| resp.wait_ms else |_| 0;
+        const wait_ms = ratelimit.wait(c.io, delays[attempt] * std.time.ms_per_s, asked);
+        // The wait itself (it can be longer than the table's: `Retry-After`), rounded up. Not cut
+        // short by a stop: a job not completed stays held, and a job's cancel ends this sleep.
+        const wait_s = @divFloor(wait_ms + std.time.ms_per_s - 1, std.time.ms_per_s);
         if (r) |resp| {
             try logfmt.line(c.err, .warn, "completejob_retry", "http={d} wait_s={d}", .{
-                @backingInt(resp.status), delays[attempt],
+                @backingInt(resp.status), wait_s,
             });
-        } else |e| try logfmt.line(c.err, .warn, "completejob_retry", "err={t} wait_s={d}", .{ e, delays[attempt] });
-        c.io.sleep(.fromSeconds(delays[attempt]), .awake) catch {};
+        } else |e| try logfmt.line(c.err, .warn, "completejob_retry", "err={t} wait_s={d}", .{ e, wait_s });
+        try c.io.sleep(.fromMilliseconds(wait_ms), .awake);
     }
 }
 
@@ -1876,4 +1922,58 @@ test "acquirejob is tried again after a 5xx or a failed connection, not after a 
         const retries = std.mem.count(u8, out.buffered(), "trying again");
         try std.testing.expectEqual(@as(usize, 2), retries);
     }
+}
+
+/// Raises the stop signal once `accepted` connections have reached `server` (or at once, with 0).
+fn raiseStopAfter(io: std.Io, server: *const @import("../github/testserver.zig").Server, accepted: u32) void {
+    while (server.accepts.load(.acquire) < accepted) io.sleep(.fromMilliseconds(5), .awake) catch return;
+    io.sleep(.fromMilliseconds(50), .awake) catch return;
+    stop_signals.store(1, .release);
+}
+
+test "a stop ends a long wait: the stop path is taken, not the timer" {
+    const io = std.testing.io;
+    var server: @import("../github/testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    stop_signals.store(0, .release);
+    defer stop_signals.store(0, .release);
+    var raiser = try io.concurrent(raiseStopAfter, .{ io, &server, 0 });
+    defer raiser.cancel(io);
+    // Ten minutes: a timer that won would hang here, not fail; a stop ends it at the next check.
+    try std.testing.expect(try sleepUnlessStopped(io, 10 * 60 * std.time.ms_per_s));
+    // And a short wait with no stop elapses.
+    stop_signals.store(0, .release);
+    try std.testing.expect(!try sleepUnlessStopped(io, 1));
+}
+
+test "acquirejob's wait on Retry-After ends at a stop, without another request" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var server: @import("../github/testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    var url_buf: [64]u8 = undefined;
+    var cfg: Config = .{ .gh_token = "", .scope = undefined };
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    const c = testRunner(arena, &log, &err, &cfg);
+    const jr: runservice.JobRequest = .{
+        .runner_request_id = "r",
+        .run_service_url = try arena.dupe(u8, server.url(&url_buf, "127.0.0.1", "/limited")),
+    };
+    stop_signals.store(0, .release);
+    defer stop_signals.store(0, .release);
+    var raiser = try io.concurrent(raiseStopAfter, .{ io, &server, 1 });
+    defer raiser.cancel(io);
+    // The server asks for 7 s (and the backoff is 1 ms): the stop comes during that wait.
+    const r = try acquire(c, jr, "token", &[_]i64{ 1, 1 });
+    try std.testing.expectEqual(std.http.Status.too_many_requests, r.status);
+    // Without the stop path the wait ran out and a second request was made.
+    try std.testing.expectEqual(@as(u32, 1), server.accepts.load(.acquire));
 }

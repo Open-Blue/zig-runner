@@ -8,6 +8,7 @@
 const std = @import("std");
 const broker = @import("broker.zig");
 const http = @import("http.zig");
+const ratelimit = @import("ratelimit.zig");
 const job_mod = @import("../job.zig");
 const sink = @import("../sink.zig");
 const timefmt = @import("../timefmt.zig");
@@ -135,6 +136,8 @@ pub const Result = struct {
     detail: []const u8,
     /// A failure that another try may get past (`transientError`, `transientStatus`).
     transient: bool = false,
+    /// How long GitHub asked to wait before another try (`broker.Response.wait_ms`), in milliseconds.
+    wait_ms: i64 = 0,
 };
 
 /// What every call answers for a job that names no results service.
@@ -227,11 +230,21 @@ fn retrying(io: std.Io, retry: Retry, comptime try_fn: anytype, args: anytype) R
     while (true) : (attempt += 1) {
         const r = tryOnce(try_fn, args);
         if (r.ok or !r.transient or attempt == retry.delays_ms.len) return r;
-        const delay_ns = retry.delays_ms[attempt] * std.time.ns_per_ms;
+        // At least what GitHub asked (`Retry-After`, the rate limit's reset), unless the budget
+        // runs out first: then this gives up now, not after sleeping to the end of it.
         const elapsed = std.Io.Clock.awake.now(io).toNanoseconds() - started;
-        if (elapsed + delay_ns >= retry.budget.nanoseconds) return r;
+        const delay_ns = delayWithinBudget(io, retry, attempt, r.wait_ms, elapsed) orelse return r;
         io.sleep(.fromNanoseconds(delay_ns), .awake) catch return r;
     }
+}
+
+/// How long to wait before try `attempt` + 1: the backoff, or what GitHub asked if longer
+/// (`ratelimit.wait`); null when `elapsed_ns` plus that is past the budget, and the retry gives up.
+fn delayWithinBudget(io: std.Io, retry: Retry, attempt: usize, asked_ms: i64, elapsed_ns: i96) ?i96 {
+    const delay_ms = ratelimit.wait(io, retry.delays_ms[attempt], asked_ms);
+    const delay_ns = @as(i96, delay_ms) * std.time.ns_per_ms;
+    if (elapsed_ns + delay_ns >= retry.budget.nanoseconds) return null;
+    return delay_ns;
 }
 
 /// Whether a request that failed with `err` may pass when made again: the name server, the
@@ -447,7 +460,8 @@ pub const blob_deadline_max: std.Io.Duration = .fromSeconds(5 * 60);
 fn failed(arena: Allocator, what: []const u8, r: broker.Response) !Result {
     return .{
         .ok = false,
-        .transient = transientStatus(r.status),
+        .transient = transientStatus(r.status) or (r.status == .forbidden and r.wait_ms > 0),
+        .wait_ms = r.wait_ms,
         .detail = try std.fmt.allocPrint(arena, "{s}: HTTP {d}: {s}", .{
             what,
             @backingInt(r.status),
@@ -718,4 +732,65 @@ test "what is worth trying again" {
     try std.testing.expect(transientStatus(.bad_gateway));
     try std.testing.expect(!transientStatus(.forbidden));
     try std.testing.expect(!transientStatus(.not_found));
+}
+
+test "a 429 with Retry-After is waited out before the next try, not retried at once" {
+    var server: @import("testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    server.results_fail = 1;
+    server.results_fail_on = "SignedBlobURL";
+    server.results_fail_status = "429 Too Many Requests";
+    server.results_fail_headers = "Retry-After: 1\r\n";
+    const started = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+    const r = testUpload(&server, .job, quick);
+    const took = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - started;
+    try std.testing.expect(r.ok);
+    // The backoff was 1 ms; the server asked for a second.
+    try std.testing.expect(took >= 1000 * std.time.ns_per_ms);
+}
+
+test "a 403 with x-ratelimit-remaining 0 waits for the reset" {
+    var server: @import("testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    server.results_fail = 1;
+    server.results_fail_on = "SignedBlobURL";
+    server.results_fail_status = "403 Forbidden";
+    var hdr: [96]u8 = undefined;
+    const now_s = @divFloor(std.Io.Clock.real.now(std.testing.io).toMilliseconds(), 1000);
+    server.results_fail_headers = try std.fmt.bufPrint(&hdr, "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {d}\r\n", .{now_s + 2});
+    const started = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+    const r = testUpload(&server, .job, quick);
+    const took = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - started;
+    try std.testing.expect(r.ok);
+    // Two seconds after the second the clock was read in: more than one full second from now.
+    try std.testing.expect(took >= 1000 * std.time.ns_per_ms);
+}
+
+test "a Retry-After longer than the budget gives up at once, not after the wait" {
+    const io = std.testing.io;
+    const short: Retry = .{ .delays_ms = &.{ 1, 1 }, .budget = .fromMilliseconds(500) };
+    // No sleep is decided on, whatever the clock: 30 s asked, 500 ms of budget (and the same for
+    // an hour, a day, and a huge number the header parser bounds).
+    for ([_]i64{ 30_000, 3_600_000, std.math.maxInt(i64) }) |asked| {
+        try std.testing.expectEqual(@as(?i96, null), delayWithinBudget(io, short, 0, asked, 0));
+    }
+    // Within the budget the wait is the request, with jitter.
+    const long: Retry = .{ .delays_ms = &.{ 1, 1 }, .budget = .fromSeconds(600) };
+    const d = delayWithinBudget(io, long, 0, 30_000, 0).?;
+    try std.testing.expect(d >= 30_000 * std.time.ns_per_ms and d <= 33_000 * std.time.ns_per_ms);
+
+    // End to end: one request is made, and the retry ends there (a sleep to the 30 s would have
+    // let the budget's check run again and a second request through, or hung this test).
+    var server: @import("testserver.zig").Server = undefined;
+    try server.start();
+    defer server.stop();
+    server.results_fail = 100;
+    server.results_fail_on = "SignedBlobURL";
+    server.results_fail_status = "429 Too Many Requests";
+    server.results_fail_headers = "Retry-After: 30\r\n";
+    const r = testUpload(&server, .job, short);
+    try std.testing.expect(!r.ok and r.transient);
+    try std.testing.expectEqual(@as(u32, 99), server.results_fail);
 }
