@@ -2442,11 +2442,16 @@ test "homeOf reads the home directory of a uid from /etc/passwd" {
     try std.testing.expect(homeOf("garbage", 0) == null);
 }
 
-/// Renames a file back and forth in `dir` until `stop`, to race what follows a `..`.
+/// Renames a file back and forth in `dir` until `stop`, to race what follows a `..`. Each pair
+/// gives up the CPU if another thread is waiting for it: on an idle machine that changes nothing,
+/// on a busy one it keeps a storm that spins on its own cores from starving the opener it races
+/// (openIn gives up after `open_tries` EAGAINs in a row, which only a renamer that is running
+/// while the opener is not can bring about).
 fn renameUntil(dir: linux.fd_t, stop: *std.atomic.Value(bool)) void {
     while (!stop.load(.monotonic)) {
         _ = linux.renameat(dir, "a", dir, "b");
         _ = linux.renameat(dir, "b", dir, "a");
+        std.Thread.yield() catch {};
     }
 }
 
