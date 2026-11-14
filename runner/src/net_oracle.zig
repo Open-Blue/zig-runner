@@ -405,10 +405,10 @@ test "oracle: a body written past its declared length is an error the caller see
     var url_buf: [96]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/sink", .{server.port});
     const Long = struct {
-        /// `len` and 10 more bytes, in the one write (it is buffered) or in pieces past the queue.
-        fn write(ptr: *const anyopaque, w: *Io.Writer) anyerror!void {
-            const total: *const usize = @ptrCast(@alignCast(ptr));
-            var left = total.*;
+        /// How many bytes `write` writes, set per case (it runs on this thread).
+        var total: usize = 0;
+        fn write(_: *const anyopaque, w: *Io.Writer) anyerror!void {
+            var left = total;
             const chunk: [4096]u8 = @splat('x');
             while (left > 0) {
                 const n = @min(left, chunk.len);
@@ -417,15 +417,17 @@ test "oracle: a body written past its declared length is an error the caller see
             }
         }
     };
+    const unused: u8 = 0;
     // Declared 100, 110 written (in the buffer, over at the flush); declared 0; declared 3 MiB
     // and 10 bytes more (the writer meets the refusal at the end of a long body).
     for ([_][2]usize{ .{ 100, 110 }, .{ 0, 10 }, .{ 3 << 20, (3 << 20) + 10 } }) |c| {
-        const body: net_client.Body = .{ .len = c[0], .ptr = &c[1], .writeFn = Long.write };
+        Long.total = c[1];
+        const body: net_client.Body = .{ .len = c[0], .ptr = &unused, .writeFn = Long.write };
         try std.testing.expectError(error.BodyLongerThanDeclared, net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = body, .deadline = .fromSeconds(10) }));
     }
     // Exactly its length is fine.
-    const exact: usize = 100;
-    const ok: net_client.Body = .{ .len = 100, .ptr = &exact, .writeFn = Long.write };
+    Long.total = 100;
+    const ok: net_client.Body = .{ .len = 100, .ptr = &unused, .writeFn = Long.write };
     try std.testing.expectEqual(std.http.Status.ok, (try net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = ok, .deadline = .fromSeconds(10) })).status);
 }
 
