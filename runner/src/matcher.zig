@@ -72,8 +72,10 @@ pub const Loaded = struct {
 };
 
 pub fn load(arena: Allocator, json_text: []const u8) Error!Loaded {
-    const parsed = std.json.parseFromSlice(std.json.Value, arena, json_text, .{}) catch
-        return error.BadMatcher;
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, json_text, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.BadMatcher,
+    };
     const root = parsed.value;
     if (root != .object) return error.BadMatcher;
     const list = root.object.get("problemMatcher") orelse return error.BadMatcher;
@@ -109,6 +111,9 @@ pub fn load(arena: Allocator, json_text: []const u8) Error!Loaded {
                 break;
             }
             const re = regex.Regex.compile(arena, rx_v.string) catch |e| {
+                // Out of memory is no verdict on the pattern: a matcher refused for it stayed
+                // inert for the whole job, with "OutOfMemory" as its reason.
+                if (e == error.OutOfMemory) return error.OutOfMemory;
                 // One unusable pattern makes the whole matcher inert: a matcher whose second
                 // pattern cannot compile would otherwise emit annotations from half a sequence.
                 const why = @errorName(e);
@@ -684,4 +689,37 @@ test "the newest matcher is tried first, and one GitHub would drop passes the li
     try testing.expect(known.line == null);
     // Nothing at all: no issue.
     try testing.expect(try drops.feed(ar, "") == null);
+}
+
+test "allocation failures: a matcher file loaded, with a pattern refused and a file that is not one" {
+    const af = @import("alloc_failures.zig");
+    const S = struct {
+        /// Out of memory is never the matcher's refusal or a bad file; those are as without it.
+        fn run(a: std.mem.Allocator, text: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            const loaded = load(arena.allocator(), text) catch |e| {
+                if (e == error.BadMatcher) return;
+                return e;
+            };
+            // A matcher that loads is the same with and without failures; that they can be told
+            // apart here is what the refusals' count and the matchers' are for.
+            try testing.expectEqual(expected_matchers(text), loaded.matchers.len);
+            try testing.expectEqual(expected_refused(text), loaded.refused.len);
+        }
+        fn expected_matchers(text: []const u8) usize {
+            return if (std.mem.indexOf(u8, text, "a-b") == null and std.mem.indexOf(u8, text, "problemMatcher") != null) 1 else 0;
+        }
+        fn expected_refused(text: []const u8) usize {
+            return if (std.mem.indexOf(u8, text, "a-b") != null) 1 else 0;
+        }
+    };
+    for ([_][]const u8{
+        go_matcher,
+        \\{ "problemMatcher": [ { "owner": "exotic", "pattern": [
+        \\  { "regexp": "^(?<a-b>x)(.*)$", "message": 1 } ] } ] }
+        ,
+        "not json",
+        "{}",
+    }) |text| try af.checkOne(S.run, .{text});
 }
