@@ -267,7 +267,7 @@ pub fn lockKey(
     while (true) {
         const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
         if (flock(f, lock_ex | lock_nb)) {
-            if (sameFile(arena, f, path)) return f;
+            if (sameFile(f, path)) return f;
             f.close(io);
             continue;
         }
@@ -314,7 +314,7 @@ pub fn open(s: Store, arena: Allocator, io: std.Io, key: Key) !?Hit {
     const lock_path = try join(arena, dir, "lock");
     const f = std.Io.Dir.cwd().openFile(io, lock_path, .{}) catch return null;
     // Waits out an eviction under way, which then leaves the path naming nothing.
-    if (!flock(f, lock_sh) or !sameFile(arena, f, lock_path)) {
+    if (!flock(f, lock_sh) or !sameFile(f, lock_path)) {
         f.close(io);
         return null;
     }
@@ -542,7 +542,7 @@ pub fn checkEntry(s: Store, arena: Allocator, io: std.Io, name: []const u8) !?u6
         return e;
     };
     defer f.close(io);
-    if (!flock(f, lock_sh) or !sameFile(arena, f, lock_path)) return null;
+    if (!flock(f, lock_sh) or !sameFile(f, lock_path)) return null;
     const m = try metaOf(arena, io, dir);
     // A layer whose data is not yet synced counts what the page cache will take (`settle` counts it again).
     if (m.pending != null) return m.bytes;
@@ -1479,7 +1479,7 @@ fn evictOpened(s: Store, arena: Allocator, io: std.Io, name: []const u8, lock: ?
     const full = std.fmt.allocPrint(arena, "{s}/layers/{s}", .{ s.root, name }) catch return false;
     if (lock) |l| {
         if (!flock(l, lock_ex | lock_nb)) return false;
-        if (!sameFile(arena, l, join(arena, full, "lock") catch return false)) return false;
+        if (!sameFile(l, join(arena, full, "lock") catch return false)) return false;
     }
     var raw: [8]u8 = undefined;
     io.random(&raw);
@@ -1588,15 +1588,21 @@ pub fn lockBeside(arena: Allocator, io: std.Io, path: []const u8) !std.Io.File {
     return error.Locked;
 }
 
-/// Whether `f` is the file `path` names now.
-pub fn sameFile(arena: Allocator, f: std.Io.File, p: []const u8) bool {
+/// Whether `f` is the file `path` names now. The path is copied to the stack, not an arena: this
+/// is asked in loops that go round again on "no" (`lockKey`, `oci.Store.lockDir`), and a "no" made
+/// by an allocation that failed went round for ever, spinning. A path too long for the kernel
+/// names nothing.
+pub fn sameFile(f: std.Io.File, p: []const u8) bool {
     var held: linux.Statx = undefined;
     var named: linux.Statx = undefined;
-    const z = arena.dupeSentinel(u8, p, 0) catch return false;
+    var z: [linux.PATH_MAX]u8 = undefined;
+    if (p.len >= z.len) return false;
+    @memcpy(z[0..p.len], p);
+    z[p.len] = 0;
     const mask: linux.STATX = .{ .INO = true };
     if (linux.errno(linux.statx(f.handle, "", linux.AT.EMPTY_PATH, mask, &held)) != .SUCCESS)
         return false;
-    if (linux.errno(linux.statx(linux.AT.FDCWD, z, 0, mask, &named)) != .SUCCESS) return false;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, z[0..p.len :0], 0, mask, &named)) != .SUCCESS) return false;
     return held.ino == named.ino and held.dev_major == named.dev_major and
         held.dev_minor == named.dev_minor;
 }
@@ -4027,13 +4033,13 @@ test "native store: sameFile tells the file a path names from another on the sam
     const f = try tmp.dir.openFile(io, "one", .{});
     defer f.close(io);
     const one = try std.fmt.allocPrint(arena, "{s}/one", .{root});
-    try std.testing.expect(sameFile(arena, f, one));
-    try std.testing.expect(!sameFile(arena, f, try std.fmt.allocPrint(arena, "{s}/two", .{root})));
-    try std.testing.expect(!sameFile(arena, f, try std.fmt.allocPrint(arena, "{s}/none", .{root})));
+    try std.testing.expect(sameFile(f, one));
+    try std.testing.expect(!sameFile(f, try std.fmt.allocPrint(arena, "{s}/two", .{root})));
+    try std.testing.expect(!sameFile(f, try std.fmt.allocPrint(arena, "{s}/none", .{root})));
     // Replaced under the same name, as an eviction leaves it: no longer the file held.
     try tmp.dir.deleteFile(io, "one");
     try tmp.dir.writeFile(io, .{ .sub_path = "one", .data = "1" });
-    try std.testing.expect(!sameFile(arena, f, one));
+    try std.testing.expect(!sameFile(f, one));
 }
 
 test "native store: trees queued while a collect holds the reaper wait for its release" {
@@ -4106,4 +4112,27 @@ test "native store: a collect leaves what the store holds known, publishes add t
     s.limits.min_free_pct = 100;
     try std.testing.expect(!s.lagFits(arena, io));
     s.collect(arena, io);
+}
+
+test "allocation failures: a key's lock" {
+    const af = @import("../alloc_failures.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try tmp.dir.createDirPath(std.testing.io, "keys");
+    const S = struct {
+        /// Out of memory is an error to the caller, never a lock that is not the file's and is
+        /// asked for again: that went round for ever.
+        fn run(a: Allocator, root_: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            const s: Store = .{ .root = root_ };
+            var never: std.atomic.Value(bool) = .init(false);
+            var kh: KeyHasher = .plain("alloc");
+            const held = try s.lockKey(arena.allocator(), std.testing.io, kh.final(), &never);
+            held.close(std.testing.io);
+        }
+    };
+    try af.checkOne(S.run, .{root});
 }

@@ -359,7 +359,7 @@ fn dropUnfinished(arena: Allocator, io: std.Io, tree: []const u8, entry: []const
     const lock_path = std.fmt.allocPrint(arena, "{s}.lock", .{entry}) catch return;
     const lock = Store.lockBeside(arena, io, lock_path) catch return;
     defer lock.close(io);
-    if (!flock(lock, lock_ex | lock_nb) or !Store.sameFile(arena, lock, lock_path)) return;
+    if (!flock(lock, lock_ex | lock_nb) or !Store.sameFile(lock, lock_path)) return;
     _ = removeSome(arena, tree, io, budget);
 }
 
@@ -615,7 +615,7 @@ fn dropStray(arena: Allocator, io: std.Io, dir: []const u8) void {
     defer lock.close(io);
     if (!flock(lock, lock_ex | lock_nb)) return;
     const path = std.fmt.allocPrint(arena, "{s}.lock", .{dir}) catch return;
-    if (!Store.sameFile(arena, lock, path) or isDir(arena, dir)) return;
+    if (!Store.sameFile(lock, path) or isDir(arena, dir)) return;
     forget(arena, io, dir);
 }
 
@@ -2464,7 +2464,7 @@ test "native eviction: a job that waited on a lock an eviction removed does not 
     eviction.close(io);
     t.join();
     defer job.got.?.close(io);
-    try testing.expect(Store.sameFile(arena, job.got.?, lock_path));
+    try testing.expect(Store.sameFile(job.got.?, lock_path));
 }
 
 test "native eviction: a pass syncs the filesystem once, however many areas have something dead" {

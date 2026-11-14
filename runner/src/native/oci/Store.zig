@@ -89,7 +89,7 @@ pub fn lockDir(arena: Allocator, io: std.Io, dir: []const u8, how: i32) !std.Io.
         const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
         errdefer f.close(io);
         try flock(f, how);
-        if (LayerStore.sameFile(arena, f, path)) return f;
+        if (LayerStore.sameFile(f, path)) return f;
         f.close(io);
     }
 }
@@ -522,4 +522,25 @@ test "native store: an upper flattened onto its lower, whiteouts and opaque dire
     if (have_opq) try testing.expectError(error.FileNotFound, d.access(io, "out/opq/old", .{}));
     const st = try d.statFile(io, "out/keep/k", .{});
     try testing.expectEqual(@as(u64, 2), st.nlink);
+}
+
+test "allocation failures: a directory's lock file" {
+    const af = @import("../../alloc_failures.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const S = struct {
+        /// Out of memory is an error to the caller, never a lock that is not the file's and is
+        /// asked for again: that went round for ever.
+        fn run(a: Allocator, path: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            const held = try lockDir(arena.allocator(), testing.io, path, lock_sh);
+            held.close(testing.io);
+            const hold_it = (try holdDir(arena.allocator(), testing.io, path)) orelse return;
+            hold_it.close(testing.io);
+        }
+    };
+    try af.checkOne(S.run, .{dir});
 }

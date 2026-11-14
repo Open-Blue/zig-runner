@@ -1421,7 +1421,7 @@ fn lockSlot(arena: Allocator, io: std.Io, dir: []const u8) !Slot {
     for (0..net.max_slots) |n| {
         const path = try std.fmt.allocPrint(arena, "{s}/{d}.lock", .{ dir, n });
         const lock = lockFile(arena, io, path, false) catch continue;
-        if (!sameFile(arena, lock, path)) {
+        if (!sameFile(lock, path)) {
             lock.close(io);
             continue;
         }
@@ -1594,7 +1594,7 @@ fn sweep(arena: Allocator, io: std.Io, store: []const u8, cg_parent: ?[]const u8
         defer held.close(io);
         if (std.os.linux.errno(std.os.linux.flock(held.handle, 2 | 4)) != .SUCCESS) continue;
         // Free because its runner let go of it just now, the directory removed: not stale.
-        if (!sameFile(arena, held, lock_path)) continue;
+        if (!sameFile(held, lock_path)) continue;
         // Only a runner that died leaves one: worth seeing (and the stress test fails on it, as
         // a live job's directory taken for stale did before `removeJobDir`).
         std.log.warn("native: removing {s}, a job directory a runner left (it died)", .{path});
