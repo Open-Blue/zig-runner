@@ -35,6 +35,8 @@ fn maskSpans(w: *std.Io.Writer, text: []const u8, secrets: anytype) std.Io.Write
     var plain: usize = 0; // the start of the text not written yet
     var i: usize = 0;
     while (i < text.len) {
+        if (comptime @TypeOf(secrets) == *const Set) i = secrets.nextStart(text, i);
+        if (i == text.len) break;
         const n = secrets.longestAt(text[i..]);
         if (n == 0) {
             i += 1;
@@ -80,6 +82,12 @@ pub const Set = struct {
     all: std.ArrayList([]const u8) = .empty,
     /// The trie's first level, by byte: a node, or 0 for none.
     root: [256]u32 = @splat(0),
+    /// Which two bytes a secret can start with, one bit for each of the 65,536 pairs (a
+    /// secret of one byte sets all 256 pairs it begins). A position of a log line is tried against
+    /// the trie only when its pair is here: a secret's first byte alone is common in text (any
+    /// letter of a base64 token), its first two rarely are, and testing a bit costs a load where
+    /// the trie costs a hash lookup.
+    starts: [1024]u64 = @splat(0),
     /// The deeper levels: `node << 8 | byte` to the node it leads to.
     edges: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     /// Whether a secret ends at each node (index 0 is the root, where none does).
@@ -94,6 +102,7 @@ pub const Set = struct {
         try set.edges.ensureUnusedCapacity(gpa, @intCast(secret.len));
         const owned = try gpa.dupe(u8, secret);
         if (set.ends.items.len == 0) set.ends.appendAssumeCapacity(false);
+        set.markStart(owned);
         const first = &set.root[owned[0]];
         if (first.* == 0) first.* = set.newNode();
         var node = first.*;
@@ -106,6 +115,16 @@ pub const Set = struct {
         set.all.insertAssumeCapacity(longestFirstAt(set.all.items, owned.len), owned);
     }
 
+    fn markStart(set: *Set, secret: []const u8) void {
+        const high = @as(usize, secret[0]) << 8;
+        if (secret.len > 1) return set.setStart(high | secret[1]);
+        for (0..256) |second| set.setStart(high | second);
+    }
+
+    fn setStart(set: *Set, pair: usize) void {
+        set.starts[pair / 64] |= @as(u64, 1) << @truncate(pair);
+    }
+
     fn newNode(set: *Set) u32 {
         set.ends.appendAssumeCapacity(false);
         return @intCast(set.ends.items.len - 1);
@@ -115,9 +134,27 @@ pub const Set = struct {
         return @as(u64, node) << 8 | b;
     }
 
+    /// The first place at or after `from` that a secret could start at, by `starts`: `text.len`
+    /// for none. The same test as `longestAt`'s, in a loop of its own, which is most of what a log
+    /// line costs.
+    fn nextStart(set: *const Set, text: []const u8, from: usize) usize {
+        var i = from;
+        while (i + 1 < text.len) : (i += 1) {
+            const pair = @as(usize, text[i]) << 8 | text[i + 1];
+            if (set.starts[pair / 64] >> @truncate(pair) & 1 != 0) return i;
+        }
+        // The last byte has no pair: a secret of one byte may be there.
+        return if (i < text.len) i else text.len;
+    }
+
     /// The length of the longest secret `text` starts with, or 0.
     fn longestAt(set: *const Set, text: []const u8) usize {
         if (text.len == 0) return 0;
+        // The last byte of a text has no pair: a secret of one byte may be there.
+        if (text.len > 1) {
+            const pair = @as(usize, text[0]) << 8 | text[1];
+            if (set.starts[pair / 64] >> @truncate(pair) & 1 == 0) return 0;
+        }
         var node = set.root[text[0]];
         var best: usize = 0;
         var j: usize = 1;
@@ -483,6 +520,27 @@ test "a set masks as write does with its list, longest first, whatever order mas
     var got: std.Io.Writer.Allocating = .init(ar);
     try set.write(&got.writer, "abcde bc abx");
     try std.testing.expectEqualStrings("***e ***c ***x", got.written());
+}
+
+test "a set finds a secret of one byte at the end of a text, where no pair starts, and before any byte" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    var set: Set = .{};
+    for ([_][]const u8{ "q", "\xff", "mn" }) |s| try set.add(ar, s);
+    for ([_][2][]const u8{
+        .{ "q", "***" },
+        .{ "aq", "a***" },
+        .{ "qz\xff", "***z***" },
+        .{ "m", "m" },
+        .{ "xm", "xm" },
+        .{ "mn", "***" },
+        .{ "amnq", "a***" }, // touching spans are one
+    }) |case| {
+        var got: std.Io.Writer.Allocating = .init(ar);
+        try set.write(&got.writer, case[0]);
+        try std.testing.expectEqualStrings(case[1], got.written());
+    }
 }
 
 test "a lone secret is masked by alloc, whatever its length, one byte too" {

@@ -8,7 +8,9 @@ name: analysis
 #                  registries, workflows, jobs and servers hand the runner, and the text paths
 #                  that guard secrets and a job's environment (masking, file commands, the
 #                  broker's messages, HTTP/2 framing) held to GitHub's runner, and the runner's own
-#                  zstd decoder held to std's on every input (an image layer from any registry).
+#                  zstd decoder held to std's, and libzstd, which reads the layers, to that decoder,
+#                  and zlib-ng's inflater held to std's, on every input (an image layer from any
+#                  registry).
 #                  The corpus each finds
 #                  is kept from night to night in the Actions cache; a crash, a failed check, a
 #                  leak or a hang fails the job, named after its target, with the input as an
@@ -201,10 +203,14 @@ jobs:
           - { target: file commands, runs: 1M }
           - { target: job messages, runs: 2M }
           - { target: HTTP2 frames, runs: 800K }
-          # Two decoders per input, std's slow one among them: about 500 runs a second on a laptop
+          # Two decoders per input, std's slow one among them (libzstd's target runs the runner's
+          # decoder and libzstd instead): about 500 runs a second on a laptop
           # and 1,000 on GitHub's runner (the first run, pull request #426: 200K in 3 minutes after
           # a 2 minute build), so about ten minutes, with room for a corpus that grows.
           - { target: zstd, runs: 500K }
+          - { target: libzstd, runs: 500K }
+          # zlib-ng's inflater against std's.
+          - { target: zlib-ng, runs: 500K }
           # What a TLS server sends the network library's rustls (the database's TLS, docs/rust-net.md):
           # the runs set below are a first guess, to be set from the first run's timing as zstd's was.
           - { target: TLS records, runs: 300K }

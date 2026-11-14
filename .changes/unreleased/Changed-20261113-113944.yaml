@@ -1,0 +1,3 @@
+kind: Changed
+body: 'CI builds the release binaries once for the merge queue''s ci run: the arm64 check runs the x86_64 job''s build instead of compiling it again'
+time: 2026-11-13T11:39:44.186990152-05:00

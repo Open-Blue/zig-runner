@@ -10,6 +10,7 @@ const results = @import("../github/results.zig");
 const http = @import("../github/http.zig");
 const sink = @import("../sink.zig");
 const redact = @import("../redact.zig");
+const logfmt = @import("../logfmt.zig");
 const timefmt = @import("../timefmt.zig");
 const Live = @import("../live.zig").Live;
 const Runner = @import("../loop.zig").Runner;
@@ -174,8 +175,7 @@ pub fn logs(
     const sizes = try c.arena.alloc(results.KeptBlob.Size, log_steps);
     const job_size: results.KeptBlob.Size =
         results.KeptBlob.count(kept, c.io, try keptBuffer(c), sizes) catch |e| blk: {
-            try c.err.print("job {d}: the job's log could not be read back ({s}); it is not " ++
-                "uploaded\n", .{ job.check_run_id, @errorName(e) });
+            try logfmt.line(c.err, .err, "job_log_unreadable", "job={d} err={t} uploaded=false", .{ job.check_run_id, e });
             @memset(sizes, .{});
             break :blk .{};
         };
@@ -241,9 +241,11 @@ pub fn logs(
     // goes up again now, with the rest. One still running after `early_wait` is given up on and
     // goes up again too: a step's upload once hung for 17 minutes on a dead connection, and the
     // job waited for it, "in progress" on GitHub (#100).
-    if (early) |e| if (!e.waitAtMost(up.early_wait)) try c.err.print(
-        "job {d}: a step's log upload was still running {d} s into the job's end; uploading it " ++
-            "again\n",
+    if (early) |e| if (!e.waitAtMost(up.early_wait)) try logfmt.line(
+        c.err,
+        .warn,
+        "step_upload_late",
+        "job={d} waited_s={d} action=upload_again",
         .{ job.check_run_id, @divTrunc(up.early_wait.nanoseconds, std.time.ns_per_s) },
     );
     for (covered.items) |cv| {
@@ -267,7 +269,22 @@ pub fn logs(
     );
     for (uploads.items) |*u| {
         const r = u.result;
-        const outcome = if (r.ok) "ok, " else "FAILED: ";
+        if (!r.ok) {
+            const what = switch (u.what) {
+                .log => |w| switch (w) {
+                    .step => "step_log",
+                    .job => "job_log",
+                },
+                .summary => "summary",
+            };
+            if (u.again) |why| try logfmt.line(c.err, .err, "upload_failed", "job={d} what={s} name={f} detail={f} again_after={f}", .{
+                job.check_run_id, what, logfmt.q(u.name), logfmt.q(r.detail), logfmt.q(why),
+            }) else try logfmt.line(c.err, .err, "upload_failed", "job={d} what={s} name={f} detail={f}", .{
+                job.check_run_id, what, logfmt.q(u.name), logfmt.q(r.detail),
+            });
+            continue;
+        }
+        const outcome = "ok, ";
         switch (u.what) {
             .log => |w| switch (w) {
                 .step => if (u.again) |why| try c.err.print(
@@ -1037,13 +1054,15 @@ test "hung uploads hold up the job's end no longer than its limit, and a hung st
     try std.testing.expect(took >= 600 and took < 3_000);
 
     const said = err.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, said, "uploading it again") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "kind=step_upload_late job=") != null);
     // Step a: given up as the step finished, and up at the end.
     try std.testing.expectEqual(@as(u32, 2), HungResults.a_calls.load(.acquire));
     try std.testing.expect(std.mem.indexOf(u8, said, "log upload 'a': ok, up (again; as the step finished: Canceled)") != null);
     try std.testing.expect(std.mem.indexOf(u8, said, "log upload 'Set up job': ok, up") != null);
     // The job's whole log: cancelled at the limit, and reported.
-    try std.testing.expect(std.mem.indexOf(u8, said, "log upload job: FAILED: Canceled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "kind=upload_failed job=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "what=job_log") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "detail=Canceled") != null);
 }
 
 test "the steps GitHub shows: Set up job, pre, the job's steps, post, Complete job, numbered in order" {

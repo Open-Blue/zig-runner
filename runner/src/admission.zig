@@ -54,6 +54,7 @@
 //! memory to spare the limit moves out of its way (`Admission.growHigh`).
 const proc_stats = @import("proc_stats.zig");
 const std = @import("std");
+const logfmt = @import("logfmt.zig");
 const builtin = @import("builtin");
 
 /// The thresholds (`RUNNER_MIN_MEM_AVAILABLE_MB` and the rest, see deploy/runner.env.example). 0
@@ -206,6 +207,9 @@ pub const Admission = struct {
     /// How often `heartbeat` says how the machine and the gate are doing, in ms; 0 never
     /// (`Config.health_interval_secs`).
     health_interval_ms: u32 = 0,
+    /// How often `heartbeat` says the runner process's own `health: proc` while no job runs or
+    /// waits, in ms; 0 never (`Config.health_idle_interval_secs`).
+    health_idle_interval_ms: u32 = 0,
     /// When the last health line was due (awake clock, ms); null before the first. Kept across idle
     /// stretches, so a stream of short jobs logs once per interval, not once per job.
     health_last_ms: ?i64 = null,
@@ -583,15 +587,25 @@ pub const Admission = struct {
     }
 
     /// The health line for `buf`, when one is due: `health_interval_ms` have passed since the last
-    /// and a job runs or waits; null otherwise, so an idle pool's log stays quiet. Only the stack
-    /// and `buf` are used, so it can be said while the machine is out of memory. The machine's
-    /// files are read here once per line, through the readers the gate uses.
+    /// and a job runs or waits. While none does, only the process's own `health: proc` line, once
+    /// `health_idle_interval_ms` have passed since the last line of either kind (and never when
+    /// `health_interval_ms` is 0: that turns every health line off); null otherwise. Only the
+    /// stack and `buf` are used, so it can be said while the machine is out of memory. The
+    /// machine's files are read here once per line, through the readers the gate uses.
     pub fn heartbeat(a: *Admission, buf: []u8) ?[]const u8 {
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
         const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
         var active = false;
         for (a.slots) |s| active = active or s.running();
+        if (!active) {
+            if (a.health_interval_ms == 0) return null;
+            if (!idleHealthDue(a.health_idle_interval_ms, a.health_last_ms, now_ms)) return null;
+            a.health_last_ms = now_ms;
+            var w: std.Io.Writer = .fixed(buf);
+            w.print("health: proc {f}", .{proc_stats.read()}) catch return w.buffered();
+            return w.buffered();
+        }
         if (!healthDue(a.health_interval_ms, a.health_last_ms, now_ms, active)) return null;
         a.health_last_ms = now_ms;
         const engine = if (a.engine.dir) |dir| readEngine(a.io, dir) else null;
@@ -694,7 +708,7 @@ pub const Admission = struct {
         const path = std.fmt.bufPrint(&path_buf, "{s}/memory.high", .{dir}) catch return;
         const text = std.fmt.bufPrint(&text_buf, "{d}", .{@as(u64, next) << 20}) catch return;
         std.Io.Dir.cwd().writeFile(a.io, .{ .sub_path = path, .data = text }) catch |e| {
-            std.log.warn("native: cannot raise {s}: {s}", .{ path, @errorName(e) });
+            logfmt.warn("memory_high_not_raised", "path={f} err={t}", .{ logfmt.q(path), e });
             return;
         };
         s.high_mb = next;
@@ -767,10 +781,10 @@ pub const Admission = struct {
             persist.warned = false;
         } else |e| {
             persist.dirty = true;
-            if (!persist.warned) std.log.warn(
-                "memory gate: cannot write the learned estimates to {s}: {s}; they are lost " ++
-                    "if the runner restarts",
-                .{ path, @errorName(e) },
+            if (!persist.warned) logfmt.warn(
+                "memory_gate_estimates_not_saved",
+                "path={f} err={t}",
+                .{ logfmt.q(path), e },
             );
             persist.warned = true;
         }
@@ -1256,8 +1270,9 @@ pub const Gate = struct {
         // not as a small run that teaches a size too small to finish in.
         if (s.native and s.killed) {
             const raised = a.oomRaise(seen_mb, before orelse s.est_mb orelse 0, s.oom_cap_mb);
-            std.log.warn(
-                "memory gate: job {x:0>16} was killed for memory at {d} MB; its next run reserves {d} MB",
+            logfmt.warn(
+                "job_killed_for_memory",
+                "key={x:0>16} seen_mb={d} next_mb={d}",
                 .{ key, seen_mb, raised },
             );
             seen_mb = raised;
@@ -1632,9 +1647,10 @@ pub fn writeFileAtomic(io: std.Io, path: []const u8, data: []const u8) !void {
 }
 
 fn removeTemp(io: std.Io, tmp: []const u8) void {
-    std.Io.Dir.cwd().deleteFile(io, tmp) catch |e| std.log.warn(
-        "memory gate: cannot remove {s}: {s}",
-        .{ tmp, @errorName(e) },
+    std.Io.Dir.cwd().deleteFile(io, tmp) catch |e| logfmt.warn(
+        "memory_gate_temp_not_removed",
+        "path={f} err={t}",
+        .{ logfmt.q(tmp), e },
     );
 }
 
@@ -2367,10 +2383,10 @@ pub const Budget = struct {
     fn warn(b: *Budget, e: anyerror) void {
         if (b.warned) return;
         b.warned = true;
-        std.log.warn(
-            "memory gate: the machine's shared reservations in {s} are not used: {s}; this pool " ++
-                "counts its own, as without them (RUNNER_SHARED_MEMORY_BUDGET=false stops this)",
-            .{ b.path, @errorName(e) },
+        logfmt.warn(
+            "memory_gate_shared_budget_unused",
+            "path={f} err={t}",
+            .{ logfmt.q(b.path), e },
         );
     }
 };
@@ -2387,6 +2403,14 @@ const health_wrap = 160;
 /// passed since the last (or none was said yet).
 pub fn healthDue(interval_ms: u32, last_ms: ?i64, now_ms: i64, active: bool) bool {
     if (interval_ms == 0 or !active) return false;
+    const last = last_ms orelse return true;
+    return now_ms - last >= interval_ms;
+}
+
+/// Whether the idle `health: proc` line is due: the setting is on and `interval_ms` have passed
+/// since the last health line of any kind (or none was said yet).
+pub fn idleHealthDue(interval_ms: u32, last_ms: ?i64, now_ms: i64) bool {
+    if (interval_ms == 0) return false;
     const last = last_ms orelse return true;
     return now_ms - last >= interval_ms;
 }
@@ -2686,6 +2710,47 @@ test "the pool's heartbeat: quiet while idle, then one line per interval from th
     try std.testing.expect(pool.heartbeat(&buf) == null);
     // The gate's own setting off: never.
     pool.health_last_ms = null;
+    pool.health_interval_ms = 0;
+    try std.testing.expect(pool.heartbeat(&buf) == null);
+}
+
+test "the idle health line is due on its own interval, since the last line of any kind" {
+    const t: i64 = 10_000_000;
+    const quarter_hour = 900_000;
+    // Off.
+    try std.testing.expect(!idleHealthDue(0, null, t));
+    try std.testing.expect(!idleHealthDue(0, t - 10 * quarter_hour, t));
+    // None said yet: now.
+    try std.testing.expect(idleHealthDue(quarter_hour, null, t));
+    try std.testing.expect(!idleHealthDue(quarter_hour, t - quarter_hour + 1, t));
+    try std.testing.expect(idleHealthDue(quarter_hour, t - quarter_hour, t));
+}
+
+test "the pool's idle heartbeat: one health: proc line per idle interval, none with the setting off" {
+    const io = std.testing.io;
+    var slots: [2]Admission.Slot = undefined;
+    var pool: Admission = .init(io, .{}, &slots);
+    pool.health_interval_ms = 60_000;
+    pool.health_idle_interval_ms = 900_000;
+    var buf: [512]u8 = undefined;
+    // Idle: the first line is the baseline, and it is the process's line only.
+    const first = pool.heartbeat(&buf).?;
+    try std.testing.expect(std.mem.startsWith(u8, first, "health: proc rss="));
+    try std.testing.expect(std.mem.indexOfScalar(u8, first, '\n') == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "mem_avail") == null);
+    // Not again until the idle interval has passed...
+    try std.testing.expect(pool.heartbeat(&buf) == null);
+    const now = std.Io.Clock.awake.now(io).toMilliseconds();
+    pool.health_last_ms = now - 899_000;
+    try std.testing.expect(pool.heartbeat(&buf) == null);
+    // ...and then again.
+    pool.health_last_ms = now - 900_000;
+    try std.testing.expect(std.mem.startsWith(u8, pool.heartbeat(&buf).?, "health: proc "));
+    // Off: its own setting, or every health line's.
+    pool.health_last_ms = null;
+    pool.health_idle_interval_ms = 0;
+    try std.testing.expect(pool.heartbeat(&buf) == null);
+    pool.health_idle_interval_ms = 900_000;
     pool.health_interval_ms = 0;
     try std.testing.expect(pool.heartbeat(&buf) == null);
 }
