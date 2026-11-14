@@ -271,6 +271,9 @@ pub const Admission = struct {
         queued_ms: i64 = 0,
         /// The job's steps are paused (`Admission.govern`), since when, and not again before.
         paused: bool = false,
+        /// The job is being signalled or is over (`Gate.thaw`, `nativeDone`): `govern` does not
+        /// pause it again, or the signal that follows the thaw would wait in a frozen cgroup.
+        ending: bool = false,
         /// The last attempt to thaw it failed: it stays `paused`, and the next tick tries again.
         thaw_failed: bool = false,
         paused_since_ms: i64 = 0,
@@ -757,7 +760,7 @@ pub const Admission = struct {
         for (a.slots, 0..) |s, i| {
             if (!s.running()) continue;
             if (!s.paused) top = @max(top, s.level);
-            if (!s.native or s.cgroup() == null or n == cands.len) continue;
+            if (!s.native or s.cgroup() == null or n == cands.len or s.ending) continue;
             any_paused = any_paused or s.paused;
             cands[n] = .{
                 .level = s.level,
@@ -1529,6 +1532,7 @@ pub const Gate = struct {
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
         const s = &a.slots[g.slot];
+        s.ending = true;
         // Its processes are about to be removed with the cgroup, which a frozen one would hold up.
         _ = a.thaw(s, "ended");
         s.paused = false;
@@ -1566,6 +1570,9 @@ pub const Gate = struct {
         const a = g.pool;
         a.mu.lockUncancelable(a.io);
         defer a.mu.unlock(a.io);
+        // Ending first, under the lock `govern` takes: it cannot freeze the job again between the
+        // thaw and the signal that follows it.
+        a.slots[g.slot].ending = true;
         _ = a.thaw(&a.slots[g.slot], "signal");
     }
 
@@ -5975,6 +5982,29 @@ test "priority: a cancel or shutdown thaws a frozen job before it signals it, an
     slots[1].paused = true;
     _ = gate.ended();
     try std.testing.expectEqualStrings("0", try tmp.dir.readFile(std.testing.io, "lo/steps/cgroup.freeze", &out));
+}
+
+test "priority: govern does not pause a job that is being signalled or has ended" {
+    var slots: [2]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool: Admission = .init(std.testing.io, .{ .priority = .{ .freeze = true, .freeze_pressure = 2000 } }, &slots);
+    try frozenPair(&tmp, &slots);
+    var path_buf: [256]u8 = undefined;
+    pool.paths.pressure = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/pressure", .{tmp.sub_path});
+    // Pressed: the lower job is paused at a tick.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pressure", .data = "some avg10=30.00 avg60=0.00 avg300=0.00 total=0\n" });
+    var gate: Gate = .{ .pool = &pool, .slot = 1 };
+    gate.thaw();
+    try std.testing.expect(slots[1].ending and !slots[1].paused);
+    pool.govern();
+    try std.testing.expect(!slots[1].paused);
+    var out: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("0", try tmp.dir.readFile(std.testing.io, "lo/steps/cgroup.freeze", &out));
+    // Control: the same tick pauses it when it is not ending.
+    slots[1].ending = false;
+    pool.govern();
+    try std.testing.expect(slots[1].paused);
 }
 
 test "priority: a thaw that fails keeps the job paused, and the next tick tries again" {
