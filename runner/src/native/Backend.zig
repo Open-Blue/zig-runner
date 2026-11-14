@@ -13,6 +13,7 @@
 const Backend = @This();
 
 const std = @import("std");
+const logfmt = @import("../logfmt.zig");
 const builtin = @import("builtin");
 const Sha256 = @import("../sha256.zig").Sha256;
 const job_mod = @import("../job.zig");
@@ -791,15 +792,19 @@ fn natRulesFor(
 ) !?[]const u8 {
     const ups = try net.uplinks(arena, io);
     if (ups.len == 0 and !probing) return null;
+    var reach_buf: [net.max_reach]net.Reach = undefined;
+    const reach = net.allowed(&reach_buf);
     const joined = try std.mem.concat(arena, u8, &.{
         try std.mem.join(arena, "\x00", ups),
         "\x01",
         std.mem.sliceAsBytes(dns),
+        "\x02",
+        std.mem.sliceAsBytes(reach),
     });
     rules_mu.lockUncancelable(io);
     defer rules_mu.unlock(io);
     if (ups.len > 0 and std.mem.eql(u8, joined, rules_for[0..rules_len])) return null;
-    if (try net.natRules(arena, io, subnet, ups, dns)) |why| return why;
+    if (try net.natRules(arena, io, subnet, ups, dns, reach)) |why| return why;
     // Too long to keep: the rules are made again next time.
     rules_len = if (joined.len <= rules_for.len) joined.len else 0;
     @memcpy(rules_for[0..rules_len], joined[0..rules_len]);
@@ -1555,7 +1560,7 @@ fn detachNetns(arena: Allocator, path: []const u8) void {
     switch (std.os.linux.errno(std.os.linux.umount2(p, std.os.linux.MNT.DETACH))) {
         // Not mounted, or not there: nothing to detach (the sweep asks of every job's directory).
         .SUCCESS, .INVAL, .NOENT => {},
-        else => |e| std.log.warn("native: {s} was not detached: {t}", .{ path, e }),
+        else => |e| logfmt.warn("netns_not_detached", "path={f} err={t}", .{ logfmt.q(path), e }),
     }
 }
 

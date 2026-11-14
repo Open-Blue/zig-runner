@@ -261,7 +261,7 @@ kernel picks before relying on it. razorbill doesn't use it today.
 ### The health line
 
 While a job runs or waits, the runner logs one `health:` line a minute (`RUNNER_HEALTH_INTERVAL`
-seconds, 0 for none; nothing while the pool is idle): `MemAvailable` and `SwapFree`, memory PSI
+seconds, 0 for none): `MemAvailable` and `SwapFree`, memory PSI
 (`some`/`full` avg10), I/O PSI (`some` avg10), the load averages, what the gate has reserved, the
 jobs running and waiting, and for each running job its name, elapsed time and working set (with a
 `~` when it is the engine's, which every job on it shares). After a machine drops off, the last
@@ -275,6 +275,40 @@ same figures once its teardown ran, and how they changed while it ran (`dheap`, 
 `dthr`, `dmounts`). Other jobs of the process change them too, so read them as a trend: a heap,
 descriptor count or mount count that only climbs across jobs is a leak
 (`journalctl -u <unit> | grep job-end:`). A zombie child is logged as a warning at the job's end.
+
+While no job runs or waits, only the process's own line is logged, `health: proc …`, every 15
+minutes (`RUNNER_HEALTH_IDLE_INTERVAL` seconds, or `--health-idle-interval`; 0 for none, and
+`RUNNER_HEALTH_INTERVAL=0` turns it off too). It counts from the last health line of either kind, so
+growth between jobs shows, and the first one is said when the runner starts, as a baseline.
+
+### The runner's warnings and errors
+
+The runner's own warnings and errors, on its stderr (the journal), have one format, so that a grep
+or an alert can key on it:
+
+```
+warn: kind=cgroup_not_removed path=/sys/fs/cgroup/zig-runner/job-7 err=Busy
+error: kind=upload_failed job=123 what=job_log name="" detail=NameServerFailure
+```
+
+- The line starts `warn:` (something went wrong that the runner worked around, or may repeat) or
+  `error:` (the runner or a job's step gave up on it).
+- `kind=` follows, a short snake_case name for what happened: the same kind for the same event, so
+  `grep 'kind=upload_failed'` finds every one.
+- The rest are `key=value` pairs. A value with a space, a quote, an `=`, a backslash or a control
+  character is double-quoted, with `\"`, `\\`, `\n` and `\xNN` escapes, so a line is one line
+  and a value never reads as a key. `err=` is a Zig error's name or a system error's (`Busy`,
+  `FileNotFound`), `job=` a check run id, `path=` a path.
+- A warning from a part of the runner that has not named its kind is `kind=<its prefix>
+  msg="…"`: `native: cannot remove /x: Busy` is `warn: kind=native msg="cannot remove /x: Busy"`.
+  One with no prefix is `kind=log msg="…"`.
+- `info` lines (`info(scope): …`) and the lines with formats of their own are not warnings and
+  keep them: `health:`, `job-end:`, `step-end:`, `request:`, and the plain `job N: …` progress
+  lines. What a job's log shows to the user (GitHub's `##[warning]`, an action's `Warning:`) is
+  the job's, and stays as GitHub shows it.
+
+`journalctl -u <unit> | grep -E '^(warn|error):'` lists them all; `grep ' kind=zombie_children '`
+finds one kind.
 
 ### The step-end and request lines
 

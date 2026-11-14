@@ -1,0 +1,3 @@
+kind: Changed
+body: 'The runner''s own warnings and errors have one format, `warn: kind=… key=value` or `error: kind=… key=value` (documented in docs/OPERATIONS.md), so that a grep or an alert can key on them; plain log lines get `kind=<prefix> msg="…"`. Lines that changed: the log upload failures, `error during …`, `github error: …`, `trying again`, `could not remove runner registration`, the memory gate''s and the Gitea poller''s warnings. While no job runs, a `health: proc` line is logged every 15 minutes (`RUNNER_HEALTH_IDLE_INTERVAL`, 0 for none), so growth between jobs shows.'
+time: 2026-11-13T11:45:42.820689889-05:00

@@ -16,3 +16,12 @@ targetRules = ["generic-api-key"]
 paths = ['''^runner/src/native/layers\.zig$''']
 regexTarget = "line"
 regexes = ['''^\s*const key = "[0-9a-f]{64}";$''']
+
+# libzstd's xxhash.h (vendored, unchanged): an AVX-512 intrinsic's variable named `data_key_lo` and
+# `data_key_hi`, which generic-api-key reads as a key assigned a long value.
+[[allowlists]]
+description = "AVX-512 variable names in the vendored runner/src/vendor/zstd/common/xxhash.h"
+targetRules = ["generic-api-key"]
+paths = ['''^runner/src/vendor/zstd/common/xxhash\.h$''']
+regexTarget = "line"
+regexes = ['''^\s*__m512i const data_key_(lo|hi) = _mm512_srli_epi64 \(data_key, 32\);$''']

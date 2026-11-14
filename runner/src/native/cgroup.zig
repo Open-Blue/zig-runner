@@ -43,6 +43,7 @@
 //!   (`Backend.jobCgroup`).
 
 const std = @import("std");
+const logfmt = @import("../logfmt.zig");
 const linux = std.os.linux;
 const admission = @import("../admission.zig");
 
@@ -689,7 +690,7 @@ pub const Job = struct {
             const i = io orelse break;
             i.sleep(.fromMilliseconds(10), .awake) catch break;
         }
-        std.log.warn("native: cannot remove the job's cgroup {s}", .{j.dir});
+        logfmt.warn("cgroup_not_removed", "path={f}", .{logfmt.q(j.dir)});
         return false;
     }
 };

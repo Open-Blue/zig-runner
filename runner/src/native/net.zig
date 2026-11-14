@@ -9,6 +9,7 @@
 //! netlink (`natRules`, `nft.zig`), with no `iptables`.
 
 const std = @import("std");
+const logfmt = @import("../logfmt.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const nft = @import("nft.zig");
@@ -350,7 +351,7 @@ pub const Socket = struct {
         switch (s.request(&m)) {
             // Gone meanwhile: what was wanted.
             .SUCCESS, .NODEV => {},
-            else => |e| std.log.warn("native: slot {d}'s veth was not deleted: {t}", .{ slot, e }),
+            else => |e| logfmt.warn("veth_not_deleted", "slot={d} err={t}", .{ slot, e }),
         }
     }
 
@@ -500,6 +501,54 @@ const Message = struct {
     }
 };
 
+/// An address and port of the host's own instance (a Gitea or Forgejo) that jobs may reach, and
+/// nothing else of the host's: `addr` as the instance's URL names it. On the loopback, a job
+/// reaches it at the bridge's address, where the runner forwards it (`gitea/reach.zig`).
+pub const Reach = struct {
+    addr: [4]u8,
+    port: u16,
+
+    pub fn loopback(r: Reach) bool {
+        return r.addr[0] == 127;
+    }
+};
+
+/// The most instances a runner lets its jobs reach: its own, and the address its tasks name.
+pub const max_reach = 8;
+
+var reach_list: [max_reach]Reach = undefined;
+var reach_len: usize = 0;
+var reach_mu: std.atomic.Mutex = .unlocked;
+
+/// Lets jobs reach `r` from now on: the next job's rules (`natRules`) carry it. False when the
+/// list is full. Called by a Gitea or Forgejo runner for its instance's address, and for the one
+/// its tasks name (`github.server_url`), which may be another (a tailnet name for the same host).
+pub fn allow(r: Reach) bool {
+    while (!reach_mu.tryLock()) std.atomic.spinLoopHint();
+    defer reach_mu.unlock();
+    for (reach_list[0..reach_len]) |have| if (std.meta.eql(have, r)) return true;
+    if (reach_len == max_reach) return false;
+    reach_list[reach_len] = r;
+    reach_len += 1;
+    // Recorded for the host's other processes, whose rules would otherwise leave it out.
+    nft.publishReach(linux.getpid(), reach_list[0..reach_len]);
+    return true;
+}
+
+/// This process's instances forgotten by the others: at its end (a pid that is gone is ignored
+/// anyway).
+pub fn forget() void {
+    nft.publishReach(linux.getpid(), &.{});
+}
+
+/// What `allow` was told, copied into `buf`.
+pub fn allowed(buf: *[max_reach]Reach) []const Reach {
+    while (!reach_mu.tryLock()) std.atomic.spinLoopHint();
+    defer reach_mu.unlock();
+    @memcpy(buf[0..reach_len], reach_list[0..reach_len]);
+    return buf[0..reach_len];
+}
+
 /// What the runner needs from the host for its jobs' traffic to leave, and nothing more:
 ///
 /// - IPv4 forwarding on. It is host-wide and stays on (other runners' jobs need it too); the
@@ -509,7 +558,8 @@ const Message = struct {
 ///   out; from `zr0` nothing into the host but replies, and nothing forwarded but out through the
 ///   host's uplinks (the interfaces of its default routes), so never to another job, to Docker's
 ///   containers or to the host's other networks; but DNS to the jobs' nameservers (`dns`,
-///   `Resolver`), on port 53 only, wherever they are; to `zr0` replies only. The host's
+///   `Resolver`), on port 53 only, wherever they are; and the one port of each instance `allow`
+///   was told of (`Reach`); to `zr0` replies only. The host's
 ///   iptables-nft `FORWARD` and `DOCKER-USER` chains (Docker's and ufw's, whose policies drop)
 ///   accept the bridge's traffic and leave the deciding to the runner's table.
 /// - To `zr0` from the host's own processes (`OUTPUT`), replies only, as routed traffic to it:
@@ -522,6 +572,7 @@ pub fn natRules(
     subnet: Subnet,
     ups: []const []const u8,
     dns: []const [4]u8,
+    reach: []const Reach,
 ) !?[]const u8 {
     if (ups.len == 0) return "the host has no default route for the jobs' traffic to leave by";
     const cwd = std.Io.Dir.cwd();
@@ -546,7 +597,7 @@ pub fn natRules(
         std.log.warn("native: this host has iptables-legacy tables (/proc/net/ip_tables_names), " ++
             "which the jobs' nftables rules do not reach; a legacy FORWARD policy of DROP " ++
             "would cut the jobs' traffic", .{});
-    return nft.apply(subnet, ups, dns);
+    return nft.apply(subnet, ups, dns, reach);
 }
 
 /// The host's uplinks: the interfaces of its IPv4 default routes (`/proc/net/route`), the bridge

@@ -1886,12 +1886,18 @@ fn unshiftAt(arena: Allocator, fd: linux.fd_t, st: linux.Statx, ids: Ids) !void 
     }
     // The magic link reaches the descriptor's inode, not a name: followed, it is that entry.
     const p = try std.fmt.allocPrintSentinel(arena, "/proc/self/fd/{d}", .{fd}, 0);
+    // Which of the three xattrs the entry has, in one call: each read through the magic link
+    // makes the kernel resolve `/proc/self/fd/N` (3 µs, where `fgetxattr` on a descriptor takes
+    // 0.4), and nearly every entry of a tree has none of them. `getxattrat` (Linux 6.13) would
+    // read through the descriptor, but refuses an `O_PATH` one (`EBADF`).
+    const has = try ownXattrs(p);
     // Read before the chown, which drops a file's capabilities.
-    const cap = if (kind == linux.S.IFREG) try ownXattr(arena, p, cap_xattr) else null;
+    const cap = if (kind == linux.S.IFREG and has.cap) try ownXattr(arena, p, cap_xattr) else null;
     if (linux.errno(linux.fchownat(fd, "", ids.inside(st.uid), ids.inside(st.gid), linux.AT.EMPTY_PATH)) != .SUCCESS)
         return error.Chown;
     if (st.mode & (linux.S.ISUID | linux.S.ISGID) != 0) try chmodFd(fd, p, st.mode & 0o7777);
-    for (acl_xattrs) |acl| {
+    for (acl_xattrs, has.acl) |acl, listed| {
+        if (!listed) continue;
         const v = try ownXattr(arena, p, acl) orelse continue;
         const shifted = try arena.dupe(u8, v);
         unshiftAcl(shifted, ids);
@@ -1913,6 +1919,32 @@ fn chmodFd(fd: linux.fd_t, p: [:0]const u8, mode: u32) !void {
         else => return error.Chmod,
     }
     if (linux.errno(linux.chmod(p, mode)) != .SUCCESS) return error.Chmod;
+}
+
+/// Which of the xattrs `unshiftAt` shifts an entry has (`cap`: `cap_xattr`; `acl`: as `acl_xattrs`).
+const Listed = struct { cap: bool, acl: [2]bool };
+
+/// The xattrs the entry `p` (a descriptor's magic link) has that `unshiftAt` looks for. All of
+/// them when the list cannot be had (a filesystem that does not list them, or a list too long
+/// for the buffer), so that each is then asked for, and an entry with none costs one call.
+fn ownXattrs(p: [:0]const u8) !Listed {
+    var buf: [64 * 1024]u8 = undefined;
+    const got = linux.listxattr(p, &buf, buf.len);
+    switch (linux.errno(got)) {
+        .SUCCESS => {},
+        .OPNOTSUPP => return .{ .cap = false, .acl = .{ false, false } },
+        .RANGE => return .{ .cap = true, .acl = .{ true, true } },
+        else => return error.GetXattr,
+    }
+    var listed: Listed = .{ .cap = false, .acl = .{ false, false } };
+    var names = std.mem.splitScalar(u8, buf[0..got], 0);
+    while (names.next()) |name| {
+        if (std.mem.eql(u8, name, cap_xattr)) listed.cap = true;
+        for (acl_xattrs, &listed.acl) |acl, *l| if (std.mem.eql(u8, name, acl)) {
+            l.* = true;
+        };
+    }
+    return listed;
 }
 
 /// An xattr's value, or null when the entry has none or its filesystem does not keep that kind.

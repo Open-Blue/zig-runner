@@ -2,6 +2,7 @@
 //! client per request (what the runner did before) loaded the bundle every time, into memory that a
 //! waiting runner only frees after its next job, so idle runners grew by hundreds of KB per poll.
 const std = @import("std");
+const logfmt = @import("../logfmt.zig");
 const builtin = @import("builtin");
 const request_log = @import("request_log.zig");
 
@@ -44,7 +45,7 @@ pub fn renew(stale: *std.http.Client) void {
     const stale_owned = shared_owned.swap(true, .acq_rel);
     // Its idle connections close now, and the ones in use as they finish.
     stale.connection_pool.resize(stale.io, 0) catch |e|
-        std.log.warn("http: the replaced client's idle connections stay open: {t}", .{e});
+        logfmt.warn("http_idle_connections_open", "err={t}", .{e});
     if (stale_owned) retire(stale, now);
     freeRetired(stale.io, now, false);
 }
@@ -69,7 +70,7 @@ fn retire(c: *std.http.Client, now: i64) void {
     defer retired_lock.unlock(c.io);
     if (retired_len == max_retired) {
         // Left as before, never freed: a process that renewed this often has worse problems.
-        std.log.warn("http: {d} replaced clients still in use; one more is not freed", .{max_retired});
+        logfmt.warn("http_clients_retired_full", "max={d}", .{max_retired});
         return;
     }
     retired[retired_len] = .{ .client = c, .at_s = now };
@@ -109,11 +110,11 @@ fn free(c: *std.http.Client) void {
 /// left, and said so, as `Client.deinit` would assert.
 pub fn deinitShared(io: std.Io) void {
     freeRetired(io, 0, true);
-    if (retired_len != 0) std.log.warn("http: {d} replaced clients still had a connection in use at the end", .{retired_len});
+    if (retired_len != 0) logfmt.warn("http_clients_in_use_at_end", "replaced={d}", .{retired_len});
     if (!shared_owned.load(.acquire)) return;
     const c = shared.load(.acquire) orelse return;
     if (!noneInUse(io, c)) {
-        std.log.warn("http: the shared client still had a connection in use at the end", .{});
+        logfmt.warn("http_clients_in_use_at_end", "replaced=0 shared=true", .{});
         return;
     }
     shared.store(null, .release);

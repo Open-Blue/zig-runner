@@ -335,10 +335,11 @@ run_conclusion() {
 }
 
 # uploads_failed JOB_ID: what the runner under test says of the job's log uploads that failed
-# ("job 123: log upload job: FAILED: NameServerFailure"), from its log when `start` started it.
+# ("error: kind=upload_failed job=123 what=job_log name=… detail=NameServerFailure"), from its log
+# when `start` started it.
 uploads_failed() {
-	grep -hF -- "job $1: " "$out/runner-$backend.log" 2>/dev/null | grep -E 'upload.*FAILED' |
-		sed -E 's/^job [0-9]+: //' | tr '\n' ';' || true
+	grep -hF -- "kind=upload_failed job=$1 " "$out/runner-$backend.log" 2>/dev/null |
+		sed -E 's/^error: kind=upload_failed job=[0-9]+ //' | tr '\n' ';' || true
 }
 
 # job_log JOB_ID [CONCLUSION]: its log, which GitHub may take a few seconds after the job ends to
@@ -352,7 +353,7 @@ log_budget=${E2E_LOG_WAIT:-60}
 job_log() {
 	local log why="" i tries=8 said
 	said=$(uploads_failed "$1")
-	[[ ${2:-} == skipped || $said == *"log upload job: FAILED"* ]] && tries=1
+	[[ ${2:-} == skipped || $said == *"what=job_log"* ]] && tries=1
 	for ((i = 1; i <= tries; i++)); do
 		if log=$(api "${escapes[@]}" "repos/$repo/actions/jobs/$1/logs" 2>"$out/log.err") && [[ -n $log ]]; then
 			printf '%s\n' "$log"

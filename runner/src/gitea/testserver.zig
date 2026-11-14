@@ -34,6 +34,11 @@ pub const Server = struct {
     mu: Io.Mutex = .init,
     replies: std.ArrayList(Reply) = .empty,
     calls: std.ArrayList(Call) = .empty,
+    /// Answers `UpdateLog` with what it was sent, all of it acknowledged, when nothing is queued
+    /// for it (`reply` queues a different answer: a partial `ackIndex`, say).
+    echo_acks: bool = false,
+    /// Answers for a method once its queue is used up, instead of a 404 (`replyAlways`).
+    always: std.ArrayList(Reply) = .empty,
     held: [4]Io.net.Stream = undefined,
     held_len: usize = 0,
 
@@ -64,6 +69,12 @@ pub const Server = struct {
             gpa.free(r.body);
         }
         s.replies.deinit(gpa);
+        for (s.always.items) |r| {
+            gpa.free(r.method);
+            gpa.free(r.status);
+            gpa.free(r.body);
+        }
+        s.always.deinit(gpa);
         for (s.calls.items) |c| {
             gpa.free(c.method);
             gpa.free(c.uuid);
@@ -88,6 +99,29 @@ pub const Server = struct {
             .body = try gpa.dupe(u8, body),
             .silent = false,
         });
+    }
+
+    /// What `method` is answered when nothing queued is left, for any number of calls.
+    pub fn replyAlways(s: *Server, method: []const u8, status: []const u8, body: []const u8) !void {
+        const io = std.testing.io;
+        s.mu.lockUncancelable(io);
+        defer s.mu.unlock(io);
+        try s.always.append(gpa, .{
+            .method = try gpa.dupe(u8, method),
+            .status = try gpa.dupe(u8, status),
+            .body = try gpa.dupe(u8, body),
+            .silent = false,
+        });
+    }
+
+    /// The calls so far of `method`, copied; the test owns the slice's memory (`gpa`).
+    pub fn bodies(s: *Server, method: []const u8) ![]const []const u8 {
+        const io = std.testing.io;
+        s.mu.lockUncancelable(io);
+        defer s.mu.unlock(io);
+        var out: std.ArrayList([]const u8) = .empty;
+        for (s.calls.items) |c| if (std.mem.eql(u8, c.method, method)) try out.append(gpa, try gpa.dupe(u8, c.body));
+        return out.toOwnedSlice(gpa);
     }
 
     /// Queues a call to `method` that is never answered.
@@ -152,6 +186,18 @@ pub const Server = struct {
 
 const Outcome = enum { close, hold, quit };
 
+const default_status: []const u8 = "404 Not Found";
+
+/// `{"ackIndex":"<index + rows>"}` for an `UpdateLog` body, or null when it is none.
+fn ackFor(body: []const u8) ?[]u8 {
+    const Req = struct { index: ?[]const u8 = null, rows: []const std.json.Value = &.{} };
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const q = std.json.parseFromSliceLeaky(Req, arena.allocator(), body, .{ .ignore_unknown_fields = true }) catch return null;
+    const index = if (q.index) |i| std.fmt.parseInt(i64, i, 10) catch return null else 0;
+    return std.fmt.allocPrint(gpa, "{{\"ackIndex\":\"{d}\"}}", .{index + (std.math.cast(i64, q.rows.len) orelse return null)}) catch null;
+}
+
 fn connect(port: u16) !Io.net.Stream {
     const addr = try Io.net.IpAddress.parse("127.0.0.1", port);
     return addr.connect(std.testing.io, .{ .mode = .stream });
@@ -210,7 +256,7 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
         .connect_version = gpa.dupe(u8, version) catch @panic("oom"),
         .body = gpa.dupe(u8, body) catch @panic("oom"),
     }) catch @panic("oom");
-    var status: []const u8 = "404 Not Found";
+    var status: []const u8 = default_status;
     var out_body: []const u8 = "{\"code\":\"unimplemented\",\"message\":\"no such method\"}";
     var silent = false;
     for (s.replies.items) |*rep| {
@@ -220,6 +266,22 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
         out_body = rep.body;
         silent = rep.silent;
         break;
+    }
+    var echoed: ?[]u8 = null;
+    defer if (echoed) |e| gpa.free(e);
+    if (status.ptr == default_status.ptr) {
+        for (s.always.items) |rep| if (std.mem.eql(u8, rep.method, method)) {
+            status = rep.status;
+            out_body = rep.body;
+            break;
+        };
+        if (s.echo_acks and std.mem.eql(u8, method, "UpdateLog")) {
+            echoed = ackFor(body);
+            if (echoed) |e| {
+                status = "200 OK";
+                out_body = e;
+            }
+        }
     }
     // Copied out: the queue may grow (and move) once the lock is let go.
     const status_copy = gpa.dupe(u8, status) catch @panic("oom");
