@@ -4,6 +4,8 @@ const std = @import("std");
 const jitconfig = @import("jitconfig.zig");
 const auth = @import("auth.zig");
 const http = @import("http.zig");
+const request_log = @import("request_log.zig");
+const net_hooks = @import("net_hooks.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -65,14 +67,14 @@ pub const RequestOptions = struct {
     /// The request's body written out as it is sent, in place of `payload`: one too big to hold
     /// (a job's log, `results.upload`).
     body: ?Body = null,
+    /// Whether the request gets a `request:` line (`request_log`). Off for the Dagger engine's
+    /// queries, which go to the engine on this machine.
+    log: bool = true,
 };
 
-/// A body of `len` bytes that `writeFn` writes, as many times as the request is sent.
-pub const Body = struct {
-    len: usize,
-    ptr: *const anyopaque,
-    writeFn: *const fn (ptr: *const anyopaque, w: *std.Io.Writer) anyerror!void,
-};
+/// A body of `len` bytes that `writeFn` writes, as many times as the request is sent (the network
+/// library's: `net_client.Body`).
+pub const Body = @import("../net_client.zig").Body;
 
 pub fn request(
     arena: Allocator,
@@ -99,7 +101,7 @@ pub fn request(
     var fresh = false;
     while (true) : (attempt += 1) {
         const used = http.shared.load(.acquire);
-        return requestWithin(arena, io, method, url, payload, opts, fresh) catch |err| {
+        return requestWithin(arena, io, method, url, payload, opts, fresh, attempt) catch |err| {
             if (err == error.Canceled) return err;
             if (!renewed and http.staleClock(err) and used != null) {
                 http.renew(used.?);
@@ -138,10 +140,22 @@ fn requestWithin(
     payload: ?[]const u8,
     opts: RequestOptions,
     fresh: bool,
+    attempt: u32,
 ) anyerror!Response {
-    const args = .{ arena, io, method, url, payload, opts, fresh };
-    const limit = opts.deadline orelse return @call(.auto, requestOnce, args);
-    const r = try http.within(io, limit, requestOnce, args);
+    // The request's `request:` line: written by `exchange` when it ends, here when it did not
+    // (it ran out of time, or was cancelled).
+    var probe: request_log.Probe = .init(io, opts.log, method, std.Uri.parse(url) catch .{ .scheme = "" }, attempt);
+    const args = .{ arena, io, method, url, payload, opts, fresh, &probe };
+    const limit = opts.deadline orelse {
+        const r = @call(.auto, requestOnce, args);
+        if (r) |_| {} else |_| probe.finishOuter(false);
+        return r;
+    };
+    const r = http.within(io, limit, requestOnce, args) catch |e| {
+        probe.finishOuter(false);
+        return e;
+    };
+    if (r == null) probe.finishOuter(true);
     return r orelse error.Timeout;
 }
 
@@ -154,6 +168,7 @@ fn requestOnce(
     payload: ?[]const u8,
     opts: RequestOptions,
     fresh: bool,
+    probe: *request_log.Probe,
 ) anyerror!Response {
     // What the request needs only while it runs (headers, the decompression window) is freed with
     // it; only the response body goes to `arena`, which a waiting runner keeps until its next job.
@@ -170,7 +185,7 @@ fn requestOnce(
     // A fresh client's CA bundle is freed with it, not kept in `arena` (one is rarely needed).
     var local: std.http.Client = .{
         .allocator = if (fresh and shared != null) shared.?.allocator else arena,
-        .io = io,
+        .io = net_hooks.wrap(io),
         .write_buffer_size = http.write_buffer_size,
     };
     defer local.deinit();
@@ -185,7 +200,8 @@ fn requestOnce(
     var current = method;
     var hops: u32 = 0;
     while (true) : (hops += 1) {
-        const next = switch (try exchange(.{
+        if (hops > 0) probe.hop(target);
+        const next = switch (try exchange(probe, .{
             .arena = arena,
             .scratch = scratch,
             .client = client,
@@ -227,9 +243,20 @@ const Exchange = struct {
 
 const Redirect = struct { uri: std.Uri, see_other: bool };
 
+const Exchanged = union(enum) { done: Response, redirect: Redirect };
+
 /// One request and its answer, or where a redirect points when the request has no body to resend.
 /// A request with a body gets the redirect as it came: its body is already sent.
-fn exchange(x: Exchange) !union(enum) { done: Response, redirect: Redirect } {
+fn exchange(probe: *request_log.Probe, x: Exchange) !Exchanged {
+    const r = exchangeProbed(probe, x) catch |e| {
+        if (e != error.Canceled) probe.finish(e);
+        return e;
+    };
+    probe.finish(null);
+    return r;
+}
+
+fn exchangeProbed(probe: *request_log.Probe, x: Exchange) !Exchanged {
     if (trace) std.debug.print("trace: connecting {s}\n", .{@tagName(x.method)});
     var req = try x.client.request(x.method, x.uri, .{
         .headers = .{
@@ -243,6 +270,7 @@ fn exchange(x: Exchange) !union(enum) { done: Response, redirect: Redirect } {
         .redirect_behavior = .unhandled,
     });
     defer req.deinit();
+    probe.connected(x.client.io, req.connection);
     if (req.connection) |conn| http.keepAlive(conn.stream_reader.stream.socket.handle);
     // A connection a request failed on is not given back to the pool: one that failed while writing
     // (the server had closed it) would otherwise fail every later request to that host, which is
@@ -254,9 +282,11 @@ fn exchange(x: Exchange) !union(enum) { done: Response, redirect: Redirect } {
 
     if (trace) std.debug.print("trace: connected\n", .{});
     send(&req, x.payload, x.body) catch |e| return canceledOr(&req, e);
+    probe.sent();
     if (trace) std.debug.print("trace: request sent\n", .{});
 
     var response = req.receiveHead(&.{}) catch |e| return canceledOr(&req, e);
+    probe.head(response.head);
     if (trace) std.debug.print("trace: head status={d} content_length={?d} chunked={}\n", .{
         @backingInt(response.head.status),
         response.head.content_length,
@@ -284,11 +314,13 @@ fn exchange(x: Exchange) !union(enum) { done: Response, redirect: Redirect } {
     // one, so mark the connection closing (deinit then skips draining it).
     if (response.head.status == .no_content or response.head.status == .not_modified) {
         req.connection.?.closing = true;
+        probe.bytes_in = 0;
         return .{ .done = .{ .status = response.head.status, .body = "" } };
     }
 
     const body = readBody(x.scratch, &response, x.max_body) catch |e|
         return canceledOr(&req, e);
+    probe.bytes_in = body.len;
     if (trace) std.debug.print("trace: body {d} bytes\n", .{body.len});
     return .{ .done = .{ .status = response.head.status, .body = try x.arena.dupe(u8, body) } };
 }
@@ -537,4 +569,47 @@ test "parseSettings" {
     const s = try parseSettings(a.allocator(), &files);
     try std.testing.expectEqual(@as(u64, 2), s.agent_id);
     try std.testing.expect(s.use_v2);
+}
+
+test "request lines: timed, without the query or a token, and a 429's rate limit headers and retry-after" {
+    const TestServer = @import("testserver.zig").Server;
+    var server: TestServer = undefined;
+    try server.start();
+    defer server.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var lines: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer lines.deinit();
+    request_log.capture = &lines;
+    request_log.enabled.store(true, .monotonic);
+    defer {
+        request_log.capture = null;
+        request_log.enabled.store(false, .monotonic);
+    }
+    var buf: [128]u8 = undefined;
+    const t: RequestOptions = .{ .token = "t0k-secret" };
+
+    // A new connection to "localhost", so that its lookup, connect and (no) TLS are timed.
+    _ = try request(a, std.testing.io, .GET, server.url(&buf, "localhost", "/broker/message?sig=SECRET&sessionId=x"), null, t);
+    const limited = try request(a, std.testing.io, .GET, server.url(&buf, "127.0.0.1", "/limited/ghs" ++ "_16C7e42F292c6912E7710c838347Ae178B4a"), null, t);
+    try std.testing.expectEqual(std.http.Status.too_many_requests, limited.status);
+
+    const text = lines.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "SECRET") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "t0k") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ghs_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "sig") == null);
+    var it = std.mem.splitScalar(u8, text, '\n');
+    const first = it.next().?;
+    var want: [160]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, first, try std.fmt.bufPrint(&want, "request: host=localhost:{d} method=GET path=/broker/message status=200 dns_ms=", .{server.port})));
+    try std.testing.expect(std.mem.indexOf(u8, first, " tls_ms=0.0 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, " bytes_in=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, " retry=0 reused=0 rl_remaining=? rl_limit=? rl_reset=? rl_resource=?") != null);
+    // Every time of a new connection was measured.
+    try std.testing.expect(std.mem.indexOf(u8, first, "ms=?") == null);
+    const second = it.next().?;
+    try std.testing.expect(std.mem.indexOf(u8, second, " path=/limited/* status=429 ") != null);
+    try std.testing.expect(std.mem.endsWith(u8, second, " retry=0 reused=0 rl_remaining=0 rl_limit=5000 rl_reset=1700000000 rl_resource=core"));
 }

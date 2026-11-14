@@ -4205,16 +4205,10 @@ fn pullWithin(
     deadline: std.Io.Duration,
     why: *[]const u8,
 ) !oci.Image {
-    var local: std.http.Client = .{
-        .allocator = gpa,
-        .io = io,
-        .write_buffer_size = http.write_buffer_size,
-    };
-    defer local.deinit();
     const store: ImageStore = .{ .root = root };
     const req: oci.Request = .{ .image = image, .creds = creds, .owners = owners };
     const r = try http.within(io, deadline, pullInto, .{
-        arena, gpa, io, http.client(&local), store, req, why,
+        arena, gpa, io, store, req, why,
     });
     return (r orelse {
         why.* = try std.fmt.allocPrint(arena, "it took longer than {d} minutes", .{@divTrunc(deadline.toSeconds(), 60)});
@@ -4246,12 +4240,11 @@ fn pullInto(
     arena: Allocator,
     gpa: Allocator,
     io: std.Io,
-    client: *std.http.Client,
     store: ImageStore,
     req: oci.Request,
     why: *[]const u8,
 ) anyerror!oci.Image {
-    return oci.pull(arena, gpa, io, client, store, req, why);
+    return oci.pull(arena, gpa, io, store, req, why);
 }
 
 /// The default image provisioned (`set_up.provision_script`, or `provision_runner_script` when
@@ -11400,4 +11393,56 @@ test "host paths: the runner's own files refused, and each job held to the list 
     const replaced = (try configFor(arena, io, &env, &cfg, true)).?;
     try std.testing.expectEqual(@as(usize, 0), replaced.host_paths.len);
     try std.testing.expectEqual(@as(usize, 1), replaced.host_paths_closed.len);
+}
+
+test "root runner: each step of a short job ends with a step-end line from its own cgroup" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    // A step that holds 60 MB and burns some CPU, and one that does neither.
+    var heavy = testStep("x=$(head -c 60000000 /dev/zero | tr '\\0' a); echo ${#x}; seq 1 1500000 | sha256sum");
+    heavy.name = "heavy";
+    var light = testStep("true");
+    light.name = "light";
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    var step_ends: std.Io.Writer.Allocating = .init(arena);
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_ends = &step_ends,
+        .sink_job_id = 4242,
+        .gpa = std.testing.allocator,
+    }, testJob(&.{ heavy, light }), &log);
+    if (!res.succeeded) std.debug.print("{s}\n", .{w.written()});
+    try std.testing.expect(res.succeeded);
+    std.debug.print("{s}", .{step_ends.written()});
+
+    var lines = std.mem.splitScalar(u8, step_ends.written(), '\n');
+    const first = lines.next().?;
+    const second = lines.next().?;
+    try std.testing.expect(std.mem.startsWith(u8, first, "step-end: job=4242 step=1 name='heavy' result=success wall_ms="));
+    try std.testing.expect(std.mem.startsWith(u8, second, "step-end: job=4242 step=2 name='light' result=success wall_ms="));
+    const cpu = try stepEndNumber(first, " cpu_ms=");
+    try std.testing.expect(cpu > 10);
+    const peak = try stepEndNumber(first, " mem_peak=");
+    try std.testing.expect(peak > 60_000_000);
+    try std.testing.expect(try stepEndNumber(first, " minflt=") > 1000);
+    try std.testing.expect(try stepEndNumber(first, " root_ms=") > 0);
+    // The second step's peak is its own where the kernel lets it be reset (Linux 6.12).
+    if (std.mem.indexOf(u8, second, "peak_scope=job") == null)
+        try std.testing.expect(try stepEndNumber(second, " mem_peak=") < 60_000_000);
+}
+
+/// The number after `key` in a `step-end:` line.
+fn stepEndNumber(line: []const u8, key: []const u8) !f64 {
+    const at = std.mem.indexOf(u8, line, key) orelse return error.TestUnexpectedResult;
+    const rest = line[at + key.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+    return std.fmt.parseFloat(f64, rest[0..end]) catch error.TestUnexpectedResult;
 }

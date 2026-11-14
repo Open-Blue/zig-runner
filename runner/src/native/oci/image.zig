@@ -68,7 +68,6 @@ pub fn pull(
     arena: Allocator,
     gpa: Allocator,
     io: std.Io,
-    http: *std.http.Client,
     store: Store,
     req: Request,
     why: *[]const u8,
@@ -99,7 +98,7 @@ pub fn pull(
         };
     }
 
-    var c: registry.Client = .{ .arena = arena, .http = http, .ref = ref, .creds = req.creds };
+    var c: registry.Client = .{ .arena = arena, .io = io, .ref = ref, .creds = req.creds };
     errdefer if (c.why.len > 0 and why.len == 0) {
         why.* = c.why;
     };

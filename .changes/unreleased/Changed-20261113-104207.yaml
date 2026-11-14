@@ -1,0 +1,3 @@
+kind: Changed
+body: 'The runner''s HTTP connections to GitHub, Gitea and Forgejo set TCP_NODELAY: a new TLS connection no longer waits about 40 ms for Nagle''s algorithm and the peer''s delayed ACK (45 ms against 2.2 ms for a cold request, measured locally).'
+time: 2026-11-13T10:42:07.485212379-05:00

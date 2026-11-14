@@ -1,0 +1,22 @@
+# ThreadSanitizer suppressions for the runner's tests and e2e runs (zig-test.sh, e2e.sh).
+#
+# The Rust side is instrumented (build-zr-net.sh `tsan`: nightly Rust, -Zsanitizer=thread
+# -Zbuild-std; docs/rust-net.md, "ThreadSanitizer"), so a race in or across it is reported like
+# one in Zig. One report is not a race, and is suppressed by the frame that makes it:
+#
+# tokio registers a socket with epoll and hands the kernel a pointer to the socket's ScheduledIo as
+# the event's data (`RegistrationSet::allocate` writes the struct, then mio's epoll_ctl(ADD)). The
+# driver thread gets the pointer back from epoll_wait and reads the struct (`Driver::turn`,
+# `ScheduledIo::wake`). The kernel orders the two, which TSan cannot see: epoll_ctl to epoll_wait
+# is no happens-before edge to it. Reported, every time a socket is registered while the driver
+# runs, as a write in `allocate` (a `__tsan_memcpy`) against a read or write in `turn`/`wake`.
+# Matching on `allocate` alone keeps it narrow: only a race whose one side is that initial write.
+race:tokio::runtime::io::registration_set::RegistrationSet>::allocate
+
+# A thread that finished and was not joined, reported once at the process's end. The runtime lives as
+# long as the process (docs/rust-net.md, "Threading and the runtime"): tokio's blocking pool (the
+# getaddrinfo threads) keeps the handle of a thread that has gone idle for
+# its 10 s and left, to join it at the next spawn or at shutdown, and a test process ends with the
+# runtime still started. Not a race, and not a leak that grows: the pool's size is capped.
+# (A `thread:` entry matches the stack that created the thread.)
+thread:tokio::runtime::blocking::pool::Spawner>::spawn_thread

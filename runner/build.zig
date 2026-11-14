@@ -20,9 +20,6 @@ pub fn build(b: *std.Build) void {
     // binary is on that machine?" by comparing file sizes and timestamps is how an hour went
     // missing once; `git describe` answers it exactly.
     const version = b.createModule(.{ .root_source_file = versionFile(b) });
-    // TLS to the database (`src/pg.zig`): std's client cannot answer a server that asks for a
-    // client certificate, which Tiger Data does.
-    const tls = b.dependency("tls", .{}).module("tls");
 
     const exe = b.addExecutable(.{
         .name = "runner",
@@ -34,13 +31,12 @@ pub fn build(b: *std.Build) void {
             .sanitize_thread = sanitize_thread,
             .imports = &.{
                 .{ .name = "build_version", .module = version },
-                .{ .name = "tls", .module = tls },
             },
         }),
     });
     addLibzstd(exe.root_module);
     addLibzlibng(exe.root_module, target.result.cpu.arch);
-    addZrNet(exe.root_module, target.result.cpu.arch, target.result.abi);
+    addZrNet(exe.root_module, target.result.cpu.arch, target.result.abi, sanitize_thread == true);
     exe.pie = pie;
     b.installArtifact(exe);
 
@@ -91,6 +87,33 @@ pub fn build(b: *std.Build) void {
     // runner's main loop (`loop.cycle`): a type error there passed `zig build test`, and CI with
     // it, and turned up only when the release image was built.
     test_step.dependOn(&exe.step);
+
+    // The old TLS client as an oracle for the new one (`tls_oracle.zig`, docs/rust-net.md): tls.zig,
+    // which the database's TLS was before the network library, is a lazy dependency in
+    // build.zig.zon, and only this step needs it. Zig's configure phase does not know which steps
+    // were asked for, so a lazy dependency requested in it is fetched for every invocation: the
+    // request is behind `-Dtls-oracle`, and no other build, `zig build test` included, fetches or
+    // compiles it. Where the Database fixture is: `zig build test-tls-oracle -Dtls-oracle`.
+    const oracle_step = b.step("test-tls-oracle", "Compare the old TLS client with the new one (needs -Dtls-oracle, which fetches tls.zig)");
+    if (b.option(bool, "tls-oracle", "Fetch tls.zig for test-tls-oracle") orelse false) {
+        if (b.lazyDependency("tls", .{ .target = target, .optimize = optimize })) |tls| {
+            const oracle = b.addTest(.{ .root_module = b.createModule(.{
+                .root_source_file = b.path("tls_oracle.zig"),
+                .target = target,
+                .optimize = optimize,
+                .sanitize_thread = sanitize_thread,
+                .imports = &.{.{ .name = "tls", .module = tls.module("tls") }},
+            }) });
+            oracle.pie = pie;
+            addZrNet(oracle.root_module, target.result.cpu.arch, target.result.abi, sanitize_thread == true);
+            const run_oracle = b.addRunArtifact(oracle);
+            // Which servers it finds depends on the environment (PG*, ZIG_TEST_PG_TLS_DIR).
+            run_oracle.has_side_effects = true;
+            oracle_step.dependOn(&run_oracle.step);
+        }
+    } else {
+        oracle_step.dependOn(&b.addFail("test-tls-oracle fetches tls.zig: run it as `zig build test-tls-oracle -Dtls-oracle`").step);
+    }
 }
 
 /// A file holding the version, for `src/version.zig` to `@embedFile`: `v0.2.0-118-g5063ae36`, with
@@ -223,11 +246,12 @@ fn addLibzlibng(module: *std.Build.Module, arch: std.Target.Cpu.Arch) void {
 /// references even with `panic = "abort"`. The step runs on every build, as the version's does:
 /// cargo has its own cache and a clean tree costs it about a second; the Zig compilation after it
 /// repeats only when the archive's bytes change.
-fn addZrNet(module: *std.Build.Module, arch: std.Target.Cpu.Arch, abi: std.Target.Abi) void {
+fn addZrNet(module: *std.Build.Module, arch: std.Target.Cpu.Arch, abi: std.Target.Abi, sanitize_thread: bool) void {
     const b = module.owner;
     const cargo = b.addSystemCommand(&.{ "../.github/scripts/build-zr-net.sh", @tagName(arch) });
     const archive = cargo.addOutputFileArg("libzr_net.a");
-    cargo.addArg(if (abi.isMusl()) "musl" else "gnu");
+    // Under ThreadSanitizer the archive is built instrumented too (nightly Rust, `-Zsanitizer=thread`).
+    cargo.addArg(if (sanitize_thread) "tsan" else if (abi.isMusl()) "musl" else "gnu");
     cargo.has_side_effects = true;
     module.addObjectFile(archive);
     module.link_libc = true;

@@ -364,7 +364,11 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
 
     const job_started_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
     var reporter = try startReporter(c, job, job_started_ms);
-    const result = try runJobSteps(c, job, log, &cancel, &live, &step_logs, if (reporter) |*r| r else null);
+    // Each step's `step-end:` line, made as it ends, logged with the job's `native phases`.
+    var step_ends: std.Io.Writer.Allocating = .init(c.arena);
+    var step_ends_said = false;
+    defer if (!step_ends_said) sayStepEnds(c, &step_ends);
+    const result = try runJobSteps(c, job, log, &cancel, &live, &step_logs, if (reporter) |*r| r else null, &step_ends);
     // A native job's teardown (its eviction of the store, its network, its cgroup) comes after its
     // result is reported to GitHub, not before: the result does not depend on it. It runs on every
     // path out of here, and before the gate lets go of the job (`gate.ended`, deferred above), so
@@ -412,6 +416,8 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     // The result is with GitHub: the job's hold needs no more renewing, and the teardown can go.
     renewer.stop.store(true, .release);
     if (result.teardown) |t| phases = t.run();
+    step_ends_said = true;
+    sayStepEnds(c, &step_ends);
     if (phases) |p| try c.err.print("job {d} '{s}': native phases (ms): {s}\n", .{
         job.check_run_id,
         jobName(job),
@@ -420,6 +426,11 @@ pub fn handleJob(c: Runner, session: Listening, body: []const u8) !Cycle {
     sayJobEnd(c, job, stats_before);
     if (failed) |f| return f;
     return .{ .job = result.succeeded };
+}
+
+/// The `step-end:` lines the job's steps made (`dagger/step_end.zig`).
+fn sayStepEnds(c: Runner, lines: *std.Io.Writer.Allocating) void {
+    c.err.writeAll(lines.written()) catch return;
 }
 
 /// One line per job, once its teardown ran: the runner process's resources and what changed while
@@ -707,12 +718,13 @@ fn runJobSteps(
     /// Told of the steps first; passes them on to `live`.
     step_logs: *upload.StepLogs,
     reporter: ?*Reporter,
+    step_ends: ?*std.Io.Writer.Allocating,
 ) !dagger.Result {
     if (try unrunnable(c, job, log)) |failed| return failed;
     return execute(c, job, log, cancel, observer: {
         live.next = if (reporter) |r| r.observer() else null;
         break :observer step_logs.observer();
-    });
+    }, step_ends);
 }
 
 /// The result of a job this runner does not run: one it does not trust (`trust.zig`), or whose
@@ -733,13 +745,15 @@ pub fn unrunnable(c: Runner, job: job_mod.Job, log: *sink.LogSink) !?dagger.Resu
 
 /// The steps of a job that may run, on the backend the runner is set up for, told to `observer` as
 /// each starts and ends. The result carries the native teardown not run yet (`defer_teardown`): the
-/// caller runs it once it has reported, as `handleJob` does.
+/// caller runs it once it has reported, as `handleJob` does. `step_ends` collects each step's
+/// `step-end:` line (`dagger/step_end.zig`), or null for none.
 pub fn execute(
     c: Runner,
     job: job_mod.Job,
     log: *sink.LogSink,
     cancel: *dagger.Cancel,
     observer: ?dagger.Observer,
+    step_ends: ?*std.Io.Writer.Allocating,
 ) !dagger.Result {
     const cfg = c.cfg;
     const zig_seeds: zig_release.Resolved = if (cfg.zig_seed_registry) |r|
@@ -785,6 +799,7 @@ pub fn execute(
         .sink_job_id = job.check_run_id,
         .runner_name = c.name,
         .native = native,
+        .step_ends = step_ends,
         // Reported first, torn down after (`handleJob`).
         .defer_teardown = true,
     }, job, log);
@@ -888,7 +903,7 @@ test "the gate learns a job in its trust scope, and not at all from one the runn
     pool.slots[0].peak_mb = 5000;
     var cancel: dagger.Cancel = .{};
     var log: sink.LogSink = .{ .collect = .{ .arena = arena, .io = std.testing.io, .inner = &stdout_log } };
-    const result = try runJobSteps(runner, job, &log, &cancel, undefined, undefined, null);
+    const result = try runJobSteps(runner, job, &log, &cancel, undefined, undefined, null, null);
     try std.testing.expect(result.set_up_failed);
     try std.testing.expect(gate.ended() == null);
     try std.testing.expectEqual(@as(usize, 0), pool.learned.len);

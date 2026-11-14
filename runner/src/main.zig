@@ -21,6 +21,8 @@ const pg = @import("pg.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
 const http = @import("github/http.zig");
+const net_hooks = @import("github/net_hooks.zig");
+const request_log = @import("github/request_log.zig");
 const zig_release = @import("zig_release.zig");
 const broker = @import("github/broker.zig");
 const jitconfig = @import("github/jitconfig.zig");
@@ -36,6 +38,8 @@ pub const std_options: std.Options = .{ .logFn = logfmt.logFn };
 comptime {
     _ = @import("sha256.zig");
     _ = @import("zr_net.zig");
+    _ = @import("net_client.zig");
+    _ = @import("net_oracle.zig");
     _ = @import("sink.zig");
     _ = @import("native/Backend.zig");
     _ = @import("native/cgroup.zig");
@@ -44,6 +48,9 @@ comptime {
     _ = @import("native/reaper.zig");
     _ = @import("native/collector.zig");
     _ = @import("proc_stats.zig");
+    _ = @import("github/net_hooks.zig");
+    _ = @import("dagger/step_end.zig");
+    _ = @import("github/request_log.zig");
     _ = @import("native/sync_choice.zig");
     _ = @import("native/sandbox.zig");
     _ = @import("native/net.zig");
@@ -162,6 +169,7 @@ pub fn main(process_init: std.process.Init) !u8 {
         try logfmt.line(err, .err, "config", "detail={f}", .{logfmt.q(Config.explain(e) orelse @errorName(e))});
         return @backingInt(Exit.config);
     };
+    request_log.enabled.store(cfg.log_requests, .monotonic);
     // `RUNNER_ENGINE=cli` runs `dagger run ... sh -c ...` and `cat` for every job. The release image
     // (built FROM scratch) has none of them, and without this check each job would fail in "Set up
     // job" instead of the pool not starting.
@@ -251,9 +259,10 @@ pub fn main(process_init: std.process.Init) !u8 {
     if (try refuseNativeWithoutEngine(arena, io, init, &cfg, err)) |code| return code;
 
     // One HTTP client for every runner (see `github/http.zig`).
+    // Its connects are timed for the `request:` lines (`github/net_hooks.zig`).
     var client: std.http.Client = .{
         .allocator = init.gpa,
-        .io = io,
+        .io = net_hooks.wrap(io),
         .write_buffer_size = http.write_buffer_size,
     };
     defer client.deinit();
@@ -261,7 +270,7 @@ pub fn main(process_init: std.process.Init) !u8 {
     // Before `client`'s, as defers run: the clients `renew` made in its place.
     defer http.deinitShared(io);
     var zig_seeds: zig_release.Registry = undefined;
-    try resolveZigSeeds(arena, init, &cfg, &client, &zig_seeds);
+    try resolveZigSeeds(arena, init, &cfg, &zig_seeds);
     defer zig_seeds.deinit();
     const stale = try settleRegistrations(arena, io, &cfg, log);
     installStopSignals();
@@ -317,14 +326,13 @@ fn resolveZigSeeds(
     arena: std.mem.Allocator,
     init: std.process.Init,
     cfg: *Config,
-    client: *std.http.Client,
     zig_seeds: *zig_release.Registry,
 ) !void {
-    zig_seeds.* = .{ .io = init.io, .gpa = init.gpa, .client = client };
+    zig_seeds.* = .{ .io = init.io, .gpa = init.gpa, .online = true };
     if (cfg.zig_seed) |*s| {
         cfg.zig_seeds = s[0..1];
     } else if (cfg.package_caches) {
-        const r = try zig_release.resolve(arena, init.gpa, client, cfg.zig_seed_versions);
+        const r = try zig_release.resolve(arena, init.gpa, init.io, cfg.zig_seed_versions);
         cfg.zig_seeds = r.seeds;
         cfg.zig_seeds_unverified = r.unverified;
         try zig_seeds.add(r);
@@ -354,7 +362,7 @@ fn giteaMain(
     http.shared.store(&client, .release);
     defer http.deinitShared(init.io);
     var zig_seeds: zig_release.Registry = undefined;
-    try resolveZigSeeds(arena, init, cfg, &client, &zig_seeds);
+    try resolveZigSeeds(arena, init, cfg, &zig_seeds);
     defer zig_seeds.deinit();
     // The instances this process let its jobs reach are forgotten by the others' rules.
     defer net.forget();

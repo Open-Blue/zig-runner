@@ -11,6 +11,8 @@
 //!   /see-other   303 to /echo
 //!   /loop        302 to /loop
 //!   /unavailable/...  503
+//!   /limited/...  429 with `Retry-After: 7` and GitHub's `X-RateLimit-*` headers (remaining 0 of
+//!                5000, resetting at 1700000000, resource `core`)
 //!   /broker/message?...  200, a `RunnerJobRequest` whose run service is /nowhere (so acquirejob
 //!                answers 404); each one counted in `Server.polls`
 //!   /silent      never answered: the connection stays open, as one to a peer that went away
@@ -29,6 +31,11 @@
 //!                (PUT) 201. Each kind counted in `Server.results`. The first `results_fail`
 //!                requests whose path contains `results_fail_on` answer `results_fail_status`
 //!                instead (a results service having a bad moment).
+//!   /blob/<n>    200, n bytes of `blobByte` (any size: a download for streaming tests)
+//!   /to-cdn/<n>  302 to http://localhost:<port>/cdn-blob/<n>, another host name
+//!   /cdn-blob/<n>  the same bytes, but 403 for a request that carries an Authorization header (a
+//!                signed URL refuses the token it was not made for)
+//!   /sink        200, "<bytes received> <fnv1a-64 of them, hex>" for any body (an upload)
 //!   anything else 404, with GitHub's `{"message":"Not Found"}`
 //!
 //! Every connection accepted is counted in `Server.accepts`.
@@ -116,6 +123,22 @@ pub const Server = struct {
     }
 };
 
+/// The byte at `i` of a /blob/<n>.
+pub fn blobByte(i: u64) u8 {
+    return @truncate((i *% 2654435761) >> 7);
+}
+
+/// What /sink received: how much, and its FNV-1a (64).
+pub const Sink = struct {
+    bytes: u64 = 0,
+    hash: u64 = 0xcbf29ce484222325,
+
+    pub fn add(s: *Sink, data: []const u8) void {
+        for (data) |c| s.hash = (s.hash ^ c) *% 0x100000001b3;
+        s.bytes += data.len;
+    }
+};
+
 /// What becomes of a connection once its request is answered (or not).
 const Outcome = enum { close, hold, quit };
 
@@ -151,7 +174,17 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
         if (std.ascii.eqlIgnoreCase(name, "content-length"))
             body_len = std.fmt.parseInt(usize, value, 10) catch 0;
     }
-    r.interface.discardAll(body_len) catch {};
+    var sunk: Sink = .{};
+    if (std.mem.eql(u8, path, "/sink")) {
+        var left = body_len;
+        var chunk: [16 * 1024]u8 = undefined;
+        while (left > 0) {
+            const n = r.interface.readSliceShort(chunk[0..@min(left, chunk.len)]) catch return .close;
+            if (n == 0) return .close;
+            sunk.add(chunk[0..n]);
+            left -= n;
+        }
+    } else r.interface.discardAll(body_len) catch return .close;
     if (std.mem.eql(u8, path, "/quit")) return .quit;
     if (std.mem.eql(u8, path, "/silent")) return .hold;
     if (std.mem.startsWith(u8, path, "/silent-once/")) {
@@ -163,7 +196,32 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
     var w = conn.writer(io, &wb);
     const out = &w.interface;
     var loc_buf: [128]u8 = undefined;
-    if (std.mem.eql(u8, path, "/echo")) {
+    if (std.mem.startsWith(u8, path, "/blob/") or std.mem.startsWith(u8, path, "/cdn-blob/") or
+        std.mem.startsWith(u8, path, "/to-cdn/"))
+    {
+        const tail = path[std.mem.lastIndexOfScalar(u8, path, '/').? + 1 ..];
+        const n = std.fmt.parseInt(u64, tail[0 .. std.mem.indexOfScalar(u8, tail, '?') orelse tail.len], 10) catch 0;
+        if (std.mem.startsWith(u8, path, "/to-cdn/")) {
+            var b: [64]u8 = undefined;
+            const loc = std.fmt.bufPrint(&b, "http://localhost:{d}/cdn-blob/{d}", .{ port, n }) catch return .close;
+            respond(out, "302 Found", loc, "");
+        } else if (std.mem.startsWith(u8, path, "/cdn-blob/") and !std.mem.eql(u8, auth, "-")) {
+            respond(out, "403 Forbidden", null, "token refused");
+        } else {
+            out.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{n}) catch return .close;
+            var chunk: [8192]u8 = undefined;
+            var at: u64 = 0;
+            while (at < n) {
+                const len: usize = @intCast(@min(n - at, chunk.len));
+                for (chunk[0..len], 0..) |*c, i| c.* = blobByte(at + i);
+                out.writeAll(chunk[0..len]) catch return .close;
+                at += len;
+            }
+        }
+    } else if (std.mem.eql(u8, path, "/sink")) {
+        var b: [64]u8 = undefined;
+        respond(out, "200 OK", null, std.fmt.bufPrint(&b, "{d} {x:0>16}", .{ sunk.bytes, sunk.hash }) catch return .close);
+    } else if (std.mem.eql(u8, path, "/echo")) {
         var body_buf: [1100]u8 = undefined;
         const body = std.fmt.bufPrint(&body_buf, "{s} {s}", .{ method, auth }) catch return .close;
         respond(out, "200 OK", null, body);
@@ -179,6 +237,10 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
         respond(out, "302 Found", "/loop", "");
     } else if (std.mem.startsWith(u8, path, "/unavailable/")) {
         respond(out, "503 Service Unavailable", null, "");
+    } else if (std.mem.startsWith(u8, path, "/limited/")) {
+        out.writeAll("HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n" ++
+            "Retry-After: 7\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Limit: 5000\r\n" ++
+            "X-RateLimit-Reset: 1700000000\r\nX-RateLimit-Resource: core\r\n\r\n") catch return .close;
     } else if (std.mem.startsWith(u8, path, "/broker/message?")) {
         _ = s.polls.fetchAdd(1, .acq_rel);
         var body_buf: [256]u8 = undefined;

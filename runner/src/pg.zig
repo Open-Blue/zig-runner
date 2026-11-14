@@ -12,10 +12,13 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 /// Not std's TLS client: it fails when the server asks for a client certificate (a TLS 1.3
-/// CertificateRequest), which Tiger Data and any Postgres configured with a CA file do. This one
-/// answers with an empty Certificate message, as RFC 8446 §4.4.2 says a client without one does.
-const tls = @import("tls");
+/// CertificateRequest), which Tiger Data and any Postgres configured with a CA file do. This one is
+/// the network library's rustls (docs/rust-net.md), driven over this file's own socket: it answers
+/// with the client's certificate when `Config` names one (`sslcert`, `sslkey`) and with an empty
+/// Certificate message otherwise, as RFC 8446 §4.4.2 says a client without one does.
+const tls = @import("tls_stream.zig");
 const http = @import("github/http.zig");
+const zr_net = @import("zr_net.zig");
 const Io = std.Io;
 
 /// PostgreSQL's port, when the URL or PGPORT names none.
@@ -37,6 +40,12 @@ pub const Config = struct {
     password: []const u8 = "",
     database: []const u8,
     sslmode: SslMode = .require,
+    /// libpq's `sslrootcert`, `sslcert` and `sslkey`: PEM files. The roots replace the system's
+    /// (`SSL_CERT_FILE` and `SSL_CERT_DIR` choose those); the certificate and key are what the
+    /// server's client-certificate check (`clientcert`, Tiger Data) is answered with.
+    sslrootcert: []const u8 = "",
+    sslcert: []const u8 = "",
+    sslkey: []const u8 = "",
     application_name: []const u8 = "zig-actions-runner",
     /// How long connecting may take, through TLS and authentication, before it is given up
     /// (`error.Timeout`). A host that accepts and never answers, or a network that dropped the
@@ -49,7 +58,8 @@ pub const Config = struct {
 
 pub const ParseError = error{ InvalidUrl, InvalidSslMode, OutOfMemory };
 
-/// `postgres://user:password@host:port/database?sslmode=require|disable|no-verify`. User and
+/// `postgres://user:password@host:port/database?sslmode=require|disable|no-verify`, and
+/// `sslrootcert`, `sslcert` and `sslkey` (paths). User and
 /// password may be percent-encoded. A missing sslmode means `require`.
 pub fn parseUrl(arena: Allocator, url: []const u8) ParseError!Config {
     var rest = url;
@@ -101,7 +111,12 @@ pub fn parseUrl(arena: Allocator, url: []const u8) ParseError!Config {
     var params = std.mem.splitScalar(u8, query, '&');
     while (params.next()) |p| {
         const eq = std.mem.indexOfScalar(u8, p, '=') orelse continue;
-        if (std.mem.eql(u8, p[0..eq], "sslmode")) cfg.sslmode = try parseSslMode(p[eq + 1 ..]);
+        const name = p[0..eq];
+        const value = p[eq + 1 ..];
+        if (std.mem.eql(u8, name, "sslmode")) cfg.sslmode = try parseSslMode(value);
+        if (std.mem.eql(u8, name, "sslrootcert")) cfg.sslrootcert = try percentDecode(arena, value);
+        if (std.mem.eql(u8, name, "sslcert")) cfg.sslcert = try percentDecode(arena, value);
+        if (std.mem.eql(u8, name, "sslkey")) cfg.sslkey = try percentDecode(arena, value);
     }
     return cfg;
 }
@@ -114,7 +129,8 @@ pub fn parseSslMode(s: []const u8) ParseError!SslMode {
     return error.InvalidSslMode;
 }
 
-/// The standard libpq variables: PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE, PGSSLMODE.
+/// The standard libpq variables: PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE, PGSSLMODE,
+/// PGSSLROOTCERT, PGSSLCERT, PGSSLKEY.
 /// Returns null unless at least host, user and database are set.
 pub fn fromEnv(env: *const std.process.Environ.Map) ParseError!?Config {
     const host = env.get("PGHOST") orelse return null;
@@ -128,6 +144,9 @@ pub fn fromEnv(env: *const std.process.Environ.Map) ParseError!?Config {
         .password = env.get("PGPASSWORD") orelse "",
         .database = database,
         .sslmode = if (env.get("PGSSLMODE")) |m| try parseSslMode(m) else .require,
+        .sslrootcert = env.get("PGSSLROOTCERT") orelse "",
+        .sslcert = env.get("PGSSLCERT") orelse "",
+        .sslkey = env.get("PGSSLKEY") orelse "",
     };
 }
 
@@ -391,13 +410,10 @@ pub const Client = struct {
     stream: Io.net.Stream,
     stream_reader: Io.net.Stream.Reader,
     stream_writer: Io.net.Stream.Writer,
-    tls: ?tls.Connection = null,
-    tls_reader: tls.Connection.Reader = undefined,
-    tls_writer: tls.Connection.Writer = undefined,
+    tls: ?tls.Stream = null,
     r: *Io.Reader,
     w: *Io.Writer,
     buffers: []u8,
-    ca_bundle: std.crypto.Certificate.Bundle = .empty,
     /// "ERROR 42P01: relation ... does not exist": the last ErrorResponse from the server.
     last_error: []const u8 = "",
     error_buf: [512]u8 = undefined,
@@ -407,6 +423,8 @@ pub const Client = struct {
     query_timeout: Io.Duration,
 
     const plain_buf_len = 16 * 1024;
+    /// The socket's buffers: a TLS record with its overhead.
+    const sock_buffer_len = 17 * 1024;
 
     /// Connects within `cfg.connect_timeout` (`error.Timeout`): it runs next to a timer, and
     /// whichever ends first cancels the other, which interrupts a blocked connect, read or write.
@@ -437,7 +455,7 @@ pub const Client = struct {
         // waiting for its answer, which would otherwise wait for good.
         http.keepAlive(stream.socket.handle);
 
-        const sock_len = tls.input_buffer_len + tls.output_buffer_len;
+        const sock_len = 2 * sock_buffer_len;
         const buffers = try gpa.alloc(u8, sock_len + 2 * plain_buf_len);
         errdefer gpa.free(buffers);
 
@@ -445,8 +463,8 @@ pub const Client = struct {
         errdefer gpa.destroy(c);
         // Socket-level buffers (ciphertext when TLS is on, sized for a whole record), then the TLS
         // plaintext buffers.
-        const sock_r = buffers[0..tls.input_buffer_len];
-        const sock_w = buffers[tls.input_buffer_len..sock_len];
+        const sock_r = buffers[0..sock_buffer_len];
+        const sock_w = buffers[sock_buffer_len..sock_len];
         c.* = .{
             .gpa = gpa,
             .io = io,
@@ -461,7 +479,7 @@ pub const Client = struct {
         c.r = &c.stream_reader.interface;
         c.w = &c.stream_writer.interface;
 
-        errdefer c.ca_bundle.deinit(gpa);
+        errdefer if (c.tls) |*t| t.close();
         if (cfg.sslmode != .disable) try c.startTls(cfg, buffers[sock_len..]);
         try c.startup(cfg);
         return c;
@@ -470,9 +488,8 @@ pub const Client = struct {
     pub fn close(c: *Client) void {
         c.sendMessage('X', "") catch {};
         c.flush() catch {};
-        if (c.tls) |*t| t.close() catch {};
+        if (c.tls) |*t| t.close();
         c.stream.close(c.io);
-        c.ca_bundle.deinit(c.gpa);
         const gpa = c.gpa;
         gpa.free(c.buffers);
         gpa.destroy(c);
@@ -493,21 +510,35 @@ pub const Client = struct {
         const answer = c.r.takeByte() catch return error.ConnectionClosed;
         if (answer != 'S') return error.TlsRefused;
 
-        const rng: std.Random.IoSource = .{ .io = c.io };
-        const now = Io.Clock.real.now(c.io);
-        const verify = cfg.sslmode == .require;
-        if (verify) c.ca_bundle.rescan(c.gpa, c.io, now) catch return error.TlsFailed;
-        c.tls = tls.client(c.r, c.w, .{
-            .rng = rng.interface(),
-            .now = now,
+        // The PEM files are read here and handed over whole: the library does no file I/O.
+        var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const roots = readPem(arena, c.io, cfg.sslrootcert) catch return error.TlsFailed;
+        const cert = readPem(arena, c.io, cfg.sslcert) catch return error.TlsFailed;
+        const key = readPem(arena, c.io, if (cfg.sslkey.len > 0) cfg.sslkey else cfg.sslcert) catch return error.TlsFailed;
+        c.tls = @as(tls.Stream, undefined);
+        c.tls.?.open(c.r, c.w, .{
             .host = cfg.host,
-            .root_ca = c.ca_bundle,
-            .insecure_skip_verify = !verify,
-        }) catch return error.TlsFailed;
-        c.tls_reader = c.tls.?.reader(plain[0..plain_buf_len]);
-        c.tls_writer = c.tls.?.writer(plain[plain_buf_len..]);
-        c.r = &c.tls_reader.interface;
-        c.w = &c.tls_writer.interface;
+            .verify = cfg.sslmode == .require,
+            .roots_pem = roots,
+            .cert_pem = cert,
+            .key_pem = key,
+        }, plain[0..plain_buf_len], plain[plain_buf_len..]) catch |e| {
+            // What the library says (an unknown issuer, a name that does not match) is the reason
+            // an operator needs; `last_error` is where this file keeps the server's.
+            c.last_error = std.fmt.bufPrint(&c.error_buf, "TLS {t}: {s}", .{ c.tls.?.kind, c.tls.?.message() }) catch c.error_buf[0..0];
+            std.log.warn("pg: TLS to {s}: {s}", .{ cfg.host, c.last_error });
+            c.tls = null;
+            return if (e == error.ConnectionClosed) error.ConnectionClosed else error.TlsFailed;
+        };
+        c.r = &c.tls.?.reader.interface;
+        c.w = &c.tls.?.writer.interface;
+    }
+
+    fn readPem(arena: Allocator, io: Io, path: []const u8) ![]const u8 {
+        if (path.len == 0) return "";
+        return Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
     }
 
     /// With TLS on, each record is written through to the socket as it is sealed.
@@ -1024,4 +1055,119 @@ test "a server that accepts and never answers is given up, connecting and in a s
     try std.testing.expectError(error.Timeout, c.exec("select 1"));
     try std.testing.expect(started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 10_000);
     try connecting.await(io);
+}
+
+// --- TLS against a Postgres that requires it (.github/scripts/pg-tls-fixture.sh) ---
+
+/// A config for the TLS tests: the integration database's host and port, TLS on, the fixture's files in
+/// `ZIG_TEST_PG_TLS_DIR` (the Database tests job and a developer's container set it), else skipped.
+fn tlsConfig(arena: Allocator, user: []const u8, certs: struct { root: []const u8 = "ca.pem", cert: []const u8 = "", key: []const u8 = "" }) !Config {
+    var env = try std.testing.environ.createMap(arena);
+    const dir = env.get("ZIG_TEST_PG_TLS_DIR") orelse return @import("dbtest.zig").unavailable(&env);
+    var cfg = try testConfig(arena);
+    cfg.user = user;
+    cfg.sslmode = .require;
+    // The fixture's server certificate names localhost and 127.0.0.1.
+    cfg.host = "127.0.0.1";
+    cfg.password = if (std.mem.eql(u8, user, "postgres")) cfg.password else "";
+    const join = struct {
+        fn f(a: Allocator, d: []const u8, name: []const u8) ![]const u8 {
+            return if (name.len == 0) "" else std.fmt.allocPrint(a, "{s}/{s}", .{ d, name });
+        }
+    }.f;
+    cfg.sslrootcert = try join(arena, dir, certs.root);
+    cfg.sslcert = try join(arena, dir, certs.cert);
+    cfg.sslkey = try join(arena, dir, certs.key);
+    return cfg;
+}
+
+fn expectUser(arena: Allocator, cfg: Config, user: []const u8) !void {
+    const c = try Client.connect(std.testing.allocator, std.testing.io, cfg);
+    defer c.close();
+    try std.testing.expectEqualStrings(user, (try c.query(arena, "select current_user"))[0][0].?);
+    try std.testing.expectEqualStrings("true", (try c.query(arena, "select ssl::text from pg_stat_ssl where pid = pg_backend_pid()"))[0][0] orelse "");
+}
+
+test "tls: a client certificate with an ECDSA key (PKCS#8 and SEC1) is accepted by a private CA's server" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try expectUser(arena, try tlsConfig(arena, "pgecdsa", .{ .cert = "client-ecdsa.pem", .key = "client-ecdsa-key.pem" }), "pgecdsa");
+    try expectUser(arena, try tlsConfig(arena, "pgecdsa", .{ .cert = "client-ecdsa.pem", .key = "client-ecdsa-sec1-key.pem" }), "pgecdsa");
+}
+
+test "tls: a client certificate with an RSA key (PKCS#8 and PKCS#1) is accepted" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try expectUser(arena, try tlsConfig(arena, "pgrsa", .{ .cert = "client-rsa.pem", .key = "client-rsa-key.pem" }), "pgrsa");
+    try expectUser(arena, try tlsConfig(arena, "pgrsa", .{ .cert = "client-rsa.pem", .key = "client-rsa-pkcs1-key.pem" }), "pgrsa");
+}
+
+test "tls: a server that asks for a client certificate and gets none refuses the connection" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cfg = try tlsConfig(arena, "pgrsa", .{});
+    const err = Client.connect(std.testing.allocator, std.testing.io, cfg);
+    // The server's alert reaches the client as a failed handshake, or as the connection ending.
+    if (err) |c| {
+        c.close();
+        return error.TestUnexpectedResult;
+    } else |e| try std.testing.expect(e == error.TlsFailed or e == error.ConnectionClosed or e == error.ServerError);
+}
+
+test "tls: a server certificate from an unknown CA fails the handshake, saying so" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The system's roots (the sandbox's SSL_CERT_FILE or not) do not hold the fixture's CA.
+    for ([_][]const u8{ "other-ca.pem", "" }) |root| {
+        const cfg = try tlsConfig(arena, "postgres", .{ .root = root });
+        try std.testing.expectError(error.TlsFailed, Client.connect(std.testing.allocator, std.testing.io, cfg));
+    }
+}
+
+test "tls: no-verify encrypts without checking, and a password still works" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cfg = try tlsConfig(arena, "postgres", .{ .root = "" });
+    cfg.sslmode = .no_verify;
+    try expectUser(arena, cfg, "postgres");
+}
+
+test "tls: large results and COPY go through the records whole, in both directions" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cfg = try tlsConfig(arena, "pgecdsa", .{ .cert = "client-ecdsa.pem", .key = "client-ecdsa-key.pem" });
+    const c = try Client.connect(std.testing.allocator, std.testing.io, cfg);
+    defer c.close();
+    // 8 MiB back: many records, each larger than the plaintext buffer's half.
+    const rows = try c.query(arena, "select repeat('0123456789abcdef', 524288)");
+    try std.testing.expectEqual(@as(usize, 8 << 20), rows[0][0].?.len);
+    // And 4 MiB up, through COPY.
+    try c.exec("create temp table zig_pg_tls (line text)");
+    var data: std.Io.Writer.Allocating = .init(arena);
+    for (0..4096) |_| {
+        for (0..64) |_| try data.writer.writeAll("0123456789abcdef");
+        try data.writer.writeByte('\n');
+    }
+    try std.testing.expectEqual(@as(u64, 4096), try c.copyIn("copy zig_pg_tls (line) from stdin", data.written()));
+    try std.testing.expectEqualStrings("4194304", (try c.query(arena, "select sum(length(line))::text from zig_pg_tls"))[0][0].?);
+}
+
+test "tls: connecting and closing again and again leaves no memory behind in Rust" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cfg = try tlsConfig(arena, "pgecdsa", .{ .cert = "client-ecdsa.pem", .key = "client-ecdsa-key.pem" });
+    // The first connection loads what is kept for the process (roots, provider tables).
+    try expectUser(arena, cfg, "pgecdsa");
+    const before = zr_net.heap().bytes;
+    for (0..50) |_| try expectUser(arena, cfg, "pgecdsa");
+    const after = zr_net.heap().bytes;
+    // Allowing for the allocator's bookkeeping of a thread or two, never a connection's worth (50 x tens of KB).
+    try std.testing.expect(after <= before + 16 * 1024);
 }

@@ -30,6 +30,8 @@ const layer = @import("native/oci/layer.zig");
 const zstd = @import("native/oci/zstd.zig");
 const libzstd = @import("native/oci/libzstd.zig");
 const zlibng = @import("native/oci/zlibng.zig");
+const tls_stream = @import("tls_stream.zig");
+const net_client = @import("net_client.zig");
 const registry = @import("native/oci/registry.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
@@ -1671,6 +1673,224 @@ fn jobMessages(_: void, smith: *Smith) !void {
         try std.testing.expectEqualStrings("j", job.job_id);
         try std.testing.expectEqual(@as(usize, 1), job.steps.len);
     }
+}
+
+// --- TLS records (the network library's rustls, behind the C ABI) ---
+
+test "fuzz: TLS records" {
+    const flight13 = @embedFile("fuzz_corpus/tls/flight13.bin");
+    const flight12 = @embedFile("fuzz_corpus/tls/flight12.bin");
+    try std.testing.fuzz({}, tlsRecords, .{
+        .corpus = comptime seeds(&.{
+            // The server's first flight, in one piece and in two (verifying, then not).
+            &.{ "\x01", flight13 },
+            &.{ "\x00", flight13[0..90], flight13[90..] },
+            &.{ "\x01", flight12 },
+            &.{ "\x00", flight12[0..60], flight12[60..400], flight12[400..] },
+            // An alert, and records of the wrong version and length.
+            &.{ "\x01", "\x15\x03\x03\x00\x02\x02\x28" },
+            &.{ "\x01", "\x16\x03\x01\x00\x04\x02\x00\x00\x00", "\x17\x03\x03\xff\xff" },
+        }),
+    });
+}
+
+/// What the server of one TLS connection sends, in chunks of any size and content: the library
+/// returns an error or goes on, never panics (which would end the process: `panic = "abort"`), and
+/// never holds more than it was given. Input: a string of flags (bit 0: check the server's
+/// certificate), then the server's chunks.
+fn tlsRecords(_: void, smith: *Smith) !void {
+    var flags_buf: [8]u8 = undefined;
+    const flags = take(smith, &flags_buf);
+    const verify = flags.len > 0 and flags[0] & 1 != 0;
+    const before = @import("zr_net.zig").heap().bytes;
+    {
+        const p = tls_stream.Probe.init(.{
+            .host = "db.example",
+            .verify = verify,
+            .roots_pem = @embedFile("fuzz_corpus/tls/ca.crt"),
+        }) orelse return error.TlsProbeNotCreated;
+        defer p.deinit();
+        _ = p.drain();
+        var total: usize = 0;
+        var chunk: [20000]u8 = undefined;
+        while (!smith.eos()) {
+            const bytes = take(smith, &chunk);
+            total += bytes.len;
+            if (!p.feed(bytes)) break;
+        }
+        // What the library holds for one connection is bounded by its buffers (rustls limits what it
+        // keeps unread to 64 KiB of plaintext and about as much of ciphertext), however much it was fed.
+        const during = @import("zr_net.zig").heap().bytes;
+        try std.testing.expect(during <= before + 512 * 1024 + total / 8);
+    }
+    // And all of it is returned when the connection is.
+    try std.testing.expect(@import("zr_net.zig").heap().bytes <= before + 64 * 1024);
+}
+
+// --- HTTP responses (the network library's hyper, behind the C ABI) ---
+
+test "fuzz: HTTP responses" {
+    try std.testing.fuzz({}, httpResponses, .{
+        .corpus = comptime seeds(&.{
+            &.{"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Ratelimit-Remaining: 4999\r\n\r\nok"},
+            &.{"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"},
+            &.{"HTTP/1.1 302 Found\r\nLocation: /echo\r\nContent-Length: 0\r\n\r\n"},
+            &.{"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n"},
+            &.{"HTTP/1.0 200 OK\r\n\r\nuntil the connection closes"},
+            &.{"HTTP/1.1 200 OK\r\nContent-Length: 99999999999\r\n\r\nshort"},
+            &.{"HTTP/1.1 301 Moved\r\nLocation: http://[::1\r\n\r\n"},
+            &.{"\x16\x03\x01\x02\x00\x01\x00\x01\xfc"},
+        }),
+    });
+}
+
+/// A loopback server that answers each request's head with `bytes` and closes: what the HTTP
+/// targets fuzz the library's client against.
+const AnswerServer = struct {
+    listener: std.Io.net.Server,
+    stop_flag: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+    bytes: []const u8,
+
+    fn start(s: *AnswerServer, io: std.Io) !void {
+        var addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        s.listener = try addr.listen(io, .{ .reuse_address = true });
+        s.thread = try std.Thread.spawn(.{}, run, .{s});
+    }
+
+    fn port(s: *const AnswerServer) u16 {
+        return s.listener.socket.address.getPort();
+    }
+
+    fn run(s: *AnswerServer) void {
+        while (!s.stop_flag.load(.acquire)) {
+            const conn = s.listener.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
+            if (s.stop_flag.load(.acquire)) return;
+            var rb: [2048]u8 = undefined;
+            var r = conn.reader(std.testing.io, &rb);
+            // The request's head, then the answer, then the connection closes.
+            while (true) {
+                const line = r.interface.takeDelimiterInclusive('\n') catch break;
+                if (line.len <= 2) break;
+            }
+            var wb: [512]u8 = undefined;
+            var w = conn.writer(std.testing.io, &wb);
+            w.interface.writeAll(s.bytes) catch return;
+            w.interface.flush() catch return;
+        }
+    }
+
+    /// Ends the server: the next accept is the last.
+    fn finish(s: *AnswerServer, io: std.Io) void {
+        s.stop_flag.store(true, .release);
+        const last = std.Io.net.IpAddress.parse("127.0.0.1", s.port()) catch return;
+        if (last.connect(io, .{ .mode = .stream })) |c| c.close(io) else |_| {}
+        s.thread.join();
+        s.listener.deinit(io);
+    }
+};
+
+/// What a server answers a request with, byte for byte, whatever it is: the library's answer (or
+/// error) comes back and the process lives (a Rust panic aborts it), within the deadline, with at
+/// most `max_response` bytes of body. Input: the bytes sent in answer to each request, and any
+/// redirect they ask for is followed (up to two) into the same server.
+fn httpResponses(_: void, smith: *Smith) !void {
+    // Not `std.testing.io`: its threads free their tasks after the awaiting thread was woken, and a
+    // leak check that runs in between reports them (see "fuzz: OCI layer").
+    var threaded: std.Io.Threaded = .init(std.heap.smp_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var buf: [4096]u8 = undefined;
+    var server: AnswerServer = .{ .listener = undefined, .bytes = take(smith, &buf) };
+    try server.start(io);
+    defer server.finish(io);
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{server.port()});
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    if (net_client.fetch(arena.allocator(), io, .{
+        .url = url,
+        .deadline = .fromMilliseconds(400),
+        .max_redirects = 2,
+        .max_response = 1 << 16,
+    })) |r| {
+        try std.testing.expect(r.body.len <= 1 << 16);
+    } else |_| {}
+}
+
+// --- HTTP streams (R4: the same answers, read as a stream; and an upload into them) ---
+
+test "fuzz: HTTP streams" {
+    try std.testing.fuzz({}, httpStreams, .{
+        .corpus = comptime seeds(&.{
+            &.{"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"},
+            &.{"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"},
+            &.{"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffff\r\nx"},
+            &.{"HTTP/1.1 302 Found\r\nLocation: /x\r\nContent-Length: 0\r\n\r\n"},
+            &.{"HTTP/1.1 200 OK\r\nContent-Length: 99999999999\r\n\r\nshort"},
+            &.{"HTTP/1.1 413 Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"},
+            &.{"HTTP/1.0 200 OK\r\n\r\nuntil the connection closes"},
+            &.{"\x16\x03\x01\x02\x00\x01\x00\x01\xfc"},
+        }),
+    });
+}
+
+const FuzzBody = struct {
+    len: usize,
+
+    fn write(ptr: *const anyopaque, w: *std.Io.Writer) anyerror!void {
+        const b: *const FuzzBody = @ptrCast(@alignCast(ptr));
+        var chunk: [1000]u8 = @splat('u');
+        var left = b.len;
+        while (left > 0) {
+            const n = @min(left, chunk.len);
+            try w.writeAll(chunk[0..n]);
+            left -= n;
+        }
+    }
+};
+
+/// What a server answers a streamed request with, read in pieces of any size, and a request body
+/// of any size written into a server that may answer before it is sent and close: the stream ends
+/// with an error or its end, within the deadline, never more than `max_response` bytes, and the
+/// process lives. Input: the answer, then how the read and the upload go (a read size, whether and
+/// how much to upload).
+fn httpStreams(_: void, smith: *Smith) !void {
+    var threaded: std.Io.Threaded = .init(std.heap.smp_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var buf: [4096]u8 = undefined;
+    var server: AnswerServer = .{ .listener = undefined, .bytes = take(smith, &buf) };
+    const read_size = @as(usize, smith.value(u16)) % 3000 + 1;
+    const upload_len: ?usize = if (smith.value(bool)) smith.value(u16) else null;
+    try server.start(io);
+    defer server.finish(io);
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{server.port()});
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const body: FuzzBody = .{ .len = upload_len orelse 0 };
+    var s = net_client.open(arena.allocator(), io, .{
+        .method = if (upload_len != null) .PUT else .GET,
+        .url = url,
+        .upload = if (upload_len != null) .{ .len = body.len, .ptr = &body, .writeFn = FuzzBody.write } else null,
+        .deadline = .fromMilliseconds(400),
+        .total = .fromMilliseconds(800),
+        .read_idle = .fromMilliseconds(300),
+        .max_redirects = 2,
+        .max_response = 1 << 16,
+    }) catch return;
+    defer s.close();
+    var out: [3000]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = s.read(out[0..read_size]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    try std.testing.expect(total <= 1 << 16);
+    try std.testing.expect(s.queuePeak() < (1 << 20) + (1 << 19));
 }
 
 // --- HTTP/2 framing ---

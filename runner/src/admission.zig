@@ -2532,7 +2532,7 @@ pub fn writeHealth(
 ) std.Io.Writer.Error!void {
     try writeHealthMachine(w, h, jobs, more);
     // The runner process's own, on a line of its own, so the job list keeps its place:
-    // `health: proc rss=63M anon=60M thr=24 fds=71 mounts=29 zombies=0 heap=41M/41200`.
+    // `health: proc rss=63M anon=60M thr=24 fds=71 mounts=29 zombies=0 heap=41M/41200 rust=310K`.
     if (h.proc) |p| try w.print("\nhealth: proc {f}", .{p});
 }
 
@@ -2621,7 +2621,7 @@ test "the health line: the runner process's own stats follow on a line of their 
     } }, &.{}, 0);
     try std.testing.expectEqualStrings(
         "health: mem_avail=? swap_free=? psi_mem=?/? psi_io=? load=? reserved=0M running=0 waiting=0\n" ++
-            "health: proc rss=64M anon=61M thr=24 fds=71 mounts=29 zombies=0 heap=41M/41200",
+            "health: proc rss=64M anon=61M thr=24 fds=71 mounts=29 zombies=0 heap=41M/41200 rust=0K",
         w.buffered(),
     );
 }

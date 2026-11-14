@@ -8,6 +8,7 @@
 const std = @import("std");
 const broker = @import("broker.zig");
 const http = @import("http.zig");
+const net_client = @import("../net_client.zig");
 const job_mod = @import("../job.zig");
 const sink = @import("../sink.zig");
 const timefmt = @import("../timefmt.zig");
@@ -252,6 +253,11 @@ fn transientError(err: anyerror) bool {
         error.EndOfStream,
         error.BrokenPipe,
         error.HttpConnectionClosing,
+        // The network library's (`net_client.Error`): the same kinds.
+        error.DnsFailed,
+        error.ConnectionFailed,
+        error.StaleConnection,
+        error.NetworkIo,
         => true,
         else => false,
     };
@@ -416,15 +422,34 @@ fn updateStepsInner(
 }
 
 /// PUTs a blob to a signed blob URL: no bearer token (the URL is the authorization), but Azure
-/// needs the blob type.
+/// needs the blob type. Through the network library (`net_client`): a log too big to hold is
+/// written as it is sent, in a queue of a fixed size. A kept connection that turned out to be
+/// closed (`error.StaleConnection`, seen on log uploads to blob storage), or one that went away
+/// without a word (no answer by the deadline, a read or write that failed: a log upload read such a
+/// connection for 17 minutes, #100), is tried once more on a connection made for it, as
+/// `broker.request` did.
 fn putBlob(arena: Allocator, io: std.Io, url: []const u8, blob: Blob) !broker.Response {
     const text: ?[]const u8 = if (blob.stream == null) blob.text else null;
-    return broker.request(arena, io, .PUT, url, text, .{
-        .content_type = "text/plain",
-        .extra_headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }},
-        .deadline = blobDeadline(blob.len()),
-        .body = blob.stream,
-    });
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        const r = net_client.fetch(arena, io, .{
+            .method = .PUT,
+            .url = url,
+            .headers = &.{
+                .{ .name = "Content-Type", .value = "text/plain" },
+                .{ .name = "x-ms-blob-type", .value = "BlockBlob" },
+            },
+            .payload = text,
+            .upload = blob.stream,
+            .deadline = blobDeadline(blob.len()),
+            .fresh = attempt > 0,
+            .retry = attempt,
+        }) catch |e| switch (e) {
+            error.StaleConnection, error.Timeout, error.NetworkIo => if (attempt == 0) continue else return e,
+            else => return e,
+        };
+        return .{ .status = r.status, .body = r.body };
+    }
 }
 
 /// How long a blob upload of `bytes` may take: a request's deadline, and as long again for each

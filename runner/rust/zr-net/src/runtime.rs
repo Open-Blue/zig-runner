@@ -13,7 +13,7 @@ pub fn start(threads: u32) -> i32 {
     match Builder::new_multi_thread()
         .worker_threads(workers)
         .thread_name("zr-net")
-        .enable_time()
+        .enable_all()
         .build()
     {
         Ok(rt) => {
@@ -22,6 +22,15 @@ pub fn start(threads: u32) -> i32 {
         }
         Err(e) => -(e.raw_os_error().unwrap_or(5)),
     }
+}
+
+/// The runtime's handle, starting it with the default workers when nothing has: the first network
+/// call does that, as docs/rust-net.md says.
+pub fn handle() -> Option<tokio::runtime::Handle> {
+    if RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).is_none() && start(0) != 0 {
+        return None;
+    }
+    RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|rt| rt.handle().clone())
 }
 
 pub fn selftest(n: u32) -> i64 {
@@ -43,9 +52,18 @@ pub fn stop() {
 }
 
 #[cfg(test)]
+pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: Mutex<()> = Mutex::new(());
+    L.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn start_selftest_stop() {
+        // Tests that use the process's runtime (call.rs) take the same lock: this one stops it.
+        let _g = super::test_lock();
+        super::stop();
         assert_eq!(super::selftest(1), -1);
         assert_eq!(super::start(1), 0);
         assert_eq!(super::start(1), 0);

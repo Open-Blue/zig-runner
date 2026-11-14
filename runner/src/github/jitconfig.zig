@@ -3,7 +3,7 @@ const std = @import("std");
 const Config = @import("../config.zig").Config;
 const Scope = @import("../config.zig").Scope;
 const broker = @import("broker.zig");
-const http = @import("http.zig");
+const net_client = @import("../net_client.zig");
 const app = @import("app.zig");
 
 const Allocator = std.mem.Allocator;
@@ -30,7 +30,7 @@ pub const Error = error{
     /// Non-2xx from GitHub. Maps to exit code 2.
     GithubRejected,
     BadResponse,
-} || Allocator.Error || http.FetchError || app.Error;
+} || Allocator.Error || net_client.Error || std.Io.Writer.Error || app.Error;
 
 /// The token runner management sends: `GH_TOKEN`, or the GitHub App's installation token. When
 /// GitHub will not give the App one, its status and reason go to `status_out` and `message_out`.
@@ -132,42 +132,36 @@ pub fn generate(
         .labels = labels.items,
     }, .{}, &body.writer);
 
-    var local: std.http.Client = .{ .allocator = arena, .io = io };
-    defer local.deinit();
-    const client = http.client(&local);
-
-    var resp: std.Io.Writer.Allocating = .init(arena);
+    var resp: []const u8 = "";
     // Sent again only after a 401 with a GitHub App, with a new token (see `manage`): a
     // registration GitHub refused was not made, so the second does not make two.
     var attempt: u32 = 0;
     const result = while (true) : (attempt += 1) {
         const t = try token(arena, io, cfg, status_out, message_out);
-        resp.clearRetainingCapacity();
-        const r = try http.fetch(client, .{
-            .location = .{ .url = url },
+        const r = try net_client.fetch(arena, io, .{
+            .url = url,
             .method = .POST,
             .payload = body.written(),
-            .headers = .{
-                .authorization = .{ .override = try std.fmt.allocPrint(arena, "Bearer {s}", .{t}) },
-                .content_type = .{ .override = "application/json" },
-            },
-            .extra_headers = &.{
+            .headers = &.{
+                .{ .name = "Authorization", .value = try std.fmt.allocPrint(arena, "Bearer {s}", .{t}) },
+                .{ .name = "Content-Type", .value = "application/json" },
                 .{ .name = "Accept", .value = "application/vnd.github+json" },
                 api_version_header,
             },
-            .response_writer = &resp.writer,
+            .retry = attempt,
         });
+        resp = r.body;
         if (r.status != .unauthorized or attempt > 0) break r;
         const a = cfg.app_auth orelse break r;
         a.invalidate(io, t);
     };
     status_out.* = result.status;
     if (result.status.class() != .success) {
-        message_out.* = errorMessage(arena, resp.written());
+        message_out.* = errorMessage(arena, resp);
         return error.GithubRejected;
     }
 
-    return parseResponse(arena, resp.written());
+    return parseResponse(arena, resp);
 }
 
 /// The `message` of a GitHub API error body; "" when there is none.

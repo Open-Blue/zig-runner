@@ -22,13 +22,16 @@ pub const Stats = struct {
     /// What `heap` counts as allocated and not freed.
     heap_bytes: u64 = 0,
     heap_blocks: u64 = 0,
+    /// What the network library (Rust, `zr_net.zig`) holds: its own allocator, not Zig's `heap`.
+    rust_bytes: u64 = 0,
 
-    /// ` rss=63M anon=60M thr=24 fds=71 mounts=29 zombies=0 heap=41M/41200`, each `?` when it
-    /// could not be read.
+    /// ` rss=63M anon=60M thr=24 fds=71 mounts=29 zombies=0 heap=41M/41200 rust=310K`, each `?` when
+    /// it could not be read.
     pub fn format(s: Stats, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try w.print("rss={f} anon={f} thr={f} fds={f} mounts={f} zombies={f} heap={f}/{d}", .{
-            Kb{ .v = s.rss_kb },    Kb{ .v = s.anon_kb },    Count{ .v = s.threads },        Count{ .v = s.fds },
-            Count{ .v = s.mounts }, Count{ .v = s.zombies }, Kb{ .v = s.heap_bytes / 1024 }, s.heap_blocks,
+        try w.print("rss={f} anon={f} thr={f} fds={f} mounts={f} zombies={f} heap={f}/{d} rust={f}", .{
+            Kb{ .v = s.rss_kb },            Kb{ .v = s.anon_kb },    Count{ .v = s.threads },        Count{ .v = s.fds },
+            Count{ .v = s.mounts },         Count{ .v = s.zombies }, Kb{ .v = s.heap_bytes / 1024 }, s.heap_blocks,
+            Kb{ .v = s.rust_bytes / 1024 },
         });
     }
 };
@@ -86,7 +89,11 @@ const Signed = struct {
 
 /// The process's own resources now: a handful of small reads of /proc/self.
 pub fn read() Stats {
-    var s: Stats = .{ .heap_bytes = heap.bytes.load(.monotonic), .heap_blocks = heap.blocks.load(.monotonic) };
+    var s: Stats = .{
+        .heap_bytes = heap.bytes.load(.monotonic),
+        .heap_blocks = heap.blocks.load(.monotonic),
+        .rust_bytes = @import("zr_net.zig").heap().bytes,
+    };
     if (builtin.os.tag != .linux) return s;
     var buf: [4096]u8 = undefined;
     if (readFile("/proc/self/status", &buf)) |text| {

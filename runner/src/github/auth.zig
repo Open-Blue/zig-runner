@@ -1,7 +1,7 @@
 //! Runner credentials and the OAuth client-credentials exchange (DESIGN §6 step 3).
 //! Field names are from `actions/runner` source.
 const std = @import("std");
-const http = @import("http.zig");
+const net_client = @import("../net_client.zig");
 const rsa_sign = @import("rsa_sign.zig");
 const jitconfig = @import("jitconfig.zig");
 
@@ -24,7 +24,7 @@ pub const Error = error{
     TokenRejected,
     BadTokenResponse,
 } ||
-    Allocator.Error || http.FetchError || rsa_sign.Error;
+    Allocator.Error || net_client.Error || std.Io.Writer.Error || rsa_sign.Error;
 
 pub fn findFile(files: []const jitconfig.File, name: []const u8) ?[]const u8 {
     for (files) |f| if (std.mem.eql(u8, f.name, name)) return f.content;
@@ -129,22 +129,18 @@ pub fn fetchAccessToken(
         .{jwt},
     );
 
-    var local: std.http.Client = .{ .allocator = arena, .io = io };
-    defer local.deinit();
-    const client = http.client(&local);
-
-    var resp: std.Io.Writer.Allocating = .init(arena);
-    const result = try http.fetch(client, .{
-        .location = .{ .url = creds.authorization_url },
+    const result = try net_client.fetch(arena, io, .{
+        .url = creds.authorization_url,
         .method = .POST,
         .payload = form,
-        .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } },
-        .extra_headers = &.{.{ .name = "Accept", .value = "application/json" }},
-        .response_writer = &resp.writer,
+        .headers = &.{
+            .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+            .{ .name = "Accept", .value = "application/json" },
+        },
     });
     status_out.* = result.status;
     if (result.status.class() != .success) return error.TokenRejected;
-    return parseTokenResponse(arena, resp.written());
+    return parseTokenResponse(arena, result.body);
 }
 
 pub fn parseTokenResponse(arena: Allocator, body: []const u8) Error![]const u8 {
