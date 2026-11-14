@@ -3707,6 +3707,11 @@ fn readContainerOptions(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void
         n >> 20,
         try b.limitMemory(n, err_msg),
     });
+    if (o.cpuMax()) |m| try more.print(b.arena, ", `--cpus`/`--cpu-quota` {d}/{d} µs{s}", .{
+        m.quota,
+        m.period,
+        try b.limitCpu(m, err_msg),
+    });
     try b.setUpSandboxOptions(o);
     try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Container options: {d} " ++
         "`--env`{s}{s}{s}; {d} understood and without effect natively (`--workdir`, " ++
@@ -3735,6 +3740,37 @@ fn limitMemory(b: *Backend, want: u64, err_msg: *[]const u8) ![]const u8 {
         return error.BaseContainerFailed;
     };
     b.limits.memory_max = want;
+    return "";
+}
+
+/// `--cpus` (or `--cpu-quota` and `--cpu-period`) as the job's `cpu.max`. Like `--memory` it
+/// fails the native set-up, with the reason, where it cannot be held to the limit: the job has no
+/// cgroup of its own, or the cpu controller is not delegated to it (the job then goes to Dagger,
+/// which drops the flag, or fails with no engine; never runs natively unlimited). More CPUs than the machine has is no error here, as it is for
+/// Docker's daemon: the limit then never throttles. The words that follow the number in "Set up
+/// job".
+fn limitCpu(b: *Backend, m: container_options.CpuMax, err_msg: *[]const u8) ![]const u8 {
+    const j = b.job_cgroup orelse {
+        err_msg.* = "the job container's `--cpus` needs the job's own cgroup, which this " ++
+            "job has none of (RUNNER_NATIVE_CGROUP)";
+        return error.BaseContainerFailed;
+    };
+    j.limitCpu(b.arena, m.quota, m.period) catch |e| {
+        err_msg.* = switch (e) {
+            error.CpuControllerUnavailable => try std.fmt.allocPrint(b.arena, "the job container's " ++
+                "`--cpus` needs the cpu controller in the job's cgroup, which {s} does not give " ++
+                "its children (cgroup.controllers lacks cpu: delegate it, e.g. systemd's " ++
+                "`Delegate=cpu`, or run the job where the flag is not set)", .{
+                std.fs.path.dirname(j.dir) orelse j.dir,
+            }),
+            else => "the job container's `--cpus` could not be set on the job's cgroup",
+        };
+        return error.BaseContainerFailed;
+    };
+    const cpus = std.Thread.getCpuCount() catch 0;
+    if (cpus > 0 and m.quota > @as(u64, cpus) * m.period)
+        return try std.fmt.allocPrint(b.arena, " (more than this machine's {d} CPUs: it never " ++
+            "throttles)", .{cpus});
     return "";
 }
 
@@ -5128,7 +5164,11 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     container.container.?.volumes = &.{};
     // An option the sandbox does not carry out is named, never dropped; the others are native.
     container.container.?.options = .{ .lit = "--cpus 1" };
+    try std.testing.expect(unsupported(io, container, root, ok) == null);
+    container.container.?.options = .{ .lit = "--cpus 1,5" };
     try expectReason("`--cpus`", unsupported(io, container, root, ok));
+    container.container.?.options = .{ .lit = "--cpu-shares 512" };
+    try expectReason("`--cpu-shares`", unsupported(io, container, root, ok));
     container.container.?.options = .{ .lit = "--user 1001 -e A=1 --workdir /w --health-cmd true" };
     try std.testing.expect(unsupported(io, container, root, ok) == null);
     container.container.?.options = .{ .lit = "--hostname h --add-host a:10.0.0.1 --shm-size 1g " ++
@@ -7331,6 +7371,51 @@ test "root runner: a container job's --memory lowers the job's memory.max, and n
     const capped = try runNativeJob(arena, cfg, job, .root);
     try std.testing.expect(capped.res.succeeded);
     try expectLines(capped.text, &.{ "memory.max=268435456", "the runner's limit of 256 MiB is lower" });
+}
+
+test "root runner: a container job's --cpus 0.5 sets the job's cpu.max and throttles a busy loop, with no engine" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    const layers = try testImageLayers(arena);
+    const img = try testregistry.testImage(arena, "test/optscpu", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    // The job's cgroup is the steps' parent: its limit and its throttling, as the step sees the
+    // host's files. A second of arithmetic in the shell is far over half a CPU's 50 ms a period.
+    var step = testStep("cg=$(cut -d: -f3 /proc/self/cgroup | sed 's,/steps$,,')\n" ++
+        "echo \"cpu.max=$(cat /sys/fs/cgroup$cg/cpu.max)\"\n" ++
+        "i=0; while [ $i -lt 1500000 ]; do i=$((i+1)); done\n" ++
+        "grep nr_throttled /sys/fs/cgroup$cg/cpu.stat | sed 's/^/job /'");
+    step.name = "throttled";
+    const image = try server.image(arena, "test/optscpu:1");
+    var job = testJob(&.{step});
+    job.container = .{ .name = "", .image = .{ .lit = image }, .options = .{ .lit = "--cpus 0.5" } };
+    const limited = try runNativeJob(arena, cfg, job, .root);
+    if (!limited.res.succeeded) std.debug.print("{s}\n", .{limited.text});
+    try std.testing.expect(limited.res.succeeded);
+    // "Engine: native": no Dagger session was started for it.
+    try expectLines(limited.text, &.{ "Engine: native", "cpu.max=50000 100000", "`--cpus`/`--cpu-quota` 50000/100000" });
+    const at = std.mem.indexOf(u8, limited.text, "job nr_throttled ") orelse {
+        std.debug.print("no nr_throttled in:\n{s}\n", .{limited.text});
+        return error.TestUnexpectedResult;
+    };
+    const rest = limited.text[at + "job nr_throttled ".len ..];
+    const n = try std.fmt.parseInt(u64, rest[0 .. std.mem.indexOfAny(u8, rest, "\r\n") orelse rest.len], 10);
+    try std.testing.expect(n > 0);
+
+    // Not delegated: the native set-up fails with the reason, never running unlimited. The
+    // stand-in is a job with no cgroup at all; the failure is Dagger's to report (no engine here).
+    cfg.cgroup.parent = "none";
+    const bare = try runNativeJob(arena, cfg, job, .root);
+    try std.testing.expect(!bare.res.succeeded);
 }
 
 test "a container job's volumes on the native backend: directories of the job, there for every step" {
