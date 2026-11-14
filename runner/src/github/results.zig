@@ -137,7 +137,7 @@ pub const Result = struct {
     /// A failure that another try may get past (`transientError`, `transientStatus`).
     transient: bool = false,
     /// How long GitHub asked to wait before another try (`broker.Response.wait_ms`), in milliseconds.
-    wait_ms: u64 = 0,
+    wait_ms: i64 = 0,
 };
 
 /// What every call answers for a job that names no results service.
@@ -232,8 +232,8 @@ fn retrying(io: std.Io, retry: Retry, comptime try_fn: anytype, args: anytype) R
         if (r.ok or !r.transient or attempt == retry.delays_ms.len) return r;
         // At least what GitHub asked (`Retry-After`, the rate limit's reset), unless the budget
         // runs out first: then this gives up now, not after sleeping to the end of it.
-        const delay_ms = ratelimit.wait(io, @intCast(retry.delays_ms[attempt]), r.wait_ms);
-        const delay_ns = @as(i96, @intCast(delay_ms)) * std.time.ns_per_ms;
+        const delay_ms = ratelimit.wait(io, retry.delays_ms[attempt], r.wait_ms);
+        const delay_ns = @as(i96, delay_ms) * std.time.ns_per_ms;
         const elapsed = std.Io.Clock.awake.now(io).toNanoseconds() - started;
         if (elapsed + delay_ns >= retry.budget.nanoseconds) return r;
         io.sleep(.fromNanoseconds(delay_ns), .awake) catch return r;
@@ -752,7 +752,7 @@ test "a 403 with x-ratelimit-remaining 0 waits for the reset" {
     server.results_fail_status = "403 Forbidden";
     var hdr: [96]u8 = undefined;
     const now_s = @divFloor(std.Io.Clock.real.now(std.testing.io).toMilliseconds(), 1000);
-    server.results_fail_headers = std.fmt.bufPrint(&hdr, "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {d}\r\n", .{now_s + 2}) catch unreachable;
+    server.results_fail_headers = try std.fmt.bufPrint(&hdr, "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {d}\r\n", .{now_s + 2});
     const started = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
     const r = testUpload(&server, .job, quick);
     const took = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - started;

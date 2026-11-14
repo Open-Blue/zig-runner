@@ -41,11 +41,11 @@ pub const Response = struct {
     body: []const u8,
     /// How long GitHub asked to wait before asking again, in milliseconds (`ratelimit.parse`: a
     /// 429, a 503, or a secondary rate limit's 403); 0 for no request.
-    wait_ms: u64 = 0,
+    wait_ms: i64 = 0,
 };
 
 /// What `head` asks a retry to wait.
-fn askedWait(io: std.Io, head: std.http.Client.Response.Head) u64 {
+fn askedWait(io: std.Io, head: std.http.Client.Response.Head) i64 {
     var retry_after: ?[]const u8 = null;
     var remaining: ?[]const u8 = null;
     var reset: ?[]const u8 = null;
@@ -622,7 +622,7 @@ test "request lines: timed, without the query or a token, and a 429's rate limit
     const limited = try request(a, std.testing.io, .GET, server.url(&buf, "127.0.0.1", "/limited/ghs" ++ "_16C7e42F292c6912E7710c838347Ae178B4a"), null, t);
     try std.testing.expectEqual(std.http.Status.too_many_requests, limited.status);
     // The server's Retry-After: 7 reaches the caller, who retries by it.
-    try std.testing.expectEqual(@as(u64, 7000), limited.wait_ms);
+    try std.testing.expectEqual(@as(i64, 7000), limited.wait_ms);
 
     const text = lines.written();
     try std.testing.expect(std.mem.indexOf(u8, text, "SECRET") == null);

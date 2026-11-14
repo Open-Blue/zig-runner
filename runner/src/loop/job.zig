@@ -242,7 +242,7 @@ fn acquire(
                 @backingInt(r.status),
             });
             // At least what GitHub asked (`Retry-After`, a rate limit's reset).
-            try c.io.sleep(.fromMilliseconds(@intCast(ratelimit.wait(c.io, @intCast(retry_ms[attempt]), r.wait_ms))), .awake);
+            try c.io.sleep(.fromMilliseconds(ratelimit.wait(c.io, retry_ms[attempt], r.wait_ms)), .awake);
             continue;
         } else |e| {
             if (last or e == error.OutOfMemory) return e;
@@ -1105,14 +1105,14 @@ fn completeJob(
         );
         const retry = if (r) |resp| retryable(resp) else |_| true;
         if (!retry or attempt == delays.len) return r;
-        const asked: u64 = if (r) |resp| resp.wait_ms else |_| 0;
-        const wait_ms = ratelimit.wait(c.io, @intCast(delays[attempt] * std.time.ms_per_s), asked);
+        const asked: i64 = if (r) |resp| resp.wait_ms else |_| 0;
+        const wait_ms = ratelimit.wait(c.io, delays[attempt] * std.time.ms_per_s, asked);
         if (r) |resp| {
             try logfmt.line(c.err, .warn, "completejob_retry", "http={d} wait_s={d}", .{
                 @backingInt(resp.status), delays[attempt],
             });
         } else |e| try logfmt.line(c.err, .warn, "completejob_retry", "err={t} wait_s={d}", .{ e, delays[attempt] });
-        try c.io.sleep(.fromMilliseconds(@intCast(wait_ms)), .awake);
+        try c.io.sleep(.fromMilliseconds(wait_ms), .awake);
     }
 }
 
