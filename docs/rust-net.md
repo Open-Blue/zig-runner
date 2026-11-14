@@ -325,7 +325,7 @@ connect (`http.withinClosing`) ends it where it blocks. Errors come back with a 
   anything but what a table of cases says; a difference between the two must carry its reason (`why`). A lazy dependency is fetched when the build script asks for it, and the configure phase does
   not know which step was named, so the request is behind `-Dtls-oracle`: `zig build`, `zig build test` and CI's direct-compiler paths never fetch, hash or compile tls.zig. Servers: the Database
   job's Postgres (private CA, client certificates; `pg-tls-fixture.sh`) and, for certificates Postgres does not have, the test's own endpoint (it answers the SSLRequest with `S` and
-  proxies to `openssl s_server` on a Unix socket), where "outcome" is how far each client got. CI runs it in the Database tests job (the step "TLS oracle"), and the analysis scope of
+  proxies to `openssl s_server` on a Unix socket), where "outcome" is how far each client got. CI runs it in a job of its own, "TLS oracle", beside the Database tests job (same database, started by the same script; not a required check), and the analysis scope of
   `ci-scope.sh` includes its files. Measured (laptop, TimescaleDB container, same as CI's):
 
   | case | old | new |
@@ -342,7 +342,7 @@ connect (`http.withinClosing`) ends it where it blocks. Errors come back with a 
 
   The same statements through both clients over TLS (verified and no-verify) give the same results byte for byte: `current_user` and `pg_stat_ssl`, 20,000 rows with NULLs and non-ASCII text
   (same SHA-256), an 8 MiB field, the server's errors (`22012`, `42P01`, `42601`: same class and text, the connection usable after), COPY of 4,096 rows and 4 MiB. Cost: the
-  Database job's step compiles Zig's build system (about 100 s cold on a hosted runner) and tls.zig, and runs for about 20 s.
+  TLS oracle job compiles Zig's build system (about 100 s cold on a hosted runner) and tls.zig, and runs for about 20 s.
 - **Validation brought by R2**: the live TLS tests (7, in `pg.zig`, run by the Database tests job against a container started by `ci-database.sh` with
   `pg-tls-fixture.sh`'s CA and users; they skip locally unless `ZIG_TEST_PG_TLS_DIR` is set, and fail without it where `ZIG_TEST_REQUIRE_DB` is); 8 cargo tests (`cargo-test.sh`, now a CI step:
   the TLS state machine, kinds of failure, bad input, `SSL_CERT_FILE`, garbage from a server); the fuzz target `fuzz: TLS records` (what a TLS server sends, in any chunks, held to
