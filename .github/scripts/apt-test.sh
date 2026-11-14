@@ -45,7 +45,7 @@ fi
 image=$(tr -d '\n' <runner/src/dagger.zig |
 	grep -oE '"ubuntu:[A-Za-z0-9._-]+" *\+\+ *"@sha256:[a-f0-9]{64}"' | tr -d '" +')
 # The server's image: tiny, and already on the runners (alpine and busybox are both small).
-server_image=busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+server_image=busybox:1.38@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4
 archive_hosts=(archive.ubuntu.com azure.archive.ubuntu.com security.ubuntu.com ports.ubuntu.com)
 down=()
 for host in "${archive_hosts[@]}"; do
