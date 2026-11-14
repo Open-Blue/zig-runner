@@ -434,21 +434,20 @@ pub const BaseImage = struct {
     id: []const u8,
 };
 
+/// An interface an implementation embeds as a field and recovers itself from with `@fieldParentPtr`.
 pub const Bases = struct {
-    ptr: *anyopaque,
     /// The image `ref` names, or null with `why` saying why it cannot be had.
-    resolveFn: *const fn (ptr: *anyopaque, arena: Allocator, ref: []const u8, why: *[]const u8) anyerror!?BaseImage,
+    resolveFn: *const fn (self: *Bases, arena: Allocator, ref: []const u8, why: *[]const u8) anyerror!?BaseImage,
 };
 
 /// What a build reads of the outside, for its keys: the context's files, and what an `ADD`
 /// of a URL downloads.
 pub const Context = struct {
-    ptr: *anyopaque,
     /// The digest of the content of the paths and patterns `sources` in the context.
-    digestFn: *const fn (ptr: *anyopaque, arena: Allocator, sources: []const []const u8) anyerror![64]u8,
+    digestFn: *const fn (self: *Context, arena: Allocator, sources: []const []const u8) anyerror![64]u8,
     /// `ADD`'s download of `url`: the file it was saved in, and its content's digest. Null when
     /// the build cannot download.
-    fetchFn: ?*const fn (ptr: *anyopaque, arena: Allocator, url: []const u8) anyerror!Fetched = null,
+    fetchFn: ?*const fn (self: *Context, arena: Allocator, url: []const u8) anyerror!Fetched = null,
 };
 
 pub const Fetched = struct { file: []const u8, digest: [64]u8 };
@@ -476,9 +475,9 @@ fn platformArgs(arena: Allocator, out: *std.ArrayList(Var)) !void {
 pub fn plan(
     arena: Allocator,
     instructions: []const Instruction,
-    bases: Bases,
+    bases: *Bases,
     build_args: []const Var,
-    context: Context,
+    context: *Context,
 ) !Planned {
     var p: Planner = .{ .arena = arena, .bases = bases, .build_args = build_args, .context = context };
     const got = p.run(instructions) catch |e| switch (e) {
@@ -490,9 +489,9 @@ pub fn plan(
 
 const Planner = struct {
     arena: Allocator,
-    bases: Bases,
+    bases: *Bases,
     build_args: []const Var,
-    context: Context,
+    context: *Context,
     refusal: Refusal = .{ .line = 0, .why = "" },
     /// The ARGs before the first FROM, which only FROM sees.
     global: std.ArrayList(Var) = .empty,
@@ -645,7 +644,7 @@ const Planner = struct {
             };
         } else {
             var why: []const u8 = "";
-            const img = (try p.bases.resolveFn(p.bases.ptr, arena, from.image, &why)) orelse
+            const img = (try p.bases.resolveFn(p.bases, arena, from.image, &why)) orelse
                 return p.refuse(from_ins.line, why);
             base = .{ .image = .{ .ref = from.image, .rootfs = img.config.rootfs } };
             st = .{
@@ -826,7 +825,7 @@ const Planner = struct {
                 from_id = try std.fmt.allocPrint(arena, "stage {d}", .{d});
             } else {
                 var why: []const u8 = "";
-                const img = (try p.bases.resolveFn(p.bases.ptr, arena, name, &why)) orelse
+                const img = (try p.bases.resolveFn(p.bases, arena, name, &why)) orelse
                     return p.refuse(ins.line, why);
                 from = .{ .rootfs = img.config.rootfs };
                 base_reads = img.id;
@@ -853,7 +852,7 @@ const Planner = struct {
                 const is_http = std.mem.startsWith(u8, src, "http://") or std.mem.startsWith(u8, src, "https://");
                 if (!is_http) return p.refuseFmt(ins.line, "ADD of {s}: only http and https URLs are native", .{src});
                 const fetch = p.context.fetchFn orelse return p.refuse(ins.line, "ADD of a URL needs the network");
-                const got = fetch(p.context.ptr, arena, src) catch |e|
+                const got = fetch(p.context, arena, src) catch |e|
                     return p.refuseFmt(ins.line, "ADD of {s} failed: {s}", .{ src, @errorName(e) });
                 try sources.append(arena, .{ .url = .{ .url = src, .file = got.file, .name = urlName(src) } });
                 try urls.append(arena, try arena.dupe(u8, &got.digest));
@@ -872,7 +871,7 @@ const Planner = struct {
 
         var reads = base_reads;
         if (from == .context and paths.items.len > 0) {
-            const digest = p.context.digestFn(p.context.ptr, arena, paths.items) catch |e| switch (e) {
+            const digest = p.context.digestFn(p.context, arena, paths.items) catch |e| switch (e) {
                 error.SourceMissing => return p.refuse(ins.line, "a source of the COPY is not in the build context"),
                 else => return e,
             };
@@ -1545,7 +1544,7 @@ const Copier = struct {
         defer to.close(c.io);
         const base = std.fs.path.basenamePosix(target_path);
         const m = c.op.chmod orelse mode;
-        try to.writeFile(c.io, .{ .sub_path = base, .data = data, .flags = .{ .permissions = .fromMode(@intCast(m)) } });
+        try to.writeFile(c.io, .{ .sub_path = base, .data = data, .flags = .{ .permissions = .fromMode(m) } });
         c.finish(to, base, m, null);
     }
 
@@ -1556,7 +1555,7 @@ const Copier = struct {
         const base = std.fs.path.basenamePosix(target_path);
         // Docker saves what it downloads readable by its owner alone.
         const m = c.op.chmod orelse 0o600;
-        try std.Io.Dir.cwd().copyFile(path, to, base, c.io, .{ .permissions = .fromMode(@intCast(m)) });
+        try std.Io.Dir.cwd().copyFile(path, to, base, c.io, .{ .permissions = .fromMode(m) });
         c.finish(to, base, m, null);
     }
 
@@ -1581,7 +1580,7 @@ const Copier = struct {
 
     fn copyOne(c: *Copier, e: layer_view.Entry, to: std.Io.Dir, to_name: []const u8) !void {
         const mode: u32 = c.op.chmod orelse e.mode;
-        try e.parent().copyFile(e.name, to, to_name, c.io, .{ .permissions = .fromMode(@intCast(mode)) });
+        try e.parent().copyFile(e.name, to, to_name, c.io, .{ .permissions = .fromMode(mode) });
         c.finish(to, to_name, mode, e);
     }
 
@@ -1726,12 +1725,14 @@ const FixedBases = struct {
     asked: std.ArrayList([]const u8) = .empty,
     arena: Allocator,
 
-    fn bases(f: *FixedBases) Bases {
-        return .{ .ptr = f, .resolveFn = resolve };
+    iface: Bases = .{ .resolveFn = resolve },
+
+    fn bases(f: *FixedBases) *Bases {
+        return &f.iface;
     }
 
-    fn resolve(ptr: *anyopaque, _: Allocator, ref: []const u8, why: *[]const u8) anyerror!?BaseImage {
-        const f: *FixedBases = @ptrCast(@alignCast(ptr));
+    fn resolve(b: *Bases, _: Allocator, ref: []const u8, why: *[]const u8) anyerror!?BaseImage {
+        const f: *FixedBases = @fieldParentPtr("iface", b);
         try f.asked.append(f.arena, ref);
         if (std.mem.eql(u8, ref, "missing")) {
             why.* = "the image missing could not be pulled";
@@ -1743,14 +1744,15 @@ const FixedBases = struct {
 
 const Fixed = struct {
     digest: [64]u8 = @splat('0'),
-    fn context(f: *Fixed) Context {
-        return .{ .ptr = f, .digestFn = digestOf, .fetchFn = fetchOf };
+    iface: Context = .{ .digestFn = digestOf, .fetchFn = fetchOf },
+    fn context(f: *Fixed) *Context {
+        return &f.iface;
     }
-    fn digestOf(ptr: *anyopaque, _: Allocator, _: []const []const u8) anyerror![64]u8 {
-        const f: *Fixed = @ptrCast(@alignCast(ptr));
+    fn digestOf(c: *Context, _: Allocator, _: []const []const u8) anyerror![64]u8 {
+        const f: *Fixed = @fieldParentPtr("iface", c);
         return f.digest;
     }
-    fn fetchOf(_: *anyopaque, _: Allocator, _: []const u8) anyerror!Fetched {
+    fn fetchOf(_: *Context, _: Allocator, _: []const u8) anyerror!Fetched {
         return .{ .file = "/nowhere", .digest = @splat('7') };
     }
 };
@@ -2295,8 +2297,9 @@ const Harness = struct {
 
     const Ctx = struct {
         view: *View,
-        fn digest(ptr: *anyopaque, ar: Allocator, sources: []const []const u8) anyerror![64]u8 {
-            const c: *@This() = @ptrCast(@alignCast(ptr));
+        iface: Context = .{ .digestFn = digest },
+        fn digest(i: *Context, ar: Allocator, sources: []const []const u8) anyerror![64]u8 {
+            const c: *@This() = @fieldParentPtr("iface", i);
             return contextDigest(ar, c.view, sources);
         }
     };
@@ -2307,7 +2310,7 @@ const Harness = struct {
         const view = try testView(arena, h.tmp, "ctx");
         var c: Ctx = .{ .view = view };
         var fb = h.base();
-        const p = (try plan(arena, (try parse(arena, text)).ok, fb.bases(), &.{}, .{ .ptr = &c, .digestFn = Ctx.digest })).ok;
+        const p = (try plan(arena, (try parse(arena, text)).ok, fb.bases(), &.{}, &c.iface)).ok;
         return build(arena, std.testing.io, p, h.store, rec.runner(), .{
             .context = view,
             .opaque_xattr = "user.overlay.opaque",
@@ -2678,7 +2681,7 @@ test "build: a context's .dockerignore leaves files out of COPY, patterns, and t
     view.filter = ig.filter();
     var fb = h.base();
     var c: Harness.Ctx = .{ .view = view };
-    const p = (try plan(arena, (try parse(arena, "FROM a\nCOPY . /app/\nCOPY *.log /logs/")).ok, fb.bases(), &.{}, .{ .ptr = &c, .digestFn = Harness.Ctx.digest })).ok;
+    const p = (try plan(arena, (try parse(arena, "FROM a\nCOPY . /app/\nCOPY *.log /logs/")).ok, fb.bases(), &.{}, &c.iface)).ok;
     const built = (try build(arena, io, p, h.store, rec.runner(), .{ .context = view, .opaque_xattr = "user.overlay.opaque" })).ok;
     try expectFile(arena, built.lowers, "app/keep.txt", "keep");
     try expectFile(arena, built.lowers, "app/src/a.c", "a");
@@ -2690,10 +2693,10 @@ test "build: a context's .dockerignore leaves files out of COPY, patterns, and t
     // A file that is left out changes nothing, a file that is not changes the key.
     const before = p.stages[0].steps[0].key;
     try tmp.dir.writeFile(io, .{ .sub_path = "ctx/skip.log", .data = "changed" });
-    const same = (try plan(arena, (try parse(arena, "FROM a\nCOPY . /app/\nCOPY *.log /logs/")).ok, fb.bases(), &.{}, .{ .ptr = &c, .digestFn = Harness.Ctx.digest })).ok;
+    const same = (try plan(arena, (try parse(arena, "FROM a\nCOPY . /app/\nCOPY *.log /logs/")).ok, fb.bases(), &.{}, &c.iface)).ok;
     try std.testing.expectEqualSlices(u8, &before, &same.stages[0].steps[0].key);
     try tmp.dir.writeFile(io, .{ .sub_path = "ctx/keep.txt", .data = "changed" });
-    const other = (try plan(arena, (try parse(arena, "FROM a\nCOPY . /app/\nCOPY *.log /logs/")).ok, fb.bases(), &.{}, .{ .ptr = &c, .digestFn = Harness.Ctx.digest })).ok;
+    const other = (try plan(arena, (try parse(arena, "FROM a\nCOPY . /app/\nCOPY *.log /logs/")).ok, fb.bases(), &.{}, &c.iface)).ok;
     try std.testing.expect(!std.mem.eql(u8, &before, &other.stages[0].steps[0].key));
 }
 
