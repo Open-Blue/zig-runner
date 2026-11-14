@@ -717,7 +717,7 @@ fn looksLikeTests(cmdline: []const u8) bool {
 // Tests. Each works in a directory of its own under `.zig-cache/tmp` (`std.testing.tmpDir`), named
 // to the functions above as the tests' temporary directory.
 
-fn testRun(arena: std.mem.Allocator) Run {
+fn testRun(arena: std.mem.Allocator) !Run {
     return .{
         .io = std.testing.io,
         .gpa = std.testing.allocator,
@@ -725,9 +725,9 @@ fn testRun(arena: std.mem.Allocator) Run {
         .names = &.{},
         .free = &.{},
         .alone = &.{},
-        .took_ns = arena.alloc(u64, 0) catch unreachable,
-        .began_ns = arena.alloc(i128, 0) catch unreachable,
-        .ended_ns = arena.alloc(i128, 0) catch unreachable,
+        .took_ns = try arena.alloc(u64, 0),
+        .began_ns = try arena.alloc(i128, 0),
+        .ended_ns = try arena.alloc(i128, 0),
     };
 }
 
@@ -769,7 +769,7 @@ test "leakCheck flags a directory the tests left, names it, removes it, and fail
     const kept = tmpNames(arena, std.testing.io, where);
     try tmp.dir.createDir(std.testing.io, "leaked", .default_dir);
     try makeChain(tmp.dir.handle, "leaked-deep", 300);
-    var run = testRun(arena);
+    var run = try testRun(arena);
     leakCheck(arena, &run, where, kept);
     // The two new ones are leaks (with no test running when they were made); `kept` is not.
     try std.testing.expectEqual(@as(usize, 2), run.failed.load(.monotonic));
@@ -800,7 +800,7 @@ test "heldOpen sees a directory a process has open, and sweepStale and leakCheck
     // Both are "old" at age 0, but the one held is left alone.
     sweepStale(arena, io, where, 0);
     try tmp.dir.access(io, "busy", .{});
-    var run = testRun(arena);
+    var run = try testRun(arena);
     leakCheck(arena, &run, where, kept);
     try tmp.dir.access(io, "busy", .{});
     try std.testing.expectEqual(@as(usize, 0), run.failed.load(.monotonic));
