@@ -105,7 +105,9 @@ pub fn checkOne(comptime f: anytype, args: anytype) !void {
     if (stride() == 1) check(gpa, f, args) catch |e| {
         std.debug.print("allocation failures: failed for input " ++ fmt ++ "\n", .{args[0]});
         // A failure that was swallowed: failing them one at a time says which allocation it was.
-        if (e == error.SwallowedOutOfMemoryError) checkEachAllocationFailure(f, args) catch {};
+        if (e == error.SwallowedOutOfMemoryError) checkEachAllocationFailure(f, args) catch |each| {
+            std.debug.print("allocation failures: failing one at a time: {s}\n", .{@errorName(each)});
+        };
         return e;
     };
     checkEachAllocationFailure(f, args) catch |e| {
