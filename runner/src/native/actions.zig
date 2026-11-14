@@ -26,6 +26,8 @@ const Backend = @import("Backend.zig");
 const sandbox = @import("sandbox.zig");
 const images = @import("images.zig");
 const docker_action = @import("docker_action.zig");
+const tarball = @import("tarball.zig");
+const checkout_mod = @import("../dagger/checkout.zig");
 const Exec = @import("../dagger/Exec.zig");
 const js = @import("../dagger/js.zig");
 const config = @import("../config.zig");
@@ -61,11 +63,7 @@ fn reasonFor(b: *Backend, job: job_mod.Job, u: job_mod.Uses, depth: u32) anyerro
     if (u.local) return localReason(b, job, u.path, depth);
     const k = try key(arena, u);
     const lr = b.actions.get(k) orelse lr: {
-        const fetched = fetch(b, job, u) catch |e| switch (e) {
-            error.NoGit => return "the job's image has no git to fetch its actions with " ++
-                "natively (Dagger fetches them with its own)",
-            else => return e,
-        };
+        const fetched = try fetch(b, job, u);
         try b.actions.put(arena, k, fetched);
         break :lr fetched;
     };
@@ -313,14 +311,33 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
     var out: Backend.Captured = .{ .arena = arena };
     const ended = try b.execOn(&.{ "sh", "-c", aw.written() }, env, &.{git_config_file}, 0, 0, out.output(), null);
     // `sh` found no git in the image (any image is native since P3, not only the provisioned
-    // default one): Dagger fetches with git of its own.
-    if (ended.failure.len == 0 and ended.code == 127) return error.NoGit;
-    if (ended.failure.len > 0 or ended.code != 0) return .{ .unresolved = try std.fmt.allocPrint(
+    // default one): the action's tarball instead (`tarball.zig`), here and for the job's later
+    // fetches.
+    var tar_sha: []const u8 = "";
+    if (Backend.gitMissing(ended, &out)) {
+        b.dropTop();
+        b.no_git = true;
+    }
+    if (b.no_git) {
+        const own = std.mem.eql(u8, repository, job.github.repository);
+        const src = if (own and job.job_token.len > 0)
+            try tarball.checkoutSource(arena, server, repository, u.ref, job.job_token)
+        else
+            try tarball.actionSource(arena, server, repository, u.ref);
+        switch (try tarball.fetchInto(b, mount, src, if (checkout_mod.isSha(u.ref)) u.ref else null, 0, 0)) {
+            .sha => |s| tar_sha = s,
+            .failed => |why| return .{ .unresolved = try std.fmt.allocPrint(
+                arena,
+                "Unable to resolve action `{s}`: {s}",
+                .{ ref_label, why },
+            ) },
+        }
+    } else if (ended.failure.len > 0 or ended.code != 0) return .{ .unresolved = try std.fmt.allocPrint(
         arena,
         "Unable to resolve action `{s}`: {s}",
         .{ ref_label, if (ended.failure.len > 0) ended.failure else out.tail() },
     ) };
-    const sha = out.tail();
+    const sha = if (b.no_git) tar_sha else out.tail();
     // The tree is the commit's, whoever fetched it and when: keyed so, the base and the steps
     // above it keep their keys from job to job (`Backend.keyFetched`).
     if (sha.len == 40) try b.keyFetched(try std.fmt.allocPrint(arena, "an action's tree: {s}/{s}.git " ++
