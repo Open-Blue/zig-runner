@@ -30,7 +30,8 @@
 //!                /results-blob for the Get...SignedBlobURL methods, "{}" for the rest; /results-blob
 //!                (PUT) 201. Each kind counted in `Server.results`. The first `results_fail`
 //!                requests whose path contains `results_fail_on` answer `results_fail_status`
-//!                instead (a results service having a bad moment).
+//!                instead (a results service having a bad moment). A blob put is hashed (FNV-1a, in
+//!                `results.put_hashes`), and the first `results_drop` of them are not answered.
 //!   /blob/<n>    200, n bytes of `blobByte` (any size: a download for streaming tests)
 //!   /to-cdn/<n>  302 to http://localhost:<port>/cdn-blob/<n>, another host name
 //!   /cdn-blob/<n>  the same bytes, but 403 for a request that carries an Authorization header (a
@@ -51,7 +52,10 @@ pub const Server = struct {
     /// Connections accepted so far.
     accepts: std.atomic.Value(u32),
     /// Requests to the results service so far: signed URLs asked for, blobs put, metadata made.
-    results: struct { urls: u32 = 0, puts: u32 = 0, metas: u32 = 0, put_bytes: usize = 0 },
+    results: struct { urls: u32 = 0, puts: u32 = 0, metas: u32 = 0, put_bytes: usize = 0, put_hashes: [4]u64 = @splat(0) },
+    /// How many puts to /results-blob are read to their end and the connection closed unanswered
+    /// (a server that took the blob and went away); they count in `results.puts`.
+    results_drop: u32,
     /// How many requests to a path containing `results_fail_on` answer `results_fail_status`.
     results_fail: u32,
     results_fail_on: []const u8,
@@ -78,6 +82,7 @@ pub const Server = struct {
         s.silent_once = 0;
         s.results = .{};
         s.results_fail = 0;
+        s.results_drop = 0;
         s.results_fail_on = "";
         s.results_fail_status = "503 Service Unavailable";
         s.results_fail_headers = "";
@@ -178,7 +183,7 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
             body_len = std.fmt.parseInt(usize, value, 10) catch 0;
     }
     var sunk: Sink = .{};
-    if (std.mem.eql(u8, path, "/sink")) {
+    if (std.mem.eql(u8, path, "/sink") or std.mem.eql(u8, path, "/results-blob")) {
         var left = body_len;
         var chunk: [16 * 1024]u8 = undefined;
         while (left > 0) {
@@ -263,8 +268,13 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
                 s.results_fail_status, body.len, s.results_fail_headers, body,
             }) catch return .close;
         } else if (std.mem.eql(u8, path, "/results-blob")) {
+            if (s.results.puts < s.results.put_hashes.len) s.results.put_hashes[s.results.puts] = sunk.hash;
             s.results.puts += 1;
             s.results.put_bytes = body_len;
+            if (s.results_drop > 0) {
+                s.results_drop -= 1;
+                return .close;
+            }
             respond(out, "201 Created", null, "");
         } else if (std.mem.indexOf(u8, path, "SignedBlobURL") != null) {
             s.results.urls += 1;

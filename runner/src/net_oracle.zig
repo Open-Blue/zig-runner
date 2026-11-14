@@ -394,6 +394,71 @@ test "oracle: an upload whose writer stops short or fails is an error, not a hun
     try std.testing.expectError(error.UploadFailed, net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = failing, .deadline = .fromSeconds(5) }));
 }
 
+test "oracle: a body written past its declared length is an error the caller sees, not a silent cut" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/sink", .{server.port});
+    const Long = struct {
+        /// `len` and 10 more bytes, in the one write (it is buffered) or in pieces past the queue.
+        fn write(ptr: *const anyopaque, w: *Io.Writer) anyerror!void {
+            const total: *const usize = @ptrCast(@alignCast(ptr));
+            var left = total.*;
+            const chunk: [4096]u8 = @splat('x');
+            while (left > 0) {
+                const n = @min(left, chunk.len);
+                try w.writeAll(chunk[0..n]);
+                left -= n;
+            }
+        }
+    };
+    // Declared 100, 110 written (in the buffer, over at the flush); declared 0; declared 3 MiB
+    // and 10 bytes more (the writer meets the refusal at the end of a long body).
+    for ([_][2]usize{ .{ 100, 110 }, .{ 0, 10 }, .{ 3 << 20, (3 << 20) + 10 } }) |c| {
+        const body: net_client.Body = .{ .len = c[0], .ptr = &c[1], .writeFn = Long.write };
+        try std.testing.expectError(error.BodyLongerThanDeclared, net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = body, .deadline = .fromSeconds(10) }));
+    }
+    // Exactly its length is fine.
+    const exact: usize = 100;
+    const ok: net_client.Body = .{ .len = 100, .ptr = &exact, .writeFn = Long.write };
+    try std.testing.expectEqual(std.http.Status.ok, (try net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = ok, .deadline = .fromSeconds(10) })).status);
+}
+
+test "oracle: a response limit of 0 allows no body, whole or streamed, and maxInt none" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/blob/1000", .{server.port});
+    try std.testing.expectError(error.BodyTooLarge, net_client.fetch(arena, io, .{ .url = url, .max_response = 0 }));
+    // Streamed: the head says how long the body is, or the first read finds it too long.
+    if (net_client.open(arena, io, .{ .url = url, .max_response = 0 })) |opened| {
+        var s = opened;
+        defer s.close();
+        var buf: [4096]u8 = undefined;
+        try std.testing.expectError(error.BodyTooLarge, s.read(&buf));
+    } else |e| try std.testing.expectEqual(error.BodyTooLarge, e);
+    var s = try net_client.open(arena, io, .{ .url = url, .max_response = std.math.maxInt(usize) });
+    defer s.close();
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = try s.read(&buf);
+        if (n == 0) break;
+        total += n;
+    }
+    try std.testing.expectEqual(@as(usize, 1000), total);
+}
+
 test "oracle: a streamed download's request line has the whole body's bytes and the final figures" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();

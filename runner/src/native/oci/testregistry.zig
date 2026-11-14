@@ -29,6 +29,8 @@ pub const Route = struct {
     content_type: []const u8 = "application/octet-stream",
     /// Served from /cdn/<this> on "localhost" instead.
     redirect: bool = false,
+    /// Only this many bytes of the body are sent, whole length declared, and the connection closed.
+    cut_at: ?usize = null,
 };
 
 pub const Server = struct {
@@ -156,6 +158,12 @@ fn answer(s: *Server, conn: Io.net.Stream) bool {
                 const digest = path[std.mem.lastIndexOfScalar(u8, path, '/').? + 1 ..];
                 const loc = std.fmt.bufPrint(&hb, "Location: http://localhost:{d}/cdn/{s}\r\n", .{ s.port, digest }) catch return false;
                 return respond(s, out, "307 Temporary Redirect", loc, "text/plain", "");
+            }
+            if (rt.cut_at) |n| {
+                out.print("HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ rt.content_type, rt.body.len }) catch return false;
+                out.writeAll(rt.body[0..n]) catch {};
+                out.flush() catch {};
+                return false;
             }
             return respond(s, out, "200 OK", "", rt.content_type, rt.body);
         };
@@ -351,6 +359,44 @@ test "native oci pull: a blob that does not match its digest is refused and not 
     var it = blobs.iterate();
     try testing.expect(try it.next(io) == null);
     try testing.expectError(error.FileNotFound, tmp.dir.access(io, try std.fmt.allocPrint(arena, "oci/images/{s}.rootless", .{img.manifest["sha256:".len..]}), .{}));
+}
+
+test "native oci blob: a declared size of 0 allows no body, and a download cut off halfway writes nothing more to the file" {
+    const registry = @import("registry.zig");
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const big = try arena.alloc(u8, 200_000);
+    @memset(big, 'b');
+    const small = "not empty";
+    const big_digest = try digestOf(arena, big);
+    const small_digest = try digestOf(arena, small);
+    const routes = [_]Route{
+        .{ .path = try std.fmt.allocPrint(arena, "/v2/test/b/blobs/{s}", .{big_digest}), .body = big, .cut_at = 100_000 },
+        .{ .path = try std.fmt.allocPrint(arena, "/v2/test/b/blobs/{s}", .{small_digest}), .body = small },
+    };
+    var server: Server = .{ .routes = &routes };
+    try server.start();
+    defer server.stop();
+    var c: registry.Client = .{ .arena = arena, .io = io, .ref = try registry.parseRef(arena, try server.image(arena, "test/b:1")), .creds = null };
+
+    // A blob that says it is 0 bytes and has a body: refused, and nothing written.
+    const zero = try tmp.dir.createFile(io, "zero", .{});
+    defer zero.close(io);
+    if (c.blob(small_digest, 0, zero)) |_| return error.TestExpectedError else |e| {
+        try testing.expect(e == error.BodyTooLarge or e == error.ResponseTooLarge);
+    }
+    try testing.expectEqual(@as(u64, 0), (try zero.stat(io)).size);
+
+    // A download that ends halfway, in the 1 MiB the file body keeps waiting: none of it is written
+    // after the error (the file holds only what was written before, here nothing).
+    const cut = try tmp.dir.createFile(io, "cut", .{});
+    defer cut.close(io);
+    if (c.blob(big_digest, big.len, cut)) |_| return error.TestExpectedError else |_| {}
+    try testing.expectEqual(@as(u64, 0), (try cut.stat(io)).size);
 }
 
 test "native oci pull: a kept-alive connection the registry closed is replaced; a registry that never answers fails, after a bounded number of tries" {
