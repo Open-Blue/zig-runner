@@ -5761,7 +5761,7 @@ test "priority: a low job waiting is passed by later high ones for at most the s
     // The low job came first, at time 0 (the awake clock is arbitrary; only differences count).
     const t0: i64 = 1_000_000;
     slots[0] = .{ .started_ms = t0, .waiting = true, .wait_seq = 1, .level = priority.low, .queued_ms = t0 };
-    const bound: i64 = @intCast(priority.starvationBoundMs(priority.low, step).?);
+    const bound = priority.starvationBoundMs(priority.low, step).?;
     // A fresh job of the highest level arrives every instant, as late and as high as can be: the
     // low job is ahead of it from the bound on, not before.
     var t: i64 = 0;
