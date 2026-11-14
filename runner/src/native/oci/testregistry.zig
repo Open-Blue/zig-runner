@@ -522,11 +522,18 @@ test "allocation failures: a pull through token auth, an index, gzip and zstd la
     const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
 
     // The registry client's, the manifests' and the store's memory fail one allocation at a time,
-    // in `arena`. The memory the layers' fetching tasks use (`gpa`) is not failed: they run
-    // beside the pull's own thread, so which allocation is number N would vary between runs.
+    // in `arena` (`checkOne`: every run must end in `error.OutOfMemory`). The memory the layers'
+    // fetching tasks use (`gpa`) is failed in a second pass, `FailNth`: those tasks run beside the
+    // pull's own thread, so which allocation is number N varies between runs, and a failure may
+    // land where it is survived on purpose (a message that cannot be copied is left empty). That
+    // pass can only require that a run ends in `error.OutOfMemory` or in a pull, with nothing
+    // leaked, and no other error.
     const S = struct {
         var run_count: usize = 0;
         fn pull(a_: Allocator, root_: []const u8, reference_: []const u8, creds: ?@import("registry.zig").Credentials) !void {
+            return pullWith(a_, testing.allocator, root_, reference_, creds);
+        }
+        fn pullWith(a_: Allocator, gpa_: Allocator, root_: []const u8, reference_: []const u8, creds: ?@import("registry.zig").Credentials) !void {
             var scratch: af.Scratch = .init(a_);
             defer scratch.deinit();
             const arena_ = scratch.allocator();
@@ -536,7 +543,7 @@ test "allocation failures: a pull through token auth, an index, gzip and zstd la
             // Each run its own store: a layer already in it would not be fetched.
             const store: Store = .{ .root = try std.fmt.allocPrint(arena_, "{s}/store{d}", .{ root_, run_count }) };
             var why: []const u8 = "";
-            const got = try image.pull(arena_, testing.allocator, testing.io, &client, store, .{
+            const got = try image.pull(arena_, gpa_, testing.io, &client, store, .{
                 .image = reference_,
                 .creds = creds,
                 .owners = false,
@@ -545,5 +552,141 @@ test "allocation failures: a pull through token auth, an index, gzip and zstd la
             try testing.expectEqual(@as(usize, 1), got.env.len);
         }
     };
-    try af.checkOne(S.pull, .{ root, reference, @as(?@import("registry.zig").Credentials, .{ .username = "user", .password = "pass" }) });
+    const creds: ?@import("registry.zig").Credentials = .{ .username = "user", .password = "pass" };
+    try af.checkOne(S.pull, .{ root, reference, creds });
+
+    // A pinned reference seen before: its ref file is read (`image.pull`'s first lookup), and the
+    // image comes from the store without a request. Unseen is not a failure to read it: out of
+    // memory there must come back as itself, not as "not seen" and a pull over the network.
+    const known_root = try std.fmt.allocPrint(arena, "{s}/known", .{root});
+    const pinned = try server.image(arena, try std.fmt.allocPrint(arena, "test/img@{s}", .{img.index}));
+    {
+        var client: std.http.Client = .{ .allocator = testing.allocator, .io = io };
+        defer client.deinit();
+        var why: []const u8 = "";
+        const first = try image.pull(arena, testing.allocator, io, &client, .{ .root = known_root }, .{
+            .image = pinned,
+            .creds = creds,
+            .owners = false,
+        }, &why);
+        first.lock.close(io);
+    }
+    const K = struct {
+        fn again(a_: Allocator, root_: []const u8, reference_: []const u8, creds_: ?@import("registry.zig").Credentials) !void {
+            var scratch: af.Scratch = .init(a_);
+            defer scratch.deinit();
+            var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+            defer client.deinit();
+            var why: []const u8 = "";
+            const got = try image.pull(scratch.allocator(), testing.allocator, testing.io, &client, .{ .root = root_ }, .{
+                .image = reference_,
+                .creds = creds_,
+                .owners = false,
+            }, &why);
+            got.lock.close(testing.io);
+            try testing.expectEqual(@as(usize, 1), got.env.len);
+            // From the store: no layer was fetched again.
+            try testing.expect(got.pulled == null);
+        }
+    };
+    try af.checkOne(K.again, .{ known_root, pinned, creds });
+
+    var clean: FailNth = .{ .child = testing.allocator, .fail_at = std.math.maxInt(usize) };
+    try S.pullWith(testing.allocator, clean.allocator(), root, reference, creds);
+    try testing.expectEqual(@as(isize, 0), clean.live.load(.monotonic));
+    const n = clean.count.load(.monotonic);
+    try testing.expect(n > 0);
+    const step: usize = if (std.valgrind.runningOnValgrind() != 0) 13 else 1;
+    var i: usize = 0;
+    while (i < n) : (i += step) {
+        var once: FailNth = .{ .child = testing.allocator, .fail_at = i };
+        S.pullWith(testing.allocator, once.allocator(), root, reference, creds) catch |e| if (e != error.OutOfMemory) {
+            std.debug.print("allocation failures: layer tasks' allocation {d} of {d} failing, the pull ended in {s}\n", .{ i, n, @errorName(e) });
+            return e;
+        };
+        if (once.live.load(.monotonic) != 0) {
+            std.debug.print("allocation failures: layer tasks' allocation {d} of {d} failing leaked\n", .{ i, n });
+            return error.MemoryLeakDetected;
+        }
+    }
+}
+
+/// Fails the allocation numbered `fail_at` (from any thread: the count is atomic), and counts the
+/// bytes not yet freed.
+const FailNth = struct {
+    child: Allocator,
+    fail_at: usize,
+    count: std.atomic.Value(usize) = .init(0),
+    live: std.atomic.Value(isize) = .init(0),
+
+    fn allocator(o: *FailNth) Allocator {
+        return .{ .ptr = o, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const o: *FailNth = @ptrCast(@alignCast(ctx));
+        if (o.count.fetchAdd(1, .monotonic) == o.fail_at) return null;
+        const memory = o.child.rawAlloc(len, alignment, ra) orelse return null;
+        _ = o.live.fetchAdd(@intCast(len), .monotonic);
+        return memory;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const o: *FailNth = @ptrCast(@alignCast(ctx));
+        if (!o.child.rawResize(memory, alignment, new_len, ra)) return false;
+        _ = o.live.fetchAdd(@as(isize, @intCast(new_len)) - @as(isize, @intCast(memory.len)), .monotonic);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const o: *FailNth = @ptrCast(@alignCast(ctx));
+        const moved = o.child.rawRemap(memory, alignment, new_len, ra) orelse return null;
+        _ = o.live.fetchAdd(@as(isize, @intCast(new_len)) - @as(isize, @intCast(memory.len)), .monotonic);
+        return moved;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const o: *FailNth = @ptrCast(@alignCast(ctx));
+        _ = o.live.fetchSub(@intCast(memory.len), .monotonic);
+        o.child.rawFree(memory, alignment, ra);
+    }
+};
+
+test "allocation failures: a registry's refusal keeps its status, and running out of memory is not hidden by it" {
+    const af = @import("../../alloc_failures.zig");
+    var server: Server = .{};
+    try server.start();
+    defer server.stop();
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", a.allocator());
+    const reference = try server.image(a.allocator(), "test/img:missing");
+
+    const S = struct {
+        /// A manifest the registry answers 404 with a body: out of memory while keeping the body
+        /// for the message must be `error.OutOfMemory`, not the 404 with the body left out.
+        fn missing(a_: Allocator, root_: []const u8, reference_: []const u8) !void {
+            var scratch: af.Scratch = .init(a_);
+            defer scratch.deinit();
+            var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+            defer client.deinit();
+            var why: []const u8 = "";
+            const got = image.pull(scratch.allocator(), testing.allocator, testing.io, &client, .{ .root = root_ }, .{
+                .image = reference_,
+                .owners = false,
+            }, &why);
+            if (got) |g| {
+                g.lock.close(testing.io);
+                return error.TestUnexpectedResult;
+            } else |e| {
+                if (e == error.OutOfMemory) return e;
+                try testing.expectEqual(error.NotFound, e);
+                try testing.expect(std.mem.indexOf(u8, why, "HTTP 404") != null);
+                try testing.expect(std.mem.indexOf(u8, why, "MANIFEST_UNKNOWN") != null);
+            }
+        }
+    };
+    try af.checkOne(S.missing, .{ root, reference });
 }

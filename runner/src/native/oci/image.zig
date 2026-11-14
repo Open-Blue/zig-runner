@@ -89,7 +89,10 @@ pub fn pull(
 
     // A pinned reference seen before: its platform's manifest is known, and its rootfs is here.
     if (ref.digest) |d| {
-        const known = cwd.readFileAlloc(io, try store.refPath(arena, d, platform.name()), arena, .limited(128)) catch null;
+        const known = cwd.readFileAlloc(io, try store.refPath(arena, d, platform.name()), arena, .limited(128)) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
         if (known) |m| if (registry.validDigest(m)) {
             if (try store.hold(arena, io, "oci/images", try imageKey(arena, m, req.owners))) |lock| {
                 errdefer lock.close(io);

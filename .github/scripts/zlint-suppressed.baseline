@@ -99,7 +99,6 @@ src/native/nft.zig	eb549e27fc88d88a	if (try s.chain("filter", name) != null) acc
 src/native/oci/image.zig	276f4551b7769b90	errdefer cwd.deleteFile(io, tmp) catch {};
 src/native/oci/image.zig	6bed8fe96bf9c46a	cwd.rename(tmp, cwd, path, io) catch cwd.deleteFile(io, tmp) catch {};
 src/native/oci/layer.zig	a0a0624e29bfa665	const proc = std.fmt.bufPrintSentinel(&buf, "/proc/self/fd/{d}", .{fd}, 0) catch unreachable;
-src/native/oci/registry.zig	be34d0c30edff64d	err_body.take(r) catch {};
 src/native/oci/registry.zig	cc416da0ad22cd76	_ = r.discardRemaining() catch {};
 src/native/oci/testregistry.zig	641c633e4cf85866	w.interface.flush() catch {};
 src/native/oci/testregistry.zig	9554515ba43a452a	out.flush() catch {};
