@@ -1385,8 +1385,10 @@ pub const end_batch = struct {
         const start = phases.now();
         while (ending > 0 and phases.now() -| start < @as(u64, window_ms) * std.time.ns_per_ms) {
             mu.unlock(io);
-            io.sleep(.fromMilliseconds(1), .awake) catch {};
+            // Canceled (the teardown blocks it, so never here): the batch syncs now.
+            const slept = if (io.sleep(.fromMilliseconds(1), .awake)) true else |_| false;
             mu.lockUncancelable(io);
+            if (!slept) break;
         }
         var batch: [max]*Ticket = undefined;
         const n = n_waiting;
@@ -3154,7 +3156,10 @@ const EndJob = struct {
 
     /// The job's end, on a thread of its own, after `delay_ms`.
     fn end(j: *EndJob, io: std.Io, delay_ms: u32) void {
-        if (delay_ms > 0) io.sleep(.fromMilliseconds(delay_ms), .awake) catch {};
+        if (delay_ms > 0) io.sleep(.fromMilliseconds(delay_ms), .awake) catch |e| {
+            j.result = e;
+            return;
+        };
         var a: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
         defer a.deinit();
         j.result = j.s.settleEnd(a.allocator(), io, null);
