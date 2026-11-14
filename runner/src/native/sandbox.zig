@@ -2451,7 +2451,7 @@ fn renameUntil(dir: linux.fd_t, stop: *std.atomic.Value(bool)) void {
     while (!stop.load(.monotonic)) {
         _ = linux.renameat(dir, "a", dir, "b");
         _ = linux.renameat(dir, "b", dir, "a");
-        std.Thread.yield() catch {};
+        if (std.Thread.yield()) {} else |_| std.atomic.spinLoopHint();
     }
 }
 
