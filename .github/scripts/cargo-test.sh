@@ -12,6 +12,10 @@
 #                          not a race is suppressed by .github/tsan.supp, as in the Zig tests.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
+# In a job, cargo's registry goes in the job's temp directory, as in build-zr-net.sh (#543).
+if [[ -n ${RUNNER_TEMP:-} && -z ${CARGO_HOME:-} ]]; then
+	export CARGO_HOME=$RUNNER_TEMP/cargo-home
+fi
 mode=${1:-}
 case $mode in
 "")
