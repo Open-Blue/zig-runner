@@ -992,7 +992,8 @@ pub const Gate = struct {
             if (i != g.slot and s.running()) others += 1;
         }
         const free = cores -| others;
-        var n: u32 = @intCast(@min(layers, @as(usize, @max(2, @min(free, cap)))));
+        const wanted: u32 = @max(2, @min(free, cap));
+        var n: u32 = @min(std.math.cast(u32, layers) orelse wanted, wanted);
         why.* = if (n == layers) "layers" else if (free < cap) "cores left by other jobs" else "cap";
         const signal = a.signals(std.Io.Clock.awake.now(a.io).toMilliseconds());
         while (n > 1 and decide(a.limits, signal, .{ .jobs = 0, .mb = @as(u64, n) * fetch_mb }, false) != null) n -= 1;
