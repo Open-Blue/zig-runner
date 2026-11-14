@@ -564,16 +564,168 @@ t_candidate_names() {
 	check "build metadata is no rc" status_is 1
 }
 
-t_prune_keeps_the_newest_main_candidates() {
-	setup
+# The pruning script, against a fake gh that serves a release list and the pool's deployments, and
+# logs what is deleted. NOW is 2026-11-14; ages are in days.
+now=1794614400
+prune_fixture() {
 	helper_gh
-	{
-		for n in 1 2 3 9 10 11; do printf 'main-%s-%012d\ttrue\n' "$n" "$n"; done
-		printf 'v0.35.0-rc1\ttrue\nv0.34.0\tfalse\n'
-	} | sed 's/\t/ /' | awk '{print $1}' >"$fx/list"
-	# gh release list --json ... --jq: the helper prints the names the jq would.
-	out=$(PATH=$root/helper:$PATH GH_REPO=o/r "$scripts/prune-candidates.sh" 3 2>&1)
-	check "the three oldest by number are deleted, no rc, no release" test "$(sort "$fx/deleted" | tr '\n' ' ')" = "main-1-000000000001 main-2-000000000002 main-3-000000000003 "
+	cat >"$root/helper/gh" <<'EOF2'
+#!/usr/bin/env bash
+case $1 in
+api)
+	[[ -e $FX/deployments-fail ]] && exit 1
+	cat "$FX/deployed" 2>/dev/null
+	;;
+release)
+	case $2 in
+	list) cat "$FX/list.json" ;;
+	delete) echo "$3" >>"$FX/deleted" ;;
+	esac
+	;;
+esac
+EOF2
+	chmod +x "$root/helper/gh"
+	: >"$fx/deleted"
+	local rows=() entry tag age pre draft
+	# tag age-in-days prerelease draft
+	for entry in \
+		"main-1-000000000001 30 true false" "main-2-000000000002 20 true false" \
+		"main-3-000000000003 10 true false" "main-4-000000000004 40 true false" \
+		"main-5-000000000005 50 true false" "main-6-000000000006 60 true false" \
+		"main-9-000000000009 90 true true" "main-7-short 90 true false" \
+		"v0.35.0-rc1 30 true false" "v0.35.0-rc2 30 true false" \
+		"v0.35.0-rc3 30 true false" "v0.35.0-rc4 30 true false" \
+		"v0.36.0 90 true false" "v0.34.0 100 false false" "v0.33.0 400 false false"; do
+		read -r tag age pre draft <<<"$entry"
+		rows+=("$(jq -n --arg t "$tag" --argjson age "$age" --argjson pre "$pre" --argjson draft "$draft" --argjson now "$now" \
+			'{tagName: $t, isPrerelease: $pre, isDraft: $draft, publishedAt: (($now - $age * 86400) | todate)}')")
+	done
+	printf '%s\n' "${rows[@]}" | jq -s . >"$fx/list.json"
+	echo v0.35.0-rc1 >"$fx/deployed"
+}
+prune() { PATH=$root/helper:$PATH GH_REPO=o/r NOW=$now "$scripts/prune-candidates.sh" "$@" 2>&1; }
+deleted() { sort "$fx/deleted" | tr '\n' ' '; }
+
+t_prune_deletes_old_candidates_only() {
+	setup
+	prune_fixture
+	# Window 14 days, newest 2 of each kind: main-6 and main-5 are the newest (by number, not age),
+	# rc3 and rc4 the newest rcs, rc1 is what the pool is deployed from, main-3 is young.
+	out=$(prune --days 14 --keep 2)
+	status=$?
+	check "exit 0" status_is 0
+	check "the old, undeployed, unheld candidates are deleted; nothing else" \
+		test "$(deleted)" = "main-1-000000000001 main-2-000000000002 main-4-000000000004 v0.35.0-rc2 "
+	check "says what it did" out_has "pruned 4"
+}
+
+t_prune_never_touches_releases_drafts_or_odd_tags() {
+	setup
+	prune_fixture
+	out=$(prune --days 0 --keep 1)
+	check "no release, draft, non-candidate pre-release or malformed tag" \
+		not grep -qE '^(v0\.34\.0|v0\.33\.0|v0\.36\.0|main-9-000000000009|main-7-short)$' "$fx/deleted"
+	check "the newest of each kind and the deployed one stay" \
+		not grep -qE '^(main-6-000000000006|v0\.35\.0-rc4|v0\.35\.0-rc1)$' "$fx/deleted"
+	check "the others go, window 0" test "$(deleted)" = "main-1-000000000001 main-2-000000000002 main-3-000000000003 main-4-000000000004 main-5-000000000005 v0.35.0-rc2 v0.35.0-rc3 "
+}
+
+t_prune_dry_run_deletes_nothing() {
+	setup
+	prune_fixture
+	out=$(prune --dry-run --days 14 --keep 2)
+	check "nothing deleted" test ! -s "$fx/deleted"
+	check "lists what it would delete" out_has "would prune main-1-000000000001"
+	check "lists the release candidate" out_has "would prune v0.35.0-rc2"
+	check "does not list a kept one" not out_has "would prune main-3-"
+	check "counts" out_has "would have pruned 4"
+}
+
+t_prune_protects_what_it_is_told_to() {
+	setup
+	prune_fixture
+	out=$(prune --days 14 --keep 2 --protect main-4-000000000004 --protect v0.35.0-rc2)
+	check "held tags stay" test "$(deleted)" = "main-1-000000000001 main-2-000000000002 "
+}
+
+t_prune_deletes_nothing_when_deployments_are_unreadable() {
+	setup
+	prune_fixture
+	: >"$fx/deployments-fail"
+	status=0
+	out=$(prune --days 0 --keep 1) || status=$?
+	check "fails" test "$status" != 0
+	check "nothing deleted" test ! -s "$fx/deleted"
+}
+
+t_prune_refuses_nonsense_settings() {
+	setup
+	prune_fixture
+	status=0
+	out=$(prune --keep 0) || status=$?
+	check "keep 0 refused" test "$status" != 0
+	status=0
+	out=$(prune --days soon) || status=$?
+	check "days must be a number" test "$status" != 0
+	check "nothing deleted" test ! -s "$fx/deleted"
+}
+
+# The hard requirement: a machine on `stable` never installs a candidate (a pre-release, a release
+# candidate or a main build), whatever the tags, the releases feed or the deployments' order say.
+t_stable_never_installs_a_candidate() {
+	setup
+	binary v1.2.3
+	# The feed, newest first, full of candidates with higher versions, some labelled as releases.
+	main_candidate 999 abcdef012345 9.9.9
+	rc_release v9.0.0-rc1
+	release v9.9.9 v9.9.9 candidate.yml refs/tags/v9.9.9
+	feed v9.9.9 false
+	release v9.9.8 v9.9.8-main.5+aaaaaaaaaaaa candidate.yml refs/heads/main
+	feed v9.9.8 true
+	# The deployments API: a candidate first, then a candidate posing as a release, then an older
+	# release candidate, in this order and in the reverse one.
+	deployment 4 main-999-abcdef012345
+	deployment 3 v9.9.9
+	deployment 2 v9.0.0-rc1
+	run_agent
+	check "newest deployment a main candidate: refused" status_is 1
+	check "nothing installed" installed_is v1.2.3
+	check "nothing downloaded" no_downloads
+
+	setup
+	binary v1.2.3
+	main_candidate 999 abcdef012345 9.9.9
+	release v9.9.9 v9.9.9 candidate.yml refs/tags/v9.9.9
+	feed v9.9.9 false
+	deployment 3 v9.9.9
+	run_agent
+	check "a candidate named like a release: refused" status_is 1
+	check "still v1.2.3" installed_is v1.2.3
+	check "its provenance is not a release's" out_has "no provenance from release.yml"
+
+	setup
+	binary v1.2.3
+	rc_release v9.0.0-rc1
+	deployment 2 v9.0.0-rc1
+	deployment 1 main-999-abcdef012345
+	run_agent
+	check "a release candidate: refused" status_is 1
+	check "still v1.2.3 again" installed_is v1.2.3
+	check "nothing downloaded again" no_downloads
+
+	# A genuine release first, candidates behind it: the release is installed, the candidates never.
+	setup
+	binary v1.2.3
+	stable_release v1.2.4
+	main_candidate 999 abcdef012345 9.9.9
+	rc_release v9.0.0-rc1
+	deployment 3 v1.2.4
+	deployment 2 v9.0.0-rc1
+	deployment 1 main-999-abcdef012345
+	run_agent
+	check "the release is installed" installed_is v1.2.4
+	check "only the release was downloaded" test "$(downloads)" = 1
+	check "no candidate fetched" not grep -qE 'release download (main-|v9)' "$fx/calls"
 }
 
 for t in $(declare -F | awk '$3 ~ /^t_/ {print $3}'); do

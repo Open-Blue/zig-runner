@@ -1,3 +1,0 @@
-kind: Added
-body: 'Deploy channels (#550): every push to main and every tag vX.Y.Z-rcN is built, attested and published as a pre-release (the `candidate` workflow: main-N-SHA12, with binaries saying vX.Y.Z-main.N+SHA12; the newest 20 main candidates kept; never latest), and zig-runner-deploy follows a channel per agent (`CHANNEL=stable|rc|main`, `zig-runner-deploy@.service` for a second pool beside the stable one) with the same checksum and provenance checks against the right workflow, ref and commit, a version monotonic within the channel, and an explicit, logged switch between channels. `stable`, the default, installs releases only and refuses a candidate. docs/OPERATIONS.md has a "Channels" section'
-time: 2026-11-14T00:22:50.644057977-05:00

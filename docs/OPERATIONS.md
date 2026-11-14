@@ -182,13 +182,44 @@ every tag `vX.Y.Z-rcN`, and publishes them as a pre-release. A main candidate is
 `main-N-SHA12` (N is the workflow's run number, so it only grows) whose binaries say
 `vX.Y.Z-main.N+SHA12`, X.Y.Z being the latest release with its patch raised by one. It is never
 "latest", so nothing that follows the latest release sees it, and `release` ignores any tag with a
-hyphen. The newest 20 main candidates are kept, the rest deleted with their tags; release
-candidates stay. Release tags are created only by the version workflow's deploy key (the "release
-tags" ruleset), so an `-rc` tag is too. Why releases and not workflow artifacts or one rolling
+hyphen, so a release candidate never takes the release path (stable releases are tagged, built,
+published and signed as before). Release tags are created only by the version workflow's deploy key
+(the "release tags" ruleset), so an `-rc` tag is too. Why releases and not workflow artifacts or one rolling
 `channel-main` release: a release is public, so the agent needs no more access than for a release,
 and each candidate is immutable with its own checksum and attestation (the repository's releases are
 immutable), where artifacts expire and need a token that reads Actions, and a rolling release would
 be overwritten under a machine that was reading it.
+
+**Retention.** Candidates are pre-releases, so they are never "latest", and they are pruned:
+`prune-candidates.sh` deletes a main candidate or release candidate (and its tag) published more
+than `CANDIDATE_RETENTION_DAYS` ago (14), unless it is among the newest `CANDIDATE_KEEP` (20) of its
+kind (main candidates by run number, release candidates by version), the ref of one of the newest
+three deployments of `razorbill-rc` (what the rc pool runs, and what it rolls back to), or named
+with `--protect`. Releases, drafts and anything not named exactly like a candidate are never
+touched. `candidate` runs it after publishing, and `candidate-prune` daily (the days nothing
+merged); a run of the latter by hand defaults to a dry run, which lists what would go and deletes
+nothing (`GH_REPO=... prune-candidates.sh --dry-run --days 14 --keep 20` does the same by hand).
+What a unit on `main` runs is not recorded anywhere GitHub can read, so it is held only by being
+among the newest; keep `CANDIDATE_KEEP` above the number of merges a day times the days a machine
+might be offline. The image of a pruned release candidate stays in the registry.
+
+**The release candidate's image and deployment.** A tag `vX.Y.Z-rcN` also builds, scans (Trivy,
+as a release's) and pushes `ghcr.io/<owner>/zig-runner:vX.Y.Z-rcN` for both architectures, from the
+candidate's own binaries (checked against `SHA256SUMS` and their `candidate.yml` provenance), with
+the image's provenance and SBOM attested, and `:rc` while it is the newest release candidate. It
+never pushes `:latest` or a release's tag (`:vX.Y.Z`), so `latest` and the stable versions are what
+only `release.yml` makes. Once CI has passed on the tagged commit, a deployment is recorded to
+the environment `razorbill-rc` (a release's goes to `razorbill`, whose deployments stable machines
+install): a pool is an environment name, so another pool on `rc` is another environment and a line
+in `candidate.yml`. A main candidate gets neither image nor deployment record: one image per merge
+would fill the registry, and a machine on `main` reads the releases feed anyway.
+
+**To set up (maintainer).** Nothing is needed for the workflows to run. Optional: repository
+variables `CANDIDATE_RETENTION_DAYS` and `CANDIDATE_KEEP`; the `razorbill-rc` environment is created
+by the first deployment (add protection rules to it, or a name for another pool, by hand if wanted);
+if the "release tags" ruleset also restricts deleting tags, pruning an `-rc` tag fails (the release
+is deleted, the tag stays, logged) until the ruleset lets `github-actions` delete tags matching
+`v*-rc*`; GHCR packages may need the repository's Actions access to push (as for releases).
 
 **The agent.** `CHANNEL` in the agent's env file picks the channel (`stable` if unset, which is
 everything described under "The deploy agent", unchanged). On `rc` and `main` it reads the releases

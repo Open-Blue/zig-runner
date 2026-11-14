@@ -10,7 +10,9 @@
 # failure means (the second argument). Only GitHub Actions' check runs count (another app could
 # name one the same), from every page, and for each name the latest (the highest id): a re-run is a
 # new check run under the same name. A failed request counts as none found yet, so a passing
-# GitHub hiccup costs a poll. release.yml's deploy job waits so for the tagged commit, and
+# GitHub hiccup costs a poll. OWN_WORKFLOWS (default version|release) names the workflows whose
+# runs wait and so are not counted; candidate.yml's deploy job adds itself. release.yml's deploy job
+# waits so for the tagged commit, and
 # version.yml's tag job for main's, before tagging it. Needs gh with GH_TOKEN, and
 # GITHUB_REPOSITORY.
 #
@@ -69,8 +71,8 @@ while :; do
 		# usual case; a version run waiting for approval is another. What they wait for comes from
 		# the other workflows. (Found by proofs/tla/ReleasePipeline.tla, `-own-run`.)
 		runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$sha&per_page=100" \
-			--jq '[.workflow_runs[] | select(.path | test("^\\.github/workflows/(version|release)\\.yml") | not)
-				| .status]' 2>/dev/null) || runs='["unknown"]'
+			--jq "[.workflow_runs[] | select(.path | test(\"^\\\\.github/workflows/(${OWN_WORKFLOWS:-version|release})\\\\.yml\") | not)
+				| .status]" 2>/dev/null) || runs='["unknown"]'
 		open=$(jq '[.[] | select(. != "completed")] | length' <<<"$runs")
 		total=$(jq 'length' <<<"$runs")
 		if ((open == 0 && total > 0)); then

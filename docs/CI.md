@@ -39,7 +39,8 @@ unreported instead, and the merge queue waiting for it.
 | `proofs` | pull requests, merge queue, `main`, weekly | the Lean proofs, and the `hashFiles()` model against `glob.zig` |
 | `store model` | changes to the store or release pipeline, weekly | the TLA+ models, with SPIN on their Promela ports |
 | `release` | tags; pull requests touching the packaging | binaries, image, provenance, deploy |
-| `candidate` | `main`; tags `vX.Y.Z-rcN` | the release's binaries as a pre-release, attested, for the `main` and `rc` channels (OPERATIONS.md, "Channels") |
+| `candidate` | `main`; tags `vX.Y.Z-rcN` | the release's binaries as a pre-release, attested, for the `main` and `rc` channels; an rc also gets an image and a deployment record (OPERATIONS.md, "Channels") |
+| `candidate-prune` | daily, by hand (dry run) | deletes candidates past their retention |
 | `provisioned image` | pull requests (build only), `main`, by hand | the default job image with the runner's packages installed, both architectures |
 | `version` | daily, or by hand | cuts the release, after approval |
 | `security` | pull requests, weekly | gitleaks and dependency review |
