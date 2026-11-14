@@ -126,6 +126,20 @@ jobs:
       - name: Unsafe constructs ratchet
         run: .github/scripts/unsafe-ratchet.sh
 
+      # The memory soak's judging, on made-up series (a leak, a rising handle count, a shape that did
+      # nothing must fail; noise must pass): a second, so only on a change to the soak's files
+      # (ci-scope.sh soak). The soak itself runs nightly (analysis.yml).
+      - name: Whether this change can affect the memory soak
+        id: soak_scope
+        if: ${{ !cancelled() }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh soak
+
+      - name: Memory soak selftest
+        if: ${{ !cancelled() && steps.soak_scope.outputs.run == 'true' }}
+        run: python3 -I .github/scripts/memory_soak.py selftest
+
       # The runner's check of the tool cache's trees (runner/src/dagger/tool_trees.sh), on a small
       # fake tree: its lists let it skip re-reading unchanged files, never a changed, added or
       # deleted one, and a list a job writes into the tool cache is never read.

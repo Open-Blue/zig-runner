@@ -9,6 +9,7 @@
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)
 #   ci-scope.sh go           Workflows' Go tools steps (ci.yml)
 #   ci-scope.sh apt          Workflows' apt mirror fallback step (ci.yml)
+#   ci-scope.sh soak         Workflows' memory soak selftest step (ci.yml)
 #   ci-scope.sh analysis     Fuzz, Valgrind, Stress, ZLint (suppressed-errors) (analysis.yml)
 #   ci-scope.sh tsan         ThreadSanitizer, native; ThreadSanitizer, end to end (analysis.yml)
 #   ci-scope.sh store        Store stress, Store crash (analysis.yml)
@@ -145,6 +146,14 @@ needed() {
 		*) return 1 ;;
 		esac
 		;;
+	soak)
+		# memory_soak.py's selftest judges made-up series, in a second.
+		case $1 in
+		.github/scripts/memory_soak.py | .github/scripts/memory-soak.sh | .github/workflows/ci.yml | \
+			.github/scripts/ci-scope.sh) return 0 ;;
+		*) return 1 ;;
+		esac
+		;;
 	analysis)
 		# Only the searches themselves, on a pull request: a change to the runner's code is the
 		# nightly run's to search, not every pull request's (each costs minutes per target).
@@ -236,10 +245,10 @@ needed() {
 }
 
 case $scope in
-tests | binaries | e2e | proofs | packaging | go | apt | analysis | tsan | store | coverage | \
+tests | binaries | e2e | proofs | packaging | go | apt | soak | analysis | tsan | store | coverage | \
 	codeql-actions | codeql-go | codeql-python) ;;
 *)
-	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|apt|analysis|tsan|store|coverage|codeql-actions|codeql-go|codeql-python" >&2
+	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|apt|soak|analysis|tsan|store|coverage|codeql-actions|codeql-go|codeql-python" >&2
 	exit 2
 	;;
 esac

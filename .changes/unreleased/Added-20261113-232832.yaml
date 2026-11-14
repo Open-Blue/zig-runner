@@ -1,0 +1,3 @@
+kind: Added
+body: 'A memory soak for the runner (`.github/scripts/memory-soak.sh`): 500 jobs of seven shapes (run steps, checkout, a container, a failing job, a cancelled job, a large log, a step timeout) through one native runner in a capped container against a local Gitea, sampling after each job and failing when resident or anonymous memory, the heap, the network library''s counter, descriptors, threads, mounts or zombies grow past their margins. The nightly analysis run does a 50-job version.'
+time: 2026-11-13T23:28:32.105381182-05:00
