@@ -806,6 +806,8 @@ var test_after_walks: ?*const fn () void = null;
 var test_stuck = false;
 /// A walk (`usage`) stops after this many directories, as on a volume too big for its second. Tests.
 var test_dirs_max: u32 = 0;
+/// Directories the last walk (`usage`) took up to list. Tests: a bound on work that no clock can.
+var test_dirs_walked: u32 = 0;
 /// Levels `removeSome` went down. Tests.
 var test_descents: u32 = 0;
 /// A directory listing says no entry's kind, as on a filesystem that reports DT_UNKNOWN. Tests.
@@ -1143,6 +1145,7 @@ fn usage(out: Allocator, io: std.Io, dir: []const u8, budget: Budget, from: Walk
     var whole = true;
     var seen: u32 = 0;
     var dirs: u32 = 0;
+    defer test_dirs_walked = dirs;
     var name: [256:0]u8 = undefined;
     while (stack.pop()) |rel| {
         // The directory not yet listed is the first to be, next time.
@@ -2851,9 +2854,15 @@ test "native eviction: a walk of a chain of directories too deep to name ends at
     // Each directory below a path's length used to cost its depth to open, and the clock was asked
     // every 64 of them: 11 s over a budget of 1 s at 60,000 deep, and minutes with more. The clock
     // stands still here: the walk ends of itself, never by the budget, however loaded the machine.
+    // A walk that ran away (a chain taken to its end, or each directory listed again) would hang
+    // to the shard's timeout, not fail: so the work is counted, and bounded by what a path can name
+    // (one "a/" per two bytes), a third of the chain's depth, whatever the machine's speed.
     const walk_budget: Budget = .initAt(io, 5000, 0);
     const seen = usage(f.arena(), io, dir, walk_budget, .{ .bytes = 0, .whole = false });
     try testing.expect(!walk_budget.late());
+    try testing.expect(test_dirs_walked >= 1000);
+    try testing.expect(test_dirs_walked <= linux.PATH_MAX / 2 + 8);
+    try testing.expect(test_dirs_walked * 3 < depth);
     try testing.expect(!seen.whole);
     try testing.expect(seen.bytes > 6000);
     // The chain is removed as a pass removes one: the test directory's own cleanup would take minutes.
