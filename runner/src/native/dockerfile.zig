@@ -2587,6 +2587,11 @@ test "build: COPY --chmod makes the directories on the way 0755 and keeps the mo
     try expectMode(arena, built.lowers, "cm2/d/x", 0o555);
     try expectMode(arena, built.lowers, "cm2/d/sub", 0o555);
     try expectMode(arena, built.lowers, "cm2/d/sub/y", 0o555);
+    // So the temporary directory can be removed.
+    for (built.lowers) |low| for ([_][]const u8{ "cm2/d/sub", "cm2/d" }) |rel| {
+        const at = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ low, rel }, 0);
+        _ = linux.chmod(at, 0o755);
+    };
 }
 
 test "Ignore: .dockerignore as Docker reads it" {
