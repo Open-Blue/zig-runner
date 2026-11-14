@@ -26,6 +26,13 @@ pub fn parseJobRequest(arena: Allocator, body: []const u8) !JobRequest {
     );
 }
 
+/// What each call does when it arrives twice, which decides its `broker.Resend`. actions/runner's
+/// own `RunServer` retries `acquirejob`, `renewjob` and `completejob` on any failure but a 404 (and
+/// 409/422 for acquire, 401 for complete), with the same body: they are keyed by the job message id
+/// or by plan and job id, and a repeat is answered the same, or refused (409, 404), never done twice
+/// (actions/runner `src/Runner.Common/RunServer.cs`, `src/Sdk/RSWebApi/RunServiceHttpClient.cs`,
+/// read 2026-11-14; the server's side is not public, so this is the client's evidence). Nothing
+/// there retries `acknowledge`, and nothing shows it deduplicated: never resent.
 pub fn endpoint(arena: Allocator, req: JobRequest, op: []const u8) Allocator.Error![]const u8 {
     const base = std.mem.trimEnd(u8, req.run_service_url, "/");
     return std.fmt.allocPrint(arena, "{s}/{s}?api-version={s}", .{ base, op, api_version });
@@ -38,8 +45,9 @@ fn post(
     token: []const u8,
     op: []const u8,
     body: []const u8,
+    resend: broker.Resend,
 ) !broker.Response {
-    return broker.call(arena, io, .POST, try endpoint(arena, req, op), token, body);
+    return broker.call(arena, io, .POST, try endpoint(arena, req, op), token, body, resend);
 }
 
 pub fn acknowledge(
@@ -53,7 +61,7 @@ pub fn acknowledge(
         "{{\"runnerRequestId\":\"{s}\"}}",
         .{req.runner_request_id},
     );
-    return post(arena, io, req, token, "acknowledge", body);
+    return post(arena, io, req, token, "acknowledge", body, .never);
 }
 
 /// Returns the job definition (steps, contexts, variables, tokens). Treat the body as secret.
@@ -63,7 +71,7 @@ pub fn acquire(arena: Allocator, io: std.Io, req: JobRequest, token: []const u8)
         "{{\"jobMessageId\":\"{s}\",\"runnerOS\":\"Linux\",\"billingOwnerId\":\"{s}\"}}",
         .{ req.runner_request_id, req.billing_owner_id },
     );
-    return post(arena, io, req, token, "acquirejob", body);
+    return post(arena, io, req, token, "acquirejob", body, .once_more);
 }
 
 /// Renews the runner's hold on the job, as actions/runner does every 60 s while a job runs (its
@@ -81,7 +89,7 @@ pub fn renew(
         "{{\"planId\":\"{s}\",\"jobId\":\"{s}\"}}",
         .{ plan_id, job_id },
     );
-    return post(arena, io, req, token, "renewjob", body);
+    return post(arena, io, req, token, "renewjob", body, .once_more);
 }
 
 /// As the run service spells them (the .NET TaskResult names): "cancelled" is rejected with 400.
@@ -132,7 +140,7 @@ pub fn complete(
             try environmentUrlField(arena, environment_url),
         },
     );
-    return post(arena, io, req, token, "completejob", body);
+    return post(arena, io, req, token, "completejob", body, .once_more);
 }
 
 /// `,"environmentUrl":"<url>"` for completejob's body, or nothing without a url.

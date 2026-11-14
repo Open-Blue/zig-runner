@@ -32,7 +32,7 @@ pub fn run(
     const sid = (try openSession(arena, io, settings, base, token, out)) orelse return 0;
     try pollForMessage(arena, io, out, base, sid, token);
     const q = try std.fmt.allocPrint(arena, "{s}session?sessionId={s}", .{ base, sid });
-    const d = try broker.call(arena, io, .DELETE, q, token, null);
+    const d = try broker.call(arena, io, .DELETE, q, token, null, .once_more);
     try out.print("DELETE session -> HTTP {d}\n", .{@backingInt(d.status)});
     return 0;
 }
@@ -118,7 +118,7 @@ fn openSession(
     const url = try std.fmt.allocPrint(arena, "{s}session", .{base});
     try out.print("\nPOST session ... (body {d} bytes)\n", .{body.len});
     try out.flush();
-    const resp = try broker.call(arena, io, .POST, url, token, body);
+    const resp = try broker.call(arena, io, .POST, url, token, body, .never);
     try out.print("\nPOST session -> HTTP {d}\n", .{@backingInt(resp.status)});
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, resp.body, .{}) catch null;
     if (resp.status.class() != .success) {
@@ -158,7 +158,7 @@ fn pollForMessage(
             .GET,
             try broker.messageUrl(arena, base, sid, "Online"),
             null,
-            .{ .token = token, .deadline = .fromSeconds(90) },
+            .{ .token = token, .deadline = .fromSeconds(90), .resend = .once_more },
         );
         try out.print(
             "GET message -> HTTP {d}, {d} body bytes\n",

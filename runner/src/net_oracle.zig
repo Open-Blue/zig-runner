@@ -256,7 +256,7 @@ const broker_cases = [_]BrokerCase{
 };
 
 fn brokerOpts(c: BrokerCase) broker.RequestOptions {
-    return .{ .token = c.token, .extra_headers = c.extra, .max_body = c.max_body };
+    return .{ .token = c.token, .extra_headers = c.extra, .max_body = c.max_body, .resend = .once_more };
 }
 
 test "oracle: broker.request answers what the std version did, the differences written down" {
@@ -299,9 +299,9 @@ test "oracle: a redirect of a streamed upload: std hands the 302 back, the libra
     const url = server.url(&buf, "127.0.0.1", "/same");
     const pattern: Pattern = .{ .len = 1000 };
     const body: net_client.Body = .{ .len = 1000, .ptr = &pattern, .writeFn = Pattern.write };
-    const old = try std_broker.request(arena, io, .PUT, url, null, .{ .body = body });
+    const old = try std_broker.request(arena, io, .PUT, url, null, .{ .body = body, .resend = .once_more });
     try std.testing.expectEqual(std.http.Status.found, old.status);
-    try std.testing.expectError(error.ProtocolError, broker.request(arena, io, .PUT, url, null, .{ .body = body }));
+    try std.testing.expectError(error.ProtocolError, broker.request(arena, io, .PUT, url, null, .{ .body = body, .resend = .once_more }));
 }
 
 test "oracle: a request nobody answers, and a kept connection that dies, end the same way in both" {
@@ -313,7 +313,7 @@ test "oracle: a request nobody answers, and a kept connection that dies, end the
     defer server.stop();
     const io = std.testing.io;
     var buf: [64]u8 = undefined;
-    const quick: broker.RequestOptions = .{ .deadline = .fromMilliseconds(1000) };
+    const quick: broker.RequestOptions = .{ .deadline = .fromMilliseconds(1000), .resend = .once_more };
     // Silent: one attempt and one more on a connection of its own, in both.
     const impls = .{ std_broker, broker };
     inline for (impls) |impl| {
@@ -330,12 +330,24 @@ test "oracle: a request nobody answers, and a kept connection that dies, end the
             try std.testing.expectEqualStrings("GET -", r.body);
         }
     }
-    // Answered the second time (a connection that died under the first).
+    // Answered the second time (a connection that died under the first): in both, for a call that
+    // may be sent again.
     inline for (impls) |impl| {
         server.silent_once = 0;
         const r = try impl.request(arena, io, .POST, server.url(&buf, "127.0.0.1", "/silent-once/x"), "{}", quick);
         try std.testing.expectEqualStrings("ok", r.body);
     }
+    // The difference, on purpose: a call that says `.never` is sent once by the library's broker (the
+    // std one, as it was, sent every request again), so that a session or a runner is not made twice.
+    var never = quick;
+    never.resend = .never;
+    server.silent_once = 0;
+    const before = server.accepts.load(.acquire);
+    try std.testing.expectError(error.Timeout, broker.request(arena, io, .POST, server.url(&buf, "127.0.0.1", "/silent-once/x"), "{}", never));
+    try std.testing.expectEqual(before + 1, server.accepts.load(.acquire));
+    server.silent_once = 0;
+    const sent_again = try std_broker.request(arena, io, .POST, server.url(&buf, "127.0.0.1", "/silent-once/x"), "{}", never);
+    try std.testing.expectEqualStrings("ok", sent_again.body);
 }
 
 test "oracle: a long poll with no deadline waits as long as it is let, and a cancel ends it at once, in both" {
@@ -350,10 +362,10 @@ test "oracle: a long poll with no deadline waits as long as it is let, and a can
     const url = server.url(&buf, "127.0.0.1", "/silent");
     const Poll = struct {
         fn std_(a: std.mem.Allocator, i: Io, u: []const u8) anyerror!void {
-            _ = try std_broker.request(a, i, .GET, u, null, .{ .token = "t", .deadline = null });
+            _ = try std_broker.request(a, i, .GET, u, null, .{ .token = "t", .deadline = null, .resend = .once_more });
         }
         fn lib(a: std.mem.Allocator, i: Io, u: []const u8) anyerror!void {
-            _ = try broker.request(a, i, .GET, u, null, .{ .token = "t", .deadline = null });
+            _ = try broker.request(a, i, .GET, u, null, .{ .token = "t", .deadline = null, .resend = .once_more });
         }
     };
     inline for (.{ Poll.std_, Poll.lib }) |run| {
@@ -507,7 +519,7 @@ test "oracle: an upload written as it is sent arrives as the same bytes through 
         const lib = try net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = &body.body, .headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }} });
         try std.testing.expectEqual(std.http.Status.ok, lib.status);
         try std.testing.expectEqualStrings(expect, lib.body);
-        const old = try std_broker.request(arena, io, .PUT, url, null, .{ .body = &body.body, .content_type = "text/plain" });
+        const old = try std_broker.request(arena, io, .PUT, url, null, .{ .body = &body.body, .content_type = "text/plain", .resend = .once_more });
         try std.testing.expectEqual(std.http.Status.ok, old.status);
         try std.testing.expectEqualStrings(expect, old.body);
     }
@@ -972,7 +984,7 @@ fn benchIdle(which: []const u8, comptime impl: type) !void {
     while (Io.Clock.awake.now(io).toMilliseconds() - start.wall_ms < secs * 1000) {
         var poll_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer poll_arena.deinit();
-        const r = try impl.request(poll_arena.allocator(), io, .GET, url, null, .{ .token = "t0k", .deadline = .fromSeconds(90) });
+        const r = try impl.request(poll_arena.allocator(), io, .GET, url, null, .{ .token = "t0k", .deadline = .fromSeconds(90), .resend = .once_more });
         try std.testing.expectEqual(std.http.Status.accepted, r.status);
         polls += 1;
     }

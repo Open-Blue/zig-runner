@@ -298,6 +298,8 @@ fn putLog(arena: Allocator, io: std.Io, job: job_mod.Job, which: Which, blob: Bl
         try twirpUrl(arena, job.results_endpoint, get_method),
         job.job_token,
         try ids(arena, job, which, null),
+        // Only asks for a signed address: nothing is created or changed.
+        .once_more,
     );
     if (signed.status.class() != .success) return failed(arena, get_method, signed);
     const logs_url = (try jsonString(arena, signed.body, "logs_url")) orelse return .{
@@ -329,7 +331,7 @@ fn registerLog(
     ), job.job_token, try ids(arena, job, which, .{
         .uploaded_at = uploaded_at,
         .line_count = line_count,
-    }));
+    }), .never);
     if (meta.status.class() != .success) return failed(arena, meta_method, meta);
     return .{ .ok = true, .detail = "" };
 }
@@ -364,6 +366,8 @@ fn uploadSummaryInner(
         try twirpUrl(arena, job.results_endpoint, "GetStepSummarySignedBlobURL"),
         job.job_token,
         try ids(arena, job, which, null),
+        // Only asks for a signed address: nothing is created or changed.
+        .once_more,
     );
     if (signed.status.class() != .success) return failed(
         arena,
@@ -391,6 +395,7 @@ fn uploadSummaryInner(
         try twirpUrl(arena, job.results_endpoint, "CreateStepSummaryMetadata"),
         job.job_token,
         body,
+        .never,
     );
     if (meta.status.class() != .success) return failed(arena, "CreateStepSummaryMetadata", meta);
     return .{ .ok = true, .detail = try std.fmt.allocPrint(arena, "{d} bytes", .{markdown.len}) };
@@ -434,7 +439,7 @@ fn updateStepsInner(
     try w.writeAll(",\"workflow_run_backend_id\":");
     try std.json.Stringify.value(job.plan_id, .{}, w);
     try w.writeByte('}');
-    const r = try broker.call(arena, io, .POST, url, job.job_token, aw.written());
+    const r = try broker.call(arena, io, .POST, url, job.job_token, aw.written(), .never);
     if (r.status.class() != .success) return failed(arena, "WorkflowStepsUpdate", r);
     return .{ .ok = true, .detail = "" };
 }
@@ -622,7 +627,7 @@ test "a kept log's blobs are read as they go up, as formatBlob makes them, throu
     var url_buf: [64]u8 = undefined;
     const url = server.url(&url_buf, "127.0.0.1", "/same");
     // A redirect of a streamed body would send it again: the library refuses (std handed the 302 back).
-    try std.testing.expectError(error.ProtocolError, broker.request(arena, io, .PUT, url, null, .{ .body = stream }));
+    try std.testing.expectError(error.ProtocolError, broker.request(arena, io, .PUT, url, null, .{ .body = stream, .resend = .never }));
 }
 
 test "a blob upload's deadline grows with its size, up to a cap" {

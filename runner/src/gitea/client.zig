@@ -49,13 +49,21 @@ pub const Client = struct {
     /// longest a stop waits for a call in flight.
     deadline: std.Io.Duration = .fromSeconds(10),
 
-    /// POSTs `body` to `method` and returns the answer's body. A refusal fills `failure`.
+    /// POSTs `body` to `method` and returns the answer's body. A refusal fills `failure`. `resend`
+    /// is what a call that may have arrived and got no answer does: `Register` creates a runner and
+    /// `FetchTask` hands out a task, so neither is sent again (the poller asks again next time);
+    /// `Declare` overwrites the runner's labels with the same ones and `UpdateLog` has Gitea trim
+    /// the rows it already acknowledged (`routers/api/actions/runner/runner.go`, read 2026-11-14),
+    /// so both may be; `UpdateTask` and `UpdateStepSummary` also run the instance's side effects
+    /// (statuses, notifications) and nothing there shows them deduplicated: not sent again, the
+    /// reporter sends the state again on its next beat.
     pub fn call(
         c: Client,
         arena: Allocator,
         io: std.Io,
         method: []const u8,
         body: []const u8,
+        resend: broker.Resend,
         failure: *Failure,
     ) !([]const u8) {
         const url = try std.fmt.allocPrint(arena, "{s}/api/actions/runner.v1.RunnerService/{s}", .{ c.url, method });
@@ -67,6 +75,7 @@ pub const Client = struct {
             .extra_headers = headers.items,
             .deadline = c.deadline,
             .max_body = 16 * 1024 * 1024,
+            .resend = resend,
         });
         if (r.status == .ok) return r.body;
         failure.* = refusal(arena, r);
@@ -106,7 +115,7 @@ pub const Client = struct {
         var q = req;
         if (c.flavor == .forgejo) q.capabilities = &.{};
         const body = try json(arena, q);
-        const r = try runnerOf(arena, try c.call(arena, io, "Register", body, failure));
+        const r = try runnerOf(arena, try c.call(arena, io, "Register", body, .never, failure));
         if (r.uuid.len == 0 or r.token.len == 0) return error.BadResponse;
         return r;
     }
@@ -123,7 +132,7 @@ pub const Client = struct {
         var q = req;
         if (c.flavor == .forgejo) q.capabilities = &.{};
         const body = try json(arena, q);
-        return runnerOf(arena, try c.call(arena, io, "Declare", body, failure));
+        return runnerOf(arena, try c.call(arena, io, "Declare", body, .once_more, failure));
     }
 
     /// Asks for a task. `tasks_version` is the last the runner saw (0 at first): the instance
@@ -140,7 +149,7 @@ pub const Client = struct {
             "{}"
         else
             try std.fmt.allocPrint(arena, "{{\"tasksVersion\":\"{d}\"}}", .{tasks_version});
-        const text = try c.call(arena, io, "FetchTask", body, failure);
+        const text = try c.call(arena, io, "FetchTask", body, .never, failure);
         const parsed = std.json.parseFromSliceLeaky(
             struct {
                 task: ?task_mod.Wire = null,
@@ -187,7 +196,7 @@ pub const Client = struct {
             try w.writeByte('}');
         }
         try w.writeByte('}');
-        const text = try c.call(arena, io, "UpdateTask", out.written(), failure);
+        const text = try c.call(arena, io, "UpdateTask", out.written(), .never, failure);
         const parsed = std.json.parseFromSliceLeaky(
             struct {
                 state: ?struct { result: ?Result = null } = null,
@@ -231,7 +240,7 @@ pub const Client = struct {
         }
         if (no_more) try w.writeAll(",\"noMore\":true");
         try w.writeByte('}');
-        const text = try c.call(arena, io, "UpdateLog", out.written(), failure);
+        const text = try c.call(arena, io, "UpdateLog", out.written(), .once_more, failure);
         const parsed = std.json.parseFromSliceLeaky(
             struct { ackIndex: task_mod.Int64 = .{} },
             arena,
@@ -261,7 +270,7 @@ pub const Client = struct {
             try w.writeByte('}');
         }
         try w.writeAll("]}");
-        _ = try c.call(arena, io, "UpdateStepSummary", out.written(), failure);
+        _ = try c.call(arena, io, "UpdateStepSummary", out.written(), .never, failure);
     }
 
     /// `TaskState` as protobuf's JSON. Forgejo has no `reportedSteps`, and a field its message does
