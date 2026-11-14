@@ -36,6 +36,7 @@ const collector = @import("collector.zig");
 const volumes = @import("volumes.zig");
 const trees_check = @import("tool_trees.zig");
 const admission = @import("../admission.zig");
+const priority = @import("../priority.zig");
 const services = @import("services.zig");
 const images = @import("images.zig");
 const container_options = @import("container_options.zig");
@@ -1139,7 +1140,9 @@ fn jobCgroup(
             // the hard cap. Only where it can slow a job, not stop it: the job's own swap is 0
             // here (above), so none is set; a job that asks for swap (`limitSwap`) gets it then.
             const g = b.gate orelse return;
-            _ = g.native(j.dir) orelse return;
+            const high_opt = g.native(j.dir);
+            try b.prioritize(arena, j, g);
+            _ = high_opt orelse return;
             g.noHigh(if (b.limits.memory_max) |m| m >> 20 else null);
             try b.notes.append(arena, "Native steps: no memory.high: with no swap it would " ++
                 "stop a job past it instead of slowing it. memory.max ends one that takes " ++
@@ -3930,6 +3933,24 @@ fn limitSwap(b: *Backend, o: container_options.Options, more: *std.ArrayList(u8)
         text,
         if (capped) " (capped: jobs may not swap here, RUNNER_NATIVE_SWAP is off or the kernel does not account for swap)" else "",
     });
+}
+
+/// The job's priority (`priority.zig`) as its cgroup's weights and memory protection. Nothing is
+/// written for the default level, so a pool with no priorities touches no extra file.
+fn prioritize(b: *Backend, arena: Allocator, j: cgroup.Job, g: *admission.Gate) !void {
+    const st = g.standing();
+    if (st.level == priority.normal) return;
+    const protect: u64 = if (priority.protectsMemory(st.level)) @as(u64, st.est_mb) << 20 else 0;
+    const done = j.limitPriority(arena, st.level, protect);
+    try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: priority {d}: cpu.weight " ++
+        "{d}{s}, io.weight {d}{s}{s}.", .{
+        st.level,
+        priority.cpuWeight(st.level),
+        if (done.cpu) "" else " (not set: no cpu controller)",
+        priority.ioWeight(st.level),
+        if (done.io) "" else " (not set: no io controller)",
+        if (protect == 0) "" else if (done.memory) ", memory.low set" else ", memory.low not set",
+    }));
 }
 
 /// `--cpu-shares` as the job's `cpu.weight` (`cgroup.cpuWeight`).

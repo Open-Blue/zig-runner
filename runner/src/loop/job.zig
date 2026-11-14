@@ -29,6 +29,7 @@ const logfmt = @import("../logfmt.zig");
 const timefmt = @import("../timefmt.zig");
 const Live = @import("../live.zig").Live;
 const admission = @import("../admission.zig");
+const priority = @import("../priority.zig");
 const upload = @import("upload.zig");
 const Runner = @import("../loop.zig").Runner;
 const Cycle = @import("../loop.zig").Cycle;
@@ -296,6 +297,34 @@ fn gateKey(c: Runner, job: job_mod.Job, name: []const u8) u64 {
     return admission.jobKeyIn(trusted, g.repository, g.workflow_ref, name);
 }
 
+/// The job's priority (`priority.zig`): the operator's policy file first, which is the word of whoever
+/// runs the pool; then the job's own `ZIG_RUNNER_PRIORITY` (a workflow- or job-level `env:` with a
+/// literal value), capped for what the operator allows a workflow and, for a job the runner does not
+/// vouch for (a pull request), at the default level, so it cannot jump the line by asking; then
+/// the pool's default.
+fn jobPriority(c: Runner, policy: priority.Policy, job: job_mod.Job, name: []const u8) priority.Level {
+    const cfg = c.cfg.admission_limits.priority;
+    const g = job.github;
+    if (policy.resolve(.{
+        .repository = g.repository,
+        .workflow_ref = g.workflow_ref,
+        .event = g.event_name,
+        .ref = g.ref,
+        .job = name,
+    })) |level| return level;
+    const trusted = trust.vouches(c.cfg.trusted_refs, c.cfg.trusted_events, g);
+    var asked: ?priority.Level = null;
+    for (job.env) |e| {
+        if (!std.mem.eql(u8, e.name, "ZIG_RUNNER_PRIORITY")) continue;
+        switch (e.value) {
+            // The later entry overrides, as for any variable (job-level over workflow-level).
+            .lit => |v| asked = priority.fromEnv(v, cfg, trusted) orelse asked,
+            .expr => {},
+        }
+    }
+    return asked orelse cfg.default;
+}
+
 /// A job's place at the memory gate from the moment it is named to its end: it reserves what jobs
 /// of its name took (`admission.Learned`), and what it took is learned and said when it ends.
 pub const Admitted = struct {
@@ -307,6 +336,7 @@ pub const Admitted = struct {
         if (c.gate) |gate| {
             gate.assigned(gateKey(c, job, name));
             gate.named(name);
+            gate.prioritize(jobPriority(c, gate.pool.policy, job, name));
         }
         return .{ .c = c, .name = name };
     }

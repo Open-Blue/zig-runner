@@ -183,6 +183,19 @@ pub fn poolWith(c: Runner, n: u32, serving: anytype) !Exit {
         m.* = .init(c.io, c.cfg.admission_limits, entries);
         m.native = c.cfg.backend == .native;
         m.health_interval_ms = c.cfg.health_interval_secs *| std.time.ms_per_s;
+        if (c.cfg.priority_policy.len > 0) {
+            // Read once, here: a policy that does not parse stops the runner (a rule silently
+            // dropped would put the wrong jobs first).
+            const text = std.Io.Dir.cwd().readFileAlloc(c.io, c.cfg.priority_policy, c.arena, .limited(1 << 20)) catch |e| {
+                try logfmt.line(c.err, .err, "config", "setting=RUNNER_PRIORITY_POLICY file={f} err={t}", .{ logfmt.q(c.cfg.priority_policy), e });
+                return .config;
+            };
+            m.policy = @import("priority.zig").Policy.parse(c.arena, text) catch |e| {
+                try logfmt.line(c.err, .err, "config", "setting=RUNNER_PRIORITY_POLICY file={f} err={t}", .{ logfmt.q(c.cfg.priority_policy), e });
+                return .config;
+            };
+            try say(c, "priority: {d} rules from {s}", .{ m.policy.rules.len, c.cfg.priority_policy });
+        }
         m.health_idle_interval_ms = c.cfg.health_idle_interval_secs *| std.time.ms_per_s;
         m.engine.source = engineSource(c.cfg);
         // Only a root runner shares the record: its directory is root's, so no other user can

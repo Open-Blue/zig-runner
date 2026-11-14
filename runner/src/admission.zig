@@ -55,6 +55,7 @@
 const proc_stats = @import("proc_stats.zig");
 const std = @import("std");
 const logfmt = @import("logfmt.zig");
+const priority = @import("priority.zig");
 const builtin = @import("builtin");
 
 /// The thresholds (`RUNNER_MIN_MEM_AVAILABLE_MB` and the rest, see deploy/runner.env.example). 0
@@ -93,6 +94,9 @@ pub const Limits = struct {
     /// this is the low end, since the gate's floor (`min_available_mb`) is a margin too. Not on
     /// `per_job_mb` or `native_per_job_mb`, which are the operator's numbers. 0 turns it off.
     margin_percent: u32 = 10,
+    /// Job priority (`priority.zig`): the order jobs waiting for room start in, and which are
+    /// paused under pressure. With every job at the default level, the arrival order.
+    priority: priority.Config = .{},
 };
 
 /// What a native job killed for memory (`memory.events` `oom_kill`) is learned to need, in
@@ -185,6 +189,8 @@ pub const Admission = struct {
     /// Counts the jobs that came to wait (`Slot.wait_seq`): the oldest is let through when
     /// nothing else runs, however little room there is.
     waits: u64 = 0,
+    /// Where priorities come from besides a job's own marker (`RUNNER_PRIORITY_POLICY`).
+    policy: priority.Policy = .{},
     /// Each runner's job, one entry per runner (`Gate.slot`): a runner runs one job at a time.
     slots: []Slot,
     /// What jobs took, by name: on the engine, and natively. Kept in a file between runs when
@@ -213,6 +219,12 @@ pub const Admission = struct {
     /// When the last health line was due (awake clock, ms); null before the first. Kept across idle
     /// stretches, so a stream of short jobs logs once per interval, not once per job.
     health_last_ms: ?i64 = null,
+    /// What `memory.low` the jobs' parent cgroup holds for the protected jobs (`syncProtection`),
+    /// in MB, and where: the kernel hands a child only what its parent is protected for, so a
+    /// job's own `memory.low` does nothing until the parent has some.
+    protected_mb: u64 = 0,
+    protected_dir_buf: [256]u8 = @splat(0),
+    protected_dir_len: usize = 0,
 
     /// One runner's job. Cleared when the job ends, so a job that is over reserves nothing,
     /// however soon it ended.
@@ -252,6 +264,15 @@ pub const Admission = struct {
         /// jobs behind them (#415); the order they came in is `wait_seq`.
         waiting: bool = false,
         wait_seq: u64 = 0,
+        /// The job's priority (`priority.zig`), and when it began to wait (awake clock, ms): the
+        /// line is ordered by the level it has risen to by waiting (`Admission.before`), then
+        /// by `wait_seq`.
+        level: priority.Level = priority.normal,
+        queued_ms: i64 = 0,
+        /// The job's steps are paused (`Admission.govern`), since when, and not again before.
+        paused: bool = false,
+        paused_since_ms: i64 = 0,
+        pause_ok_ms: i64 = std.math.minInt(i64),
         /// The job started although it did not fit beside the first in line, because it is
         /// expected to finish soon (`Admission.aheadOpen`, #415).
         ahead: bool = false,
@@ -365,17 +386,17 @@ pub const Admission = struct {
     /// Whether the job in `slot` is the one waiting longest and no other job runs: the one that
     /// may start whatever the room (`Gate.start`). A job handed out and not named yet counts as
     /// running, for it may be a job that fits, or end at once.
-    fn firstAlone(a: *const Admission, slot: usize) bool {
+    fn firstAlone(a: *const Admission, slot: usize, now_ms: i64) bool {
         // Another pool's job holds room on this machine: it frees it within `ramp_ms`, or when it
         // ends, so the first job here waits for that instead of starting into memory another pool
         // has taken (as `idleFor` does for a poll). Without this the budget held only polls back,
         // and an idle pool's first job went past every other pool's reservation.
         if (a.peers.jobs > 0) return false;
-        const mine = a.slots[slot].wait_seq;
-        for (a.slots, 0..) |s, i| {
+        const mine = &a.slots[slot];
+        for (a.slots, 0..) |*s, i| {
             if (i == slot) continue;
             if (s.waiting) {
-                if (s.wait_seq < mine) return false;
+                if (a.before(s, mine, now_ms)) return false;
             } else if (s.running()) return false;
         }
         return true;
@@ -456,13 +477,31 @@ pub const Admission = struct {
 
     /// The job waiting longest for room: the next to start
     /// (`firstAlone`), whose room no other job may take (`withHead`). Null with none waiting.
-    fn head(a: *const Admission) ?*const Slot {
+    fn head(a: *const Admission, now_ms: i64) ?*const Slot {
         var first: ?*const Slot = null;
         for (a.slots) |*s| {
             if (!s.waiting) continue;
-            if (first == null or s.wait_seq < first.?.wait_seq) first = s;
+            if (first == null or a.before(s, first.?, now_ms)) first = s;
         }
         return first;
+    }
+
+    /// The level a waiting job ranks at: its own, risen by one for each `age_step_ms` it has waited
+    /// (`priority.effective`).
+    fn rank(a: *const Admission, s: *const Slot, now_ms: i64) priority.Level {
+        return priority.effective(s.level, now_ms - s.queued_ms, a.limits.priority.age_step_ms);
+    }
+
+    /// Whether the waiting job `x` is ahead of `y` in the line: the higher rank, and at the same
+    /// rank the one that came first (`wait_seq`). With every job at one level and no aging
+    /// that is the arrival order. A job's rank only rises while it waits and is capped at
+    /// `priority.max_level`, so no job is passed by later arrivals for more than
+    /// `priority.starvationBoundMs` (then only the jobs that came before it are ahead).
+    fn before(a: *const Admission, x: *const Slot, y: *const Slot, now_ms: i64) bool {
+        const rx = a.rank(x, now_ms);
+        const ry = a.rank(y, now_ms);
+        if (rx != ry) return rx > ry;
+        return x.wait_seq < y.wait_seq;
     }
 
     /// `r` and, if a job waits for room that is not the one in `slot`, what that job needs to
@@ -470,8 +509,8 @@ pub const Admission = struct {
     /// room to start with it (#415). The jobs behind the head are not counted, so a small job
     /// passes beside a heavy one waiting wherever there is room for both, and the head is never
     /// delayed by a job that began after it did.
-    fn withHead(a: *const Admission, r: Reservation, slot: ?usize) Reservation {
-        const h = a.head() orelse return r;
+    fn withHead(a: *const Admission, r: Reservation, slot: ?usize, now_ms: i64) Reservation {
+        const h = a.head(now_ms) orelse return r;
         if (slot) |i| if (h == &a.slots[i]) return r;
         const mb: u64 = h.est_mb orelse a.unknown();
         return .{ .jobs = r.jobs + 1, .mb = r.mb + mb, .native_mb = r.native_mb + mb };
@@ -514,7 +553,7 @@ pub const Admission = struct {
     ///   not, so no more go ahead on the word of a learned run time while it runs; when it ends
     ///   its run is learned (`Learned.recordRun`) and its name is long.
     fn aheadOpen(a: *const Admission, signal: Signals, now_ms: i64) bool {
-        const h = a.head() orelse return false;
+        const h = a.head(now_ms) orelse return false;
         var r = a.reserved(now_ms, a.polling, false);
         var freed_mb: u64 = 0;
         var others_run = false;
@@ -657,6 +696,8 @@ pub const Admission = struct {
     /// the health line after it.
     pub fn tick(a: *Admission) void {
         a.samplePeaks();
+        a.govern();
+        a.syncProtection();
         a.persistNow(false);
     }
 
@@ -684,6 +725,119 @@ pub const Admission = struct {
             }
             if (engine) |e| s.peak_mb = @max(s.peak_mb, e.used_mb);
         }
+    }
+
+    /// Pauses and resumes native jobs by priority under memory pressure (`priority.govern`), at
+    /// most one a second. A job is paused by freezing its steps' cgroup (`setFrozen`): its
+    /// memory stays, and so does the job at the gate and its renewal (the runner is in no job's
+    /// cgroup), but it uses no CPU and takes no more memory until it goes on.
+    fn govern(a: *Admission) void {
+        const cfg = a.limits.priority;
+        if (!cfg.freeze) return;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
+        var cands: [64]priority.Candidate = undefined;
+        var idx: [64]usize = undefined;
+        var n: usize = 0;
+        var top: priority.Level = 0;
+        var any_paused = false;
+        for (a.slots, 0..) |s, i| {
+            if (!s.running()) continue;
+            if (!s.paused) top = @max(top, s.level);
+            if (!s.native or s.cgroup() == null or n == cands.len) continue;
+            any_paused = any_paused or s.paused;
+            cands[n] = .{
+                .level = s.level,
+                .paused = s.paused,
+                .paused_ms = if (s.paused) now_ms - s.paused_since_ms else 0,
+                .pause_ok_ms = s.pause_ok_ms,
+                .mb = a.slotMb(s),
+            };
+            idx[n] = i;
+            n += 1;
+        }
+        // Nothing paused and nothing below the top: no reason to read the pressure.
+        if (!any_paused) {
+            var below = false;
+            for (cands[0..n]) |c| below = below or c.level < top;
+            if (!below) return;
+        }
+        const pressure = read(a.io, a.paths, null).pressure orelse 0;
+        switch (priority.govern(cfg, cands[0..n], top, pressure, now_ms)) {
+            .none => {},
+            .pause => |k| {
+                const s = &a.slots[idx[k]];
+                if (!a.setFrozen(s, true)) return;
+                s.paused = true;
+                s.paused_since_ms = now_ms;
+                logfmt.warn("job_paused", "job={f} level={d} top={d} pressure={d}", .{
+                    logfmt.q(s.name_buf[0..s.name_len]), s.level, top, pressure,
+                });
+            },
+            .resume_job => |r| {
+                const s = &a.slots[idx[r.i]];
+                _ = a.setFrozen(s, false);
+                s.paused = false;
+                if (r.expired) s.pause_ok_ms = now_ms + cfg.freeze_max_ms;
+                logfmt.warn("job_resumed", "job={f} level={d} paused_ms={d} expired={}", .{
+                    logfmt.q(s.name_buf[0..s.name_len]), s.level, now_ms - s.paused_since_ms, r.expired,
+                });
+            },
+        }
+    }
+
+    /// The jobs' parent's `memory.low`: the estimates of the running native jobs that are
+    /// protected (`priority.protectsMemory`), so that when the machine must reclaim, the
+    /// pages it takes from the jobs are the lower ones'. Written when the sum changes, and back to
+    /// 0 when no protected job is left. One pool's word: another pool or runner on the same
+    /// parent writes its own sum there, and the last wins.
+    fn syncProtection(a: *Admission) void {
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        var sum_mb: u64 = 0;
+        var dir: ?[]const u8 = null;
+        for (a.slots) |*s| {
+            if (!s.running() or !s.native or !priority.protectsMemory(s.level)) continue;
+            const job_dir = s.cgroup() orelse continue;
+            sum_mb += a.slotMb(s.*);
+            dir = std.fs.path.dirname(job_dir);
+        }
+        if (sum_mb == a.protected_mb) return;
+        const target = dir orelse a.protected_dir_buf[0..a.protected_dir_len];
+        if (target.len == 0 or target.len > a.protected_dir_buf.len) return;
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var text_buf: [32]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/memory.low", .{target}) catch return;
+        const text = std.fmt.bufPrint(&text_buf, "{d}", .{sum_mb << 20}) catch return;
+        std.Io.Dir.cwd().writeFile(a.io, .{ .sub_path = path, .data = text }) catch |e| {
+            logfmt.warn("memory_low_not_set", "path={f} err={t}", .{ logfmt.q(path), e });
+            a.protected_mb = sum_mb;
+            return;
+        };
+        @memcpy(a.protected_dir_buf[0..target.len], target);
+        a.protected_dir_len = target.len;
+        a.protected_mb = sum_mb;
+    }
+
+    /// `cgroup.freeze` of the job's steps (`<cgroup>/steps`, or the job's own where the kernel
+    /// lacks the split), and not of its services: a database or a cache a step talks to goes on
+    /// answering its health checks. The runner and its helpers are in no job's cgroup, so they keep
+    /// renewing the job with GitHub and streaming its log. Whether it was written.
+    pub fn setFrozen(a: *Admission, s: *const Slot, frozen: bool) bool {
+        const dir = s.cgroup() orelse return false;
+        const text = if (frozen) "1" else "0";
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const steps = std.fmt.bufPrint(&path_buf, "{s}/steps/cgroup.freeze", .{dir}) catch return false;
+        std.Io.Dir.cwd().writeFile(a.io, .{ .sub_path = steps, .data = text }) catch |e| switch (e) {
+            error.FileNotFound => {
+                const own = std.fmt.bufPrint(&path_buf, "{s}/cgroup.freeze", .{dir}) catch return false;
+                std.Io.Dir.cwd().writeFile(a.io, .{ .sub_path = own, .data = text }) catch return false;
+                return true;
+            },
+            else => return false,
+        };
+        return true;
     }
 
     /// A native job near its `memory.high` gets more of it while the host has the memory: the limit
@@ -944,7 +1098,7 @@ pub const Gate = struct {
         const signal = a.signals(now_ms);
         // A runner asks beside every runner polling; the warm asks for itself alone.
         const asking = if (g.warm) 1 else a.polling + @intFromBool(!g.claimed);
-        var r = a.withHead(a.reserved(now_ms, asking, false), null);
+        var r = a.withHead(a.reserved(now_ms, asking, false), null, now_ms);
         // The pre-warm is a job on the engine, not a native one, however it is counted.
         if (g.warm and a.native) r.native_mb -|= a.unknown();
         var hold = decide(a.limits, signal, r, g.holding);
@@ -952,7 +1106,7 @@ pub const Gate = struct {
         // that job, since what it is handed is told at `start`, where a job that is not expected
         // to be short waits behind the first in line. The cost is the runner it holds, and no more
         // than half the pool's are let to (`Admission.aheadOpen`, #415).
-        if (hold != null and !g.warm and a.head() != null) {
+        if (hold != null and !g.warm and a.head(now_ms) != null) {
             const no_head = a.reserved(now_ms, asking, false);
             if (decide(a.limits, signal, no_head, g.holding) == null and
                 a.waitingCount() < a.slots.len / 2 and a.aheadOpen(signal, now_ms))
@@ -1034,7 +1188,7 @@ pub const Gate = struct {
         const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
         const signal = a.signals(now_ms);
         const est: u64 = s.est_mb orelse a.unknown();
-        var r = a.withHead(a.reserved(now_ms, a.polling, false), g.slot);
+        var r = a.withHead(a.reserved(now_ms, a.polling, false), g.slot, now_ms);
         r.jobs += 1;
         r.mb += est;
         r.native_mb += est;
@@ -1049,7 +1203,7 @@ pub const Gate = struct {
         // No room beside the first in line, but room without it, and a name expected to be gone
         // soon: it goes ahead (#415). A name not learned is long, and waits its turn. Not in a
         // cooldown, which holds every big job, short or not.
-        if (h != .cooldown and a.head() != &a.slots[g.slot]) {
+        if (h != .cooldown and a.head(now_ms) != &a.slots[g.slot]) {
             const short = if (a.runMs(s.key)) |ms| ms <= short_run_ms else false;
             var no_head = a.reserved(now_ms, a.polling, false);
             no_head.jobs += 1;
@@ -1065,7 +1219,7 @@ pub const Gate = struct {
                 return .started;
             }
         }
-        if (!a.firstAlone(g.slot)) return .{ .wait = h };
+        if (!a.firstAlone(g.slot, now_ms)) return .{ .wait = h };
         Admission.admit(s, now_ms);
         a.publish();
         g.holding = false;
@@ -1102,6 +1256,27 @@ pub const Gate = struct {
         a.slots[g.slot] = .{ .started_ms = now_ms, .overlaps = a.shareEngine(g.slot, true) };
     }
 
+    /// The runner's job has priority `level` (`priority.zig`), from the policy or its own
+    /// marker. Called after `assigned` and before `start`: the line ahead of a job that is waiting
+    /// is ordered by it, so a held runner looks again.
+    pub fn prioritize(g: *Gate, level: priority.Level) void {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        defer a.changed();
+        const s = &a.slots[g.slot];
+        if (s.running()) s.level = @min(level, priority.max_level);
+    }
+
+    /// The runner's job's priority, and its estimate in MB (0 when not known).
+    pub fn standing(g: *Gate) struct { level: priority.Level, est_mb: u32 } {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const s = a.slots[g.slot];
+        return .{ .level = s.level, .est_mb = s.est_mb orelse 0 };
+    }
+
     /// The runner's job is known as `key` (`jobKey`): it reserves what jobs of that name took, or
     /// the worst case for a name not seen yet, and is measured from here (`Admission.sample`). On
     /// a native pool it reserves what it took natively, or else on the engine (it went there
@@ -1116,6 +1291,7 @@ pub const Gate = struct {
         const s = &a.slots[g.slot];
         std.debug.assert(s.running());
         s.key = key;
+        s.level = a.limits.priority.default;
         // The pre-warm never waits here: `ready` let it through already. It reserves as on the
         // engine until the native store's warm makes its cgroup (`native`), and stays on the
         // engine for the engine's warm.
@@ -1131,6 +1307,7 @@ pub const Gate = struct {
             s.waiting = true;
             a.waits += 1;
             s.wait_seq = a.waits;
+            s.queued_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
         } else if (a.limits.per_job_mb > 0) s.est_mb = a.reserve(a.learned.estimate(key));
         // Measured on the engine until it goes native, so a job a native pool sends to Dagger is
         // learned there. Without the engine's cgroup (another OS, `RUNNER_ENGINE_CGROUP=none`)
@@ -4429,7 +4606,7 @@ test "a job not learned or learned long waits behind the first in line, and so d
     // A short job that takes what is left of the room waits: 4336 + 200 + 200 x 10 > 6500.
     try setAvailable(tmp.dir, 4500);
     try std.testing.expectEqual(StartTag.wait, named(&gates[5], burst_light));
-    try std.testing.expectEqual(@as(?*const Admission.Slot, &slots[1]), pool.head());
+    try std.testing.expectEqual(@as(?*const Admission.Slot, &slots[1]), pool.head(std.Io.Clock.awake.now(std.testing.io).toMilliseconds()));
 }
 
 test "no short job goes ahead once the first in line would fit without the ones ahead: a stream cannot starve it (#415)" {
@@ -5530,4 +5707,124 @@ test "an image pull's downloads at once: the layers, the cores the other jobs le
     try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable: 1027072 kB\n" });
     try std.testing.expectEqual(@as(u32, 1), gate.fetchConcurrency(40, 12, 8, &why));
     try std.testing.expectEqualStrings("memory or pressure at the gate", why);
+}
+
+// ---- Job priority (#544) ----
+
+test "priority: the job waiting longest is no longer first when a higher one waits; equal levels keep arrival order" {
+    var slots: [6]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 6500);
+    var gates: [6]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    // One heavy job runs; three more come, low, normal, high, and wait for its room.
+    try std.testing.expectEqual(StartTag.started, named(&gates[0], burst_heavy));
+    for ([_]priority.Level{ priority.low, priority.normal, priority.high }, 1..) |level, i| {
+        gates[i].leave(true);
+        gates[i].assigned(burst_heavy);
+        gates[i].prioritize(level);
+        try std.testing.expectEqual(StartTag.wait, std.meta.activeTag(gates[i].start()));
+    }
+    const now_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    try std.testing.expectEqual(@as(?*const Admission.Slot, &slots[3]), pool.head(now_ms));
+    // Room for one more heavy job: the low and normal ones that came first do not start, the high one does.
+    _ = gates[0].ended();
+    try std.testing.expectEqual(StartTag.wait, std.meta.activeTag(gates[1].start()));
+    try std.testing.expectEqual(StartTag.wait, std.meta.activeTag(gates[2].start()));
+    try std.testing.expectEqual(StartTag.started, std.meta.activeTag(gates[3].start()));
+    // Then normal before low.
+    _ = gates[3].ended();
+    try std.testing.expectEqual(StartTag.wait, std.meta.activeTag(gates[1].start()));
+    try std.testing.expectEqual(StartTag.started, std.meta.activeTag(gates[2].start()));
+    _ = gates[2].ended();
+    try std.testing.expectEqual(StartTag.started, std.meta.activeTag(gates[1].start()));
+}
+
+test "priority: with the default level everywhere the order is the arrival order, as before" {
+    var slots: [4]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 6500);
+    var gates: [4]Gate = undefined;
+    for (&gates, 0..) |*g, i| g.* = .{ .pool = &pool, .slot = i };
+    try std.testing.expectEqual(StartTag.started, named(&gates[0], burst_heavy));
+    for (gates[1..]) |*g| try std.testing.expectEqual(StartTag.wait, named(g, burst_heavy));
+    const now_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    try std.testing.expectEqual(@as(?*const Admission.Slot, &slots[1]), pool.head(now_ms));
+}
+
+test "priority: a low job waiting is passed by later high ones for at most the starvation bound" {
+    const step: u32 = 1000;
+    var slots: [2]Admission.Slot = undefined;
+    var pool: Admission = .init(std.testing.io, .{ .priority = .{ .age_step_ms = step } }, &slots);
+    // The low job came first, at time 0 (the awake clock is arbitrary; only differences count).
+    const t0: i64 = 1_000_000;
+    slots[0] = .{ .started_ms = t0, .waiting = true, .wait_seq = 1, .level = priority.low, .queued_ms = t0 };
+    const bound: i64 = @intCast(priority.starvationBoundMs(priority.low, step).?);
+    // A fresh job of the highest level arrives every instant, as late and as high as can be: the
+    // low job is ahead of it from the bound on, not before.
+    var t: i64 = 0;
+    while (t <= bound + 2 * step) : (t += step / 4) {
+        slots[1] = .{ .started_ms = t0 + t, .waiting = true, .wait_seq = 2, .level = priority.max_level, .queued_ms = t0 + t };
+        const low_first = pool.head(t0 + t) == &slots[0];
+        try std.testing.expectEqual(t >= bound, low_first);
+    }
+    // And it is only ever passed by jobs that came after it while it ranks below the top: a job
+    // of any level that came before it (lower `wait_seq`) stays ahead of it once both are at the top.
+    slots[0].wait_seq = 3;
+    slots[1] = .{ .started_ms = t0, .waiting = true, .wait_seq = 2, .level = priority.max_level, .queued_ms = t0 };
+    try std.testing.expect(pool.head(t0 + 20 * step) == &slots[1]);
+}
+
+test "priority: with aging off the level alone decides, and a low job can be passed for ever" {
+    var slots: [2]Admission.Slot = undefined;
+    var pool: Admission = .init(std.testing.io, .{ .priority = .{ .age_step_ms = 0 } }, &slots);
+    slots[0] = .{ .started_ms = 1, .waiting = true, .wait_seq = 1, .level = priority.low, .queued_ms = 0 };
+    slots[1] = .{ .started_ms = 1, .waiting = true, .wait_seq = 2, .level = priority.normal, .queued_ms = 1 << 40 };
+    try std.testing.expect(pool.head(1 << 41) == &slots[1]);
+}
+
+test "priority: under pressure the lower job's steps are frozen, and thawed when it passes; the higher job and the services are not" {
+    var slots: [3]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool = try burstPool(tmp.dir, &tmp.sub_path, &slots, 6500);
+    pool.limits.priority = .{ .freeze = true, .freeze_pressure = 2000 };
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const jobs = [_][]const u8{ "hi", "lo" };
+    for (jobs, 0..) |name, i| {
+        try tmp.dir.createDirPath(std.testing.io, name);
+        try tmp.dir.createDirPath(std.testing.io, try std.fmt.allocPrint(arena, "{s}/steps", .{name}));
+        const path = try std.fmt.bufPrint(&slots[i].cgroup_buf, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+        slots[i].cgroup_len = path.len;
+        slots[i].started_ms = 1;
+        slots[i].native = true;
+        slots[i].level = if (i == 0) priority.high else priority.low;
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/steps/cgroup.freeze", .{name}), .data = "0" });
+    }
+    var path_buf: [256]u8 = undefined;
+    pool.paths.pressure = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/pressure", .{tmp.sub_path});
+    var out: [8]u8 = undefined;
+    // Calm: nothing happens.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pressure", .data = "some avg10=1.00 avg60=0.00 avg300=0.00 total=0\n" });
+    pool.govern();
+    try std.testing.expectEqualStrings("0", try tmp.dir.readFile(std.testing.io, "lo/steps/cgroup.freeze", &out));
+    // Pressed: the low job's steps freeze, the high job's do not.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pressure", .data = "some avg10=30.00 avg60=0.00 avg300=0.00 total=0\n" });
+    pool.govern();
+    try std.testing.expectEqualStrings("1", try tmp.dir.readFile(std.testing.io, "lo/steps/cgroup.freeze", &out));
+    try std.testing.expectEqualStrings("0", try tmp.dir.readFile(std.testing.io, "hi/steps/cgroup.freeze", &out));
+    try std.testing.expect(slots[1].paused and !slots[0].paused);
+    // Still pressed a little (above half the line): it stays frozen.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pressure", .data = "some avg10=15.00 avg60=0.00 avg300=0.00 total=0\n" });
+    pool.govern();
+    try std.testing.expect(slots[1].paused);
+    // Calm again: it goes on.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pressure", .data = "some avg10=2.00 avg60=0.00 avg300=0.00 total=0\n" });
+    pool.govern();
+    try std.testing.expectEqualStrings("0", try tmp.dir.readFile(std.testing.io, "lo/steps/cgroup.freeze", &out));
+    try std.testing.expect(!slots[1].paused);
 }
