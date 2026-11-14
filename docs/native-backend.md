@@ -2464,9 +2464,6 @@ fixture's `differences.txt` lists, which is where the builder does something els
 - A fetched action's context has no `.git` (GitHub's copy of the action has none).
 - The layers carry no timestamps of the build.
 
-Open at the time of writing: the comparison was last run before `--chmod` of a created destination
-directory, `adduser`-style RUNs without the tests' host `/usr`, and `ADD` of a URL were settled;
-fixtures whose results are not yet equal list their differences in `differences.txt`.
 
 The `Runner` is the sandbox (`docker_action.BuildRunner`): a `RUN` runs as a container whose
 lowers are the image's layers so far, each idmapped on a root runner, and whose upper is the

@@ -1405,13 +1405,13 @@ const Builder = struct {
         defer if (dst) |d| d.close();
         var layer = try std.Io.Dir.cwd().openDir(b.io, upper, .{});
         defer layer.close(b.io);
-        var cp: Copier = .{ .arena = b.arena, .io = b.io, .src = null, .dst = dst, .layer = layer, .op = undefined };
+        var cp: Copier = .{ .arena = b.arena, .io = b.io, .src = null, .dst = dst, .layer = layer, .op = .{ .from = .context, .sources = &.{}, .dest = "", .chown = "", .chmod = null } };
         if (user.len > 0) if (dst) |d| {
             const passwd = try cp.textOf(d, "etc/passwd");
             const group = try cp.textOf(d, "etc/group");
             if (images.userIds(user, passwd, group)) |ids| cp.owner = .{ .uid = ids.uid, .gid = ids.gid };
         };
-        var made = cp.placeDir(path, null) catch |e| switch (e) {
+        var made = cp.placeDir(path) catch |e| switch (e) {
             error.CopyFailed => return cp.why,
             else => return e,
         };
@@ -1508,13 +1508,13 @@ const Copier = struct {
     fn entry(c: *Copier, e: layer_view.Entry, name: []const u8, into: bool, dest: []const u8) !void {
         switch (e.kind) {
             .dir => {
-                var to = try c.placeDir(dest, c.op.chmod);
+                var to = try c.placeDir(dest);
                 defer to.close(c.io);
                 try c.tree(e, to, 0);
             },
             .file => {
                 const at = try c.destPath(name, into, dest);
-                var to = try c.placeDir(std.fs.path.dirnamePosix(at) orelse "", null);
+                var to = try c.placeDir(std.fs.path.dirnamePosix(at) orelse "");
                 defer to.close(c.io);
                 try c.copyOne(e, to, std.fs.path.basenamePosix(at));
             },
@@ -1530,7 +1530,7 @@ const Copier = struct {
 
     fn bytes(c: *Copier, name: []const u8, data: []const u8, mode: u32, into: bool, dest: []const u8) !void {
         const target_path = try c.destPath(name, into, dest);
-        var to = try c.placeDir(std.fs.path.dirnamePosix(target_path) orelse "", null);
+        var to = try c.placeDir(std.fs.path.dirnamePosix(target_path) orelse "");
         defer to.close(c.io);
         const base = std.fs.path.basenamePosix(target_path);
         const m = c.op.chmod orelse mode;
@@ -1540,7 +1540,7 @@ const Copier = struct {
 
     fn download(c: *Copier, name: []const u8, path: []const u8, into: bool, dest: []const u8) !void {
         const target_path = try c.destPath(name, into, dest);
-        var to = try c.placeDir(std.fs.path.dirnamePosix(target_path) orelse "", null);
+        var to = try c.placeDir(std.fs.path.dirnamePosix(target_path) orelse "");
         defer to.close(c.io);
         const base = std.fs.path.basenamePosix(target_path);
         // Docker saves what it downloads readable by its owner alone.
@@ -1609,7 +1609,7 @@ const Copier = struct {
     /// The directory `path` (of the image, absolute or not) in the new layer, made with the
     /// directories on the way, an opened handle. Where the image has a directory its mode and
     /// owner are kept; a link on the way is followed through the image, as `RUN` would see it.
-    fn placeDir(c: *Copier, path: []const u8, leaf_mode: ?u32) !std.Io.Dir {
+    fn placeDir(c: *Copier, path: []const u8) !std.Io.Dir {
         const Seg = struct { name: []const u8, existing: ?layer_view.Entry };
         var real: std.ArrayList(Seg) = .empty;
         var pending: std.ArrayList([]const u8) = .empty;
@@ -1643,7 +1643,7 @@ const Copier = struct {
         }
         var dir = try c.layer.openDir(c.io, ".", .{});
         errdefer dir.close(c.io);
-        for (real.items, 0..) |seg, at| {
+        for (real.items) |seg| {
             var made = true;
             dir.createDir(c.io, seg.name, .default_dir) catch |err| switch (err) {
                 error.PathAlreadyExists => made = false,
@@ -1660,8 +1660,8 @@ const Copier = struct {
             } else {
                 const o = c.owner orelse Owner{ .uid = 0, .gid = 0 };
                 _ = linux.fchown(dir.handle, o.uid, o.gid);
-                // `--chmod` is the mode of the directory a copy of a directory makes of its destination.
-                _ = linux.fchmod(dir.handle, if (at == real.items.len - 1) leaf_mode orelse 0o755 else 0o755);
+                // `--chmod` is the mode of every directory a copy makes, as BuildKit makes them.
+                _ = linux.fchmod(dir.handle, c.op.chmod orelse 0o755);
             }
         }
         return dir;
