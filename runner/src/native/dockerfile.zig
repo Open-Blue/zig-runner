@@ -2771,9 +2771,9 @@ test "allocation failures: a Dockerfile parsed, substituted and planned" {
                 .ok => |ok| ok,
                 .refused => return,
             };
-            const base: images.Image = .{ .rootfs = "", .env = &.{"PATH=/usr/bin:/bin"}, .cmd = &.{"/bin/sh"} };
+            var fb: FixedBases = .{ .arena = ar, .config = .{ .rootfs = "", .env = &.{"PATH=/usr/bin:/bin"}, .cmd = &.{"/bin/sh"} } };
             var ctx: Fixed = .{};
-            _ = try plan(ar, ins, base, "base", &.{}, ctx.context());
+            _ = try plan(ar, ins, fb.bases(), &.{}, ctx.context());
         }
     };
     const docker =
