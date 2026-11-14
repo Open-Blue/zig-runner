@@ -161,8 +161,8 @@ fn answer(s: *Server, conn: Io.net.Stream) bool {
             }
             if (rt.cut_at) |n| {
                 out.print("HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ rt.content_type, rt.body.len }) catch return false;
-                out.writeAll(rt.body[0..n]) catch {};
-                out.flush() catch {};
+                out.writeAll(rt.body[0..n]) catch return false;
+                out.flush() catch return false;
                 return false;
             }
             return respond(s, out, "200 OK", "", rt.content_type, rt.body);
