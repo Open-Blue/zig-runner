@@ -184,7 +184,7 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
             sunk.add(chunk[0..n]);
             left -= n;
         }
-    } else r.interface.discardAll(body_len) catch {};
+    } else r.interface.discardAll(body_len) catch return .close;
     if (std.mem.eql(u8, path, "/quit")) return .quit;
     if (std.mem.eql(u8, path, "/silent")) return .hold;
     if (std.mem.startsWith(u8, path, "/silent-once/")) {

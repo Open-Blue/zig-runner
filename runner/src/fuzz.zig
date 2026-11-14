@@ -1784,7 +1784,7 @@ const AnswerServer = struct {
     /// Ends the server: the next accept is the last.
     fn finish(s: *AnswerServer, io: std.Io) void {
         s.stop_flag.store(true, .release);
-        const last = std.Io.net.IpAddress.parse("127.0.0.1", s.port()) catch unreachable;
+        const last = std.Io.net.IpAddress.parse("127.0.0.1", s.port()) catch return;
         if (last.connect(io, .{ .mode = .stream })) |c| c.close(io) else |_| {}
         s.thread.join();
         s.listener.deinit(io);
