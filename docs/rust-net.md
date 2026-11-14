@@ -309,6 +309,17 @@ documents (DNS approximate, TLS inferred) go away with the wrapper.
   the User-Agent is `zig-runner/<version>` where the registry's was `zig-runner`; a token service that redirects is an error (`TooManyRedirects`, with 0 redirects allowed) where std handed back the 3xx, and the pull says
   "the token service: TooManyRedirects" instead of "answered HTTP 302"; the registry's stale-connection retry counts (`staleRetries + 1` tries) become the library's one repeat; errors are `net_client.Error`'s names (a registry that closes every
   connection unanswered is `NetworkIo`, not `HttpConnectionClosing`).
+- **Measured** (cowbird, loopback server in the same process, 512 MiB, ReleaseSafe, `net_oracle.zig`'s `bench:` tests, three alternating runs; load average 2.8 for the last set, 6-8 for the first):
+  | | wall | CPU (process, server thread included) | peak RSS |
+  |---|---|---|---|
+  | tarball, std, whole body in memory (the old `zig_release`) | 445-527 ms (970-1150 MiB/s) | 0.82-0.96 s | 526 MB |
+  | tarball, library stream, hashed as it arrives | 478-540 ms (950-1070 MiB/s) | 0.99-1.10 s | 3.9 MB |
+  | blob into a file and SHA-256, std (the old registry) | 590-603 ms (850-870 MiB/s) | 1.06-1.10 s | 1.8 MB |
+  | blob, library stream (the new registry's `Body.take`) | 586-693 ms (740-870 MiB/s) | 1.49-1.73 s | 4.9 MB |
+  So: equal wall time within noise on a 1 GiB/s loopback, 100-250 ms (tarball) and 400-600 ms (blob) more CPU per 512 MiB, and 500 MB less memory for a tarball. The CPU is the hop between
+  the runtime's thread and the caller's (one wake and one read per burst of the connection). The first run was twice as slow: hyper's adaptive read buffer allocates a block of hundreds of KiB per read and musl maps and
+  unmaps each one, so the connection now reads into a fixed 64 KiB (`READ_BUF`) and `alloc.rs` keeps up to 16 freed blocks of 32-512 KiB for reuse (CPU 2.2-2.5 s before, 1.5-1.7 s after, for the blob). Not measured: the
+  Raspberry Pi (disk streaming vs std; planned in the R4 row below), a real registry or ziglang.org (network-bound; the loopback isolates the client), HTTP/2 (the client is h1 only; no gain was shown to justify it).
 - **Validation.** Cargo: 7 new tests through the C ABI as Zig drives it (48 MiB streamed plain and chunked with a slow reader and the queue's peak asserted below 1.5 MiB, reuse after a stream, a cancel halfway closes the
   connection at the server, a stalled body and a call over its total each have their own error, a 24 MiB upload through a slow server with the writer made to wait, a server that answers a 512 MiB upload at once stops the writer,
   303 and 307 for a streamed body, the token left behind at a redirect), and queue unit tests. Zig: the oracle's download (five sizes up to 24 MiB, three read sizes, hashed on both sides), redirect, upload
