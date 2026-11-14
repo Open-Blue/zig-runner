@@ -215,7 +215,7 @@ test "takeOpened gives the lookup that ended before the connect, inside the wind
             const slot = &lookups[lookups_next % slots];
             lookups_next +%= 1;
             @memcpy(slot.host[0..host.len], host);
-            slot.host_len = @intCast(host.len);
+            slot.host_len = std.math.cast(u8, host.len).?;
             slot.start = start;
             slot.end = end;
         }
