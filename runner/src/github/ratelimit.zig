@@ -29,15 +29,22 @@ pub fn parse(
 }
 
 /// A `Retry-After` value: whole seconds, or an HTTP date (IMF-fixdate, the form GitHub uses).
+/// Seconds too many for any integer are the longest wait, not garbage. A negative number, text,
+/// and the obsolete date forms (RFC 850 "Sunday, 06-Nov-94 ...", asctime "Sun Nov  6 ...") are
+/// null: the caller falls back to the rate limit's reset header, else its own backoff.
 fn retryAfter(value: []const u8, now_ms: i64) ?i64 {
     const v = std.mem.trim(u8, value, " ");
-    if (std.fmt.parseInt(u32, v, 10)) |s| return clamp(@as(i64, s) * std.time.ms_per_s) else |_| {}
+    if (v.len > 0 and std.mem.indexOfNone(u8, v, "0123456789") == null) {
+        const s = std.fmt.parseInt(u64, v, 10) catch return max_wait_ms;
+        const secs: i64 = @intCast(@min(s, max_wait_ms / std.time.ms_per_s));
+        return secs * std.time.ms_per_s;
+    }
     const at = httpDate(v) orelse return null;
     return clamp(at *| std.time.ms_per_s -| now_ms);
 }
 
 fn clamp(ms: i64) i64 {
-    return @max(ms, 0);
+    return std.math.clamp(ms, 0, max_wait_ms);
 }
 
 /// "Sun, 06 Nov 1994 08:49:37 GMT" as epoch seconds.
@@ -90,7 +97,9 @@ pub fn wait(io: std.Io, backoff_ms: i64, asked_ms: i64) i64 {
 test "Retry-After in seconds, an HTTP date, and x-ratelimit-reset with remaining 0" {
     const t = std.testing;
     try t.expectEqual(@as(i64, 7000), parse(.too_many_requests, "7", null, null, 0));
-    try t.expectEqual(@as(i64, 120_000), parse(.service_unavailable, " 120 ", null, null, 5));
+    try t.expectEqual(@as(i64, 20_000), parse(.service_unavailable, " 20 ", null, null, 5));
+    // Longer than `max_wait_ms` is the most a retry waits.
+    try t.expectEqual(max_wait_ms, parse(.service_unavailable, " 120 ", null, null, 5));
     // 1994-11-06 08:49:37 GMT is 784111777; ten seconds before it:
     try t.expectEqual(@as(i64, 10_000), parse(.too_many_requests, "Sun, 06 Nov 1994 08:49:37 GMT", null, null, 784_111_767_000));
     // A date in the past asks for nothing.
@@ -101,6 +110,26 @@ test "Retry-After in seconds, an HTTP date, and x-ratelimit-reset with remaining
     try t.expectEqual(@as(i64, 0), parse(.forbidden, null, null, null, 0));
     try t.expectEqual(@as(i64, 0), parse(.ok, "9", "0", "99999999999", 0));
     try t.expectEqual(@as(i64, 0), parse(.too_many_requests, "soon", null, null, 0));
+}
+
+test "a huge, negative, garbage or obsolete-form Retry-After" {
+    const t = std.testing;
+    // Past u32, past i64, and past a day: the longest wait, whatever the integer's width.
+    try t.expectEqual(max_wait_ms, parse(.too_many_requests, "99999999999", null, null, 0));
+    try t.expectEqual(max_wait_ms, parse(.too_many_requests, "99999999999999999999999", null, null, 0));
+    try t.expectEqual(max_wait_ms, parse(.too_many_requests, "18446744073709551615", null, null, 0));
+    // Not a delay: the reset header answers when it can, else nothing.
+    try t.expectEqual(@as(i64, 0), parse(.too_many_requests, "-5", null, null, 0));
+    try t.expectEqual(@as(i64, 4000), parse(.too_many_requests, "-5", "0", "4", 0));
+    try t.expectEqual(@as(i64, 4000), parse(.too_many_requests, "1.5", "0", "4", 0));
+    try t.expectEqual(@as(i64, 4000), parse(.too_many_requests, "", "0", "4", 0));
+    try t.expectEqual(@as(i64, 4000), parse(.too_many_requests, "7 seconds", "0", "4", 0));
+    // RFC 850 and asctime dates are not parsed (GitHub sends IMF-fixdate): as garbage, the reset
+    // header answers.
+    try t.expectEqual(@as(i64, 4000), parse(.too_many_requests, "Sunday, 06-Nov-94 08:49:37 GMT", "0", "4", 0));
+    try t.expectEqual(@as(i64, 4000), parse(.too_many_requests, "Sun Nov  6 08:49:37 1994", "0", "4", 0));
+    // A date far in the future is bounded too.
+    try t.expectEqual(max_wait_ms, parse(.too_many_requests, "Fri, 31 Dec 9999 23:59:59 GMT", null, null, 0));
 }
 
 test "a wait is the server's request over the backoff, bounded" {

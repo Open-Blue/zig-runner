@@ -232,12 +232,19 @@ fn retrying(io: std.Io, retry: Retry, comptime try_fn: anytype, args: anytype) R
         if (r.ok or !r.transient or attempt == retry.delays_ms.len) return r;
         // At least what GitHub asked (`Retry-After`, the rate limit's reset), unless the budget
         // runs out first: then this gives up now, not after sleeping to the end of it.
-        const delay_ms = ratelimit.wait(io, retry.delays_ms[attempt], r.wait_ms);
-        const delay_ns = @as(i96, delay_ms) * std.time.ns_per_ms;
         const elapsed = std.Io.Clock.awake.now(io).toNanoseconds() - started;
-        if (elapsed + delay_ns >= retry.budget.nanoseconds) return r;
+        const delay_ns = delayWithinBudget(io, retry, attempt, r.wait_ms, elapsed) orelse return r;
         io.sleep(.fromNanoseconds(delay_ns), .awake) catch return r;
     }
+}
+
+/// How long to wait before try `attempt` + 1: the backoff, or what GitHub asked if longer
+/// (`ratelimit.wait`); null when `elapsed_ns` plus that is past the budget, and the retry gives up.
+fn delayWithinBudget(io: std.Io, retry: Retry, attempt: usize, asked_ms: i64, elapsed_ns: i96) ?i96 {
+    const delay_ms = ratelimit.wait(io, retry.delays_ms[attempt], asked_ms);
+    const delay_ns = @as(i96, delay_ms) * std.time.ns_per_ms;
+    if (elapsed_ns + delay_ns >= retry.budget.nanoseconds) return null;
+    return delay_ns;
 }
 
 /// Whether a request that failed with `err` may pass when made again: the name server, the
@@ -762,6 +769,20 @@ test "a 403 with x-ratelimit-remaining 0 waits for the reset" {
 }
 
 test "a Retry-After longer than the budget gives up at once, not after the wait" {
+    const io = std.testing.io;
+    const short: Retry = .{ .delays_ms = &.{ 1, 1 }, .budget = .fromMilliseconds(500) };
+    // No sleep is decided on, whatever the clock: 30 s asked, 500 ms of budget (and the same for
+    // an hour, a day, and a huge number the header parser bounds).
+    for ([_]i64{ 30_000, 3_600_000, std.math.maxInt(i64) }) |asked| {
+        try std.testing.expectEqual(@as(?i96, null), delayWithinBudget(io, short, 0, asked, 0));
+    }
+    // Within the budget the wait is the request, with jitter.
+    const long: Retry = .{ .delays_ms = &.{ 1, 1 }, .budget = .fromSeconds(600) };
+    const d = delayWithinBudget(io, long, 0, 30_000, 0).?;
+    try std.testing.expect(d >= 30_000 * std.time.ns_per_ms and d <= 33_000 * std.time.ns_per_ms);
+
+    // End to end: one request is made, and the retry ends there (a sleep to the 30 s would have
+    // let the budget's check run again and a second request through, or hung this test).
     var server: @import("testserver.zig").Server = undefined;
     try server.start();
     defer server.stop();
@@ -769,12 +790,7 @@ test "a Retry-After longer than the budget gives up at once, not after the wait"
     server.results_fail_on = "SignedBlobURL";
     server.results_fail_status = "429 Too Many Requests";
     server.results_fail_headers = "Retry-After: 30\r\n";
-    const short: Retry = .{ .delays_ms = &.{ 1, 1 }, .budget = .fromMilliseconds(500) };
-    const started = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
     const r = testUpload(&server, .job, short);
-    const took = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - started;
     try std.testing.expect(!r.ok and r.transient);
-    try std.testing.expect(took < 400 * std.time.ns_per_ms);
-    // Asked once; the second try would have started after the wait.
     try std.testing.expectEqual(@as(u32, 99), server.results_fail);
 }
