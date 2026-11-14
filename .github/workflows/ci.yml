@@ -432,17 +432,21 @@ jobs:
             # with each job's own ids and network (nft makes its NAT), in `native-root`.
             # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
             sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
-            ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/zig-test.sh
+            ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/memory-peak.sh compile-and-run -- ../.github/scripts/zig-test.sh
           else
             stop="tests-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
             echo "::stop-commands::$stop" >&2
             log="$(mktemp)"
             status=0
             set -o pipefail
-            if [ "$RUNNER_ARCH" = ARM64 ]; then
-              zig build test -j1 --summary all 2>&1 | tee "$log" >&2 || status=$?
-            else
-              zig build test --summary all 2>&1 | tee "$log" >&2 || status=$?
+            # The compile and the run apart, each with the memory peak it reached, as one
+            # `memory-peak:` line (memory-peak.sh): the Pi's compile has peaked within a few percent
+            # of its job's 3.1 GB limit and killed one run. `test` after `test-compile` only runs.
+            jobs=()
+            [ "$RUNNER_ARCH" = ARM64 ] && jobs=(-j1)
+            ../.github/scripts/memory-peak.sh compile -- zig build test-compile "${jobs[@]}" --summary all 2>&1 | tee "$log" >&2 || status=$?
+            if [ "$status" = 0 ]; then
+              ../.github/scripts/memory-peak.sh run -- zig build test "${jobs[@]}" --summary all 2>&1 | tee "$log" >&2 || status=$?
             fi
             echo "::$stop::" >&2
             # A floor on the tests that passed (as the overlayfs step's, ZIG_TEST_MIN_PASSED): the

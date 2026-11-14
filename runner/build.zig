@@ -59,6 +59,12 @@ pub fn build(b: *std.Build) void {
     // `-Dllvm`, which it needs too, turns this off.
     const shard_tests = b.option(bool, "shard-tests", "Run the tests in several processes (default: unless -Dllvm)") orelse
         (use_llvm != true);
+    // `zig build test-compile`: everything `test` compiles, without running it, so that CI can
+    // report the memory peak of the compile and of the run apart (.github/scripts/memory-peak.sh).
+    // `test` after it only runs: its compiles are in the cache.
+    const compile_step = b.step("test-compile", "Compile the tests, the runner and the test runner without running them");
+    compile_step.dependOn(&tests.step);
+    compile_step.dependOn(&exe.step);
     const run_tests = if (shard_tests) run: {
         const shards = b.addExecutable(.{
             .name = "test_shards",
@@ -67,6 +73,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
             }),
         });
+        compile_step.dependOn(&shards.step);
         const run_shards = b.addRunArtifact(shards);
         run_shards.addArtifactArg(tests);
         break :run run_shards;
