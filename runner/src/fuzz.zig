@@ -31,6 +31,7 @@ const zstd = @import("native/oci/zstd.zig");
 const libzstd = @import("native/oci/libzstd.zig");
 const zlibng = @import("native/oci/zlibng.zig");
 const registry = @import("native/oci/registry.zig");
+const tarball = @import("native/tarball.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
 const dagger = @import("dagger.zig");
@@ -648,6 +649,55 @@ fn ociRefs(_: void, smith: *Smith) !void {
         error.OutOfMemory => return e,
         else => {},
     }
+}
+
+test "fuzz: tarball sources and pax header" {
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    try std.testing.fuzz({}, tarballs, .{ .corpus = comptime seeds(&.{
+        &.{ "https://github.com", "o/r", "refs/pull/7/merge", "\x00" ++ "52 comment=" ++ sha ++ "\n" },
+        &.{ "https://git.example.com:8443/", "org/repo", "feat/a b?c#d", "" },
+        &.{ "http://127.0.0.1:1", "a/b", "../../etc", "9999 comment=x\n" },
+        &.{ "https://acme.ghe.com", "x/y", "v1.2.3", "1 \n" },
+    }) });
+}
+
+/// The URLs built from a job's server, repository and ref, and the commit read out of the first
+/// bytes of an archive a server sent (`native/tarball.zig`): no input panics, a URL stays one URL
+/// whose path starts where it should, and a commit is 40 hex digits or nothing.
+fn tarballs(_: void, smith: *Smith) !void {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var sbuf: [128]u8 = undefined;
+    var rbuf: [128]u8 = undefined;
+    var fbuf: [128]u8 = undefined;
+    var hbuf: [2048]u8 = undefined;
+    const server = take(smith, &sbuf);
+    const repo = take(smith, &rbuf);
+    const ref = take(smith, &fbuf);
+    const record = take(smith, &hbuf);
+    for ([_]tarball.Source{
+        try tarball.checkoutSource(arena, server, repo, ref, null),
+        try tarball.actionSource(arena, server, repo, ref),
+    }) |src| {
+        // The ref is percent-encoded into the path: a `?` or `#` in it never starts a query or a
+        // fragment, whatever the server and repository are.
+        if (std.Uri.parse(src.url)) |uri| {
+            try std.testing.expect(std.mem.indexOfScalar(u8, ref, '?') == null or uri.query == null or
+                std.mem.indexOf(u8, src.url, "%3F") != null);
+        } else |_| {}
+    }
+    // A pax header block holding the record, as a tar's first entry.
+    var block: [1024 + 2048]u8 = @splat(0);
+    block[156] = if (smith.value(bool)) 'g' else 'x';
+    _ = try std.fmt.bufPrint(block[124..136], "{o:0>11}", .{record.len});
+    @memcpy(block[512..][0..record.len], record);
+    const got = try tarball.paxCommit(arena, block[0 .. 512 + record.len + 512]);
+    if (got) |c| try std.testing.expect(c.len == 40 and for (c) |ch| {
+        if (!std.ascii.isHex(ch)) break false;
+    } else true);
+    // And the raw bytes as they come, not framed.
+    _ = try tarball.paxCommit(arena, record);
 }
 
 test "fuzz: OCI manifests" {

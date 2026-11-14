@@ -149,7 +149,8 @@ needed() {
 		# The decoders (libzstd and zlib-ng, which read every layer a registry sends, and the Zig
 		# decoders they are held to) are the exception, with their corpora: a change to them is
 		# fuzzed before it merges. The same for the network library (docs/rust-net.md): it reads
-		# what servers send, and its tests run under Valgrind.
+		# what servers send, and its tests run under Valgrind; and for `native/tarball.zig`, which
+		# reads the first bytes of an archive a server sent.
 		case $1 in
 		.github/workflows/analysis.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/zig-fuzz.sh | .github/scripts/zig-valgrind.sh | \
@@ -160,6 +161,7 @@ needed() {
 			runner/src/vendor/zstd/* | runner/src/fuzz_corpus/zstd/* | \
 			runner/src/native/oci/zlibng.zig | runner/src/vendor/zlib-ng/* | \
 			runner/src/fuzz_corpus/gzip/* | \
+			runner/src/native/tarball.zig | \
 			runner/src/zr_net.zig | runner/rust/* | .github/scripts/build-zr-net.sh | \
 			.github/scripts/zig-cc.sh | .github/scripts/install-rust.sh | \
 			.github/valgrind.supp) return 0 ;;

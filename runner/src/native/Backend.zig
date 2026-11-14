@@ -42,6 +42,7 @@ const container_options = @import("container_options.zig");
 const publish = @import("publish.zig");
 const host_paths = @import("host_paths.zig");
 const native_actions = @import("actions.zig");
+const tarball = @import("tarball.zig");
 const Exec = @import("../dagger/Exec.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
 const SpanDemux = @import("../dagger/JobLog.zig").SpanDemux;
@@ -122,6 +123,9 @@ cancel: ?*dagger.Cancel = null,
 hash_settings: hash_files.Settings = .{},
 /// Local actions read so far before the job (`actions.readOwn`), naming their files.
 preflights: u32 = 0,
+/// The job's image has no git (a fetch ran `git` and the image said it is not found): the
+/// checkout and the actions' fetch download the repository's tarball instead (`tarball.zig`).
+no_git: bool = false,
 /// Why the last Dockerfile could not be planned or built, for the step's message.
 build_reason: []const u8 = "",
 /// Why the job runs on Dagger after all, found in `base` (`error.NativeToDagger`): one of its
@@ -2439,6 +2443,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
         f.result = .{ .failed = "no repository to check out (the job has no github.repository)" };
         return f;
     }
+    if (b.no_git) return b.fetchCheckoutTarball(x, co, f);
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.writeAll("set -e\nmkdir -p ");
@@ -2544,6 +2549,12 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
         f.result = .{ .dir = "native" };
         return f;
     }
+    // An image with no git: the repository's tarball instead, here and for the job's later fetches.
+    if (gitMissing(ended, &out)) {
+        b.dropTop();
+        b.no_git = true;
+        return b.fetchCheckoutTarball(x, co, f);
+    }
     // The sandbox's own failure fails the step, as a fetch Dagger could not make does.
     const why = if (ended.failure.len > 0) ended.failure else out.tail();
     const msg = x.sh.redacted(arena, why) catch why;
@@ -2552,6 +2563,60 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
         if (checkout.looksLikeAuthFailure(msg)) " (the job's GITHUB_TOKEN reads only " ++
             "the job's own repository; another private one cannot be checked out)" else "",
     }) };
+    return f;
+}
+
+/// Whether a script that ran `git` ended because the image has none: `sh` exits 127 and names it.
+pub fn gitMissing(ended: sandbox.Ended, out: *const Captured) bool {
+    if (ended.failure.len > 0 or ended.code != 127) return false;
+    return std.mem.indexOf(u8, out.text.items, "git") != null;
+}
+
+/// The built-in checkout in an image with no git (`tarball.zig`): the repository's tarball from
+/// GitHub's API with the job's token, extracted by the image's `tar`. A tree with no `.git`, as
+/// actions/checkout leaves it without git; what needs one (submodules) fails the step and says so.
+fn fetchCheckoutTarball(b: *Backend, x: *Exec, co: job_mod.Checkout, f_in: dagger.Fetched) !dagger.Fetched {
+    const arena = b.arena;
+    var f = f_in;
+    f.fetched_with = "the repository's tarball (the job's image has no git)";
+    f.depth = 1;
+    f.tags = false;
+    if (co.submodules) {
+        f.result = .{ .failed = "this job's image has no git, so a checkout with `submodules:` " ++
+            "cannot fetch them (a tarball has none); use an image with git" };
+        return f;
+    }
+    const token: ?[]const u8 = if (x.gitAuth()) |id| plaintext(x, id) else null;
+    const src = try tarball.checkoutSource(arena, x.job.github.server_url, f.repo, f.want, token);
+    const script = try tarball.extractScript(arena, f.mount);
+    // A commit is the same tree every time, so a step under caching like any other; a branch moves.
+    const key = if (checkout.isSha(f.want))
+        try b.keyFor(.step, try std.fmt.allocPrint(arena, "# tarball {s}\n{s}", .{ src.url, script }), &.{}, b.uid, b.gid)
+    else
+        null;
+    const claim = b.claimKey(key, "fetch") catch |e| switch (e) {
+        error.Stopped => {
+            f.result = .{ .failed = "the step was stopped" };
+            return f;
+        },
+        else => return e,
+    };
+    defer claim.release(b.io);
+    if (claim.hit != null) {
+        f.result = .{ .dir = "native" };
+        return f;
+    }
+    const got = try tarball.fetchInto(b, f.mount, src, null, b.uid, b.gid);
+    switch (got) {
+        .sha => {
+            if (claim.key) |k| try b.publishTop(k, .fetch, .{ .log = "", .fc = "" });
+            f.result = .{ .dir = "native" };
+        },
+        .failed => |why| {
+            const msg = x.sh.redacted(arena, why) catch why;
+            f.result = .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}@{s}: {s}", .{ f.repo, f.ref_label, msg }) };
+        },
+    }
     return f;
 }
 

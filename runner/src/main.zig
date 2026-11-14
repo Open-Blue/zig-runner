@@ -76,6 +76,7 @@ comptime {
     _ = @import("native/store_stress.zig");
     _ = @import("native/store_crash.zig");
     _ = @import("native/actions.zig");
+    _ = @import("native/tarball.zig");
     _ = @import("redact.zig");
     _ = @import("yaml.zig");
     _ = @import("action.zig");

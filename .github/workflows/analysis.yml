@@ -186,6 +186,7 @@ jobs:
           - { target: OCI layer, runs: 1M }
           - { target: OCI references and challenges, runs: 8M }
           - { target: OCI manifests, runs: 8M }
+          - { target: tarball sources and pax header, runs: 8M }
           - { target: expressions, runs: 1M }
           - { target: YAML, runs: 5M }
           - { target: regular expressions, runs: 1M }
