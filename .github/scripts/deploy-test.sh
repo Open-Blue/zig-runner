@@ -127,7 +127,12 @@ release() {
 	(cd "$d" && sha256sum "$asset" >SHA256SUMS)
 	echo "$3 $4 ${5:--}" >"$d/prov"
 }
-feed() { printf '%s\t%s\n' "$1" "$2" >>"$fx/releases.tsv"; }
+# feed TAG PRERELEASE [NAME]: a release in the feed, created after the ones before it.
+feed_seq=0
+feed() {
+	feed_seq=$((feed_seq + 1))
+	printf '%s\t%s\t%s\t2026-11-14T00:00:%02dZ\n' "$1" "$2" "${3:--}" "$feed_seq" >>"$fx/releases.tsv"
+}
 sha_of() { printf '%s%028d' "$1" 0; }
 
 # stable_release vX.Y.Z: in the feed and a release.yml-attested release.
@@ -144,7 +149,7 @@ main_candidate() {
 	local tag=main-$1-$2
 	release "$tag" "v${3:-1.2.4}-main.$1+$2" candidate.yml refs/heads/main "$(sha_of "$2")"
 	sha_of "$2" >"$fx/commit/$tag"
-	feed "$tag" true
+	feed "$tag" true "v${3:-1.2.4}-main.$1+$2"
 }
 deployment() {
 	echo "$1" >>"$fx/dep/ids"
@@ -325,6 +330,54 @@ t_main_does_not_install_an_older_or_equal_candidate() {
 	check "still main.5" installed_is v1.2.4-main.5+aaaaaaaaaaaa
 	check "nothing downloaded" no_downloads
 	check "channel unchanged: nothing recorded as installed" not test -e "$root/sandbox/state/channel.bad"
+}
+
+# The run number restarts (candidate.yml recreated): a higher base version still orders after.
+t_main_advances_across_a_run_number_reset_with_a_higher_base() {
+	setup
+	binary v1.2.4-main.50+aaaaaaaaaaaa
+	main_candidate 1 bbbbbbbbbbbb 1.2.5
+	channel main
+	run_agent
+	check "exit 0" status_is 0
+	check "the reset candidate is newer" installed_is v1.2.5-main.1+bbbbbbbbbbbb
+	check "no stall warning" not out_has "kind=main_candidate_stalled"
+}
+
+t_main_picks_the_highest_base_then_number() {
+	setup
+	binary v1.2.4-main.3+aaaaaaaaaaaa
+	main_candidate 90 111111111111 1.2.4
+	main_candidate 2 222222222222 1.2.6
+	main_candidate 7 333333333333 1.2.6
+	main_candidate 99 444444444444 1.2.5
+	channel main
+	run_agent
+	check "1.2.6 main.7" installed_is v1.2.6-main.7+333333333333
+}
+
+# A reset under the same base cannot be ordered: say so instead of staying silent.
+t_main_warns_when_the_newest_candidate_is_not_newer() {
+	setup
+	binary v1.2.4-main.50+aaaaaaaaaaaa
+	main_candidate 49 bbbbbbbbbbbb
+	main_candidate 3 cccccccccccc
+	channel main
+	run_agent
+	check "exit 0" status_is 0
+	check "nothing installed" installed_is v1.2.4-main.50+aaaaaaaaaaaa
+	check "nothing downloaded" no_downloads
+	check "the stall is named" out_has "kind=main_candidate_stalled: main-3-cccccccccccc"
+}
+
+t_main_does_not_warn_when_up_to_date() {
+	setup
+	main_candidate 4 bbbbbbbbbbbb
+	main_candidate 5 aaaaaaaaaaaa
+	binary v1.2.4-main.5+aaaaaaaaaaaa
+	channel main
+	run_agent
+	check "no warning" not out_has "kind=main_candidate_stalled"
 }
 
 t_main_already_installed_does_nothing() {

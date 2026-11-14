@@ -231,7 +231,10 @@ at the right ref, and the binary says the version the candidate is named for:
 - `rc`: `candidate.yml`, `refs/tags/<tag>`;
 - `main`: `candidate.yml`, `refs/heads/main`, and the commit the tag points at.
 
-The version is monotonic within a channel: a main candidate with a number no higher than the
+The version is monotonic within a channel: a main candidate is ordered by its base version
+(X.Y.Z of its release's name), then its run number N, so a restart of the run numbers under a higher
+base still advances; one that restarts under the same base cannot be ordered, and the agent says so
+in its journal (`kind=main_candidate_stalled`) instead of waiting silently. A main candidate that is not above the
 installed one, or an rc or release older than the installed one, is not installed (logged, not a
 failure; `ALLOW_DOWNGRADE` is `stable`'s). Installing, restarting, the health check and the
 `$BIN.prev` rollback are the same. A `stable` machine never installs a candidate: it takes a

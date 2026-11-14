@@ -268,24 +268,38 @@ record_channel() {
 	fi
 }
 
-# The newest candidate of the channel in the releases feed (tag and whether it is a pre-release,
-# tab-separated, on stdin) that was not rejected: for `main` the highest N; for `rc` the newest
-# version of the release candidates and releases. A tag whose pre-release flag disagrees with its
-# form is not a candidate of any channel (a release candidate published as latest, say).
+# The newest candidate of the channel in the releases feed (tag, whether it is a pre-release, name
+# and creation time, tab-separated, on stdin) that was not rejected: for `main` the highest (base
+# version, N); for `rc` the newest version of the release candidates and releases. A tag whose
+# pre-release flag disagrees with its form is not a candidate of any channel (a release candidate
+# published as latest, say). A main candidate's base version is X.Y.Z of its release's name
+# (vX.Y.Z-main.N+SHA12, candidate-version.sh): the run number N restarts from 1 if the candidate
+# workflow is ever recreated, and the base, which follows the latest release, then still orders.
+# Prints: the tag, its base, and for main the newest candidate by creation time and its base.
+main_base() {
+	[[ $1 =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-main\. ]] && echo "${BASH_REMATCH[1]}" || echo 0.0.0
+}
+# Whether main candidate (base $1, N $2) is newer than (base $3, N $4).
+main_newer() {
+	[[ $1 == "$3" ]] && return $(($2 > $4 ? 0 : 1))
+	[[ $(printf '%s\n' "$1" "$3" | sort -V | tail -n1) == "$1" ]]
+}
 newest_candidate() {
-	local tag pre n best='' best_n=-1
-	while IFS=$'\t' read -r tag pre; do
+	local tag pre name created n base best='' best_base='' best_n=-1 latest='' latest_base='' latest_created=''
+	while IFS=$'\t' read -r tag pre name created; do
 		! grep -qxF -- "$tag" "$STATE_DIR/rejected" 2>/dev/null || continue
 		if [[ $CHANNEL == main ]]; then
 			[[ $pre == true && $tag =~ $main_tag_re ]] || continue
 			n=$((10#${BASH_REMATCH[1]}))
-			if ((n > best_n)); then best=$tag best_n=$n; fi
+			base=$(main_base "$name")
+			if [[ -z $best ]] || main_newer "$base" "$n" "$best_base" "$best_n"; then best=$tag best_base=$base best_n=$n; fi
+			if [[ -z $latest || $created > $latest_created ]]; then latest=$tag latest_base=$base latest_created=$created; fi
 		else
 			[[ ($pre == true && $tag =~ $rc_re) || ($pre == false && $tag =~ $stable_re) ]] || continue
 			if [[ -z $best ]] || older "$best" "$tag"; then best=$tag; fi
 		fi
 	done
-	echo "$best"
+	echo "${best:--} ${best_base:-0.0.0} ${latest:--} ${latest_base:-0.0.0}"
 }
 
 # What this machine needs is checked before any deployment is touched: a deployment reported failed
@@ -337,10 +351,10 @@ if [[ $CHANNEL == stable ]]; then
 	# Only a release: a candidate, however it got into a deployment, is refused here.
 	[[ $tag =~ $stable_re ]] || fail "not a version tag: $tag"
 else
-	feed=$(gh api "repos/$REPO/releases?per_page=100" --jq '.[] | select(.draft | not) | [.tag_name, .prerelease] | @tsv') ||
+	feed=$(gh api "repos/$REPO/releases?per_page=100" --jq '.[] | select(.draft | not) | [.tag_name, .prerelease, (.name // "-" | if . == "" then "-" else . end), .created_at] | @tsv') ||
 		transient "could not list $REPO's releases"
-	tag=$(newest_candidate <<<"$feed")
-	[[ -n $tag ]] || exit 0
+	read -r tag tag_base latest_tag latest_base < <(newest_candidate <<<"$feed")
+	[[ $tag != - ]] || exit 0
 	if [[ $tag =~ $main_tag_re ]]; then
 		kind=main
 	elif [[ $tag =~ $rc_re ]]; then
@@ -374,10 +388,21 @@ elif [[ $CHANNEL == stable ]]; then
 		fail "$tag is older than the installed $current: refused (ALLOW_DOWNGRADE=$tag on $(hostname) allows it)"
 	fi
 elif [[ $kind == main ]]; then
-	# The candidate's number is its order: the same number from another commit is not newer either.
-	if [[ $current =~ $main_version_re ]] && ! is_tag_version "$BIN" && ((10#${BASH_REMATCH[1]} >= tag_n)); then
-		log "main: $tag is not newer than the installed $current; nothing to do"
-		exit 0
+	# Ordered by (base version, N): the same pair from another commit is not newer either. The
+	# installed binary's base is the X.Y.Z of its version.
+	if [[ $current =~ $main_version_re ]] && ! is_tag_version "$BIN"; then
+		current_n=$((10#${BASH_REMATCH[1]}))
+		current_sha12=${BASH_REMATCH[2]}
+		if ! main_newer "$tag_base" "$tag_n" "$(main_base "$current")" "$current_n"; then
+			log "main: $tag is not newer than the installed $current; nothing to do"
+			# The newest published candidate that sorts at or below the installed one: a run number
+			# that restarted under the same base stalls the machine here, silently but for this.
+			if [[ $latest_tag =~ $main_tag_re && ${BASH_REMATCH[2]} != "$current_sha12" ]] &&
+				! main_newer "$latest_base" "$((10#${BASH_REMATCH[1]}))" "$(main_base "$current")" "$current_n"; then
+				log "kind=main_candidate_stalled: $latest_tag is the newest published candidate but not newer than the installed $current by (base, run number); did the candidate run numbers restart?"
+			fi
+			exit 0
+		fi
 	fi
 elif [[ $current =~ $stable_re || $current =~ $rc_re ]] && older "$tag" "$current"; then
 	# The newest the feed offers is older than what is installed: nothing to install, not a failure.
