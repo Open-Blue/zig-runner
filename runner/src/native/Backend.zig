@@ -3712,6 +3712,17 @@ fn readContainerOptions(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void
         m.period,
         try b.limitCpu(m, err_msg),
     });
+    if (o.cpu_shares) |n| try more.print(b.arena, ", `--cpu-shares` {d} (cpu.weight {d})", .{
+        n,
+        cgroup.cpuWeight(n),
+    });
+    if (o.cpu_shares) |n| try b.limitWeight(cgroup.cpuWeight(n), err_msg);
+    if (o.cpuset_cpus) |l| try more.print(b.arena, ", `--cpuset-cpus` {s}{s}", .{ l, try b.limitCpuset("cpuset.cpus", "--cpuset-cpus", l, err_msg) });
+    if (o.cpuset_mems) |l| try more.print(b.arena, ", `--cpuset-mems` {s}{s}", .{ l, try b.limitCpuset("cpuset.mems", "--cpuset-mems", l, err_msg) });
+    if (o.pids_limit) |n| try more.print(b.arena, ", `--pids-limit` {d}{s}", .{ n, try b.limitPids(n, err_msg) });
+    if (o.memory_swap) |n| try more.print(b.arena, ", `--memory-swap` {s}", .{
+        if (n == -1) "-1 (a job may not swap: its memory limit holds)" else "(a job may not swap: its memory limit holds)",
+    });
     try b.setUpSandboxOptions(o);
     try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Container options: {d} " ++
         "`--env`{s}{s}{s}; {d} understood and without effect natively (`--workdir`, " ++
@@ -3743,34 +3754,97 @@ fn limitMemory(b: *Backend, want: u64, err_msg: *[]const u8) ![]const u8 {
     return "";
 }
 
+/// The job's own cgroup, for a flag that is a limit of it: a job with none fails rather than run
+/// without what it asked for (the native set-up fails, so the job goes to Dagger, which drops
+/// the flag, or fails where there is no engine).
+fn cgroupFor(b: *Backend, flag: []const u8, err_msg: *[]const u8) !cgroup.Job {
+    return b.job_cgroup orelse {
+        err_msg.* = try std.fmt.allocPrint(b.arena, "the job container's `{s}` needs the job's own " ++
+            "cgroup, which this job has none of (RUNNER_NATIVE_CGROUP)", .{flag});
+        return error.BaseContainerFailed;
+    };
+}
+
+fn controllerMissing(b: *Backend, j: cgroup.Job, flag: []const u8, controller: []const u8, err_msg: *[]const u8) !noreturn {
+    err_msg.* = try std.fmt.allocPrint(b.arena, "the job container's `{s}` needs the {s} controller " ++
+        "in the job's cgroup, which {s} does not give its children (cgroup.controllers lacks " ++
+        "{s}: delegate it, e.g. systemd's `Delegate={s}`, or run the job where the flag is not set)", .{
+        flag,
+        controller,
+        std.fs.path.dirname(j.dir) orelse j.dir,
+        controller,
+        controller,
+    });
+    return error.BaseContainerFailed;
+}
+
 /// `--cpus` (or `--cpu-quota` and `--cpu-period`) as the job's `cpu.max`. Like `--memory` it
 /// fails the native set-up, with the reason, where it cannot be held to the limit: the job has no
 /// cgroup of its own, or the cpu controller is not delegated to it (the job then goes to Dagger,
-/// which drops the flag, or fails with no engine; never runs natively unlimited). More CPUs than the machine has is no error here, as it is for
-/// Docker's daemon: the limit then never throttles. The words that follow the number in "Set up
-/// job".
+/// which drops the flag, or fails with no engine; never runs natively unlimited). Deliberately
+/// not Docker's: more CPUs than the machine has is no error (Docker's daemon refuses "range of
+/// CPUs is from 0.01 to N"), the limit then never throttles, which the words that follow the
+/// number in "Set up job" say.
 fn limitCpu(b: *Backend, m: container_options.CpuMax, err_msg: *[]const u8) ![]const u8 {
-    const j = b.job_cgroup orelse {
-        err_msg.* = "the job container's `--cpus` needs the job's own cgroup, which this " ++
-            "job has none of (RUNNER_NATIVE_CGROUP)";
-        return error.BaseContainerFailed;
-    };
-    j.limitCpu(b.arena, m.quota, m.period) catch |e| {
-        err_msg.* = switch (e) {
-            error.CpuControllerUnavailable => try std.fmt.allocPrint(b.arena, "the job container's " ++
-                "`--cpus` needs the cpu controller in the job's cgroup, which {s} does not give " ++
-                "its children (cgroup.controllers lacks cpu: delegate it, e.g. systemd's " ++
-                "`Delegate=cpu`, or run the job where the flag is not set)", .{
-                std.fs.path.dirname(j.dir) orelse j.dir,
-            }),
-            else => "the job container's `--cpus` could not be set on the job's cgroup",
-        };
-        return error.BaseContainerFailed;
+    const j = try b.cgroupFor("--cpus", err_msg);
+    j.limitCpu(b.arena, m.quota, m.period) catch |e| switch (e) {
+        error.CpuControllerUnavailable => try b.controllerMissing(j, "--cpus", "cpu", err_msg),
+        else => {
+            err_msg.* = "the job container's `--cpus` could not be set on the job's cgroup";
+            return error.BaseContainerFailed;
+        },
     };
     const cpus = std.Thread.getCpuCount() catch 0;
     if (cpus > 0 and m.quota > @as(u64, cpus) * m.period)
         return try std.fmt.allocPrint(b.arena, " (more than this machine's {d} CPUs: it never " ++
             "throttles)", .{cpus});
+    return "";
+}
+
+/// `--cpu-shares` as the job's `cpu.weight` (`cgroup.cpuWeight`).
+fn limitWeight(b: *Backend, weight: u32, err_msg: *[]const u8) !void {
+    const j = try b.cgroupFor("--cpu-shares", err_msg);
+    j.limitWeight(b.arena, weight) catch |e| switch (e) {
+        error.CpuControllerUnavailable => try b.controllerMissing(j, "--cpu-shares", "cpu", err_msg),
+        else => {
+            err_msg.* = "the job container's `--cpu-shares` could not be set on the job's cgroup";
+            return error.BaseContainerFailed;
+        },
+    };
+}
+
+/// `--cpuset-cpus` and `--cpuset-mems` as the job's `cpuset.cpus` and `cpuset.mems`, after a check
+/// against what the cpuset controller allows the job (Docker's "Requested CPUs are not available"):
+/// a list outside it fails the native set-up, saying what is available.
+fn limitCpuset(b: *Backend, file: []const u8, flag: []const u8, list: []const u8, err_msg: *[]const u8) ![]const u8 {
+    const j = try b.cgroupFor(flag, err_msg);
+    const effective = if (std.mem.eql(u8, file, "cpuset.cpus")) "cpuset.cpus.effective" else "cpuset.mems.effective";
+    const available = j.cpusetAvailable(b.arena, effective) orelse
+        try b.controllerMissing(j, flag, "cpuset", err_msg);
+    if (!cgroup.listWithin(list, available)) {
+        err_msg.* = try std.fmt.allocPrint(b.arena, "the job container's `{s}` {s} is not available: " ++
+            "this machine's cgroup allows {s}", .{ flag, list, available });
+        return error.BaseContainerFailed;
+    }
+    j.limitCpuset(b.arena, file, list) catch {
+        err_msg.* = try std.fmt.allocPrint(b.arena, "the job container's `{s}` could not be set on " ++
+            "the job's cgroup", .{flag});
+        return error.BaseContainerFailed;
+    };
+    return "";
+}
+
+/// `--pids-limit` as the job's `pids.max`, lowered when it is below the runner's own for a job
+/// (never raised, as `--memory`).
+fn limitPids(b: *Backend, want: u64, err_msg: *[]const u8) ![]const u8 {
+    const j = try b.cgroupFor("--pids-limit", err_msg);
+    if (b.limits.pids_max) |have| if (want >= have)
+        return try std.fmt.allocPrint(b.arena, " (the runner's limit of {d} is lower, and holds)", .{have});
+    j.lowerPids(b.arena, want) catch {
+        err_msg.* = "the job container's `--pids-limit` could not be set on the job's cgroup";
+        return error.BaseContainerFailed;
+    };
+    b.limits.pids_max = @intCast(@min(want, std.math.maxInt(u32)));
     return "";
 }
 
@@ -5167,8 +5241,8 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     try std.testing.expect(unsupported(io, container, root, ok) == null);
     container.container.?.options = .{ .lit = "--cpus 1,5" };
     try expectReason("`--cpus`", unsupported(io, container, root, ok));
-    container.container.?.options = .{ .lit = "--cpu-shares 512" };
-    try expectReason("`--cpu-shares`", unsupported(io, container, root, ok));
+    container.container.?.options = .{ .lit = "--blkio-weight 500" };
+    try expectReason("`--blkio-weight`", unsupported(io, container, root, ok));
     container.container.?.options = .{ .lit = "--user 1001 -e A=1 --workdir /w --health-cmd true" };
     try std.testing.expect(unsupported(io, container, root, ok) == null);
     container.container.?.options = .{ .lit = "--hostname h --add-host a:10.0.0.1 --shm-size 1g " ++
@@ -7416,6 +7490,60 @@ test "root runner: a container job's --cpus 0.5 sets the job's cpu.max and throt
     cfg.cgroup.parent = "none";
     const bare = try runNativeJob(arena, cfg, job, .root);
     try std.testing.expect(!bare.res.succeeded);
+}
+
+/// A job container with `options`, whose one step runs `script` after setting `cg` to the job's
+/// cgroup directory under the host's mount (the steps' parent), as the root tests of options read
+/// the limits of the job; what it printed.
+fn runOptionsJob(arena: Allocator, cfg: Config, options: []const u8, script: []const u8) ![]const u8 {
+    var server: testregistry.Server = undefined;
+    const layers = try testImageLayers(arena);
+    const img = try testregistry.testImage(arena, "test/optsc", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+    var step = testStep(try std.fmt.allocPrint(arena, "cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup | " ++
+        "sed 's,/steps$,,')\n{s}", .{script}));
+    step.name = "limits";
+    var job = testJob(&.{step});
+    job.container = .{ .name = "", .image = .{ .lit = try server.image(arena, "test/optsc:1") }, .options = .{ .lit = options } };
+    const r = try runNativeJob(arena, cfg, job, .root);
+    if (!r.res.succeeded) std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(r.res.succeeded);
+    try expectLines(r.text, &.{"Engine: native"});
+    return r.text;
+}
+
+test "root runner: a container job's --cpu-shares sets cpu.weight, and --pids-limit lowers pids.max, never raises it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    const show = "echo \"weight=$(cat $cg/cpu.weight)\"; echo \"pids=$(cat $cg/pids.max)\"";
+    // 512 shares are half the default 1024, which is the kernel's default weight of 100.
+    const text = try runOptionsJob(arena, cfg, "--cpu-shares 512 --pids-limit 100", show);
+    try expectLines(text, &.{ "weight=50", "pids=100", "`--cpu-shares` 512 (cpu.weight 50)", "`--pids-limit` 100" });
+    const high = try runOptionsJob(arena, cfg, "-c 2048 --pids-limit 100000", show);
+    try expectLines(high, &.{ "weight=200", "pids=8192", "the runner's limit of 8192 is lower" });
+}
+
+test "root runner: a container job's --cpuset-cpus and --cpuset-mems confine its processes" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    // The step's own affinity, as the kernel reports it, and the job's file.
+    const text = try runOptionsJob(arena, cfg, "--cpuset-cpus 0 --cpuset-mems 0 --memory-swap -1 -m 512m", "echo \"cpuset.cpus=$(cat $cg/cpuset.cpus)\"; " ++
+        "echo \"cpuset.mems=$(cat $cg/cpuset.mems)\"; grep Cpus_allowed_list /proc/self/status");
+    try expectLines(text, &.{ "cpuset.cpus=0", "cpuset.mems=0", "Cpus_allowed_list:\t0", "`--cpuset-cpus` 0" });
 }
 
 test "a container job's volumes on the native backend: directories of the job, there for every step" {
