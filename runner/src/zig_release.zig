@@ -14,7 +14,8 @@ const Sha256 = @import("sha256.zig").Sha256;
 const builtin = @import("builtin");
 const config = @import("config.zig");
 const minisign = @import("minisign.zig");
-const http = @import("github/http.zig");
+const net_client = @import("net_client.zig");
+const Blake2b512 = std.crypto.hash.blake2.Blake2b512;
 
 /// Zig's minisign public key, as https://ziglang.org/download/ publishes it ("Files are signed with
 /// minisign using this public key"), checked there on 2026-10-31.
@@ -72,17 +73,50 @@ pub fn check(
     tarball: []const u8,
     minisig: []const u8,
 ) (CheckError || std.mem.Allocator.Error)!config.ZigSeed {
-    const trusted = try minisign.verify(pk, tarball, minisig);
+    var d: Digests = .{};
+    d.update(tarball);
+    return checkDigests(arena, pk, version, d.final(), minisig);
+}
+
+/// The two digests of a tarball, taken as it streams in.
+const Digests = struct {
+    blake: Blake2b512 = .init(.{}),
+    sha: Sha256 = .init(.{}),
+    bytes: u64 = 0,
+
+    fn update(d: *Digests, data: []const u8) void {
+        d.blake.update(data);
+        d.sha.update(data);
+        d.bytes += data.len;
+    }
+
+    const Final = struct { blake: [Blake2b512.digest_length]u8, sha: [32]u8 };
+
+    fn final(d: *Digests) Final {
+        var out: Final = undefined;
+        d.blake.final(&out.blake);
+        d.sha.final(&out.sha);
+        return out;
+    }
+};
+
+/// `check` for a tarball that was never held: its digests taken as it was downloaded.
+fn checkDigests(
+    arena: std.mem.Allocator,
+    pk: minisign.PublicKey,
+    version: []const u8,
+    digests: Digests.Final,
+    minisig: []const u8,
+) (CheckError || std.mem.Allocator.Error)!config.ZigSeed {
+    const trusted = try minisign.verifyDigest(pk, digests.blake, minisig);
     const file = try std.mem.concat(arena, u8, &.{ "file:", try tarballName(arena, version) });
     var words = std.mem.tokenizeAny(u8, trusted, " \t");
     while (words.next()) |w| {
         if (std.mem.eql(u8, w, file)) break;
     } else return error.WrongFile;
-    var digest: [32]u8 = undefined;
-    Sha256.hash(tarball, &digest, .{});
     return .{
         .version = try arena.dupe(u8, version),
-        .sha256 = try arena.dupe(u8, &std.fmt.bytesToHex(digest, .lower)),
+        .sha256 = try arena.dupe(u8, &std.fmt.bytesToHex(digests.sha, .lower)),
     };
 }
 
@@ -98,29 +132,31 @@ pub const Resolved = struct {
 pub fn resolve(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
-    client: *std.http.Client,
+    io: std.Io,
     list: []const u8,
 ) !Resolved {
     const pk = minisign.PublicKey.parse(public_key) catch unreachable;
     var out: std.ArrayList(config.ZigSeed) = .empty;
     var unverified: std.ArrayList([]const u8) = .empty;
     for (try versions(arena, list)) |v| {
-        // The tarball (about 50 MB) is freed once its digest is taken.
+        // The tarball (about 50 MB) is never held: it is hashed as it arrives, and only its
+        // digests are kept (`download`).
         var tmp: std.heap.ArenaAllocator = .init(gpa);
         defer tmp.deinit();
         const url = try tarballUrl(tmp.allocator(), v);
-        const tarball = download(tmp.allocator(), client, url) catch |e| {
+        var digests: Digests = .{};
+        download(tmp.allocator(), io, url, &digests) catch |e| {
             std.log.warn("Zig seed: {s} not seeded, {s}: {s}", .{ v, url, @errorName(e) });
             try unverified.append(arena, v);
             continue;
         };
         const sig_url = try std.mem.concat(tmp.allocator(), u8, &.{ url, ".minisig" });
-        const sig = download(tmp.allocator(), client, sig_url) catch |e| {
+        const sig = downloadSmall(tmp.allocator(), io, sig_url) catch |e| {
             std.log.warn("Zig seed: {s} not seeded, {s}: {s}", .{ v, sig_url, @errorName(e) });
             try unverified.append(arena, v);
             continue;
         };
-        const seed = check(arena, pk, v, tarball, sig) catch |e| {
+        const seed = checkDigests(arena, pk, v, digests.final(), sig) catch |e| {
             std.log.err(
                 "Zig seed: {s} not seeded, its signature does not verify: {s}",
                 .{ v, @errorName(e) },
@@ -144,7 +180,8 @@ pub fn resolve(
 pub const Registry = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
-    client: ?*std.http.Client,
+    /// Whether it may download (`forJob` verifies what `discover` queued); tests have none.
+    online: bool,
     mu: std.Io.Mutex = .init,
     seeds: std.ArrayList(config.ZigSeed) = .empty,
     unverified: std.ArrayList([]const u8) = .empty,
@@ -206,7 +243,7 @@ pub const Registry = struct {
     /// download each, once, outside the lock).
     pub fn forJob(r: *Registry, arena: std.mem.Allocator) !Resolved {
         var taken: []const []const u8 = &.{};
-        if (r.client != null) {
+        if (r.online) {
             r.mu.lockUncancelable(r.io);
             defer r.mu.unlock(r.io);
             taken = try arena.dupe([]const u8, r.pending.items);
@@ -215,7 +252,7 @@ pub const Registry = struct {
         }
         if (taken.len > 0) {
             const todo = try std.mem.join(arena, ",", taken);
-            const got = try resolve(r.gpa, r.gpa, r.client.?, todo);
+            const got = try resolve(r.gpa, r.gpa, r.io, todo);
             r.mu.lockUncancelable(r.io);
             defer r.mu.unlock(r.io);
             for (taken) |v| for (r.inflight.items, 0..) |w, i| {
@@ -238,26 +275,37 @@ pub const Registry = struct {
 const download_deadline: std.Io.Duration = .fromSeconds(300);
 const max_download = 256 * 1024 * 1024;
 
-fn download(arena: std.mem.Allocator, client: *std.http.Client, url: []const u8) ![]const u8 {
-    var body: std.Io.Writer.Allocating = .init(arena);
-    const r = try http.within(client.io, download_deadline, fetchInto, .{ client, url, &body });
-    const status = try (r orelse return error.Timeout);
-    if (status != .ok) return error.HttpStatus;
-    if (body.written().len > max_download) return error.TooLarge;
-    return body.written();
+/// The tarball at `url`, into `digests`, as it arrives: through the network library's stream, so
+/// a 50 MB tarball costs the library's queue (1 MiB) and not its size. Redirects (GitHub's and
+/// ziglang.org's mirrors) are followed by the library, which keeps credentials at their origin (there
+/// are none here).
+fn download(arena: std.mem.Allocator, io: std.Io, url: []const u8, digests: *Digests) !void {
+    var s = try net_client.open(arena, io, .{
+        .url = url,
+        .total = download_deadline,
+        .deadline = .fromSeconds(60),
+        .read_idle = .fromSeconds(60),
+        .max_response = max_download,
+    });
+    defer s.close();
+    if (s.status != .ok) return error.HttpStatus;
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = try s.read(&buf);
+        if (n == 0) return;
+        digests.update(buf[0..n]);
+    }
 }
 
-fn fetchInto(
-    client: *std.http.Client,
-    url: []const u8,
-    body: *std.Io.Writer.Allocating,
-) std.http.Client.FetchError!std.http.Status {
-    const res = try client.fetch(.{ .location = .{ .url = url }, .response_writer = &body.writer });
-    return res.status;
+/// A small file (a `.minisig`) whole.
+fn downloadSmall(arena: std.mem.Allocator, io: std.Io, url: []const u8) ![]const u8 {
+    const r = try net_client.fetch(arena, io, .{ .url = url, .deadline = download_deadline, .max_response = 64 * 1024 });
+    if (r.status != .ok) return error.HttpStatus;
+    return r.body;
 }
 
 test "a registry frees what it holds: its lists and the versions it queued" {
-    var r: Registry = .{ .io = std.testing.io, .gpa = std.testing.allocator, .client = null };
+    var r: Registry = .{ .io = std.testing.io, .gpa = std.testing.allocator, .online = false };
     defer r.deinit();
     const seeds = [_]config.ZigSeed{.{ .version = "0.17.0", .sha256 = "" }};
     try r.add(.{ .seeds = &seeds, .unverified = &.{"0.16.0"} });
@@ -311,7 +359,7 @@ test "Registry: tool cache versions are queued once each, within the cap, and on
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
-    var r: Registry = .{ .io = std.testing.io, .gpa = arena, .client = null };
+    var r: Registry = .{ .io = std.testing.io, .gpa = arena, .online = false };
     try r.add(.{ .seeds = &.{.{ .version = "0.17.0", .sha256 = "00" }}, .unverified = &.{} });
     const tc = "/opt/hostedtoolcache";
     r.discover(tc, "d " ++ tc ++ "/zig/0.17.0/zig-x86_64-linux-0.17.0\n" ++

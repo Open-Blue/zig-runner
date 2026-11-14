@@ -2839,7 +2839,7 @@ test "a repo job's checked trees tell the seed registry the Zig versions its too
     const check = "{\"data\":{\"loadContainerFromID\":{\"withMountedCache\":{\"withUser\":{\"withEnvVariable\":{\"withExec\":{\"stdout\":\"" ++
         zig_digest ++ " " ++ zig_tree ++ " 19500 0\\n" ++ zig_digest ++ " " ++ older ++ " 19400 0\\n\"}}}}}}}";
     for ([_]bool{ true, false }) |trusted| {
-        var reg: zig_release.Registry = .{ .io = std.testing.io, .gpa = arena, .client = null };
+        var reg: zig_release.Registry = .{ .io = std.testing.io, .gpa = arena, .online = false };
         try reg.add(.{ .seeds = &.{test_zig_seed}, .unverified = &.{} });
         _ = try toolTreesRun(arena, .{ .trusted = trusted, .nesting = false, .zig_seed_registry = &reg }, check);
         if (trusted) {
