@@ -434,7 +434,7 @@ fn hasWord(text: []const u8, word: []const u8) bool {
 /// get a third of what its neighbours get; the runner does not copy that.
 pub fn cpuWeight(shares: u64) u32 {
     const held = std.math.clamp(shares, 2, 262144);
-    return @intCast(std.math.clamp(held * 100 / 1024, 1, 10000));
+    return std.math.cast(u32, std.math.clamp(held * 100 / 1024, 1, 10000)) orelse 10000;
 }
 
 const max_cpu_id = 8192;
