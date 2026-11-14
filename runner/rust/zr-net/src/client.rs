@@ -638,6 +638,11 @@ mod tests {
                 let (o, acceptor) = (o.clone(), acceptor.clone());
                 tokio::spawn(async move {
                     if o.tls {
+                        // The delay runs from the ClientHello's arrival, not from the accept: the client
+                        // measures from just before it sends it, and a client stalled between the connect
+                        // and that point (a loaded machine) would otherwise find the delay already spent
+                        // and measure only the handshake's round trips.
+                        let _ = s.peek(&mut [0u8; 1]).await;
                         tokio::time::sleep(o.tls_delay).await;
                         if let Ok(t) = acceptor.accept(s).await {
                             serve_conn(t, o, port).await;

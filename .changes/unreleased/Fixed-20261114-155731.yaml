@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The network library''s TLS phase timing test no longer fails on a loaded machine: its test server now starts the 150 ms handshake delay when the ClientHello arrives, not when the connection is accepted, so a client stalled between the connect and the handshake still measures the delay (main''s push CI failed with a 4.5 ms TLS phase).'
+time: 2026-11-14T15:57:31.432187868-05:00
