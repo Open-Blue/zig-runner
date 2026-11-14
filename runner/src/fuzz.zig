@@ -690,7 +690,7 @@ fn tarballs(_: void, smith: *Smith) !void {
     // A pax header block holding the record, as a tar's first entry.
     var block: [1024 + 2048]u8 = @splat(0);
     block[156] = if (smith.value(bool)) 'g' else 'x';
-    _ = std.fmt.bufPrint(block[124..136], "{o:0>11}", .{record.len}) catch {};
+    _ = try std.fmt.bufPrint(block[124..136], "{o:0>11}", .{record.len});
     @memcpy(block[512..][0..record.len], record);
     const got = try tarball.paxCommit(arena, block[0 .. 512 + record.len + 512]);
     if (got) |c| try std.testing.expect(c.len == 40 and for (c) |ch| {

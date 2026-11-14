@@ -131,7 +131,7 @@ pub fn fetchInto(b: *Backend, mount: []const u8, src: Source, expect: ?[]const u
     const dir = try std.fmt.allocPrint(arena, "{s}/source-{d}", .{ b.dir, b.preflights });
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(b.io, dir);
-    defer cwd.deleteTree(b.io, dir) catch {};
+    defer cwd.deleteTree(b.io, dir) catch |e| std.log.warn("native: the downloaded archive in {s} is left behind: {s}", .{ dir, @errorName(e) });
     const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, archive_name });
 
     var why: []const u8 = "";
@@ -445,8 +445,8 @@ const TestServer = struct {
             if (addr.connect(io, .{ .mode = .stream })) |conn| {
                 var wb: [64]u8 = undefined;
                 var w = conn.writer(io, &wb);
-                w.interface.writeAll("GET /quit HTTP/1.1\r\nHost: x\r\n\r\n") catch {};
-                w.interface.flush() catch {};
+                const sent = w.interface.writeAll("GET /quit HTTP/1.1\r\nHost: x\r\n\r\n");
+                if (sent) w.interface.flush() catch |e| std.log.warn("test server: {s}", .{@errorName(e)}) else |e| std.log.warn("test server: {s}", .{@errorName(e)});
                 conn.close(io);
             } else |_| {}
         } else |_| {}
@@ -517,7 +517,7 @@ const TestServer = struct {
     fn reply(out: *Io.Writer, status: []const u8, extra: []const u8, body: []const u8) bool {
         out.print("HTTP/1.1 {s}\r\n{s}Content-Type: application/gzip\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ status, extra, body.len }) catch return false;
         out.writeAll(body) catch return false;
-        out.flush() catch {};
+        out.flush() catch return false;
         return false;
     }
 };
