@@ -257,7 +257,7 @@ fn acquire(
 /// watcher run next to each other and whichever ends first cancels the other (as `loop.poll`).
 /// Cancellation of the caller is an error, not a stop.
 fn sleepUnlessStopped(io: std.Io, ms: i64) error{ Canceled, ConcurrencyUnavailable }!bool {
-    const Woke = union(enum) { elapsed: void, stopped: void };
+    const Woke = union(enum) { elapsed: error{Canceled}!void, stopped: void };
     var buf: [2]Woke = undefined;
     var sel: std.Io.Select(Woke) = .init(io, &buf);
     errdefer while (sel.cancel()) |_| {};
@@ -265,11 +265,17 @@ fn sleepUnlessStopped(io: std.Io, ms: i64) error{ Canceled, ConcurrencyUnavailab
     try sel.concurrent(.stopped, sleepUntilStop, .{io});
     const first = try sel.await();
     while (sel.cancel()) |_| {}
-    return first == .stopped;
+    return switch (first) {
+        .stopped => true,
+        .elapsed => |slept| {
+            try slept;
+            return false;
+        },
+    };
 }
 
-fn sleepFor(io: std.Io, ms: i64) void {
-    io.sleep(.fromMilliseconds(ms), .awake) catch {};
+fn sleepFor(io: std.Io, ms: i64) error{Canceled}!void {
+    return io.sleep(.fromMilliseconds(ms), .awake);
 }
 
 /// Returns once a stop is requested, or when cancelled. In short steps, as `waitForStop` does.
