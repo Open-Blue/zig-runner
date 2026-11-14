@@ -1366,22 +1366,22 @@ const Builder = struct {
             // A directory the image has needs no layer.
             if (step.op == .mkdir and try b.hasDir(step.op.mkdir.path, stack.items)) continue;
             const upper = try b.store.begin(arena, io, &step.key);
-            errdefer std.Io.Dir.cwd().deleteTree(io, upper) catch {};
+            errdefer discard(io, upper);
             switch (step.op) {
                 .none => unreachable,
                 .run => |r| {
                     const code = try b.runner.runFn(b.runner.ptr, stack.items, upper, r);
                     if (code != 0) {
-                        std.Io.Dir.cwd().deleteTree(io, upper) catch {};
+                        discard(io, upper);
                         return .{ .failed = .{ .line = step.line, .what = .run, .code = code } };
                     }
                 },
                 .copy => |c| if (try b.place(c, step.line, upper, stack.items)) |failed| {
-                    std.Io.Dir.cwd().deleteTree(io, upper) catch {};
+                    discard(io, upper);
                     return .{ .failed = failed };
                 },
                 .mkdir => |m| if (try b.makeDir(m.path, m.user, upper, stack.items)) |why| {
-                    std.Io.Dir.cwd().deleteTree(io, upper) catch {};
+                    discard(io, upper);
                     return .{ .failed = .{ .line = step.line, .what = .workdir, .why = why } };
                 },
             }
@@ -1446,6 +1446,12 @@ const Builder = struct {
 };
 
 const Owner = struct { uid: u32, gid: u32 };
+
+/// A failed step's upper removed; one that stays is only disk used, so it is logged, not the build's error.
+fn discard(io: std.Io, upper: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(io, upper) catch |e|
+        std.log.warn("native: cannot remove a failed step's layer {s}: {s}", .{ upper, @errorName(e) });
+}
 
 /// Places a `COPY`'s sources in a new layer as Docker places them: a directory's contents (not
 /// the directory) into the destination, a file at the destination or, when the destination ends
@@ -1598,7 +1604,7 @@ const Copier = struct {
                 .file => try c.copyOne(e, to, name),
                 .symlink => {
                     const link = try view.readLink(e);
-                    to.deleteFile(c.io, name) catch {};
+                    to.deleteFile(c.io, name) catch |err| if (err != error.FileNotFound) return err;
                     try to.symLink(c.io, link, name, .{});
                     const o = c.idsOf(e);
                     var buf: [std.fs.max_name_bytes + 1]u8 = undefined;
