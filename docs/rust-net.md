@@ -328,6 +328,14 @@ documents (DNS approximate, TLS inferred) go away with the wrapper.
   the reader is woken after 128 KiB or when the connection has nothing more at once (not per chunk), and the connection is woken when half the queue is free (not at every read): those two cut the tarball's CPU to
   within 10% of std's and the blob's wakeups, but the epoll-and-read pair remains, so the blob is still about 25% above std in CPU and equal in wall time. Not measured: the Raspberry Pi (disk streaming vs std), a real
   registry or ziglang.org (network-bound), HTTP/2 (h1 only; no gain was shown). One runtime worker instead of two was tried and made no clear difference.
+- **Over TLS** (the same benches against `openssl s_server` on loopback, an external process so its CPU is not counted; `ZIG_RUNNER_BENCH_URL` and `ZIG_RUNNER_BENCH_CA`; load average 6-9, so the wall times are
+  pessimistic): the library is ahead of std's TLS client, which is the case real registry and release pulls are in. 512 MiB, CPU / wall: tarball std 1.81-1.86 s / 1.82-1.86 s, library 1.0-1.2 s / 0.7-0.84 s;
+  blob std 2.04-2.14 s / 2.0-2.1 s, library 1.69-1.74 s / 0.77-0.81 s (that is, per GiB: tarball 3.6 s vs 2.0-2.4 s, blob 4.1-4.3 s vs 3.4-3.5 s). rustls with ring decrypts faster than std's client.
+  The plain-HTTP deficit (above) is therefore the localhost registry's only.
+- **io_uring and the caller's thread, measured before building** (`/tmp` spike, not in the tree: one thread reads 512 MiB from a loopback socket, CPU of that thread alone, three runs each): a blocking `read` of 64 KiB
+  108-130 ms; tokio's current-thread runtime (epoll + read) 117-133 ms; io_uring multishot `RecvMulti` with provided buffers, buffers re-provided per completion, 171-184 ms. So the epoll-and-read pair costs about 10 ms
+  of the 0.3 s the library's threads add over std; the rest is the hand-over between hyper's thread and the caller's (queue, wakes, two workers). io_uring receive is not cheaper than a plain read here. Reading the
+  body on the caller's thread (without the runtime) could at best equal std for plain HTTP, and for TLS std is already behind; neither was built.
 - **Validation.** Cargo: 7 new tests through the C ABI as Zig drives it (48 MiB streamed plain and chunked with a slow reader and the queue's peak asserted below 1.5 MiB, reuse after a stream, a cancel halfway closes the
   connection at the server, a stalled body and a call over its total each have their own error, a 24 MiB upload through a slow server with the writer made to wait, a server that answers a 512 MiB upload at once stops the writer,
   303 and 307 for a streamed body, the token left behind at a redirect), and queue unit tests. Zig: the oracle's download (five sizes up to 24 MiB, three read sizes, hashed on both sides), redirect, upload
