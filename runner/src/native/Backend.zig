@@ -3832,7 +3832,7 @@ fn limitPids(b: *Backend, want: u64, err_msg: *[]const u8) ![]const u8 {
         err_msg.* = "the job container's `--pids-limit` could not be set on the job's cgroup";
         return error.BaseContainerFailed;
     };
-    b.limits.pids_max = @intCast(@min(want, std.math.maxInt(u32)));
+    b.limits.pids_max = std.math.cast(u32, want) orelse std.math.maxInt(u32);
     return "";
 }
 

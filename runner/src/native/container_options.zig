@@ -191,19 +191,19 @@ pub fn parse(arena: Allocator, text: []const u8, why: *[]const u8) Error!Options
             const n = std.fmt.parseInt(i64, value, 10) catch
                 return refuse(arena, why, w, "is not a whole number of microseconds");
             // Docker's runtime takes a negative quota as "no quota" (runc writes `max`).
-            out.cpu_quota = if (n <= 0) null else @intCast(n);
+            out.cpu_quota = if (n <= 0) null else std.math.cast(u64, n);
         } else if (std.mem.eql(u8, name, "--cpu-period")) {
             const n = std.fmt.parseInt(i64, value, 10) catch
                 return refuse(arena, why, w, "is not a whole number of microseconds");
             if (n != 0 and (n < min_cpu_period or n > max_cpu_period)) return refuse(arena, why, w, "is not 0 or " ++
                 "between 1000 and 1000000 microseconds (1 ms to 1 s), as Docker takes");
-            out.cpu_period = if (n == 0) null else @intCast(n);
+            out.cpu_period = if (n == 0) null else std.math.cast(u32, n);
         } else if (std.mem.eql(u8, name, "--cpu-shares")) {
             const n = std.fmt.parseInt(i64, value, 10) catch
                 return refuse(arena, why, w, "is not a whole number");
             // `getCPUResources`: "invalid CPU shares (%d): value must be a positive integer".
             if (n < 0) return refuse(arena, why, w, "is negative");
-            out.cpu_shares = if (n == 0) null else @intCast(n);
+            out.cpu_shares = if (n == 0) null else std.math.cast(u64, n);
         } else if (std.mem.eql(u8, name, "--cpuset-cpus") or std.mem.eql(u8, name, "--cpuset-mems")) {
             var set: [8192]bool = undefined;
             if (!expandList(value, &set)) return refuse(arena, why, w, "is not a list of numbers " ++
@@ -215,7 +215,7 @@ pub fn parse(arena: Allocator, text: []const u8, why: *[]const u8) Error!Options
             // Docker: 0 and negative values unset the limit (`getPidsLimit`).
             if (n > 0 and n < min_pids_limit) return refuse(arena, why, w, "is below the " ++
                 "16 processes a native step needs for itself and its sandbox");
-            out.pids_limit = if (n <= 0) null else @intCast(n);
+            out.pids_limit = if (n <= 0) null else std.math.cast(u64, n);
         } else if (std.mem.eql(u8, name, "--memory-swap")) {
             if (std.mem.eql(u8, value, "-1")) {
                 out.memory_swap = -1;
