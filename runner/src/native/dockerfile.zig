@@ -1468,6 +1468,9 @@ const Copier = struct {
     op: Copy,
     owner: ?Owner = null,
     why: []const u8 = "",
+    /// The mode `placeDir` left for the caller to set on the directory it made last, once it is filled:
+    /// a mode without write permission (`--chmod=640`) would keep the files out.
+    leaf_later: ?u32 = null,
 
     fn fail(c: *Copier, comptime fmt: []const u8, args: anytype) error{ CopyFailed, OutOfMemory } {
         c.why = try std.fmt.allocPrint(c.arena, fmt, args);
@@ -1508,9 +1511,11 @@ const Copier = struct {
     fn entry(c: *Copier, e: layer_view.Entry, name: []const u8, into: bool, dest: []const u8) !void {
         switch (e.kind) {
             .dir => {
+                c.leaf_later = null;
                 var to = try c.placeDir(dest, c.op.chmod);
                 defer to.close(c.io);
                 try c.tree(e, to, 0);
+                if (c.leaf_later) |m| _ = linux.fchmod(to.handle, m);
             },
             .file => {
                 const at = try c.destPath(name, into, dest);
@@ -1662,7 +1667,8 @@ const Copier = struct {
                 _ = linux.fchown(dir.handle, o.uid, o.gid);
                 // A directory made on the way is 0755 whatever `--chmod` says (BuildKit gives it the file mode,
                 // 0640 for instance, which nobody can enter); `--chmod` is the mode of a copied directory itself.
-                _ = linux.fchmod(dir.handle, if (at == real.items.len - 1) leaf_mode orelse 0o755 else 0o755);
+                _ = linux.fchmod(dir.handle, 0o755);
+                if (at == real.items.len - 1) c.leaf_later = leaf_mode;
             }
         }
         return dir;
@@ -2555,7 +2561,7 @@ test "build: heredoc files, with their mode, and --chmod over it" {
     try expectFile(arena, built.lowers, "docs/B", "b\n");
 }
 
-test "build: COPY --chmod makes the directories on the way 0755 and keeps the mode on the files" {
+test "build: COPY --chmod makes the directories on the way 0755 and keeps the mode on files and copied directories, as non-root" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -2564,15 +2570,23 @@ test "build: COPY --chmod makes the directories on the way 0755 and keeps the mo
     var held: std.ArrayList(std.Io.File) = .empty;
     defer for (held.items) |f| f.close(std.testing.io);
     var h = try Harness.init(arena, &tmp, &held);
-    try plant(&tmp, "ctx", &.{.{ "f", "f" }});
+    try plant(&tmp, "ctx", &.{ .{ "f", "f" }, .{ "d/x", "x" }, .{ "d/sub/y", "y" } });
     var rec: Recorder = .{ .arena = arena };
     const built = (try h.run(
         \\FROM alpine
         \\COPY --chmod=640 f /cm1/deep/f
+        \\COPY --chmod=555 d /cm2/d
     , &rec)).ok;
     try expectMode(arena, built.lowers, "cm1", 0o755);
     try expectMode(arena, built.lowers, "cm1/deep", 0o755);
     try expectMode(arena, built.lowers, "cm1/deep/f", 0o640);
+    // A copied directory is filled before it takes a mode without write permission (555 here: a 640 one
+    // could not be walked by the store as this user).
+    try expectMode(arena, built.lowers, "cm2", 0o755);
+    try expectMode(arena, built.lowers, "cm2/d", 0o555);
+    try expectMode(arena, built.lowers, "cm2/d/x", 0o555);
+    try expectMode(arena, built.lowers, "cm2/d/sub", 0o555);
+    try expectMode(arena, built.lowers, "cm2/d/sub/y", 0o555);
 }
 
 test "Ignore: .dockerignore as Docker reads it" {

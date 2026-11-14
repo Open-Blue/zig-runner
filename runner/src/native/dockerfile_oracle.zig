@@ -12,6 +12,7 @@
 //!   cases/<name>/expected.tar, expected.json    what BuildKit built from it
 //!   cases/<name>/differences.txt                (optional) `<path or config field>\t<why>` of
 //!                                               what the native build does differently on purpose
+//!                                               (a path ending in `=` allows that path alone, not what is under it)
 //!
 //! Each base is put in the native image store as a pulled one would be; each case is built by
 //! `docker_action.buildImage` as a Docker action's would be, its layers merged (`Store.flatten`)
@@ -139,7 +140,7 @@ fn configLines(arena: Allocator, c: images.Image) ![]const Entry {
 }
 
 /// What the case's `differences.txt` allows: a path (or a directory, which allows what is under
-/// it) and why, and whether the difference was seen.
+/// it; a path ending in `=` allows that path alone) and why, and whether the difference was seen.
 const Allowed = struct { path: []const u8, why: []const u8, seen: bool = false };
 
 fn allowedFor(arena: Allocator, io: std.Io, case_dir: []const u8) ![]Allowed {
@@ -159,6 +160,10 @@ fn allowedFor(arena: Allocator, io: std.Io, case_dir: []const u8) ![]Allowed {
 
 fn allows(list: []Allowed, path: []const u8) ?*Allowed {
     for (list) |*a| {
+        if (a.path.len > 0 and a.path[a.path.len - 1] == '=') {
+            if (std.mem.eql(u8, a.path[0 .. a.path.len - 1], path)) return a;
+            continue;
+        }
         if (std.mem.eql(u8, a.path, path)) return a;
         if (std.mem.startsWith(u8, path, a.path) and path.len > a.path.len and path[a.path.len] == '/') return a;
     }
@@ -190,6 +195,15 @@ fn compare(case: []const u8, native: []const Entry, expected: []const Entry, all
         std.debug.print("{s}: {s}\n    native:   {s}\n    BuildKit: {s}\n", .{ case, path, have, want });
     }
     return bad;
+}
+
+test "allows: a path with a trailing = allows that path alone, any other one what is under it" {
+    var list = [_]Allowed{ .{ .path = "a=", .why = "" }, .{ .path = "b", .why = "" } };
+    try std.testing.expect(allows(&list, "a") != null);
+    try std.testing.expect(allows(&list, "a/f") == null);
+    try std.testing.expect(allows(&list, "b") != null);
+    try std.testing.expect(allows(&list, "b/f") != null);
+    try std.testing.expect(allows(&list, "bc") == null);
 }
 
 test "oracle: the Dockerfile builder builds what BuildKit builds" {
