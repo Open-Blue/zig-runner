@@ -1,0 +1,3 @@
+kind: Added
+body: Native jobs in an image with no git (slim and Alpine images) fetch the checkout and `uses:` actions from the repository's tarball, as actions/checkout does, instead of going to the Dagger engine or failing
+time: 2026-11-13T20:23:31.57621328-05:00

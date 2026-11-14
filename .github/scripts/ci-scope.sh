@@ -163,6 +163,7 @@ needed() {
 		# what servers send, and its tests run under Valgrind, and for the Dockerfile builder's
 		# parser and planner and the fuzz targets themselves: they read what an action's author
 		# wrote, before the job's first step.
+		# `native/tarball.zig` is another: it reads the first bytes of an archive a server sent.
 		case $1 in
 		.github/workflows/analysis.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/zig-fuzz.sh | .github/scripts/zig-valgrind.sh | \
@@ -178,6 +179,7 @@ needed() {
 			runner/tls_oracle.zig | runner/tools/tls_oracle/* | .github/scripts/pg-tls-fixture.sh | \
 			.github/scripts/build-zr-net.sh | \
 			.github/scripts/zig-cc.sh | .github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | \
+			runner/src/native/tarball.zig | \
 			.github/valgrind.supp) return 0 ;;
 		*) return 1 ;;
 		esac
