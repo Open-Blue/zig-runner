@@ -1756,9 +1756,16 @@ fn httpResponses(_: void, smith: *Smith) !void {
     const io = threaded.io();
     var buf: [4096]u8 = undefined;
     const answer = take(smith, &buf);
-    var addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    var listener = try addr.listen(io, .{ .reuse_address = true });
-    defer listener.deinit(io);
+    // One listener for the whole run, not one per input: a new port 0 listener each time, with the
+    // server closing first, left tens of thousands of TIME_WAIT sockets on fresh ports until bind
+    // found none free (AddressInUse, CI run 43541758435). Each input's server thread still starts
+    // and stops below; only the socket is shared. It outlives `threaded`, so it uses the testing Io.
+    const listener = &http_responses_listener;
+    if (listener.* == null) {
+        var addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        listener.* = try addr.listen(std.testing.io, .{ .reuse_address = true });
+    }
+    const server = &listener.*.?;
     const Server = struct {
         fn run(l: *std.Io.net.Server, bytes: []const u8, stop: *std.atomic.Value(bool)) void {
             while (!stop.load(.acquire)) {
@@ -1774,15 +1781,17 @@ fn httpResponses(_: void, smith: *Smith) !void {
                 }
                 var wb: [512]u8 = undefined;
                 var w = conn.writer(std.testing.io, &wb);
-                w.interface.writeAll(bytes) catch return;
-                w.interface.flush() catch return;
+                // A connection left over from the input before (its wake-up, or a request the
+                // client gave up on) is gone by now: skip it rather than end this input's server.
+                w.interface.writeAll(bytes) catch continue;
+                w.interface.flush() catch continue;
             }
         }
     };
     var stop: std.atomic.Value(bool) = .init(false);
-    const t = try std.Thread.spawn(.{}, Server.run, .{ &listener, answer, &stop });
+    const t = try std.Thread.spawn(.{}, Server.run, .{ server, answer, &stop });
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{listener.socket.address.getPort()});
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{server.socket.address.getPort()});
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     if (net_client.fetch(arena.allocator(), io, .{
@@ -1795,10 +1804,13 @@ fn httpResponses(_: void, smith: *Smith) !void {
     } else |_| {}
     // Ends the server: the next accept is the last.
     stop.store(true, .release);
-    const last = try std.Io.net.IpAddress.parse("127.0.0.1", listener.socket.address.getPort());
+    const last = try std.Io.net.IpAddress.parse("127.0.0.1", server.socket.address.getPort());
     if (last.connect(io, .{ .mode = .stream })) |c| c.close(io) else |_| {}
     t.join();
 }
+
+/// The listener "fuzz: HTTP responses" shares across inputs (see there).
+var http_responses_listener: ?std.Io.net.Server = null;
 
 // --- HTTP/2 framing ---
 
