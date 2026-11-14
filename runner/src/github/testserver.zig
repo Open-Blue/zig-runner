@@ -192,6 +192,15 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
 
     var auth_buf: [1024]u8 = undefined;
     var auth: []const u8 = "-";
+    // What /headers echoes: the headers the call sites set (accept, content-type, the Gitea runner's).
+    var accept_buf: [128]u8 = undefined;
+    var accept: []const u8 = "-";
+    var ctype_buf: [128]u8 = undefined;
+    var ctype: []const u8 = "-";
+    var token_buf: [128]u8 = undefined;
+    var runner_token: []const u8 = "-";
+    var connect_buf: [32]u8 = undefined;
+    var connect_version: []const u8 = "-";
     var body_len: usize = 0;
     while (true) {
         const line = r.interface.takeDelimiterInclusive('\n') catch return .close;
@@ -201,6 +210,10 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
         const name = header[0..colon];
         const value = std.mem.trim(u8, header[colon + 1 ..], " ");
         if (std.ascii.eqlIgnoreCase(name, "authorization")) auth = copy(&auth_buf, value);
+        if (std.ascii.eqlIgnoreCase(name, "accept")) accept = copy(&accept_buf, value);
+        if (std.ascii.eqlIgnoreCase(name, "content-type")) ctype = copy(&ctype_buf, value);
+        if (std.ascii.eqlIgnoreCase(name, "x-runner-token")) runner_token = copy(&token_buf, value);
+        if (std.ascii.eqlIgnoreCase(name, "connect-protocol-version")) connect_version = copy(&connect_buf, value);
         if (std.ascii.eqlIgnoreCase(name, "content-length"))
             body_len = std.fmt.parseInt(usize, value, 10) catch 0;
     }
@@ -255,6 +268,17 @@ fn answer(s: *Server, conn: Io.net.Stream) Outcome {
         var body_buf: [1100]u8 = undefined;
         const body = std.fmt.bufPrint(&body_buf, "{s} {s}", .{ method, auth }) catch return .close;
         respond(out, "200 OK", null, body);
+    } else if (std.mem.eql(u8, path, "/headers")) {
+        var body_buf: [700]u8 = undefined;
+        const body = std.fmt.bufPrint(&body_buf, "{s} {s} accept={s} content-type={s} x-runner-token={s} connect={s}", .{ method, auth, accept, ctype, runner_token, connect_version }) catch return .close;
+        respond(out, "200 OK", null, body);
+    } else if (std.mem.eql(u8, path, "/no-content")) {
+        out.writeAll("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n") catch return .close;
+    } else if (std.mem.eql(u8, path, "/text-body")) {
+        // Not JSON, and long enough to be read in pieces.
+        var chunk: [3000]u8 = undefined;
+        @memset(&chunk, 'x');
+        respond(out, "200 OK", null, &chunk);
     } else if (std.mem.eql(u8, path, "/same")) {
         respond(out, "302 Found", fmtLoc(&loc_buf, "127.0.0.1", port), "");
     } else if (std.mem.eql(u8, path, "/other")) {

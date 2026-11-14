@@ -376,6 +376,37 @@ documents (DNS approximate, TLS inferred) go away with the wrapper.
   into a server that may answer before it and close; nightly matrix and analysis scope, as `HTTP responses`); the registry's tests (token auth, CDN redirect without the token, digest mismatch, stale and reset) on the
   library. TSan (cargo and the whole Zig suite) and Valgrind clean.
 
+## The broker, the run service and Gitea (R5, as built)
+
+- **What moved.** `broker.request` (`github/broker.zig`), which every call of the run service (`runservice.zig`), the broker's session and long poll
+  (`loop.zig`, `loop/job.zig`), `inspect.zig`, the Dagger engine's queries (`dagger.zig`, `log = false`) and the Gitea and Forgejo client (`gitea/client.zig`) use, is now
+  `net_client.fetch` with the same options and result: the std request, its hand-written redirects, `net_hooks.wrap` per request, the per-request client of a retry and the
+  decompression window are gone from it (about 250 lines). `Options.deadline` may be null (a long poll, a Dagger query) and `Options.log` turns the `request:` line off.
+- **Kept.** Deadlines through `http.within` (`fetch`'s), cancel through std.Io (the descriptor wait; a cancel frees the call and its connection), the `request:` lines (one implementation),
+  the redirect rule (token dropped at another origin), the #100 retry: a connection that died under the request (`Timeout`, `NetworkIo`, `StaleConnection`) is tried once more on a connection
+  of its own (`Options.fresh`). A kept connection found closed before anything was sent is replaced by the library, unseen, so `http.staleRetries` (the pool's size plus one) and
+  `http.renew`/`keepFresh` (the stale clock) are no longer needed by any call but the live feed's: the library's roots are loaded once and reloaded when a handshake fails with an unknown issuer.
+- **std's client is left for the feed.** `main` still makes one std client for `feed.zig` (GitHub only; the Gitea path has none now), and `feed.zig` calls `http.keepFresh` before it uses it and `http.renew`
+  when a handshake failed (the other calls did that for it); R6 deletes all of it. The old `broker.request` lives on in `std_broker.zig`, imported by the oracle only, until R6.
+- **Differences from std** (each in `net_oracle.zig`): a request with a body that is redirected is followed (a 302 of a POST is a GET; 307 and 308 repeat it) where std handed the 3xx back, a streamed body
+  refuses a redirect (`ProtocolError`; std handed the 302 back: `results.putBlob`'s signed URLs do not redirect); `Accept-Encoding` is not sent (std asked for gzip and deflate; JSON answers are small and the
+  engine is on this machine); the User-Agent is `zig-runner/<version>`; errors have the library's names (`DnsFailed`, `NetworkIo`, `TooManyRedirects`, `ProtocolError`) where std's were `UnknownHostName`,
+  `ReadFailed`, `TooManyHttpRedirects`; `ResponseTooLarge` is kept. The `request:` line of every library call now shows an explicit port (`host=127.0.0.1:8080`, as the std line always did; R3 and R4 dropped it).
+- **Validation.** `net_oracle.zig`: 15 broker cases against `testserver.zig` (the Gitea RPC's headers, the run service's, 204, a large body, `max_body`, the redirects, a loop) through `std_broker.request` and
+  `broker.request`, a silent server and kept connections that die (the same number of connections accepted by both: the first try and the retry), a streamed upload's redirect, and a long poll with no deadline that a cancel ends
+  at once in both. The Gitea suites (`gitea/client.zig`, `report.zig`, `poller.zig`, `run.zig` over `gitea/testserver.zig`) and the registration, token and results tests pass unchanged. No parsing is new, so there is no new fuzz target
+  (the existing `HTTP responses` and `HTTP streams` targets cover what the library reads). Cargo plain and under TSan, the Zig suite plain and under TSan, and Valgrind over the new tests are clean.
+- **Idle cost** (a runner waiting for jobs: `bench: a runner waiting for jobs`, `ZIG_RUNNER_BENCH=idle-std|idle-library`, 10 minutes of long polls of 50 s each on one kept connection, to a server in the same process): 
+  | 10 minutes, 12 polls | process CPU | voluntary context switches | runtime threads' CPU |
+  |---|---|---|---|
+  | std (`broker.request` as it was, the shared client) | 243 ms | 6102 | none |
+  | library (`broker.request` on `net_client`) | 192 ms | 6134 | 0 ms (both threads) |
+
+  Both figures are almost all the benchmark's own server (it wakes every 100 ms to see whether it is stopping: about 6000 of the switches) and the test process's start; the
+  library's two runtime threads used no measurable CPU in 10 minutes of waiting (10 ms ticks: 0), and the caller's thread waits on a descriptor, as std's blocked in a read. The std row ran
+  at the same time as the library's build (load average 5-7); the library's alone. A waiting runner costs the same, in practice nothing, with either stack. (The first library run
+  hung at the end, not in the polls: its pooled connection kept the benchmark's server from stopping; the benchmark now frees the client first.)
+
 ## The WebSocket feed (R6)
 
 `feed.zig` upgrades a std request by hand and frames in Zig. The Rust side uses `tokio-tungstenite` (rustls via the
@@ -547,7 +578,7 @@ Each PR brings its own checks; none is left to "later".
 | **R2** | `src/tls.rs` sans-IO rustls, `tls_stream.zig`, `pg.zig` on it, client certs (`sslcert`, `sslkey`, `sslrootcert`), roots loader, allocation counter, `cargo test` in CI | `tls.zig` dependency, `build.zig.zon` tls entry, `zig_package_hash` and the tls fetch in `zig-modules.sh`, `ca_bundle` in `pg.zig` | minor | TLS fuzz target, live pg client-cert and private-CA tests, in-process rustls tests |
 | **R3** | the client API (`net_client.zig`; pool, proxy, redirects, h1, exact timings), `request:` lines through #530's `request_log.zig`, `auth.zig`, `app.zig`, `jitconfig.zig` fetches on it; oracle harness | their std client use (`http.fetch` there) | minor | oracle against `testserver.zig`, HTTP head fuzz, phase-delay test, cgroup-of-threads test, TSan suppressions |
 | **R4** (built: "Streaming", above) | streaming bodies; `zig_release.zig` download, `results.zig` uploads, `native/oci/registry.zig` (redirect privacy tests) | `registry.zig`'s hand-written redirect/authorization workaround, `zig_release`'s std path | minor | streamed oracle cases, memory bound test; the Pi disk-streaming benchmark vs std is not run yet (laptop numbers in the PR) |
-| **R5** | `runservice.zig`, `broker.zig` long-poll (cancel, keepalive, #100's dead-connection test), `gitea/client.zig` | `http.within`'s client coupling, `http.keepAlive` | minor | long-poll oracle and kill-the-network test, Gitea job diff tool |
+| **R5** (built: "The broker, the run service and Gitea", above) | `runservice.zig`, `broker.zig` long-poll (cancel, keepalive, #100's dead-connection test), `gitea/client.zig` | `http.within`'s client coupling, `http.keepAlive` | minor | long-poll oracle and kill-the-network test, Gitea job diff tool |
 | **R6** | `feed.zig` on tokio-tungstenite | std client use everywhere, `net_hooks.zig`, `http.zig`'s retired list and `renew`, the oracle harness, feed framing | minor | WebSocket fuzz target, feed oracle until deleted |
 
 Every PR bumps the version (changie `Added` or `Changed`, minor), runs the pre-release smoke test on the laptop pool before release, and is checked on

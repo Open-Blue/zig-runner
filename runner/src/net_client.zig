@@ -190,7 +190,11 @@ pub const Options = struct {
     /// this file's.
     first_byte: ?Io.Duration = null,
     read_idle: ?Io.Duration = null,
-    deadline: Io.Duration = http.request_deadline,
+    /// Null for none (a long poll, a request that lasts as long as something else does).
+    deadline: ?Io.Duration = http.request_deadline,
+    /// Whether the call writes its `request:` line (off for the Dagger engine's queries, which go to
+    /// this machine).
+    log: bool = true,
     /// Which attempt this is, for the line's `retry`.
     retry: u32 = 0,
     /// Roots (PEM) that replace the system's, for the client this call creates. Tests.
@@ -235,10 +239,15 @@ pub fn deinit() void {
 
 /// One request within `opts.deadline`, with its `request:` line. The error is the library's
 /// (`Error`); a certificate problem is told apart, and the message goes to the log.
+/// What a null `deadline` waits: ten years, a limit no request reaches, which keeps one code path for
+/// both (the timer is a task that is cancelled with the request).
+const no_deadline: Io.Duration = .fromSeconds(10 * 365 * 24 * 3600);
+
 pub fn fetch(arena: Allocator, io: Io, opts: Options) Error!Response {
     var line: Probe = .{ .io = io, .opts = opts };
     line.start(io);
-    const r = http.within(io, opts.deadline, call, .{ arena, io, opts, &line }) catch |e| {
+    const limit = opts.deadline orelse no_deadline;
+    const r = http.within(io, limit, call, .{ arena, io, opts, &line }) catch |e| {
         line.finish(.{ .err = "Canceled" });
         return e;
     };
@@ -269,9 +278,17 @@ const Probe = struct {
     fn finish(p: *Probe, outcome: request_log.Status) void {
         if (p.logged) return;
         p.logged = true;
+        if (!p.opts.log) return;
         const uri = std.Uri.parse(p.opts.url) catch std.Uri{ .scheme = "" };
-        var host_buf: [255]u8 = undefined;
-        const host = if (uri.host) |h| (h.toRaw(&host_buf) catch "?") else "?";
+        var host_buf: [255 + 6]u8 = undefined;
+        const name = if (uri.host) |h| (h.toRaw(host_buf[0..255]) catch "?") else "?";
+        if (name.ptr != &host_buf) @memcpy(host_buf[0..name.len], name);
+        // With its port when the URL names one, as the line has always shown it.
+        const host_len = name.len + if (uri.port) |port|
+            (std.fmt.bufPrint(host_buf[name.len..], ":{d}", .{port}) catch @as([]u8, host_buf[0..0])).len
+        else
+            0;
+        const host = host_buf[0..host_len];
         var path_buf: [256]u8 = undefined;
         var raw_path_buf: [512]u8 = undefined;
         const path = request_log.redactPath(&path_buf, if (uri.path.toRaw(&raw_path_buf)) |s| s else |_| "");
@@ -606,7 +623,8 @@ pub const Stream = struct {
 pub fn open(arena: Allocator, io: Io, opts: Options) Error!Stream {
     var line: Probe = .{ .io = io, .opts = opts };
     line.start(io);
-    const r = http.withinClosing(io, opts.deadline, openCall, .{ arena, io, opts, &line }, {}, closeLate) catch |e| {
+    const limit = opts.deadline orelse no_deadline;
+    const r = http.withinClosing(io, limit, openCall, .{ arena, io, opts, &line }, {}, closeLate) catch |e| {
         line.finish(.{ .err = "Canceled" });
         return e;
     };

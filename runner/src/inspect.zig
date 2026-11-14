@@ -19,7 +19,6 @@ pub fn run(
     name: []const u8,
     out: *std.Io.Writer,
 ) !u8 {
-    broker.trace = true;
     const jit = (try registerAndShow(arena, io, cfg, name, out)) orelse return 2;
     defer cleanup(arena, io, cfg, jit.runner_id, out);
     const token = (try exchangeToken(arena, io, jit, out)) orelse return 2;
