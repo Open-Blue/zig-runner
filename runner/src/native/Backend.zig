@@ -3788,11 +3788,19 @@ fn limitCpu(b: *Backend, m: container_options.CpuMax, err_msg: *[]const u8) ![]c
 /// reclaims and slows the job instead of letting it take its neighbours' memory. The gate takes
 /// back the estimate `noHigh` replaced (`Gate.restoreHigh`), and grows the limit as it does for
 /// any job with one (`Admission.growHigh`).
-fn highForSwap(b: *Backend, j: cgroup.Job) !void {
+fn highForSwap(b: *Backend, j: cgroup.Job, allowance: ?u64) !void {
     const g = b.gate orelse return;
-    if (!cgroup.canSwap(j.all, b.io)) return;
+    if (!cgroup.canSwap(j.all, b.io, allowance)) {
+        try b.notes.append(b.arena, "Native steps: no memory.high: the job asked for swap, but " ++
+            "the machine has none free to reclaim into (SwapFree), and past a memory.high the " ++
+            "job would stall instead of swapping. It is treated as a job with swap 0.");
+        return;
+    }
     const high_mb = g.restoreHigh() orelse return;
     const high = j.setHigh(b.arena, b.io, @as(u64, high_mb) << 20) catch |e| {
+        // The write may have gone through before the read-back failed: the kernel must not keep
+        // a limit the gate has given up.
+        j.clearHigh(b.arena);
         g.noHigh(if (b.limits.memory_max) |m| m >> 20 else null);
         try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Native steps: the " ++
             "job's memory.high could not be set ({s}).", .{@errorName(e)}));
@@ -3817,7 +3825,10 @@ fn limitSwap(b: *Backend, o: container_options.Options, more: *std.ArrayList(u8)
         err_msg.* = "the job container's `--memory-swap` could not be set on the job's cgroup";
         return error.BaseContainerFailed;
     };
-    if (std.meta.activeTag(set) != .none) try b.highForSwap(j);
+    if (std.meta.activeTag(set) != .none) try b.highForSwap(j, switch (set) {
+        .bytes => |n| n,
+        else => null,
+    });
     const asked = o.swapMax(true);
     const capped = !allowed and std.meta.activeTag(asked) != .none;
     if (o.memory_swap != null or capped) try more.print(b.arena, ", `--memory-swap` {d}: memory.swap.max {s}{s}", .{
@@ -10849,7 +10860,7 @@ test "root runner: a job that asks for swap with --memory-swap gets memory.high,
     const parent = try testCgroup(arena, &cfg);
     defer parent.remove(arena);
     // The machine must have swap to reclaim into (`cgroup.canSwap`), and the kernel account for it.
-    if (!cgroup.canSwap(.{ .swap = true }, io)) return error.SkipZigTest;
+    if (!cgroup.canSwap(.{ .swap = true }, io, null)) return error.SkipZigTest;
     var probe_buf: [8]u8 = undefined;
     _ = std.Io.Dir.cwd().readFile(io, try std.fmt.allocPrint(arena, "{s}/memory.swap.max", .{parent.dir}), &probe_buf) catch return error.SkipZigTest;
     cfg.cgroup.swap = true;

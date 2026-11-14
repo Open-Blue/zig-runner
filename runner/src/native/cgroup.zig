@@ -187,8 +187,23 @@ fn meminfo(io: std.Io, key: []const u8) ?u64 {
 /// 7 s and not 55 in the next 100, with no OOM event. `memory.max` is what ends such a job, so
 /// it is left to (`Backend.jobCgroup`, `Gate.noHigh`). Without swap accounting nothing here says
 /// how much a job may swap, so none is assumed.
-pub fn canSwap(all: All, io: std.Io) bool {
-    return all.accounted and all.swap and (meminfo(io, "SwapTotal:") orelse 0) > 0;
+///
+/// Swap that exists but is full is no better: `allowance` is what the job may swap (null: all it
+/// finds), and `memory.high` is for it only while `SwapFree` is `swapRoom` for it.
+pub fn canSwap(all: All, io: std.Io, allowance: ?u64) bool {
+    if (!all.accounted or !all.swap) return false;
+    return swapRoom(meminfo(io, "SwapTotal:") orelse 0, meminfo(io, "SwapFree:") orelse 0, allowance);
+}
+
+/// Swap a job needs free to be slowed at `memory.high` instead of stopped there: its allowance,
+/// at most this floor (an allowance of a terabyte does not mean the machine must have one free).
+pub const swap_floor = 512 << 20;
+
+/// Whether a machine with `total` bytes of swap and `free` of it left can take what a job with
+/// `allowance` bytes (null: any) may swap.
+pub fn swapRoom(total: u64, free: u64, allowance: ?u64) bool {
+    if (total == 0) return false;
+    return free >= @min(allowance orelse swap_floor, swap_floor);
 }
 
 /// Where this runner's jobs' cgroups go, or why they have none.
@@ -798,6 +813,11 @@ pub const Job = struct {
         return admission.readCgroupBytes(io, j.dir, "memory.high") orelse error.MemoryHighFailed;
     }
 
+    /// Back to no `memory.high` (`max`), for a limit the kernel holds that nothing else knows of.
+    pub fn clearHigh(j: Job, arena: Allocator) void {
+        _ = write(arena, j.dir, "memory.high", "max");
+    }
+
     /// What the job has used so far.
     pub fn usage(j: Job, io: std.Io) Usage {
         var events_buf: [512]u8 = undefined;
@@ -1394,11 +1414,27 @@ fn autoSelfChild(arena: Allocator, io: std.Io, ns: []const u8) u8 {
 
 test "native cgroup: no swap, or nowhere to swap to, is no use for memory.high" {
     const io = std.testing.io;
-    try std.testing.expect(!canSwap(.{ .swap = false }, io));
+    try std.testing.expect(!canSwap(.{ .swap = false }, io, null));
     // Without swap accounting, for the first job of a parent and those after it alike.
-    try std.testing.expect(!canSwap(.{ .swap = true, .accounted = false }, io));
-    const has_swap = (meminfo(io, "SwapTotal:") orelse 0) > 0;
-    try std.testing.expectEqual(has_swap, canSwap(.{ .swap = true }, io));
+    try std.testing.expect(!canSwap(.{ .swap = true, .accounted = false }, io, null));
+    const total = meminfo(io, "SwapTotal:") orelse 0;
+    const free = meminfo(io, "SwapFree:") orelse 0;
+    try std.testing.expectEqual(swapRoom(total, free, null), canSwap(.{ .swap = true }, io, null));
+}
+
+test "native cgroup: memory.high needs swap that can be reclaimed into now" {
+    const gb: u64 = 1 << 30;
+    // No swap at all.
+    try std.testing.expect(!swapRoom(0, 0, null));
+    try std.testing.expect(!swapRoom(0, 0, gb));
+    // Swap there, and full.
+    try std.testing.expect(!swapRoom(8 * gb, 0, null));
+    try std.testing.expect(!swapRoom(8 * gb, swap_floor - 1, gb));
+    // Enough free: the floor, or a small allowance.
+    try std.testing.expect(swapRoom(8 * gb, swap_floor, null));
+    try std.testing.expect(swapRoom(8 * gb, swap_floor, 1024 * gb));
+    try std.testing.expect(swapRoom(8 * gb, 100 << 20, 100 << 20));
+    try std.testing.expect(!swapRoom(8 * gb, 99 << 20, 100 << 20));
 }
 
 test "native cgroup: the kernel's most processes is as much as is asked for" {
