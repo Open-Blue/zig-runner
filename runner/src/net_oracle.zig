@@ -333,7 +333,7 @@ test "oracle: a request nobody answers, and a kept connection that dies, end the
     // Answered the second time (a connection that died under the first): in both, for a call that
     // may be sent again.
     inline for (impls) |impl| {
-        server.silent_once = 0;
+        server.silent_once.store(0, .release);
         const r = try impl.request(arena, io, .POST, server.url(&buf, "127.0.0.1", "/silent-once/x"), "{}", quick);
         try std.testing.expectEqualStrings("ok", r.body);
     }
@@ -341,11 +341,11 @@ test "oracle: a request nobody answers, and a kept connection that dies, end the
     // std one, as it was, sent every request again), so that a session or a runner is not made twice.
     var never = quick;
     never.resend = .never;
-    server.silent_once = 0;
+    server.silent_once.store(0, .release);
     const before = server.accepts.load(.acquire);
     try std.testing.expectError(error.Timeout, broker.request(arena, io, .POST, server.url(&buf, "127.0.0.1", "/silent-once/x"), "{}", never));
     try std.testing.expectEqual(before + 1, server.accepts.load(.acquire));
-    server.silent_once = 0;
+    server.silent_once.store(0, .release);
     const sent_again = try std_broker.request(arena, io, .POST, server.url(&buf, "127.0.0.1", "/silent-once/x"), "{}", never);
     try std.testing.expectEqualStrings("ok", sent_again.body);
 }
