@@ -1210,6 +1210,8 @@ const volumes = @import("volumes.zig");
 const Fixture = struct {
     a: std.heap.ArenaAllocator,
     tmp: testing.TmpDir,
+    /// The temporary directory's path, which `s.root` may leave for a test of its own.
+    home: []const u8,
     s: Store,
 
     fn init() !*Fixture {
@@ -1218,11 +1220,18 @@ const Fixture = struct {
         f.tmp = testing.tmpDir(.{});
         const root = try f.tmp.dir.realPathFileAlloc(testing.io, ".", f.a.allocator());
         f.s = .{ .root = root };
+        f.home = root;
         return f;
     }
 
+    /// Whatever the test left, a chain of directories too deep to name among it, is removed (an
+    /// fd-relative walk from the bottom), and the test's directory must be gone at the end: a
+    /// failed or timed-out test leaves nothing for `du` or a file watcher to choke on.
     fn deinit(f: *Fixture) void {
+        wipeTree(f.a.allocator(), testing.io, f.home);
         f.tmp.cleanup();
+        const gone = if (std.Io.Dir.cwd().statFile(testing.io, f.home, .{})) |_| false else |_| true;
+        if (!gone) std.debug.panic("a test's directory is left behind: {s}", .{f.home});
         f.a.deinit();
         testing.allocator.destroy(f);
     }
@@ -1863,6 +1872,43 @@ test "native eviction: a dead name that is no directory goes, and one that will 
 /// (NAMETOOLONG once the path inside it is too long), and only after building most of the chain: a
 /// run in a container spent over nine minutes on the two longest before they were skipped by
 /// `goDown`. So they skip at the start there, and say why.
+/// Everything below `root` removed, however deep: from the bottom, by names relative to a
+/// directory descriptor (the full path is too long to name), one step at a time through `..`.
+/// `root` itself stays. Best effort: what cannot be removed is left for the caller to find.
+fn wipeTree(arena: Allocator, io: std.Io, root: []const u8) void {
+    var names: std.ArrayList([:0]const u8) = .empty;
+    const rz = arena.dupeSentinel(u8, root, 0) catch return;
+    var cur = Store.openDirAt(linux.AT.FDCWD, rz) catch return;
+    defer _ = linux.close(cur);
+    while (true) {
+        const first: ?[:0]const u8 = first: {
+            const again = Store.openDirAt(cur, ".") catch return;
+            defer _ = linux.close(again);
+            var d: std.Io.Dir = .{ .handle = again };
+            var it = d.iterate();
+            const e = (it.next(io) catch return) orelse break :first null;
+            break :first arena.dupeSentinel(u8, e.name, 0) catch return;
+        };
+        if (first) |name| {
+            switch (linux.errno(linux.unlinkat(cur, name, 0))) {
+                .SUCCESS => continue,
+                .ISDIR, .PERM => {},
+                else => return,
+            }
+            const down = Store.openDirAt(cur, name) catch return;
+            _ = linux.close(cur);
+            cur = down;
+            names.append(arena, name) catch return;
+        } else {
+            const name = names.pop() orelse return;
+            const up = Store.openDirAt(cur, "..") catch return;
+            _ = linux.close(cur);
+            cur = up;
+            if (linux.errno(linux.unlinkat(cur, name, linux.AT.REMOVEDIR)) != .SUCCESS) return;
+        }
+    }
+}
+
 fn needsDeepDirs(f: *Fixture, depth: usize) !void {
     // Valgrind takes half an hour over the cleanup of a tree this deep, past its job's limit.
     if (depth > 8000 and std.valgrind.runningOnValgrind() != 0) {
@@ -2803,10 +2849,11 @@ test "native eviction: a walk of a chain of directories too deep to name ends at
     }
     _ = linux.close(fd);
     // Each directory below a path's length used to cost its depth to open, and the clock was asked
-    // every 64 of them: 11 s over a budget of 1 s at 60,000 deep, and minutes with more.
-    const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
-    const seen = usage(f.arena(), io, dir, .init(io, 5000), .{ .bytes = 0, .whole = false });
-    try testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - t0 < 1500);
+    // every 64 of them: 11 s over a budget of 1 s at 60,000 deep, and minutes with more. The clock
+    // stands still here: the walk ends of itself, never by the budget, however loaded the machine.
+    const walk_budget: Budget = .initAt(io, 5000, 0);
+    const seen = usage(f.arena(), io, dir, walk_budget, .{ .bytes = 0, .whole = false });
+    try testing.expect(!walk_budget.late());
     try testing.expect(!seen.whole);
     try testing.expect(seen.bytes > 6000);
     // The chain is removed as a pass removes one: the test directory's own cleanup would take minutes.
