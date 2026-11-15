@@ -14,6 +14,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const hooks = @import("net_hooks.zig");
+const logfmt = @import("../logfmt.zig");
+const dns_probe = @import("../native/dns_probe.zig");
 
 /// Off in tests, which would print a line for every request; the tests that look at the lines
 /// turn it on.
@@ -143,10 +145,36 @@ fn isUuid(s: []const u8) bool {
     return true;
 }
 
+/// The two kinds of `native/dns_probe.zig` for a request whose name lookup was slow (`dns_ms` over
+/// its threshold) or failed (its error names the resolver), so a stall of the runner's own calls
+/// reads the same as a job's.
+fn warnDns(l: Line) void {
+    const kind = dnsKind(l) orelse return;
+    const host = l.host[0 .. std.mem.lastIndexOfScalar(u8, l.host, ':') orelse l.host.len];
+    const took = (l.dns_ns orelse l.total_ns) / std.time.ns_per_ms;
+    if (std.mem.eql(u8, kind, "dns_lookup_failed"))
+        logfmt.warn("dns_lookup_failed", "name={f} ms={d} source=request err={s}", .{ logfmt.q(host), took, l.status.err })
+    else
+        logfmt.warn("dns_lookup_slow", "name={f} ms={d} source=request", .{ logfmt.q(host), took });
+}
+
+/// The kind `l` is logged under, null for a request whose lookup was quick and did not fail.
+fn dnsKind(l: Line) ?[]const u8 {
+    if (l.status == .err and isDnsError(l.status.err)) return "dns_lookup_failed";
+    if (l.dns_ns) |ns| if (ns / std.time.ns_per_ms > dns_probe.slow_ms) return "dns_lookup_slow";
+    return null;
+}
+
+fn isDnsError(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, "Dns") != null or std.mem.indexOf(u8, name, "HostName") != null or
+        std.mem.indexOf(u8, name, "NameServer") != null;
+}
+
 /// Writes `l` as one line on stderr, in a single write so that lines of requests made at once do
 /// not mix; and the warning a 403 or 429 gets, with the `retry-after` when it came.
 pub fn emit(io: std.Io, l: Line, retry_after: []const u8) void {
     if (!enabled.load(.monotonic)) return;
+    warnDns(l);
     var buf: [1536]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     l.write(&w) catch return;
@@ -388,4 +416,18 @@ test "a path loses its query and the segments that could be secrets" {
         .{ "", "" },
     };
     for (cases) |c| try std.testing.expectEqualStrings(c[1], redactPath(&buf, c[0]));
+}
+
+test "a request's lookup is logged as slow over the threshold and as failed on a resolver error" {
+    const base: Line = .{ .host = "api.github.com:443", .method = "GET", .path = "/", .status = .{ .code = 200 }, .total_ns = 1 };
+    var l = base;
+    l.dns_ns = 1_500 * std.time.ns_per_ms;
+    try std.testing.expectEqual(@as(?[]const u8, null), dnsKind(l));
+    l.dns_ns = 2_500 * std.time.ns_per_ms;
+    try std.testing.expectEqualStrings("dns_lookup_slow", dnsKind(l).?);
+    l.status = .{ .err = "TemporaryNameServerFailure" };
+    try std.testing.expectEqualStrings("dns_lookup_failed", dnsKind(l).?);
+    l = base;
+    l.status = .{ .err = "ConnectionRefused" };
+    try std.testing.expectEqual(@as(?[]const u8, null), dnsKind(l));
 }

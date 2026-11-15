@@ -473,6 +473,13 @@ error: kind=upload_failed job=123 what=job_log name="" detail=NameServerFailure
 - A warning from a part of the runner that has not named its kind is `kind=<its prefix>
   msg="…"`: `native: cannot remove /x: Busy` is `warn: kind=native msg="cannot remove /x: Busy"`.
   One with no prefix is `kind=log msg="…"`.
+
+- Name lookups (#522): at the start of each native job on a root runner, the runner asks the nameserver the job gets
+  for `github.com` once, off the job's path, and logs `warn: kind=dns_lookup_slow name=github.com ms=3120
+  server=100.100.100.100` when the answer took over 2 s, or `kind=dns_lookup_failed … err=Timeout` when none came in 5 s.
+  The runner's own requests log the same two kinds (`source=request`) when their `dns_ms` is over 2 s or the error
+  names the resolver. Nothing about the job's resolver changes; the thresholds are fixed. A job's resolv.conf holds
+  the host's IPv4 nameservers off the loopback (razorbill: Tailscale's 100.100.100.100 only, its IPv6 one is dropped).
 - `info` lines (`info(scope): …`) and the lines with formats of their own are not warnings and
   keep them: `health:`, `job-end:`, `step-end:`, `request:`, and the plain `job N: …` progress
   lines. What a job's log shows to the user (GitHub's `##[warning]`, an action's `Warning:`) is
