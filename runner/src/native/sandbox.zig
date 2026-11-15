@@ -1316,13 +1316,15 @@ test "a signal waits for a step's own PID 1 to handle it, and goes on once it do
 }
 
 test "a signal is held for PID 1 until it has exec'd the step's program" {
-    // The test process is the helper's own forked child before its exec: same executable.
-    try std.testing.expect(!Warning.execed(linux.getpid()));
-    var w: Warning = .{ .pid1 = linux.getpid(), .held = .USR2 };
+    // The test process is the helper's own forked child before its exec: same executable, same comm.
+    var w: Warning = .init(linux.getpid());
+    try std.testing.expectEqual(@as(?bool, false), w.exeDiffers(linux.getpid()));
+    try std.testing.expectEqual(@as(?bool, false), w.commDiffers(linux.getpid()));
+    w.held = .USR2;
     w.tendHeld();
     try std.testing.expect(w.held != null and !w.started);
-    // A child that exec'd `sleep`: its handlers are its own, and it has none for INT, so as before
-    // the signal stays held; once exec'd, the decision is the handler's alone.
+    // A child that exec'd `sleep`: its handlers are its own, and it has none for the signal, so as
+    // before the signal stays held; once exec'd, the decision is the handler's alone.
     const pid = linux.fork();
     try std.testing.expect(linux.errno(pid) == .SUCCESS);
     if (pid == 0) {
@@ -1339,13 +1341,35 @@ test "a signal is held for PID 1 until it has exec'd the step's program" {
     }
     // The fork's child shows the test binary until its exec lands.
     var tries: usize = 0;
-    while (!(Warning.exeDiffers(child) orelse false)) : (tries += 1) {
+    while (!(w.exeDiffers(child) orelse false) or !(w.commDiffers(child) orelse false)) : (tries += 1) {
         try std.testing.expect(tries < 500);
         try std.testing.io.sleep(.fromMilliseconds(10), .awake);
     }
-    var v: Warning = .{ .pid1 = child, .held = .USR2 };
+    var v: Warning = .init(child);
+    v.own_exe_len = w.own_exe_len;
+    v.own_exe = w.own_exe;
+    v.own_comm_len = w.own_comm_len;
+    v.own_comm = w.own_comm;
+    v.held = .USR2;
     v.tendHeld();
-    try std.testing.expect(v.started and v.held != null);
+    try std.testing.expect(v.started and v.held != null and !v.unverified_said);
+}
+
+test "PID 1's exec is told by its executable, else by its comm, else taken as done and said" {
+    try std.testing.expectEqual(@as(?bool, true), Warning.decide(true, false));
+    try std.testing.expectEqual(@as(?bool, false), Warning.decide(false, true));
+    // The link of a PID 1 that is not dumpable cannot be read: its comm decides.
+    try std.testing.expectEqual(@as(?bool, true), Warning.decide(null, true));
+    try std.testing.expectEqual(@as(?bool, false), Warning.decide(null, false));
+    try std.testing.expectEqual(@as(?bool, null), Warning.decide(null, null));
+    // A PID that is gone: neither can be read, so it counts as exec'd, and the line is said once.
+    var w: Warning = .init(linux.getpid());
+    try std.testing.expectEqual(@as(?bool, null), w.exeDiffers(0x7ffffff0));
+    try std.testing.expectEqual(@as(?bool, null), w.commDiffers(0x7ffffff0));
+    try std.testing.expect(w.execed(0x7ffffff0));
+    try std.testing.expect(w.unverified_said);
+    var buf: [96]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, Warning.unverifiedLine(&buf), "warn: kind=sigint_hold_unverified "));
 }
 
 test "swapRanges exchanges two ids and keeps the rest" {
@@ -1680,7 +1704,7 @@ fn makeDirsOpen(arena: Allocator, root: linux.fd_t, path: []const u8) linux.fd_t
 fn superviseStep(pid: linux.pid_t, own_program: bool, early: []const u8) u32 {
     const pidfd_rc = linux.pidfd_open(pid, 0);
     const pidfd: ?linux.fd_t = if (linux.errno(pidfd_rc) == .SUCCESS) @intCast(pidfd_rc) else null;
-    var warning: Warning = .{ .pid1 = if (own_program) pid else null };
+    var warning: Warning = .init(if (own_program) pid else null);
     var stopped = false;
     for (early) |byte| stopped = stopped or !warning.take(byte);
     while (!stopped) {
@@ -1747,9 +1771,25 @@ const Warning = struct {
     held: ?linux.SIG = null,
     /// `pid1` has exec'd the step's program (`execed`): from then on its handlers are the program's.
     started: bool = false,
+    /// The helper's own executable and `comm`, read once (`init`): what PID 1 is until its exec.
+    own_exe: [std.fs.max_path_bytes]u8 = undefined,
+    own_exe_len: usize = 0,
+    own_comm: [16]u8 = undefined,
+    own_comm_len: usize = 0,
+    /// The line for a PID 1 whose exec could not be told (`execed`) was written.
+    unverified_said: bool = false,
     /// The process sending it. Its zombie must be reaped: PID 1 cannot finish exiting while one
     /// of its namespace is left (`zap_pid_ns_processes`), and the step would never end.
     sender: ?linux.pid_t = null,
+
+    const comm_max = 16;
+
+    fn init(pid1: ?linux.pid_t) Warning {
+        var w: Warning = .{ .pid1 = pid1 };
+        w.own_exe_len = readExe("/proc/self/exe", &w.own_exe) orelse 0;
+        w.own_comm_len = readComm("/proc/self/comm", &w.own_comm) orelse 0;
+        return w;
+    }
 
     /// A byte from the lifeline: false when it is no warning, which stops the step.
     fn take(w: *Warning, byte: u8) bool {
@@ -1781,32 +1821,76 @@ const Warning = struct {
     fn tendHeld(w: *Warning) void {
         const sig = w.held orelse return;
         const p = w.pid1.?;
-        if (!w.started) w.started = execed(p);
+        if (!w.started) w.started = w.execed(p);
         if (!w.started or !handles(p, sig)) return;
         w.held = null;
         _ = linux.kill(p, sig);
     }
 
-    /// Whether `pid` has exec'd: its executable is no longer the helper's own, which the child
-    /// forked for PID 1 runs until its `execve`. Until then its handlers are the helper's (the
-    /// sanitizers' and the runtime's, which show as caught), and a SIGINT it takes goes nowhere: a
-    /// post step signalled within a tick of its start, while its sandbox was still being made (slow
-    /// under ThreadSanitizer), lost it before its shell existed. True when a link is unreadable.
-    fn execed(pid: linux.pid_t) bool {
-        return exeDiffers(pid) orelse true;
+    /// Whether `pid` has exec'd the step's program: until its `execve` the child forked for PID 1
+    /// runs the helper's own code, whose handlers (the sanitizers' and the runtime's) show as
+    /// caught, and a SIGINT it takes goes nowhere: a post step signalled within a tick of its
+    /// start, while its sandbox was still being made (slow under ThreadSanitizer), lost it before
+    /// its shell existed. Told by the executable no longer being the helper's, or, where that link
+    /// cannot be read (a PID 1 that changed to a non-zero uid is not dumpable, and reading its
+    /// link needs ptrace access), by its `comm` no longer being the helper's, which is world
+    /// readable. A step whose program is the helper's own binary has the same executable and
+    /// `comm` before and after, which neither tells apart: its signal stays held until the next
+    /// stage drops it. When neither can be read it is taken as exec'd, the old behaviour, and said
+    /// once (`unverified_said`).
+    fn execed(w: *Warning, pid: linux.pid_t) bool {
+        if (decide(exeDiffers(w, pid), commDiffers(w, pid))) |d| return d;
+        if (!w.unverified_said) {
+            w.unverified_said = true;
+            var buf: [96]u8 = undefined;
+            const line = unverifiedLine(&buf);
+            _ = linux.write(2, line.ptr, line.len);
+        }
+        return true;
     }
 
-    /// Whether `pid`'s executable is not this process's; null when a link cannot be read (it
-    /// cannot for a moment during an `execve`).
-    fn exeDiffers(pid: linux.pid_t) ?bool {
-        var mine: [std.fs.max_path_bytes]u8 = undefined;
-        var theirs: [std.fs.max_path_bytes]u8 = undefined;
-        const m = linux.readlink("/proc/self/exe", &mine, mine.len);
+    /// The executable's verdict where it could be read, else the `comm`'s; null when neither was.
+    fn decide(exe: ?bool, comm: ?bool) ?bool {
+        return exe orelse comm;
+    }
+
+    fn unverifiedLine(buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "warn: kind=sigint_hold_unverified msg=\"PID 1's exec cannot be told\"\n", .{}) catch "";
+    }
+
+    /// Whether `pid`'s executable is not the helper's; null when a link cannot be read (it cannot
+    /// for a moment during an `execve`, nor for a PID that is not dumpable).
+    fn exeDiffers(w: *const Warning, pid: linux.pid_t) ?bool {
+        if (w.own_exe_len == 0) return null;
         var path_buf: [32]u8 = undefined;
         const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/exe", .{pid}, 0) catch return null;
-        const t = linux.readlink(path, &theirs, theirs.len);
-        if (linux.errno(m) != .SUCCESS or linux.errno(t) != .SUCCESS) return null;
-        return !std.mem.eql(u8, mine[0..m], theirs[0..t]);
+        var theirs: [std.fs.max_path_bytes]u8 = undefined;
+        const n = readExe(path, &theirs) orelse return null;
+        return !std.mem.eql(u8, w.own_exe[0..w.own_exe_len], theirs[0..n]);
+    }
+
+    /// Whether `pid`'s `comm` (the program's file name, set by `execve`) is not the helper's.
+    fn commDiffers(w: *const Warning, pid: linux.pid_t) ?bool {
+        if (w.own_comm_len == 0) return null;
+        var path_buf: [32]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/comm", .{pid}, 0) catch return null;
+        var theirs: [comm_max]u8 = undefined;
+        const n = readComm(path, &theirs) orelse return null;
+        return !std.mem.eql(u8, w.own_comm[0..w.own_comm_len], theirs[0..n]);
+    }
+
+    fn readExe(path: [*:0]const u8, buf: []u8) ?usize {
+        const n = linux.readlink(path, buf.ptr, buf.len);
+        return if (linux.errno(n) == .SUCCESS and n > 0) n else null;
+    }
+
+    fn readComm(path: [*:0]const u8, buf: *[comm_max]u8) ?usize {
+        const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        const fd = std.math.cast(linux.fd_t, rc) orelse return null;
+        defer _ = linux.close(fd);
+        const n = linux.read(fd, buf, buf.len);
+        if (linux.errno(n) != .SUCCESS or n == 0) return null;
+        return std.mem.trimEnd(u8, buf[0..n], "\n").len;
     }
 
     /// Whether `pid` catches or ignores `sig` (`SigCgt` and `SigIgn` of /proc/<pid>/status).
