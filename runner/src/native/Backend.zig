@@ -72,6 +72,8 @@ rootfs: []const u8,
 /// `Config.rootfs`: the operator's provisioned default image, used instead of a native pull of
 /// it; "" for none.
 operator_rootfs: []const u8 = "",
+/// `Config.image_tag_ttl_s`.
+image_tag_ttl_s: u32 = oci.default_tag_ttl_s,
 /// `Config.provisioned_image` and `Config.provisioned_pins`.
 provisioned_image: bool = true,
 provisioned_pins: provisioned.Pins = provisioned.pinned,
@@ -278,6 +280,8 @@ pub const Config = struct {
     /// pull it provisions, as without.
     provisioned_image: bool = true,
     provisioned_pins: provisioned.Pins = provisioned.pinned,
+    /// How long an image tag's resolution is reused (`RUNNER_IMAGE_TAG_TTL`).
+    image_tag_ttl_s: u32 = oci.default_tag_ttl_s,
     /// Where jobs' layers live while they run, and pulled images and provisioned rootfs
     /// (`RUNNER_NATIVE_STORE`).
     store: []const u8 = "",
@@ -464,6 +468,7 @@ pub fn configFor(
         .host_paths_unmapped = cfg.native_host_paths_unmapped,
         .rootfs = cfg.native_rootfs,
         .provisioned_image = cfg.provisioned_image,
+        .image_tag_ttl_s = cfg.image_tag_ttl_secs,
         .store = try cfg.nativeStore(arena, environ),
         .self_exe = exe.path,
         .self_exe_replaced = exe.replaced,
@@ -992,6 +997,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .operator_rootfs = cfg.rootfs,
         .provisioned_image = cfg.provisioned_image,
         .provisioned_pins = cfg.provisioned_pins,
+        .image_tag_ttl_s = cfg.image_tag_ttl_s,
         .binds = cfg.binds,
         .lock = lock,
         .how = how,
@@ -3744,7 +3750,7 @@ fn fetchRootfs(
             p.ms,                                                                                                  p.layers, p.bytes / 1024,
             if (p.devices > 0) try std.fmt.allocPrint(arena, "; {d} device nodes left out", .{p.devices}) else "",
         },
-    ) else "Image: from the native store");
+    ) else if (img.reused) |r| try std.fmt.allocPrint(arena, "Image: from the native store; {s}", .{r}) else "Image: from the native store");
     b.rootfs = img.rootfs;
     t = b.timings.since(arena, .image, t);
     if (provision_it) b.rootfs = try b.provision(
@@ -4489,7 +4495,7 @@ fn pullBefore(
     deadline: std.Io.Duration,
     why: *[]const u8,
 ) !oci.Image {
-    const img = try pullWithin(b.arena, b.gpa, b.io, b.store_cfg.root, b.how.userns == .mapped, image, creds, deadline, b.gate, why);
+    const img = try pullWithin(b.arena, b.gpa, b.io, b.store_cfg.root, b.how.userns == .mapped, image, creds, deadline, b.gate, b.image_tag_ttl_s, why);
     errdefer img.lock.close(b.io);
     // Held to the job's end, as its layers are: eviction leaves it alone (`evict.zig`).
     try b.held.append(b.arena, img.lock);
@@ -4507,9 +4513,10 @@ pub fn pullAt(
     owners: bool,
     image: []const u8,
     creds: ?registry.Credentials,
+    tag_ttl_s: u32,
     why: *[]const u8,
 ) !oci.Image {
-    return pullWithin(arena, gpa, io, root, owners, image, creds, pull_deadline, null, why);
+    return pullWithin(arena, gpa, io, root, owners, image, creds, pull_deadline, null, tag_ttl_s, why);
 }
 
 fn pullWithin(
@@ -4522,10 +4529,11 @@ fn pullWithin(
     creds: ?registry.Credentials,
     deadline: std.Io.Duration,
     gate: ?*admission.Gate,
+    tag_ttl_s: u32,
     why: *[]const u8,
 ) !oci.Image {
     const store: ImageStore = .{ .root = root };
-    const req: oci.Request = .{ .image = image, .creds = creds, .owners = owners, .gate = gate };
+    const req: oci.Request = .{ .image = image, .creds = creds, .owners = owners, .gate = gate, .tag_ttl_s = tag_ttl_s };
     const r = try http.within(io, deadline, pullInto, .{
         arena, gpa, io, store, req, why,
     });

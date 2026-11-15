@@ -1006,8 +1006,17 @@ directories and the step's file-command files at a 4 KiB block each.
   then no variant) on the Pi; attestations never match. The platform's manifest and config, each
   blob checked against its digest and size as it arrives, then kept content-addressed; the
   layers applied in order into one directory, flattened, kept under the manifest's digest. A
-  digest-pinned reference seen before (the default image) needs no request at all; a tag is
-  resolved at the registry each time, as Dagger does.
+  digest-pinned reference seen before (the default image) needs no request at all. A tag's
+  resolution is kept (`oci/refs/tag-*`, with the time) and reused for `RUNNER_IMAGE_TAG_TTL`
+  seconds (default 300) when the store still has the image: a burst of jobs on one image asks the
+  registry once, not twice a job (the index, then its platform's manifest), which also keeps
+  Docker Hub's anonymous limit out of reach. Five minutes because a tag that moved is then seen by
+  the next job after that and the saving is almost all of a burst's; `0` asks on every job, as
+  `docker pull` does. When the registry cannot answer (the network, a 429 or a 5xx) and the store
+  holds the tag's last resolution, that image runs and "Set up job" says which digest; a 401, a 403
+  or a 404 is an error, never the old image. With nothing to fall back on, a 429 is waited out as
+  its `Retry-After` asks (at most 60 s, twice). The runner has no `pull_policy`; a job that must
+  have the newest tag pins `image@sha256:...` or runs where the setting is 0.
 - `runner/src/native/oci/layer.zig`: one layer applied safely (gzip, zstd or plain by the blob's
   first bytes; ustar, GNU long names, PAX; whiteouts and opaque directories; the diff id
   checked). See its comment for the rules: no `..`, parents resolved inside the rootfs
@@ -1040,6 +1049,7 @@ holds the image's set-uid files with the image's owners, the host's root's on a 
 ```
 oci/blobs/sha256/<hex>                a blob, renamed into place once its digest checked
 oci/refs/<hex>.<platform>             which manifest a pinned index gives this platform
+oci/refs/tag-<hex>.<platform>         what a tag resolved to (manifest, index, epoch seconds)
 oci/images/<hex>[.rootless]/          rootfs/ and config.json, by the manifest's digest
 rootfs/<key>/rootfs/                  a rootfs a native step made (provisioning; apart from P2's layers/)
 ```

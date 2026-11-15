@@ -102,7 +102,7 @@ fn judge(
         .node => {
             // The musl build on a musl image (`container: alpine`), as `js.zig` mounts it.
             const rt = (if (b.isMusl()) js.runtimes_musl else js.runtimes).get(b.js_runtime);
-            return switch (try docker_action.find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, rt.image, &b.held)) {
+            return switch (try docker_action.find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, rt.image, b.image_tag_ttl_s, &b.held)) {
                 .image => null,
                 .missing => |why| try std.fmt.allocPrint(arena, "{s} is a JavaScript action, " ++
                     "and its runtime is not here: {s}", .{ label, why }),
@@ -257,7 +257,7 @@ pub fn loadLocal(b: *Backend, x: *Exec, u: job_mod.Uses) !Exec.LoadResult {
 }
 
 fn imageReason(b: *Backend, image: []const u8) !?[]const u8 {
-    return switch (try docker_action.find(b.arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, image, &b.held)) {
+    return switch (try docker_action.find(b.arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, image, b.image_tag_ttl_s, &b.held)) {
         .missing => |why| why,
         .image => |img| try docker_action.userReason(b.arena, &.{img.rootfs}, image, img.user),
     };
