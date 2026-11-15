@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'spin.sh leaves nothing running when it ends, on any path: an EXIT trap (also on INT and TERM) ends its heartbeat and every worker with the spin, gcc and pan it runs, and for a SIGKILL the heartbeat does so at its next tick, so a pre-push hook that ended no longer leaves a heartbeat or workers writing into a shared SPIN_DIR; two runs in one SPIN_DIR take turns (flock)'
+time: 2026-11-14T21:36:07.659676249-05:00
