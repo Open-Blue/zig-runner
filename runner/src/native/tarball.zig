@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const http = @import("../github/http.zig");
+const ratelimit = @import("../github/ratelimit.zig");
 const checkout = @import("../dagger/checkout.zig");
 const sandbox = @import("sandbox.zig");
 const Backend = @import("Backend.zig");
@@ -40,7 +41,14 @@ pub const Source = struct {
     url: []const u8,
     /// Sent to the first host only, never to where a redirect leads.
     token: ?[]const u8 = null,
+    /// The first wait before a retry, doubled for each after it (a test's is a millisecond).
+    backoff_ms: i64 = 1000,
 };
+
+/// How many times a download is made again after a 429, a 5xx or a rate-limited 403. With the
+/// backoff (1, 2, 4 s) and what GitHub asks (at most `ratelimit.max_wait_ms` each) this stays well
+/// inside the download's own `deadline`, which bounds the whole of it.
+const max_retries = 3;
 
 /// GitHub's API for a server: `api.github.com` for github.com, `<server>/api/v3` for a GitHub
 /// Enterprise Server, `api.<host>` for GitHub's data-residency hosts (`*.ghe.com`).
@@ -55,8 +63,21 @@ pub fn apiBase(arena: Allocator, server_url: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "{s}/api/v3", .{server});
 }
 
+/// Why `ref` cannot be put in a URL's path, or null. A segment that is empty, `.` or `..` would
+/// move the request to another path of the same host (the job's token goes with it); git's ref
+/// names cannot have one (`git check-ref-format`), so no branch, tag or commit is refused.
+pub fn refProblem(ref: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, ref, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, ".."))
+            return "the ref has an empty, `.` or `..` path segment, which no git ref has";
+    }
+    return null;
+}
+
 /// A refs' path in a URL: each segment percent-encoded, the slashes of `refs/pull/7/merge` kept.
 fn refPath(arena: Allocator, ref: []const u8) ![]const u8 {
+    if (refProblem(ref) != null) return error.InvalidRef;
     var w: std.Io.Writer.Allocating = .init(arena);
     var it = std.mem.splitScalar(u8, ref, '/');
     var first = true;
@@ -95,15 +116,23 @@ pub fn actionSource(arena: Allocator, server_url: []const u8, repo: []const u8, 
 /// top directory GitHub adds stripped, owners not applied), the modes git's checkout gives and the
 /// files given the checkout's fixed time (`checkout.mtime`).
 pub fn extractScript(arena: Allocator, mount: []const u8) ![]const u8 {
+    return extractScriptFrom(arena, mount, bind_at);
+}
+
+fn extractScriptFrom(arena: Allocator, mount: []const u8, from: []const u8) ![]const u8 {
     var w: std.Io.Writer.Allocating = .init(arena);
     try w.writer.writeAll("set -e\nmkdir -p ");
     try shellQuote(&w.writer, mount);
     try w.writer.writeAll(" && cd ");
     try shellQuote(&w.writer, mount);
-    try w.writer.print("\ntar -xzf {s}/{s} --strip-components=1 -o\n", .{ bind_at, archive_name });
+    try w.writer.print("\ntar -xzf {s}/{s} --strip-components=1 -o\n", .{ from, archive_name });
     // Modes as git's checkout makes them, whatever the archive stores (GitHub's are `git archive`'s,
     // group-writable) and whoever extracts it: directories 755, executables 755, other files 644.
-    try w.writer.writeAll("find . -type d -exec chmod 755 {} +\n" ++
+    // A directory the archive stores with no owner access (mode 000) is made enterable first, one
+    // `chmod` at a time: `find` runs it before it reads the directory, where the batched `+` forms
+    // below run after the walk, which a non-root job user cannot make through one.
+    try w.writer.writeAll("find . -type d ! -perm -700 -exec chmod u+rwx {} \\;\n" ++
+        "find . -type d -exec chmod 755 {} +\n" ++
         "find . -type f -perm -100 -exec chmod 755 {} +\n" ++
         "find . -type f ! -perm -100 -exec chmod 644 {} +\n");
     try w.writer.print("find . -exec touch -h -d @{d} {{}} +\n", .{checkout.mtime});
@@ -134,13 +163,10 @@ pub fn fetchInto(b: *Backend, mount: []const u8, src: Source, expect: ?[]const u
     defer cwd.deleteTree(b.io, dir) catch |e| std.log.warn("native: the downloaded archive in {s} is left behind: {s}", .{ dir, @errorName(e) });
     const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, archive_name });
 
-    var why: []const u8 = "";
-    download(arena, b.gpa, b.io, src, path, &why) catch |e| return .{ .failed = try std.fmt.allocPrint(
-        arena,
-        "could not download {s}: {s}",
-        .{ src.url, if (why.len > 0) why else @errorName(e) },
-    ) };
-    const sha: []const u8 = expect orelse (try commitOf(arena, b.io, path)) orelse "";
+    if (try downloadFailure(arena, b.gpa, b.io, src, path)) |msg| return .{ .failed = msg };
+    const archived = try commitOf(arena, b.io, path);
+    if (try commitMismatch(arena, expect, archived)) |msg| return .{ .failed = msg };
+    const sha: []const u8 = archived orelse expect orelse "";
 
     const script = try extractScript(arena, mount);
     const saved = b.binds;
@@ -160,6 +186,31 @@ pub fn fetchInto(b: *Backend, mount: []const u8, src: Source, expect: ?[]const u
         .{ src.url, if (ended.failure.len > 0) ended.failure else out.tail() },
     ) };
     return .{ .sha = sha };
+}
+
+/// Why `src` could not be downloaded into `path`, for the step to say, or null when it was. Only
+/// the download's own failures are one: memory that ran out is an error, not a verdict on it.
+fn downloadFailure(arena: Allocator, gpa: Allocator, io: std.Io, src: Source, path: []const u8) !?[]const u8 {
+    var why: []const u8 = "";
+    download(arena, gpa, io, src, path, &why) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return try std.fmt.allocPrint(
+            arena,
+            "could not download {s}: {s}",
+            .{ src.url, if (why.len > 0) why else @errorName(e) },
+        ),
+    };
+    return null;
+}
+
+/// Why the archive is not the commit that was asked for, or null: `expect` (a 40-digit hex commit
+/// the job named, or null for a branch or a tag) against the commit the archive records. An
+/// archive that records none cannot be compared and is taken as the request.
+fn commitMismatch(arena: Allocator, expect: ?[]const u8, archived: ?[]const u8) !?[]const u8 {
+    const want = expect orelse return null;
+    const got = archived orelse return null;
+    if (!checkout.isSha(want) or std.ascii.eqlIgnoreCase(want, got)) return null;
+    return try std.fmt.allocPrint(arena, "the archive holds commit {s}, not the {s} that was asked for", .{ got, want });
 }
 
 /// GET `src` into the file `path`, following up to `max_redirects` redirects itself: std's client
@@ -182,12 +233,22 @@ fn downloadWith(arena: Allocator, client: *std.http.Client, io: std.Io, src: Sou
     const origin = uri;
     var redirects: u32 = 0;
     var stale: u32 = 0;
+    var retries: u32 = 0;
     while (true) {
         const own = sameOrigin(uri, origin);
         const bearer: ?[]const u8 = if (own) (if (src.token) |t| try std.fmt.allocPrint(arena, "Bearer {s}", .{t}) else null) else null;
-        const next = onceAt(arena, client, uri, bearer, file, why) catch |e| switch (e) {
+        var miss: Miss = .{};
+        const next = onceAt(arena, client, uri, bearer, file, why, &miss, io) catch |e| switch (e) {
             error.HttpConnectionClosing, error.ResetBeforeHead => if (stale < http.staleRetries(client)) {
                 stale += 1;
+                continue;
+            } else return e,
+            // A server that is busy or limiting: again, after at least what it asked for (a
+            // cancel of the job ends the sleep), a bounded number of times.
+            error.HttpStatus => if (miss.retryable() and retries < max_retries) {
+                const backoff = src.backoff_ms << @intCast(retries);
+                retries += 1;
+                try io.sleep(.fromMilliseconds(ratelimit.wait(io, backoff, miss.asked_ms)), .awake);
                 continue;
             } else return e,
             else => return e,
@@ -210,8 +271,19 @@ fn sameOrigin(a: std.Uri, b: std.Uri) bool {
     return std.ascii.eqlIgnoreCase(ha.bytes, hb.bytes) and a.port == b.port;
 }
 
+/// What a refused request says of trying again.
+const Miss = struct {
+    status: std.http.Status = .ok,
+    /// What the response's `Retry-After` or rate-limit headers ask to wait, in milliseconds.
+    asked_ms: i64 = 0,
+
+    fn retryable(m: Miss) bool {
+        return m.status == .too_many_requests or m.status.class() == .server_error or m.asked_ms > 0;
+    }
+};
+
 /// One request: null when answered (the body is in `file`), else where it redirects to.
-fn onceAt(arena: Allocator, client: *std.http.Client, uri: std.Uri, bearer: ?[]const u8, file: std.Io.File, why: *[]const u8) !?std.Uri {
+fn onceAt(arena: Allocator, client: *std.http.Client, uri: std.Uri, bearer: ?[]const u8, file: std.Io.File, why: *[]const u8, miss: *Miss, io: std.Io) !?std.Uri {
     var req = try client.request(.GET, uri, .{
         .headers = .{
             .accept_encoding = .omit,
@@ -231,10 +303,16 @@ fn onceAt(arena: Allocator, client: *std.http.Client, uri: std.Uri, bearer: ?[]c
     };
     const status = res.head.status;
     var location: ?[]const u8 = null;
+    var retry_after: ?[]const u8 = null;
+    var remaining: ?[]const u8 = null;
+    var reset: ?[]const u8 = null;
     var it = res.head.iterateHeaders();
-    while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "location")) {
-        location = try arena.dupe(u8, h.value);
-    };
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "location")) location = try arena.dupe(u8, h.value);
+        if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) retry_after = try arena.dupe(u8, h.value);
+        if (std.ascii.eqlIgnoreCase(h.name, "x-ratelimit-remaining")) remaining = try arena.dupe(u8, h.value);
+        if (std.ascii.eqlIgnoreCase(h.name, "x-ratelimit-reset")) reset = try arena.dupe(u8, h.value);
+    }
     var transfer: [64]u8 = undefined;
     const r = res.reader(&transfer);
     if (status.class() == .redirect) if (location) |loc| {
@@ -250,6 +328,10 @@ fn onceAt(arena: Allocator, client: *std.http.Client, uri: std.Uri, bearer: ?[]c
         return next;
     };
     if (status != .ok) {
+        miss.* = .{
+            .status = status,
+            .asked_ms = ratelimit.parse(status, retry_after, remaining, reset, std.Io.Clock.real.now(io).toMilliseconds()),
+        };
         why.* = try std.fmt.allocPrint(arena, "HTTP {d}{s}", .{
             @backingInt(status),
             if (status == .not_found) " (not found, or a private repository the job's token cannot read)" else "",
@@ -425,11 +507,20 @@ const TestServer = struct {
     thread: std.Thread = undefined,
     api_path: []const u8 = "",
     archive_path: []const u8 = "",
+    /// A second archive, a second action's.
+    archive_path2: []const u8 = "",
     body: []const u8 = "",
     requests: std.atomic.Value(u32) = .init(0),
     api_auth: [256]u8 = undefined,
     api_auth_len: std.atomic.Value(usize) = .init(0),
     cdn_saw_auth: std.atomic.Value(bool) = .init(false),
+    /// `flaky_path` answers `flaky_status` (with `flaky_extra` headers) `flaky_fails` times, then
+    /// the archive.
+    flaky_path: []const u8 = "",
+    flaky_status: []const u8 = "",
+    flaky_extra: []const u8 = "",
+    flaky_fails: u32 = 0,
+    flaky_seen: std.atomic.Value(u32) = .init(0),
 
     fn start(s: *TestServer) !void {
         const io = std.testing.io;
@@ -507,7 +598,12 @@ const TestServer = struct {
             }
             return reply(out, "200 OK", "", s.body);
         }
-        if (std.mem.eql(u8, path, s.archive_path)) {
+        if (s.flaky_path.len > 0 and std.mem.eql(u8, path, s.flaky_path)) {
+            if (s.flaky_seen.fetchAdd(1, .acq_rel) < s.flaky_fails)
+                return reply(out, s.flaky_status, s.flaky_extra, "busy");
+            return reply(out, "200 OK", "", s.body);
+        }
+        if (std.mem.eql(u8, path, s.archive_path) or (s.archive_path2.len > 0 and std.mem.eql(u8, path, s.archive_path2))) {
             if (auth.len > 0) s.cdn_saw_auth.store(true, .release);
             return reply(out, "200 OK", "", s.body);
         }
@@ -590,6 +686,184 @@ test "download: the token goes to the API and not to where it redirects; failure
         .url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/nope", .{srv.port}),
     }, dest, &why));
     try std.testing.expect(std.mem.indexOf(u8, why, "HTTP 404") != null);
+}
+
+test "download: a 429 or 5xx is tried again (Retry-After honoured), a persistent one gives up, a 404 is not retried" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ar = try testArchive(arena, &tmp);
+    const io = std.testing.io;
+    const dest = try std.fmt.allocPrint(arena, "{s}/got.tgz", .{ar.root});
+    var why: []const u8 = "";
+
+    // 429 with Retry-After: 1, then the archive: the wait is at least what was asked.
+    var limited: TestServer = .{ .flaky_path = "/limited", .flaky_status = "429 Too Many Requests", .flaky_extra = "Retry-After: 1\r\n", .flaky_fails = 1, .body = ar.tgz };
+    try limited.start();
+    defer limited.stop();
+    const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
+    try download(arena, std.testing.allocator, io, .{
+        .url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/limited", .{limited.port}),
+        .backoff_ms = 1,
+    }, dest, &why);
+    try std.testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - t0 >= 1000);
+    try std.testing.expectEqual(@as(u32, 2), limited.flaky_seen.load(.acquire));
+    const got = try tmp.dir.readFileAlloc(io, "got.tgz", arena, .limited(1 << 20));
+    try std.testing.expectEqualSlices(u8, ar.tgz, got);
+
+    // 502, then the archive.
+    var bad_gateway: TestServer = .{ .flaky_path = "/gw", .flaky_status = "502 Bad Gateway", .flaky_fails = 2, .body = ar.tgz };
+    try bad_gateway.start();
+    defer bad_gateway.stop();
+    try download(arena, std.testing.allocator, io, .{
+        .url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/gw", .{bad_gateway.port}),
+        .backoff_ms = 1,
+    }, dest, &why);
+    try std.testing.expectEqual(@as(u32, 3), bad_gateway.flaky_seen.load(.acquire));
+
+    // A 500 that never ends: one try and `max_retries` more, then the status as the reason.
+    var broken: TestServer = .{ .flaky_path = "/broken", .flaky_status = "500 Internal Server Error", .flaky_fails = 1000, .body = ar.tgz };
+    try broken.start();
+    defer broken.stop();
+    try std.testing.expectError(error.HttpStatus, download(arena, std.testing.allocator, io, .{
+        .url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/broken", .{broken.port}),
+        .backoff_ms = 1,
+    }, dest, &why));
+    try std.testing.expectEqual(@as(u32, 1 + max_retries), broken.flaky_seen.load(.acquire));
+    try std.testing.expect(std.mem.indexOf(u8, why, "HTTP 500") != null);
+
+    // A 404 is the answer at once.
+    var missing: TestServer = .{ .body = ar.tgz };
+    try missing.start();
+    defer missing.stop();
+    try std.testing.expectError(error.NotFound, download(arena, std.testing.allocator, io, .{
+        .url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/nope", .{missing.port}),
+        .backoff_ms = 1,
+    }, dest, &why));
+    try std.testing.expectEqual(@as(u32, 1), missing.requests.load(.acquire));
+}
+
+test "an allocation that fails is OutOfMemory, not a failed download" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ar = try testArchive(arena, &tmp);
+    var srv: TestServer = .{ .archive_path = "/o/r/archive/v1.tar.gz", .body = ar.tgz };
+    try srv.start();
+    defer srv.stop();
+    const io = std.testing.io;
+    const dest = try std.fmt.allocPrint(arena, "{s}/got.tgz", .{ar.root});
+    const src: Source = .{ .url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/o/r/archive/v1.tar.gz", .{srv.port}) };
+    // Each allocation fails in turn, in the step's arena (a token makes it allocate) and then in
+    // the client's: the outcome is never a message.
+    const with_token: Source = .{ .url = src.url, .token = "tok" };
+    inline for (.{ true, false }) |in_arena| {
+        var index: usize = 0;
+        while (true) : (index += 1) {
+            var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = index });
+            var scratch = @import("../alloc_failures.zig").Scratch.init(if (in_arena) failing.allocator() else std.testing.allocator);
+            defer scratch.deinit();
+            const gpa = if (in_arena) std.testing.allocator else failing.allocator();
+            if (downloadFailure(scratch.allocator(), gpa, io, with_token, dest)) |msg| {
+                try std.testing.expect(msg == null);
+                try std.testing.expect(index > 0);
+                break;
+            } else |e| try std.testing.expectEqual(error.OutOfMemory, e);
+        }
+    }
+    // A failure that is the download's own stays one, with its message.
+    const bad: Source = .{ .url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/nope", .{srv.port}) };
+    const msg = (try downloadFailure(arena, std.testing.allocator, io, bad, dest)).?;
+    try std.testing.expect(std.mem.indexOf(u8, msg, "HTTP 404") != null);
+}
+
+test "a ref with an empty, . or .. segment is refused; refs git has are not" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    for ([_][]const u8{ "..", ".", "a/../b", "../../user", "a/./b", "a//b", "/a", "a/", "refs/heads/../../x" }) |bad| {
+        try std.testing.expect(refProblem(bad) != null);
+        try std.testing.expectError(error.InvalidRef, checkoutSource(arena, "https://github.com", "o/r", bad, "tok"));
+        try std.testing.expectError(error.InvalidRef, actionSource(arena, "https://github.com", "o/r", bad));
+    }
+    for ([_][]const u8{ "main", "v1.2.3", "refs/pull/7/merge", "feat/a..b", ".hidden/x", "0123456789abcdef0123456789abcdef01234567" }) |ok|
+        try std.testing.expect(refProblem(ok) == null);
+}
+
+test "gitMissing: the shell's own not-found forms for git, and no other 127" {
+    const ended: sandbox.Ended = .{ .code = 127, .failure = "" };
+    var c: Backend.Captured = .{ .arena = std.testing.allocator };
+    defer c.text.deinit(std.testing.allocator);
+    for ([_][]const u8{
+        "sh: 1: git: not found\n",
+        "set -e\nsh: git: not found\n",
+        "bash: line 3: git: command not found\n",
+        "sh: /usr/bin/git: No such file or directory\r\n",
+        "git: not found",
+    }) |text| {
+        c.text.clearRetainingCapacity();
+        try c.text.appendSlice(std.testing.allocator, text);
+        try std.testing.expect(Backend.gitMissing(ended, &c));
+    }
+    // 127 from another tool, with git named in what it printed; and git-named things that are not git.
+    for ([_][]const u8{
+        "sh: 1: sed: not found\nfetching git history\n",
+        "sh: 1: git-lfs: not found\n",
+        "sh: 1: legit: not found\n",
+        "git failed: sh: 1: curl: not found\n",
+        "fatal: unable to access 'https://x/git: not found'\n",
+        "",
+    }) |text| {
+        c.text.clearRetainingCapacity();
+        try c.text.appendSlice(std.testing.allocator, text);
+        try std.testing.expect(!Backend.gitMissing(ended, &c));
+    }
+    // Only exit 127 without a sandbox failure counts.
+    c.text.clearRetainingCapacity();
+    try c.text.appendSlice(std.testing.allocator, "sh: 1: git: not found\n");
+    try std.testing.expect(!Backend.gitMissing(.{ .code = 1, .failure = "" }, &c));
+    try std.testing.expect(!Backend.gitMissing(.{ .code = 127, .failure = "oom" }, &c));
+}
+
+test "commitMismatch: a requested commit must be the archive's, naming both when not" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const one = "0123456789abcdef0123456789abcdef01234567";
+    const two = "fedcba9876543210fedcba9876543210fedcba98";
+    try std.testing.expect((try commitMismatch(arena, one, one)) == null);
+    try std.testing.expect((try commitMismatch(arena, "0123456789ABCDEF0123456789abcdef01234567", one)) == null);
+    // Nothing requested, a ref that is not a commit, or an archive that says nothing: no comparison.
+    try std.testing.expect((try commitMismatch(arena, null, one)) == null);
+    try std.testing.expect((try commitMismatch(arena, "v1", one)) == null);
+    try std.testing.expect((try commitMismatch(arena, one, null)) == null);
+    const msg = (try commitMismatch(arena, one, two)).?;
+    try std.testing.expect(std.mem.indexOf(u8, msg, one) != null and std.mem.indexOf(u8, msg, two) != null);
+}
+
+test "extraction makes a mode 000 directory usable by the job's user" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    // An archive whose directories and files all have mode 000, made by GNU tar (skipped without it).
+    const make = try std.fmt.allocPrint(arena, "set -e; cd '{s}'; mkdir -p top/locked/inner; echo a > top/locked/inner/f; echo b > top/g; " ++
+        "mkdir dl; tar -czf dl/source.tar.gz --mode='u-rwx,g-rwx,o-rwx' top", .{root});
+    const made = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", make } }) catch return error.SkipZigTest;
+    if (made.term != .exited or made.term.exited != 0) return error.SkipZigTest;
+    const script = try extractScriptFrom(arena, try std.fmt.allocPrint(arena, "{s}/out", .{root}), try std.fmt.allocPrint(arena, "{s}/dl", .{root}));
+    const ran = try std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", script } });
+    errdefer std.debug.print("{s}{s}\n", .{ ran.stdout, ran.stderr });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, ran.term);
+    const listed = try std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", try std.fmt.allocPrint(arena, "cd '{s}/out' && find . -printf '%P|%m\\n' | sort", .{root}) } });
+    try std.testing.expectEqualStrings("|755\ng|644\nlocked|755\nlocked/inner|755\nlocked/inner/f|644\n", listed.stdout);
 }
 
 /// The listing a job prints of its workspace, for comparing a tree from git with one from a tarball:
@@ -714,4 +988,74 @@ test "a remote action fetched in an image with no git: its archive extracted, th
     try std.testing.expect(std.mem.indexOf(u8, text, "composite-ran 7 from /github/_actions/o/act/v1") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "data.txt") != null);
     try std.testing.expect(!srv.cdn_saw_auth.load(.acquire));
+}
+
+test "after the first fetch finds no git, the next action's fetch does not run git again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    const ar = try testArchiveOf(arena, &tmp, "printf 'runs:\\n  using: composite\\n  steps:\\n    - shell: bash\\n      run: echo ran\\n' > action.yml");
+    // A git that counts its runs, in a file of the test's directory (bound in the step).
+    try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "rootfs/{s}", .{ar.root}));
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{ .host = ar.root, .at = ar.root }} });
+    try tmp.dir.writeFile(io, .{ .sub_path = "nogit.sh", .data = try std.fmt.allocPrint(
+        arena,
+        "#!/bin/sh\necho x >> '{s}/git-runs'\necho \"sh: 1: git: not found\" >&2\nexit 127\n",
+        .{ar.root},
+    ), .flags = .{ .permissions = .fromMode(0o755) } });
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{
+        .host = try std.fmt.allocPrint(arena, "{s}/nogit.sh", .{ar.root}),
+        .at = "/usr/bin/git",
+    }} });
+    var srv: TestServer = .{ .archive_path = "/o/one/archive/v1.tar.gz", .archive_path2 = "/o/two/archive/v1.tar.gz", .body = ar.tgz };
+    try srv.start();
+    defer srv.stop();
+
+    const steps = [_]job_mod.Step{ usesStep("one", "o", "one", "v1", &.{}), usesStep("two", "o", "two", "v1", &.{}) };
+    var job = testJob(&steps);
+    job.github.server_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port});
+    var env: std.process.Environ.Map = .init(arena);
+    var w: Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, io, &env, .{ .native = cfg, .step_user = .root, .gpa = std.testing.allocator }, job, &log);
+    errdefer std.debug.print("{s}\n", .{w.written()});
+    try expectSucceeded(res, w.written(), 2);
+    const runs = try tmp.dir.readFileAlloc(io, "git-runs", arena, .limited(1 << 12));
+    try std.testing.expectEqualStrings("x\n", runs);
+}
+
+test "an action pinned to a commit the archive is not: the step says both" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    const ar = try testArchiveOf(arena, &tmp, "printf 'runs:\\n  using: composite\\n  steps:\\n    - shell: bash\\n      run: echo ran\\n' > action.yml");
+    try tmp.dir.writeFile(io, .{ .sub_path = "nogit.sh", .data = "#!/bin/sh\necho \"sh: 1: git: not found\" >&2\nexit 127\n", .flags = .{ .permissions = .fromMode(0o755) } });
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{
+        .host = try std.fmt.allocPrint(arena, "{s}/nogit.sh", .{ar.root}),
+        .at = "/usr/bin/git",
+    }} });
+    const asked = "fedcba9876543210fedcba9876543210fedcba98";
+    var srv: TestServer = .{ .archive_path = "/o/act/archive/" ++ asked ++ ".tar.gz", .body = ar.tgz };
+    try srv.start();
+    defer srv.stop();
+    const steps = [_]job_mod.Step{usesStep("act", "o", "act", asked, &.{})};
+    var job = testJob(&steps);
+    job.github.server_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port});
+    var env: std.process.Environ.Map = .init(arena);
+    var w: Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, io, &env, .{ .native = cfg, .step_user = .root, .gpa = std.testing.allocator }, job, &log);
+    errdefer std.debug.print("{s}\n", .{w.written()});
+    try std.testing.expect(res.steps[0].outcome != .success);
+    const text = w.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, asked) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, ar.sha) != null);
 }

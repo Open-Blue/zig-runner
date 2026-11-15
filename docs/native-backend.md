@@ -3563,29 +3563,37 @@ at 21.3 ms on the same machine and Dagger's ~224 ms for the latter.
 The checkout and the fetch of a `uses:` action run `git` in the job's image. An image without it
 (`python:*-slim`, Alpine, most minimal images) used to send a job with a remote action to Dagger,
 and failed its checkout step natively; with `RUNNER_ENGINE=none` it was a refusal. Now the first
-fetch that finds no git (`sh` exits 127 naming it, `Backend.gitMissing`) makes the rest of the job's
-fetches use the repository's tarball, as actions/checkout does without git:
+fetch that finds no git (`sh` exits 127 and says `git: not found`, `git: command not found` or
+`git: No such file or directory`, `Backend.gitMissing`; another tool's 127 that only mentions git is not
+it) makes the rest of the job's fetches use (and they do not run the git script again) the repository's tarball, as actions/checkout does without git:
 
 - The runner downloads it (HTTPS, its own client): the checkout from the REST API
   (`/repos/<repo>/tarball/<ref>`, `<server>/api/v3` on a GitHub Enterprise Server, `api.<host>` on
   `*.ghe.com`) with the job's token; an action from the web archive
   (`<server>/<repo>/archive/<ref>.tar.gz`) with none, as the Dagger path fetches other repositories.
   Redirects are followed by the runner, and the token goes to the first host only (std's client
-  would keep it across hosts).
+  would keep it across hosts). A 429, a 5xx or a rate-limited 403 is tried again up to three times,
+  after 1, 2 and 4 s or what GitHub asks (`Retry-After`, `x-ratelimit-reset`, at most a minute, as
+  `github/ratelimit.zig`), inside the download's 15-minute limit; a cancel ends the wait. A ref with an
+  empty, `.` or `..` segment is refused (it would change the request's path; no git ref has one).
 - The step extracts it with the image's `tar` (so the image needs `tar` and `gzip`, as every image
   that has a shell does) from a read-only bind of the download, so the files get the job's ids and
   the layer as any step's do: no code of the runner touches a layer. Modes are normalised to git's
   checkout (755 for directories and executables, 644 otherwise) and the files get the checkout's
-  fixed time. A tarball of a commit is cached like any fetch of one; a branch's is not.
+  fixed time (a directory the archive stores with mode 000 is made enterable first, so a job user that
+  is not root can walk it). A tarball of a commit is cached like any fetch of one; a branch's is not.
 - Not covered: a Gitea or Forgejo instance's checkout in such an image (their API is `/api/v1`, not
   `/api/v3`): it fails saying the download got a 404, as the git fetch failed before.
 - What it lacks, as without git on GitHub: no `.git` (the step's `git` lines that set refs fail
   quietly, as `refCommands` says they may), no history, no tags, and no submodules: a checkout with
   `submodules:` fails saying the image has no git. `fetch-depth` and `fetch-tags` are logged as 1
-  and none.
+  and none. **Git LFS pointers arrive unresolved**: a tarball holds the pointer files, not the large
+  files they name (as with actions/checkout without git), so a repository that uses LFS needs an
+  image with git.
 - An action's commit is the one `git archive` records in the archive's first entry (a pax global
   header, read by `tarball.commitOf` from the first KiB of the stream and accepted only as 40 hex
-  digits), or the ref when it is one. Fuzzed: `fuzz: tarball sources and pax header`.
+  digits), or the ref when it is one; when a commit was asked for (a 40-hex ref), the archive's must
+  be that commit, else the step fails naming both. Fuzzed: `fuzz: tarball sources and pax header`.
 - Tested against the git path as an oracle (`native/tarball.zig`, root tests): the same
   repository checked out by git over `file://` and by tarball from a local server give the same
   listing (names, types, modes, sizes, mtimes, hashes, a link); the token reaches the API and not

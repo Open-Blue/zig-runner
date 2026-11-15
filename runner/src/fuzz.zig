@@ -681,7 +681,12 @@ fn tarballs(_: void, smith: *Smith) !void {
     const repo = take(smith, &rbuf);
     const ref = take(smith, &fbuf);
     const record = take(smith, &hbuf);
-    for ([_]tarball.Source{
+    // A ref with an empty, `.` or `..` segment is refused (`error.InvalidRef`), as a job's is.
+    const refused = tarball.refProblem(ref) != null;
+    if (refused) {
+        try std.testing.expectError(error.InvalidRef, tarball.actionSource(arena, server, repo, ref));
+    }
+    if (!refused) for ([_]tarball.Source{
         try tarball.checkoutSource(arena, server, repo, ref, null),
         try tarball.actionSource(arena, server, repo, ref),
     }) |src| {
@@ -691,7 +696,7 @@ fn tarballs(_: void, smith: *Smith) !void {
             try std.testing.expect(std.mem.indexOfScalar(u8, ref, '?') == null or uri.query == null or
                 std.mem.indexOf(u8, src.url, "%3F") != null);
         } else |_| {}
-    }
+    };
     // A pax header block holding the record, as a tar's first entry.
     var block: [1024 + 2048]u8 = @splat(0);
     block[156] = if (smith.value(bool)) 'g' else 'x';

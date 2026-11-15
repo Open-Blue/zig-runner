@@ -2562,10 +2562,23 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     return f;
 }
 
-/// Whether a script that ran `git` ended because the image has none: `sh` exits 127 and names it.
+/// Whether a script that ran `git` ended because the image has none: `sh` exits 127 and says the
+/// `git` command is the one it could not find (dash and busybox "sh: 1: git: not found", bash
+/// "git: command not found", a path's "/usr/bin/git: No such file or directory"). Another tool's
+/// 127 that only mentions git is not it.
 pub fn gitMissing(ended: sandbox.Ended, out: *const Captured) bool {
     if (ended.failure.len > 0 or ended.code != 127) return false;
-    return std.mem.indexOf(u8, out.text.items, "git") != null;
+    var lines = std.mem.splitScalar(u8, out.text.items, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, " \r");
+        for ([_][]const u8{ "git: not found", "git: command not found", "git: No such file or directory" }) |tail| {
+            if (!std.mem.endsWith(u8, line, tail)) continue;
+            const before = line[0 .. line.len - tail.len];
+            // `git` is the whole name: not `legit` or `git-lfs`.
+            if (before.len == 0 or before[before.len - 1] == ' ' or before[before.len - 1] == '/') return true;
+        }
+    }
+    return false;
 }
 
 /// The built-in checkout in an image with no git (`tarball.zig`): the repository's tarball from
@@ -2580,6 +2593,10 @@ fn fetchCheckoutTarball(b: *Backend, x: *Exec, co: job_mod.Checkout, f_in: dagge
     if (co.submodules) {
         f.result = .{ .failed = "this job's image has no git, so a checkout with `submodules:` " ++
             "cannot fetch them (a tarball has none); use an image with git" };
+        return f;
+    }
+    if (tarball.refProblem(f.want)) |why| {
+        f.result = .{ .failed = try std.fmt.allocPrint(arena, "cannot fetch {s}@{s}: {s}", .{ f.repo, f.ref_label, why }) };
         return f;
     }
     const token: ?[]const u8 = if (x.gitAuth()) |id| plaintext(x, id) else null;
@@ -2602,7 +2619,7 @@ fn fetchCheckoutTarball(b: *Backend, x: *Exec, co: job_mod.Checkout, f_in: dagge
         f.result = .{ .dir = "native" };
         return f;
     }
-    const got = try tarball.fetchInto(b, f.mount, src, null, b.uid, b.gid);
+    const got = try tarball.fetchInto(b, f.mount, src, if (checkout.isSha(f.want)) f.want else null, b.uid, b.gid);
     switch (got) {
         .sha => {
             if (claim.key) |k| try b.publishTop(k, .fetch, .{ .log = "", .fc = "" });
