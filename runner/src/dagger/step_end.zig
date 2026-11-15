@@ -18,10 +18,10 @@
 //! lines go to `Options.step_ends`, which the caller writes out with the job's other lines.
 
 const std = @import("std");
-const linux = std.os.linux;
 const dagger = @import("../dagger.zig");
 const phases = @import("../native/phases.zig");
 const admission = @import("../admission.zig");
+const cgroup = @import("../native/cgroup.zig");
 
 /// A step's figures, as the line shows them. Null is `?`.
 pub const Figures = struct {
@@ -137,41 +137,7 @@ fn readFile(io: std.Io, dir: []const u8, name: []const u8, buf: []u8) ?[]const u
     return std.Io.Dir.cwd().readFile(io, path, buf) catch null;
 }
 
-/// `memory.peak` of a cgroup, from a file descriptor kept open from the step's start: where the
-/// kernel lets a write reset it, the reset is for that descriptor, so it reads the most memory
-/// the cgroup held since.
-const Peak = struct {
-    fd: ?linux.fd_t = null,
-    /// Whether the descriptor was reset: the peak is the step's.
-    reset: bool = false,
-
-    fn open(dir: []const u8) Peak {
-        var path_buf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
-        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/memory.peak", .{dir}, 0) catch return .{};
-        const rw = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-        if (linux.errno(rw) == .SUCCESS) {
-            const fd: linux.fd_t = std.math.cast(linux.fd_t, rw) orelse return .{};
-            if (linux.errno(linux.write(fd, "1", 1)) == .SUCCESS) return .{ .fd = fd, .reset = true };
-            // Open for writing but not resettable: the job's peak, read at the end.
-            return .{ .fd = fd };
-        }
-        const ro = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-        if (linux.errno(ro) != .SUCCESS) return .{};
-        return .{ .fd = std.math.cast(linux.fd_t, ro) };
-    }
-
-    fn read(p: Peak) ?u64 {
-        const fd = p.fd orelse return null;
-        var buf: [64]u8 = undefined;
-        const n = linux.pread(fd, &buf, buf.len, 0);
-        if (linux.errno(n) != .SUCCESS) return null;
-        return std.fmt.parseInt(u64, std.mem.trim(u8, buf[0..n], " \n"), 10) catch null;
-    }
-
-    fn close(p: Peak) void {
-        if (p.fd) |fd| _ = linux.close(fd);
-    }
-};
+const Peak = cgroup.Peak;
 
 /// The observer that writes a `step-end:` line as each step finishes, and passes everything on to
 /// `inner`. Steps run one at a time, so one step is under measurement at a time.
