@@ -1,0 +1,3 @@
+kind: Added
+body: 'Each native step''s log ends with its memory peak ("Native steps: this step''s memory peak was 2410 MB of the job''s 4.5 GB limit"), also when the step was OOM-killed, and the journal has a matching kind=step_memory_peak line (step, peak_mb, limit_mb, scope=step|job), so CI sees how close a step came to its limit without help from the job''s image. On kernels before 6.12 the peak cannot be reset per step and the line says "peak so far" (scope=job); with no memory.peak (cgroup v1, Linux before 5.19) there is no line. See docs/native-backend.md.'
+time: 2026-11-14T22:54:12.500964295-05:00

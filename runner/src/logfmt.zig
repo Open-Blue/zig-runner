@@ -95,6 +95,26 @@ pub fn warn(comptime kind: []const u8, comptime fmt: []const u8, args: anytype) 
     std.log.warn(joined(kind, fmt), args);
 }
 
+/// A plain event as `info: kind=<kind> <pairs>` on stderr, whatever the build's log level (a
+/// warning would be read as one by an alert; `std.log.info` is dropped in a release build).
+pub fn info(comptime kind: []const u8, comptime fmt: []const u8, args: anytype) void {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.writeAll("info: ") catch return;
+    w.print(comptime joined(kind, fmt) ++ "\n", args) catch {
+        w.end = buf.len - 1;
+        buf[w.end] = '\n';
+        w.end += 1;
+    };
+    const io = std.Options.debug_io;
+    const prev = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(prev);
+    var buffer: [64]u8 = undefined;
+    const stderr = std.debug.lockStderr(&buffer).terminal();
+    defer std.debug.unlockStderr();
+    stderr.writer.writeAll(w.buffered()) catch {};
+}
+
 /// An error through `std.log`.
 pub fn err(comptime kind: []const u8, comptime fmt: []const u8, args: anytype) void {
     std.log.err(joined(kind, fmt), args);

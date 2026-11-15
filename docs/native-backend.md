@@ -1368,6 +1368,29 @@ it with a native step (20.2 s, `apt-get` the whole of it), and ran a step in it 
   (`zig_release.Registry.discover`) is off natively. Rootless runners without delegation have no
   limits (P5 must refuse untrusted jobs there).
 
+#### A step's memory peak
+
+When a native step ends, whatever ended it (success, failure, cancel, or an OOM kill: the runner
+writes the line, not the step), its log gets one line from the runner:
+
+    Native steps: this step's memory peak was 2410 MB of the job's 4.5 GB limit
+
+The figure is `memory.peak` of the job's `steps` cgroup (`cgroup.Peak`), page cache included, so it
+reads higher than the step's resident memory and is what the kernel compares with the limit (the
+job's `memory.max`). It exists so that a job sees how close a step came to its limit without any
+tool in the job's image (a step cannot read its own cgroup's files from inside the sandbox, and an
+image may lack `/usr/bin/time`). The journal has the same as `info: kind=step_memory_peak step=<n>
+peak_mb=<n> limit_mb=<n|max> scope=step|job`; the kind is stable, as the other log kinds are.
+
+- **Per step (`scope=step`).** Linux 6.12 lets a write to `memory.peak` reset it for the open file
+  that wrote it. The runner opens the file when the step starts, resets it, and reads it when the
+  step ends, so each step reports its own peak.
+- **Cumulative (`scope=job`).** On an older kernel the file cannot be reset. The line then says
+  "the job's memory peak so far (this kernel cannot reset it per step)": the highest the steps have
+  held since the job began, so a later step's figure is never below an earlier one's.
+- **No line** where `memory.peak` does not exist (cgroup v1, Linux before 5.19), and for a step
+  replayed from the cache, which did not run. A missing number is not replaced by a wrong one.
+
 #### The tool cache's trees
 
 A rerun of a job that installs a tool took 49 s natively and 2 s on Dagger (razorbill, v0.25.0, a

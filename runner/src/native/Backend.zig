@@ -1936,6 +1936,8 @@ pub fn execScript(
             .arena = arena,
             .record = if (claim.key != null) .empty else null,
         };
+        const peak: ?cgroup.Peak = if (b.job_cgroup) |j| cgroup.Peak.open(j.stepsDir()) else null;
+        defer if (peak) |p| p.close();
         const ended = try b.exec(
             script,
             try b.envStrings(extra.items),
@@ -1951,6 +1953,7 @@ pub fn execScript(
         // Every line is in: the pipe is closed only once every process of the step has ended.
         demux.flushPartial();
         try b.limitsReached(x, num);
+        if (peak) |p| b.reportPeak(x, num, p);
         x.sh.ended[num - 1].store(true, .release);
         x.sh.flush();
         if (ended.failure.len > 0) {
@@ -2041,6 +2044,25 @@ fn limitsReached(b: *Backend, x: *Exec, num: u32) !void {
             "refused {d} new process(es) or thread(s).",
         .{ Limit.count(b.limits.pids_max), u.pids_max_hits - b.pids_max_hits },
     ));
+}
+
+/// Says in the step's log how much memory the step peaked at, and in the journal as
+/// `kind=step_memory_peak` (`cgroup.Peak`): after an OOM kill too, as the runner writes it.
+/// Nothing where the kernel has no `memory.peak`.
+fn reportPeak(b: *Backend, x: *Exec, num: u32, p: cgroup.Peak) void {
+    const bytes = p.read() orelse return;
+    const j = b.job_cgroup orelse return;
+    const limit = admission.readCgroupBytes(b.io, j.dir, "memory.max");
+    const text = cgroup.peakText(b.arena, bytes, limit, p.reset) catch return orelse return;
+    x.sh.append(num, text);
+    var limit_buf: [24]u8 = undefined;
+    const limit_mb = if (limit) |l|
+        std.fmt.bufPrint(&limit_buf, "{d}", .{l >> 20}) catch "max"
+    else
+        "max";
+    logfmt.info("step_memory_peak", "step={d} peak_mb={d} limit_mb={s} scope={s}", .{
+        num, bytes >> 20, limit_mb, if (p.reset) "step" else "job",
+    });
 }
 
 /// The error line for `killed` processes OOM-killed in a step, by the limit they were killed for.
@@ -11917,6 +11939,47 @@ test "root runner: each step of a short job ends with a step-end line from its o
     // The second step's peak is its own where the kernel lets it be reset (Linux 6.12).
     if (std.mem.indexOf(u8, second, "peak_scope=job") == null)
         try std.testing.expect(try stepEndNumber(second, " mem_peak=") < 60_000_000);
+}
+
+test "root runner: each native step's log says its memory peak, the next step's its own" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    // About 200 MB held in a shell variable (the pipe's copies add to it, well under the caps).
+    var heavy = testStep("x=$(head -c 200000000 /dev/zero | tr '\\0' a); echo ${#x}");
+    var light = testStep("true");
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    heavy.name = "heavy";
+    light.name = "light";
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .sink_job_id = 4243,
+        .gpa = std.testing.allocator,
+    }, testJob(&.{ heavy, light }), &log);
+    try std.testing.expect(res.succeeded);
+    var peaks: [2]u64 = undefined;
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, w.written(), '\n');
+    const says = "Native steps: this step's memory peak was ";
+    while (lines.next()) |l| {
+        const at = std.mem.indexOf(u8, l, says) orelse continue;
+        const rest = l[at + says.len ..];
+        if (n < 2) peaks[n] = try std.fmt.parseInt(u64, rest[0..std.mem.indexOfScalar(u8, rest, ' ').?], 10);
+        n += 1;
+    }
+    std.debug.print("{s}\n", .{w.written()});
+    // Without a resettable memory.peak (before Linux 6.12) the lines say "so far" and these are none.
+    if (n == 0) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expect(peaks[0] >= 200);
+    try std.testing.expect(peaks[1] < 200);
 }
 
 /// The number after `key` in a `step-end:` line.

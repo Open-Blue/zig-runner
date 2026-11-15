@@ -939,6 +939,92 @@ pub const Usage = struct {
     pids_max_hits: u64,
 };
 
+/// A step's memory peak: `memory.peak` of the cgroup the steps run in, read at the step's end
+/// through the file held open since its start. Since Linux 6.12 a write to `memory.peak` resets
+/// the peak for that open file only, so the peak read is the step's own (`reset`); where the file
+/// cannot be written, it is the most the cgroup held since the job began (cumulative). Where the
+/// file is absent (cgroup v1, Linux before 5.19) there is no peak, and nothing is reported.
+pub const Peak = struct {
+    fd: ?linux.fd_t = null,
+    /// Whether the descriptor was reset: the peak is the step's.
+    reset: bool = false,
+
+    /// Held from the step's start. `dir` is `Job.stepsDir`.
+    pub fn open(dir: []const u8) Peak {
+        var path_buf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/memory.peak", .{dir}, 0) catch return .{};
+        const rw = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        if (linux.errno(rw) == .SUCCESS) {
+            const fd: linux.fd_t = std.math.cast(linux.fd_t, rw) orelse return .{};
+            if (linux.errno(linux.write(fd, "1", 1)) == .SUCCESS) return .{ .fd = fd, .reset = true };
+            // Open for writing but not resettable: the job's peak, read at the end.
+            return .{ .fd = fd };
+        }
+        const ro = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(ro) != .SUCCESS) return .{};
+        return .{ .fd = std.math.cast(linux.fd_t, ro) };
+    }
+
+    /// The peak in bytes, null when there is none to read.
+    pub fn read(p: Peak) ?u64 {
+        const fd = p.fd orelse return null;
+        var buf: [64]u8 = undefined;
+        const n = linux.pread(fd, &buf, buf.len, 0);
+        if (linux.errno(n) != .SUCCESS) return null;
+        return std.fmt.parseInt(u64, std.mem.trim(u8, buf[0..n], " \n"), 10) catch null;
+    }
+
+    pub fn close(p: Peak) void {
+        if (p.fd) |fd| _ = linux.close(fd);
+    }
+};
+
+/// The log line for a step's memory peak, null when there is none (`Peak.bytes`). `limit`: the
+/// job's `memory.max`, null for none.
+pub fn peakText(arena: Allocator, peak: ?u64, limit: ?u64, reset: bool) !?[]const u8 {
+    const b = peak orelse return null;
+    const mb = b >> 20;
+    const of: []const u8 = if (limit) |l|
+        try std.fmt.allocPrint(arena, " of the job's {f} limit", .{admission.gb(l >> 20)})
+    else
+        " (the job has no memory limit)";
+    return try std.fmt.allocPrint(arena, "Native steps: {s} {d} MB{s}", .{
+        if (reset) "this step's memory peak was" else "the job's memory peak so far (this kernel cannot reset it per step) is",
+        mb,
+        of,
+    });
+}
+
+test "native cgroup: the step's memory peak line says per step or so far, and nothing without a peak" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    try std.testing.expectEqual(@as(?[]const u8, null), try peakText(arena, null, 4 << 30, true));
+    try std.testing.expectEqualStrings(
+        "Native steps: this step's memory peak was 2410 MB of the job's 4.5 GB limit",
+        (try peakText(arena, 2410 << 20, 4608 << 20, true)).?,
+    );
+    const so_far = (try peakText(arena, 300 << 20, null, false)).?;
+    try std.testing.expect(std.mem.indexOf(u8, so_far, "peak so far") != null);
+    try std.testing.expect(std.mem.indexOf(u8, so_far, "300 MB (the job has no memory limit)") != null);
+}
+
+test "native cgroup: Peak reads a file's value and reports none for a missing one" {
+    const io = std.testing.io;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try std.testing.expectEqual(@as(?u64, null), Peak.open(dir).read());
+    try tmp.dir.writeFile(io, .{ .sub_path = "memory.peak", .data = "209715200\n" });
+    const p = Peak.open(dir);
+    defer p.close();
+    // A plain file takes the write, as a 6.12 kernel's does.
+    try std.testing.expect(p.reset);
+}
+
 /// Which limit an OOM kill in a job came from: `memory.events` counts `oom_kill` where the process
 /// was, and `oom` where the limit ran out. A kill for the machine's memory, or a limit above the
 /// jobs' parent, counts no `oom` here.
