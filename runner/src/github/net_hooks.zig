@@ -185,10 +185,72 @@ test "a wrapped Io times the lookup and the connect of a new connection, and no 
     const host: net.HostName = try .init("localhost");
     const stream = try host.connect(io, listener.socket.address.getPort(), .{ .mode = .stream });
     defer stream.close(io);
+    // The lookup was timed. `connect` has awaited it by now, so its note is in the table, though
+    // it may have been made after the connection (the lookup answers, the connect starts, and the
+    // lookup's own thread is not scheduled again until later): then `takeOpened` leaves it out of
+    // the connection's time, rightly, and whether it did is a matter of scheduling.
+    acquire();
+    var lookups_seen: usize = 0;
+    for (lookups) |l| if (l.host_len != 0 and l.start >= t0 and l.end >= l.start and
+        std.ascii.eqlIgnoreCase(l.host[0..l.host_len], "localhost"))
+    {
+        lookups_seen += 1;
+    };
+    lock.unlock();
+    try std.testing.expectEqual(@as(usize, 1), lookups_seen);
+    // The connect was timed: found by its socket, and only this once.
     const opened = takeOpened(stream.socket.handle, "LOCALHOST", t0, now()).?;
-    try std.testing.expect(opened.dns_ns != null);
+    if (opened.dns_ns) |dns| try std.testing.expect(dns <= now() - t0);
     // Taken once: a second look finds a connection that is no longer new.
     try std.testing.expect(takeOpened(stream.socket.handle, "localhost", t0, now()) == null);
+}
+
+test "takeOpened gives the lookup that ended before the connect, inside the window, of the host" {
+    // The notes written by hand, with the times a test chooses, as the hooks would have left them.
+    const fd = 1 << 20;
+    const note = struct {
+        fn lookup(host: []const u8, start: u64, end: u64) void {
+            acquire();
+            defer lock.unlock();
+            const slot = &lookups[lookups_next % slots];
+            lookups_next +%= 1;
+            @memcpy(slot.host[0..host.len], host);
+            slot.host_len = std.math.cast(u8, host.len).?;
+            slot.start = start;
+            slot.end = end;
+        }
+        fn connect(at: i32, start: u64, end: u64) void {
+            acquire();
+            defer lock.unlock();
+            connects[connects_next % slots] = .{ .fd = at, .start = start, .end = end };
+            connects_next +%= 1;
+        }
+    };
+    // A lookup before the window, another host's, and one that ended after the connect: none is
+    // this connection's. Of the two that fit, the one that ended last (30 ns) is, though the other
+    // (20 ns) was noted after it.
+    note.lookup("unit.test", 100, 200);
+    note.lookup("other.test", 1_000, 1_010);
+    note.lookup("unit.test", 1_000, 1_900);
+    note.lookup("unit.test", 1_000, 1_030);
+    note.lookup("unit.test", 1_005, 1_025);
+    note.connect(fd, 1_040, 1_100);
+    const opened = takeOpened(fd, "UNIT.test", 500, 1_500).?;
+    try std.testing.expectEqual(@as(?u64, 30), opened.dns_ns);
+    try std.testing.expectEqual(@as(u64, 60), opened.connect_ns);
+    try std.testing.expectEqual(@as(u64, 400), opened.after_connect_ns);
+    try std.testing.expect(takeOpened(fd, "unit.test", 500, 1_500) == null);
+    // A connection that ended before the window was open already.
+    note.connect(fd, 10, 20);
+    try std.testing.expect(takeOpened(fd, "unit.test", 500, 1_500) == null);
+    // A lookup that ended at the very moment the connect did fits; one a nanosecond later does not.
+    note.lookup("unit.test", 2_900, 3_100);
+    note.lookup("unit.test", 2_950, 3_101);
+    note.connect(fd, 3_000, 3_100);
+    try std.testing.expectEqual(@as(?u64, 200), takeOpened(fd, "unit.test", 2_800, 3_200).?.dns_ns);
+    // And no lookup at all in the window: the connection is new, the lookup is not known.
+    note.connect(fd, 2_000, 2_100);
+    try std.testing.expectEqual(@as(?u64, null), takeOpened(fd, "unit.test", 1_950, 2_200).?.dns_ns);
 }
 
 test "a wrapped connect sets TCP_NODELAY on its socket" {
