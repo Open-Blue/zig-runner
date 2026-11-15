@@ -10,7 +10,8 @@ name: analysis
 #                  broker's messages, HTTP/2 framing) held to GitHub's runner, and the runner's own
 #                  zstd decoder held to std's, and libzstd, which reads the layers, to that decoder,
 #                  and zlib-ng's inflater held to std's, on every input (an image layer from any
-#                  registry).
+#                  registry), and the native Dockerfile builder's parser and planner, which read
+#                  what an action's author wrote.
 #                  The corpus each finds
 #                  is kept from night to night in the Actions cache; a crash, a failed check, a
 #                  leak or a hang fails the job, named after its target, with the input as an
@@ -220,6 +221,11 @@ jobs:
           # What an HTTP server answers the network library's client with (hyper's parsing and our
           # redirect, header and body handling), one loopback server per run.
           - { target: HTTP responses, runs: 100K }
+          # What an action's Dockerfile is, read by the native builder before the job's first step:
+          # its parser and planner (stages, heredocs, flags, ARG scopes) and COPY's pattern matcher.
+          # No I/O: a run costs microseconds, so many runs fit in the time.
+          - { target: Dockerfile builder, runs: 2M }
+          - { target: COPY patterns, runs: 3M }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

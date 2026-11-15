@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Native eviction tests no longer fail under load: the pass''s time budget can be held still in tests, so a slow disk cannot cut a pass short (#548)'
+time: 2026-11-13T22:34:06.51014738-05:00

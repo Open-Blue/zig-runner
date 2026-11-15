@@ -210,7 +210,11 @@ Weekly, the comparison tools (`.github/scripts/*-diff.sh`) check the expression 
 reader, `hashFiles()`, problem matcher regular expressions, HPACK decoder and RS256 signing against
 the implementations they follow, on fresh random cases. One of them, `gitea-job-diff.sh`, has no
 random cases: it compares the `job.Job` built from each Gitea and Forgejo task in a committed
-corpus with what Gitea's own workflow model reads from the same task. It also lints the tools' own Go
+corpus with what Gitea's own workflow model reads from the same task. Another,
+`dockerfile-diff.sh`, builds the Dockerfiles of `runner/tools/dockerfile_oracle` with BuildKit and
+with the runner's native builder (as root, in the job) and compares the filesystems (paths, modes,
+owners, sizes, hashes, link targets) and the image configs; a fixture's `differences.txt` lists
+what the native build does differently on purpose. It also lints the tools' own Go
 (`.github/scripts/go-lint.sh`: `go vet`, a pinned staticcheck, the race detector, and govulncheck
 for information).
 

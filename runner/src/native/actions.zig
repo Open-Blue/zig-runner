@@ -73,15 +73,19 @@ fn reasonFor(b: *Backend, job: job_mod.Job, u: job_mod.Uses, depth: u32) anyerro
         .ok => |a| a,
         .failed, .unresolved => return null,
     };
-    return judge(b, job, act.meta, act.ref_label, .{
+    return judge(b, job, act.meta, act.ref_label, .{ .fetched = .{
         .dir = act.dir,
         .sub = act.sub,
-    }, depth);
+    } }, depth);
 }
 
-/// Where a fetched action's Dockerfile is, for `docker_action.buildReason`; null for a local
-/// action, whose tree is only in the workspace.
+/// Where a fetched action's Dockerfile is, for `docker_action.buildReason`.
 const Tree = struct { dir: []const u8, sub: []const u8 };
+
+/// Where an action's files are when it is judged: fetched, in a layer of the job; or local, in
+/// the job's repository at its commit (the path of the action's directory), where only what
+/// git can read before the job is known.
+const Where = union(enum) { fetched: Tree, local: []const u8 };
 
 /// Why an action with metadata `meta` cannot run natively, or null.
 fn judge(
@@ -89,7 +93,7 @@ fn judge(
     job: job_mod.Job,
     meta: action.Metadata,
     label: []const u8,
-    tree: ?Tree,
+    where: Where,
     depth: u32,
 ) anyerror!?[]const u8 {
     const arena = b.arena;
@@ -107,16 +111,26 @@ fn judge(
         .docker => |dk| {
             if (std.mem.startsWith(u8, dk.image, "docker://"))
                 return imageReason(b, dk.image["docker://".len..]);
-            const t = tree orelse return try std.fmt.allocPrint(arena, "{s} is built from a " ++
-                "Dockerfile in the workspace, which native steps build only from a fetched " ++
-                "action yet", .{label});
-            const from = if (t.sub.len > 0) t.sub else ".";
-            const rel = try std.fs.path.resolvePosix(arena, &.{ from, dk.image });
-            return docker_action.buildReason(b, .{
-                .dir = t.dir,
-                .context = std.fs.path.dirnamePosix(rel) orelse ".",
-                .dockerfile = std.fs.path.basenamePosix(rel),
-            }, label);
+            switch (where) {
+                .fetched => |t| {
+                    const from = if (t.sub.len > 0) t.sub else ".";
+                    const rel = try std.fs.path.resolvePosix(arena, &.{ from, dk.image });
+                    return docker_action.buildReason(b, .{
+                        .dir = t.dir,
+                        .context = std.fs.path.dirnamePosix(rel) orelse ".",
+                        .dockerfile = std.fs.path.basenamePosix(rel),
+                    }, label);
+                },
+                // Its Dockerfile read from the commit, as its `action.yml` was: what it asks of the
+                // builder is in the text. Its context is read from the workspace by the step.
+                .local => |at| {
+                    const rel = try std.fs.path.resolvePosix(arena, &.{ if (at.len > 0) at else ".", dk.image });
+                    const text = (try readOwn(b, job, std.fs.path.dirnamePosix(rel) orelse "", &.{std.fs.path.basenamePosix(rel)})) orelse
+                        return try std.fmt.allocPrint(arena, "the Dockerfile {s} of {s} is not in {s} at " ++
+                            "{s}, so what it builds cannot be known before the job", .{ rel, label, job.github.repository, job.github.sha });
+                    return docker_action.buildReasonText(b, text, label);
+                },
+            }
         },
         .composite => |steps| for (steps) |st| {
             if (st.condition) |c| if (try expr.neverTrue(arena, c)) continue;
@@ -159,17 +173,18 @@ fn localReason(b: *Backend, job: job_mod.Job, path: []const u8, depth: u32) anye
     const not_known = try std.fmt.allocPrint(arena, "the local action {s} is not in {s} at " ++
         "{s}, so what it is cannot be known before the job", .{ label, job.github.repository, job.github.sha });
     if (job.github.repository.len == 0 or job.github.sha.len == 0) return not_known;
-    const text = (try readOwn(b, job, path)) orelse return not_known;
+    const text = (try readOwn(b, job, path, &.{ "action.yml", "action.yaml" })) orelse return not_known;
     const meta = switch (try action.parse(arena, text)) {
         .ok => |m| m,
         // The step reads it again and fails with why, as on Dagger.
         .invalid => return null,
     };
-    return judge(b, job, meta, label, null, depth);
+    return judge(b, job, meta, label, .{ .local = path }, depth);
 }
 
-/// `<path>/action.yml` (or `.yaml`) of the job's repository at its commit, or null.
-fn readOwn(b: *Backend, job: job_mod.Job, path: []const u8) !?[]const u8 {
+/// The first of the files `names` in the directory `path` of the job's repository at its commit
+/// (an action's `action.yml` or `.yaml`, its Dockerfile), or null.
+fn readOwn(b: *Backend, job: job_mod.Job, path: []const u8, names: []const []const u8) !?[]const u8 {
     const arena = b.arena;
     const server = std.mem.trimEnd(u8, job.github.server_url, "/");
     b.preflights += 1;
@@ -181,7 +196,12 @@ fn readOwn(b: *Backend, job: job_mod.Job, path: []const u8) !?[]const u8 {
     try dagger.shellQuote(w, try std.fmt.allocPrint(arena, "{s}/{s}.git", .{ server, job.github.repository }));
     try w.writeAll("\ngit -c protocol.version=2 fetch -q --depth=1 --filter=blob:none --no-tags origin ");
     try dagger.shellQuote(w, job.github.sha);
-    try w.writeAll("\nfor f in action.yml action.yaml; do\n  if git cat-file -e FETCH_HEAD:");
+    try w.writeAll("\nfor f in");
+    for (names) |n| {
+        try w.writeByte(' ');
+        try dagger.shellQuote(w, n);
+    }
+    try w.writeAll("; do\n  if git cat-file -e FETCH_HEAD:");
     try dagger.shellQuote(w, try std.fmt.allocPrint(arena, "{s}{s}", .{ path, if (path.len > 0) "/" else "" }));
     try w.writeAll("\"$f\" 2>/dev/null; then git cat-file -p FETCH_HEAD:");
     try dagger.shellQuote(w, try std.fmt.allocPrint(arena, "{s}{s}", .{ path, if (path.len > 0) "/" else "" }));
@@ -691,9 +711,10 @@ test "preload: a JavaScript action, a local one, or an image not in the store se
     const cfg = try testActions(arena, &tmp);
     try testRepo(arena, &tmp, "js", &.{.{ "action.yml", "runs:\n  using: node20\n  main: index.js\n" }});
     try testRepo(arena, &tmp, "far", &.{.{ "action.yml", "runs:\n  using: docker\n  image: docker://zr-test/other:1\n" }});
+    // Multi-stage builds are native now; an archive in `ADD` is still not.
     try testRepo(arena, &tmp, "multi", &.{
         .{ "action.yml", "runs:\n  using: docker\n  image: Dockerfile\n" },
-        .{ "Dockerfile", "FROM zr-test/base:1 AS build\nFROM zr-test/base:1\n" },
+        .{ "Dockerfile", "FROM scratch\nADD app.tar.gz /\n" },
     });
     const Case = struct { step: job_mod.Step, why: ?[]const u8 };
     var local = testStep("");
@@ -706,7 +727,7 @@ test "preload: a JavaScript action, a local one, or an image not in the store se
         .{ .step = usesStep("j", "o", "js", "v1", &.{}), .why = "o/js@v1 is a JavaScript action" },
         .{ .step = local, .why = "is not in o/r at" },
         .{ .step = usesStep("f", "o", "far", "v1", &.{}), .why = "zr-test/other:1 is not in the tests' images directory" },
-        .{ .step = usesStep("m", "o", "multi", "v1", &.{}), .why = "line 1: multi-stage" },
+        .{ .step = usesStep("m", "o", "multi", "v1", &.{}), .why = "line 2: ADD of an archive" },
         // One that cannot be fetched is not a reason: native "Set up job" fails with it.
         .{ .step = usesStep("n", "o", "nope", "v1", &.{}), .why = null },
     }) |c| {
@@ -824,6 +845,8 @@ test "local actions natively: judged from the job's commit before the job, read 
     try tmp.dir.createDirPath(std.testing.io, "work/r/.github/actions/hello");
     try tmp.dir.createDirPath(std.testing.io, "work/r/.github/actions/img");
     try tmp.dir.createDirPath(std.testing.io, "work/r/.github/actions/built");
+    try tmp.dir.createDirPath(std.testing.io, "work/r/.github/actions/onbuild");
+    try tmp.dir.createDirPath(std.testing.io, "work/r/.github/actions/built/data");
     const sha = try ownRepo(arena, &tmp, &.{
         .{
             ".github/actions/hello/action.yml",
@@ -844,15 +867,32 @@ test "local actions natively: judged from the job's commit before the job, read 
             \\  entrypoint: sh
             \\  args: ["-c", "echo local image action in $PWD"]
         },
-        .{ ".github/actions/built/action.yml", "runs:\n  using: docker\n  image: Dockerfile\n" },
-        .{ ".github/actions/built/Dockerfile", "FROM zr-test/base:1\n" },
+        .{ ".github/actions/built/action.yml", "runs:\n  using: docker\n  image: Dockerfile\n  args: [\"local\"]\n" },
+        // A Dockerfile action of the repository itself, built from the workspace's files (the
+        // context is the Dockerfile's directory): a COPY from it, a RUN, a stage's COPY --from.
+        .{
+            ".github/actions/built/Dockerfile",
+            \\FROM zr-test/base:1 AS build
+            \\COPY entrypoint.sh /out/entrypoint.sh
+            \\RUN chmod 755 /out/entrypoint.sh && echo built-by-run > /out/built
+            \\FROM zr-test/base:1
+            \\COPY --from=build /out /
+            \\COPY data /data
+            \\ENTRYPOINT ["/entrypoint.sh"]
+        },
+        .{ ".github/actions/built/entrypoint.sh", "#!/bin/sh\necho \"built $1: $(cat /built) $(cat /data/a) in $PWD\"\n" },
+        .{ ".github/actions/built/data/a", "data-a" },
+        .{ ".github/actions/onbuild/action.yml", "runs:\n  using: docker\n  image: Dockerfile\n" },
+        .{ ".github/actions/onbuild/Dockerfile", "FROM zr-test/base:1\nONBUILD RUN true\n" },
     });
     const x = [_]job_mod.Input{.{ .name = "x", .value = .{ .lit = "yes" } }};
     var co = testStep("");
     co.action = .{ .checkout = &.{} };
     var hello = testStep("");
     hello.action = .{ .uses = .{ .owner = "", .name = "", .path = ".github/actions/hello", .ref = "", .inputs = &x, .local = true } };
-    var job = testJob(&.{ co, hello });
+    var built = testStep("");
+    built.action = .{ .uses = .{ .owner = "", .name = "", .path = ".github/actions/built", .ref = "", .local = true } };
+    var job = testJob(&.{ co, hello, built });
     job.github.server_url = "file:///srv/git";
     job.github.sha = sha;
 
@@ -867,17 +907,22 @@ test "local actions natively: judged from the job's commit before the job, read 
     const text = w.written();
     errdefer std.debug.print("{s}\n", .{text});
     try std.testing.expect(res.succeeded);
-    for ([_][]const u8{ "Engine: native", "local composite yes", "local image action in /github/workspace" }) |e|
+    for ([_][]const u8{
+        "Engine: native",
+        "local composite yes",
+        "local image action in /github/workspace",
+        "built local: built-by-run data-a in /github/workspace",
+    }) |e|
         if (std.mem.indexOf(u8, text, e) == null) {
             std.debug.print("missing {s}\n", .{e});
             return error.TestUnexpectedResult;
         };
 
-    // Not at the job's commit, or built from a Dockerfile in the workspace: to Dagger.
+    // Not at the job's commit, or built from a Dockerfile the builder refuses: to Dagger.
     const Case = struct { path: []const u8, why: []const u8 };
     for ([_]Case{
         .{ .path = "made/by/a/step", .why = "is not in o/r at" },
-        .{ .path = ".github/actions/built", .why = "Dockerfile in the workspace" },
+        .{ .path = ".github/actions/onbuild", .why = "ONBUILD" },
     }) |c| {
         var st = testStep("");
         st.action = .{ .uses = .{ .owner = "", .name = "", .path = c.path, .ref = "", .local = true } };

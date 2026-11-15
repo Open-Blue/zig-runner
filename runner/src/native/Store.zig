@@ -790,10 +790,19 @@ fn publishStaged(
     const lazy = s.deferEpoch(io);
     const entry = try openRoot(arena, tmp);
     defer _ = linux.close(entry);
+    // Directories its user cannot enter (`enter`), made enterable for the walks and put back before
+    // the layer is published, or on any error.
+    var entered: []const Entered = &.{};
+    defer leave(arena, entry, entered);
     var whole_disk = false;
     var syncfs_ns: ?u64 = null;
     const todo = if (lazy != null) &.{} else writeBack(arena, io, entry, s.syncLimit(io)) catch |e| switch (e) {
         error.Unreadable, error.TooLarge => no: {
+            whole_disk = true;
+            break :no &.{};
+        },
+        error.Stat, error.OpenDir => no: {
+            entered = try enter(arena, io, entry);
             whole_disk = true;
             break :no &.{};
         },
@@ -811,7 +820,19 @@ fn publishStaged(
     // and the store would count less than it holds.
     // The same walk counts its entries, for the step's next upper (`Layer.entries`): synced or
     // not, as a deferred sync (`lazy`) walks nothing else.
-    const size = try treeSize(arena, io, fs_tmp);
+    const size = treeSize(arena, io, fs_tmp) catch |e| switch (e) {
+        error.Stat, error.OpenDir => no: {
+            if (entered.len == 0) entered = try enter(arena, io, entry);
+            break :no try treeSize(arena, io, fs_tmp);
+        },
+        else => return e,
+    };
+    if (entered.len > 0) {
+        // Their modes back, and on disk with the rest: a crash must not leave the entered ones.
+        leave(arena, entry, entered);
+        entered = &.{};
+        if (lazy == null) try s.syncDisk(lock.?);
+    }
     m.bytes = size.bytes;
     m.pending = lazy;
     if (ph) |p| t = p.since(arena, .size, t);
@@ -1444,7 +1465,7 @@ fn collectLocked(s: Store, arena: Allocator, io: std.Io, ph: ?*phases.Phases, st
     // again. So under it a layer goes as the rest does (`evict.floor`), sparing recent use, and
     // only past the cap whatever its use.
     const keep = @min(s.max_bytes, total -| (Eviction.shortOf(arena, io, s) orelse 0));
-    const budget: Eviction.Budget = .init(io, s.limits.budget_ms);
+    const budget: Eviction.Budget = .initAt(io, s.limits.budget_ms, s.limits.budget_clock_ms);
     if (total > keep) {
         std.mem.sort(Entry, entries.items, {}, struct {
             fn lt(_: void, a: Entry, b: Entry) bool {
@@ -1770,6 +1791,70 @@ fn listDir(arena: Allocator, io: std.Io, fd: linux.fd_t) ![]Node {
     return out.items;
 }
 
+/// A directory `enter` made searchable, and the mode it had. Only a tree no one else can see
+/// (`publishStaged`'s, before its rename): a published layer is a lower other jobs mount, and a
+/// crash in the middle leaves a staging tree, which the store's sweep of `.tmp-*` removes.
+const Entered = struct { rel: []const u8, mode: u32 };
+
+/// Gives every directory under `root` that its owner could not search (a `COPY --chmod=640` of a
+/// directory, a step's `chmod 000`) u+rx, so a walk can read it, and returns what it changed in the
+/// order it did (parents first). `leave` puts the modes back. A directory the caller does not own
+/// is left as it is, and the walk fails there as it did.
+fn enter(arena: Allocator, io: std.Io, root: linux.fd_t) ![]const Entered {
+    var done: std.ArrayList(Entered) = .empty;
+    errdefer leave(arena, root, done.items);
+    var rst: linux.Statx = undefined;
+    if (linux.errno(linux.statx(root, "", linux.AT.EMPTY_PATH, stat_mask, &rst)) != .SUCCESS) return error.Stat;
+    if (rst.mode & 0o500 != 0o500 and linux.errno(linux.fchmod(root, (rst.mode & 0o7777) | 0o500)) == .SUCCESS)
+        try done.append(arena, .{ .rel = "", .mode = rst.mode & 0o7777 });
+    var stack: std.ArrayList([]const u8) = .empty;
+    try stack.append(arena, "");
+    while (stack.pop()) |rel| {
+        // The root again from its start: a listing is read once from a descriptor.
+        const fd = try openRel(arena, root, if (rel.len == 0) "." else rel);
+        defer _ = linux.close(fd);
+        for (try listDir(arena, io, fd)) |n| {
+            if (n.kind() != linux.S.IFDIR) continue;
+            const sub = if (rel.len == 0) try arena.dupe(u8, n.name) else try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, n.name });
+            const mode = n.st.mode & 0o7777;
+            // From the parent: a 0000 directory cannot be opened to be changed through its own descriptor.
+            if (mode & 0o500 != 0o500 and chmodDirAt(arena, fd, n.name, mode | 0o500))
+                try done.append(arena, .{ .rel = sub, .mode = mode });
+            try stack.append(arena, sub);
+        }
+    }
+    return done.items;
+}
+
+/// The modes `enter` changed, put back exactly, children before parents; each one that cannot be
+/// is logged.
+fn leave(arena: Allocator, root: linux.fd_t, done: []const Entered) void {
+    var i = done.len;
+    while (i > 0) {
+        i -= 1;
+        const fd = if (done[i].rel.len == 0) root else openRel(arena, root, done[i].rel) catch |e| {
+            std.log.warn("native: cannot open {s} to restore its mode {o}: {s}", .{ done[i].rel, done[i].mode, @errorName(e) });
+            continue;
+        };
+        const rc = linux.fchmod(fd, done[i].mode);
+        if (linux.errno(rc) != .SUCCESS) std.log.warn("native: cannot restore the mode {o} of {s}: {t}", .{ done[i].mode, done[i].rel, linux.errno(rc) });
+        if (fd != root) _ = linux.close(fd);
+    }
+}
+
+/// `name` of the directory `parent` given `mode`, only if it is a directory (never a link put there
+/// since it was listed): through an `O_PATH` descriptor, which a directory nobody may open allows,
+/// and its `/proc/self/fd` name.
+fn chmodDirAt(arena: Allocator, parent: linux.fd_t, name: [*:0]const u8, mode: u32) bool {
+    const flags: linux.O = .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true };
+    const rc = linux.openat(parent, name, flags, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    const fd: linux.fd_t = std.math.cast(linux.fd_t, rc) orelse return false;
+    defer _ = linux.close(fd);
+    const p = std.fmt.allocPrintSentinel(arena, "/proc/self/fd/{d}", .{fd}, 0) catch return false;
+    return linux.errno(linux.chmod(p, mode)) == .SUCCESS;
+}
+
 pub fn openDirAt(fd: linux.fd_t, name: [*:0]const u8) !linux.fd_t {
     const flags: linux.O = .{
         .ACCMODE = .RDONLY,
@@ -2063,6 +2148,8 @@ pub fn treeDigestTo(
 ) !Key {
     const fd = try openRoot(arena, p);
     defer _ = linux.close(fd);
+    // Never `enter`s: a layer it is asked of may be published, used as a lower by other jobs, and
+    // a chmod of it would be seen by them. A directory its user cannot search fails the walk.
     var h: KeyHasher = .{ .h = .init(.{}), .bytes = bytes };
     h.field("tree");
     try digestIn(arena, io, &h, fd, "", depth, ids, 0);
@@ -3187,6 +3274,100 @@ test "native store: a publish syncs the entry's own tree, and a file it cannot o
         try treeBytes(arena, io, hit.layer.fs),
     );
     _ = linux.chmod(try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/a/secret", .{hit.layer.fs}), 0), 0o600);
+}
+
+/// `d` and `d/sub` under `base` back to 0700, in the order a walk needs, so a test's directory can be
+/// removed by the user that made it.
+fn unlockForCleanup(arena: Allocator, base: []const u8) void {
+    for ([_][]const u8{ "d", "d/sub" }) |rel| {
+        const at = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ base, rel }, 0) catch return;
+        _ = linux.chmod(at, 0o700);
+    }
+}
+
+test "native store: a tree with directories its user cannot enter (0640, 0000) publishes with its modes unchanged" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const tree = try std.fmt.allocPrint(arena, "{s}/t", .{root});
+    try tmp.dir.createDirPath(io, "t/d/sub/deep");
+    try tmp.dir.writeFile(io, .{ .sub_path = "t/d/f", .data = "f" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "t/d/sub/deep/g", .data = "g" });
+    const modes = [_]struct { rel: []const u8, mode: u32 }{ .{ .rel = "d/sub", .mode = 0 }, .{ .rel = "d", .mode = 0o640 } };
+    defer unlockForCleanup(arena, tree);
+    // Inside out, as a user's `COPY --chmod` leaves them.
+    for (modes) |m| {
+        const at = try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/{s}", .{ tree, m.rel }), 0);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(at, m.mode)));
+    }
+    const s: Store = .{ .root = try std.fmt.allocPrint(arena, "{s}/store", .{root}) };
+    try prepare(arena, io, s.root, .{ .check_parents = false });
+    var kh: KeyHasher = .plain("unenterable");
+    const k = kh.final();
+    var never: std.atomic.Value(bool) = .init(false);
+    const kl = try s.lockKey(arena, io, k, &never);
+    defer kl.close(io);
+    const l = try s.publish(arena, io, k, .fetch, tree, .{ .log = "", .fc = "" });
+    l.lock.close(io);
+    const hit = (try s.open(arena, io, k)).?;
+    hit.layer.lock.close(io);
+    defer unlockForCleanup(arena, hit.layer.fs);
+    // d/sub is beyond a path walk while d is 0640: d is looked at, then opened up to look at d/sub.
+    for ([_]usize{ 1, 0 }) |at_mode| {
+        const m = modes[at_mode];
+        if (at_mode == 0) _ = linux.chmod(try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/d", .{hit.layer.fs}), 0), 0o700);
+        var st: linux.Statx = undefined;
+        const at = try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/{s}", .{ hit.layer.fs, m.rel }), 0);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, at, 0, stat_mask, &st)));
+        errdefer std.debug.print("{s}: mode {o}\n", .{ m.rel, st.mode & 0o7777 });
+        try std.testing.expectEqual(m.mode, st.mode & 0o7777);
+    }
+    _ = linux.chmod(try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/d", .{hit.layer.fs}), 0), 0o640);
+    var again: linux.Statx = undefined;
+    const d0 = try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/d", .{hit.layer.fs}), 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, d0, 0, stat_mask, &again)));
+    try std.testing.expectEqual(@as(u32, 0o640), again.mode & 0o7777);
+}
+
+test "native store: digests of one tree walked together agree, and never change a mode (even where a directory cannot be entered)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try tmp.dir.createDirPath(io, "ok/a/b");
+    try tmp.dir.writeFile(io, .{ .sub_path = "ok/a/b/f", .data = "f" });
+    try tmp.dir.createDirPath(io, "locked/d");
+    try tmp.dir.writeFile(io, .{ .sub_path = "locked/d/x", .data = "x" });
+    const ok = try std.fmt.allocPrint(arena, "{s}/ok", .{root});
+    const locked = try std.fmt.allocPrint(arena, "{s}/locked", .{root});
+    const locked_d = try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/d", .{locked}), 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(locked_d, 0o640)));
+    defer _ = linux.chmod(locked_d, 0o700);
+    const Walk = struct {
+        fn run(path: []const u8, out: *[8]?Key) void {
+            var ar: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            defer ar.deinit();
+            for (out) |*o| o.* = treeDigest(ar.allocator(), std.testing.io, path, .content, .{}) catch null;
+        }
+    };
+    var r: [4][8]?Key = undefined;
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Walk.run, .{ if (i % 2 == 0) ok else locked, &r[i] });
+    for (threads) |t| t.join();
+    for (r[0]) |d| try std.testing.expect(d != null);
+    for (r[0], r[2]) |x, y| try std.testing.expectEqual(x.?, y.?);
+    // The unenterable tree has no digest (for a user; root enters it), and its directory is as it was.
+    for (r[1]) |d| try std.testing.expectEqual(linux.geteuid() == 0, d != null);
+    var st: linux.Statx = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, locked_d, 0, stat_mask, &st)));
+    try std.testing.expectEqual(@as(u32, 0o640), st.mode & 0o7777);
 }
 
 test "native store: a published layer is found and held; eviction keeps under the cap, never a held one" {

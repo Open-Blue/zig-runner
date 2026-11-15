@@ -140,6 +140,13 @@ pub const Budget = struct {
         return b.next;
     }
 
+    /// How many tickets have been given out.
+    fn queued(b: *Budget) u64 {
+        b.lock();
+        defer b.unlock();
+        return b.next;
+    }
+
     /// The ticket being served: it moves as the queue does.
     pub fn position(b: *Budget) u64 {
         b.lock();
@@ -209,7 +216,26 @@ pub const Limits = struct {
     /// `if: always()` step, the job's outputs) runs on, as GitHub's does in the grace period, until
     /// its `hard_deadline_ms`. Waiting for a turn is interrupted the same way.
     cancel: ?*const dagger.Cancel = null,
+    /// Tests: the awake clock the call and its wait for the turn read, one a test moves by hand.
+    clock: ?*const TestClock = null,
 };
+
+/// A clock a test sets, and counts the reads of, so that what it waits for is a count and not a
+/// time that load can stretch.
+pub const TestClock = struct {
+    ms: std.atomic.Value(i64) = .init(0),
+    reads: std.atomic.Value(u64) = .init(0),
+
+    fn read(c: *const TestClock) i64 {
+        _ = @constCast(&c.reads).fetchAdd(1, .monotonic);
+        return c.ms.load(.monotonic);
+    }
+};
+
+/// The awake clock in milliseconds, or the test's.
+fn awakeMs(io: std.Io, clock: ?*const TestClock) i64 {
+    return if (clock) |c| c.read() else nowMs(io, .awake);
+}
 
 /// The layers of the job's overlay, as it would mount them for the next step.
 pub const Stack = struct {
@@ -252,6 +278,7 @@ const Counted = struct {
     cancel: ?*const dagger.Cancel,
     cancelled_before: bool,
     wait_limit_ms: u64,
+    clock: ?*const TestClock = null,
     /// Bytes under the allowance, and bytes in the turn.
     free_used: usize = 0,
     pool_used: usize = 0,
@@ -304,7 +331,7 @@ const Counted = struct {
     fn acquire(c: *Counted) bool {
         const t = c.budget.ticket();
         c.ticket = t;
-        const began = nowMs(c.io, .awake);
+        const began = awakeMs(c.io, c.clock);
         // The limit is on a queue that has stopped, not on the wait: each call ahead may hold the
         // turn for its own timeout, so a wait is as long as the calls ahead make it, and a job
         // that keeps taking turns only delays a neighbour.
@@ -314,7 +341,7 @@ const Counted = struct {
             const position = c.budget.position();
             if (position != seen) {
                 seen = position;
-                moved = nowMs(c.io, .awake);
+                moved = awakeMs(c.io, c.clock);
             }
             if (c.cancel) |cancel| {
                 if (!c.cancelled_before and cancel.requested.load(.acquire)) return c.abandon(.cancelled);
@@ -323,12 +350,12 @@ const Counted = struct {
                     if (hard > 0 and nowMs(c.io, .real) > hard) return c.abandon(.cancelled);
                 }
             }
-            if (c.wait_limit_ms != std.math.maxInt(u64) and nowMs(c.io, .awake) - moved > c.wait_limit_ms)
+            if (c.wait_limit_ms != std.math.maxInt(u64) and awakeMs(c.io, c.clock) - moved > c.wait_limit_ms)
                 return c.abandon(.waited_too_long);
             c.nap();
             if (c.io_cancelled) return c.abandon(.cancelled);
         }
-        c.waited_ms += nowMs(c.io, .awake) - began;
+        c.waited_ms += awakeMs(c.io, c.clock) - began;
         c.turn = true;
         return true;
     }
@@ -425,6 +452,7 @@ pub fn hashFiles(
         .cancel = l.cancel,
         .cancelled_before = if (l.cancel) |c| c.requested.load(.acquire) else false,
         .wait_limit_ms = l.timeout_ms *| 2,
+        .clock = l.clock,
     };
     // The turn goes on once the arena is freed (deferred first, so it runs last).
     defer counted.release();
@@ -487,7 +515,7 @@ fn runWaited(
         .step = stack.step,
         .opaque_xattr = stack.opaque_xattr,
         .limits = stack.limits,
-        .began_ms = nowMs(io, .awake),
+        .began_ms = awakeMs(io, stack.limits.clock),
         .waited = waited,
     };
     // A call that began after the cancel is not cut short by it: see `Limits.cancel`.
@@ -661,7 +689,7 @@ const Merged = struct {
     /// reads them too: 1024 blocks are 64 MiB, whose hash takes seconds on a slow machine.
     fn clocks(m: *Merged) Error!void {
         if (m.limits.timeout_ms != std.math.maxInt(u64) and
-            nowMs(m.io, .awake) - m.began_ms - m.waited.* > m.limits.timeout_ms)
+            awakeMs(m.io, m.limits.clock) - m.began_ms - m.waited.* > m.limits.timeout_ms)
             return m.fail("couldn't finish within {d} seconds", .{(m.limits.timeout_ms + 999) / 1000});
         // Begun after the cancel, it runs to the end of the grace period GitHub gives.
         if (m.limits.cancel) |c| if (m.cancelled_before) {
@@ -1947,13 +1975,19 @@ test "native hashFiles: a queue that moves outlasts the wait's limit, so calls a
     var budget: Budget = .{};
     const first = budget.ticket();
     const second = budget.ticket();
-    var r: Runner = .{ .fx = &f, .stack = try f.stackOf(&.{"l0"}, .{ .allowance = 64 << 10, .budget = &budget, .timeout_ms = 2500 }), .args = &.{"**"} };
+    var clock: TestClock = .{};
+    var r: Runner = .{ .fx = &f, .stack = try f.stackOf(&.{"l0"}, .{ .allowance = 64 << 10, .budget = &budget, .timeout_ms = 2500, .clock = &clock }), .args = &.{"**"} };
     const thread = try std.Thread.spawn(.{}, Runner.run, .{&r});
+    // The call has taken its place in the queue behind the two.
+    while (budget.queued() < 3) sleepMs(1);
     // Each call ahead holds the turn for less than the limit of 5 seconds, and more than that goes
-    // by in all. The gaps are wide: at 300 ms this failed on a Pi under load.
-    sleepMs(3000);
+    // by in all. The clock is moved by hand, and only once the waiting call has seen the queue
+    // move (a few reads of the clock after it did): no load can make a gap too long or too short.
+    clock.ms.store(3000, .monotonic);
     _ = budget.done(first);
-    sleepMs(3000);
+    const seen = clock.reads.load(.monotonic);
+    while (clock.reads.load(.monotonic) < seen + 4) sleepMs(1);
+    clock.ms.store(6000, .monotonic);
     _ = budget.done(second);
     thread.join();
     try std.testing.expect(r.result.? == .ok);
