@@ -297,8 +297,7 @@ test "oracle: a redirect of a streamed upload: std hands the 302 back, the libra
     const io = std.testing.io;
     var buf: [64]u8 = undefined;
     const url = server.url(&buf, "127.0.0.1", "/same");
-    const pattern: testserver.PatternBody = .{ .len = 1000 };
-    const body: net_client.Body = .{ .len = 1000, .ptr = &pattern, .writeFn = testserver.PatternBody.write };
+    const body: net_client.Body = .{ .len = 1000, .ptr = testserver.PatternBody.ptr(1000), .writeFn = testserver.PatternBody.write };
     const old = try std_broker.request(arena, io, .PUT, url, null, .{ .body = body, .resend = .once_more });
     try std.testing.expectEqual(std.http.Status.found, old.status);
     try std.testing.expectError(error.ProtocolError, broker.request(arena, io, .PUT, url, null, .{ .body = body, .resend = .once_more }));
