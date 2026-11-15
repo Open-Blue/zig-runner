@@ -333,8 +333,7 @@ test "oracle: an upload written as it is sent arrives as the same bytes through 
         var expect_buf: [64]u8 = undefined;
         const want = expectedBlob(n);
         const expect = try std.fmt.bufPrint(&expect_buf, "{d} {x:0>16}", .{ want.bytes, want.hash });
-        const pattern: testserver.PatternBody = .{ .len = n };
-        const body: net_client.Body = .{ .len = n, .ptr = &pattern, .writeFn = testserver.PatternBody.write };
+        const body: net_client.Body = .{ .len = n, .ptr = testserver.PatternBody.ptr(n), .writeFn = testserver.PatternBody.write };
         const lib = try net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = body, .headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }} });
         try std.testing.expectEqual(std.http.Status.ok, lib.status);
         try std.testing.expectEqualStrings(expect, lib.body);
