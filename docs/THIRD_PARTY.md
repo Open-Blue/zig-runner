@@ -65,6 +65,8 @@ Two more, `runner/tools/hpackdiff` and `runner/tools/rsadiff` (Go, run by `.gith
 
 CI runs these six weekly (`.github/workflows/compare.yml`); none of them is in any build.
 
+The zr-net fuzz targets (`runner/rust/zr-net/fuzz`, run by `.github/scripts/zr-net-fuzz.sh`) build with [libfuzzer-sys](https://github.com/rust-fuzz/libfuzzer) (MIT OR Apache-2.0), which bundles LLVM's libFuzzer under the [NCSA license](https://opensource.org/license/uoi-ncsa) (permissive, BSD-style); it is in `fuzz/Cargo.lock` only, in no build of the runner, and Dependency review allows it by name (`security.yml`).
+
 ## actions/runner's license
 
 ```
