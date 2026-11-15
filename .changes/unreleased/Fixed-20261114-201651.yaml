@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Eviction''s test of a big volume counted over several passes no longer fails now and then on a loaded disk: it flushes the files it writes before the walk that sets the count to reach, since a dirty file''s blocks are counted differently as the disk allocates them; two tests'' pass counts became deadlines'
+time: 2026-11-14T20:16:51.031395272-05:00

@@ -1958,8 +1958,10 @@ test "native eviction: a chain of directories deeper than a pass gets through go
     try deepChain(f, 30_000);
     const old = try f.volume("old", 6000, 30);
     f.s.limits = .{ .volumes_max_bytes = 1, .min_free_pct = 0, .budget_ms = 60, .budget_clock_ms = null };
-    var passes: usize = 0;
-    while (try f.deadLeft() > 0 and passes < 400) : (passes += 1) run(f.s, testing.io);
+    // Bounded by time, not by passes: a loaded machine gets less done in each pass's 60 ms, so it
+    // takes more of them; a removal that is stuck still fails, at the deadline.
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 120 * std.time.ms_per_s;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline and try f.deadLeft() > 0) run(f.s, testing.io);
     try testing.expectEqual(@as(usize, 0), try f.deadLeft());
     run(f.s, testing.io);
     try testing.expect(!f.there(old));
@@ -2211,9 +2213,10 @@ test "native eviction: a slow sync does not eat what a pass may delete" {
     test_sync_ms = 400;
     defer test_sync_ms = 0;
     // Each pass gets its time after the sync, so a busy machine only takes more of them: a sync
-    // that ate the budget would leave the tree whole for good.
-    var passes: usize = 0;
-    while (passes < 30 and try f.deadLeft() > 0) : (passes += 1) run(f.s, testing.io);
+    // that ate the budget would leave the tree whole for good. Bounded by time, not by a count of
+    // passes, which a loaded machine, getting less done in each, would run past.
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 60 * std.time.ms_per_s;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline and try f.deadLeft() > 0) run(f.s, testing.io);
     try testing.expectEqual(@as(usize, 0), try f.deadLeft());
 }
 
@@ -2870,6 +2873,20 @@ test "native eviction: a walk of a chain of directories too deep to name ends at
     while (removeSome(f.arena(), dir, io, &budget) == .spent) budget = .init(io, 60_000);
 }
 
+/// The file `path` written out to the disk. The blocks of a file whose data is dirty are not
+/// settled: the disk allocates them as the machine gets to it, and a walk that meets that moment
+/// counts them differently from one after it (a file's, 8192 bytes, on a hosted runner, and under
+/// a loop of `sync` here, once in a thousand runs). A test that compares two walks' counts of a
+/// tree it has just written flushes the files first.
+fn flushFile(arena: Allocator, path: []const u8) !void {
+    const z = try arena.dupeSentinel(u8, path, 0);
+    const rc = linux.open(z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const fd = std.math.cast(linux.fd_t, rc) orelse return error.Unexpected;
+    defer _ = linux.close(fd);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fsync(fd)));
+}
+
 test "native eviction: a volume too big for a pass's walk is counted over several, from where the last stopped" {
     const f = try Fixture.init();
     defer f.deinit();
@@ -2881,7 +2898,9 @@ test "native eviction: a volume too big for a pass's walk is counted over severa
         const d = try std.fmt.allocPrint(arena, "{s}/d{d}/s", .{ dir, i });
         try std.Io.Dir.cwd().createDirPath(io, d);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/f", .{d}), .data = &payload });
+        try flushFile(arena, try std.fmt.allocPrint(arena, "{s}/f", .{d}));
     }
+    try flushFile(arena, try std.fmt.allocPrint(arena, "{s}/f", .{dir}));
     const all = usage(arena, io, dir, .init(io, 60_000), .{ .bytes = 0, .whole = false });
     try testing.expect(all.whole);
     // Nine directories a walk: 81 of them need nine walks, each from the size file the one
