@@ -22,7 +22,7 @@ pub const Blob = struct {
     text: []const u8 = "",
     line_count: usize,
     /// Written out as it is uploaded, in place of `text` (`KeptBlob`).
-    stream: ?broker.Body = null,
+    stream: ?*const broker.Body = null,
 
     fn len(b: Blob) usize {
         return if (b.stream) |s| s.len else b.text.len;
@@ -32,7 +32,7 @@ pub const Blob = struct {
     pub fn textAlloc(b: Blob, arena: Allocator) ![]const u8 {
         const s = b.stream orelse return b.text;
         var aw: std.Io.Writer.Allocating = .init(arena);
-        try s.writeFn(s.ptr, &aw.writer);
+        try s.writeFn(s, &aw.writer);
         return aw.written();
     }
 };
@@ -65,8 +65,13 @@ pub const KeptBlob = struct {
     step: ?u32,
     /// Read buffer, at least a spool record's header (`Kept.iterate`).
     buf: []u8,
-    /// The bytes it writes (`count`).
-    len: usize,
+    /// The bytes it writes (`count`), and what the upload writes them through.
+    body: net_client.Body,
+
+    /// The body of `len` bytes (`count`), for the `body` field.
+    pub fn bodyOf(len: usize) net_client.Body {
+        return .{ .len = len, .writeFn = write };
+    }
 
     /// Each step's line count, text bytes and blob size, and the whole job's (`all`), in one read
     /// of the log. `steps.len` is the number of log steps; a line of a step past it counts only in
@@ -105,12 +110,12 @@ pub const KeptBlob = struct {
     pub fn blob(b: *const KeptBlob, line_count: usize) Blob {
         return .{
             .line_count = line_count,
-            .stream = .{ .len = b.len, .ptr = b, .writeFn = write },
+            .stream = &b.body,
         };
     }
 
-    fn write(ptr: *const anyopaque, w: *std.Io.Writer) anyerror!void {
-        const b: *const KeptBlob = @ptrCast(@alignCast(ptr));
+    fn write(body: *const net_client.Body, w: *std.Io.Writer) anyerror!void {
+        const b: *const KeptBlob = @fieldParentPtr("body", body);
         var it = b.kept.iterate(b.io, b.buf);
         var written: usize = 0;
         while (try it.next()) |l| {
@@ -120,7 +125,7 @@ pub const KeptBlob = struct {
             // The log is only appended to, and `count` read the same part of it; a line that
             // would go past `len` all the same ends the upload, not the runner (`broker.Body`).
             written += ts.len + 1 + it.textLen() + 1;
-            if (written > b.len) return error.LogChangedWhileUploaded;
+            if (written > b.body.len) return error.LogChangedWhileUploaded;
             try w.writeAll(ts);
             try w.writeByte(' ');
             try it.writeText(w);
@@ -582,7 +587,7 @@ test "a kept log's blobs are read as they go up, as formatBlob makes them, throu
             .io = io,
             .step = step,
             .buf = &blob_buf,
-            .len = size.bytes,
+            .body = KeptBlob.bodyOf(size.bytes),
         };
         try std.testing.expectEqualStrings(want.text, try kb.blob(size.lines).textAlloc(arena));
     }
@@ -603,10 +608,10 @@ test "a kept log's blobs are read as they go up, as formatBlob makes them, throu
     var big_sizes: [2]KeptBlob.Size = undefined;
     const big_all = try KeptBlob.count(&big, io, &buf, &big_sizes);
     try std.testing.expectEqual(@as(usize, 4096), big_sizes[1].lines);
-    const kb: KeptBlob = .{ .kept = &big, .io = io, .step = 1, .buf = &buf, .len = big_all.bytes };
+    const kb: KeptBlob = .{ .kept = &big, .io = io, .step = 1, .buf = &buf, .body = KeptBlob.bodyOf(big_all.bytes) };
     var sent: std.Io.Writer.Discarding = .init(&dbuf);
     const stream = kb.blob(big_sizes[1].lines).stream.?;
-    try stream.writeFn(stream.ptr, &sent.writer);
+    try stream.writeFn(stream, &sent.writer);
     try std.testing.expectEqual(@as(u64, big_all.bytes), sent.fullCount());
 
     // And into a request, over a real connection.
@@ -735,7 +740,7 @@ test "a blob upload the server took and dropped is written again from its start,
         const len = 300_000;
         /// How many times the body was written (on this thread).
         var runs: usize = 0;
-        fn write(_: *const anyopaque, w: *std.Io.Writer) anyerror!void {
+        fn write(_: *const net_client.Body, w: *std.Io.Writer) anyerror!void {
             runs += 1;
             var piece: [1000]u8 = undefined;
             var at: usize = 0;
@@ -749,14 +754,14 @@ test "a blob upload the server took and dropped is written again from its start,
     };
     var want: testserver.Sink = .{};
     for (0..Counting.len) |i| want.add(&.{testserver.blobByte(i)});
-    const unused: u8 = 0;
+    const counting: net_client.Body = .{ .len = Counting.len, .writeFn = Counting.write };
     // The first put is read to its end, then its connection closed without an answer.
     server.results_drop = 1;
     var url_buf: [64]u8 = undefined;
     const url = server.url(&url_buf, "127.0.0.1", "/results-blob");
     const r = try putBlob(arena, std.testing.io, url, .{
         .line_count = 0,
-        .stream = .{ .len = Counting.len, .ptr = &unused, .writeFn = Counting.write },
+        .stream = &counting,
     });
     try std.testing.expectEqual(std.http.Status.created, r.status);
     try std.testing.expectEqual(@as(usize, 2), Counting.runs);

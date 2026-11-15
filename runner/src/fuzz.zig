@@ -1869,10 +1869,11 @@ fn httpStreams(_: void, smith: *Smith) !void {
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{server.port()});
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
+    const pattern: testserver.PatternBody = .init(upload_len orelse 0);
     var s = net_client.open(arena.allocator(), io, .{
         .method = if (upload_len != null) .PUT else .GET,
         .url = url,
-        .upload = if (upload_len != null) .{ .len = upload_len.?, .ptr = testserver.PatternBody.ptr(upload_len.?), .writeFn = testserver.PatternBody.write } else null,
+        .upload = if (upload_len != null) &pattern.body else null,
         .deadline = .fromMilliseconds(400),
         .total = .fromMilliseconds(800),
         .read_idle = .fromMilliseconds(300),

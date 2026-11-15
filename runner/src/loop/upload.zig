@@ -379,7 +379,7 @@ fn keptBlob(
         .io = c.io,
         .step = log_step,
         .buf = try keptBuffer(c),
-        .len = size.bytes,
+        .body = results.KeptBlob.bodyOf(size.bytes),
     };
     return b.blob(size.lines);
 }

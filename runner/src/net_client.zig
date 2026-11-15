@@ -162,11 +162,12 @@ pub const Response = struct {
     }
 };
 
-/// A body of `len` bytes that `writeFn` writes, once per attempt.
+/// A body of `len` bytes that `writeFn` writes, once per attempt. An implementation embeds it as a
+/// field and recovers itself in `writeFn` with `@fieldParentPtr`; the request holds a pointer to
+/// it, so it must not be copied.
 pub const Body = struct {
     len: usize,
-    ptr: *const anyopaque,
-    writeFn: *const fn (ptr: *const anyopaque, w: *std.Io.Writer) anyerror!void,
+    writeFn: *const fn (body: *const Body, w: *std.Io.Writer) anyerror!void,
 };
 
 pub const Options = struct {
@@ -176,7 +177,7 @@ pub const Options = struct {
     /// The body; null for none.
     payload: ?[]const u8 = null,
     /// A body written as it is sent, in place of `payload`.
-    upload: ?Body = null,
+    upload: ?*const Body = null,
     /// A connection made for this request, not a kept one (an upload sent again after
     /// `error.StaleConnection`).
     fresh: bool = false,
@@ -380,10 +381,10 @@ const Live = struct {
 
     /// Writes `body` through the library's queue as it is sent. Null when the call ended before the
     /// body did (the server answered, or the call failed): its result says how.
-    fn upload(l: Live, body: Body) Error!void {
+    fn upload(l: Live, body: *const Body) Error!void {
         var buf: [16 * 1024]u8 = undefined;
         var u: Uploader = .{ .live = l, .len = body.len, .interface = .{ .vtable = &.{ .drain = Uploader.drain }, .buffer = &buf, .end = 0 } };
-        body.writeFn(body.ptr, &u.interface) catch |e| {
+        body.writeFn(body, &u.interface) catch |e| {
             if (u.err) |c| return c;
             if (u.overrun) return error.BodyLongerThanDeclared;
             if (u.over) return;
