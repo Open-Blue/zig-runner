@@ -4499,8 +4499,8 @@ test "allocation failures: a tree's size and digest, its ids shifted, layers fla
             const upper = try failureTree(io, base, "upper", ma);
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(ma, "{s}/extra", .{upper}), .data = "z" });
             // Written back before anything is measured: a file the kernel is writing back shows
-            // fewer blocks than it takes (as `publishStaged` notes), so a size taken while a
-            // neighbour's `syncfs` or the flusher had these files in flight differed from the next
+            // fewer blocks than it takes (as `publishStaged` notes), so a size taken while
+            // these files were still in flight (writeback, from whatever started it) differed from the next
             // one by a block (CI, "expected 12288, found 16384"), with no allocation involved.
             const base_fd = try openRoot(ma, base);
             defer _ = linux.close(base_fd);
