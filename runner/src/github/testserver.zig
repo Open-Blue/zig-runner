@@ -136,17 +136,19 @@ pub fn blobByte(i: u64) u8 {
     return @truncate((i *% 2654435761) >> 7);
 }
 
-/// A request body of `len` bytes of `blobByte`, for the network client's `Body`: `ptr` is `&self`, `writeFn` is `write`.
-/// The one place the callback's opaque pointer is cast back, for the tests that upload.
+/// A request body of `len` bytes of `blobByte`, for the network client's `Body`: `ptr` is `ptr(len)`, `writeFn` is `write`.
+/// The length travels as the pointer's address (plus one, as the address of a pointer is never 0), so that nothing is cast back.
 pub const PatternBody = struct {
-    len: usize,
+    pub fn ptr(len: usize) *const anyopaque {
+        return @ptrFromInt(len + 1);
+    }
 
-    pub fn write(ptr: *const anyopaque, w: *std.Io.Writer) anyerror!void {
-        const p: *const PatternBody = @ptrCast(@alignCast(ptr));
+    pub fn write(p: *const anyopaque, w: *std.Io.Writer) anyerror!void {
+        const len_total = @intFromPtr(p) - 1;
         var chunk: [7000]u8 = undefined;
         var at: usize = 0;
-        while (at < p.len) {
-            const len = @min(p.len - at, chunk.len);
+        while (at < len_total) {
+            const len = @min(len_total - at, chunk.len);
             for (chunk[0..len], 0..) |*c, i| c.* = blobByte(at + i);
             try w.writeAll(chunk[0..len]);
             at += len;
