@@ -716,7 +716,7 @@ test "each post script of a native job hears its own SIGINT at the job's limit" 
             \\  post-entrypoint: sh
             \\  args:
             \\    - -c
-            \\    - if [ -e seen{0s} ]; then trap 'echo heard-int-{0s}; exit 0' INT; sleep 613.8{0s} & wait; else touch seen{0s}; fi
+            \\    - if [ -e seen{0s} ]; then echo started-{0s}; trap 'echo heard-int-{0s}; exit 0' INT; sleep 613.8{0s} & wait; else touch seen{0s}; fi
         , .{n}),
     }});
     var job = testJob(&.{
