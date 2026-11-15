@@ -2589,26 +2589,27 @@ fn tagsDigest(b: *Backend, url: []const u8, env: []const []const u8) !?[]const u
     return if (digest.len == 0) null else digest;
 }
 
-/// The contents of `path` as the job's last step left it (a problem matcher's file), relative
-/// to the working directory unless absolute, as Dagger reads it from the container; null when
-/// it is not there. Read layer by layer, newest first, each inside itself and through no
-/// symlink (`sandbox.readIn`); a whiteout ends the search, as it hides the file below.
-pub fn readFile(b: *Backend, path: []const u8) ?[]const u8 {
+/// The contents of `path` as the job's last step left it (a problem matcher's file, a local
+/// action's `action.yml`), relative to the working directory unless absolute, as Dagger reads it
+/// from the container; null when it is not there. Read layer by layer, newest
+/// first, each inside itself and through no symlink (`sandbox.readIn`); a whiteout ends the
+/// search, as it hides the file below. Running out of memory is an error, never "not there".
+pub fn readFile(b: *Backend, path: []const u8) Allocator.Error!?[]const u8 {
     const arena = b.arena;
     const full = if (std.fs.path.isAbsolutePosix(path))
         path
     else
-        std.fmt.allocPrint(arena, "{s}/{s}", .{ b.workdir, path }) catch return null;
+        try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.workdir, path });
     var i = b.layers.items.len;
     while (i > 0) {
         i -= 1;
-        switch (sandbox.readIn(arena, b.layers.items[i].path, full, max_read) catch return null) {
+        switch (try sandbox.readIn(arena, b.layers.items[i].path, full, max_read)) {
             .text => |t| return t,
             .whiteout => return null,
             .missing => {},
         }
     }
-    return switch (sandbox.readIn(arena, b.rootfs, full, max_read) catch return null) {
+    return switch (try sandbox.readIn(arena, b.rootfs, full, max_read)) {
         .text => |t| t,
         .missing, .whiteout => null,
     };
@@ -11740,4 +11741,35 @@ fn stepEndNumber(line: []const u8, key: []const u8) !f64 {
     const rest = line[at + key.len ..];
     const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
     return std.fmt.parseFloat(f64, rest[0..end]) catch error.TestUnexpectedResult;
+}
+
+test "readFile: a file in a layer is read, one nowhere is null, and a failed allocation is an error, not a missing file" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var b = try init(arena, std.testing.io, std.testing.allocator, cfg);
+    defer b.deinit();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rootfs/present", .data = "here\n" });
+    try std.testing.expectEqualStrings("here\n", (try b.readFile("/present")).?);
+    try std.testing.expect((try b.readFile("/absent")) == null);
+
+    // Every allocation it makes, failed in turn: each is `error.OutOfMemory`, never null.
+    const real = b.arena;
+    defer b.arena = real;
+    var fail_at: usize = 0;
+    while (fail_at < 8) : (fail_at += 1) {
+        var failing: std.testing.FailingAllocator = .init(real, .{ .fail_index = fail_at });
+        b.arena = failing.allocator();
+        const got = b.readFile("/present") catch |e| {
+            try std.testing.expectEqual(error.OutOfMemory, e);
+            continue;
+        };
+        // Past its last allocation it succeeds.
+        try std.testing.expectEqualStrings("here\n", got.?);
+        try std.testing.expect(fail_at > 0);
+        break;
+    } else return error.TestUnexpectedResult;
 }

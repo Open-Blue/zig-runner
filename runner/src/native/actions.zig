@@ -236,7 +236,7 @@ pub fn loadLocal(b: *Backend, x: *Exec, u: job_mod.Uses) !Exec.LoadResult {
         x.ev.workspace;
     const label = try std.fmt.allocPrint(arena, "./{s}", .{u.path});
     for ([_][]const u8{ "action.yml", "action.yaml" }) |name| {
-        const text = b.readFile(try std.fmt.allocPrint(arena, "{s}/{s}", .{ abs, name })) orelse continue;
+        const text = (try b.readFile(try std.fmt.allocPrint(arena, "{s}/{s}", .{ abs, name }))) orelse continue;
         const meta = switch (try action.parse(arena, text)) {
             .ok => |m| m,
             .invalid => |why| return .{ .failed = try std.fmt.allocPrint(
