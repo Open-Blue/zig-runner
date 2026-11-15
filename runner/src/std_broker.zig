@@ -176,7 +176,7 @@ const Exchange = struct {
     headers: []const std.http.Header,
     content_type: []const u8,
     max_body: usize,
-    body: ?Body,
+    body: ?*const Body,
 };
 
 const Redirect = struct { uri: std.Uri, see_other: bool };
@@ -304,13 +304,13 @@ fn acceptJsonHeaders(scratch: Allocator, extra: []const std.http.Header) ![]std.
 }
 
 /// The request line and headers, then `payload` or `body` as the body when there is one.
-fn send(req: *std.http.Client.Request, payload: ?[]const u8, body_in: ?Body) !void {
+fn send(req: *std.http.Client.Request, payload: ?[]const u8, body_in: ?*const Body) !void {
     if (body_in) |b| {
         req.transfer_encoding = .{ .content_length = b.len };
         var body = try req.sendBodyUnflushed(&.{});
         // The writer stops short of `len` rather than past it (std's body writer would underflow);
         // short of it, `end` would trip its assertion and take the process down.
-        try b.writeFn(b.ptr, &body.writer);
+        try b.writeFn(b, &body.writer);
         try body.writer.flush();
         if (body.state.content_length != 0) return error.BodyShorterThanItsLength;
         try body.end();
