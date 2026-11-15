@@ -267,16 +267,28 @@
       "datasourceTemplate": "docker"
     },
     {
-      "description": "The Dockerfile oracle's bases.txt (one `name:tag@sha256:...` per base image, as the fixtures name them) and the fixture that builds its FROM from an ARG (`FROM ${IMAGE}:3.22@sha256:...`, the name in the ARG), which the Dockerfile manager does not see; the other fixtures' lines it reads itself. Pinned by the multi-arch index digest.",
+      "description": "The Dockerfile oracle's bases.txt: one `name:tag@sha256:...` per base image, as the fixtures name them (the oracle keys its prepared bases by that reference), pinned by the multi-arch index digest.",
       "customType": "regex",
       "managerFilePatterns": [
-        "/^runner/tools/dockerfile_oracle/bases\\.txt$/",
+        "/^runner/tools/dockerfile_oracle/bases\\.txt$/"
+      ],
+      "matchStrings": [
+        "^(?<depName>[a-z0-9./-]+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})$"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "description": "The Dockerfile oracle's fixtures that name alpine through an ARG, which the oracle must keep testing: `ARG BASE=alpine:3.22@sha256:...` (multistage-chain) and `FROM ${IMAGE}:3.22@sha256:...` with `ARG IMAGE=alpine` (config). Their other FROM lines are read by the Dockerfile manager.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^runner/tools/dockerfile_oracle/multistage-chain/ctx/Dockerfile$/",
         "/^runner/tools/dockerfile_oracle/config/ctx/Dockerfile$/"
       ],
       "matchStrings": [
-        "^(?<depName>[a-z0-9./-]+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})$",
+        "^ARG BASE=alpine:(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})$",
         "^FROM \\$\\{IMAGE\\}:(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})$"
       ],
+      "depNameTemplate": "alpine",
       "datasourceTemplate": "docker"
     },
     {
