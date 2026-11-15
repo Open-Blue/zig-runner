@@ -506,13 +506,34 @@ fn fixtureImage(
 
 /// A port of the loopback no one listens on now.
 fn freePort() !u16 {
+    return (try freePorts(1))[0];
+}
+
+/// `n` different ports of the loopback no one listens on now. The listeners stay open until all
+/// are picked: closing one before the next lets the kernel hand out the same port twice, which
+/// failed the services test on a hosted arm64 runner (web and echo on one port).
+fn freePorts(comptime n: usize) ![n]u16 {
     const linux = std.os.linux;
-    const fd = try Backend.listen(0, 0x7f000001);
-    defer _ = linux.close(fd);
-    var sa: linux.sockaddr.in = undefined;
-    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
-    _ = linux.getsockname(fd, @ptrCast(&sa), &len);
-    return std.mem.bigToNative(u16, sa.port);
+    var fds: [n]linux.fd_t = undefined;
+    var opened: usize = 0;
+    defer for (fds[0..opened]) |fd| {
+        _ = linux.close(fd);
+    };
+    var ports: [n]u16 = undefined;
+    for (&ports, &fds) |*port, *fd| {
+        fd.* = try Backend.listen(0, 0x7f000001);
+        opened += 1;
+        var sa: linux.sockaddr.in = undefined;
+        var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+        _ = linux.getsockname(fd.*, @ptrCast(&sa), &len);
+        port.* = std.mem.bigToNative(u16, sa.port);
+    }
+    return ports;
+}
+
+test "native services: freePorts hands out different ports" {
+    const ports = try freePorts(8);
+    for (ports, 0..) |p, i| for (ports[i + 1 ..]) |q| try std.testing.expect(p != q);
 }
 
 /// A TCP server that greets each connection with `hi from <name>`, and says in its log what it
@@ -566,9 +587,7 @@ test "native services: by name and on localhost, health checks and port probes, 
     const root_runner = std.os.linux.geteuid() == 0;
     // Rootless (tests only), services share the host's network: listen on its loopback alone.
     const addr = if (root_runner) "0.0.0.0" else "127.0.0.1";
-    const web_port = try freePort();
-    const web_published = try freePort();
-    const echo_port = try freePort();
+    const web_port, const web_published, const echo_port = try freePorts(3);
     const web = try std.fmt.allocPrint(arena, "{d}", .{web_port});
     const echo = try std.fmt.allocPrint(arena, "{d}", .{echo_port});
     const py: []const []const u8 = &.{ "python3", "-u", "-c", greeter, addr };
