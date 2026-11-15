@@ -255,8 +255,9 @@ fn storeSecret(arena: Allocator, io: std.Io, store: Store) Allocator.Error!?[32]
             f.writeStreamingAll(io, &fresh) catch return null;
             if (linux.errno(linux.fsync(f.handle)) != .SUCCESS) return null;
         }
-        cwd.rename(tmp, cwd, path, io) catch {
-            cwd.deleteFile(io, tmp) catch {};
+        cwd.rename(tmp, cwd, path, io) catch |e| {
+            cwd.deleteFile(io, tmp) catch |d| std.log.debug("image store: {s} not removed: {t}", .{ tmp, d });
+            std.log.debug("image store: the secret was not put in place: {t}", .{e});
             return null;
         };
     }
