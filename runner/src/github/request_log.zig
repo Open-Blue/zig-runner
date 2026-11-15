@@ -146,16 +146,26 @@ fn isUuid(s: []const u8) bool {
 }
 
 /// The two kinds of `native/dns_probe.zig` for a request whose name lookup was slow (`dns_ms` over
-/// its threshold) or failed (its error names the resolver), so a stall of the runner's own calls
-/// reads the same as a job's.
+/// its threshold) or failed (its error is the resolver's), so a stall of the runner's own calls
+/// reads the same as a job's. `ms` here is the request's own lookup time (`source=request`, the
+/// runner's resolver in the host's namespace, the whole getaddrinfo); the probe's is one query to
+/// one nameserver (`source=probe`). A failure that had no lookup time logs `total_ms` instead.
 fn warnDns(l: Line) void {
     const kind = dnsKind(l) orelse return;
-    const host = l.host[0 .. std.mem.lastIndexOfScalar(u8, l.host, ':') orelse l.host.len];
-    const took = (l.dns_ns orelse l.total_ns) / std.time.ns_per_ms;
-    if (std.mem.eql(u8, kind, "dns_lookup_failed"))
-        logfmt.warn("dns_lookup_failed", "name={f} ms={d} source=request err={s}", .{ logfmt.q(host), took, l.status.err })
-    else
-        logfmt.warn("dns_lookup_slow", "name={f} ms={d} source=request", .{ logfmt.q(host), took });
+    const name = hostName(l.host);
+    if (std.mem.eql(u8, kind, "dns_lookup_failed")) {
+        if (l.dns_ns) |ns|
+            logfmt.warn("dns_lookup_failed", "name={f} ms={d} source=request err={s}", .{ logfmt.q(name), ns / std.time.ns_per_ms, l.status.err })
+        else
+            logfmt.warn("dns_lookup_failed", "name={f} total_ms={d} source=request err={s}", .{ logfmt.q(name), l.total_ns / std.time.ns_per_ms, l.status.err });
+    } else logfmt.warn("dns_lookup_slow", "name={f} ms={d} source=request", .{ logfmt.q(name), l.dns_ns.? / std.time.ns_per_ms });
+}
+
+/// `host` without its port: `api.github.com:443`, `[::1]:443` (brackets off) or a bare name.
+fn hostName(host: []const u8) []const u8 {
+    if (host.len > 0 and host[0] == '[') return host[1 .. std.mem.indexOfScalar(u8, host, ']') orelse host.len];
+    if (std.mem.count(u8, host, ":") == 1) return host[0..std.mem.indexOfScalar(u8, host, ':').?];
+    return host;
 }
 
 /// The kind `l` is logged under, null for a request whose lookup was quick and did not fail.
@@ -165,9 +175,12 @@ fn dnsKind(l: Line) ?[]const u8 {
     return null;
 }
 
+/// The errors a name lookup ends in, by name: `net_client.zig`'s `DnsFailed` and the resolver errors
+/// of Zig's HTTP client. `InvalidHostName` is a URI that does not parse, not a lookup.
 fn isDnsError(name: []const u8) bool {
-    return std.mem.indexOf(u8, name, "Dns") != null or std.mem.indexOf(u8, name, "HostName") != null or
-        std.mem.indexOf(u8, name, "NameServer") != null;
+    for ([_][]const u8{ "DnsFailed", "UnknownHostName", "TemporaryNameServerFailure", "NameServerFailure", "HostLacksNetworkAddresses" }) |e|
+        if (std.mem.eql(u8, name, e)) return true;
+    return false;
 }
 
 /// Writes `l` as one line on stderr, in a single write so that lines of requests made at once do
@@ -428,6 +441,18 @@ test "a request's lookup is logged as slow over the threshold and as failed on a
     l.status = .{ .err = "TemporaryNameServerFailure" };
     try std.testing.expectEqualStrings("dns_lookup_failed", dnsKind(l).?);
     l = base;
-    l.status = .{ .err = "ConnectionRefused" };
-    try std.testing.expectEqual(@as(?[]const u8, null), dnsKind(l));
+    for ([_][]const u8{ "ConnectionRefused", "InvalidHostName", "UnexpectedCharacter" }) |e| {
+        l.status = .{ .err = e };
+        try std.testing.expectEqual(@as(?[]const u8, null), dnsKind(l));
+    }
+    l.status = .{ .err = "DnsFailed" };
+    try std.testing.expectEqualStrings("dns_lookup_failed", dnsKind(l).?);
+}
+
+test "a host's name is cut from its port, an IPv6 literal's brackets too" {
+    try std.testing.expectEqualStrings("api.github.com", hostName("api.github.com:443"));
+    try std.testing.expectEqualStrings("api.github.com", hostName("api.github.com"));
+    try std.testing.expectEqualStrings("::1", hostName("[::1]:443"));
+    try std.testing.expectEqualStrings("2001:db8::7", hostName("[2001:db8::7]"));
+    try std.testing.expectEqualStrings("::1", hostName("::1"));
 }
