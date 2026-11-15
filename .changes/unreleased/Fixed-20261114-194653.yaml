@@ -1,0 +1,3 @@
+kind: Fixed
+body: The allocation-failure test for a tree's size no longer fails when a file's blocks were being written back as it measured them (a file still being written back can show fewer blocks than it takes), as it did in CI with "expected 12288, found 16384"
+time: 2026-11-14T19:46:53.1147859-05:00
