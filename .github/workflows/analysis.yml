@@ -104,6 +104,9 @@ on:
       - .github/workflows/analysis.yml
       - .github/scripts/ci-scope.sh
       - .github/scripts/zig-fuzz.sh
+      - .github/scripts/zr-net-fuzz.sh
+      - .github/scripts/install-rust-nightly.sh
+      - runner/rust/**
       - .github/scripts/zig-valgrind.sh
       - .github/scripts/changed-tests.sh
       - .github/scripts/zig-coverage.sh
@@ -273,6 +276,51 @@ jobs:
         with:
           name: ${{ steps.key.outputs.prefix }}input
           path: ${{ runner.temp }}/fuzz
+          if-no-files-found: ignore
+
+  # The network library's libFuzzer targets (runner/rust/zr-net/fuzz): the same code Zig's
+  # "HTTP responses" and "TLS records" targets reach, from Rust, under libFuzzer and
+  # AddressSanitizer (nightly Rust). A pull request only builds them (the build is what a change
+  # to the library can break); the night runs each for a minute on top of the corpus it kept.
+  zr-net-fuzz:
+    name: Fuzz (zr-net, libFuzzer)
+    needs: scope
+    if: needs.scope.outputs.analysis == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the targets
+        if: github.event_name == 'pull_request'
+        run: .github/scripts/zr-net-fuzz.sh build
+
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name != 'pull_request'
+        with:
+          path: runner/rust/zr-net/fuzz/corpus
+          key: fuzz-zr-net-${{ github.run_id }}
+          restore-keys: fuzz-zr-net-
+
+      - name: Fuzz
+        if: github.event_name != 'pull_request'
+        run: .github/scripts/zr-net-fuzz.sh run 60
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        with:
+          path: runner/rust/zr-net/fuzz/corpus
+          key: fuzz-zr-net-${{ github.run_id }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: fuzz-zr-net-input
+          path: runner/rust/zr-net/fuzz/artifacts
           if-no-files-found: ignore
 
   # Every test, about 21 minutes on GitHub's runner (the 11-03 night: 20 minutes 54 seconds), nightly

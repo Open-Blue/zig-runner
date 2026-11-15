@@ -6,12 +6,13 @@
 
 mod alloc;
 mod body;
-mod call;
+// `call` and `tls` are public for the fuzz targets (fuzz/), which drive the C ABI as Zig does.
+pub mod call;
 mod client;
 mod proxy;
 mod roots;
 mod runtime;
-mod tls;
+pub mod tls;
 
 #[global_allocator]
 static COUNTING: alloc::Counting = alloc::Counting;

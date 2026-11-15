@@ -292,6 +292,18 @@
       "datasourceTemplate": "docker"
     },
     {
+      "description": "cargo-fuzz, built from crates.io by version in zr-net-fuzz.sh (its own lock file is used, --locked).",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/scripts/zr-net-fuzz\\.sh$/"
+      ],
+      "matchStrings": [
+        "\\nversion=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "cargo-fuzz",
+      "datasourceTemplate": "crate"
+    },
+    {
       "description": "libzstd: `version=` in vendor-zstd.sh (releases of facebook/zstd). The tarball's SHA-256 and the vendored files are updated by hand, which CI enforces by failing until they are (vendor-zstd.sh --check, in the Workflows job).",
       "customType": "regex",
       "managerFilePatterns": [
