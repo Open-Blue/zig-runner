@@ -27,6 +27,9 @@ set -euo pipefail
 version="Spin Version 6.5.2 -- 6 December 2019"
 here=$(cd "$(dirname "$0")/../../proofs/spin" && pwd)
 dir="${SPIN_DIR:-${RUNNER_TEMP:-/tmp}/spin}"
+# shellcheck source=.github/scripts/spin-heartbeat.sh
+# shellcheck source=.github/scripts/spin-heartbeat.sh
+source "$(dirname "$0")/spin-heartbeat.sh"
 
 if [[ $(spin -V 2>&1) != "$version" ]]; then
 	echo "spin -V says '$(spin -V 2>&1)', not '$version'" >&2
@@ -138,15 +141,17 @@ jobs=$(nproc)
 running=0
 mkdir -p "$dir"
 : >"$dir/finished"
-(
-	trap 'kill "$nap" 2>/dev/null; exit 0' TERM
-	while :; do
-		sleep 60 &
-		nap=$!
-		wait "$nap"
-		echo "spin: $SECONDS s, $(wc -l <"$dir/finished") of ${#names[@]} configurations finished"
-	done
-) &
+# The heartbeat ends with this script on every path: the EXIT trap kills it (INT and TERM exit, so
+# the trap runs), and the loop asks after this script at every tick, for the death no trap sees.
+heartbeat=
+trap 'kill "$heartbeat" 2>/dev/null || true' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# shellcheck disable=SC2329 # run by heartbeat_loop, by name
+progress() {
+	echo "spin: $SECONDS s, $(wc -l <"$dir/finished") of ${#names[@]} configurations finished"
+}
+heartbeat_loop "$$" "${SPIN_HEARTBEAT_S:-60}" progress &
 heartbeat=$!
 pids=()
 for n in "${names[@]}"; do
