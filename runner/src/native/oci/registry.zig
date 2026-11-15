@@ -242,7 +242,7 @@ pub const Client = struct {
             c.retry_ms = 0;
             const ct = c.once(url, accept, body, &challenge) catch |e| {
                 if (e == error.HttpStatus and c.status == 429 and c.wait_on_limit and waits < max_waits) {
-                    // What it asked for, else 1 s, 2 s: the whole wait is bounded (`ratelimit.max_wait_ms`).
+                    // What it asked for, else 1 s, 2 s: each wait is at most `ratelimit.max_wait_ms`, and there are at most `max_waits`.
                     const ms = if (c.retry_ms > 0) c.retry_ms else @as(i64, 1000) << waits;
                     waits += 1;
                     std.log.info("registry: {s} answered 429; waiting {d} ms", .{ c.ref.host, ms });

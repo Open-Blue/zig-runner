@@ -49,6 +49,8 @@ pub const Server = struct {
     resets: std.atomic.Value(u32) = .init(0),
     /// How many manifest requests are answered `429 Too Many Requests`, `Retry-After: 1`.
     limited: std.atomic.Value(u32) = .init(0),
+    /// When not 0, every manifest request is answered with this status (401, 403, 503, ...).
+    refuse: std.atomic.Value(u32) = .init(0),
     requests: std.atomic.Value(u32) = .init(0),
     connections: std.atomic.Value(u32) = .init(0),
 
@@ -159,6 +161,11 @@ fn answer(s: *Server, conn: Io.net.Stream) bool {
             _ = s.limited.fetchSub(1, .acq_rel);
             return respond(s, out, "429 Too Many Requests", "Retry-After: 1\r\n", "application/json", "{\"errors\":[{\"code\":\"TOOMANYREQUESTS\"}]}");
         }
+        if (std.mem.indexOf(u8, path, "/manifests/") != null and s.refuse.load(.acquire) != 0) {
+            var sb: [32]u8 = undefined;
+            const line = std.fmt.bufPrint(&sb, "{d} Refused", .{s.refuse.load(.acquire)}) catch return false;
+            return respond(s, out, line, "", "application/json", "{\"errors\":[]}");
+        }
         for (s.routes) |rt| if (std.mem.eql(u8, rt.path, path)) {
             if (rt.redirect) {
                 const digest = path[std.mem.lastIndexOfScalar(u8, path, '/').? + 1 ..];
@@ -258,6 +265,7 @@ pub fn testImage(a: Allocator, repo: []const u8, tag: []const u8, layers: []cons
 // --- the pull's tests ---
 
 const image = @import("image.zig");
+const registry_api = @import("registry.zig");
 const Store = @import("Store.zig");
 const testing = std.testing;
 
@@ -424,6 +432,113 @@ test "native oci pull: a registry that answers 429 gives the last known digest; 
     server.limited.store(0, .release);
     server.routes = &.{};
     try testing.expectError(error.NotFound, pullTag(arena, store, ref, 0, &why));
+}
+
+/// The one tag record in the store's refs, rewritten to `text` (null: its path only).
+fn tagRecord(arena: Allocator, store: Store, text: ?[]const u8) ![]const u8 {
+    var d = try std.Io.Dir.cwd().openDir(testing.io, try std.fmt.allocPrint(arena, "{s}/oci/refs", .{store.root}), .{ .iterate = true });
+    defer d.close(testing.io);
+    var it = d.iterate();
+    while (try it.next(testing.io)) |e| if (std.mem.startsWith(u8, e.name, "tag-")) {
+        const path = try std.fmt.allocPrint(arena, "{s}/oci/refs/{s}", .{ store.root, e.name });
+        if (text) |t| try d.writeFile(testing.io, .{ .sub_path = e.name, .data = t });
+        return path;
+    };
+    return error.NoTagRecord;
+}
+
+test "native oci pull: a tag's record belongs to the credentials that resolved it" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(testing.io, ".", arena) };
+    const one = try tinyImage(arena, "test/img", "t", "one");
+    var server: Server = .{ .routes = one.routes, .private = true };
+    try server.start();
+    defer server.stop();
+    const ref = try server.image(arena, "test/img:t");
+    const good: registry_api.Credentials = .{ .username = "user", .password = "pass" };
+    var why: []const u8 = "";
+    const mine = try image.pull(arena, testing.allocator, testing.io, store, .{ .image = ref, .creds = good, .owners = false, .tag_ttl_s = 300 }, &why);
+    mine.lock.close(testing.io);
+    // Within the TTL, the same login is served without a request...
+    const seen = server.requests.load(.acquire);
+    (try image.pull(arena, testing.allocator, testing.io, store, .{ .image = ref, .creds = good, .owners = false, .tag_ttl_s = 300 }, &why)).lock.close(testing.io);
+    try testing.expectEqual(seen, server.requests.load(.acquire));
+    // ... no login, or another, asks the registry and is refused, on a TTL's reuse and as a fallback.
+    for ([_]?registry_api.Credentials{ null, .{ .username = "user", .password = "other" }, .{ .username = "other", .password = "pass" } }) |cr| {
+        try testing.expectError(error.Unauthorized, image.pull(arena, testing.allocator, testing.io, store, .{ .image = ref, .creds = cr, .owners = false, .tag_ttl_s = 300 }, &why));
+        try testing.expect(server.requests.load(.acquire) > seen);
+    }
+}
+
+test "native oci pull: with a record, a 401, a 403 and a 404 are errors; a 503, 429 and no answer fall back; an evicted image does not; a bad record is not trusted" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(testing.io, ".", arena) };
+    const one = try tinyImage(arena, "test/img", "t", "one");
+    const two = try tinyImage(arena, "test/img", "t", "two");
+    var server: Server = .{ .routes = one.routes };
+    try server.start();
+    defer server.stop();
+    const ref = try server.image(arena, "test/img:t");
+    var why: []const u8 = "";
+    const first = try pullTag(arena, store, ref, 300, &why);
+
+    for ([_]u32{ 401, 403 }) |status| {
+        server.refuse.store(status, .release);
+        try testing.expectError(error.HttpStatus, pullTag(arena, store, ref, 0, &why));
+    }
+    server.refuse.store(503, .release);
+    const down = try pullTag(arena, store, ref, 0, &why);
+    try testing.expectEqualStrings(one.index, down.digest);
+    try testing.expect(down.reused != null);
+    server.refuse.store(0, .release);
+
+    // No answer at all.
+    server.mute = true;
+    const mute = try pullTag(arena, store, ref, 0, &why);
+    try testing.expectEqualStrings(first.rootfs, mute.rootfs);
+    try testing.expect(mute.reused != null);
+    server.mute = false;
+
+    // Records that are not to be trusted: the registry is asked, and the moved tag seen.
+    server.routes = two.routes;
+    const path = try tagRecord(arena, store, null);
+    const bad = [_][]const u8{
+        "garbage",
+        "",
+        try std.fmt.allocPrint(arena, "{s} {s} 9999999999999\n", .{ one.manifest, one.index }),
+        try std.fmt.allocPrint(arena, "{s} {s} -5\n", .{ one.manifest, one.index }),
+        try std.fmt.allocPrint(arena, "{s} sha256:zz 1\n", .{one.manifest}),
+    };
+    for (bad) |text| {
+        _ = try tagRecord(arena, store, text);
+        const got = try pullTag(arena, store, ref, 300, &why);
+        try testing.expectEqualStrings(two.index, got.digest);
+        // Back to the first image's record for the next.
+        server.routes = one.routes;
+        _ = try pullTag(arena, store, ref, 0, &why);
+        server.routes = two.routes;
+    }
+    _ = path;
+
+    // The record's image evicted: a 429 is waited out, not given a digest the store lacks.
+    server.routes = one.routes;
+    _ = try pullTag(arena, store, ref, 0, &why);
+    const key = one.manifest["sha256:".len..];
+    const dir = try std.fmt.allocPrint(arena, "{s}/oci/images/{s}.rootless", .{ store.root, key });
+    Store.removeTree(testing.io, dir);
+    server.limited.store(1, .release);
+    const t0 = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    const again = try pullTag(arena, store, ref, 0, &why);
+    try testing.expect(std.Io.Clock.awake.now(testing.io).toMilliseconds() - t0 >= 900);
+    try testing.expect(again.reused == null and again.pulled != null);
 }
 
 test "native oci pull: a blob that does not match its digest is refused and not kept" {

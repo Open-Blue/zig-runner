@@ -114,7 +114,7 @@ pub fn pull(
     }
 
     // A tag resolved lately, or whose last resolution the registry may fail to repeat.
-    const tag_path: ?[]const u8 = if (ref.digest == null) try tagPath(arena, store, ref, platform) else null;
+    const tag_path: ?[]const u8 = if (ref.digest == null) try tagPath(arena, store, ref, req.creds, platform) else null;
     const known_tag: ?TagRecord = if (tag_path) |p| try readTag(arena, io, p) else null;
     if (known_tag) |k| {
         const age = std.Io.Clock.real.now(io).toSeconds() - k.at;
@@ -123,23 +123,26 @@ pub fn pull(
         }
     }
 
-    // With a last known digest to fall back on, a registry's "slow down" is not waited out.
-    var c: registry.Client = .{ .arena = arena, .io = io, .ref = ref, .creds = req.creds, .wait_on_limit = known_tag == null };
+    // The last known digest's image, if the store still has it: what a registry that cannot answer
+    // is replaced by, and then its "slow down" is not waited out.
+    var fallback: ?Image = if (known_tag) |k| try fromKnown(arena, io, store, k.top, k.manifest, req.owners) else null;
+    errdefer if (fallback) |f| f.lock.close(io);
+    var c: registry.Client = .{ .arena = arena, .io = io, .ref = ref, .creds = req.creds, .wait_on_limit = fallback == null };
     errdefer if (c.why.len > 0 and why.len == 0) {
         why.* = c.why;
     };
     const top = c.manifest(ref.reference()) catch |e| {
-        if (known_tag) |k| if (c.unavailable()) {
-            if (try fromKnown(arena, io, store, k.top, k.manifest, req.owners)) |img_| {
-                var img = img_;
-                img.reused = try std.fmt.allocPrint(arena, "the registry did not answer ({s}); using the last " ++
-                    "known digest of {s}, {s}", .{ if (c.why.len > 0) c.why else @errorName(e), req.image, k.top });
-                std.log.warn("image {s}: {s}", .{ req.image, img.reused.? });
-                return img;
-            }
+        if (fallback) |*img| if (c.unavailable()) {
+            img.reused = try std.fmt.allocPrint(arena, "the registry did not answer ({s}); using the last " ++
+                "known digest of {s}, {s}", .{ if (c.why.len > 0) c.why else @errorName(e), req.image, known_tag.?.top });
+            std.log.warn("image {s}: {s}", .{ req.image, img.reused.? });
+            return img.*;
         };
         return fail(arena, why, &c, e, "its manifest");
     };
+    // Not needed: the pull goes on, and holds what it pulls itself.
+    if (fallback) |f| f.lock.close(io);
+    fallback = null;
     const top_doc = try parseManifest(arena, top, why);
     const man = if (top_doc.manifests) |list| m: {
         const pick = pickPlatform(list, platform) orelse {
@@ -213,8 +216,14 @@ fn fromKnown(arena: Allocator, io: std.Io, store: Store, digest: []const u8, man
 /// manifest and what the tag named (the index, for a multi-platform image).
 const TagRecord = struct { manifest: []const u8, top: []const u8, at: i64 };
 
-fn tagPath(arena: Allocator, store: Store, ref: registry.Ref, platform: Platform) ![]const u8 {
-    const name = try std.fmt.allocPrint(arena, "{f}", .{ref});
+/// Where the tag's record is: named by a hash of the reference and of who asked (`anonymous`, or
+/// the credentials' user and password, which only their hash is of: never stored), so that what one
+/// credential context was let pull is never served to another (a private image, a revoked login).
+fn tagPath(arena: Allocator, store: Store, ref: registry.Ref, creds: ?registry.Credentials, platform: Platform) ![]const u8 {
+    const name = if (creds) |cr|
+        try std.fmt.allocPrint(arena, "{f}\x00{d}:{s}\x00{s}", .{ ref, cr.username.len, cr.username, cr.password })
+    else
+        try std.fmt.allocPrint(arena, "{f}\x00anonymous", .{ref});
     var sum: [32]u8 = undefined;
     Sha256.hash(name, &sum, .{});
     return std.fmt.allocPrint(arena, "{s}/oci/refs/tag-{s}.{s}", .{ store.root, &std.fmt.bytesToHex(sum, .lower), platform.name() });
