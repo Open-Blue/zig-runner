@@ -9044,11 +9044,13 @@ fn expectSucceeded(r: anytype) !void {
     };
 }
 
-/// The step lines of a log, without the note a replayed step ends with.
+/// The step lines of a log, without the runner's lines about this execution: the note a replayed
+/// step ends with, and the memory peak a step that ran gets (a replay did not run, so has none).
 fn replayableLines(arena: Allocator, text: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for (try stepLines(arena, text)) |l| {
         if (std.mem.indexOf(u8, l, dagger.native_reused_note) != null) continue;
+        if (cgroup.isPeakLine(l)) continue;
         try out.append(arena, l);
     }
     return out.items;

@@ -920,6 +920,12 @@ pub const Peak = struct {
     pub fn open(dir: []const u8) Peak {
         var path_buf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
         const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/memory.peak", .{dir}, 0) catch return .{};
+        return openFile(path);
+    }
+
+    /// `open` of the file at `path`: the fallbacks apply to any file, which lets a test reach them
+    /// whatever the kernel.
+    fn openFile(path: [:0]const u8) Peak {
         const rw = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
         if (linux.errno(rw) == .SUCCESS) {
             const fd: linux.fd_t = std.math.cast(linux.fd_t, rw) orelse return .{};
@@ -946,6 +952,19 @@ pub const Peak = struct {
     }
 };
 
+/// What the peak line begins with, per step or cumulative (`peakText`); the replay of a cached step
+/// has no such line (the runner writes it for a step that ran, outside the step's recorded log).
+const peak_per_step = "this step's memory peak was";
+const peak_so_far = "the job's memory peak so far (this kernel cannot reset it per step) is";
+
+/// Whether `line` is the runner's memory-peak line, as `peakText` writes it: a diagnostic about one
+/// execution, not step output.
+pub fn isPeakLine(line: []const u8) bool {
+    const at = std.mem.indexOf(u8, line, "Native steps: ") orelse return false;
+    const rest = line[at + "Native steps: ".len ..];
+    return std.mem.startsWith(u8, rest, peak_per_step) or std.mem.startsWith(u8, rest, peak_so_far);
+}
+
 /// The log line for a step's memory peak, null when there is none (`Peak.bytes`). `limit`: the
 /// job's `memory.max`, null for none.
 pub fn peakText(arena: Allocator, peak: ?u64, limit: ?u64, reset: bool) !?[]const u8 {
@@ -956,7 +975,7 @@ pub fn peakText(arena: Allocator, peak: ?u64, limit: ?u64, reset: bool) !?[]cons
     else
         " (the job has no memory limit)";
     return try std.fmt.allocPrint(arena, "Native steps: {s} {d} MB{s}", .{
-        if (reset) "this step's memory peak was" else "the job's memory peak so far (this kernel cannot reset it per step) is",
+        if (reset) peak_per_step else peak_so_far,
         mb,
         of,
     });
@@ -990,6 +1009,31 @@ test "native cgroup: Peak reads a file's value and reports none for a missing on
     defer p.close();
     // A plain file takes the write, as a 6.12 kernel's does.
     try std.testing.expect(p.reset);
+}
+
+test "native cgroup: Peak without a resettable file keeps the descriptor and reads the job's peak" {
+    // /proc/self/oom_score is a number nobody can write, as `memory.peak` is before Linux 6.12:
+    // opened for writing (root) or only for reading, the write fails, so the peak is not the step's.
+    const p = Peak.openFile("/proc/self/oom_score");
+    defer p.close();
+    try std.testing.expect(p.fd != null);
+    try std.testing.expect(!p.reset);
+    try std.testing.expect(p.read() != null);
+    // A directory cannot be read as a number: no peak, not a wrong one.
+    const d = Peak.openFile("/proc/self");
+    defer d.close();
+    try std.testing.expectEqual(@as(?u64, null), d.read());
+    // Nothing at all: no descriptor, no line.
+    const none = Peak.openFile("/proc/self/no-such-file");
+    try std.testing.expect(none.fd == null);
+    try std.testing.expect(!none.reset);
+    try std.testing.expectEqual(@as(?u64, null), none.read());
+    try std.testing.expect(isPeakLine("[job 0 step 1 stdout] Native steps: this step's memory peak was 3 MB of the job's 6.9 GB limit"));
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    for ([_]bool{ true, false }) |reset|
+        try std.testing.expect(isPeakLine((try peakText(a.allocator(), 5 << 20, null, reset)).?));
+    try std.testing.expect(!isPeakLine("Native steps: Not replayed: the script changed"));
 }
 
 /// Which limit an OOM kill in a job came from: `memory.events` counts `oom_kill` where the process
