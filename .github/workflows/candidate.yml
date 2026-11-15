@@ -197,10 +197,13 @@ jobs:
           install -m 0755 dist/zig-runner-linux-x86_64 runner/prebuilt/runner-amd64
           install -m 0755 dist/zig-runner-linux-aarch64 runner/prebuilt/runner-arm64
 
+      # As release.yml: not the Dockerfile oracle's fixtures (tools/dockerfile_oracle), builder
+      # inputs that use what BuildKit accepts (no USER, a relative WORKDIR), not images we ship.
       - name: Scan the Dockerfile
         run: |
           docker run --rm -v "$PWD:/src:ro" -w /src "$TRIVY_IMAGE" config \
-            --exit-code 1 --severity HIGH,CRITICAL --ignorefile .trivyignore.yaml runner/
+            --exit-code 1 --severity HIGH,CRITICAL --ignorefile .trivyignore.yaml \
+            --skip-dirs tools/dockerfile_oracle runner/
 
       - name: Trivy's database
         run: |
