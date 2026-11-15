@@ -1305,7 +1305,7 @@ test "a signal waits for a step's own PID 1 to handle it, and goes on once it do
     };
     defer _ = linux.sigaction(.USR2, &dfl, null);
     try std.testing.expect(!Warning.handles(me, .USR2));
-    var w: Warning = .{ .pid1 = me, .held = .USR2 };
+    var w: Warning = .{ .pid1 = me, .held = .USR2, .started = true };
     w.tendHeld();
     try std.testing.expect(w.held != null);
     try std.testing.expect(w.busy());
@@ -1313,6 +1313,39 @@ test "a signal waits for a step's own PID 1 to handle it, and goes on once it do
     try std.testing.expect(Warning.handles(me, .USR2));
     w.tendHeld();
     try std.testing.expect(w.held == null);
+}
+
+test "a signal is held for PID 1 until it has exec'd the step's program" {
+    // The test process is the helper's own forked child before its exec: same executable.
+    try std.testing.expect(!Warning.execed(linux.getpid()));
+    var w: Warning = .{ .pid1 = linux.getpid(), .held = .USR2 };
+    w.tendHeld();
+    try std.testing.expect(w.held != null and !w.started);
+    // A child that exec'd `sleep`: its handlers are its own, and it has none for INT, so as before
+    // the signal stays held; once exec'd, the decision is the handler's alone.
+    const pid = linux.fork();
+    try std.testing.expect(linux.errno(pid) == .SUCCESS);
+    if (pid == 0) {
+        const argv = [_:null]?[*:0]const u8{ "sleep", "5" };
+        const envp = [_:null]?[*:0]const u8{};
+        _ = linux.execve("/bin/sleep", &argv, &envp);
+        linux.exit_group(127);
+    }
+    const child = std.math.cast(linux.pid_t, pid).?;
+    defer {
+        _ = linux.kill(child, .KILL);
+        var status: i32 = 0;
+        _ = linux.waitpid(child, &status, 0);
+    }
+    // The fork's child shows the test binary until its exec lands.
+    var tries: usize = 0;
+    while (!(Warning.exeDiffers(child) orelse false)) : (tries += 1) {
+        try std.testing.expect(tries < 500);
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    var v: Warning = .{ .pid1 = child, .held = .USR2 };
+    v.tendHeld();
+    try std.testing.expect(v.started and v.held != null);
 }
 
 test "swapRanges exchanges two ids and keeps the rest" {
@@ -1712,6 +1745,8 @@ const Warning = struct {
     pending: ?linux.SIG = null,
     /// A signal for `pid1` that waits for it to have a handler for it (`tend`).
     held: ?linux.SIG = null,
+    /// `pid1` has exec'd the step's program (`execed`): from then on its handlers are the program's.
+    started: bool = false,
     /// The process sending it. Its zombie must be reaped: PID 1 cannot finish exiting while one
     /// of its namespace is left (`zap_pid_ns_processes`), and the step would never end.
     sender: ?linux.pid_t = null,
@@ -1746,9 +1781,32 @@ const Warning = struct {
     fn tendHeld(w: *Warning) void {
         const sig = w.held orelse return;
         const p = w.pid1.?;
-        if (!handles(p, sig)) return;
+        if (!w.started) w.started = execed(p);
+        if (!w.started or !handles(p, sig)) return;
         w.held = null;
         _ = linux.kill(p, sig);
+    }
+
+    /// Whether `pid` has exec'd: its executable is no longer the helper's own, which the child
+    /// forked for PID 1 runs until its `execve`. Until then its handlers are the helper's (the
+    /// sanitizers' and the runtime's, which show as caught), and a SIGINT it takes goes nowhere: a
+    /// post step signalled within a tick of its start, while its sandbox was still being made (slow
+    /// under ThreadSanitizer), lost it before its shell existed. True when a link is unreadable.
+    fn execed(pid: linux.pid_t) bool {
+        return exeDiffers(pid) orelse true;
+    }
+
+    /// Whether `pid`'s executable is not this process's; null when a link cannot be read (it
+    /// cannot for a moment during an `execve`).
+    fn exeDiffers(pid: linux.pid_t) ?bool {
+        var mine: [std.fs.max_path_bytes]u8 = undefined;
+        var theirs: [std.fs.max_path_bytes]u8 = undefined;
+        const m = linux.readlink("/proc/self/exe", &mine, mine.len);
+        var path_buf: [32]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/exe", .{pid}, 0) catch return null;
+        const t = linux.readlink(path, &theirs, theirs.len);
+        if (linux.errno(m) != .SUCCESS or linux.errno(t) != .SUCCESS) return null;
+        return !std.mem.eql(u8, mine[0..m], theirs[0..t]);
     }
 
     /// Whether `pid` catches or ignores `sig` (`SigCgt` and `SigIgn` of /proc/<pid>/status).
