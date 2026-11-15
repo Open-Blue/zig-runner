@@ -327,18 +327,27 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
     try w.writeAll("\ngit checkout -q --detach FETCH_HEAD\nrm -f .git/FETCH_HEAD\n" ++
         "git rev-parse HEAD\n");
 
-    const env = try gitEnv(b, job, std.mem.eql(u8, repository, job.github.repository));
     var out: Backend.Captured = .{ .arena = arena };
-    const ended = try b.execOn(&.{ "sh", "-c", aw.written() }, env, &.{git_config_file}, 0, 0, out.output(), null);
-    // `sh` found no git in the image (any image is native since P3, not only the provisioned
-    // default one): the action's tarball instead (`tarball.zig`), here and for the job's later
-    // fetches.
     var tar_sha: []const u8 = "";
-    if (Backend.gitMissing(ended, &out)) {
-        b.dropTop();
-        b.no_git = true;
+    var ended: sandbox.Ended = .{ .code = 0, .failure = "" };
+    // Once the image is known to have no git, its script is not run again.
+    if (!b.no_git) {
+        const env = try gitEnv(b, job, std.mem.eql(u8, repository, job.github.repository));
+        ended = try b.execOn(&.{ "sh", "-c", aw.written() }, env, &.{git_config_file}, 0, 0, out.output(), null);
+        // `sh` found no git in the image (any image is native since P3, not only the provisioned
+        // default one): the action's tarball instead (`tarball.zig`), here and for the job's later
+        // fetches.
+        if (Backend.gitMissing(ended, &out)) {
+            b.dropTop();
+            b.no_git = true;
+        }
     }
     if (b.no_git) {
+        if (tarball.refProblem(u.ref)) |why| return .{ .unresolved = try std.fmt.allocPrint(
+            arena,
+            "Unable to resolve action `{s}`: {s}",
+            .{ ref_label, why },
+        ) };
         const own = std.mem.eql(u8, repository, job.github.repository);
         const src = if (own and job.job_token.len > 0)
             try tarball.checkoutSource(arena, server, repository, u.ref, job.job_token)
