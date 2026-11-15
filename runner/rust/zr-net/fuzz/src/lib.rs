@@ -51,20 +51,58 @@ fn serve(mut s: TcpStream, f: &Fixture) {
     let _ = s.shutdown(std::net::Shutdown::Both);
 }
 
-/// Whether a response may be served: a redirect, a refresh or any other `//` in it could name a
-/// host of the fuzzer's choosing, and the client would connect there. Only the fixture's own
-/// address (`http://127.0.0.1:PORT`) may follow a `//`.
+/// Whether a response may be served: a redirect (or any other text) could name a host of the
+/// fuzzer's choosing, and the client would connect there. Every `//` in it must be the start of a
+/// URL that the client's own parser (`http::Uri`) reads as the fixture's: scheme http, host
+/// 127.0.0.1, this port, and no userinfo (`http://127.0.0.1:PORT@evil.example/` has the host
+/// evil.example). The URL ends at the first space, control or non-ASCII byte or quote.
 pub fn safe_response(port: u16, r: &[u8]) -> bool {
-    let own = format!("//127.0.0.1:{port}");
     let mut i = 0;
     while let Some(k) = r[i..].windows(2).position(|w| w == b"//") {
         let at = i + k;
-        if !(r[at..].starts_with(own.as_bytes()) && r[..at].ends_with(b"http:")) {
+        i = at + 2;
+        if !r[..at].ends_with(b"http:") {
             return false;
         }
-        i = at + 2;
+        let start = at - "http:".len();
+        let end = r[start..].iter().position(|&b| b <= b' ' || b >= 0x7f || matches!(b, b'"' | b'\'' | b'<' | b'>' | b'\\')).map_or(r.len(), |e| start + e);
+        let Ok(text) = std::str::from_utf8(&r[start..end]) else { return false };
+        let Ok(uri) = text.parse::<http::Uri>() else { return false };
+        let ok = uri.scheme_str() == Some("http")
+            && uri.host() == Some("127.0.0.1")
+            && uri.port_u16() == Some(port)
+            && uri.authority().is_some_and(|a| !a.as_str().contains('@'));
+        if !ok {
+            return false;
+        }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_response;
+
+    #[test]
+    fn only_the_fixtures_own_address_is_served() {
+        let ok = |s: &str| safe_response(4000, s.as_bytes());
+        assert!(ok("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+        assert!(ok("HTTP/1.1 302 Found\r\nLocation: /next\r\n\r\n"));
+        assert!(ok("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:4000/x?y=1#z\r\n\r\n"));
+        assert!(ok("Location: http://127.0.0.1:4000\r\n"));
+        // Userinfo makes the host the one after the `@`.
+        assert!(!ok("Location: http://127.0.0.1:4000@evil.example/\r\n"));
+        assert!(!ok("Location: http://127.0.0.1:4000@evil.example\r\n"));
+        assert!(!ok("Location: http://127.0.0.1:4000:80@evil.example/\r\n"));
+        assert!(!ok("Location: http://a:b@127.0.0.1:4000/\r\n"));
+        assert!(!ok("Location: http://127.0.0.1:40000/\r\n"));
+        assert!(!ok("Location: http://127.0.0.1:4000.evil.example/\r\n"));
+        assert!(!ok("Location: http://127.0.0.1/\r\n"));
+        assert!(!ok("Location: https://127.0.0.1:4000/\r\n"));
+        assert!(!ok("Location: //evil.example/\r\n"));
+        assert!(!ok("Location: http://evil.example/\r\n"));
+        assert!(!ok("Location: ftp://127.0.0.1:4000/\r\n"));
+    }
 }
 
 /// One request through the C ABI.

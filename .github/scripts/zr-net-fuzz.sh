@@ -11,7 +11,7 @@
 #                                   workflow); a crash, a failed check or a hang fails it, leaving
 #                                   the input under fuzz/artifacts
 #
-# cargo-fuzz is built from crates.io at its pinned version, with its own lock file (--locked).
+# cargo-fuzz is built from crates.io at its pinned version (--locked, its own lock file).
 set -euo pipefail
 
 version=0.13.2
@@ -27,6 +27,11 @@ fi
 export PATH=$tools/bin:$PATH
 
 targets=(http_response request_spec tls_records)
+
+# cargo-fuzz has no --locked of its own: this fails when fuzz/Cargo.lock does not satisfy the
+# manifests, which the build would otherwise rewrite (fuzz/Cargo.lock started as zr-net's lock file,
+# so the library's dependencies are the versions the library is tested with).
+cargo fetch --locked
 
 case ${1:-} in
 build)
