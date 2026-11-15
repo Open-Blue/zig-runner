@@ -246,7 +246,7 @@ fn downloadWith(arena: Allocator, client: *std.http.Client, io: std.Io, src: Sou
             // A server that is busy or limiting: again, after at least what it asked for (a
             // cancel of the job ends the sleep), a bounded number of times.
             error.HttpStatus => if (miss.retryable() and retries < max_retries) {
-                const backoff = src.backoff_ms << @intCast(retries);
+                const backoff = std.math.shl(@TypeOf(src.backoff_ms), src.backoff_ms, retries);
                 retries += 1;
                 try io.sleep(.fromMilliseconds(ratelimit.wait(io, backoff, miss.asked_ms)), .awake);
                 continue;
