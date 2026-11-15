@@ -736,7 +736,9 @@ test "each post script of a native job hears its own SIGINT at the job's limit" 
     });
 }
 
-test "a post step that runs as a non-root user, signalled at its start, hears its SIGINT" {
+test "root runner: a post step that runs as a non-root user, signalled at its start, hears its SIGINT" {
+    // A rootless runner runs a Docker action as root only, and sends this one to Dagger.
+    try Backend.requireRoot();
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
