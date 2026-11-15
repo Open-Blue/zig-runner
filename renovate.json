@@ -165,6 +165,17 @@
         "patch"
       ],
       "enabled": false
+    },
+    {
+      "description": "The images of the Dockerfile builder's BuildKit oracle (runner/tools/dockerfile_oracle): every fixture's FROM and COPY --from, the ARG and ${IMAGE} forms and bases.txt name the same tag and index digest, and the oracle (dockerfile-diff.sh) looks a base up by that exact reference, so they move together in one pull request, not with busybox's or ubuntu's own above.",
+      "matchFileNames": [
+        "runner/tools/dockerfile_oracle/**"
+      ],
+      "matchDepNames": [
+        "alpine",
+        "busybox"
+      ],
+      "groupName": "dockerfile oracle images"
     }
   ],
   "customManagers": [
@@ -252,6 +263,19 @@
       ],
       "matchStrings": [
         "(?:TRIVY|BUILDKIT|SBOM_SCANNER)_IMAGE: (?<depName>[a-z0-9./-]+):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "description": "The Dockerfile oracle's bases.txt (one `name:tag@sha256:...` per base image, as the fixtures name them) and the fixture that builds its FROM from an ARG (`FROM ${IMAGE}:3.22@sha256:...`, the name in the ARG), which the Dockerfile manager does not see; the other fixtures' lines it reads itself. Pinned by the multi-arch index digest.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^runner/tools/dockerfile_oracle/bases\\.txt$/",
+        "/^runner/tools/dockerfile_oracle/config/ctx/Dockerfile$/"
+      ],
+      "matchStrings": [
+        "^(?<depName>[a-z0-9./-]+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})$",
+        "^FROM \\$\\{IMAGE\\}:(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})$"
       ],
       "datasourceTemplate": "docker"
     },
