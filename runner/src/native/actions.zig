@@ -736,6 +736,43 @@ test "each post script of a native job hears its own SIGINT at the job's limit" 
     });
 }
 
+test "a post step that runs as a non-root user, signalled at its start, hears its SIGINT" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testActions(arena, &tmp);
+    // Its PID 1 changed to a uid that is not the helper's, so it is not dumpable: its executable's
+    // link may be unreadable to the helper, and the hold must still tell its exec (`Warning.execed`).
+    const user_images = try docker_action.testImage(arena, &tmp, "zr-test/user:1",
+        \\{"config":{"User":"1000","Env":["PATH=/usr/bin:/bin"]}}
+    );
+    try std.testing.expectEqualStrings(cfg.images, user_images);
+    // The main run is `true`; the post script traps at once and waits to be told. The limit is
+    // already near when it starts, so its SIGINT comes within a tick.
+    try testRepo(arena, &tmp, "user", &.{.{
+        "action.yml",
+        \\runs:
+        \\  using: docker
+        \\  image: docker://zr-test/user:1
+        \\  entrypoint: "true"
+        \\  post-entrypoint: sh
+        \\  args:
+        \\    - -c
+        \\    - trap 'echo heard-int-user; exit 0' INT; echo started-user; sleep 613.85 & wait
+        ,
+    }});
+    var job = testJob(&.{
+        usesStep("user", "o", "user", "v1", &.{}),
+        testStep("sleep 613.86"),
+    });
+    job.github.server_url = "file:///srv/git";
+    const r = try Backend.runCancelled(arena, cfg, job, .{ .when = "613.86", .grace_ms = 10_000 });
+    errdefer std.debug.print("took {d} ms:\n{s}\n", .{ r.took_ms, r.text });
+    try Backend.expectLines(r.text, &.{"heard-int-user"});
+}
+
 test "preload: a JavaScript action, a local one, or an image not in the store sends the job to Dagger" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
