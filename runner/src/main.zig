@@ -55,6 +55,7 @@ comptime {
     _ = @import("native/sync_choice.zig");
     _ = @import("native/sandbox.zig");
     _ = @import("native/net.zig");
+    _ = @import("native/dns_probe.zig");
     _ = @import("native/seccomp.zig");
     _ = @import("native/nft.zig");
     _ = @import("native/key_diff.zig");

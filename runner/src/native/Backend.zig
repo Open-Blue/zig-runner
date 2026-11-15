@@ -23,6 +23,7 @@ const expr = @import("../expr.zig");
 const dagger = @import("../dagger.zig");
 const sandbox = @import("sandbox.zig");
 const net = @import("net.zig");
+const dns_probe = @import("dns_probe.zig");
 const Store = @import("Store.zig");
 const oci = @import("oci/image.zig");
 const registry = @import("oci/registry.zig");
@@ -1206,6 +1207,7 @@ fn jobBinds(b: *Backend, cfg: Config, why: *[]const u8) ![]const sandbox.Spec.Bi
             return failed(why, b.arena, "making the job's resolver from", from, e);
         };
         b.nameservers = r.nameservers;
+        dns_probe.start(r.nameservers);
         if (r.fallback) try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Native " ++
             "steps: the host's resolver ({s}) names no nameserver the job's network can reach " ++
             "(only loopback or IPv6 ones), so the job resolves through 8.8.8.8 and 8.8.4.4, as " ++
