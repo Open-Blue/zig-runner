@@ -17,6 +17,7 @@ const std = @import("std");
 const net_client = @import("../../net_client.zig");
 
 const Allocator = std.mem.Allocator;
+const ratelimit = @import("../../github/ratelimit.zig");
 const Sha256 = @import("../../sha256.zig").Sha256;
 
 /// An image reference, normalized as Docker does: `ubuntu:24.04` is
@@ -158,6 +159,13 @@ pub const Client = struct {
     why: []const u8 = "",
     /// The last response's.
     content_type: []const u8 = "",
+    /// What the last 429's `Retry-After` asked for.
+    retry_ms: i64 = 0,
+    /// The last request's HTTP status; 0 when none came (the network failed).
+    status: u16 = 0,
+    /// A 429 is waited out as its `Retry-After` asks (`ratelimit`), up to `max_waits` times; off
+    /// when the pull has a last known digest to fall back on instead.
+    wait_on_limit: bool = true,
 
     pub const Manifest = struct {
         bytes: []const u8,
@@ -217,12 +225,32 @@ pub const Client = struct {
         return body.memory.bytes.items;
     }
 
+    /// Whether the last failure says the registry cannot answer now (the network, a 429 or a 5xx),
+    /// not that the answer is no: a reference that is not there, or credentials that are wrong.
+    pub fn unavailable(c: Client) bool {
+        return c.status == 0 or c.status == 429 or c.status >= 500;
+    }
+
+    const max_waits = 2;
+
     /// GET `url` into `body`, answering one auth challenge. The response's content type.
     fn get(c: *Client, url: []const u8, accept: []const u8, body: *Body) ![]const u8 {
         var challenged = false;
+        var waits: u6 = 0;
         while (true) {
             var challenge: ?[]const u8 = null;
-            const ct = try c.once(url, accept, body, &challenge);
+            c.retry_ms = 0;
+            const ct = c.once(url, accept, body, &challenge) catch |e| {
+                if (e == error.HttpStatus and c.status == 429 and c.wait_on_limit and waits < max_waits) {
+                    // What it asked for, else 1 s, 2 s: the whole wait is bounded (`ratelimit.max_wait_ms`).
+                    const ms = if (c.retry_ms > 0) c.retry_ms else @as(i64, 1000) << waits;
+                    waits += 1;
+                    std.log.info("registry: {s} answered 429; waiting {d} ms", .{ c.ref.host, ms });
+                    try c.io.sleep(.fromMilliseconds(ms), .awake);
+                    continue;
+                }
+                return e;
+            };
             const ch = challenge orelse return ct;
             if (challenged) {
                 c.why = try std.fmt.allocPrint(c.arena, "{f}: unauthorized{s}", .{
@@ -248,6 +276,7 @@ pub const Client = struct {
         const headers = try c.arena.alloc(std.http.Header, if (c.authorization != null) 2 else 1);
         headers[0] = .{ .name = "Accept", .value = accept };
         if (c.authorization) |a| headers[1] = .{ .name = "Authorization", .value = a };
+        c.status = 0;
         var stream = net_client.open(c.arena, c.io, .{
             .url = url,
             .headers = headers,
@@ -261,7 +290,15 @@ pub const Client = struct {
         };
         defer stream.close();
         const status = stream.status;
+        c.status = @backingInt(status);
         c.content_type = "";
+        if (status == .too_many_requests) c.retry_ms = ratelimit.parse(
+            status,
+            stream.header("retry-after"),
+            null,
+            null,
+            std.Io.Clock.real.now(c.io).toMilliseconds(),
+        );
         if (stream.header("content-type")) |ct| {
             c.content_type = try c.arena.dupe(u8, std.mem.trim(u8, ct[0 .. std.mem.indexOfScalar(u8, ct, ';') orelse ct.len], " "));
         }

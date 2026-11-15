@@ -150,6 +150,10 @@ pub const Config = struct {
     /// with apt as before (`RUNNER_PROVISIONED_IMAGE`). Off for a host that must pull from nowhere
     /// but the Ubuntu mirrors.
     provisioned_image: bool = true,
+    /// How long a native container job reuses what an image tag resolved to, without asking the
+    /// registry (`RUNNER_IMAGE_TAG_TTL`, seconds; 0 asks on every job). A tag that moved is seen
+    /// after this long; a registry that cannot answer falls back to the last known digest.
+    image_tag_ttl_secs: u32 = 300,
     /// Reuse a step's result from an earlier run when its inputs are unchanged (steps that use
     /// secrets always run). A workflow can opt out with `ZIG_RUNNER_STEP_CACHE: false` in its env.
     step_cache: bool = true,
@@ -560,6 +564,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_PACKAGE_CACHES")) |v| c.package_caches = try boolean(v);
         if (environ.get("RUNNER_TOOL_TREES")) |v| c.tool_trees = try boolean(v);
         if (environ.get("RUNNER_PROVISIONED_IMAGE")) |v| c.provisioned_image = try boolean(v);
+        if (environ.get("RUNNER_IMAGE_TAG_TTL")) |v| c.image_tag_ttl_secs = try secs(v);
         if (environ.get("RUNNER_STEP_CACHE")) |v| c.step_cache = try boolean(v);
         if (environ.get("RUNNER_STEP_USER")) |v| c.step_user = try stepUser(v);
         if (environ.get("RUNNER_BACKEND")) |v| c.backend = try stepBackend(v);
@@ -678,6 +683,7 @@ pub const Config = struct {
         else if (eq(key, "package-caches")) c.package_caches = try boolean(val) //
         else if (eq(key, "tool-trees")) c.tool_trees = try boolean(val) //
         else if (eq(key, "provisioned-image")) c.provisioned_image = try boolean(val) //
+        else if (eq(key, "image-tag-ttl")) c.image_tag_ttl_secs = try secs(val) //
         else if (eq(key, "step-cache")) c.step_cache = try boolean(val) //
         else if (eq(key, "step-user")) c.step_user = try stepUser(val) //
         else if (eq(key, "backend")) c.backend = try stepBackend(val) //
@@ -1367,6 +1373,10 @@ test "the provisioned image is on by default and can be turned off" {
     try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--provisioned-image=false" })).provisioned_image);
     try env.put("RUNNER_PROVISIONED_IMAGE", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).provisioned_image);
+    try std.testing.expectEqual(@as(u32, 300), (try Config.load(&env, &.{"runner"})).image_tag_ttl_secs);
+    try env.put("RUNNER_IMAGE_TAG_TTL", "0");
+    try std.testing.expectEqual(@as(u32, 0), (try Config.load(&env, &.{"runner"})).image_tag_ttl_secs);
+    try std.testing.expectEqual(@as(u32, 60), (try Config.load(&env, &.{ "runner", "--image-tag-ttl=60" })).image_tag_ttl_secs);
 }
 
 test "step caching is on by default and can be turned off" {

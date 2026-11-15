@@ -498,7 +498,9 @@ fn dropRefs(arena: Allocator, io: std.Io, root: []const u8) void {
     while (it.next(io) catch null) |e| {
         const p = std.fmt.allocPrint(arena, "{s}/{s}", .{ refs, e.name }) catch return;
         const text = std.Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(128)) catch continue;
-        const manifest = std.mem.trim(u8, text, " \n");
+        // A tag's record names the manifest first, then the digest the tag gave and when.
+        var words = std.mem.tokenizeAny(u8, text, " \n");
+        const manifest = words.next() orelse continue;
         if (!std.mem.startsWith(u8, manifest, "sha256:")) continue;
         const hex = manifest["sha256:".len..];
         const base = std.fmt.allocPrint(arena, "{s}/oci/images/{s}", .{ root, hex }) catch return;

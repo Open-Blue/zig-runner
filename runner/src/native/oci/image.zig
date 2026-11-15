@@ -12,6 +12,7 @@ const registry = @import("registry.zig");
 const layer = @import("layer.zig");
 const Store = @import("Store.zig");
 const admission = @import("../../admission.zig");
+const Sha256 = @import("../../sha256.zig").Sha256;
 const zr_net = @import("../../zr_net.zig");
 const linux = std.os.linux;
 
@@ -45,7 +46,14 @@ pub const Request = struct {
     /// The runner's place at the memory gate, for sizing the layer downloads (`Prefetch.start`);
     /// without it, `Prefetch.default_fetchers`.
     gate: ?*admission.Gate = null,
+    /// How long a tag's resolution (`tag_record`) is reused without asking the registry, in
+    /// seconds; 0 asks every time (a failed ask still falls back to the last known digest).
+    tag_ttl_s: u32 = 0,
 };
+
+/// What a tag resolved to by default (`Config.image_tag_ttl_secs`): minutes, so that a burst of
+/// jobs asks the registry once and a moved tag is picked up before the next one.
+pub const default_tag_ttl_s: u32 = 300;
 
 /// A pulled image: its rootfs and what its config says steps start with.
 pub const Image = struct {
@@ -64,6 +72,9 @@ pub const Image = struct {
     /// Held shared on the image in the store (`Store.hold`) until the caller closes it, which a
     /// job does at its end: a pull's rootfs is a lower of its mounts, and of what it provisions.
     lock: std.Io.File,
+    /// Why the registry was not asked or did not answer, when this is its last known digest for
+    /// the tag (`tag_record`) and not a fresh resolution; for the job's log.
+    reused: ?[]const u8 = null,
 };
 
 pub const Pulled = struct { layers: usize, bytes: u64, ms: i64, devices: u64 };
@@ -98,19 +109,37 @@ pub fn pull(
             else => null,
         };
         if (known) |m| if (registry.validDigest(m)) {
-            if (try store.hold(arena, io, "oci/images", try imageKey(arena, m, req.owners))) |lock| {
-                errdefer lock.close(io);
-                if (try fromStore(arena, io, store, d, m, req.owners, lock)) |img| return img;
-                lock.close(io);
-            }
+            if (try fromKnown(arena, io, store, d, m, req.owners)) |img| return img;
         };
     }
 
-    var c: registry.Client = .{ .arena = arena, .io = io, .ref = ref, .creds = req.creds };
+    // A tag resolved lately, or whose last resolution the registry may fail to repeat.
+    const tag_path: ?[]const u8 = if (ref.digest == null) try tagPath(arena, store, ref, platform) else null;
+    const known_tag: ?TagRecord = if (tag_path) |p| try readTag(arena, io, p) else null;
+    if (known_tag) |k| {
+        const age = std.Io.Clock.real.now(io).toSeconds() - k.at;
+        if (age >= 0 and age < req.tag_ttl_s) {
+            if (try fromKnown(arena, io, store, k.top, k.manifest, req.owners)) |img| return img;
+        }
+    }
+
+    // With a last known digest to fall back on, a registry's "slow down" is not waited out.
+    var c: registry.Client = .{ .arena = arena, .io = io, .ref = ref, .creds = req.creds, .wait_on_limit = known_tag == null };
     errdefer if (c.why.len > 0 and why.len == 0) {
         why.* = c.why;
     };
-    const top = c.manifest(ref.reference()) catch |e| return fail(arena, why, &c, e, "its manifest");
+    const top = c.manifest(ref.reference()) catch |e| {
+        if (known_tag) |k| if (c.unavailable()) {
+            if (try fromKnown(arena, io, store, k.top, k.manifest, req.owners)) |img_| {
+                var img = img_;
+                img.reused = try std.fmt.allocPrint(arena, "the registry did not answer ({s}); using the last " ++
+                    "known digest of {s}, {s}", .{ if (c.why.len > 0) c.why else @errorName(e), req.image, k.top });
+                std.log.warn("image {s}: {s}", .{ req.image, img.reused.? });
+                return img;
+            }
+        };
+        return fail(arena, why, &c, e, "its manifest");
+    };
     const top_doc = try parseManifest(arena, top, why);
     const man = if (top_doc.manifests) |list| m: {
         const pick = pickPlatform(list, platform) orelse {
@@ -124,7 +153,8 @@ pub fn pull(
         why.* = try std.fmt.allocPrint(arena, "{s}: the manifest is not an image's", .{req.image});
         return error.BadManifest;
     }
-    if (ref.digest) |d| writeRef(arena, io, try store.refPath(arena, d, platform.name()), man.digest);
+    if (ref.digest) |d| try writeRef(arena, io, try store.refPath(arena, d, platform.name()), man.digest);
+    if (tag_path) |p| try writeTag(arena, io, p, top.digest, man.digest);
 
     const started = std.Io.Clock.awake.now(io).toMilliseconds();
     var unpack: Unpack = .{
@@ -169,6 +199,46 @@ fn fail(arena: Allocator, why: *[]const u8, c: *const registry.Client, e: anyerr
     return e;
 }
 
+/// The store's copy of the image under `manifest` (`digest` is what its reference resolved to),
+/// held, or null when it is not there.
+fn fromKnown(arena: Allocator, io: std.Io, store: Store, digest: []const u8, manifest: []const u8, owners: bool) !?Image {
+    const lock = (try store.hold(arena, io, "oci/images", try imageKey(arena, manifest, owners))) orelse return null;
+    errdefer lock.close(io);
+    if (try fromStore(arena, io, store, digest, manifest, owners, lock)) |img| return img;
+    lock.close(io);
+    return null;
+}
+
+/// What a tag resolved to, and when (epoch seconds): `<manifest> <top> <at>`, the platform's
+/// manifest and what the tag named (the index, for a multi-platform image).
+const TagRecord = struct { manifest: []const u8, top: []const u8, at: i64 };
+
+fn tagPath(arena: Allocator, store: Store, ref: registry.Ref, platform: Platform) ![]const u8 {
+    const name = try std.fmt.allocPrint(arena, "{f}", .{ref});
+    var sum: [32]u8 = undefined;
+    Sha256.hash(name, &sum, .{});
+    return std.fmt.allocPrint(arena, "{s}/oci/refs/tag-{s}.{s}", .{ store.root, &std.fmt.bytesToHex(sum, .lower), platform.name() });
+}
+
+/// The record at `path`, or null when there is none or it is not one.
+fn readTag(arena: Allocator, io: std.Io, path: []const u8) Allocator.Error!?TagRecord {
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(256)) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    var it = std.mem.tokenizeAny(u8, raw, " \n");
+    const manifest = it.next() orelse return null;
+    const top = it.next() orelse return null;
+    const at = std.fmt.parseInt(i64, it.next() orelse return null, 10) catch return null;
+    if (!registry.validDigest(manifest) or !registry.validDigest(top)) return null;
+    return .{ .manifest = manifest, .top = top, .at = at };
+}
+
+fn writeTag(arena: Allocator, io: std.Io, path: []const u8, top: []const u8, manifest: []const u8) Allocator.Error!void {
+    const text = try std.fmt.allocPrint(arena, "{s} {s} {d}\n", .{ manifest, top, std.Io.Clock.real.now(io).toSeconds() });
+    try writeRef(arena, io, path, text);
+}
+
 /// An image's directory in the store: its manifest's digest, apart for a rootless runner, whose
 /// files are all its own instead of the image's owners'.
 fn imageKey(arena: Allocator, manifest: []const u8, owners: bool) ![]const u8 {
@@ -204,10 +274,10 @@ fn fromStore(arena: Allocator, io: std.Io, store: Store, digest: []const u8, man
 
 /// Records which manifest a pinned index gives this platform: written aside and renamed, so a
 /// reader never sees half of it.
-fn writeRef(arena: Allocator, io: std.Io, path: []const u8, manifest: []const u8) void {
+fn writeRef(arena: Allocator, io: std.Io, path: []const u8, manifest: []const u8) Allocator.Error!void {
     var raw: [8]u8 = undefined;
     io.random(&raw);
-    const tmp = std.fmt.allocPrint(arena, "{s}.tmp-{s}", .{ path, &std.fmt.bytesToHex(raw, .lower) }) catch return;
+    const tmp = try std.fmt.allocPrint(arena, "{s}.tmp-{s}", .{ path, &std.fmt.bytesToHex(raw, .lower) });
     const cwd = std.Io.Dir.cwd();
     {
         const f = cwd.createFile(io, tmp, .{}) catch return;

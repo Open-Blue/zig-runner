@@ -47,6 +47,8 @@ pub const Server = struct {
     /// How many token requests are answered with a reset, as a socket closed with the request
     /// unread answers one.
     resets: std.atomic.Value(u32) = .init(0),
+    /// How many manifest requests are answered `429 Too Many Requests`, `Retry-After: 1`.
+    limited: std.atomic.Value(u32) = .init(0),
     requests: std.atomic.Value(u32) = .init(0),
     connections: std.atomic.Value(u32) = .init(0),
 
@@ -152,6 +154,10 @@ fn answer(s: *Server, conn: Io.net.Stream) bool {
         if (s.private and !std.mem.eql(u8, auth, "Bearer tok")) {
             const ch = std.fmt.bufPrint(&hb, "WWW-Authenticate: Bearer realm=\"http://127.0.0.1:{d}/token\",service=\"test\"\r\n", .{s.port}) catch return false;
             return respond(s, out, "401 Unauthorized", ch, "application/json", "{\"errors\":[{\"code\":\"UNAUTHORIZED\"}]}");
+        }
+        if (std.mem.indexOf(u8, path, "/manifests/") != null and s.limited.load(.acquire) > 0) {
+            _ = s.limited.fetchSub(1, .acq_rel);
+            return respond(s, out, "429 Too Many Requests", "Retry-After: 1\r\n", "application/json", "{\"errors\":[{\"code\":\"TOOMANYREQUESTS\"}]}");
         }
         for (s.routes) |rt| if (std.mem.eql(u8, rt.path, path)) {
             if (rt.redirect) {
@@ -330,6 +336,94 @@ test "native oci pull: token auth with credentials, an index, gzip and zstd laye
     const cached = try image.pull(arena, testing.allocator, io, store, .{ .image = pinned, .owners = false }, &why);
     try testing.expectEqual(seen, server.requests.load(.acquire));
     try testing.expectEqualStrings(got.rootfs, cached.rootfs);
+}
+
+/// An image with one layer at `repo:tag`, on a server whose routes are `routes` (a second image
+/// served under the same tag later: a tag that moved).
+fn tinyImage(arena: Allocator, repo: []const u8, tag: []const u8, marker: []const u8) !TestImage {
+    var t: layer.TestTar = .{ .a = arena };
+    try t.add(.{ .path = "marker", .body = marker });
+    return testImage(arena, repo, tag, &.{try t.finish()}, "\"A=1\"", false);
+}
+
+fn pullTag(arena: Allocator, store: Store, ref: []const u8, ttl: u32, why: *[]const u8) !image.Image {
+    const img = try image.pull(arena, testing.allocator, testing.io, store, .{ .image = ref, .owners = false, .tag_ttl_s = ttl }, why);
+    img.lock.close(testing.io);
+    return img;
+}
+
+test "native oci pull: a tag resolved within the TTL costs no request, one past it asks and sees a moved tag" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(testing.io, ".", arena) };
+    const one = try tinyImage(arena, "test/img", "t", "one");
+    const two = try tinyImage(arena, "test/img", "t", "two");
+    var server: Server = .{ .routes = one.routes };
+    try server.start();
+    defer server.stop();
+    const ref = try server.image(arena, "test/img:t");
+    var why: []const u8 = "";
+
+    const first = try pullTag(arena, store, ref, 300, &why);
+    try testing.expect(first.pulled != null);
+    // Five more jobs within the TTL: the registry is not asked.
+    const seen = server.requests.load(.acquire);
+    for (0..5) |_| {
+        const again = try pullTag(arena, store, ref, 300, &why);
+        try testing.expectEqualStrings(one.index, again.digest);
+        try testing.expectEqualStrings(first.rootfs, again.rootfs);
+    }
+    try testing.expectEqual(seen, server.requests.load(.acquire));
+    // The tag moves; within the TTL it is not seen, past it (here: TTL 0) it is.
+    server.routes = two.routes;
+    try testing.expectEqualStrings(one.index, (try pullTag(arena, store, ref, 300, &why)).digest);
+    const moved = try pullTag(arena, store, ref, 0, &why);
+    try testing.expectEqualStrings(two.index, moved.digest);
+    try testing.expect(moved.pulled != null);
+    // And the new resolution is what is reused after.
+    const after = server.requests.load(.acquire);
+    try testing.expectEqualStrings(two.index, (try pullTag(arena, store, ref, 300, &why)).digest);
+    try testing.expectEqual(after, server.requests.load(.acquire));
+}
+
+test "native oci pull: a registry that answers 429 gives the last known digest; a first pull waits out Retry-After" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(testing.io, ".", arena) };
+    const one = try tinyImage(arena, "test/img", "t", "one");
+    var server: Server = .{ .routes = one.routes };
+    try server.start();
+    defer server.stop();
+    const ref = try server.image(arena, "test/img:t");
+    var why: []const u8 = "";
+
+    // Nothing known yet: the 429 is waited out (Retry-After: 1) and the pull goes through.
+    server.limited.store(1, .release);
+    const started = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    const first = try pullTag(arena, store, ref, 0, &why);
+    try testing.expect(std.Io.Clock.awake.now(testing.io).toMilliseconds() - started >= 900);
+    try testing.expect(first.reused == null);
+
+    // Known now: a 429 is not waited for, the last known digest serves, saying so.
+    server.limited.store(100, .release);
+    const t0 = std.Io.Clock.awake.now(testing.io).toMilliseconds();
+    const stale = try pullTag(arena, store, ref, 0, &why);
+    try testing.expect(std.Io.Clock.awake.now(testing.io).toMilliseconds() - t0 < 900);
+    try testing.expectEqualStrings(one.index, stale.digest);
+    try testing.expectEqualStrings(first.rootfs, stale.rootfs);
+    try testing.expect(stale.reused != null);
+    try testing.expect(std.mem.indexOf(u8, stale.reused.?, one.index) != null);
+
+    // A tag the registry no longer has is an error, not the old digest.
+    server.limited.store(0, .release);
+    server.routes = &.{};
+    try testing.expectError(error.NotFound, pullTag(arena, store, ref, 0, &why));
 }
 
 test "native oci pull: a blob that does not match its digest is refused and not kept" {

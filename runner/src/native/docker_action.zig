@@ -141,7 +141,7 @@ pub fn unsupported(
         // job to Dagger for an image no step uses (#351). A step that may run is pulled, as a
         // pull that fails is Dagger's to try, and the job cannot start natively without it.
         if (try expr.neverTrue(arena, step.condition)) continue;
-        switch (try find(arena, gpa, io, cfg.images, cfg.store, d.image, null)) {
+        switch (try find(arena, gpa, io, cfg.images, cfg.store, d.image, cfg.image_tag_ttl_s, null)) {
             .missing => |why| return why,
             // GitHub's documentation asks for root ("Docker actions must be run by the default
             // Docker user"); Dagger's path gives another USER the directories it writes, which
@@ -164,12 +164,13 @@ pub fn find(
     dir: []const u8,
     store: []const u8,
     ref: []const u8,
+    tag_ttl_s: u32,
     held: ?*std.ArrayList(std.Io.File),
 ) !images.Found {
     if (dir.len > 0) return images.lookup(arena, io, dir, ref);
     var why: []const u8 = "";
     const owners = std.os.linux.geteuid() == 0;
-    const img = Backend.pullAt(arena, gpa, io, store, owners, ref, null, &why) catch |e|
+    const img = Backend.pullAt(arena, gpa, io, store, owners, ref, null, tag_ttl_s, &why) catch |e|
         return .{ .missing = try std.fmt.allocPrint(arena, "the image {s} could not be pulled " ++
             "natively: {s}", .{ ref, if (why.len > 0) why else @errorName(e) }) };
     if (held) |h| h.append(arena, img.lock) catch |e| {
@@ -195,7 +196,7 @@ pub fn run(
     const arena = b.arena;
     var img_lowers: []const []const u8 = &.{};
     const ref, const img = switch (dr.image) {
-        .pull => |r| .{ r, switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, r, &b.held)) {
+        .pull => |r| .{ r, switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, r, b.image_tag_ttl_s, &b.held)) {
             .image => |i| i,
             .missing => |why| {
                 _ = try x.actionFailed(num, "could not pull {s} for {s}: {s}", .{ r, dr.label, why });
@@ -425,7 +426,7 @@ const Planning = struct {
     fn resolve(iface: *dockerfile.Bases, arena: Allocator, ref: []const u8, why: *[]const u8) anyerror!?dockerfile.BaseImage {
         const p: *Planning = @fieldParentPtr("bases_iface", iface);
         const b = p.b;
-        switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, ref, &b.held)) {
+        switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, ref, b.image_tag_ttl_s, &b.held)) {
             .image => |i| return .{ .config = i, .id = if (p.digests) try baseId(arena, b.io, i) else "" },
             .missing => |w| {
                 why.* = w;
