@@ -333,11 +333,11 @@ test "oracle: an upload written as it is sent arrives as the same bytes through 
         var expect_buf: [64]u8 = undefined;
         const want = expectedBlob(n);
         const expect = try std.fmt.bufPrint(&expect_buf, "{d} {x:0>16}", .{ want.bytes, want.hash });
-        const body: net_client.Body = .{ .len = n, .ptr = testserver.PatternBody.ptr(n), .writeFn = testserver.PatternBody.write };
-        const lib = try net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = body, .headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }} });
+        const body: testserver.PatternBody = .init(n);
+        const lib = try net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = &body.body, .headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }} });
         try std.testing.expectEqual(std.http.Status.ok, lib.status);
         try std.testing.expectEqualStrings(expect, lib.body);
-        const old = try broker.request(arena, io, .PUT, url, null, .{ .body = body, .content_type = "text/plain" });
+        const old = try broker.request(arena, io, .PUT, url, null, .{ .body = &body.body, .content_type = "text/plain" });
         try std.testing.expectEqual(std.http.Status.ok, old.status);
         try std.testing.expectEqualStrings(expect, old.body);
     }
@@ -362,19 +362,18 @@ test "oracle: an upload whose writer stops short or fails is an error, not a hun
     var url_buf: [96]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/sink", .{server.port});
     const Short = struct {
-        fn write(_: *const anyopaque, w: *Io.Writer) anyerror!void {
+        fn write(_: *const net_client.Body, w: *Io.Writer) anyerror!void {
             try w.writeAll("only this");
         }
-        fn fail(_: *const anyopaque, w: *Io.Writer) anyerror!void {
+        fn fail(_: *const net_client.Body, w: *Io.Writer) anyerror!void {
             try w.writeAll("this much");
             return error.LogChangedWhileUploaded;
         }
     };
-    var unused: u8 = 0;
-    const short: net_client.Body = .{ .len = 100, .ptr = &unused, .writeFn = Short.write };
-    try std.testing.expectError(error.UploadFailed, net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = short, .deadline = .fromSeconds(5) }));
-    const failing: net_client.Body = .{ .len = 100, .ptr = &unused, .writeFn = Short.fail };
-    try std.testing.expectError(error.UploadFailed, net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = failing, .deadline = .fromSeconds(5) }));
+    const short: net_client.Body = .{ .len = 100, .writeFn = Short.write };
+    try std.testing.expectError(error.UploadFailed, net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = &short, .deadline = .fromSeconds(5) }));
+    const failing: net_client.Body = .{ .len = 100, .writeFn = Short.fail };
+    try std.testing.expectError(error.UploadFailed, net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = &failing, .deadline = .fromSeconds(5) }));
 }
 
 test "oracle: a body written past its declared length is an error the caller sees, not a silent cut" {
@@ -390,7 +389,7 @@ test "oracle: a body written past its declared length is an error the caller see
     const Long = struct {
         /// How many bytes `write` writes, set per case (it runs on this thread).
         var total: usize = 0;
-        fn write(_: *const anyopaque, w: *Io.Writer) anyerror!void {
+        fn write(_: *const net_client.Body, w: *Io.Writer) anyerror!void {
             var left = total;
             const chunk: [4096]u8 = @splat('x');
             while (left > 0) {
@@ -400,18 +399,17 @@ test "oracle: a body written past its declared length is an error the caller see
             }
         }
     };
-    const unused: u8 = 0;
     // Declared 100, 110 written (in the buffer, over at the flush); declared 0; declared 3 MiB
     // and 10 bytes more (the writer meets the refusal at the end of a long body).
     for ([_][2]usize{ .{ 100, 110 }, .{ 0, 10 }, .{ 3 << 20, (3 << 20) + 10 } }) |c| {
         Long.total = c[1];
-        const body: net_client.Body = .{ .len = c[0], .ptr = &unused, .writeFn = Long.write };
-        try std.testing.expectError(error.BodyLongerThanDeclared, net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = body, .deadline = .fromSeconds(10) }));
+        const body: net_client.Body = .{ .len = c[0], .writeFn = Long.write };
+        try std.testing.expectError(error.BodyLongerThanDeclared, net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = &body, .deadline = .fromSeconds(10) }));
     }
     // Exactly its length is fine.
     Long.total = 100;
-    const ok: net_client.Body = .{ .len = 100, .ptr = &unused, .writeFn = Long.write };
-    try std.testing.expectEqual(std.http.Status.ok, (try net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = ok, .deadline = .fromSeconds(10) })).status);
+    const ok: net_client.Body = .{ .len = 100, .writeFn = Long.write };
+    try std.testing.expectEqual(std.http.Status.ok, (try net_client.fetch(arena, io, .{ .method = .PUT, .url = url, .upload = &ok, .deadline = .fromSeconds(10) })).status);
 }
 
 test "oracle: a response limit of 0 allows no body, whole or streamed, and maxInt none" {

@@ -84,7 +84,7 @@ pub const RequestOptions = struct {
     max_body: usize = std.math.maxInt(usize),
     /// The request's body written out as it is sent, in place of `payload`: one too big to hold
     /// (a job's log, `results.upload`).
-    body: ?Body = null,
+    body: ?*const Body = null,
     /// Whether the request gets a `request:` line (`request_log`). Off for the Dagger engine's
     /// queries, which go to the engine on this machine.
     log: bool = true,
@@ -256,7 +256,7 @@ const Exchange = struct {
     headers: []const std.http.Header,
     content_type: []const u8,
     max_body: usize,
-    body: ?Body,
+    body: ?*const Body,
 };
 
 const Redirect = struct { uri: std.Uri, see_other: bool };
@@ -390,13 +390,13 @@ fn acceptJsonHeaders(scratch: Allocator, extra: []const std.http.Header) ![]std.
 }
 
 /// The request line and headers, then `payload` or `body` as the body when there is one.
-fn send(req: *std.http.Client.Request, payload: ?[]const u8, body_in: ?Body) !void {
+fn send(req: *std.http.Client.Request, payload: ?[]const u8, body_in: ?*const Body) !void {
     if (body_in) |b| {
         req.transfer_encoding = .{ .content_length = b.len };
         var body = try req.sendBodyUnflushed(&.{});
         // The writer stops short of `len` rather than past it (std's body writer would underflow);
         // short of it, `end` would trip its assertion and take the process down.
-        try b.writeFn(b.ptr, &body.writer);
+        try b.writeFn(b, &body.writer);
         try body.writer.flush();
         if (body.state.content_length != 0) return error.BodyShorterThanItsLength;
         try body.end();
@@ -500,19 +500,23 @@ test "over real connections: the token stays on its host, and only bodiless requ
     // So does one whose body is written as it is sent; one that writes less than it said it would
     // fails, rather than tripping the body writer's assertion and taking the process down.
     const Written = struct {
+        body: Body,
         text: []const u8,
-        fn write(ptr: *const anyopaque, w: *std.Io.Writer) anyerror!void {
-            const self: *const @This() = @ptrCast(@alignCast(ptr));
+        fn init(len: usize, text: []const u8) @This() {
+            return .{ .body = .{ .len = len, .writeFn = write }, .text = text };
+        }
+        fn write(body: *const Body, w: *std.Io.Writer) anyerror!void {
+            const self: *const @This() = @fieldParentPtr("body", body);
             try w.writeAll(self.text);
         }
     };
-    const whole: Written = .{ .text = "{}" };
+    const whole: Written = .init(2, "{}");
     var streamed = t;
-    streamed.body = .{ .len = 2, .ptr = &whole, .writeFn = Written.write };
+    streamed.body = &whole.body;
     const sent = try request(a, io, .POST, server.url(&buf, "127.0.0.1", "/same"), null, streamed);
     try std.testing.expectEqual(std.http.Status.found, sent.status);
-    const short: Written = .{ .text = "{" };
-    streamed.body = .{ .len = 2, .ptr = &short, .writeFn = Written.write };
+    const short: Written = .init(2, "{");
+    streamed.body = &short.body;
     try std.testing.expectError(
         error.BodyShorterThanItsLength,
         request(a, io, .POST, server.url(&buf, "127.0.0.1", "/same"), null, streamed),

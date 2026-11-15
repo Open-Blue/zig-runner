@@ -42,6 +42,7 @@
 //! Every connection accepted is counted in `Server.accepts`.
 const std = @import("std");
 const Io = std.Io;
+const net_client = @import("../net_client.zig");
 
 pub const Server = struct {
     listener: Io.net.Server,
@@ -136,15 +137,16 @@ pub fn blobByte(i: u64) u8 {
     return @truncate((i *% 2654435761) >> 7);
 }
 
-/// A request body of `len` bytes of `blobByte`, for the network client's `Body`: `ptr` is `ptr(len)`, `writeFn` is `write`.
-/// The length travels as the pointer's address (plus one, as the address of a pointer is never 0), so that nothing is cast back.
+/// A request body of `len` bytes of `blobByte`: pass `&b.body` as the upload.
 pub const PatternBody = struct {
-    pub fn ptr(len: usize) *const anyopaque {
-        return @ptrFromInt(len + 1);
+    body: net_client.Body,
+
+    pub fn init(len: usize) PatternBody {
+        return .{ .body = .{ .len = len, .writeFn = write } };
     }
 
-    pub fn write(p: *const anyopaque, w: *std.Io.Writer) anyerror!void {
-        const len_total = @intFromPtr(p) - 1;
+    fn write(body: *const net_client.Body, w: *std.Io.Writer) anyerror!void {
+        const len_total = body.len;
         var chunk: [7000]u8 = undefined;
         var at: usize = 0;
         while (at < len_total) {

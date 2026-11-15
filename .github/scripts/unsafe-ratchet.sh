@@ -12,7 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 baseline=.github/scripts/unsafe-ratchet.baseline
-constructs=('@bitCast' '@ptrCast' '@alignCast' '@intCast' 'catch unreachable')
+constructs=('@bitCast' '@ptrCast' '@alignCast' '@intCast' '@ptrFromInt' 'catch unreachable')
 
 count() {
 	find runner/src -name '*.zig' -type f -print0 |
