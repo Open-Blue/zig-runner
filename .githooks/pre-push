@@ -130,8 +130,10 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 		(cd "$tree/proofs" && lake build >"$quiet") || fail "the proofs do not check: run lake build in proofs/"
 		(cd "$tree" && .github/scripts/glob-lean-diff.sh 2000 "$RANDOM" >&2) || fail "glob.zig and the Lean model differ"
 	fi
-	if grep -qE '^proofs/(tla|spin)/|^\.github/workflows/(version|release|store-model)\.yml$|^\.github/scripts/(next-version|wait-for-checks|check-names|spin)\.sh$|^\.github/checks-on-main$' <<<"$changed"; then
+	if grep -qE '^proofs/(tla|spin)/|^\.github/workflows/(version|release|store-model)\.yml$|^\.github/scripts/(next-version|wait-for-checks|check-names|spin[a-z-]*)\.sh$|^\.github/checks-on-main$' <<<"$changed"; then
 		say "SPIN, the store's and the release pipeline's models (a minute)"
+		(cd "$tree" && .github/scripts/spin-heartbeat-test.sh >"$quiet") ||
+			fail "spin.sh leaves processes behind: .github/scripts/spin-heartbeat-test.sh shows it"
 		command -v spin >/dev/null || fail "the models or the release pipeline changed, and checking them needs SPIN 6.5.2 (.github/scripts/spin.sh)"
 		(cd "$tree" && SPIN_DIR="${SPIN_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/zig-runner-spin}" .github/scripts/spin.sh >"$quiet") ||
 			fail "SPIN found an error: .github/scripts/spin.sh shows it"
