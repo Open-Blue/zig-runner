@@ -862,8 +862,8 @@ test "extraction makes a mode 000 directory usable by the job's user" {
     const ran = try std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", script } });
     errdefer std.debug.print("{s}{s}\n", .{ ran.stdout, ran.stderr });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, ran.term);
-    const listed = try std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", try std.fmt.allocPrint(arena, "cd '{s}/out' && find . -printf '%P|%m\\n' | sort", .{root}) } });
-    try std.testing.expectEqualStrings("|755\ng|644\nlocked|755\nlocked/inner|755\nlocked/inner/f|644\n", listed.stdout);
+    const listed = try std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", try std.fmt.allocPrint(arena, "cd '{s}/out' && find . -printf '%P|%m\\n' | LC_ALL=C sort", .{root}) } });
+    try std.testing.expectEqualStrings("g|644\nlocked/inner/f|644\nlocked/inner|755\nlocked|755\n|755\n", listed.stdout);
 }
 
 /// The listing a job prints of its workspace, for comparing a tree from git with one from a tarball:
@@ -999,9 +999,13 @@ test "after the first fetch finds no git, the next action's fetch does not run g
     defer tmp.cleanup();
     var cfg = try Backend.testConfig(arena, &tmp);
     const ar = try testArchiveOf(arena, &tmp, "printf 'runs:\\n  using: composite\\n  steps:\\n    - shell: bash\\n      run: echo ran\\n' > action.yml");
-    // A git that counts its runs, in a file of the test's directory (bound in the step).
+    // A git that counts its runs, in a file of the test's directory (bound in the step, where the
+    // job's user is not the test's: the file is open to all).
+    try tmp.dir.writeFile(io, .{ .sub_path = "git-runs", .data = "" });
+    const opened = try std.process.run(arena, io, .{ .argv = &.{ "chmod", "a+rwx", ar.root, try std.fmt.allocPrint(arena, "{s}/git-runs", .{ar.root}) } });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, opened.term);
     try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "rootfs/{s}", .{ar.root}));
-    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{ .host = ar.root, .at = ar.root }} });
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{ .host = ar.root, .at = ar.root, .read_only = false }} });
     try tmp.dir.writeFile(io, .{ .sub_path = "nogit.sh", .data = try std.fmt.allocPrint(
         arena,
         "#!/bin/sh\necho x >> '{s}/git-runs'\necho \"sh: 1: git: not found\" >&2\nexit 127\n",
