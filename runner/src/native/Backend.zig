@@ -1207,7 +1207,6 @@ fn jobBinds(b: *Backend, cfg: Config, why: *[]const u8) ![]const sandbox.Spec.Bi
             return failed(why, b.arena, "making the job's resolver from", from, e);
         };
         b.nameservers = r.nameservers;
-        dns_probe.start(r.nameservers);
         if (r.fallback) try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Native " ++
             "steps: the host's resolver ({s}) names no nameserver the job's network can reach " ++
             "(only loopback or IPv6 ones), so the job resolves through 8.8.8.8 and 8.8.4.4, as " ++
@@ -1410,7 +1409,7 @@ pub fn networkPath(b: *Backend) !?[]const u8 {
             b.net_why = std.fmt.allocPrint(arena, "making the job's network {s} ({s} {s}): {s}", .{
                 h.path, b.self_exe, net.command, if (said.len > 0) said else "it failed",
             }) catch "making the job's network failed";
-        }
+        } else dns_probe.start(h.path, b.nameservers);
     }
     if (b.net_why != null) return error.JobNetworkFailed;
     return b.netns;
