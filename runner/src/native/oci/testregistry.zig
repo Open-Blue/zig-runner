@@ -43,7 +43,9 @@ pub const Server = struct {
     /// Answers as if the connection were kept, then closes it.
     stale: bool = false,
     /// Closes every connection once its request is read, without answering it.
-    mute: bool = false,
+    mute: std.atomic.Value(bool) = .init(false),
+    /// Routes swapped in while it runs (`setRoutes`); `routes` until then.
+    moved: std.atomic.Value(?*const []const Route) = .init(null),
     /// How many token requests are answered with a reset, as a socket closed with the request
     /// unread answers one.
     resets: std.atomic.Value(u32) = .init(0),
@@ -53,6 +55,16 @@ pub const Server = struct {
     refuse: std.atomic.Value(u32) = .init(0),
     requests: std.atomic.Value(u32) = .init(0),
     connections: std.atomic.Value(u32) = .init(0),
+
+    /// What a request is answered from: the routes, or those swapped in after the start.
+    fn current(s: *const Server) []const Route {
+        return if (s.moved.load(.acquire)) |m| m.* else s.routes;
+    }
+
+    /// Answers from `routes` from now on; the slice must outlive the server.
+    pub fn setRoutes(s: *Server, routes: *const []const Route) void {
+        s.moved.store(routes, .release);
+    }
 
     pub fn start(s: *Server) !void {
         const io = std.testing.io;
@@ -128,7 +140,7 @@ fn answer(s: *Server, conn: Io.net.Stream) bool {
     }
     if (std.mem.eql(u8, path, "/quit")) return true;
     _ = s.requests.fetchAdd(1, .acq_rel);
-    if (s.mute) return false;
+    if (s.mute.load(.acquire)) return false;
     if (std.mem.startsWith(u8, path, "/token?") and s.resets.load(.acquire) > 0) {
         _ = s.resets.fetchSub(1, .acq_rel);
         // No lingering: the close sends a reset, not an end of stream.
@@ -148,7 +160,7 @@ fn answer(s: *Server, conn: Io.net.Stream) bool {
     }
     if (std.mem.startsWith(u8, path, "/cdn/")) {
         if (auth.len > 0) return respond(s, out, "400 Bad Request", "", "text/plain", "credentials sent to the CDN");
-        for (s.routes) |rt| if (rt.redirect and std.mem.endsWith(u8, rt.path, path["/cdn/".len..]))
+        for (s.current()) |rt| if (rt.redirect and std.mem.endsWith(u8, rt.path, path["/cdn/".len..]))
             return respond(s, out, "200 OK", "", rt.content_type, rt.body);
         return respond(s, out, "404 Not Found", "", "text/plain", "");
     }
@@ -166,7 +178,7 @@ fn answer(s: *Server, conn: Io.net.Stream) bool {
             const line = std.fmt.bufPrint(&sb, "{d} Refused", .{s.refuse.load(.acquire)}) catch return false;
             return respond(s, out, line, "", "application/json", "{\"errors\":[]}");
         }
-        for (s.routes) |rt| if (std.mem.eql(u8, rt.path, path)) {
+        for (s.current()) |rt| if (std.mem.eql(u8, rt.path, path)) {
             if (rt.redirect) {
                 const digest = path[std.mem.lastIndexOfScalar(u8, path, '/').? + 1 ..];
                 const loc = std.fmt.bufPrint(&hb, "Location: http://localhost:{d}/cdn/{s}\r\n", .{ s.port, digest }) catch return false;
@@ -386,7 +398,7 @@ test "native oci pull: a tag resolved within the TTL costs no request, one past 
     }
     try testing.expectEqual(seen, server.requests.load(.acquire));
     // The tag moves; within the TTL it is not seen, past it (here: TTL 0) it is.
-    server.routes = two.routes;
+    server.setRoutes(&two.routes);
     try testing.expectEqualStrings(one.index, (try pullTag(arena, store, ref, 300, &why)).digest);
     const moved = try pullTag(arena, store, ref, 0, &why);
     try testing.expectEqualStrings(two.index, moved.digest);
@@ -430,7 +442,8 @@ test "native oci pull: a registry that answers 429 gives the last known digest; 
 
     // A tag the registry no longer has is an error, not the old digest.
     server.limited.store(0, .release);
-    server.routes = &.{};
+    const none: []const Route = &.{};
+    server.setRoutes(&none);
     try testing.expectError(error.NotFound, pullTag(arena, store, ref, 0, &why));
 }
 
@@ -551,14 +564,14 @@ test "native oci pull: with a record, a 401, a 403 and a 404 are errors; a 503, 
     server.refuse.store(0, .release);
 
     // No answer at all.
-    server.mute = true;
+    server.mute.store(true, .release);
     const mute = try pullTag(arena, store, ref, 0, &why);
     try testing.expectEqualStrings(first.rootfs, mute.rootfs);
     try testing.expect(mute.reused != null);
-    server.mute = false;
+    server.mute.store(false, .release);
 
     // Records that are not to be trusted: the registry is asked, and the moved tag seen.
-    server.routes = two.routes;
+    server.setRoutes(&two.routes);
     const path = try tagRecord(arena, store, null);
     const bad = [_][]const u8{
         "garbage",
@@ -572,14 +585,14 @@ test "native oci pull: with a record, a 401, a 403 and a 404 are errors; a 503, 
         const got = try pullTag(arena, store, ref, 300, &why);
         try testing.expectEqualStrings(two.index, got.digest);
         // Back to the first image's record for the next.
-        server.routes = one.routes;
+        server.setRoutes(&one.routes);
         _ = try pullTag(arena, store, ref, 0, &why);
-        server.routes = two.routes;
+        server.setRoutes(&two.routes);
     }
     _ = path;
 
     // The record's image evicted: a 429 is waited out, not given a digest the store lacks.
-    server.routes = one.routes;
+    server.setRoutes(&one.routes);
     _ = try pullTag(arena, store, ref, 0, &why);
     const key = one.manifest["sha256:".len..];
     const dir = try std.fmt.allocPrint(arena, "{s}/oci/images/{s}.rootless", .{ store.root, key });
@@ -694,7 +707,7 @@ test "native oci pull: a kept-alive connection the registry closed is replaced; 
 
     // A registry that closes every connection unanswered is no stale connection: the pull fails
     // with the error, after the one repeat the library makes of a GET that met a closed connection.
-    var mute: Server = .{ .routes = img.routes, .mute = true };
+    var mute: Server = .{ .routes = img.routes, .mute = .init(true) };
     try mute.start();
     defer mute.stop();
     why = "";
