@@ -564,6 +564,7 @@ dependencies = [
 name = "zr-net-fuzz"
 version = "0.0.0"
 dependencies = [
+ "http",
  "libfuzzer-sys",
  "zr-net",
 ]

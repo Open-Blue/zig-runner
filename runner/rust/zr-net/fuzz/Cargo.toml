@@ -10,6 +10,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+# The parser the client resolves redirects and URLs with (`safe_response` reads URLs as it does).
+http = "1"
 zr-net = { path = ".." }
 
 # Not a member of zr-net's workspace (it has none): its own lock file and target directory.
