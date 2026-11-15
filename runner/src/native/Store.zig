@@ -4498,6 +4498,13 @@ test "allocation failures: a tree's size and digest, its ids shifted, layers fla
             const lower = try failureTree(io, base, "lower", ma);
             const upper = try failureTree(io, base, "upper", ma);
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(ma, "{s}/extra", .{upper}), .data = "z" });
+            // Written back before anything is measured: a file the kernel is writing back shows
+            // fewer blocks than it takes (as `publishStaged` notes), so a size taken while a
+            // neighbour's `syncfs` or the flusher had these files in flight differed from the next
+            // one by a block (CI, "expected 12288, found 16384"), with no allocation involved.
+            const base_fd = try openRoot(ma, base);
+            defer _ = linux.close(base_fd);
+            try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.syncfs(base_fd)));
             const want_size = try treeSize(ma, io, upper);
             const want_digest = try treeDigest(ma, io, upper, .content, Ids.host);
             const want_meta = try treeDigest(ma, io, upper, .metadata, Ids.host);
