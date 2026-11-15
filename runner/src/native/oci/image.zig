@@ -114,7 +114,7 @@ pub fn pull(
     }
 
     // A tag resolved lately, or whose last resolution the registry may fail to repeat.
-    const tag_path: ?[]const u8 = if (ref.digest == null) try tagPath(arena, store, ref, req.creds, platform) else null;
+    const tag_path: ?[]const u8 = if (ref.digest == null) try tagPath(arena, io, store, ref, req.creds, platform) else null;
     const known_tag: ?TagRecord = if (tag_path) |p| try readTag(arena, io, p) else null;
     if (known_tag) |k| {
         const age = std.Io.Clock.real.now(io).toSeconds() - k.at;
@@ -216,17 +216,64 @@ fn fromKnown(arena: Allocator, io: std.Io, store: Store, digest: []const u8, man
 /// manifest and what the tag named (the index, for a multi-platform image).
 const TagRecord = struct { manifest: []const u8, top: []const u8, at: i64 };
 
-/// Where the tag's record is: named by a hash of the reference and of who asked (`anonymous`, or
-/// the credentials' user and password, which only their hash is of: never stored), so that what one
-/// credential context was let pull is never served to another (a private image, a revoked login).
-fn tagPath(arena: Allocator, store: Store, ref: registry.Ref, creds: ?registry.Credentials, platform: Platform) ![]const u8 {
+/// Where the tag's record is: named by an HMAC-SHA256 of the reference and of who asked
+/// (`anonymous`, or the credentials' user and password), keyed by the store's own secret
+/// (`storeSecret`), so that what one credential context was let pull is never served to another (a
+/// private image, a revoked login), and a weak password cannot be guessed from the file names.
+/// Null when the store has no secret and cannot be given one: its tags are then not remembered.
+pub fn tagPath(arena: Allocator, io: std.Io, store: Store, ref: registry.Ref, creds: ?registry.Credentials, platform: Platform) !?[]const u8 {
+    const secret = (try storeSecret(arena, io, store)) orelse return null;
     const name = if (creds) |cr|
         try std.fmt.allocPrint(arena, "{f}\x00{d}:{s}\x00{s}", .{ ref, cr.username.len, cr.username, cr.password })
     else
         try std.fmt.allocPrint(arena, "{f}\x00anonymous", .{ref});
-    var sum: [32]u8 = undefined;
-    Sha256.hash(name, &sum, .{});
-    return std.fmt.allocPrint(arena, "{s}/oci/refs/tag-{s}.{s}", .{ store.root, &std.fmt.bytesToHex(sum, .lower), platform.name() });
+    var mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, name, &secret);
+    return try std.fmt.allocPrint(arena, "{s}/oci/refs/tag-{s}.{s}", .{ store.root, &std.fmt.bytesToHex(mac, .lower), platform.name() });
+}
+
+/// The store's 32-byte secret (`oci/refs.key`, 0600 in the store's private directory, never
+/// logged): made from random bytes the first time, written aside and renamed so a reader never sees
+/// half of it, and read back, so that runners racing to make it use the one that won. A file that
+/// is missing, short or unreadable is replaced; records made under the old one are then never
+/// found, and the registry is asked. Null when it can be neither read nor written.
+fn storeSecret(arena: Allocator, io: std.Io, store: Store) Allocator.Error!?[32]u8 {
+    const path = try std.fmt.allocPrint(arena, "{s}/oci/refs.key", .{store.root});
+    const cwd = std.Io.Dir.cwd();
+    for (0..2) |_| {
+        if (readSecret(arena, io, path)) |k| return k else |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NoSecret => {},
+        }
+        var fresh: [32]u8 = undefined;
+        io.random(&fresh);
+        var raw: [8]u8 = undefined;
+        io.random(&raw);
+        const tmp = try std.fmt.allocPrint(arena, "{s}.tmp-{s}", .{ path, &std.fmt.bytesToHex(raw, .lower) });
+        {
+            const f = cwd.createFile(io, tmp, .{ .permissions = .fromMode(0o600), .exclusive = true }) catch return null;
+            defer f.close(io);
+            f.writeStreamingAll(io, &fresh) catch return null;
+            if (linux.errno(linux.fsync(f.handle)) != .SUCCESS) return null;
+        }
+        cwd.rename(tmp, cwd, path, io) catch {
+            cwd.deleteFile(io, tmp) catch {};
+            return null;
+        };
+    }
+    return readSecret(arena, io, path) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NoSecret => null,
+    };
+}
+
+fn readSecret(arena: Allocator, io: std.Io, path: []const u8) error{ OutOfMemory, NoSecret }![32]u8 {
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64)) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.NoSecret,
+    };
+    if (raw.len != 32) return error.NoSecret;
+    return raw[0..32].*;
 }
 
 /// The record at `path`, or null when there is none or it is not one.

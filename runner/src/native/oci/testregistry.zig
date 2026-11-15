@@ -474,6 +474,56 @@ test "native oci pull: a tag's record belongs to the credentials that resolved i
     }
 }
 
+test "native oci pull: tag records are named by a keyed hash: each store's own, 0600, and made again when lost" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = testing.io;
+    var tmp1 = testing.tmpDir(.{});
+    defer tmp1.cleanup();
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    const s1: Store = .{ .root = try tmp1.dir.realPathFileAlloc(io, ".", arena) };
+    const s2: Store = .{ .root = try tmp2.dir.realPathFileAlloc(io, ".", arena) };
+    try s1.prepare(arena, io);
+    try s2.prepare(arena, io);
+    const ref = try registry_api.parseRef(arena, "example.com/test/img:t");
+    const cr: registry_api.Credentials = .{ .username = "user", .password = "pass" };
+    const p1 = (try image.tagPath(arena, io, s1, ref, cr, .{ .architecture = "amd64" })).?;
+    const p2 = (try image.tagPath(arena, io, s2, ref, cr, .{ .architecture = "amd64" })).?;
+    try testing.expect(!std.mem.eql(u8, std.fs.path.basename(p1), std.fs.path.basename(p2)));
+    // Stable in one store, and the password is not in the name, nor is the secret's file open.
+    try testing.expectEqualStrings(p1, (try image.tagPath(arena, io, s1, ref, cr, .{ .architecture = "amd64" })).?);
+    const other = (try image.tagPath(arena, io, s1, ref, .{ .username = "user", .password = "pass2" }, .{ .architecture = "amd64" })).?;
+    try testing.expect(!std.mem.eql(u8, p1, other));
+    var st: linux.Statx = undefined;
+    const key = try arena.dupeSentinel(u8, try std.fmt.allocPrint(arena, "{s}/oci/refs.key", .{s1.root}), 0);
+    try testing.expect(linux.errno(linux.statx(linux.AT.FDCWD, key, 0, .{ .MODE = true, .SIZE = true }, &st)) == .SUCCESS);
+    try testing.expectEqual(@as(u32, 0o600), st.mode & 0o7777);
+    try testing.expectEqual(@as(u64, 32), st.size);
+
+    // A lost or damaged secret: a new one, so the old records are not found and the registry is asked.
+    const one = try tinyImage(arena, "test/img", "t", "one");
+    var server: Server = .{ .routes = one.routes };
+    try server.start();
+    defer server.stop();
+    const sref = try server.image(arena, "test/img:t");
+    var why: []const u8 = "";
+    _ = try pullTag(arena, s1, sref, 300, &why);
+    const seen = server.requests.load(.acquire);
+    _ = try pullTag(arena, s1, sref, 300, &why);
+    try testing.expectEqual(seen, server.requests.load(.acquire));
+    for ([_]?[]const u8{ null, "short" }) |damage| {
+        if (damage) |d| try tmp1.dir.writeFile(io, .{ .sub_path = "oci/refs.key", .data = d }) else try tmp1.dir.deleteFile(io, "oci/refs.key");
+        const before = server.requests.load(.acquire);
+        _ = try pullTag(arena, s1, sref, 300, &why);
+        try testing.expect(server.requests.load(.acquire) > before);
+        const again = server.requests.load(.acquire);
+        _ = try pullTag(arena, s1, sref, 300, &why);
+        try testing.expectEqual(again, server.requests.load(.acquire));
+    }
+}
+
 test "native oci pull: with a record, a 401, a 403 and a 404 are errors; a 503, 429 and no answer fall back; an evicted image does not; a bad record is not trusted" {
     var a: std.heap.ArenaAllocator = .init(testing.allocator);
     defer a.deinit();
@@ -927,5 +977,10 @@ test "allocation failures: a registry's refusal keeps its status, and running ou
             }
         }
     };
+    // A store in use has its secret (`image.tagPath` makes it once): the run that makes it
+    // allocates otherwise than the ones that read it.
+    const primed: Store = .{ .root = root };
+    try primed.prepare(a.allocator(), testing.io);
+    _ = try image.tagPath(a.allocator(), testing.io, primed, try registry_api.parseRef(a.allocator(), reference), null, .{ .architecture = "amd64" });
     try af.checkOne(S.missing, .{ root, reference });
 }
