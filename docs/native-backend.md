@@ -2392,9 +2392,6 @@ Dagger.** What it covers, as built:
 
 What it does not do yet, and who pays:
 
-- **Local actions built from a Dockerfile.** Their tree is only in the workspace, spread over
-  the job's layers, where the builder needs one host directory. They send the job to Dagger;
-  debt of P7 (a build context read from the layers).
 - **A local action that differs at run time from the job's commit** (a step rewrote it): the
   pre-flight judged the commit's. With every kind of action native, the only way that bites is an
   image the commit's version did not need and the store lacks: the step fails saying so, where
@@ -2414,18 +2411,64 @@ What it does not do yet, and who pays:
   belong in `env:`.
 
 **The Dockerfile builder** (`runner/src/native/dockerfile.zig`). `parse` reads a Dockerfile as Docker's parser
-does (comments, parser directives, `\` continuations, either case, JSON and shell forms); `plan`
-evaluates `FROM`, `RUN`, `COPY`, `ADD`, `ENV`, `WORKDIR`, `ENTRYPOINT`, `CMD`, `ARG`, `USER` and
-`LABEL` into the image's config and one key per instruction, chained from the base's:
+does (comments, parser directives, `\` continuations, either case, JSON and shell forms, heredocs);
+`plan` evaluates `FROM`, `RUN`, `COPY`, `ADD`, `ENV`, `WORKDIR`, `ENTRYPOINT`, `CMD`, `ARG`, `USER`,
+`LABEL` and `SHELL` into the image's config and one key per instruction, chained from the base's:
 `sha256(parent key, instruction as evaluated, what it reads)`, where a `RUN` reads the env and
 build arguments it sees and a `COPY` the content of its sources (`contextDigest`: a sorted walk
 of paths, kinds, modes, link targets and contents, through no symlink). A config-only
 instruction gets a key and no layer, so the `RUN` after it is keyed on it. `build` takes each
 layer from the store by its key, or makes it (`COPY`/`ADD` by the runner, as Docker places
 sources; `RUN` through a `Runner`, the sandbox) and publishes it (`layers.zig`, the stand-in for
-P2's store: "the layer under K, or store this directory under K", by rename). It refuses, with
-the line and why: multi-stage builds, `COPY --from`, wildcards, `ADD` of a URL or an archive,
-`SHELL`, `ONBUILD`, heredocs, sources outside the context, and `--chown` by name.
+P2's store: "the layer under K, or store this directory under K", by rename).
+
+What a Dockerfile may use (the rest is refused with the line and why, and goes to Dagger, or fails
+a job with no engine): multi-stage builds (`FROM x AS name`, a stage `FROM` another, `COPY --from` a
+stage by name or number or an image, `FROM --platform` the runner's own, the auto-set
+`BUILDPLATFORM`/`TARGET*` arguments), wildcards in `COPY` and `ADD` sources (`*`, `?`, `[a-z]`, as
+Go's `path.Match`), `.dockerignore` (also `<Dockerfile>.dockerignore`), `ADD` of an http or https
+URL, heredocs (`RUN <<EOF`, `RUN cat <<EOF > f`, `COPY <<EOF /file`, `<<-` and quoted delimiters),
+`SHELL`, `--chown` by id or by a name in the image's /etc/passwd and /etc/group, `--chmod` by
+octal, `--link` (a layer of its own, as every layer here is), `FROM scratch`. Not: `ADD` of an
+archive (Docker unpacks it) or a git repository, `ONBUILD`, `RUN --mount`/`--network`/`--security`,
+`COPY --parents`/`--exclude`, a heredoc script that starts `#!`, an escape directive other than
+`\`, a `RUN` as a non-root user, and another platform than the runner's.
+
+Stages are a chain. A stage that starts `FROM` an earlier one carries on that stage's keys, so
+the layers of a stage and of the same instructions in one stage are one set in the store; a
+`COPY --from` a stage is keyed by the stage's key (a layer the store has is taken without
+building the stage it copies from) and by the image's identity for an image; only the stages the
+last one needs are planned (their base images pulled) and built. What a `COPY` reads is a
+`layer_view.View`: the merge of a stage's layers, an image's rootfs or the build context, by
+lookup (the topmost layer decides, a whiteout deletes, an opaque directory hides what is below
+it), through no host symlink; and the destination is looked up in the layers so far, so a
+directory that is there keeps its mode and owner, a link on the way (`/var/run` to `/run`,
+`/bin` to `usr/bin`) leads where it leads in the image, and a missing one is made with root's.
+`WORKDIR` makes its directory in a layer, owned by the `USER` in effect, unless the image has
+it.
+
+*Compared with BuildKit.* `.github/scripts/dockerfile-diff.sh` builds the fixtures of
+`runner/tools/dockerfile_oracle` with `docker build` and with the runner (as root; weekly in
+compare.yml, and locally with `PREPARE_ONLY=1` for a container to run the comparison) and compares
+the image's filesystem (every path's kind, mode, owner, size and content hash or link target) and
+config (env, entrypoint, cmd, working directory, user). They are equal except for what each
+fixture's `differences.txt` lists, which is where the builder does something else on purpose:
+
+- A stage's `COPY --from` is keyed by the stage's key, not by a checksum of the files copied, so
+  an unchanged copy is reused without building the stage, and a stage that changes without
+  changing the files copied makes a new layer (BuildKit would reuse it).
+- The same instructions in two stages, or in a stage and in one Dockerfile, are one set of layers.
+- `WORKDIR` makes no (empty) layer when the image has the directory.
+- A file with several matches of a wildcard and a destination that is not a directory is written
+  as BuildKit writes it (the last match wins), though Docker's documentation says it is an error.
+- A fetched action's context has no `.git` (GitHub's copy of the action has none).
+- The layers carry no timestamps of the build.
+- `COPY --chmod` and `ADD --chmod` make the directories they create on the way to the destination
+  (`COPY --chmod=640 f /a/b/f` makes `/a` and `/a/b`) 0755. BuildKit gives them the `--chmod` mode
+  too, so with `--chmod=640` they are directories nobody but root can enter, and the files in them
+  cannot be reached. The mode applies to what `--chmod` names: the files, and a copied directory
+  tree (the destination directory of a directory copy and the directories inside it keep the
+  `--chmod` mode, as in BuildKit). Directories the image already has keep their mode and owner.
 
 The `Runner` is the sandbox (`docker_action.BuildRunner`): a `RUN` runs as a container whose
 lowers are the image's layers so far, each idmapped on a root runner, and whose upper is the
@@ -2483,10 +2526,15 @@ JavaScript action's runtime cannot be pulled goes to Dagger (`actions.preload`).
 **Local actions.** `preload` judges a local action (top level or nested) from the job's own
 repository at the job's commit, which is what a checkout of it gives: a blobless fetch of that
 one commit by git in the job's image (the job's token, as the checkout's), and only its
-`action.yml` read (`git cat-file`), then the look's layer dropped, so no unkeyed layer is left
-below the base (`Backend.dropTop`). One that is not there (made by a step, another
-repository checked out there) sends the job to Dagger. At run time the step reads the workspace,
-as on Dagger (`actions.loadLocal`, through `Backend.readFile`).
+`action.yml` read (`git cat-file`), and its Dockerfile when it has one (a second look, for what
+the builder asks of the text: its context is not anywhere yet), then the look's layer dropped,
+so no unkeyed layer is left below the base (`Backend.dropTop`). One that is not there (made by a
+step, another repository checked out there) sends the job to Dagger. At run time the step reads
+the workspace, as on Dagger (`actions.loadLocal`, through `Backend.readFile`); a Dockerfile action
+is built from the job's own layers: the build context is a `layer_view.View` of the job's layers
+(`Backend.jobLayers`) at the action's directory in the workspace, as the steps before left it, so
+what a step wrote there is in the build, and the layers made are the store's, keyed by what they
+read, like a fetched action's.
 
 **For P3 and P2, what to swap when they land:**
 

@@ -46,4 +46,5 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           PR: ${{ github.event.pull_request.number }}
-        run: gh pr merge --auto --merge "$PR" --repo "$GITHUB_REPOSITORY"
+        # Rebase: main keeps a linear history (its ruleset requires it, and the merge queue rebases).
+        run: gh pr merge --auto --rebase "$PR" --repo "$GITHUB_REPOSITORY"

@@ -36,6 +36,9 @@ if ! verified &>/dev/null; then
 fi
 chmod +x "$bin"
 
-mapfile -t dockerfiles < <(git ls-files ':(glob)**/Dockerfile' ':(glob)**/Dockerfile.*' ':(glob)**/*.Dockerfile')
+# Not the oracle's fixtures: they are inputs to the Dockerfile builder, written to use what BuildKit
+# accepts (a relative WORKDIR, a root USER, ADD of a file, heredocs hadolint cannot parse) and to
+# be built as they are, so they are not meant to follow the rules.
+mapfile -t dockerfiles < <(git ls-files ':(glob)**/Dockerfile' ':(glob)**/Dockerfile.*' ':(glob)**/*.Dockerfile' ':(exclude)runner/tools/dockerfile_oracle')
 "$bin" "${dockerfiles[@]}"
 echo "hadolint: ${#dockerfiles[@]} Dockerfiles, no findings"

@@ -1,0 +1,19 @@
+ARG VERSION=1.2
+ARG IMAGE=alpine
+FROM ${IMAGE}:3.22
+ARG VERSION
+ARG EXTRA=x
+ENV VERSION_ENV=$VERSION \
+    SPACED="a b c" \
+    EMPTY=
+ENV LEGACY legacy value
+WORKDIR /a/b
+WORKDIR ../c
+RUN echo "$VERSION $EXTRA $VERSION_ENV|$SPACED|$LEGACY" > /vars && pwd >> /vars
+USER 1000:1000
+USER nobody
+USER root
+EXPOSE 80/tcp
+VOLUME /data
+HEALTHCHECK CMD true
+CMD ["a", "b c"]

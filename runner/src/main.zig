@@ -77,6 +77,8 @@ comptime {
     _ = @import("native/volumes.zig");
     _ = @import("native/docker_action.zig");
     _ = @import("native/dockerfile.zig");
+    _ = @import("native/dockerfile_oracle.zig");
+    _ = @import("native/layer_view.zig");
     _ = @import("native/layers.zig");
     _ = @import("native/tool_trees.zig");
     _ = @import("native/hash_files.zig");

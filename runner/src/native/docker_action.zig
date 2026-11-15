@@ -26,6 +26,9 @@ const scripts = @import("../dagger/scripts.zig");
 const dockerfile = @import("dockerfile.zig");
 const Store = @import("Store.zig");
 const layers = @import("layers.zig");
+const layer_view = @import("layer_view.zig");
+const net_client = @import("../net_client.zig");
+const Sha256 = @import("../sha256.zig").Sha256;
 
 const Allocator = std.mem.Allocator;
 
@@ -378,23 +381,20 @@ fn ownTree(io: std.Io, dir: std.Io.Dir, uid: u32, gid: u32, depth: u32) void {
 
 const Build = @FieldType(Exec.DockerRun.Image, "build");
 
-/// The Dockerfile's build context, opened through no symlink below the action's repository
-/// (`Loaded.dir`, its directory in the layer its fetch made), as `/proc/self/fd/<n>` for the
-/// builder's paths; and the open directory, to close.
-fn openContext(arena: Allocator, io: std.Io, bd: Build) !struct { path: []const u8, dir: std.Io.Dir } {
-    var dir = try std.Io.Dir.cwd().openDir(io, bd.dir, .{ .follow_symlinks = false });
+/// The Dockerfile's build context: `bd.context` in the directory `bd.dir` (a fetched action's,
+/// `Loaded.dir`, its directory in the layer its fetch made) or, for a local action (`bd.dir`
+/// is no host path), in the job's own layers at the action's place (`bd.path`), where its files
+/// are as the steps before left them. Looked into through no symlink, as a view the builder
+/// reads its sources and the Dockerfile through. Null when it is no directory of the action.
+fn openContext(b: *Backend, bd: Build) !?*layer_view.View {
     var parts = std.mem.tokenizeScalar(u8, bd.context, '/');
-    while (parts.next()) |part| {
-        if (std.mem.eql(u8, part, ".")) continue;
-        if (std.mem.eql(u8, part, "..")) return error.ContextOutsideTheAction;
-        const sub = dir.openDir(io, part, .{ .follow_symlinks = false }) catch |e| {
-            dir.close(io);
-            return e;
-        };
-        dir.close(io);
-        dir = sub;
-    }
-    return .{ .path = try std.fmt.allocPrint(arena, "/proc/self/fd/{d}", .{dir.handle}), .dir = dir };
+    while (parts.next()) |part| if (std.mem.eql(u8, part, "..")) return null;
+    if (std.fs.path.isAbsolutePosix(bd.dir))
+        return layer_view.View.open(b.arena, b.io, &.{bd.dir}, bd.context, b.opaqueXattr());
+    var at = std.mem.tokenizeScalar(u8, bd.path, '/');
+    while (at.next()) |part| if (std.mem.eql(u8, part, "..")) return null;
+    const base = try std.fmt.allocPrint(b.arena, "{s}/{s}", .{ bd.path, bd.context });
+    return layer_view.View.open(b.arena, b.io, try b.jobLayers(b.arena), base, b.opaqueXattr());
 }
 
 /// What a build's base image is, for its keys (`dockerfile.fromKey`): its reference only names it,
@@ -406,15 +406,101 @@ fn baseId(arena: Allocator, io: std.Io, base: images.Image) ![]const u8 {
     return arena.dupe(u8, &Store.hex(try Store.rootfsFingerprint(arena, io, base.rootfs, "")));
 }
 
-/// The Dockerfile of `bd` read and planned on its base image from the native store; `digests`:
-/// the COPY sources' content and the base's identity keyed (a build), else fixed ones (only
-/// whether it can be built).
-fn planBuild(b: *Backend, bd: Build, ctx: []const u8, digests: bool) !struct { dockerfile.Plan, images.Image } {
+/// What the planner asks of the world: the images a Dockerfile starts or copies from (pulled
+/// into the native store, `find`), the content of the context's sources, and an `ADD`'s
+/// downloads. Without `digests` (judging whether a build can run, before the job) none of it is
+/// read: the keys are not used, and nothing is downloaded.
+const Planning = struct {
+    b: *Backend,
+    /// The context to read the sources' content from; null when `digests` is not wanted.
+    context: ?*layer_view.View,
+    digests: bool,
+    bases_iface: dockerfile.Bases = .{ .resolveFn = resolve },
+    context_iface: dockerfile.Context = .{ .digestFn = digest, .fetchFn = fetch },
+
+    fn bases(p: *Planning) *dockerfile.Bases {
+        return &p.bases_iface;
+    }
+
+    fn resolve(iface: *dockerfile.Bases, arena: Allocator, ref: []const u8, why: *[]const u8) anyerror!?dockerfile.BaseImage {
+        const p: *Planning = @fieldParentPtr("bases_iface", iface);
+        const b = p.b;
+        switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, ref, &b.held)) {
+            .image => |i| return .{ .config = i, .id = if (p.digests) try baseId(arena, b.io, i) else "" },
+            .missing => |w| {
+                why.* = w;
+                return null;
+            },
+        }
+    }
+
+    fn ctx(p: *Planning) *dockerfile.Context {
+        return &p.context_iface;
+    }
+
+    fn digest(i: *dockerfile.Context, arena: Allocator, sources: []const []const u8) anyerror![64]u8 {
+        const p: *Planning = @fieldParentPtr("context_iface", i);
+        if (!p.digests) return @splat('0');
+        return dockerfile.contextDigest(arena, p.context.?, sources);
+    }
+
+    /// An `ADD`'s URL downloaded into the job's directory, whole, by the runner's own client.
+    fn fetch(i: *dockerfile.Context, arena: Allocator, url: []const u8) anyerror!dockerfile.Fetched {
+        const p: *Planning = @fieldParentPtr("context_iface", i);
+        if (!p.digests) return .{ .file = "", .digest = @splat('0') };
+        const res = try net_client.fetch(arena, p.b.io, .{ .url = url, .max_response = max_add_bytes });
+        if (res.status != .ok) return error.BadStatus;
+        var sum: [32]u8 = undefined;
+        Sha256.hash(res.body, &sum, .{});
+        const hex = std.fmt.bytesToHex(sum, .lower);
+        const file = try std.fmt.allocPrint(arena, "{s}/ADD-{s}", .{ p.b.dir, hex[0..32] });
+        try std.Io.Dir.cwd().writeFile(p.b.io, .{ .sub_path = file, .data = res.body });
+        return .{ .file = file, .digest = hex };
+    }
+};
+
+/// The most an `ADD` of a URL downloads, held in memory whole.
+const max_add_bytes = 256 << 20;
+
+/// The Dockerfile of `bd` read from `context` and planned, with the base images from the native
+/// store, the sources' content and the images' identity keyed (a build).
+fn planBuild(b: *Backend, bd: Build, context: *layer_view.View) !dockerfile.Plan {
     const arena = b.arena;
-    const text = switch (try sandbox.readIn(arena, ctx, bd.dockerfile, 1 << 20)) {
-        .text => |t| t,
-        .missing, .whiteout => return error.NoDockerfile,
-    };
+    const df = (try context.resolve(bd.dockerfile, true)) orelse return error.NoDockerfile;
+    if (df.kind != .file) return error.NoDockerfile;
+    const text = try df.parent().readFileAlloc(b.io, df.name, arena, .limited(max_dockerfile));
+    try ignoreFiles(b, bd, context);
+    return planText(b, text, context);
+}
+
+/// What the context leaves out of a build: its `.dockerignore` (a `<Dockerfile>.dockerignore`
+/// beside the Dockerfile is the one then), and, for an action fetched by git, the repository's
+/// own `.git`, which GitHub's copy of the action has not. Set on the view once the Dockerfile,
+/// which is always the builder's to read, has been read through it.
+fn ignoreFiles(b: *Backend, bd: Build, context: *layer_view.View) !void {
+    const arena = b.arena;
+    var text: []const u8 = "";
+    const specific = try std.fmt.allocPrint(arena, "{s}.dockerignore", .{bd.dockerfile});
+    for ([_][]const u8{ specific, ".dockerignore" }) |name| {
+        const e = (try context.resolve(name, true)) orelse continue;
+        if (e.kind != .file) continue;
+        text = try e.parent().readFileAlloc(b.io, e.name, arena, .limited(max_dockerfile));
+        break;
+    }
+    const always: []const []const u8 = if (std.fs.path.isAbsolutePosix(bd.dir)) &.{".git"} else &.{};
+    const ignore = try arena.create(dockerfile.Ignore);
+    ignore.* = try dockerfile.Ignore.parse(arena, text, always);
+    context.filter = ignore.filter();
+}
+
+/// The most a Dockerfile may be.
+const max_dockerfile = 1 << 20;
+
+/// `text` planned: with a `context`, a build's (what the sources hold and what the images are
+/// keyed); without, only whether it can be built, with fixed keys and nothing downloaded.
+fn planText(b: *Backend, text: []const u8, context: ?*layer_view.View) !dockerfile.Plan {
+    const arena = b.arena;
+    const digests = context != null;
     const ins = switch (try dockerfile.parse(arena, text)) {
         .ok => |i| i,
         .refused => |r| {
@@ -422,68 +508,56 @@ fn planBuild(b: *Backend, bd: Build, ctx: []const u8, digests: bool) !struct { d
             return error.Refused;
         },
     };
-    const Ctx = struct {
-        dir: []const u8,
-        io: std.Io,
-        digests: bool,
-        fn digest(ptr: *anyopaque, ar: Allocator, sources: []const []const u8) anyerror![64]u8 {
-            const c: *@This() = @ptrCast(@alignCast(ptr));
-            if (!c.digests) return @splat('0');
-            return dockerfile.contextDigest(ar, c.io, c.dir, sources);
-        }
-    };
-    var c: Ctx = .{ .dir = ctx, .io = b.io, .digests = digests };
-    const context: dockerfile.Context = .{ .ptr = &c, .digestFn = Ctx.digest };
-    // The base's reference first (it may come from an ARG), then the plan on its config.
-    const first = try dockerfile.plan(arena, ins, .{ .rootfs = "" }, "", &.{}, context);
-    const base_ref = switch (first) {
-        .ok => |p| p.base,
+    var planning: Planning = .{ .b = b, .context = context, .digests = digests };
+    const p = switch (try dockerfile.plan(arena, ins, planning.bases(), &.{}, planning.ctx())) {
+        .ok => |p| p,
         .refused => |r| {
             b.build_reason = try std.fmt.allocPrint(arena, "line {d}: {s}", .{ r.line, r.why });
             return error.Refused;
         },
     };
-    const base = switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, base_ref, &b.held)) {
-        .image => |i| i,
-        .missing => |why| {
-            b.build_reason = why;
-            return error.Refused;
-        },
-    };
-    const p = (try dockerfile.plan(arena, ins, base, if (digests) try baseId(arena, b.io, base) else "", &.{}, context)).ok;
     // Whether the USER is one the image has is known once it is built (`run`).
-    if (!images.runsAsRoot(p.config.user) and b.how.userns != .mapped) {
+    const user = p.stages[p.final].config.user;
+    if (!images.runsAsRoot(user) and b.how.userns != .mapped) {
         b.build_reason = try std.fmt.allocPrint(arena, "the image runs as USER {s}, and a " ++
-            "rootless runner's Docker actions run as root only", .{p.config.user});
+            "rootless runner's Docker actions run as root only", .{user});
         return error.Refused;
     }
-    for (p.steps) |st| if (st.op == .run and !images.runsAsRoot(st.op.run.user)) {
+    for (p.stages) |stage| for (stage.steps) |st| if (st.op == .run and !images.runsAsRoot(st.op.run.user)) {
         b.build_reason = try std.fmt.allocPrint(arena, "line {d}: a RUN as USER {s} is not " ++
             "native yet", .{ st.line, st.op.run.user });
         return error.Refused;
     };
-    return .{ p, base };
+    return p;
 }
 
 /// Why the Dockerfile action `label` cannot be built natively, or null (`actions.preload`).
 pub fn buildReason(b: *Backend, bd: Build, label: []const u8) !?[]const u8 {
     const arena = b.arena;
-    const ctx = openContext(arena, b.io, bd) catch return try std.fmt.allocPrint(
+    const ctx = (try openContext(b, bd)) orelse return try std.fmt.allocPrint(
         arena,
         "the build context {s} of {s} is not a directory of the action",
         .{ bd.context, label },
     );
-    defer ctx.dir.close(b.io);
-    _ = planBuild(b, bd, ctx.path, false) catch |e| return switch (e) {
-        error.Refused => try std.fmt.allocPrint(arena, "{s}'s Dockerfile cannot be built " ++
+    defer ctx.close();
+    const df = (try ctx.resolve(bd.dockerfile, true)) orelse
+        return try std.fmt.allocPrint(arena, "{s} has no {s}", .{ label, bd.dockerfile });
+    if (df.kind != .file) return try std.fmt.allocPrint(arena, "{s} has no {s}", .{ label, bd.dockerfile });
+    return buildReasonText(b, try df.parent().readFileAlloc(b.io, df.name, arena, .limited(max_dockerfile)), label);
+}
+
+/// `buildReason` for a Dockerfile whose text is all there is (a local action's, read from the
+/// job's commit before the job: its context is not anywhere yet).
+pub fn buildReasonText(b: *Backend, text: []const u8, label: []const u8) !?[]const u8 {
+    _ = planText(b, text, null) catch |e| return switch (e) {
+        error.Refused => try std.fmt.allocPrint(b.arena, "{s}'s Dockerfile cannot be built " ++
             "natively: {s}", .{ label, b.build_reason }),
-        error.NoDockerfile => try std.fmt.allocPrint(arena, "{s} has no {s}", .{ label, bd.dockerfile }),
         else => e,
     };
     return null;
 }
 
-const Built = union(enum) {
+pub const Built = union(enum) {
     image: struct { lowers: []const []const u8, config: images.Image },
     failed: []const u8,
 };
@@ -491,12 +565,12 @@ const Built = union(enum) {
 /// A Dockerfile action's image, built natively on its base from the image store: each
 /// instruction's layer taken from the native layer store by its key, or made and stored there
 /// (`dockerfile.build`), a RUN in a sandbox on the layers before it (`Backend.execBuild`).
-fn buildImage(b: *Backend, bd: Build) !Built {
+pub fn buildImage(b: *Backend, bd: Build) !Built {
     const arena = b.arena;
-    const ctx = openContext(arena, b.io, bd) catch return .{ .failed = "the build context is " ++
+    const ctx = (try openContext(b, bd)) orelse return .{ .failed = "the build context is " ++
         "not a directory of the action" };
-    defer ctx.dir.close(b.io);
-    const p, const base = planBuild(b, bd, ctx.path, true) catch |e| return switch (e) {
+    defer ctx.close();
+    const p = planBuild(b, bd, ctx) catch |e| return switch (e) {
         error.Refused => .{ .failed = b.build_reason },
         error.NoDockerfile => .{ .failed = "the action has no such Dockerfile" },
         else => e,
@@ -510,16 +584,26 @@ fn buildImage(b: *Backend, bd: Build) !Built {
         .userns = @tagName(b.how.userns),
     };
     var runner: BuildRunner = .{ .b = b };
-    return switch (try dockerfile.build(arena, b.io, p, base.rootfs, ctx.path, store, runner.runner())) {
-        .ok => |built| .{ .image = .{ .lowers = built.lowers, .config = built.config } },
-        .failed => |f| .{ .failed = if (runner.failure.len > 0)
-            try std.fmt.allocPrint(arena, "the RUN on line {d}: {s}", .{ f.line, runner.failure })
+    return switch (try dockerfile.build(arena, b.io, p, store, runner.runner(), .{
+        .context = ctx,
+        .opaque_xattr = b.opaqueXattr(),
+    })) {
+        .ok => |built| if (built.lowers.len == 0)
+            .{ .failed = "the Dockerfile builds an image with no files" }
         else
-            try std.fmt.allocPrint(arena, "the RUN on line {d} exited with {d}: {s}", .{
-                f.line,
-                f.code,
-                runner.last.tail(),
-            }) },
+            .{ .image = .{ .lowers = built.lowers, .config = built.config } },
+        .failed => |f| switch (f.what) {
+            .copy => .{ .failed = try std.fmt.allocPrint(arena, "the COPY on line {d}: {s}", .{ f.line, f.why }) },
+            .workdir => .{ .failed = try std.fmt.allocPrint(arena, "the WORKDIR on line {d}: {s}", .{ f.line, f.why }) },
+            .run => .{ .failed = if (runner.failure.len > 0)
+                try std.fmt.allocPrint(arena, "the RUN on line {d}: {s}", .{ f.line, runner.failure })
+            else
+                try std.fmt.allocPrint(arena, "the RUN on line {d} exited with {d}: {s}", .{
+                    f.line,
+                    f.code,
+                    runner.last.tail(),
+                }) },
+        },
     };
 }
 

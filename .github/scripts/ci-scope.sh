@@ -9,6 +9,7 @@
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)
 #   ci-scope.sh go           Workflows' Go tools steps (ci.yml)
 #   ci-scope.sh apt          Workflows' apt mirror fallback step (ci.yml)
+#   ci-scope.sh soak         Workflows' memory soak selftest step (ci.yml)
 #   ci-scope.sh analysis     Fuzz, Valgrind, Stress, ZLint (suppressed-errors) (analysis.yml)
 #   ci-scope.sh tsan         ThreadSanitizer, native; ThreadSanitizer, end to end (analysis.yml)
 #   ci-scope.sh store        Store stress, Store crash (analysis.yml)
@@ -138,9 +139,17 @@ needed() {
 		esac
 		;;
 	apt)
-		# apt-test.sh runs apt.sh's mirror fallback in a container, against the real mirrors.
+		# apt-test.sh runs apt.sh's mirror fallback in a container, against a signed repository it serves itself (no internet).
 		case $1 in
 		.github/scripts/apt.sh | .github/scripts/apt-test.sh | .github/workflows/ci.yml | \
+			.github/scripts/ci-scope.sh) return 0 ;;
+		*) return 1 ;;
+		esac
+		;;
+	soak)
+		# memory_soak.py's selftest judges made-up series, in a second.
+		case $1 in
+		.github/scripts/memory_soak.py | .github/scripts/memory-soak.sh | .github/workflows/ci.yml | \
 			.github/scripts/ci-scope.sh) return 0 ;;
 		*) return 1 ;;
 		esac
@@ -151,7 +160,9 @@ needed() {
 		# The decoders (libzstd and zlib-ng, which read every layer a registry sends, and the Zig
 		# decoders they are held to) are the exception, with their corpora: a change to them is
 		# fuzzed before it merges. The same for the network library (docs/rust-net.md): it reads
-		# what servers send, and its tests run under Valgrind.
+		# what servers send, and its tests run under Valgrind, and for the Dockerfile builder's
+		# parser and planner and the fuzz targets themselves: they read what an action's author
+		# wrote, before the job's first step.
 		case $1 in
 		.github/workflows/analysis.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/zig-fuzz.sh | .github/scripts/zig-valgrind.sh | \
@@ -162,6 +173,7 @@ needed() {
 			runner/src/vendor/zstd/* | runner/src/fuzz_corpus/zstd/* | \
 			runner/src/native/oci/zlibng.zig | runner/src/vendor/zlib-ng/* | \
 			runner/src/fuzz_corpus/gzip/* | \
+			runner/src/native/dockerfile.zig | runner/src/native/layer_view.zig | runner/src/fuzz.zig | \
 			runner/src/zr_net.zig | runner/src/tls_stream.zig | runner/src/net_client.zig | runner/src/net_oracle.zig | runner/src/fuzz_corpus/tls/* | runner/rust/* | \
 			runner/tls_oracle.zig | runner/tools/tls_oracle/* | .github/scripts/pg-tls-fixture.sh | \
 			.github/scripts/build-zr-net.sh | \
@@ -236,10 +248,10 @@ needed() {
 }
 
 case $scope in
-tests | binaries | e2e | proofs | packaging | go | apt | analysis | tsan | store | coverage | \
+tests | binaries | e2e | proofs | packaging | go | apt | soak | analysis | tsan | store | coverage | \
 	codeql-actions | codeql-go | codeql-python) ;;
 *)
-	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|apt|analysis|tsan|store|coverage|codeql-actions|codeql-go|codeql-python" >&2
+	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|apt|soak|analysis|tsan|store|coverage|codeql-actions|codeql-go|codeql-python" >&2
 	exit 2
 	;;
 esac

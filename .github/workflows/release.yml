@@ -319,11 +319,15 @@ jobs:
           install -m 0755 dist/zig-runner-linux-x86_64 runner/prebuilt/runner-amd64
           install -m 0755 dist/zig-runner-linux-aarch64 runner/prebuilt/runner-arm64
 
+      # Not the oracle's fixtures (tools/dockerfile_oracle): they are inputs to the Dockerfile
+      # builder, written to use what BuildKit accepts (no USER, a relative WORKDIR), not images the
+      # repository ships. Only that directory is skipped.
       - name: Scan the Dockerfile
         if: env.RUN == 'true'
         run: |
           docker run --rm -v "$PWD:/src:ro" -w /src "$TRIVY_IMAGE" config \
-            --exit-code 1 --severity HIGH,CRITICAL --ignorefile .trivyignore.yaml runner/
+            --exit-code 1 --severity HIGH,CRITICAL --ignorefile .trivyignore.yaml \
+            --skip-dirs tools/dockerfile_oracle runner/
 
       # Trivy's vulnerability database, fetched once, with retries, from Google's mirror of it
       # first (GitHub's registry limits anonymous pulls): on a tag the release is already public,

@@ -2617,6 +2617,18 @@ pub fn readFile(b: *Backend, path: []const u8) ?[]const u8 {
 
 pub const max_read = 16 * 1024 * 1024;
 
+/// The job's layers as its next step's overlay stacks them, topmost first: its own, newest first,
+/// the Zig cache seeds' and the rootfs (`hashFiles`' stack, a Dockerfile's context read from the
+/// workspace).
+pub fn jobLayers(b: *Backend, arena: Allocator) ![]const []const u8 {
+    const n = b.layers.items.len;
+    const out = try arena.alloc([]const u8, n + b.seed_layers.items.len + 1);
+    for (b.layers.items, 0..) |l, i| out[n - 1 - i] = l.path;
+    @memcpy(out[n..][0..b.seed_layers.items.len], b.seed_layers.items);
+    out[out.len - 1] = b.rootfs;
+    return out;
+}
+
 /// `hashFiles(args)` over the job's files as the next step would see them (`native/hash_files.zig`):
 /// the layers as they are now, so what earlier steps wrote is there, read by the runner with no
 /// mount, for the steps' user (`hashStep`). `ws` is the workspace.
@@ -2703,7 +2715,7 @@ fn hashStep(b: *const Backend, layer_ids: []Store.Ids) ?hash_files.Step {
 
 /// Overlay's attribute that marks a directory opaque: `trusted.` when the job's overlay is mounted
 /// as the host's root, `user.` under `userxattr` (a rootless runner's).
-fn opaqueXattr(b: *const Backend) [:0]const u8 {
+pub fn opaqueXattr(b: *const Backend) [:0]const u8 {
     return if (b.how.userns == .mapped) "trusted.overlay.opaque" else "user.overlay.opaque";
 }
 

@@ -539,7 +539,11 @@ test "allocation failures: a directory's lock file" {
     const af = @import("../../alloc_failures.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+    // The lock file is `<dir>.lock`, beside the directory: inside the test's own directory, so
+    // `tmp.cleanup()` takes it, and not beside that in the shared `.zig-cache/tmp` for a leak.
+    const dir = try std.fmt.allocPrint(testing.allocator, "{s}/d", .{tmp_path});
     defer testing.allocator.free(dir);
     const S = struct {
         /// Out of memory is an error to the caller, never a lock that is not the file's and is

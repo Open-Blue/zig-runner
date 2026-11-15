@@ -10,7 +10,8 @@ name: analysis
 #                  broker's messages, HTTP/2 framing) held to GitHub's runner, and the runner's own
 #                  zstd decoder held to std's, and libzstd, which reads the layers, to that decoder,
 #                  and zlib-ng's inflater held to std's, on every input (an image layer from any
-#                  registry).
+#                  registry), and the native Dockerfile builder's parser and planner, which read
+#                  what an action's author wrote.
 #                  The corpus each finds
 #                  is kept from night to night in the Actions cache; a crash, a failed check, a
 #                  leak or a hang fails the job, named after its target, with the input as an
@@ -33,6 +34,9 @@ name: analysis
 #                  backends with a runner built under ThreadSanitizer: the runner's main loop, its
 #                  pool and its helpers, which no test reaches. Any report in the runner's log or
 #                  the jobs' fails it.
+#   Memory soak    50 jobs of seven shapes through one runner, one at a time: its resident and
+#                  anonymous memory, heap, descriptors, threads, mounts and zombies must not grow
+#                  (.github/scripts/memory-soak.sh; nightly, not on pull requests).
 #   Stress         the concurrency-sensitive tests (.github/scripts/zig-race-tests.sh: cancels,
 #                  deadlines, the memory gate, the native store's locks, the database, the
 #                  broker's long-poll, log uploads) 100 times over under CPU and memory load
@@ -217,6 +221,11 @@ jobs:
           # What an HTTP server answers the network library's client with (hyper's parsing and our
           # redirect, header and body handling), one loopback server per run.
           - { target: HTTP responses, runs: 100K }
+          # What an action's Dockerfile is, read by the native builder before the job's first step:
+          # its parser and planner (stages, heredocs, flags, ARG scopes) and COPY's pattern matcher.
+          # No I/O: a run costs microseconds, so many runs fit in the time.
+          - { target: Dockerfile builder, runs: 2M }
+          - { target: COPY patterns, runs: 3M }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -570,6 +579,24 @@ jobs:
           path: ${{ runner.temp }}/stress
           if-no-files-found: ignore
 
+  # Every default mirror of apt.sh carries every pocket (apt-test.sh --real-mirrors): the hermetic
+  # test in ci cannot tell. Needs the internet and a public mirror may be out, so only at night
+  # (a failure is a mirror to look at, not a broken change), never on a pull request.
+  apt-real-mirrors:
+    name: apt default mirrors
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: every pocket on every default mirror
+        run: .github/scripts/apt-test.sh --real-mirrors
+
   # Under a minute: ZLint reads the sources, nothing is compiled.
   zlint-suppressed-errors:
     name: ZLint (suppressed-errors)
@@ -766,4 +793,43 @@ jobs:
           name: store-crash
           path: |
             ${{ runner.temp }}/store-crash/keep
+          if-no-files-found: ignore
+
+  # About 20 minutes: the build, the image's pull and provisioning, a throwaway Gitea, and 50 jobs of
+  # seven shapes through one runner, one at a time. Nightly only: .github/scripts/memory-soak.sh
+  # says what it checks; the long run (500 jobs) is for a machine of one's own.
+  memory-soak:
+    name: Memory soak
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      - name: Build the runner
+        run: .github/scripts/e2e.sh build "$RUNNER_TEMP/zig-runner"
+
+      # The runner needs root and user namespaces (it runs in a container of its own, with a memory
+      # limit, as the native tests do), and the Gitea it polls is a container too.
+      - name: Soak
+        env:
+          ZR_SOAK_DIR: ${{ runner.temp }}/soak
+          ZR_SOAK_LOCK: ${{ runner.temp }}/soak.lock
+        run: .github/scripts/memory-soak.sh --jobs 50 --own-instance --bin "$RUNNER_TEMP/zig-runner"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: memory-soak
+          path: |
+            ${{ runner.temp }}/soak/run-*/samples.csv
+            ${{ runner.temp }}/soak/run-*/verdict.txt
+            ${{ runner.temp }}/soak/run-*/runner.log
           if-no-files-found: ignore
