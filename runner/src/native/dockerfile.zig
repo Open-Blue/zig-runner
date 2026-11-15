@@ -2798,3 +2798,28 @@ test "allocation failures: a Dockerfile parsed, substituted and planned" {
     for ([_][]const u8{ "$A ${A}- ${E:-z} ${A:+w} ${E:+no}- \\$A $", "${A:-${E:-deep}}", "${unclosed" }) |text|
         try af.checkOne(S.substituteOnly, .{text});
 }
+
+test "plan: a reference pinned by digest (name:tag@sha256) is asked for whole, in FROM, an ARG and COPY --from" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const text =
+        \\ARG IMAGE=alpine
+        \\ARG BASE=alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f
+        \\FROM ${IMAGE}:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f AS one
+        \\FROM ${BASE} AS two
+        \\FROM alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f
+        \\COPY --from=one /a /a
+        \\COPY --from=two /b /b
+        \\COPY --from=busybox:1.38@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f /bin/busybox /bin/busybox
+    ;
+    var f: FixedBases = .{ .arena = arena };
+    var ctx: Fixed = .{};
+    _ = try planOf(arena, text, &f, &ctx);
+    const want = "alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f";
+    try std.testing.expectEqual(@as(usize, 4), f.asked.items.len);
+    try std.testing.expectEqualStrings(want, f.asked.items[0]);
+    try std.testing.expectEqualStrings(want, f.asked.items[1]);
+    try std.testing.expectEqualStrings(want, f.asked.items[2]);
+    try std.testing.expectEqualStrings("busybox:1.38@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f", f.asked.items[3]);
+}

@@ -439,6 +439,8 @@ test "references normalise as Docker resolves them, and key one directory each" 
         .{ "localhost:5000/x", "localhost:5000/x:latest" },
         .{ "localhost/x:1", "localhost/x:1" },
         .{ "alpine@sha256:abcd", "docker.io/library/alpine@sha256:abcd" },
+        .{ "alpine:3.22@sha256:abcd", "docker.io/library/alpine:3.22@sha256:abcd" },
+        .{ "ghcr.io/acme/tool:1@sha256:abcd", "ghcr.io/acme/tool:1@sha256:abcd" },
     }) |c| try std.testing.expectEqualStrings(c[1], try normalize(arena, c[0]));
     try std.testing.expectEqualStrings(
         "docker.io%2Flibrary%2Falpine%3A3.22",
