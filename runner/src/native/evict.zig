@@ -497,7 +497,7 @@ fn dropRefs(arena: Allocator, io: std.Io, root: []const u8) void {
     var it = d.iterate();
     while (it.next(io) catch null) |e| {
         const p = std.fmt.allocPrint(arena, "{s}/{s}", .{ refs, e.name }) catch return;
-        const text = std.Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(128)) catch continue;
+        const text = std.Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(512)) catch continue;
         // A tag's record names the manifest first, then the digest the tag gave and when.
         var words = std.mem.tokenizeAny(u8, text, " \n");
         const manifest = words.next() orelse continue;
@@ -2451,6 +2451,29 @@ test "native eviction: a pin's record goes with its image, and one whose image i
     try testing.expect(!f.there(gone));
     try testing.expectError(error.FileNotFound, f.tmp.dir.access(io, "oci/refs/" ++ hex_gone ++ ".amd64", .{}));
     try f.tmp.dir.access(io, "oci/refs/" ++ hex_kept ++ ".amd64", .{});
+}
+
+test "native eviction: a tag's record (manifest, digest, time: over 128 bytes) goes with its image too" {
+    const f = try Fixture.init();
+    defer f.deinit();
+    const io = testing.io;
+    const arena = f.arena();
+    const hex_gone: [64]u8 = @splat('a');
+    const hex_kept: [64]u8 = @splat('b');
+    const oci: OciStore = .{ .root = f.s.root };
+    try oci.prepare(arena, io);
+    const gone = try testTree(f, "oci/images", &hex_gone, 1000, 30);
+    _ = try testTree(f, "oci/images", &hex_kept, 1000, 0);
+    for ([_][]const u8{ &hex_gone, &hex_kept }) |h| {
+        const text = try std.fmt.allocPrint(arena, "sha256:{s} sha256:{s} 1700000000\n", .{ h, h });
+        try testing.expect(text.len > 128);
+        try f.tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "oci/refs/tag-{s}.amd64", .{h}), .data = text });
+    }
+    f.s.limits = .{ .images_max_bytes = 1500, .volumes_max_bytes = 0, .min_free_pct = 0 };
+    run(f.s, io);
+    try testing.expect(!f.there(gone));
+    try testing.expectError(error.FileNotFound, f.tmp.dir.access(io, "oci/refs/tag-" ++ hex_gone ++ ".amd64", .{}));
+    try f.tmp.dir.access(io, "oci/refs/tag-" ++ hex_kept ++ ".amd64", .{});
 }
 
 fn raceTree(r: *Race, arena: Allocator, i: usize, n: usize) !void {
