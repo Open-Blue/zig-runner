@@ -757,7 +757,7 @@ fn readMatcherFiles(x: *Exec, paths: []const []const u8) ?[]const []const u8 {
 
 /// The contents of `path` in the job's container; null when it could not be read.
 fn readMatcherFile(x: *Exec, path: []const u8) ?[]const u8 {
-    if (x.native) |b| return b.readFile(path);
+    if (x.native) |b| return b.readFile(path) catch null;
     var q: Query = .init(x.arena);
     q.call("loadContainerFromID", .{ .id = x.container_id }) catch return null;
     q.call("file", .{ .path = path }) catch return null;
