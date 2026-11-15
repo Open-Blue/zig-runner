@@ -1,0 +1,3 @@
+kind: Added
+body: 'OpenSSF Scorecard''s Fuzzing check finds libFuzzer targets for the network library (runner/rust/zr-net/fuzz): what an HTTP server answers the client with (redirects, headers, body limits, chunked and streamed bodies), what a caller''s request becomes on the wire, and what a TLS server sends, through the C ABI Zig calls and under AddressSanitizer. A pull request that changes the library builds them; the night fuzzes each for a minute (analysis.yml, zr-net-fuzz).'
+time: 2026-11-15T01:49:31.366250112-05:00

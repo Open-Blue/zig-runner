@@ -1,0 +1,37 @@
+[package]
+name = "zr-net-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "cargo-fuzz targets for zr-net: what servers answer the HTTP client with, what the caller's request lines turn into on the wire, and what a TLS server sends (docs/rust-net.md)"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zr-net = { path = ".." }
+
+# Not a member of zr-net's workspace (it has none): its own lock file and target directory.
+[workspace]
+
+[[bin]]
+name = "http_response"
+path = "fuzz_targets/http_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request_spec"
+path = "fuzz_targets/request_spec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_records"
+path = "fuzz_targets/tls_records.rs"
+test = false
+doc = false
+bench = false

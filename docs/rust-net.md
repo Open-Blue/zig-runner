@@ -555,8 +555,10 @@ Each PR brings its own checks; none is left to "later".
    into `zr_net_tls_give_cipher`, asserting no crash and bounded memory. They live beside the existing fuzz targets (`zig-fuzz.sh`, `src/fuzz.zig`)
    with corpora under `src/fuzz_corpus/`. They are **wired into the analysis scope in `.github/scripts/ci-scope.sh`** (as the zstd decoder is), so a change
    to `runner/rust/*` or `zr_net.zig` is fuzzed before it merges, not only at night: R1 already adds `runner/rust/*`, `runner/src/zr_net.zig`
-   and the build scripts to that case. Rust's own `cargo fuzz` (libFuzzer) is not used: Zig's fuzzer is the one in CI, and the shared ABI is the
-   boundary that matters to the runner. R2 brings the TLS one, R3 HTTP head and header parsing, R6 WebSocket frames.
+   and the build scripts to that case. Zig's fuzzer is the one that holds them to an oracle, and the shared ABI is the
+   boundary that matters to the runner. Rust's libFuzzer runs the same boundary under AddressSanitizer too (`runner/rust/zr-net/fuzz`, driven by
+   `.github/scripts/zr-net-fuzz.sh`: `http_response`, `request_spec` and `tls_records`, seeded from `fuzz/seeds`; a pull request builds them and the
+   night runs each for a minute, in analysis.yml's `zr-net-fuzz` job; OpenSSF Scorecard's Fuzzing check looks for it). R2 brings the TLS one, R3 HTTP head and header parsing, R6 WebSocket frames.
 3. **Valgrind clean on the Zig tests that call into Rust.** `zig-valgrind.sh` already runs every test through the module graph, which
    now includes the archive, so tests that start the runtime run under memcheck: R1's does, with **no reports** (done: `the runtime starts...` passes
    under `zig-valgrind.sh` with no suppression). Limits, to know what that proves: a static musl binary hides `malloc` from Valgrind's

@@ -166,7 +166,7 @@ needed() {
 		# `native/tarball.zig` is another: it reads the first bytes of an archive a server sent.
 		case $1 in
 		.github/workflows/analysis.yml | .github/scripts/ci-scope.sh | \
-			.github/scripts/zig-fuzz.sh | .github/scripts/zig-valgrind.sh | \
+			.github/scripts/zig-fuzz.sh | .github/scripts/zr-net-fuzz.sh | .github/scripts/zig-valgrind.sh | \
 			.github/scripts/changed-tests.sh | \
 			.github/scripts/zig-race-tests.sh | .github/scripts/zig-stress.sh | \
 			.github/scripts/zlint.sh | .github/scripts/zlint-suppressed.baseline | \
