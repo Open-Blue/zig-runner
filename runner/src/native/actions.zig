@@ -14,8 +14,10 @@
 //! built from their Dockerfile (`docker_action.zig`, `dockerfile.zig`), and composite actions,
 //! whose steps are scripts, nested actions and checkouts like the job's. JavaScript actions need
 //! a JavaScript runtime mounted in the job's image, which the Dagger path takes from its own
-//! image; they send the job to Dagger, as local actions (`uses: ./path`) do: those are read from
-//! the workspace once a step has checked it out, after the choice.
+//! image; they send the job to Dagger. Local actions (`uses: ./path`) are judged from the job's
+//! commit before the job (`localReason`), which sends the job to Dagger when one is not there; on a
+//! runner with no engine nothing is judged before the job: each is read from the workspace when its
+//! step runs, whatever the steps before it wrote.
 
 const std = @import("std");
 const job_mod = @import("../job.zig");
@@ -165,19 +167,19 @@ fn judge(
 /// itself reads the workspace, as on Dagger (`loadLocal`). One that is not in the repository at
 /// that commit (made by a step, or another repository checked out there) sends the job to
 /// Dagger, since nothing can be known of it before the job.
+///
+/// With no engine (`Backend.engineless`) there is nowhere to send the job, and the commit is not
+/// what the step will find (an earlier step may have made or changed any of its files), so it is
+/// not read: the step reads the workspace, judges what it finds there and builds a Dockerfile
+/// from the job's layers, and fails saying why when native cannot run it.
 fn localReason(b: *Backend, job: job_mod.Job, path: []const u8, depth: u32) anyerror!?[]const u8 {
+    if (b.engineless) return null;
     const arena = b.arena;
     const label = try std.fmt.allocPrint(arena, "./{s}", .{path});
     const not_known = try std.fmt.allocPrint(arena, "the local action {s} is not in {s} at " ++
         "{s}, so what it is cannot be known before the job", .{ label, job.github.repository, job.github.sha });
-    if (job.github.repository.len == 0 or job.github.sha.len == 0) return if (b.engineless) null else not_known;
-    const text = (try readOwn(b, job, path, &.{ "action.yml", "action.yaml" })) orelse {
-        // With an engine, Dagger is where such a job goes. With none, nowhere is: the step reads
-        // the action from the workspace when it runs, as it does for one that is in the commit, and
-        // builds its Dockerfile from the job's layers if it has one.
-        if (b.engineless) return null;
-        return not_known;
-    };
+    if (job.github.repository.len == 0 or job.github.sha.len == 0) return not_known;
+    const text = (try readOwn(b, job, path, &.{ "action.yml", "action.yaml" })) orelse return not_known;
     const meta = switch (try action.parse(arena, text)) {
         .ok => |m| m,
         // The step reads it again and fails with why, as on Dagger.
@@ -1005,4 +1007,148 @@ test "no engine: a local action no commit holds is read from the workspace when 
     try std.testing.expect(res.succeeded);
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "made-by-an-earlier-step") != null);
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "needs the Dagger engine") == null);
+}
+
+/// Runs `steps` natively with no engine, in a job at `sha` of `o/r`: what its log says, and whether it succeeded.
+fn runEngineless(arena: Allocator, cfg: Backend.Config, steps: []const job_mod.Step, sha: []const u8) !struct {
+    succeeded: bool,
+    log: []const u8,
+} {
+    var job = testJob(steps);
+    job.github.server_url = "file:///srv/git";
+    job.github.sha = sha;
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .engineless = true,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    return .{ .succeeded = res.succeeded, .log = w.written() };
+}
+
+fn expectLog(log: []const u8, wanted: []const []const u8) !void {
+    for (wanted) |e| if (std.mem.indexOf(u8, log, e) == null) {
+        std.debug.print("missing {s} in:\n{s}\n", .{ e, log });
+        return error.TestUnexpectedResult;
+    };
+}
+
+fn localUses(path: []const u8) job_mod.Step {
+    var st = testStep("");
+    st.action = .{ .uses = .{ .owner = "", .name = "", .path = path, .ref = "", .local = true } };
+    return st;
+}
+
+test "no engine: a Dockerfile local action an earlier step wrote, action.yml and Dockerfile both, is built and run" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testActions(arena, &tmp);
+    const sha = try ownRepo(arena, &tmp, &.{.{ "README", "x\n" }});
+    var co = testStep("");
+    co.action = .{ .checkout = &.{} };
+    const make = testStep(
+        \\d="$GITHUB_WORKSPACE/made"; mkdir -p "$d"
+        \\printf 'runs:\n  using: docker\n  image: Dockerfile\n' > "$d/action.yml"
+        \\printf 'FROM zr-test/base:1\nRUN echo ws-built > /marker\nENTRYPOINT ["sh","-c","echo ran $(cat /marker)"]\n' > "$d/Dockerfile"
+    );
+    const res = try runEngineless(arena, cfg, &.{ co, make, localUses("made") }, sha);
+    errdefer std.debug.print("{s}\n", .{res.log});
+    try std.testing.expect(res.succeeded);
+    try expectLog(res.log, &.{ "Engine: native", "ran ws-built" });
+}
+
+test "no engine: a local action whose action.yml is in the commit and whose Dockerfile an earlier step wrote is built, not refused" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testActions(arena, &tmp);
+    try tmp.dir.createDirPath(std.testing.io, "work/r/act");
+    const sha = try ownRepo(arena, &tmp, &.{.{ "act/action.yml", "runs:\n  using: docker\n  image: Dockerfile\n" }});
+    var co = testStep("");
+    co.action = .{ .checkout = &.{} };
+    const make = testStep(
+        \\printf 'FROM zr-test/base:1\nENTRYPOINT ["sh","-c","echo late-dockerfile"]\n' > "$GITHUB_WORKSPACE/act/Dockerfile"
+    );
+    const res = try runEngineless(arena, cfg, &.{ co, make, localUses("act") }, sha);
+    errdefer std.debug.print("{s}\n", .{res.log});
+    try std.testing.expect(res.succeeded);
+    try expectLog(res.log, &.{"late-dockerfile"});
+    try std.testing.expect(std.mem.indexOf(u8, res.log, "is not in o/r") == null);
+}
+
+test "no engine: a local action is judged from the Dockerfile an earlier step changed, not the commit's" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testActions(arena, &tmp);
+    // The commit's Dockerfile has an ONBUILD, which the builder refuses; the step replaces it.
+    try tmp.dir.createDirPath(std.testing.io, "work/r/act");
+    const sha = try ownRepo(arena, &tmp, &.{
+        .{ "act/action.yml", "runs:\n  using: docker\n  image: Dockerfile\n" },
+        .{ "act/Dockerfile", "FROM zr-test/base:1\nONBUILD RUN true\n" },
+    });
+    var co = testStep("");
+    co.action = .{ .checkout = &.{} };
+    const change = testStep(
+        \\printf 'FROM zr-test/base:1\nENTRYPOINT ["sh","-c","echo changed-dockerfile"]\n' > "$GITHUB_WORKSPACE/act/Dockerfile"
+    );
+    const res = try runEngineless(arena, cfg, &.{ co, change, localUses("act") }, sha);
+    errdefer std.debug.print("{s}\n", .{res.log});
+    try std.testing.expect(res.succeeded);
+    try expectLog(res.log, &.{"changed-dockerfile"});
+}
+
+test "no engine: a local action whose Dockerfile an earlier step spoiled fails its step, though the commit's is fine" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testActions(arena, &tmp);
+    var co = testStep("");
+    co.action = .{ .checkout = &.{} };
+    try tmp.dir.createDirPath(std.testing.io, "work/r/act");
+    const bad = try ownRepo(arena, &tmp, &.{
+        .{ "act/action.yml", "runs:\n  using: docker\n  image: Dockerfile\n" },
+        .{ "act/Dockerfile", "FROM zr-test/base:1\nENTRYPOINT [\"sh\",\"-c\",\"echo commit-dockerfile\"]\n" },
+    });
+    const spoil = testStep(
+        \\printf 'FROM zr-test/base:1\nONBUILD RUN true\n' > "$GITHUB_WORKSPACE/act/Dockerfile"
+    );
+    const failed = try runEngineless(arena, cfg, &.{ co, spoil, localUses("act") }, bad);
+    try std.testing.expect(!failed.succeeded);
+    try expectLog(failed.log, &.{"ONBUILD"});
+    try std.testing.expect(std.mem.indexOf(u8, failed.log, "commit-dockerfile") == null);
+}
+
+test "no engine: a node local action in an image with no JavaScript runtime fails its step, saying why" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testActions(arena, &tmp);
+    const sha = try ownRepo(arena, &tmp, &.{.{ "README", "x\n" }});
+    var co = testStep("");
+    co.action = .{ .checkout = &.{} };
+    const make = testStep(
+        \\d="$GITHUB_WORKSPACE/js"; mkdir -p "$d"
+        \\printf 'runs:\n  using: node20\n  main: index.js\n' > "$d/action.yml"
+        \\echo 'console.log("ne" + "ver")' > "$d/index.js"
+    );
+    const res = try runEngineless(arena, cfg, &.{ co, make, localUses("js") }, sha);
+    errdefer std.debug.print("{s}\n", .{res.log});
+    try std.testing.expect(!res.succeeded);
+    try expectLog(res.log, &.{ "JavaScript", "runtime" });
+    try std.testing.expect(std.mem.indexOf(u8, res.log, "never") == null);
 }
