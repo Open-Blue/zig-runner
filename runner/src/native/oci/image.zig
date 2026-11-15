@@ -12,7 +12,6 @@ const registry = @import("registry.zig");
 const layer = @import("layer.zig");
 const Store = @import("Store.zig");
 const admission = @import("../../admission.zig");
-const Sha256 = @import("../../sha256.zig").Sha256;
 const zr_net = @import("../../zr_net.zig");
 const linux = std.os.linux;
 
