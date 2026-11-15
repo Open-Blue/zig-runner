@@ -1623,6 +1623,7 @@ test "native eviction: a volume is measured when new, its size kept beside it" {
     defer v.release(io);
     const data = try arena.alloc(u8, 64 * 1024);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/f", .{v.dir}), .data = data });
+    try flushFile(arena, try std.fmt.allocPrint(arena, "{s}/f", .{v.dir}));
     f.s.limits = .{ .volumes_max_bytes = 0, .min_free_pct = 0 };
     run(f.s, io);
     const text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(arena, "{s}.size", .{v.dir}), arena, .limited(32));
@@ -1961,8 +1962,14 @@ test "native eviction: a chain of directories deeper than a pass gets through go
     // Bounded by time, not by passes: a loaded machine gets less done in each pass's 60 ms, so it
     // takes more of them; a removal that is stuck still fails, at the deadline.
     const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 120 * std.time.ms_per_s;
-    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline and try f.deadLeft() > 0) run(f.s, testing.io);
+    var passes: usize = 0;
+    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline and try f.deadLeft() > 0) : (passes += 1) run(f.s, testing.io);
     try testing.expectEqual(@as(usize, 0), try f.deadLeft());
+    // The count of passes is bounded whatever the load: a pass takes at least `least_removed`
+    // steps whatever the clock says, and a level of the chain costs two (a descent and a removal),
+    // so no pass gets through fewer than least_removed / 2 levels. The most it can take is the
+    // depth over that, and a walk whose work per pass grew with the depth would take more.
+    try testing.expect(passes <= 30_000 / (least_removed / 2) + 2);
     run(f.s, testing.io);
     try testing.expect(!f.there(old));
 }
@@ -2876,7 +2883,7 @@ test "native eviction: a walk of a chain of directories too deep to name ends at
 /// The file `path` written out to the disk. The blocks of a file whose data is dirty are not
 /// settled: the disk allocates them as the machine gets to it, and a walk that meets that moment
 /// counts them differently from one after it (a file's, 8192 bytes, on a hosted runner, and under
-/// a loop of `sync` here, once in a thousand runs). A test that compares two walks' counts of a
+/// a loop of `sync` here, 2 runs in 3000). A test that compares two walks' counts of a
 /// tree it has just written flushes the files first.
 fn flushFile(arena: Allocator, path: []const u8) !void {
     const z = try arena.dupeSentinel(u8, path, 0);
