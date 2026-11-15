@@ -1015,7 +1015,7 @@ directories and the step's file-command files at a 4 KiB block each.
   `docker pull` does. When the registry cannot answer (the network, a 429 or a 5xx) and the store
   holds the tag's last resolution, that image runs and "Set up job" says which digest; a 401, a 403
   or a 404 is an error, never the old image. With nothing to fall back on, a 429 is waited out as
-  its `Retry-After` asks (each wait at most 60 s, at most two). A record belongs to the credentials that resolved it (a hash of the registry login, or "anonymous"; the secret is never stored): another login, or none, asks the registry and gets its 401. For the same credentials a tag that was deleted, or access that was revoked, is still served until the TTL passes, and by the fallback. The runner has no `pull_policy`; a job that must
+  its `Retry-After` asks (each wait at most 60 s, at most two). A record belongs to the credentials that resolved it (an HMAC-SHA256 of the reference and the registry login, or "anonymous", keyed by a random per-store secret in `oci/refs.key`, mode 0600, made on first use and made again if lost, which only costs the records; the login itself is never stored, nor guessable from the file names): another login, or none, asks the registry and gets its 401. For the same credentials a tag that was deleted, or access that was revoked, is still served until the TTL passes, and by the fallback. The runner has no `pull_policy`; a job that must
   have the newest tag pins `image@sha256:...` or runs where the setting is 0.
 - `runner/src/native/oci/layer.zig`: one layer applied safely (gzip, zstd or plain by the blob's
   first bytes; ustar, GNU long names, PAX; whiteouts and opaque directories; the diff id
