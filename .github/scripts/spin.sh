@@ -23,11 +23,13 @@
 #
 # Locally: .github/scripts/spin.sh (spin 6.5.2, gcc and python3 on the PATH).
 set -euo pipefail
+# Job control: each worker below leads a process group of its own, so that the EXIT trap, or the
+# heartbeat after a SIGKILL, ends it with the spin, gcc and pan it runs.
+set -m
 
 version="Spin Version 6.5.2 -- 6 December 2019"
 here=$(cd "$(dirname "$0")/../../proofs/spin" && pwd)
 dir="${SPIN_DIR:-${RUNNER_TEMP:-/tmp}/spin}"
-# shellcheck source=.github/scripts/spin-heartbeat.sh
 # shellcheck source=.github/scripts/spin-heartbeat.sh
 source "$(dirname "$0")/spin-heartbeat.sh"
 
@@ -140,20 +142,31 @@ done | sort -k1,1nr | cut -d' ' -f2)
 jobs=$(nproc)
 running=0
 mkdir -p "$dir"
+# One run at a time in a directory: the pre-push hooks of two worktrees share one, and a second run
+# would delete the first's configurations under it. The lock is on this file, held through fd 9,
+# which every worker inherits: workers that outlive a SIGKILLed script still hold it until they end,
+# so a later run waits for them.
+exec 9>"$dir/lock"
+if ! flock -n 9; then
+	echo "spin: $dir is in use by another run; waiting for it"
+	flock 9
+fi
 : >"$dir/finished"
-# The heartbeat ends with this script on every path: the EXIT trap kills it (INT and TERM exit, so
-# the trap runs), and the loop asks after this script at every tick, for the death no trap sees.
+: >"$dir/workers"
+# Nothing outlives this script, on any path. The EXIT trap ends the heartbeat and every worker's
+# process group (INT and TERM exit, so the trap runs); for the death no trap sees, the heartbeat asks
+# after this script at every tick and, when it is gone, ends the groups listed in $dir/workers.
 heartbeat=
-trap 'kill "$heartbeat" 2>/dev/null || true' EXIT
+pids=()
+trap 'spin_stop "$heartbeat" "${pids[@]}"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 # shellcheck disable=SC2329 # run by heartbeat_loop, by name
 progress() {
 	echo "spin: $SECONDS s, $(wc -l <"$dir/finished") of ${#names[@]} configurations finished"
 }
-heartbeat_loop "$$" "${SPIN_HEARTBEAT_S:-60}" progress &
+heartbeat_loop "$$" "${SPIN_HEARTBEAT_S:-60}" "$dir/workers" progress &
 heartbeat=$!
-pids=()
 for n in "${names[@]}"; do
 	if ((running >= jobs)); then
 		wait -n
@@ -161,10 +174,13 @@ for n in "${names[@]}"; do
 	fi
 	(check "$n") &
 	pids+=($!)
+	echo "$!" >>"$dir/workers"
 	running=$((running + 1))
 done
 wait "${pids[@]}" || true
-kill "$heartbeat" 2>/dev/null || true
+spin_stop "$heartbeat"
+heartbeat=
+pids=()
 
 status=0
 for n in "${names[@]}"; do
