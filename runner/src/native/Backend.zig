@@ -1092,6 +1092,13 @@ fn jobCgroup(
                 why_out.* = untrusted_limits_why;
                 return error.NoJobLimits;
             }
+            // No swap unless the job asks (`--memory-swap`, `limitSwap`), and the runner lets it
+            // (`RUNNER_NATIVE_SWAP`): its own `memory.swap.max` is 0 from the start, whatever the parent's.
+            j.setSwap(arena, "0") catch {
+                j.remove(arena, b.io);
+                why_out.* = "the job's memory.swap.max could not be set to 0";
+                return error.NoJobLimits;
+            };
             b.job_cgroup = j;
             b.parent_ooms = j.usage(b.io).parent_ooms;
             // What holds is what the log says, and what a kill is put down to.
@@ -1111,7 +1118,8 @@ fn jobCgroup(
                 if (!j.all.accounted)
                     "may swap: this kernel does not account for swap"
                 else if (j.all.swap)
-                    "may swap (RUNNER_NATIVE_SWAP)"
+                    "may swap (RUNNER_NATIVE_SWAP): each job's own memory.swap.max is 0 unless its " ++
+                        "container options ask for swap (--memory-swap)"
                 else
                     "may not swap",
             }));
@@ -1124,26 +1132,14 @@ fn jobCgroup(
                 std.log.warn("native: {s}", .{said});
             }
             // memory.high from what the gate reserves for the job; under memory.max, which stays
-            // the hard cap. Only where it can slow a job, not stop it (`cgroup.canSwap`).
+            // the hard cap. Only where it can slow a job, not stop it: the job's own swap is 0
+            // here (above), so none is set; a job that asks for swap (`limitSwap`) gets it then.
             const g = b.gate orelse return;
-            const high_mb = g.native(j.dir) orelse return;
-            if (!cgroup.canSwap(j.all, b.io)) {
-                g.noHigh(if (b.limits.memory_max) |m| m >> 20 else null);
-                try b.notes.append(arena, "Native steps: no memory.high: with no swap it would " ++
-                    "stop a job past it instead of slowing it. memory.max ends one that takes " ++
-                    "too much.");
-                return;
-            }
-            const high = j.setHigh(arena, b.io, @as(u64, high_mb) << 20) catch |e| {
-                try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: the " ++
-                    "job's memory.high could not be set ({s}).", .{@errorName(e)}));
-                return;
-            };
-            try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native steps: memory.high " ++
-                "{f}, from what the memory gate reserves for the job: past it the kernel " ++
-                "reclaims and slows the job instead of letting it take its neighbours' memory.", .{
-                Limit.memory(high),
-            }));
+            _ = g.native(j.dir) orelse return;
+            g.noHigh(if (b.limits.memory_max) |m| m >> 20 else null);
+            try b.notes.append(arena, "Native steps: no memory.high: with no swap it would " ++
+                "stop a job past it instead of slowing it. memory.max ends one that takes " ++
+                "too much.");
             return;
         } else |e| try std.fmt.allocPrint(arena, "it could not be made under {s}: {s}", .{
             dir,
@@ -3707,6 +3703,20 @@ fn readContainerOptions(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void
         n >> 20,
         try b.limitMemory(n, err_msg),
     });
+    if (o.cpuMax()) |m| try more.print(b.arena, ", `--cpus`/`--cpu-quota` {d}/{d} µs{s}", .{
+        m.quota,
+        m.period,
+        try b.limitCpu(m, err_msg),
+    });
+    if (o.cpu_shares) |n| try more.print(b.arena, ", `--cpu-shares` {d} (cpu.weight {d})", .{
+        n,
+        cgroup.cpuWeight(n),
+    });
+    if (o.cpu_shares) |n| try b.limitWeight(cgroup.cpuWeight(n), err_msg);
+    if (o.cpuset_cpus) |l| try more.print(b.arena, ", `--cpuset-cpus` {s}{s}", .{ l, try b.limitCpuset("cpuset.cpus", "--cpuset-cpus", l, err_msg) });
+    if (o.cpuset_mems) |l| try more.print(b.arena, ", `--cpuset-mems` {s}{s}", .{ l, try b.limitCpuset("cpuset.mems", "--cpuset-mems", l, err_msg) });
+    if (o.pids_limit) |n| try more.print(b.arena, ", `--pids-limit` {d}{s}", .{ n, try b.limitPids(n, err_msg) });
+    try b.limitSwap(o, &more, err_msg);
     try b.setUpSandboxOptions(o);
     try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Container options: {d} " ++
         "`--env`{s}{s}{s}; {d} understood and without effect natively (`--workdir`, " ++
@@ -3735,6 +3745,155 @@ fn limitMemory(b: *Backend, want: u64, err_msg: *[]const u8) ![]const u8 {
         return error.BaseContainerFailed;
     };
     b.limits.memory_max = want;
+    return "";
+}
+
+/// The job's own cgroup, for a flag that is a limit of it: a job with none fails rather than run
+/// without what it asked for (the native set-up fails, so the job goes to Dagger, which drops
+/// the flag, or fails where there is no engine).
+fn cgroupFor(b: *Backend, flag: []const u8, err_msg: *[]const u8) !cgroup.Job {
+    return b.job_cgroup orelse {
+        err_msg.* = try std.fmt.allocPrint(b.arena, "the job container's `{s}` needs the job's own " ++
+            "cgroup, which this job has none of (RUNNER_NATIVE_CGROUP)", .{flag});
+        return error.BaseContainerFailed;
+    };
+}
+
+fn controllerMissing(b: *Backend, j: cgroup.Job, flag: []const u8, controller: []const u8, err_msg: *[]const u8) !noreturn {
+    err_msg.* = try std.fmt.allocPrint(b.arena, "the job container's `{s}` needs the {s} controller " ++
+        "in the job's cgroup, which {s} does not give its children (cgroup.controllers lacks " ++
+        "{s}: delegate it, e.g. systemd's `Delegate={s}`, or run the job where the flag is not set)", .{
+        flag,
+        controller,
+        std.fs.path.dirname(j.dir) orelse j.dir,
+        controller,
+        controller,
+    });
+    return error.BaseContainerFailed;
+}
+
+/// `--cpus` (or `--cpu-quota` and `--cpu-period`) as the job's `cpu.max`. Like `--memory` it
+/// fails the native set-up, with the reason, where it cannot be held to the limit: the job has no
+/// cgroup of its own, or the cpu controller is not delegated to it (the job then goes to Dagger,
+/// which drops the flag, or fails with no engine; never runs natively unlimited). Deliberately
+/// not Docker's: more CPUs than the machine has is no error (Docker's daemon refuses "range of
+/// CPUs is from 0.01 to N"), the limit then never throttles, which the words that follow the
+/// number in "Set up job" say.
+fn limitCpu(b: *Backend, m: container_options.CpuMax, err_msg: *[]const u8) ![]const u8 {
+    const j = try b.cgroupFor("--cpus", err_msg);
+    j.limitCpu(b.arena, m.quota, m.period) catch |e| switch (e) {
+        error.CpuControllerUnavailable => try b.controllerMissing(j, "--cpus", "cpu", err_msg),
+        else => {
+            err_msg.* = "the job container's `--cpus` could not be set on the job's cgroup";
+            return error.BaseContainerFailed;
+        },
+    };
+    const cpus = std.Thread.getCpuCount() catch 0;
+    if (cpus > 0 and m.quota > @as(u64, cpus) * m.period)
+        return try std.fmt.allocPrint(b.arena, " (more than this machine's {d} CPUs: it never " ++
+            "throttles)", .{cpus});
+    return "";
+}
+
+/// A job that has swap gets `memory.high` after all, from what the gate reserves for it, where it
+/// can slow the job (`cgroup.canSwap`: the machine has swap to reclaim into): past it the kernel
+/// reclaims and slows the job instead of letting it take its neighbours' memory. The gate takes
+/// back the estimate `noHigh` replaced (`Gate.restoreHigh`), and grows the limit as it does for
+/// any job with one (`Admission.growHigh`).
+fn highForSwap(b: *Backend, j: cgroup.Job, allowance: ?u64) !void {
+    const g = b.gate orelse return;
+    if (!cgroup.canSwap(j.all, b.io, allowance)) {
+        try b.notes.append(b.arena, "Native steps: no memory.high: the job asked for swap, but " ++
+            "the machine has none free to reclaim into (SwapFree), and past a memory.high the " ++
+            "job would stall instead of swapping. It is treated as a job with swap 0.");
+        return;
+    }
+    const high_mb = g.restoreHigh() orelse return;
+    const high = j.setHigh(b.arena, b.io, @as(u64, high_mb) << 20) catch |e| {
+        // The write may have gone through before the read-back failed: the kernel must not keep
+        // a limit the gate has given up.
+        j.clearHigh(b.arena);
+        g.noHigh(if (b.limits.memory_max) |m| m >> 20 else null);
+        try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Native steps: the " ++
+            "job's memory.high could not be set ({s}).", .{@errorName(e)}));
+        return;
+    };
+    try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Native steps: memory.high " ++
+        "{f}, as the job has swap: past it the kernel reclaims and slows the job instead of " ++
+        "letting it take its neighbours' memory.", .{Limit.memory(high)}));
+}
+
+/// The job's own `memory.swap.max`, as Docker reads `--memory-swap` (`Options.swapMax`), whenever
+/// the job has a cgroup: 0 without the flag, up to what the runner allows (`RUNNER_NATIVE_SWAP`
+/// and a kernel that accounts for it); a flag asking for more is capped to 0, and "Set up job"
+/// says so.
+fn limitSwap(b: *Backend, o: container_options.Options, more: *std.ArrayList(u8), err_msg: *[]const u8) !void {
+    const j = b.job_cgroup orelse return;
+    const allowed = j.all.accounted and j.all.swap;
+    const set = o.swapMax(allowed);
+    var buf: [24]u8 = undefined;
+    const text = set.text(&buf);
+    j.setSwap(b.arena, text) catch {
+        err_msg.* = "the job container's `--memory-swap` could not be set on the job's cgroup";
+        return error.BaseContainerFailed;
+    };
+    if (std.meta.activeTag(set) != .none) try b.highForSwap(j, switch (set) {
+        .bytes => |n| n,
+        else => null,
+    });
+    const asked = o.swapMax(true);
+    const capped = !allowed and std.meta.activeTag(asked) != .none;
+    if (o.memory_swap != null or capped) try more.print(b.arena, ", `--memory-swap` {d}: memory.swap.max {s}{s}", .{
+        o.memory_swap orelse 0,
+        text,
+        if (capped) " (capped: jobs may not swap here, RUNNER_NATIVE_SWAP is off or the kernel does not account for swap)" else "",
+    });
+}
+
+/// `--cpu-shares` as the job's `cpu.weight` (`cgroup.cpuWeight`).
+fn limitWeight(b: *Backend, weight: u32, err_msg: *[]const u8) !void {
+    const j = try b.cgroupFor("--cpu-shares", err_msg);
+    j.limitWeight(b.arena, weight) catch |e| switch (e) {
+        error.CpuControllerUnavailable => try b.controllerMissing(j, "--cpu-shares", "cpu", err_msg),
+        else => {
+            err_msg.* = "the job container's `--cpu-shares` could not be set on the job's cgroup";
+            return error.BaseContainerFailed;
+        },
+    };
+}
+
+/// `--cpuset-cpus` and `--cpuset-mems` as the job's `cpuset.cpus` and `cpuset.mems`, after a check
+/// against what the cpuset controller allows the job (Docker's "Requested CPUs are not available"):
+/// a list outside it fails the native set-up, saying what is available.
+fn limitCpuset(b: *Backend, file: []const u8, flag: []const u8, list: []const u8, err_msg: *[]const u8) ![]const u8 {
+    const j = try b.cgroupFor(flag, err_msg);
+    const effective = if (std.mem.eql(u8, file, "cpuset.cpus")) "cpuset.cpus.effective" else "cpuset.mems.effective";
+    const available = j.cpusetAvailable(b.arena, effective) orelse
+        try b.controllerMissing(j, flag, "cpuset", err_msg);
+    if (!cgroup.listWithin(list, available)) {
+        err_msg.* = try std.fmt.allocPrint(b.arena, "the job container's `{s}` {s} is not available: " ++
+            "this machine's cgroup allows {s}", .{ flag, list, available });
+        return error.BaseContainerFailed;
+    }
+    j.limitCpuset(b.arena, file, list) catch {
+        err_msg.* = try std.fmt.allocPrint(b.arena, "the job container's `{s}` could not be set on " ++
+            "the job's cgroup", .{flag});
+        return error.BaseContainerFailed;
+    };
+    return "";
+}
+
+/// `--pids-limit` as the job's `pids.max`, lowered when it is below the runner's own for a job
+/// (never raised, as `--memory`).
+fn limitPids(b: *Backend, want: u64, err_msg: *[]const u8) ![]const u8 {
+    const j = try b.cgroupFor("--pids-limit", err_msg);
+    if (b.limits.pids_max) |have| if (want >= have)
+        return try std.fmt.allocPrint(b.arena, " (the runner's limit of {d} is lower, and holds)", .{have});
+    j.lowerPids(b.arena, want) catch {
+        err_msg.* = "the job container's `--pids-limit` could not be set on the job's cgroup";
+        return error.BaseContainerFailed;
+    };
+    b.limits.pids_max = std.math.cast(u32, want) orelse std.math.maxInt(u32);
     return "";
 }
 
@@ -5128,7 +5287,11 @@ test "unsupported: what sends a job to Dagger, and the first reason given" {
     container.container.?.volumes = &.{};
     // An option the sandbox does not carry out is named, never dropped; the others are native.
     container.container.?.options = .{ .lit = "--cpus 1" };
+    try std.testing.expect(unsupported(io, container, root, ok) == null);
+    container.container.?.options = .{ .lit = "--cpus 1,5" };
     try expectReason("`--cpus`", unsupported(io, container, root, ok));
+    container.container.?.options = .{ .lit = "--blkio-weight 500" };
+    try expectReason("`--blkio-weight`", unsupported(io, container, root, ok));
     container.container.?.options = .{ .lit = "--user 1001 -e A=1 --workdir /w --health-cmd true" };
     try std.testing.expect(unsupported(io, container, root, ok) == null);
     container.container.?.options = .{ .lit = "--hostname h --add-host a:10.0.0.1 --shm-size 1g " ++
@@ -7331,6 +7494,119 @@ test "root runner: a container job's --memory lowers the job's memory.max, and n
     const capped = try runNativeJob(arena, cfg, job, .root);
     try std.testing.expect(capped.res.succeeded);
     try expectLines(capped.text, &.{ "memory.max=268435456", "the runner's limit of 256 MiB is lower" });
+}
+
+test "root runner: a container job's --cpus 0.5 sets the job's cpu.max and throttles a busy loop, with no engine" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    const layers = try testImageLayers(arena);
+    const img = try testregistry.testImage(arena, "test/optscpu", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    var server: testregistry.Server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+
+    // The job's cgroup is the steps' parent: its limit and its throttling, as the step sees the
+    // host's files. A second of arithmetic in the shell is far over half a CPU's 50 ms a period.
+    var step = testStep("cg=$(cut -d: -f3 /proc/self/cgroup | sed 's,/steps$,,')\n" ++
+        "echo \"cpu.max=$(cat /sys/fs/cgroup$cg/cpu.max)\"\n" ++
+        "i=0; while [ $i -lt 1500000 ]; do i=$((i+1)); done\n" ++
+        "grep nr_throttled /sys/fs/cgroup$cg/cpu.stat | sed 's/^/job /'");
+    step.name = "throttled";
+    const image = try server.image(arena, "test/optscpu:1");
+    var job = testJob(&.{step});
+    job.container = .{ .name = "", .image = .{ .lit = image }, .options = .{ .lit = "--cpus 0.5" } };
+    const limited = try runNativeJob(arena, cfg, job, .root);
+    if (!limited.res.succeeded) std.debug.print("{s}\n", .{limited.text});
+    try std.testing.expect(limited.res.succeeded);
+    // "Engine: native": no Dagger session was started for it.
+    try expectLines(limited.text, &.{ "Engine: native", "cpu.max=50000 100000", "`--cpus`/`--cpu-quota` 50000/100000" });
+    const at = std.mem.indexOf(u8, limited.text, "job nr_throttled ") orelse {
+        std.debug.print("no nr_throttled in:\n{s}\n", .{limited.text});
+        return error.TestUnexpectedResult;
+    };
+    const rest = limited.text[at + "job nr_throttled ".len ..];
+    const n = try std.fmt.parseInt(u64, rest[0 .. std.mem.indexOfAny(u8, rest, "\r\n") orelse rest.len], 10);
+    try std.testing.expect(n > 0);
+
+    // Not delegated: the native set-up fails with the reason, never running unlimited. The
+    // stand-in is a job with no cgroup at all; the failure is Dagger's to report (no engine here).
+    cfg.cgroup.parent = "none";
+    const bare = try runNativeJob(arena, cfg, job, .root);
+    try std.testing.expect(!bare.res.succeeded);
+}
+
+/// A job container with `options`, whose one step runs `script` after setting `cg` to the job's
+/// cgroup directory under the host's mount (the steps' parent), as the root tests of options read
+/// the limits of the job; what it printed.
+fn runOptionsJob(arena: Allocator, cfg: Config, options: []const u8, script: []const u8) ![]const u8 {
+    var server: testregistry.Server = undefined;
+    const layers = try testImageLayers(arena);
+    const img = try testregistry.testImage(arena, "test/optsc", "1", layers, "\"PATH=/usr/bin:/bin\"", false);
+    server = .{ .routes = img.routes };
+    try server.start();
+    defer server.stop();
+    var step = testStep(try std.fmt.allocPrint(arena, "cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup | " ++
+        "sed 's,/steps$,,')\n{s}", .{script}));
+    step.name = "limits";
+    var job = testJob(&.{step});
+    job.container = .{ .name = "", .image = .{ .lit = try server.image(arena, "test/optsc:1") }, .options = .{ .lit = options } };
+    const r = try runNativeJob(arena, cfg, job, .root);
+    if (!r.res.succeeded) std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(r.res.succeeded);
+    try expectLines(r.text, &.{"Engine: native"});
+    return r.text;
+}
+
+test "root runner: a container job's --cpu-shares sets cpu.weight, and --pids-limit lowers pids.max, never raises it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    const show = "echo \"weight=$(cat $cg/cpu.weight)\"; echo \"pids=$(cat $cg/pids.max)\"";
+    // 512 shares are half the default 1024, which is the kernel's default weight of 100.
+    const text = try runOptionsJob(arena, cfg, "--cpu-shares 512 --pids-limit 100", show);
+    try expectLines(text, &.{ "weight=50", "pids=100", "`--cpu-shares` 512 (cpu.weight 50)", "`--pids-limit` 100" });
+    const high = try runOptionsJob(arena, cfg, "-c 2048 --pids-limit 100000", show);
+    try expectLines(high, &.{ "weight=200", "pids=8192", "the runner's limit of 8192 is lower" });
+}
+
+test "root runner: a container job's --cpuset-cpus and --cpuset-mems confine its processes" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    // The step's own affinity, as the kernel reports it, and the job's file.
+    const text = try runOptionsJob(arena, cfg, "--cpuset-cpus 0 --cpuset-mems 0 --memory-swap -1 -m 512m", "echo \"cpuset.cpus=$(cat $cg/cpuset.cpus)\"; " ++
+        "echo \"cpuset.mems=$(cat $cg/cpuset.mems)\"; grep Cpus_allowed_list /proc/self/status");
+    try expectLines(text, &.{ "cpuset.cpus=0", "cpuset.mems=0", "Cpus_allowed_list:\t0", "`--cpuset-cpus` 0" });
+}
+
+test "root runner: a container job's --memory-swap is capped to 0 where the runner does not let jobs swap" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    // RUNNER_NATIVE_SWAP is off in the test config: the flag asks for 512 MiB of swap, the job gets 0.
+    const text = try runOptionsJob(arena, cfg, "-m 512m --memory-swap 1g", "echo \"swap=$(cat $cg/memory.swap.max)\"");
+    try expectLines(text, &.{ "swap=0", "`--memory-swap` 1073741824: memory.swap.max 0 (capped" });
 }
 
 test "a container job's volumes on the native backend: directories of the job, there for every step" {
@@ -10553,7 +10829,7 @@ test "root runner: native gate accuracy, each job's own cgroup against the engin
     try std.testing.expect(seen[2] >= 2 * mb - 20);
 }
 
-test "root runner: a native job's cgroup gets memory.high from what the gate reserves for it" {
+test "root runner: a native job with no options has memory.swap.max 0 and no memory.high, though the runner lets jobs swap" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -10563,9 +10839,9 @@ test "root runner: a native job's cgroup gets memory.high from what the gate res
     var cfg = try testConfig(arena, &tmp);
     const parent = try testCgroup(arena, &cfg);
     defer parent.remove(arena);
-    // On a machine with no swap at all it has no use (`cgroup.canSwap`), and the test below has it.
-    const can = cgroup.canSwap(.{ .swap = true }, io);
-    if (!can) return error.SkipZigTest;
+    // The kernel must account for swap, or there is no file.
+    var swap_file: [8]u8 = undefined;
+    _ = std.Io.Dir.cwd().readFile(io, try std.fmt.allocPrint(arena, "{s}/memory.swap.max", .{parent.dir}), &swap_file) catch return error.SkipZigTest;
     cfg.cgroup.swap = true;
     var slots: [1]admission.Admission.Slot = undefined;
     var pool: admission.Admission = .init(io, .{ .margin_percent = 0 }, &slots);
@@ -10574,50 +10850,47 @@ test "root runner: a native job's cgroup gets memory.high from what the gate res
     var gate: admission.Gate = .{ .pool = &pool };
     var gated = cfg;
     gated.gate = &gate;
-    const key = admission.jobKey("o/r", "ci.yml", "memory.high");
-    const job = testJob(&.{testStep("echo small job")});
-
-    // Not learned yet: `native_per_job_mb` (256 MB), twice that and 512 MB of headroom, as the
-    // kernel holds it (read back from the job's cgroup), beside its memory.max.
     gate.leave(true);
-    gate.assigned(key);
-    const first = try runNativeJob(arena, gated, job, .root);
-    if (!first.res.succeeded) std.debug.print("{s}\n", .{first.text});
-    try std.testing.expect(first.res.succeeded);
+    gate.assigned(admission.jobKey("o/r", "ci.yml", "no swap unless asked"));
+    const step = testStep("cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup | sed 's,/steps$,,')\n" ++
+        "echo \"swap=$(cat $cg/memory.swap.max)\"; echo \"high=$(cat $cg/memory.high)\"");
+    const r = try runNativeJob(arena, gated, testJob(&.{step}), .root);
+    if (!r.res.succeeded) std.debug.print("{s}\n", .{r.text});
+    try expectLines(r.text, &.{ "swap=0", "high=max", "Native steps: no memory.high", "each job's own memory.swap.max is 0 unless" });
+    try std.testing.expectEqual(@as(?u32, null), slots[0].high_mb);
+    _ = gate.ended();
+}
+
+test "root runner: a job that asks for swap with --memory-swap gets memory.high, and the gate reserves for it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    const parent = try testCgroup(arena, &cfg);
+    defer parent.remove(arena);
+    // The machine must have swap to reclaim into (`cgroup.canSwap`), and the kernel account for it.
+    if (!cgroup.canSwap(.{ .swap = true }, io, null)) return error.SkipZigTest;
+    var probe_buf: [8]u8 = undefined;
+    _ = std.Io.Dir.cwd().readFile(io, try std.fmt.allocPrint(arena, "{s}/memory.swap.max", .{parent.dir}), &probe_buf) catch return error.SkipZigTest;
+    cfg.cgroup.swap = true;
+    var slots: [1]admission.Admission.Slot = undefined;
+    var pool: admission.Admission = .init(io, .{ .margin_percent = 0 }, &slots);
+    pool.paths = .{ .meminfo = "/nonexistent", .pressure = "/nonexistent" };
+    pool.native = true;
+    var gate: admission.Gate = .{ .pool = &pool };
+    var gated = cfg;
+    gated.gate = &gate;
+    gate.leave(true);
+    gate.assigned(admission.jobKey("o/r", "ci.yml", "asks for swap"));
+    const show = "echo \"swap=$(cat $cg/memory.swap.max)\"; echo \"high=$(cat $cg/memory.high)\"";
+    // 1 GiB of memory plus swap over 512 MiB of memory: 512 MiB of swap, and the gate's memory.high
+    // (twice the 256 MB a job not learned yet reserves, and 512 MB of headroom).
+    const text = try runOptionsJob(arena, gated, "-m 512m --memory-swap 1g", show);
+    try expectLines(text, &.{ "swap=536870912", "high=1073741824", "Native steps: memory.high 1.0 GB", "as the job has swap" });
     try std.testing.expectEqual(@as(?u32, 1024), slots[0].high_mb);
-    try expectLines(first.text, &.{
-        "with memory.max ",
-        "Native steps: all native jobs under ",
-        "Native steps: memory.high 1.0 GB, from what the memory gate reserves for the job",
-    });
-    // All jobs' limits are on the parent.
-    const all = cgroup.Limits.of(io, cfg.cgroup, parent.dir);
-    // The kernel rounds it down to a page.
-    const held = admission.readCgroupBytes(io, parent.dir, "memory.max").?;
-    try std.testing.expect(held <= all.memory_total.? and all.memory_total.? - held < 1 << 16);
-    var pids_buf: [32]u8 = undefined;
-    const pids = try std.Io.Dir.cwd().readFile(
-        io,
-        try std.fmt.allocPrint(arena, "{s}/pids.max", .{parent.dir}),
-        &pids_buf,
-    );
-    const pids_held = try std.fmt.parseInt(u32, std.mem.trim(u8, pids, "\n"), 10);
-    try std.testing.expectEqual(all.pids_total.?, pids_held);
-    const learned = gate.ended() orelse return error.TestUnexpectedResult;
-    try std.testing.expect(learned.native and learned.alone);
-    // The job's own few MB (its shell and helper), or the 64 MB floor.
-    try std.testing.expect(learned.estimate_mb < 128);
-
-    // Learned: its next memory.high is from what it took, 640 MB at the floor.
-    gate.leave(true);
-    gate.assigned(key);
-    const second = try runNativeJob(arena, gated, job, .root);
-    try std.testing.expect(second.res.succeeded);
-    const high = admission.nativeHighMb(learned.estimate_mb);
-    try std.testing.expectEqual(@as(?u32, high), slots[0].high_mb);
-    try expectLines(second.text, &.{
-        try std.fmt.allocPrint(arena, "Native steps: memory.high {d} MB, from ", .{high}),
-    });
     _ = gate.ended();
 }
 
