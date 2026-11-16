@@ -885,9 +885,24 @@ fn zstdFrames(_: void, smith: *Smith) !void {
     try zstdAgrees(take(smith, &buf));
 }
 
+/// Which bits of a seed of `bits` bits the flip tests flip. Every one with ZIG_TEST_FULL=1 (the
+/// nightly's full run; run it after a change to a decoder) and under Valgrind (which strides on its
+/// own). Else the bits where one change tells two decoders apart most often, all of them: the
+/// header and first block header (the first `flip_head` bytes) and the end (the last `flip_tail`
+/// bytes: a checksum, the last block's marker), and every `flip_every`th of the rest. The same bits
+/// every run.
+fn flipped(bit: usize, bits: usize, valgrind_stride: usize) bool {
+    if (valgrind_stride != 1 or @import("alloc_failures.zig").full()) return true;
+    return bit < flip_head * 8 or bit + flip_tail * 8 >= bits or bit % flip_every == 0;
+}
+
+const flip_head = 24;
+const flip_tail = 12;
+const flip_every = 7;
+
 // The fuzzer's byte mutations rarely make the exact change that tells two decoders apart (the
 // marker bit of a stream's last byte moved, one bit of a header), so every bit of each small
-// seed is flipped, one at a time, as a test.
+// seed is flipped, one at a time, as a test (`flipped` says which bits a default run flips).
 test "zstd decoders: every bit of the small seeds flipped" {
     var buf: [400]u8 = undefined;
     // Under Valgrind (many times slower, two decoders a run) every 37th bit: it looks for memory
@@ -898,6 +913,7 @@ test "zstd decoders: every bit of the small seeds flipped" {
         if (comptime frame.len <= buf.len) {
             var bit: usize = 0;
             while (bit < frame.len * 8) : (bit += stride) {
+                if (!flipped(bit, frame.len * 8, stride)) continue;
                 @memcpy(buf[0..frame.len], frame);
                 buf[bit / 8] ^= std.math.shl(u8, 1, bit % 8);
                 zstdAgrees(buf[0..frame.len]) catch |e| {
@@ -989,6 +1005,7 @@ test "libzstd and the Zig decoder: every bit of the small seeds flipped" {
         if (comptime frame.len <= buf.len) {
             var bit: usize = 0;
             while (bit < frame.len * 8) : (bit += stride) {
+                if (!flipped(bit, frame.len * 8, stride)) continue;
                 @memcpy(buf[0..frame.len], frame);
                 buf[bit / 8] ^= std.math.shl(u8, 1, bit % 8);
                 libzstdAgrees(buf[0..frame.len]) catch |e| {
@@ -1066,6 +1083,7 @@ test "zlib-ng and std's inflater: every bit of the small seeds flipped" {
         if (comptime member.len <= buf.len) {
             var bit: usize = 0;
             while (bit < member.len * 8) : (bit += stride) {
+                if (!flipped(bit, member.len * 8, stride)) continue;
                 @memcpy(buf[0..member.len], member);
                 buf[bit / 8] ^= std.math.shl(u8, 1, bit % 8);
                 zlibngAgrees(buf[0..member.len]) catch |e| {

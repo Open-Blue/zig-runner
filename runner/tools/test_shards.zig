@@ -22,6 +22,10 @@
 //! ZIG_TEST_PART=K/N runs only part K of N: every N-th test, starting at the K-th, so N machines
 //! share a suite (CI's native tests as root, which run one at a time on each).
 //! `zig build test -Dshard-tests=false` runs the tests without it.
+//! ZIG_TEST_TIMES=1 prints every test's wall time (`time: 1.234 s name`, longest first) and each
+//! shard's busy time and test count before the totals line; off by default (only the five slowest
+//! tests past 2 s are named). `ZIG_TEST_FULL=1` is read by the tests, not here: it runs their
+//! exhaustive sweeps (see CONTRIBUTING.md).
 //!
 //! A leak check, like the allocator's for memory, for the temporary directories `std.testing.tmpDir`
 //! makes (`.zig-cache/tmp`, under the working directory): what is there after the run, and was not
@@ -114,6 +118,8 @@ const Run = struct {
     /// How long each test took, by index: each is run once, by one shard, and read after the
     /// shards are joined.
     took_ns: []u64,
+    /// Which shard ran each test, by index, for ZIG_TEST_TIMES.
+    shard_of: []u8,
     /// When each began and ended, by index, on the real clock (a directory's creation time is on it).
     began_ns: []i128,
     ended_ns: []i128,
@@ -196,6 +202,7 @@ pub fn main(init: std.process.Init) !u8 {
         .free = free.items,
         .alone = alone.items,
         .took_ns = try arena.alloc(u64, names.len),
+        .shard_of = try arena.alloc(u8, names.len),
         .began_ns = try arena.alloc(i128, names.len),
         .ended_ns = try arena.alloc(i128, names.len),
     };
@@ -203,17 +210,18 @@ pub fn main(init: std.process.Init) !u8 {
     @memset(run.ended_ns, 0);
     _ = run.skipped.fetchAdd(tsan_skipped, .monotonic);
     @memset(run.took_ns, 0);
+    @memset(run.shard_of, 0);
     const started = Io.Clock.awake.now(io);
     const threads = try arena.alloc(std.Thread, shards);
     for (threads, 0..) |*t, i|
-        t.* = try std.Thread.spawn(.{}, work, .{ &run, if (i == 0) first else null });
+        t.* = try std.Thread.spawn(.{}, work, .{ &run, @as(u8, @intCast(i)), if (i == 0) first else null });
     for (threads) |t| t.join();
     leakCheck(arena, &run, tmp_path, kept);
 
     const failed = run.failed.load(.monotonic);
     const took = started.durationTo(Io.Clock.awake.now(io));
     const seconds = @as(f64, @floatFromInt(took.toNanoseconds())) / std.time.ns_per_s;
-    printSlowest(arena, &run);
+    if (timesWanted(init.environ_map)) printTimes(arena, &run, shards) else printSlowest(arena, &run);
     std.debug.print("{d} passed; {d} skipped; {d} failed ({d} shards, {d:.1} s).\n", .{
         run.passed.load(.monotonic), run.skipped.load(.monotonic), failed, shards, seconds,
     });
@@ -236,6 +244,39 @@ fn printSlowest(arena: std.mem.Allocator, run: *const Run) void {
         const seconds = @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
         std.debug.print("slow: {d:.1} s {s}\n", .{ seconds, run.names[i] });
     }
+}
+
+/// ZIG_TEST_TIMES=1: every test's time and each shard's busy time, instead of the five slowest.
+fn timesWanted(environ_map: *const std.process.Environ.Map) bool {
+    const v = environ_map.get("ZIG_TEST_TIMES") orelse return false;
+    return std.mem.eql(u8, v, "1");
+}
+
+fn printTimes(arena: std.mem.Allocator, run: *const Run, shards: usize) void {
+    const order = arena.alloc(u32, run.took_ns.len) catch return;
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    std.mem.sort(u32, order, run.took_ns, struct {
+        fn longer(took: []const u64, a: u32, b: u32) bool {
+            return took[a] > took[b];
+        }
+    }.longer);
+    const busy = arena.alloc(u64, shards) catch return;
+    const count = arena.alloc(usize, shards) catch return;
+    @memset(busy, 0);
+    @memset(count, 0);
+    var total: u64 = 0;
+    for (order) |i| {
+        const ns = run.took_ns[i];
+        if (ns == 0 and run.began_ns[i] == 0) continue; // not run here (a part, ThreadSanitizer)
+        busy[run.shard_of[i]] += ns;
+        count[run.shard_of[i]] += 1;
+        total += ns;
+        std.debug.print("time: {d:.3} s {s}\n", .{ @as(f64, @floatFromInt(ns)) / std.time.ns_per_s, run.names[i] });
+    }
+    for (busy, count, 0..) |b, c, s| {
+        std.debug.print("shard {d}: {d:.1} s busy, {d} tests\n", .{ s + 1, @as(f64, @floatFromInt(b)) / std.time.ns_per_s, c });
+    }
+    std.debug.print("tests total: {d:.1} s summed\n", .{@as(f64, @floatFromInt(total)) / std.time.ns_per_s});
 }
 
 const slowest_shown = 5;
@@ -277,7 +318,7 @@ fn shardCount(environ_map: *const std.process.Environ.Map) !usize {
 
 /// One shard's thread: tests until none are left. The first to find the serial tests free takes
 /// them all, one after another, and then joins the others.
-fn work(run: *Run, started: ?Shard) void {
+fn work(run: *Run, id: u8, started: ?Shard) void {
     var shard: ?Shard = started;
     defer if (shard) |*s| s.finish(run);
     while (true) {
@@ -287,18 +328,19 @@ fn work(run: *Run, started: ?Shard) void {
                 while (true) {
                     const n = run.next_alone.fetchAdd(1, .monotonic);
                     if (n >= run.alone.len) break;
-                    runOne(run, &shard, run.alone[n]);
+                    runOne(run, &shard, id, run.alone[n]);
                 }
             }
             const n = run.next_free.fetchAdd(1, .monotonic);
             if (n >= run.free.len) return;
             break :i run.free[n];
         };
-        runOne(run, &shard, index);
+        runOne(run, &shard, id, index);
     }
 }
 
-fn runOne(run: *Run, shard: *?Shard, index: u32) void {
+fn runOne(run: *Run, shard: *?Shard, id: u8, index: u32) void {
+    run.shard_of[index] = id;
     if (shard.* == null) shard.* = Shard.start(run.gpa, run.io, run.argv) catch |e| {
         _ = run.failed.fetchAdd(1, .monotonic);
         say(run, index, "the test binary did not start: {t}\n", .{e});
@@ -726,6 +768,7 @@ fn testRun(arena: std.mem.Allocator) !Run {
         .free = &.{},
         .alone = &.{},
         .took_ns = try arena.alloc(u64, 0),
+        .shard_of = try arena.alloc(u8, 0),
         .began_ns = try arena.alloc(i128, 0),
         .ended_ns = try arena.alloc(i128, 0),
     };

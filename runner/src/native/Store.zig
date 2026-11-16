@@ -4486,17 +4486,18 @@ test "allocation failures: a tree's size and digest, its ids shifted, layers fla
     const root = try tmp.dir.realPathFileAlloc(io, ".", setup.allocator());
     const S = struct {
         var runs: usize = 0;
+        // The trees, made and written back once: a run measures them, with memory and without, and
+        // flattens them into an `out` of its own. Made again for every run, as they were, the
+        // `syncfs` that makes a size dependable took most of the test's 20 seconds, 300 times.
+        var base: []const u8 = "";
+        var lower: []const u8 = "";
+        var upper: []const u8 = "";
 
-        /// Each answers as it does with memory, or runs out of it.
-        fn run(a: Allocator, root_: []const u8) !void {
-            runs += 1;
-            var made: std.heap.ArenaAllocator = .init(std.testing.allocator);
-            defer made.deinit();
-            const ma = made.allocator();
-            const base = try std.fmt.allocPrint(ma, "{s}/run{d}", .{ root_, runs });
+        fn prepare(ma: Allocator, root_: []const u8) !void {
+            base = try std.fmt.allocPrint(ma, "{s}/trees", .{root_});
             try std.Io.Dir.cwd().createDirPath(io, base);
-            const lower = try failureTree(io, base, "lower", ma);
-            const upper = try failureTree(io, base, "upper", ma);
+            lower = try failureTree(io, base, "lower", ma);
+            upper = try failureTree(io, base, "upper", ma);
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(ma, "{s}/extra", .{upper}), .data = "z" });
             // Written back before anything is measured: a file the kernel is writing back shows
             // fewer blocks than it takes (as `publishStaged` notes), so a size taken while
@@ -4505,6 +4506,16 @@ test "allocation failures: a tree's size and digest, its ids shifted, layers fla
             const base_fd = try openRoot(ma, base);
             defer _ = linux.close(base_fd);
             try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.syncfs(base_fd)));
+        }
+
+        /// Each answers as it does with memory, or runs out of it.
+        fn run(a: Allocator, _: []const u8) !void {
+            runs += 1;
+            var made: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer made.deinit();
+            const ma = made.allocator();
+            // What the trees measure now, with memory: a run before this one may have touched the
+            // metadata (the ids set again), which the next is held to as it finds it.
             const want_size = try treeSize(ma, io, upper);
             const want_digest = try treeDigest(ma, io, upper, .content, Ids.host);
             const want_meta = try treeDigest(ma, io, upper, .metadata, Ids.host);
@@ -4519,7 +4530,7 @@ test "allocation failures: a tree's size and digest, its ids shifted, layers fla
             // The ids as they are: nothing changes, the digest included.
             try unshift(arena, io, upper, Ids.host);
             try std.testing.expectEqualSlices(u8, &want_digest, &(try treeDigest(ma, io, upper, .content, Ids.host)));
-            const out = try std.fmt.allocPrint(ma, "{s}/out", .{base});
+            const out = try std.fmt.allocPrint(ma, "{s}/out{d}", .{ base, runs });
             const layers = [_][]const u8{ lower, upper };
             flatten(arena, io, &layers, out, "user.overlay.opaque") catch |e| {
                 // Nothing half made is left for the next try to trip on.
@@ -4529,5 +4540,6 @@ test "allocation failures: a tree's size and digest, its ids shifted, layers fla
             try std.testing.expectEqualSlices(u8, &want_digest, &(try treeDigest(ma, io, out, .content, Ids.host)));
         }
     };
+    try S.prepare(setup.allocator(), root);
     try af.checkOne(S.run, .{root});
 }

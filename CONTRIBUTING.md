@@ -28,6 +28,23 @@ zig build test
 `.github/scripts/zig-test.sh` runs the same tests the way CI does, by calling the compiler
 directly. `ZIG_TEST_FILTER="native eviction"` runs a subset, and `ZIG_TEST_PART=K/N` one part of N.
 
+`ZIG_TEST_TIMES=1` prints every test's wall time (longest first), each shard's busy time and the
+tests' summed time before the totals line; `ZIG_TEST_SHARDS=4` sets the number of shards (CI's Pi
+has 4 cores). Measure with both, and say the machine's load.
+
+Exhaustive sweeps run sampled by default, so that a test run stays short: the allocation-failure
+tests (`runner/src/alloc_failures.zig`) fail the first and last allocations of a run and, of each
+place that allocates (told by its call stack), its first visits, then every power of two, and its
+last; the bit-flip fuzz tests flip every bit of a seed's header and end and every 7th between; the
+two long eviction tests and the many-entries hashFiles test use smaller trees (the eviction ones with
+a clock that stands still, so that a pass removes the same on every machine). `ZIG_TEST_FULL=1` runs
+every allocation, every bit and the full-size trees: do it after changing code such a test covers
+(`ZIG_TEST_FULL=1 ZIG_TEST_FILTER="allocation failures" .github/scripts/zig-test.sh`; `zig build test` does not hand that variable on to the tests, though it does `ZIG_TEST_TIMES` and `ZIG_TEST_SHARDS`), and a new sweep of this
+kind should take its samples from `alloc_failures.zig` (`full()`, `sampledIndex`) and say what it
+skips. Waits on a deadline in a test (a pass of the eviction, a peer that never answers) are bounded
+by what the code guarantees (a count of passes, a short deadline for the silent request and a long
+one for the answered), never by a wall-clock allowance: a machine at load 30 runs those out.
+
 Tests that need something extra skip without it and say why:
 
 - **Native backend tests** need user namespaces. Some need root (`ZIG_TEST_NATIVE_AS_ROOT=1`); run
