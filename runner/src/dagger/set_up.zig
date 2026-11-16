@@ -2699,7 +2699,9 @@ test "usesZig: a script or an action that names Zig" {
 test "cachesUsed: a job mounts the caches of the tools it names, Zig's as usesZig decides, and the tool cache always" {
     const zig_only = cachesUsed(testJob(&.{testStep("zig build test --summary all")}));
     for (package_cache_dirs, zig_only) |d, u| {
-        const want = std.mem.eql(u8, d.name, zig_packages) or std.mem.eql(u8, d.name, "toolcache");
+        // Cargo's crate caches too: a Zig build may run cargo.
+        const want = std.mem.eql(u8, d.name, zig_packages) or std.mem.eql(u8, d.name, "toolcache") or
+            std.mem.startsWith(u8, d.name, "cargo-");
         try std.testing.expectEqual(want, u);
     }
     // A script file that installs into the tool cache names it nowhere in the workflow (v0.22.0).
