@@ -134,23 +134,37 @@ est_mb() {
 
 # plan_jobs: jobs, how many at once, and mem_mb, the budget their estimates must fit.
 plan_jobs() {
-	local avail cpus
+	local avail cpus mem
 	cpus=$(nproc)
 	cgroup_limits
 	[[ -z $cg_cpus ]] || ((cg_cpus >= cpus)) || cpus=$cg_cpus
-	avail=$(($(sed -n 's/^MemAvailable: *\([0-9]*\) kB/\1/p' /proc/meminfo) / 1024))
-	[[ -z $cg_mem ]] || ((cg_mem >= avail)) || avail=$cg_mem
-	mem_mb=$((avail * 70 / 100))
+	mem=$(sed -n 's/^MemAvailable: *\([0-9]*\) kB/\1/p' /proc/meminfo)
+	avail=''
+	if [[ -n $mem ]]; then
+		avail=$((mem / 1024))
+	else
+		echo "spin: no MemAvailable in /proc/meminfo; the memory limit is the cgroup's, if any" >&2
+	fi
+	if [[ -n $cg_mem ]] && { [[ -z $avail ]] || ((cg_mem < avail)); }; then avail=$cg_mem; fi
+	mem_mb=-1 # not looked at
+	if [[ -n $avail ]]; then mem_mb=$((avail * 70 / 100)); fi
 	jobs=$cpus
 	if [[ -n ${SPIN_MEM_MB:-} ]]; then mem_mb=$SPIN_MEM_MB; fi
 	if [[ -n ${SPIN_JOBS:-} ]]; then
-		if [[ ! $SPIN_JOBS =~ ^[1-9][0-9]*$ ]]; then
-			echo "spin: SPIN_JOBS='$SPIN_JOBS' is not a positive number" >&2
+		jobs=$SPIN_JOBS
+		mem_mb=-1
+	fi
+}
+
+# check_env: SPIN_JOBS and SPIN_MEM_MB, when set, are positive decimal integers.
+check_env() {
+	local v
+	for v in SPIN_JOBS SPIN_MEM_MB; do
+		if [[ -n ${!v:-} && ! ${!v} =~ ^[1-9][0-9]*$ ]]; then
+			echo "spin: $v='${!v}' is not a positive decimal integer" >&2
 			exit 1
 		fi
-		jobs=$SPIN_JOBS
-		mem_mb=-1 # not looked at
-	fi
+	done
 }
 
 stored() { sed -n 's/^ *\([0-9]*\) states, stored.*/\1/p' "$1"; }
@@ -226,7 +240,7 @@ done
 mapfile -t names < <(for n in "${names[@]}"; do
 	printf '%s %s\n' "$(sed -n 's/^ \* spin-states: \([0-9]*\).*/\1/p' "$here/$n.pml")" "$n"
 done | sort -k1,1nr | cut -d' ' -f2)
-plan_jobs
+check_env
 running=0
 used=0
 declare -A cost
@@ -240,6 +254,7 @@ if ! flock -n 9; then
 	echo "spin: $dir is in use by another run; waiting for it"
 	flock 9
 fi
+plan_jobs
 : >"$dir/finished"
 : >"$dir/workers"
 # Nothing outlives this script, on any path. The EXIT trap ends the heartbeat and every worker's
@@ -272,9 +287,14 @@ while ((${#pending[@]})); do
 		done
 	fi
 	if ((pick < 0)); then
+		done_pid=''
 		wait -n -p done_pid || true
-		used=$((used - cost[$done_pid]))
-		running=$((running - 1))
+		# Only a worker frees its share (not the heartbeat, say).
+		if [[ -n $done_pid && -n ${cost[$done_pid]:-} ]]; then
+			used=$((used - cost[$done_pid]))
+			unset "cost[$done_pid]"
+			running=$((running - 1))
+		fi
 		continue
 	fi
 	n=${pending[$pick]}
