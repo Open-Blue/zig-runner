@@ -1,3 +1,0 @@
-kind: Changed
-body: 'The broker, run service, results service and Gitea client no longer send a POST again after a timeout or a lost connection unless it is one the server answers the same when it comes twice: each call now says (`broker.Resend`). GETs, DELETEs, the run service''s acquirejob, renewjob and completejob (actions/runner retries them too) and Gitea''s Declare and UpdateLog are sent once more on a new connection; session creation, acknowledge, the results metadata and step updates, Gitea''s Register, FetchTask and UpdateTask, and the Dagger engine''s queries are not. A closed kept connection is still replaced unseen'
-time: 2026-11-14T13:18:47.369612725-05:00

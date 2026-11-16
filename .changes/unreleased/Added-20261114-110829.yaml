@@ -1,3 +1,0 @@
-kind: Added
-body: 'The pre-push hook names the log of its long steps as they start (`build and tests (output: /tmp/pre-push-tests.…)`), so `tail -f` follows them, and `PRE_PUSH_VERBOSE=1 git push` shows every check''s output as it runs; by default each step still prints only its name and a summary line.'
-time: 2026-11-14T11:08:29.764432081-05:00

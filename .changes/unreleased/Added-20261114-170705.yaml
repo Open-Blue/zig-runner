@@ -1,3 +1,0 @@
-kind: Added
-body: 'CI''s Test step prints the memory peak of the compile and of the run apart, one `memory-peak: phase=... peak_mb=... source=cgroup|cgroup-total|time|none` line each (from the step''s cgroup, or the largest process where there is none), to measure the Pi''s compile spike that came within a few percent of the job''s 3.1 GB limit; new `zig build test-compile` step.'
-time: 2026-11-14T17:07:05.332387358-05:00

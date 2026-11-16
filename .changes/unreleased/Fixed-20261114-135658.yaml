@@ -1,3 +1,0 @@
-kind: Fixed
-body: A kept connection the server closed under a request (hyper reports the request as canceled, nothing sent) is replaced and the request sent again, as for the other closed-connection errors; it failed with NetworkIo about one registry pull in twenty against a server that closes after every answer
-time: 2026-11-14T13:56:58.663002636-05:00

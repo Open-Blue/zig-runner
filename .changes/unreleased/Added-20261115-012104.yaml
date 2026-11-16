@@ -1,3 +1,0 @@
-kind: Added
-body: 'Native jobs and the runner''s own requests log slow or failed name lookups: warn kind=dns_lookup_slow (over 2 s) and kind=dns_lookup_failed, with the name, the time and the nameserver, so a DNS stall (#522) can be shown from the journal. Nothing about a job''s resolver changes.'
-time: 2026-11-15T01:21:04.487357233-05:00

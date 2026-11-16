@@ -1,3 +1,0 @@
-kind: Added
-body: The native Dockerfile builder builds multi-stage Dockerfiles (stages keyed one on another, `COPY --from` a stage or an image, only the stages the last needs), wildcards in `COPY` and `ADD`, `.dockerignore`, `ADD` of a URL, heredocs, `SHELL`, `FROM scratch`, `FROM --platform` and `COPY --chown` by name, and a Dockerfile action of the job's own repository from the job's files, so these no longer send a job to the Dagger engine; `dockerfile-diff.sh` compares its images with BuildKit's weekly, and a fuzz target covers its parser (differences in docs/native-backend.md)
-time: 2026-11-13T23:19:25.580486535-05:00

@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Job priority: a cancel, timeout or shutdown thaws a job''s frozen steps before it signals them (they waited up to RUNNER_PRIORITY_FREEZE_MAX_SECS), a failed thaw is retried at the next tick, a job''s directory left frozen by a dead runner is thawed when it is made again, a job holding a file lock another process waits for is not paused, and a job''s own --cpu-shares wins over its level''s cpu.weight. Priorities not applied (no cpu controller, no memory.low) are logged.'
-time: 2026-11-14T14:13:08.400194713-05:00

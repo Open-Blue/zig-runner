@@ -1,3 +1,0 @@
-kind: Fixed
-body: Retries wait at least GitHub's Retry-After (seconds or a date) or the rate limit's reset on a 429, 503 or secondary-limit 403, within the caller's own budget; a push to main fails when fewer than 900 tests pass; ci.yml's comment says End to end is a required check
-time: 2026-11-13T23:01:18.030464397-05:00

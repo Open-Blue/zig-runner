@@ -1,3 +1,0 @@
-kind: Changed
-body: 'Native container jobs no longer ask the registry for their image on every job: a tag resolved within RUNNER_IMAGE_TAG_TTL seconds (default 300; 0 asks every time) is taken from the store, ten repeat jobs on one image cost 0 registry requests instead of 20; a registry that answers 429 or cannot be reached runs the tag''s last known digest and says so in "Set up job", and with nothing known a 429 is waited out as its Retry-After asks (#551)'
-time: 2026-11-15T01:16:03.575456666-05:00

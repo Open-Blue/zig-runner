@@ -1,3 +1,0 @@
-kind: Fixed
-body: A release candidate's image scan skips the Dockerfile oracle's test fixtures, as the release's scan already did, so v*-rc* builds publish their image.
-time: 2026-11-15T01:46:43.38292123-05:00

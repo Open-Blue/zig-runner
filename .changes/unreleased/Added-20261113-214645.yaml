@@ -1,3 +1,0 @@
-kind: Added
-body: 'A native job whose container `options:` carry `--cpus` (or `--cpu-quota` and `--cpu-period`) no longer falls back to the Dagger engine: the runner sets `cpu.max` on the job''s cgroup as Docker does (`--cpus 0.5` is 50000 of every 100000 µs), asking its parent for the cpu controller when it does not give it. Values are read as Docker reads them (decimals such as 0.5 and 1.5, `a/b`; negative, too precise, a quota under 1 ms, a period outside 1 ms to 1 s, and `--cpus` with a quota or period are refused with the flag named). Where the cpu controller cannot be delegated or the job has no cgroup, the native set-up fails saying so (the job then goes to Dagger, which drops the flag) instead of running unlimited.'
-time: 2026-11-13T21:46:45.177207715-05:00

@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A job no longer fails with EAGAIN when other jobs on the machine are publishing layers or mounting while it opens a path through `..`: the retry gives up the CPU, then waits a millisecond between tries, for up to about a quarter of a second.'
-time: 2026-11-14T18:17:40.442743357-05:00

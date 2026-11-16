@@ -1,3 +1,0 @@
-kind: Fixed
-body: Three tests that failed on a busy machine, the HTTP hooks' lookup and connect timing, openIn under a rename storm and the results upload's retry budget, no longer depend on how long anything takes
-time: 2026-11-14T14:10:06.800805186-05:00

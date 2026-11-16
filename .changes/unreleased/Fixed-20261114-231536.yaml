@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A cancel arriving while a step''s sandbox is still starting is delivered to the step, not lost: a Docker action''s SIGINT is held until its PID 1 has exec''d the action''s program (a post step signalled within a tick of its start lost it under load, which failed the ThreadSanitizer native job''s post-script test).'
-time: 2026-11-14T23:15:36.038959417-05:00

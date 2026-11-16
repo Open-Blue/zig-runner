@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The Dockerfile builder''s BuildKit oracle pins its fixtures'' base images by digest (alpine:3.22@sha256:...), the form the builder has to read in FROM, an ARG''s default and COPY --from (a test covers it), and Renovate keeps those digests and bases.txt together in one pull request; bases.txt names the busybox the copy-from-image fixture really uses (1.38), which the oracle missed since #busybox''s bump.'
-time: 2026-11-15T01:45:18.157429107-05:00
