@@ -52,6 +52,10 @@ main() {
 		;;
 	*) echo "forge-live: --forge is gitea or forgejo" >&2 && exit 2 ;;
 	esac
+	# The runner's container: Ubuntu 24.04 by digest. It is privileged (the native backend makes
+	# namespaces, mounts and cgroups, and its network rules, `nft`, are for this ephemeral VM only:
+	# a FORWARD chain that drops, as Docker leaves one; never on a machine that routes).
+	base=${ZR_FORGE_BASE:-ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5}
 	port=${ZR_FORGE_PORT:-3398}
 	url=http://127.0.0.1:$port
 	lock=${ZR_FORGE_LOCK:-$HOME/.cache/zig-runner-locks/root-tests.lock}
@@ -123,7 +127,11 @@ main() {
 		exit 0
 	fi
 
-	cat >"$dir/inner.sh" <<'IN'
+	# What the privileged runner container sees: the runner, its script and the registration token,
+	# and not the admin API token beside them.
+	rdir=$dir/runner-$forge
+	mkdir -p "$rdir"
+	cat >"$rdir/inner.sh" <<'IN'
 #!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -145,14 +153,14 @@ export RUNNER_STATE_DIR=/store/state RUNNER_NATIVE_STORE=/store/native RUNNER_NA
 export RUNNER_NATIVE_CGROUP=/sys/fs/cgroup/zr.slice RUNNER_HEALTH_IDLE_INTERVAL=2 RUNNER_HEALTH_INTERVAL=3600
 exec /live/runner
 IN
-	chmod 755 "$dir/inner.sh"
-	cp "$bin" "$dir/runner"
-	cp "$reg_file" "$dir/reg-token"
+	chmod 755 "$rdir/inner.sh"
+	cp "$bin" "$rdir/runner"
+	cp "$reg_file" "$rdir/reg-token"
 	# shellcheck disable=SC2064
-	trap "rm -f '$dir/reg-token'; cleanup" EXIT
+	trap "rm -rf '$rdir'; cleanup" EXIT
 	docker run -d --name "$runner" --privileged --network host --cgroupns private --memory 4g --memory-swap 4g \
-		--oom-score-adj=800 -e FORGE_URL="$url" -e FORGE_PLATFORM="$forge" -v "$dir:/live:ro" -v "$out:/out" -v "$store:/store" \
-		ubuntu:24.04 bash -c '/live/inner.sh >>/out/runner.log 2>&1' >/dev/null
+		--oom-score-adj=800 -e FORGE_URL="$url" -e FORGE_PLATFORM="$forge" -v "$rdir:/live:ro" -v "$out:/out" -v "$store:/store" \
+		"$base" bash -c '/live/inner.sh >>/out/runner.log 2>&1' >/dev/null
 	for _ in $(seq 360); do
 		grep -aq "registered runner\|registered earlier" "$out/runner.log" 2>/dev/null && break
 		sleep 1
