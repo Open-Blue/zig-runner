@@ -258,6 +258,8 @@ const Spec = struct {
     image: []const u8,
     env: []const job_mod.EnvVar,
     ports: []const Port,
+    /// Gitea's `cmd:`, evaluated; empty when the service has none.
+    cmd: []const []const u8 = &.{},
 };
 
 /// What a service container needs to start (its image, env and ports) with expressions evaluated,
@@ -298,6 +300,8 @@ pub fn serviceSpec(x: *Exec, ls: u32, sc: expr.Scope, svc: job_mod.Service) !?Sp
         };
         try ports.append(arena, port);
     }
+    var cmd: std.ArrayList([]const u8) = .empty;
+    for (svc.cmd) |t| try cmd.append(arena, ev.render(t, sc) catch "");
     x.sh.append(ls, try std.fmt.allocPrint(arena, "Image: {s}", .{image}));
     if (svc.options) |t| {
         const ignored = try ignoredOptions(arena, ev.render(t, sc) catch "");
@@ -309,7 +313,10 @@ pub fn serviceSpec(x: *Exec, ls: u32, sc: expr.Scope, svc: job_mod.Service) !?Sp
     }
     if (svc.volumes.len > 0)
         x.sh.append(ls, "##[warning]Service volumes are not supported and were ignored.");
-    return .{ .image = image, .env = env, .ports = ports.items };
+    // Only the native backend starts a service with a command of its own.
+    if (cmd.items.len > 0 and x.native == null)
+        x.sh.append(ls, "##[warning]Service cmd is not supported by the Dagger backend and was ignored.");
+    return .{ .image = image, .env = env, .ports = ports.items, .cmd = cmd.items };
 }
 
 /// How a query on an image starts: `container`, for a private registry its credentials, then

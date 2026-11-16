@@ -1,0 +1,3 @@
+kind: Added
+body: 'Gitea and Forgejo services: a service''s own cmd: (Gitea''s field) starts the image''s entrypoint with those arguments on the native backend, instead of being dropped, and a Gitea task''s services are tested end to end on the native backend (by name, on localhost, health check, teardown) (#520, G6). The Dagger backend logs that it ignores cmd. See docs/GITEA.md.'
+time: 2026-11-16T11:49:18.33218301-05:00

@@ -277,7 +277,7 @@ const Builder = struct {
     }
 
     /// One service, or the job's container: a mapping, or just the image. A field `job.Service`
-    /// has no place for (Gitea's `cmd`, say) is ignored, as `job.parse` ignores the same.
+    /// has no place for is ignored, as `job.parse` ignores the same.
     fn service(b: *Builder, name: []const u8, n: Node) BuildError!job_mod.Service {
         if (n.scalarText() != null) return .{ .name = name, .image = try b.scalarTemplate(n, "image") };
         if (n != .map) return error.Bad;
@@ -290,6 +290,8 @@ const Builder = struct {
                 svc.env = try b.mappingInputs(e.value, "env");
             } else if (std.mem.eql(u8, k, "ports")) {
                 svc.ports = try b.sequenceTemplates(e.value, "ports");
+            } else if (std.mem.eql(u8, k, "cmd")) {
+                svc.cmd = try b.sequenceTemplates(e.value, "cmd");
             } else if (std.mem.eql(u8, k, "volumes")) {
                 svc.volumes = try b.sequenceTemplates(e.value, "volumes");
             } else if (std.mem.eql(u8, k, "options")) {
@@ -1147,6 +1149,26 @@ test "uses steps: where the action is fetched from (self:, $/, a URL, the defaul
         try testing.expect(st.action == .unsupported);
         try testing.expect(std.mem.indexOf(u8, st.action.unsupported, "not a valid action reference") != null);
     }
+}
+
+test "a service's cmd (Gitea's own field) is read, as templates" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const c = try convertText(arena,
+        \\    services:
+        \\      db:
+        \\        image: postgres:16
+        \\        cmd: ["postgres", "-c", "max_connections=${{ github.run_id }}"]
+        \\      plain: redis:7
+        \\    steps:
+        \\      - run: "true"
+    );
+    const svcs = c.job.services;
+    try testing.expectEqual(@as(usize, 3), svcs[0].cmd.len);
+    try testing.expectEqualStrings("postgres", svcs[0].cmd[0].lit);
+    try testing.expect(svcs[0].cmd[2] == .expr);
+    try testing.expectEqual(@as(usize, 0), svcs[1].cmd.len);
 }
 
 test "the default actions URL: the instance's own is the server, another is kept, github and self are named" {

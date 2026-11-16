@@ -36,3 +36,25 @@ The runner's own variables (`RUNNER_OS`, `RUNNER_ARCH`, `RUNNER_TEMP`, `RUNNER_T
 are GitHub's, set the same on every platform. The first rows are tested over a Gitea-style and a
 Forgejo-style job (`Evaluator.zig`, "a Gitea or Forgejo job's steps see what act_runner and
 forgejo-runner set besides GitHub's"), and the trailing slash in `gitea/job.zig`.
+
+## Services
+
+A job's `services:` run as they do for a GitHub job, on either backend's rules (the native backend
+runs them in sandboxes of their own, reachable from the steps by name and on `localhost` at the
+published ports, with `options: --health-cmd ...` health checks, and stopped with the job). The
+workflow is read as Gitea's model reads it: a service is an image, or a mapping with `image`, `env`,
+`ports`, `volumes`, `options` and `credentials`, and Gitea's own `cmd`.
+
+- `cmd: [a, b]` starts the image's entrypoint with these arguments in place of the image's default
+  command (Docker's `create IMAGE COMMAND`). Each element may be an expression. The native backend
+  does it; the Dagger backend logs "Service cmd is not supported by the Dagger backend and was
+  ignored".
+- `volumes` and the options the native backend does not carry out are logged and ignored, as for a
+  GitHub job.
+- A `container:` job with `services:` is the same job as on GitHub.
+
+Tested end to end on the native backend (`native/services.zig`, "native services from a Gitea
+task"): a task's YAML goes through `gitea/job.zig`, the services start from a fixture image with the
+task's own `cmd`, the step reaches one by name and by `localhost:<published port>`, and it is gone
+with the job. Services from real postgres and redis images run in the existing
+`ZIG_RUNNER_SERVICE_IMAGES` test.

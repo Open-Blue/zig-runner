@@ -203,7 +203,11 @@ fn startOne(
         return null;
     };
     if (image.digest) |d| x.sh.append(ls, try std.fmt.allocPrint(arena, "Digest: {s}", .{d}));
-    const argv = try std.mem.concat(arena, []const u8, &.{ image.entrypoint, image.cmd });
+    // Docker's `create IMAGE COMMAND`: a command of the service's own replaces the image's.
+    const argv = try std.mem.concat(arena, []const u8, &.{
+        image.entrypoint,
+        if (spec.cmd.len > 0) spec.cmd else image.cmd,
+    });
     if (argv.len == 0) {
         x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "The image {s} of service {s} has no " ++
             "entrypoint or command to run", .{ spec.image, svc.name }));
@@ -665,6 +669,87 @@ test "native services: by name and on localhost, health checks and port probes, 
     defer jobs.close(io);
     var it = jobs.iterate();
     try std.testing.expect(try it.next(io) == null);
+}
+
+test "native services from a Gitea task: by name and on localhost, the task's own cmd, health check and teardown" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    cfg.test_rootless_services = true;
+    const root_runner = std.os.linux.geteuid() == 0;
+    const addr = if (root_runner) "0.0.0.0" else "127.0.0.1";
+    const web_port, const web_published = try freePorts(2);
+    // The image's own command names the server "image-default"; the task's `cmd:` replaces it.
+    try fixtureImage(arena, &tmp, &cfg, "fixture+web:1", &.{ "python3", "-u", "-c", greeter, addr, "1", "image-default" });
+    const code = try std.mem.replaceOwned(u8, arena, greeter, "\n", "\n            ");
+    const workflow = try std.fmt.allocPrint(arena,
+        \\name: t
+        \\jobs:
+        \\  j:
+        \\    runs-on: x
+        \\    services:
+        \\      web:
+        \\        image: fixture/web:1
+        \\        env:
+        \\          GREETING: hello
+        \\        ports:
+        \\          - "{d}:{d}"
+        \\        options: --health-cmd "python3 -c 'import socket; socket.create_connection((\"127.0.0.1\", {d}), 1)'" --health-interval 2s --health-retries 15
+        \\        cmd:
+        \\          - python3
+        \\          - -u
+        \\          - -c
+        \\          - |
+        \\            {s}
+        \\          - "{s}"
+        \\          - "{d}"
+        \\          - gitea-cmd
+        \\    steps:
+        \\      - run: |
+        \\          python3 - <<'EOF'
+        \\          import os, socket
+        \\          def get(host, port):
+        \\              try: return socket.create_connection((host, int(port)), 3).recv(100).decode().strip()
+        \\              except OSError as e: return "unreachable %s" % e
+        \\          print("by-name", get("web", os.environ["WEB"]))
+        \\          print("relayed", get("localhost", os.environ["WEB_PUBLISHED"]))
+        \\          EOF
+        \\        env:
+        \\          WEB: "{d}"
+        \\          WEB_PUBLISHED: ${{{{ job.services.web.ports['{d}'] }}}}
+    , .{ web_published, web_port, web_port, code, addr, web_port, web_port, web_port });
+    const task: @import("../gitea/task.zig").Task = .{
+        .id = 9,
+        .workflow = workflow,
+        .context = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+            \\{"repository":"o/r","server_url":"http://127.0.0.1:1/","run_id":"9"}
+        , .{}),
+        .secrets = &.{},
+        .vars = &.{},
+        .needs = &.{},
+    };
+    var why: []const u8 = "";
+    var job = (try @import("../gitea/job.zig").fromTask(arena, task, &why)).job;
+    job.github.forge = .gitea;
+    try std.testing.expect(Backend.unsupported(io, job, .{ .step_user = .root }, cfg) == null);
+    const r = try Backend.runNativeJob(arena, cfg, job, .root);
+    if (!r.res.succeeded) {
+        std.debug.print("{s}\n", .{r.text});
+        return error.TestUnexpectedResult;
+    }
+    try Backend.expectLines(r.text, &.{
+        "Starting web service container",
+        "web service is healthy.",
+        "by-name hi from gitea-cmd",
+        "relayed hi from gitea-cmd",
+        "Stop and remove container: web",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "image-default") == null);
+    try std.testing.expect(!reachable(.{ 127, 0, 0, 1 }, web_published));
 }
 
 test "native services: a service has no docker.sock, whether or not the job has a Docker API, and no layer holds one" {
