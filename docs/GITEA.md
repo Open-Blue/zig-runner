@@ -138,6 +138,18 @@ task's own `cmd`, the step reaches one by name and by `localhost:<published port
 with the job. Services from real postgres and redis images run in the existing
 `ZIG_RUNNER_SERVICE_IMAGES` test.
 
+## Reaching the instance from a job
+
+A job's network reaches the instance's address and port, and nothing else of the host's
+(`native/nft.zig`). That holds for an instance on the host's loopback (the runner forwards it, so the
+job's `github.server_url` works), on another machine, and on the host's own address when it listens
+there. It did **not** hold in the live jobs' first run for an instance in a Docker container with a
+published port, dialled at the host's own address: the jobs' connections timed out. The probable
+cause is that Docker's NAT rewrites the destination before the runner's rule sees it; the live jobs
+run the instance on the host's network (`--network host`), where it works. An instance on the
+loopback also cannot hand a job URLs made from its `ROOT_URL` (artifact uploads, for one): the job's
+`127.0.0.1` is its own. Give `ROOT_URL` the address the host has on its network.
+
 ## Artifacts and the cache
 
 **Artifacts** go through the instance, as with its own runner: an action that uploads or downloads one
