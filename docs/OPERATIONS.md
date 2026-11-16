@@ -175,7 +175,12 @@ On razorbill, `zig-runner-deploy.timer` asks GitHub every minute. For a new depl
    minute later, up to `ATTEMPTS` (30) times before it reports failure. A check that fails reports
    failure at once;
 3. installs it and restarts every runner instance (`zig-runner.service` and
-   `zig-runner@*.service`, or `UNITS`), each finishing its running jobs first;
+   `zig-runner@*.service`, or `UNITS`), each finishing its running jobs first. That needs
+   `KillMode=mixed` in the unit (deploy/zig-runner.service has it since v0.36.0): with systemd's
+   default, the stop's SIGTERM also reaches a native job's processes, which share the unit's cgroup,
+   and their step dies at once. A unit installed before it takes the setting with
+   `sudo systemctl edit zig-runner.service` (and `zig-runner@.service`): `[Service]` and
+   `KillMode=mixed`, then `sudo systemctl daemon-reload`;
 4. reports success once each instance is listening for jobs again, or puts the previous binary back
    and reports failure.
 

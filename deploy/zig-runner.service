@@ -19,6 +19,11 @@ ExecStart=/usr/local/bin/zig-runner
 # job: the running step stops, always() steps and post scripts get 1 minute, the job is reported.
 # 15 minutes leaves that, and the reports, room; past it systemd kills the runner, the engine
 # stops its steps, and GitHub fails its jobs once their hold runs out. Raise both together.
+# KillMode=mixed: the stop's SIGTERM goes to the runner alone. Native jobs run in this unit's
+# cgroup (RUNNER_NATIVE_CGROUP=self), and the default, control-group, sent it to every one of their
+# processes too, so a deploy's restart killed the running steps at once (exit 143) instead of
+# letting them finish. Whatever is left when the runner exits is SIGKILLed.
+KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=15min
 Restart=on-failure
