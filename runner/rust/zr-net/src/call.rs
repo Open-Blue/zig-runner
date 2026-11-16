@@ -672,7 +672,9 @@ mod tests {
         assert_eq!(s.info().status, 200);
         let (total, _, end) = s.read_all(100, Duration::ZERO);
         assert_eq!((total, end), (3, 100 + Code::Timeout as i32));
-        let s = start(c, "GET", &url, FLAG_STREAM_RESPONSE, 0, 0, 0, 300, "");
+        // The call's whole deadline ends the stalled body. 2 s, not less: the head has to arrive
+        // within it too, and on a loaded CI runner connect and the server task took over 300 ms.
+        let s = start(c, "GET", &url, FLAG_STREAM_RESPONSE, 0, 0, 0, 2000, "");
         assert_eq!(s.info().status, 200);
         let (total, _, end) = s.read_all(100, Duration::ZERO);
         assert_eq!((total, end), (3, 100 + Code::Timeout as i32));
