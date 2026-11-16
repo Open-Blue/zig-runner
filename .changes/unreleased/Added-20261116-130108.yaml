@@ -1,0 +1,3 @@
+kind: Added
+body: 'CI: a job against a real Gitea and a real Forgejo ("Live gitea", "Live forgejo", .github/scripts/forge-live.sh): the runner built from the pull request serves a throwaway instance of each and four dispatched workflows check actions named by self:, a URL, $/ and the default actions URL, the variables the instance''s runner sets, services and the checkout, outputs, masking and a failing step (#520, G7). Not required; see docs/CI.md.'
+time: 2026-11-16T13:01:08.610969685-05:00

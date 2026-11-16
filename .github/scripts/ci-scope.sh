@@ -5,6 +5,7 @@
 #                            Workflows' ZLint steps (ci.yml)
 #   ci-scope.sh binaries     Release builds; Release builds (arm64) (ci.yml)
 #   ci-scope.sh e2e          End to end (ci.yml)
+#   ci-scope.sh forge        Live Gitea, Live Forgejo (ci.yml)
 #   ci-scope.sh proofs       Proofs (proofs.yml)
 #   ci-scope.sh packaging    Binaries (check), Binaries (same as zig build), Image (release.yml)
 #   ci-scope.sh go           Workflows' Go tools steps (ci.yml)
@@ -169,6 +170,22 @@ needed() {
 		*) return 0 ;;
 		esac
 		;;
+	forge)
+		# Gitea and Forgejo support, run against a real instance of each (forge-live.sh): what
+		# talks to the instance, what turns its tasks into jobs, and what the jobs' actions,
+		# variables and services go through.
+		case $1 in
+		runner/src/gitea/* | runner/src/job.zig | runner/src/native/actions.zig | \
+			runner/src/native/services.zig | runner/src/dagger/Evaluator.zig | \
+			runner/src/dagger/actions.zig | runner/src/dagger/services.zig | runner/src/loop/* | \
+			runner/src/config.zig | runner/src/main.zig | \
+			.github/workflows/ci.yml | .github/scripts/ci-scope.sh | .github/scripts/e2e.sh | \
+			.github/scripts/forge-live.sh | .github/scripts/forge-live-workflows.sh | \
+			.github/scripts/install-zig.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | \
+			.github/scripts/zig-cc.sh | .github/scripts/install-rust.sh | runner/rust/*) return 0 ;;
+		*) return 1 ;;
+		esac
+		;;
 	analysis)
 		# Only the searches themselves, on a pull request: a change to the runner's code is the
 		# nightly run's to search, not every pull request's (each costs minutes per target).
@@ -265,10 +282,10 @@ needed() {
 }
 
 case $scope in
-tests | binaries | e2e | proofs | packaging | go | apt | soak | workflows | analysis | tsan | store | coverage | \
+tests | binaries | e2e | forge | proofs | packaging | go | apt | soak | workflows | analysis | tsan | store | coverage | \
 	codeql-actions | codeql-go | codeql-python) ;;
 *)
-	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|apt|soak|workflows|analysis|tsan|store|coverage|codeql-actions|codeql-go|codeql-python" >&2
+	echo "usage: ci-scope.sh tests|binaries|e2e|forge|proofs|packaging|go|apt|soak|workflows|analysis|tsan|store|coverage|codeql-actions|codeql-go|codeql-python" >&2
 	exit 2
 	;;
 esac
