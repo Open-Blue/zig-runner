@@ -61,6 +61,25 @@ pub const JobTimeout = struct {
     paused: ?admission.PauseClock = null,
     stop: std.atomic.Value(bool) = .init(false),
 
+    /// The job's limit, moved by the pauses of its place at the memory gate (null: never paused).
+    pub fn of(
+        io: std.Io,
+        log: *sink.LogSink,
+        cancel: *dagger.Cancel,
+        task_id: i64,
+        minutes: i64,
+        gate: ?*admission.Gate,
+    ) JobTimeout {
+        return .{
+            .io = io,
+            .log = log,
+            .cancel = cancel,
+            .task_id = task_id,
+            .minutes = minutes,
+            .paused = if (gate) |g| g.pauseClock() else null,
+        };
+    }
+
     pub fn run(w: *JobTimeout) void {
         const started = std.Io.Clock.awake.now(w.io).toMilliseconds();
         const limit_ms = w.minutes *| w.unit_ms;
@@ -193,14 +212,7 @@ fn runJob(
 
     // The instance's cancel arrives through the pump (`Reporter.reportStateLocked`); the job's
     // own limit and the runner's stop are watched here, and go down the same ladder.
-    var timeout: JobTimeout = .{
-        .io = c.io,
-        .log = c.log,
-        .cancel = cancel,
-        .task_id = t_id,
-        .minutes = jobTimeout(c.arena, &job, converted.timeout_minutes),
-        .paused = if (c.gate) |g| g.pauseClock() else null,
-    };
+    var timeout = JobTimeout.of(c.io, c.log, cancel, t_id, jobTimeout(c.arena, &job, converted.timeout_minutes), c.gate);
     var timing: ?std.Io.Future(void) = c.io.concurrent(JobTimeout.run, .{&timeout}) catch null;
     defer if (timing) |*f| {
         timeout.stop.store(true, .release);
@@ -304,6 +316,40 @@ test "a job paused for longer than its timeout is not cancelled while paused, an
     var plain: JobTimeout = .{ .io = std.testing.io, .log = &log, .cancel = &plain_cancel, .task_id = 6, .minutes = 200, .unit_ms = 1 };
     plain.run();
     try std.testing.expect(std.Io.Clock.awake.now(std.testing.io).toMilliseconds() - t0 >= 200);
+}
+
+test "a job's gate pauses move its limit: a job paused for longer than its limit is cancelled only after it" {
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out.writer } };
+    var cancel: dagger.Cancel = .{};
+    var slots = [_]admission.Admission.Slot{.{}};
+    var pool: admission.Admission = .init(io, .{}, &slots);
+    var gate: admission.Gate = .{ .pool = &pool, .slot = 0 };
+    const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
+    // Paused for 600 ms from the start, banked as `Admission.thaw` does; a 200 ms limit (in ms).
+    slots[0].paused = true;
+    slots[0].paused_since_ms = t0;
+    var ending = try io.concurrent(struct {
+        fn end(p: *admission.Admission) void {
+            std.testing.io.sleep(.fromMilliseconds(600), .awake) catch return;
+            p.mu.lockUncancelable(std.testing.io);
+            defer p.mu.unlock(std.testing.io);
+            const s = &p.slots[0];
+            s.paused_total_ms += std.Io.Clock.awake.now(std.testing.io).toMilliseconds() - s.paused_since_ms;
+            s.paused = false;
+        }
+    }.end, .{&pool});
+    defer ending.cancel(io);
+    var w: JobTimeout = .of(io, &log, &cancel, 8, 200, &gate);
+    w.unit_ms = 1;
+    w.run();
+    try std.testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - t0 >= 790);
+    try std.testing.expectEqual(dagger.Cancel.Why.job_timeout, cancel.why.load(.acquire));
+    // No gate: nothing moves it.
+    const plain: JobTimeout = .of(io, &log, &cancel, 9, 1, null);
+    try std.testing.expect(plain.paused == null);
 }
 
 test "a job past its timeout is cancelled as a timeout, with a grace; one that ended first is not" {

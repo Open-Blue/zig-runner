@@ -717,6 +717,10 @@ pub const Options = struct {
     /// (`RUNNER_PROVISIONED_IMAGE`); `provisioned_pins` is what it pins (tests give their own).
     provisioned_image: bool = true,
     provisioned_pins: @import("dagger/provisioned.zig").Pins = @import("dagger/provisioned.zig").pinned,
+    /// How long the job has been paused by its priority: its steps' deadlines move by it
+    /// (`Watch.paused`) and "Complete job" says it. `runNative` gives the job's gate's; tests give
+    /// their own.
+    pause: ?admission.PauseClock = null,
     /// Key under which output lines are written to the sink.
     sink_job_id: u64 = 0,
     /// The name the runner registered under (`runner.name`, RUNNER_NAME).
@@ -797,6 +801,8 @@ pub const Options = struct {
     test_transport: ?Transport = null,
     /// Tests: this job's `ran_env` value instead of a random one.
     test_ran_marker: ?[]const u8 = null,
+    /// Tests: what a minute of `timeout-minutes` is, in ms.
+    test_timeout_unit_ms: i64 = std.time.ms_per_min,
     /// Tests: this job's `mark_env` value instead of a random one.
     test_step_mark: ?[]const u8 = null,
 };
@@ -2004,10 +2010,11 @@ fn runStep(
     const coe = std.mem.eql(u8, ev.render(step.continue_on_error, sc1) catch "false", "true");
     res.continued = coe;
     const written: ?[]const u8 = if (step.timeout_minutes) |t| ev.render(t, sc1) catch null else null;
-    const timeout_ms = timeoutMs(written);
+    const minutes_ms = timeoutMs(written);
+    const timeout_ms = @divTrunc(minutes_ms, std.time.ms_per_min) *| x.timeout_unit_ms;
     // GitHub's message on a timeout names the whole minutes it waited.
-    const limit: ?[]const u8 = if (timeout_ms > 0)
-        try std.fmt.allocPrint(arena, "{d}", .{@divTrunc(timeout_ms, 60_000)})
+    const limit: ?[]const u8 = if (minutes_ms > 0)
+        try std.fmt.allocPrint(arena, "{d}", .{@divTrunc(minutes_ms, 60_000)})
     else
         written;
 
@@ -2311,6 +2318,27 @@ fn runSteps(
     /// goes there (`Exec.execScript`).
     native: ?*Backend,
 ) !Result {
+    // A native job's pauses are its gate's (`admission.Gate.pausedMs`).
+    var opts = opts_in;
+    if (opts.pause == null) if (native) |b| if (b.gate) |g| {
+        opts.pause = g.pauseClock();
+    };
+    var result = try runStepsPaused(arena, io, opts, job, sh, results, transport, native);
+    // On every way out, a failed job's too: "Complete job" says how long the job was paused.
+    try pausedNote(arena, opts.pause, &result);
+    return result;
+}
+
+fn runStepsPaused(
+    arena: Allocator,
+    io: std.Io,
+    opts_in: Options,
+    job: job_mod.Job,
+    sh: *JobLog,
+    results: []StepResult,
+    transport: Transport,
+    native: ?*Backend,
+) !Result {
     // Each step's `step-end:` line (`dagger/step_end.zig`), made as the step finishes.
     var opts = opts_in;
     var meter: StepMeter = undefined;
@@ -2376,6 +2404,7 @@ fn runSteps(
         };
     var x = try execFor(arena, io, transport, sh, &ev, &job, opts, plan, base.id, secrets, step_cache);
     x.container_path = base.runtime_path;
+    x.timeout_unit_ms = opts.test_timeout_unit_ms;
     x.native = native;
     x.tool_trees = base.tool_trees;
     // A native job's tool cache is its `toolcache` volume, in no layer, so a replayed step that
@@ -2386,9 +2415,7 @@ fn runSteps(
 
     var watch: Watch = .{ .io = io, .transport = transport, .cancel = opts.cancel, .log = sh };
     // A pause by the job's priority moves its steps' deadlines (`Watch.paused`).
-    if (native) |b| if (b.gate) |g| {
-        watch.paused = g.pauseClock();
-    };
+    watch.paused = opts.pause;
     var watching: ?std.Io.Future(void) = null;
     if (transport.abortFn != null) watching = io.concurrent(Watch.run, .{&watch}) catch null;
     x.watch = &watch;
@@ -2484,19 +2511,18 @@ fn finishJob(x: *Exec, opts: Options, results: []StepResult) !Result {
     result.summaries = x.summaries;
     try jobOutputs(arena, x.ev, x.sh, job.*, &result);
     try environmentUrl(arena, x.ev, x.sh, job.*, &result);
-    try pausedNote(x, &result);
     return result;
 }
 
 /// "Complete job" says how long the job's priority paused it, when it did: its step and job
-/// timeouts were extended by that time (`Watch.paused`, `admission.Gate.pausedMs`).
-fn pausedNote(x: *Exec, result: *Result) !void {
-    const g = (x.native orelse return).gate orelse return;
-    const ms = g.pausedMs();
+/// timeouts were extended by that time (`Watch.paused`, `admission.Gate.pausedMs`). Pre and post
+/// scripts have no timeout of their own and no `step-end:` line: their pauses are only in this.
+fn pausedNote(arena: Allocator, pause: ?admission.PauseClock, result: *Result) !void {
+    const ms = (pause orelse return).total();
     if (ms <= 0) return;
     var lines: std.ArrayList([]const u8) = .empty;
-    try lines.appendSlice(x.arena, result.output_lines);
-    try lines.append(x.arena, try std.fmt.allocPrint(x.arena, "Native steps: this job was paused " ++
+    try lines.appendSlice(arena, result.output_lines);
+    try lines.append(arena, try std.fmt.allocPrint(arena, "Native steps: this job was paused " ++
         "for {d}.{d} s by its priority (RUNNER_PRIORITY_FREEZE); its step and job timeouts " ++
         "ran that much longer.", .{ @divTrunc(ms, 1000), @divTrunc(@mod(ms, 1000), 100) }));
     result.output_lines = lines.items;
@@ -3098,6 +3124,93 @@ test "a cancel during a pause still stops the step, whatever the pause has added
     w.tick(2_000, 2_000);
     try std.testing.expectEqual(@as(u32, 1), f.aborted);
     try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
+}
+
+/// A session that answers the base, then holds the next query (a step's exec) until `abort`.
+/// One at a time (a file's state, so no cast is needed to find it): the test that uses it resets it.
+const HoldingSession = struct {
+    var sent: std.atomic.Value(u32) = .init(0);
+    var holding: std.atomic.Value(bool) = .init(false);
+    var aborted: std.atomic.Value(u32) = .init(0);
+
+    fn reset() void {
+        sent.store(0, .release);
+        holding.store(false, .release);
+        aborted.store(0, .release);
+    }
+
+    fn send(_: *anyopaque, _: Allocator, _: []const u8, _: usize) anyerror![]const u8 {
+        if (sent.fetchAdd(1, .acq_rel) == 0) return base_answer;
+        holding.store(true, .release);
+        defer holding.store(false, .release);
+        while (aborted.load(.acquire) == 0) std.testing.io.sleep(.fromMilliseconds(5), .awake) catch return error.Canceled;
+        return error.QueryAborted;
+    }
+
+    fn abort(_: *anyopaque) bool {
+        if (!holding.load(.acquire)) return false;
+        _ = aborted.fetchAdd(1, .acq_rel);
+        return true;
+    }
+
+    fn transport(ctx: *anyopaque) Transport {
+        return .{ .ptr = ctx, .sendFn = send, .abortFn = abort };
+    }
+};
+
+/// Ends a pause `after_ms` on, as `Admission.thaw` does once the steps are thawed.
+fn endPauseAfter(pool: *admission.Admission, slot: usize, after_ms: i64) void {
+    const io = std.testing.io;
+    io.sleep(.fromMilliseconds(after_ms), .awake) catch return;
+    pool.mu.lockUncancelable(io);
+    defer pool.mu.unlock(io);
+    const s = &pool.slots[slot];
+    s.paused_total_ms += std.Io.Clock.awake.now(io).toMilliseconds() - s.paused_since_ms;
+    s.paused = false;
+}
+
+test "a whole job: a step paused longer than its timeout is not stopped while paused, only at the extended deadline, and the pause is reported" {
+    const io = std.testing.io;
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var hog = testStep("hog");
+    hog.timeout_minutes = .{ .lit = "1" };
+    const steps = [_]job_mod.Step{hog};
+    // The job's gate slot has been paused since the start, for 1.2 s, and the step's minute is 300 ms.
+    var slots = [_]admission.Admission.Slot{.{}};
+    var pool: admission.Admission = .init(io, .{}, &slots);
+    var gate: admission.Gate = .{ .pool = &pool, .slot = 0 };
+    const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
+    slots[0].paused = true;
+    slots[0].paused_since_ms = t0;
+    var ending = try io.concurrent(endPauseAfter, .{ &pool, 0, 1_200 });
+    defer ending.cancel(io);
+    HoldingSession.reset();
+    var unused: u8 = 0;
+    var ends: std.Io.Writer.Allocating = .init(arena);
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = HoldingSession.transport(&unused),
+        .test_timeout_unit_ms = 300,
+        .pause = gate.pauseClock(),
+        .step_ends = &ends,
+    }, testJob(&steps), &log);
+    const took = std.Io.Clock.awake.now(io).toMilliseconds() - t0;
+    // Not stopped before the pause ended and the 300 ms after it were out: 1_500 ms from the start
+    // of the pause, less a few ms the step began late.
+    try std.testing.expect(took >= 1_490);
+    try std.testing.expectEqual(@as(u32, 1), HoldingSession.aborted.load(.acquire));
+    try std.testing.expectEqual(Outcome.failure, res.steps[0].outcome);
+    try std.testing.expect(res.steps[0].paused_ms > 0 and res.steps[0].paused_ms <= 1_200);
+    try std.testing.expect(std.mem.indexOf(u8, ends.written(), " paused_ms=") != null);
+    var told = false;
+    for (res.output_lines) |l| told = told or std.mem.indexOf(u8, l, "was paused for 1.") != null;
+    try std.testing.expect(told);
 }
 
 test "a deadline passed between a step's queries stops its next query" {

@@ -1574,6 +1574,8 @@ pub const Gate = struct {
         s.ending = true;
         // Its processes are about to be removed with the cgroup, which a frozen one would hold up.
         _ = a.thaw(s, "ended");
+        // A thaw that failed leaves it paused: what it was paused for still counts.
+        if (s.paused) s.paused_total_ms +|= @max(0, std.Io.Clock.awake.now(a.io).toMilliseconds() - s.paused_since_ms);
         s.paused = false;
         s.thaw_failed = false;
         if (s.cgroup()) |dir| {
@@ -6056,6 +6058,19 @@ test "priority: a job's paused time adds up over pauses, the one under way inclu
     try std.testing.expectEqual(before, gate.pausedMs());
     _ = pool.thaw(&slots[1], "test");
     try std.testing.expectEqual(before, slots[1].paused_total_ms);
+}
+
+test "priority: a pause whose thaw failed at the job's end is still counted in what it was paused for" {
+    var slots: [1]Admission.Slot = .{.{}};
+    var pool: Admission = .init(std.testing.io, .{ .priority = .{ .freeze = true } }, &slots);
+    var gate: Gate = .{ .pool = &pool };
+    const now = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    // No cgroup to write to: the thaw fails.
+    slots[0].paused = true;
+    slots[0].paused_since_ms = now - 3_000;
+    gate.nativeDone();
+    try std.testing.expect(!slots[0].paused);
+    try std.testing.expect(gate.pausedMs() >= 3_000);
 }
 
 test "priority: govern does not pause a job that is being signalled or has ended" {

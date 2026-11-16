@@ -460,7 +460,7 @@ pauses added, the one under way included) moves the deadline of the step that wa
 the job's `timeout-minutes` where the runner enforces it. A step with `timeout-minutes: 10` that
 was paused for 80 s runs out 10 minutes and 80 s after it began, counting only what it ran. The
 step's `step-end:` line carries `paused_ms=<ms>` when it was paused, "Set up job" says that a pool
-may pause, and "Complete job" says how long the job was paused. Two limits: a step that began in
+may pause, and "Complete job" says how long the job was paused. What is not extended: the readiness waits of services and image pulls (set-up, before the steps run, so before a pause can happen), and a pre or post script, which has no timeout of its own and no `step-end:` line (its pause is only in the job's total, in "Complete job"). Two limits: a step that began in
 the middle of a pause counts only what came after its start, and a job's own `timeout-minutes` on
 GitHub is enforced by GitHub itself (it cancels the job through the session, and the job
 definition does not carry the limit), so there a pause moves the step timeouts but not the job's;
