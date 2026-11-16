@@ -97,13 +97,15 @@ unreported instead, and the merge queue waiting for it.
 
   "Every test file is compiled" (`test-files.sh`: each file with tests has them all in the test
   binary) compiles the tests once more, which cost the Pi 2.5 min and 3.6 GB of its 4.3 GB, the
-  slowest step and the memory peak. On the prebuilt path the prebuild job runs it instead, natively
-  (x86_64) on GitHub's runner: what it checks is that every file's tests are listed in `main.zig`,
-  a fact of the source and not of the CPU, and the binary's names must be read by running it, which
-  the aarch64 cross-compile cannot do here. A failure fails the prebuild, which fails "Tests
-  (x86_64)" at "The prebuilt tests"; the Pi's step logs that it ran there. Where the Test step
-  compiles for itself (pull requests, the merge queue, a hosted `PROD_RUNNER`, or a failed
-  download) the check runs in the Test job as before.
+  slowest step and the memory peak. On a push to main with a self-hosted `PROD_RUNNER` the job
+  **Every test file is compiled (for the Pi)** (`test-files`, GitHub's runner, beside the prebuild
+  and under its condition) runs it instead, natively (x86_64): what it checks is that every file's
+  tests are listed in `main.zig`, a fact of the source and not of the CPU, and the binary's names
+  must be read by running it, which the aarch64 cross-compile cannot do here. "Tests (x86_64)"
+  needs both jobs and waits for the longer, not their sum; its "The prebuilt tests" step fails the
+  check when either did not succeed, naming the job. The Pi's step logs where the check ran. Where
+  the Test step compiles for itself (pull requests, the merge queue, a hosted `PROD_RUNNER`, or a
+  failed download) both jobs are skipped or ignored and the check runs in the Test job as before.
 
   On a runner with no readable cgroup and no GNU time (the Pi's native steps), the `memory-peak:`
   line is sampled from `/proc` (`source=proc`: the largest sum of resident sets of the command and
