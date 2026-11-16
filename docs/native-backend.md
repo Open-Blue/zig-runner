@@ -2700,7 +2700,13 @@ errors. Nothing is built yet (1b).
   connection take in what its client had already sent (a connection answers once it has nothing
   more to read, and one still in the listen queue is accepted first) before it reads the count of
   requests beyond ping/version/info, so a client that wrote a request and exited without reading the
-  answer is counted against its own step. It waits at most 2 s. A connection a step's background
+  answer is counted against its own step. It waits at most 2 s.
+  **A limit for 1b to close**: the step end's check of the listen queue has a 2 ms grace for a
+  connection just taken from it, so a request from a connection admitted after that can be counted
+  against the next step. That is the safe direction for the next step (it is not stored) but not
+  for the step that made the request, which may then be stored and replayed. 1b must close it
+  (an epoch per connection, a connection refused or held while a step ends, or the API's effects
+  keyed) before a request has an effect worth replaying. A connection a step's background
   process holds open stays open.
 - **The job's own `DOCKER_HOST`**: the runner's `DOCKER_HOST` and `DOCKER_BUILDKIT` are put only
   where the image, the job container's `env:` and `options: --env` have not set the name, and the

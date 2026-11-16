@@ -321,6 +321,9 @@ pub const Server = struct {
                 // One short write into a fresh socket's buffer: it cannot block.
                 if (sendAll(s, fd, busy_answer, 100)) {} else |_| {} // the peer going is no matter
                 _ = linux.close(fd);
+                // A connect-and-close loop gets no more than this many a second of the runner's
+                // time: the wait is the cost of being refused.
+                if (!waitStop(s, busy_delay_ms)) return;
                 continue;
             };
             // Field by field: `settle` reads the atomic ones from another thread.
@@ -331,6 +334,8 @@ pub const Server = struct {
             slot.generation.store(slot.generation.load(.monotonic) +% 1, .release);
             slot.live.store(true, .release);
             slot.thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, connection, .{slot}) catch {
+                // No thread will clear it: a `settle` would wait for a connection that is not.
+                slot.live.store(false, .release);
                 _ = linux.close(fd);
                 continue;
             };
@@ -353,6 +358,7 @@ pub const Server = struct {
 };
 
 const accept_backoff_ms = 100;
+const busy_delay_ms = 10;
 
 const Clock = *const fn () u32;
 
@@ -498,17 +504,20 @@ fn waitStop(s: *const Server, ms: u32) bool {
 /// nothing to read: a poll that finds data takes it first.
 fn waitHead(s: *const Server, slot: *Server.Slot, deadline: u64) Wait {
     const fd = slot.fd;
+    // Set once a `settle` in progress has been answered: its eventfd stays readable until it ends,
+    // so it is left out of the next poll, which then does not wait long.
+    var answered = false;
     while (true) {
         const now = nowMs();
         if (now >= deadline) return .timeout;
-        const epoch = s.settle_epoch.load(.acquire);
-        const asking = slot.ack.load(.acquire) != epoch;
         var fds = [_]linux.pollfd{
             .{ .fd = fd, .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = s.wake_fd, .events = linux.POLL.IN, .revents = 0 },
-            .{ .fd = if (asking) s.settle_fd else -1, .events = linux.POLL.IN, .revents = 0 },
+            // Always in the poll otherwise: an idle connection hears of a settle at once.
+            .{ .fd = if (answered) -1 else s.settle_fd, .events = linux.POLL.IN, .revents = 0 },
         };
-        const rc = linux.poll(&fds, fds.len, std.math.lossyCast(i32, deadline - now));
+        const left = std.math.lossyCast(i32, deadline - now);
+        const rc = linux.poll(&fds, fds.len, if (answered) @min(left, 2) else left);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
@@ -516,7 +525,11 @@ fn waitHead(s: *const Server, slot: *Server.Slot, deadline: u64) Wait {
         }
         if (fds[1].revents != 0) return .stopped;
         if (fds[0].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) != 0) return .ready;
-        if (fds[2].revents != 0) slot.ack.store(epoch, .release);
+        answered = false;
+        if (fds[2].revents != 0) {
+            const epoch = s.settle_epoch.load(.acquire);
+            if (slot.ack.load(.acquire) != epoch) slot.ack.store(epoch, .release) else answered = true;
+        }
     }
 }
 
@@ -1892,4 +1905,52 @@ test "docker api: /version and /info are made once" {
     const b = try get(f.path, "/info");
     defer testing.allocator.free(b);
     try testing.expectEqualStrings(bodyOf(a), bodyOf(b));
+}
+
+var hook_bucket: *std.atomic.Value(u64) = undefined;
+var hook_calls: u32 = 0;
+/// A clock that, on its first reading, is also another thread: it refills the bucket and takes a
+/// token between the loop's load and its swap, so that the swap fails and the loop goes round again.
+fn interferingClock() u32 {
+    hook_calls += 1;
+    if (hook_calls == 1) {
+        hook_bucket.store(@as(u64, 1000) << 32 | 900, .release);
+        return 150;
+    }
+    return 950;
+}
+
+test "docker api: a compare-and-swap that loses goes round again with a new reading and the new bucket" {
+    const lim: Limits = .{ .rate_per_s = 10, .burst = 5 };
+    var bucket: std.atomic.Value(u64) = .init(@as(u64, 3000) << 32 | 100);
+    hook_bucket = &bucket;
+    hook_calls = 0;
+    try testing.expectEqual(@as(?u32, null), takeToken(&bucket, lim, interferingClock));
+    try testing.expectEqual(@as(u32, 2), hook_calls);
+    // 1000 left by the other thread at 900, 50 ms to 950 at 10 a second: 500 more, one taken.
+    try testing.expectEqual(@as(u64, 500), bucket.load(.acquire) >> 32);
+    try testing.expectEqual(@as(u32, 950), @as(u32, @truncate(bucket.load(.acquire))));
+}
+
+test "docker api: settle returns at once for an idle connection opened before the first settle, and for one that answered one" {
+    var f = try Fixture.start(test_cfg);
+    defer _ = f.finish();
+    const idle = try connect(f.path);
+    defer _ = linux.close(idle);
+    const one = try askOn(idle, "GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n", 1000);
+    testing.allocator.free(one.text);
+    // A connection that has not said a word, too.
+    const silent = try connect(f.path);
+    defer _ = linux.close(silent);
+    var round: usize = 0;
+    while (round < 4) : (round += 1) {
+        errdefer std.debug.print("ERROR settle round {d}\n", .{round});
+        const t0 = nowMs();
+        f.server.settle();
+        try testing.expect(nowMs() - t0 < 300);
+    }
+    // Still served after them.
+    const again = try askOn(idle, "GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n", 1000);
+    defer testing.allocator.free(again.text);
+    try testing.expectEqual(@as(u16, 200), statusOf(again.text));
 }
