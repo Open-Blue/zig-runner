@@ -423,6 +423,11 @@ jobs:
     env:
       ZIG_RUNNER_REQUIRE_NATIVE: "1"
       ZIG_TEST_SANITIZE_THREAD: "1"
+      # The store stress test's own default (30 s, 15 s for its deferred half) is too short under
+      # ThreadSanitizer: one 15 s run had 10 volume jobs, none evicted between jobs, so its coverage
+      # check (volume_new > 3) failed. Twice the time keeps the check meaningful; the store-stress
+      # job below is the long run.
+      ZIG_TEST_STORE_STRESS_SECONDS: "60"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
