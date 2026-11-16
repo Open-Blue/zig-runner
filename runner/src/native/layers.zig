@@ -45,8 +45,11 @@ pub const Store = struct {
 
     /// The layer stored under `key`, held for the job, or null.
     pub fn get(s: Store, arena: Allocator, io: std.Io, hex: []const u8) !?[]const u8 {
-        const hit = (try s.store.open(arena, io, try s.key(hex))) orelse return null;
-        try s.held.append(s.held_arena orelse arena, hit.layer.lock);
+        // What the store and the held list keep (a sync log's names too) is the job's, whatever
+        // arena the call has.
+        const a = s.held_arena orelse arena;
+        const hit = (try s.store.open(a, io, try s.key(hex))) orelse return null;
+        try s.held.append(a, hit.layer.lock);
         return hit.layer.fs;
     }
 
@@ -70,21 +73,22 @@ pub const Store = struct {
     /// publish, would empty the entry the rename makes visible (proofs/tla/StoreLocking.tla).
     pub fn publish(s: Store, arena: Allocator, io: std.Io, built: []const u8, hex: []const u8) ![]const u8 {
         const k = try s.key(hex);
-        const key_lock = try s.store.lockKey(arena, io, k, s.stop);
+        const a = s.held_arena orelse arena;
+        const key_lock = try s.store.lockKey(a, io, k, s.stop);
         defer key_lock.close(io);
         // Looked up first, under the lock: a layer another builder stored is used, and one that
         // is not there cannot appear before this publish. Publishing first and looking up on a
         // refused rename failed the build when a collect evicted the other builder's layer in
         // between (the store's stress test, `store_stress.zig`).
-        if (try s.store.open(arena, io, k)) |first| {
+        if (try s.store.open(a, io, k)) |first| {
             P2Store.removeTree(arena, io, built);
-            try s.held.append(s.held_arena orelse arena, first.layer.lock);
+            try s.held.append(a, first.layer.lock);
             return first.layer.fs;
         }
         // Kind `fetch`: a tree with an empty record, never replayed as a step's (P2 has no
         // `build` kind yet).
-        const layer = try s.store.publish(arena, io, k, .fetch, built, .{ .log = "", .fc = "" });
-        try s.held.append(s.held_arena orelse arena, layer.lock);
+        const layer = try s.store.publish(a, io, k, .fetch, built, .{ .log = "", .fc = "" });
+        try s.held.append(a, layer.lock);
         return layer.fs;
     }
 };
@@ -199,7 +203,8 @@ test "a build's own arena, freed after each call, never holds up the job's list 
     try P2Store.prepare(job_arena, io, root, .{ .check_parents = false });
     var held: std.ArrayList(std.Io.File) = .empty;
     defer for (held.items) |f| f.close(io);
-    const store: Store = .{ .dir = root, .store = .{ .root = root }, .held = &held, .held_arena = job_arena, .scope = "repo", .userns = "mapped" };
+    const log = P2Store.newSyncLog(job_arena).?;
+    const store: Store = .{ .dir = root, .store = .{ .root = root, .sync_log = log }, .held = &held, .held_arena = job_arena, .scope = "repo", .userns = "mapped" };
     var n: usize = 0;
     while (n < 40) : (n += 1) {
         // Each build's call has an arena of its own, gone before the next.
@@ -212,4 +217,6 @@ test "a build's own arena, freed after each call, never holds up the job's list 
         try std.testing.expect(try store.get(call.allocator(), io, key) != null);
     }
     try std.testing.expect(held.items.len >= 40);
+    // What the store's sync log noted is the job's, readable after every call's arena is gone.
+    for (log.since.items) |name| try std.testing.expectEqual(@as(usize, 64), name.len);
 }
