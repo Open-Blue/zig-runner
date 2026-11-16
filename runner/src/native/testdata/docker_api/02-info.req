@@ -1,0 +1,8 @@
+HEAD /_ping HTTP/1.1
+Host: api.moby.localhost
+User-Agent: Docker-Client/29.9.3 (linux)
+
+GET /v1.52/info HTTP/1.1
+Host: api.moby.localhost
+User-Agent: Docker-Client/29.9.3 (linux)
+

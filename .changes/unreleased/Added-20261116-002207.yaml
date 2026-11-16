@@ -1,0 +1,3 @@
+kind: Added
+body: 'Native jobs can have a Docker-compatible API of their own (#448, stage 1a): RUNNER_NATIVE_DOCKER_API=true (off by default; nothing changes while it is off) serves a unix socket per job, bound into every step at /var/run/docker.sock with DOCKER_HOST and DOCKER_BUILDKIT=0 set (a workflow''s env: wins), torn down with the job and never the host''s. It answers /_ping, /version and /info for the CLI; every other endpoint, builds included until stage 1b, gets HTTP 501 ''not supported by zig-runner yet: <METHOD> <path>'', and BuildKit''s endpoints a hint. Requests are bounded and time out; a job that used the API logs one kind=native_docker_api line. See docs/OPERATIONS.md and docs/native-backend.md.'
+time: 2026-11-16T00:22:07.50125022-05:00
