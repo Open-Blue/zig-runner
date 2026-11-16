@@ -185,6 +185,9 @@ default_working_directory: ?[]const u8 = null,
 /// Watches each step for a stop; post and pre scripts are bracketed too, so a stop of one does not
 /// run over the next.
 watch: ?*@import("../dagger.zig").Watch = null,
+/// The first wait before a remote action's fetch is tried again after a network failure
+/// (`fetch_retry.zig`); a test's is a millisecond.
+fetch_backoff_ms: i64 = @import("fetch_retry.zig").default_base_ms,
 /// The job runs on the native backend: each exec goes there instead of to Dagger
 /// (`Backend.execScript`), and so do reads of the container's files.
 native: ?*Backend = null,

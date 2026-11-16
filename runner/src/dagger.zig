@@ -799,6 +799,8 @@ pub const Options = struct {
     /// transport.
     test_session_argv: ?[]const []const u8 = null,
     test_transport: ?Transport = null,
+    /// Tests: the first wait before a remote action's fetch is tried again (`fetch_retry.zig`).
+    test_fetch_backoff_ms: i64 = @import("dagger/fetch_retry.zig").default_base_ms,
     /// Tests: this job's `ran_env` value instead of a random one.
     test_ran_marker: ?[]const u8 = null,
     /// Tests: what a minute of `timeout-minutes` is, in ms.
@@ -2406,6 +2408,7 @@ fn runStepsPaused(
     x.container_path = base.runtime_path;
     x.timeout_unit_ms = opts.test_timeout_unit_ms;
     x.native = native;
+    x.fetch_backoff_ms = opts.test_fetch_backoff_ms;
     x.tool_trees = base.tool_trees;
     // A native job's tool cache is its `toolcache` volume, in no layer, so a replayed step that
     // points at a tree there runs again (#229), unless "Set up job" checked a tree that holds it

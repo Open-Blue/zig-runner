@@ -53,6 +53,7 @@ comptime {
     _ = @import("proc_stats.zig");
     _ = @import("github/net_hooks.zig");
     _ = @import("dagger/step_end.zig");
+    _ = @import("dagger/fetch_retry.zig");
     _ = @import("github/request_log.zig");
     _ = @import("native/sync_choice.zig");
     _ = @import("native/sandbox.zig");
