@@ -4490,11 +4490,20 @@ test "allocation failures: a tree's size and digest, its ids shifted, layers fla
         // flattens them into an `out` of its own. Made again for every run, as they were, the
         // `syncfs` that makes a size dependable took most of the test's 20 seconds, 300 times.
         var base: []const u8 = "";
+        var setup_a: Allocator = undefined;
+        var generation: usize = 0;
+        /// What the trees held when made: a run that failed may have left them changed (an
+        /// `unshift` that stopped half way), and the next finds that out here and makes them
+        /// again, so that no run starts from a damaged one.
+        var made_size: TreeSize = undefined;
+        var made_digest: Key = undefined;
+        var remade: usize = 0;
         var lower: []const u8 = "";
         var upper: []const u8 = "";
 
-        fn prepare(ma: Allocator, root_: []const u8) !void {
-            base = try std.fmt.allocPrint(ma, "{s}/trees", .{root_});
+        fn makeTrees(ma: Allocator, root_: []const u8) !void {
+            generation += 1;
+            base = try std.fmt.allocPrint(ma, "{s}/trees{d}", .{ root_, generation });
             try std.Io.Dir.cwd().createDirPath(io, base);
             lower = try failureTree(io, base, "lower", ma);
             upper = try failureTree(io, base, "upper", ma);
@@ -4506,18 +4515,26 @@ test "allocation failures: a tree's size and digest, its ids shifted, layers fla
             const base_fd = try openRoot(ma, base);
             defer _ = linux.close(base_fd);
             try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.syncfs(base_fd)));
+            made_size = try treeSize(ma, io, upper);
+            made_digest = try treeDigest(ma, io, upper, .content, Ids.host);
         }
 
         /// Each answers as it does with memory, or runs out of it.
-        fn run(a: Allocator, _: []const u8) !void {
+        fn run(a: Allocator, root_: []const u8) !void {
             runs += 1;
             var made: std.heap.ArenaAllocator = .init(std.testing.allocator);
             defer made.deinit();
             const ma = made.allocator();
             // What the trees measure now, with memory: a run before this one may have touched the
             // metadata (the ids set again), which the next is held to as it finds it.
-            const want_size = try treeSize(ma, io, upper);
-            const want_digest = try treeDigest(ma, io, upper, .content, Ids.host);
+            var want_size = try treeSize(ma, io, upper);
+            var want_digest = try treeDigest(ma, io, upper, .content, Ids.host);
+            if (!std.meta.eql(want_size, made_size) or !std.mem.eql(u8, &want_digest, &made_digest)) {
+                remade += 1;
+                try makeTrees(setup_a, root_);
+                want_size = made_size;
+                want_digest = made_digest;
+            }
             const want_meta = try treeDigest(ma, io, upper, .metadata, Ids.host);
 
             var scratch: af.Scratch = .init(a);
@@ -4540,6 +4557,7 @@ test "allocation failures: a tree's size and digest, its ids shifted, layers fla
             try std.testing.expectEqualSlices(u8, &want_digest, &(try treeDigest(ma, io, out, .content, Ids.host)));
         }
     };
-    try S.prepare(setup.allocator(), root);
+    S.setup_a = setup.allocator();
+    try S.makeTrees(S.setup_a, root);
     try af.checkOne(S.run, .{root});
 }

@@ -68,6 +68,8 @@ const run_edges = 8;
 /// The most runs of a sweep (each a whole operation) a default run makes; past it, the first and
 /// last `run_edges` and an even spread of the sites between.
 const max_runs = 48;
+/// A run with more allocations than this, all from one site, has no stack traces to go by.
+const blind_min = 16;
 
 fn isEdge(i: usize, n: usize) bool {
     return i < run_edges or i + run_edges >= n;
@@ -100,6 +102,14 @@ fn sample(sites: []const u64, n: usize) ![]bool {
     var totals: std.AutoHashMapUnmanaged(u64, u32) = .empty;
     defer totals.deinit(gpa);
     for (sites) |site| (try totals.getOrPutValue(gpa, site, 0)).value_ptr.* += 1;
+    // One site for many allocations is no sampling to trust: the stacks came back empty (no frame
+    // pointers, a build that cannot unwind), and every allocation looks the same. Then by stride:
+    // every allocation is a candidate, spread evenly to `max_runs` below.
+    const blind = n > blind_min and totals.count() == 1;
+    if (blind) {
+        std.debug.print("allocation failures: {d} allocations and one site (no stack traces?): sampled by stride\n", .{n});
+        @memset(keep, true);
+    }
     var seen: std.AutoHashMapUnmanaged(u64, u32) = .empty;
     defer seen.deinit(gpa);
     for (sites, keep, 0..) |site, *k, i| {
@@ -108,6 +118,7 @@ fn sample(sites: []const u64, n: usize) ![]bool {
             e.value_ptr.* += 1;
             break :blk e.value_ptr.*;
         };
+        if (blind) continue;
         k.* = isEdge(i, n) or visit <= site_first or
             std.math.isPowerOfTwo(visit) or visit == totals.get(site).?;
     }
@@ -387,6 +398,37 @@ pub const FailOnce = struct {
         o.child.rawFree(memory, alignment, ra);
     }
 };
+
+test "allocation failures: with no stack traces the sample falls back to a stride, and with them it follows the sites" {
+    const n = 300;
+    // Empty traces: one site for every allocation. Not 16 and a few, but the cap, spread out.
+    const blind: [n]u64 = @splat(7);
+    const keep = try sample(&blind, n);
+    defer gpa.free(keep);
+    var picked: usize = 0;
+    var middle: usize = 0;
+    for (keep, 0..) |k, i| {
+        picked += @intFromBool(k);
+        middle += @intFromBool(k and !isEdge(i, n));
+    }
+    try std.testing.expectEqual(@as(usize, max_runs), picked);
+    // Spread over the run, not bunched at its start: one in each sixth, at the least.
+    for (0..6) |sixth| {
+        var in_sixth: usize = 0;
+        for (keep[sixth * n / 6 ..][0 .. n / 6]) |k| in_sixth += @intFromBool(k);
+        try std.testing.expect(in_sixth >= 4);
+    }
+    // Two sites alternating, each visited 150 times: told apart, so by visits (3, powers of two,
+    // the last) and not by stride.
+    var told: [n]u64 = undefined;
+    for (&told, 0..) |*t, i| t.* = i % 2;
+    const by_site = try sample(&told, n);
+    defer gpa.free(by_site);
+    var kept: usize = 0;
+    for (by_site) |k| kept += @intFromBool(k);
+    try std.testing.expect(kept < max_runs);
+    try std.testing.expect(by_site[0] and by_site[1] and by_site[n - 1]);
+}
 
 test "allocation failures: a leak after one failure is found" {
     const S = struct {
