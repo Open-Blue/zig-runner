@@ -64,11 +64,17 @@ pub const Limits = struct {
     /// Requests answered on one connection.
     max_requests: u32 = 1000,
     max_connections: usize = 8,
+    /// Requests a second the job's API answers, and how many it takes in a burst: a request that
+    /// finds none left is 429. The server's work is the runner's, outside the job's CPU limit.
+    rate_per_s: u32 = 100,
+    burst: u32 = 200,
 };
 
 pub const Config = struct {
-    /// The job, named in `/info` (`Name`) and in the log line.
+    /// The job's id (its directory's name), `ID` in `/info` and what tells two jobs' APIs apart.
     job: []const u8,
+    /// The job's own hostname (`--hostname`), `Name` in `/info`; "" for a neutral one.
+    hostname: []const u8 = "",
     /// The runner's version, as `--version` prints it.
     version: []const u8,
     limits: Limits = .{},
@@ -86,6 +92,11 @@ pub const Stats = struct {
     timeouts: u32 = 0,
     /// Turned away for want of a free connection.
     busy: u32 = 0,
+    /// Answered 429: over the job's request budget.
+    limited: u32 = 0,
+    /// Requests that were anything but a 200 (`/_ping`, `/version`, `/info`) answered: those that
+    /// would have an effect once there are any (1b), which the step cache must not replay.
+    beyond: u32 = 0,
 };
 
 pub const Server = struct {
@@ -97,6 +108,11 @@ pub const Server = struct {
     wake_fd: linux.fd_t,
     thread: std.Thread = undefined,
     slots: []Slot,
+    /// `/version` and `/info`, made once at the start: a client asking again costs a copy.
+    version_body: []const u8,
+    info_body: []const u8,
+    /// The request budget: milli-tokens in the high half, the `nowMs` of the last refill below.
+    bucket: std.atomic.Value(u64),
     counters: struct {
         connections: std.atomic.Value(u32) = .init(0),
         requests: std.atomic.Value(u32) = .init(0),
@@ -104,6 +120,8 @@ pub const Server = struct {
         refused: std.atomic.Value(u32) = .init(0),
         timeouts: std.atomic.Value(u32) = .init(0),
         busy: std.atomic.Value(u32) = .init(0),
+        limited: std.atomic.Value(u32) = .init(0),
+        beyond: std.atomic.Value(u32) = .init(0),
     } = .{},
 
     const Slot = struct {
@@ -134,6 +152,14 @@ pub const Server = struct {
         errdefer gpa.free(own_cfg.job);
         own_cfg.version = try gpa.dupe(u8, cfg.version);
         errdefer gpa.free(own_cfg.version);
+        own_cfg.hostname = try gpa.dupe(u8, cfg.hostname);
+        errdefer gpa.free(own_cfg.hostname);
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        const version_body = try gpa.dupe(u8, try versionJson(arena.allocator(), own_cfg));
+        errdefer gpa.free(version_body);
+        const info_body = try gpa.dupe(u8, try infoJson(arena.allocator(), own_cfg));
+        errdefer gpa.free(info_body);
         for (slots) |*sl| sl.* = .{};
         s.* = .{
             .gpa = gpa,
@@ -142,6 +168,9 @@ pub const Server = struct {
             .listen_fd = lfd,
             .wake_fd = wfd,
             .slots = slots,
+            .version_body = version_body,
+            .info_body = info_body,
+            .bucket = .init(@as(u64, cfg.limits.burst) * 1000 << 32 | (nowMs() & 0xffff_ffff)),
         };
         s.thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, acceptLoop, .{s});
         return s;
@@ -160,6 +189,9 @@ pub const Server = struct {
         gpa.free(s.path);
         gpa.free(s.cfg.job);
         gpa.free(s.cfg.version);
+        gpa.free(s.cfg.hostname);
+        gpa.free(s.version_body);
+        gpa.free(s.info_body);
         gpa.free(s.slots);
         gpa.destroy(s);
         return st;
@@ -174,7 +206,25 @@ pub const Server = struct {
             .refused = c.refused.load(.acquire),
             .timeouts = c.timeouts.load(.acquire),
             .busy = c.busy.load(.acquire),
+            .limited = c.limited.load(.acquire),
+            .beyond = c.beyond.load(.acquire),
         };
+    }
+
+    /// Takes one request from the budget: false when there is none left.
+    fn admit(s: *Server) bool {
+        const lim = s.cfg.limits;
+        const now: u32 = @truncate(nowMs());
+        var old = s.bucket.load(.acquire);
+        while (true) {
+            const tokens: u64 = old >> 32;
+            const last: u32 = @truncate(old);
+            const refill = @as(u64, now -% last) * lim.rate_per_s;
+            const have = @min(@as(u64, lim.burst) * 1000, tokens + refill);
+            if (have < 1000) return false;
+            const next = (have - 1000) << 32 | now;
+            old = s.bucket.cmpxchgWeak(old, next, .acq_rel, .acquire) orelse return true;
+        }
     }
 
     fn bump(s: *Server, comptime field: []const u8) void {
@@ -204,7 +254,13 @@ pub const Server = struct {
             }
             // A refusal (a connection that went, no descriptors left) is tried again when the next
             // one arrives.
-            const fd = fdOf(linux.accept4(s.listen_fd, null, null, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK)) catch continue;
+            const fd = fdOf(linux.accept4(s.listen_fd, null, null, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK)) catch {
+                // Out of descriptors or memory: the connection stays queued and the poll above
+                // would return at once, so wait a moment (or for the stop) instead of spinning.
+                var wake = [_]linux.pollfd{.{ .fd = s.wake_fd, .events = linux.POLL.IN, .revents = 0 }};
+                if (linux.poll(&wake, 1, accept_backoff_ms) > 0 and wake[0].revents != 0) return;
+                continue;
+            };
             s.bump("connections");
             const slot = s.freeSlot() orelse {
                 s.bump("busy");
@@ -236,6 +292,8 @@ pub const Server = struct {
         return free;
     }
 };
+
+const accept_backoff_ms = 100;
 
 const busy_answer = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n" ++
     "Content-Length: 46\r\nConnection: close\r\n\r\n" ++
@@ -403,6 +461,7 @@ fn serve(s: *Server, fd: linux.fd_t, arena: *std.heap.ArenaAllocator) void {
         const end = while (true) {
             if (std.mem.indexOf(u8, head_buf[0..have], "\r\n\r\n")) |i| break i + 4;
             if (have == head_buf.len) {
+                s.bump("refused");
                 _ = reply(s, fd, arena.allocator(), 431, error_json(arena.allocator(), "request header too large"), false, false);
                 return;
             }
@@ -411,6 +470,7 @@ fn serve(s: *Server, fd: linux.fd_t, arena: *std.heap.ArenaAllocator) void {
                 .timeout => {
                     if (started) {
                         s.bump("timeouts");
+                        s.bump("refused");
                         _ = reply(s, fd, arena.allocator(), 408, error_json(arena.allocator(), "request timeout"), false, false);
                     }
                     return;
@@ -444,11 +504,27 @@ fn serve(s: *Server, fd: linux.fd_t, arena: *std.heap.ArenaAllocator) void {
         s.bump("requests");
         served += 1;
         const has_body = req.chunked or (req.content_length orelse 0) > 0;
-        const answer = route(a, s.cfg, req.method, req.target) catch Answer.oom;
+        const answer = if (s.admit())
+            route(a, s, req.method, req.target) catch Answer.oom
+        else
+            error_json_status(a, 429, "too many requests to this job's Docker API: slow down (the budget is " ++
+                "100 a second, refilled continuously)");
         switch (answer.status) {
-            501 => s.bump("unsupported"),
-            400...499 => s.bump("refused"),
-            else => {},
+            200 => {},
+            429 => {
+                s.bump("limited");
+                s.bump("refused");
+                s.bump("beyond");
+            },
+            501 => {
+                s.bump("unsupported");
+                s.bump("beyond");
+            },
+            400...428, 430...499 => {
+                s.bump("refused");
+                s.bump("beyond");
+            },
+            else => s.bump("beyond"),
         }
         // A request with a body is answered and the connection closed: the body is not kept.
         const keep = req.keep_alive and !has_body and served < lim.max_requests;
@@ -561,6 +637,12 @@ const Answer = struct {
     const oom: Answer = .{ .status = 500, .body = "{\"message\":\"out of memory\"}\n" };
 };
 
+fn error_json_status(a: Allocator, status: u16, message: []const u8) Answer {
+    var ans = error_json(a, message);
+    ans.status = status;
+    return ans;
+}
+
 fn error_json(a: Allocator, message: []const u8) Answer {
     return .{ .status = 0, .body = jsonMessage(a, message) catch "{\"message\":\"error\"}\n" };
 }
@@ -587,6 +669,7 @@ fn reasonOf(status: u16) []const u8 {
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         501 => "Not Implemented",
+        429 => "Too Many Requests",
         503 => "Service Unavailable",
         else => "Error",
     };
@@ -595,41 +678,73 @@ fn reasonOf(status: u16) []const u8 {
 /// The prefix `/vMAJOR.MINOR` of `path`, if it has one: its version, and the path after it.
 const Versioned = struct { major: u32, minor: u32, rest: []const u8 };
 
-fn versionPrefix(path: []const u8) ?Versioned {
-    if (path.len < 4 or path[0] != '/' or path[1] != 'v') return null;
+const Prefix = union(enum) { none, malformed, ok: Versioned };
+
+/// A number as Docker's clients write one: one to three digits, no sign, no leading zero.
+fn canonical(text: []const u8) ?u32 {
+    if (text.len == 0 or text.len > 3) return null;
+    if (text.len > 1 and text[0] == '0') return null;
+    for (text) |ch| if (!std.ascii.isDigit(ch)) return null;
+    return std.fmt.parseInt(u32, text, 10) catch null;
+}
+
+/// `/v` and a digit start a version; a segment that starts one and is not `N.N` canonically (`/v1.+40`,
+/// `/v01.052`, `/v1.99999`) is `.malformed`, any other path has none.
+fn versionPrefix(path: []const u8) Prefix {
+    if (path.len < 3 or path[0] != '/' or path[1] != 'v' or !std.ascii.isDigit(path[2])) return .none;
     const end = std.mem.indexOfScalarPos(u8, path, 1, '/') orelse path.len;
     const ver = path[2..end];
-    const dot = std.mem.indexOfScalar(u8, ver, '.') orelse return null;
-    const major = std.fmt.parseInt(u32, ver[0..dot], 10) catch return null;
-    const minor = std.fmt.parseInt(u32, ver[dot + 1 ..], 10) catch return null;
-    return .{ .major = major, .minor = minor, .rest = path[end..] };
+    const dot = std.mem.indexOfScalar(u8, ver, '.') orelse return .none;
+    const major = canonical(ver[0..dot]) orelse return .malformed;
+    const minor = canonical(ver[dot + 1 ..]) orelse return .malformed;
+    return .{ .ok = .{ .major = major, .minor = minor, .rest = path[end..] } };
+}
+
+/// `text` as UTF-8 for a JSON string: a byte that is not part of a valid sequence becomes U+FFFD,
+/// and what is past `max` bytes is cut at a character boundary.
+fn cleanText(a: Allocator, text: []const u8, max: usize) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
+        const valid = n > 0 and i + n <= text.len and std.unicode.utf8ValidateSlice(text[i .. i + n]);
+        const piece: []const u8 = if (valid) text[i .. i + n] else "\u{FFFD}";
+        if (out.items.len + piece.len > max) break;
+        try out.appendSlice(a, piece);
+        i += if (valid) n else 1;
+    }
+    return out.items;
 }
 
 /// What `method target` is answered, for the server's config. A status of 0 in an `Answer` the
 /// caller makes itself (`error_json`) stands for the one it gives.
-fn route(a: Allocator, cfg: Config, method: []const u8, target: []const u8) !Answer {
+fn route(a: Allocator, s: *const Server, method: []const u8, target: []const u8) !Answer {
     const q = std.mem.indexOfScalar(u8, target, '?');
     var path = target[0 .. q orelse target.len];
     const query = if (q) |i| target[i + 1 ..] else "";
-    if (versionPrefix(path)) |v| {
-        if (v.major != 1 or v.minor > newest_minor) return failure(a, 400, try std.fmt.allocPrint(
-            a,
-            "client version {d}.{d} is too new. Maximum supported API version is " ++ api_version,
-            .{ v.major, v.minor },
-        ));
-        if (v.minor < oldest_minor) return failure(a, 400, try std.fmt.allocPrint(
-            a,
-            "client version {d}.{d} is too old. Minimum supported API version is " ++
-                min_api_version ++ ", please upgrade your client to a newer version",
-            .{ v.major, v.minor },
-        ));
-        path = if (v.rest.len == 0) "/" else v.rest;
+    switch (versionPrefix(path)) {
+        .none => {},
+        .malformed => return failure(a, 400, "invalid API version prefix: a version is /v1.NN, with no sign or leading zero"),
+        .ok => |v| {
+            if (v.major != 1 or v.minor > newest_minor) return failure(a, 400, try std.fmt.allocPrint(
+                a,
+                "client version {d}.{d} is too new. Maximum supported API version is " ++ api_version,
+                .{ v.major, v.minor },
+            ));
+            if (v.minor < oldest_minor) return failure(a, 400, try std.fmt.allocPrint(
+                a,
+                "client version {d}.{d} is too old. Minimum supported API version is " ++
+                    min_api_version ++ ", please upgrade your client to a newer version",
+                .{ v.major, v.minor },
+            ));
+            path = if (v.rest.len == 0) "/" else v.rest;
+        },
     }
     const is_get = std.mem.eql(u8, method, "GET");
     if ((is_get or std.mem.eql(u8, method, "HEAD")) and std.mem.eql(u8, path, "/_ping"))
         return .{ .status = 200, .body = "OK", .content_type = "text/plain; charset=utf-8" };
-    if (is_get and std.mem.eql(u8, path, "/version")) return .{ .status = 200, .body = try versionJson(a, cfg) };
-    if (is_get and std.mem.eql(u8, path, "/info")) return .{ .status = 200, .body = try infoJson(a, cfg) };
+    if (is_get and std.mem.eql(u8, path, "/version")) return .{ .status = 200, .body = s.version_body };
+    if (is_get and std.mem.eql(u8, path, "/info")) return .{ .status = 200, .body = s.info_body };
     // `docker buildx build` looks for its builder's container (`buildx_buildkit_<name>`) first.
     if (std.mem.eql(u8, path, "/grpc") or std.mem.eql(u8, path, "/session") or
         std.mem.startsWith(u8, path, "/containers/buildx_buildkit"))
@@ -640,11 +755,10 @@ fn route(a: Allocator, cfg: Config, method: []const u8, target: []const u8) !Ans
             return failure(a, 501, buildkit_hint);
         return failure(a, 501, build_stage_1b);
     }
-    const shown = if (path.len > 200) path[0..200] else path;
     return failure(a, 501, try std.fmt.allocPrint(
         a,
         "not supported by zig-runner yet: {s} {s}",
-        .{ if (method.len > 16) method[0..16] else method, shown },
+        .{ try cleanText(a, method, 16), try cleanText(a, path, 200) },
     ));
 }
 
@@ -769,7 +883,7 @@ fn infoJson(a: Allocator, cfg: Config) ![]const u8 {
         .HttpProxy = "",
         .HttpsProxy = "",
         .NoProxy = "",
-        .Name = cstr(&k.host),
+        .Name = if (cfg.hostname.len > 0) cfg.hostname else "zig-runner",
         .Labels = [_][]const u8{},
         .ExperimentalBuild = false,
         .ServerVersion = version,
@@ -802,12 +916,11 @@ fn reply(s: *Server, fd: linux.fd_t, a: Allocator, status: u16, answer: Answer, 
     var out: std.Io.Writer.Allocating = .init(a);
     out.writer.print(
         "HTTP/1.1 {d} {s}\r\nApi-Version: " ++ api_version ++ "\r\nBuilder-Version: 1\r\n" ++
-            "Docker-Experimental: false\r\nOstype: linux\r\nServer: zig-runner/{s} (linux)\r\n" ++
+            "Docker-Experimental: false\r\nOstype: linux\r\nServer: zig-runner (linux)\r\n" ++
             "Content-Type: {s}\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n",
         .{
             code,
             reasonOf(code),
-            std.mem.trimStart(u8, s.cfg.version, "v"),
             answer.content_type,
             answer.body.len,
             if (keep) "keep-alive" else "close",
@@ -1241,13 +1354,15 @@ test "docker api: with every connection busy the next is 503, and stop does not 
     const third = try ask(f.path, "GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n", 3000);
     defer testing.allocator.free(third.text);
     try testing.expectEqual(@as(u16, 503), statusOf(third.text));
+    const kept_path = try testing.allocator.dupe(u8, f.path);
+    defer testing.allocator.free(kept_path);
     const t0 = nowMs();
     const st = f.finish();
     try testing.expect(nowMs() - t0 < 1000);
     try testing.expectEqual(@as(u32, 1), st.busy);
     try testing.expectEqual(@as(u32, 3), st.connections);
     // The socket's file is gone with the server.
-    try testing.expectError(error.Connect, connect(f.path));
+    try testing.expectError(error.Connect, connect(kept_path));
 }
 
 test "docker api: a socket path past sun_path is bound through its directory" {
@@ -1293,7 +1408,7 @@ test "docker api: the log line's counts" {
     const c = try ask(f.path, "junk\r\n\r\n", 3000);
     testing.allocator.free(c.text);
     const st = f.finish();
-    try testing.expectEqual(Stats{ .connections = 3, .requests = 3, .unsupported = 1, .refused = 1 }, st);
+    try testing.expectEqual(Stats{ .connections = 3, .requests = 3, .unsupported = 1, .refused = 1, .beyond = 1 }, st);
 }
 
 // For recording a real `docker` CLI's traffic (`testdata/docker_api/`): with
@@ -1458,4 +1573,113 @@ test "docker api: a real docker CLI's traffic, replayed, is answered as it was (
             } else try testing.expectEqualStrings(w.body, g.body);
         }
     }
+}
+
+test "docker api: a path of bytes that are not UTF-8 or too long still makes a JSON message" {
+    var f = try Fixture.start(test_cfg);
+    defer _ = f.finish();
+    const bad = try get(f.path, "/\xff\xfe");
+    defer testing.allocator.free(bad);
+    try testing.expectEqual(@as(u16, 501), statusOf(bad));
+    var p = try std.json.parseFromSlice(std.json.Value, testing.allocator, bodyOf(bad), .{});
+    defer p.deinit();
+    try testing.expectEqualStrings("not supported by zig-runner yet: GET /\u{FFFD}\u{FFFD}", p.value.object.get("message").?.string);
+    // 300 bytes of a three-byte character: cut between characters, not inside one.
+    const long = try get(f.path, "/" ++ comptime repeat("\xe2\x82\xac", 100));
+    defer testing.allocator.free(long);
+    var q = try std.json.parseFromSlice(std.json.Value, testing.allocator, bodyOf(long), .{});
+    defer q.deinit();
+    const msg = q.value.object.get("message").?.string;
+    try testing.expect(std.unicode.utf8ValidateSlice(msg));
+    try testing.expect(std.mem.indexOf(u8, msg, "\u{FFFD}") == null);
+    try testing.expect(msg.len <= "not supported by zig-runner yet: GET ".len + 200);
+}
+
+test "docker api: only canonical version prefixes are accepted" {
+    var f = try Fixture.start(test_cfg);
+    defer _ = f.finish();
+    const prefix_error = "invalid API version prefix: a version is /v1.NN, with no sign or leading zero";
+    for ([_][]const u8{ "/v1.+40/_ping", "/v1.-40/_ping", "/v01.52/_ping", "/v1.052/_ping", "/v1.99999/_ping", "/v1234.1/_ping", "/v1./_ping", "/v1.4x/_ping" }) |target| {
+        errdefer std.debug.print("ERROR target {s}\n", .{target});
+        try expectMessage(&f, "GET", target, 400, prefix_error);
+    }
+    const ok = try get(f.path, "/v1.40/_ping");
+    defer testing.allocator.free(ok);
+    try testing.expectEqual(@as(u16, 200), statusOf(ok));
+}
+
+test "docker api: the Server header names no version, /info's Name is the job's hostname or a neutral one" {
+    var cfg = test_cfg;
+    cfg.hostname = "ci-box";
+    var f = try Fixture.start(cfg);
+    const ping = try get(f.path, "/_ping");
+    defer testing.allocator.free(ping);
+    try expectContains(ping, "Server: zig-runner (linux)\r\n");
+    try testing.expect(std.mem.indexOf(u8, ping, "9.9.9") == null);
+    const info = try get(f.path, "/info");
+    defer testing.allocator.free(info);
+    try expectContains(info, "\"Name\":\"ci-box\"");
+    _ = f.finish();
+    var g = try Fixture.start(test_cfg);
+    defer _ = g.finish();
+    const info2 = try get(g.path, "/info");
+    defer testing.allocator.free(info2);
+    try expectContains(info2, "\"Name\":\"zig-runner\"");
+}
+
+test "docker api: past its budget a job's API answers 429, counted, and refills" {
+    var cfg = test_cfg;
+    cfg.limits.rate_per_s = 20;
+    cfg.limits.burst = 5;
+    var f = try Fixture.start(cfg);
+    const fd = try connect(f.path);
+    defer _ = linux.close(fd);
+    const batch = comptime repeat("GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n", 12);
+    var heard: std.ArrayList(u8) = .empty;
+    defer heard.deinit(testing.allocator);
+    const until = nowMs() + 3000;
+    var first = true;
+    while (std.mem.count(u8, heard.items, "HTTP/1.1 ") < 12 and nowMs() < until) {
+        const part = try askOn(fd, if (first) batch else "", 100);
+        defer testing.allocator.free(part.text);
+        first = false;
+        try heard.appendSlice(testing.allocator, part.text);
+    }
+    try testing.expectEqual(@as(usize, 12), std.mem.count(u8, heard.items, "HTTP/1.1 "));
+    const limited = std.mem.count(u8, heard.items, "HTTP/1.1 429 ");
+    try testing.expect(limited >= 5 and limited <= 8);
+    try expectContains(heard.items, "too many requests to this job's Docker API");
+    // 20 a second: 100 ms later there are tokens again.
+    const later = try askOn(fd, "", 150);
+    testing.allocator.free(later.text);
+    const again = try askOn(fd, "GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n", 500);
+    defer testing.allocator.free(again.text);
+    try testing.expectEqual(@as(u16, 200), statusOf(again.text));
+    const st = f.finish();
+    try testing.expectEqual(limited, @as(usize, st.limited));
+    try testing.expect(st.beyond >= st.limited);
+}
+
+test "docker api: an oversized head is counted as refused, a stalled one as a timeout and refused" {
+    var cfg = test_cfg;
+    cfg.limits.header_bytes = 256;
+    cfg.limits.header_ms = 150;
+    var f = try Fixture.start(cfg);
+    const big = try ask(f.path, "GET /_ping HTTP/1.1\r\nX: " ++ comptime repeat("a", 400) ++ "\r\n\r\n", 3000);
+    testing.allocator.free(big.text);
+    const slow = try ask(f.path, "GET /_ping HTTP/1.1\r\n", 3000);
+    testing.allocator.free(slow.text);
+    const st = f.finish();
+    try testing.expectEqual(@as(u32, 2), st.refused);
+    try testing.expectEqual(@as(u32, 1), st.timeouts);
+}
+
+test "docker api: /version and /info are made once" {
+    var f = try Fixture.start(test_cfg);
+    defer _ = f.finish();
+    const a = try get(f.path, "/info");
+    defer testing.allocator.free(a);
+    const b = try get(f.path, "/info");
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings(bodyOf(a), bodyOf(b));
 }
