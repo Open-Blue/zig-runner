@@ -430,7 +430,8 @@ const Planning = struct {
         if (b.docker_api_state) |st| if (try st.baseOf(arena, ref)) |local| {
             return .{ .config = local.config, .id = if (p.digests) local.id else "" };
         };
-        switch (try find(arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, ref, b.image_tag_ttl_s, &b.held)) {
+        // `find` grows the job's list of held locks from the arena it is given: the job's.
+        switch (try find(b.arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, ref, b.image_tag_ttl_s, &b.held)) {
             .image => |i| return .{ .config = i, .id = if (p.digests) try baseId(arena, b.io, i) else "" },
             .missing => |w| {
                 why.* = w;
@@ -453,7 +454,15 @@ const Planning = struct {
     fn fetch(i: *dockerfile.Context, arena: Allocator, url: []const u8) anyerror!dockerfile.Fetched {
         const p: *Planning = @fieldParentPtr("context_iface", i);
         if (!p.digests) return .{ .file = "", .digest = @splat('0') };
-        const res = try net_client.fetch(arena, p.b.io, .{ .url = url, .max_response = max_add_bytes });
+        // A server that stalls ends the build at its limits (the job's own cancel is the step's end,
+        // which waits for them): no first byte or no byte for 30 s, 10 minutes in all.
+        const res = try net_client.fetch(arena, p.b.io, .{
+            .url = url,
+            .max_response = max_add_bytes,
+            .first_byte = .fromSeconds(30),
+            .read_idle = .fromSeconds(30),
+            .deadline = .fromSeconds(600),
+        });
         if (res.status != .ok) return error.BadStatus;
         var sum: [32]u8 = undefined;
         Sha256.hash(res.body, &sum, .{});
@@ -464,8 +473,9 @@ const Planning = struct {
     }
 };
 
-/// The most an `ADD` of a URL downloads, held in memory whole.
-const max_add_bytes = 256 << 20;
+/// The most an `ADD` of a URL downloads, held in memory whole (the build's own arena, for an API
+/// build, freed when it ends).
+const max_add_bytes = 128 << 20;
 
 /// The Dockerfile of `bd` read from `context` and planned, with the base images from the native
 /// store, the sources' content and the images' identity keyed (a build).
@@ -484,12 +494,11 @@ fn planBuild(b: *Backend, bd: Build, context: *layer_view.View) !dockerfile.Plan
 /// which is always the builder's to read, has been read through it.
 fn ignoreFiles(b: *Backend, bd: Build, context: *layer_view.View) !void {
     const always: []const []const u8 = if (std.fs.path.isAbsolutePosix(bd.dir)) &.{".git"} else &.{};
-    return ignoreFilesOf(b, bd.dockerfile, always, context);
+    return ignoreFilesOf(b, b.arena, bd.dockerfile, always, context);
 }
 
 /// `ignoreFiles` for the Dockerfile `dockerfile` and `always` left out whatever the ignore file says.
-fn ignoreFilesOf(b: *Backend, dockerfile_name: []const u8, always: []const []const u8, context: *layer_view.View) !void {
-    const arena = b.arena;
+fn ignoreFilesOf(b: *Backend, arena: Allocator, dockerfile_name: []const u8, always: []const []const u8, context: *layer_view.View) !void {
     var text: []const u8 = "";
     const specific = try std.fmt.allocPrint(arena, "{s}.dockerignore", .{dockerfile_name});
     for ([_][]const u8{ specific, ".dockerignore" }) |name| {
@@ -509,7 +518,7 @@ const max_dockerfile = 1 << 20;
 /// `text` planned: with a `context`, a build's (what the sources hold and what the images are
 /// keyed); without, only whether it can be built, with fixed keys and nothing downloaded.
 fn planText(b: *Backend, text: []const u8, context: ?*layer_view.View) !dockerfile.Plan {
-    return planTextFor(b, text, context, .action, .{});
+    return planTextFor(b, b.arena, text, context, .action, .{});
 }
 
 /// What a plan is for: a Docker action, whose image the runner then runs (as its `USER`), or the
@@ -518,12 +527,12 @@ const PlanFor = enum { action, api };
 
 fn planTextFor(
     b: *Backend,
+    arena: Allocator,
     text: []const u8,
     context: ?*layer_view.View,
     purpose: PlanFor,
     opts: dockerfile.Options,
 ) !dockerfile.Plan {
-    const arena = b.arena;
     const digests = context != null;
     const ins = switch (try dockerfile.parse(arena, text)) {
         .ok => |i| i,
@@ -725,6 +734,8 @@ pub const ApiRequest = struct {
     dockerfile: []const u8,
     options: dockerfile.Options,
     api: *const Api,
+    /// What the build allocates from: its own, freed when it ends (not the job's).
+    arena: Allocator,
     observer: ?*Observer = null,
     /// Set when the build is to stop (before each of its steps).
     cancel: ?*const std.atomic.Value(bool) = null,
@@ -746,7 +757,8 @@ pub const ApiBuilt = union(enum) {
 /// included as Docker's context has it, and the `RUN`s in the job's cgroup beside the step that
 /// asked. Layers are the store's, keyed with the job's trust scope, as an action's are.
 pub fn buildApi(b: *Backend, req: ApiRequest) !ApiBuilt {
-    const arena = b.arena;
+    const arena = req.arena;
+    defer b.build_reason = "";
     const ctx = (try layer_view.View.open(arena, b.io, &.{req.dir}, "", b.opaqueXattr())) orelse
         return .{ .failed = "the build context is empty" };
     defer ctx.close();
@@ -754,8 +766,8 @@ pub fn buildApi(b: *Backend, req: ApiRequest) !ApiBuilt {
     const df = (try ctx.resolve(req.dockerfile, true)) orelse return .{ .failed = missing };
     if (df.kind != .file) return .{ .failed = missing };
     const text = try df.parent().readFileAlloc(b.io, df.name, arena, .limited(max_dockerfile));
-    try ignoreFilesOf(b, req.dockerfile, &.{}, ctx);
-    const p = planTextFor(b, text, ctx, .api, req.options) catch |e| return switch (e) {
+    try ignoreFilesOf(b, arena, req.dockerfile, &.{}, ctx);
+    const p = planTextFor(b, arena, text, ctx, .api, req.options) catch |e| return switch (e) {
         error.Refused => .{ .failed = b.build_reason },
         else => e,
     };
@@ -767,6 +779,7 @@ pub fn buildApi(b: *Backend, req: ApiRequest) !ApiBuilt {
         .dir = b.dir,
         .store = b.store_cfg,
         .held = &b.held,
+        .held_arena = b.arena,
         .scope = b.scope,
         .userns = @tagName(b.how.userns),
     };

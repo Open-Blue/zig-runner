@@ -24,6 +24,9 @@ pub const Store = struct {
     store: P2Store,
     /// The locks of the layers in use, held until the job ends (`Backend.held`).
     held: *std.ArrayList(std.Io.File),
+    /// What `held` grows from, when the arena a call is given is not the job's (a build's own, freed
+    /// when it ends): the job's.
+    held_arena: ?Allocator = null,
     /// The job's trust scope (`set_up.packageCacheScope`: `repo` or `untrusted`), in every key.
     scope: []const u8,
     /// How the job's ids are mapped (the userns mode's name, as in `Backend.below`), in every key:
@@ -43,7 +46,7 @@ pub const Store = struct {
     /// The layer stored under `key`, held for the job, or null.
     pub fn get(s: Store, arena: Allocator, io: std.Io, hex: []const u8) !?[]const u8 {
         const hit = (try s.store.open(arena, io, try s.key(hex))) orelse return null;
-        try s.held.append(arena, hit.layer.lock);
+        try s.held.append(s.held_arena orelse arena, hit.layer.lock);
         return hit.layer.fs;
     }
 

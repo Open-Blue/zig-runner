@@ -219,6 +219,7 @@ fn sameThroughApi(b: *Backend, arena: Allocator, name: []const u8, ctx: []const 
         .dockerfile = "Dockerfile",
         .options = .{},
         .api = &api,
+        .arena = arena,
     });
     const image = switch (got) {
         .image => |i| i,

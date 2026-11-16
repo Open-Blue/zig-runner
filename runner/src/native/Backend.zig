@@ -356,6 +356,9 @@ pub const Config = struct {
     docker_api: bool = false,
     /// Tests only: how long the job's API holds a request before it routes and counts it.
     test_docker_api_delay_ms: u32 = 0,
+    /// Tests only: no engine to fall back to for a job that looks to need more than the Docker API
+    /// serves (`docker_api_job.jobNeedsDaemon`), as the tests' probes read the socket by `curl`.
+    test_engineless: bool = false,
     /// Past this many bytes, the store's least recently used layers go
     /// (`RUNNER_NATIVE_STORE_MAX_MB`, `Store.collect`).
     store_max_bytes: u64 = Store.default_max_bytes,
@@ -660,7 +663,7 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
     // serves it: with an engine to send it to, it goes there, as it would without the option. A
     // heuristic over the steps' scripts and `uses:` (`jobNeedsDaemon`): a command a script's own
     // tools run for it is not seen, and meets the 501 at run time.
-    if (cfg.docker_api and !opts.engineless and docker_api_job.jobNeedsDaemon(job.steps))
+    if (cfg.docker_api and !opts.engineless and !cfg.test_engineless and docker_api_job.jobNeedsDaemon(job.steps))
         return "a step uses Docker beyond what the native job's Docker API serves (`docker build`, " ++
             "`tag`, `rmi`, `image inspect`): `docker run`, `compose`, `push`, `pull`, `buildx` or a " ++
             "`docker/` action (RUNNER_NATIVE_DOCKER_API), which an engine runs";
@@ -2119,7 +2122,7 @@ pub fn execScript(
         const peak: ?cgroup.Peak = if (b.job_cgroup) |j| cgroup.Peak.open(j.stepsDir()) else null;
         defer if (peak) |p| p.close();
         const api_before = b.apiBeyond();
-        const ended = try b.exec(
+        const ended = try b.execStep(
             script,
             try b.envStrings(extra.items),
             files.items,
@@ -3089,7 +3092,20 @@ fn exec(
     gid: u32,
     out: sandbox.Output,
 ) !sandbox.Ended {
-    return b.execOn(&.{ "sh", "-c", script }, env, files, uid, gid, out, null);
+    return b.execIn(&.{ "sh", "-c", script }, env, files, uid, gid, out, null, true, false);
+}
+
+/// `exec` for a step's own script: the job's Docker API is open to it.
+fn execStep(
+    b: *Backend,
+    script: []const u8,
+    env: []const []const u8,
+    files: []const sandbox.Spec.File,
+    uid: u32,
+    gid: u32,
+    out: sandbox.Output,
+) !sandbox.Ended {
+    return b.execIn(&.{ "sh", "-c", script }, env, files, uid, gid, out, null, true, true);
 }
 
 /// `exec` of `argv`, in a Docker action's `container` when it has one (`docker_action.zig`):
@@ -3104,7 +3120,7 @@ pub fn execOn(
     out: sandbox.Output,
     container: ?sandbox.Spec.Container,
 ) !sandbox.Ended {
-    return b.execIn(argv, env, files, uid, gid, out, container, true);
+    return b.execIn(argv, env, files, uid, gid, out, container, true, true);
 }
 
 /// A Dockerfile's `RUN` in its `container` (`docker_action.zig`): what it writes goes to the
@@ -3119,7 +3135,7 @@ pub fn execBuild(
     out: sandbox.Output,
     container: sandbox.Spec.Container,
 ) !sandbox.Ended {
-    return b.execIn(argv, env, &.{}, uid, gid, out, container, false);
+    return b.execIn(argv, env, &.{}, uid, gid, out, container, false, false);
 }
 
 /// A `RUN` of a build the job's Docker API runs (`docker_api_handler.zig`), while a step of the job
@@ -3153,6 +3169,7 @@ fn execIn(
     out: sandbox.Output,
     container: ?sandbox.Spec.Container,
     new_layer: bool,
+    api: bool,
 ) !sandbox.Ended {
     const arena = b.arena;
     if (b.layers.items.len >= b.flatten_at) b.flattenTimed() catch |e| return if (e == error.LayerNotShifted) e else .{
@@ -3163,7 +3180,7 @@ fn execIn(
     // A container with an owner has its own idmaps of the job's directory (`sandbox.jobView`).
     const owned = if (container) |c| c.owner != null else false;
     const idmapped = new_layer and !owned and b.upperIdmapped() and b.idmappedUpper();
-    return b.runIn(argv, env, files, uid, gid, out, container, new_layer, idmapped, .{ .running = &b.running, .api = new_layer });
+    return b.runIn(argv, env, files, uid, gid, out, container, new_layer, idmapped, .{ .running = &b.running, .api = api });
 }
 
 /// How a `runIn` differs from a step's own.
@@ -3233,10 +3250,15 @@ fn runIn(
     const api_server: ?*docker_api.Server = if (mode.api) b.docker_api_server else null;
     // The backend is returned by value from `init`: its state was made with an address it no longer
     // has, and is given this one before anything can ask it for the job.
-    if (b.docker_api_state) |state| state.b = b;
+    if (api_server != null) if (b.docker_api_state) |state| {
+        state.b = b;
+    };
     if (api_server) |srv| srv.openGate();
-    defer if (api_server) |srv| if (!srv.closeGate()) {
-        logfmt.warn("native_docker_api", "job={s} a request of the step did not end in time", .{std.fs.path.basename(b.dir)});
+    // Closed (and every build of the step ended) before anything below touches the layers or the
+    // timings, which a build's RUN reads and writes: once, by the first of the two ways out.
+    var gate_open = api_server != null;
+    defer if (gate_open) if (api_server) |srv| {
+        _ = srv.closeGate();
     };
     const ended = try sandbox.run(arena, b.io, b.how.argv_prefix, .{
         .root = b.dir,
@@ -3268,6 +3290,10 @@ fn runIn(
         .container = container,
         .container_opts = b.sandbox_opts,
     }, mode.running, out);
+    if (api_server) |srv| {
+        gate_open = false;
+        if (!srv.closeGate()) logfmt.warn("native_docker_api", "job={s} the server stopped while a request of the step was in flight", .{std.fs.path.basename(b.dir)});
+    }
     b.timings.helper(arena, ended.helper, ended.spawned, ended.ended);
     if (new_layer) try b.layers.append(arena, .{ .name = upper, .path = upper_path, .canonical = idmapped });
     return ended;
@@ -5186,6 +5212,7 @@ pub fn testConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
 /// process of a test's own (`store_stress.zig`), whose jobs must key alike with the test's.
 pub fn testConfigAt(arena: Allocator, root: []const u8, exe: []const u8) !Config {
     return .{
+        .test_engineless = true,
         .rootfs = try std.fmt.allocPrint(arena, "{s}/rootfs", .{root}),
         .store = try std.fmt.allocPrint(arena, "{s}/store", .{root}),
         .self_exe = exe,
@@ -13033,6 +13060,7 @@ test "native docker api: a job that needs more than the API serves goes to the e
     defer tmp.cleanup();
     var cfg = try testConfig(arena, &tmp);
     cfg.docker_api = true;
+    cfg.test_engineless = false;
     const io = std.testing.io;
     const opts: dagger.Options = .{ .step_user = .root };
     const served = testJob(&.{ testStep("docker build -t x ."), testStep("docker image inspect x") });

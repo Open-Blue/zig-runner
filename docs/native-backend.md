@@ -2813,7 +2813,8 @@ index, the ID) are `native/docker_build.zig`; what answers for the job is `nativ
   shells, `xargs`, `make`/`just`/`npm`/`python` and the like, scripts by path or `*.sh`, a `$VAR`
   command or subcommand, `docker-compose`, `docker-buildx` and `podman` send it to Dagger; and so does
   every `uses:` but `actions/*` and `docker/metadata-action`, a local action included. A heuristic over
-  text, said so: it errs toward the engine, and a tool that calls docker behind its back meets a 501.
+  text, said so (also: `go|cargo|dotnet test`, `mvn`, `gradle`, `pytest`, `kind`, `find -exec`, `alias`, a
+  `curl` at `docker.sock`, and a `shell:` that is not bash or sh): it errs toward the engine, and a tool that calls docker behind its back meets a 501.
   No run-time rerun (a native job's steps have run, with effects).
 - **Tests**: `docker_build.zig`'s (`docker build:`: the query, references, the unpacker's escapes and
   limits, the index, the ID), `docker_api.zig`'s with a handler that builds nothing (`docker api:
@@ -3868,3 +3869,14 @@ it) makes the rest of the job's fetches use (and they do not run the git script 
   fallback: the pre-warm polling the socket and queueing for the engine's turn, the gate looking
   for the engine's cgroup, and a job sent to Dagger (`backToEngine`) hanging on a socket that is
   not there. The last is the one that mattered: it now fails at once with the reason native gave.
+
+**Review notes (stage 1b).** A build's `RUN` is stopped for good when its build is cancelled
+(`Running.stop`, which a helper that has no lifeline yet obeys as soon as it has one: no cancel is lost
+between the builder's look at the flag and its sandbox). The `RUN`'s output goes to the client in
+pieces of 256 bytes through one reused buffer (`docker_build.streamInto`); a client that does not
+read blocks the write, which fills the `RUN`'s output pipe, and after the write timeout the build is
+cancelled. A step's end closes the gate before it touches the job's layers and timings. Setuid and
+setgid bits of a context's files are not kept (Docker keeps them); a directory keeps sticky and
+setgid, and a context with more than 10,000 directories of a mode of their own fails. The runner's own
+scripts (seed, git config) never have the API. The soft limit of open files is raised to the hard one
+when a job's API starts, since a context's walk keeps a descriptor per directory it visits.

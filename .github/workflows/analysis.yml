@@ -405,7 +405,9 @@ jobs:
   # then as root with the service images) with ZIG_TEST_SANITIZE_THREAD=1 (zig-test.sh): the tests
   # and the runner binary they start for each step (`zig-runner native-step`), whose reports land
   # on its stderr, the step's failure. Both dynamically linked against glibc, as TSan's runtime
-  # needs; zig-test.sh says why not the release's static PIE.
+  # needs; zig-test.sh says why not the release's static PIE. The root pass is the one that runs the
+  # job's Docker API with its image builds beside a step (`native image build:`, `native docker api:`):
+  # the build worker's thread against the job's, which only root's tests start.
   tsan-native:
     name: ThreadSanitizer, native (${{ matrix.arch }})
     needs: scope

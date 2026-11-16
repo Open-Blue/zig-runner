@@ -166,6 +166,8 @@ pub const BuildCall = struct {
     query: docker_build.Query,
     /// The tar the client sent, a file of the job's directory that the server removes after.
     tar_path: []const u8,
+    /// Its size.
+    tar_bytes: u64,
     /// A name for the build, unique in the job: a directory name.
     id: u32,
     /// What the unpacked context may hold.
@@ -434,11 +436,16 @@ pub const Server = struct {
             // Until it has ended, whatever it takes: a build that kept running into the next step
             // would be counted against it (the builder and the unpacker look at the cancel
             // between their steps). Only the server's stop ends this wait early.
+            var rounds: u32 = 0;
             while (s.gate.load(.acquire) & ~gate_closed_bit != 0) {
                 if (!waitStop(s, 1)) {
                     clean = false;
                     break;
                 }
+                // The cancel again now and then: a sandbox that began after the first one is
+                // stopped by it too.
+                rounds += 1;
+                if (rounds % 100 == 0) if (s.cfg.handler) |h| h.cancelFn(h, null);
             }
         }
         // A request that did not end in time is one the step's count cannot be trusted about.
@@ -1582,7 +1589,7 @@ fn serveBuild(
         "Content-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
     sendAll(s, fd, head, lim.write_ms) catch return;
     var sink: Sink = .{ .server = s, .fd = fd };
-    var call: BuildCall = .{ .arena = a, .query = q, .tar_path = tar_path, .id = n, .limits = lim.context, .sink = &sink };
+    var call: BuildCall = .{ .arena = a, .query = q, .tar_path = tar_path, .tar_bytes = got, .id = n, .limits = lim.context, .sink = &sink };
     const done_rc = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(done_rc) != .SUCCESS) {
         sink.write(docker_build.errorLine(a, "the runner has no file descriptor left for the build") catch "");
@@ -1606,13 +1613,19 @@ fn serveBuild(
             .{ .fd = s.wake_fd, .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = if (cancelled) -1 else fd, .events = linux.POLL.IN | poll_rdhup, .revents = 0 },
         };
-        const rc = linux.poll(&fds, fds.len, -1);
+        const rc = linux.poll(&fds, fds.len, 200);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
             else => break,
         }
         if (fds[0].revents != 0) break;
+        // A client too slow to read (the sink's write timed out) is as good as gone.
+        if (!cancelled and sink.gone()) {
+            cancelled = true;
+            h.cancelFn(h, n);
+            continue;
+        }
         if (!cancelled) {
             var gone = fds[1].revents != 0 or sink.gone();
             if (fds[2].revents & (linux.POLL.HUP | linux.POLL.ERR | poll_rdhup) != 0) gone = true;
@@ -1624,6 +1637,8 @@ fn serveBuild(
             }
             if (gone) {
                 cancelled = true;
+                // A build still queued for the job's one builder never starts.
+                sink.failed.store(true, .release);
                 h.cancelFn(h, n);
             }
         } else if (fds[1].revents != 0) {

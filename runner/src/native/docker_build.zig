@@ -424,7 +424,12 @@ pub fn unpack(
                     why.* = try std.fmt.allocPrint(arena, "the directory {s} could not be made", .{try printable(arena, entry.name)});
                     return error.BadContext;
                 }
-                if (entry.mode & 0o777 != 0o755 and dirs.items.len < max_modes) {
+                if (entry.mode & 0o7777 != 0o755) {
+                    if (dirs.items.len >= max_modes) {
+                        why.* = try std.fmt.allocPrint(arena, "the context has more than {d} directories with " ++
+                            "a mode of their own", .{max_modes});
+                        return error.BadContext;
+                    }
                     const joined = try std.mem.join(arena, "/", parts);
                     try dirs.append(arena, .{ .path = joined, .mode = entry.mode });
                 }
@@ -463,7 +468,8 @@ pub fn unpack(
         defer if (fd != root) {
             _ = linux.close(fd);
         };
-        _ = linux.fchmod(fd, (d.mode & 0o777) | 0o700);
+        // A directory keeps its sticky and setgid bits, as Docker's context does.
+        _ = linux.fchmod(fd, (d.mode & 0o3777) | 0o700);
     }
     return done;
 }
@@ -523,7 +529,9 @@ fn writeFile(
         left -= n;
     }
     it.unread_file_bytes = 0;
-    // Its own mode, but never unreadable to the runner, which copies it; no setuid bits.
+    // Its own mode, but never unreadable to the runner, which copies it. A file's setuid and setgid
+    // bits are not kept (Docker keeps them in its context): a context is the client's to write, and
+    // what runs setuid in an image is its RUNs' to make.
     _ = linux.fchmod(fd, (entry.mode & 0o777) | 0o400);
 }
 
@@ -866,6 +874,61 @@ pub const Index = struct {
 /// One JSON message of a build's stream: `{"stream":"..."}`.
 pub fn streamLine(arena: Allocator, text: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "{f}\n", .{std.json.fmt(.{ .stream = text }, .{})});
+}
+
+/// The most bytes `streamInto` takes at once: its buffer is `stream_buffer` long.
+pub const stream_piece = 256;
+pub const stream_buffer = 6 * stream_piece + 16;
+
+/// `{"stream":"<text>"}` and a newline, written into `buf` (at least `stream_buffer` bytes, with
+/// `text` at most `stream_piece`): quotes, backslashes and control characters escaped, bytes that
+/// are no UTF-8 shown as U+FFFD. No allocation, so that a RUN's output of any size is a stream of
+/// one reused buffer.
+pub fn streamInto(buf: []u8, text: []const u8) []const u8 {
+    std.debug.assert(text.len <= stream_piece and buf.len >= stream_buffer);
+    var n: usize = 0;
+    const head = "{\"stream\":\"";
+    @memcpy(buf[0..head.len], head);
+    n = head.len;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        const esc: []const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            else => "",
+        };
+        if (esc.len > 0) {
+            @memcpy(buf[n..][0..esc.len], esc);
+            n += esc.len;
+        } else if (c < 0x20) {
+            const digits = "0123456789abcdef";
+            @memcpy(buf[n..][0..4], "\\u00");
+            buf[n + 4] = digits[c >> 4];
+            buf[n + 5] = digits[c & 15];
+            n += 6;
+        } else if (c < 0x80) {
+            buf[n] = c;
+            n += 1;
+        } else {
+            const len = std.unicode.utf8ByteSequenceLength(c) catch 0;
+            if (len > 0 and i + len <= text.len and std.unicode.utf8ValidateSlice(text[i .. i + len])) {
+                @memcpy(buf[n..][0..len], text[i .. i + len]);
+                n += len;
+                i += len;
+                continue;
+            }
+            @memcpy(buf[n..][0..3], "\xEF\xBF\xBD");
+            n += 3;
+        }
+        i += 1;
+    }
+    const tail = "\"}\n";
+    @memcpy(buf[n..][0..tail.len], tail);
+    return buf[0 .. n + tail.len];
 }
 
 /// `{"aux":{"ID":"sha256:..."}}`, which the CLI reads the image's ID from.
@@ -1293,4 +1356,31 @@ test "docker build: a directory keeps its mode with or without the slash; a canc
         try testing.expectError(error.BadContext, r.got);
         try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "out/b", .{}));
     }
+}
+
+test "docker build: a stream line is JSON in one reused buffer, whatever the bytes" {
+    var buf: [stream_buffer]u8 = undefined;
+    try testing.expectEqualStrings("{\"stream\":\"a\\\"b\\\\c\\n\\u0001\xc3\xa9\xef\xbf\xbd\"}\n", streamInto(&buf, "a\"b\\c\n\x01\xc3\xa9\xff"));
+    // The worst case fits, and parses.
+    const worst: [stream_piece]u8 = @splat(0x01);
+    const line = streamInto(&buf, &worst);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), line, .{});
+    try testing.expectEqual(@as(usize, stream_piece), v.object.get("stream").?.string.len);
+}
+
+test "docker build: more directories with a mode of their own than the cap fail the context, a sticky bit stays" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tar = try tarOf(arena, &.{
+        .{ .name = "tmp/", .kind = '5', .mode = 0o1777 },
+    });
+    const r = try unpackTest(arena, &tmp, tar, .{});
+    _ = try r.got;
+    const st = try tmp.dir.statFile(testing.io, "out/tmp", .{});
+    try testing.expectEqual(@as(u32, 0o1777), std.math.lossyCast(u32, st.permissions.toMode() & 0o7777));
 }

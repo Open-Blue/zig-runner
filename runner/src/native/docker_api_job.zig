@@ -62,6 +62,13 @@ pub const State = struct {
     };
 
     pub fn create(b: *Backend) !*State {
+        // A build's context is walked through a descriptor per directory it visits: the soft
+        // limit is raised to the hard one, as a runner that serves builds needs.
+        var lim: std.os.linux.rlimit = undefined;
+        if (std.os.linux.getrlimit(.NOFILE, &lim) == 0 and lim.cur < lim.max) {
+            lim.cur = lim.max;
+            _ = std.os.linux.setrlimit(.NOFILE, &lim);
+        }
         const st = try b.gpa.create(State);
         st.* = .{ .b = b, .gpa = b.gpa, .index = .init(b.gpa) };
         return st;
@@ -85,7 +92,9 @@ pub const State = struct {
         if (st.active) |a| if (id == null or id.? == a.id) {
             a.cancelled = true;
             a.flag.store(true, .release);
-            _ = a.running.kill(io);
+            // For good: a RUN that begins after this (between the builder's last look at the flag
+            // and its sandbox) is stopped as soon as it has a lifeline.
+            a.running.stop(io);
         };
     }
 
@@ -167,8 +176,18 @@ const Telling = struct {
 
     fn chunk(t: *Telling, bytes: []const u8) void {
         if (t.quiet) return;
-        const line = docker_build.streamLine(t.arena, bytes) catch return;
-        t.sink.write(line);
+        // A reused buffer, a piece at a time: the output of a RUN is never held. The write blocks
+        // when the client does not read (the RUN's output pipe then fills and the RUN waits), and
+        // fails after the server's write timeout, which cancels the build.
+        var buf: [docker_build.stream_buffer]u8 = undefined;
+        var off: usize = 0;
+        while (off < bytes.len) {
+            var end = @min(off + docker_build.stream_piece, bytes.len);
+            // Not in the middle of a character, when the next byte shows it.
+            while (end < bytes.len and end > off + 1 and bytes[end] & 0xC0 == 0x80) end -= 1;
+            t.sink.write(docker_build.streamInto(&buf, bytes[off..end]));
+            off = end;
+        }
     }
 
     fn say(t: *Telling, comptime fmt: []const u8, args: anytype) void {
@@ -242,10 +261,15 @@ fn run(st: *State, call: *docker_api.BuildCall) !void {
     const b = st.b;
     const a = call.arena;
     const q = call.query;
+    // What the build allocates is its own, freed when it ends: not the job's for its life.
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
     var active: State.Active = .{ .st = st, .id = call.id };
     active.api = .{ .running = &active.running, .out = undefined, .cancelledFn = cancelledOf };
     if (!st.begin(&active)) return fail(call, "the build was cancelled: the step that asked for it has ended");
     defer st.end();
+    // A client that left while the build waited its turn is not built for.
+    if (call.sink.gone()) return;
 
     // The tags first: a build is not made for a name it cannot give.
     var tags: std.ArrayList([]const u8) = .empty;
@@ -259,7 +283,7 @@ fn run(st: *State, call: *docker_api.BuildCall) !void {
     try std.Io.Dir.cwd().createDirPath(b.io, dir);
     defer Store.removeTree(a, b.io, dir);
     var why: []const u8 = "";
-    if (st.unpacked.load(.acquire) >= context_budget) return fail(call, "this job's builds have used " ++
+    if (st.unpacked.load(.acquire) +| call.tar_bytes > context_budget) return fail(call, "this job's builds have used " ++
         "the contexts the runner allows one job (4 GiB in all)");
     const unpacked = docker_build.unpack(a, b.io, dir, call.tar_path, call.limits, &active.flag, &why) catch |e| switch (e) {
         error.BadContext => return fail(call, why),
@@ -287,6 +311,7 @@ fn run(st: *State, call: *docker_api.BuildCall) !void {
         .dockerfile = q.dockerfile,
         .options = .{ .build_args = args.items, .target = q.target, .salt = salt, .labels = labels.items },
         .api = &active.api,
+        .arena = scratch.allocator(),
         .observer = &tell.observer,
         .cancel = &active.flag,
     });
@@ -457,10 +482,11 @@ fn isOptionWord(w: []const u8) bool {
 /// Commands that run other commands, or scripts, that may call `docker` where this cannot see.
 fn runsOthers(w: []const u8) bool {
     const names = [_][]const u8{
-        "eval",    "xargs",            "bash",      "sh",   "zsh", "dash",   "ksh",     "source",  ".",              "make",
-        "gmake",   "just",             "task",      "npm",  "npx", "yarn",   "pnpm",    "node",    "python",         "python3",
-        "ruby",    "perl",             "php",       "pwsh", "act", "podman", "nerdctl", "buildah", "docker-compose", "docker-buildx",
-        "ansible", "ansible-playbook", "terraform", "tox",  "nox",
+        "eval",    "xargs",            "bash",      "sh",   "zsh", "dash",     "ksh",     "source",  ".",              "make",
+        "gmake",   "just",             "task",      "npm",  "npx", "yarn",     "pnpm",    "node",    "python",         "python3",
+        "ruby",    "perl",             "php",       "pwsh", "act", "podman",   "nerdctl", "buildah", "docker-compose", "docker-buildx",
+        "ansible", "ansible-playbook", "terraform", "tox",  "nox", "alias",    "mvn",     "mvnw",    "gradle",         "gradlew",
+        "pytest",  "py.test",          "java",      "kind", "k3d", "minikube", "bun",     "deno",
     };
     for (names) |n| if (std.mem.eql(u8, w, n)) return true;
     // A script by its path or name, and a variable as the command.
@@ -483,6 +509,10 @@ fn runsOthers(w: []const u8) bool {
 /// that is not and calls Docker meets a 501. What it cannot see is what a command it allows runs
 /// behind the scenes (a tool that calls docker itself).
 pub fn needsDaemon(script: []const u8) ?[]const u8 {
+    // The daemon's socket by name: a `curl --unix-socket` at it, a volume of it.
+    if (std.mem.indexOf(u8, script, "docker.sock") != null) for ([_][]const u8{ "--unix-socket", "curl", "wget", "socat", "netcat", "python" }) |t| {
+        if (std.mem.indexOf(u8, script, t) != null) return "docker.sock";
+    };
     var i: usize = 0;
     var at_command = true;
     var redirect = false;
@@ -526,6 +556,8 @@ pub fn needsDaemon(script: []const u8) ?[]const u8 {
             redirect = false;
             continue;
         }
+        // `find -exec`, `xargs`-like, run what this cannot read.
+        if (std.mem.eql(u8, w, "-exec") or std.mem.eql(u8, w, "-execdir") or std.mem.eql(u8, w, "-ok")) return w;
         const base = if (std.mem.lastIndexOfScalar(u8, w, '/')) |s| w[s + 1 ..] else w;
         const is_docker = std.mem.eql(u8, base, "docker") and (w.len == base.len or std.mem.endsWith(u8, w, "/docker"));
         if (!is_docker) {
@@ -535,6 +567,9 @@ pub fn needsDaemon(script: []const u8) ?[]const u8 {
             if (isOptionWord(w)) continue;
             at_command = false;
             if (runsOthers(w)) return w;
+            // Test runners that start containers themselves (testcontainers and the like).
+            if (std.mem.eql(u8, w, "go") or std.mem.eql(u8, w, "cargo") or std.mem.eql(u8, w, "dotnet"))
+                if (laterWord(script, i, &.{ "test", "nextest", "it" })) return w;
             continue;
         }
         at_command = false;
@@ -590,6 +625,40 @@ fn null_after(i: *usize, j: usize) ?[]const u8 {
     return null;
 }
 
+/// Whether one of `names` is a word of the command that goes on from `from` (to the line's or the
+/// pipeline's end).
+fn laterWord(s: []const u8, from: usize, names: []const []const u8) bool {
+    var j = from;
+    while (j < s.len) {
+        const c = s[j];
+        if (c == '\n' or c == ';' or c == '&' or c == '|') return false;
+        if (c == ' ' or c == '\t' or c == '"' or c == '\'' or c == '(' or c == ')') {
+            j += 1;
+            continue;
+        }
+        const w = wordAt(s, j);
+        if (w.len == 0) {
+            j += 1;
+            continue;
+        }
+        j += w.len;
+        for (names) |n| if (std.mem.eql(u8, w, n)) return true;
+    }
+    return false;
+}
+
+/// Whether a step's `shell:` is one this reads: none, `bash` or `sh` (and their options). Any other
+/// (`python {0}`, `pwsh`, a custom command) runs a script this cannot read.
+pub fn shellIsPlain(shell: ?job_mod.Template) bool {
+    const t = shell orelse return true;
+    const text = switch (t) {
+        .lit => |l| l,
+        .expr => return false,
+    };
+    const first = std.mem.sliceTo(std.mem.trim(u8, text, " \t"), ' ');
+    return std.mem.eql(u8, first, "bash") or std.mem.eql(u8, first, "sh");
+}
+
 fn wordAt(s: []const u8, from: usize) []const u8 {
     var e = from;
     while (e < s.len) : (e += 1) switch (s[e]) {
@@ -618,7 +687,7 @@ pub fn jobNeedsDaemon(steps: []const job_mod.Step) bool {
                 .lit => |t| t,
                 .expr => |t| t,
             };
-            if (needsDaemon(text) != null) return true;
+            if (needsDaemon(text) != null or !shellIsPlain(s.shell)) return true;
         },
         .uses => |u| if (u.local or actionNeedsDaemon(u.owner, u.name)) return true,
         .checkout, .docker, .unsupported => {},
@@ -651,6 +720,7 @@ test "docker api job: scripts that only build, tag, inspect and remove images ar
         "docker",
         "",
         "mkdir -p out && cp a b && echo done",
+        "go build ./... && cargo build --release && zig build",
         "docker image inspect secret:1 2>&1 >/dev/null | head -1\nexport DOCKER_CLI_HINTS=false\nmkdir -p /tmp/s && printf 'FROM redis:8-alpine\\nARG TOKEN\\nRUN test -n \"$TOKEN\" && echo \"layer made\"\\n' > /tmp/s/Dockerfile\ndocker build -t secret:1 --build-arg TOKEN=\"$(printf 's3cr3t-%s' value-0042)\" /tmp/s 2>&1",
     };
     for (served) |s| if (needsDaemon(s)) |why| {
@@ -697,6 +767,18 @@ test "docker api job: scripts that only build, tag, inspect and remove images ar
         .{ .script = "source env.sh", .why = "source" },
         .{ .script = "podman build .", .why = "podman" },
         .{ .script = "run-ci.sh", .why = "run-ci.sh" },
+        // Test runners that may start containers, and the socket by name.
+        .{ .script = "go test ./...", .why = "go" },
+        .{ .script = "cd x && cargo test --all", .why = "cargo" },
+        .{ .script = "cargo nextest run", .why = "cargo" },
+        .{ .script = "dotnet test", .why = "dotnet" },
+        .{ .script = "mvn -B verify", .why = "mvn" },
+        .{ .script = "gradle test", .why = "gradle" },
+        .{ .script = "pytest -x", .why = "pytest" },
+        .{ .script = "kind create cluster", .why = "kind" },
+        .{ .script = "alias d=docker", .why = "alias" },
+        .{ .script = "find . -name x -exec sh -c 'true' {} \\;", .why = "-exec" },
+        .{ .script = "curl --unix-socket /var/run/docker.sock http://localhost/info", .why = "docker.sock" },
     };
     for (not_served) |c| {
         const got = needsDaemon(c.script) orelse {
@@ -705,6 +787,16 @@ test "docker api job: scripts that only build, tag, inspect and remove images ar
         };
         try std.testing.expectEqualStrings(c.why, got);
     }
+}
+
+test "docker api job: a step's shell that is not bash or sh runs what this cannot read" {
+    try std.testing.expect(shellIsPlain(null));
+    try std.testing.expect(shellIsPlain(.{ .lit = "bash" }));
+    try std.testing.expect(shellIsPlain(.{ .lit = "bash -e {0}" }));
+    try std.testing.expect(shellIsPlain(.{ .lit = "sh" }));
+    try std.testing.expect(!shellIsPlain(.{ .lit = "python {0}" }));
+    try std.testing.expect(!shellIsPlain(.{ .lit = "pwsh" }));
+    try std.testing.expect(!shellIsPlain(.{ .expr = "matrix.shell" }));
 }
 
 test "docker api job: only GitHub's own actions and the tag computer need no daemon" {

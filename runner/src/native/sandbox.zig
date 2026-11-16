@@ -2708,3 +2708,17 @@ test "a host path swapped for a symlink after its check fails to open, wherever 
     const middle = openHostPath(arena, sub);
     try std.testing.expect(middle == .err and middle.err == .LOOP);
 }
+
+test "a stop before the helper has its lifeline stops it when it has: nothing is lost in between" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var r: Running = .{};
+    // Nothing running: `kill` finds no lifeline and is forgotten, `stop` is not.
+    try std.testing.expect(!r.kill(io));
+    r.stop(io);
+    const file = try tmp.dir.createFile(io, "lifeline", .{});
+    r.begin(io, file);
+    try std.testing.expect(r.wasKilled(io));
+    try std.testing.expect(r.lifeline == null);
+}

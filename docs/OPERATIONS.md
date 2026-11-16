@@ -157,7 +157,7 @@ and 256 tags), and no other job, repository or trust scope sees them. The image 
 build gives the same ID, and nothing here is pushed, saved or run (`docker run`, `save`, `push` are
 501). A build's context is unpacked into the job's directory (at most 1 GiB, 200,000 entries; a link
 that leads out of it, a hard link or a device is refused) and removed after; one build runs at a
-time (a second is refused while one is in hand), a job makes at most 32, and its uploads and its unpacked contexts are each bounded to 4 GiB in all.
+time (a second is refused while one is in hand), a job makes at most 32 (a build allocates from an arena of its own, freed when it ends; an `ADD <url>` is bounded to 128 MiB and gives up after 30 s of silence or 10 minutes), and its uploads and its unpacked contexts are each bounded to 4 GiB in all.
 
 **Not supported yet** (each says so, with the line): `RUN` as a `USER` other than root,
 `RUN --mount`, `ADD` of an archive or a git repository, `FROM` another platform (`--platform` is
@@ -170,12 +170,16 @@ works, and so does `COPY --from` a stage).
 why), unless every `docker` in its scripts is a served command (`build`, `tag`, `rmi`, `inspect`,
 `image build|inspect|tag|rm`, `version`, `info`) and nothing in them can run a command the check does
 not see: `eval`, `bash -c`, `xargs`, `make`, `npm`, `python`, another script by its path or a
-variable as a command, `docker-compose`, `podman`. A wrapper's own command is read (`timeout 60
+variable as a command, `docker-compose`, `podman`, test runners that may start containers themselves
+(`go test`, `cargo test`, `dotnet test`, `mvn`, `gradle`, `pytest`, `tox`, `kind`, `k3d`, `minikube`), `find -exec`,
+`alias`, a `curl` at `docker.sock`, and a step whose `shell:` is not `bash` or `sh`. A wrapper's own command is read (`timeout 60
 docker build` is served, `timeout 60 docker run` is not). Every `uses:` that is not GitHub's own
 (`actions/`) or `docker/metadata-action`, and every local action, counts too. The check reads the
 script as text and errs toward the engine; what it cannot see is what a tool it allows runs behind
 its back, which meets the 501 when it runs. With `RUNNER_ENGINE=none` there is nothing to send it
-to, and the job runs natively.
+to, and the job runs natively. This keeps false positives on purpose (a `make` or `npm` job, a third-party
+action, a quoted `docker run` in a commit message): until `docker run` is served, a job sent to the engine
+loses nothing, and one that is not may lose a working path.
 
 **Replay.** A step that made a request beyond ping, version and info is not stored for replay in
 the step cache, and the steps after it run uncached: what a build made is in no step key. A request
