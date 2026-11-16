@@ -2535,10 +2535,19 @@ const Fake = struct {
     hang: bool = false,
     last_image_op: ?[]const u8 = null,
 
+    /// What the handler wrote is read by the test thread after `sync`: the lock is the order
+    /// ThreadSanitizer sees (the socket's is not one it knows).
+    fn sync(f: *Fake) void {
+        while (!f.mu.tryLock()) {}
+        f.mu.unlock();
+    }
+
     fn build(h: *Handler, call: *BuildCall) void {
         const f: *Fake = @fieldParentPtr("iface", h);
         _ = f.builds.fetchAdd(1, .acq_rel);
         const data = std.Io.Dir.cwd().readFileAlloc(testing.io, call.tar_path, testing.allocator, .limited(64 << 20)) catch "";
+        while (!f.mu.tryLock()) {}
+        defer f.mu.unlock();
         f.tar = @constCast(data);
         f.tags_len = call.query.tags.len;
         if (call.query.build_args.len > 0) {
@@ -2561,6 +2570,8 @@ const Fake = struct {
 
     fn image(h: *Handler, a: Allocator, op: ImageOp) ImageAnswer {
         const f: *Fake = @fieldParentPtr("iface", h);
+        while (!f.mu.tryLock()) {}
+        defer f.mu.unlock();
         switch (op) {
             .inspect => |n| f.last_image_op = std.fmt.allocPrint(testing.allocator, "inspect {s}", .{n}) catch "",
             .tag => |t| f.last_image_op = std.fmt.allocPrint(testing.allocator, "tag {s} {s} {s}", .{ t.name, t.repo, t.tag }) catch "",
@@ -2647,6 +2658,7 @@ test "docker api: POST /build reads a chunked context, hands it to the handler a
     const got = try ask(f.path, req, 5000);
     defer testing.allocator.free(got.text);
     try testing.expect(got.closed);
+    fake.sync();
     try testing.expectEqual(@as(u16, 200), statusOf(got.text));
     try expectContains(got.text, "Transfer-Encoding: chunked\r\n");
     try expectContains(got.text, "Content-Type: application/json\r\n");
@@ -2675,6 +2687,7 @@ test "docker api: POST /build takes a Content-Length body too, and a context in 
     const got = try ask(f.path, head ++ "hello world", 5000);
     defer testing.allocator.free(got.text);
     try testing.expectEqual(@as(u16, 200), statusOf(got.text));
+    fake.sync();
     try testing.expectEqualStrings("hello world", fake.tar);
     testing.allocator.free(fake.tar);
 }
@@ -2709,6 +2722,7 @@ test "docker api: POST /build refuses what it cannot build before reading the co
     defer testing.allocator.free(none.text);
     try testing.expectEqual(@as(u16, 400), statusOf(none.text));
     try expectContains(none.text, "needs a context");
+    fake.sync();
     if (fake.tar.len > 0) testing.allocator.free(fake.tar);
 }
 
@@ -2794,6 +2808,7 @@ test "docker api: closing the gate cancels the build in flight, waits for it, an
     // Cancelled and ended well before the build's own 5 s.
     try testing.expect(nowMs() - t1 < 3000);
     try testing.expect(fake.cancels.load(.acquire) >= 1);
+    fake.sync();
     // Closed: the next request is 503 and counted, whichever it is.
     const got = try get(f.path, "/_ping");
     defer testing.allocator.free(got);
@@ -2845,6 +2860,7 @@ test "docker api: a request from a client that has gone is counted by the step t
     f.server.settle();
     try testing.expect(f.server.stats().gated >= 1);
     // It reached no handler: the image op the handler saw last is the first request's.
+    fake.sync();
     try testing.expectEqualStrings("inspect x", fake.last_image_op.?);
     testing.allocator.free(fake.last_image_op.?);
     try testing.expect(f.server.stats().beyond > before);
@@ -2870,6 +2886,7 @@ test "docker api: the image routes reach the handler with the name decoded" {
         const got = try ask(f.path, req, 3000);
         defer testing.allocator.free(got.text);
         try testing.expectEqual(@as(u16, 200), statusOf(got.text));
+        fake.sync();
         try testing.expectEqualStrings(c.op, fake.last_image_op.?);
         testing.allocator.free(fake.last_image_op.?);
         fake.last_image_op = null;
@@ -2892,6 +2909,7 @@ test "docker api: the docker CLI's own build requests (recorded) reach the handl
         defer testing.allocator.free(got.text);
         try expectContains(got.text, "HTTP/1.1 200 OK");
         try expectContains(got.text, "Transfer-Encoding: chunked");
+        fake.sync();
         try testing.expect(fake.tar.len > 1024);
         // What it sent is a tar with a Dockerfile in it, which unpacks.
         var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -2909,6 +2927,7 @@ test "docker api: the docker CLI's own build requests (recorded) reach the handl
         testing.allocator.free(fake.tar);
         fake.tar = &.{};
     }
+    fake.sync();
     try testing.expectEqual(@as(usize, 1), fake.arg_len);
 }
 
@@ -2930,6 +2949,7 @@ test "docker api: the docker CLI's own image requests (recorded) are the routes 
         const got = try ask(f.path, c.req, 300);
         defer testing.allocator.free(got.text);
         try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got.text, "HTTP/1.1 "));
+        fake.sync();
         try testing.expectEqualStrings(c.op, fake.last_image_op.?);
         testing.allocator.free(fake.last_image_op.?);
         fake.last_image_op = null;

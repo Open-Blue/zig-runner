@@ -878,9 +878,11 @@ const testing = std.testing;
 test "docker build: the query's options are read, repeated tags and JSON maps included" {
     var a: std.heap.ArenaAllocator = .init(testing.allocator);
     defer a.deinit();
-    const q = (try parseQuery(a.allocator(), "t=x%3A1&t=y&dockerfile=sub%2FDockerfile&" ++
+    // The runner's own platform, whichever machine this is.
+    const text = "t=x%3A1&t=y&dockerfile=sub%2FDockerfile&" ++
         "buildargs=%7B%22A%22%3A%221%22%2C%22B%22%3Anull%7D&labels=%7B%22k%22%3A%22v+w%22%7D&" ++
-        "target=build&nocache=1&pull=false&q=true&rm=1&cachefrom=%5B%5D&memory=0&platform=linux%2Famd64")).ok;
+        "target=build&nocache=1&pull=false&q=true&rm=1&cachefrom=%5B%5D&memory=0&platform=linux%2F" ++ comptime archName();
+    const q = (try parseQuery(a.allocator(), text)).ok;
     try testing.expectEqual(@as(usize, 2), q.tags.len);
     try testing.expectEqualStrings("x:1", q.tags[0]);
     try testing.expectEqualStrings("y", q.tags[1]);
@@ -891,7 +893,7 @@ test "docker build: the query's options are read, repeated tags and JSON maps in
     try testing.expectEqualStrings("v w", q.labels[0].value);
     try testing.expectEqualStrings("build", q.target);
     try testing.expect(q.nocache and !q.pull and q.quiet);
-    try testing.expectEqualStrings("linux/amd64", q.platform);
+    try testing.expectEqualStrings(ownPlatform(), q.platform);
     // Nothing set: Docker's defaults.
     const none = (try parseQuery(a.allocator(), "")).ok;
     try testing.expectEqualStrings("Dockerfile", none.dockerfile);

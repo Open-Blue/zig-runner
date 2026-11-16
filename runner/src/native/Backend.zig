@@ -12753,12 +12753,12 @@ fn dockerBuildConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
     };
     var cfg = try testConfig(arena, tmp);
     cfg.docker_api = true;
-    // The services' layout (`redis+8-alpine/rootfs`) in the builder's (the reference's key), by a
+    // The services' layout (`redis:8-alpine/rootfs`) in the builder's (the reference's key), by a
     // link to the entry: a base the Dockerfile builder finds in its image store.
     try tmp.dir.createDirPath(std.testing.io, "images");
     try tmp.dir.symLink(
         std.testing.io,
-        try std.fmt.allocPrint(arena, "{s}/redis+8-alpine", .{dir}),
+        try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, docker_build_base }),
         try std.fmt.allocPrint(arena, "images/{s}", .{try images.key(arena, docker_build_base)}),
         .{},
     );
@@ -12935,7 +12935,7 @@ test "native image build: a build argument's value is in no line of the log, and
         return error.SkipZigTest;
     }
     // It looks for the repo job's tag before it builds anything.
-    const looker = testStep("docker image inspect secret:1 2>&1 | head -1\n" ++ build);
+    const looker = testStep("docker image inspect secret:1 2>&1 >/dev/null | head -1\n" ++ build);
     const second = try runCachedJob(arena, hostile, testJob(&.{looker}), untrusted, .{});
     errdefer std.debug.print("{s}\n", .{second.text});
     try expectAll(second.text, &.{ "No such image: secret:1", "layer made", "Successfully tagged secret:1" });
