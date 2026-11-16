@@ -276,15 +276,28 @@ dispatch() {
 }
 
 # find_run WORKFLOW TITLE: the run's ID, once it is listed (a few seconds after the dispatch).
+# On giving up it says why on stderr: the suite's time ran out, or the last API error (a rate limit
+# or an outage reads the same as a run that was never made without it), or no run of that title.
 find_run() {
-	local id
-	for _ in $(seq 60); do
-		((SECONDS < suite_end)) || return 1
-		id=$(api "repos/$repo/actions/workflows/$1/runs?event=workflow_dispatch&per_page=50" \
-			--jq ".workflow_runs[] | select(.display_title == \"$2\") | .id" 2>/dev/null | head -n1)
-		[[ -n $id ]] && { echo "$id" && return 0; }
+	local id err='' tries ef
+	ef=$(mktemp)
+	for tries in $(seq 60); do
+		((SECONDS < suite_end)) || { echo "find_run $1 \"$2\": the suite's time ran out after $((tries - 1)) tries" >&2 && rm -f "$ef" && return 1; }
+		if id=$(api "repos/$repo/actions/workflows/$1/runs?event=workflow_dispatch&per_page=50" \
+			--jq ".workflow_runs[] | select(.display_title == \"$2\") | .id" 2>"$ef" | head -n1); then
+			err=''
+		else
+			err=$(head -c 300 "$ef")
+		fi
+		[[ -n $id ]] && { rm -f "$ef" && echo "$id" && return 0; }
 		sleep 3
 	done
+	rm -f "$ef"
+	if [[ -n $err ]]; then
+		echo "find_run $1 \"$2\": not found in 60 tries; the last API call failed: $err" >&2
+	else
+		echo "find_run $1 \"$2\": no run of that title among the 50 newest dispatches after 60 tries" >&2
+	fi
 	return 1
 }
 
