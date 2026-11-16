@@ -157,7 +157,7 @@ and 256 tags), and no other job, repository or trust scope sees them. The image 
 build gives the same ID, and nothing here is pushed, saved or run (`docker run`, `save`, `push` are
 501). A build's context is unpacked into the job's directory (at most 1 GiB, 200,000 entries; a link
 that leads out of it, a hard link or a device is refused) and removed after; one build runs at a
-time (a second is refused while one is in hand), a job makes at most 32 (a build allocates from an arena of its own, freed when it ends; an `ADD <url>` is bounded to 128 MiB and gives up after 30 s of silence or 10 minutes), and its uploads and its unpacked contexts are each bounded to 4 GiB in all.
+time (a second is refused while one is in hand), a job makes at most 32 (a build allocates from an arena of its own, freed when it ends; an `ADD <url>` is bounded to 128 MiB each and 256 MiB a build, gives up after 30 s of silence or 10 minutes, is refused for an address of the machine itself, and is cancelled with its build), and its uploads and its unpacked contexts are each bounded to 4 GiB in all.
 
 **Not supported yet** (each says so, with the line): `RUN` as a `USER` other than root,
 `RUN --mount`, `ADD` of an archive or a git repository, `FROM` another platform (`--platform` is

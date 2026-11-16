@@ -1341,6 +1341,9 @@ fn digestEntry(arena: Allocator, view: *View, e: layer_view.Entry, h: *KeyHasher
             h.int(names.len);
             for (names) |sub| {
                 h.field(sub);
+                // The descriptors a directory's walk opened are closed when it leaves it.
+                const m = view.mark();
+                defer view.releaseTo(m);
                 try digestEntry(arena, view, (try view.child(e, sub)) orelse return error.SourceMissing, h, depth + 1);
             }
         },
@@ -1720,6 +1723,8 @@ const Copier = struct {
         if (depth > 128) return c.fail("a directory nested more than 128 deep", .{});
         const view = c.src.?;
         for (try view.names(dir)) |name| {
+            const m = view.mark();
+            defer view.releaseTo(m);
             const e = (try view.child(dir, name)) orelse continue;
             switch (e.kind) {
                 .dir => {
@@ -2938,4 +2943,31 @@ test "plan: a reference pinned by digest (name:tag@sha256) is asked for whole, i
     try std.testing.expectEqualStrings(want, f.asked.items[1]);
     try std.testing.expectEqualStrings(want, f.asked.items[2]);
     try std.testing.expectEqualStrings("busybox:1.38@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f", f.asked.items[3]);
+}
+
+test "a context of many directories is walked with few descriptors open: digested and copied under a low limit" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var n: usize = 0;
+    while (n < 600) : (n += 1) {
+        const dir = try std.fmt.allocPrint(arena, "ctx/d{d}/sub", .{n});
+        try tmp.dir.createDirPath(io, dir);
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/f", .{dir}), .data = "x" });
+    }
+    const view = try testView(arena, &tmp, "ctx");
+    defer view.close();
+    // A soft limit well under the directories' number (the test's own descriptors are few).
+    var old: linux.rlimit = undefined;
+    if (linux.errno(linux.getrlimit(.NOFILE, &old)) != .SUCCESS) return error.SkipZigTest;
+    var low = old;
+    low.cur = @min(old.cur, 200);
+    if (linux.errno(linux.setrlimit(.NOFILE, &low)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.setrlimit(.NOFILE, &old);
+    _ = try contextDigest(arena, view, &.{"."});
+    // What the walk held it let go of: well under the directories' number.
+    try std.testing.expect(view.fds.items.len < 50);
 }

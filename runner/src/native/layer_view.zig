@@ -93,6 +93,16 @@ pub const View = struct {
         return v;
     }
 
+    /// Where the descriptors the view has open end now: `releaseTo` closes the ones opened after,
+    /// when nothing keeps an entry that holds them (a walk that has left a directory).
+    pub fn mark(v: *const View) usize {
+        return v.fds.items.len;
+    }
+
+    pub fn releaseTo(v: *View, m: usize) void {
+        while (v.fds.items.len > m) _ = linux.close(v.fds.pop().?);
+    }
+
     pub fn close(v: *View) void {
         for (v.fds.items) |fd| _ = linux.close(fd);
         v.fds.clearRetainingCapacity();
@@ -142,6 +152,8 @@ pub const View = struct {
                 const name = try v.arena.dupe(u8, e.name);
                 if ((try seen.getOrPut(v.arena, name)).found_existing) continue;
                 // Whether the merge shows it: a whiteout on top deletes the entry.
+                const m = v.mark();
+                defer v.releaseTo(m);
                 if ((try v.child(dir, name)) != null) try out.append(v.arena, name);
             }
         }

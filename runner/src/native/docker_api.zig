@@ -95,6 +95,9 @@ pub const Limits = struct {
     body_ms: u32 = 10 * 60_000,
     /// Builds a job may make, and how many at once (one: they share the job's build directories).
     max_builds: u32 = 32,
+    /// How long `closeGate` waits for what it cancelled: past it the gate is closed for good and the
+    /// step fails (a fetch, a pull, a RUN or an unpack that obeys a cancel ends well before).
+    cancel_grace_ms: u32 = 30_000,
     /// What a job's uploaded contexts may add up to (the tar files spooled in its directory).
     spool_budget: u64 = 4 << 30,
     /// What a build's context may hold once unpacked.
@@ -260,6 +263,8 @@ pub const Server = struct {
     } = .{},
     /// The gate: the high bit says it is closed, the rest counts the requests in flight.
     gate: std.atomic.Value(u32) = .init(0),
+    /// `closeGate` gave up: the gate stays closed.
+    dead: std.atomic.Value(bool) = .init(false),
     /// A build (its upload and its run) is in hand: one at a time per job.
     building: std.atomic.Value(bool) = .init(false),
     /// What the job's uploads have spooled so far.
@@ -420,6 +425,8 @@ pub const Server = struct {
 
     /// Lets requests in: a step's processes may run now.
     pub fn openGate(s: *Server) void {
+        // A gate that gave up on a request that would not end stays closed.
+        if (s.dead.load(.acquire)) return;
         if (s.cfg.handler) |h| h.resetFn(h);
         _ = s.gate.fetchAnd(~gate_closed_bit, .acq_rel);
     }
@@ -437,9 +444,11 @@ pub const Server = struct {
             // would be counted against it (the builder and the unpacker look at the cancel
             // between their steps). Only the server's stop ends this wait early.
             var rounds: u32 = 0;
+            const give_up = nowMs() + s.cfg.limits.cancel_grace_ms;
             while (s.gate.load(.acquire) & ~gate_closed_bit != 0) {
-                if (!waitStop(s, 1)) {
+                if (!waitStop(s, 1) or nowMs() >= give_up) {
                     clean = false;
+                    s.dead.store(true, .release);
                     break;
                 }
                 // The cancel again now and then: a sandbox that began after the first one is
@@ -449,7 +458,11 @@ pub const Server = struct {
             }
         }
         // A request that did not end in time is one the step's count cannot be trusted about.
-        if (!clean) s.bump("beyond");
+        if (!clean) {
+            s.bump("beyond");
+            // Nothing more is taken in: the connection that is stuck cannot answer a settle.
+            return false;
+        }
         s.settle();
         return clean;
     }
@@ -2561,6 +2574,8 @@ const Fake = struct {
     cancelled: std.atomic.Value(bool) = .init(false),
     /// The build waits for a cancel (or 5 s) before it ends, as a long RUN does.
     hang: bool = false,
+    /// The build ignores the cancel for this long (a fetch, a pull or an unpack that does not look).
+    stubborn_ms: u32 = 0,
     last_image_op: ?[]const u8 = null,
 
     /// What the handler wrote is read by the test thread after `sync`: the lock is the order
@@ -2584,6 +2599,14 @@ const Fake = struct {
             @memcpy(f.arg_name[0..f.arg_len], n[0..f.arg_len]);
         }
         call.sink.write("{\"stream\":\"Step 1/1 : FROM scratch\\n\"}\n");
+        if (f.stubborn_ms > 0) {
+            f.mu.unlock();
+            defer while (!f.mu.tryLock()) {};
+            var ts: linux.timespec = .{ .sec = f.stubborn_ms / 1000, .nsec = @as(isize, f.stubborn_ms % 1000) * 1_000_000 };
+            _ = linux.nanosleep(&ts, null);
+            call.sink.write("{\"aux\":{\"ID\":\"sha256:late\"}}\n");
+            return;
+        }
         if (f.hang) {
             const end = nowMs() + 5000;
             while (!f.cancelled.load(.acquire) and !call.sink.gone() and nowMs() < end) {
@@ -3022,4 +3045,33 @@ test "docker api: one build at a time, a job's uploads are budgeted" {
     const two = try ask(f.path, big, 3000);
     defer testing.allocator.free(two.text);
     try testing.expectEqual(@as(u16, 413), statusOf(two.text));
+}
+
+test "docker api: a request that will not end after its cancel is given up on: the step fails and the gate stays closed" {
+    var fake: Fake = .{ .tmp_dir = "", .stubborn_ms = 2500 };
+    var cfg = test_cfg;
+    cfg.limits.cancel_grace_ms = 300;
+    var f = try startBuilding(&fake, cfg);
+    f.server.openGate();
+    const fd = try connect(f.path);
+    defer _ = linux.close(fd);
+    const req = "POST /build HTTP/1.1\r\nHost: d\r\nContent-Length: 2\r\n\r\nhi";
+    _ = linux.sendto(fd, req.ptr, req.len, linux.MSG.NOSIGNAL, null, 0);
+    const t0 = nowMs();
+    while (fake.builds.load(.acquire) == 0 and nowMs() - t0 < 3000) {
+        var ts: linux.timespec = .{ .sec = 0, .nsec = 2_000_000 };
+        _ = linux.nanosleep(&ts, null);
+    }
+    const t1 = nowMs();
+    // Not the 2.5 s the build takes: the grace, and then false.
+    try testing.expect(!f.server.closeGate());
+    try testing.expect(nowMs() - t1 < 2000);
+    // Closed for good, though a step starts again.
+    f.server.openGate();
+    const got = try get(f.path, "/_ping");
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(u16, 503), statusOf(got));
+    // The build ends by itself; the server's stop waits for it.
+    _ = f.finish();
+    testing.allocator.free(fake.tar);
 }

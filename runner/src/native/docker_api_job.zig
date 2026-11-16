@@ -62,13 +62,6 @@ pub const State = struct {
     };
 
     pub fn create(b: *Backend) !*State {
-        // A build's context is walked through a descriptor per directory it visits: the soft
-        // limit is raised to the hard one, as a runner that serves builds needs.
-        var lim: std.os.linux.rlimit = undefined;
-        if (std.os.linux.getrlimit(.NOFILE, &lim) == 0 and lim.cur < lim.max) {
-            lim.cur = lim.max;
-            _ = std.os.linux.setrlimit(.NOFILE, &lim);
-        }
         const st = try b.gpa.create(State);
         st.* = .{ .b = b, .gpa = b.gpa, .index = .init(b.gpa) };
         return st;

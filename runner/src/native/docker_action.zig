@@ -411,7 +411,103 @@ fn baseId(arena: Allocator, io: std.Io, base: images.Image) ![]const u8 {
 /// into the native store, `find`), the content of the context's sources, and an `ADD`'s
 /// downloads. Without `digests` (judging whether a build can run, before the job) none of it is
 /// read: the keys are not used, and nothing is downloaded.
+/// What a build's planning does over the network is stopped by this flag, at once: an `ADD` of a
+/// URL and a pull of a base are tasks that the flag's watcher cancels (`cancellable`).
+pub const Net = struct {
+    cancel: ?*const std.atomic.Value(bool) = null,
+    /// Refuse an `ADD` whose address is the host's own (loopback, link-local, unspecified): the
+    /// fetch is made from the runner's network, not the job's.
+    deny_local: bool = false,
+    /// What the `ADD`s of one build may download in all.
+    add_budget: u64 = 256 << 20,
+};
+
+/// Calls `function(args)`, or, with a `flag`, as a task that ends when the flag is set: its error is
+/// `error.Cancelled` then, and what the task was doing (a fetch, a pull) is cancelled where it
+/// waits.
+fn cancellable(
+    comptime T: type,
+    io: std.Io,
+    flag: ?*const std.atomic.Value(bool),
+    function: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(function)),
+) error{Cancelled}!T {
+    const f = flag orelse return @call(.auto, function, args);
+    if (f.load(.acquire)) return error.Cancelled;
+    const Event = union(enum) { done: T, flagged: void };
+    var buf: [2]Event = undefined;
+    var sel: std.Io.Select(Event) = .init(io, &buf);
+    sel.concurrent(.done, function, args) catch return @call(.auto, function, args);
+    sel.concurrent(.flagged, watch, .{ io, f }) catch {
+        // No task for the watcher: the work alone, uncancellable.
+        const got = sel.await() catch {
+            sel.cancelDiscard();
+            return error.Cancelled;
+        };
+        sel.cancelDiscard();
+        return switch (got) {
+            .done => |v| v,
+            .flagged => error.Cancelled,
+        };
+    };
+    const got = sel.await() catch {
+        sel.cancelDiscard();
+        return error.Cancelled;
+    };
+    sel.cancelDiscard();
+    return switch (got) {
+        .done => |v| v,
+        .flagged => error.Cancelled,
+    };
+}
+
+fn watch(io: std.Io, flag: *const std.atomic.Value(bool)) void {
+    while (!flag.load(.acquire)) io.sleep(.fromMilliseconds(100), .awake) catch return;
+}
+
+/// Whether `url`'s host is the machine's own by its name: `localhost`, a loopback, link-local or
+/// unspecified address. By the written form (a name that resolves there, a redirect, is not seen).
+pub fn hostIsLocal(url: []const u8) bool {
+    const rest = if (std.mem.indexOf(u8, url, "://")) |i| url[i + 3 ..] else url;
+    const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    var host = rest[0..end];
+    if (std.mem.lastIndexOfScalar(u8, host, '@')) |at| host = host[at + 1 ..];
+    if (host.len > 0 and host[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, host, ']') orelse return true;
+        host = host[1..close];
+    } else if (std.mem.lastIndexOfScalar(u8, host, ':')) |c| host = host[0..c];
+    if (std.ascii.eqlIgnoreCase(host, "localhost") or std.ascii.endsWithIgnoreCase(host, ".localhost")) return true;
+    if (std.Io.net.Ip6Address.parse(host, 0)) |a| {
+        const b = a.bytes;
+        var zero = true;
+        for (b[0..15]) |x| if (x != 0) {
+            zero = false;
+        };
+        if (zero and (b[15] == 0 or b[15] == 1)) return true; // :: and ::1
+        if (b[0] == 0xfe and b[1] & 0xc0 == 0x80) return true; // fe80::/10
+        // ::ffff:a.b.c.d
+        if (std.mem.eql(u8, b[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff }))
+            return ipv4Local(b[12], b[13]);
+        return false;
+    } else |_| {}
+    var o: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, host, '.');
+    var n: usize = 0;
+    while (it.next()) |part| : (n += 1) {
+        if (n == 4) return false;
+        o[n] = std.fmt.parseInt(u8, part, 10) catch return false;
+    }
+    if (n != 4) return false;
+    return ipv4Local(o[0], o[1]);
+}
+
+fn ipv4Local(a: u8, b: u8) bool {
+    return a == 127 or a == 0 or (a == 169 and b == 254);
+}
+
 const Planning = struct {
+    net: Net = .{},
+    added: u64 = 0,
     b: *Backend,
     /// The context to read the sources' content from; null when `digests` is not wanted.
     context: ?*layer_view.View,
@@ -431,7 +527,8 @@ const Planning = struct {
             return .{ .config = local.config, .id = if (p.digests) local.id else "" };
         };
         // `find` grows the job's list of held locks from the arena it is given: the job's.
-        switch (try find(b.arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, ref, b.image_tag_ttl_s, &b.held)) {
+        const found = try cancellable(anyerror!images.Found, b.io, p.net.cancel, find, .{ b.arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, ref, b.image_tag_ttl_s, &b.held });
+        switch (try found) {
             .image => |i| return .{ .config = i, .id = if (p.digests) try baseId(arena, b.io, i) else "" },
             .missing => |w| {
                 why.* = w;
@@ -454,16 +551,19 @@ const Planning = struct {
     fn fetch(i: *dockerfile.Context, arena: Allocator, url: []const u8) anyerror!dockerfile.Fetched {
         const p: *Planning = @fieldParentPtr("context_iface", i);
         if (!p.digests) return .{ .file = "", .digest = @splat('0') };
+        if (p.net.deny_local and hostIsLocal(url)) return error.LocalAddress;
+        if (p.added >= p.net.add_budget) return error.TooMuchAdded;
         // A server that stalls ends the build at its limits (the job's own cancel is the step's end,
         // which waits for them): no first byte or no byte for 30 s, 10 minutes in all.
-        const res = try net_client.fetch(arena, p.b.io, .{
+        const res = try try cancellable(net_client.Error!net_client.Response, p.b.io, p.net.cancel, net_client.fetch, .{ arena, p.b.io, net_client.Options{
             .url = url,
-            .max_response = max_add_bytes,
+            .max_response = std.math.lossyCast(usize, @min(max_add_bytes, p.net.add_budget - p.added)),
             .first_byte = .fromSeconds(30),
             .read_idle = .fromSeconds(30),
             .deadline = .fromSeconds(600),
-        });
+        } });
         if (res.status != .ok) return error.BadStatus;
+        p.added += res.body.len;
         var sum: [32]u8 = undefined;
         Sha256.hash(res.body, &sum, .{});
         const hex = std.fmt.bytesToHex(sum, .lower);
@@ -518,7 +618,7 @@ const max_dockerfile = 1 << 20;
 /// `text` planned: with a `context`, a build's (what the sources hold and what the images are
 /// keyed); without, only whether it can be built, with fixed keys and nothing downloaded.
 fn planText(b: *Backend, text: []const u8, context: ?*layer_view.View) !dockerfile.Plan {
-    return planTextFor(b, b.arena, text, context, .action, .{});
+    return planTextFor(b, b.arena, text, context, .action, .{}, .{});
 }
 
 /// What a plan is for: a Docker action, whose image the runner then runs (as its `USER`), or the
@@ -532,6 +632,7 @@ fn planTextFor(
     context: ?*layer_view.View,
     purpose: PlanFor,
     opts: dockerfile.Options,
+    net: Net,
 ) !dockerfile.Plan {
     const digests = context != null;
     const ins = switch (try dockerfile.parse(arena, text)) {
@@ -541,7 +642,7 @@ fn planTextFor(
             return error.Refused;
         },
     };
-    var planning: Planning = .{ .b = b, .context = context, .digests = digests };
+    var planning: Planning = .{ .b = b, .context = context, .digests = digests, .net = net };
     const p = switch (try dockerfile.planWith(arena, ins, planning.bases(), planning.ctx(), opts)) {
         .ok => |p| p,
         .refused => |r| {
@@ -767,8 +868,10 @@ pub fn buildApi(b: *Backend, req: ApiRequest) !ApiBuilt {
     if (df.kind != .file) return .{ .failed = missing };
     const text = try df.parent().readFileAlloc(b.io, df.name, arena, .limited(max_dockerfile));
     try ignoreFilesOf(b, arena, req.dockerfile, &.{}, ctx);
-    const p = planTextFor(b, arena, text, ctx, .api, req.options) catch |e| return switch (e) {
+    const p = planTextFor(b, arena, text, ctx, .api, req.options, .{ .cancel = req.cancel, .deny_local = true }) catch |e| return switch (e) {
         error.Refused => .{ .failed = b.build_reason },
+        error.Cancelled => .{ .failed = "the build was cancelled" },
+        error.LocalAddress => .{ .failed = "an ADD of an address of the machine itself (loopback, link-local) is refused: the fetch is made from the runner's network, not the job's" },
         else => e,
     };
     if (req.observer) |o| switch (try dockerfile.parse(arena, text)) {
@@ -1328,4 +1431,85 @@ test "on a root runner, a Docker action as the image's USER writes the workspace
         for (res2.steps) |st| try std.testing.expectEqual(dagger.Outcome.success, st.outcome);
         try std.testing.expect(std.mem.indexOf(u8, w2.written(), "wrote its output") != null);
     }
+}
+
+test "an ADD of the machine's own address is refused by its written form" {
+    for ([_][]const u8{
+        "http://127.0.0.1/x",   "http://127.0.0.1:8080/x",   "http://localhost/x", "https://LOCALHOST:9/x",
+        "http://a.localhost/x", "http://[::1]:80/x",         "http://[::]/x",      "http://169.254.169.254/latest",
+        "http://0.0.0.0:1/",    "http://user:pw@127.1.2.3/", "http://[fe80::1]/x", "http://[::ffff:127.0.0.1]/x",
+        "http://127.0.0.1",
+    }) |u| try std.testing.expect(hostIsLocal(u));
+    for ([_][]const u8{
+        "https://example.com/x",  "http://10.0.0.5/x",               "http://192.168.1.1:80/", "http://8.8.8.8/",
+        "http://[2001:db8::1]/x", "https://localhost.example.com/x", "http://172.17.0.1/x",
+    }) |u| try std.testing.expect(!hostIsLocal(u));
+}
+
+fn sleepsLong(io: std.Io) error{Never}!u32 {
+    io.sleep(.fromSeconds(60), .awake) catch return 7;
+    return 1;
+}
+
+test "a task tied to a flag ends when it is set, however long the work would wait" {
+    const io = std.testing.io;
+    var flag: std.atomic.Value(bool) = .init(false);
+    const Setter = struct {
+        fn run(f: *std.atomic.Value(bool)) void {
+            var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 300_000_000 };
+            _ = std.os.linux.nanosleep(&ts, null);
+            f.store(true, .release);
+        }
+    };
+    const t0 = std.Io.Clock.awake.now(io);
+    const th = try std.Thread.spawn(.{}, Setter.run, .{&flag});
+    defer th.join();
+    try std.testing.expectError(error.Cancelled, cancellable(error{Never}!u32, io, &flag, sleepsLong, .{io}));
+    try std.testing.expect(t0.durationTo(std.Io.Clock.awake.now(io)).toSeconds() < 5);
+    // Already set: not even started. Not tied: called as is.
+    try std.testing.expectError(error.Cancelled, cancellable(error{Never}!u32, io, &flag, sleepsLong, .{io}));
+    const quick = struct {
+        fn f() error{Never}!u32 {
+            return 3;
+        }
+    }.f;
+    try std.testing.expectEqual(@as(u32, 3), try try cancellable(error{Never}!u32, io, null, quick, .{}));
+}
+
+test "a fetch from a server that never answers ends when the build's flag is set" {
+    const linux = std.os.linux;
+    const io = std.testing.io;
+    // A listener that accepts and says nothing (the connection is the kernel's, never read).
+    const lfd_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(lfd_rc) != .SUCCESS) return error.SkipZigTest;
+    const lfd = std.math.cast(linux.fd_t, lfd_rc) orelse return error.SkipZigTest;
+    defer _ = linux.close(lfd);
+    var any: extern union { base: linux.sockaddr, in: linux.sockaddr.in } = .{ .in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) } };
+    if (linux.errno(linux.bind(lfd, &any.base, @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    if (linux.errno(linux.listen(lfd, 4)) != .SUCCESS) return error.SkipZigTest;
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    if (linux.errno(linux.getsockname(lfd, &any.base, &len)) != .SUCCESS) return error.SkipZigTest;
+    const port = std.mem.bigToNative(u16, any.in.port);
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const url = try std.fmt.allocPrint(a.allocator(), "http://127.0.0.1:{d}/x", .{port});
+    var flag: std.atomic.Value(bool) = .init(false);
+    const Setter = struct {
+        fn run(f: *std.atomic.Value(bool)) void {
+            var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 400_000_000 };
+            _ = std.os.linux.nanosleep(&ts, null);
+            f.store(true, .release);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Setter.run, .{&flag});
+    defer th.join();
+    const t0 = std.Io.Clock.awake.now(io);
+    const got = cancellable(net_client.Error!net_client.Response, io, &flag, net_client.fetch, .{ a.allocator(), io, net_client.Options{
+        .url = url,
+        .first_byte = .fromSeconds(120),
+        .read_idle = .fromSeconds(120),
+        .deadline = .fromSeconds(600),
+    } });
+    try std.testing.expectError(error.Cancelled, got);
+    try std.testing.expect(t0.durationTo(std.Io.Clock.awake.now(io)).toSeconds() < 10);
 }

@@ -3878,5 +3878,18 @@ read blocks the write, which fills the `RUN`'s output pipe, and after the write 
 cancelled. A step's end closes the gate before it touches the job's layers and timings. Setuid and
 setgid bits of a context's files are not kept (Docker keeps them); a directory keeps sticky and
 setgid, and a context with more than 10,000 directories of a mode of their own fails. The runner's own
-scripts (seed, git config) never have the API. The soft limit of open files is raised to the hard one
-when a job's API starts, since a context's walk keeps a descriptor per directory it visits.
+runs (the seed, git's fetches, the tarball's extract) never have the API: only a step's script and a
+Docker action's container do. A context's walk (the digest of a source, a `COPY` of a tree) closes the
+descriptors it opened for a directory when it leaves it (`View.mark`, `releaseTo`), so a context of
+200,000 directories is walked with a few open (tested under a low soft limit).
+
+What a build's planning does over the network is cancellable: an `ADD <url>` and the pull of a `FROM`
+base run as tasks beside a watcher of the build's cancel flag (`docker_action.cancellable`), so a
+cancel ends a fetch or a pull where it waits, at once. `closeGate` then gives what it cancelled 30 s
+(`Limits.cancel_grace_ms`); past that the gate is closed for good (`Server.dead`: it never opens
+again in this job), the step fails with the reason, and nothing waits for the build any longer (what
+remains of it ends at its next look at the flag). An `ADD` of a URL is made from the runner's network,
+not the job's: for a build through the API, an address of the machine itself (`localhost`, a loopback,
+link-local or unspecified address, by how it is written; a name that resolves there, or a redirect to
+it, is not seen) is refused, and what the `ADD`s of one build download is at most 256 MiB in all,
+held in the build's arena until it ends.

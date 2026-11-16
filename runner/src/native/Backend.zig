@@ -3120,7 +3120,9 @@ pub fn execOn(
     out: sandbox.Output,
     container: ?sandbox.Spec.Container,
 ) !sandbox.Ended {
-    return b.execIn(argv, env, files, uid, gid, out, container, true, true);
+    // Only a Docker action's container has the job's Docker API: the runner's own git and tarball
+    // runs, which execute no step code, have none.
+    return b.execIn(argv, env, files, uid, gid, out, container, true, container != null);
 }
 
 /// A Dockerfile's `RUN` in its `container` (`docker_action.zig`): what it writes goes to the
@@ -3292,7 +3294,13 @@ fn runIn(
     }, mode.running, out);
     if (api_server) |srv| {
         gate_open = false;
-        if (!srv.closeGate()) logfmt.warn("native_docker_api", "job={s} the server stopped while a request of the step was in flight", .{std.fs.path.basename(b.dir)});
+        if (!srv.closeGate()) {
+            logfmt.warn("native_docker_api", "job={s} a request of the step did not end after its cancel: the job's API is closed for good", .{std.fs.path.basename(b.dir)});
+            return .{
+                .code = 1,
+                .failure = "a build of this step through the job's Docker API did not stop when the step ended; the API is closed for the rest of the job",
+            };
+        }
     }
     b.timings.helper(arena, ended.helper, ended.spawned, ended.ended);
     if (new_layer) try b.layers.append(arena, .{ .name = upper, .path = upper_path, .canonical = idmapped });
