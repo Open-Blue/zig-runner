@@ -67,6 +67,7 @@ pub const Options = struct {
     uv_env_in_cache: bool = false,
     zig_local_cache: bool = false,
     zig_local_cache_max_mb: u32 = 0,
+    cargo_target_cache: bool = false,
     zig_seeds: []const config.ZigSeed = &.{},
     zig_seeds_unverified: []const []const u8 = &.{},
     /// "Set up job" checks the tool cache's trees (`tool_trees.zig`).
@@ -81,6 +82,7 @@ pub const Options = struct {
             .uv_env_in_cache = opts.uv_env_in_cache,
             .zig_local_cache = opts.zig_local_cache,
             .zig_local_cache_max_mb = opts.zig_local_cache_max_mb,
+            .cargo_target_cache = opts.cargo_target_cache,
             .zig_seeds = opts.zig_seeds,
             .zig_seeds_unverified = opts.zig_seeds_unverified,
             .tool_trees = opts.tool_trees,
@@ -798,6 +800,10 @@ pub fn plan(
             .name = "ZIG_LOCAL_CACHE_DIR",
             .value = set_up.zigLocalCacheEnv(as_runner, opts.zig_local_cache_max_mb),
         });
+        if (opts.cargo_target_cache) try p.early_env.append(arena, .{
+            .name = "CARGO_TARGET_DIR",
+            .value = try set_up.cargoTargetDir(arena, as_runner, opts.zig_local_cache_max_mb),
+        });
         // Shared only between the jobs the runner vouches for (`set_up.zigLocalShared`): Zig
         // runs what it finds there without checking it.
         if (std.mem.eql(u8, scope, "repo")) {
@@ -1116,6 +1122,9 @@ test "native volumes: the job's caches, by scope and step user, as the Dagger ba
         "/home/runner/.npm",
         "/tmp/node-compile-cache",
         "/home/runner/.cache/uv",
+        // A Zig job gets cargo's crate caches (`set_up.package_cache_dirs`).
+        "/home/runner/.cargo/registry",
+        "/home/runner/.cargo/git",
         "/home/runner/.cache/zig/p",
         "/home/runner/.cache/zig-local",
     };
@@ -1133,6 +1142,17 @@ test "native volumes: the job's caches, by scope and step user, as the Dagger ba
     try std.testing.expectEqualStrings(
         "/home/runner/.cache/zig-local/current",
         trusted.early_env.items[0].value,
+    );
+    // No cargo target directory unless asked for, and then inside Zig's local cache's volume.
+    try std.testing.expectEqual(@as(usize, 1), trusted.early_env.items.len);
+    var cargo_opts = opts;
+    cargo_opts.cargo_target_cache = true;
+    var with_cargo = try plan(arena, io, store, cargo_opts, "repo", job, dagger.default_image, true, false, null);
+    defer with_cargo.release(io);
+    try std.testing.expectEqualStrings("CARGO_TARGET_DIR", with_cargo.early_env.items[1].name);
+    try std.testing.expectEqualStrings(
+        "/home/runner/.cache/zig-local/current/cargo-target",
+        with_cargo.early_env.items[1].value,
     );
     try std.testing.expect(trusted.zig_local_roll != null);
     try std.testing.expectEqualStrings("/home/runner/.cache/zig/b", trusted.zig_builtin.?.at);

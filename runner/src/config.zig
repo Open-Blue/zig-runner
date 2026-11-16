@@ -275,6 +275,14 @@ pub const Config = struct {
     /// 111 MB for every commit built, and a Zig cache must never lose part of itself. 0 lets it
     /// grow, in the volume's root as before.
     zig_local_cache_max_mb: u32 = 4096,
+    /// With `zig_local_cache`, cargo's target directory (`CARGO_TARGET_DIR`) goes in Zig's local
+    /// cache volume, in `cargo-target/` beside Zig's own directories: a Rust library a Zig build
+    /// compiles (zig-runner's `zr-net`) is not compiled again by the next job. The same volume, so
+    /// the same scope (only the jobs the runner vouches for, `set_up.zigLocalShared`), the same size
+    /// limit and generations: cargo's compiled outputs and build scripts run unchecked in later
+    /// jobs, as Zig's `o/` does. Off by default, because it moves `target/` out of the workspace
+    /// (a workflow's own `CARGO_TARGET_DIR` wins).
+    cargo_target_cache: bool = false,
     /// Seed Zig jobs' global cache with what every `zig build` compiles before it reads any
     /// project: the build runner, 104 s on one core and about 1 GB on the laptop (`set_up.zig`,
     /// "The Zig cache seed"). The Zig releases to seed, comma-separated, at most three
@@ -603,6 +611,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_ZIG_LOCAL_CACHE")) |v| c.zig_local_cache = try boolean(v);
         if (environ.get("RUNNER_ZIG_LOCAL_CACHE_MAX_MB")) |v|
             c.zig_local_cache_max_mb = try num(u32, v);
+        if (environ.get("RUNNER_CARGO_TARGET_CACHE")) |v| c.cargo_target_cache = try boolean(v);
         if (environ.get("RUNNER_ZIG_SEED")) |v| c.zig_seed = try zigSeed(v);
         if (environ.get("RUNNER_ZIG_SEED_VERSIONS")) |v| c.zig_seed_versions = v;
         if (environ.get("RUNNER_PREWARM")) |v| try c.setPrewarm(v);
@@ -715,6 +724,7 @@ pub const Config = struct {
         else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache")) c.zig_local_cache = try boolean(val) //
         else if (eq(key, "zig-local-cache-max-mb")) c.zig_local_cache_max_mb = try num(u32, val) //
+        else if (eq(key, "cargo-target-cache")) c.cargo_target_cache = try boolean(val) //
         else if (eq(key, "zig-seed")) c.zig_seed = try zigSeed(val) //
         else if (eq(key, "zig-seed-versions")) c.zig_seed_versions = val //
         else if (eq(key, "prewarm")) try c.setPrewarm(val) //
@@ -1349,6 +1359,10 @@ test "Zig's local cache is kept only when asked for, and uv's setting is read" {
     try std.testing.expectEqual(@as(u32, 4096), (try Config.load(&env, &.{"runner"})).zig_local_cache_max_mb);
     try env.put("RUNNER_ZIG_LOCAL_CACHE_MAX_MB", "0");
     try std.testing.expectEqual(@as(u32, 0), (try Config.load(&env, &.{"runner"})).zig_local_cache_max_mb);
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).cargo_target_cache);
+    try std.testing.expect((try Config.load(&env, &.{ "runner", "--cargo-target-cache=true" })).cargo_target_cache);
+    try env.put("RUNNER_CARGO_TARGET_CACHE", "true");
+    try std.testing.expect((try Config.load(&env, &.{"runner"})).cargo_target_cache);
     try env.put("RUNNER_UV_ENV_IN_CACHE", "false");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).uv_env_in_cache);
 }

@@ -856,6 +856,7 @@ pub fn execute(
         .uv_env_in_cache = c.cfg.uv_env_in_cache,
         .zig_local_cache = c.cfg.zig_local_cache,
         .zig_local_cache_max_mb = c.cfg.zig_local_cache_max_mb,
+        .cargo_target_cache = c.cfg.cargo_target_cache,
         .zig_seeds = zig_seeds.seeds,
         .zig_seeds_unverified = zig_seeds.unverified,
         .zig_seed_registry = cfg.zig_seed_registry,

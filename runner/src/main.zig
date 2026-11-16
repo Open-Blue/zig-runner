@@ -796,6 +796,7 @@ fn execJobFile(
         .uv_env_in_cache = cfg.uv_env_in_cache,
         .zig_local_cache = cfg.zig_local_cache,
         .zig_local_cache_max_mb = cfg.zig_local_cache_max_mb,
+        .cargo_target_cache = cfg.cargo_target_cache,
         .zig_seeds = if (cfg.zig_seed) |*s| s[0..1] else &.{},
         .step_cache = cfg.step_cache,
         .step_user = cfg.step_user,
