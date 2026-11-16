@@ -432,6 +432,40 @@ slowing to a crawl. The trade-off is a failed job in place of a slow one, and th
 process killed is the engine itself, whose unclean restart wipes its cache: check which process the
 kernel picks before relying on it. razorbill doesn't use it today.
 
+### Job priority (#549)
+
+A zig-runner extension that GitHub Actions does not have (shipped as a prototype in v0.35.0; the
+extension is named `ZIG_RUNNER_PRIORITY`). A job has a level 0 to 9, named `low` 1, `normal` 4 and
+`high` 7. The level comes, first match wins, from a policy file (`RUNNER_PRIORITY_POLICY`), from
+the job's own `env: ZIG_RUNNER_PRIORITY` (a literal in a workflow- or job-level `env:`, capped at
+`RUNNER_PRIORITY_ENV_MAX`, and at `RUNNER_PRIORITY_DEFAULT` for a job the runner does not vouch
+for: on a pool with `RUNNER_TRUSTED_REFS=*` no job's own marker rises above the default, and only
+the policy file raises a job), or from `RUNNER_PRIORITY_DEFAULT`. Jobs waiting at the memory gate
+start in order of level, rising one level for each `RUNNER_PRIORITY_AGE_SECS` (60 s by default,
+per pool: a `low` job reaches the top within 8 minutes); native jobs get `cpu.weight`,
+`io.weight` and, for a high one, `memory.low` from the level.
+
+**The policy file's format is experimental** until it has run on real pools: its fields, its
+globs and its first-match order may change between releases. A level in `ZIG_RUNNER_PRIORITY` and
+the `RUNNER_PRIORITY_*` settings are not part of that note.
+
+**Freezing is opt-in and bounded** (`RUNNER_PRIORITY_FREEZE`, off by default): under memory
+pressure a lower native job's steps are frozen (`cgroup.freeze`) for a higher job, for at most
+`RUNNER_PRIORITY_FREEZE_MAX_SECS` (90 s) at a time. The runner itself is in no job's cgroup, so
+the job's hold and log go on while its steps are paused; a cancel, a timeout or a shutdown thaws
+the steps before it signals them.
+
+**A pause does not eat a timeout.** The time a job was paused (on the monotonic clock, all its
+pauses added, the one under way included) moves the deadline of the step that was running, and of
+the job's `timeout-minutes` where the runner enforces it. A step with `timeout-minutes: 10` that
+was paused for 80 s runs out 10 minutes and 80 s after it began, counting only what it ran. The
+step's `step-end:` line carries `paused_ms=<ms>` when it was paused, "Set up job" says that a pool
+may pause, and "Complete job" says how long the job was paused. Two limits: a step that began in
+the middle of a pause counts only what came after its start, and a job's own `timeout-minutes` on
+GitHub is enforced by GitHub itself (it cancels the job through the session, and the job
+definition does not carry the limit), so there a pause moves the step timeouts but not the job's;
+on Gitea and Forgejo, where the runner enforces the job's limit, both move.
+
 ### The health line
 
 While a job runs or waits, the runner logs one `health:` line a minute (`RUNNER_HEALTH_INTERVAL`

@@ -47,9 +47,10 @@ pub const Config = struct {
     /// PSI `some avg10`, in hundredths of a percent, from which a lower job is paused. The
     /// gate's own `max_pressure` is the line for taking no new job; this is the second line.
     freeze_pressure: u32 = 2000,
-    /// The longest one pause lasts, in ms: a paused job keeps its place and its memory, but its
-    /// step timeouts and its connections' idle timeouts run on, so a pause is bounded, and the
-    /// job is then not paused again for as long (`govern`).
+    /// The longest one pause lasts, in ms: a paused job keeps its place and its memory, and its
+    /// connections' idle timeouts run on, so a pause is bounded, and the job is then not paused
+    /// again for as long (`govern`). Its step and job timeouts do not run on: they are extended by
+    /// the time paused (`admission.Gate.pausedMs`).
     freeze_max_ms: u32 = 90 * std.time.ms_per_s,
 };
 
@@ -128,7 +129,8 @@ pub const Rule = struct {
 };
 
 /// The policy file (`RUNNER_PRIORITY_POLICY`): one rule a line, the first that matches wins, `#`
-/// starts a comment:
+/// starts a comment. Its format is experimental until it has run on real pools (#549), and may
+/// change:
 ///
 ///     high   repo=Open-Blue/zig-runner event=push ref=refs/heads/main
 ///     high   repo=Open-Blue/* job=release*

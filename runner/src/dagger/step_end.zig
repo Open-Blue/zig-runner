@@ -45,6 +45,9 @@ pub const Figures = struct {
     exit_us: ?u64 = null,
     /// `mem_peak` is the job's, not the step's.
     peak_job_scope: bool = false,
+    /// How long the job's priority paused the step, in ms: its timeout ran that much longer.
+    /// Written only when the step was paused.
+    paused_ms: i64 = 0,
 
     pub fn write(f: Figures, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("step-end: job={d} step={d} name='", .{ f.job, f.step });
@@ -75,6 +78,7 @@ pub const Figures = struct {
             try tenths(w, v[1]);
         }
         if (f.peak_job_scope) try w.writeAll(" peak_scope=job");
+        if (f.paused_ms > 0) try w.print(" paused_ms={d}", .{f.paused_ms});
         try w.writeByte('\n');
     }
 };
@@ -234,6 +238,7 @@ pub const Meter = struct {
                 .skipped, .not_run => "skipped",
             },
             .wall_ns = if (m.began) |b| phases.now() -| b else 0,
+            .paused_ms = res.paused_ms,
         };
         if (m.began != null) {
             if (m.timings) |t| {
@@ -295,6 +300,19 @@ test "the line: exact text for fixed figures, `?` for what was not read, and a n
             "root_ms=? exit_ms=? peak_scope=job\n",
         w.buffered(),
     );
+}
+
+test "the line carries paused_ms only for a step that was paused" {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try (Figures{ .job = 1, .step = 2, .name = "x", .result = "success", .wall_ns = 1_000_000, .paused_ms = 12_500 }).write(&w);
+    try std.testing.expect(std.mem.endsWith(u8, w.buffered(), " exit_ms=? paused_ms=12500\n"));
+    w = .fixed(&buf);
+    try (Figures{ .job = 1, .step = 2, .name = "x", .result = "success", .wall_ns = 1_000_000, .peak_job_scope = true, .paused_ms = 7 }).write(&w);
+    try std.testing.expect(std.mem.endsWith(u8, w.buffered(), " peak_scope=job paused_ms=7\n"));
+    w = .fixed(&buf);
+    try (Figures{ .job = 1, .step = 2, .name = "x", .result = "success", .wall_ns = 1_000_000 }).write(&w);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "paused_ms") == null);
 }
 
 fn fakeCgroup(tmp: *std.testing.TmpDir, cpu: u64, majflt: u64, minflt: u64, rb: u64, wb: u64) !void {

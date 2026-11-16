@@ -19,6 +19,7 @@ const sink = @import("../sink.zig");
 const redact = @import("../redact.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
 const loop = @import("../loop.zig");
+const admission = @import("../admission.zig");
 const jobs = @import("../loop/job.zig");
 const client_mod = @import("client.zig");
 const convert = @import("job.zig");
@@ -55,13 +56,17 @@ pub const JobTimeout = struct {
     grace_ms: i64 = jobs.CancelWatch.cancelLimitMs(jobs.CancelWatch.default_grace_ms),
     /// A test counts in less than minutes.
     unit_ms: i64 = std.time.ms_per_min,
+    /// How long the job's priority has paused it: the limit is that much later, so a pause
+    /// never eats the job's `timeout-minutes`.
+    paused: ?admission.PauseClock = null,
     stop: std.atomic.Value(bool) = .init(false),
 
     pub fn run(w: *JobTimeout) void {
         const started = std.Io.Clock.awake.now(w.io).toMilliseconds();
         const limit_ms = w.minutes *| w.unit_ms;
         while (!w.stop.load(.acquire)) {
-            if (std.Io.Clock.awake.now(w.io).toMilliseconds() - started >= limit_ms) break;
+            const paused = if (w.paused) |p| p.total() else 0;
+            if (std.Io.Clock.awake.now(w.io).toMilliseconds() - started - paused >= limit_ms) break;
             w.io.sleep(.fromMilliseconds(@min(100, @max(1, limit_ms))), .awake) catch return;
         } else return;
         w.cancel.requestBecause(std.Io.Clock.real.now(w.io).toMilliseconds() + w.grace_ms, .job_timeout);
@@ -194,6 +199,7 @@ fn runJob(
         .cancel = cancel,
         .task_id = t_id,
         .minutes = jobTimeout(c.arena, &job, converted.timeout_minutes),
+        .paused = if (c.gate) |g| g.pauseClock() else null,
     };
     var timing: ?std.Io.Future(void) = c.io.concurrent(JobTimeout.run, .{&timeout}) catch null;
     defer if (timing) |*f| {
@@ -275,6 +281,29 @@ test "a job's timeout is its whole minutes, and 360 when it says none or nonsens
     try std.testing.expectEqual(@as(i64, 360), timeoutMinutes("soon"));
     try std.testing.expectEqual(@as(i64, 360), timeoutMinutes("nan"));
     try std.testing.expectEqual(@as(i64, 366 * 24 * 60), timeoutMinutes("1e12"));
+}
+
+test "a job paused for longer than its timeout is not cancelled while paused, and is when the extended limit ends" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &out.writer } };
+    var cancel: dagger.Cancel = .{};
+    const start = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    // 200 ms of timeout, paused for 400 ms: the job is cancelled at 600 ms, not at 200.
+    const pause: std.atomic.Value(i64) = .init(400);
+    var w: JobTimeout = .{ .io = std.testing.io, .log = &log, .cancel = &cancel, .task_id = 5, .minutes = 200, .unit_ms = 1, .paused = .{ .counter = &pause } };
+    w.run();
+    const took = std.Io.Clock.awake.now(std.testing.io).toMilliseconds() - start;
+    try std.testing.expect(took >= 600);
+    try std.testing.expect(cancel.requested.load(.acquire));
+    try std.testing.expectEqual(dagger.Cancel.Why.job_timeout, cancel.why.load(.acquire));
+
+    // The same job never paused ends at its limit: the control.
+    var plain_cancel: dagger.Cancel = .{};
+    const t0 = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    var plain: JobTimeout = .{ .io = std.testing.io, .log = &log, .cancel = &plain_cancel, .task_id = 6, .minutes = 200, .unit_ms = 1 };
+    plain.run();
+    try std.testing.expect(std.Io.Clock.awake.now(std.testing.io).toMilliseconds() - t0 >= 200);
 }
 
 test "a job past its timeout is cancelled as a timeout, with a grace; one that ended first is not" {
