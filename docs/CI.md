@@ -94,6 +94,21 @@ unreported instead, and the merge queue waiting for it.
   itself; a tar that downloaded and fails the sha256, architecture or commit check fails the job.
   The artifact is named per attempt (`tests-aarch64-N`), by the prebuild's output. The Rust tests and the
   expression conformance step still build on the runner they run on.
+
+  "Every test file is compiled" (`test-files.sh`: each file with tests has them all in the test
+  binary) compiles the tests once more, which cost the Pi 2.5 min and 3.6 GB of its 4.3 GB, the
+  slowest step and the memory peak. On the prebuilt path the prebuild job runs it instead, natively
+  (x86_64) on GitHub's runner: what it checks is that every file's tests are listed in `main.zig`,
+  a fact of the source and not of the CPU, and the binary's names must be read by running it, which
+  the aarch64 cross-compile cannot do here. A failure fails the prebuild, which fails "Tests
+  (x86_64)" at "The prebuilt tests"; the Pi's step logs that it ran there. Where the Test step
+  compiles for itself (pull requests, the merge queue, a hosted `PROD_RUNNER`, or a failed
+  download) the check runs in the Test job as before.
+
+  On a runner with no readable cgroup and no GNU time (the Pi's native steps), the `memory-peak:`
+  line is sampled from `/proc` (`source=proc`: the largest sum of resident sets of the command and
+  its descendants); the runner's own "this step's memory peak" line, from the cgroup, is the
+  authority and is higher by the page cache.
 - **Native tests as root**: the native backend's root-only tests, in two parts per architecture,
   the slow tests (`test_shards.zig`'s `slow`) shared out among the parts on their own. In ci the
   store stress test runs for 10 s, where analysis runs it for minutes.
