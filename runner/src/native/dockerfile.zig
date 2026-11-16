@@ -285,6 +285,15 @@ fn lookup(vars: []const Var, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// `name` set to `value` in `list`: replaced where it is, else added last.
+fn putLabel(arena: Allocator, list: *std.ArrayList(images.Label), name: []const u8, value: []const u8) !void {
+    for (list.items) |*l| if (std.mem.eql(u8, l.name, name)) {
+        l.value = value;
+        return;
+    };
+    try list.append(arena, .{ .name = name, .value = value });
+}
+
 fn put(arena: Allocator, list: *std.ArrayList(Var), name: []const u8, value: []const u8) !void {
     for (list.items) |*v| if (std.mem.eql(u8, v.name, name)) {
         v.value = value;
@@ -396,7 +405,12 @@ pub const Source = union(enum) {
 /// What a stage starts from.
 pub const Base = union(enum) {
     /// An image's filesystem, a directory (`images.Image.rootfs`).
-    image: struct { ref: []const u8, rootfs: []const u8 },
+    image: struct {
+        ref: []const u8,
+        rootfs: []const u8,
+        /// Layers an image built earlier in the job (the Docker API's) has over its `rootfs`, top first.
+        layers: []const []const u8 = &.{},
+    },
     /// The result of an earlier stage (`FROM build`).
     stage: u32,
     /// Nothing (`FROM scratch`).
@@ -479,7 +493,38 @@ pub fn plan(
     build_args: []const Var,
     context: *Context,
 ) !Planned {
-    var p: Planner = .{ .arena = arena, .bases = bases, .build_args = build_args, .context = context };
+    return planWith(arena, instructions, bases, context, .{ .build_args = build_args });
+}
+
+/// What a build asks beyond the Dockerfile (the Docker API's `POST /build`, `docker_api.zig`).
+pub const Options = struct {
+    /// `--build-arg`.
+    build_args: []const Var = &.{},
+    /// `--target`: the stage the image is, by its `AS` name or its number; "" for the last.
+    target: []const u8 = "",
+    /// `--no-cache`: a value no earlier build had, which every `RUN`'s key holds, so none of them
+    /// (nor any instruction after one) is taken from the store.
+    salt: []const u8 = "",
+    /// `LABEL`s the build adds to the image's config, after the Dockerfile's own (`--label`).
+    labels: []const Var = &.{},
+};
+
+pub fn planWith(
+    arena: Allocator,
+    instructions: []const Instruction,
+    bases: *Bases,
+    context: *Context,
+    opts: Options,
+) !Planned {
+    var p: Planner = .{
+        .arena = arena,
+        .bases = bases,
+        .build_args = opts.build_args,
+        .context = context,
+        .target = opts.target,
+        .salt = opts.salt,
+        .labels = opts.labels,
+    };
     const got = p.run(instructions) catch |e| switch (e) {
         error.Refused => return .{ .refused = p.refusal },
         else => return e,
@@ -492,6 +537,9 @@ const Planner = struct {
     bases: *Bases,
     build_args: []const Var,
     context: *Context,
+    target: []const u8 = "",
+    salt: []const u8 = "",
+    labels: []const Var = &.{},
     refusal: Refusal = .{ .line = 0, .why = "" },
     /// The ARGs before the first FROM, which only FROM sees.
     global: std.ArrayList(Var) = .empty,
@@ -551,11 +599,20 @@ const Planner = struct {
         const ends = try arena.alloc(usize, n);
         for (ends, 0..) |*e, s| e.* = if (s + 1 < n) starts.items[s + 1] else ins.len;
 
-        // The stages the last one needs, through the stages it starts from and copies from.
+        // The stage the image is: the last, or the `--target`'s.
+        var final: usize = n - 1;
+        if (p.target.len > 0) {
+            final = stageNamed(froms, n, p.target) orelse return p.refuseFmt(
+                ins[starts.items[n - 1]].line,
+                "target stage \"{s}\" could not be found",
+                .{p.target},
+            );
+        }
+        // The stages it needs, through the stages it starts from and copies from.
         const needed = try arena.alloc(bool, n);
         @memset(needed, false);
         var work: std.ArrayList(usize) = .empty;
-        try work.append(arena, n - 1);
+        try work.append(arena, final);
         while (work.pop()) |s| {
             if (needed[s]) continue;
             needed[s] = true;
@@ -583,7 +640,15 @@ const Planner = struct {
             const stage = try p.planStage(s, froms, ins[starts.items[s]..ends[s]]);
             try p.stages.append(arena, stage);
         }
-        return .{ .stages = p.stages.items, .final = @intCast(n - 1) };
+        // The build's own labels are the image's, whichever stage it is, over the Dockerfile's.
+        if (p.labels.len > 0) {
+            const cfg = &p.stages.items[final].config;
+            var merged: std.ArrayList(images.Label) = .empty;
+            try merged.appendSlice(arena, cfg.labels);
+            for (p.labels) |l| try putLabel(arena, &merged, l.name, l.value);
+            cfg.labels = merged.items;
+        }
+        return .{ .stages = p.stages.items, .final = @intCast(final) };
     }
 
     /// The `--from=` value of a COPY, with the global ARGs substituted; null when it has none.
@@ -646,7 +711,7 @@ const Planner = struct {
             var why: []const u8 = "";
             const img = (try p.bases.resolveFn(p.bases, arena, from.image, &why)) orelse
                 return p.refuse(from_ins.line, why);
-            base = .{ .image = .{ .ref = from.image, .rootfs = img.config.rootfs } };
+            base = .{ .image = .{ .ref = from.image, .rootfs = img.config.rootfs, .layers = img.config.layers } };
             st = .{
                 .cfg = img.config,
                 .key = fromKey(try images.normalize(arena, from.image), img.id, null),
@@ -674,7 +739,13 @@ const Planner = struct {
                     evaluated = try substitute(arena, x.text, scope);
                     for (try pairs(arena, evaluated)) |v| try put(arena, &st.env, v.name, v.value);
                 },
-                .label => evaluated = try substitute(arena, x.text, scope),
+                .label => {
+                    evaluated = try substitute(arena, x.text, scope);
+                    var labels: std.ArrayList(images.Label) = .empty;
+                    try labels.appendSlice(arena, st.cfg.labels);
+                    for (try pairs(arena, evaluated)) |v| try putLabel(arena, &labels, v.name, v.value);
+                    st.cfg.labels = labels.items;
+                },
                 .workdir => {
                     const w = try substitute(arena, x.text, scope);
                     st.workdir = try std.fs.path.resolvePosix(arena, &.{ st.workdir, w });
@@ -720,6 +791,7 @@ const Planner = struct {
                     // A heredoc's lines are part of what runs, though not of the instruction's text.
                     if (x.heredocs.len > 0) evaluated = argv[argv.len - 1];
                     // A RUN's result depends on the build arguments it sees, as BuildKit keys it.
+                    if (p.salt.len > 0) try run_env.append(arena, p.salt);
                     reads = try arena.dupe(u8, &listDigest(run_env.items));
                 },
                 .copy, .add => {
@@ -835,6 +907,8 @@ const Planner = struct {
                 var why: []const u8 = "";
                 const img = (try p.bases.resolveFn(p.bases, arena, name, &why)) orelse
                     return p.refuse(ins.line, why);
+                if (img.config.layers.len > 0) return p.refuse(ins.line, "`COPY --from` an image built " ++
+                    "earlier in the job is not supported yet");
                 from = .{ .rootfs = img.config.rootfs };
                 base_reads = img.id;
                 from_id = try images.normalize(arena, name);
@@ -1292,6 +1366,31 @@ pub const Sources = struct {
     /// The build context; null for a build that copies nothing from one.
     context: ?*View,
     opaque_xattr: [:0]const u8,
+    /// Told of each stage and step as the build reaches it (the Docker API's `Step 3/7 : ...`).
+    progress: ?Progress = null,
+};
+
+/// What a build tells its caller as it goes.
+pub const Progress = struct {
+    ptr: *anyopaque,
+    /// A stage `stage` (its number, by `FROM`) is started.
+    stageFn: *const fn (ptr: *anyopaque, stage: u32) void,
+    /// A step of a stage: what it is going to be (`How`), and once more with `.built` when a
+    /// layer that was not in the store has been made.
+    stepFn: *const fn (ptr: *anyopaque, step: Step, how: How) void,
+
+    pub const How = enum {
+        /// Its layer was in the store.
+        cached,
+        /// It changes the config only: no layer.
+        config,
+        /// Its layer is about to be made.
+        building,
+        /// ... and it was.
+        built,
+        /// A `WORKDIR` the image has already: no layer.
+        present,
+    };
 };
 
 pub const Failed = struct {
@@ -1357,21 +1456,33 @@ const Builder = struct {
         std.debug.assert(st.needed);
         var stack: std.ArrayList([]const u8) = .empty;
         switch (st.base) {
-            .image => |im| try stack.append(arena, im.rootfs),
+            .image => |im| {
+                try stack.appendSlice(arena, im.layers);
+                try stack.append(arena, im.rootfs);
+            },
             .stage => |parent| switch (try b.stage(parent)) {
                 .ok => |l| try stack.appendSlice(arena, l),
                 .failed => |f| return .{ .failed = f },
             },
             .scratch => {},
         }
+        if (b.src.progress) |pg| pg.stageFn(pg.ptr, i);
         for (st.steps) |step| {
-            if (step.op == .none) continue;
+            if (step.op == .none) {
+                if (b.src.progress) |pg| pg.stepFn(pg.ptr, step, .config);
+                continue;
+            }
             if (try b.store.get(arena, io, &step.key)) |layer| {
+                if (b.src.progress) |pg| pg.stepFn(pg.ptr, step, .cached);
                 try stack.insert(arena, 0, layer);
                 continue;
             }
             // A directory the image has needs no layer.
-            if (step.op == .mkdir and try b.hasDir(step.op.mkdir.path, stack.items)) continue;
+            if (step.op == .mkdir and try b.hasDir(step.op.mkdir.path, stack.items)) {
+                if (b.src.progress) |pg| pg.stepFn(pg.ptr, step, .present);
+                continue;
+            }
+            if (b.src.progress) |pg| pg.stepFn(pg.ptr, step, .building);
             const upper = try b.store.begin(arena, io, &step.key);
             errdefer discard(io, upper);
             switch (step.op) {
@@ -1393,6 +1504,7 @@ const Builder = struct {
                 },
             }
             try stack.insert(arena, 0, try b.store.publish(arena, io, upper, &step.key));
+            if (b.src.progress) |pg| pg.stepFn(pg.ptr, step, .built);
         }
         b.made[i] = stack.items;
         return .{ .ok = stack.items };

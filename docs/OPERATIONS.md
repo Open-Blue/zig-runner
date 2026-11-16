@@ -131,7 +131,7 @@ engine's other state (its layer cache, and through a trusted job's nesting the e
 not scoped at all; and nesting is control of the host. A second instance on prod's machine
 (`zig-runner@sandbox.service`) gets its own engine, or none.
 
-### A Docker API for native jobs (stage 1a of #448)
+### A Docker API for native jobs (#448)
 
 `RUNNER_NATIVE_DOCKER_API=true` (`--native-docker-api`; off by default) gives every native job a
 Docker-compatible API of its own: a unix socket in the job's directory, bound into each step at
@@ -140,16 +140,50 @@ the step's environment (a workflow's own `env:` wins). It is the runner's thread
 the host's Docker daemon and not a Dagger engine, and only that job's steps have the socket; it is
 removed with the job. Nothing changes for a job while the option is off.
 
-This first stage answers `/_ping`, `/version` and `/info`, so a `docker` CLI in the step (an image
-that has one, or a setup action; the runner does not provide it) finds a server and says what it
-is. Every other endpoint, `docker build` included for now, gets HTTP 501 with
+**What it serves.** `/_ping`, `/version` and `/info`; `docker build` (the classic builder,
+`POST /build`) with `-f`, `-t` (repeatable), `--build-arg`, `--label`, `--target`, `--no-cache`,
+`--pull` (accepted), `-q`; and the images the job built: `docker image inspect`, `docker tag`,
+`docker rmi`, and a later build can start `FROM` an image the job built. A build is made by the runner's own Dockerfile builder, as a Docker action's is: its
+`RUN`s run in the job's cgroup and network (with no Docker API inside them), its layers are the
+shared layer store's under the job's trust scope, and a second identical build takes them from
+there (`---> Using cache`). A step's `docker` CLI is the workflow's to provide (an image that has
+one, or a setup action; the runner does not). What it does not serve gets HTTP 501 with
 `{"message":"not supported by zig-runner yet: <METHOD> <path>"}`, and BuildKit's (`docker buildx`,
-`docker/build-push-action`) a hint that they need a later stage. A job that uses the API logs one
-`info: kind=native_docker_api job=.. connections=.. requests=.. unsupported=.. refused=..
-timeouts=.. busy=..` line when it ends. Each job's API answers at most 100 requests a second (429 past that), and a step that makes any
-request beyond those three is not stored for replay in the step cache. A job container whose
-`volumes:` are at or around `/var/run/docker.sock` gets no API, and says so in "Set up job". Sending a job that needs more than this to an engine
-ahead of time, so that no Docker job is lost, is a later stage (#448, decision 2).
+`docker/build-push-action`) a hint that they need a later stage.
+
+**Images are the job's own.** The tags are in the runner's memory for that job (at most 100 images
+and 256 tags), and no other job, repository or trust scope sees them. The image ID is
+`sha256:` and a hash of the image's config and its last step's key, not Docker's value: the same
+build gives the same ID, and nothing here is pushed, saved or run (`docker run`, `save`, `push` are
+501). A build's context is unpacked into the job's directory (at most 1 GiB, 200,000 entries; a link
+that leads out of it, a hard link or a device is refused) and removed after; one build runs at a
+time, and a job makes at most 100.
+
+**Not supported yet** (each says so, with the line): `RUN` as a `USER` other than root,
+`RUN --mount`, `ADD` of an archive or a git repository, `FROM` another platform (`--platform` is
+refused unless it is the runner's own), `docker build` of a URL, `--squash`, `--network=host`,
+a compressed context (`--compress`), and `COPY --from` an image the job built earlier (`FROM` one
+works, and so does `COPY --from` a stage).
+
+**A job that needs more goes to the engine.** With the option on and an engine configured
+(`RUNNER_ENGINE` not `none`), a job whose scripts or `uses:` look like they need more than the above
+runs on Dagger, as it would with the option off, and "Set up job" says why: a `docker run`,
+`compose`, `push`, `pull`, `images`, `buildx`, `docker-compose` or `docker login` command, or a
+`docker/` action but `docker/metadata-action`. The check reads each script as text (a `docker` that
+starts a command: after `;`, `&&`, `|`, `$(`, `then`, `sudo`, and so on; options skipped to its
+subcommand), so it errs toward the engine (an `echo "docker push"` is found) and cannot see a
+command that a Makefile, another script or `xargs` runs. Such a command meets the 501 when it runs.
+With `RUNNER_ENGINE=none` there is nothing to send it to, and the job runs natively.
+
+**Replay.** A step that made a request beyond ping, version and info is not stored for replay in
+the step cache, and the steps after it run uncached: what a build made is in no step key. A request
+is counted against the step that made it: the API answers only while a step's process runs, a
+request after that is 503 and counted, a build is cancelled when its step ends or its client leaves
+(`docker build` killed, a timeout), and a step's end waits for what is in flight. A job that uses the
+API logs one `info: kind=native_docker_api job=.. connections=.. requests=.. unsupported=..
+refused=.. timeouts=.. busy=.. limited=.. builds=.. gated=..` line when it ends. Each job's API
+answers at most 100 requests a second (429 past that). A job container whose `volumes:` are at or
+around `/var/run/docker.sock` gets no API, and says so in "Set up job".
 
 ## Deploying releases
 

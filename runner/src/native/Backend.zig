@@ -54,6 +54,7 @@ const set_up = @import("../dagger/set_up.zig");
 const provisioned = @import("../dagger/provisioned.zig");
 const phases = @import("phases.zig");
 const docker_api = @import("docker_api.zig");
+const docker_api_job = @import("docker_api_job.zig");
 const build_version = @import("../version.zig");
 const hash_files = @import("hash_files.zig");
 const key_diff = @import("key_diff.zig");
@@ -151,6 +152,8 @@ etc_binds: []const sandbox.Spec.Bind = &.{},
 /// The job's Docker API while it is served (`startDockerApi`): its socket is in `binds`, and
 /// `deinit` stops the server and logs what it was used for.
 docker_api_server: ?*docker_api.Server = null,
+/// What answers it (`docker_api_job.zig`): the job's builds and tag index, gone with the job.
+docker_api_state: ?*docker_api_job.State = null,
 /// Where its socket is, in the job's directory.
 docker_api_path: []const u8 = "",
 /// Where in `notes` the note that the job has the API is, for `dropDockerApi` to take away.
@@ -652,6 +655,15 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
     if (as_runner and std.os.linux.geteuid() != 0) return "steps run as the runner user need a " ++
         "range of ids, which a rootless runner does not have (RUNNER_STEP_USER=root, or a root " ++
         "runner)";
+    // The job's Docker API serves `docker build` and the images it makes (`docker_api_job.zig`); a job
+    // that also runs containers, composes, pushes or uses buildx would find 501s where Dagger's engine
+    // serves it: with an engine to send it to, it goes there, as it would without the option. A
+    // heuristic over the steps' scripts and `uses:` (`jobNeedsDaemon`): a command a script's own
+    // tools run for it is not seen, and meets the 501 at run time.
+    if (cfg.docker_api and !opts.engineless and docker_api_job.jobNeedsDaemon(job.steps))
+        return "a step uses Docker beyond what the native job's Docker API serves (`docker build`, " ++
+            "`tag`, `rmi`, `image inspect`): `docker run`, `compose`, `push`, `pull`, `buildx` or a " ++
+            "`docker/` action (RUNNER_NATIVE_DOCKER_API), which an engine runs";
     for (job.steps) |step| switch (step.action) {
         // What they are is in their `action.yml`: decided once fetched (`actions.preload`).
         .uses => {},
@@ -1086,11 +1098,15 @@ fn makeEmptyFile(io: std.Io, file: []const u8) !void {
 
 fn startDockerApi(b: *Backend, id: []const u8, cfg_delay: u32) !void {
     const path = try std.fmt.allocPrint(b.arena, "{s}/docker.sock", .{b.dir});
+    const state = try docker_api_job.State.create(b);
     const server = docker_api.Server.start(b.gpa, path, .{
         .job = id,
         .version = build_version.string,
         .test_route_delay_ms = cfg_delay,
+        .handler = state.handler(),
+        .work_dir = b.dir,
     }) catch |e| {
+        state.destroy();
         try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Docker API: not served to " ++
             "this job (RUNNER_NATIVE_DOCKER_API): the socket {s} could not be made: {t}", .{ path, e }));
         return;
@@ -1101,12 +1117,16 @@ fn startDockerApi(b: *Backend, id: []const u8, cfg_delay: u32) !void {
         const made: ?anyerror = if (makeEmptyFile(b.io, file)) null else |e| e;
         if (made) |e| {
             _ = server.stop();
+            state.destroy();
             try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Docker API: not served to " ++
                 "this job (RUNNER_NATIVE_DOCKER_API): making {s} failed: {t}", .{ file, e }));
             return;
         }
     }
     b.docker_api_server = server;
+    b.docker_api_state = state;
+    // Closed until a step's process runs (`runIn`): nothing of the job is there to ask before.
+    _ = server.closeGate();
     b.docker_api_path = path;
     b.docker_api_note = b.notes.items.len;
     b.binds = try std.mem.concat(b.arena, sandbox.Spec.Bind, &.{ b.binds, &.{.{
@@ -1117,9 +1137,11 @@ fn startDockerApi(b: *Backend, id: []const u8, cfg_delay: u32) !void {
     }} });
     try b.notes.append(b.arena, "Docker API: this job's steps (and a Docker action's container) have a " ++
         "Docker-compatible API at " ++ docker_api.socket_at ++ " (DOCKER_HOST, DOCKER_BUILDKIT=0 set " ++
-        "unless the image, the container or the workflow sets them): /_ping, /version and /info are " ++
-        "answered, everything else is 501 \"not supported by zig-runner yet\". A step that uses it " ++
-        "beyond those is not stored for replay.");
+        "unless the image, the container or the workflow sets them): `docker build` (the classic " ++
+        "builder, POST /build) and `docker image inspect`, `tag` and `rmi` are answered by the native " ++
+        "Dockerfile builder, as are /_ping, /version and /info; everything else is 501 \"not " ++
+        "supported by zig-runner yet\". A step that uses it beyond ping, version and info is not " ++
+        "stored for replay.");
 }
 
 /// Gives the job no Docker API after all, because the job binds the socket's path itself (a
@@ -1150,6 +1172,13 @@ fn dropDockerApi(b: *Backend, why: []const u8) !void {
         "job (RUNNER_NATIVE_DOCKER_API): {s}", .{why}));
 }
 
+/// The job's binds without the Docker API's socket (a build's `RUN`).
+fn bindsWithoutApi(b: *Backend) ![]const sandbox.Spec.Bind {
+    var out: std.ArrayList(sandbox.Spec.Bind) = .empty;
+    for (b.binds) |bd| if (!std.mem.eql(u8, bd.host, b.docker_api_path)) try out.append(b.arena, bd);
+    return out.items;
+}
+
 /// How many requests the job's API has answered with anything but `/_ping`, `/version` or
 /// `/info`: a step that makes one is not stored for replay (the API's effects are in no key).
 fn apiBeyond(b: *const Backend) u32 {
@@ -1163,8 +1192,10 @@ fn stopDockerApi(b: *Backend) void {
     const s = b.docker_api_server orelse return;
     b.docker_api_server = null;
     const st = s.stop();
+    if (b.docker_api_state) |state| state.destroy();
+    b.docker_api_state = null;
     if (st.connections > 0) logfmt.info("native_docker_api", "job={s} connections={d} " ++
-        "requests={d} unsupported={d} refused={d} timeouts={d} busy={d} limited={d}", .{
+        "requests={d} unsupported={d} refused={d} timeouts={d} busy={d} limited={d} builds={d} gated={d}", .{
         std.fs.path.basename(b.dir),
         st.connections,
         st.requests,
@@ -1173,6 +1204,8 @@ fn stopDockerApi(b: *Backend) void {
         st.timeouts,
         st.busy,
         st.limited,
+        st.builds,
+        st.gated,
     });
 }
 
@@ -3089,6 +3122,27 @@ pub fn execBuild(
     return b.execIn(argv, env, &.{}, uid, gid, out, container, false);
 }
 
+/// A `RUN` of a build the job's Docker API runs (`docker_api_handler.zig`), while a step of the job
+/// is running: as `execBuild`, in the job's cgroup, but with a `Running` of its own (so the step's
+/// is not taken over, and the build can be stopped without it), job-overlay directories of its own
+/// (`AW`, `AM`; the step's are `W`, `M`), the job's layers left as they are (no flattening under
+/// the running step) and no Docker API in it: a build's `RUN` cannot ask for another.
+pub fn execBuildApi(
+    b: *Backend,
+    running: *sandbox.Running,
+    argv: []const []const u8,
+    env: []const []const u8,
+    out: sandbox.Output,
+    container: sandbox.Spec.Container,
+) !sandbox.Ended {
+    return b.runIn(argv, env, &.{}, 0, 0, out, container, false, false, .{
+        .running = running,
+        .api = false,
+        .work = "AW",
+        .merged = "AM",
+    });
+}
+
 fn execIn(
     b: *Backend,
     argv: []const []const u8,
@@ -3109,8 +3163,19 @@ fn execIn(
     // A container with an owner has its own idmaps of the job's directory (`sandbox.jobView`).
     const owned = if (container) |c| c.owner != null else false;
     const idmapped = new_layer and !owned and b.upperIdmapped() and b.idmappedUpper();
-    return b.runIn(argv, env, files, uid, gid, out, container, new_layer, idmapped);
+    return b.runIn(argv, env, files, uid, gid, out, container, new_layer, idmapped, .{ .running = &b.running });
 }
+
+/// How a `runIn` differs from a step's own.
+const RunMode = struct {
+    running: *sandbox.Running,
+    /// The job's Docker API is open to it (`Server.openGate`), if the job has one: its socket is
+    /// bound, and it is answered only while this runs.
+    api: bool = true,
+    /// The job overlay's work directory and mount point.
+    work: []const u8 = "W",
+    merged: []const u8 = "M",
+};
 
 /// `execIn` after its layers are in order: the step run, its upper written through an idmapped
 /// mount when `idmapped` (`Spec.upper_canonical`), whose layer then has the canonical ids already.
@@ -3125,11 +3190,14 @@ fn runIn(
     container: ?sandbox.Spec.Container,
     new_layer: bool,
     idmapped: bool,
+    mode: RunMode,
 ) !sandbox.Ended {
     const arena = b.arena;
     const upper = if (new_layer) try b.layerName('L') else "BU";
     const upper_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, upper });
     try std.Io.Dir.cwd().createDirPath(b.io, upper_path);
+    if (!std.mem.eql(u8, mode.work, "W")) for ([_][]const u8{ mode.work, mode.merged }) |d|
+        try std.Io.Dir.cwd().createDirPath(b.io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, d }));
     const base_id = b.idBase();
     const netns = b.networkPath() catch return .{
         .code = 1,
@@ -3159,12 +3227,22 @@ fn runIn(
     // the trees by a verdict again (`tool_trees.Epochs`). Every start with a volume mounted, a
     // step, an action's pre or post script, a Docker build or a set-up script alike.
     volumes.endEpochs(b.io, b.binds);
+    // The job's Docker API answers while this runs, and not a moment after: what a client of the
+    // step asks of it is then all counted before the step is judged (`Server.closeGate`).
+    const api_server: ?*docker_api.Server = if (mode.api) b.docker_api_server else null;
+    // The backend is returned by value from `init`: its state was made with an address it no longer
+    // has, and is given this one before anything can ask it for the job.
+    if (b.docker_api_state) |state| state.b = b;
+    if (api_server) |srv| srv.openGate();
+    defer if (api_server) |srv| if (!srv.closeGate()) {
+        logfmt.warn("native_docker_api", "job={s} a request of the step did not end in time", .{std.fs.path.basename(b.dir)});
+    };
     const ended = try sandbox.run(arena, b.io, b.how.argv_prefix, .{
         .root = b.dir,
         .lowers = lowers,
         .upper = upper,
-        .work = "W",
-        .merged = "M",
+        .work = mode.work,
+        .merged = mode.merged,
         .workdir = b.workdir,
         .uid = uid,
         .gid = gid,
@@ -3174,12 +3252,12 @@ fn runIn(
         .argv = argv,
         .env = env,
         .files = files,
-        .binds = b.binds,
+        .binds = if (b.docker_api_server != null and !mode.api) try b.bindsWithoutApi() else b.binds,
         .userns = b.how.userns,
         .id_base = base_id,
         .id_count = ids_per_slot,
         .netns = netns,
-        .mount_points = if (b.docker_api_server != null) api_mount_points else mount_points,
+        .mount_points = if (b.docker_api_server != null and mode.api) api_mount_points else mount_points,
         .cgroup = if (b.job_cgroup) |j| j.stepsDir() else null,
         .image_layers = @intCast(b.seed_layers.items.len + 1),
         .canonical = canonical,
@@ -3188,7 +3266,7 @@ fn runIn(
         .volume_id_base = volumeIdBase(b.subid_base),
         .container = container,
         .container_opts = b.sandbox_opts,
-    }, &b.running, out);
+    }, mode.running, out);
     b.timings.helper(arena, ended.helper, ended.spawned, ended.ended);
     if (new_layer) try b.layers.append(arena, .{ .name = upper, .path = upper_path, .canonical = idmapped });
     return ended;
@@ -3309,7 +3387,7 @@ const idmapped_trial = "mkdir /idmapped-trial && echo x > /idmapped-trial/f && "
 fn tryIdmappedUpper(b: *Backend) ?[]const u8 {
     const arena = b.arena;
     var out: Captured = .{ .arena = arena };
-    const ended = b.runIn(&.{ "sh", "-c", idmapped_trial }, &.{"PATH=/usr/bin:/bin"}, &.{}, 0, 0, out.output(), null, true, true) catch |e|
+    const ended = b.runIn(&.{ "sh", "-c", idmapped_trial }, &.{"PATH=/usr/bin:/bin"}, &.{}, 0, 0, out.output(), null, true, true, .{ .running = &b.running, .api = false }) catch |e|
         return @errorName(e);
     const top = b.layers.pop() orelse return "no layer was made";
     defer removeTree(arena, b.io, top.path);
@@ -12655,4 +12733,329 @@ test "native docker api: a step that made a request beyond ping, version and inf
         ,
         "echo two",
     }, "late"));
+}
+
+// --- the job's Docker API: image builds (#448, stage 1b) ---
+
+/// The tests' base image: alpine's, as `native-service-images.sh` (or a developer's own copy of one
+/// image under this name) puts in `ZIG_RUNNER_SERVICE_IMAGES`. A job that builds `FROM` it needs
+/// the host's `docker` CLI in the step's `/usr`, which `testConfigAt` binds.
+const docker_build_base = "redis:8-alpine";
+
+/// A config for a root job with the Docker API and the base image in its image store, or a skip.
+fn dockerBuildConfig(arena: Allocator, tmp: *std.testing.TmpDir) !Config {
+    var env = try std.testing.environ.createMap(arena);
+    const dir = env.get("ZIG_RUNNER_SERVICE_IMAGES") orelse return error.SkipZigTest;
+    try requireRoot();
+    std.Io.Dir.accessAbsolute(std.testing.io, "/usr/bin/docker", .{}) catch {
+        std.debug.print("native image build test skipped: no docker CLI in /usr/bin\n", .{});
+        return error.SkipZigTest;
+    };
+    var cfg = try testConfig(arena, tmp);
+    cfg.docker_api = true;
+    // The services' layout (`redis+8-alpine/rootfs`) in the builder's (the reference's key), by a
+    // link to the entry: a base the Dockerfile builder finds in its image store.
+    try tmp.dir.createDirPath(std.testing.io, "images");
+    try tmp.dir.symLink(
+        std.testing.io,
+        try std.fmt.allocPrint(arena, "{s}/redis+8-alpine", .{dir}),
+        try std.fmt.allocPrint(arena, "images/{s}", .{try images.key(arena, docker_build_base)}),
+        .{},
+    );
+    cfg.images = try tmp.dir.realPathFileAlloc(std.testing.io, "images", arena);
+    return cfg;
+}
+
+/// A context with a two-stage Dockerfile, in /tmp/ctx, made by a step.
+const docker_build_context =
+    \\set -e
+    \\export DOCKER_CLI_HINTS=false
+    \\mkdir -p /tmp/ctx && cd /tmp/ctx
+    \\printf 'hello from the context\n' > hello.txt
+    \\cat > Dockerfile <<'DF'
+    \\FROM redis:8-alpine AS base
+    \\ARG GREETING=hi
+    \\ENV KIND=demo
+    \\LABEL org.example.stage=base
+    \\COPY hello.txt /hello.txt
+    \\RUN echo "$GREETING from $KIND" > /greeting && cat /hello.txt >> /greeting
+    \\FROM base AS final
+    \\LABEL org.example.stage=final
+    \\RUN echo final-stage >> /greeting
+    \\DF
+    \\set +e
+    \\
+;
+
+test "native image build: the CLI's build through the job's API, with FROM, COPY, RUN, ENV, ARG, --target and labels, inspected, rebuilt from the store, untagged" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try dockerBuildConfig(arena, &tmp);
+    const script = docker_build_context ++
+        \\echo "== first"
+        \\docker build -t x:1 -t x:latest --build-arg GREETING=hello --label built=yes --target base . 2>&1
+        \\echo "build exit: $?"
+        \\id1=$(docker image inspect --format '{{.Id}}' x:1)
+        \\echo "id: $id1"
+        \\echo "labels: $(docker image inspect --format '{{json .Config.Labels}}' x:1)"
+        \\echo "env: $(docker image inspect --format '{{.Config.Env}}' x:latest)"
+        \\echo "tags: $(docker image inspect --format '{{.RepoTags}}' x:1)"
+        \\echo "== second, the same"
+        \\docker build -t x:1 --build-arg GREETING=hello --label built=yes --target base . 2>&1
+        \\id2=$(docker image inspect --format '{{.Id}}' x:1)
+        \\if [ "$id1" = "$id2" ]; then echo "same image id"; else echo "different image ids: $id1 $id2"; fi
+        \\echo "== the last stage"
+        \\qid=$(docker build -q -t y:1 . 2>/dev/null)
+        \\echo "quiet: $qid"
+        \\echo "final labels: $(docker image inspect --format '{{json .Config.Labels}}' y:1)"
+        \\echo "== from an image built before"
+        \\mkdir -p /tmp/ctx2 && printf 'FROM x:latest\nRUN cat /greeting && echo derived > /derived\n' > /tmp/ctx2/Dockerfile
+        \\docker build -t w:1 /tmp/ctx2 2>&1
+        \\echo "derived: $(docker image inspect --format '{{.Config.Env}} {{json .Config.Labels}}' w:1)"
+        \\mkdir -p /tmp/ctx3 && printf 'FROM redis:8-alpine\nCOPY --from=x:latest /greeting /g\n' > /tmp/ctx3/Dockerfile
+        \\docker build /tmp/ctx3 2>&1 | tail -2
+        \\echo "== tag and remove"
+        \\docker tag x:1 z:2
+        \\docker image inspect --format '{{.RepoTags}}' z:2
+        \\docker rmi x:1
+        \\docker rmi z:2
+        \\docker image inspect x:1 2>&1 || echo "x:1 is gone"
+        \\echo "latest still: $(docker image inspect --format '{{.RepoTags}}' x:latest)"
+    ;
+    const job = testJob(&.{testStep(script)});
+    const r = try runNativeJob(arena, cfg, job, .root);
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(r.res.succeeded);
+    try expectAll(r.text, &.{
+        "Step 1/6 : FROM " ++ docker_build_base ++ " AS base",
+        "Step 2/6 : ARG GREETING=hi",
+        "Step 6/6 : RUN echo \"$GREETING from $KIND\" > /greeting && cat /hello.txt >> /greeting",
+        " ---> Running in ",
+        "Successfully built ",
+        "Successfully tagged x:1",
+        "Successfully tagged x:latest",
+        "build exit: 0",
+        "labels: {\"built\":\"yes\",\"org.example.stage\":\"base\"}",
+        "KIND=demo",
+        "[x:1 x:latest]",
+        "same image id",
+        // The second build took its layers from the store.
+        " ---> Using cache",
+        // Without a target the last stage is the image.
+        "quiet: sha256:",
+        "final labels: {\"org.example.stage\":\"final\"}",
+        "Step 1/2 : FROM x:latest",
+        "hello from demo",
+        "derived: [PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin KIND=demo] {\"built\":\"yes\",\"org.example.stage\":\"base\"}",
+        "`COPY --from` an image built earlier in the job is not supported yet",
+        "[x:1 x:latest z:2]",
+        "Untagged: x:1",
+        "Untagged: z:2",
+        "No such image: x:1",
+        "x:1 is gone",
+        "latest still: [x:latest]",
+    });
+}
+
+test "native image build: a failed RUN, a refused Dockerfile, a missing base and a bad request end the build with a clear error, and the next build works" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try dockerBuildConfig(arena, &tmp);
+    const script =
+        \\export DOCKER_CLI_HINTS=false
+        \\set +e
+        \\mkdir -p /tmp/f1 /tmp/f2 /tmp/f3 /tmp/f4 /tmp/f5
+        \\printf 'FROM redis:8-alpine\nRUN echo before && exit 3\n' > /tmp/f1/Dockerfile
+        \\printf 'FROM redis:8-alpine\nRUN --mount=type=cache,target=/c true\n' > /tmp/f2/Dockerfile
+        \\printf 'FROM nosuch.invalid/none:1\n' > /tmp/f3/Dockerfile
+        \\printf 'FROM redis:8-alpine\nUSER nobody\nRUN id\n' > /tmp/f4/Dockerfile
+        \\printf 'FROM redis:8-alpine\nRUN echo ok > /ok\n' > /tmp/f5/Dockerfile
+        \\for n in 1 2 3 4; do
+        \\  echo "== f$n"; docker build -t f$n /tmp/f$n 2>&1; echo "exit: $?"
+        \\done
+        \\echo "== a platform that is not ours"; docker build --platform linux/s390x /tmp/f5 2>&1; echo "exit: $?"
+        \\echo "== no such target"; docker build --target nope /tmp/f5 2>&1; echo "exit: $?"
+        \\echo "== after the failures"; docker build -q /tmp/f5 2>&1; echo "exit: $?"
+    ;
+    const job = testJob(&.{testStep(script)});
+    const r = try runNativeJob(arena, cfg, job, .root);
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(r.res.succeeded);
+    try expectAll(r.text, &.{
+        "before",
+        "The command on line 2 returned a non-zero code: 3",
+        "`RUN --mount` is not native yet",
+        "a RUN as USER nobody is not native yet",
+        "exit: 1",
+        "platform linux/s390x is not supported by zig-runner",
+        "target stage \"nope\" could not be found",
+        "sha256:",
+    });
+}
+
+test "native image build: a build argument's value is in no line of the log, and an untrusted job sees no tag and no layer of a repo job" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try dockerBuildConfig(arena, &tmp);
+    const build =
+        \\export DOCKER_CLI_HINTS=false
+        \\mkdir -p /tmp/s && printf 'FROM redis:8-alpine\nARG TOKEN\nRUN test -n "$TOKEN" && echo "layer made"\n' > /tmp/s/Dockerfile
+        \\docker build -t secret:1 --build-arg TOKEN="$(printf 's3cr3t-%s' value-0042)" /tmp/s 2>&1
+    ;
+    const step = testStep(build);
+    const repo_job = testJob(&.{step});
+    const caches: volumes.Options = .{};
+    const first = try runCachedJob(arena, cfg, repo_job, caches, .{});
+    errdefer std.debug.print("{s}\n", .{first.text});
+    try expectAll(first.text, &.{ "layer made", "Successfully tagged secret:1" });
+    // The CLI prints the instruction as written, and the builder never says an argument's value.
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first.text, "s3cr3t-value-0042"));
+    // Another job, untrusted: no tag of the first's, and its build is made, not taken from the
+    // store under the repo's scope.
+    // (As `configFor` makes it for a job the runner does not vouch for, which runs only with the
+    // job's own limits: a cgroup of the test's own.)
+    var untrusted = caches;
+    untrusted.trusted = false;
+    var hostile = cfg;
+    hostile.vouched = false;
+    const parent = try testCgroup(arena, &hostile);
+    defer parent.remove(arena);
+    hostile.job_limits = jobLimits(arena, std.testing.io, hostile.cgroup);
+    if (!hostile.job_limits) {
+        std.debug.print("skipped the untrusted case: no cgroup for per-job limits\n", .{});
+        return error.SkipZigTest;
+    }
+    // It looks for the repo job's tag before it builds anything.
+    const looker = testStep("docker image inspect secret:1 2>&1 | head -1\n" ++ build);
+    const second = try runCachedJob(arena, hostile, testJob(&.{looker}), untrusted, .{});
+    errdefer std.debug.print("{s}\n", .{second.text});
+    try expectAll(second.text, &.{ "No such image: secret:1", "layer made", "Successfully tagged secret:1" });
+    // What the repo job stored under its own scope is not taken: the layer is made again.
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, second.text, "Using cache"));
+    // A repo job again takes its own layers.
+    const third = try runCachedJob(arena, cfg, repo_job, caches, .{});
+    try expectAll(third.text, &.{ "Using cache", "Successfully tagged secret:1" });
+}
+
+test "native image build: a job's tags are its own: a second job finds none of the first's" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try dockerBuildConfig(arena, &tmp);
+    const make =
+        \\export DOCKER_CLI_HINTS=false
+        \\mkdir -p /tmp/t && printf 'FROM redis:8-alpine\nRUN echo t > /t\n' > /tmp/t/Dockerfile
+        \\docker build -q -t private:1 /tmp/t
+    ;
+    const look =
+        \\export DOCKER_CLI_HINTS=false
+        \\docker image inspect private:1 2>&1 | head -2
+    ;
+    const first = try runNativeJob(arena, cfg, testJob(&.{testStep(make)}), .root);
+    try std.testing.expect(first.res.succeeded);
+    const second = try runNativeJob(arena, cfg, testJob(&.{testStep(look)}), .root);
+    errdefer std.debug.print("{s}\n", .{second.text});
+    try expectAll(second.text, &.{"No such image: private:1"});
+    try std.testing.expect(std.mem.indexOf(u8, second.text, "RepoTags") == null);
+}
+
+test "native image build: a step that built is never replayed, and neither is the step after it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try dockerBuildConfig(arena, &tmp);
+    const script =
+        \\export DOCKER_CLI_HINTS=false
+        \\mkdir -p /tmp/r && printf 'FROM redis:8-alpine\nRUN echo r > /r\n' > /tmp/r/Dockerfile
+        \\docker build -q -t r:1 /tmp/r
+        \\docker image inspect --format '{{.RepoTags}}' r:1
+    ;
+    try std.testing.expectEqual(@as(usize, 0), try replayedWithApi(arena, cfg, &.{ script, "echo two" }, "build"));
+    // A step that only looked, and found nothing, is not replayed either: the index is the job's,
+    // in no key.
+    try std.testing.expectEqual(@as(usize, 0), try replayedWithApi(arena, cfg, &.{
+        "docker image inspect nothing:1 2>&1 | head -1; echo done",
+        "echo two",
+    }, "inspect"));
+}
+
+test "native image build: a client that leaves cancels its RUN, the job goes on and builds again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try dockerBuildConfig(arena, &tmp);
+    const killed =
+        \\export DOCKER_CLI_HINTS=false
+        \\mkdir -p /tmp/slow && printf 'FROM redis:8-alpine\nRUN sleep 120\n' > /tmp/slow/Dockerfile
+        \\docker build /tmp/slow >/tmp/slow.log 2>&1 &
+        \\pid=$!
+        \\sleep 4
+        \\kill $pid
+        \\wait $pid || true
+        \\echo "client killed"
+    ;
+    const again =
+        \\export DOCKER_CLI_HINTS=false
+        \\mkdir -p /tmp/ok && printf 'FROM redis:8-alpine\nRUN echo fine\n' > /tmp/ok/Dockerfile
+        \\docker build -t ok:1 /tmp/ok 2>&1
+    ;
+    const job = testJob(&.{ testStep(killed), testStep(again) });
+    const t0 = std.Io.Clock.awake.now(std.testing.io);
+    const r = try runNativeJob(arena, cfg, job, .root);
+    const took = t0.durationTo(std.Io.Clock.awake.now(std.testing.io)).toSeconds();
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(r.res.succeeded);
+    try expectAll(r.text, &.{ "client killed", "Successfully tagged ok:1" });
+    // The `sleep 120` did not run on after its client.
+    try std.testing.expect(took < 60);
+}
+
+test "native docker api: a job that needs more than the API serves goes to the engine, unless it has none or the option is off" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    cfg.docker_api = true;
+    const io = std.testing.io;
+    const opts: dagger.Options = .{ .step_user = .root };
+    const served = testJob(&.{ testStep("docker build -t x ."), testStep("docker image inspect x") });
+    try std.testing.expect(unsupported(io, served, opts, cfg) == null);
+    // Each of these sends the job to the engine, with the reason.
+    const run_step = testStep("make\ndocker run --rm x true");
+    var buildx = testStep("");
+    buildx.action = .{ .uses = .{ .owner = "docker", .name = "build-push-action", .ref = "v6" } };
+    var tags = testStep("");
+    tags.action = .{ .uses = .{ .owner = "docker", .name = "metadata-action", .ref = "v5" } };
+    for ([_]job_mod.Step{ run_step, buildx, testStep("docker compose up -d"), testStep("docker push x") }) |step| {
+        const job = testJob(&.{ testStep("docker build -t x ."), step });
+        const why = unsupported(io, job, opts, cfg) orelse return error.TestUnexpectedResult;
+        try expectAll(why, &.{"beyond what the native job's Docker API serves"});
+        // No engine to go to: it stays native, and meets the 501 when it runs.
+        var engineless = opts;
+        engineless.engineless = true;
+        try std.testing.expect(unsupported(io, job, engineless, cfg) == null);
+        // The option off: as before the option, which never looked.
+        var off = cfg;
+        off.docker_api = false;
+        try std.testing.expect(unsupported(io, job, opts, off) == null);
+    }
+    // An action that only computes tags needs no daemon.
+    try std.testing.expect(unsupported(io, testJob(&.{tags}), opts, cfg) == null);
 }

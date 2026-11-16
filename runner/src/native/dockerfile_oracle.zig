@@ -28,6 +28,7 @@ const Backend = @import("Backend.zig");
 const docker_action = @import("docker_action.zig");
 const images = @import("images.zig");
 const Store = @import("Store.zig");
+const sandbox = @import("sandbox.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = @import("../sha256.zig").Sha256;
@@ -197,6 +198,53 @@ fn compare(case: []const u8, native: []const Entry, expected: []const Entry, all
     return bad;
 }
 
+const Discard = struct {
+    fn out() sandbox.Output {
+        return .{ .ptr = undefined, .chunkFn = chunk };
+    }
+    fn chunk(_: *anyopaque, _: []const u8) void {}
+    fn never(_: *anyopaque) bool {
+        return false;
+    }
+};
+
+/// The API path's build of the case's context, compared with the Docker action path's: the same
+/// layers in the same order (they are keyed by what made them, so the store gives the one set to
+/// both) and the same config. 0 when they are the same, else the differences, printed, counted.
+fn sameThroughApi(b: *Backend, arena: Allocator, name: []const u8, ctx: []const u8, built: anytype, same_layers: bool) !usize {
+    var running: sandbox.Running = .{};
+    var dummy: u8 = 0;
+    const got = try docker_action.buildApi(b, .{
+        .dir = ctx,
+        .dockerfile = "Dockerfile",
+        .options = .{},
+        .api = .{ .ptr = &dummy, .running = &running, .out = Discard.out(), .cancelledFn = Discard.never },
+    });
+    const image = switch (got) {
+        .image => |i| i,
+        .failed => |why| {
+            std.debug.print("{s}: the build through the API failed: {s}\n", .{ name, why });
+            return 1;
+        },
+    };
+    var bad: usize = 0;
+    if (same_layers and image.lowers.len != built.lowers.len) {
+        std.debug.print("{s}: the API's image has {d} layers, the action's {d}\n", .{ name, image.lowers.len, built.lowers.len });
+        return 1;
+    }
+    if (same_layers) for (image.lowers, built.lowers) |x, y| if (!std.mem.eql(u8, x, y)) {
+        std.debug.print("{s}: the API's layer {s} is not the action's {s}\n", .{ name, x, y });
+        bad += 1;
+    };
+    const a = try configLines(arena, image.config);
+    const c = try configLines(arena, built.config);
+    if (a.len != c.len) bad += 1 else for (a, c) |x, y| if (!std.mem.eql(u8, x.line, y.line)) {
+        std.debug.print("{s}: the API's config differs: {s} against {s}\n", .{ name, x.line, y.line });
+        bad += 1;
+    };
+    return bad;
+}
+
 test "allows: a path with a trailing = allows that path alone, any other one what is under it" {
     var list = [_]Allowed{ .{ .path = "a=", .why = "" }, .{ .path = "b", .why = "" } };
     try std.testing.expect(allows(&list, "a") != null);
@@ -274,6 +322,21 @@ test "oracle: the Dockerfile builder builds what BuildKit builds" {
                 continue;
             },
         };
+        // And as the Docker API's `POST /build` builds it (`docker_action.buildApi`): the same
+        // planner and layers, so the same image, found in the store by its keys.
+        // The action path again: a case whose `COPY --from=<image>` keys move between two builds in a
+        // process (the base's fingerprint is of its ctimes, which the first build's reads move) has
+        // layers the API path cannot be compared by; its config is compared still.
+        const again = try docker_action.buildImage(&b, .{
+            .dir = try std.fmt.allocPrint(arena, "{s}/ctx", .{case_dir}),
+            .context = ".",
+            .dockerfile = "Dockerfile",
+        });
+        var stable = again == .image and again.image.lowers.len == built.lowers.len;
+        if (stable) for (again.image.lowers, built.lowers) |x, y| {
+            stable = stable and std.mem.eql(u8, x, y);
+        };
+        failures += try sameThroughApi(&b, arena, name, try std.fmt.allocPrint(arena, "{s}/ctx", .{case_dir}), built, stable);
         const bottom_first = try arena.alloc([]const u8, built.lowers.len);
         for (built.lowers, 0..) |l, k| bottom_first[built.lowers.len - 1 - k] = l;
         const merged = try std.fmt.allocPrint(arena, "{s}/native-{s}", .{ work, name });

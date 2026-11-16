@@ -2625,14 +2625,18 @@ at least the cold `run:` step's ~224 ms. Dagger could not be timed for this pull
 laptop's engine for this runner's Dagger version was stopped, and starting one was not done
 without the user (the PR says how to take the figure).
 
-### The job's Docker API (#448, stage 1a)
+### The job's Docker API (#448, stages 1a and 1b)
 
 Native steps run with no Docker daemon and, with `RUNNER_ENGINE=none`, no Dagger engine, so a step
-that runs `docker build` has nothing to talk to. The plan (#448) is for the runner to serve a
-Docker-compatible API for each job, answered from its own builder (`dockerfile.zig`,
-`docker_action.buildImage`), so that the `docker` CLI in a step builds with neither. **Stage 1a**
-(`native/docker_api.zig`) is the skeleton: the socket, its binding, the environment and clear
-errors. Nothing is built yet (1b).
+that runs `docker build` has nothing to talk to. The runner serves a Docker-compatible API for each
+job, answered from its own builder (`dockerfile.zig`, `docker_action.buildApi`), so that the `docker`
+CLI in a step builds with neither. **Stage 1a** (`native/docker_api.zig`) is the skeleton: the
+socket, its binding, the environment and clear errors. **Stage 1b** makes `docker build` work
+through it: the classic `POST /build`, the images it makes (`GET /images/{name}/json`, `POST
+/images/{name}/tag`, `DELETE /images/{name}`) over a per-job tag index, the gate that attributes
+every request to the step that made it, and the check that sends a job that needs more than that to
+the engine. The Docker-side pieces without a socket or a job (the query, the tar unpacker, the
+index, the ID) are `native/docker_build.zig`; what answers for the job is `native/docker_api_job.zig`.
 
 - **Opt-in**: `RUNNER_NATIVE_DOCKER_API=true` (`--native-docker-api`, `Config.native_docker_api`,
   off by default). Off, a job is exactly what it was: no mount point, no bind, no variable, no
@@ -2682,8 +2686,9 @@ errors. Nothing is built yet (1b).
   Docker's clients write it (a sign, a leading zero, more than three digits: `/v1.+40`,
   `/v01.052`) a 400 "invalid API version prefix". `/grpc`, `/session` and `POST
   /build?version=2` get 501 "BuildKit is not supported by zig-runner yet; DOCKER_BUILDKIT=0 is set
-  for you, and docker buildx / docker/build-push-action need a later stage"; `POST /build` 501
-  "not supported by zig-runner yet (stage 1b)"; everything else 501 `{"message":"not supported by
+  for you, and docker buildx / docker/build-push-action need a later stage"; `POST /build` and
+  `/images/{name}/...` are the handler's (below; 501 "not supported by zig-runner yet: POST /build"
+  where a server has none); everything else 501 `{"message":"not supported by
   zig-runner yet: <METHOD> <path>"}`, the path without its version prefix and query, bytes that
   are not UTF-8 shown as U+FFFD and cut at 200 bytes on a character boundary.
 - **A budget**: the server's work is the runner's, in no job's cgroup, so each job's API has a
@@ -2701,13 +2706,17 @@ errors. Nothing is built yet (1b).
   more to read, and one still in the listen queue is accepted first) before it reads the count of
   requests beyond ping/version/info, so a client that wrote a request and exited without reading the
   answer is counted against its own step. It waits at most 2 s.
-  **A limit for 1b to close**: the step end's check of the listen queue has a 2 ms grace for a
-  connection just taken from it, so a request from a connection admitted after that can be counted
-  against the next step. That is the safe direction for the next step (it is not stored) but not
-  for the step that made the request, which may then be stored and replayed. 1b must close it
-  (an epoch per connection, a connection refused or held while a step ends, or the API's effects
-  keyed) before a request has an effect worth replaying. A connection a step's background
-  process holds open stays open.
+  **Closed in 1b by a gate** (`Server.openGate`, `closeGate`; `Backend.runIn` calls them around every
+  sandbox that has the socket, so around every step, action and set-up script): a request is let
+  in only while the gate is open, and counted in flight; `closeGate` turns later requests away (503
+  "no step of the job is running"), cancels what is in flight (a build's `RUN` is killed), waits for
+  it to end (30 s at most; past that the step is not stored whatever it did), and then takes in what
+  the dead clients had sent as above, which is 503 and counted. So a request is never admitted
+  after its step's end check, a build never outlives its step, and the next step starts with no
+  request of the last one's. The epoch per connection the 1a note asks for is not needed: nothing
+  crosses the gate. A connection a step's background process holds open stays open, and its next
+  request meets the gate as any other.
+
 - **The job's own `DOCKER_HOST`**: the runner's `DOCKER_HOST` and `DOCKER_BUILDKIT` are put only
   where the image, the job container's `env:` and `options: --env` have not set the name, and the
   workflow's `env:` (job and step) wins over all of them. A job container whose `volumes:` or
@@ -2716,13 +2725,19 @@ errors. Nothing is built yet (1b).
   `--tmpfs` at `/var` or `/var/run` is refused as always) gets **no API**: the
   server is stopped, the bind and the variables are left out, and "Set up job" says only why it is
   not served. The job still runs.
-- **Step cache (decision for 1b)**: what a step does through the API (an image built, a tag
-  made) is in no step key, since the socket's path is normalised to no input. So **a step that
-  makes any request beyond `/_ping`, `/version` and `/info` is not stored** (the server counts
-  them, `Backend.apiBeyond`; the step still runs and succeeds, and the steps after it run
-  uncached, as after a log too big to store), and a step is never replayed in place of one that
-  would have called it. Until 1b keys the API's state (the tag index and what a build read), that
-  stays so. The key's normalisation applies only to the server's own socket path.
+- **Step cache**: what a step does through the API (an image built, a tag made) is in no step key,
+  since the socket's path is normalised to no input. So **a step that makes any request beyond
+  `/_ping`, `/version` and `/info` is not stored** (the server counts them, `Backend.apiBeyond`; the
+  step still runs and succeeds, and the steps after it run uncached, as after a log too big to
+  store), and a step is never replayed in place of one that would have called it. Stage 1b chose to
+  keep this rather than key the API's state: keying needs the tag index's contents in the step key
+  and the index's delta (each image's ID, config and layer keys) in the step's record, restored on a
+  replay and checked against a store that may have evicted the layers, which is a change to the
+  store's record format. A replayed build is no gain anyway (its layers are taken from the store,
+  `---> Using cache`, in under a second); a later stage may add it. The key's normalisation
+  applies only to the server's own socket path. Tested: a step that built is not replayed, nor the
+  step after it (`native image build: a step that built is never replayed`).
+
 - **Docker actions**: a Docker action's container gets the same bind, as on GitHub, where the
   runner mounts its `/var/run/docker.sock` into one. The mount-point layer sits below the
   action's image like the job's, and is made owned as the image's own layers are (idmapped on a
@@ -2738,14 +2753,81 @@ errors. Nothing is built yet (1b).
   socket and no variable; the replay test (`docker api: a real docker CLI's traffic`) sends what
   `docker version`, `docker info` and `docker build .` sent (`native/testdata/docker_api/`) and
   checks what the server answers, normalising what differs between machines.
-- **For stage 1b**: `POST /build` (a tar context; `t`, `buildargs`, `labels`, `target`,
-  `dockerfile`) through `docker_action.buildImage` in the job's cgroup; `/images/{name}/json`, tag
-  and delete over a per-job tag index; the image ID (a hash of the config and the final step key);
-  and the check that sends a job that needs more than `docker build` to the engine ahead of time
-  (decision 2, "never lose a Docker job"): `Backend.unsupported`'s loop over `job.steps` (the
-  `.script` arm, today empty) is where it goes, reading the scripts and `uses:` for `docker`, with
-  the option on and an engine configured. A replayed step (the step cache) is not a build: a step
-  that ran `docker build` must not be keyed for replay until the builder's inputs are (1b).
+- **Builds** (`docker_api_job.zig`): `POST /build` reads the query (`docker_build.parseQuery`:
+  `dockerfile`, `t` repeatable, `buildargs`, `labels`, `target`, `nocache`, `pull`, `q`, `platform`;
+  `squash`, `remote`, `extrahosts`, `outputs`, `networkmode` other than the default and BuildKit's
+  `version=2` are refused, `rm`, `cachefrom`, `memory` and the like are accepted), then the body (a
+  tar, `Content-Length` or chunked, as the CLI sends it, at most 1.25 GiB, 30 s of silence, 10
+  minutes) into a file of the job's directory, and answers 200 and a chunked stream of JSON lines
+  as Docker's classic builder does: `{"stream":"Step 2/6 : RUN ..."}`, ` ---> Using cache`, ` --->
+  Running in <key>`, the RUN's output as it comes, `Successfully built <id>`, `Successfully tagged
+  x:1`, `{"aux":{"ID":"sha256:..."}}`, and for a failure `{"errorDetail":{"message":..},"error":..}`
+  (with 200, as Docker's: the CLI prints it and exits 1). A request that is wrong is answered
+  before the body is read: 400 (query, `--platform` other than the runner's), 413, 408, 501.
+  The build runs on a thread of its own, so that the connection's thread can see the client leave
+  (the CLI killed, a timeout) and cancel it. The context is unpacked by `docker_build.unpack` into
+  `<job>/api-build-<n>` by `openat` with `O_NOFOLLOW` a component at a time (so no entry is written
+  through a link) and removed after; a link is made only if its target is relative, climbs only at its
+  start and no higher than its own directory, so no chain of links leads out; hard links, devices
+  and FIFOs, absolute and climbing names, more than 1 GiB or 200,000 entries are refused.
+  Then `docker_action.buildApi`: the Dockerfile read through a `layer_view` of the context (its
+  `.dockerignore` honoured, its `.git` kept, as Docker's context has it), planned with
+  `dockerfile.planWith` (`--build-arg`, `--target`, `--label`, `--no-cache`: a salt in every `RUN`'s
+  key, so none is taken from the store and none after it), and built with `dockerfile.build`; each
+  `RUN` through `Backend.execBuildApi`: in the **job's cgroup** and network, like a step, with a
+  `sandbox.Running` of its own (the step's is not touched, and the build is stopped without it),
+  overlay directories of its own (`AW`, `AM`), no flattening of the job's layers under the running
+  step, and **no Docker API in it** (a build's `RUN` cannot ask for another build). The runner's
+  own work for a build is the HTTP, the unpack, the planning and the `COPY`s, bounded as said; a
+  `RUN`'s is the job's. One build at a time per job (they share its build directories), at most 100
+  per job.
+- **Images**: the job's tag index (`docker_build.Index`) is in the runner's memory, in no file and
+  no store: at most 100 images and 256 tags, gone with the job (`Backend.stopDockerApi`), never
+  shared with another job, repository or trust scope. The layers an image names are the shared
+  store's, keyed with the job's scope (`layers.Store.scope`), held by the job until it ends; an
+  untrusted job's builds and a repo job's never share a layer (tested). The ID is `sha256:` and the
+  SHA-256 of the config as `docker_build.configJson` renders it (architecture, os, user, env,
+  entrypoint, cmd, working directory, labels sorted, the layers' keys as `diff_ids`; no timestamp), a
+  newline and the key of the build's last step: the same build is the same ID, a different label,
+  base or file is another; it is not Docker's value (decision 3). `Size` is 0 and `RootFS.Layers`
+  are the layer keys, not OCI digests: those come with `docker push` and `save`.
+  `GET /images/{name}/json` takes a tag (`x`, `x:1`, `repo/x:1`; `x` is `x:latest`) or an ID
+  (whole or a prefix of at least 4 digits that one image has); `POST /images/{name}/tag?repo=&tag=`
+  is 201; `DELETE /images/{name}` answers `[{"Untagged":..},{"Deleted":..}]`, 404 for a name it
+  has not, 409 for an ID with several tags unless `force`. The tag `x:1` moves from an image to
+  the one built with `-t x:1` later, as Docker's does.
+- **`FROM` an image built earlier in the job**: `docker_action.Planning.resolve` asks the job's
+  index first (`State.baseOf`; a tag it holds is the job's own image, never pulled); the base is its
+  layers over the rootfs it was built on (`images.Image.layers`, `dockerfile.Base.image.layers`), keyed
+  by its ID, so a changed image is another key. `COPY --from=<such an image>` is refused ("not
+  supported yet"): the copy reads one directory, and a built image is several.
+- **A job that needs more goes to the engine** (decision 2, `docker_api_job.jobNeedsDaemon`, called
+  from `Backend.unsupported`): with the option on and an engine configured (`!opts.engineless`),
+  the job's `run:` scripts are read as text and its `uses:` by name; a `docker` command (at the
+  start of a command: after a newline, `;`, `&`, `|`, `(`, `{`, a backtick, `$(`, `then`, `do`,
+  `else`, `sudo`, `exec`, a variable assignment) whose subcommand is not `build`, `tag`, `rmi`,
+  `inspect`, `version`, `info`, `help`, `image build|inspect|tag|rm`, `builder build` (options
+  skipped, `--context`, `-H` and the like with their values), `docker-compose` and `docker-buildx`, and every
+  `docker/` action but `docker/metadata-action`, send the job to Dagger with a "Set up job" note,
+  exactly as with the option off. Heuristic and said so: it errs toward the engine (a quoted
+  `"docker push"` is found), and misses what a Makefile, another script or `xargs` runs, which then
+  meets a 501 at run time (not a lost job: a failed step with the reason; the workflow runs on an engine
+  again by dropping the option for it). Decision 2's fallback at run time (rerun on the engine at the
+  first unsupported call) is not done: a native job's steps have run, with effects.
+- **Tests**: `docker_build.zig`'s (`docker build:`: the query, references, the unpacker's escapes and
+  limits, the index, the ID), `docker_api.zig`'s with a handler that builds nothing (`docker api:
+  POST /build ...`: chunked and sized bodies, the limits' statuses, a client that leaves, the gate,
+  the image routes, and the CLI's own recorded build requests, which reach the handler with their
+  context whole), `docker_api_job.zig`'s (the detection), and the native root tests (`native image
+  build:`, which need `ZIG_RUNNER_SERVICE_IMAGES` with `redis:8-alpine` and a `docker` CLI in
+  `/usr/bin`, as CI's root job has): a real `docker build -t x .` with FROM, COPY, RUN, ENV, ARG,
+  `--target` and labels, its output, `docker image inspect` (labels, env, tags, the ID), a second
+  identical build reusing layers (the same ID), `tag` and `rmi`; failures (a RUN that exits 3, a
+  `RUN --mount`, a `USER` with a RUN, a missing base, a platform, a target); a build argument's
+  value in no line of the log; a second job and an untrusted one that see no tag and take no layer
+  of a repo job's; a build step that is not replayed; and a client killed in the middle of a
+  `RUN sleep 120`, after which the job goes on and builds again.
+
 - **Rootless**: the same design (the mount-point layer and the bind do not depend on the
   runner's user; the socket is `0666`). Not run rootless yet: on the development laptop Ubuntu's
   AppArmor refuses an unprivileged user namespace map (errno 13), also in a privileged container as

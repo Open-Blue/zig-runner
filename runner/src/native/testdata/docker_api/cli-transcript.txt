@@ -82,7 +82,8 @@ DEPRECATED: The legacy builder is deprecated and will be removed in a future rel
             BuildKit is currently disabled; enable it by removing the DOCKER_BUILDKIT=0
             environment-variable.
 
-Sending build context to Docker daemon  2.048kB
+Sending build context to Docker daemon  2.048kB
+
 Error response from daemon: not supported by zig-runner yet (stage 1b)
 [exit 1]
 $ docker build -t app:1 --build-arg A=1 --target x .
@@ -90,7 +91,8 @@ DEPRECATED: The legacy builder is deprecated and will be removed in a future rel
             BuildKit is currently disabled; enable it by removing the DOCKER_BUILDKIT=0
             environment-variable.
 
-Sending build context to Docker daemon  2.048kB
+Sending build context to Docker daemon  2.048kB
+
 Error response from daemon: not supported by zig-runner yet (stage 1b)
 [exit 1]
 $ docker build .
@@ -105,3 +107,9 @@ Error response from daemon: not supported by zig-runner yet: GET /containers/jso
 $ docker images
 Error response from daemon: not supported by zig-runner yet: GET /images/json
 [exit 1]
+
+$ docker image inspect myorg/app:1.2 ; docker tag myorg/app:1.2 reg.io/y:2 ; docker rmi reg.io/y:2 ;
+$ docker image inspect sha256:0123456789ab ; docker rmi -f 0123abcd
+(09 to 13: the requests of CLI 29.9.3 against a recorder that answered 200/201 with canned bodies,
+ 2026-11-16: `GET /v1.52/images/{name}/json`, `POST .../tag?repo=&tag=`, `DELETE .../images/{name}`,
+ each after the CLI's `HEAD /_ping`. The build's own 200 is the stream the native tests' real CLI reads.)

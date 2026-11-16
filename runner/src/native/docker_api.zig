@@ -2,14 +2,24 @@
 //! bound into every step at `/var/run/docker.sock`, and a thread of the runner that answers on it.
 //!
 //! Stage 1a is the skeleton, so that a step's `docker` CLI finds a server, says what it is and
-//! learns plainly what is not there yet:
+//! learns plainly what is not there yet; stage 1b makes `docker build` work through it, answered
+//! by the job's `Handler` (`Backend.zig`, the native Dockerfile builder):
 //!
 //!   GET|HEAD /_ping      `OK`, with `API-Version`, `Builder-Version: 1` and `OSType: linux`
 //!   GET /version, /info  JSON a real `docker version` and `docker info` print
-//!   POST /build          501 "not supported by zig-runner yet (stage 1b)"
+//!   POST /build          the classic builder: a tar context in the body, the build's output
+//!                        streamed back as JSON lines (`Handler.buildFn`); without a handler 501
+//!   GET /images/{name}/json, POST /images/{name}/tag, DELETE /images/{name}
+//!                        over the job's tag index (`Handler.imageFn`)
 //!   /grpc, /session, /build?version=2
 //!                        501 with the BuildKit hint (the classic builder is the first stage)
 //!   anything else        501 `{"message":"not supported by zig-runner yet: <METHOD> <path>"}`
+//!
+//! **The gate.** A request is answered only while a step's process may be running (`openGate`,
+//! `closeGate`, which `Backend.runIn` calls around every sandbox that has the socket): a request
+//! found with the gate closed is told 503 and counted, and `closeGate` cancels what is in flight
+//! (a build), waits for it to end and takes in what the dead clients had sent, so every request is
+//! counted against the step that made it, and a build never runs on after its step.
 //!
 //! An optional `/v1.NN` prefix is stripped (1.24 to 1.52 are served; others get Docker's own 400).
 //!
@@ -30,6 +40,7 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 
 const Allocator = std.mem.Allocator;
+const docker_build = @import("docker_build.zig");
 
 /// The newest API version served, answered as `API-Version`.
 pub const api_version = "1.52";
@@ -45,7 +56,11 @@ pub const env_host = "unix://" ++ socket_at;
 
 pub const buildkit_hint = "BuildKit is not supported by zig-runner yet; DOCKER_BUILDKIT=0 is set " ++
     "for you, and docker buildx / docker/build-push-action need a later stage";
-pub const build_stage_1b = "not supported by zig-runner yet (stage 1b)";
+/// `POST /build` with no handler to build it.
+pub const build_unavailable = "not supported by zig-runner yet: POST /build";
+/// What a request finds between steps.
+pub const gate_closed = "no step of the job is running: its Docker API answers only to a step's own " ++
+    "processes, while the step runs";
 
 pub const Limits = struct {
     /// The most bytes of a request's line and headers.
@@ -72,6 +87,101 @@ pub const Limits = struct {
     deny_delay_ms: u32 = 100,
     /// How long `settle` waits for the connections to take in what they were sent.
     settle_ms: u32 = 2000,
+    /// A build's context as the client sends it: its bytes (the tar's own, a little over what
+    /// `docker_build.Limits.bytes` allows the files), how long a read may wait for more and how
+    /// long the whole upload may take.
+    body_bytes: u64 = (1 << 30) + (1 << 28),
+    body_idle_ms: u32 = 30_000,
+    body_ms: u32 = 10 * 60_000,
+    /// How long `closeGate` waits for a request in flight to end after it was cancelled.
+    cancel_ms: u32 = 30_000,
+    /// Builds a job may make, and how many at once (one: they share the job's build directories).
+    max_builds: u32 = 100,
+    /// What a build's context may hold once unpacked.
+    context: docker_build.Limits = .{},
+};
+
+/// The answer of `Handler.imageFn`.
+pub const ImageAnswer = struct { status: u16, body: []const u8 };
+
+pub const ImageOp = union(enum) {
+    /// `GET /images/{name}/json`.
+    inspect: []const u8,
+    /// `POST /images/{name}/tag?repo=&tag=`.
+    tag: struct { name: []const u8, repo: []const u8, tag: []const u8 },
+    /// `DELETE /images/{name}`.
+    remove: struct { name: []const u8, force: bool },
+};
+
+/// Where a build writes what the client reads: JSON lines (`docker_build.streamLine`).
+pub const Sink = struct {
+    server: *Server,
+    fd: linux.fd_t,
+    lock: std.atomic.Mutex = .unlocked,
+    /// A write failed (the client is gone or too slow): the build should stop.
+    failed: std.atomic.Value(bool) = .init(false),
+
+    /// One chunk of the response. After a failure it writes nothing.
+    pub fn write(k: *Sink, bytes: []const u8) void {
+        if (bytes.len == 0 or k.failed.load(.acquire)) return;
+        while (!k.lock.tryLock()) std.Thread.yield() catch {};
+        defer k.lock.unlock();
+        if (k.failed.load(.acquire)) return;
+        var head: [24]u8 = undefined;
+        const h = std.fmt.bufPrint(&head, "{x}\r\n", .{bytes.len}) catch unreachable;
+        const lim = k.server.cfg.limits;
+        // The frame in one write when it is small: one syscall for a line of output.
+        var small: [1024]u8 = undefined;
+        if (h.len + bytes.len + 2 <= small.len) {
+            @memcpy(small[0..h.len], h);
+            @memcpy(small[h.len..][0..bytes.len], bytes);
+            @memcpy(small[h.len + bytes.len ..][0..2], "\r\n");
+            sendAll(k.server, k.fd, small[0 .. h.len + bytes.len + 2], lim.write_ms) catch {
+                k.failed.store(true, .release);
+            };
+            return;
+        }
+        sendAll(k.server, k.fd, h, lim.write_ms) catch {
+            k.failed.store(true, .release);
+            return;
+        };
+        sendAll(k.server, k.fd, bytes, lim.write_ms) catch {
+            k.failed.store(true, .release);
+            return;
+        };
+        sendAll(k.server, k.fd, "\r\n", lim.write_ms) catch k.failed.store(true, .release);
+    }
+
+    pub fn gone(k: *const Sink) bool {
+        return k.failed.load(.acquire);
+    }
+};
+
+/// One `POST /build` for the handler.
+pub const BuildCall = struct {
+    /// Freed when the call ends.
+    arena: Allocator,
+    query: docker_build.Query,
+    /// The tar the client sent, a file of the job's directory that the server removes after.
+    tar_path: []const u8,
+    /// A name for the build, unique in the job: a directory name.
+    id: u32,
+    /// What the unpacked context may hold.
+    limits: docker_build.Limits,
+    sink: *Sink,
+};
+
+/// What answers for the job: the Docker API's effects. `ptr` is the job's own state.
+pub const Handler = struct {
+    ptr: *anyopaque,
+    /// Runs the build and streams its output to `call.sink`, ending with the aux ID or an
+    /// `errorDetail`. Called on a thread of its own, so that the connection's can watch the client.
+    buildFn: *const fn (ptr: *anyopaque, call: *BuildCall) void,
+    imageFn: *const fn (ptr: *anyopaque, arena: Allocator, op: ImageOp) ImageAnswer,
+    /// Stops the build `id` (a `BuildCall.id`) if it is the one in flight; with null, whichever is,
+    /// and any that starts before `resetFn` (the gate's close).
+    cancelFn: *const fn (ptr: *anyopaque, id: ?u32) void,
+    resetFn: *const fn (ptr: *anyopaque) void,
 };
 
 pub const Config = struct {
@@ -82,6 +192,11 @@ pub const Config = struct {
     /// The runner's version, as `--version` prints it.
     version: []const u8,
     limits: Limits = .{},
+    /// What answers `POST /build` and `/images`; without it they are 501.
+    handler: ?Handler = null,
+    /// A directory of the job's, where a build's context is kept while it is read: its own files
+    /// `api-<n>.tar`. Required with a handler.
+    work_dir: []const u8 = "",
     /// Tests only: how long a request waits before it is routed and counted, so that a test can
     /// end a step with its request still unread (`settle`).
     test_route_delay_ms: u32 = 0,
@@ -104,6 +219,10 @@ pub const Stats = struct {
     /// Requests that were anything but a 200 (`/_ping`, `/version`, `/info`) answered: those that
     /// would have an effect once there are any (1b), which the step cache must not replay.
     beyond: u32 = 0,
+    /// Builds started (`POST /build` with a context read).
+    builds: u32 = 0,
+    /// Turned away because no step was running (the gate was closed).
+    gated: u32 = 0,
 };
 
 pub const Server = struct {
@@ -132,7 +251,11 @@ pub const Server = struct {
         busy: std.atomic.Value(u32) = .init(0),
         limited: std.atomic.Value(u32) = .init(0),
         beyond: std.atomic.Value(u32) = .init(0),
+        builds: std.atomic.Value(u32) = .init(0),
+        gated: std.atomic.Value(u32) = .init(0),
     } = .{},
+    /// The gate: the high bit says it is closed, the rest counts the requests in flight.
+    gate: std.atomic.Value(u32) = .init(0),
 
     const Slot = struct {
         thread: ?std.Thread = null,
@@ -169,6 +292,8 @@ pub const Server = struct {
         errdefer gpa.free(own_cfg.version);
         own_cfg.hostname = try gpa.dupe(u8, cfg.hostname);
         errdefer gpa.free(own_cfg.hostname);
+        own_cfg.work_dir = try gpa.dupe(u8, cfg.work_dir);
+        errdefer gpa.free(own_cfg.work_dir);
         var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
         const version_body = try gpa.dupe(u8, try versionJson(arena.allocator(), own_cfg));
@@ -209,6 +334,7 @@ pub const Server = struct {
         gpa.free(s.cfg.job);
         gpa.free(s.cfg.version);
         gpa.free(s.cfg.hostname);
+        gpa.free(s.cfg.work_dir);
         gpa.free(s.version_body);
         gpa.free(s.info_body);
         gpa.free(s.slots);
@@ -227,6 +353,8 @@ pub const Server = struct {
             .busy = c.busy.load(.acquire),
             .limited = c.limited.load(.acquire),
             .beyond = c.beyond.load(.acquire),
+            .builds = c.builds.load(.acquire),
+            .gated = c.gated.load(.acquire),
         };
     }
 
@@ -278,6 +406,51 @@ pub const Server = struct {
         }
         var drained: u64 = 0;
         _ = linux.read(s.settle_fd, std.mem.asBytes(&drained).ptr, @sizeOf(u64));
+    }
+
+    const gate_closed_bit: u32 = 1 << 31;
+
+    /// Lets requests in: a step's processes may run now.
+    pub fn openGate(s: *Server) void {
+        if (s.cfg.handler) |h| h.resetFn(h.ptr);
+        _ = s.gate.fetchAnd(~gate_closed_bit, .acq_rel);
+    }
+
+    /// Turns requests away (503) from now on, cancels what is in flight, waits for it to end (at
+    /// most `cancel_ms`) and then takes in what clients had sent before they went (`settle`), which
+    /// is told 503 and counted. Returns false when something in flight did not end in time: the
+    /// step's requests are not all counted, so the caller must not store the step.
+    pub fn closeGate(s: *Server) bool {
+        const before = s.gate.fetchOr(gate_closed_bit, .acq_rel);
+        var clean = true;
+        if (before & ~gate_closed_bit != 0) {
+            if (s.cfg.handler) |h| h.cancelFn(h.ptr, null);
+            const deadline = nowMs() + s.cfg.limits.cancel_ms;
+            while (s.gate.load(.acquire) & ~gate_closed_bit != 0) {
+                if (nowMs() >= deadline) {
+                    clean = false;
+                    break;
+                }
+                if (!waitStop(s, 1)) break;
+            }
+        }
+        // A request that did not end in time is one the step's count cannot be trusted about.
+        if (!clean) s.bump("beyond");
+        s.settle();
+        return clean;
+    }
+
+    /// A request is let in, or told the gate is closed.
+    fn enter(s: *Server) bool {
+        var cur = s.gate.load(.acquire);
+        while (true) {
+            if (cur & gate_closed_bit != 0) return false;
+            cur = s.gate.cmpxchgWeak(cur, cur + 1, .acq_rel, .acquire) orelse return true;
+        }
+    }
+
+    fn leave(s: *Server) void {
+        _ = s.gate.fetchSub(1, .acq_rel);
     }
 
     fn bump(s: *Server, comptime field: []const u8) void {
@@ -358,6 +531,8 @@ pub const Server = struct {
 };
 
 const accept_backoff_ms = 100;
+/// `POLLRDHUP`: the peer shut its end of the socket.
+const poll_rdhup: i16 = 0x2000;
 const busy_delay_ms = 10;
 
 const Clock = *const fn () u32;
@@ -658,31 +833,74 @@ fn serve(s: *Server, slot: *Server.Slot, arena: *std.heap.ArenaAllocator) void {
             if (sendAll(s, fd, limited_answer, lim.write_ms)) {} else |_| {}
             return;
         }
-        if (s.cfg.test_route_delay_ms > 0) _ = waitStop(s, s.cfg.test_route_delay_ms);
-        const answer = route(a, s, req.method, req.target) catch Answer.oom;
-        switch (answer.status) {
-            200 => {},
-            501 => {
-                s.bump("unsupported");
-                s.bump("beyond");
-            },
-            400...428, 430...499 => {
-                s.bump("refused");
-                s.bump("beyond");
-            },
-            else => s.bump("beyond"),
-        }
-        // A request with a body is answered and the connection closed: the body is not kept.
-        const keep = req.keep_alive and !has_body and served < lim.max_requests;
-        if (!reply(s, fd, a, answer.status, answer, req.head_only, keep)) return;
-        if (!keep) {
+        if (!s.enter()) {
+            // Between steps (or after the step's processes are gone): nothing of the job is
+            // there to ask. Counted, so a step that sent it is not stored; the connection closes.
+            s.bump("gated");
+            s.bump("refused");
+            s.bump("beyond");
+            _ = reply(s, fd, a, 503, error_json(a, gate_closed), req.head_only, false);
             if (has_body) drain(s, fd, lim);
             return;
         }
+        const keep_open = dispatch(s, slot, arena, req, head_buf[end..have], has_body, served);
+        s.leave();
+        if (!keep_open) return;
         // What came after the head (a pipelined request) stays for the next round.
         std.mem.copyForwards(u8, head_buf[0 .. have - end], head_buf[end..have]);
         have -= end;
     }
+}
+
+/// One admitted request, answered. False when the connection is to be closed.
+fn dispatch(
+    s: *Server,
+    slot: *Server.Slot,
+    arena: *std.heap.ArenaAllocator,
+    req: Request,
+    after_head: []const u8,
+    has_body: bool,
+    served: u32,
+) bool {
+    const fd = slot.fd;
+    const lim = s.cfg.limits;
+    const a = arena.allocator();
+    if (s.cfg.test_route_delay_ms > 0) _ = waitStop(s, s.cfg.test_route_delay_ms);
+    const routed = route(a, s, req.method, req.target) catch Routed{ .answer = Answer.oom };
+    const answer = switch (routed) {
+        .answer => |ans| ans,
+        .build => |query| {
+            s.bump("beyond");
+            serveBuild(s, slot, arena, req, after_head, query);
+            return false;
+        },
+        .image => |op| img: {
+            s.bump("beyond");
+            const h = s.cfg.handler.?;
+            const got = h.imageFn(h.ptr, a, op);
+            break :img Answer{ .status = got.status, .body = got.body };
+        },
+    };
+    switch (answer.status) {
+        200 => {},
+        501 => {
+            s.bump("unsupported");
+            s.bump("beyond");
+        },
+        400...428, 430...499 => {
+            s.bump("refused");
+            s.bump("beyond");
+        },
+        else => s.bump("beyond"),
+    }
+    // A request with a body is answered and the connection closed: the body is not kept.
+    const keep = req.keep_alive and !has_body and served < lim.max_requests;
+    if (!reply(s, fd, a, answer.status, answer, req.head_only, keep)) return false;
+    if (!keep) {
+        if (has_body) drain(s, fd, lim);
+        return false;
+    }
+    return true;
 }
 
 /// Reads and drops what the client is still sending, so that closing does not reset the
@@ -803,7 +1021,12 @@ fn failure(a: Allocator, status: u16, message: []const u8) !Answer {
 fn reasonOf(status: u16) []const u8 {
     return switch (status) {
         200 => "OK",
+        201 => "Created",
         400 => "Bad Request",
+        404 => "Not Found",
+        409 => "Conflict",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         408 => "Request Timeout",
         414 => "URI Too Long",
         431 => "Request Header Fields Too Large",
@@ -856,50 +1079,96 @@ fn cleanText(a: Allocator, text: []const u8, max: usize) ![]const u8 {
     return out.items;
 }
 
+/// What a request comes to: an answer made at once, or work for the handler.
+const Routed = union(enum) {
+    answer: Answer,
+    /// `POST /build`, with the query's text.
+    build: []const u8,
+    image: ImageOp,
+};
+
 /// What `method target` is answered, for the server's config. A status of 0 in an `Answer` the
 /// caller makes itself (`error_json`) stands for the one it gives.
-fn route(a: Allocator, s: *const Server, method: []const u8, target: []const u8) !Answer {
+fn route(a: Allocator, s: *const Server, method: []const u8, target: []const u8) !Routed {
     const q = std.mem.indexOfScalar(u8, target, '?');
     var path = target[0 .. q orelse target.len];
     const query = if (q) |i| target[i + 1 ..] else "";
     switch (versionPrefix(path)) {
         .none => {},
-        .malformed => return failure(a, 400, "invalid API version prefix: a version is /v1.NN, with no sign or leading zero"),
+        .malformed => return .{ .answer = try failure(a, 400, "invalid API version prefix: a version is /v1.NN, with no sign or leading zero") },
         .ok => |v| {
-            if (v.major != 1 or v.minor > newest_minor) return failure(a, 400, try std.fmt.allocPrint(
+            if (v.major != 1 or v.minor > newest_minor) return .{ .answer = try failure(a, 400, try std.fmt.allocPrint(
                 a,
                 "client version {d}.{d} is too new. Maximum supported API version is " ++ api_version,
                 .{ v.major, v.minor },
-            ));
-            if (v.minor < oldest_minor) return failure(a, 400, try std.fmt.allocPrint(
+            )) };
+            if (v.minor < oldest_minor) return .{ .answer = try failure(a, 400, try std.fmt.allocPrint(
                 a,
                 "client version {d}.{d} is too old. Minimum supported API version is " ++
                     min_api_version ++ ", please upgrade your client to a newer version",
                 .{ v.major, v.minor },
-            ));
+            )) };
             path = if (v.rest.len == 0) "/" else v.rest;
         },
     }
     const is_get = std.mem.eql(u8, method, "GET");
     if ((is_get or std.mem.eql(u8, method, "HEAD")) and std.mem.eql(u8, path, "/_ping"))
-        return .{ .status = 200, .body = "OK", .content_type = "text/plain; charset=utf-8" };
-    if (is_get and std.mem.eql(u8, path, "/version")) return .{ .status = 200, .body = s.version_body };
-    if (is_get and std.mem.eql(u8, path, "/info")) return .{ .status = 200, .body = s.info_body };
+        return .{ .answer = .{ .status = 200, .body = "OK", .content_type = "text/plain; charset=utf-8" } };
+    if (is_get and std.mem.eql(u8, path, "/version")) return .{ .answer = .{ .status = 200, .body = s.version_body } };
+    if (is_get and std.mem.eql(u8, path, "/info")) return .{ .answer = .{ .status = 200, .body = s.info_body } };
     // `docker buildx build` looks for its builder's container (`buildx_buildkit_<name>`) first.
     if (std.mem.eql(u8, path, "/grpc") or std.mem.eql(u8, path, "/session") or
         std.mem.startsWith(u8, path, "/containers/buildx_buildkit"))
-        return failure(a, 501, buildkit_hint);
+        return .{ .answer = try failure(a, 501, buildkit_hint) };
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/build")) {
         var params = std.mem.splitScalar(u8, query, '&');
         while (params.next()) |p| if (std.mem.eql(u8, p, "version=2"))
-            return failure(a, 501, buildkit_hint);
-        return failure(a, 501, build_stage_1b);
+            return .{ .answer = try failure(a, 501, buildkit_hint) };
+        if (s.cfg.handler == null) return .{ .answer = try failure(a, 501, build_unavailable) };
+        return .{ .build = query };
     }
-    return failure(a, 501, try std.fmt.allocPrint(
+    if (s.cfg.handler != null) if (try imageRoute(a, method, path, query)) |r| return r;
+    return .{ .answer = try failure(a, 501, try std.fmt.allocPrint(
         a,
         "not supported by zig-runner yet: {s} {s}",
         .{ try cleanText(a, method, 16), try cleanText(a, path, 200) },
-    ));
+    )) };
+}
+
+/// `/images/{name}/json`, `/images/{name}/tag` and `/images/{name}` (the name may hold slashes and
+/// be percent-encoded); null for any other path.
+fn imageRoute(a: Allocator, method: []const u8, path: []const u8, query: []const u8) !?Routed {
+    const prefix = "/images/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const rest = path[prefix.len..];
+    const is_get = std.mem.eql(u8, method, "GET");
+    const is_post = std.mem.eql(u8, method, "POST");
+    const is_delete = std.mem.eql(u8, method, "DELETE");
+    var name_enc: []const u8 = "";
+    if (is_get and std.mem.endsWith(u8, rest, "/json")) {
+        name_enc = rest[0 .. rest.len - "/json".len];
+    } else if (is_post and std.mem.endsWith(u8, rest, "/tag")) {
+        name_enc = rest[0 .. rest.len - "/tag".len];
+    } else if (is_delete) {
+        name_enc = rest;
+    } else return null;
+    // `/images/json` and `/images/search` are the list and the search, not an image.
+    if (name_enc.len == 0) return null;
+    const name = (try docker_build.pathDecode(a, name_enc)) orelse
+        return .{ .answer = try failure(a, 400, "invalid image name: a bad percent escape") };
+    if (is_get) return .{ .image = .{ .inspect = name } };
+    var repo: []const u8 = "";
+    var tag: []const u8 = "";
+    var force = false;
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |part| {
+        const eq = std.mem.indexOfScalar(u8, part, '=') orelse part.len;
+        const k = (try docker_build.percentDecode(a, part[0..eq])) orelse continue;
+        const v = (try docker_build.percentDecode(a, if (eq < part.len) part[eq + 1 ..] else "")) orelse continue;
+        if (std.mem.eql(u8, k, "repo")) repo = v else if (std.mem.eql(u8, k, "tag")) tag = v else if (std.mem.eql(u8, k, "force")) force = docker_build.boolValue(v);
+    }
+    if (is_post) return .{ .image = .{ .tag = .{ .name = name, .repo = repo, .tag = tag } } };
+    return .{ .image = .{ .remove = .{ .name = name, .force = force } } };
 }
 
 /// `{}` where a struct's field must be an object and an empty tuple would be `[]`.
@@ -1072,6 +1341,295 @@ fn reply(s: *Server, fd: linux.fd_t, a: Allocator, status: u16, answer: Answer, 
         return false;
     };
     return true;
+}
+
+// --- POST /build ---
+
+const BodyEnd = enum { ok, too_large, timeout, gone, malformed, disk };
+
+/// The request's body written to `out_fd`: `after_head` is what came behind the head already.
+/// Content-Length or chunked, at most `max` bytes, each wait `idle_ms`, the whole `total_ms`.
+fn readBody(
+    s: *Server,
+    fd: linux.fd_t,
+    req: Request,
+    after_head: []const u8,
+    out_fd: linux.fd_t,
+    max: u64,
+    written: *u64,
+) BodyEnd {
+    const lim = s.cfg.limits;
+    const total_deadline = nowMs() + lim.body_ms;
+    var dec: BodyDecoder = .{ .out = out_fd, .max = max, .chunked = req.chunked, .remaining = req.content_length orelse 0 };
+    if (!req.chunked and (req.content_length orelse 0) > max) return .too_large;
+    var buf: [32 * 1024]u8 = undefined;
+    var first = after_head;
+    while (true) {
+        const got: []const u8 = if (first.len > 0) blk: {
+            const g = first;
+            first = "";
+            break :blk g;
+        } else blk: {
+            const deadline = @min(total_deadline, nowMs() + lim.body_idle_ms);
+            switch (waitFor(s, fd, linux.POLL.IN, deadline)) {
+                .ready => {},
+                .timeout => return .timeout,
+                .stopped, .gone => return .gone,
+            }
+            const rc = linux.recvfrom(fd, &buf, buf.len, linux.MSG.DONTWAIT, null, null);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR, .AGAIN => continue,
+                else => return .gone,
+            }
+            if (rc == 0) return .gone;
+            break :blk buf[0..rc];
+        };
+        switch (dec.feed(got)) {
+            .more => {},
+            .done => {
+                written.* = dec.total;
+                return .ok;
+            },
+            .too_large => return .too_large,
+            .malformed => return .malformed,
+            .disk => return .disk,
+        }
+    }
+}
+
+/// Decodes a body, whole or chunked, into a file.
+const BodyDecoder = struct {
+    out: linux.fd_t,
+    max: u64,
+    chunked: bool,
+    /// Bytes of the body, or of the chunk in hand, still to come.
+    remaining: u64,
+    total: u64 = 0,
+    state: enum { size, data, data_end, trailer } = .size,
+    line: [80]u8 = undefined,
+    line_len: usize = 0,
+    /// A chunk's `\r\n`: how much of it was seen.
+    crlf: u8 = 0,
+    /// The last chunk was seen (`0`): the trailers' lines follow.
+    last: bool = false,
+
+    const Step = enum { more, done, too_large, malformed, disk };
+
+    fn feed(d: *BodyDecoder, bytes: []const u8) Step {
+        if (!d.chunked) {
+            const n: usize = @intCast(@min(d.remaining, bytes.len));
+            if (!d.write(bytes[0..n])) return .disk;
+            d.remaining -= n;
+            return if (d.remaining == 0) .done else .more;
+        }
+        var i: usize = 0;
+        while (i < bytes.len) {
+            switch (d.state) {
+                .size, .trailer => {
+                    const c = bytes[i];
+                    i += 1;
+                    if (c != '\n') {
+                        if (d.line_len == d.line.len) return .malformed;
+                        d.line[d.line_len] = c;
+                        d.line_len += 1;
+                        continue;
+                    }
+                    const line = std.mem.trimEnd(u8, d.line[0..d.line_len], "\r");
+                    d.line_len = 0;
+                    if (d.state == .trailer) {
+                        // The blank line ends the message.
+                        if (line.len == 0) return .done;
+                        continue;
+                    }
+                    const hex = line[0 .. std.mem.indexOfScalar(u8, line, ';') orelse line.len];
+                    if (hex.len == 0 or hex.len > 12) return .malformed;
+                    const n = std.fmt.parseInt(u64, std.mem.trim(u8, hex, " \t"), 16) catch return .malformed;
+                    if (n == 0) {
+                        d.state = .trailer;
+                    } else {
+                        if (n > d.max - d.total) return .too_large;
+                        d.remaining = n;
+                        d.state = .data;
+                    }
+                },
+                .data => {
+                    const n: usize = @intCast(@min(d.remaining, bytes.len - i));
+                    if (!d.write(bytes[i..][0..n])) return .disk;
+                    i += n;
+                    d.remaining -= n;
+                    if (d.remaining == 0) {
+                        d.state = .data_end;
+                        d.crlf = 0;
+                    }
+                },
+                .data_end => {
+                    const want: u8 = if (d.crlf == 0) '\r' else '\n';
+                    if (bytes[i] != want) return .malformed;
+                    i += 1;
+                    d.crlf += 1;
+                    if (d.crlf == 2) d.state = .size;
+                },
+            }
+        }
+        return .more;
+    }
+
+    fn write(d: *BodyDecoder, bytes: []const u8) bool {
+        if (bytes.len > d.max - d.total) return false;
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const rc = linux.write(d.out, bytes[off..].ptr, bytes.len - off);
+            switch (linux.errno(rc)) {
+                .SUCCESS => off += rc,
+                .INTR => {},
+                else => return false,
+            }
+        }
+        d.total += bytes.len;
+        return true;
+    }
+};
+
+/// The thread a build runs on, so that the connection's can watch for the client leaving.
+const Worker = struct {
+    h: Handler,
+    call: *BuildCall,
+    done_fd: linux.fd_t,
+    fn run(w: *Worker) void {
+        w.h.buildFn(w.h.ptr, w.call);
+        const one: u64 = 1;
+        _ = linux.write(w.done_fd, std.mem.asBytes(&one).ptr, @sizeOf(u64));
+    }
+};
+
+fn buildError(s: *Server, a: Allocator, fd: linux.fd_t, status: u16, message: []const u8) void {
+    s.bump("refused");
+    _ = reply(s, fd, a, status, error_json(a, message), false, false);
+}
+
+/// `POST /build`: the query read and the context received (before a byte of it is built), then the
+/// build streamed. The connection is closed after.
+fn serveBuild(
+    s: *Server,
+    slot: *Server.Slot,
+    arena: *std.heap.ArenaAllocator,
+    req: Request,
+    after_head: []const u8,
+    query: []const u8,
+) void {
+    const fd = slot.fd;
+    const lim = s.cfg.limits;
+    const a = arena.allocator();
+    const h = s.cfg.handler.?;
+    const has_body = req.chunked or (req.content_length orelse 0) > 0;
+    const q = switch (docker_build.parseQuery(a, query) catch return buildError(s, a, fd, 500, "out of memory")) {
+        .ok => |ok| ok,
+        .bad => |m| return finishEarly(s, fd, a, 400, m, has_body),
+        .unsupported => |m| return finishEarly(s, fd, a, 501, m, has_body),
+    };
+    if (!has_body) return buildError(s, a, fd, 400, "the build needs a context: a tar in the request's body");
+    if (s.counters.builds.load(.acquire) >= lim.max_builds)
+        return finishEarly(s, fd, a, 429, "too many builds in this job", has_body);
+    const n = s.counters.builds.fetchAdd(1, .acq_rel);
+    const tar_path = std.fmt.allocPrint(a, "{s}/api-{d}.tar", .{ s.cfg.work_dir, n }) catch
+        return buildError(s, a, fd, 500, "out of memory");
+    defer if (unlinkPathA(a, tar_path)) {} else |_| {};
+    const out_rc = linux.open(a.dupeSentinel(u8, tar_path, 0) catch return, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .EXCL = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0o600);
+    if (linux.errno(out_rc) != .SUCCESS)
+        return buildError(s, a, fd, 500, "the job's directory cannot hold the build's context");
+    const out_fd: linux.fd_t = @intCast(out_rc);
+    var got: u64 = 0;
+    const end = readBody(s, fd, req, after_head, out_fd, lim.body_bytes, &got);
+    _ = linux.close(out_fd);
+    switch (end) {
+        .ok => {},
+        .too_large => return buildError(s, a, fd, 413, std.fmt.allocPrint(
+            a,
+            "the build context is larger than {d} MiB",
+            .{lim.body_bytes >> 20},
+        ) catch "the build context is too large"),
+        .timeout => return buildError(s, a, fd, 408, "the build context was not sent in time"),
+        .malformed => return buildError(s, a, fd, 400, "the build context's chunked encoding is malformed"),
+        .disk => return buildError(s, a, fd, 500, "the build context could not be stored (disk full?)"),
+        .gone => return,
+    }
+    // From here the answer is 200 and what goes wrong is told in the stream, as Docker's does.
+    const head = "HTTP/1.1 200 OK\r\nApi-Version: " ++ api_version ++ "\r\nBuilder-Version: 1\r\n" ++
+        "Docker-Experimental: false\r\nOstype: linux\r\nServer: zig-runner (linux)\r\n" ++
+        "Content-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    sendAll(s, fd, head, lim.write_ms) catch return;
+    var sink: Sink = .{ .server = s, .fd = fd };
+    var call: BuildCall = .{ .arena = a, .query = q, .tar_path = tar_path, .id = n, .limits = lim.context, .sink = &sink };
+    const done_rc = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(done_rc) != .SUCCESS) {
+        sink.write(docker_build.errorLine(a, "the runner has no file descriptor left for the build") catch "");
+        _ = sendAll(s, fd, "0\r\n\r\n", lim.write_ms) catch {};
+        return;
+    }
+    const done_fd: linux.fd_t = @intCast(done_rc);
+    defer _ = linux.close(done_fd);
+    var worker: Worker = .{ .h = h, .call = &call, .done_fd = done_fd };
+    const thread = std.Thread.spawn(.{ .stack_size = 16 * 1024 * 1024 }, Worker.run, .{&worker}) catch {
+        sink.write(docker_build.errorLine(a, "the runner could not start the build") catch "");
+        _ = sendAll(s, fd, "0\r\n\r\n", lim.write_ms) catch {};
+        return;
+    };
+    // Until the build ends: if the client goes (the step was stopped, `docker build` killed) or the
+    // server stops, the build is cancelled, and waited for.
+    var cancelled = false;
+    while (true) {
+        var fds = [_]linux.pollfd{
+            .{ .fd = done_fd, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = s.wake_fd, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = if (cancelled) -1 else fd, .events = linux.POLL.IN | poll_rdhup, .revents = 0 },
+        };
+        const rc = linux.poll(&fds, fds.len, -1);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => break,
+        }
+        if (fds[0].revents != 0) break;
+        if (!cancelled) {
+            var gone = fds[1].revents != 0 or sink.gone();
+            if (fds[2].revents & (linux.POLL.HUP | linux.POLL.ERR | poll_rdhup) != 0) gone = true;
+            if (fds[2].revents & linux.POLL.IN != 0) {
+                // A client has nothing more to say: bytes are junk, EOF is leaving.
+                var junk: [512]u8 = undefined;
+                const r = linux.recvfrom(fd, &junk, junk.len, linux.MSG.DONTWAIT, null, null);
+                if (linux.errno(r) == .SUCCESS and r == 0) gone = true;
+            }
+            if (gone) {
+                cancelled = true;
+                h.cancelFn(h.ptr, n);
+            }
+        } else if (fds[1].revents != 0) {
+            // Stopping: the cancel is made; wait for the build in a short sleep loop.
+            var again = [_]linux.pollfd{.{ .fd = done_fd, .events = linux.POLL.IN, .revents = 0 }};
+            _ = linux.poll(&again, 1, 10);
+        }
+    }
+    thread.join();
+    _ = sendAll(s, fd, "0\r\n\r\n", lim.write_ms) catch {};
+}
+
+/// A refusal before the context is read: answered, and what the client is sending dropped.
+fn finishEarly(s: *Server, fd: linux.fd_t, a: Allocator, status: u16, message: []const u8, has_body: bool) void {
+    s.bump("refused");
+    _ = reply(s, fd, a, status, error_json(a, message), false, false);
+    if (has_body) drain(s, fd, s.cfg.limits);
+}
+
+fn unlinkPathA(a: Allocator, path: []const u8) !void {
+    const z = try a.dupeSentinel(u8, path, 0);
+    _ = linux.unlink(z);
 }
 
 // --- tests ---
@@ -1271,15 +1829,15 @@ test "docker api: every other endpoint is 501 naming the method and the path" {
     try expectMessage(&f, "GET", "/a\"b\\c", 501, prefix ++ "GET /a\"b\\c");
 }
 
-test "docker api: BuildKit's endpoints get the hint, the classic /build says stage 1b" {
+test "docker api: BuildKit's endpoints get the hint, the classic /build says it is not built without a handler" {
     var f = try Fixture.start(test_cfg);
     defer _ = f.finish();
     try expectMessage(&f, "POST", "/grpc", 501, buildkit_hint);
     try expectMessage(&f, "POST", "/v1.47/session", 501, buildkit_hint);
     try expectMessage(&f, "POST", "/build?version=2&t=x", 501, buildkit_hint);
     try expectMessage(&f, "GET", "/v1.52/containers/buildx_buildkit_default/json", 501, buildkit_hint);
-    try expectMessage(&f, "POST", "/v1.41/build?t=x&dockerfile=Dockerfile", 501, build_stage_1b);
-    try expectMessage(&f, "POST", "/build", 501, build_stage_1b);
+    try expectMessage(&f, "POST", "/v1.41/build?t=x&dockerfile=Dockerfile", 501, build_unavailable);
+    try expectMessage(&f, "POST", "/build", 501, build_unavailable);
     try testing.expect(std.mem.indexOf(u8, buildkit_hint, "DOCKER_BUILDKIT=0 is set for you") != null);
 }
 
@@ -1441,7 +1999,7 @@ test "docker api: a request with a body is answered at once, then its body is dr
     // The answer comes before the body is sent.
     var got = try askOn(fd, "", 3000);
     try testing.expectEqual(@as(u16, 501), statusOf(got.text));
-    try expectContains(got.text, build_stage_1b);
+    try expectContains(got.text, build_unavailable);
     try expectContains(got.text, "Connection: close");
     testing.allocator.free(got.text);
     // And the client may still send all of it: it is read, not reset.
@@ -1953,4 +2511,427 @@ test "docker api: settle returns at once for an idle connection opened before th
     const again = try askOn(idle, "GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n", 1000);
     defer testing.allocator.free(again.text);
     try testing.expectEqual(@as(u16, 200), statusOf(again.text));
+}
+
+// --- POST /build and /images, the gate (stage 1b), with a handler that builds nothing ---
+
+/// A handler that records what it was asked and answers as a build would.
+const Fake = struct {
+    tmp_dir: []const u8,
+    mu: std.atomic.Mutex = .unlocked,
+    tags_len: usize = 0,
+    arg_name: [8]u8 = undefined,
+    arg_len: usize = 0,
+    tar: []u8 = &.{},
+    builds: std.atomic.Value(u32) = .init(0),
+    cancels: std.atomic.Value(u32) = .init(0),
+    resets: std.atomic.Value(u32) = .init(0),
+    cancelled: std.atomic.Value(bool) = .init(false),
+    /// The build waits for a cancel (or 5 s) before it ends, as a long RUN does.
+    hang: bool = false,
+    last_image_op: ?[]const u8 = null,
+
+    fn handler(f: *Fake) Handler {
+        return .{ .ptr = f, .buildFn = build, .imageFn = image, .cancelFn = cancel, .resetFn = reset };
+    }
+
+    fn build(ptr: *anyopaque, call: *BuildCall) void {
+        const f: *Fake = @ptrCast(@alignCast(ptr));
+        _ = f.builds.fetchAdd(1, .acq_rel);
+        const data = std.Io.Dir.cwd().readFileAlloc(testing.io, call.tar_path, testing.allocator, .limited(64 << 20)) catch "";
+        f.tar = @constCast(data);
+        f.tags_len = call.query.tags.len;
+        if (call.query.build_args.len > 0) {
+            const n = call.query.build_args[0].name;
+            f.arg_len = @min(n.len, f.arg_name.len);
+            @memcpy(f.arg_name[0..f.arg_len], n[0..f.arg_len]);
+        }
+        call.sink.write("{\"stream\":\"Step 1/1 : FROM scratch\\n\"}\n");
+        if (f.hang) {
+            const end = nowMs() + 5000;
+            while (!f.cancelled.load(.acquire) and !call.sink.gone() and nowMs() < end) {
+                var ts: linux.timespec = .{ .sec = 0, .nsec = 2_000_000 };
+                _ = linux.nanosleep(&ts, null);
+            }
+            call.sink.write("{\"errorDetail\":{\"message\":\"cancelled\"},\"error\":\"cancelled\"}\n");
+            return;
+        }
+        call.sink.write("{\"aux\":{\"ID\":\"sha256:abc\"}}\n");
+    }
+
+    fn image(ptr: *anyopaque, a: Allocator, op: ImageOp) ImageAnswer {
+        const f: *Fake = @ptrCast(@alignCast(ptr));
+        switch (op) {
+            .inspect => |n| f.last_image_op = std.fmt.allocPrint(testing.allocator, "inspect {s}", .{n}) catch "",
+            .tag => |t| f.last_image_op = std.fmt.allocPrint(testing.allocator, "tag {s} {s} {s}", .{ t.name, t.repo, t.tag }) catch "",
+            .remove => |r| f.last_image_op = std.fmt.allocPrint(testing.allocator, "remove {s} {}", .{ r.name, r.force }) catch "",
+        }
+        _ = a;
+        return .{ .status = 200, .body = "{}\n" };
+    }
+
+    fn cancel(ptr: *anyopaque, id: ?u32) void {
+        _ = id;
+        const f: *Fake = @ptrCast(@alignCast(ptr));
+        _ = f.cancels.fetchAdd(1, .acq_rel);
+        f.cancelled.store(true, .release);
+    }
+
+    fn reset(ptr: *anyopaque) void {
+        const f: *Fake = @ptrCast(@alignCast(ptr));
+        _ = f.resets.fetchAdd(1, .acq_rel);
+        f.cancelled.store(false, .release);
+    }
+};
+
+/// A fixture whose server has `fake` as its handler and a directory for contexts.
+fn startBuilding(fake: *Fake, cfg_in: Config) !Fixture {
+    var f: Fixture = .{ .tmp = std.testing.tmpDir(.{}), .path = "", .server = undefined };
+    errdefer f.tmp.cleanup();
+    const dir = try f.tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    var cfg = cfg_in;
+    cfg.work_dir = dir;
+    cfg.handler = fake.handler();
+    fake.tmp_dir = "";
+    f.path = try std.fmt.allocPrint(testing.allocator, "{s}/docker.sock", .{dir});
+    errdefer testing.allocator.free(f.path);
+    f.server = try Server.start(testing.allocator, f.path, cfg);
+    return f;
+}
+
+/// `data` as a chunked body of `size`-byte chunks.
+fn chunked(data: []const u8, size: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    var i: usize = 0;
+    while (i < data.len) : (i += size) {
+        const part = data[i..@min(i + size, data.len)];
+        try out.print(testing.allocator, "{x}\r\n", .{part.len});
+        try out.appendSlice(testing.allocator, part);
+        try out.appendSlice(testing.allocator, "\r\n");
+    }
+    try out.appendSlice(testing.allocator, "0\r\n\r\n");
+    return out.toOwnedSlice(testing.allocator);
+}
+
+/// The JSON lines a chunked response carries, joined.
+fn dechunk(a: Allocator, text: []const u8) ![]const u8 {
+    const body = bodyOf(text);
+    var out: std.ArrayList(u8) = .empty;
+    var rest = body;
+    while (true) {
+        const nl = std.mem.indexOf(u8, rest, "\r\n") orelse return error.BadChunk;
+        const n = try std.fmt.parseInt(usize, rest[0..nl], 16);
+        if (n == 0) return out.items;
+        if (rest.len < nl + 2 + n + 2) return error.BadChunk;
+        try out.appendSlice(a, rest[nl + 2 ..][0..n]);
+        rest = rest[nl + 2 + n + 2 ..];
+    }
+}
+
+const build_head = "POST /v1.52/build?dockerfile=Dockerfile&t=x%3A1&t=y&buildargs=%7B%22A%22%3A%221%22%7D&version=1 HTTP/1.1\r\n" ++
+    "Host: api.moby.localhost\r\nUser-Agent: Docker-Client/29.9.3 (linux)\r\nTransfer-Encoding: chunked\r\n" ++
+    "Content-Type: application/x-tar\r\nX-Registry-Config: e30=\r\n\r\n";
+
+test "docker api: POST /build reads a chunked context, hands it to the handler and streams its lines" {
+    var fake: Fake = .{ .tmp_dir = "" };
+    var f = try startBuilding(&fake, test_cfg);
+    const context = try testing.allocator.alloc(u8, 70_000);
+    defer testing.allocator.free(context);
+    for (context, 0..) |*c, i| c.* = @truncate(i *% 31);
+    const body = try chunked(context, 512);
+    defer testing.allocator.free(body);
+    const req = try std.mem.concat(testing.allocator, u8, &.{ build_head, body });
+    defer testing.allocator.free(req);
+    const got = try ask(f.path, req, 5000);
+    defer testing.allocator.free(got.text);
+    try testing.expect(got.closed);
+    try testing.expectEqual(@as(u16, 200), statusOf(got.text));
+    try expectContains(got.text, "Transfer-Encoding: chunked\r\n");
+    try expectContains(got.text, "Content-Type: application/json\r\n");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const lines = try dechunk(arena.allocator(), got.text);
+    try testing.expectEqualStrings("{\"stream\":\"Step 1/1 : FROM scratch\\n\"}\n{\"aux\":{\"ID\":\"sha256:abc\"}}\n", lines);
+    // The handler had the whole context, and what the query asked.
+    try testing.expectEqualSlices(u8, context, fake.tar);
+    testing.allocator.free(fake.tar);
+    try testing.expectEqual(@as(usize, 2), fake.tags_len);
+    try testing.expectEqualStrings("A", fake.arg_name[0..fake.arg_len]);
+    // The context's file is gone once the build is.
+    const st = f.server.stats();
+    try testing.expectEqual(@as(u32, 1), st.builds);
+    try testing.expect(st.beyond >= 1);
+    try testing.expectError(error.FileNotFound, f.tmp.dir.access(testing.io, "api-0.tar", .{}));
+    _ = f.finish();
+}
+
+test "docker api: POST /build takes a Content-Length body too, and a context in one piece with the head" {
+    var fake: Fake = .{ .tmp_dir = "" };
+    var f = try startBuilding(&fake, test_cfg);
+    defer _ = f.finish();
+    const head = "POST /build?t=z HTTP/1.1\r\nHost: d\r\nContent-Length: 11\r\n\r\n";
+    const got = try ask(f.path, head ++ "hello world", 5000);
+    defer testing.allocator.free(got.text);
+    try testing.expectEqual(@as(u16, 200), statusOf(got.text));
+    try testing.expectEqualStrings("hello world", fake.tar);
+    testing.allocator.free(fake.tar);
+}
+
+test "docker api: POST /build refuses what it cannot build before reading the context" {
+    var fake: Fake = .{ .tmp_dir = "" };
+    var f = try startBuilding(&fake, test_cfg);
+    defer _ = f.finish();
+    const Case = struct { target: []const u8, status: u16, message: []const u8 };
+    const cases = [_]Case{
+        .{ .target = "/build?buildargs=nope", .status = 400, .message = "not a JSON object" },
+        .{ .target = "/build?t=UPPER", .status = 200, .message = "" },
+        .{ .target = "/build?platform=linux%2Farm64x", .status = 400, .message = "is not supported by zig-runner" },
+        .{ .target = "/build?networkmode=host", .status = 501, .message = "--network=host" },
+        .{ .target = "/build?squash=1", .status = 501, .message = "--squash" },
+        .{ .target = "/build?remote=https%3A%2F%2Fx", .status = 501, .message = "remote build context" },
+        .{ .target = "/build?version=2", .status = 501, .message = "BuildKit" },
+    };
+    for (cases) |c| {
+        const req = try std.fmt.allocPrint(testing.allocator, "POST {s} HTTP/1.1\r\nHost: d\r\nContent-Length: 3\r\n\r\nabc", .{c.target});
+        defer testing.allocator.free(req);
+        const got = try ask(f.path, req, 3000);
+        defer testing.allocator.free(got.text);
+        testing.expectEqual(c.status, statusOf(got.text)) catch |e| {
+            std.debug.print("case {s}: {s}\n", .{ c.target, got.text });
+            return e;
+        };
+        if (c.message.len > 0) try expectContains(got.text, c.message);
+    }
+    // A build with no context at all.
+    const none = try ask(f.path, "POST /build HTTP/1.1\r\nHost: d\r\n\r\n", 3000);
+    defer testing.allocator.free(none.text);
+    try testing.expectEqual(@as(u16, 400), statusOf(none.text));
+    try expectContains(none.text, "needs a context");
+    if (fake.tar.len > 0) testing.allocator.free(fake.tar);
+}
+
+test "docker api: a context over the limit is 413, a broken chunk 400, a slow upload 408" {
+    var fake: Fake = .{ .tmp_dir = "" };
+    var cfg = test_cfg;
+    cfg.limits.body_bytes = 1000;
+    cfg.limits.body_idle_ms = 300;
+    var f = try startBuilding(&fake, cfg);
+    defer _ = f.finish();
+    {
+        const got = try ask(f.path, "POST /build HTTP/1.1\r\nHost: d\r\nContent-Length: 5000\r\n\r\n", 3000);
+        defer testing.allocator.free(got.text);
+        try testing.expectEqual(@as(u16, 413), statusOf(got.text));
+    }
+    {
+        const big: [2000]u8 = @splat('x');
+        const body = try chunked(&big, 400);
+        defer testing.allocator.free(body);
+        const req = try std.mem.concat(testing.allocator, u8, &.{ "POST /build HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\n", body });
+        defer testing.allocator.free(req);
+        const got = try ask(f.path, req, 3000);
+        defer testing.allocator.free(got.text);
+        try testing.expectEqual(@as(u16, 413), statusOf(got.text));
+    }
+    {
+        const got = try ask(f.path, "POST /build HTTP/1.1\r\nHost: d\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n", 3000);
+        defer testing.allocator.free(got.text);
+        try testing.expectEqual(@as(u16, 400), statusOf(got.text));
+    }
+    {
+        const got = try ask(f.path, "POST /build HTTP/1.1\r\nHost: d\r\nContent-Length: 10\r\n\r\nabc", 3000);
+        defer testing.allocator.free(got.text);
+        try testing.expectEqual(@as(u16, 408), statusOf(got.text));
+    }
+    try testing.expectEqual(@as(u32, 0), fake.builds.load(.acquire));
+}
+
+test "docker api: a client that leaves cancels its build, and the build is waited for" {
+    var fake: Fake = .{ .tmp_dir = "", .hang = true };
+    var f = try startBuilding(&fake, test_cfg);
+    const fd = try connect(f.path);
+    const req = "POST /build HTTP/1.1\r\nHost: d\r\nContent-Length: 2\r\n\r\nhi";
+    _ = linux.sendto(fd, req.ptr, req.len, linux.MSG.NOSIGNAL, null, 0);
+    // The build has started (its first line is there), then the client goes.
+    var buf: [4096]u8 = undefined;
+    var seen: usize = 0;
+    const t0 = nowMs();
+    while (nowMs() - t0 < 3000 and std.mem.indexOf(u8, buf[0..seen], "FROM scratch") == null) {
+        var fds = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+        if (linux.poll(&fds, 1, 100) > 0) seen += linux.read(fd, buf[seen..].ptr, buf.len - seen);
+    }
+    try testing.expect(std.mem.indexOf(u8, buf[0..seen], "FROM scratch") != null);
+    _ = linux.close(fd);
+    const t1 = nowMs();
+    while (fake.cancels.load(.acquire) == 0 and nowMs() - t1 < 3000) {
+        var ts: linux.timespec = .{ .sec = 0, .nsec = 2_000_000 };
+        _ = linux.nanosleep(&ts, null);
+    }
+    try testing.expect(fake.cancels.load(.acquire) >= 1);
+    // stop joins the connection, which joined the build.
+    _ = f.finish();
+    testing.allocator.free(fake.tar);
+}
+
+test "docker api: closing the gate cancels the build in flight, waits for it, and turns requests away" {
+    var fake: Fake = .{ .tmp_dir = "", .hang = true };
+    var f = try startBuilding(&fake, test_cfg);
+    defer _ = f.finish();
+    f.server.openGate();
+    const fd = try connect(f.path);
+    defer _ = linux.close(fd);
+    const req = "POST /build HTTP/1.1\r\nHost: d\r\nContent-Length: 2\r\n\r\nhi";
+    _ = linux.sendto(fd, req.ptr, req.len, linux.MSG.NOSIGNAL, null, 0);
+    const t0 = nowMs();
+    while (fake.builds.load(.acquire) == 0 and nowMs() - t0 < 3000) {
+        var ts: linux.timespec = .{ .sec = 0, .nsec = 2_000_000 };
+        _ = linux.nanosleep(&ts, null);
+    }
+    try testing.expectEqual(@as(u32, 1), fake.builds.load(.acquire));
+    const t1 = nowMs();
+    try testing.expect(f.server.closeGate());
+    // Cancelled and ended well before the build's own 5 s.
+    try testing.expect(nowMs() - t1 < 3000);
+    try testing.expect(fake.cancels.load(.acquire) >= 1);
+    // Closed: the next request is 503 and counted, whichever it is.
+    const got = try get(f.path, "/_ping");
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(u16, 503), statusOf(got));
+    try expectContains(got, "no step of the job is running");
+    try testing.expect(f.server.stats().gated >= 1);
+    // Open again: the handler is told to forget the cancel, and the ping answers.
+    const resets = fake.resets.load(.acquire);
+    f.server.openGate();
+    try testing.expect(fake.resets.load(.acquire) > resets);
+    const ok = try get(f.path, "/_ping");
+    defer testing.allocator.free(ok);
+    try testing.expectEqual(@as(u16, 200), statusOf(ok));
+    testing.allocator.free(fake.tar);
+}
+
+test "docker api: a request from a client that has gone is counted by the step that made it, and none by the next" {
+    var fake: Fake = .{ .tmp_dir = "" };
+    var cfg = test_cfg;
+    // Held in the connection's thread after it was read, as a late-admitted request is.
+    cfg.test_route_delay_ms = 200;
+    var f = try startBuilding(&fake, cfg);
+    defer _ = f.finish();
+    f.server.openGate();
+    {
+        const fd = try connect(f.path);
+        const req = "GET /images/x/json HTTP/1.1\r\nHost: d\r\n\r\n";
+        _ = linux.sendto(fd, req.ptr, req.len, linux.MSG.NOSIGNAL, null, 0);
+        _ = linux.close(fd);
+    }
+    // The step ends with its request in flight (read, and held by the test's delay): the gate
+    // waits for it, and it is counted.
+    const t0 = nowMs();
+    while (f.server.stats().requests == 0 and nowMs() - t0 < 3000) {
+        var ts: linux.timespec = .{ .sec = 0, .nsec = 2_000_000 };
+        _ = linux.nanosleep(&ts, null);
+    }
+    try testing.expect(f.server.closeGate());
+    try testing.expectEqual(@as(u32, 1), f.server.stats().beyond);
+    const before = f.server.stats().beyond;
+    // A request after the end finds the gate closed: it cannot be in flight in the next step's
+    // window, and it is 503 whenever it is read.
+    {
+        const fd = try connect(f.path);
+        const req = "GET /images/y/json HTTP/1.1\r\nHost: d\r\n\r\n";
+        _ = linux.sendto(fd, req.ptr, req.len, linux.MSG.NOSIGNAL, null, 0);
+        _ = linux.close(fd);
+    }
+    f.server.settle();
+    try testing.expect(f.server.stats().gated >= 1);
+    // It reached no handler: the image op the handler saw last is the first request's.
+    try testing.expectEqualStrings("inspect x", fake.last_image_op.?);
+    testing.allocator.free(fake.last_image_op.?);
+    try testing.expect(f.server.stats().beyond > before);
+}
+
+test "docker api: the image routes reach the handler with the name decoded" {
+    var fake: Fake = .{ .tmp_dir = "" };
+    var f = try startBuilding(&fake, test_cfg);
+    defer _ = f.finish();
+    const Case = struct { method: []const u8, target: []const u8, op: []const u8 };
+    const cases = [_]Case{
+        .{ .method = "GET", .target = "/v1.52/images/x:1/json", .op = "inspect x:1" },
+        .{ .method = "GET", .target = "/images/myorg/app:2/json", .op = "inspect myorg/app:2" },
+        .{ .method = "GET", .target = "/images/sha256%3Aabcd/json", .op = "inspect sha256:abcd" },
+        .{ .method = "POST", .target = "/images/x/tag?repo=y&tag=2", .op = "tag x y 2" },
+        .{ .method = "POST", .target = "/images/x/tag?repo=reg.io%2Fy", .op = "tag x reg.io/y " },
+        .{ .method = "DELETE", .target = "/images/x:1", .op = "remove x:1 false" },
+        .{ .method = "DELETE", .target = "/images/x?force=1&noprune=0", .op = "remove x true" },
+    };
+    for (cases) |c| {
+        const req = try std.fmt.allocPrint(testing.allocator, "{s} {s} HTTP/1.1\r\nHost: d\r\n\r\n", .{ c.method, c.target });
+        defer testing.allocator.free(req);
+        const got = try ask(f.path, req, 3000);
+        defer testing.allocator.free(got.text);
+        try testing.expectEqual(@as(u16, 200), statusOf(got.text));
+        try testing.expectEqualStrings(c.op, fake.last_image_op.?);
+        testing.allocator.free(fake.last_image_op.?);
+        fake.last_image_op = null;
+    }
+    // The list and the search are not an image.
+    const list = try get(f.path, "/images/json");
+    defer testing.allocator.free(list);
+    try testing.expectEqual(@as(u16, 501), statusOf(list));
+}
+
+test "docker api: the docker CLI's own build requests (recorded) reach the handler with their context whole" {
+    var fake: Fake = .{ .tmp_dir = "" };
+    var f = try startBuilding(&fake, .{ .job = "0123456789abcdef", .version = "v0.0.0-recorded" });
+    defer _ = f.finish();
+    for ([_]usize{ 2, 3 }) |which| {
+        const c = captures[which];
+        errdefer std.debug.print("ERROR capture {s}\n", .{c.name});
+        // The CLI sent a ping, then the build, on one connection.
+        const got = try ask(f.path, c.request, 5000);
+        defer testing.allocator.free(got.text);
+        try expectContains(got.text, "HTTP/1.1 200 OK");
+        try expectContains(got.text, "Transfer-Encoding: chunked");
+        try testing.expect(fake.tar.len > 1024);
+        // What it sent is a tar with a Dockerfile in it, which unpacks.
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "ctx.tar", .data = fake.tar });
+        try tmp.dir.createDirPath(testing.io, "out");
+        const base = try tmp.dir.realPathFileAlloc(testing.io, ".", arena.allocator());
+        var why: []const u8 = "";
+        const out = try docker_build.unpack(arena.allocator(), testing.io, try std.fmt.allocPrint(arena.allocator(), "{s}/out", .{base}), try std.fmt.allocPrint(arena.allocator(), "{s}/ctx.tar", .{base}), .{}, &why);
+        try testing.expect(out.entries >= 1);
+        const df = try tmp.dir.readFileAlloc(testing.io, "out/Dockerfile", arena.allocator(), .limited(1 << 16));
+        try testing.expect(std.mem.startsWith(u8, df, "FROM "));
+        testing.allocator.free(fake.tar);
+        fake.tar = &.{};
+    }
+    try testing.expectEqual(@as(usize, 1), fake.arg_len);
+}
+
+test "docker api: the docker CLI's own image requests (recorded) are the routes the handler gets" {
+    var fake: Fake = .{ .tmp_dir = "" };
+    var f = try startBuilding(&fake, .{ .job = "0123456789abcdef", .version = "v0.0.0-recorded" });
+    defer _ = f.finish();
+    const Case = struct { req: []const u8, op: []const u8 };
+    const cases = [_]Case{
+        .{ .req = @embedFile("testdata/docker_api/09-image-inspect.req"), .op = "inspect myorg/app:1.2" },
+        .{ .req = @embedFile("testdata/docker_api/10-image-tag.req"), .op = "tag myorg/app:1.2 reg.io/y 2" },
+        .{ .req = @embedFile("testdata/docker_api/11-image-rmi.req"), .op = "remove reg.io/y:2 false" },
+        .{ .req = @embedFile("testdata/docker_api/12-image-inspect-id.req"), .op = "inspect sha256:0123456789ab" },
+        .{ .req = @embedFile("testdata/docker_api/13-image-rmi-force.req"), .op = "remove 0123abcd true" },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("ERROR request for {s}\n", .{c.op});
+        // The CLI's ping, then its request, on one connection: both answered.
+        const got = try ask(f.path, c.req, 300);
+        defer testing.allocator.free(got.text);
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got.text, "HTTP/1.1 "));
+        try testing.expectEqualStrings(c.op, fake.last_image_op.?);
+        testing.allocator.free(fake.last_image_op.?);
+        fake.last_image_op = null;
+    }
 }

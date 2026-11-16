@@ -19,6 +19,8 @@ const Allocator = std.mem.Allocator;
 
 /// What a service runs from: the image's filesystem (a directory used read-only, as the lowest
 /// layer of the service's overlay) and the parts of its configuration a container takes.
+pub const Label = struct { name: []const u8, value: []const u8 };
+
 pub const Image = struct {
     /// Absolute.
     rootfs: []const u8,
@@ -36,6 +38,11 @@ pub const Image = struct {
     /// image is, config and layers. A tag moved, or an index that changed for another platform,
     /// is told apart by this and not by the reference (or by `digest`, an index's).
     manifest: ?[]const u8 = null,
+    /// `LABEL`s (and `--label`s), in the order they were set; a name appears once.
+    labels: []const Label = &.{},
+    /// Layers over `rootfs`, top first, for an image the Docker API built in this job
+    /// (`docker_api_job.zig`): its filesystem is these and then `rootfs`. Empty for any other.
+    layers: []const []const u8 = &.{},
 };
 
 /// The entry's name in the images directory: the reference with each `/` as `+`, which no
@@ -134,6 +141,13 @@ pub fn parseConfig(arena: Allocator, text: []const u8) !Image {
         image.env = try strings(arena, c.object.get("Env"));
         image.workdir = string(c.object.get("WorkingDir"));
         image.user = string(c.object.get("User"));
+        if (c.object.get("Labels")) |l| if (l == .object) {
+            var out: std.ArrayList(Label) = .empty;
+            var it = l.object.iterator();
+            while (it.next()) |kv| if (kv.value_ptr.* == .string)
+                try out.append(arena, .{ .name = kv.key_ptr.*, .value = kv.value_ptr.string });
+            image.labels = out.items;
+        };
         if (c.object.get("Healthcheck")) |h| if (h == .object) {
             image.healthcheck = .{
                 .test_cmd = try strings(arena, h.object.get("Test")),

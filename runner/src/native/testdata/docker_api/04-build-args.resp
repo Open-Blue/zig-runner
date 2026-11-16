@@ -15,7 +15,7 @@ Docker-Experimental: false
 Ostype: linux
 Server: zig-runner/0.0.0-recorded (linux)
 Content-Type: application/json
-Content-Length: 57
+Content-Length: 59
 Connection: close
 
-{"message":"not supported by zig-runner yet (stage 1b)"}
+{"message":"not supported by zig-runner yet: POST /build"}
