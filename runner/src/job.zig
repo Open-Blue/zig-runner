@@ -207,6 +207,16 @@ pub const Job = struct {
     /// Service URLs JavaScript actions reach through the `ACTIONS_*` variables (cache, artifacts).
     runtime: Runtime = .{},
     steps: []const Step,
+
+    /// What git over HTTPS to the job's server authenticates with: the job's `GITHUB_TOKEN`, else
+    /// its job token. On GitHub they are one token; on Gitea and Forgejo the job token is the
+    /// runtime token (for the artifact and cache services), which git refuses, and the secret
+    /// `GITHUB_TOKEN` is the task's token for the repository.
+    pub fn gitToken(job: Job) []const u8 {
+        for (job.secret_vars) |sv|
+            if (std.mem.eql(u8, sv.name, "GITHUB_TOKEN") and sv.value.len > 0) return sv.value;
+        return job.job_token;
+    }
 };
 
 /// `defaults.run`: its two settings, each a literal or an expression.
@@ -1173,6 +1183,16 @@ pub const fixture =
     \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"github.sha"}}]}}
     \\ ]}
 ;
+
+test "Job.gitToken: the job's GITHUB_TOKEN secret, else its job token" {
+    var job = std.mem.zeroInit(Job, .{});
+    job.job_token = "runtime";
+    try std.testing.expectEqualStrings("runtime", job.gitToken());
+    job.secret_vars = &.{ .{ .name = "OTHER", .value = "x" }, .{ .name = "GITHUB_TOKEN", .value = "task-token" } };
+    try std.testing.expectEqualStrings("task-token", job.gitToken());
+    job.secret_vars = &.{.{ .name = "GITHUB_TOKEN", .value = "" }};
+    try std.testing.expectEqualStrings("runtime", job.gitToken());
+}
 
 test "Uses.resolve: the default is the actions URL or the server, GitHub's token only for the job's repository" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
