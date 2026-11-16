@@ -52,7 +52,8 @@ git config core.hooksPath .githooks
   constructs ratchet. When runner code changed: the tests again on overlayfs (in Docker) and ZLint.
   When the matching files changed: actionlint, zizmor and the check names the release waits for;
   shellcheck and shfmt; hadolint; `gofmt` and `go vet`; the Lean proofs and the `hashFiles()` model;
-  SPIN. A small change takes under a minute.
+  SPIN (`spin.sh` runs as many configurations at once as the cores and memory it is given allow,
+  cgroup limits included; `SPIN_JOBS=N` fixes the number). A small change takes under a minute.
 
 Each pre-push step prints its name and, when it ends, one summary line; a check's own output is
 hidden unless it fails. The long steps name their log as they start (`build and tests (output:
