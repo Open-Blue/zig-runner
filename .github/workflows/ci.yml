@@ -439,6 +439,15 @@ jobs:
           # A tar of executables: already as small as it gets in a few seconds.
           compression-level: 1
 
+      # The Test job's "Every test file is compiled", moved here on the prebuilt path: it compiles
+      # the tests once more and costs the Pi 2.5 min and 3.6 GB of its 4.3. It checks that every
+      # file with tests is listed in main.zig's test block, a fact of the source and not of the CPU,
+      # so it runs natively here (x86_64), as the pull requests' Test job does, and not for aarch64
+      # (which could not run `test_shards --names` on the binary). A failure fails this job, and
+      # with it "Tests (x86_64)" ("The prebuilt tests" step).
+      - name: Every test file is compiled
+        run: .github/scripts/test-files.sh
+
   # A push to main runs on prod, this project's own runner, so every merge exercises it; pull
   # requests and the merge queue run on GitHub's runner on purpose, cold every time, the worst case
   # for a build (docs/OPERATIONS.md, "Environments"). The repository variables PROD_RUNNER and PREPROD_RUNNER
@@ -505,7 +514,7 @@ jobs:
           PREBUILD_RESULT: ${{ needs.prebuild.result }}
         run: |
           if [ "$PREBUILD_RESULT" != success ]; then
-            echo "The prebuild job ended $PREBUILD_RESULT: no tests to run" >&2
+            echo "The prebuild job ended $PREBUILD_RESULT: no tests to run (it compiles them and checks that every test file is listed: see its log)" >&2
             exit 1
           fi
           echo "dir=$RUNNER_TEMP/prebuilt" >>"$GITHUB_OUTPUT"
@@ -533,6 +542,7 @@ jobs:
       # process and memory limits), which would otherwise become this job's annotations
       # (zig-test.sh does the same for its own runs).
       - name: Test
+        id: test
         if: steps.scope.outputs.run == 'true'
         working-directory: runner
         env:
@@ -569,6 +579,7 @@ jobs:
               # Nothing to compile: the prebuild job did, and this runs its tests, after checking the
               # tar against the digest that job output (zig-test-prebuilt.sh).
               ../.github/scripts/memory-peak.sh run -- ../.github/scripts/zig-test-prebuilt.sh run "$PREBUILT_DIR/tests-aarch64.tar" "$PREBUILT_SHA256" 2>&1 | tee "$log" >&2 || status=$?
+              echo "prebuilt=true" >>"$GITHUB_OUTPUT"
             else
               ../.github/scripts/memory-peak.sh compile -- zig build test-compile "${jobs[@]}" --summary all 2>&1 | tee "$log" >&2 || status=$?
               if [ "$status" = 0 ]; then
@@ -648,9 +659,19 @@ jobs:
         working-directory: runner
         run: zig build-exe --dep runner --dep corpus -Mroot=tools/hashfilescorpus.zig -Mrunner=src/hashfiles_corpus.zig -Mcorpus=tools/corpus.zig --name hashfilescorpus -fno-emit-bin
 
+      # Not on the prebuilt path: the prebuild job ran it (natively, on GitHub's runner) and a
+      # failure there fails this job already. Where the Test step compiled for itself (a pull
+      # request, the merge queue, a hosted prod, or a failed download) it runs here as before.
       - name: Every test file is compiled
         if: steps.scope.outputs.run == 'true'
-        run: .github/scripts/test-files.sh
+        run: |
+          if [ "$PREBUILT" = true ]; then
+            echo "Every test file is compiled: checked in the job \"Tests, compiled for the Pi\" (prebuild), not on this runner"
+          else
+            .github/scripts/test-files.sh
+          fi
+        env:
+          PREBUILT: ${{ steps.test.outputs.prebuilt }}
 
   # The native backend's tests as root, on both architectures, in two parts each. As root they run
   # one at a time (a root job takes the host's first free slot of ids and addresses,
