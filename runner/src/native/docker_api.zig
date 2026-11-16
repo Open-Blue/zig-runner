@@ -173,17 +173,17 @@ pub const BuildCall = struct {
     sink: *Sink,
 };
 
-/// What answers for the job: the Docker API's effects. `ptr` is the job's own state.
+/// What answers for the job: the Docker API's effects. An implementation embeds it as a field and
+/// recovers itself from the pointer with `@fieldParentPtr`.
 pub const Handler = struct {
-    ptr: *anyopaque,
     /// Runs the build and streams its output to `call.sink`, ending with the aux ID or an
     /// `errorDetail`. Called on a thread of its own, so that the connection's can watch the client.
-    buildFn: *const fn (ptr: *anyopaque, call: *BuildCall) void,
-    imageFn: *const fn (ptr: *anyopaque, arena: Allocator, op: ImageOp) ImageAnswer,
+    buildFn: *const fn (h: *Handler, call: *BuildCall) void,
+    imageFn: *const fn (h: *Handler, arena: Allocator, op: ImageOp) ImageAnswer,
     /// Stops the build `id` (a `BuildCall.id`) if it is the one in flight; with null, whichever is,
     /// and any that starts before `resetFn` (the gate's close).
-    cancelFn: *const fn (ptr: *anyopaque, id: ?u32) void,
-    resetFn: *const fn (ptr: *anyopaque) void,
+    cancelFn: *const fn (h: *Handler, id: ?u32) void,
+    resetFn: *const fn (h: *Handler) void,
 };
 
 pub const Config = struct {
@@ -195,7 +195,7 @@ pub const Config = struct {
     version: []const u8,
     limits: Limits = .{},
     /// What answers `POST /build` and `/images`; without it they are 501.
-    handler: ?Handler = null,
+    handler: ?*Handler = null,
     /// A directory of the job's, where a build's context is kept while it is read: its own files
     /// `api-<n>.tar`. Required with a handler.
     work_dir: []const u8 = "",
@@ -414,7 +414,7 @@ pub const Server = struct {
 
     /// Lets requests in: a step's processes may run now.
     pub fn openGate(s: *Server) void {
-        if (s.cfg.handler) |h| h.resetFn(h.ptr);
+        if (s.cfg.handler) |h| h.resetFn(h);
         _ = s.gate.fetchAnd(~gate_closed_bit, .acq_rel);
     }
 
@@ -426,7 +426,7 @@ pub const Server = struct {
         const before = s.gate.fetchOr(gate_closed_bit, .acq_rel);
         var clean = true;
         if (before & ~gate_closed_bit != 0) {
-            if (s.cfg.handler) |h| h.cancelFn(h.ptr, null);
+            if (s.cfg.handler) |h| h.cancelFn(h, null);
             const deadline = nowMs() + s.cfg.limits.cancel_ms;
             while (s.gate.load(.acquire) & ~gate_closed_bit != 0) {
                 if (nowMs() >= deadline) {
@@ -879,7 +879,7 @@ fn dispatch(
         .image => |op| img: {
             s.bump("beyond");
             const h = s.cfg.handler.?;
-            const got = h.imageFn(h.ptr, a, op);
+            const got = h.imageFn(h, a, op);
             break :img Answer{ .status = got.status, .body = got.body };
         },
     };
@@ -1420,7 +1420,7 @@ const BodyDecoder = struct {
 
     fn feed(d: *BodyDecoder, bytes: []const u8) Step {
         if (!d.chunked) {
-            const n: usize = @intCast(@min(d.remaining, bytes.len));
+            const n = std.math.lossyCast(usize, @min(d.remaining, bytes.len));
             if (!d.write(bytes[0..n])) return .disk;
             d.remaining -= n;
             return if (d.remaining == 0) .done else .more;
@@ -1456,7 +1456,7 @@ const BodyDecoder = struct {
                     }
                 },
                 .data => {
-                    const n: usize = @intCast(@min(d.remaining, bytes.len - i));
+                    const n = std.math.lossyCast(usize, @min(d.remaining, bytes.len - i));
                     if (!d.write(bytes[i..][0..n])) return .disk;
                     i += n;
                     d.remaining -= n;
@@ -1495,11 +1495,11 @@ const BodyDecoder = struct {
 
 /// The thread a build runs on, so that the connection's can watch for the client leaving.
 const Worker = struct {
-    h: Handler,
+    h: *Handler,
     call: *BuildCall,
     done_fd: linux.fd_t,
     fn run(w: *Worker) void {
-        w.h.buildFn(w.h.ptr, w.call);
+        w.h.buildFn(w.h, w.call);
         const one: u64 = 1;
         _ = linux.write(w.done_fd, std.mem.asBytes(&one).ptr, @sizeOf(u64));
     }
@@ -1546,7 +1546,8 @@ fn serveBuild(
     }, 0o600);
     if (linux.errno(out_rc) != .SUCCESS)
         return buildError(s, a, fd, 500, "the job's directory cannot hold the build's context");
-    const out_fd: linux.fd_t = @intCast(out_rc);
+    const out_fd = fdOf(out_rc) catch
+        return buildError(s, a, fd, 500, "the job's directory cannot hold the build's context");
     var got: u64 = 0;
     const end = readBody(s, fd, req, after_head, out_fd, lim.body_bytes, &got);
     _ = linux.close(out_fd);
@@ -1575,7 +1576,7 @@ fn serveBuild(
         if (sendAll(s, fd, "0\r\n\r\n", lim.write_ms)) {} else |_| {} // the peer going is no matter
         return;
     }
-    const done_fd: linux.fd_t = @intCast(done_rc);
+    const done_fd = fdOf(done_rc) catch return;
     defer _ = linux.close(done_fd);
     var worker: Worker = .{ .h = h, .call = &call, .done_fd = done_fd };
     const thread = std.Thread.spawn(.{ .stack_size = 16 * 1024 * 1024 }, Worker.run, .{&worker}) catch {
@@ -1610,7 +1611,7 @@ fn serveBuild(
             }
             if (gone) {
                 cancelled = true;
-                h.cancelFn(h.ptr, n);
+                h.cancelFn(h, n);
             }
         } else if (fds[1].revents != 0) {
             // Stopping: the cancel is made; wait for the build in a short sleep loop.
@@ -2520,6 +2521,7 @@ test "docker api: settle returns at once for an idle connection opened before th
 /// A handler that records what it was asked and answers as a build would.
 const Fake = struct {
     tmp_dir: []const u8,
+    iface: Handler = .{ .buildFn = build, .imageFn = image, .cancelFn = cancel, .resetFn = reset },
     mu: std.atomic.Mutex = .unlocked,
     tags_len: usize = 0,
     arg_name: [8]u8 = undefined,
@@ -2533,12 +2535,8 @@ const Fake = struct {
     hang: bool = false,
     last_image_op: ?[]const u8 = null,
 
-    fn handler(f: *Fake) Handler {
-        return .{ .ptr = f, .buildFn = build, .imageFn = image, .cancelFn = cancel, .resetFn = reset };
-    }
-
-    fn build(ptr: *anyopaque, call: *BuildCall) void {
-        const f: *Fake = @ptrCast(@alignCast(ptr));
+    fn build(h: *Handler, call: *BuildCall) void {
+        const f: *Fake = @fieldParentPtr("iface", h);
         _ = f.builds.fetchAdd(1, .acq_rel);
         const data = std.Io.Dir.cwd().readFileAlloc(testing.io, call.tar_path, testing.allocator, .limited(64 << 20)) catch "";
         f.tar = @constCast(data);
@@ -2561,8 +2559,8 @@ const Fake = struct {
         call.sink.write("{\"aux\":{\"ID\":\"sha256:abc\"}}\n");
     }
 
-    fn image(ptr: *anyopaque, a: Allocator, op: ImageOp) ImageAnswer {
-        const f: *Fake = @ptrCast(@alignCast(ptr));
+    fn image(h: *Handler, a: Allocator, op: ImageOp) ImageAnswer {
+        const f: *Fake = @fieldParentPtr("iface", h);
         switch (op) {
             .inspect => |n| f.last_image_op = std.fmt.allocPrint(testing.allocator, "inspect {s}", .{n}) catch "",
             .tag => |t| f.last_image_op = std.fmt.allocPrint(testing.allocator, "tag {s} {s} {s}", .{ t.name, t.repo, t.tag }) catch "",
@@ -2572,15 +2570,15 @@ const Fake = struct {
         return .{ .status = 200, .body = "{}\n" };
     }
 
-    fn cancel(ptr: *anyopaque, id: ?u32) void {
+    fn cancel(h: *Handler, id: ?u32) void {
         _ = id;
-        const f: *Fake = @ptrCast(@alignCast(ptr));
+        const f: *Fake = @fieldParentPtr("iface", h);
         _ = f.cancels.fetchAdd(1, .acq_rel);
         f.cancelled.store(true, .release);
     }
 
-    fn reset(ptr: *anyopaque) void {
-        const f: *Fake = @ptrCast(@alignCast(ptr));
+    fn reset(h: *Handler) void {
+        const f: *Fake = @fieldParentPtr("iface", h);
         _ = f.resets.fetchAdd(1, .acq_rel);
         f.cancelled.store(false, .release);
     }
@@ -2594,7 +2592,7 @@ fn startBuilding(fake: *Fake, cfg_in: Config) !Fixture {
     defer testing.allocator.free(dir);
     var cfg = cfg_in;
     cfg.work_dir = dir;
-    cfg.handler = fake.handler();
+    cfg.handler = &fake.iface;
     fake.tmp_dir = "";
     f.path = try std.fmt.allocPrint(testing.allocator, "{s}/docker.sock", .{dir});
     errdefer testing.allocator.free(f.path);

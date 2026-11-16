@@ -80,7 +80,7 @@ fn decode(arena: Allocator, text: []const u8, plus: bool) !?[]const u8 {
             if (i + 2 >= text.len) return null;
             const hi = std.fmt.charToDigit(text[i + 1], 16) catch return null;
             const lo = std.fmt.charToDigit(text[i + 2], 16) catch return null;
-            try out.append(arena, @intCast(hi * 16 + lo));
+            try out.append(arena, hi * 16 + lo);
             i += 2;
         } else try out.append(arena, c);
     }
@@ -343,7 +343,7 @@ pub fn unpack(
         why.* = "the context's directory could not be opened";
         return error.BadContext;
     }
-    const root: linux.fd_t = @intCast(root_rc);
+    const root = std.math.cast(linux.fd_t, root_rc) orelse return error.BadContext;
     defer _ = linux.close(root);
     var file = std.Io.Dir.cwd().openFile(io, tar_path, .{}) catch {
         why.* = "the context could not be read back";
@@ -453,7 +453,7 @@ pub fn unpack(
         defer if (fd != root) {
             _ = linux.close(fd);
         };
-        _ = linux.fchmod(fd, @intCast((d.mode & 0o7777 & ~@as(u32, 0o7000)) | 0o700));
+        _ = linux.fchmod(fd, (d.mode & 0o777) | 0o700);
     }
     return done;
 }
@@ -488,12 +488,12 @@ fn writeFile(
         why.* = try std.fmt.allocPrint(arena, "the file {s} could not be made", .{try printable(arena, entry.name)});
         return error.BadContext;
     }
-    const fd: linux.fd_t = @intCast(rc);
+    const fd = std.math.cast(linux.fd_t, rc) orelse return error.BadContext;
     defer _ = linux.close(fd);
     var buf: [64 * 1024]u8 = undefined;
     var left = entry.size;
     while (left > 0) {
-        const n: usize = @intCast(@min(left, buf.len));
+        const n = std.math.lossyCast(usize, @min(left, buf.len));
         it.reader.readSliceAll(buf[0..n]) catch {
             why.* = "the context's tar ends in the middle of a file";
             return error.BadContext;
@@ -514,7 +514,7 @@ fn writeFile(
     }
     it.unread_file_bytes = 0;
     // Its own mode, but never unreadable to the runner, which copies it; no setuid bits.
-    _ = linux.fchmod(fd, @intCast((entry.mode & 0o777) | 0o400));
+    _ = linux.fchmod(fd, (entry.mode & 0o777) | 0o400);
 }
 
 // --- images ---
@@ -712,7 +712,7 @@ pub fn layerKeys(arena: Allocator, lowers: []const []const u8) ![]const []const 
 
 /// `secs` since the epoch as RFC 3339 in UTC, as Docker prints `Created`.
 pub fn rfc3339(arena: Allocator, secs: i64) ![]const u8 {
-    const es: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@max(secs, 0)) };
+    const es: std.time.epoch.EpochSeconds = .{ .secs = std.math.lossyCast(u64, @max(secs, 0)) };
     const day = es.getEpochDay().calculateYearDay();
     const md = day.calculateMonthDay();
     const t = es.getDaySeconds();
@@ -1022,7 +1022,7 @@ test "docker build: a context's files, directories and links are unpacked, with 
     const target = try tmp.dir.readLink(io, "out/src/link", &buf);
     try testing.expectEqualStrings("run.sh", buf[0..target]);
     const st = try tmp.dir.statFile(io, "out/src/run.sh", .{});
-    try testing.expectEqual(@as(u32, 0o755), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+    try testing.expectEqual(@as(u32, 0o755), std.math.lossyCast(u32, st.permissions.toMode() & 0o777));
 }
 
 test "docker build: a context with an entry outside it, a link out of it or a type it has no use for is refused" {

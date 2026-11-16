@@ -1367,17 +1367,17 @@ pub const Sources = struct {
     context: ?*View,
     opaque_xattr: [:0]const u8,
     /// Told of each stage and step as the build reaches it (the Docker API's `Step 3/7 : ...`).
-    progress: ?Progress = null,
+    progress: ?*Progress = null,
 };
 
-/// What a build tells its caller as it goes.
+/// What a build tells its caller as it goes: an implementation embeds it as a field and recovers
+/// itself with `@fieldParentPtr`.
 pub const Progress = struct {
-    ptr: *anyopaque,
     /// A stage `stage` (its number, by `FROM`) is started.
-    stageFn: *const fn (ptr: *anyopaque, stage: u32) void,
+    stageFn: *const fn (p: *Progress, stage: u32) void,
     /// A step of a stage: what it is going to be (`How`), and once more with `.built` when a
     /// layer that was not in the store has been made.
-    stepFn: *const fn (ptr: *anyopaque, step: Step, how: How) void,
+    stepFn: *const fn (p: *Progress, step: Step, how: How) void,
 
     pub const How = enum {
         /// Its layer was in the store.
@@ -1466,23 +1466,23 @@ const Builder = struct {
             },
             .scratch => {},
         }
-        if (b.src.progress) |pg| pg.stageFn(pg.ptr, i);
+        if (b.src.progress) |pg| pg.stageFn(pg, i);
         for (st.steps) |step| {
             if (step.op == .none) {
-                if (b.src.progress) |pg| pg.stepFn(pg.ptr, step, .config);
+                if (b.src.progress) |pg| pg.stepFn(pg, step, .config);
                 continue;
             }
             if (try b.store.get(arena, io, &step.key)) |layer| {
-                if (b.src.progress) |pg| pg.stepFn(pg.ptr, step, .cached);
+                if (b.src.progress) |pg| pg.stepFn(pg, step, .cached);
                 try stack.insert(arena, 0, layer);
                 continue;
             }
             // A directory the image has needs no layer.
             if (step.op == .mkdir and try b.hasDir(step.op.mkdir.path, stack.items)) {
-                if (b.src.progress) |pg| pg.stepFn(pg.ptr, step, .present);
+                if (b.src.progress) |pg| pg.stepFn(pg, step, .present);
                 continue;
             }
-            if (b.src.progress) |pg| pg.stepFn(pg.ptr, step, .building);
+            if (b.src.progress) |pg| pg.stepFn(pg, step, .building);
             const upper = try b.store.begin(arena, io, &step.key);
             errdefer discard(io, upper);
             switch (step.op) {
@@ -1504,7 +1504,7 @@ const Builder = struct {
                 },
             }
             try stack.insert(arena, 0, try b.store.publish(arena, io, upper, &step.key));
-            if (b.src.progress) |pg| pg.stepFn(pg.ptr, step, .built);
+            if (b.src.progress) |pg| pg.stepFn(pg, step, .built);
         }
         b.made[i] = stack.items;
         return .{ .ok = stack.items };

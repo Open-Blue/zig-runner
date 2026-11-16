@@ -34,6 +34,7 @@ const Allocator = std.mem.Allocator;
 pub const State = struct {
     b: *Backend,
     gpa: Allocator,
+    iface: docker_api.Handler = .{ .buildFn = buildFn, .imageFn = imageFn, .cancelFn = cancelFn, .resetFn = resetFn },
     index: docker_build.Index,
     /// One build at a time.
     build_mu: std.Io.Mutex = .init,
@@ -49,6 +50,8 @@ pub const State = struct {
         id: u32,
         running: sandbox.Running = .{},
         cancelled: bool = false,
+        /// What the builder asks of this build (`docker_action.Api`).
+        api: docker_action.Api = undefined,
     };
 
     pub fn create(b: *Backend) !*State {
@@ -62,18 +65,12 @@ pub const State = struct {
         st.gpa.destroy(st);
     }
 
-    pub fn handler(st: *State) docker_api.Handler {
-        return .{
-            .ptr = st,
-            .buildFn = buildFn,
-            .imageFn = imageFn,
-            .cancelFn = cancelFn,
-            .resetFn = resetFn,
-        };
+    pub fn handler(st: *State) *docker_api.Handler {
+        return &st.iface;
     }
 
-    fn cancelFn(ptr: *anyopaque, id: ?u32) void {
-        const st: *State = @ptrCast(@alignCast(ptr));
+    fn cancelFn(h: *docker_api.Handler, id: ?u32) void {
+        const st: *State = @fieldParentPtr("iface", h);
         const io = st.b.io;
         st.mu.lockUncancelable(io);
         defer st.mu.unlock(io);
@@ -84,8 +81,8 @@ pub const State = struct {
         };
     }
 
-    fn resetFn(ptr: *anyopaque) void {
-        const st: *State = @ptrCast(@alignCast(ptr));
+    fn resetFn(h: *docker_api.Handler) void {
+        const st: *State = @fieldParentPtr("iface", h);
         const io = st.b.io;
         st.mu.lockUncancelable(io);
         defer st.mu.unlock(io);
@@ -124,7 +121,7 @@ pub const State = struct {
         st.active = null;
     }
 
-    fn isCancelled(a: *Active) bool {
+    fn isCancelled(a: *const Active) bool {
         const st = a.st;
         const io = st.b.io;
         st.mu.lockUncancelable(io);
@@ -135,14 +132,13 @@ pub const State = struct {
 
 // --- builds ---
 
-fn cancelledOf(ptr: *anyopaque) bool {
-    const a: *State.Active = @ptrCast(@alignCast(ptr));
+fn cancelledOf(api: *const docker_action.Api) bool {
+    const a: *const State.Active = @fieldParentPtr("api", api);
     return State.isCancelled(a);
 }
 
 /// What a build says as it goes, in Docker's classic builder's words.
 const Telling = struct {
-    st: *State,
     arena: Allocator,
     sink: *docker_api.Sink,
     quiet: bool,
@@ -151,20 +147,22 @@ const Telling = struct {
     froms: std.ArrayList(dockerfile.Instruction) = .empty,
     total: u32 = 0,
     n: u32 = 0,
-    output: Output = undefined,
+    observer: docker_action.Observer = .{
+        .plannedFn = planned,
+        .progress = .{ .stageFn = stage, .stepFn = step },
+    },
 
-    const Output = struct {
-        t: *Telling,
-        fn out(o: *Output) sandbox.Output {
-            return .{ .ptr = o, .chunkFn = chunk };
-        }
-        fn chunk(ptr: *anyopaque, bytes: []const u8) void {
-            const o: *Output = @ptrCast(@alignCast(ptr));
-            if (o.t.quiet) return;
-            const line = docker_build.streamLine(o.t.arena, bytes) catch return;
-            o.t.sink.write(line);
-        }
-    };
+    /// The RUNs' output, as the stream's lines.
+    fn output(t: *Telling) sandbox.Output {
+        return .{ .ptr = t, .chunkFn = chunk };
+    }
+
+    fn chunk(ptr: *anyopaque, bytes: []const u8) void {
+        const t: *Telling = @ptrCast(@alignCast(ptr));
+        if (t.quiet) return;
+        const line = docker_build.streamLine(t.arena, bytes) catch return;
+        t.sink.write(line);
+    }
 
     fn say(t: *Telling, comptime fmt: []const u8, args: anytype) void {
         if (t.quiet) return;
@@ -173,12 +171,12 @@ const Telling = struct {
         t.sink.write(line);
     }
 
-    fn planned(ptr: *anyopaque, plan: dockerfile.Plan, ins: []const dockerfile.Instruction) void {
-        const t: *Telling = @ptrCast(@alignCast(ptr));
+    fn planned(o: *docker_action.Observer, plan: dockerfile.Plan, ins: []const dockerfile.Instruction) void {
+        const t: *Telling = @fieldParentPtr("observer", o);
         t.ins = ins;
         for (ins) |x| if (x.kind == .from) t.froms.append(t.arena, x) catch return;
         for (plan.stages) |st| {
-            if (st.needed) t.total += 1 + @as(u32, @intCast(st.steps.len));
+            if (st.needed) t.total += 1 + std.math.lossyCast(u32, st.steps.len);
         }
     }
 
@@ -189,13 +187,15 @@ const Telling = struct {
         t.say("Step {d}/{d} : {s} {s}\n", .{ t.n, t.total, kind, x.text });
     }
 
-    fn stage(ptr: *anyopaque, i: u32) void {
-        const t: *Telling = @ptrCast(@alignCast(ptr));
+    fn stage(p: *dockerfile.Progress, i: u32) void {
+        const o: *docker_action.Observer = @fieldParentPtr("progress", p);
+        const t: *Telling = @fieldParentPtr("observer", o);
         if (i < t.froms.items.len) t.header(t.froms.items[i]);
     }
 
-    fn step(ptr: *anyopaque, s: dockerfile.Step, how: dockerfile.Progress.How) void {
-        const t: *Telling = @ptrCast(@alignCast(ptr));
+    fn step(p: *dockerfile.Progress, s: dockerfile.Step, how: dockerfile.Progress.How) void {
+        const o: *docker_action.Observer = @fieldParentPtr("progress", p);
+        const t: *Telling = @fieldParentPtr("observer", o);
         const short = s.key[0..12];
         if (how == .built) {
             t.say(" ---> {s}\n", .{short});
@@ -214,8 +214,8 @@ const Telling = struct {
     }
 };
 
-fn buildFn(ptr: *anyopaque, call: *docker_api.BuildCall) void {
-    const st: *State = @ptrCast(@alignCast(ptr));
+fn buildFn(h: *docker_api.Handler, call: *docker_api.BuildCall) void {
+    const st: *State = @fieldParentPtr("iface", h);
     const io = st.b.io;
     st.build_mu.lockUncancelable(io);
     defer st.build_mu.unlock(io);
@@ -236,6 +236,7 @@ fn run(st: *State, call: *docker_api.BuildCall) !void {
     const a = call.arena;
     const q = call.query;
     var active: State.Active = .{ .st = st, .id = call.id };
+    active.api = .{ .running = &active.running, .out = undefined, .cancelledFn = cancelledOf };
     if (!st.begin(&active)) return fail(call, "the build was cancelled: the step that asked for it has ended");
     defer st.end();
 
@@ -256,8 +257,7 @@ fn run(st: *State, call: *docker_api.BuildCall) !void {
         else => return e,
     };
 
-    var tell: Telling = .{ .st = st, .arena = a, .sink = call.sink, .quiet = q.quiet };
-    tell.output = .{ .t = &tell };
+    var tell: Telling = .{ .arena = a, .sink = call.sink, .quiet = q.quiet };
     // The CLI says "Sending build context" itself.
     _ = unpacked;
 
@@ -272,21 +272,13 @@ fn run(st: *State, call: *docker_api.BuildCall) !void {
         salt = try std.fmt.allocPrint(a, "{s}", .{std.fmt.bytesToHex(raw, .lower)});
     }
 
+    active.api.out = tell.output();
     const built = try docker_action.buildApi(b, .{
         .dir = dir,
         .dockerfile = q.dockerfile,
         .options = .{ .build_args = args.items, .target = q.target, .salt = salt, .labels = labels.items },
-        .api = .{
-            .ptr = &active,
-            .running = &active.running,
-            .out = tell.output.out(),
-            .cancelledFn = cancelledOf,
-        },
-        .observer = .{
-            .ptr = &tell,
-            .plannedFn = Telling.planned,
-            .progress = .{ .ptr = &tell, .stageFn = Telling.stage, .stepFn = Telling.step },
-        },
+        .api = &active.api,
+        .observer = &tell.observer,
     });
     if (State.isCancelled(&active) or call.sink.gone()) return fail(call, "the build was cancelled");
     const image = switch (built) {
@@ -354,8 +346,8 @@ fn dupeImage(a: Allocator, im: images.Image) !images.Image {
 
 // --- images ---
 
-fn imageFn(ptr: *anyopaque, a: Allocator, op: docker_api.ImageOp) docker_api.ImageAnswer {
-    const st: *State = @ptrCast(@alignCast(ptr));
+fn imageFn(h: *docker_api.Handler, a: Allocator, op: docker_api.ImageOp) docker_api.ImageAnswer {
+    const st: *State = @fieldParentPtr("iface", h);
     return images_(st, a, op) catch .{ .status = 500, .body = "{\"message\":\"out of memory\"}\n" };
 }
 

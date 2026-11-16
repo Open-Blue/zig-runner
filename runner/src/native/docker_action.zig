@@ -641,24 +641,6 @@ const BuildRunner = struct {
     failure: []const u8 = "",
     /// Set for a build the job's Docker API runs, while a step of the job is running.
     api: ?*const Api = null,
-    tee: Tee = undefined,
-
-    /// Output to the build's capture and to the API's stream.
-    const Tee = struct {
-        last: *Backend.Captured,
-        to: sandbox.Output,
-
-        fn output(t: *Tee) sandbox.Output {
-            return .{ .ptr = t, .chunkFn = chunk };
-        }
-
-        fn chunk(ptr: *anyopaque, bytes: []const u8) void {
-            const t: *Tee = @ptrCast(@alignCast(ptr));
-            const own = t.last.output();
-            own.chunkFn(own.ptr, bytes);
-            t.to.chunkFn(t.to.ptr, bytes);
-        }
-    };
 
     fn runner(r: *BuildRunner) dockerfile.Runner {
         return .{ .ptr = r, .runFn = runStep };
@@ -695,8 +677,7 @@ const BuildRunner = struct {
                 r.failure = "the build was cancelled";
                 return 125;
             }
-            r.tee = .{ .last = &r.last, .to = api.out };
-            break :api try b.execBuildApi(api.running, op.argv, op.env, r.tee.output(), container);
+            break :api try b.execBuildApi(api.running, op.argv, op.env, api.out, container);
         } else try b.execBuild(op.argv, op.env, 0, 0, r.last.output(), container);
         // The sandbox's own failure is the build's, with why.
         if (ended.failure.len > 0) {
@@ -716,26 +697,25 @@ const BuildRunner = struct {
     }
 };
 
-/// What the job's Docker API gives a build it runs while a step is running (`buildApi`).
+/// What the job's Docker API gives a build it runs while a step is running (`buildApi`): an
+/// implementation embeds it as a field and recovers itself with `@fieldParentPtr`.
 pub const Api = struct {
-    ptr: *anyopaque,
     /// The build's `RUN`s run under this (so that stopping them leaves the step alone) and write
     /// their output to `out`.
     running: *sandbox.Running,
     out: sandbox.Output,
     /// Whether the build was stopped: no `RUN` starts after.
-    cancelledFn: *const fn (ptr: *anyopaque) bool,
+    cancelledFn: *const fn (api: *const Api) bool,
 
     fn cancelled(a: *const Api) bool {
-        return a.cancelledFn(a.ptr);
+        return a.cancelledFn(a);
     }
 };
 
 /// Tells a build's progress: its plan once made (`planned`), then its stages and steps
-/// (`dockerfile.Progress`, which has the same `ptr`).
+/// (`progress`). Embedded and recovered like the interfaces above.
 pub const Observer = struct {
-    ptr: *anyopaque,
-    plannedFn: *const fn (ptr: *anyopaque, plan: dockerfile.Plan, ins: []const dockerfile.Instruction) void,
+    plannedFn: *const fn (o: *Observer, plan: dockerfile.Plan, ins: []const dockerfile.Instruction) void,
     progress: dockerfile.Progress,
 };
 
@@ -744,8 +724,8 @@ pub const ApiRequest = struct {
     dir: []const u8,
     dockerfile: []const u8,
     options: dockerfile.Options,
-    api: Api,
-    observer: ?Observer = null,
+    api: *const Api,
+    observer: ?*Observer = null,
 };
 
 pub const ApiBuilt = union(enum) {
@@ -778,7 +758,7 @@ pub fn buildApi(b: *Backend, req: ApiRequest) !ApiBuilt {
         else => e,
     };
     if (req.observer) |o| switch (try dockerfile.parse(arena, text)) {
-        .ok => |ins| o.plannedFn(o.ptr, p, ins),
+        .ok => |ins| o.plannedFn(o, p, ins),
         .refused => {},
     };
     const store: layers.Store = .{
@@ -788,11 +768,11 @@ pub fn buildApi(b: *Backend, req: ApiRequest) !ApiBuilt {
         .scope = b.scope,
         .userns = @tagName(b.how.userns),
     };
-    var runner: BuildRunner = .{ .b = b, .api = &req.api };
+    var runner: BuildRunner = .{ .b = b, .api = req.api };
     return switch (try dockerfile.build(arena, b.io, p, store, runner.runner(), .{
         .context = ctx,
         .opaque_xattr = b.opaqueXattr(),
-        .progress = if (req.observer) |o| o.progress else null,
+        .progress = if (req.observer) |o| &o.progress else null,
     })) {
         .ok => |built| if (built.lowers.len == 0)
             .{ .failed = "the Dockerfile builds an image with no files" }

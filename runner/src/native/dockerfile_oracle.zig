@@ -203,7 +203,7 @@ const Discard = struct {
         return .{ .ptr = undefined, .chunkFn = chunk };
     }
     fn chunk(_: *anyopaque, _: []const u8) void {}
-    fn never(_: *anyopaque) bool {
+    fn never(_: *const docker_action.Api) bool {
         return false;
     }
 };
@@ -213,12 +213,12 @@ const Discard = struct {
 /// both) and the same config. 0 when they are the same, else the differences, printed, counted.
 fn sameThroughApi(b: *Backend, arena: Allocator, name: []const u8, ctx: []const u8, built: anytype, same_layers: bool) !usize {
     var running: sandbox.Running = .{};
-    var dummy: u8 = 0;
+    const api: docker_action.Api = .{ .running = &running, .out = Discard.out(), .cancelledFn = Discard.never };
     const got = try docker_action.buildApi(b, .{
         .dir = ctx,
         .dockerfile = "Dockerfile",
         .options = .{},
-        .api = .{ .ptr = &dummy, .running = &running, .out = Discard.out(), .cancelledFn = Discard.never },
+        .api = &api,
     });
     const image = switch (got) {
         .image => |i| i,
