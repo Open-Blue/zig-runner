@@ -16,7 +16,8 @@
 #
 # The search is exhaustive: no bitstate or hash compaction, which may miss states, and no partial
 # order reduction, which reduces nothing here (every step touches the shared store) and costs time.
-# The configurations run side by side, one a core, each in its own directory under $SPIN_DIR. Their
+# The configurations run side by side, each in its own directory under $SPIN_DIR, as many at once as
+# the machine gives this script (see "Concurrency" below). Their
 # output is not interleaved: pan prints its report once, at the end, so each configuration says when
 # it starts and, with its verdict, when it ends (a line naming it, in the order they finish), and a
 # heartbeat line says every minute which are still running. The ordered verdicts follow at the end.
@@ -59,12 +60,105 @@ live() {
 	./pan-liveness -m1000000 -w"$hw" -a -f -N "$1" >"pan-$1.out" 2>&1 || true
 }
 
+# table_bits <states>: pan's -w, the hash table's size as a power of two; <states> is the spin-states
+# line, empty for a mutant. The table is 2^bits slots of 8 bytes: 32 MB for a mutant (2^22), not the
+# 512 MB of -w26. The size is only speed, never which states are found (each slot is a chain): about
+# twice the states, at most 2^26.
+table_bits() {
+	local ns=$1 hw=22
+	if [[ -n $ns ]]; then
+		hw=19
+		while ((hw < 26 && (1 << (hw - 1)) < ns)); do hw=$((hw + 1)); done
+	fi
+	echo "$hw"
+}
+
+# Concurrency. A worker is a core and the memory of its pan: the hash table, 8 bytes a slot, and every
+# state it stores (the state vector and pan's overhead). Memory, not cores, ran out on a laptop with
+# 16 cores in a 4 GB scope: the biggest checks would have held 2 GB at once each, and the kernel
+# killed one, and systemd then the whole scope. So the script starts a configuration only while
+# both fit what it is given:
+#   cores   the smaller of nproc (affinity) and the CPU quota (cpu.max, cgroup v2) of its cgroup or
+#           any ancestor, rounded down, at least 1;
+#   memory  70% of what is left under the smallest memory.max or memory.high of its cgroup and its
+#           ancestors (their limit minus what they hold now) and of MemAvailable, against the sum of
+#           the running configurations' estimates (est_mb). One configuration always runs, however
+#           large its estimate.
+# SPIN_JOBS=N overrides both: N at a time, the memory not looked at. SPIN_MEM_MB=M overrides the
+# memory it may use. Only the number running at once changes, never a configuration or its verdict.
+
+# cgroup_limits: cg_cpus (a count) and cg_mem (MB left), set to the cgroup's limits, empty without.
+# SPIN_CGROUP_ROOT is for tests.
+cgroup_limits() {
+	local root=${SPIN_CGROUP_ROOT:-/sys/fs/cgroup} rel d f q p v cur c
+	cg_cpus='' cg_mem=''
+	rel=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null) || rel=''
+	d="$root${rel%/}"
+	while [[ -d $d ]]; do
+		if [[ -r $d/cpu.max ]] && { read -r q p <"$d/cpu.max"; } 2>/dev/null &&
+			[[ $q =~ ^[0-9]+$ && $p =~ ^[0-9]+$ ]] && ((p > 0)); then
+			c=$((q / p))
+			((c >= 1)) || c=1
+			if [[ -z $cg_cpus ]] || ((c < cg_cpus)); then cg_cpus=$c; fi
+		fi
+		for f in memory.max memory.high; do
+			{ read -r v <"$d/$f"; } 2>/dev/null || continue
+			[[ $v =~ ^[0-9]+$ ]] || continue
+			{ read -r cur <"$d/memory.current"; } 2>/dev/null || cur=0
+			[[ $cur =~ ^[0-9]+$ ]] || cur=0
+			c=$(((v - cur) / 1048576))
+			((c >= 0)) || c=0
+			if [[ -z $cg_mem ]] || ((c < cg_mem)); then cg_mem=$c; fi
+		done
+		[[ $d == "$root" ]] && break
+		d=${d%/*}
+	done
+}
+
+# est_mb <name>: the megabytes pan peaks at on this configuration, from its spin-states line and
+# table_bits: 150 for the compile, the report and a mutant's states to its violation, the hash table,
+# and the states times bytes each, measured on 2026-11-15 (peak RSS of each pan, run alone) and
+# rounded up by 10 to 20%: StoreLocking 2025 MB for 16.5 M states, -crash 1719 for 14.7 M, -faults
+# 1330 for 10.8 M, StoreEviction-crash 1260 for 7.4 M, StoreEviction 593 for 3.1 M, ReleasePipeline
+# 313 for 2.0 M; the mutants and the rest 12 to 230 MB.
+est_mb() {
+	local ns bytes
+	ns=$(sed -n 's/^ \* spin-states: \([0-9]*\).*/\1/p' "$here/$1.pml")
+	case $1 in
+	StoreLocking*) bytes=110 ;;
+	ReleasePipeline*) bytes=140 ;;
+	*) bytes=175 ;; # StoreEviction measured about 170; a module not measured is taken at least that
+	esac
+	echo $((150 + (8 << $(table_bits "$ns")) / 1048576 + ${ns:-0} * bytes / 1048576))
+}
+
+# plan_jobs: jobs, how many at once, and mem_mb, the budget their estimates must fit.
+plan_jobs() {
+	local avail cpus
+	cpus=$(nproc)
+	cgroup_limits
+	[[ -z $cg_cpus ]] || ((cg_cpus >= cpus)) || cpus=$cg_cpus
+	avail=$(($(sed -n 's/^MemAvailable: *\([0-9]*\) kB/\1/p' /proc/meminfo) / 1024))
+	[[ -z $cg_mem ]] || ((cg_mem >= avail)) || avail=$cg_mem
+	mem_mb=$((avail * 70 / 100))
+	jobs=$cpus
+	if [[ -n ${SPIN_MEM_MB:-} ]]; then mem_mb=$SPIN_MEM_MB; fi
+	if [[ -n ${SPIN_JOBS:-} ]]; then
+		if [[ ! $SPIN_JOBS =~ ^[1-9][0-9]*$ ]]; then
+			echo "spin: SPIN_JOBS='$SPIN_JOBS' is not a positive number" >&2
+			exit 1
+		fi
+		jobs=$SPIN_JOBS
+		mem_mb=-1 # not looked at
+	fi
+}
+
 stored() { sed -n 's/^ *\([0-9]*\) states, stored.*/\1/p' "$1"; }
 elapsed() { sed -n 's/^pan: elapsed time \(.*\)/\1/p' "$1"; }
 
 # check <name>: compiles and runs one configuration in $dir/<name>; the verdict is in result.
 check() {
-	local name=$1 w="$dir/$1" started=$SECONDS first want ltl p verdict ns hw=22
+	local name=$1 w="$dir/$1" started=$SECONDS first want ltl p verdict ns hw
 	rm -rf "${w:?}"
 	mkdir -p "$w"
 	cp "$here"/*.pml "$w"/
@@ -73,15 +167,8 @@ check() {
 	first=$(head -n 1 "$name.pml")
 	want=$(sed -n 's/.*must fail: \([A-Za-z]*\).*/\1/p' <<<"$first")
 	ltl=$(sed -n 's/^ \* spin-ltl: \([A-Za-z ]*\).*/\1/p' "$name.pml")
-	# The hash table's size, 2^hw slots: about twice the states the spin-states line says, or 2^22
-	# for a mutant, which stops at its first violation. The size is only speed, never which states
-	# are found (each slot is a chain), and its memory is 8 bytes a slot: 32 MB for a mutant, not
-	# the 512 MB of -w26.
 	ns=$(sed -n 's/^ \* spin-states: \([0-9]*\).*/\1/p' "$name.pml")
-	if [[ -n $ns ]]; then
-		hw=19
-		while ((hw < 26 && (1 << (hw - 1)) < ns)); do hw=$((hw + 1)); done
-	fi
+	hw=$(table_bits "$ns")
 	if [[ -n $want && " $ltl " == *" $want "* ]]; then
 		# A mutant that must fail a temporal property: its claim's violation, under fairness.
 		if ! build "$name" liveness; then
@@ -139,8 +226,10 @@ done
 mapfile -t names < <(for n in "${names[@]}"; do
 	printf '%s %s\n' "$(sed -n 's/^ \* spin-states: \([0-9]*\).*/\1/p' "$here/$n.pml")" "$n"
 done | sort -k1,1nr | cut -d' ' -f2)
-jobs=$(nproc)
+plan_jobs
 running=0
+used=0
+declare -A cost
 mkdir -p "$dir"
 # One run at a time in a directory: the pre-push hooks of two worktrees share one, and a second run
 # would delete the first's configurations under it. The lock is on this file, held through fd 9,
@@ -167,13 +256,34 @@ progress() {
 }
 heartbeat_loop "$$" "${SPIN_HEARTBEAT_S:-60}" "$dir/workers" progress &
 heartbeat=$!
-for n in "${names[@]}"; do
-	if ((running >= jobs)); then
-		wait -n
-		running=$((running - 1))
+if ((mem_mb < 0)); then budget="its memory not looked at"; else budget="estimates within $mem_mb MB"; fi
+echo "spin: ${#names[@]} configurations, $jobs at a time, $budget"
+pending=("${names[@]}")
+while ((${#pending[@]})); do
+	pick=-1
+	if ((running < jobs)); then
+		# The first, the largest, that fits; with none running, the first however large.
+		for i in "${!pending[@]}"; do
+			e=$(est_mb "${pending[$i]}")
+			if ((running == 0 || mem_mb < 0 || used + e <= mem_mb)); then
+				pick=$i
+				break
+			fi
+		done
 	fi
+	if ((pick < 0)); then
+		wait -n -p done_pid || true
+		used=$((used - cost[$done_pid]))
+		running=$((running - 1))
+		continue
+	fi
+	n=${pending[$pick]}
+	unset "pending[$pick]"
+	pending=("${pending[@]}")
 	(check "$n") &
 	pids+=($!)
+	cost[$!]=$e
+	used=$((used + e))
 	echo "$!" >>"$dir/workers"
 	running=$((running + 1))
 done

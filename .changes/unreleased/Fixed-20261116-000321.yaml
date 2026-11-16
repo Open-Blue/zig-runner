@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'spin.sh (the SPIN model checks of the pre-push hook and CI) sizes its parallelism to what it is given instead of one check a core: the cores are nproc and the cgroup''s cpu.max quota, and a configuration starts only while the estimates of the running pans (hash table plus states, measured per configuration) stay within 70% of the memory left under the cgroup''s memory.max or memory.high and MemAvailable, so a push in a 4 GB scope no longer ends in an OOM kill. SPIN_JOBS=N overrides it. The configurations and verdicts are unchanged.'
+time: 2026-11-16T00:03:21.850055111-05:00

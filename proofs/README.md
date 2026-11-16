@@ -364,6 +364,7 @@ removed, SPIN is the only checker and its counts are the reference.
 
 ```
 .github/scripts/spin.sh   # SPIN 6.5.2: every module's configurations and mutants
+# (as many at once as the cores and memory it is given allow; SPIN_JOBS=N fixes the number)
 ```
 
 CI runs them (`store-model.yml`) on pull requests and pushes that touch `runner/src/native/Store.zig`,
