@@ -78,13 +78,13 @@ pub const Store = struct {
         // between (the store's stress test, `store_stress.zig`).
         if (try s.store.open(arena, io, k)) |first| {
             P2Store.removeTree(arena, io, built);
-            try s.held.append(arena, first.layer.lock);
+            try s.held.append(s.held_arena orelse arena, first.layer.lock);
             return first.layer.fs;
         }
         // Kind `fetch`: a tree with an empty record, never replayed as a step's (P2 has no
         // `build` kind yet).
         const layer = try s.store.publish(arena, io, k, .fetch, built, .{ .log = "", .fc = "" });
-        try s.held.append(arena, layer.lock);
+        try s.held.append(s.held_arena orelse arena, layer.lock);
         return layer.fs;
     }
 };
@@ -186,4 +186,30 @@ test "a layer is published under its key's lock, so collect never takes its entr
     try std.testing.expectEqualStrings(p, (try store.get(arena, io, key)).?);
     const again = try store.store.lockKey(arena, io, try store.key(key), &stop);
     again.close(io);
+}
+
+test "a build's own arena, freed after each call, never holds up the job's list of held locks" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const job_arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", job_arena);
+    try P2Store.prepare(job_arena, io, root, .{ .check_parents = false });
+    var held: std.ArrayList(std.Io.File) = .empty;
+    defer for (held.items) |f| f.close(io);
+    const store: Store = .{ .dir = root, .store = .{ .root = root }, .held = &held, .held_arena = job_arena, .scope = "repo", .userns = "mapped" };
+    var n: usize = 0;
+    while (n < 40) : (n += 1) {
+        // Each build's call has an arena of its own, gone before the next.
+        var call: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer call.deinit();
+        const key = try std.fmt.allocPrint(call.allocator(), "{x:0>64}", .{n});
+        const upper = try store.begin(call.allocator(), io, key);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(call.allocator(), "{s}/f", .{upper}), .data = "x" });
+        _ = try store.publish(call.allocator(), io, upper, key);
+        try std.testing.expect(try store.get(call.allocator(), io, key) != null);
+    }
+    try std.testing.expect(held.items.len >= 40);
 }
