@@ -448,18 +448,41 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
     return readAction(b, u, ref_label, repository, ref, mount, layer, sha);
 }
 
-/// Where the tree is mounted: GitHub's `/github/_actions/<repository>/<ref>`, and under `@<host>`
-/// when it comes from a server other than the job's default one, so that two servers' `o/r@v1`
-/// are two trees.
+/// Where the tree is mounted: GitHub's `/github/_actions/<repository>/<ref>` (the ref as one
+/// directory name: its `/` escaped, so that no mount is inside another, as `o/r@a/b` would be in
+/// `o/r@a`), and under `@<host>` when it comes from a server other than the job's default one, so
+/// that two servers' `o/r@v1` are two trees.
 fn mountFor(arena: Allocator, job: job_mod.Job, from: job_mod.Resolved) ![]const u8 {
     const default = std.mem.trimEnd(u8, if (job.github.actions_url.len > 0) job.github.actions_url else job.github.server_url, "/");
+    const ref = try escapeSegment(arena, from.ref);
     if (std.mem.eql(u8, from.server, default))
-        return std.fmt.allocPrint(arena, "/github/_actions/{s}/{s}", .{ from.repository, from.ref });
-    const host = try arena.dupe(u8, if (std.mem.indexOf(u8, from.server, "://")) |i| from.server[i + 3 ..] else from.server);
-    for (host) |*c| if (!(std.ascii.isAlphanumeric(c.*) or c.* == '.' or c.* == '-')) {
-        c.* = '_';
-    };
-    return std.fmt.allocPrint(arena, "/github/_actions/@{s}/{s}/{s}", .{ host, from.repository, from.ref });
+        return std.fmt.allocPrint(arena, "/github/_actions/{s}/{s}", .{ from.repository, ref });
+    const host = try escapeSegment(arena, if (std.mem.indexOf(u8, from.server, "://")) |i| from.server[i + 3 ..] else from.server);
+    return std.fmt.allocPrint(arena, "/github/_actions/@{s}/{s}/{s}", .{ host, from.repository, ref });
+}
+
+/// `s` as one path segment, injectively: letters, digits and `-._+@` kept, every other byte as
+/// `%XX` (so `h:80` and `h_80` are two names, and `%` itself is escaped).
+fn escapeSegment(arena: Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (s) |c| {
+        if (std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "-._+@", c) != null) {
+            try out.append(arena, c);
+        } else try out.print(arena, "%{X:0>2}", .{c});
+    }
+    return out.items;
+}
+
+test "escapeSegment: no two inputs share a name, and a ref's slash does not nest a directory" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    try std.testing.expectEqualStrings("a%2Fb", try escapeSegment(arena, "a/b"));
+    try std.testing.expectEqualStrings("h%3A80", try escapeSegment(arena, "h:80"));
+    try std.testing.expectEqualStrings("h_80", try escapeSegment(arena, "h_80"));
+    try std.testing.expectEqualStrings("100%25", try escapeSegment(arena, "100%"));
+    try std.testing.expectEqualStrings("v1.2-rc+x@y", try escapeSegment(arena, "v1.2-rc+x@y"));
+    try std.testing.expect(!std.mem.eql(u8, try escapeSegment(arena, "a/b"), try escapeSegment(arena, "a%2Fb")));
 }
 
 /// The action's `action.yml` (or `.yaml`) in `layer`, where its repository's tree is at `mount`.
@@ -545,7 +568,7 @@ fn testRepoAt(arena: Allocator, tmp: *std.testing.TmpDir, server: []const u8, na
         \\set -e
         \\cd '{s}/{s}'
         \\git init -q -b main . && git add -A
-        \\git -c user.name=t -c user.email=t@t commit -q -m one && git tag v1
+        \\git -c user.name=t -c user.email=t@t commit -q -m one && git tag v1 && git branch v1/b
         \\git clone -q --bare . '{s}/git/{s}o/{s}.git'
     , .{ root, work, root, at, name });
     const res = try std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", script } });
@@ -816,6 +839,37 @@ test "an action's failed fetch leaves nothing the next fetch of the same reposit
     try std.testing.expect(std.mem.indexOf(u8, text, "remote origin already exists") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Unable to resolve action `o/comp@v1`") != null);
     try std.testing.expect(res.steps.len >= 1);
+}
+
+test "a ref with a slash and the ref that is its prefix are two trees, in either order" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testActions(arena, &tmp);
+    // The tag `v1` and the branch `v1/b`: `/github/_actions/o/comp/v1/b` would be inside `.../v1`.
+    try testRepo(arena, &tmp, "comp", &.{.{ "action.yml", "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo comp-ran\n" }});
+    for ([_][2][]const u8{ .{ "v1/b", "v1" }, .{ "v1", "v1/b" } }) |order| {
+        var steps = [_]job_mod.Step{
+            usesStep("first", "o", "comp", order[0], &.{}),
+            usesStep("second", "o", "comp", order[1], &.{}),
+        };
+        var job = testJob(&steps);
+        job.github.server_url = "file:///srv/git";
+        var env: std.process.Environ.Map = .init(arena);
+        var w: std.Io.Writer.Allocating = .init(arena);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+        const res = try dagger.run(arena, std.testing.io, &env, .{
+            .native = cfg,
+            .step_user = .root,
+            .gpa = std.testing.allocator,
+        }, job, &log);
+        const text = w.written();
+        errdefer std.debug.print("{s}\n", .{text});
+        for (res.steps) |st| try std.testing.expectEqual(dagger.Outcome.success, st.outcome);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "stdout] comp-ran"));
+    }
 }
 
 test "an action's name or ref that moves a path or starts an option is not fetched, and two servers' o/comp@v1 are two trees" {

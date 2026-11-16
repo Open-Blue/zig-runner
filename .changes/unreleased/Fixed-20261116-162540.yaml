@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'Gitea and Forgejo action trees: a ref''s slash no longer nests one tree''s directory in another''s (o/r@a/b and o/r@a are two directories, whichever is fetched first), directory names made from a ref or a host are escaped injectively (h:80 and h_80 differ), and the host of an absolute URL in uses: must be a host name or IPv4 address and an optional port (#520, G5).'
+time: 2026-11-16T16:25:40.403492514-05:00

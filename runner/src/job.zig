@@ -140,6 +140,21 @@ pub fn validName(s: []const u8) bool {
     return real;
 }
 
+/// The authority of an absolute URL in `uses:`: a host name or IPv4 address and an optional port,
+/// nothing else (no credentials, no `?`, `#`, `\\`, space, bracket or percent sign).
+pub fn validHost(authority: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, authority, ':');
+    const host = if (colon) |c| authority[0..c] else authority;
+    if (host.len == 0 or host[0] == '.' or host[0] == '-') return false;
+    for (host) |c| if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-')) return false;
+    if (colon) |c| {
+        const port = authority[c + 1 ..];
+        if (port.len == 0 or port.len > 5) return false;
+        for (port) |d| if (!std.ascii.isDigit(d)) return false;
+    }
+    return true;
+}
+
 /// Why `ref` is not one a branch, a tag or a commit can be fetched by, or null: letters, digits and
 /// `-_./+@`, no leading `-` (git would read an option), no `..`, no empty, `.` or `..` segment.
 pub fn refProblem(ref: []const u8) ?[]const u8 {
@@ -1246,6 +1261,13 @@ test "Job.gitToken: the job's GITHUB_TOKEN secret, else its job token" {
     try std.testing.expectEqualStrings("", job.gitToken());
     job.secret_vars = &.{.{ .name = "GITHUB_TOKEN", .value = "task-token" }};
     try std.testing.expectEqualStrings("task-token", job.gitToken());
+}
+
+test "validHost: a name or address and a port, nothing that changes what the URL means" {
+    for ([_][]const u8{ "git.example.com", "127.0.0.1:3300", "h-1.example.org:443", "localhost" }) |h|
+        try std.testing.expect(validHost(h));
+    for ([_][]const u8{ "", ":80", "h:", "h:80a", "h?x", "h#x", "h x", "h\\x", "[::1]:80", "h%41", "-h", ".h", "h:123456", "u@h" }) |h|
+        try std.testing.expect(!validHost(h));
 }
 
 test "Resolved.problem: names and refs that move a path or start an option are refused" {

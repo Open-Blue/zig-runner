@@ -466,6 +466,7 @@ const Builder = struct {
             const slash = std.mem.indexOfScalar(u8, after, '/') orelse return invalid;
             const host = after[0..slash];
             if (host.len == 0) return invalid;
+            if (std.mem.indexOfScalar(u8, host, '@') == null and !job_mod.validHost(host)) return invalid;
             if (std.mem.indexOfScalar(u8, host, '@') != null) return .{ .unsupported = try std.fmt.allocPrint(
                 arena,
                 "uses: {s}: credentials in an action's URL are not used",
@@ -1100,6 +1101,9 @@ test "uses steps: where the action is fetched from (self:, $/, a URL, the defaul
         \\      - uses: o/../r@v1
         \\      - uses: self:o/r@a..b
         \\      - uses: o/r@-x
+        \\      - uses: https://h?x=1/o/r@v1
+        \\      - uses: https://h:80a/o/r@v1
+        \\      - uses: https://[::1]:80/o/r@v1
     , "{\"server_url\":\"http://127.0.0.1:3300/\"}");
     const s = c.job.steps;
     try testing.expectEqual(job_mod.Source.instance, s[0].action.uses.source);
@@ -1122,7 +1126,7 @@ test "uses steps: where the action is fetched from (self:, $/, a URL, the defaul
     // `self:actions/checkout` is that repository's action, not the built-in checkout.
     try testing.expect(s[13].action == .uses);
     // A name or a ref that moves a path or starts an option is not a reference.
-    for (s[14..20]) |st| {
+    for (s[14..23]) |st| {
         try testing.expect(st.action == .unsupported);
         try testing.expect(std.mem.indexOf(u8, st.action.unsupported, "not a valid action reference") != null);
     }
