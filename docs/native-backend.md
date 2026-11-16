@@ -2646,8 +2646,11 @@ errors. Nothing is built yet (1b).
   no limit. It is never the host's socket: nothing of the host's `/var/run` is bound. It is
   removed, and its server stopped, with the job (`Backend.deinit`, before the job's directory goes).
   A Docker action's container gets the bind as the job's other binds; services do not.
-- **The mount point** is an empty file in the job's mount-points layer (`Backend.mount_points`,
-  below every image), made in `/var/run` and in `/run`: an image's `/var/run` is usually a link to
+- **The mount point** is an empty file in a mount-points layer of the job's own steps
+  (`Backend.api_mount_points`, `Q`, made once the job's server runs; below every image, as `P`
+  is, which holds only the resolver's and hosts' files and is what services and a job whose server
+  did not start get, so they have a free path at `/var/run/docker.sock` and `/run/docker.sock`),
+  made in `/var/run` and in `/run`: an image's `/var/run` is usually a link to
   `/run` (Ubuntu's, Alpine's) and a bind is made where the link leads, and the layer is below the
   image's, so an image with a directory there is bound in place. No step's layer holds a file for it,
   which a step cache's replay would otherwise carry to another job. The bind is `optional`: an
@@ -2670,15 +2673,43 @@ errors. Nothing is built yet (1b).
   MiB, 2 s) and the connection closed, so the CLI that is still sending a build context reads our
   answer instead of a reset. `Server.stop` wakes every thread through one eventfd and joins them.
 - **The endpoints**: `GET`/`HEAD /_ping` (`OK`; `Api-Version: 1.52`, `Builder-Version: 1`,
-  `Ostype: linux`), `GET /version` and `GET /info` (valid JSON, `Platform.Name` and
+  `Ostype: linux`; the `Server:` header names no version), `GET /version` and `GET /info` (valid JSON, `Platform.Name` and
   `OperatingSystem` "zig-runner", the runner's version, the kernel's and the machine's CPUs and
-  memory; `ID` is the job's directory name, which makes the API of two jobs tell apart). An optional
+  memory; `ID` is the job's directory name, which makes the API of two jobs tell apart; `Name` is a
+  neutral "zig-runner", not the host's name). Both are made once, when the server starts. An optional
   `/v1.NN` prefix is stripped from 1.24 to 1.52; another version gets Docker's own 400 ("client
-  version 1.53 is too new. Maximum supported API version is 1.52"). `/grpc`, `/session` and `POST
+  version 1.53 is too new. Maximum supported API version is 1.52"), and one that is not written as
+  Docker's clients write it (a sign, a leading zero, more than three digits: `/v1.+40`,
+  `/v01.052`) a 400 "invalid API version prefix". `/grpc`, `/session` and `POST
   /build?version=2` get 501 "BuildKit is not supported by zig-runner yet; DOCKER_BUILDKIT=0 is set
   for you, and docker buildx / docker/build-push-action need a later stage"; `POST /build` 501
   "not supported by zig-runner yet (stage 1b)"; everything else 501 `{"message":"not supported by
-  zig-runner yet: <METHOD> <path>"}`, the path without its version prefix and query.
+  zig-runner yet: <METHOD> <path>"}`, the path without its version prefix and query, bytes that
+  are not UTF-8 shown as U+FFFD and cut at 200 bytes on a character boundary.
+- **A budget**: the server's work is the runner's, in no job's cgroup, so each job's API has a
+  token bucket of 100 requests a second (200 in a burst), checked before a request is routed; a
+  request over it is 429 "too many requests to this job's Docker API: slow down", counted
+  (`limited=` in the log line) with the 8-connection cap. `/version` and `/info` are rendered once
+  at the start, so a request costs a copy. **Stage 1b's build work must run in the job's cgroup
+  (`execBuild`), as the job's steps do, not in this thread**; only the HTTP parsing is the
+  runner's.
+- **The job's own `DOCKER_HOST`**: the runner's `DOCKER_HOST` and `DOCKER_BUILDKIT` are put only
+  where the image, the job container's `env:` and `options: --env` have not set the name, and the
+  workflow's `env:` (job and step) wins over all of them. A job container whose `volumes:` are at
+  or around the socket's path (`/var`, `/var/run`, `/run`, or either file) gets **no API**: the
+  server is stopped, the bind and the variables are left out, and "Set up job" says why. The job
+  still runs.
+- **Step cache (decision for 1b)**: what a step does through the API (an image built, a tag
+  made) is in no step key, since the socket's path is normalised to no input. So **a step that
+  makes any request beyond `/_ping`, `/version` and `/info` is not stored** (the server counts
+  them, `Backend.apiBeyond`; the step still runs and succeeds, and the steps after it run
+  uncached, as after a log too big to store), and a step is never replayed in place of one that
+  would have called it. Until 1b keys the API's state (the tag index and what a build read), that
+  stays so. The key's normalisation applies only to the server's own socket path.
+- **Docker actions**: a Docker action's container gets the same bind, as on GitHub, where the
+  runner mounts its `/var/run/docker.sock` into one. The mount-point layer sits below the
+  action's image like the job's, and is made owned as the image's own layers are (idmapped on a
+  root runner): an image with no `/run` or `/var` gets writable ones (tested).
 - **The log**: one `info: kind=native_docker_api job=<job directory id> connections=.. requests=..
   unsupported=.. refused=.. timeouts=.. busy=..` line when a job that used the API ends (`kind=`
   names are an alert contract: this one is new, and stays). "Set up job" says whether the job has

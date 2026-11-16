@@ -146,7 +146,9 @@ is. Every other endpoint, `docker build` included for now, gets HTTP 501 with
 `{"message":"not supported by zig-runner yet: <METHOD> <path>"}`, and BuildKit's (`docker buildx`,
 `docker/build-push-action`) a hint that they need a later stage. A job that uses the API logs one
 `info: kind=native_docker_api job=.. connections=.. requests=.. unsupported=.. refused=..
-timeouts=.. busy=..` line when it ends. Sending a job that needs more than this to an engine
+timeouts=.. busy=..` line when it ends. Each job's API answers at most 100 requests a second (429 past that), and a step that makes any
+request beyond those three is not stored for replay in the step cache. A job container whose
+`volumes:` are at or around `/var/run/docker.sock` gets no API, and says so in "Set up job". Sending a job that needs more than this to an engine
 ahead of time, so that no Docker job is lost, is a later stage (#448, decision 2).
 
 ## Deploying releases
