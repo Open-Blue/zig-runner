@@ -1368,6 +1368,9 @@ pub const Sources = struct {
     opaque_xattr: [:0]const u8,
     /// Told of each stage and step as the build reaches it (the Docker API's `Step 3/7 : ...`).
     progress: ?*Progress = null,
+    /// Set when the build is to stop: checked before every step, which then ends the build with
+    /// `error.Cancelled`.
+    cancel: ?*const std.atomic.Value(bool) = null,
 };
 
 /// What a build tells its caller as it goes: an implementation embeds it as a field and recovers
@@ -1468,6 +1471,7 @@ const Builder = struct {
         }
         if (b.src.progress) |pg| pg.stageFn(pg, i);
         for (st.steps) |step| {
+            if (b.src.cancel) |c| if (c.load(.acquire)) return error.Cancelled;
             if (step.op == .none) {
                 if (b.src.progress) |pg| pg.stepFn(pg, step, .config);
                 continue;

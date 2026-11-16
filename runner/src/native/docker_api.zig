@@ -93,10 +93,10 @@ pub const Limits = struct {
     body_bytes: u64 = (1 << 30) + (1 << 28),
     body_idle_ms: u32 = 30_000,
     body_ms: u32 = 10 * 60_000,
-    /// How long `closeGate` waits for a request in flight to end after it was cancelled.
-    cancel_ms: u32 = 30_000,
     /// Builds a job may make, and how many at once (one: they share the job's build directories).
-    max_builds: u32 = 100,
+    max_builds: u32 = 32,
+    /// What a job's uploaded contexts may add up to (the tar files spooled in its directory).
+    spool_budget: u64 = 4 << 30,
     /// What a build's context may hold once unpacked.
     context: docker_build.Limits = .{},
 };
@@ -258,6 +258,10 @@ pub const Server = struct {
     } = .{},
     /// The gate: the high bit says it is closed, the rest counts the requests in flight.
     gate: std.atomic.Value(u32) = .init(0),
+    /// A build (its upload and its run) is in hand: one at a time per job.
+    building: std.atomic.Value(bool) = .init(false),
+    /// What the job's uploads have spooled so far.
+    spooled: std.atomic.Value(u64) = .init(0),
 
     const Slot = struct {
         thread: ?std.Thread = null,
@@ -418,22 +422,23 @@ pub const Server = struct {
         _ = s.gate.fetchAnd(~gate_closed_bit, .acq_rel);
     }
 
-    /// Turns requests away (503) from now on, cancels what is in flight, waits for it to end (at
-    /// most `cancel_ms`) and then takes in what clients had sent before they went (`settle`), which
-    /// is told 503 and counted. Returns false when something in flight did not end in time: the
-    /// step's requests are not all counted, so the caller must not store the step.
+    /// Turns requests away (503) from now on, cancels what is in flight, waits for it to end
+    /// (without a limit: the builder and unpacker see the cancel between their steps) and then takes
+    /// in what clients had sent before they went (`settle`), which is told 503 and counted. Returns
+    /// false only when the server was stopped meanwhile.
     pub fn closeGate(s: *Server) bool {
         const before = s.gate.fetchOr(gate_closed_bit, .acq_rel);
         var clean = true;
         if (before & ~gate_closed_bit != 0) {
             if (s.cfg.handler) |h| h.cancelFn(h, null);
-            const deadline = nowMs() + s.cfg.limits.cancel_ms;
+            // Until it has ended, whatever it takes: a build that kept running into the next step
+            // would be counted against it (the builder and the unpacker look at the cancel
+            // between their steps). Only the server's stop ends this wait early.
             while (s.gate.load(.acquire) & ~gate_closed_bit != 0) {
-                if (nowMs() >= deadline) {
+                if (!waitStop(s, 1)) {
                     clean = false;
                     break;
                 }
-                if (!waitStop(s, 1)) break;
             }
         }
         // A request that did not end in time is one the step's count cannot be trusted about.
@@ -1531,9 +1536,16 @@ fn serveBuild(
         .unsupported => |m| return finishEarly(s, fd, a, 501, m, has_body),
     };
     if (!has_body) return buildError(s, a, fd, 400, "the build needs a context: a tar in the request's body");
-    if (s.counters.builds.load(.acquire) >= lim.max_builds)
-        return finishEarly(s, fd, a, 429, "too many builds in this job", has_body);
+    // One at a time: a second upload would hold another context's worth of disk and a thread.
+    if (s.building.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
+        return finishEarly(s, fd, a, 429, "another build of this job is in progress: one at a time", has_body);
+    defer s.building.store(false, .release);
     const n = s.counters.builds.fetchAdd(1, .acq_rel);
+    if (n >= lim.max_builds)
+        return finishEarly(s, fd, a, 429, "too many builds in this job", has_body);
+    const spooled = s.spooled.load(.acquire);
+    if (spooled >= lim.spool_budget)
+        return finishEarly(s, fd, a, 413, "this job's uploaded contexts have used what the runner allows one job", has_body);
     const tar_path = std.fmt.allocPrint(a, "{s}/api-{d}.tar", .{ s.cfg.work_dir, n }) catch
         return buildError(s, a, fd, 500, "out of memory");
     defer if (unlinkPathA(a, tar_path)) {} else |_| {};
@@ -1549,8 +1561,9 @@ fn serveBuild(
     const out_fd = fdOf(out_rc) catch
         return buildError(s, a, fd, 500, "the job's directory cannot hold the build's context");
     var got: u64 = 0;
-    const end = readBody(s, fd, req, after_head, out_fd, lim.body_bytes, &got);
+    const end = readBody(s, fd, req, after_head, out_fd, @min(lim.body_bytes, lim.spool_budget - spooled), &got);
     _ = linux.close(out_fd);
+    _ = s.spooled.fetchAdd(got, .acq_rel);
     switch (end) {
         .ok => {},
         .too_large => return buildError(s, a, fd, 413, std.fmt.allocPrint(
@@ -2920,7 +2933,7 @@ test "docker api: the docker CLI's own build requests (recorded) reach the handl
         try tmp.dir.createDirPath(testing.io, "out");
         const base = try tmp.dir.realPathFileAlloc(testing.io, ".", arena.allocator());
         var why: []const u8 = "";
-        const out = try docker_build.unpack(arena.allocator(), testing.io, try std.fmt.allocPrint(arena.allocator(), "{s}/out", .{base}), try std.fmt.allocPrint(arena.allocator(), "{s}/ctx.tar", .{base}), .{}, &why);
+        const out = try docker_build.unpack(arena.allocator(), testing.io, try std.fmt.allocPrint(arena.allocator(), "{s}/out", .{base}), try std.fmt.allocPrint(arena.allocator(), "{s}/ctx.tar", .{base}), .{}, null, &why);
         try testing.expect(out.entries >= 1);
         const df = try tmp.dir.readFileAlloc(testing.io, "out/Dockerfile", arena.allocator(), .limited(1 << 16));
         try testing.expect(std.mem.startsWith(u8, df, "FROM "));
@@ -2954,4 +2967,44 @@ test "docker api: the docker CLI's own image requests (recorded) are the routes 
         testing.allocator.free(fake.last_image_op.?);
         fake.last_image_op = null;
     }
+}
+
+test "docker api: one build at a time, a job's uploads are budgeted" {
+    var fake: Fake = .{ .tmp_dir = "", .hang = true };
+    var cfg = test_cfg;
+    cfg.limits.spool_budget = 100;
+    var f = try startBuilding(&fake, cfg);
+    defer _ = f.finish();
+    f.server.openGate();
+    const fd = try connect(f.path);
+    defer _ = linux.close(fd);
+    const req = "POST /build HTTP/1.1\r\nHost: d\r\nContent-Length: 2\r\n\r\nhi";
+    _ = linux.sendto(fd, req.ptr, req.len, linux.MSG.NOSIGNAL, null, 0);
+    const t0 = nowMs();
+    while (fake.builds.load(.acquire) == 0 and nowMs() - t0 < 3000) {
+        var ts: linux.timespec = .{ .sec = 0, .nsec = 2_000_000 };
+        _ = linux.nanosleep(&ts, null);
+    }
+    // A second build while the first is in hand is told so, without being read.
+    const second = try ask(f.path, req, 2000);
+    defer testing.allocator.free(second.text);
+    try testing.expectEqual(@as(u16, 429), statusOf(second.text));
+    try expectContains(second.text, "one at a time");
+    try testing.expect(f.server.closeGate());
+    fake.sync();
+    testing.allocator.free(fake.tar);
+    fake.tar = &.{};
+    // The budget: 100 bytes of uploads in all.
+    f.server.openGate();
+    const big = "POST /build HTTP/1.1\r\nHost: d\r\nContent-Length: 90\r\n\r\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    fake.hang = false;
+    const one = try ask(f.path, big, 3000);
+    defer testing.allocator.free(one.text);
+    try testing.expectEqual(@as(u16, 200), statusOf(one.text));
+    fake.sync();
+    testing.allocator.free(fake.tar);
+    fake.tar = &.{};
+    const two = try ask(f.path, big, 3000);
+    defer testing.allocator.free(two.text);
+    try testing.expectEqual(@as(u16, 413), statusOf(two.text));
 }

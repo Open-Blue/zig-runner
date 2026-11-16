@@ -357,6 +357,16 @@ pub const Output = struct {
     fn chunk(o: Output, bytes: []const u8) void {
         o.chunkFn(o.ptr, bytes);
     }
+
+    /// An `Output` that calls `f(ctx, bytes)`: the one place that turns the pointer back.
+    pub fn of(comptime T: type, ctx: *T, comptime f: fn (*T, []const u8) void) Output {
+        const Adapter = struct {
+            fn chunk(ptr: *anyopaque, bytes: []const u8) void {
+                f(@ptrCast(@alignCast(ptr)), bytes);
+            }
+        };
+        return .{ .ptr = ctx, .chunkFn = Adapter.chunk };
+    }
 };
 
 /// The helper running now, if any, for `warn` and `kill` from another task (a timeout or a cancel,

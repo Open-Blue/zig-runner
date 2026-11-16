@@ -726,6 +726,8 @@ pub const ApiRequest = struct {
     options: dockerfile.Options,
     api: *const Api,
     observer: ?*Observer = null,
+    /// Set when the build is to stop (before each of its steps).
+    cancel: ?*const std.atomic.Value(bool) = null,
 };
 
 pub const ApiBuilt = union(enum) {
@@ -769,11 +771,15 @@ pub fn buildApi(b: *Backend, req: ApiRequest) !ApiBuilt {
         .userns = @tagName(b.how.userns),
     };
     var runner: BuildRunner = .{ .b = b, .api = req.api };
-    return switch (try dockerfile.build(arena, b.io, p, store, runner.runner(), .{
+    return switch (dockerfile.build(arena, b.io, p, store, runner.runner(), .{
         .context = ctx,
         .opaque_xattr = b.opaqueXattr(),
         .progress = if (req.observer) |o| &o.progress else null,
-    })) {
+        .cancel = req.cancel,
+    }) catch |e| switch (e) {
+        error.Cancelled => return .{ .failed = "the build was cancelled" },
+        else => return e,
+    }) {
         .ok => |built| if (built.lowers.len == 0)
             .{ .failed = "the Dockerfile builds an image with no files" }
         else

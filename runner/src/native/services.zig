@@ -79,11 +79,10 @@ const Lines = struct {
     const max_line = 64 * 1024;
 
     fn output(l: *Lines) sandbox.Output {
-        return .{ .ptr = l, .chunkFn = chunk };
+        return sandbox.Output.of(Lines, l, chunk);
     }
 
-    fn chunk(ptr: *anyopaque, bytes: []const u8) void {
-        const l: *Lines = @ptrCast(@alignCast(ptr));
+    fn chunk(l: *Lines, bytes: []const u8) void {
         var rest = bytes;
         while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
             l.partial.appendSlice(l.arena, rest[0..nl]) catch return;

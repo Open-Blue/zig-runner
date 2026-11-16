@@ -243,6 +243,9 @@ pub const Limits = struct {
     link_bytes: usize = 4096,
 };
 
+/// Directories whose own mode is kept in memory until the end.
+const max_modes = 10_000;
+
 pub const Unpacked = struct { entries: u32, bytes: u64 };
 
 pub const UnpackError = error{BadContext} || Allocator.Error;
@@ -332,6 +335,7 @@ pub fn unpack(
     dest: []const u8,
     tar_path: []const u8,
     lim: Limits,
+    cancel: ?*const std.atomic.Value(bool),
     why: *[]const u8,
 ) UnpackError!Unpacked {
     const root_rc = linux.open(try zname(arena, dest), .{
@@ -361,20 +365,30 @@ pub fn unpack(
     } else |_| {}
     var name_buf: [4096]u8 = undefined;
     var link_buf: [4096]u8 = undefined;
-    var diag: std.tar.Diagnostics = .{ .allocator = arena };
+    // No diagnostics: the first entry of a kind that is not read ends it, so a tar of a million
+    // FIFOs costs nothing.
     var it: std.tar.Iterator = .init(&reader.interface, .{
         .file_name_buffer = &name_buf,
         .link_name_buffer = &link_buf,
-        .diagnostics = &diag,
     });
-    var dirs: std.ArrayList(struct { path: []const []const u8, mode: u32 }) = .empty;
+    // What one entry needs is freed at the next; a directory whose mode is not the default is
+    // remembered (at most `max_modes`) to be given it at the end.
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    var dirs: std.ArrayList(struct { path: []const u8, mode: u32 }) = .empty;
     var done: Unpacked = .{ .entries = 0, .bytes = 0 };
     while (true) {
+        _ = scratch.reset(.retain_capacity);
+        if (cancel) |c| if (done.entries % 256 == 0 and c.load(.acquire)) {
+            why.* = "the build was cancelled";
+            return error.BadContext;
+        };
         const entry = (it.next() catch |e| {
             why.* = switch (e) {
                 error.TarInsufficientBuffer => "a name in the context is too long",
                 error.UnexpectedEndOfStream, error.EndOfStream => "the context's tar ends in the middle of an entry",
-                error.TarUnsupportedHeader => "the context has an entry of a type that is not supported yet",
+                error.TarUnsupportedHeader => "the context has an entry of a type that is not supported yet (a hard link, a device, a FIFO or a sparse file)",
                 else => try std.fmt.allocPrint(arena, "the context is not a valid tar: {t}", .{e}),
             };
             return error.BadContext;
@@ -384,7 +398,7 @@ pub fn unpack(
             why.* = try std.fmt.allocPrint(arena, "the context has more than {d} entries", .{lim.entries});
             return error.BadContext;
         }
-        const parts = (try components(arena, entry.name, lim)) orelse {
+        const parts = (try components(sa, entry.name, lim)) orelse {
             why.* = try std.fmt.allocPrint(arena, "the context has an entry whose name is not " ++
                 "inside it: {s}", .{try printable(arena, entry.name)});
             return error.BadContext;
@@ -393,7 +407,7 @@ pub fn unpack(
             // `./` itself.
             continue;
         }
-        const parent = (try walkTo(arena, root, parts[0 .. parts.len - 1])) orelse {
+        const parent = (try walkTo(sa, root, parts[0 .. parts.len - 1])) orelse {
             why.* = try std.fmt.allocPrint(arena, "the context's entry {s} is inside a link or a file", .{
                 try printable(arena, entry.name),
             });
@@ -402,7 +416,7 @@ pub fn unpack(
         defer if (parent != root) {
             _ = linux.close(parent);
         };
-        const leaf = try zname(arena, parts[parts.len - 1]);
+        const leaf = try zname(sa, parts[parts.len - 1]);
         switch (entry.kind) {
             .directory => {
                 const rc = linux.mkdirat(parent, leaf, 0o755);
@@ -410,7 +424,10 @@ pub fn unpack(
                     why.* = try std.fmt.allocPrint(arena, "the directory {s} could not be made", .{try printable(arena, entry.name)});
                     return error.BadContext;
                 }
-                try dirs.append(arena, .{ .path = parts, .mode = entry.mode });
+                if (entry.mode & 0o777 != 0o755 and dirs.items.len < max_modes) {
+                    const joined = try std.mem.join(arena, "/", parts);
+                    try dirs.append(arena, .{ .path = joined, .mode = entry.mode });
+                }
             },
             .sym_link => {
                 if (entry.link_name.len > lim.link_bytes or !linkInside(entry.link_name, parts.len - 1)) {
@@ -419,7 +436,7 @@ pub fn unpack(
                     return error.BadContext;
                 }
                 _ = linux.unlinkat(parent, leaf, 0);
-                const rc = linux.symlinkat(try zname(arena, entry.link_name), parent, leaf);
+                const rc = linux.symlinkat(try zname(sa, entry.link_name), parent, leaf);
                 if (!errnoOk(rc)) {
                     why.* = try std.fmt.allocPrint(arena, "the link {s} could not be made", .{try printable(arena, entry.name)});
                     return error.BadContext;
@@ -435,21 +452,14 @@ pub fn unpack(
             },
         }
     }
-    if (diag.errors.items.len > 0) {
-        const first = diag.errors.items[0];
-        why.* = switch (first) {
-            .unsupported_file_type => |u| try std.fmt.allocPrint(arena, "the context has {s} of a type " ++
-                "that is not supported yet ({t})", .{ try printable(arena, u.file_name), u.file_type }),
-            else => "the context has an entry that cannot be unpacked",
-        };
-        return error.BadContext;
-    }
     // Directories' own modes last, so that one without write permission was written into first.
     var i = dirs.items.len;
     while (i > 0) {
         i -= 1;
         const d = dirs.items[i];
-        const fd = (try walkTo(arena, root, d.path)) orelse continue;
+        _ = scratch.reset(.retain_capacity);
+        const parts = (try components(sa, d.path, lim)) orelse continue;
+        const fd = (try walkTo(sa, root, parts)) orelse continue;
         defer if (fd != root) {
             _ = linux.close(fd);
         };
@@ -994,7 +1004,7 @@ fn unpackTest(arena: Allocator, tmp: *testing.TmpDir, tar: []const u8, lim: Limi
     const base = try tmp.dir.realPathFileAlloc(io, ".", arena);
     const root = try std.fmt.allocPrint(arena, "{s}/out", .{base});
     var why: []const u8 = "";
-    const got = unpack(arena, io, root, try std.fmt.allocPrint(arena, "{s}/in.tar", .{base}), lim, &why);
+    const got = unpack(arena, io, root, try std.fmt.allocPrint(arena, "{s}/in.tar", .{base}), lim, null, &why);
     return .{ .got = got, .why = why, .root = root };
 }
 
@@ -1235,4 +1245,52 @@ test "docker build: a time is RFC 3339 and layer keys come bottom first" {
     try testing.expectEqual(@as(usize, 2), keys.len);
     try testing.expectEqualStrings("bottom", keys[0]);
     try testing.expectEqualStrings("top", keys[1]);
+}
+
+test "docker build: a directory keeps its mode with or without the slash; a cancel ends the unpack; the first unsupported entry ends it" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const tar = try tarOf(arena, &.{
+            .{ .name = "wide/", .kind = '5', .mode = 0o777 },
+            .{ .name = "wide2", .kind = '5', .mode = 0o777 },
+            .{ .name = "tight/", .kind = '5', .mode = 0o700 },
+            .{ .name = "tight/f", .data = "x" },
+        });
+        const r = try unpackTest(arena, &tmp, tar, .{});
+        _ = try r.got;
+        for ([_][]const u8{ "out/wide", "out/wide2" }) |d| {
+            const st = try tmp.dir.statFile(testing.io, d, .{});
+            try testing.expectEqual(@as(u32, 0o777), std.math.lossyCast(u32, st.permissions.toMode() & 0o777));
+        }
+        const st = try tmp.dir.statFile(testing.io, "out/tight", .{});
+        try testing.expectEqual(@as(u32, 0o700), std.math.lossyCast(u32, st.permissions.toMode() & 0o777));
+    }
+    {
+        // Cancelled before it starts: nothing is unpacked.
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "in.tar", .data = try tarOf(arena, &.{.{ .name = "f", .data = "x" }}) });
+        try tmp.dir.createDirPath(testing.io, "out");
+        const base = try tmp.dir.realPathFileAlloc(testing.io, ".", arena);
+        var flag: std.atomic.Value(bool) = .init(true);
+        var why: []const u8 = "";
+        try testing.expectError(error.BadContext, unpack(arena, testing.io, try std.fmt.allocPrint(arena, "{s}/out", .{base}), try std.fmt.allocPrint(arena, "{s}/in.tar", .{base}), .{}, &flag, &why));
+        try testing.expect(std.mem.indexOf(u8, why, "cancelled") != null);
+    }
+    {
+        // A FIFO ends it at once, whatever follows.
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const r = try unpackTest(arena, &tmp, try tarOf(arena, &.{
+            .{ .name = "a", .data = "x" },
+            .{ .name = "p", .kind = '6' },
+            .{ .name = "b", .data = "y" },
+        }), .{});
+        try testing.expectError(error.BadContext, r.got);
+        try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "out/b", .{}));
+    }
 }

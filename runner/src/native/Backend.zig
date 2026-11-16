@@ -3163,15 +3163,16 @@ fn execIn(
     // A container with an owner has its own idmaps of the job's directory (`sandbox.jobView`).
     const owned = if (container) |c| c.owner != null else false;
     const idmapped = new_layer and !owned and b.upperIdmapped() and b.idmappedUpper();
-    return b.runIn(argv, env, files, uid, gid, out, container, new_layer, idmapped, .{ .running = &b.running });
+    return b.runIn(argv, env, files, uid, gid, out, container, new_layer, idmapped, .{ .running = &b.running, .api = new_layer });
 }
 
 /// How a `runIn` differs from a step's own.
 const RunMode = struct {
     running: *sandbox.Running,
     /// The job's Docker API is open to it (`Server.openGate`), if the job has one: its socket is
-    /// bound, and it is answered only while this runs.
-    api: bool = true,
+    /// bound, and it is answered only while this runs. Only a step's, an action's and its pre and
+    /// post: never a build's `RUN`, nor the runner's own scripts.
+    api: bool = false,
     /// The job overlay's work directory and mount point.
     work: []const u8 = "W",
     merged: []const u8 = "M",
@@ -5050,11 +5051,10 @@ pub const Live = struct {
     record: ?std.ArrayList(u8),
 
     pub fn output(l: *Live) sandbox.Output {
-        return .{ .ptr = l, .chunkFn = chunk };
+        return sandbox.Output.of(Live, l, chunk);
     }
 
-    fn chunk(ptr: *anyopaque, bytes: []const u8) void {
-        const l: *Live = @ptrCast(@alignCast(ptr));
+    fn chunk(l: *Live, bytes: []const u8) void {
         SpanDemux.onRecord(l.demux, .{ .span = "native", .stream = 1, .text = bytes });
         if (l.record) |*r| {
             if (r.items.len + bytes.len > Store.max_record_bytes) {
@@ -5075,11 +5075,10 @@ pub const Captured = struct {
     const keep = 4096;
 
     pub fn output(c: *Captured) sandbox.Output {
-        return .{ .ptr = c, .chunkFn = chunk };
+        return sandbox.Output.of(Captured, c, chunk);
     }
 
-    fn chunk(ptr: *anyopaque, bytes: []const u8) void {
-        const c: *Captured = @ptrCast(@alignCast(ptr));
+    fn chunk(c: *Captured, bytes: []const u8) void {
         c.text.appendSlice(c.arena, bytes) catch return;
         if (c.text.items.len > 2 * keep)
             c.text.replaceRangeAssumeCapacity(0, c.text.items.len - keep, &.{});
@@ -12729,7 +12728,7 @@ test "native docker api: a step that made a request beyond ping, version and inf
     var slow = cfg;
     slow.test_docker_api_delay_ms = 300;
     try std.testing.expectEqual(@as(usize, 0), try replayedWithApi(arena, slow, &.{
-        \\python3 -c "import socket; s=socket.socket(socket.AF_UNIX); s.connect('/var/run/docker.sock'); s.send(b'GET /images/json HTTP/1.1\r\nHost: x\r\n\r\n')"
+        \\curl -s --max-time 0.05 --unix-socket /var/run/docker.sock http://localhost/images/json >/dev/null || true
         ,
         "echo two",
     }, "late"));

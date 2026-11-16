@@ -2710,7 +2710,8 @@ index, the ID) are `native/docker_build.zig`; what answers for the job is `nativ
   sandbox that has the socket, so around every step, action and set-up script): a request is let
   in only while the gate is open, and counted in flight; `closeGate` turns later requests away (503
   "no step of the job is running"), cancels what is in flight (a build's `RUN` is killed), waits for
-  it to end (30 s at most; past that the step is not stored whatever it did), and then takes in what
+  it to end (as long as it takes: the unpacker and the builder see the cancel between entries and
+  steps), and then takes in what
   the dead clients had sent as above, which is 503 and counted. So a request is never admitted
   after its step's end check, a build never outlives its step, and the next step starts with no
   request of the last one's. The epoch per connection the 1a note asks for is not needed: nothing
@@ -2779,8 +2780,10 @@ index, the ID) are `native/docker_build.zig`; what answers for the job is `nativ
   overlay directories of its own (`AW`, `AM`), no flattening of the job's layers under the running
   step, and **no Docker API in it** (a build's `RUN` cannot ask for another build). The runner's
   own work for a build is the HTTP, the unpack, the planning and the `COPY`s, bounded as said; a
-  `RUN`'s is the job's. One build at a time per job (they share its build directories), at most 100
-  per job.
+  `RUN`'s is the job's. One build at a time per job (they share its build directories: a second request is 429 before its
+  context is read), at most 32 per job, 4 GiB of uploads and 4 GiB of unpacked contexts over all of
+  them. A Docker action's build `RUN`s never have the API (`RunMode.api` is false but for a step's
+  and an action's own runs).
 - **Images**: the job's tag index (`docker_build.Index`) is in the runner's memory, in no file and
   no store: at most 100 images and 256 tags, gone with the job (`Backend.stopDockerApi`), never
   shared with another job, repository or trust scope. The layers an image names are the shared
@@ -2801,19 +2804,17 @@ index, the ID) are `native/docker_build.zig`; what answers for the job is `nativ
   layers over the rootfs it was built on (`images.Image.layers`, `dockerfile.Base.image.layers`), keyed
   by its ID, so a changed image is another key. `COPY --from=<such an image>` is refused ("not
   supported yet"): the copy reads one directory, and a built image is several.
-- **A job that needs more goes to the engine** (decision 2, `docker_api_job.jobNeedsDaemon`, called
-  from `Backend.unsupported`): with the option on and an engine configured (`!opts.engineless`),
-  the job's `run:` scripts are read as text and its `uses:` by name; a `docker` command (at the
-  start of a command: after a newline, `;`, `&`, `|`, `(`, `{`, a backtick, `$(`, `then`, `do`,
-  `else`, `sudo`, `exec`, a variable assignment) whose subcommand is not `build`, `tag`, `rmi`,
-  `inspect`, `version`, `info`, `help`, `image build|inspect|tag|rm`, `builder build` (options
-  skipped, `--context`, `-H` and the like with their values), `docker-compose` and `docker-buildx`, and every
-  `docker/` action but `docker/metadata-action`, send the job to Dagger with a "Set up job" note,
-  exactly as with the option off. Heuristic and said so: it errs toward the engine (a quoted
-  `"docker push"` is found), and misses what a Makefile, another script or `xargs` runs, which then
-  meets a 501 at run time (not a lost job: a failed step with the reason; the workflow runs on an engine
-  again by dropping the option for it). Decision 2's fallback at run time (rerun on the engine at the
-  first unsupported call) is not done: a native job's steps have run, with effects.
+- **A job that might need more goes to the engine** (decision 2, `docker_api_job.jobNeedsDaemon`,
+  from `Backend.unsupported`): with the option on and an engine configured (`!opts.engineless`), the
+  default is the engine. A job stays native only if every `docker` word in its `run:` scripts is a
+  served command (`build`, `tag`, `rmi`, `inspect`, `version`, `info`, `help`, `image
+  build|inspect|tag|rm`, `builder build`, options skipped) and no command word can run something
+  unseen: a wrapper (`sudo`, `timeout`, `env`, `nice` ...) is read through to its command, but `eval`,
+  shells, `xargs`, `make`/`just`/`npm`/`python` and the like, scripts by path or `*.sh`, a `$VAR`
+  command or subcommand, `docker-compose`, `docker-buildx` and `podman` send it to Dagger; and so does
+  every `uses:` but `actions/*` and `docker/metadata-action`, a local action included. A heuristic over
+  text, said so: it errs toward the engine, and a tool that calls docker behind its back meets a 501.
+  No run-time rerun (a native job's steps have run, with effects).
 - **Tests**: `docker_build.zig`'s (`docker build:`: the query, references, the unpacker's escapes and
   limits, the index, the ID), `docker_api.zig`'s with a handler that builds nothing (`docker api:
   POST /build ...`: chunked and sized bodies, the limits' statuses, a client that leaves, the gate,

@@ -31,6 +31,9 @@ const job_mod = @import("../job.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// What all of a job's contexts may add up to once unpacked (their layers are no larger than that).
+const context_budget: u64 = 4 << 30;
+
 pub const State = struct {
     b: *Backend,
     gpa: Allocator,
@@ -43,6 +46,8 @@ pub const State = struct {
     active: ?*Active = null,
     /// The gate closed: no build runs until it opens (`resetFn`).
     cancelled_all: bool = false,
+    /// What the job's builds have unpacked, over all of them: past `context_budget` no more.
+    unpacked: std.atomic.Value(u64) = .init(0),
 
     /// The build in flight: what stops it.
     const Active = struct {
@@ -50,6 +55,8 @@ pub const State = struct {
         id: u32,
         running: sandbox.Running = .{},
         cancelled: bool = false,
+        /// The same, for the unpacker and the builder to read between their steps.
+        flag: std.atomic.Value(bool) = .init(false),
         /// What the builder asks of this build (`docker_action.Api`).
         api: docker_action.Api = undefined,
     };
@@ -77,6 +84,7 @@ pub const State = struct {
         if (id == null) st.cancelled_all = true;
         if (st.active) |a| if (id == null or id.? == a.id) {
             a.cancelled = true;
+            a.flag.store(true, .release);
             _ = a.running.kill(io);
         };
     }
@@ -154,11 +162,10 @@ const Telling = struct {
 
     /// The RUNs' output, as the stream's lines.
     fn output(t: *Telling) sandbox.Output {
-        return .{ .ptr = t, .chunkFn = chunk };
+        return sandbox.Output.of(Telling, t, chunk);
     }
 
-    fn chunk(ptr: *anyopaque, bytes: []const u8) void {
-        const t: *Telling = @ptrCast(@alignCast(ptr));
+    fn chunk(t: *Telling, bytes: []const u8) void {
         if (t.quiet) return;
         const line = docker_build.streamLine(t.arena, bytes) catch return;
         t.sink.write(line);
@@ -252,14 +259,16 @@ fn run(st: *State, call: *docker_api.BuildCall) !void {
     try std.Io.Dir.cwd().createDirPath(b.io, dir);
     defer Store.removeTree(a, b.io, dir);
     var why: []const u8 = "";
-    const unpacked = docker_build.unpack(a, b.io, dir, call.tar_path, call.limits, &why) catch |e| switch (e) {
+    if (st.unpacked.load(.acquire) >= context_budget) return fail(call, "this job's builds have used " ++
+        "the contexts the runner allows one job (4 GiB in all)");
+    const unpacked = docker_build.unpack(a, b.io, dir, call.tar_path, call.limits, &active.flag, &why) catch |e| switch (e) {
         error.BadContext => return fail(call, why),
         else => return e,
     };
 
     var tell: Telling = .{ .arena = a, .sink = call.sink, .quiet = q.quiet };
     // The CLI says "Sending build context" itself.
-    _ = unpacked;
+    _ = st.unpacked.fetchAdd(unpacked.bytes, .acq_rel);
 
     var args: std.ArrayList(dockerfile.Var) = .empty;
     for (q.build_args) |p| try args.append(a, .{ .name = p.name, .value = p.value });
@@ -279,6 +288,7 @@ fn run(st: *State, call: *docker_api.BuildCall) !void {
         .options = .{ .build_args = args.items, .target = q.target, .salt = salt, .labels = labels.items },
         .api = &active.api,
         .observer = &tell.observer,
+        .cancel = &active.flag,
     });
     if (State.isCancelled(&active) or call.sink.gone()) return fail(call, "the build was cancelled");
     const image = switch (built) {
@@ -424,20 +434,54 @@ fn takesValue(opt: []const u8) bool {
     return false;
 }
 
-/// Words that put the next word in command position.
+/// Words that run the command after them (with options of their own, skipped): `sudo`, `timeout 60`,
+/// `env A=1`, `nice -n 5`, the shell's keywords.
 fn introducesCommand(word: []const u8) bool {
-    for ([_][]const u8{ "sudo", "then", "do", "else", "elif", "if", "while", "until", "time", "exec", "command", "nohup", "!" }) |w|
-        if (std.mem.eql(u8, word, w)) return true;
+    for ([_][]const u8{
+        "sudo",    "then", "do",   "else",   "elif",   "if",     "while",  "until",   "time",  "exec",  "command", "nohup", "!",
+        "timeout", "env",  "nice", "ionice", "stdbuf", "setsid", "chroot", "unshare", "flock", "watch", "strace",
+    }) |w| if (std.mem.eql(u8, word, w)) return true;
     return false;
 }
 
-/// The first `docker` command in `script` that the job's API does not serve (`docker run`,
-/// `docker compose`, `docker push`, `docker buildx`, `docker-compose` ...), as it is written, or
-/// null. A heuristic that reads the script as text, not as a shell does: `docker` is a command when
-/// it starts a line or follows `;`, `&`, `|`, `(`, `{`, a backtick, `$(`, `then`, `do`, `else`,
-/// `sudo`, `exec` or a variable assignment; its options are skipped to its subcommand. It errs
-/// toward the engine: a quoted command or an `echo docker push` is found, and a command that a
-/// script, a Makefile or `xargs` runs for it is not.
+/// A word after one of those that is still its options: `-E`, `60`, `5s`, `A=1`.
+fn isOptionWord(w: []const u8) bool {
+    if (w.len == 0) return true;
+    if (w[0] == '-') return true;
+    if (std.mem.indexOfScalar(u8, w, '=') != null and std.mem.indexOfScalar(u8, w, '/') == null) return true;
+    var digits: usize = 0;
+    while (digits < w.len and std.ascii.isDigit(w[digits])) digits += 1;
+    return digits > 0 and (digits == w.len or (digits + 1 == w.len and std.mem.indexOfScalar(u8, "smhd", w[digits]) != null));
+}
+
+/// Commands that run other commands, or scripts, that may call `docker` where this cannot see.
+fn runsOthers(w: []const u8) bool {
+    const names = [_][]const u8{
+        "eval",    "xargs",            "bash",      "sh",   "zsh", "dash",   "ksh",     "source",  ".",              "make",
+        "gmake",   "just",             "task",      "npm",  "npx", "yarn",   "pnpm",    "node",    "python",         "python3",
+        "ruby",    "perl",             "php",       "pwsh", "act", "podman", "nerdctl", "buildah", "docker-compose", "docker-buildx",
+        "ansible", "ansible-playbook", "terraform", "tox",  "nox",
+    };
+    for (names) |n| if (std.mem.eql(u8, w, n)) return true;
+    // A script by its path or name, and a variable as the command.
+    if (std.mem.startsWith(u8, w, "./") or std.mem.startsWith(u8, w, "../") or std.mem.startsWith(u8, w, "~/")) return true;
+    if (std.mem.endsWith(u8, w, ".sh") or std.mem.endsWith(u8, w, ".py") or std.mem.endsWith(u8, w, ".bash")) return true;
+    if (w.len > 0 and w[0] == '$' and !std.mem.startsWith(u8, w, "$(") and !std.mem.eql(u8, w, "$?")) return true;
+    // Any other path (`/opt/tool`, `scripts/ci`) but docker's own.
+    if (std.mem.indexOfScalar(u8, w, '/') != null and !std.mem.endsWith(u8, w, "/docker")) return true;
+    return false;
+}
+
+/// Whether `script` might use Docker beyond what the job's API serves: null only when every `docker`
+/// in it is a served command (`docker build`, `tag`, `rmi`, `inspect`, `image build|inspect|tag|rm`,
+/// `version`, `info`, `--version`) and nothing in it can run a command this does not see: a
+/// wrapper's own command is read (`timeout 60 docker build` is `docker build`, `timeout 60 docker run`
+/// is not), but `eval`, `bash -c`, `xargs`, `make`, `npm`, `python`, another script by its path, a
+/// variable as a command and `docker-compose`/`podman` are taken to need a daemon. Otherwise the
+/// first thing found, as written. A heuristic that reads the script as text, and errs toward the
+/// engine: a job that is sent there loses nothing (it runs as it does without the option), and one
+/// that is not and calls Docker meets a 501. What it cannot see is what a command it allows runs
+/// behind the scenes (a tool that calls docker itself).
 pub fn needsDaemon(script: []const u8) ?[]const u8 {
     var i: usize = 0;
     var at_command = true;
@@ -464,13 +508,18 @@ pub fn needsDaemon(script: []const u8) ?[]const u8 {
             continue;
         }
         i += w.len;
-        if (!at_command) continue;
-        if (std.mem.indexOfScalar(u8, w, '=') != null and std.mem.indexOfScalar(u8, w, '/') == null) continue;
-        if (introducesCommand(w)) continue;
-        at_command = false;
         const base = if (std.mem.lastIndexOfScalar(u8, w, '/')) |s| w[s + 1 ..] else w;
-        if (std.mem.eql(u8, base, "docker-compose") or std.mem.eql(u8, base, "docker-buildx")) return base;
-        if (!std.mem.eql(u8, base, "docker")) continue;
+        const is_docker = std.mem.eql(u8, base, "docker") and (w.len == base.len or std.mem.endsWith(u8, w, "/docker"));
+        if (!is_docker) {
+            if (!at_command) continue;
+            if (std.mem.indexOfScalar(u8, w, '=') != null and std.mem.indexOfScalar(u8, w, '/') == null) continue;
+            if (introducesCommand(w)) continue;
+            if (isOptionWord(w)) continue;
+            at_command = false;
+            if (runsOthers(w)) return w;
+            continue;
+        }
+        at_command = false;
         // The next words: options (and their values), then the subcommand and the word after it.
         var n: usize = 0;
         var j = i;
@@ -502,7 +551,7 @@ pub fn needsDaemon(script: []const u8) ?[]const u8 {
             }
             if (n == 0 and x[0] == '-') {
                 // `--version` and `-v` are answered as `docker version` is.
-                if (std.mem.eql(u8, x, "--version") or std.mem.eql(u8, x, "-v") or std.mem.eql(u8, x, "--help")) return null;
+                if (std.mem.eql(u8, x, "--version") or std.mem.eql(u8, x, "-v") or std.mem.eql(u8, x, "--help")) return null_after(&i, j);
                 if (takesValue(x)) skip_value = true;
                 continue;
             }
@@ -510,8 +559,16 @@ pub fn needsDaemon(script: []const u8) ?[]const u8 {
             n += 1;
         }
         if (n == 0) continue;
+        // `docker $X`, `docker "$SUB"`: a subcommand that is a variable is anything.
+        if (words[0][0] == '$') return words[0];
         if (!servedSubcommand(words[0], if (n > 1) words[1] else "")) return words[0];
     }
+    return null;
+}
+
+/// `docker --version`: served, and the scan goes on after it.
+fn null_after(i: *usize, j: usize) ?[]const u8 {
+    i.* = j;
     return null;
 }
 
@@ -524,15 +581,18 @@ fn wordAt(s: []const u8, from: usize) []const u8 {
     return s[from..e];
 }
 
-/// Whether `uses: owner/name` is an action that talks to a Docker daemon beyond what the job's API
-/// serves: all of the `docker/` organisation's (setup-buildx, build-push, login, bake, compose ...)
-/// but the one that only computes tags.
+/// Whether `uses: owner/name` might use Docker beyond what the job's API serves: every action but
+/// GitHub's own (`actions/`, which the job's steps already trust) and the one that only computes tags
+/// (`docker/metadata-action`). A third-party or local action may call `docker` itself.
 pub fn actionNeedsDaemon(owner: []const u8, name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(owner, "docker") and !std.ascii.eqlIgnoreCase(name, "metadata-action");
+    if (std.ascii.eqlIgnoreCase(owner, "actions")) return false;
+    if (std.ascii.eqlIgnoreCase(owner, "docker") and std.ascii.eqlIgnoreCase(name, "metadata-action")) return false;
+    return true;
 }
 
-/// Whether a step of the job needs a Docker daemon the API is not (`needsDaemon`,
-/// `actionNeedsDaemon`). For `Backend.unsupported`, with the API on and an engine to fall back to.
+/// Whether a step of the job might need a Docker daemon the API is not (`needsDaemon`,
+/// `actionNeedsDaemon`; a local action is read when it runs, so it counts). For
+/// `Backend.unsupported`, with the API on and an engine to fall back to.
 pub fn jobNeedsDaemon(steps: []const job_mod.Step) bool {
     for (steps) |step| switch (step.action) {
         .script => |s| {
@@ -542,13 +602,13 @@ pub fn jobNeedsDaemon(steps: []const job_mod.Step) bool {
             };
             if (needsDaemon(text) != null) return true;
         },
-        .uses => |u| if (!u.local and actionNeedsDaemon(u.owner, u.name)) return true,
+        .uses => |u| if (u.local or actionNeedsDaemon(u.owner, u.name)) return true,
         .checkout, .docker, .unsupported => {},
     };
     return false;
 }
 
-test "docker api job: scripts that build, tag, inspect and remove images are served; the rest is not" {
+test "docker api job: scripts that only build, tag, inspect and remove images are served; anything that may do more is not" {
     const served = [_][]const u8{
         "docker build -t x .",
         "set -e\ndocker build --build-arg A=1 -f sub/Dockerfile -t x:1 -t x:2 .\ndocker image inspect x:1",
@@ -560,55 +620,81 @@ test "docker api job: scripts that build, tag, inspect and remove images are ser
         "docker --version",
         "if docker inspect x >/dev/null 2>&1; then echo yes; fi",
         "DOCKER_BUILDKIT=0 docker build .",
-        "cd docker && make",
         "ls docker/ build/docker",
         "echo $(docker build -q .)",
         "x=$(docker image inspect --format '{{.Id}}' x)",
         "sudo docker build .",
+        "timeout 60 docker build .",
+        "env FOO=1 docker build .",
+        "nice -n 5 docker build .",
+        "sudo -E docker build .",
         "/usr/bin/docker build .",
-        "make docker",
-        "echo docker-ish",
+        "echo docker-ish; cd docker; ls",
         "docker",
         "",
+        "mkdir -p out && cp a b && echo done",
     };
     for (served) |s| if (needsDaemon(s)) |why| {
         std.debug.print("ERROR served script found to need {s}: {s}\n", .{ why, s });
         return error.TestUnexpectedResult;
     };
-    const Case = struct { script: []const u8, sub: []const u8 };
+    const Case = struct { script: []const u8, why: []const u8 };
     const not_served = [_]Case{
-        .{ .script = "docker run --rm alpine true", .sub = "run" },
-        .{ .script = "docker build .\ndocker push x", .sub = "push" },
-        .{ .script = "docker compose up -d", .sub = "compose" },
-        .{ .script = "docker-compose up", .sub = "docker-compose" },
-        .{ .script = "docker buildx build .", .sub = "buildx" },
-        .{ .script = "docker login -u x --password-stdin", .sub = "login" },
-        .{ .script = "docker pull alpine && docker build .", .sub = "pull" },
-        .{ .script = "docker images", .sub = "images" },
-        .{ .script = "docker image ls", .sub = "image" },
-        .{ .script = "docker save x | gzip > x.tgz", .sub = "save" },
-        .{ .script = "echo hi && docker exec c true", .sub = "exec" },
-        .{ .script = "if true; then docker ps; fi", .sub = "ps" },
-        .{ .script = "DOCKER_BUILDKIT=1 docker -H x ps", .sub = "ps" },
-        .{ .script = "docker \\\n  run x", .sub = "run" },
-        .{ .script = "x=$(docker run --rm a)", .sub = "run" },
-        .{ .script = "(docker network create n)", .sub = "network" },
-        .{ .script = "sudo docker system prune -f", .sub = "system" },
+        .{ .script = "docker run --rm alpine true", .why = "run" },
+        .{ .script = "docker build .\ndocker push x", .why = "push" },
+        .{ .script = "docker compose up -d", .why = "compose" },
+        .{ .script = "docker-compose up", .why = "docker-compose" },
+        .{ .script = "docker buildx build .", .why = "buildx" },
+        .{ .script = "docker login -u x --password-stdin", .why = "login" },
+        .{ .script = "docker pull alpine && docker build .", .why = "pull" },
+        .{ .script = "docker images", .why = "images" },
+        .{ .script = "docker image ls", .why = "image" },
+        .{ .script = "docker save x | gzip > x.tgz", .why = "save" },
+        .{ .script = "echo hi && docker exec c true", .why = "exec" },
+        .{ .script = "if true; then docker ps; fi", .why = "ps" },
+        .{ .script = "DOCKER_BUILDKIT=1 docker -H x ps", .why = "ps" },
+        .{ .script = "docker \\\n  run x", .why = "run" },
+        .{ .script = "x=$(docker run --rm a)", .why = "run" },
+        .{ .script = "(docker network create n)", .why = "network" },
+        .{ .script = "sudo docker system prune -f", .why = "system" },
+        // Wrappers and indirection, which the first version did not see.
+        .{ .script = "timeout 60 docker run x", .why = "run" },
+        .{ .script = "env FOO=1 docker run x", .why = "run" },
+        .{ .script = "nice -n 5 docker run x", .why = "run" },
+        .{ .script = "sudo -E docker run x", .why = "run" },
+        .{ .script = "eval 'docker run x'", .why = "eval" },
+        .{ .script = "bash -c 'docker run x'", .why = "bash" },
+        .{ .script = "sh -c \"docker build .\"", .why = "sh" },
+        .{ .script = "echo x | xargs docker run", .why = "xargs" },
+        .{ .script = "echo x | xargs -n1 echo", .why = "xargs" },
+        .{ .script = "X=docker; $X run y", .why = "$X" },
+        .{ .script = "docker $SUB y", .why = "$SUB" },
+        .{ .script = "./scripts/ci.sh", .why = "./scripts/ci.sh" },
+        .{ .script = "scripts/ci", .why = "scripts/ci" },
+        .{ .script = "make test", .why = "make" },
+        .{ .script = "cd docker && make", .why = "make" },
+        .{ .script = "npm run build", .why = "npm" },
+        .{ .script = "python3 tools/x.py", .why = "python3" },
+        .{ .script = "source env.sh", .why = "source" },
+        .{ .script = "podman build .", .why = "podman" },
+        .{ .script = "run-ci.sh", .why = "run-ci.sh" },
     };
     for (not_served) |c| {
         const got = needsDaemon(c.script) orelse {
             std.debug.print("ERROR not found: {s}\n", .{c.script});
             return error.TestUnexpectedResult;
         };
-        try std.testing.expectEqualStrings(c.sub, got);
+        try std.testing.expectEqualStrings(c.why, got);
     }
 }
 
-test "docker api job: the docker organisation's actions need a daemon, but not the one that only computes tags" {
+test "docker api job: only GitHub's own actions and the tag computer need no daemon" {
     try std.testing.expect(actionNeedsDaemon("docker", "build-push-action"));
     try std.testing.expect(actionNeedsDaemon("docker", "setup-buildx-action"));
     try std.testing.expect(actionNeedsDaemon("Docker", "login-action"));
+    try std.testing.expect(actionNeedsDaemon("dtolnay", "rust-toolchain"));
+    try std.testing.expect(actionNeedsDaemon("someone", "compose-up"));
     try std.testing.expect(!actionNeedsDaemon("docker", "metadata-action"));
     try std.testing.expect(!actionNeedsDaemon("actions", "checkout"));
-    try std.testing.expect(!actionNeedsDaemon("dockerfile", "x"));
+    try std.testing.expect(!actionNeedsDaemon("actions", "upload-artifact"));
 }
