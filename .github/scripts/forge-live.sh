@@ -59,7 +59,7 @@ main() {
 	script_dir=$(cd "$(dirname "$0")" && pwd)
 	out=${out:-$dir/run-$forge-$(date +%Y%m%d-%H%M%S)}
 
-	if ((!setup_only)) && [[ ${ZR_FORGE_LOCKED:-} != 1 ]]; then
+	if ((! setup_only)) && [[ ${ZR_FORGE_LOCKED:-} != 1 ]]; then
 		mkdir -p "$(dirname "$lock")"
 		ZR_FORGE_LOCKED=1 exec flock "$lock" "$0" --forge "$forge" --bin "$bin" --out "$out"
 	fi
@@ -107,6 +107,7 @@ main() {
 	done
 	# shellcheck source=/dev/null
 	source "$script_dir/forge-live-workflows.sh"
+	# shellcheck disable=SC2154 # defined by the file above
 	put act action.yml "$act_action"
 	put act sub/action.yml "$act_action"
 	put main .gitea/actions/mine/action.yml "$act_action"
