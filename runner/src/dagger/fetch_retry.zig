@@ -416,20 +416,25 @@ test "Budget: retries stop once the failed attempts and the waits would pass the
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
-    var budget: Budget = .{ .limit_ms = 100 };
+    // Whatever the jitter or the speed of the machine: the waits are 1, 2, 4 and 8 ms at most, a
+    // limit of 10 s is never reached by them.
+    var budget: Budget = .{ .limit_ms = 10_000 };
     var at: Attempts = .{ .io = std.testing.io, .base_ms = 1, .budget = &budget };
-    // 1 ms waits fit: two retries, each 1 then 2 ms (halved to all of it), and so on up to the limit.
     var retries: u32 = 0;
     while (try at.again(arena, "o/r@v1", "Could not resolve host: x", true)) retries += 1;
     try std.testing.expectEqual(max_attempts - 1, retries);
+    // A wait is at least half of 4 s: a limit of 3 ms is passed by any.
     var tight: Budget = .{ .limit_ms = 3 };
     var at2: Attempts = .{ .io = std.testing.io, .base_ms = 4000, .budget = &tight };
     try std.testing.expect(!try at2.again(arena, "o/r@v1", "Could not resolve host: x", true));
-    // Shared: what one fetch's retry spent, the next fetch's does not have.
+    // Shared: a retry planned adds its wait (at least 2 s of a 4 s base) to what is spent, and
+    // what is spent is what the next fetch does not have: with the limit 1 ms past it, none is
+    // left, whatever the jitter.
     var shared: Budget = .{ .limit_ms = 10_000 };
-    var first: Attempts = .{ .io = std.testing.io, .base_ms = 8000, .budget = &shared };
+    var first: Attempts = .{ .io = std.testing.io, .base_ms = 4000, .budget = &shared };
     try std.testing.expect(try first.plan(arena, "o/a@v1", "Could not resolve host: x", true));
-    try std.testing.expect(shared.spent_ms >= 4000);
-    var second: Attempts = .{ .io = std.testing.io, .base_ms = 8000, .budget = &shared };
+    try std.testing.expect(shared.spent_ms >= 2000 and shared.spent_ms <= 4000);
+    shared.spent_ms = shared.limit_ms - 1;
+    var second: Attempts = .{ .io = std.testing.io, .base_ms = 4000, .budget = &shared };
     try std.testing.expect(!try second.plan(arena, "o/b@v1", "Could not resolve host: x", true));
 }
