@@ -151,22 +151,6 @@ request beyond those three is not stored for replay in the step cache. A job con
 `volumes:` are at or around `/var/run/docker.sock` gets no API, and says so in "Set up job". Sending a job that needs more than this to an engine
 ahead of time, so that no Docker job is lost, is a later stage (#448, decision 2).
 
-### Where a Gitea or Forgejo job's actions come from (#520)
-
-A step's `uses:` is read as Gitea's workflow model reads it (`model.ParseActionUses`):
-
-| `uses:` | fetched from |
-|---|---|
-| `owner/repo[/path]@ref` | the instance's default actions URL, which the task carries as `gitea_default_actions_url` (`https://github.com` on a default Gitea, `https://data.forgejo.org` on Forgejo; the instance's own address when it is configured `self`) |
-| `self:owner/repo[/path]@ref` | the instance the job runs on, with the task's `GITHUB_TOKEN` secret (what the instance sends as the task's token; the `gitea_runtime_token` is for its artifact and cache services, and git refuses it) |
-| `https://host/owner/repo[/path]@ref` | that host, anonymously; the instance's own address is the instance |
-| `$/path` | the workflow's own repository at the job's commit (no `@ref`, no `..`), with the same token |
-| `./path` | the workspace, as on GitHub |
-
-`ssh://` and credentials in the URL (`https://token@host/...`) are refused, with the reason in the step's log. A composite action's own
-`uses: owner/repo@ref` steps come from the default actions URL too. `actions/checkout@v4` stays the built-in checkout; `self:actions/checkout` is the instance's action of that name.
-GitHub jobs are not changed by any of this.
-
 ## Deploying releases
 
 A release deploys itself to razorbill. Once its binaries and image are built and CI has passed on

@@ -1,7 +1,86 @@
 # Gitea and Forgejo (#520)
 
-This page is what a job from a Gitea or Forgejo instance sees. Where its actions come from is in
-[OPERATIONS.md](OPERATIONS.md#where-a-gitea-or-forgejo-jobs-actions-come-from-520).
+zig-runner can serve a Gitea or Forgejo instance instead of GitHub: the same runner, its native or
+Dagger backend, its step cache and its trust rules, for the tasks an instance hands out. This page
+is how to set it up and what a job from an instance sees. Linux only, as everywhere else.
+
+Tested live against Gitea 28.3 and Forgejo 13.0 (register, fetch, run, report, cancel), and the
+weekly oracle run compares 79 real tasks from both with what Gitea's own workflow model reads
+([CI.md](CI.md)).
+
+## Install
+
+Build or download the runner as the [README](../README.md#quick-start) says. The native backend
+with `RUNNER_ENGINE=none` needs no Docker and no GitHub credentials; the instance's runner token is
+the only secret. In `/etc/zig-runner.env` (or the unit's environment):
+
+```sh
+RUNNER_PLATFORM=gitea                      # or forgejo
+RUNNER_GITEA_URL=https://git.example.com   # the instance's address: http(s)://host[:port], no path
+RUNNER_GITEA_REGISTRATION_TOKEN=...        # only until the runner is registered
+RUNNER_LABELS=self-hosted,linux,zig        # what workflows name in runs-on
+RUNNER_BACKEND=native
+RUNNER_ENGINE=none
+RUNNER_TRUSTED_REFS=refs/heads/main        # see Trust, below
+```
+
+Then run `zig-runner` (or the systemd unit in `deploy/`). `GH_TOKEN` and `GH_APP_*` are not used.
+
+## Registration
+
+Get a registration token from the instance: Site administration, Actions, Runners (every
+repository), or the same page of an organization, a user or one repository. The runner registers
+once, with `RUNNER_GITEA_REGISTRATION_TOKEN`, and keeps the credentials the instance gives it in
+`gitea-runner-<RUNNER_NAME_PREFIX>.json` in `RUNNER_STATE_DIR` (`/var/lib/zig-runner` for root, else
+the user's state directory), readable by its user alone. After that the token is not needed and can
+be removed from the environment. Starting again declares the labels again, so a changed
+`RUNNER_LABELS` takes effect on restart. A runner the instance has forgotten stops with the
+instance's reason; delete the state file to register a new one. A state file left from another
+instance is not used.
+
+`RUNNER_COUNT` pollers share the one registration (act_runner's `capacity`), each running one task at
+a time; `RUNNER_GITEA_FETCH_INTERVAL` and `RUNNER_GITEA_FETCH_INTERVAL_MAX` set how often an idle
+runner asks (2 s, growing to 60 s). The runner stops cleanly on SIGTERM and cancels a job the instance
+cancels (the job's `timeout-minutes` too).
+
+A job's steps reach the instance, if it is on the host's loopback, LAN or tailnet, through an
+address the runner opens for them (`gitea/reach.zig`), so `github.server_url` works from a step.
+
+## Labels
+
+`RUNNER_LABELS` is a comma-separated list; the instance matches a job's `runs-on` against it, and
+sends the runner only jobs whose labels it all has. Write plain names (`self-hosted,linux,zig`,
+`ubuntu-latest`). A label with a scheme, as act_runner's `ubuntu-latest:docker://node:20`, is passed
+to the instance as written, and the runner does not read the part after the name: a job runs on the runner's
+backend (the native rootfs, or `container:` when the workflow names one). Name a label for what a
+job needs (`zig`, `arm64`), and keep `prod`-style labels for runners with trust rules.
+
+## Trust
+
+A workflow can be changed by a pull request, so the trust rules of
+[OPERATIONS.md](OPERATIONS.md#environments) apply to instance jobs as to GitHub's:
+`RUNNER_TRUSTED_REFS` and `RUNNER_TRUSTED_EVENTS` (default `push,workflow_dispatch`) say which jobs
+run, and an untrusted job fails before a step runs, with the reason in its log. The instance does
+not send GitHub's `workflow_ref`, so the runner builds it from the ref the run is for, which is the
+ref the instance read the workflow at. Unset `RUNNER_TRUSTED_REFS` trusts nothing. A runner of a
+public repository should trust only `refs/heads/main` and its tags: `pull_request` runs are then
+refused, and nothing a fork sends reaches the runner's caches or secrets.
+
+## Where actions come from
+
+A step's `uses:` is read as Gitea's workflow model reads it (`model.ParseActionUses`):
+
+| `uses:` | fetched from |
+|---|---|
+| `owner/repo[/path]@ref` | the instance's default actions URL, which the task carries as `gitea_default_actions_url` (`https://github.com` on a default Gitea, `https://data.forgejo.org` on Forgejo; the instance's own address when it is configured `self`) |
+| `self:owner/repo[/path]@ref` | the instance the job runs on, with the task's `GITHUB_TOKEN` secret (what the instance sends as the task's token; the `gitea_runtime_token` is for its artifact and cache services, and git refuses it) |
+| `https://host/owner/repo[/path]@ref` | that host, anonymously; the instance's own address is the instance |
+| `$/path` | the workflow's own repository at the job's commit (no `@ref`, no `..`), with the same token |
+| `./path` | the workspace, as on GitHub |
+
+`ssh://` and credentials in the URL (`https://token@host/...`) are refused, with the reason in the step's log. A composite action's own
+`uses: owner/repo@ref` steps come from the default actions URL too. `actions/checkout@v4` stays the built-in checkout; `self:actions/checkout` is the instance's action of that name.
+GitHub jobs are not changed by any of this.
 
 ## Environment variables
 

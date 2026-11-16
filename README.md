@@ -50,6 +50,9 @@ why its default is what it is. The ones most setups touch:
 - **Trust.** `RUNNER_TRUSTED_REFS` and `RUNNER_TRUSTED_EVENTS` say which jobs a runner runs, and
   which of them share the repository's trusted caches. An unset `RUNNER_TRUSTED_REFS` trusts
   nothing. See [docs/OPERATIONS.md](docs/OPERATIONS.md), "Environments".
+- **Gitea and Forgejo.** `RUNNER_PLATFORM=gitea` (or `forgejo`) with `RUNNER_GITEA_URL` and a
+  registration token serves an instance instead of GitHub, with no GitHub credentials. See
+  [docs/GITEA.md](docs/GITEA.md): install, registration, labels, trust, where actions come from.
 - **Memory.** The memory gate is on by default: a runner asks GitHub for a job only while the
   machine has room for it. See [docs/OPERATIONS.md](docs/OPERATIONS.md), "Memory".
 
@@ -74,6 +77,7 @@ sandbox, the error names it.
 | Document | For |
 | --- | --- |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Running it: trust and environments, caches, deploying releases, rebooting, memory |
+| [docs/GITEA.md](docs/GITEA.md) | Serving a Gitea or Forgejo instance: setup, labels, trust, actions, variables, services |
 | [docs/native-backend.md](docs/native-backend.md) | The native backend's design, its phases and what each one taught |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Measurements on the reference machine, a Raspberry Pi 5 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Changing it: set-up, hooks, branches and versions, tests, the changelog |
