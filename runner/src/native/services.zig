@@ -752,6 +752,28 @@ test "native services from a Gitea task: by name and on localhost, the task's ow
     try std.testing.expect(!reachable(.{ 127, 0, 0, 1 }, web_published));
 }
 
+test "native services: a cmd that does not evaluate fails the service, it does not start with an empty argument" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    cfg.test_rootless_services = true;
+    try fixtureImage(arena, &tmp, &cfg, "fixture+web:1", &.{ "python3", "-c", "print(1)" });
+    var job = testJob(&.{testStep("echo the-step-ran")});
+    job.services = &.{.{
+        .name = "web",
+        .image = .{ .lit = "fixture/web:1" },
+        .cmd = &.{ .{ .lit = "python3" }, .{ .expr = "nosuchfunction(1)" } },
+    }};
+    const r = try Backend.runNativeJob(arena, cfg, job, .root);
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(!r.res.succeeded);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "Could not evaluate the cmd of service 'web'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "the-step-ran") == null);
+}
+
 test "native services: a service has no docker.sock, whether or not the job has a Docker API, and no layer holds one" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
