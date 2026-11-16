@@ -12849,7 +12849,8 @@ test "native image build: the CLI's build through the job's API, with FROM, COPY
         "final labels: {\"org.example.stage\":\"final\"}",
         "Step 1/2 : FROM x:latest",
         "hello from demo",
-        "derived: [PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin KIND=demo] {\"built\":\"yes\",\"org.example.stage\":\"base\"}",
+        // The base image's own env (redis's has its version) is whatever the image has.
+        "KIND=demo] {\"built\":\"yes\",\"org.example.stage\":\"base\"}",
         "`COPY --from` an image built earlier in the job is not supported yet",
         "[x:1 x:latest z:2]",
         "Untagged: x:1",
