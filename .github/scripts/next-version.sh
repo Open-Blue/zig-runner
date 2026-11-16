@@ -10,7 +10,9 @@ set -euo pipefail
 base_branch=${BASE_BRANCH:-main}
 head=$(git rev-parse -q --verify "origin/$base_branch" || git rev-parse HEAD)
 
-last=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+# The last release, not a candidate: the glob also matches v1.2.3-rc1, which sorts above v1.2.2, and
+# a candidate tagged on main's head would read as "nothing merged since".
+last=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | head -n1)
 if [[ -z $last ]]; then
 	echo "no version tag to bump from: tag a first release (v0.1.0) by hand" >&2
 	exit 1
