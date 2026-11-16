@@ -46,6 +46,7 @@ const publish = @import("publish.zig");
 const host_paths = @import("host_paths.zig");
 const native_actions = @import("actions.zig");
 const tarball = @import("tarball.zig");
+const fetch_retry = @import("../dagger/fetch_retry.zig");
 const Exec = @import("../dagger/Exec.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
 const SpanDemux = @import("../dagger/JobLog.zig").SpanDemux;
@@ -2667,7 +2668,7 @@ pub const host_id = "host:";
 /// checked out with its `.git` and no refs (the step's script adds them, `checkout.refCommands`)
 /// and every file at `checkout.mtime`. Its output is not the step's, as Dagger's fetch is not:
 /// on failure the step says why.
-pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetched {
+pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout, num: u32) !dagger.Fetched {
     const arena = b.arena;
     var f = try checkout.describe(arena, x.job.*, co);
     f.fetched_with = "git in the job's image";
@@ -2675,7 +2676,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
         f.result = .{ .failed = "no repository to check out (the job has no github.repository)" };
         return f;
     }
-    if (b.no_git) return b.fetchCheckoutTarball(x, co, f);
+    if (b.no_git) return b.fetchCheckoutTarball(x, co, f, num);
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.writeAll("set -e\nmkdir -p ");
@@ -2767,15 +2768,28 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
         f.result = .{ .dir = "native" };
         return f;
     }
+    // A network failure is tried again (`fetch_retry.zig`) from a clean layer: the failed
+    // attempt's, with its half-made clone, is dropped first. The whole script runs again, so a
+    // failed submodule or tags fetch is one too.
+    var retry = x.checkoutRetry(num, b.fetch_backoff_ms);
     var out: Captured = .{ .arena = arena };
-    const ended = try b.exec(
-        aw.written(),
-        env,
-        &.{native_actions.git_config_file},
-        b.uid,
-        b.gid,
-        out.output(),
-    );
+    var ended: sandbox.Ended = undefined;
+    while (true) {
+        out = .{ .arena = arena };
+        ended = try b.exec(
+            aw.written(),
+            env,
+            &.{native_actions.git_config_file},
+            b.uid,
+            b.gid,
+            out.output(),
+        );
+        if (ended.code == 0 and ended.failure.len == 0 and !ended.killed) break;
+        if (ended.killed or gitMissing(ended, &out)) break;
+        const said = if (ended.failure.len > 0) ended.failure else out.text.items;
+        if (!try retry.again(arena, try std.fmt.allocPrint(arena, "{s}@{s}", .{ f.repo, f.ref_label }), said, fetch_retry.transientText(said))) break;
+        b.dropTop();
+    }
     if (ended.code == 0 and ended.failure.len == 0 and !ended.killed) {
         if (claim.key) |k| try b.publishTop(k, .fetch, .{ .log = "", .fc = "" });
         f.result = .{ .dir = "native" };
@@ -2785,7 +2799,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     if (gitMissing(ended, &out)) {
         b.dropTop();
         b.no_git = true;
-        return b.fetchCheckoutTarball(x, co, f);
+        return b.fetchCheckoutTarball(x, co, f, num);
     }
     // The sandbox's own failure fails the step, as a fetch Dagger could not make does.
     const why = if (ended.failure.len > 0) ended.failure else out.tail();
@@ -2820,7 +2834,7 @@ pub fn gitMissing(ended: sandbox.Ended, out: *const Captured) bool {
 /// The built-in checkout in an image with no git (`tarball.zig`): the repository's tarball from
 /// GitHub's API with the job's token, extracted by the image's `tar`. A tree with no `.git`, as
 /// actions/checkout leaves it without git; what needs one (submodules) fails the step and says so.
-fn fetchCheckoutTarball(b: *Backend, x: *Exec, co: job_mod.Checkout, f_in: dagger.Fetched) !dagger.Fetched {
+fn fetchCheckoutTarball(b: *Backend, x: *Exec, co: job_mod.Checkout, f_in: dagger.Fetched, num: u32) !dagger.Fetched {
     const arena = b.arena;
     var f = f_in;
     f.fetched_with = "the repository's tarball (the job's image has no git)";
@@ -2836,7 +2850,8 @@ fn fetchCheckoutTarball(b: *Backend, x: *Exec, co: job_mod.Checkout, f_in: dagge
         return f;
     }
     const token: ?[]const u8 = if (x.gitAuth()) |id| plaintext(x, id) else null;
-    const src = try tarball.checkoutSource(arena, x.job.github.server_url, f.repo, f.want, token);
+    var src = try tarball.checkoutSource(arena, x.job.github.server_url, f.repo, f.want, token);
+    src.backoff_ms = b.fetch_backoff_ms;
     const script = try tarball.extractScript(arena, f.mount);
     // A commit is the same tree every time, so a step under caching like any other; a branch moves.
     const key = if (checkout.isSha(f.want))
@@ -2855,17 +2870,20 @@ fn fetchCheckoutTarball(b: *Backend, x: *Exec, co: job_mod.Checkout, f_in: dagge
         f.result = .{ .dir = "native" };
         return f;
     }
-    const got = try tarball.fetchInto(b, f.mount, src, if (checkout.isSha(f.want)) f.want else null, b.uid, b.gid);
-    switch (got) {
+    var retry = x.checkoutRetry(num, b.fetch_backoff_ms);
+    while (true) switch (try tarball.fetchInto(b, f.mount, src, if (checkout.isSha(f.want)) f.want else null, b.uid, b.gid)) {
         .sha => {
             if (claim.key) |k| try b.publishTop(k, .fetch, .{ .log = "", .fc = "" });
             f.result = .{ .dir = "native" };
+            break;
         },
         .failed => |why| {
             const msg = x.sh.redacted(arena, why) catch why;
+            if (try retry.again(arena, try std.fmt.allocPrint(arena, "{s}@{s}", .{ f.repo, f.ref_label }), msg, fetch_retry.transientDownload(msg))) continue;
             f.result = .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}@{s}: {s}", .{ f.repo, f.ref_label, msg }) };
+            break;
         },
-    }
+    };
     return f;
 }
 

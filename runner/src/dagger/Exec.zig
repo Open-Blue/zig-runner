@@ -1144,6 +1144,21 @@ pub const hashFiles = @import("hash_files.zig").hashFiles;
 pub const hashListed = @import("hash_files.zig").hashListed;
 
 /// A line of the job's "Set up job" log (step 0).
+/// The attempts of the checkout at step `num` (`fetch_retry.Retrying`): warned in its log, ended by
+/// the job's cancel.
+pub fn checkoutRetry(x: *Exec, num: u32, base_ms: i64) @import("fetch_retry.zig").Retrying {
+    return .{
+        .at = .{
+            .io = x.io,
+            .cancel = if (x.watch) |w| if (w.cancel) |c| &c.requested else null else null,
+            .base_ms = base_ms,
+            .kind = "repository",
+        },
+        .sh = x.sh,
+        .num = num,
+    };
+}
+
 pub fn setUpLine(x: *Exec, line: []const u8) void {
     x.sh.append(0, line);
 }

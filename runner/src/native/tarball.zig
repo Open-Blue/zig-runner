@@ -596,6 +596,8 @@ const TestServer = struct {
         var wb: [64 * 1024]u8 = undefined;
         var w = conn.writer(io, &wb);
         const out = &w.interface;
+        if ((std.mem.eql(u8, path, s.archive_path) or (s.api_path.len > 0 and std.mem.eql(u8, path, s.api_path))) and
+            s.drop_seen.fetchAdd(1, .acq_rel) < s.drop_first) return false;
         if (std.mem.eql(u8, path, s.api_path)) {
             @memcpy(s.api_auth[0..auth.len], auth);
             s.api_auth_len.store(auth.len, .release);
@@ -615,7 +617,6 @@ const TestServer = struct {
                 return reply(out, s.flaky_status, s.flaky_extra, "busy");
             return reply(out, "200 OK", "", s.body);
         }
-        if (std.mem.eql(u8, path, s.archive_path) and s.drop_seen.fetchAdd(1, .acq_rel) < s.drop_first) return false;
         if (std.mem.eql(u8, path, s.archive_path) or (s.archive_path2.len > 0 and std.mem.eql(u8, path, s.archive_path2))) {
             if (auth.len > 0) s.cdn_saw_auth.store(true, .release);
             return reply(out, "200 OK", "", s.body);
@@ -1127,7 +1128,7 @@ test "an action pinned to a commit the archive is not: the step says both" {
     try std.testing.expect(std.mem.indexOf(u8, text, ar.sha) != null);
 }
 
-test "an action fetch over the tarball whose connection is dropped every time once is tried again, and the job runs" {
+test "fetch retry: an action fetch over the tarball whose connection is dropped every time once is tried again, and the job runs" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -1165,7 +1166,7 @@ test "an action fetch over the tarball whose connection is dropped every time on
     try std.testing.expect(std.mem.indexOf(u8, text, "composite-ran") != null);
 }
 
-test "an action fetch over the tarball that gets a 404 is not tried again" {
+test "fetch retry: an action fetch over the tarball that gets a 404 is not tried again" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -1195,4 +1196,42 @@ test "an action fetch over the tarball that gets a 404 is not tried again" {
     try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.acquire));
     try std.testing.expect(std.mem.indexOf(u8, text, "Failed to fetch action") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "HTTP 404") != null);
+}
+
+test "fetch retry: a checkout over the tarball whose connection is dropped every time once is tried again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    const ar = try testArchive(arena, &tmp);
+    try tmp.dir.writeFile(io, .{ .sub_path = "nogit.sh", .data = "#!/bin/sh\necho \"sh: 1: git: not found\" >&2\nexit 127\n", .flags = .{ .permissions = .fromMode(0o755) } });
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{
+        .host = try std.fmt.allocPrint(arena, "{s}/nogit.sh", .{ar.root}),
+        .at = "/usr/bin/git",
+    }} });
+    var srv: TestServer = .{
+        .api_path = try std.fmt.allocPrint(arena, "/api/v3/repos/o/r/tarball/{s}", .{ar.sha}),
+        .body = ar.tgz,
+        .drop_first = http.staleRetries(null) + 1,
+    };
+    try srv.start();
+    defer srv.stop();
+    var co = testStep("");
+    co.name = "checkout";
+    co.action = .{ .checkout = &.{.{ .name = "ref", .value = .{ .lit = ar.sha } }} };
+    var env: std.process.Environ.Map = .init(arena);
+    var w: Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    var job = testJob(&.{co});
+    job.github.server_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port});
+    job.secret_vars = &.{.{ .name = "GITHUB_TOKEN", .value = "tok-123" }};
+    const res = try dagger.run(arena, io, &env, .{ .native = cfg, .step_user = .root, .gpa = std.testing.allocator }, job, &log);
+    errdefer std.debug.print("{s}\n", .{w.written()});
+    try expectSucceeded(res, w.written(), 1);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.written(), "##[warning]Failed to fetch repository 'o/r@"));
+    try std.testing.expect(std.mem.indexOf(u8, w.written(), "tok-123") == null);
 }
