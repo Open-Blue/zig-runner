@@ -529,6 +529,10 @@ const TestServer = struct {
     flaky_extra: []const u8 = "",
     flaky_fails: u32 = 0,
     flaky_seen: std.atomic.Value(u32) = .init(0),
+    /// The first `drop_first` requests for `archive_path` are closed with no answer at all, as a
+    /// connection that a network resets.
+    drop_first: u32 = 0,
+    drop_seen: std.atomic.Value(u32) = .init(0),
 
     fn start(s: *TestServer) !void {
         const io = std.testing.io;
@@ -611,6 +615,7 @@ const TestServer = struct {
                 return reply(out, s.flaky_status, s.flaky_extra, "busy");
             return reply(out, "200 OK", "", s.body);
         }
+        if (std.mem.eql(u8, path, s.archive_path) and s.drop_seen.fetchAdd(1, .acq_rel) < s.drop_first) return false;
         if (std.mem.eql(u8, path, s.archive_path) or (s.archive_path2.len > 0 and std.mem.eql(u8, path, s.archive_path2))) {
             if (auth.len > 0) s.cdn_saw_auth.store(true, .release);
             return reply(out, "200 OK", "", s.body);
@@ -1120,4 +1125,74 @@ test "an action pinned to a commit the archive is not: the step says both" {
     const text = w.written();
     try std.testing.expect(std.mem.indexOf(u8, text, asked) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, ar.sha) != null);
+}
+
+test "an action fetch over the tarball whose connection is dropped every time once is tried again, and the job runs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    const ar = try testArchiveOf(arena, &tmp, "printf 'runs:\\n  using: composite\\n  steps:\\n" ++
+        "    - shell: bash\\n      run: echo composite-ran\\n' > action.yml");
+    try tmp.dir.writeFile(io, .{ .sub_path = "nogit.sh", .data = "#!/bin/sh\necho \"sh: 1: git: not found\" >&2\nexit 127\n", .flags = .{ .permissions = .fromMode(0o755) } });
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{
+        .host = try std.fmt.allocPrint(arena, "{s}/nogit.sh", .{ar.root}),
+        .at = "/usr/bin/git",
+    }} });
+    var srv: TestServer = .{ .archive_path = "/o/act/archive/v1.tar.gz", .body = ar.tgz, .drop_first = http.staleRetries(null) + 1 };
+    try srv.start();
+    defer srv.stop();
+
+    const steps = [_]job_mod.Step{usesStep("act", "o", "act", "v1", &.{})};
+    var job = testJob(&steps);
+    job.github.server_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port});
+    var env: std.process.Environ.Map = .init(arena);
+    var w: Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, io, &env, .{ .native = cfg, .step_user = .root, .gpa = std.testing.allocator }, job, &log);
+    const text = w.written();
+    errdefer std.debug.print("{s}\n", .{text});
+    try std.testing.expectEqual(dagger.Outcome.success, res.steps[0].outcome);
+    // The first fetch met a connection closed on every try (the client's own stale-connection
+    // retries, `staleRetries`, all spent); the second got the archive.
+    try std.testing.expectEqual(http.staleRetries(null) + 2, srv.requests.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "##[warning]Failed to fetch action 'o/act@v1' (attempt 1 of 5): could not download "));
+    try std.testing.expect(std.mem.indexOf(u8, text, "Download action repository 'o/act@v1' (SHA:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "composite-ran") != null);
+}
+
+test "an action fetch over the tarball that gets a 404 is not tried again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    try tmp.dir.writeFile(io, .{ .sub_path = "nogit.sh", .data = "#!/bin/sh\necho \"sh: 1: git: not found\" >&2\nexit 127\n", .flags = .{ .permissions = .fromMode(0o755) } });
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{
+        .host = try std.fmt.allocPrint(arena, "{s}/nogit.sh", .{try tmp.dir.realPathFileAlloc(io, ".", arena)}),
+        .at = "/usr/bin/git",
+    }} });
+    var srv: TestServer = .{ .body = "" };
+    try srv.start();
+    defer srv.stop();
+    const steps = [_]job_mod.Step{usesStep("act", "o", "act", "v1", &.{})};
+    var job = testJob(&steps);
+    job.github.server_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port});
+    var env: std.process.Environ.Map = .init(arena);
+    var w: Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, io, &env, .{ .native = cfg, .step_user = .root, .gpa = std.testing.allocator }, job, &log);
+    const text = w.written();
+    errdefer std.debug.print("{s}\n", .{text});
+    try std.testing.expect(!res.succeeded and res.set_up_failed);
+    try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.acquire));
+    try std.testing.expect(std.mem.indexOf(u8, text, "Failed to fetch action") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "HTTP 404") != null);
 }

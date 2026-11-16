@@ -2607,7 +2607,16 @@ taken from the store like a step's layer, and the base and the steps above it ke
 from job to job. If one is something native cannot run yet (below), the job goes to Dagger with
 the reason (`error.NativeToDagger`), and Dagger fetches again; otherwise "Set up job" takes them from the Backend (`Exec.loadAction`) and
 logs "Download action repository ... (SHA:...)" as on Dagger. An action that cannot be fetched
-is not a reason: native "Set up job" fails with it, as Dagger's does. Native runs Docker actions
+is not a reason: native "Set up job" fails with it, as Dagger's does. A fetch that fails on the network is
+tried again first (`dagger/fetch_retry.zig`, the Dagger path's `fetchAction` too, and the tarball path below): a lookup
+that fails (`Could not resolve host`), a refused or reset connection, a timeout, a TLS failure, a 5xx or a 429. Up to 5
+attempts, waiting 4, 8, 16 and 32 s between them, each a random half to all of that, so 30 to 60 s of waiting in all:
+actions/runner (`ActionManager.cs`, `DownloadRepositoryArchive`) tries 3 times, 10 to 30 s apart, any error but a 404 or
+an access denial, and a cancel ends its waiting too. A missing repository or ref, refused credentials and an exhausted
+15 minutes are not retried. Each retry is a `##[warning]Failed to fetch action '<owner>/<repo>@<ref>' (attempt N of 5): <the
+last line git said>. Retrying in S seconds.` in "Set up job", where the actions are downloaded (also when the fetch then fails for good); a failed attempt's layer, with its half-made `.git`, is dropped before the next. The job's cancel (or
+`timeout-minutes`) ends the waiting. The checkout step's own git and a service image's pull are not retried this way.
+Native runs Docker actions
 (a `docker://` image, or built from the Dockerfile in the fetched tree, the context opened
 through no symlink) and composite actions (their steps are the shared code's: scripts, nested
 `uses:`, nested checkouts through `Backend.fetchCheckout`, `docker://` steps). In a container,

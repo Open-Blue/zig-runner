@@ -119,11 +119,17 @@ runtime_path: ?[]const u8 = null,
 timings: phases.Phases = .{},
 /// What "Set up job" says of the image and its provisioning, the job's cgroup and its caches.
 notes: std.ArrayList([]const u8) = .empty,
+/// The warnings of the action fetches that were tried again (`fetch_retry.zig`), logged by "Set up
+/// job" where the actions are downloaded.
+fetch_notes: std.ArrayList([]const u8) = .empty,
 /// Remote actions fetched before "Set up job" (`actions.preload`), by `Exec.loadAction`'s key.
 actions: std.StringHashMapUnmanaged(Exec.LoadResult) = .empty,
 /// The trees of those actions that are in a layer of the job (`actions.fetch`), by server,
 /// repository and ref: another action of the same tree (a directory of it) is read from there.
 fetched_trees: std.StringHashMapUnmanaged(FetchedTree) = .empty,
+/// The first wait before an action's fetch is tried again after a network failure
+/// (`dagger/fetch_retry.zig`), doubled for each retry; a test's is a millisecond.
+fetch_backoff_ms: i64 = @import("../dagger/fetch_retry.zig").default_base_ms,
 /// The JavaScript runtime JavaScript actions run with (`Options.js_runtime`, `actions.preload`).
 js_runtime: config.JsRuntime = .bun,
 /// This runner has no Dagger engine to send a job to (`Options.engineless`): what native cannot
@@ -300,6 +306,8 @@ pub const Config = struct {
     /// How long a tag's last known digest covers a registry that cannot answer
     /// (`RUNNER_IMAGE_TAG_MAX_STALE`); `oci.tag_max_stale_s` takes it when the backend starts.
     image_tag_max_stale_s: u32 = oci.default_tag_max_stale_s,
+    /// Tests: the first wait before an action's fetch is tried again (`Backend.fetch_backoff_ms`).
+    fetch_backoff_ms: i64 = @import("../dagger/fetch_retry.zig").default_base_ms,
     /// Where jobs' layers live while they run, and pulled images and provisioned rootfs
     /// (`RUNNER_NATIVE_STORE`).
     store: []const u8 = "",
@@ -1024,6 +1032,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .provisioned_image = cfg.provisioned_image,
         .provisioned_pins = cfg.provisioned_pins,
         .image_tag_ttl_s = cfg.image_tag_ttl_s,
+        .fetch_backoff_ms = cfg.fetch_backoff_ms,
         .binds = cfg.binds,
         .lock = lock,
         .how = how,

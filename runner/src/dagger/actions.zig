@@ -13,6 +13,7 @@ const Exec = @import("Exec.zig");
 const SecretRef = @import("../dagger.zig").SecretRef;
 const run = @import("../dagger.zig").run;
 const gql = @import("../dagger.zig").gql;
+const fetch_retry = @import("fetch_retry.zig");
 const jsonFind = @import("../dagger.zig").jsonFind;
 const jsonFindString = @import("../dagger.zig").jsonFindString;
 const splitEnv = @import("../dagger.zig").splitEnv;
@@ -1102,8 +1103,23 @@ pub fn fetchAction(x: *Exec, u: job_mod.Uses) !LoadResult {
     const own_repo = from.token;
     var msg: []const u8 = "";
     const tree_query = try x.actionTreeQuery(u, from, own_repo);
-    const data = gql(arena, x.transport, tree_query, &msg) catch
-        return .{ .unresolved = try unresolvedMessage(arena, u, msg, own_repo) };
+    // The engine's git failing on the network (a lookup, a connection) is tried again
+    // (`fetch_retry.zig`); a missing repository or version is the answer at once.
+    var at: fetch_retry.Attempts = .{
+        .io = x.io,
+        .cancel = if (x.watch) |w| if (w.cancel) |c| &c.requested else null else null,
+        .base_ms = x.fetch_backoff_ms,
+    };
+    const data = while (true) {
+        msg = "";
+        break gql(arena, x.transport, tree_query, &msg) catch |e| {
+            if (e == error.DaggerQueryFailed and try at.again(arena, ref_label, msg, fetch_retry.transientText(msg))) {
+                x.setUpLine(at.said);
+                continue;
+            }
+            return .{ .unresolved = try unresolvedMessage(arena, u, msg, own_repo) };
+        };
+    };
     const dir = jsonFindString(data, "id") orelse
         return loadFailed(arena, "could not fetch {s}: Dagger returned no tree", .{ref_label});
     const name = actionFileName(data) orelse
@@ -1909,4 +1925,56 @@ test "a pre-if that cannot be evaluated fails the pre and the job, at the top or
         try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]o/js@v1: could not " ++
             "evaluate the pre-if 'fromJSON('{')'") != null);
     }
+}
+
+test "an action fetch on Dagger that fails on the network is tried again; a missing repository is not" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const dns = "{\"errors\":[{\"message\":\"git error: failed to fetch remote https://github.com/o/act: " ++
+        "Could not resolve host: github.com\"}]}";
+    const yml = "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo hi\n";
+    const steps = [_]job_mod.Step{usesStep("act", "o", "act", "v1", &.{})};
+
+    // Two failures, then the tree: two warnings with the error, and the action downloaded.
+    const answers = [_][]const u8{
+        base_answer,
+        dns,
+        dns,
+        try treeAnswer(arena, "DL", &.{"action.yml"}),
+        try fileAnswer(arena, yml),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [16384]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    _ = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+        .test_fetch_backoff_ms = 1,
+    }, testJob(&steps), &log);
+    const out = w.buffered();
+    errdefer std.debug.print("{s}\n", .{out});
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "##[warning]Failed to fetch action 'o/act@v1' (attempt "));
+    try std.testing.expect(std.mem.indexOf(u8, out, "Could not resolve host: github.com. Retrying in ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Download action repository 'o/act@v1'") != null);
+
+    // Not there: one query, the answer.
+    const gone = [_][]const u8{
+        base_answer,
+        "{\"errors\":[{\"message\":\"git error: git authentication failed\"}]}",
+    };
+    var fake2: FakeSession = .{ .answers = &gone, .arena = arena };
+    var buf2: [8192]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    var log2: sink.LogSink = .{ .stdout = .{ .writer = &w2 } };
+    const res2 = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake2.transport(),
+        .test_fetch_backoff_ms = 1,
+    }, testJob(&steps), &log2);
+    try std.testing.expect(res2.set_up_failed);
+    try std.testing.expectEqual(@as(usize, 2), fake2.seen.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "Failed to fetch action") == null);
 }
