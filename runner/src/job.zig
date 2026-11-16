@@ -92,6 +92,8 @@ pub const Uses = struct {
     }
 };
 
+pub const Forge = enum { github, gitea, forgejo };
+
 pub const Source = enum {
     /// `owner/repo@ref`: the instance's default actions URL, or the job's server on GitHub.
     default,
@@ -111,7 +113,50 @@ pub const Resolved = struct {
     repository: []const u8,
     ref: []const u8,
     token: bool,
+
+    /// Why this cannot be fetched, or null. The owner, the name and the ref go into a URL, a
+    /// directory name in the job's image and git's command line, from a workflow anyone who can
+    /// push may write: nothing that moves a path (`..`), starts an option (`-`) or is not what a
+    /// git ref and a repository's names are made of is let through, whatever the source.
+    pub fn problem(r: Resolved) ?[]const u8 {
+        var parts = std.mem.splitScalar(u8, r.repository, '/');
+        const owner = parts.next() orelse "";
+        const name = parts.next() orelse "";
+        if (parts.next() != null or !validName(owner) or !validName(name))
+            return "the repository is not `owner/name` with letters, digits, `-`, `_` and `.`";
+        return refProblem(r.ref);
+    }
 };
+
+/// A repository's owner or name: what Gitea's `usesNameRegex` takes (`^[-.\w]*[-\w][-.\w]*$`), so
+/// never empty, `.` or `..`.
+pub fn validName(s: []const u8) bool {
+    var real = false;
+    for (s) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_') {
+            real = true;
+        } else if (c != '.') return false;
+    }
+    return real;
+}
+
+/// Why `ref` is not one a branch, a tag or a commit can be fetched by, or null: letters, digits and
+/// `-_./+@`, no leading `-` (git would read an option), no `..`, no empty, `.` or `..` segment.
+pub fn refProblem(ref: []const u8) ?[]const u8 {
+    if (ref.len == 0) return "the ref is empty";
+    if (ref[0] == '-') return "the ref starts with `-`";
+    for (ref) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "-_./+@", c) != null))
+            return "the ref has a character no git ref name needs";
+    }
+    var it = std.mem.splitScalar(u8, ref, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, ".."))
+            return "the ref has an empty, `.` or `..` path segment";
+    }
+    if (std.mem.indexOf(u8, ref, "..") != null) return "the ref has `..`";
+    return null;
+}
 
 /// Supported inputs of actions/checkout. Anything else makes the step unsupported.
 pub const Checkout = struct {
@@ -208,14 +253,15 @@ pub const Job = struct {
     runtime: Runtime = .{},
     steps: []const Step,
 
-    /// What git over HTTPS to the job's server authenticates with: the job's `GITHUB_TOKEN`, else
-    /// its job token. On GitHub they are one token; on Gitea and Forgejo the job token is the
-    /// runtime token (for the artifact and cache services), which git refuses, and the secret
-    /// `GITHUB_TOKEN` is the task's token for the repository.
+    /// What git over HTTPS to the job's server authenticates with: the job's `GITHUB_TOKEN`, else,
+    /// on GitHub, its job token (one token). On Gitea and Forgejo the job token is the runtime
+    /// token (for the artifact and cache services), which git refuses: the secret `GITHUB_TOKEN`
+    /// is the task's token for the repository, and with none there is no token ("").
     pub fn gitToken(job: Job) []const u8 {
         for (job.secret_vars) |sv|
             if (std.mem.eql(u8, sv.name, "GITHUB_TOKEN") and sv.value.len > 0) return sv.value;
-        return job.job_token;
+        // Not the runtime token of a Gitea or Forgejo task: git would be refused with it.
+        return if (job.github.forge == .github) job.job_token else "";
     }
 };
 
@@ -261,6 +307,9 @@ pub const Github = struct {
     /// Where an action named `owner/repo@ref` is fetched from, when that is not `server_url`
     /// (Gitea's `DEFAULT_ACTIONS_URL`, #520 G5).
     actions_url: []const u8 = "",
+    /// Which software sent the job; what a Gitea or Forgejo job's git and variables are
+    /// (docs/GITEA.md).
+    forge: Forge = .github,
     /// For the `runs` and `jobs` rows.
     run_id: []const u8 = "",
     workflow: []const u8 = "",
@@ -1192,6 +1241,34 @@ test "Job.gitToken: the job's GITHUB_TOKEN secret, else its job token" {
     try std.testing.expectEqualStrings("task-token", job.gitToken());
     job.secret_vars = &.{.{ .name = "GITHUB_TOKEN", .value = "" }};
     try std.testing.expectEqualStrings("runtime", job.gitToken());
+    // Not on Gitea or Forgejo, where the job token is the runtime token and git refuses it.
+    job.github.forge = .gitea;
+    try std.testing.expectEqualStrings("", job.gitToken());
+    job.secret_vars = &.{.{ .name = "GITHUB_TOKEN", .value = "task-token" }};
+    try std.testing.expectEqualStrings("task-token", job.gitToken());
+}
+
+test "Resolved.problem: names and refs that move a path or start an option are refused" {
+    const ok: Resolved = .{ .server = "s", .repository = "o/r", .ref = "v1.2", .token = false };
+    try std.testing.expect(ok.problem() == null);
+    for ([_][]const u8{ "main", "release/v1", "refs/pull/7/merge", "0123456789012345678901234567890123456789", "v1.0+b", "a@b" }) |ref| {
+        var r = ok;
+        r.ref = ref;
+        try std.testing.expect(r.problem() == null);
+    }
+    for ([_][]const u8{ "", "..", "../..", "../../..", "a/../b", "-x", "--upload-pack=touch /x", "a b", "a;b", "a\nb", "/a", "a//b", "a/./b", "a..b", "x$(y)", "a:b" }) |ref| {
+        var r = ok;
+        r.ref = ref;
+        try std.testing.expect(r.problem() != null);
+    }
+    for ([_][]const u8{ "o", "o/", "/r", "../r", "o/..", "./r", "o/r/x", "o/r r", "o/ r", ".." }) |repo| {
+        var r = ok;
+        r.repository = repo;
+        try std.testing.expect(r.problem() != null);
+    }
+    var dotted = ok;
+    dotted.repository = "owner/.repo-x.y";
+    try std.testing.expect(dotted.problem() == null);
 }
 
 test "Uses.resolve: the default is the actions URL or the server, GitHub's token only for the job's repository" {

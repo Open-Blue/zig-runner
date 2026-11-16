@@ -121,6 +121,9 @@ timings: phases.Phases = .{},
 notes: std.ArrayList([]const u8) = .empty,
 /// Remote actions fetched before "Set up job" (`actions.preload`), by `Exec.loadAction`'s key.
 actions: std.StringHashMapUnmanaged(Exec.LoadResult) = .empty,
+/// The trees of those actions that are in a layer of the job (`actions.fetch`), by server,
+/// repository and ref: another action of the same tree (a directory of it) is read from there.
+fetched_trees: std.StringHashMapUnmanaged(FetchedTree) = .empty,
 /// The JavaScript runtime JavaScript actions run with (`Options.js_runtime`, `actions.preload`).
 js_runtime: config.JsRuntime = .bun,
 /// This runner has no Dagger engine to send a job to (`Options.engineless`): what native cannot
@@ -2485,6 +2488,9 @@ pub const Warm = struct {
     as_runner: bool,
     seeds: []const config.ZigSeed = &.{},
 };
+
+/// Where a fetched action's repository is: the layer whose directory holds it, and its commit.
+pub const FetchedTree = struct { layer: []const u8, sha: []const u8 };
 
 /// What `warm` found and what it made, in milliseconds each.
 pub const Warmed = struct {

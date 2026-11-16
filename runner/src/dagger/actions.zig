@@ -1093,6 +1093,11 @@ pub fn fetchAction(x: *Exec, u: job_mod.Uses) !LoadResult {
     const repository = from.repository;
     const sub = if (u.path.len > 0) try std.fmt.allocPrint(arena, "/{s}", .{u.path}) else "";
     const ref_label = try std.fmt.allocPrint(arena, "{s}{s}@{s}", .{ repository, sub, from.ref });
+    if (from.problem()) |why| return .{ .unresolved = try std.fmt.allocPrint(
+        arena,
+        "Unable to resolve action `{s}`: {s}",
+        .{ ref_label, why },
+    ) };
     // GITHUB_TOKEN reads only the job's own repository; other actions are fetched anonymously.
     const own_repo = from.token;
     var msg: []const u8 = "";
