@@ -176,16 +176,17 @@ IN
 			sleep 1
 		done
 		((rid > before)) || { echo "forge-live: $w: no run appeared" >&2 && failed=1 && continue; }
+		# Gitea says `completed` and the conclusion; Forgejo, the conclusion as the status.
 		state=""
-		for _ in $(seq 300); do
-			state=$(api "$url/api/v1/repos/zradmin/main/actions/runs/$rid" | python3 -I -c 'import json,sys; r=json.load(sys.stdin); print(r["status"], r.get("conclusion",""))')
-			case $state in completed*) break ;; esac
+		for _ in $(seq 150); do
+			state=$(api "$url/api/v1/repos/zradmin/main/actions/runs/$rid" | python3 -I -c 'import json,sys; r=json.load(sys.stdin); s=r["status"]; print((r.get("conclusion") or "") if s == "completed" else s)')
+			case $state in success | failure | cancelled | skipped) break ;; esac
 			sleep 2
 		done
 		want=success
 		[[ $w == features ]] && want=failure # its last step fails on purpose
-		echo "forge-live: $forge $w: $state (wanted $want)"
-		[[ $state == "completed $want" ]] || failed=1
+		echo "forge-live: $forge $w: ${state:-no result} (wanted $want)"
+		[[ $state == "$want" ]] || failed=1
 	done
 	cp "$out/runner.log" "$out/runner.log.keep" 2>/dev/null || true
 	if ((failed)); then
