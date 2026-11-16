@@ -70,6 +70,8 @@ const BuildError = error{ Bad, OutOfMemory };
 const Builder = struct {
     arena: Allocator,
     why: []const u8 = "",
+    /// The task's `github.server_url`, which an action named by that same server is fetched from.
+    server: []const u8 = "",
 
     fn bad(b: *Builder, comptime fmt: []const u8, args: anytype) BuildError {
         b.why = try std.fmt.allocPrint(b.arena, fmt, args);
@@ -85,6 +87,7 @@ const Builder = struct {
                 @errorName(e), diag.line, diag.message,
             }),
         };
+        b.server = contextString(t.context, "server_url");
         const jobs = doc.get("jobs") orelse return b.bad("the workflow has no jobs", .{});
         if (jobs != .map or jobs.map.len != 1) return b.bad(
             "a task is one job, and this has {d}",
@@ -428,31 +431,83 @@ const Builder = struct {
             ) };
             return .{ .uses = .{ .owner = "", .name = "", .path = dir, .ref = "", .inputs = inputs, .local = true } };
         }
-        // Gitea's `$/path`, `self:owner/repo@ref` and `https://host/owner/repo@ref` name where the
-        // action is fetched from, which `job.Uses` cannot say: that is G5.
-        if (std.mem.startsWith(u8, text, "$/") or std.mem.startsWith(u8, text, "self:") or
-            std.mem.indexOf(u8, text, "://") != null)
-            return .{ .unsupported = try std.fmt.allocPrint(
-                arena,
-                "uses: {s}: actions named by a URL, self: or $/ are not supported yet (#520, G5)",
-                .{text},
-            ) };
+        // Where the action is fetched from, by Gitea's rules (`model.ParseActionUses`): `$/path` is
+        // the workflow's own repository, `self:` and an absolute URL name the server, and
+        // `owner/repo@ref` is the instance's default actions URL (`github.actions_url`).
         const invalid: job_mod.Action = .{ .unsupported = try std.fmt.allocPrint(
             arena,
             "uses: {s} is not a valid action reference",
             .{text},
         ) };
-        const at = std.mem.indexOfScalar(u8, text, '@') orelse return invalid;
-        const ref = text[at + 1 ..];
-        var parts = std.mem.splitScalar(u8, text[0..at], '/');
+        if (std.mem.startsWith(u8, text, "$/")) {
+            const sub = text["$/".len..];
+            if (std.mem.indexOfScalar(u8, sub, '@') != null) return invalid;
+            const dir = cleanPath(arena, sub) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Invalid => return invalid,
+            };
+            return .{ .uses = .{ .owner = "", .name = "", .path = dir, .ref = "", .inputs = inputs, .source = .workflow_repo } };
+        }
+        var source: job_mod.Source = .default;
+        var url: []const u8 = "";
+        var rest = text;
+        if (std.mem.startsWith(u8, text, "self:")) {
+            source = .instance;
+            rest = text["self:".len..];
+        } else if (std.mem.indexOf(u8, text, "://")) |at| {
+            const scheme = text[0..at];
+            if (std.mem.eql(u8, scheme, "ssh")) return .{ .unsupported = try std.fmt.allocPrint(
+                arena,
+                "uses: {s}: an action cannot be fetched over ssh",
+                .{text},
+            ) };
+            if (!std.mem.eql(u8, scheme, "https") and !std.mem.eql(u8, scheme, "http")) return invalid;
+            const after = text[at + 3 ..];
+            const slash = std.mem.indexOfScalar(u8, after, '/') orelse return invalid;
+            const host = after[0..slash];
+            if (host.len == 0) return invalid;
+            if (std.mem.indexOfScalar(u8, host, '@') != null) return .{ .unsupported = try std.fmt.allocPrint(
+                arena,
+                "uses: {s}: credentials in an action's URL are not used",
+                .{text},
+            ) };
+            url = text[0 .. at + 3 + slash];
+            rest = after[slash + 1 ..];
+            source = .url;
+            if (sameServer(url, b.server)) source = .instance;
+        }
+        const at = std.mem.indexOfScalar(u8, rest, '@') orelse return invalid;
+        const ref = rest[at + 1 ..];
+        var parts = std.mem.splitScalar(u8, rest[0..at], '/');
         const owner = parts.next() orelse "";
         const repo = parts.next() orelse "";
         const dir = std.mem.trim(u8, parts.rest(), "/");
         if (owner.len == 0 or repo.len == 0 or ref.len == 0 or std.mem.indexOf(u8, dir, "..") != null)
             return invalid;
-        if (dir.len == 0 and std.ascii.eqlIgnoreCase(text[0..at], "actions/checkout"))
+        if (source == .default and dir.len == 0 and std.ascii.eqlIgnoreCase(rest[0..at], "actions/checkout"))
             return .{ .checkout = inputs };
-        return .{ .uses = .{ .owner = owner, .name = repo, .path = dir, .ref = ref, .inputs = inputs } };
+        return .{ .uses = .{
+            .owner = owner,
+            .name = repo,
+            .path = dir,
+            .ref = ref,
+            .inputs = inputs,
+            .source = source,
+            .url = if (source == .url) url else "",
+        } };
+    }
+
+    /// `$/path` as Gitea cleans it: no `..`, empty and `.` segments dropped.
+    fn cleanPath(arena: Allocator, sub: []const u8) error{ Invalid, OutOfMemory }![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        var it = std.mem.splitScalar(u8, sub, '/');
+        while (it.next()) |seg| {
+            if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+            if (std.mem.eql(u8, seg, "..")) return error.Invalid;
+            if (out.items.len > 0) try out.append(arena, '/');
+            try out.appendSlice(arena, seg);
+        }
+        return out.items;
     }
 
     /// A `uses:` step's `with:`; empty when it has none.
@@ -623,6 +678,15 @@ fn githubOf(arena: Allocator, context: Value, job_key: []const u8) Allocator.Err
         g.workflow_ref = try std.fmt.allocPrint(arena, "{s}/{s}@{s}", .{ g.repository, g.workflow, g.ref });
     const server = contextString(context, "server_url");
     if (server.len > 0) g.server_url = server;
+    // Where `owner/repo@ref` actions come from (`DEFAULT_ACTIONS_URL`): the instance sends the
+    // URL, or the word `github` or `self` when it is configured so. The instance itself is the
+    // server's own URL, as an action fetched from there is reached like the job's repository.
+    const dflt = contextString(context, "gitea_default_actions_url");
+    if (std.mem.eql(u8, dflt, "github")) {
+        g.actions_url = "https://github.com";
+    } else if (dflt.len > 0 and !std.mem.eql(u8, dflt, "self") and !sameServer(dflt, g.server_url)) {
+        g.actions_url = dflt;
+    }
     g.job = contextString(context, "job");
     if (g.job.len == 0) g.job = job_key;
     if (context == .object) if (context.object.get("run_id")) |v| switch (v) {
@@ -631,6 +695,13 @@ fn githubOf(arena: Allocator, context: Value, job_key: []const u8) Allocator.Err
         else => {},
     };
     return g;
+}
+
+/// Whether two URLs name the same server: scheme, host and port, case aside, a trailing `/` aside.
+fn sameServer(a: []const u8, b: []const u8) bool {
+    const x = std.mem.trimEnd(u8, a, "/");
+    const y = std.mem.trimEnd(u8, b, "/");
+    return std.ascii.eqlIgnoreCase(x, y);
 }
 
 /// Every value that must stay out of the logs: the secrets, the runtime token, and the context's
@@ -785,9 +856,13 @@ fn textTask(arena: Allocator, workflow: []const u8, context_json: []const u8) !t
 }
 
 fn convertText(arena: Allocator, body: []const u8) !Converted {
+    return convertIn(arena, body, "{}");
+}
+
+fn convertIn(arena: Allocator, body: []const u8, context: []const u8) !Converted {
     const text = try std.fmt.allocPrint(arena, "name: t\njobs:\n  j:\n    runs-on: x\n{s}", .{body});
     var why: []const u8 = "";
-    return fromTask(arena, try textTask(arena, text, "{}"), &why);
+    return fromTask(arena, try textTask(arena, text, context), &why);
 }
 
 /// The context `name` of `c`'s job, as an expression value.
@@ -995,6 +1070,69 @@ test "run steps: shell, working directory, step fields and the names GitHub give
     try testing.expectEqualStrings("inputs.limit", s[3].timeout_minutes.?.expr);
 }
 
+test "uses steps: where the action is fetched from (self:, $/, a URL, the default), as model.ParseActionUses reads them" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const c = try convertIn(arena,
+        \\    steps:
+        \\      - uses: self:owner/repo/.gitea/actions/build@main
+        \\      - uses: $/.gitea/actions/build
+        \\      - uses: $//./.gitea//actions/build/
+        \\      - uses: $/
+        \\      - uses: https://code.example.org/owner/repo/sub@v1
+        \\      - uses: http://127.0.0.1:3300/owner/repo@v1
+        \\      - uses: ssh://git@host:2222/owner/repo@v1
+        \\      - uses: https://token@host/owner/repo@v1
+        \\      - uses: $/action@v1
+        \\      - uses: $/../action
+        \\      - uses: self://owner/repo@v1
+        \\      - uses: self:owner/repo
+        \\      - uses: https://host
+        \\      - uses: self:actions/checkout@v4
+    , "{\"server_url\":\"http://127.0.0.1:3300/\"}");
+    const s = c.job.steps;
+    try testing.expectEqual(job_mod.Source.instance, s[0].action.uses.source);
+    try testing.expectEqualStrings(".gitea/actions/build", s[0].action.uses.path);
+    try testing.expectEqualStrings("main", s[0].action.uses.ref);
+    for ([_]usize{ 1, 2 }) |i| {
+        try testing.expectEqual(job_mod.Source.workflow_repo, s[i].action.uses.source);
+        try testing.expectEqualStrings(".gitea/actions/build", s[i].action.uses.path);
+    }
+    try testing.expectEqual(job_mod.Source.workflow_repo, s[3].action.uses.source);
+    try testing.expectEqualStrings("", s[3].action.uses.path);
+    try testing.expectEqual(job_mod.Source.url, s[4].action.uses.source);
+    try testing.expectEqualStrings("https://code.example.org", s[4].action.uses.url);
+    try testing.expectEqualStrings("sub", s[4].action.uses.path);
+    // The task's own server, however written, is the instance (`reach` rewrites it for a job).
+    try testing.expectEqual(job_mod.Source.instance, s[5].action.uses.source);
+    for (s[6..13]) |st| try testing.expect(st.action == .unsupported);
+    try testing.expect(std.mem.indexOf(u8, s[6].action.unsupported, "ssh") != null);
+    try testing.expect(std.mem.indexOf(u8, s[7].action.unsupported, "credentials") != null);
+    // `self:actions/checkout` is that repository's action, not the built-in checkout.
+    try testing.expect(s[13].action == .uses);
+}
+
+test "the default actions URL: the instance's own is the server, another is kept, github and self are named" {
+    var g: job_mod.Github = undefined;
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(testing.allocator);
+    try obj.put(testing.allocator, "server_url", .{ .string = "http://127.0.0.1:3300/" });
+    try obj.put(testing.allocator, "gitea_default_actions_url", .{ .string = "https://data.forgejo.org" });
+    g = try githubOf(testing.allocator, .{ .object = obj }, "j");
+    try testing.expectEqualStrings("https://data.forgejo.org", g.actions_url);
+    for ([_][2][]const u8{
+        .{ "http://127.0.0.1:3300", "" },
+        .{ "self", "" },
+        .{ "github", "https://github.com" },
+        .{ "", "" },
+    }) |case| {
+        try obj.put(testing.allocator, "gitea_default_actions_url", .{ .string = case[0] });
+        g = try githubOf(testing.allocator, .{ .object = obj }, "j");
+        try testing.expectEqualStrings(case[1], g.actions_url);
+    }
+}
+
 test "uses steps: docker, local, remote with a directory, checkout, and what is not supported yet" {
     var a: std.heap.ArenaAllocator = .init(testing.allocator);
     defer a.deinit();
@@ -1049,8 +1187,8 @@ test "uses steps: docker, local, remote with a directory, checkout, and what is 
     try testing.expectEqual(@as(usize, 2), s[4].action.checkout.len);
     try testing.expectEqualStrings("true", s[4].action.checkout[1].value.lit);
 
-    for ([_]usize{ 5, 6, 7, 8, 9, 10, 11 }) |i| try testing.expect(s[i].action == .unsupported);
-    try testing.expect(std.mem.indexOf(u8, s[5].action.unsupported, "G5") != null);
+    try testing.expectEqualStrings("https://github.com", s[5].action.uses.url);
+    for ([_]usize{ 6, 7, 8, 9, 10, 11 }) |i| try testing.expect(s[i].action == .unsupported);
     try testing.expect(std.mem.indexOf(u8, s[6].action.unsupported, "reusable workflow") != null);
     try testing.expect(std.mem.indexOf(u8, s[7].action.unsupported, "not a valid action") != null);
     try testing.expect(std.mem.indexOf(u8, s[8].action.unsupported, "inside the workspace") != null);

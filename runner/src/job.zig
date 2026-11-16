@@ -60,6 +60,57 @@ pub const Uses = struct {
     /// `uses: ./path`: an action in the workflow's own repository, read from the workspace; `path`
     /// is relative to it ("" for its root) and `owner`, `name` and `ref` are empty.
     local: bool = false,
+    /// Which server `owner/name` is fetched from (Gitea's `uses:` forms, #520 G5). GitHub's
+    /// message always has `.default`.
+    source: Source = .default,
+    /// The server's URL for `.url`: `https://host`, as written in `uses:`.
+    url: []const u8 = "",
+
+    /// Where `u` is fetched from for `job`.
+    pub fn resolve(u: Uses, arena: Allocator, job: Job) Allocator.Error!Resolved {
+        const instance = std.mem.trimEnd(u8, job.github.server_url, "/");
+        const repository = try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name });
+        return switch (u.source) {
+            .default => {
+                const server = std.mem.trimEnd(u8, if (job.github.actions_url.len > 0)
+                    job.github.actions_url
+                else
+                    job.github.server_url, "/");
+                // GitHub's token reads only the job's own repository.
+                return .{
+                    .server = server,
+                    .repository = repository,
+                    .ref = u.ref,
+                    .token = std.mem.eql(u8, server, instance) and
+                        std.mem.eql(u8, repository, job.github.repository),
+                };
+            },
+            .url => .{ .server = std.mem.trimEnd(u8, u.url, "/"), .repository = repository, .ref = u.ref, .token = false },
+            .instance => .{ .server = instance, .repository = repository, .ref = u.ref, .token = true },
+            .workflow_repo => .{ .server = instance, .repository = job.github.repository, .ref = job.github.sha, .token = true },
+        };
+    }
+};
+
+pub const Source = enum {
+    /// `owner/repo@ref`: the instance's default actions URL, or the job's server on GitHub.
+    default,
+    /// `https://host/owner/repo@ref`.
+    url,
+    /// `self:owner/repo@ref`: the instance the job runs on.
+    instance,
+    /// `$/path`: the workflow's own repository at the job's commit, whose `owner`, `name` and
+    /// `ref` the job knows, not the step.
+    workflow_repo,
+};
+
+/// Where an action's repository is fetched from, and whether the job's token goes with the fetch.
+pub const Resolved = struct {
+    server: []const u8,
+    /// `owner/name`.
+    repository: []const u8,
+    ref: []const u8,
+    token: bool,
 };
 
 /// Supported inputs of actions/checkout. Anything else makes the step unsupported.
@@ -197,6 +248,9 @@ pub const Github = struct {
     sha: []const u8 = "",
     ref: []const u8 = "",
     server_url: []const u8 = "https://github.com",
+    /// Where an action named `owner/repo@ref` is fetched from, when that is not `server_url`
+    /// (Gitea's `DEFAULT_ACTIONS_URL`, #520 G5).
+    actions_url: []const u8 = "",
     /// For the `runs` and `jobs` rows.
     run_id: []const u8 = "",
     workflow: []const u8 = "",
@@ -1119,6 +1173,38 @@ pub const fixture =
     \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"github.sha"}}]}}
     \\ ]}
 ;
+
+test "Uses.resolve: the default is the actions URL or the server, GitHub's token only for the job's repository" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var job: Job = undefined;
+    job = std.mem.zeroInit(Job, .{});
+    job.github = .{ .repository = "o/r", .sha = "abc", .server_url = "https://git.example.org/" };
+    const own: Uses = .{ .owner = "o", .name = "r", .ref = "v1" };
+    const other: Uses = .{ .owner = "actions", .name = "cache", .ref = "v4" };
+
+    var r = try other.resolve(arena, job);
+    try std.testing.expectEqualStrings("https://git.example.org", r.server);
+    try std.testing.expectEqualStrings("actions/cache", r.repository);
+    try std.testing.expect(!r.token);
+    try std.testing.expect((try own.resolve(arena, job)).token);
+
+    job.github.actions_url = "https://github.com/";
+    r = try other.resolve(arena, job);
+    try std.testing.expectEqualStrings("https://github.com", r.server);
+    try std.testing.expect(!(try own.resolve(arena, job)).token);
+
+    r = try (Uses{ .owner = "x", .name = "y", .ref = "m", .source = .instance }).resolve(arena, job);
+    try std.testing.expectEqualStrings("https://git.example.org", r.server);
+    try std.testing.expect(r.token);
+    r = try (Uses{ .owner = "", .name = "", .ref = "", .path = "a", .source = .workflow_repo }).resolve(arena, job);
+    try std.testing.expectEqualStrings("o/r", r.repository);
+    try std.testing.expectEqualStrings("abc", r.ref);
+    r = try (Uses{ .owner = "x", .name = "y", .ref = "m", .source = .url, .url = "https://h.example/" }).resolve(arena, job);
+    try std.testing.expectEqualStrings("https://h.example", r.server);
+    try std.testing.expect(!r.token);
+}
 
 test "parse job fixture" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
