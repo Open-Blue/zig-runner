@@ -439,12 +439,28 @@ jobs:
           # A tar of executables: already as small as it gets in a few seconds.
           compression-level: 1
 
-      # The Test job's "Every test file is compiled", moved here on the prebuilt path: it compiles
-      # the tests once more and costs the Pi 2.5 min and 3.6 GB of its 4.3. It checks that every
-      # file with tests is listed in main.zig's test block, a fact of the source and not of the CPU,
-      # so it runs natively here (x86_64), as the pull requests' Test job does, and not for aarch64
-      # (which could not run `test_shards --names` on the binary). A failure fails this job, and
-      # with it "Tests (x86_64)" ("The prebuilt tests" step).
+  # The Test job's "Every test file is compiled" (test-files.sh) for the Pi's run: it compiles the
+  # tests once more, which cost the Pi 2.5 min and 3.6 GB of its 4.3. It checks that every file
+  # with tests is listed in main.zig's test block, a fact of the source and not of the CPU, so it
+  # runs natively here (x86_64), as the pull requests' Test job does, and not for aarch64 (whose
+  # binary could not be run here for `test_shards --names`). Beside the prebuild, not after it:
+  # the Test job waits for the longer of the two. Same condition as the prebuild; a failure fails
+  # "Tests (x86_64)" ("The prebuilt tests" step).
+  test-files:
+    name: Every test file is compiled (for the Pi)
+    if: github.event_name == 'push' && contains(vars.PROD_RUNNER, 'self-hosted')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
       - name: Every test file is compiled
         run: .github/scripts/test-files.sh
 
@@ -460,7 +476,7 @@ jobs:
     # After the prebuild, which runs on a push to main when prod is self-hosted and is skipped
     # otherwise: `always` and not the default, so that a skipped prebuild does not skip this job
     # (a skipped required check passes); one that failed or was cancelled fails it, below.
-    needs: prebuild
+    needs: [prebuild, test-files]
     if: ${{ !cancelled() }}
     runs-on: ${{ fromJSON(github.event_name == 'push' && (vars.PROD_RUNNER || '"ubuntu-26.04"') || (vars.PREPROD_RUNNER || '"ubuntu-26.04"')) }}
     timeout-minutes: 30
@@ -512,9 +528,16 @@ jobs:
         if: steps.scope.outputs.run == 'true' && needs.prebuild.result != 'skipped'
         env:
           PREBUILD_RESULT: ${{ needs.prebuild.result }}
+          TEST_FILES_RESULT: ${{ needs.test-files.result }}
         run: |
           if [ "$PREBUILD_RESULT" != success ]; then
-            echo "The prebuild job ended $PREBUILD_RESULT: no tests to run (it compiles them and checks that every test file is listed: see its log)" >&2
+            echo "The prebuild job ended $PREBUILD_RESULT: no tests to run" >&2
+            exit 1
+          fi
+          # It runs beside the prebuild, on the same condition: a result other than success is
+          # a test file that is not listed, or a job that did not finish.
+          if [ "$TEST_FILES_RESULT" != success ]; then
+            echo "The job \"Every test file is compiled (for the Pi)\" ended $TEST_FILES_RESULT: see its log" >&2
             exit 1
           fi
           echo "dir=$RUNNER_TEMP/prebuilt" >>"$GITHUB_OUTPUT"
@@ -659,14 +682,14 @@ jobs:
         working-directory: runner
         run: zig build-exe --dep runner --dep corpus -Mroot=tools/hashfilescorpus.zig -Mrunner=src/hashfiles_corpus.zig -Mcorpus=tools/corpus.zig --name hashfilescorpus -fno-emit-bin
 
-      # Not on the prebuilt path: the prebuild job ran it (natively, on GitHub's runner) and a
-      # failure there fails this job already. Where the Test step compiled for itself (a pull
+      # Not on the prebuilt path: the job "Every test file is compiled (for the Pi)" ran it
+      # (natively, on GitHub's runner) and a failure there fails this job already. Where the Test step compiled for itself (a pull
       # request, the merge queue, a hosted prod, or a failed download) it runs here as before.
       - name: Every test file is compiled
         if: steps.scope.outputs.run == 'true'
         run: |
           if [ "$PREBUILT" = true ]; then
-            echo "Every test file is compiled: checked in the job \"Tests, compiled for the Pi\" (prebuild), not on this runner"
+            echo "Every test file is compiled: checked in the job \"Every test file is compiled (for the Pi)\", not on this runner"
           else
             .github/scripts/test-files.sh
           fi
