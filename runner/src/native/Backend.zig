@@ -153,6 +153,10 @@ etc_binds: []const sandbox.Spec.Bind = &.{},
 docker_api_server: ?*docker_api.Server = null,
 /// Where its socket is, in the job's directory.
 docker_api_path: []const u8 = "",
+/// Where in `notes` the note that the job has the API is, for `dropDockerApi` to take away.
+docker_api_note: usize = 0,
+/// Whether the runner put `DOCKER_HOST` and `DOCKER_BUILDKIT` in the job's env (`baseEnv`).
+docker_env_put: [2]bool = .{ false, false },
 service_binds: []const sandbox.Spec.Bind = &.{},
 /// `Config.images`: the tests' images directory, "" to pull (`pullImage`).
 images_dir: []const u8 = "",
@@ -347,6 +351,8 @@ pub const Config = struct {
     /// `RUNNER_NATIVE_DOCKER_API`: the job gets a Docker-compatible API on a socket in its
     /// directory, bound into its steps (`docker_api.zig`).
     docker_api: bool = false,
+    /// Tests only: how long the job's API holds a request before it routes and counts it.
+    test_docker_api_delay_ms: u32 = 0,
     /// Past this many bytes, the store's least recently used layers go
     /// (`RUNNER_NATIVE_STORE_MAX_MB`, `Store.collect`).
     store_max_bytes: u64 = Store.default_max_bytes,
@@ -625,7 +631,7 @@ pub fn unsupported(io: std.Io, job: job_mod.Job, opts: dagger.Options, cfg: Conf
             .lit => |l| std.mem.eql(u8, dagger.resolveImage(l), dagger.default_image),
             .expr => true,
         };
-        if (container_options.unsupported(jc, opts.provision and default_image, job.services)) |why| return why;
+        if (container_options.unsupportedWith(jc, opts.provision and default_image, job.services, cfg.docker_api)) |why| return why;
     }
     if (job.services.len > 0) if (servicesUnsupported(job, cfg)) |why| return why;
     if (job.container) |jc| if (jc.ports.len > 0 and std.os.linux.geteuid() != 0)
@@ -1063,7 +1069,7 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
     t = phases.now();
     try b.jobCgroup(cfg, cg_parent, &id, why);
     _ = b.timings.since(arena, .cgroup, t);
-    if (cfg.docker_api) try b.startDockerApi(&id);
+    if (cfg.docker_api) try b.startDockerApi(&id, cfg.test_docker_api_delay_ms);
     return b;
 }
 
@@ -1078,11 +1084,12 @@ fn makeEmptyFile(io: std.Io, file: []const u8) !void {
     try cwd.writeFile(io, .{ .sub_path = file, .data = "" });
 }
 
-fn startDockerApi(b: *Backend, id: []const u8) !void {
+fn startDockerApi(b: *Backend, id: []const u8, cfg_delay: u32) !void {
     const path = try std.fmt.allocPrint(b.arena, "{s}/docker.sock", .{b.dir});
     const server = docker_api.Server.start(b.gpa, path, .{
         .job = id,
         .version = build_version.string,
+        .test_route_delay_ms = cfg_delay,
     }) catch |e| {
         try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Docker API: not served to " ++
             "this job (RUNNER_NATIVE_DOCKER_API): the socket {s} could not be made: {t}", .{ path, e }));
@@ -1101,6 +1108,7 @@ fn startDockerApi(b: *Backend, id: []const u8) !void {
     }
     b.docker_api_server = server;
     b.docker_api_path = path;
+    b.docker_api_note = b.notes.items.len;
     b.binds = try std.mem.concat(b.arena, sandbox.Spec.Bind, &.{ b.binds, &.{.{
         .host = path,
         .at = docker_api.socket_at,
@@ -1129,6 +1137,15 @@ fn dropDockerApi(b: *Backend, why: []const u8) !void {
     }
     b.binds = kept[0..n];
     b.docker_api_path = "";
+    // Only the "not served" note stays, and none of the variables the runner put.
+    _ = b.notes.orderedRemove(b.docker_api_note);
+    var i: usize = 0;
+    while (i < b.env.items.len) {
+        const e = b.env.items[i];
+        const ours = (b.docker_env_put[0] and std.mem.eql(u8, e.name, "DOCKER_HOST")) or
+            (b.docker_env_put[1] and std.mem.eql(u8, e.name, "DOCKER_BUILDKIT"));
+        if (ours) _ = b.env.orderedRemove(i) else i += 1;
+    }
     try b.notes.append(b.arena, try std.fmt.allocPrint(b.arena, "Docker API: not served to this " ++
         "job (RUNNER_NATIVE_DOCKER_API): {s}", .{why}));
 }
@@ -1932,8 +1949,14 @@ fn baseEnv(b: *Backend, ev: *Evaluator, plan: anytype) !void {
     // The job's own Docker API (`startDockerApi`): unless the image or the job container's
     // `env:` and `--env` set them, and under the workflow's `env:` below.
     if (b.docker_api_server != null) {
-        if (b.envValue("DOCKER_HOST") == null) try b.put("DOCKER_HOST", docker_api.env_host);
-        if (b.envValue("DOCKER_BUILDKIT") == null) try b.put("DOCKER_BUILDKIT", "0");
+        if (b.envValue("DOCKER_HOST") == null) {
+            try b.put("DOCKER_HOST", docker_api.env_host);
+            b.docker_env_put[0] = true;
+        }
+        if (b.envValue("DOCKER_BUILDKIT") == null) {
+            try b.put("DOCKER_BUILDKIT", "0");
+            b.docker_env_put[1] = true;
+        }
     }
     if (ev.job.container != null) b.runtime_path = b.envValue("PATH");
     b.uid = b.image_uid;
@@ -2104,6 +2127,8 @@ pub fn execScript(
         x.loadPendingMatchers(num);
         // What a step did through the job's Docker API is in no key: it is not stored, and the
         // steps after it run uncached (as after a log too big to store).
+        // The step's processes are gone: what they sent the API is taken in and counted first.
+        if (b.docker_api_server) |s| s.settle();
         const used_api = b.apiBeyond() != api_before;
         if (used_api and x.sh.step_debug) x.sh.append(num, "##[debug]Docker API: this step used the job's " ++
             "API beyond /_ping, /version and /info, so it is not stored for replay");
@@ -3963,6 +3988,12 @@ fn readContainerOptions(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void
         return error.BaseContainerFailed;
     };
     b.container_opts = o;
+    // A `--tmpfs` at or around where the job's Docker API is bound: the job runs without it.
+    if (b.docker_api_server != null) for (o.tmpfs) |fs| for ([_][]const u8{ docker_api.socket_at, "/run/docker.sock" }) |at| {
+        if (b.docker_api_server != null and (container_options.under(fs.target, at) or container_options.under(at, fs.target)))
+            try b.dropDockerApi(try std.fmt.allocPrint(b.arena, "the job container's `--tmpfs` at {s} is at " ++
+                "or around {s}, where the API's socket is bound", .{ fs.target, at }));
+    };
     // A tmpfs and /dev/shm are charged to the memory cgroup of the job; with none, they would pin
     // host memory nobody accounts for (docs/native-backend.md, "Job container options").
     if (b.job_cgroup == null) if (container_options.withoutCgroup(o)) |reason| {
@@ -4297,7 +4328,7 @@ fn containerVolumes(b: *Backend, ev: *Evaluator, err_msg: *[]const u8) !void {
     const jc = ev.job.container orelse return;
     if (jc.volumes.len == 0) return;
     var why: []const u8 = "";
-    const found = container_options.volumes(arena, jc.volumes, &why) catch |e| {
+    const found = container_options.volumesWith(arena, jc.volumes, &why, b.docker_api_server != null) catch |e| {
         err_msg.* = if (why.len > 0) why else @errorName(e);
         return error.BaseContainerFailed;
     };
@@ -12399,7 +12430,7 @@ test "native docker api: with the option off a job has no socket, no DOCKER_HOST
 
 /// A container job whose image has no `/run` and no `/var` (the tests' image), with `env` and
 /// `volumes` as its `container:` gives them, and `steps` run.
-fn runApiContainerJob(arena: Allocator, cfg: Config, script: []const u8, env: []const job_mod.Input, vols: []const job_mod.Template) !struct { ok: bool, text: []const u8 } {
+fn runApiContainerJob(arena: Allocator, cfg: Config, script: []const u8, env: []const job_mod.Input, vols: []const job_mod.Template, options: ?[]const u8) !struct { ok: bool, text: []const u8 } {
     const img = try testregistry.testImage(arena, "test/api", "1", try testImageLayers(arena), "\"PATH=/usr/bin:/bin\"", false);
     var server: testregistry.Server = .{ .routes = img.routes };
     try server.start();
@@ -12410,6 +12441,7 @@ fn runApiContainerJob(arena: Allocator, cfg: Config, script: []const u8, env: []
         .image = .{ .lit = try server.image(arena, "test/api:1") },
         .env = env,
         .volumes = vols,
+        .options = if (options) |o| .{ .lit = o } else null,
     };
     const r = try runVolumeJob(arena, cfg, job, true);
     if (!r.ok) std.debug.print("{s}\n", .{r.text});
@@ -12426,17 +12458,17 @@ test "native docker api: a job container's own DOCKER_HOST wins, and an image wi
     cfg.docker_api = true;
     const own = try runApiContainerJob(arena, cfg, docker_api_probe, &.{
         .{ .name = "DOCKER_HOST", .value = .{ .lit = "tcp://docker:2375" } },
-    }, &.{});
+    }, &.{}, null);
     try std.testing.expect(own.ok);
     // The container's value stays, the one it did not set is the runner's; the socket is there.
     try expectAll(own.text, &.{ "env: DOCKER_HOST=tcp://docker:2375 DOCKER_BUILDKIT=0", "socket: yes", "ping: OK", "writable: run-and-var-run" });
     // Nothing set: both are the runner's.
-    const plain = try runApiContainerJob(arena, cfg, docker_api_probe, &.{}, &.{});
+    const plain = try runApiContainerJob(arena, cfg, docker_api_probe, &.{}, &.{}, null);
     try std.testing.expect(plain.ok);
     try expectAll(plain.text, &.{ "env: DOCKER_HOST=unix:///var/run/docker.sock DOCKER_BUILDKIT=0", "ping: OK", "writable: run-and-var-run" });
 }
 
-test "native docker api: a job container volume around the socket's path gives the job no API, and the job still runs" {
+test "native docker api: a job container volume or --tmpfs around the socket's path gives the job no API, and the job still runs" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -12444,12 +12476,33 @@ test "native docker api: a job container volume around the socket's path gives t
     defer tmp.cleanup();
     var cfg = try testConfig(arena, &tmp);
     cfg.docker_api = true;
-    for ([_][]const u8{ "/var/run", "/var", "/run" }) |target| {
+    const dropped = [_][]const u8{ "socket: no", "env: DOCKER_HOST=unset DOCKER_BUILDKIT=unset", "Docker API: not served to this job" };
+    for ([_][]const u8{ "/var/run", "/var", "/run", "/var/run/docker.sock", "/run/docker.sock" }) |target| {
         errdefer std.debug.print("ERROR volume {s}\n", .{target});
-        const r = try runApiContainerJob(arena, cfg, docker_api_probe, &.{}, &.{.{ .lit = target }});
+        const r = try runApiContainerJob(arena, cfg, docker_api_probe, &.{}, &.{.{ .lit = target }}, null);
         try std.testing.expect(r.ok);
-        try expectAll(r.text, &.{ "socket: no", "env: DOCKER_HOST=unset DOCKER_BUILDKIT=unset", "Docker API: not served to this job" });
+        try expectAll(r.text, &dropped);
+        // Only the note that it is not served: not also that it is.
+        try std.testing.expect(std.mem.indexOf(u8, r.text, "have a Docker-compatible API") == null);
     }
+    for ([_][]const u8{ "/run", "/run/docker.sock" }) |target| {
+        errdefer std.debug.print("ERROR tmpfs {s}\n", .{target});
+        const opt = try std.fmt.allocPrint(arena, "--tmpfs {s}:size=1m", .{target});
+        const r = try runApiContainerJob(arena, cfg, docker_api_probe, &.{}, &.{}, opt);
+        try std.testing.expect(r.ok);
+        try expectAll(r.text, &dropped);
+        try std.testing.expect(std.mem.indexOf(u8, r.text, "have a Docker-compatible API") == null);
+    }
+    // A volume at exactly the socket is a refusal when the option is off, as it was.
+    const img_job = blk: {
+        var job = testJob(&.{testStep("true")});
+        job.container = .{ .name = "", .image = .{ .lit = "x/y:1" }, .volumes = &.{.{ .lit = "/var/run/docker.sock:/var/run/docker.sock" }} };
+        break :blk job;
+    };
+    var off = cfg;
+    off.docker_api = false;
+    try std.testing.expect(unsupported(std.testing.io, img_job, .{ .step_user = .root }, off) != null);
+    try std.testing.expect(unsupported(std.testing.io, img_job, .{ .step_user = .root }, cfg) == null);
 }
 
 /// The job's socket under `store`'s jobs, once there is one: waited for through inotify on the
@@ -12517,9 +12570,9 @@ test "native docker api: while job A is running, job B cannot reach A's socket, 
         \\echo "b-id: $(curl -sS --max-time 10 --unix-socket /var/run/docker.sock http://localhost/info | tr ',' '\n' | grep '"ID"')"
         \\echo "a-visible: $(test -e {s} && echo yes || echo no)"
         \\if curl -sS --max-time 5 --unix-socket {s} http://localhost/_ping >/dev/null 2>&1; then echo "REACHED-""A"; else echo cannot-reach-a; fi
-        \\echo "sockets: $(for s in /var/run/* /run/* /tmp/* /var/tmp/* /*.sock /*/*.sock /*/*/*.sock; do [ -S "$s" ] && echo "$s"; done | tr '\n' ' ')"
+        \\echo "sockets: $(for s in /var/run/* /run/* /tmp/* /var/tmp/* /*.sock /*/*.sock /*/*/*.sock; do [ -S "$s" ] && echo "$s"; done | sort -u | tr '\n' ' ')"
         \\echo "ls: $(ls -ld /var/run/docker.sock /run/docker.sock 2>&1 | tr '\n' ' ')"
-        \\for r in /proc/[0-9]*/root; do for s in "$r/var/run/docker.sock" "$r{s}"; do if [ "$s" != "/proc/self/root/var/run/docker.sock" ] && [ -S "$s" ] && curl -sS --max-time 3 --unix-socket "$s" http://localhost/_ping 2>/dev/null | grep -q OK; then echo "proc-root-socket: $s"; fi; done; done
+        \\for r in /proc/[0-9]*/root; do for s in "$r/var/run/docker.sock" "$r{s}" "$r/run/docker.sock"; do if [ -S "$s" ]; then echo "proc-id: $(curl -sS --max-time 3 --unix-socket "$s" http://localhost/info | tr ',' '\n' | grep '"ID"')"; fi; done; done
         \\echo done-b
     , .{ a_sock, a_sock, a_sock });
     const b = try runNativeJob(arena, cfg, testJob(&.{testStep(script)}), .root);
@@ -12527,13 +12580,30 @@ test "native docker api: while job A is running, job B cannot reach A's socket, 
     defer std.testing.allocator.free(job_a.text);
     try std.testing.expect(b.res.succeeded);
     try std.testing.expect(job_a.ok);
-    try expectAll(b.text, &.{ "a-visible: no", "cannot-reach-a", "sockets: /var/run/docker.sock", "done-b" });
+    try expectAll(b.text, &.{ "a-visible: no", "cannot-reach-a", "done-b" });
+    // The line of sockets B finds, as printed: its own and nothing else.
+    var lines = std.mem.splitScalar(u8, b.text, '\n');
+    var found_line = false;
+    while (lines.next()) |line| if (std.mem.indexOf(u8, line, "] sockets: ")) |at| {
+        try std.testing.expectEqualStrings("sockets: /var/run/docker.sock", std.mem.trimEnd(u8, line[at + 2 ..], " \r"));
+        found_line = true;
+    };
+    try std.testing.expect(found_line);
     try std.testing.expect(std.mem.indexOf(u8, b.text, "REACHED-A") == null);
     const id_a = idAfter(job_a.text);
     const id_b = idAfter(b.text);
     try std.testing.expectEqual(@as(usize, 16), id_a.len);
     try std.testing.expectEqual(@as(usize, 16), id_b.len);
     try std.testing.expect(!std.mem.eql(u8, id_a, id_b));
+    // Every socket B reached through some process's root is B's own, never A's.
+    var proc_lines = std.mem.splitScalar(u8, b.text, '\n');
+    var through_proc: usize = 0;
+    while (proc_lines.next()) |line| if (std.mem.indexOf(u8, line, "] proc-id: ") != null) {
+        through_proc += 1;
+        try std.testing.expect(std.mem.indexOf(u8, line, id_a) == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, id_b) != null);
+    };
+    try std.testing.expect(through_proc > 0);
 }
 
 fn idAfter(text: []const u8) []const u8 {
@@ -12541,4 +12611,48 @@ fn idAfter(text: []const u8) []const u8 {
     const at = std.mem.indexOf(u8, text, key) orelse return "";
     const from = at + key.len;
     return text[from..][0 .. std.mem.indexOfScalar(u8, text[from..], '"') orelse 0];
+}
+
+/// A job with the API on whose steps are `scripts`, run twice through the step cache: how many of
+/// the second run's steps were replayed.
+fn replayedWithApi(arena: Allocator, cfg: Config, scripts_in: []const []const u8, tag: []const u8) !usize {
+    const steps = try arena.alloc(job_mod.Step, scripts_in.len);
+    for (steps, scripts_in) |*s, script| s.* = testStep(script);
+    const job = testJob(steps);
+    const first = try runCached(arena, cfg, job, try std.fmt.allocPrint(arena, "{s}-a", .{tag}));
+    try expectSucceeded(first);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, first.text, dagger.native_reused_note));
+    const again = try runCached(arena, cfg, job, try std.fmt.allocPrint(arena, "{s}-b", .{tag}));
+    try expectSucceeded(again);
+    return std.mem.count(u8, again.text, dagger.native_reused_note);
+}
+
+test "native docker api: a step that made a request beyond ping, version and info is not stored, even one it never read the answer of; the next runs uncached" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testConfig(arena, &tmp);
+    cfg.docker_api = true;
+    const ping = "curl -sS --max-time 10 --unix-socket /var/run/docker.sock http://localhost/_ping";
+    // Control: ping, version and info only, then a plain step: both are replayed.
+    try std.testing.expectEqual(@as(usize, 2), try replayedWithApi(arena, cfg, &.{
+        ping ++ "; curl -sS --unix-socket /var/run/docker.sock http://localhost/version >/dev/null; echo one",
+        "echo two",
+    }, "ctl"));
+    // One 501: that step is not stored, and the step after it is keyed on nothing: neither replays.
+    try std.testing.expectEqual(@as(usize, 0), try replayedWithApi(arena, cfg, &.{
+        "curl -sS --max-time 10 --unix-socket /var/run/docker.sock http://localhost/images/json; echo one",
+        "echo two",
+    }, "one"));
+    // The request is written and the step ends without reading the answer, with the server
+    // holding the request for a while: it is counted before the step's end is judged.
+    var slow = cfg;
+    slow.test_docker_api_delay_ms = 300;
+    try std.testing.expectEqual(@as(usize, 0), try replayedWithApi(arena, slow, &.{
+        \\python3 -c "import socket; s=socket.socket(socket.AF_UNIX); s.connect('/var/run/docker.sock'); s.send(b'GET /images/json HTTP/1.1\r\nHost: x\r\n\r\n')"
+        ,
+        "echo two",
+    }, "late"));
 }

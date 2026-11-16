@@ -2687,18 +2687,29 @@ errors. Nothing is built yet (1b).
   zig-runner yet: <METHOD> <path>"}`, the path without its version prefix and query, bytes that
   are not UTF-8 shown as U+FFFD and cut at 200 bytes on a character boundary.
 - **A budget**: the server's work is the runner's, in no job's cgroup, so each job's API has a
-  token bucket of 100 requests a second (200 in a burst), checked before a request is routed; a
-  request over it is 429 "too many requests to this job's Docker API: slow down", counted
-  (`limited=` in the log line) with the 8-connection cap. `/version` and `/info` are rendered once
-  at the start, so a request costs a copy. **Stage 1b's build work must run in the job's cgroup
-  (`execBuild`), as the job's steps do, not in this thread**; only the HTTP parsing is the
-  runner's.
+  token bucket of 100 requests a second (200 in a burst), checked before a request is routed. A
+  request over it costs the runner almost nothing: it is not routed, its connection waits 100 ms
+  (or until the stop), is sent one preformatted 429 "too many requests to this job's Docker API:
+  slow down" and is closed (counted, `limited=` in the log line); a flooder, whether it pipelines
+  or reconnects, is held to that wait per request on each of the 8 connections, which are the cap.
+  The bucket reads the clock in every round of its compare-and-swap, so a thread that lost a race
+  never refills from an older reading (unit-tested with an injected clock). `/version` and `/info`
+  are rendered once at the start. **Stage 1b's build work must run in the job's cgroup
+  (`execBuild`), as the job's steps do, not in this thread**; only the HTTP parsing is the runner's.
+- **Step end** (`Server.settle`): when a step's processes are gone, the runner has every
+  connection take in what its client had already sent (a connection answers once it has nothing
+  more to read, and one still in the listen queue is accepted first) before it reads the count of
+  requests beyond ping/version/info, so a client that wrote a request and exited without reading the
+  answer is counted against its own step. It waits at most 2 s. A connection a step's background
+  process holds open stays open.
 - **The job's own `DOCKER_HOST`**: the runner's `DOCKER_HOST` and `DOCKER_BUILDKIT` are put only
   where the image, the job container's `env:` and `options: --env` have not set the name, and the
-  workflow's `env:` (job and step) wins over all of them. A job container whose `volumes:` are at
-  or around the socket's path (`/var`, `/var/run`, `/run`, or either file) gets **no API**: the
-  server is stopped, the bind and the variables are left out, and "Set up job" says why. The job
-  still runs.
+  workflow's `env:` (job and step) wins over all of them. A job container whose `volumes:` or
+  `--tmpfs` are at or around the socket's path (`/var`, `/var/run`, `/run`, or either file: a
+  volume at exactly `/var/run/docker.sock` is read, not refused as it is with the option off; a
+  `--tmpfs` at `/var` or `/var/run` is refused as always) gets **no API**: the
+  server is stopped, the bind and the variables are left out, and "Set up job" says only why it is
+  not served. The job still runs.
 - **Step cache (decision for 1b)**: what a step does through the API (an image built, a tag
   made) is in no step key, since the socket's path is normalised to no input. So **a step that
   makes any request beyond `/_ping`, `/version` and `/info` is not stored** (the server counts

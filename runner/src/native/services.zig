@@ -667,6 +667,53 @@ test "native services: by name and on localhost, health checks and port probes, 
     try std.testing.expect(try it.next(io) == null);
 }
 
+test "native services: a service has no docker.sock, whether or not the job has a Docker API, and no layer holds one" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    cfg.test_rootless_services = true;
+    cfg.docker_api = true;
+    const root_runner = std.os.linux.geteuid() == 0;
+    const addr = if (root_runner) "0.0.0.0" else "127.0.0.1";
+    const web_port, const web_published, _ = try freePorts(3);
+    const web = try std.fmt.allocPrint(arena, "{d}", .{web_port});
+    const py: []const []const u8 = &.{ "python3", "-u", "-c", greeter, addr };
+    try fixtureImage(arena, &tmp, &cfg, "fixture+web:1", try std.mem.concat(arena, []const u8, &.{
+        py, &.{ web, "web" },
+    }));
+    var job = testJob(&.{testStep("curl -sS --max-time 10 --unix-socket /var/run/docker.sock http://localhost/_ping; echo; " ++
+        "test -S /var/run/docker.sock && echo step-has-socket")});
+    job.services = &.{.{
+        .name = "web",
+        .image = .{ .lit = "fixture/web:1" },
+        .ports = &.{.{ .lit = try std.fmt.allocPrint(arena, "{d}:{d}", .{ web_published, web_port }) }},
+        // Healthy only while neither path is there: the service's root is the image's, not the steps'.
+        .options = .{ .lit = "--health-cmd \"sh -c '[ ! -e /var/run/docker.sock ] && [ ! -e /run/docker.sock ]'\" " ++
+            "--health-interval 2s --health-retries 15" },
+    }};
+    const r = try Backend.runNativeJob(arena, cfg, job, .root);
+    if (!r.res.succeeded) {
+        std.debug.print("{s}\n", .{r.text});
+        return error.TestUnexpectedResult;
+    }
+    try Backend.expectLines(r.text, &.{ "web service is healthy.", "OK", "step-has-socket" });
+    // No layer of the store, which is every one a step or service published, holds the file.
+    const layers_path = try std.fmt.allocPrint(arena, "{s}/layers", .{cfg.store});
+    var layers = std.Io.Dir.cwd().openDir(io, layers_path, .{ .iterate = true }) catch return;
+    defer layers.close(io);
+    var walker = try layers.walk(arena);
+    while (try walker.next(io)) |e| {
+        if (std.mem.endsWith(u8, e.path, "docker.sock")) {
+            std.debug.print("ERROR a layer holds {s}\n", .{e.path});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 test "native services: one unhealthy, or one that ends first, fails the job before its steps" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
