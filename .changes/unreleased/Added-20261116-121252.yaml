@@ -1,0 +1,3 @@
+kind: Added
+body: 'docs/GITEA.md: how to serve a Gitea or Forgejo instance (install, registration, labels, trust, where a step''s actions come from, the variables and services a job sees), with a pointer in the README (#520, G7). The table of where actions come from moved there from docs/OPERATIONS.md.'
+time: 2026-11-16T12:12:52.480902654-05:00
