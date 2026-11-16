@@ -352,6 +352,13 @@ pub fn unpack(
     defer file.close(io);
     var rbuf: [64 * 1024]u8 = undefined;
     var reader = file.reader(io, &rbuf);
+    // The CLI's `--compress` sends gzip; only the plain tar is read (yet).
+    if (reader.interface.peek(2)) |magic| {
+        if (std.mem.eql(u8, magic, "\x1f\x8b")) {
+            why.* = "a compressed build context (--compress) is not supported yet";
+            return error.BadContext;
+        }
+    } else |_| {}
     var name_buf: [4096]u8 = undefined;
     var link_buf: [4096]u8 = undefined;
     var diag: std.tar.Diagnostics = .{ .allocator = arena };
@@ -1047,6 +1054,7 @@ test "docker build: a context with an entry outside it, a link out of it or a ty
             .{ .name = "h", .kind = '1', .link = "f" },
         }), .why = "not supported yet" },
         .{ .name = "device", .tar = try tarOf(arena, &.{.{ .name = "dev", .kind = '3' }}), .why = "not supported yet" },
+        .{ .name = "gzip", .tar = "\x1f\x8b\x08\x00 a gzip, not a tar", .why = "--compress" },
     };
     for (cases) |c| {
         var tmp = testing.tmpDir(.{});
