@@ -112,7 +112,7 @@ tar -C "$dir" -xf "$tar_path" --no-same-owner
 	echo "zig-test-prebuilt.sh: built from $(cat "$dir/commit"), this checkout is $(git rev-parse HEAD)" >&2
 	exit 1
 }
-echo "zig-test-prebuilt.sh: running the tests built for $(cat "$dir/arch") from $(cat "$dir/commit") ($actual)" >&2
+echo "zig-test-prebuilt.sh: ran prebuilt binaries from $(cat "$dir/commit"), built for $(cat "$dir/arch"), tar sha256 $actual" >&2
 export ZIG_RUNNER_TEST_EXE=$dir/runner
 status=0
 # The shard runner's own tests first (build.zig's run_shards_tests), so the tests' count is the
