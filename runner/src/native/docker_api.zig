@@ -124,11 +124,13 @@ pub const Sink = struct {
     /// One chunk of the response. After a failure it writes nothing.
     pub fn write(k: *Sink, bytes: []const u8) void {
         if (bytes.len == 0 or k.failed.load(.acquire)) return;
-        while (!k.lock.tryLock()) std.Thread.yield() catch {};
+        while (!k.lock.tryLock()) {
+            if (std.Thread.yield()) {} else |_| {} // spinning is the fallback
+        }
         defer k.lock.unlock();
         if (k.failed.load(.acquire)) return;
         var head: [24]u8 = undefined;
-        const h = std.fmt.bufPrint(&head, "{x}\r\n", .{bytes.len}) catch unreachable;
+        const h = std.fmt.bufPrint(&head, "{x}\r\n", .{bytes.len}) catch return;
         const lim = k.server.cfg.limits;
         // The frame in one write when it is small: one syscall for a line of output.
         var small: [1024]u8 = undefined;
@@ -1570,7 +1572,7 @@ fn serveBuild(
     const done_rc = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(done_rc) != .SUCCESS) {
         sink.write(docker_build.errorLine(a, "the runner has no file descriptor left for the build") catch "");
-        _ = sendAll(s, fd, "0\r\n\r\n", lim.write_ms) catch {};
+        if (sendAll(s, fd, "0\r\n\r\n", lim.write_ms)) {} else |_| {} // the peer going is no matter
         return;
     }
     const done_fd: linux.fd_t = @intCast(done_rc);
@@ -1578,7 +1580,7 @@ fn serveBuild(
     var worker: Worker = .{ .h = h, .call = &call, .done_fd = done_fd };
     const thread = std.Thread.spawn(.{ .stack_size = 16 * 1024 * 1024 }, Worker.run, .{&worker}) catch {
         sink.write(docker_build.errorLine(a, "the runner could not start the build") catch "");
-        _ = sendAll(s, fd, "0\r\n\r\n", lim.write_ms) catch {};
+        if (sendAll(s, fd, "0\r\n\r\n", lim.write_ms)) {} else |_| {} // the peer going is no matter
         return;
     };
     // Until the build ends: if the client goes (the step was stopped, `docker build` killed) or the
@@ -1617,7 +1619,7 @@ fn serveBuild(
         }
     }
     thread.join();
-    _ = sendAll(s, fd, "0\r\n\r\n", lim.write_ms) catch {};
+    if (sendAll(s, fd, "0\r\n\r\n", lim.write_ms)) {} else |_| {} // the peer going is no matter
 }
 
 /// A refusal before the context is read: answered, and what the client is sending dropped.
