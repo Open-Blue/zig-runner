@@ -267,13 +267,13 @@
       "datasourceTemplate": "docker"
     },
     {
-      "description": "The Dockerfile oracle's bases.txt: one `name:tag@sha256:...` per base image, as the fixtures name them (the oracle keys its prepared bases by that reference), pinned by the multi-arch index digest.",
+      "description": "The Dockerfile oracle's bases.txt: one `name:tag@sha256:...` per base image (no ^/$ anchors: Renovate matches the whole file without multiline mode, so anchored lines never matched and bases.txt was never updated), as the fixtures name them (the oracle keys its prepared bases by that reference), pinned by the multi-arch index digest.",
       "customType": "regex",
       "managerFilePatterns": [
         "/^runner/tools/dockerfile_oracle/bases\\.txt$/"
       ],
       "matchStrings": [
-        "^(?<depName>[a-z0-9./-]+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})$"
+        "(?<depName>[a-z0-9./-]+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
       ],
       "datasourceTemplate": "docker"
     },
