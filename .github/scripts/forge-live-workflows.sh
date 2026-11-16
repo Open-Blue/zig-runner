@@ -122,14 +122,15 @@ jobs:
     runs-on: live
     steps:
       - run: echo hello-artifact > out.txt
-      - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@16871d9e8cfcf27ff31822cac382bbb5450f1e1e
         with: {name: probe, path: out.txt}
       - run: rm out.txt
-      - uses: https://code.forgejo.org/forgejo/download-artifact@v4
+      - uses: https://code.forgejo.org/forgejo/download-artifact@d8d0a99033603453ad2255e58720b460a0555e1e
         with: {name: probe, path: dl}
       - run: test "$(cat dl/out.txt)" = hello-artifact
+      # (Pinned by commit: v4 of each, as the first run fetched them; they run beside the runtime token.)
       # There is no cache service: the action says so and the step does not fail.
-      - uses: https://github.com/actions/cache@v4
+      - uses: https://github.com/actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with: {path: dl, key: probe}
       - run: echo after-cache
 EOF

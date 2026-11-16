@@ -20,7 +20,8 @@
 #       --setup-only  start the instance, make the repositories and the registration token, check
 #                     that they are there and stop (no runner, nothing privileged)
 #
-# Environment: ZR_FORGE_DIR (~/.cache/zr-forge-live), ZR_FORGE_PORT (3398), ZR_FORGE_LOCK
+# Environment: ZR_FORGE_HOST (the instance's address; the VM's own address, or the loopback for --setup-only),
+# ZR_FORGE_DIR (~/.cache/zr-forge-live), ZR_FORGE_PORT (3398), ZR_FORGE_LOCK
 # (~/.cache/zig-runner-locks/root-tests.lock, held while the runner's container runs). The
 # containers and the token files are removed when it ends. The steps reach the instance at
 # 127.0.0.1:<port>, which the runner makes reachable from a job's network (gitea/reach.zig); a
@@ -60,8 +61,17 @@ main() {
 	# The instance's address as a job reaches it: the VM's own, not the loopback, so that the
 	# addresses the instance puts in its answers (the artifact service's upload URLs are made from
 	# its ROOT_URL) are ones a job's network reaches too (`gitea/reach.zig` opens them).
-	host=${ZR_FORGE_HOST:-$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')}
-	host=${host:-127.0.0.1}
+	# A local --setup-only keeps to the loopback (it runs no job); a run with the runner needs the
+	# address, and does not go on with a loopback ROOT_URL when it finds none.
+	host=${ZR_FORGE_HOST:-}
+	if [[ -z $host ]]; then
+		if ((setup_only)); then
+			host=127.0.0.1
+		else
+			host=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')
+			[[ -n $host ]] || { echo "forge-live: no route out, so no address for the instance; set ZR_FORGE_HOST" >&2 && exit 1; }
+		fi
+	fi
 	url=http://$host:$port
 	[[ $forge == gitea ]] || default_actions=$url
 	lock=${ZR_FORGE_LOCK:-$HOME/.cache/zig-runner-locks/root-tests.lock}

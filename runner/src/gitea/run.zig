@@ -199,7 +199,7 @@ fn runJob(
         if (reach.allow(c.arena, c.io, subnet, job.github.server_url)) |why| loop.sayUnallocated(c, "gitea: task {d}: {s}", .{ t_id, why });
         job = try reach.viewed(c.arena, c.io, subnet, job);
         // The artifact services' addresses are the instance's, as the job reaches it.
-        job.runtime = try convert.runtimeFor(c.arena, job.github.server_url);
+        if (job.job_token.len > 0) job.runtime = try convert.runtimeFor(c.arena, job.github.server_url);
     }
     // Known by name now: it reserves what jobs of its name took at the memory gate, and what it
     // takes is learned when it ends.
