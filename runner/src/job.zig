@@ -300,6 +300,9 @@ pub const Service = struct {
     username: ?Template = null,
     password: ?Template = null,
     volumes: []const Template = &.{},
+    /// Gitea's `cmd:`: the arguments the image's entrypoint is started with, in place of its
+    /// default command (Docker's `create IMAGE [COMMAND]`). GitHub's message has none.
+    cmd: []const Template = &.{},
 };
 
 /// From the `SystemVssConnection` endpoint's `data`, and the `actions_uses_cache_service_v2`
