@@ -741,7 +741,7 @@ pub fn plan(
         base + @as(u32, if (as_runner) dagger_runner_uid else 0)
     else
         null;
-    const used = set_up.cachesUsed(job);
+    const used = set_up.cachesUsedIn(job, std.mem.eql(u8, scope, "repo"));
     // A volume the last job out is walking is waited for, and the job's cancel still ends it.
     const wait: Wait = .{ .cancel = if (opts.cancel) |c| &c.requested else null };
     var repo_parts = std.mem.splitScalar(u8, repo, '/');

@@ -187,6 +187,7 @@ pub const zig_local_roll_script =
     \\  [ -n "$p" ] && [ -n "$(find "gen-$k/.zig-runner-since" -mmin +360)" ] && rm -rf "gen-$p"
     \\  p=$k
     \\done
+    \\readlink current
 ;
 
 /// Runs `zig_local_roll_script` on the job's Zig local-cache volume, in a container of its own
@@ -204,7 +205,7 @@ fn rollZigLocal(
     as_runner: bool,
     pulled: ?[]const u8,
     nonce: []const u8,
-) !void {
+) !?[]const u8 {
     var q: Query = .init(arena);
     try q.open("container");
     try q.call("from", .{ .address = pulled orelse default_image });
@@ -222,10 +223,30 @@ fn rollZigLocal(
         if (as_runner) "1001:1001" else "",
         nonce,
     } });
-    try q.leaf("sync");
+    try q.leaf("stdout");
     var err_msg: []const u8 = "";
-    _ = gql(arena, transport, try q.finish(), &err_msg) catch
+    const answer = gql(arena, transport, try q.finish(), &err_msg) catch {
         std.log.warn("Zig local cache not rolled: {s}", .{err_msg});
+        return null;
+    };
+    return generationOf(jsonFindString(answer, "stdout") orelse return null);
+}
+
+/// The generation the roll script printed (`gen-<N>`, `current`'s target), or null.
+pub fn generationOf(printed: []const u8) ?[]const u8 {
+    const name = std.mem.trim(u8, printed, " \t\r\n");
+    if (!std.mem.startsWith(u8, name, "gen-") or name.len == 4) return null;
+    for (name[4..]) |c| if (!std.ascii.isDigit(c)) return null;
+    return name;
+}
+
+/// CARGO_TARGET_DIR in the generation `gen` of Zig's local cache that the job resolved at its
+/// start (`generationOf`), or through `current` when it did not resolve one. Cargo resolves its
+/// target directory on every file operation, where Zig opens its cache once, so a path through
+/// `current` would follow a roll that another job starts while this one's cargo runs.
+pub fn cargoTargetIn(arena: Allocator, as_runner: bool, max_mb: u32, gen: ?[]const u8) ![]const u8 {
+    const g = gen orelse return cargoTargetDir(arena, as_runner, max_mb);
+    return std.mem.concat(arena, u8, &.{ zigLocalCacheDir(as_runner), "/", g, "/cargo-target" });
 }
 
 /// Fills the `builtin.zig` volume (`zigBuiltinDir`) with what the seed has in its own `b/`, which
@@ -582,7 +603,7 @@ fn writeImage(
             try q.call("withRegistryAuth", auth);
         } else if (err_msg.len > 0) return error.BaseContainerFailed;
     }
-    try writeFrom(q, plan.pulled orelse plan.job_image, plan.zig_local_env, plan.cargo_target_env);
+    try writeFrom(q, plan.pulled orelse plan.job_image, plan.zig_local_env);
     if (job.container != null) for (plan.cache_ids, 0..) |_, i| {
         // Before the container's env, so its own value wins.
         if (package_cache_dirs[i].env.len == 0 or !plan.cache_used[i]) continue;
@@ -614,23 +635,14 @@ fn writeImage(
         try q.leafArgs("zig_runtime_path", "envVariable", .{ .name = "PATH" });
 }
 
-/// `from` the image, and Zig's local cache directory (and cargo's target directory in it) when it has a volume: the first nodes of
+/// `from` the image, and Zig's local cache directory when it has a volume: the first nodes of
 /// every job's base container, which depend on nothing of the job.
-fn writeFrom(
-    q: *Query,
-    image: []const u8,
-    zig_local_env: ?[]const u8,
-    cargo_target_env: ?[]const u8,
-) !void {
+fn writeFrom(q: *Query, image: []const u8, zig_local_env: ?[]const u8) !void {
     try q.call("from", .{ .address = image });
     // Before the container's env too, so its value (or the workflow's) wins.
     if (zig_local_env) |dir| try q.call(
         "withEnvVariable",
         .{ .name = "ZIG_LOCAL_CACHE_DIR", .value = dir },
-    );
-    if (cargo_target_env) |dir| try q.call(
-        "withEnvVariable",
-        .{ .name = "CARGO_TARGET_DIR", .value = dir },
     );
 }
 
@@ -767,6 +779,11 @@ fn writeRunEnv(q: *Query, ev: *Evaluator, plan: BasePlan) !void {
         try q.call("withVolatileVariable", .{ .name = ran_env, .value = plan.ran_marker });
     // Every step's markers carry it, with step caching or without (`mark_env`).
     try q.call(envVarNode(plan.step_cache), .{ .name = mark_env, .value = plan.mark });
+    // After the roll and not in the base container's first nodes (`writeFrom`), which are the
+    // pre-warm's: the generation the job resolved, so a roll another job starts later does not
+    // move this job's target directory under a running cargo.
+    if (plan.cargo_target_env) |dir|
+        try q.call("withEnvVariable", .{ .name = "CARGO_TARGET_DIR", .value = dir });
     if (plan.uv_env) |e| {
         try q.call("withEnvVariable", .{ .name = "UV_PROJECT_ENVIRONMENT", .value = e });
         // The environment outlives the job, and `uv venv` refuses to replace one that exists
@@ -874,8 +891,10 @@ pub fn basePlan(
         secrets,
         err_msg,
     );
-    if (volumes.zig_local) |id| if (opts.zig_local_cache_max_mb > 0)
-        try rollZigLocal(arena, transport, id, opts.zig_local_cache_max_mb, as_runner, pulled, ran_marker);
+    var generation: ?[]const u8 = null;
+    if (volumes.zig_local) |id| if (opts.zig_local_cache_max_mb > 0) {
+        generation = try rollZigLocal(arena, transport, id, opts.zig_local_cache_max_mb, as_runner, pulled, ran_marker);
+    };
     if (volumes.zig_builtin) |id| if (zig_seed) |seed|
         try seedBuiltin(arena, transport, id, seed, as_runner, pulled, ran_marker);
     return .{
@@ -888,7 +907,11 @@ pub fn basePlan(
         .step_cache = step_cache,
         .uv_env = try uvEnvFor(arena, opts, job, as_runner, step_cache),
         .cache_ids = volumes.ids,
-        .cache_used = cachesUsed(job),
+        .cache_used = cachesUsedIn(job, std.mem.eql(
+            u8,
+            try packageCacheScope(arena, ev, job.github.repository, opts.trusted),
+            "repo",
+        )),
         .zig_local = volumes.zig_local,
         .zig_builtin = volumes.zig_builtin,
         .zig_local_env = if (opts.zig_local_cache and opts.package_caches and
@@ -898,7 +921,7 @@ pub fn basePlan(
             null,
         .cargo_target_env = if (opts.cargo_target_cache and opts.zig_local_cache and
             opts.package_caches and job.github.repository.len > 0)
-            try cargoTargetDir(arena, as_runner, opts.zig_local_cache_max_mb)
+            try cargoTargetIn(arena, as_runner, opts.zig_local_cache_max_mb, generation)
         else
             null,
         .zig_seed = zig_seed,
@@ -1467,10 +1490,8 @@ pub const package_cache_dirs = [_]struct {
     .{ .name = "uv", .path = "/root/.cache/uv", .env = "UV_CACHE_DIR", .tools = &.{ "uv", "uvx" } },
     .{ .name = "go-mod", .path = "/root/go/pkg/mod", .env = "GOMODCACHE", .tools = &go_tools },
     .{ .name = "go-build", .path = "/root/.cache/go-build", .env = "GOCACHE", .tools = &go_tools },
-    // Zig's build system runs cargo for a project with Rust in it (zig-runner's own `zr-net`), and
-    // the script that does so names neither: a Zig job gets the crate caches too.
-    .{ .name = "cargo-registry", .path = "/root/.cargo/registry", .tools = &(rust_tools ++ .{"zig"}) },
-    .{ .name = "cargo-git", .path = "/root/.cargo/git", .tools = &(rust_tools ++ .{"zig"}) },
+    .{ .name = "cargo-registry", .path = "/root/.cargo/registry", .tools = &rust_tools },
+    .{ .name = "cargo-git", .path = "/root/.cargo/git", .tools = &rust_tools },
     .{
         .name = "bun",
         .path = "/root/.bun/install/cache",
@@ -1535,6 +1556,20 @@ pub fn cachesUsed(job: job_mod.Job) [package_cache_dirs.len]bool {
         if (std.mem.eql(u8, d.name, zig_packages)) u.* = usesZig(job);
         if (std.mem.eql(u8, d.name, "toolcache")) u.* = true;
     }
+    return used;
+}
+
+/// `cachesUsed`, and in the `repo` scope the cargo registry and git volumes for a job that runs
+/// Zig too: Zig's build system runs cargo for a project with Rust in it (zig-runner's own `zr-net`),
+/// and the script that does so names neither. Not in `untrusted`: cargo does not check the sources
+/// it finds unpacked in the registry again, and `build-zr-net.sh` builds from them offline, so one
+/// untrusted job could plant crate source that another's build compiles. An untrusted Zig job keeps
+/// a `CARGO_HOME` of its own in the job's temp directory and downloads and checks every crate.
+pub fn cachesUsedIn(job: job_mod.Job, repo_scope: bool) [package_cache_dirs.len]bool {
+    var used = cachesUsed(job);
+    if (repo_scope and usesZig(job)) for (package_cache_dirs, &used) |d, *u| {
+        if (std.mem.startsWith(u8, d.name, "cargo-")) u.* = true;
+    };
     return used;
 }
 
@@ -1764,10 +1799,6 @@ fn warmDocuments(arena: Allocator, opts: Options, pulled: ?[]const u8) !WarmDocu
             pulled orelse image,
             if (opts.package_caches and opts.zig_local_cache)
                 zigLocalCacheEnv(as_runner, opts.zig_local_cache_max_mb)
-            else
-                null,
-            if (opts.package_caches and opts.zig_local_cache and opts.cargo_target_cache)
-                try cargoTargetDir(arena, as_runner, opts.zig_local_cache_max_mb)
             else
                 null,
         );
@@ -2066,7 +2097,7 @@ test "the from and provisioning nodes are a byte prefix of every job's base docu
                 const as_runner = provision and step_user == .runner;
                 var q: Query = .init(arena);
                 try q.open("container");
-                try writeFrom(&q, image, if (zig_local) zigLocalCacheEnv(as_runner, 0) else null, null);
+                try writeFrom(&q, image, if (zig_local) zigLocalCacheEnv(as_runner, 0) else null);
                 if (provision) try writeProvision(&q, as_runner);
                 const prefix = q.fragment().text;
                 try std.testing.expect(std.mem.startsWith(u8, base, prefix));
@@ -2327,7 +2358,7 @@ test "with zig_local_cache, an untrusted job's Zig local cache is its own: no vo
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Zig local cache: this job's own (not kept between untrusted jobs)") != null);
 }
 
-test "cargo_target_cache: CARGO_TARGET_DIR is in Zig's local cache volume, in the base container and the pre-warm's prefix alike" {
+test "cargo_target_cache: CARGO_TARGET_DIR is in Zig's local cache volume, in the base container and not the pre-warm's prefix" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -2359,8 +2390,9 @@ test "cargo_target_cache: CARGO_TARGET_DIR is in Zig's local cache volume, in th
             const base = fake.seen.items[fake.seen.items.len - 2];
             const want = "withEnvVariable(name:\"CARGO_TARGET_DIR\",value:\"/home/runner/.cache/zig-local/cargo-target\")";
             try std.testing.expectEqual(cargo, std.mem.indexOf(u8, base, want) != null);
+            // Not in the pre-warm's prefix, which depends on nothing of a job.
             const warmed = try warmDocuments(arena, opts, null);
-            try std.testing.expectEqual(cargo, std.mem.indexOf(u8, warmed.base, want) != null);
+            try std.testing.expect(std.mem.indexOf(u8, warmed.base, "CARGO_TARGET_DIR") == null);
             // It never turns on Zig's own: no cargo cache without Zig's local cache.
             var no_zig = opts;
             no_zig.zig_local_cache = false;
@@ -2369,16 +2401,58 @@ test "cargo_target_cache: CARGO_TARGET_DIR is in Zig's local cache volume, in th
     }
 }
 
-test "a Zig job mounts cargo's crate caches (a Zig build may run cargo), a plain one does not" {
+test "a repo-scope Zig job mounts cargo's crate caches (a Zig build may run cargo), an untrusted one and a plain one do not" {
     const zig = [_]job_mod.Step{testStep("zig build test")};
     const plain = [_]job_mod.Step{testStep("make")};
     const cargo = [_]job_mod.Step{testStep("cargo test")};
     for (package_cache_dirs, 0..) |d, i| {
         if (!std.mem.startsWith(u8, d.name, "cargo-")) continue;
-        try std.testing.expect(cachesUsed(testJob(&zig))[i]);
-        try std.testing.expect(cachesUsed(testJob(&cargo))[i]);
-        try std.testing.expect(!cachesUsed(testJob(&plain))[i]);
+        try std.testing.expect(cachesUsedIn(testJob(&zig), true)[i]);
+        try std.testing.expect(!cachesUsedIn(testJob(&zig), false)[i]);
+        try std.testing.expect(cachesUsedIn(testJob(&cargo), true)[i]);
+        try std.testing.expect(cachesUsedIn(testJob(&cargo), false)[i]);
+        try std.testing.expect(!cachesUsedIn(testJob(&plain), true)[i]);
     }
+}
+
+test "a job's CARGO_TARGET_DIR is in the generation its roll resolved, and a roll's answer is read strictly" {
+    try std.testing.expectEqualStrings("gen-12", generationOf("gen-12\n").?);
+    for ([_][]const u8{ "", "gen-", "gen-1x", "../gen-1", "current", "gen-1/../../x" }) |bad|
+        try std.testing.expect(generationOf(bad) == null);
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("zig build test")};
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll("{\"data\":{\"czl\":{\"id\":\"VZL\"},\"czb\":{\"id\":\"VZB\"}");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print(",\"c{d}\":{{\"id\":\"V{d}\"}}", .{ i, i });
+    try vols.writer.writeAll("}}");
+    const answers = [_][]const u8{
+        vols.written(),
+        "{\"data\":{\"container\":{\"from\":{\"withExec\":{\"stdout\":\"gen-3\\n\"}}}}}",
+        base_answer,
+        try exec(arena, "C1", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{
+        .package_caches = true,
+        .trusted = true,
+        .zig_local_cache = true,
+        .zig_local_cache_max_mb = 4096,
+        .cargo_target_cache = true,
+        .step_user = .runner,
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+    }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    // The generation, not the `current` link a later roll would move.
+    const base = fake.seen.items[2];
+    try std.testing.expect(std.mem.indexOf(u8, base, "withEnvVariable(name:\"CARGO_TARGET_DIR\",value:\"/home/runner/.cache/zig-local/gen-3/cargo-target\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "zig-local/current/cargo-target") == null);
 }
 
 /// The `withMountedCache(...)` call of a document that mounts the volume `cache` (quoted).
@@ -2448,7 +2522,7 @@ test "with a limit, Zig's local cache rolls before the base container, under one
         // The pre-warm's prefix is still the base container's.
         var q: Query = .init(arena);
         try q.open("container");
-        try writeFrom(&q, default_image, zigLocalCacheEnv(true, opts.zig_local_cache_max_mb), null);
+        try writeFrom(&q, default_image, zigLocalCacheEnv(true, opts.zig_local_cache_max_mb));
         try writeProvision(&q, true);
         const prefix = q.fragment().text;
         try std.testing.expect(std.mem.startsWith(u8, base.*, prefix));
@@ -2699,9 +2773,7 @@ test "usesZig: a script or an action that names Zig" {
 test "cachesUsed: a job mounts the caches of the tools it names, Zig's as usesZig decides, and the tool cache always" {
     const zig_only = cachesUsed(testJob(&.{testStep("zig build test --summary all")}));
     for (package_cache_dirs, zig_only) |d, u| {
-        // Cargo's crate caches too: a Zig build may run cargo.
-        const want = std.mem.eql(u8, d.name, zig_packages) or std.mem.eql(u8, d.name, "toolcache") or
-            std.mem.startsWith(u8, d.name, "cargo-");
+        const want = std.mem.eql(u8, d.name, zig_packages) or std.mem.eql(u8, d.name, "toolcache");
         try std.testing.expectEqual(want, u);
     }
     // A script file that installs into the tool cache names it nowhere in the workflow (v0.22.0).
