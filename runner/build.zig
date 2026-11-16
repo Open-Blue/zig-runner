@@ -88,7 +88,10 @@ pub fn build(b: *std.Build) void {
     const native_exe = b.addUpdateSourceFiles();
     native_exe.addCopyFileToSource(exe.getEmittedBin(), ".zig-cache/native-step/runner");
     run_tests.step.dependOn(&native_exe.step);
-    run_tests.setEnvironmentVariable("ZIG_RUNNER_TEST_EXE", ".zig-cache/native-step/runner");
+    // Not on the sharding step, which does it itself (tools/test_shards.zig, `child_env`): a variable
+    // set here fixes the step's whole environment at configure time, so ZIG_TEST_FULL, PG* and the
+    // rest would be those of the first `zig build` after the build script last changed.
+    if (!shard_tests) run_tests.setEnvironmentVariable("ZIG_RUNNER_TEST_EXE", ".zig-cache/native-step/runner");
     test_step.dependOn(&run_tests.step);
     // The shard runner's own tests (its leak check): they work in directories of their own.
     const shards_tests = b.addTest(.{ .root_module = b.createModule(.{

@@ -125,9 +125,24 @@ const Run = struct {
     ended_ns: []i128,
 };
 
+/// What the shards run with: this process's environment, and where the build copied the runner
+/// binary the native tests start, unless told otherwise. The build cannot give that path as an
+/// environment variable of this step: a step's variables are fixed when the build is configured
+/// (and cached with it), the whole environment included, so a ZIG_TEST_FULL or a PG* variable set
+/// later never reached the tests (found 2026-11-16: ZIG_TEST_FULL=1 ran as the 0 it had at the
+/// first configure). Without its own map the step passes the live environment on.
+var child_env: ?*const std.process.Environ.Map = null;
+const native_step_exe = ".zig-cache/native-step/runner";
+
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const io = init.io;
+    {
+        const env = try arena.create(std.process.Environ.Map);
+        env.* = try init.environ_map.clone(arena);
+        if (env.get("ZIG_RUNNER_TEST_EXE") == null) try env.put("ZIG_RUNNER_TEST_EXE", native_step_exe);
+        child_env = env;
+    }
     const args = try init.minimal.args.toSlice(arena);
     if (args.len < 2) {
         std.debug.print("usage: test_shards [--names] <test binary> [its arguments]\n", .{});
@@ -432,6 +447,7 @@ const Shard = struct {
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .{ .file = err },
+            .environ_map = child_env,
         });
         errdefer child.kill(io);
         const reader = try gpa.create(Io.File.Reader);

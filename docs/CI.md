@@ -45,7 +45,7 @@ unreported instead, and the merge queue waiting for it.
 | `version` | daily, or by hand | cuts the release, after approval |
 | `security` | pull requests, weekly | gitleaks and dependency review |
 | `codeql` | pull requests, `main`, weekly (not the merge queue) | CodeQL `security-extended` |
-| `analysis` | nightly; a lighter run on pull requests | fuzzing, Valgrind, ThreadSanitizer, stress, coverage |
+| `analysis` | nightly; a lighter run on pull requests | fuzzing, Valgrind, ThreadSanitizer, stress, coverage, every test with its sweeps in full (nightly) |
 | `compare` | weekly | the comparison tools against the implementations they follow |
 | `mutation` | by hand | mutation testing of one module |
 | `scorecard` | weekly | [OpenSSF Scorecard](https://scorecard.dev) |
