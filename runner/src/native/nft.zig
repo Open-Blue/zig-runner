@@ -24,8 +24,17 @@
 //!   accepts that port at the bridge's address. A job reaches that one port and no other service
 //!   of the host's. In `forward` the instance is matched by the connection's original destination
 //!   (`ct original`), so that an instance in a Docker container with a published port on that
-//!   address, whose packets Docker's DNAT has already sent on to the container's bridge, is reached
-//!   too, and only through that address and port.
+//!   address, whose packets Docker's DNAT has already sent on to the container's bridge, is
+//!   reached too. The rule takes the connection's first direction only (`ct direction original`)
+//!   and not a packet back to the bridge (`oifname != zr0`): a job's packet made up to look like a
+//!   reply of another job's connection is un-NATed to that job and would leave by the bridge, and
+//!   is dropped. So are packets with no connection (invalid, untracked), which have no original
+//!   destination to match. What a job can reach through the rule is whatever the published port
+//!   maps to (one container's port), by that address and port; a local REDIRECT, or a DNAT to a
+//!   port of the host itself, reaches `input` and is matched there by the address and port as the
+//!   job dialled them, which the NAT may have changed (not handled: Docker does neither). The
+//!   instances are the host's runners' together (`mergedReach`, the file below), so a job reaches
+//!   the instance another runner of the host serves too.
 //! - `output` (filter): to the bridge, replies only. No process of the host's reaches a job, its
 //!   services' ports included (P6's `not_asked`).
 //!
@@ -418,8 +427,12 @@ fn reachRules(b: *Batch, chain: []const u8, reach: []const net.Reach, subnet: ne
             // What a job dials is not what `forward` sees when the instance is a Docker container
             // with a published port on this address: Docker's DNAT in prerouting has made the
             // destination the container's, and the packet is routed on, to its bridge. The
-            // connection's original destination is still the instance's address and port.
+            // connection's original destination is still the instance's address and port. Only the
+            // first direction, and not back out of the bridge: a reply-direction packet another
+            // job made up for this connection would pass the one and come out of the other.
+            b.ifname(.oif, .neq, bridge_name);
             b.l4proto(ipproto_tcp);
+            b.ctDirectionOriginal();
             b.ctOriginalEq(nft_ct_dst_ip, &addr);
             b.ctOriginalEq(nft_ct_proto_dst, &port);
         } else {
@@ -510,6 +523,7 @@ const nfta_ct_dreg = 1;
 const nfta_ct_key = 2;
 const nft_ct_state = 0;
 const nfta_ct_direction = 3;
+const nft_ct_direction = 1;
 const nft_ct_proto_dst = 12;
 const nft_ct_dst_ip = 20;
 const ct_dir_original: u8 = 0;
@@ -740,6 +754,16 @@ const Batch = struct {
         b.attrBe32(nfta_ct_dreg, nft_reg_1);
         b.endExpr(d);
         b.cmp(.eq, value);
+    }
+
+    /// `ct direction original`: the packet is of the connection's first direction (a reply is not).
+    fn ctDirectionOriginal(b: *Batch) void {
+        b.expr("ct");
+        const d = b.begin(nfta_expr_data);
+        b.attrBe32(nfta_ct_key, nft_ct_direction);
+        b.attrBe32(nfta_ct_dreg, nft_reg_1);
+        b.endExpr(d);
+        b.cmp(.eq, &.{ct_dir_original});
     }
 
     /// `reg 1 = reg 1 & mask` (xor zero), over the mask's length.
@@ -1233,99 +1257,192 @@ test "native nft: rules made by several makers at once are all made, none lost t
     }
 }
 
-/// What `dockerPublished` found: the script's lines, or why the test cannot run here.
+/// What `dockerPublished` found: a failure (the rules did not apply, the topology could not be
+/// made), the script's lines, or that the test cannot run here (no network namespace, no `ip`,
+/// `nft` or python3: a failure where `ZIG_RUNNER_REQUIRE_NATIVE=1`, as CI sets).
 const Published = struct {
-    unavailable: bool = false,
+    skip: ?[]const u8 = null,
+    failure: ?[]const u8 = null,
     out: [2048]u8 = undefined,
     out_len: usize = 0,
 };
 
-/// In a network namespace of its own (this thread's), the host of a Docker-published instance:
-/// the jobs' bridge `zr0` with a job on it, a Docker-like bridge with a "container" listening on
-/// :3000, the host's LAN address on a dummy interface, and Docker's own rule for `-p
-/// 10.1.0.48:3398:3000`: a DNAT in the nat table's prerouting. Then the runner's rules are applied
-/// (`apply`), with the instance at `10.1.0.48:3398` the one it may reach, and the job dials: the
-/// instance must answer, and neither another published port, nor the container itself, may.
-fn dockerPublished(c: *Published, with_reach: bool) void {
+/// The host's side of a published instance, in a network namespace of its own (this thread's):
+/// the jobs' bridge `zr0` with two jobs A and B on it, a Docker-like bridge with a "container"
+/// listening on :3000, the host's LAN address on a dummy interface, and Docker's rule for `-p
+/// 10.1.0.48:3398:3000`, a DNAT in the nat table's prerouting. The runner's rules are applied
+/// (`apply`) with the instance at `10.1.0.48:3398` the one jobs may reach, and then:
+///
+///  - A reaches the instance, and neither another published port nor the container itself;
+///  - B, which may send any packet it likes, makes up packets of the kind the rule must not let
+///    through, and the rule's own packet counter says whether one matched: a segment looking like
+///    the instance's reply on A's connection (conntrack takes it for A's, un-NATs it to A and
+///    sends it out of the bridge), and the same for a connection B opened with a source address
+///    that is not its own (its reply-direction packets would leave by the bridge too).
+fn dockerPublished(c: *Published, suffix: []const u8, dir: []const u8) void {
     const unshared = linux.unshare(linux.CLONE.NEWNET);
     if (linux.errno(unshared) != .SUCCESS) {
-        c.unavailable = true;
+        c.skip = "no network namespace of its own";
         return;
     }
     var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const io = std.testing.io;
+    const tools = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", "command -v ip nft python3 >/dev/null" } }) catch null;
+    if (tools == null or tools.?.term != .exited or tools.?.term.exited != 0) {
+        c.skip = "ip, nft or python3 is missing";
+        return;
+    }
     const setup =
         \\set -e
-        \\ip netns del zrt-job 2>/dev/null || true; ip netns del zrt-ctr 2>/dev/null || true
+        \\sfx=$1; d=$2
         \\ip link set lo up
         \\ip link add zr0 type bridge; ip addr add 10.211.0.1/16 dev zr0; ip link set zr0 up
         \\ip link add dk0 type bridge; ip addr add 172.17.0.1/16 dev dk0; ip link set dk0 up
         \\ip link add d0 type dummy; ip addr add 10.1.0.48/24 dev d0; ip link set d0 up
-        \\ip netns add zrt-job; ip netns add zrt-ctr
-        \\ip link add vj type veth peer name vj1; ip link set vj1 netns zrt-job; ip link set vj master zr0; ip link set vj up
-        \\ip netns exec zrt-job sh -c 'ip link set lo up; ip addr add 10.211.0.2/16 dev vj1; ip link set vj1 up; ip route add default via 10.211.0.1'
-        \\ip link add vc type veth peer name vc1; ip link set vc1 netns zrt-ctr; ip link set vc master dk0; ip link set vc up
-        \\ip netns exec zrt-ctr sh -c 'ip link set lo up; ip addr add 172.17.0.2/16 dev vc1; ip link set vc1 up; ip route add default via 172.17.0.1'
+        \\for j in a b c; do ip netns add zrt-$j-$sfx; done
+        \\for j in a:2 b:3; do
+        \\  n=${j%:*}; h=${j#*:}
+        \\  ip link add v$n type veth peer name v${n}1; ip link set v${n}1 netns zrt-$n-$sfx; ip link set v$n master zr0; ip link set v$n up
+        \\  ip netns exec zrt-$n-$sfx sh -c "ip link set lo up; ip addr add 10.211.0.$h/16 dev v${n}1; ip link set v${n}1 up; ip route add default via 10.211.0.1"
+        \\done
+        \\ip link add vc type veth peer name vc1; ip link set vc1 netns zrt-c-$sfx; ip link set vc master dk0; ip link set vc up
+        \\ip netns exec zrt-c-$sfx sh -c 'ip link set lo up; ip addr add 172.17.0.2/16 dev vc1; ip link set vc1 up; ip route add default via 172.17.0.1'
         \\echo 1 > /proc/sys/net/ipv4/ip_forward
         \\nft add table ip zrt_docker
         \\nft add chain ip zrt_docker pre '{ type nat hook prerouting priority -100; }'
         \\nft add rule ip zrt_docker pre ip daddr 10.1.0.48 tcp dport 3398 dnat to 172.17.0.2:3000
         \\nft add rule ip zrt_docker pre ip daddr 10.1.0.48 tcp dport 3399 dnat to 172.17.0.2:3000
-        \\ip netns exec zrt-ctr python3 -c 'import socket,select,time
-        \\s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("0.0.0.0", 3000)); s.listen()
-        \\end=time.time()+25
-        \\while time.time()<end:
-        \\    if select.select([s],[],[],1)[0]:
-        \\        c,_=s.accept(); c.sendall(b"hi\\n"); c.close()' >/dev/null 2>&1 &
+        \\cat > $d/server.py <<'EOF'
+        \\import socket, threading, time
+        \\s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("0.0.0.0", 3000)); s.listen()
+        \\s.settimeout(1)
+        \\def hold(c):
+        \\    c.sendall(b"hi\n"); time.sleep(12); c.close()
+        \\end = time.time() + 40
+        \\while time.time() < end:
+        \\    try: c, _ = s.accept()
+        \\    except socket.timeout: continue
+        \\    threading.Thread(target=hold, args=(c,), daemon=True).start()
+        \\EOF
+        \\cat > $d/hold.py <<'EOF'
+        \\import socket, sys, time
+        \\s = socket.create_connection(("10.1.0.48", 3398), 3)
+        \\print("answer" if s.recv(8) else "silent", s.getsockname()[1], flush=True)
+        \\time.sleep(8)
+        \\EOF
+        \\cat > $d/try.py <<'EOF'
+        \\import socket, sys
+        \\try:
+        \\    s = socket.create_connection((sys.argv[1], int(sys.argv[2])), 3); print("answer" if s.recv(8) else "silent")
+        \\except OSError:
+        \\    print("refused")
+        \\EOF
+        \\cat > $d/spoof.py <<'EOF'
+        \\import socket, struct, sys
+        \\src, sport, dst, dport, flags, payload = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6].encode()
+        \\def csum(b):
+        \\    if len(b) % 2: b += b"\0"
+        \\    t = sum(struct.unpack("!%dH" % (len(b) // 2), b))
+        \\    t = (t >> 16) + (t & 0xffff); t += t >> 16
+        \\    return ~t & 0xffff
+        \\sa, da = socket.inet_aton(src), socket.inet_aton(dst)
+        \\tcp = struct.pack("!HHLLBBHHH", sport, dport, 1000, 1000, 5 << 4, flags, 65535, 0, 0) + payload
+        \\pseudo = sa + da + struct.pack("!BBH", 0, 6, len(tcp))
+        \\tcp = tcp[:16] + struct.pack("!H", csum(pseudo + tcp)) + tcp[18:]
+        \\ip = struct.pack("!BBHHHBBH", 0x45, 0, 20 + len(tcp), 4242, 0, 64, 6, 0) + sa + da
+        \\ip = ip[:10] + struct.pack("!H", csum(ip)) + ip[12:]
+        \\r = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+        \\r.sendto(ip + tcp, (dst, 0))
+        \\EOF
+        \\echo 1 > /proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal
+        \\ip netns exec zrt-c-$sfx python3 $d/server.py >/dev/null 2>&1 &
     ;
-    const ran = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", setup } }) catch {
-        c.unavailable = true;
+    const ran = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", setup, "sh", suffix, dir } }) catch |e| {
+        c.failure = @errorName(e);
         return;
     };
     if (ran.term != .exited or ran.term.exited != 0) {
-        std.debug.print("native nft: the topology failed: {s}\n", .{ran.stderr});
-        c.unavailable = true;
+        c.failure = std.fmt.allocPrint(arena, "the topology: {s}", .{ran.stderr}) catch "the topology";
         return;
     }
-    const reach: []const net.Reach = if (with_reach) &.{.{ .addr = .{ 10, 1, 0, 48 }, .port = 3398 }} else &.{};
-    if (apply(net.Subnet.default, &.{"d0"}, &.{}, reach)) |why| {
-        std.debug.print("native nft: apply: {s}\n", .{why});
-        c.unavailable = true;
+    if (apply(net.Subnet.default, &.{"d0"}, &.{}, &.{.{ .addr = .{ 10, 1, 0, 48 }, .port = 3398 }})) |why| {
+        c.failure = std.fmt.allocPrint(arena, "apply: {s}", .{why}) catch "apply";
         return;
     }
-    const dial =
-        \\try() { ip netns exec zrt-job python3 -c "import socket,sys
-        \\try:
-        \\    s=socket.create_connection((sys.argv[1], int(sys.argv[2])), 3); print('answer' if s.recv(8) else 'silent')
-        \\except OSError as e:
-        \\    print('refused')" "$1" "$2"; }
-        \\echo "instance $(try 10.1.0.48 3398)"
-        \\echo "other_port $(try 10.1.0.48 3399)"
-        \\echo "container $(try 172.17.0.2 3000)"
-        \\ip netns del zrt-job; ip netns del zrt-ctr
+    const attack =
+        \\sfx=$1; d=$2
+        \\cnt() { nft list chain ip zig_runner forward | grep 'ct original ip daddr' | sed -n 's/.*counter packets \([0-9]*\).*/\1/p' | head -1; }
+        \\echo "other_port $(ip netns exec zrt-a-$sfx python3 $d/try.py 10.1.0.48 3399)"
+        \\echo "container $(ip netns exec zrt-a-$sfx python3 $d/try.py 172.17.0.2 3000)"
+        \\ip netns exec zrt-a-$sfx python3 $d/hold.py > $d/a.out &
+        \\for i in $(seq 50); do grep -q answer $d/a.out 2>/dev/null && break; sleep 0.2; done
+        \\echo "instance $(cut -d' ' -f1 $d/a.out)"
+        \\# The masquerade keeps a source port that is free: the reply's destination port is A's own.
+        \\m=$(cut -d' ' -f2 $d/a.out)
+        \\n0=$(cnt)
+        \\# B: a segment that looks like the instance's reply on A's connection.
+        \\ip netns exec zrt-b-$sfx python3 $d/spoof.py 172.17.0.2 3000 172.17.0.1 "$m" 16 SPOOF1
+        \\sleep 0.5
+        \\n1=$(cnt)
+        \\echo "spoofed_reply $([ "$n1" = "$n0" ] && echo dropped || echo passed)"
+        \\# B: a connection with a source that is not its own, then reply-direction packets of it.
+        \\ip netns exec zrt-b-$sfx python3 $d/spoof.py 10.211.0.250 41000 10.1.0.48 3398 2 ""
+        \\sleep 0.5
+        \\n2=$(cnt)
+        \\m2=41000
+        \\ip netns exec zrt-b-$sfx python3 $d/spoof.py 172.17.0.2 3000 172.17.0.1 "$m2" 16 SPOOF2
+        \\sleep 0.5
+        \\n3=$(cnt)
+        \\echo "spoofed_source_reply $([ "$n3" = "$n2" ] && echo dropped || echo passed)"
+        \\echo "counter $n0 $n1 $n2 $n3 port=$m"
+        \\cat /proc/net/nf_conntrack | head -6
     ;
-    const got = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", dial } }) catch {
-        c.unavailable = true;
+    const got = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", attack, "sh", suffix, dir } }) catch |e| {
+        c.failure = @errorName(e);
         return;
     };
     c.out_len = @min(got.stdout.len, c.out.len);
     @memcpy(c.out[0..c.out_len], got.stdout[0..c.out_len]);
 }
 
-test "native nft: a job reaches an instance Docker publishes on the host's address, and nothing else behind the NAT" {
+test "native nft: a job reaches an instance Docker publishes, and a job cannot use the rule for anything else" {
     if (linux.geteuid() != 0) return error.SkipZigTest;
-    for ([_]bool{ true, false }) |with_reach| {
-        var c: Published = .{};
-        const t = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, dockerPublished, .{ &c, with_reach });
-        t.join();
-        if (c.unavailable) return error.SkipZigTest;
-        const out = c.out[0..c.out_len];
-        errdefer std.debug.print("native nft (reach {}): {s}\n", .{ with_reach, out });
-        // Allowed: answered. Not allowed: no answer at all, whatever the NAT leads to.
-        try std.testing.expect((std.mem.indexOf(u8, out, "instance answer") != null) == with_reach);
-        try std.testing.expect(std.mem.indexOf(u8, out, "other_port answer") == null);
-        try std.testing.expect(std.mem.indexOf(u8, out, "container answer") == null);
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena);
+    // Names of this run's own, so that a run that died leaves none that this one meets.
+    const suffix = try std.fmt.allocPrint(arena, "{d}", .{linux.getpid()});
+    const required = blk: {
+        var env = try std.testing.environ.createMap(arena);
+        break :blk std.mem.eql(u8, env.get("ZIG_RUNNER_REQUIRE_NATIVE") orelse "", "1");
+    };
+    var c: Published = .{};
+    const t = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, dockerPublished, .{ &c, suffix, dir });
+    t.join();
+    // Whatever happened, the namespaces made are removed, and the container's server with them.
+    const clean = try std.fmt.allocPrint(arena, "for j in a b c; do ip netns del zrt-$j-{s} 2>/dev/null; done; true", .{suffix});
+    _ = std.process.run(arena, std.testing.io, .{ .argv = &.{ "sh", "-c", clean } }) catch {};
+    if (c.skip) |why| {
+        if (required) {
+            std.debug.print("native nft: cannot run ({s}), and ZIG_RUNNER_REQUIRE_NATIVE=1\n", .{why});
+            return error.TestUnexpectedResult;
+        }
+        return error.SkipZigTest;
     }
+    if (c.failure) |why| {
+        std.debug.print("native nft: {s}\n", .{why});
+        return error.TestUnexpectedResult;
+    }
+    const out = c.out[0..c.out_len];
+    errdefer std.debug.print("native nft: {s}\n", .{out});
+    try std.testing.expect(std.mem.indexOf(u8, out, "instance answer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "other_port answer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "container answer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "spoofed_reply dropped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "spoofed_source_reply dropped") != null);
 }

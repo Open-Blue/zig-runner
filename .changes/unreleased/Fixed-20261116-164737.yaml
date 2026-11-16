@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A job reaches a Gitea or Forgejo that is a Docker container with a port published on the host''s own address (-p 10.0.0.5:3000:3000, with that address as ROOT_URL): the jobs'' forward rule matches the connection''s original destination (ct original ip daddr and proto-dst), not the address Docker''s NAT has already rewritten, so the job''s connections no longer time out; nothing else behind the NAT (another published port, the container itself) is reached. Tested on the wire in a root test with Docker''s DNAT rule, a bridge and a container namespace.'
-time: 2026-11-16T16:47:37.831147099-05:00
