@@ -1342,8 +1342,6 @@ pub fn setUpJob(x: *Exec, opts: Options, results: []StepResult) !?Result {
     try x.logSetUp(opts);
     if (try evalRunDefaults(x)) |why| return try failSetUp(x, results, why);
     try warnDroppedContainerSettings(x);
-    // The fetches the native backend tried again before the job began (`fetch_retry.zig`).
-    if (x.native) |b| for (b.fetch_notes.items) |note| x.setUpLine(note);
     var downloaded: std.StringHashMapUnmanaged(void) = .empty;
     var unresolved: std.StringArrayHashMapUnmanaged(void) = .empty;
     for (x.job.steps, 1..) |step, n| if (step.action == .uses and !step.action.uses.local) {

@@ -326,6 +326,10 @@ fn gitEnv(b: *Backend, job: job_mod.Job, own: bool) ![]const []const u8 {
         "HOME=/root",
         "GIT_TERMINAL_PROMPT=0",
         "GIT_CONFIG_GLOBAL=" ++ git_config_path,
+        // A transfer that moves less than 1 KB/s for 30 s is a stalled one, not a slow one
+        // (an action's fetch is small): git ends it, and `fetch_retry` tries again.
+        "GIT_HTTP_LOW_SPEED_LIMIT=1000",
+        "GIT_HTTP_LOW_SPEED_TIME=30",
     });
     var git_config: std.ArrayList([2][]const u8) = .empty;
     if (own and job.gitToken().len > 0) {
@@ -393,19 +397,21 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
     var out: Backend.Captured = .{ .arena = arena };
     var tar_sha: []const u8 = "";
     var ended: sandbox.Ended = .{ .code = 0, .failure = "" };
+    // Why the last attempt failed, when it was the runner that stopped it (its time limit).
+    var stopped: []const u8 = "";
     // A network failure is tried again (`fetch_retry.zig`), each time in a new layer: the one a
     // failed attempt left, with its half-made `.git`, is dropped first, as for a missing git.
-    var at: fetch_retry.Attempts = .{
-        .io = b.io,
-        .cancel = if (b.cancel) |c| &c.requested else null,
-        .base_ms = b.fetch_backoff_ms,
-    };
+    // Each attempt is stopped at `attempt_limit_ms` or the job's cancel (`Backend.execLimited`),
+    // and a transfer that stalls ends by git's own low-speed limit (`gitEnv`).
+    const cancel = if (b.cancel) |c| &c.requested else null;
+    var retry = fetch_retry.Retrying.init(b.io, cancel, b.fetch_backoff_ms, "action", &b.fetch_budget, b.live_log, 0);
     // Once the image is known to have no git, its script is not run again.
     if (!b.no_git) {
         const env = try gitEnv(b, job, from.token);
         while (true) {
             out = .{ .arena = arena };
-            ended = try b.execOn(&.{ "sh", "-c", aw.written() }, env, &.{git_config_file}, 0, 0, out.output(), null);
+            const ran = try b.execLimited(&.{ "sh", "-c", aw.written() }, env, &.{git_config_file}, 0, 0, out.output(), b.fetch_attempt_limit_ms);
+            ended = ran.ended;
             // `sh` found no git in the image (any image is native since P3, not only the provisioned
             // default one): the action's tarball instead (`tarball.zig`), here and for the job's later
             // fetches.
@@ -415,10 +421,15 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
                 break;
             }
             if (ended.failure.len == 0 and ended.code == 0) break;
-            const why = if (ended.failure.len > 0) ended.failure else out.text.items;
-            if (!try at.again(arena, ref_label, why, fetch_retry.transientText(why))) break;
+            stopped = if (ran.timed_out)
+                try std.fmt.allocPrint(arena, "the fetch took longer than {d} seconds", .{b.fetch_attempt_limit_ms / 1000})
+            else
+                "";
+            const why = if (ran.timed_out) stopped else if (ended.failure.len > 0) ended.failure else out.text.items;
+            const again = try retry.plan(arena, ref_label, why, ran.timed_out or fetch_retry.transientText(why));
+            // The failed attempt's layer goes whether another follows or not.
             b.dropTop();
-            try b.fetch_notes.append(arena, at.said);
+            if (!again or !retry.wait()) break;
         }
     }
     if (b.no_git) {
@@ -448,18 +459,17 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
         else
             try tarball.instanceSource(arena, server, repository, ref, token);
         src.backoff_ms = b.fetch_backoff_ms;
-        // A lookup, a connection or a stream that fails is tried again (a 5xx or a 429 already is,
+        // The tarball's own attempts, from the first (not what the git script used up). A
+        // lookup, a connection or a stream that fails is tried again (a 5xx or a 429 already is,
         // in `tarball.download`).
+        var tar_retry = fetch_retry.Retrying.init(b.io, cancel, b.fetch_backoff_ms, "action", &b.fetch_budget, b.live_log, 0);
         while (true) switch (try tarball.fetchInto(b, mount, src, if (checkout_mod.isSha(ref)) ref else null, 0, 0)) {
             .sha => |s| {
                 tar_sha = s;
                 break;
             },
             .failed => |why| {
-                if (try at.again(arena, ref_label, why, fetch_retry.transientDownload(why))) {
-                    try b.fetch_notes.append(arena, at.said);
-                    continue;
-                }
+                if (try tar_retry.again(arena, ref_label, why, fetch_retry.transientDownload(why))) continue;
                 return .{ .unresolved = try std.fmt.allocPrint(
                     arena,
                     "Unable to resolve action `{s}`: {s}",
@@ -473,7 +483,7 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
             "Unable to resolve action `{s}`: {s}{s}",
             .{
                 ref_label,
-                if (ended.failure.len > 0) ended.failure else out.tail(),
+                if (stopped.len > 0) stopped else if (ended.failure.len > 0) ended.failure else out.tail(),
                 // The instance would have answered a token it takes; this job has none to send.
                 if (from.token and job.gitToken().len == 0 and job.github.forge != .github)
                     " (the task has no GITHUB_TOKEN secret, so the fetch had no credentials)"
@@ -1621,26 +1631,33 @@ fn testFlakyGit(arena: Allocator, tmp: *std.testing.TmpDir, cfg: *Backend.Config
     const made = try std.process.run(arena, io, .{ .argv = &.{ "chmod", "777", ctr } });
     if (made.term != .exited or made.term.exited != 0) return error.SkipZigTest;
     try tmp.dir.writeFile(io, .{ .sub_path = "rootfs/srv/bin/realgit", .data = "" });
+    // What the fetch does while it fails: say `fail_text`, or (`hang`) never answer.
+    const body: []const u8 = if (std.mem.eql(u8, fail_text, hang))
+        "      exec sleep 3600"
+    else
+        try std.fmt.allocPrint(arena, "      cat >&2 <<'MSG'\n{s}\nMSG", .{fail_text});
     try tmp.dir.writeFile(io, .{ .sub_path = "flaky-git.sh", .flags = .{ .permissions = .fromMode(0o755) }, .data = try std.fmt.allocPrint(arena,
         \\#!/bin/sh
         \\for a in "$@"; do
         \\  if [ "$a" = fetch ]; then
         \\    n=$(cat /srv/ctr/n 2>/dev/null || echo 0); n=$((n + 1)); echo $n > /srv/ctr/n
-        \\    if [ $n -le {d} ]; then cat >&2 <<'MSG'
+        \\    if [ $n -le {d} ]; then
         \\{s}
-        \\MSG
         \\      exit 128; fi
         \\  fi
         \\done
         \\exec /srv/bin/realgit "$@"
         \\
-    , .{ fails, fail_text }) });
+    , .{ fails, body }) });
     cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{
         .{ .host = try std.fmt.allocPrint(arena, "{s}/flaky-git.sh", .{root}), .at = "/usr/bin/git" },
         .{ .host = "/usr/bin/git", .at = "/srv/bin/realgit" },
         .{ .host = ctr, .at = "/srv/ctr", .read_only = false },
     } });
 }
+
+/// `testFlakyGit`'s `fail_text` for a fetch that never answers.
+const hang = "HANG";
 
 const dns_failure = "fatal: unable to access 'https://github.com/o/comp.git/': Could not resolve host: github.com";
 
@@ -1656,9 +1673,11 @@ fn flakyJob(arena: Allocator, tmp: *std.testing.TmpDir, cfg: Backend.Config, can
     const steps = [_]job_mod.Step{usesStep("comp", "o", "comp", "v1", &.{})};
     var job = testJob(&steps);
     job.github.server_url = "file:///srv/git";
+    job.secret_vars = &.{.{ .name = "GITHUB_TOKEN", .value = "tok-123" }};
     var env: std.process.Environ.Map = .init(arena);
     var w: std.Io.Writer.Allocating = .init(arena);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    log.setSecrets(try @import("../redact.zig").expand(arena, &.{"tok-123"}));
     const res = try dagger.run(arena, std.testing.io, &env, .{
         .native = cfg,
         .step_user = .root,
@@ -1879,4 +1898,56 @@ test "fetch retry: a job's cancel during a checkout's backoff stops the waiting 
     errdefer std.debug.print("{s}\n", .{r.text});
     try std.testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - t0 < 120_000);
     try std.testing.expectEqual(@as(u32, 1), r.fetches);
+}
+
+test "fetch retry: an action fetch that never answers is stopped at the attempt's limit and tried again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    cfg.fetch_attempt_limit_ms = 2000;
+    try testFlakyGit(arena, &tmp, &cfg, 2, hang);
+    const r = try flakyJob(arena, &tmp, cfg, null);
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expectEqual(dagger.Outcome.success, r.res.steps[0].outcome);
+    try std.testing.expectEqual(@as(u32, 3), r.fetches);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.text, "the fetch took longer than 2 seconds. Retrying in "));
+}
+
+test "fetch retry: the job's budget ends the retries of a network that never answers" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    cfg.fetch_attempt_limit_ms = 1000;
+    // Two attempts' time and a little more: a third is made, a fourth is not.
+    cfg.fetch_budget_ms = 2500;
+    try testFlakyGit(arena, &tmp, &cfg, 1000, hang);
+    const r = try flakyJob(arena, &tmp, cfg, null);
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(!r.res.succeeded and r.res.set_up_failed);
+    try std.testing.expectEqual(@as(u32, 3), r.fetches);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "Unable to resolve action `o/comp@v1`: the fetch took longer than 1 seconds") != null);
+}
+
+test "fetch retry: an action fetch's warning never carries the job's secret" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    try testFlakyGit(arena, &tmp, &cfg, 1, "fatal: unable to access 'https://x-access-token:tok-123@github.com/o/comp.git/': Could not resolve host: github.com");
+    const r = try flakyJob(arena, &tmp, cfg, null);
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expectEqual(@as(u32, 2), r.fetches);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.text, "##[warning]Failed to fetch action 'o/comp@v1' (attempt 1 of 5): fatal: unable to access 'https://x-access-token:***@github.com"));
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "tok-123") == null);
 }

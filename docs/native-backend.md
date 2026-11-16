@@ -2609,13 +2609,24 @@ the reason (`error.NativeToDagger`), and Dagger fetches again; otherwise "Set up
 logs "Download action repository ... (SHA:...)" as on Dagger. An action that cannot be fetched
 is not a reason: native "Set up job" fails with it, as Dagger's does. A fetch that fails on the network is
 tried again first (`dagger/fetch_retry.zig`, the Dagger path's `fetchAction` too, and the tarball path below): a lookup
-that fails (`Could not resolve host`), a refused or reset connection, a timeout, a TLS failure, a 5xx or a 429. Up to 5
-attempts, waiting 4, 8, 16 and 32 s between them, each a random half to all of that, so 30 to 60 s of waiting in all:
-actions/runner (`ActionManager.cs`, `DownloadRepositoryArchive`) tries 3 times, 10 to 30 s apart, any error but a 404 or
-an access denial, and a cancel ends its waiting too. A missing repository or ref, refused credentials and an exhausted
-15 minutes are not retried. Each retry is a `##[warning]Failed to fetch action '<owner>/<repo>@<ref>' (attempt N of 5): <the
-last line git said>. Retrying in S seconds.` in "Set up job", where the actions are downloaded (also when the fetch then fails for good); a failed attempt's layer, with its half-made `.git`, is dropped before the next. The job's cancel (or
-`timeout-minutes`) ends the waiting. The built-in checkout is retried the same way (`Backend.fetchCheckout`, its tarball fallback, Dagger's `checkout.fetch`): the whole fetch script runs again from a clean layer, so a failed tags or submodule fetch is retried too, and the warning (`Failed to fetch repository 'o/r@ref'`) is in the checkout step's log with the job's secrets and masks redacted. `readOwn`'s preflight and image pulls are not retried this way.
+that fails (`Could not resolve host`), a refused or reset connection, a timeout, a TLS handshake failure, a 5xx or a 429.
+Up to 5 attempts, waiting 4, 8, 16 and 32 s between them, each a random half to all of that, so 30 to 60 s of waiting
+in all: actions/runner (`ActionManager.cs`, `DownloadRepositoryArchive`) tries 3 times, 10 to 30 s apart, any error but a 404 or
+an access denial, and a cancel ends its waiting too. A missing repository or ref, refused credentials, a body cut short
+after bytes came and an exhausted 15 minutes are not retried. Bounds: an action's attempt is stopped after 120 s (and at
+the job's cancel; `Backend.execLimited`) and git ends a transfer that moves under 1 KB/s for 30 s
+(`GIT_HTTP_LOW_SPEED_*`); and a job has one retry budget for all its fetches, 180 s of failed attempts and waits
+(`fetch_retry.Budget`), after which a failure is the answer, so a network that never answers costs the job minutes, not
+5 attempts for each action. Each retry is a `##[warning]Failed to fetch action '<owner>/<repo>@<ref>' (attempt N of 5): <the
+last line git said>. Retrying in S seconds.` in the job's log as it happens (an action's before "Set up job" begins, since
+its fetch is first; redacted of the job's secrets); a failed attempt's layer, with its half-made `.git`, is dropped, also
+after the last. The job's cancel (or `timeout-minutes`) ends the waiting. The image with no git has the tarball's own
+attempts. The built-in checkout is retried the same way (`Backend.fetchCheckout`, its tarball fallback, Dagger's
+`checkout.fetch`): the whole fetch script runs again from a clean layer, so a failed tags or submodule fetch is retried
+too, and the warning (`Failed to fetch repository 'o/r@ref'`) is in the checkout step's log. A checkout has no attempt
+limit of its own (a large clone takes as long as it takes): the step's timeout and the job's cancel stop it, and the
+step cache's claim on its key is let go while a retry waits. The Dagger engine's fetches have no per-attempt limit (the engine
+decides). `readOwn`'s preflight and image pulls are not retried this way.
 Native runs Docker actions
 (a `docker://` image, or built from the Dockerfile in the fetched tree, the context opened
 through no symlink) and composite actions (their steps are the shared code's: scripts, nested

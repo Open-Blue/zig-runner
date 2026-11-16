@@ -53,6 +53,7 @@ const transient_needles = [_][]const u8{
     "remote end hung up unexpectedly",
     "the remote end hung up",
     "http/2 stream",
+    "operation too slow",
     // TLS
     "tls handshake timeout",
     "tls connection was non-properly terminated",
@@ -83,12 +84,15 @@ const permanent_needles = [_][]const u8{
     "returned error: 401",
     "returned error: 403",
     "returned error: 404",
+    "' not found",
     "permission denied",
 };
 
 /// The names the runner's own HTTP client gives a download's transport failures (the tarball path
-/// has no git to print them): the lookup, the connection and the stream. A 15-minute `Timeout`
-/// is none of them: it already took the time a retry would.
+/// has no git to print them): the lookup, the connection, the TLS handshake and a connection
+/// closed before the answer's head (`ResetBeforeHead`). Not a body cut short after bytes arrived
+/// (`ReadFailed`, `EndOfStream`), nor a certificate's alert, nor the 15-minute `Timeout`: that
+/// already took the time a retry would.
 const transient_errors = [_][]const u8{
     "UnknownHostName",
     "NameServerFailure",
@@ -101,9 +105,11 @@ const transient_errors = [_][]const u8{
     "HostUnreachable",
     "HttpConnectionClosing",
     "ResetBeforeHead",
-    "EndOfStream",
     "BrokenPipe",
-    "ReadFailed",
+    "TlsInitializationFailed",
+    "TlsConnectionTruncated",
+    "TlsAlertCloseNotify",
+    "TlsAlertInternalError",
 };
 
 fn mentions(text: []const u8, needles: []const []const u8) bool {
@@ -177,9 +183,24 @@ fn lastLine(text: []const u8) []const u8 {
     return if (line.len > 300) line[0..300] else line;
 }
 
+/// What a job spends on retries in all its fetches, so a network that never answers cannot hold
+/// the job for every action in turn: the time of the failed attempts and of the waits after
+/// them. A retry that would pass `limit_ms` is not made.
+pub const Budget = struct {
+    spent_ms: i64 = 0,
+    limit_ms: i64 = 180_000,
+};
+
+fn awakeMs(io: std.Io) i64 {
+    return std.Io.Clock.awake.now(io).toMilliseconds();
+}
+
 /// One fetch's attempts. `again` is asked after each failure.
 pub const Attempts = struct {
     io: std.Io,
+    budget: ?*Budget = null,
+    /// When the attempt now running began.
+    t0: i64 = -1,
     cancel: ?*const std.atomic.Value(bool) = null,
     base_ms: i64 = default_base_ms,
     n: u32 = 1,
@@ -201,6 +222,11 @@ pub const Attempts = struct {
         if (!transient or a.n >= max_attempts) return false;
         if (if (a.cancel) |c| c.load(.acquire) else false) return false;
         a.wait_ms = delayMs(a.io, a.base_ms, a.n);
+        if (a.budget) |bg| {
+            bg.spent_ms += if (a.t0 >= 0) awakeMs(a.io) - a.t0 else 0;
+            if (bg.spent_ms + a.wait_ms > bg.limit_ms) return false;
+            bg.spent_ms += a.wait_ms;
+        }
         a.said = try warning(arena, a.kind, what, a.n, failure, a.wait_ms);
         return true;
     }
@@ -209,24 +235,52 @@ pub const Attempts = struct {
     pub fn wait(a: *Attempts) bool {
         if (pause(a.io, a.cancel, a.wait_ms)) return false;
         a.n += 1;
+        a.t0 = awakeMs(a.io);
         return true;
     }
 };
 
-/// A checkout's attempts (`Backend.fetchCheckout`, `checkout.fetch`): `again` logs each warning in
-/// the step's log at once, with the failure text redacted first (the job's token and masks never
-/// reach it), and keeps it in `lines`.
+/// A fetch's attempts with where to say each retry: `again` logs the warning in the job's log at
+/// once (step `num`), with the failure text redacted first (the job's token and masks never reach
+/// it), and keeps it in `lines`.
 pub const Retrying = struct {
     at: Attempts,
     sh: ?*@import("JobLog.zig") = null,
     num: u32 = 0,
     lines: std.ArrayList([]const u8) = .empty,
 
+    pub fn init(
+        io: std.Io,
+        cancel: ?*const std.atomic.Value(bool),
+        base_ms: i64,
+        kind: []const u8,
+        budget: ?*Budget,
+        sh: ?*@import("JobLog.zig"),
+        num: u32,
+    ) Retrying {
+        return .{
+            .at = .{ .io = io, .cancel = cancel, .base_ms = base_ms, .kind = kind, .budget = budget, .t0 = awakeMs(io) },
+            .sh = sh,
+            .num = num,
+        };
+    }
+
     pub fn again(r: *Retrying, arena: std.mem.Allocator, what: []const u8, failure: []const u8, transient: bool) !bool {
+        if (!try r.plan(arena, what, failure, transient)) return false;
+        return r.wait();
+    }
+
+    /// The decision, and the warning said; the wait is `wait`'s (a caller that holds something
+    /// others wait for lets it go in between).
+    pub fn plan(r: *Retrying, arena: std.mem.Allocator, what: []const u8, failure: []const u8, transient: bool) !bool {
         const safe = if (r.sh) |sh| sh.redacted(arena, failure) catch failure else failure;
         if (!try r.at.plan(arena, what, safe, transient)) return false;
         if (r.sh) |sh| sh.append(r.num, r.at.said);
         try r.lines.append(arena, r.at.said);
+        return true;
+    }
+
+    pub fn wait(r: *Retrying) bool {
         return r.at.wait();
     }
 };
@@ -243,6 +297,7 @@ test "transient: what git, curl, Go and the HTTP client say of the network" {
         "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 429",
         "error: RPC failed; curl 56 OpenSSL SSL_read: Connection reset by peer, errno 104\nfatal: early EOF",
         "dial tcp: lookup github.com on 10.0.0.1:53: no such host",
+        "error: RPC failed; HTTP 408\nfatal: Operation too slow. Less than 1000 bytes/sec transferred the last 30 seconds",
         "dial tcp 140.82.112.3:443: i/o timeout",
         "net/http: TLS handshake timeout",
         "fatal: unable to access 'https://github.com/o/r.git/': Temporary failure in name resolution",
@@ -256,6 +311,7 @@ test "transient: what git, curl, Go and the HTTP client say of the network" {
         "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 404",
         "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 403",
         "git error: repository does not contain ref \"v10\"",
+        "fatal: repository 'https://github.com/o/r.git/' not found",
         "sh: 1: git: not found",
         "",
     }) |text| try t.expect(!transientText(text));
@@ -272,6 +328,10 @@ test "transientDownload: the client's transport errors, not a status or its own 
     try t.expect(!transientDownload("could not download https://x/y: HTTP 500"));
     try t.expect(!transientDownload("could not download https://x/y: it took longer than 15 minutes"));
     try t.expect(!transientDownload("could not download https://x/y: TooManyRedirects"));
+    try t.expect(transientDownload("could not download https://x/y: TlsInitializationFailed"));
+    // A body cut short after bytes came is not told from the archive being wrong: not retried.
+    try t.expect(!transientDownload("could not download https://x/y: ReadFailed"));
+    try t.expect(!transientDownload("could not download https://x/y: EndOfStream"));
 }
 
 test "delayMs: half to all of base, doubled per attempt, capped, and never zero for a real base" {
@@ -350,4 +410,26 @@ test "pause: a cancel ends a long wait at once, and one already set means no ret
     var late: Attempts = .{ .io = io, .cancel = &flag, .base_ms = 1 };
     try std.testing.expect(!try late.again(arena, "o/r@v1", "Could not resolve host: x", true));
     try std.testing.expectEqualStrings("", late.said);
+}
+
+test "Budget: retries stop once the failed attempts and the waits would pass the limit" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var budget: Budget = .{ .limit_ms = 100 };
+    var at: Attempts = .{ .io = std.testing.io, .base_ms = 1, .budget = &budget };
+    // 1 ms waits fit: two retries, each 1 then 2 ms (halved to all of it), and so on up to the limit.
+    var retries: u32 = 0;
+    while (try at.again(arena, "o/r@v1", "Could not resolve host: x", true)) retries += 1;
+    try std.testing.expectEqual(max_attempts - 1, retries);
+    var tight: Budget = .{ .limit_ms = 3 };
+    var at2: Attempts = .{ .io = std.testing.io, .base_ms = 4000, .budget = &tight };
+    try std.testing.expect(!try at2.again(arena, "o/r@v1", "Could not resolve host: x", true));
+    // Shared: what one fetch's retry spent, the next fetch's does not have.
+    var shared: Budget = .{ .limit_ms = 10_000 };
+    var first: Attempts = .{ .io = std.testing.io, .base_ms = 8000, .budget = &shared };
+    try std.testing.expect(try first.plan(arena, "o/a@v1", "Could not resolve host: x", true));
+    try std.testing.expect(shared.spent_ms >= 4000);
+    var second: Attempts = .{ .io = std.testing.io, .base_ms = 8000, .budget = &shared };
+    try std.testing.expect(!try second.plan(arena, "o/b@v1", "Could not resolve host: x", true));
 }
