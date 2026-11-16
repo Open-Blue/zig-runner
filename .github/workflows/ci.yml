@@ -410,6 +410,9 @@ jobs:
       contents: read # to check out the code
     outputs:
       sha256: ${{ steps.build.outputs.sha256 }}
+      # Unique per attempt: a re-run of all jobs uploads a fresh artifact (names are unique per
+      # run), and a re-run of the Test job alone downloads this attempt's, named by this output.
+      artifact: tests-aarch64-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -418,7 +421,8 @@ jobs:
       - name: Install Zig
         run: .github/scripts/install-zig.sh
 
-      # The pinned Rust, with the aarch64 musl target the network library is built for.
+      # build-zr-net.sh installs the pinned Rust (install-rust.sh), with the aarch64 musl target the
+      # network library is built for.
       - name: Compile the tests for aarch64
         id: build
         run: |
@@ -428,7 +432,7 @@ jobs:
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: tests-aarch64
+          name: tests-aarch64-${{ github.run_attempt }}
           path: ${{ runner.temp }}/tests-aarch64.tar
           if-no-files-found: error
           retention-days: 1
@@ -506,11 +510,16 @@ jobs:
           fi
           echo "dir=$RUNNER_TEMP/prebuilt" >>"$GITHUB_OUTPUT"
 
+      # The artifact service has not served this project's own runner before, and an artifact
+      # expires after a day: a download that fails is a warning and the Test step compiles here, as
+      # it did before the prebuild. A tar that downloaded and then fails its checks is not.
       - name: Download the prebuilt tests
+        id: download
         if: steps.prebuilt.outputs.dir != ''
+        continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: tests-aarch64
+          name: ${{ needs.prebuild.outputs.artifact }}
           path: ${{ steps.prebuilt.outputs.dir }}
 
       # The database tests skip themselves here: the Database tests job runs them. On GitHub's
@@ -527,7 +536,9 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         working-directory: runner
         env:
-          PREBUILT_DIR: ${{ steps.prebuilt.outputs.dir }}
+          PREBUILT_DIR: ${{ steps.download.outcome == 'success' && steps.prebuilt.outputs.dir || '' }}
+          PREBUILT_ARTIFACT: ${{ needs.prebuild.outputs.artifact }}
+          PREBUILD_RESULT: ${{ needs.prebuild.result }}
           PREBUILT_SHA256: ${{ needs.prebuild.outputs.sha256 }}
         run: |
           if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
@@ -548,6 +559,12 @@ jobs:
             # of its job's 3.1 GB limit and killed one run. `test` after `test-compile` only runs.
             jobs=()
             [ "$RUNNER_ARCH" = ARM64 ] && jobs=(-j1)
+            if [ -n "$PREBUILT_DIR" ] && [ ! -f "$PREBUILT_DIR/tests-aarch64.tar" ]; then
+              echo "::warning::The artifact $PREBUILT_ARTIFACT downloaded without tests-aarch64.tar: compiling here"
+              PREBUILT_DIR=
+            elif [ -z "$PREBUILT_DIR" ] && [ "$PREBUILD_RESULT" = success ]; then
+              echo "::warning::The prebuilt tests ($PREBUILT_ARTIFACT) could not be downloaded (the artifact service failed, or the artifact expired after its day: re-run the whole workflow): compiling here"
+            fi
             if [ -n "$PREBUILT_DIR" ]; then
               # Nothing to compile: the prebuild job did, and this runs its tests, after checking the
               # tar against the digest that job output (zig-test-prebuilt.sh).

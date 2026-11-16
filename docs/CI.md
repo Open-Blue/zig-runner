@@ -87,7 +87,12 @@ unreported instead, and the merge queue waiting for it.
   the shard runner's tests, then `test_shards` over the tests, as `zig build test` does), so the
   Pi's Test step compiles nothing and needs no memory for it; the tests still run on the Pi. A
   prebuild that failed fails the Test job; one that is skipped (pull requests, the merge queue, a
-  hosted `PROD_RUNNER`) leaves the Test job compiling for itself as above. The Rust tests and the
+  hosted `PROD_RUNNER`) leaves the Test job compiling for itself as above. The prebuild is for an
+  aarch64 `PROD_RUNNER` (the Pi): its target is fixed, and the run refuses a tar built for another
+  architecture. If the download fails (the artifact service, or the artifact's one-day retention
+  after a re-run of the Test job alone), the Test step says so in a `::warning::` and compiles for
+  itself; a tar that downloaded and fails the sha256, architecture or commit check fails the job.
+  The artifact is named per attempt (`tests-aarch64-N`), by the prebuild's output. The Rust tests and the
   expression conformance step still build on the runner they run on.
 - **Native tests as root**: the native backend's root-only tests, in two parts per architecture,
   the slow tests (`test_shards.zig`'s `slow`) shared out among the parts on their own. In ci the
