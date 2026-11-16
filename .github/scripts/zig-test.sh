@@ -110,7 +110,7 @@ read -ra extra <<<"${ZIG_TEST_CONTAINER_ARGS:-}"
 # --init: a step's timeout sends SIGTERM, which a container's PID 1 would otherwise ignore.
 docker run --rm --init --user "$(id -u):$(id -g)" -w /tmp "${extra[@]}" \
 	-v "$scratch:$scratch:ro" -v "$(dirname "$bin"):$(dirname "$bin"):ro" \
-	-e ZIG_RUNNER_TEST_EXE -e ZIG_TEST_SHARDS "$image" "$shards" "$bin" 2>&1 | tee "$scratch/container.log"
+	-e ZIG_RUNNER_TEST_EXE -e ZIG_TEST_SHARDS -e ZIG_TEST_FULL -e ZIG_TEST_TIMES "$image" "$shards" "$bin" 2>&1 | tee "$scratch/container.log"
 status=${PIPESTATUS[0]}
 # ZIG_TEST_MIN_PASSED: a floor on the tests that passed, so a mistake that skips nearly all of
 # them (the container's directory, the runner binary) cannot stay green.

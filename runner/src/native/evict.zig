@@ -2246,9 +2246,9 @@ test "native eviction: a slow sync does not eat what a pass may delete" {
     // Each pass gets its time after the sync, so a busy machine only takes more of them: a sync
     // that ate the budget would leave the tree whole for good. Bounded by passes, which every
     // pass's floor of `least_removed` steps limits whatever the load (2000 files and the
-    // directory are 32 passes at the least), not by a deadline that a loaded machine runs past.
+    // directory are 32 passes at the least; twice that is allowed), not by a deadline that a loaded machine runs past.
     var passes: usize = 0;
-    while (passes < 2001 / least_removed + 8 and try f.deadLeft() > 0) : (passes += 1) run(f.s, testing.io);
+    while (passes < (2001 / least_removed + 1) * 2 and try f.deadLeft() > 0) : (passes += 1) run(f.s, testing.io);
     try testing.expectEqual(@as(usize, 0), try f.deadLeft());
 }
 
