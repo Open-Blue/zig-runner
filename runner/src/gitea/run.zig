@@ -141,10 +141,12 @@ fn runTask(c: loop.Runner, client: client_mod.Client, t: client_mod.Task) !void 
     // The conversion fails the task, not the runner: a workflow it cannot read is reported to
     // the instance as the job's failure, with the reason in its log.
     var why: []const u8 = "";
-    const converted = convert.fromTask(c.arena, t, &why) catch |e| switch (e) {
+    var converted = convert.fromTask(c.arena, t, &why) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.BadWorkflow => return failUnread(c, client, t, why),
     };
+    // Which software sent it. `runJob` runs `converted`'s job, so it is set there.
+    converted.job.github.forge = if (client.flavor == .forgejo) .forgejo else .gitea;
     const job = converted.job;
 
     // Each secret in every form it can take in output.

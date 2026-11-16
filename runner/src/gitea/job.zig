@@ -484,6 +484,10 @@ const Builder = struct {
         const dir = std.mem.trim(u8, parts.rest(), "/");
         if (owner.len == 0 or repo.len == 0 or ref.len == 0 or std.mem.indexOf(u8, dir, "..") != null)
             return invalid;
+        // What goes into a URL, a directory and git's command line is checked here and again when
+        // the action is fetched (`Resolved.problem`).
+        if (!job_mod.validName(owner) or !job_mod.validName(repo) or job_mod.refProblem(ref) != null)
+            return invalid;
         if (source == .default and dir.len == 0 and std.ascii.eqlIgnoreCase(rest[0..at], "actions/checkout"))
             return .{ .checkout = inputs };
         return .{ .uses = .{
@@ -1090,6 +1094,12 @@ test "uses steps: where the action is fetched from (self:, $/, a URL, the defaul
         \\      - uses: self:owner/repo
         \\      - uses: https://host
         \\      - uses: self:actions/checkout@v4
+        \\      - uses: o/r@../../..
+        \\      - uses: ../..@x
+        \\      - uses: o/r@--upload-pack=touch
+        \\      - uses: o/../r@v1
+        \\      - uses: self:o/r@a..b
+        \\      - uses: o/r@-x
     , "{\"server_url\":\"http://127.0.0.1:3300/\"}");
     const s = c.job.steps;
     try testing.expectEqual(job_mod.Source.instance, s[0].action.uses.source);
@@ -1111,6 +1121,11 @@ test "uses steps: where the action is fetched from (self:, $/, a URL, the defaul
     try testing.expect(std.mem.indexOf(u8, s[7].action.unsupported, "credentials") != null);
     // `self:actions/checkout` is that repository's action, not the built-in checkout.
     try testing.expect(s[13].action == .uses);
+    // A name or a ref that moves a path or starts an option is not a reference.
+    for (s[14..20]) |st| {
+        try testing.expect(st.action == .unsupported);
+        try testing.expect(std.mem.indexOf(u8, st.action.unsupported, "not a valid action reference") != null);
+    }
 }
 
 test "the default actions URL: the instance's own is the server, another is kept, github and self are named" {

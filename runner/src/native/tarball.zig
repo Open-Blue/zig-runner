@@ -112,6 +112,14 @@ pub fn actionSource(arena: Allocator, server_url: []const u8, repo: []const u8, 
     return .{ .url = try std.fmt.allocPrint(arena, "{s}/{s}/archive/{s}.tar.gz", .{ server, repo, try refPath(arena, ref) }) };
 }
 
+/// An action's source on a Gitea or Forgejo instance, which takes the task's token on its web
+/// archive too (a private repository's): `Bearer`, sent to that host only.
+pub fn instanceSource(arena: Allocator, server_url: []const u8, repo: []const u8, ref: []const u8, token: []const u8) !Source {
+    var s = try actionSource(arena, server_url, repo, ref);
+    s.token = token;
+    return s;
+}
+
 /// The step that extracts the archive into `mount`: `tar` as it is in busybox and GNU alike (the
 /// top directory GitHub adds stripped, owners not applied), the modes git's checkout gives and the
 /// files given the checkout's fixed time (`checkout.mtime`).

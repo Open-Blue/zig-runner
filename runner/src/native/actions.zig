@@ -195,6 +195,9 @@ fn localReason(b: *Backend, job: job_mod.Job, path: []const u8, depth: u32) anye
 /// (an action's `action.yml` or `.yaml`, its Dockerfile), or null.
 fn readOwn(b: *Backend, job: job_mod.Job, path: []const u8, names: []const []const u8) !?[]const u8 {
     const arena = b.arena;
+    // The task's own repository and commit, which go to git and a URL as an action's do.
+    const own: job_mod.Resolved = .{ .server = "", .repository = job.github.repository, .ref = job.github.sha, .token = true };
+    if (own.problem() != null) return null;
     const server = std.mem.trimEnd(u8, job.github.server_url, "/");
     b.preflights += 1;
     const out_path = try std.fmt.allocPrint(arena, "/tmp/zig-runner-preflight-{d}.yml", .{b.preflights});
@@ -203,7 +206,7 @@ fn readOwn(b: *Backend, job: job_mod.Job, path: []const u8, names: []const []con
     try w.writeAll("set -e\nd=$(mktemp -d)\ntrap 'rm -rf \"$d\"' EXIT\ncd \"$d\"\ngit init -q\n" ++
         "git remote add origin ");
     try dagger.shellQuote(w, try std.fmt.allocPrint(arena, "{s}/{s}.git", .{ server, job.github.repository }));
-    try w.writeAll("\ngit -c protocol.version=2 fetch -q --depth=1 --filter=blob:none --no-tags origin ");
+    try w.writeAll("\ngit -c protocol.version=2 fetch -q --depth=1 --filter=blob:none --no-tags -- origin ");
     try dagger.shellQuote(w, job.github.sha);
     try w.writeAll("\nfor f in");
     for (names) |n| {
@@ -354,8 +357,15 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
     const ref = from.ref;
     const sub = if (u.path.len > 0) try std.fmt.allocPrint(arena, "/{s}", .{u.path}) else "";
     const ref_label = try std.fmt.allocPrint(arena, "{s}{s}@{s}", .{ repository, sub, ref });
-    const mount = try std.fmt.allocPrint(arena, "/github/_actions/{s}/{s}", .{ repository, ref });
-    if (fetchedBefore(b, repository, ref, mount)) |prev|
+    // Before anything is made of them: they name a directory and go to git and a URL.
+    if (from.problem()) |why| return .{ .unresolved = try std.fmt.allocPrint(
+        arena,
+        "Unable to resolve action `{s}`: {s}",
+        .{ ref_label, why },
+    ) };
+    const mount = try mountFor(arena, job, from);
+    const tree_key = try std.fmt.allocPrint(arena, "{s} {s}@{s}", .{ server, repository, ref });
+    if (b.fetched_trees.get(tree_key)) |prev|
         return readAction(b, u, ref_label, repository, ref, mount, prev.layer, prev.sha);
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
@@ -369,7 +379,7 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
     try dagger.shellQuote(w, mount);
     try w.writeAll("\ngit init -q\ngit remote add origin ");
     try dagger.shellQuote(w, try std.fmt.allocPrint(arena, "{s}/{s}.git", .{ server, repository }));
-    try w.writeAll("\ngit -c protocol.version=2 fetch -q --depth=1 --no-tags origin ");
+    try w.writeAll("\ngit -c protocol.version=2 fetch -q --depth=1 --no-tags -- origin ");
     try dagger.shellQuote(w, ref);
     try w.writeAll("\ngit checkout -q --detach FETCH_HEAD\nrm -f .git/FETCH_HEAD\n" ++
         "git rev-parse HEAD\n");
@@ -395,10 +405,15 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
             "Unable to resolve action `{s}`: {s}",
             .{ ref_label, why },
         ) };
-        const src = if (from.token and job.gitToken().len > 0 and u.source == .default)
-            try tarball.checkoutSource(arena, server, repository, ref, job.gitToken())
+        // The job's token goes where it is GitHub's own repository (its API's tarball), or to the
+        // instance's archive of any repository the job's token is for (`from.token`).
+        const token = job.gitToken();
+        const src = if (!from.token or token.len == 0)
+            try tarball.actionSource(arena, server, repository, ref)
+        else if (job.github.forge == .github and u.source == .default)
+            try tarball.checkoutSource(arena, server, repository, ref, token)
         else
-            try tarball.actionSource(arena, server, repository, ref);
+            try tarball.instanceSource(arena, server, repository, ref, token);
         switch (try tarball.fetchInto(b, mount, src, if (checkout_mod.isSha(ref)) ref else null, 0, 0)) {
             .sha => |s| tar_sha = s,
             .failed => |why| return .{ .unresolved = try std.fmt.allocPrint(
@@ -407,32 +422,44 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
                 .{ ref_label, why },
             ) },
         }
-    } else if (ended.failure.len > 0 or ended.code != 0) return .{ .unresolved = try std.fmt.allocPrint(
-        arena,
-        "Unable to resolve action `{s}`: {s}",
-        .{ ref_label, if (ended.failure.len > 0) ended.failure else out.tail() },
-    ) };
+    } else if (ended.failure.len > 0 or ended.code != 0) return .{
+        .unresolved = try std.fmt.allocPrint(
+            arena,
+            "Unable to resolve action `{s}`: {s}{s}",
+            .{
+                ref_label,
+                if (ended.failure.len > 0) ended.failure else out.tail(),
+                // The instance would have answered a token it takes; this job has none to send.
+                if (from.token and job.gitToken().len == 0 and job.github.forge != .github)
+                    " (the task has no GITHUB_TOKEN secret, so the fetch had no credentials)"
+                else
+                    "",
+            },
+        ),
+    };
     const sha = if (b.no_git) tar_sha else out.tail();
     // The tree is the commit's, whoever fetched it and when: keyed so, the base and the steps
     // above it keep their keys from job to job (`Backend.keyFetched`).
     if (sha.len == 40) try b.keyFetched(try std.fmt.allocPrint(arena, "an action's tree: {s}/{s}.git " ++
         "at {s} in {s}", .{ server, repository, sha, mount }));
 
-    return readAction(b, u, ref_label, repository, ref, mount, try b.layerPath(b.layers.items.len - 1), sha);
+    const layer = try b.layerPath(b.layers.items.len - 1);
+    if (sha.len == 40) try b.fetched_trees.put(arena, tree_key, .{ .layer = layer, .sha = sha });
+    return readAction(b, u, ref_label, repository, ref, mount, layer, sha);
 }
 
-/// A tree fetched earlier in the job for the same repository and ref (another action of it, in a
-/// directory of its own): the layer it is in. Two fetches into one directory would fail, and the
-/// tree is the same.
-fn fetchedBefore(b: *Backend, repository: []const u8, ref: []const u8, mount: []const u8) ?struct { layer: []const u8, sha: []const u8 } {
-    var it = b.actions.valueIterator();
-    while (it.next()) |lr| switch (lr.*) {
-        .ok => |p| if (std.mem.eql(u8, p.repository, repository) and std.mem.eql(u8, p.ref, ref) and
-            std.mem.endsWith(u8, p.dir, mount))
-            return .{ .layer = p.dir[0 .. p.dir.len - mount.len], .sha = p.sha },
-        else => {},
+/// Where the tree is mounted: GitHub's `/github/_actions/<repository>/<ref>`, and under `@<host>`
+/// when it comes from a server other than the job's default one, so that two servers' `o/r@v1`
+/// are two trees.
+fn mountFor(arena: Allocator, job: job_mod.Job, from: job_mod.Resolved) ![]const u8 {
+    const default = std.mem.trimEnd(u8, if (job.github.actions_url.len > 0) job.github.actions_url else job.github.server_url, "/");
+    if (std.mem.eql(u8, from.server, default))
+        return std.fmt.allocPrint(arena, "/github/_actions/{s}/{s}", .{ from.repository, from.ref });
+    const host = try arena.dupe(u8, if (std.mem.indexOf(u8, from.server, "://")) |i| from.server[i + 3 ..] else from.server);
+    for (host) |*c| if (!(std.ascii.isAlphanumeric(c.*) or c.* == '.' or c.* == '-')) {
+        c.* = '_';
     };
-    return null;
+    return std.fmt.allocPrint(arena, "/github/_actions/@{s}/{s}/{s}", .{ host, from.repository, from.ref });
 }
 
 /// The action's `action.yml` (or `.yaml`) in `layer`, where its repository's tree is at `mount`.
@@ -495,8 +522,14 @@ const usesStep = @import("../dagger/testing.zig").usesStep;
 /// A repository `o/<name>` at `<tmp>/git/o/<name>.git`, bare, holding `files` in one commit
 /// tagged `v1`: what the job fetches as `file:///srv/git/o/<name>.git` (`testActions`).
 fn testRepo(arena: Allocator, tmp: *std.testing.TmpDir, name: []const u8, files: []const [2][]const u8) !void {
+    return testRepoAt(arena, tmp, "", name, files);
+}
+
+/// `testRepo` on another server: `file:///srv/git/<server>/o/<name>.git`, for `server` not "".
+fn testRepoAt(arena: Allocator, tmp: *std.testing.TmpDir, server: []const u8, name: []const u8, files: []const [2][]const u8) !void {
     const io = std.testing.io;
-    const work = try std.fmt.allocPrint(arena, "work/{s}", .{name});
+    const at = if (server.len > 0) try std.fmt.allocPrint(arena, "{s}/", .{server}) else "";
+    const work = try std.fmt.allocPrint(arena, "work/{s}{s}", .{ at, name });
     try tmp.dir.createDirPath(io, work);
     for (files) |f| {
         if (std.fs.path.dirnamePosix(f[0])) |d| try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ work, d }));
@@ -506,15 +539,15 @@ fn testRepo(arena: Allocator, tmp: *std.testing.TmpDir, name: []const u8, files:
         .data = f[1],
         .flags = .{ .permissions = .fromMode(0o755) },
     });
-    try tmp.dir.createDirPath(io, "git/o");
+    try tmp.dir.createDirPath(io, try std.fmt.allocPrint(arena, "git/{s}o", .{at}));
     const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
     const script = try std.fmt.allocPrint(arena,
         \\set -e
         \\cd '{s}/{s}'
         \\git init -q -b main . && git add -A
         \\git -c user.name=t -c user.email=t@t commit -q -m one && git tag v1
-        \\git clone -q --bare . '{s}/git/o/{s}.git'
-    , .{ root, work, root, name });
+        \\git clone -q --bare . '{s}/git/{s}o/{s}.git'
+    , .{ root, work, root, at, name });
     const res = try std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", script } });
     if (res.term != .exited or res.term.exited != 0) {
         std.debug.print("{s}\n", .{res.stderr});
@@ -783,6 +816,64 @@ test "an action's failed fetch leaves nothing the next fetch of the same reposit
     try std.testing.expect(std.mem.indexOf(u8, text, "remote origin already exists") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Unable to resolve action `o/comp@v1`") != null);
     try std.testing.expect(res.steps.len >= 1);
+}
+
+test "an action's name or ref that moves a path or starts an option is not fetched, and two servers' o/comp@v1 are two trees" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testActions(arena, &tmp);
+    const first = "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo from-first-server\n";
+    const second = "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo from-second-server\n";
+    try testRepo(arena, &tmp, "comp", &.{.{ "action.yml", first }});
+    try testRepoAt(arena, &tmp, "x", "comp", &.{.{ "action.yml", second }});
+    // None of these reaches git: each is refused with its reason, before a directory is made or a
+    // command run (the third would run `touch` as git's upload-pack, were it passed on).
+    var bad = [_]job_mod.Step{
+        usesStep("dots", "o", "comp", "../../..", &.{}),
+        usesStep("owner", "..", "comp", "v1", &.{}),
+        usesStep("option", "o", "comp", "--upload-pack=touch /tmp/pwned", &.{}),
+        usesStep("odd", "o", "comp", "a b", &.{}),
+    };
+    var job = testJob(&bad);
+    job.github.server_url = "file:///srv/git";
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    _ = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const text = w.written();
+    errdefer std.debug.print("{s}\n", .{text});
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, text, "Unable to resolve action `"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "path segment") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "starts with `-`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Download action repository") == null);
+
+    // The same repository and ref on two servers: each is its own tree, each runs its own action.
+    var two = [_]job_mod.Step{
+        usesStep("one", "o", "comp", "v1", &.{}),
+        usesStep("two", "o", "comp", "v1", &.{}),
+    };
+    two[1].action.uses.source = .url;
+    two[1].action.uses.url = "file:///srv/git/x";
+    job = testJob(&two);
+    job.github.server_url = "file:///srv/git";
+    w.clearRetainingCapacity();
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+    }, job, &log);
+    const text2 = w.written();
+    errdefer std.debug.print("{s}\n", .{text2});
+    for (res.steps) |st| try std.testing.expectEqual(dagger.Outcome.success, st.outcome);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text2, "stdout] from-first-server"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text2, "stdout] from-second-server"));
 }
 
 test "a Dockerfile action whose base image changed under its tag is built again, not replayed" {
