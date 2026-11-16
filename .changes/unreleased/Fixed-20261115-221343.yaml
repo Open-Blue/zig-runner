@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The daily release no longer skips a release when a release candidate (vX.Y.Z-rcN) is tagged on main''s head: next-version.sh now bumps from the last release tag, not the newest candidate, which sorted above it and made main read as "nothing merged since".'
+time: 2026-11-15T22:13:43.885026929-05:00
