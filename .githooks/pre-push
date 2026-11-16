@@ -101,6 +101,10 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
 		say "shfmt"
 		(cd "$tree" && .github/scripts/shfmt.sh >"$quiet" 2>&1) || fail "shell scripts not formatted: .github/scripts/shfmt.sh -w formats them"
 	fi
+	if grep -qE '^\.github/scripts/memory-peak(-test)?\.sh$' <<<"$changed"; then
+		say "memory-peak.sh leaves nothing behind"
+		(cd "$tree" && .github/scripts/memory-peak-test.sh >"$quiet" 2>&1) || fail "memory-peak.sh leaves a sampler, command or temp file behind: .github/scripts/memory-peak-test.sh shows it"
+	fi
 	if grep -qE '(^|/)Dockerfile' <<<"$changed"; then
 		say "hadolint"
 		(cd "$tree" && .github/scripts/hadolint.sh >"$quiet") || fail "hadolint found problems: .github/scripts/hadolint.sh shows them"

@@ -110,7 +110,10 @@ unreported instead, and the merge queue waiting for it.
   On a runner with no readable cgroup and no GNU time (the Pi's native steps), the `memory-peak:`
   line is sampled from `/proc` (`source=proc`: the largest sum of resident sets of the command and
   its descendants); the runner's own "this step's memory peak" line, from the cgroup, is the
-  authority and is higher by the page cache.
+  authority and is higher by the page cache. `proc` misses processes that double-fork away from the
+  command and commands shorter than one 0.2 s sample (`unavailable`, as before); on TERM or INT the
+  script stops the command and its sampler and removes its temp file (`memory-peak-test.sh`, run by
+  "Workflows" and the pre-push hook).
 - **Native tests as root**: the native backend's root-only tests, in two parts per architecture,
   the slow tests (`test_shards.zig`'s `slow`) shared out among the parts on their own. In ci the
   store stress test runs for 10 s, where analysis runs it for minutes.

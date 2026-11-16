@@ -21,6 +21,8 @@
 #           than that and counts shared pages once per process; the runner's own "this step's
 #           memory peak" line, from the cgroup, is the authority, and this agrees with it to within
 #           the page cache.
+#           It also misses a process that double-forked (reparented to init, so no longer the
+#           command's descendant), and a command that ends within one sample reports "unavailable".
 #   none    "unavailable".
 # Why: the Pi's compile of the tests has peaked within a few percent of its job's 3.1 GB limit and
 # killed one run (docs: #565); one sample a minute in the runner's journal cannot see the top.
@@ -126,7 +128,29 @@ if [[ -r /proc/self/status ]] && command -v awk >/dev/null; then
 			done
 		) &
 		sampler=$!
-		"$@"
+		cmd=
+		# A signal to this script ends the sampler and removes the temp file, and reaches the
+		# command, so that a cancelled step's command stops too; the status is 128 plus the signal.
+		# shellcheck disable=SC2329 # run by the traps below
+		stop() {
+			kill "$sampler" 2>/dev/null
+			wait "$sampler" 2>/dev/null
+			rm -f "$out"
+		}
+		# shellcheck disable=SC2329 # run by the traps below
+		forward() {
+			[[ -z $cmd ]] || kill -s "$1" "$cmd" 2>/dev/null
+			wait "$cmd" 2>/dev/null
+			stop
+			trap - EXIT
+			exit "$2"
+		}
+		trap stop EXIT
+		trap 'forward TERM 143' TERM
+		trap 'forward INT 130' INT
+		"$@" <&0 &
+		cmd=$!
+		wait "$cmd"
 		status=$?
 		kill "$sampler" 2>/dev/null
 		wait "$sampler" 2>/dev/null
