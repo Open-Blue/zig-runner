@@ -1955,23 +1955,43 @@ fn deepChain(f: *Fixture, depth: usize) !void {
     }
 }
 
+/// The limits of the long-chain tests, and how many levels. By default the clock stands still and
+/// the budget is out from the start, so that a pass removes what the floor says (`least_removed`
+/// steps) and no more, whatever the load: a pass that is exactly as long on every machine, which a
+/// run's passes can be counted against, and a chain of 2500 levels, which no path can name
+/// (PATH_MAX holds 2048 of them). ZIG_TEST_FULL=1: the real clock, a pass of `real_ms` (a loaded
+/// machine gets less done in each), and `full_depth` levels.
+fn chainLimits(full: bool, real_ms: i64) Limits {
+    return .{
+        .volumes_max_bytes = 1,
+        .min_free_pct = 0,
+        .budget_ms = if (full) real_ms else 0,
+        .budget_clock_ms = if (full) null else 0,
+    };
+}
+
 test "native eviction: a chain of directories deeper than a pass gets through goes, a pass at a time" {
+    const full = @import("../alloc_failures.zig").full();
+    const depth: usize = if (full) 30_000 else 2_500;
     const f = try Fixture.init();
     defer f.deinit();
-    try deepChain(f, 30_000);
+    try deepChain(f, depth);
     const old = try f.volume("old", 6000, 30);
-    f.s.limits = .{ .volumes_max_bytes = 1, .min_free_pct = 0, .budget_ms = 60, .budget_clock_ms = null };
-    // Bounded by time, not by passes: a loaded machine gets less done in each pass's 60 ms, so it
-    // takes more of them; a removal that is stuck still fails, at the deadline.
-    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 120 * std.time.ms_per_s;
-    var passes: usize = 0;
-    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline and try f.deadLeft() > 0) : (passes += 1) run(f.s, testing.io);
-    try testing.expectEqual(@as(usize, 0), try f.deadLeft());
-    // The count of passes is bounded whatever the load: a pass takes at least `least_removed`
+    f.s.limits = chainLimits(full, 60);
+    // The count of passes is bounded whatever the load, so it is the bound that is waited for
+    // (not a deadline, which a loaded machine ran past): a pass takes at least `least_removed`
     // steps whatever the clock says, and a level of the chain costs two (a descent and a removal),
-    // so no pass gets through fewer than least_removed / 2 levels. The most it can take is the
-    // depth over that, and a walk whose work per pass grew with the depth would take more.
-    try testing.expect(passes <= 30_000 / (least_removed / 2) + 2);
+    // so no pass gets through fewer than least_removed / 2 levels. What a pass leaves above the
+    // level it reached (up to `max_chain` of them) the next descends again, so a level can cost
+    // three steps, and the order the cuts are found in varies: 128 to 190 passes of 4000 levels,
+    // with the clock still. The most is the bound the test of a chain too deep to name has, a
+    // pass for every 16 levels, and a walk whose work per pass grew with the depth would take
+    // more. A removal that is stuck fails at the bound.
+    const most = depth / 16;
+    var passes: usize = 0;
+    while (passes <= most and try f.deadLeft() > 0) : (passes += 1) run(f.s, testing.io);
+    try testing.expectEqual(@as(usize, 0), try f.deadLeft());
+    try testing.expect(passes <= most);
     run(f.s, testing.io);
     try testing.expect(!f.there(old));
 }
@@ -2171,12 +2191,13 @@ test "native eviction: a chain of directories with no files is bounded by the bu
 }
 
 test "native eviction: names a job planted under a dead tree do not stop the removal" {
+    const full = @import("../alloc_failures.zig").full();
+    const depth: usize = if (full) 20_000 else 2_500;
     const f = try Fixture.init();
     defer f.deinit();
     const arena = f.arena();
     const cwd = std.Io.Dir.cwd();
-    try needsDeepDirs(f, 20_000);
-    const depth: usize = 20_000;
+    try needsDeepDirs(f, depth);
     const dead = Hostile.p(f, "{s}/volumes/.dead-9", .{f.s.root});
     const build = Hostile.p(f, "{s}/build", .{f.s.root});
     try cwd.createDirPath(testing.io, dead);
@@ -2200,14 +2221,15 @@ test "native eviction: names a job planted under a dead tree do not stop the rem
     _ = linux.close(fd);
     try cwd.rename(Hostile.p(f, "{s}/a", .{build}), cwd, Hostile.p(f, "{s}/a", .{dead}), testing.io);
     const old = try f.volume("old", 6000, 30);
-    f.s.limits = .{ .volumes_max_bytes = 1, .min_free_pct = 0, .budget_ms = 15, .budget_clock_ms = null };
-    // Bounded by time, not by passes: each pass has 15 ms, and a loaded machine (the
-    // ThreadSanitizer suite's twelve shards) gets less done in each, so the 170 passes this takes
-    // alone, 256 under ThreadSanitizer, ran past a cap of 300. A removal that is stuck still
-    // fails, at the deadline.
-    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 120 * std.time.ms_per_s;
-    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline and
-        (try f.deadLeft() > 0 or f.there(old))) run(f.s, testing.io);
+    f.s.limits = chainLimits(full, 15);
+    // Bounded by passes, not by time: a pass removes at least `least_removed` steps whatever the
+    // load, and a level costs a descent, a removal and the planted name, so a loaded machine
+    // (the ThreadSanitizer suite's twelve shards, a reviewer's run at load 30, which ran a
+    // wall-clock deadline of 120 s out with the tree still there) takes as many passes as any
+    // other, only more slowly. A removal that is stuck fails at the bound.
+    const most = depth / 12 + 16;
+    var passes: usize = 0;
+    while (passes <= most and (try f.deadLeft() > 0 or f.there(old))) : (passes += 1) run(f.s, testing.io);
     try testing.expectEqual(@as(usize, 0), try f.deadLeft());
     try testing.expect(!f.there(old));
 }
@@ -2222,10 +2244,11 @@ test "native eviction: a slow sync does not eat what a pass may delete" {
     test_sync_ms = 400;
     defer test_sync_ms = 0;
     // Each pass gets its time after the sync, so a busy machine only takes more of them: a sync
-    // that ate the budget would leave the tree whole for good. Bounded by time, not by a count of
-    // passes, which a loaded machine, getting less done in each, would run past.
-    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 60 * std.time.ms_per_s;
-    while (std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline and try f.deadLeft() > 0) run(f.s, testing.io);
+    // that ate the budget would leave the tree whole for good. Bounded by passes, which every
+    // pass's floor of `least_removed` steps limits whatever the load (2000 files and the
+    // directory are 32 passes at the least), not by a deadline that a loaded machine runs past.
+    var passes: usize = 0;
+    while (passes < 2001 / least_removed + 8 and try f.deadLeft() > 0) : (passes += 1) run(f.s, testing.io);
     try testing.expectEqual(@as(usize, 0), try f.deadLeft());
 }
 

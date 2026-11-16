@@ -861,6 +861,9 @@ test "native oci zstd: frames one after another, skippable ones between, and not
     try testing.expectEqual(0, none.len);
 }
 
+const flip_head = 256;
+const flip_every = 11;
+
 test "native oci zstd: a stream that is wrong is refused with a reason, never read out of bounds" {
     const a = testing.allocator;
     try testing.expectError(error.BadMagic, decompressAll(a, "not zstd at all"));
@@ -869,10 +872,13 @@ test "native oci zstd: a stream that is wrong is refused with a reason, never re
     while (cut < level3.len) : (cut += 997) {
         if (decompressAll(a, level3[0..cut])) |ok| a.free(ok) else |_| {}
     }
-    // Every byte of the first blocks' headers and tables flipped, one at a time.
+    // Every byte of the first blocks' headers and tables flipped, one at a time (ZIG_TEST_FULL=1;
+    // else the first `flip_head` bytes, the frame and block headers, and every `flip_every`th after).
     const copy = try a.dupe(u8, level19[0..3000]);
     defer a.free(copy);
+    const full = @import("../../alloc_failures.zig").full();
     for (0..copy.len) |i| {
+        if (!full and i >= flip_head and i % flip_every != 0) continue;
         const was = copy[i];
         for ([_]u8{ 0x01, 0x80, 0xff }) |x| {
             copy[i] = was ^ x;

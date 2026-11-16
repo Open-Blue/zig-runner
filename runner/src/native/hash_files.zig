@@ -1641,13 +1641,17 @@ test "native hashFiles: a directory of thousands of entries costs its entries, n
     defer a.deinit();
     var f = try Fixture.init(a.allocator());
     defer f.cleanup();
-    try deepDir(&f, 200, 12000);
+    // Thousands of entries 200 levels down: 4000, and 12000 with ZIG_TEST_FULL=1 (the file's
+    // creation is most of this test).
+    const files: usize = if (@import("../alloc_failures.zig").full()) 12000 else 4000;
+    try deepDir(&f, 200, files);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const got = try hashFiles(failing.allocator(), f.arena, std.testing.io, try f.stackOf(&.{"l0"}, .{}), "/ws", "/home/runner", &.{"**"});
-    try expectHash(&hashOf(try many(f.arena, "x", 12000)), got);
-    // The matching of each path (with 200 segments) took 8 KB each and was never given back: 96 MB.
+    try expectHash(&hashOf(try many(f.arena, "x", files)), got);
+    // The matching of each path (with 200 segments) took 8 KB each and was never given back: 96 MB
+    // for 12000 entries. Held to the same bytes an entry: under 4 KB (48 MiB for 12000).
     errdefer std.debug.print("the call took {d} bytes\n", .{failing.allocated_bytes});
-    try std.testing.expect(failing.allocated_bytes < 48 << 20);
+    try std.testing.expect(failing.allocated_bytes < files * ((48 << 20) / 12000));
 }
 
 test "native hashFiles: a call that began after the job's cancel runs through the grace period" {

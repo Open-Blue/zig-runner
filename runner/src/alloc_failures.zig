@@ -40,6 +40,107 @@ fn stride() usize {
     return if (std.valgrind.runningOnValgrind() != 0) valgrind_stride else 1;
 }
 
+/// ZIG_TEST_FULL=1: fail every allocation of every run, as these tests did before they sampled
+/// (the nightly's full run, and what to run after changing code a sweep covers). Without it a run
+/// fails a sample of them, `sample`.
+pub fn full() bool {
+    const v = std.testing.environ.getPosix("ZIG_TEST_FULL") orelse return false;
+    return std.mem.eql(u8, v, "1");
+}
+
+/// For a sweep whose allocations have no stable order (threads', so no site to tell them by): the
+/// first and last `run_edges * 2` of its `n`, and one in `n / 64`, spread over the rest. All of them
+/// with `full()`.
+pub fn sampledIndex(i: usize, n: usize) bool {
+    if (full() or i < run_edges * 2 or i + run_edges * 2 >= n) return true;
+    return i % @max(1, n / 64) == 0;
+}
+
+/// How many frames of the stack tell one allocation site from another.
+const site_frames = 12;
+/// The allocations at one site that are always failed, before the doubling begins: a site hit in
+/// a loop (an entry, a line, a block) fails at its first few visits, at its 4th, 8th, 16th and so
+/// on, and at its last.
+const site_first = 3;
+/// The first and last allocations of a run, which are failed whatever their site.
+const run_edges = 8;
+
+/// The most runs of a sweep (each a whole operation) a default run makes; past it, the first and
+/// last `run_edges` and an even spread of the sites between.
+const max_runs = 48;
+
+fn isEdge(i: usize, n: usize) bool {
+    return i < run_edges or i + run_edges >= n;
+}
+
+/// A hash of the stack that made an allocation: the same call chain, the same site.
+fn siteOf(first_address: usize) u64 {
+    var addrs: [site_frames]usize = undefined;
+    const st = std.debug.captureCurrentStackTrace(.{ .first_address = first_address }, &addrs);
+    return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(st.return_addresses));
+}
+
+/// Which of the allocations of a run, whose sites are `sites` in order, to fail, so that a sweep
+/// costs the number of distinct places that allocate, not of allocations (a parser that allocates
+/// per token fails at each place its tokens are made, not at every token). Every allocation if
+/// `full()`, or under `stride()` (Valgrind's every 13th, which looks for memory errors, not for
+/// sites). Else: the first and last `run_edges`, and per site its first `site_first` visits, every
+/// power of two after, and the last, at most `max_runs` of them (spread evenly if more). A run's allocations that vary (threads) have no sites to
+/// tell: `sites` is empty and every one is picked. Freed with `gpa`.
+fn sample(sites: []const u64, n: usize) ![]bool {
+    const keep = try gpa.alloc(bool, n);
+    errdefer gpa.free(keep);
+    if (stride() != 1) {
+        for (keep, 0..) |*k, i| k.* = i % stride() == 0;
+        return keep;
+    }
+    @memset(keep, true);
+    if (full() or sites.len != n) return keep;
+    @memset(keep, false);
+    var totals: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+    defer totals.deinit(gpa);
+    for (sites) |site| (try totals.getOrPutValue(gpa, site, 0)).value_ptr.* += 1;
+    var seen: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+    defer seen.deinit(gpa);
+    for (sites, keep, 0..) |site, *k, i| {
+        const visit = blk: {
+            const e = try seen.getOrPutValue(gpa, site, 0);
+            e.value_ptr.* += 1;
+            break :blk e.value_ptr.*;
+        };
+        k.* = isEdge(i, n) or visit <= site_first or
+            std.math.isPowerOfTwo(visit) or visit == totals.get(site).?;
+    }
+    // Past `max_runs`, the edges and an even spread of the rest: a run is a whole operation (a
+    // pull, a publish), and 150 of them, twice, are what these tests took 10 to 20 seconds over.
+    var picked: usize = 0;
+    for (keep) |k| picked += @intFromBool(k);
+    if (picked > max_runs) {
+        var rest: usize = 0;
+        for (keep, 0..) |k, i| rest += @intFromBool(k and !isEdge(i, n));
+        const room = max_runs - 2 * run_edges;
+        var rank: usize = 0;
+        for (keep, 0..) |*k, i| {
+            if (!k.* or isEdge(i, n)) continue;
+            k.* = (rank + 1) * room / rest > rank * room / rest;
+            rank += 1;
+        }
+    }
+    return keep;
+}
+
+/// The sites of `f`'s allocations in a run that fails none, and how many it made.
+fn discover(comptime f: anytype, args: anytype) ![]u64 {
+    const sites = try gpa.alloc(u64, 1 << 16);
+    defer gpa.free(sites);
+    var once: FailOnce = .{ .child = std.heap.smp_allocator, .sites = sites };
+    try @call(.auto, f, .{once.allocator()} ++ args);
+    try once.checkFreed();
+    const n = once.count.load(.monotonic);
+    // More allocations than room for their sites: none is told from another.
+    return if (n > sites.len) try gpa.alloc(u64, 0) else try gpa.dupe(u64, sites[0..n]);
+}
+
 /// An arena for these tests: like `std.heap.ArenaAllocator`, everything is freed at `deinit`, but
 /// each allocation is its own call to `child`, so the failing allocator can fail any one of them.
 /// Its bookkeeping lives in `std.testing.allocator`, outside what is counted.
@@ -102,7 +203,7 @@ fn expected(e: anyerror, comptime allowed: []const anyerror) bool {
 /// `checkAllAllocationFailures`, then `checkEachAllocationFailure`, saying which input failed.
 pub fn checkOne(comptime f: anytype, args: anytype) !void {
     const fmt = if (@TypeOf(args[0]) == []const u8) "\"{s}\"" else "{any}";
-    if (stride() == 1) check(gpa, f, args) catch |e| {
+    if (stride() == 1) checkFrom(f, args) catch |e| {
         std.debug.print("allocation failures: failed for input " ++ fmt ++ "\n", .{args[0]});
         // A failure that was swallowed: failing them one at a time says which allocation it was.
         if (e == error.SwallowedOutOfMemoryError) checkEachAllocationFailure(f, args) catch |each| {
@@ -116,6 +217,37 @@ pub fn checkOne(comptime f: anytype, args: anytype) !void {
     };
 }
 
+/// `std.testing.checkAllAllocationFailures` (every allocation from the chosen one on fails, and the
+/// run must end in `error.OutOfMemory` with nothing leaked), over the `sample` of them.
+fn checkFrom(comptime f: anytype, args: anytype) !void {
+    const sites = try discover(f, args);
+    defer gpa.free(sites);
+    const n = if (sites.len == 0) try countAllocations(f, args) else sites.len;
+    const keep = try sample(sites, n);
+    defer gpa.free(keep);
+    for (keep, 0..) |k, fail_index| {
+        if (!k) continue;
+        var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = fail_index });
+        if (@call(.auto, f, .{failing.allocator()} ++ args)) |_| {
+            return if (failing.has_induced_failure) error.SwallowedOutOfMemoryError else error.NondeterministicMemoryUsage;
+        } else |err| switch (err) {
+            error.OutOfMemory => if (failing.allocated_bytes != failing.freed_bytes) {
+                std.debug.print("allocation failures: failing allocation {d} of {d} leaked {d} bytes\n", .{
+                    fail_index, n, failing.allocated_bytes - failing.freed_bytes,
+                });
+                return error.MemoryLeakDetected;
+            },
+            else => |e| return e,
+        }
+    }
+}
+
+fn countAllocations(comptime f: anytype, args: anytype) !usize {
+    var failing: std.testing.FailingAllocator = .init(gpa, .{});
+    try @call(.auto, f, .{failing.allocator()} ++ args);
+    return failing.alloc_index;
+}
+
 /// Fails one allocation at a time, the ones after it succeeding. `checkAllAllocationFailures`
 /// fails every allocation from the chosen one on, so a failure caught and turned into an answer
 /// goes unnoticed whenever anything is allocated later: that later allocation fails too, and the
@@ -124,15 +256,13 @@ pub fn checkOne(comptime f: anytype, args: anytype) !void {
 /// square of the input, and `gpa` records a stack trace for every allocation, so they go to a
 /// faster allocator; `FailOnce` counts what is left, so a leak after a failure is still found.
 fn checkEachAllocationFailure(comptime f: anytype, args: anytype) !void {
-    var n: usize = 0;
-    {
-        var once: FailOnce = .{ .child = std.heap.smp_allocator };
-        try @call(.auto, f, .{once.allocator()} ++ args);
-        try once.checkFreed();
-        n = once.count.load(.monotonic);
-    }
-    var i: usize = 0;
-    while (i < n) : (i += stride()) {
+    const sites = try discover(f, args);
+    defer gpa.free(sites);
+    const n = if (sites.len == 0) try countAllocations(f, args) else sites.len;
+    const keep = try sample(sites, n);
+    defer gpa.free(keep);
+    for (keep, 0..) |k, i| {
+        if (!k) continue;
         var once: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i };
         if (@call(.auto, f, .{once.allocator()} ++ args)) |_| {
             if (once.failed.load(.monotonic)) {
@@ -152,15 +282,13 @@ fn checkEachAllocationFailure(comptime f: anytype, args: anytype) !void {
 /// and must find for itself what it expects after. Only an error other than `error.OutOfMemory`,
 /// or memory not freed, fails here.
 pub fn checkEach(comptime f: anytype, args: anytype) !void {
-    var n: usize = 0;
-    {
-        var once: FailOnce = .{ .child = std.heap.smp_allocator };
-        try @call(.auto, f, .{once.allocator()} ++ args);
-        try once.checkFreed();
-        n = once.count.load(.monotonic);
-    }
-    var i: usize = 0;
-    while (i < n) : (i += stride()) {
+    const sites = try discover(f, args);
+    defer gpa.free(sites);
+    const n = if (sites.len == 0) try countAllocations(f, args) else sites.len;
+    const keep = try sample(sites, n);
+    defer gpa.free(keep);
+    for (keep, 0..) |k, i| {
+        if (!k) continue;
         var once: FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i };
         @call(.auto, f, .{once.allocator()} ++ args) catch |e| if (e != error.OutOfMemory) {
             std.debug.print("allocation failures: allocation {d} of {d} failing, the run failed, made at:\n", .{ i, n });
@@ -177,14 +305,13 @@ pub fn checkEach(comptime f: anytype, args: anytype) !void {
 /// fails. Every failure from one on must end in `error.OutOfMemory` or in an answer, never in
 /// another error, and with everything allocated freed.
 pub fn checkNoLeaks(comptime f: anytype, args: anytype) !void {
-    var n: usize = 0;
-    {
-        var failing: std.testing.FailingAllocator = .init(gpa, .{});
-        try @call(.auto, f, .{failing.allocator()} ++ args);
-        n = failing.alloc_index;
-    }
-    var i: usize = 0;
-    while (i < n) : (i += stride()) {
+    const sites = try discover(f, args);
+    defer gpa.free(sites);
+    const n = if (sites.len == 0) try countAllocations(f, args) else sites.len;
+    const keep = try sample(sites, n);
+    defer gpa.free(keep);
+    for (keep, 0..) |k, i| {
+        if (!k) continue;
         var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = i });
         @call(.auto, f, .{failing.allocator()} ++ args) catch |e| if (e != error.OutOfMemory) return e;
         if (failing.allocated_bytes != failing.freed_bytes) {
@@ -207,6 +334,9 @@ pub const FailOnce = struct {
     failed: std.atomic.Value(bool) = .init(false),
     /// Bytes allocated and not yet freed.
     live: std.atomic.Value(usize) = .init(0),
+    /// Where to note the site of each allocation, by its number (`discover`); those past its end
+    /// are not noted.
+    sites: []u64 = &.{},
 
     pub fn checkFreed(o: *const FailOnce) !void {
         if (o.live.load(.monotonic) != 0) return error.MemoryLeakDetected;
@@ -218,7 +348,9 @@ pub const FailOnce = struct {
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const o: *FailOnce = @ptrCast(@alignCast(ctx));
-        if (o.fail_at == o.count.fetchAdd(1, .monotonic)) {
+        const number = o.count.fetchAdd(1, .monotonic);
+        if (number < o.sites.len) o.sites[number] = siteOf(ra);
+        if (o.fail_at == number) {
             o.failed.store(true, .monotonic);
             if (o.trace) std.debug.dumpCurrentStackTrace(.{ .first_address = ra });
             return null;

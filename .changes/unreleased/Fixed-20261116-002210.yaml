@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The unit tests run faster, and the two long eviction tests no longer fail on a loaded machine: they wait for the count of passes eviction guarantees, not for a 120-second deadline, and run with a clock that stands still. ZIG_TEST_TIMES=1 prints every test''s wall time and each shard''s busy time. The allocation-failure sweeps fail a sample of the allocations (the first and last, each call site''s first visits, then every power of two, at most 48 runs of a sweep), the bit-flip fuzz tests flip the header, the end and every 7th bit of each seed, and the hashFiles many-entries test and the eviction chains use smaller trees; ZIG_TEST_FULL=1 runs everything as before. See CONTRIBUTING.md.'
+time: 2026-11-16T00:22:10.401389606-05:00

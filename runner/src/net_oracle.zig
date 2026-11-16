@@ -312,7 +312,10 @@ test "oracle: a request nobody answers, and a kept connection that dies, end the
     defer server.stop();
     const io = std.testing.io;
     var buf: [64]u8 = undefined;
-    const quick: broker.RequestOptions = .{ .deadline = .fromMilliseconds(1000), .resend = .once_more };
+    // A short deadline for what is met by silence (each attempt that is never answered waits it
+    // out), a long one for what is answered at once, which a loaded machine may take longer to do.
+    const quick: broker.RequestOptions = .{ .deadline = .fromMilliseconds(400), .resend = .once_more };
+    const patient: broker.RequestOptions = .{ .deadline = .fromMilliseconds(5000), .resend = .once_more };
     // Silent: one attempt and one more on a connection of its own, in both.
     const impls = .{ std_broker, broker };
     inline for (impls) |impl| {
@@ -323,7 +326,7 @@ test "oracle: a request nobody answers, and a kept connection that dies, end the
     // A kept connection: next time unanswered (/keep) or closed (/keep-close), answered on another.
     inline for (impls) |impl| {
         for ([_][]const u8{ "/keep", "/keep-close" }) |path| {
-            const kept = try impl.request(arena, io, .GET, server.url(&buf, "127.0.0.1", path), null, quick);
+            const kept = try impl.request(arena, io, .GET, server.url(&buf, "127.0.0.1", path), null, patient);
             try std.testing.expectEqualStrings("kept", kept.body);
             const r = try impl.request(arena, io, .GET, server.url(&buf, "127.0.0.1", "/echo"), null, quick);
             try std.testing.expectEqualStrings("GET -", r.body);

@@ -944,6 +944,7 @@ test "allocation failures: a pull through token auth, an index, gzip and zstd la
     const step: usize = if (std.valgrind.runningOnValgrind() != 0) 13 else 1;
     var i: usize = 0;
     while (i < n) : (i += step) {
+        if (!af.sampledIndex(i, n)) continue;
         var once: af.FailOnce = .{ .child = std.heap.smp_allocator, .fail_at = i };
         S.pullWith(testing.allocator, once.allocator(), root, reference, creds) catch |e| if (e != error.OutOfMemory) {
             std.debug.print("allocation failures: layer tasks' allocation {d} of {d} failing, the pull ended in {s}\n", .{ i, n, @errorName(e) });
