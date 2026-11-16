@@ -589,9 +589,11 @@ pub fn runNestedCheckout(
         .unsupported => |why| return x.actionFailed(num, "{s}", .{why}),
     };
     const f = if (x.native) |b|
-        try b.fetchCheckout(x, co)
-    else
-        try checkout.fetch(arena, x.transport, x.job.*, co, x.gitAuth());
+        try b.fetchCheckout(x, co, num)
+    else blk: {
+        var retry = x.checkoutRetry(num, x.fetch_backoff_ms);
+        break :blk try checkout.fetch(arena, x.transport, x.job.*, co, x.gitAuth(), &retry);
+    };
     if (f.result == .failed) return x.actionFailed(num, "{s}", .{f.result.failed});
     const m = [_]Mount{.{ .dir = .{
         .path = f.mount,

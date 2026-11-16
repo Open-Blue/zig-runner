@@ -2615,7 +2615,7 @@ actions/runner (`ActionManager.cs`, `DownloadRepositoryArchive`) tries 3 times, 
 an access denial, and a cancel ends its waiting too. A missing repository or ref, refused credentials and an exhausted
 15 minutes are not retried. Each retry is a `##[warning]Failed to fetch action '<owner>/<repo>@<ref>' (attempt N of 5): <the
 last line git said>. Retrying in S seconds.` in "Set up job", where the actions are downloaded (also when the fetch then fails for good); a failed attempt's layer, with its half-made `.git`, is dropped before the next. The job's cancel (or
-`timeout-minutes`) ends the waiting. The checkout step's own git and a service image's pull are not retried this way.
+`timeout-minutes`) ends the waiting. The built-in checkout is retried the same way (`Backend.fetchCheckout`, its tarball fallback, Dagger's `checkout.fetch`): the whole fetch script runs again from a clean layer, so a failed tags or submodule fetch is retried too, and the warning (`Failed to fetch repository 'o/r@ref'`) is in the checkout step's log with the job's secrets and masks redacted. `readOwn`'s preflight and image pulls are not retried this way.
 Native runs Docker actions
 (a `docker://` image, or built from the Dockerfile in the fetched tree, the context opened
 through no symlink) and composite actions (their steps are the shared code's: scripts, nested

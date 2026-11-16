@@ -1669,7 +1669,7 @@ fn flakyJob(arena: Allocator, tmp: *std.testing.TmpDir, cfg: Backend.Config, can
     return .{ .res = res, .text = w.written(), .fetches = std.fmt.parseInt(u32, std.mem.trim(u8, n, "\n"), 10) catch 0 };
 }
 
-test "a native action fetch that fails on DNS twice is tried again, each time from a clean layer, and the job runs" {
+test "fetch retry: a native action fetch that fails on DNS twice is tried again, each time from a clean layer, and the job runs" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -1690,7 +1690,7 @@ test "a native action fetch that fails on DNS twice is tried again, each time fr
     try std.testing.expect(std.mem.indexOf(u8, r.text, "composite step ran") != null);
 }
 
-test "a native action fetch that never gets through gives up after max_attempts and fails Set up job with the git error" {
+test "fetch retry: a native action fetch that never gets through gives up after max_attempts and fails Set up job with the git error" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -1708,7 +1708,7 @@ test "a native action fetch that never gets through gives up after max_attempts 
     try std.testing.expect(std.mem.indexOf(u8, r.text, "Could not resolve host: github.com") != null);
 }
 
-test "a native action fetch that fails for good (no such repository, refused credentials) is not tried again" {
+test "fetch retry: a native action fetch that fails for good (no such repository, refused credentials) is not tried again" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -1730,7 +1730,7 @@ test "a native action fetch that fails for good (no such repository, refused cre
     }
 }
 
-test "a job's cancel during an action fetch's backoff stops the waiting at once" {
+test "fetch retry: a job's cancel during an action fetch's backoff stops the waiting at once" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -1763,5 +1763,120 @@ test "a job's cancel during an action fetch's backoff stops the waiting at once"
     errdefer std.debug.print("{s}\n", .{r.text});
     try std.testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - t0 < 120_000);
     // One attempt: no second one after the cancel.
+    try std.testing.expectEqual(@as(u32, 1), r.fetches);
+}
+
+/// A job of one checkout step of the repository `o/r` (at `<tmp>/git/o/r.git`, which the fake
+/// git's `fetch` fails for), after `first`, a step that runs before it.
+fn checkoutJob(arena: Allocator, tmp: *std.testing.TmpDir, cfg: Backend.Config, first: ?[]const u8, cancel: ?*dagger.Cancel) !struct { res: dagger.Result, text: []const u8, fetches: u32 } {
+    const sha = try ownRepo(arena, tmp, &.{.{ "README", "x\n" }});
+    var co = testStep("");
+    co.action = .{ .checkout = &.{} };
+    const steps = [_]job_mod.Step{ testStep(first orelse "true"), co };
+    var job = testJob(&steps);
+    job.github.server_url = "file:///srv/git";
+    job.github.sha = sha;
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .engineless = true,
+        .gpa = std.testing.allocator,
+        .cancel = cancel,
+    }, job, &log);
+    const n = tmp.dir.readFileAlloc(std.testing.io, "ctr/n", arena, .limited(16)) catch "0";
+    return .{ .res = res, .text = w.written(), .fetches = std.fmt.parseInt(u32, std.mem.trim(u8, n, "\n"), 10) catch 0 };
+}
+
+test "fetch retry: a checkout that fails on DNS twice is tried again from a clean clone, and the step succeeds" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    try testFlakyGit(arena, &tmp, &cfg, 2, dns_failure);
+    const r = try checkoutJob(arena, &tmp, cfg, null, null);
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(r.res.succeeded);
+    try std.testing.expectEqual(@as(u32, 3), r.fetches);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.text, "##[warning]Failed to fetch repository 'o/r@"));
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "Could not resolve host: github.com. Retrying in ") != null);
+}
+
+test "fetch retry: a checkout that never gets through gives up after max_attempts, and a masked value stays out of its warnings" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    try testFlakyGit(arena, &tmp, &cfg, 1000, "fatal: unable to access 'https://x-access-token:SEKRET-VALUE@github.com/o/r.git/': Could not resolve host: github.com");
+    const r = try checkoutJob(arena, &tmp, cfg, "echo ::add-mask::SEKRET-VALUE", null);
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(!r.res.succeeded);
+    try std.testing.expectEqual(fetch_retry.max_attempts, r.fetches);
+    try std.testing.expectEqual(@as(usize, fetch_retry.max_attempts - 1), std.mem.count(u8, r.text, "##[warning]Failed to fetch repository 'o/r@"));
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "could not fetch o/r@") != null);
+    var lines = std.mem.splitScalar(u8, r.text, '\n');
+    while (lines.next()) |line| if (std.mem.indexOf(u8, line, "Failed to fetch repository") != null or std.mem.indexOf(u8, line, "could not fetch") != null)
+        try std.testing.expect(std.mem.indexOf(u8, line, "SEKRET-VALUE") == null);
+}
+
+test "fetch retry: a checkout that fails for good is not tried again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    for ([_][]const u8{
+        "remote: Repository not found.\nfatal: repository 'https://github.com/o/r.git/' not found",
+        "fatal: couldn't find remote ref v9",
+    }) |text| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var cfg = try testActions(arena, &tmp);
+        cfg.fetch_backoff_ms = 1;
+        try testFlakyGit(arena, &tmp, &cfg, 1000, text);
+        const r = try checkoutJob(arena, &tmp, cfg, null, null);
+        errdefer std.debug.print("{s}\n", .{r.text});
+        try std.testing.expect(!r.res.succeeded);
+        try std.testing.expectEqual(@as(u32, 1), r.fetches);
+        try std.testing.expect(std.mem.indexOf(u8, r.text, "Failed to fetch repository") == null);
+    }
+}
+
+test "fetch retry: a job's cancel during a checkout's backoff stops the waiting at once" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    cfg.fetch_backoff_ms = 60 * 60 * 1000;
+    try testFlakyGit(arena, &tmp, &cfg, 1000, dns_failure);
+    var cancel: dagger.Cancel = .{};
+    const io = std.testing.io;
+    const T = struct {
+        fn later(c: *dagger.Cancel, where: std.Io, dir: std.Io.Dir) void {
+            var tries: u32 = 0;
+            while (tries < 600) : (tries += 1) {
+                var buf: [16]u8 = undefined;
+                const got = dir.readFile(where, "ctr/n", &buf) catch &.{};
+                if (got.len > 0) break;
+                where.sleep(.fromMilliseconds(50), .awake) catch return;
+            }
+            where.sleep(.fromMilliseconds(500), .awake) catch return;
+            c.requested.store(true, .release);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, T.later, .{ &cancel, io, tmp.dir });
+    const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
+    const r = try checkoutJob(arena, &tmp, cfg, null, &cancel);
+    th.join();
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - t0 < 120_000);
     try std.testing.expectEqual(@as(u32, 1), r.fetches);
 }

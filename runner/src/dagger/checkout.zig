@@ -5,6 +5,7 @@ const std = @import("std");
 const job_mod = @import("../job.zig");
 const sink = @import("../sink.zig");
 const Query = @import("query.zig").Query;
+const fetch_retry = @import("fetch_retry.zig");
 const Transport = @import("../dagger.zig").Transport;
 const Fetched = @import("../dagger.zig").Fetched;
 const Outcome = @import("../dagger.zig").Outcome;
@@ -260,6 +261,7 @@ pub fn fetch(
     job: job_mod.Job,
     co: job_mod.Checkout,
     auth: ?[]const u8,
+    retry: *fetch_retry.Retrying,
 ) !Fetched {
     var f = try describe(arena, job, co);
     const repo = f.repo;
@@ -273,13 +275,20 @@ pub fn fetch(
         .doc => |d| d,
     };
     var msg: []const u8 = "";
-    if (gql(arena, t, doc, &msg)) |data| {
-        if (jsonFindString(data, "id")) |id| {
-            f.result = try checkedOutTree(arena, t, co, repo, data, id, &msg);
-            return f;
+    // The engine's git failing on the network is tried again (`fetch_retry.zig`).
+    while (true) {
+        msg = "";
+        if (gql(arena, t, doc, &msg)) |data| {
+            if (jsonFindString(data, "id")) |id| {
+                f.result = try checkedOutTree(arena, t, co, repo, data, id, &msg);
+                return f;
+            }
+            msg = "Dagger returned no tree";
+        } else |_| {
+            if (try retry.again(arena, try std.fmt.allocPrint(arena, "{s}@{s}", .{ repo, label }), msg, fetch_retry.transientText(msg))) continue;
         }
-        msg = "Dagger returned no tree";
-    } else |_| {}
+        break;
+    }
     f.result = .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}@{s}: {s}{s}", .{
         repo, label, msg,
         if (looksLikeAuthFailure(msg)) " (the job's GITHUB_TOKEN reads only " ++
@@ -488,4 +497,46 @@ test "a checkout gets the refs actions/checkout leaves" {
     // Never fails the step, and only runs where git exists.
     try std.testing.expect(std.mem.startsWith(u8, branch, "if command -v git >/dev/null 2>&1; then ( cd '/github/workspace' && "));
     try std.testing.expect(std.mem.endsWith(u8, branch, ") >/dev/null 2>&1 || true; fi\n"));
+}
+
+test "a checkout fetch on Dagger that fails on the network is tried again; a missing repository is not" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var co = testStep("x");
+    co.action = .{ .checkout = &.{} };
+    const steps = [_]job_mod.Step{co};
+    const dns = "{\"errors\":[{\"message\":\"git error: failed to fetch remote https://github.com/o/r: " ++
+        "Could not resolve host: github.com\"}]}";
+    const tree = "{\"data\":{\"git\":{\"commit\":{\"tree\":{\"id\":\"TREE1\"}}}}}";
+
+    const answers = [_][]const u8{ base_answer, dns, dns, tree, try exec(arena, "C1", 0, "ok\\n") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var job_log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    _ = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+        .test_fetch_backoff_ms = 1,
+    }, testJob(&steps), &job_log);
+    const out = w.buffered();
+    errdefer std.debug.print("{s}\n", .{out});
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out, "##[warning]Failed to fetch repository 'o/r@"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "Could not resolve host: github.com. Retrying in ") != null);
+    try std.testing.expectEqual(@as(usize, 5), fake.seen.items.len);
+
+    const gone = [_][]const u8{ base_answer, "{\"errors\":[{\"message\":\"remote: Repository not found.\"}]}" };
+    var fake2: FakeSession = .{ .answers = &gone, .arena = arena };
+    var buf2: [8192]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    var job_log2: sink.LogSink = .{ .stdout = .{ .writer = &w2 } };
+    _ = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake2.transport(),
+        .test_fetch_backoff_ms = 1,
+    }, testJob(&steps), &job_log2);
+    try std.testing.expectEqual(@as(usize, 2), fake2.seen.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "Failed to fetch repository") == null);
 }

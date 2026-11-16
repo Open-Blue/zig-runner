@@ -158,6 +158,7 @@ pub fn pause(io: std.Io, cancel: ?*const std.atomic.Value(bool), ms: i64) bool {
 /// failure said, which is the one that names the cause (`fatal: unable to access ...`).
 pub fn warning(
     arena: std.mem.Allocator,
+    kind: []const u8,
     what: []const u8,
     attempt: u32,
     failure: []const u8,
@@ -165,8 +166,8 @@ pub fn warning(
 ) ![]const u8 {
     return std.fmt.allocPrint(
         arena,
-        "##[warning]Failed to fetch action '{s}' (attempt {d} of {d}): {s}. Retrying in {d} seconds.",
-        .{ what, attempt, max_attempts, lastLine(failure), @divFloor(wait_ms + 500, 1000) },
+        "##[warning]Failed to fetch {s} '{s}' (attempt {d} of {d}): {s}. Retrying in {d} seconds.",
+        .{ kind, what, attempt, max_attempts, lastLine(failure), @divFloor(wait_ms + 500, 1000) },
     );
 }
 
@@ -182,19 +183,51 @@ pub const Attempts = struct {
     cancel: ?*const std.atomic.Value(bool) = null,
     base_ms: i64 = default_base_ms,
     n: u32 = 1,
+    /// What is fetched, for the warning: an `action`, or the `repository` of a checkout.
+    kind: []const u8 = "action",
     /// The warning to log for the retry just decided on.
     said: []const u8 = "",
+    wait_ms: i64 = 0,
 
     /// Whether to try again after attempt `n` failed with `failure`: only when `transient`, with
     /// attempts left and no cancel; `said` is then the warning, and the wait has been made.
     pub fn again(a: *Attempts, arena: std.mem.Allocator, what: []const u8, failure: []const u8, transient: bool) !bool {
+        if (!try a.plan(arena, what, failure, transient)) return false;
+        return a.wait();
+    }
+
+    /// The decision alone: whether to retry, and `said`, with the wait's length in `wait_ms`.
+    pub fn plan(a: *Attempts, arena: std.mem.Allocator, what: []const u8, failure: []const u8, transient: bool) !bool {
         if (!transient or a.n >= max_attempts) return false;
         if (if (a.cancel) |c| c.load(.acquire) else false) return false;
-        const wait = delayMs(a.io, a.base_ms, a.n);
-        a.said = try warning(arena, what, a.n, failure, wait);
-        if (pause(a.io, a.cancel, wait)) return false;
+        a.wait_ms = delayMs(a.io, a.base_ms, a.n);
+        a.said = try warning(arena, a.kind, what, a.n, failure, a.wait_ms);
+        return true;
+    }
+
+    /// The wait `plan` decided on; false when a cancel ended it, else the next attempt is `n`.
+    pub fn wait(a: *Attempts) bool {
+        if (pause(a.io, a.cancel, a.wait_ms)) return false;
         a.n += 1;
         return true;
+    }
+};
+
+/// A checkout's attempts (`Backend.fetchCheckout`, `checkout.fetch`): `again` logs each warning in
+/// the step's log at once, with the failure text redacted first (the job's token and masks never
+/// reach it), and keeps it in `lines`.
+pub const Retrying = struct {
+    at: Attempts,
+    sh: ?*@import("JobLog.zig") = null,
+    num: u32 = 0,
+    lines: std.ArrayList([]const u8) = .empty,
+
+    pub fn again(r: *Retrying, arena: std.mem.Allocator, what: []const u8, failure: []const u8, transient: bool) !bool {
+        const safe = if (r.sh) |sh| sh.redacted(arena, failure) catch failure else failure;
+        if (!try r.at.plan(arena, what, safe, transient)) return false;
+        if (r.sh) |sh| sh.append(r.num, r.at.said);
+        try r.lines.append(arena, r.at.said);
+        return r.at.wait();
     }
 };
 
