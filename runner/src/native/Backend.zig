@@ -4115,6 +4115,12 @@ fn limitCpu(b: *Backend, m: container_options.CpuMax, err_msg: *[]const u8) ![]c
 /// `--cpu-shares` of the job's own is written after, and wins over the level's `cpu.weight`.
 fn prioritize(b: *Backend, arena: Allocator, j: cgroup.Job, g: *admission.Gate) !void {
     const st = g.standing();
+    // Said where a pause can happen: the job's timeouts are not shortened by one.
+    if (g.pool.limits.priority.freeze) try b.notes.append(arena, try std.fmt.allocPrint(arena, "Native " ++
+        "steps: this pool may pause a job's steps for a higher job (at most {d} s at a time); a " ++
+        "pause extends the step's and the job's timeouts by the time paused.", .{
+        g.pool.limits.priority.freeze_max_ms / std.time.ms_per_s,
+    }));
     if (st.level == priority.normal) return;
     const protect: u64 = if (priority.protectsMemory(st.level)) @as(u64, st.est_mb) << 20 else 0;
     const done = j.limitPriority(arena, st.level, protect);

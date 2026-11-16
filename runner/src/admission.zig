@@ -277,6 +277,9 @@ pub const Admission = struct {
         /// The last attempt to thaw it failed: it stays `paused`, and the next tick tries again.
         thaw_failed: bool = false,
         paused_since_ms: i64 = 0,
+        /// What earlier pauses of the job added up to (awake clock, ms), the one under way not in
+        /// it: a pause counts when it ends (`Admission.thaw`), `Gate.pausedMs` adds the current.
+        paused_total_ms: i64 = 0,
         pause_ok_ms: i64 = std.math.minInt(i64),
         /// The job started although it did not fit beside the first in line, because it is
         /// expected to finish soon (`Admission.aheadOpen`, #415).
@@ -820,6 +823,7 @@ pub const Admission = struct {
         logfmt.warn("job_resumed", "job={f} level={d} paused_ms={d} why={s}", .{
             logfmt.q(s.name_buf[0..s.name_len]), s.level, now_ms - s.paused_since_ms, why,
         });
+        s.paused_total_ms +|= @max(0, now_ms - s.paused_since_ms);
         s.paused = false;
         s.thaw_failed = false;
         return true;
@@ -1159,6 +1163,22 @@ fn contendedLockHeld(locks: []const u8, procs: []const u8) bool {
 
 /// One runner's place at the gate. The runner is counted in `Admission.polling` from the check that
 /// lets it through until it leaves: when it takes a job, or its cycle ends.
+/// How long a job has been paused in all (ms, monotonic, only ever growing): what a timeout's
+/// deadline is moved by (`Gate.pausedMs`). A fake one is given in tests.
+pub const PauseClock = union(enum) {
+    /// A job's place at the gate: what it has been paused for.
+    gate: *Gate,
+    /// A total that something else keeps, in ms (the tests set it by hand).
+    counter: *const std.atomic.Value(i64),
+
+    pub fn total(c: PauseClock) i64 {
+        return switch (c) {
+            .gate => |g| g.pausedMs(),
+            .counter => |n| n.load(.acquire),
+        };
+    }
+};
+
 pub const Gate = struct {
     pool: *Admission,
     /// This runner's entry in `pool.slots`.
@@ -1363,6 +1383,25 @@ pub const Gate = struct {
         defer a.changed();
         const s = &a.slots[g.slot];
         if (s.running()) s.level = @min(level, priority.max_level);
+    }
+
+    /// How long the job's steps have been paused so far, in ms on the awake clock (monotonic):
+    /// every pause that ended, and the one under way. A step's and the job's timeouts are
+    /// extended by what this gained while they ran, so a pause never eats a `timeout-minutes`.
+    /// Pauses do not overlap (a slot is paused or not), so none is counted twice.
+    pub fn pausedMs(g: *Gate) i64 {
+        const a = g.pool;
+        a.mu.lockUncancelable(a.io);
+        defer a.mu.unlock(a.io);
+        const s = a.slots[g.slot];
+        if (!s.paused) return s.paused_total_ms;
+        const now_ms = std.Io.Clock.awake.now(a.io).toMilliseconds();
+        return s.paused_total_ms +| @max(0, now_ms - s.paused_since_ms);
+    }
+
+    /// `pausedMs` as a clock to hand to what enforces the timeouts.
+    pub fn pauseClock(g: *Gate) PauseClock {
+        return .{ .gate = g };
     }
 
     /// The runner's job's priority, and its estimate in MB (0 when not known).
@@ -5982,6 +6021,41 @@ test "priority: a cancel or shutdown thaws a frozen job before it signals it, an
     slots[1].paused = true;
     _ = gate.ended();
     try std.testing.expectEqualStrings("0", try tmp.dir.readFile(std.testing.io, "lo/steps/cgroup.freeze", &out));
+}
+
+test "priority: a job's paused time adds up over pauses, the one under way included, and stops growing when it is thawed" {
+    var slots: [2]Admission.Slot = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pool: Admission = .init(std.testing.io, .{ .priority = .{ .freeze = true } }, &slots);
+    try frozenPair(&tmp, &slots);
+    var gate: Gate = .{ .pool = &pool, .slot = 1 };
+    const now = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    try std.testing.expectEqual(@as(i64, 0), slots[0].paused_total_ms);
+    // A pause under way counts as far as it has got.
+    slots[1].paused_since_ms = now - 5_000;
+    const during = gate.pausedMs();
+    try std.testing.expect(during >= 5_000 and during < 5_000 + 5_000);
+    // Thawed: what it came to is kept, and does not grow with the clock.
+    gate.thaw();
+    try std.testing.expect(!slots[1].paused);
+    const once = gate.pausedMs();
+    try std.testing.expect(once >= during and once < during + 5_000);
+    try std.testing.expectEqual(once, gate.pausedMs());
+    // A second pause adds to the first; the clock handed out reads the same total.
+    slots[1].paused = true;
+    slots[1].ending = false;
+    slots[1].paused_since_ms = now - 2_000;
+    try std.testing.expect(gate.pauseClock().total() >= once + 2_000);
+    _ = pool.thaw(&slots[1], "test");
+    try std.testing.expect(slots[1].paused_total_ms >= once + 2_000);
+    // A clock stepped back (or a bad stamp in the future) never takes time away.
+    slots[1].paused = true;
+    slots[1].paused_since_ms = now + 1_000_000;
+    const before = slots[1].paused_total_ms;
+    try std.testing.expectEqual(before, gate.pausedMs());
+    _ = pool.thaw(&slots[1], "test");
+    try std.testing.expectEqual(before, slots[1].paused_total_ms);
 }
 
 test "priority: govern does not pause a job that is being signalled or has ended" {

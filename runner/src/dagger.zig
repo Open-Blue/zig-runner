@@ -62,6 +62,8 @@ const usesStep = @import("dagger/testing.zig").usesStep;
 const braceBalanced = @import("dagger/testing.zig").braceBalanced;
 const expectSecretOnlyInSetSecret = @import("dagger/testing.zig").expectSecretOnlyInSetSecret;
 
+const admission = @import("admission.zig");
+
 const Allocator = std.mem.Allocator;
 
 /// The image a job runs in without `container:`, and the shared base every job's chain starts
@@ -260,6 +262,9 @@ pub const StepResult = struct {
     exit_code: i32 = 0,
     started_ms: i64 = 0,
     completed_ms: i64 = 0,
+    /// How long the job's priority paused the step (`Watch`): its `timeout-minutes` ran that
+    /// much longer.
+    paused_ms: i64 = 0,
 };
 
 /// A native job's teardown (`Backend.deinit`): the services, the cgroup, the network, the job's
@@ -470,6 +475,12 @@ pub const Watch = struct {
     /// The running step's log step, 0 when `begin` was not told one.
     step: u32 = 0,
     deadline_ms: i64 = 0,
+    /// How long the job has been paused (priority freeze). A step's deadline moves by what this
+    /// gained since `begin`, so a pause never eats its `timeout-minutes`; null: never paused.
+    paused: ?admission.PauseClock = null,
+    paused_base_ms: i64 = 0,
+    /// How long the step that `end` ended was paused, for its `step-end:` line.
+    last_paused_ms: i64 = 0,
     /// The running step keeps running through a cancel, until the grace period ends
     /// (`survivesCancel`).
     survives_cancel: bool = false,
@@ -511,6 +522,7 @@ pub const Watch = struct {
         w.step = step;
         w.ladder = null;
         w.deadline_ms = deadline_ms;
+        w.paused_base_ms = w.pausedTotal();
         w.survives_cancel = survives_cancel;
         w.interrupt = .none;
         w.cancel_pending = false;
@@ -521,6 +533,7 @@ pub const Watch = struct {
     pub fn end(w: *Watch) Interrupt {
         w.mu.lockUncancelable(w.io);
         defer w.mu.unlock(w.io);
+        w.last_paused_ms = if (w.in_step) w.pausedTotal() - w.paused_base_ms else 0;
         w.in_step = false;
         w.step = 0;
         w.ladder = null;
@@ -567,8 +580,18 @@ pub const Watch = struct {
             w.cancel_pending = false;
             return;
         }
-        if (w.in_step and w.deadline_ms > 0 and now > w.deadline_ms and
+        if (w.in_step and w.deadline_ms > 0 and now > w.deadline_ms + w.pausedSince() and
             w.stop(now, awake, .timed_out, note)) w.deadline_ms = 0;
+    }
+
+    /// The job's whole paused time so far (0 where nothing can pause it).
+    fn pausedTotal(w: *const Watch) i64 {
+        return if (w.paused) |p| p.total() else 0;
+    }
+
+    /// What the running step has been paused for: its deadline is that much later.
+    fn pausedSince(w: *const Watch) i64 {
+        return @max(0, w.pausedTotal() - w.paused_base_ms);
     }
 
     /// What the transport needs of the job's cancel limit to stop a step.
@@ -2131,6 +2154,7 @@ fn runActionStep(
         else => unreachable,
     };
     const intr = watch.end();
+    res.paused_ms = watch.last_paused_ms;
     // However it ended, a step stopped was stopped, as on GitHub (`ThrowIfCancellationRequested`):
     // an exec's failure here, a Dockerfile's `RUN` for one, is the stop's doing.
     if (intr != .none) {
@@ -2186,6 +2210,7 @@ fn runResolvedStep(
     const name = if (step.context_name.len > 0) step.context_name else step.id;
     const ran = x.execScript(num, num, resolved, name, secret, mounts);
     const intr = watch.end();
+    res.paused_ms = watch.last_paused_ms;
     // However it ended, a step stopped was stopped, as on GitHub (`ThrowIfCancellationRequested`):
     // an exec's failure here, a Dockerfile's `RUN` for one, is the stop's doing.
     if (intr != .none) {
@@ -2360,6 +2385,10 @@ fn runSteps(
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 
     var watch: Watch = .{ .io = io, .transport = transport, .cancel = opts.cancel, .log = sh };
+    // A pause by the job's priority moves its steps' deadlines (`Watch.paused`).
+    if (native) |b| if (b.gate) |g| {
+        watch.paused = g.pauseClock();
+    };
     var watching: ?std.Io.Future(void) = null;
     if (transport.abortFn != null) watching = io.concurrent(Watch.run, .{&watch}) catch null;
     x.watch = &watch;
@@ -2455,7 +2484,22 @@ fn finishJob(x: *Exec, opts: Options, results: []StepResult) !Result {
     result.summaries = x.summaries;
     try jobOutputs(arena, x.ev, x.sh, job.*, &result);
     try environmentUrl(arena, x.ev, x.sh, job.*, &result);
+    try pausedNote(x, &result);
     return result;
+}
+
+/// "Complete job" says how long the job's priority paused it, when it did: its step and job
+/// timeouts were extended by that time (`Watch.paused`, `admission.Gate.pausedMs`).
+fn pausedNote(x: *Exec, result: *Result) !void {
+    const g = (x.native orelse return).gate orelse return;
+    const ms = g.pausedMs();
+    if (ms <= 0) return;
+    var lines: std.ArrayList([]const u8) = .empty;
+    try lines.appendSlice(x.arena, result.output_lines);
+    try lines.append(x.arena, try std.fmt.allocPrint(x.arena, "Native steps: this job was paused " ++
+        "for {d}.{d} s by its priority (RUNNER_PRIORITY_FREEZE); its step and job timeouts " ++
+        "ran that much longer.", .{ @divTrunc(ms, 1000), @divTrunc(@mod(ms, 1000), 100) }));
+    result.output_lines = lines.items;
 }
 
 /// Evaluates `environment.url` after the job outputs, as GitHub's runner does when it finishes a
@@ -2732,6 +2776,7 @@ fn engineFailed(
         .exit_code = 1,
         .started_ms = res.started_ms,
         .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds(),
+        .paused_ms = res.paused_ms,
     };
     x.sh.append(num, try std.fmt.allocPrint(x.arena, "Dagger error: {s}", .{x.err_msg}));
     if (observer) |o| o.finished(num, res.*);
@@ -2977,6 +3022,82 @@ test "a step past its timeout is stopped, and only that step" {
     w.tick(5_000, 5_000);
     try std.testing.expectEqual(@as(u32, 1), f.aborted);
     try std.testing.expectEqual(Watch.Interrupt.none, w.end());
+}
+
+/// A job's paused time that the test sets by hand.
+const FakePaused = struct {
+    n: std.atomic.Value(i64) = .init(0),
+
+    fn set(f: *FakePaused, ms: i64) void {
+        f.n.store(ms, .release);
+    }
+
+    fn clock(f: *const FakePaused) admission.PauseClock {
+        return .{ .counter = &f.n };
+    }
+};
+
+test "a step paused for longer than its time left does not time out while paused, and does at the extended deadline" {
+    var f: FakeAbort = .{};
+    var p: FakePaused = .{ .n = .init(300) }; // paused before the step: not the step's
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = null, .paused = p.clock() };
+    w.begin(0, 1_000, false);
+    f.in_flight = true;
+    // Paused from 500 on: the clock runs past the deadline and the step does not time out.
+    p.set(300 + 4_000);
+    w.tick(4_500, 4_500);
+    try std.testing.expectEqual(@as(u32, 0), f.aborted);
+    // Thawed at 4500 (paused 4000): the deadline is 1000 + 4000, and the step ran 1000 of it.
+    w.tick(5_000, 5_000);
+    try std.testing.expectEqual(@as(u32, 0), f.aborted);
+    w.tick(5_001, 5_001);
+    try std.testing.expectEqual(@as(u32, 1), f.aborted);
+    try std.testing.expectEqual(Watch.Interrupt.timed_out, w.end());
+    try std.testing.expectEqual(@as(i64, 4_000), w.last_paused_ms);
+}
+
+test "pauses of one step add up, a pause under way at the step's end is counted to it, and the next step starts at none" {
+    var f: FakeAbort = .{};
+    var p: FakePaused = .{};
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = null, .paused = p.clock() };
+    w.begin(0, 1_000, false);
+    f.in_flight = true;
+    p.set(500); // a first pause, ended
+    w.tick(1_400, 1_400);
+    p.set(500 + 700); // a second, under way
+    w.tick(1_800, 1_800);
+    try std.testing.expectEqual(@as(u32, 0), f.aborted);
+    // The step ends in the middle of the second pause: what ran of it is the step's.
+    try std.testing.expectEqual(Watch.Interrupt.none, w.end());
+    try std.testing.expectEqual(@as(i64, 1_200), w.last_paused_ms);
+    // The next step begins in the same pause: only what comes after counts for it.
+    w.begin(0, 3_000, false); // began at 2_000, 1_000 ms allowed
+    f.in_flight = true;
+    p.set(1_200 + 100);
+    w.tick(3_050, 3_050); // 1_050 ms in the step, 100 of them paused
+    try std.testing.expectEqual(@as(u32, 0), f.aborted);
+    w.tick(3_101, 3_101); // 1_101 in the step, 100 paused: past 1_000 + 100
+    try std.testing.expectEqual(@as(u32, 1), f.aborted);
+    try std.testing.expectEqual(Watch.Interrupt.timed_out, w.end());
+    try std.testing.expectEqual(@as(i64, 100), w.last_paused_ms);
+    // A step that never ran has paused nothing.
+    try std.testing.expectEqual(Watch.Interrupt.none, w.end());
+    try std.testing.expectEqual(@as(i64, 0), w.last_paused_ms);
+}
+
+test "a cancel during a pause still stops the step, whatever the pause has added to its deadline" {
+    var f: FakeAbort = .{};
+    var c: Cancel = .{};
+    var p: FakePaused = .{};
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = &c, .paused = p.clock() };
+    w.begin(0, 60_000, false);
+    f.in_flight = true;
+    p.set(30_000);
+    c.hard_deadline_ms.store(100_000, .release);
+    c.requested.store(true, .release);
+    w.tick(2_000, 2_000);
+    try std.testing.expectEqual(@as(u32, 1), f.aborted);
+    try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
 }
 
 test "a deadline passed between a step's queries stops its next query" {
