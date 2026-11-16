@@ -130,7 +130,7 @@ const Builder = struct {
             .secrets = try secretValues(arena, t, token),
             .secret_vars = try secretVars(arena, t),
             .github = github,
-            .runtime = try runtimeFor(arena, github.server_url),
+            .runtime = if (token.len > 0) try runtimeFor(arena, github.server_url) else .{},
             .env = try b.jobEnv(doc.get("env"), jn.get("env")),
             .defaults_run = dflt.run,
             .defaults_error = dflt.err,
@@ -986,6 +986,9 @@ test "every token the task carries is kept out of logs" {
     try testing.expect(!contains(j.secrets, "o/r"));
     try testing.expect(!contains(j.secrets, ""));
     try testing.expectEqualStrings("rt-token-2", j.job_token);
+    // The token that artifact actions get as ACTIONS_RUNTIME_TOKEN is masked (checked above), and
+    // the services it belongs to are the instance's.
+    try testing.expectEqualStrings("/api/actions_pipeline/", j.runtime.pipelines_url[std.mem.indexOf(u8, j.runtime.pipelines_url, "/api/").?..]);
     try testing.expectEqual(@as(usize, 2), j.secret_vars.len);
     try testing.expectEqualStrings("GITHUB_TOKEN", j.secret_vars[0].name);
     // The secrets are not in the context data an expression dump or a log might show.
@@ -1186,6 +1189,25 @@ test "a service's cmd (Gitea's own field) is read, as templates" {
     try testing.expectEqualStrings("postgres", svcs[0].cmd[0].lit);
     try testing.expect(svcs[0].cmd[2] == .expr);
     try testing.expectEqual(@as(usize, 0), svcs[1].cmd.len);
+}
+
+test "with no runtime token the artifact services are not named, and a job that is not Gitea's has none" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const t = try textTask(arena, "jobs:\n  j:\n    steps:\n      - run: echo\n", "{\"server_url\":\"http://h:3300/\",\"repository\":\"o/r\"}");
+    var why: []const u8 = "";
+    const j = (try fromTask(arena, t, &why)).job;
+    try testing.expectEqualStrings("", j.job_token);
+    try testing.expectEqualStrings("", j.runtime.pipelines_url);
+    try testing.expectEqualStrings("", j.runtime.results_url);
+    // A job nothing here made (GitHub's, whose broker message names its own services) starts with none.
+    const plain: job_mod.Job = std.mem.zeroInit(job_mod.Job, .{});
+    try testing.expectEqualStrings("", plain.runtime.pipelines_url);
+    try testing.expectEqualStrings("", plain.runtime.results_url);
+    const with_token = try runtimeFor(arena, "http://h:3300/");
+    try testing.expectEqualStrings("http://h:3300/api/actions_pipeline/", with_token.pipelines_url);
+    try testing.expectEqualStrings("http://h:3300", with_token.results_url);
 }
 
 test "the default actions URL: the instance's own is the server, another is kept, github and self are named" {
