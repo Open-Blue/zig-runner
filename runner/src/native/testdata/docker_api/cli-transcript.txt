@@ -1,0 +1,107 @@
+$ docker version
+Client: Docker Engine - Community
+ Version:           29.9.3
+ API version:       1.52 (downgraded from 1.56)
+ Go version:        go1.26.10
+ Git commit:        5457199
+ Built:             Tue Nov  3 21:42:07 2026
+ OS/Arch:           linux/amd64
+ Context:           default
+
+Server: zig-runner
+ Engine:
+  Version:          0.0.0-recorded
+  API version:      1.52 (minimum version 1.24)
+  Go version:       
+  Git commit:       
+  Built:            
+  OS/Arch:          linux/amd64
+  Experimental:     false
+[exit 0]
+$ docker info
+Client: Docker Engine - Community
+ Version:    29.9.3
+ Context:    default
+ Debug Mode: false
+ Plugins:
+  buildx: Docker Buildx (Docker Inc.)
+    Version:  v0.39.0
+    Path:     /usr/libexec/docker/cli-plugins/docker-buildx
+  compose: Docker Compose (Docker Inc.)
+    Version:  v5.7.1
+    Path:     /usr/libexec/docker/cli-plugins/docker-compose
+  model: Docker Model Runner (Docker Inc.)
+    Version:  v1.2.9
+    Path:     /usr/libexec/docker/cli-plugins/docker-model
+
+Server:
+ Containers: 0
+  Running: 0
+  Paused: 0
+  Stopped: 0
+ Images: 0
+ Server Version: 0.0.0-recorded
+ Storage Driver: overlay2
+ Logging Driver: local
+ Cgroup Driver: cgroupfs
+ Cgroup Version: 2
+ Plugins:
+  Volume: local
+  Network: bridge host null
+  Log: local
+ Swarm: inactive
+ Runtimes: io.containerd.runc.v2 runc
+ Default Runtime: runc
+ Init Binary: docker-init
+ containerd version: 
+ runc version: 
+ init version: 
+ Security Options:
+  seccomp
+   Profile: builtin
+  cgroupns
+ Kernel Version: 7.0.0-43-generic
+ Operating System: zig-runner
+ OSType: linux
+ Architecture: x86_64
+ CPUs: 12
+ Total Memory: 30.07GiB
+ Name: cowbird
+ ID: 0123456789abcdef
+ Docker Root Dir: /var/lib/docker
+ Debug Mode: false
+ Experimental: false
+ Insecure Registries:
+  127.0.0.0/8
+ Live Restore Enabled: false
+
+zig-runner serves a Docker-compatible API for this job; only /_ping, /version and /info are implemented so far (a build comes with stage 1b)
+[exit 0]
+$ docker build .
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            BuildKit is currently disabled; enable it by removing the DOCKER_BUILDKIT=0
+            environment-variable.
+
+Sending build context to Docker daemon  2.048kB
+Error response from daemon: not supported by zig-runner yet (stage 1b)
+[exit 1]
+$ docker build -t app:1 --build-arg A=1 --target x .
+DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
+            BuildKit is currently disabled; enable it by removing the DOCKER_BUILDKIT=0
+            environment-variable.
+
+Sending build context to Docker daemon  2.048kB
+Error response from daemon: not supported by zig-runner yet (stage 1b)
+[exit 1]
+$ docker build .
+ERROR: failed to build: Error response from daemon: BuildKit is not supported by zig-runner yet; DOCKER_BUILDKIT=0 is set for you, and docker buildx / docker/build-push-action need a later stage
+[exit 1]
+$ docker buildx build .
+ERROR: failed to build: Error response from daemon: BuildKit is not supported by zig-runner yet; DOCKER_BUILDKIT=0 is set for you, and docker buildx / docker/build-push-action need a later stage
+[exit 1]
+$ docker ps
+Error response from daemon: not supported by zig-runner yet: GET /containers/json
+[exit 1]
+$ docker images
+Error response from daemon: not supported by zig-runner yet: GET /images/json
+[exit 1]

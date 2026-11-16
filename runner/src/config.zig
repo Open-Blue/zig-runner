@@ -213,6 +213,11 @@ pub const Config = struct {
     /// Host paths mounted with the host's ids where the kernel cannot idmap their filesystem
     /// (`RUNNER_NATIVE_HOST_PATHS_UNMAPPED`, `sandbox.bindHostIn`); off, such a step fails.
     native_host_paths_unmapped: bool = false,
+    /// Every native job gets a Docker-compatible API on a socket of its own, at
+    /// `/var/run/docker.sock` in its steps, with `DOCKER_HOST` and `DOCKER_BUILDKIT=0` set
+    /// (`RUNNER_NATIVE_DOCKER_API`, `native/docker_api.zig`, #448). Off by default, and then a job is
+    /// exactly as it was.
+    native_docker_api: bool = false,
     /// Past this many MiB, the native step store's least recently used layers go
     /// (`RUNNER_NATIVE_STORE_MAX_MB`, `native/Store.zig`).
     native_store_max_mb: u64 = NativeStore.default_max_bytes / (1024 * 1024),
@@ -589,6 +594,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_NATIVE_PORT_IDLE_TIMEOUT")) |v| c.native_port_idle_timeout = try num(u64, v);
         if (environ.get("RUNNER_NATIVE_HOST_PATHS")) |v| c.native_host_paths = v;
         if (environ.get("RUNNER_NATIVE_HOST_PATHS_UNMAPPED")) |v| c.native_host_paths_unmapped = try boolean(v);
+        if (environ.get("RUNNER_NATIVE_DOCKER_API")) |v| c.native_docker_api = try boolean(v);
         if (environ.get("RUNNER_NATIVE_STORE_MAX_MB")) |v| c.native_store_max_mb = try num(u64, v);
         if (environ.get("RUNNER_NATIVE_VOLUMES_MAX_MB")) |v| c.native_volumes_max_mb = try num(u64, v);
         if (environ.get("RUNNER_NATIVE_IMAGES_MAX_MB")) |v| c.native_images_max_mb = try num(u64, v);
@@ -709,6 +715,7 @@ pub const Config = struct {
         else if (eq(key, "native-port-idle-timeout")) c.native_port_idle_timeout = try num(u64, val) //
         else if (eq(key, "native-host-paths")) c.native_host_paths = val //
         else if (eq(key, "native-host-paths-unmapped")) c.native_host_paths_unmapped = try boolean(val) //
+        else if (eq(key, "native-docker-api")) c.native_docker_api = try boolean(val) //
         else if (eq(key, "native-store-max-mb")) c.native_store_max_mb = try num(u64, val) //
         else if (eq(key, "native-volumes-max-mb")) c.native_volumes_max_mb = try num(u64, val) //
         else if (eq(key, "native-images-max-mb")) c.native_images_max_mb = try num(u64, val) //

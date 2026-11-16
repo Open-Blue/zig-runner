@@ -131,6 +131,24 @@ engine's other state (its layer cache, and through a trusted job's nesting the e
 not scoped at all; and nesting is control of the host. A second instance on prod's machine
 (`zig-runner@sandbox.service`) gets its own engine, or none.
 
+### A Docker API for native jobs (stage 1a of #448)
+
+`RUNNER_NATIVE_DOCKER_API=true` (`--native-docker-api`; off by default) gives every native job a
+Docker-compatible API of its own: a unix socket in the job's directory, bound into each step at
+`/var/run/docker.sock`, with `DOCKER_HOST=unix:///var/run/docker.sock` and `DOCKER_BUILDKIT=0` in
+the step's environment (a workflow's own `env:` wins). It is the runner's thread that answers, not
+the host's Docker daemon and not a Dagger engine, and only that job's steps have the socket; it is
+removed with the job. Nothing changes for a job while the option is off.
+
+This first stage answers `/_ping`, `/version` and `/info`, so a `docker` CLI in the step (an image
+that has one, or a setup action; the runner does not provide it) finds a server and says what it
+is. Every other endpoint, `docker build` included for now, gets HTTP 501 with
+`{"message":"not supported by zig-runner yet: <METHOD> <path>"}`, and BuildKit's (`docker buildx`,
+`docker/build-push-action`) a hint that they need a later stage. A job that uses the API logs one
+`info: kind=native_docker_api job=.. connections=.. requests=.. unsupported=.. refused=..
+timeouts=.. busy=..` line when it ends. Sending a job that needs more than this to an engine
+ahead of time, so that no Docker job is lost, is a later stage (#448, decision 2).
+
 ## Deploying releases
 
 A release deploys itself to razorbill. Once its binaries and image are built and CI has passed on

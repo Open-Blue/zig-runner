@@ -1,0 +1,7 @@
+POST /grpc HTTP/1.1
+Host: 
+User-Agent: moby-client/v0.6.0 linux/amd64
+Content-Length: 0
+Connection: Upgrade
+Upgrade: h2c
+

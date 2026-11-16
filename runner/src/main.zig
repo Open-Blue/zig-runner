@@ -43,6 +43,7 @@ comptime {
     _ = @import("net_oracle.zig");
     _ = @import("sink.zig");
     _ = @import("native/Backend.zig");
+    _ = @import("native/docker_api.zig");
     _ = @import("native/cgroup.zig");
     _ = @import("native/Store.zig");
     _ = @import("native/evict.zig");

@@ -2625,6 +2625,85 @@ at least the cold `run:` step's ~224 ms. Dagger could not be timed for this pull
 laptop's engine for this runner's Dagger version was stopped, and starting one was not done
 without the user (the PR says how to take the figure).
 
+### The job's Docker API (#448, stage 1a)
+
+Native steps run with no Docker daemon and, with `RUNNER_ENGINE=none`, no Dagger engine, so a step
+that runs `docker build` has nothing to talk to. The plan (#448) is for the runner to serve a
+Docker-compatible API for each job, answered from its own builder (`dockerfile.zig`,
+`docker_action.buildImage`), so that the `docker` CLI in a step builds with neither. **Stage 1a**
+(`native/docker_api.zig`) is the skeleton: the socket, its binding, the environment and clear
+errors. Nothing is built yet (1b).
+
+- **Opt-in**: `RUNNER_NATIVE_DOCKER_API=true` (`--native-docker-api`, `Config.native_docker_api`,
+  off by default). Off, a job is exactly what it was: no mount point, no bind, no variable, no
+  thread, and the step keys are the same.
+- **The socket** is `<job directory>/docker.sock`, `0666` (a step's user is another one of the
+  host's, in a user namespace; what protects it is that only this job's steps have it in their
+  root, and that the job's directory is the runner's), bound into every step's root at
+  `/var/run/docker.sock` (`Backend.startDockerApi`), the path the runner already reserved as its own
+  (`container_options.zig` refuses a `volumes:` entry or a `--tmpfs` there). A path past `sun_path`'s
+  107 bytes is bound through its directory (`/proc/self/fd/N/docker.sock`), so a long store path is
+  no limit. It is never the host's socket: nothing of the host's `/var/run` is bound. It is
+  removed, and its server stopped, with the job (`Backend.deinit`, before the job's directory goes).
+  A Docker action's container gets the bind as the job's other binds; services do not.
+- **The mount point** is an empty file in the job's mount-points layer (`Backend.mount_points`,
+  below every image), made in `/var/run` and in `/run`: an image's `/var/run` is usually a link to
+  `/run` (Ubuntu's, Alpine's) and a bind is made where the link leads, and the layer is below the
+  image's, so an image with a directory there is bound in place. No step's layer holds a file for it,
+  which a step cache's replay would otherwise carry to another job. The bind is `optional`: an
+  image whose `/var/run` leads somewhere the layer has no file for has no socket, and the `docker`
+  CLI says so, rather than the job failing.
+- **The environment**: `DOCKER_HOST=unix:///var/run/docker.sock` and `DOCKER_BUILDKIT=0`, put in
+  the job's env before the workflow's `env:` (job's and step's), which wins. The classic builder is
+  the first stage: with `DOCKER_BUILDKIT=0` the CLI uses `POST /build`. `docker buildx` and
+  `docker/build-push-action` use BuildKit's `/grpc` and `/session` and get the hint below.
+- **The step keys** hash the bind's `at` and not its host path, which differs per job (as the job's
+  resolver's does), so jobs with the API replay one another's steps and never a job without it.
+- **The server**: one thread accepting, one thread per connection, at most 8 at a time (the ninth
+  is told 503), on raw sockets and `poll` (Zig's `std.Io.net` has no read deadline). Every wait has
+  a deadline: a request's head (16 KiB at most, a 4096-byte target) must arrive within 10 s of its
+  first byte (else 408), a kept connection may idle 15 s, a write may take 10 s, 1000 requests are
+  served on one connection. A malformed request line or header (a space too many, a lowercase
+  method, a missing `Host`, a folded or control-character header, a conflicting `Content-Length`,
+  `Transfer-Encoding` with a length) gets 400 and the connection closed; an oversized head 431, a
+  long target 414. A request with a body is answered at once, then its body is read and dropped (8
+  MiB, 2 s) and the connection closed, so the CLI that is still sending a build context reads our
+  answer instead of a reset. `Server.stop` wakes every thread through one eventfd and joins them.
+- **The endpoints**: `GET`/`HEAD /_ping` (`OK`; `Api-Version: 1.52`, `Builder-Version: 1`,
+  `Ostype: linux`), `GET /version` and `GET /info` (valid JSON, `Platform.Name` and
+  `OperatingSystem` "zig-runner", the runner's version, the kernel's and the machine's CPUs and
+  memory; `ID` is the job's directory name, which makes the API of two jobs tell apart). An optional
+  `/v1.NN` prefix is stripped from 1.24 to 1.52; another version gets Docker's own 400 ("client
+  version 1.53 is too new. Maximum supported API version is 1.52"). `/grpc`, `/session` and `POST
+  /build?version=2` get 501 "BuildKit is not supported by zig-runner yet; DOCKER_BUILDKIT=0 is set
+  for you, and docker buildx / docker/build-push-action need a later stage"; `POST /build` 501
+  "not supported by zig-runner yet (stage 1b)"; everything else 501 `{"message":"not supported by
+  zig-runner yet: <METHOD> <path>"}`, the path without its version prefix and query.
+- **The log**: one `info: kind=native_docker_api job=<job directory id> connections=.. requests=..
+  unsupported=.. refused=.. timeouts=.. busy=..` line when a job that used the API ends (`kind=`
+  names are an alert contract: this one is new, and stays). "Set up job" says whether the job has
+  the API, or why not (a socket that could not be made does not fail the job: the option adds a
+  service).
+- **Tests**: `docker_api.zig`'s (`docker api:` ... ) run the server on a socket in a temporary
+  directory; the native ones (`native docker api:`) run steps whose `curl --unix-socket` gets `OK`,
+  two jobs with different `ID`s, the store not in the job's root, and the option off leaving no
+  socket and no variable; the replay test (`docker api: a real docker CLI's traffic`) sends what
+  `docker version`, `docker info` and `docker build .` sent (`native/testdata/docker_api/`) and
+  checks what the server answers, normalising what differs between machines.
+- **For stage 1b**: `POST /build` (a tar context; `t`, `buildargs`, `labels`, `target`,
+  `dockerfile`) through `docker_action.buildImage` in the job's cgroup; `/images/{name}/json`, tag
+  and delete over a per-job tag index; the image ID (a hash of the config and the final step key);
+  and the check that sends a job that needs more than `docker build` to the engine ahead of time
+  (decision 2, "never lose a Docker job"): `Backend.unsupported`'s loop over `job.steps` (the
+  `.script` arm, today empty) is where it goes, reading the scripts and `uses:` for `docker`, with
+  the option on and an engine configured. A replayed step (the step cache) is not a build: a step
+  that ran `docker build` must not be keyed for replay until the builder's inputs are (1b).
+- **Rootless**: the same design (the mount-point layer and the bind do not depend on the
+  runner's user; the socket is `0666`). Not run rootless yet: on the development laptop Ubuntu's
+  AppArmor refuses an unprivileged user namespace map (errno 13), also in a privileged container as
+  uid 1000, so the native tests above skip or fail there as every rootless native test does; they
+  passed as root. A rootless run belongs on a host that allows it (CI's rootless job).
+
 ### P8: remapping the Lean proofs
 
 - The theorems keep their shape; the code they cite changes. The "a container *is* its recipe"

@@ -1,0 +1,11 @@
+HTTP/1.1 501 Not Implemented
+Api-Version: 1.52
+Builder-Version: 1
+Docker-Experimental: false
+Ostype: linux
+Server: zig-runner/0.0.0-recorded (linux)
+Content-Type: application/json
+Content-Length: 157
+Connection: keep-alive
+
+{"message":"BuildKit is not supported by zig-runner yet; DOCKER_BUILDKIT=0 is set for you, and docker buildx / docker/build-push-action need a later stage"}

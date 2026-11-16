@@ -1,0 +1,21 @@
+HTTP/1.1 200 OK
+Api-Version: 1.52
+Builder-Version: 1
+Docker-Experimental: false
+Ostype: linux
+Server: zig-runner/0.0.0-recorded (linux)
+Content-Type: text/plain; charset=utf-8
+Content-Length: 2
+Connection: keep-alive
+
+HTTP/1.1 200 OK
+Api-Version: 1.52
+Builder-Version: 1
+Docker-Experimental: false
+Ostype: linux
+Server: zig-runner/0.0.0-recorded (linux)
+Content-Type: application/json
+Content-Length: 1592
+Connection: keep-alive
+
+{"ID":"0123456789abcdef","Containers":0,"ContainersRunning":0,"ContainersPaused":0,"ContainersStopped":0,"Images":0,"Driver":"overlay2","DriverStatus":[],"Plugins":{"Volume":["local"],"Network":["bridge","host","null"],"Authorization":null,"Log":["local"]},"MemoryLimit":true,"SwapLimit":false,"CpuCfsPeriod":true,"CpuCfsQuota":true,"CPUShares":true,"CPUSet":true,"PidsLimit":true,"IPv4Forwarding":true,"Debug":false,"NFd":0,"OomKillDisable":true,"NGoroutines":0,"SystemTime":"1970-01-01T00:00:00Z","LoggingDriver":"local","CgroupDriver":"cgroupfs","CgroupVersion":"2","NEventsListener":0,"KernelVersion":"7.0.0-43-generic","OperatingSystem":"zig-runner","OSVersion":"","OSType":"linux","Architecture":"x86_64","IndexServerAddress":"https://index.docker.io/v1/","RegistryConfig":{"InsecureRegistryCIDRs":["127.0.0.0/8"],"IndexConfigs":{},"Mirrors":null},"NCPU":12,"MemTotal":32290648064,"GenericResources":null,"DockerRootDir":"/var/lib/docker","HttpProxy":"","HttpsProxy":"","NoProxy":"","Name":"cowbird","Labels":[],"ExperimentalBuild":false,"ServerVersion":"0.0.0-recorded","Runtimes":{"io.containerd.runc.v2":{"path":"runc"},"runc":{"path":"runc"}},"DefaultRuntime":"runc","Swarm":{"NodeID":"","NodeAddr":"","LocalNodeState":"inactive","ControlAvailable":false,"Error":"","RemoteManagers":null},"LiveRestoreEnabled":false,"Isolation":"","InitBinary":"docker-init","SecurityOptions":["name=seccomp,profile=builtin","name=cgroupns"],"Warnings":["zig-runner serves a Docker-compatible API for this job; only /_ping, /version and /info are implemented so far (a build comes with stage 1b)"]}

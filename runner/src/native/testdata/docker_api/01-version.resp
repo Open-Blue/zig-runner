@@ -1,0 +1,21 @@
+HTTP/1.1 200 OK
+Api-Version: 1.52
+Builder-Version: 1
+Docker-Experimental: false
+Ostype: linux
+Server: zig-runner/0.0.0-recorded (linux)
+Content-Type: text/plain; charset=utf-8
+Content-Length: 2
+Connection: keep-alive
+
+HTTP/1.1 200 OK
+Api-Version: 1.52
+Builder-Version: 1
+Docker-Experimental: false
+Ostype: linux
+Server: zig-runner/0.0.0-recorded (linux)
+Content-Type: application/json
+Content-Length: 459
+Connection: keep-alive
+
+{"Platform":{"Name":"zig-runner"},"Components":[{"Name":"Engine","Version":"0.0.0-recorded","Details":{"ApiVersion":"1.52","Arch":"amd64","BuildTime":"","Experimental":"false","GitCommit":"","GoVersion":"","KernelVersion":"7.0.0-43-generic","MinAPIVersion":"1.24","Os":"linux"}}],"Version":"0.0.0-recorded","ApiVersion":"1.52","MinAPIVersion":"1.24","GitCommit":"","GoVersion":"","Os":"linux","Arch":"amd64","KernelVersion":"7.0.0-43-generic","BuildTime":""}

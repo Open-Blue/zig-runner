@@ -1,0 +1,21 @@
+HTTP/1.1 200 OK
+Api-Version: 1.52
+Builder-Version: 1
+Docker-Experimental: false
+Ostype: linux
+Server: zig-runner/0.0.0-recorded (linux)
+Content-Type: text/plain; charset=utf-8
+Content-Length: 2
+Connection: keep-alive
+
+HTTP/1.1 501 Not Implemented
+Api-Version: 1.52
+Builder-Version: 1
+Docker-Experimental: false
+Ostype: linux
+Server: zig-runner/0.0.0-recorded (linux)
+Content-Type: application/json
+Content-Length: 68
+Connection: keep-alive
+
+{"message":"not supported by zig-runner yet: GET /containers/json"}

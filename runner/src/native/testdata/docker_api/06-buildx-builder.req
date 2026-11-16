@@ -1,0 +1,10 @@
+HEAD /_ping HTTP/1.1
+Host: api.moby.localhost
+User-Agent: moby-client/v0.6.0 linux/amd64
+Traceparent: 00-c9aa93f133661b1214f4963b23ef32af-8b120b00b76b420a-01
+
+GET /v1.52/containers/buildx_buildkit_default/json HTTP/1.1
+Host: api.moby.localhost
+User-Agent: moby-client/v0.6.0 linux/amd64
+Traceparent: 00-c9aa93f133661b1214f4963b23ef32af-59b66a23a7fa339a-01
+
