@@ -93,7 +93,11 @@ main() {
 
 	# The instance: its default actions URL is itself, so that a bare `owner/repo@ref`
 	# resolves to the repositories made below.
-	docker run -d --name "$instance" --memory=1g --oom-score-adj=800 -p "$host:$port:3000" \
+	# On the host's network, listening on its address: a port Docker publishes is NATed to the
+	# container, and the jobs' firewall rules (native/nft.zig) match the address as the job dials
+	# it, which after the NAT is not the one they were given.
+	docker run -d --name "$instance" --memory=1g --oom-score-adj=800 --network host \
+		-e "${prefix}__server__HTTP_ADDR=$host" -e "${prefix}__server__HTTP_PORT=$port" \
 		-e "${prefix}__security__INSTALL_LOCK=true" -e "${prefix}__actions__ENABLED=true" \
 		-e "${prefix}__actions__DEFAULT_ACTIONS_URL=$default_actions" -e "${prefix}__server__ROOT_URL=$url/" \
 		-e "${prefix}__server__DISABLE_SSH=true" "$image" >/dev/null
