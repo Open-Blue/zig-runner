@@ -1072,7 +1072,7 @@ pub fn nestedFailed(
 /// A remote action, fetched once per job however many steps (or composite actions) use it, as
 /// GitHub downloads each action once in "Set up job".
 pub fn loadAction(x: *Exec, u: job_mod.Uses) !LoadResult {
-    const key = try std.fmt.allocPrint(x.arena, "{s}/{s}/{s}@{s}", .{ u.owner, u.name, u.path, u.ref });
+    const key = try @import("../native/actions.zig").key(x.arena, x.job.*, u);
     if (x.actions.get(key)) |lr| return lr;
     // On the native backend every remote action was fetched before the job started
     // (`native/actions.zig`).
@@ -1089,13 +1089,14 @@ pub fn loadAction(x: *Exec, u: job_mod.Uses) !LoadResult {
 /// `action.yml` or `action.yaml`.
 pub fn fetchAction(x: *Exec, u: job_mod.Uses) !LoadResult {
     const arena = x.arena;
-    const repository = try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name });
+    const from = try u.resolve(arena, x.job.*);
+    const repository = from.repository;
     const sub = if (u.path.len > 0) try std.fmt.allocPrint(arena, "/{s}", .{u.path}) else "";
-    const ref_label = try std.fmt.allocPrint(arena, "{s}{s}@{s}", .{ repository, sub, u.ref });
+    const ref_label = try std.fmt.allocPrint(arena, "{s}{s}@{s}", .{ repository, sub, from.ref });
     // GITHUB_TOKEN reads only the job's own repository; other actions are fetched anonymously.
-    const own_repo = std.mem.eql(u8, repository, x.job.github.repository);
+    const own_repo = from.token;
     var msg: []const u8 = "";
-    const tree_query = try x.actionTreeQuery(u, repository, own_repo);
+    const tree_query = try x.actionTreeQuery(u, from, own_repo);
     const data = gql(arena, x.transport, tree_query, &msg) catch
         return .{ .unresolved = try unresolvedMessage(arena, u, msg, own_repo) };
     const dir = jsonFindString(data, "id") orelse
@@ -1119,7 +1120,7 @@ pub fn fetchAction(x: *Exec, u: job_mod.Uses) !LoadResult {
     };
     const mount = try std.fmt.allocPrint(arena, "/github/_actions/{s}/{s}", .{
         repository,
-        u.ref,
+        from.ref,
     });
     return .{ .ok = .{
         .meta = meta,
@@ -1130,7 +1131,7 @@ pub fn fetchAction(x: *Exec, u: job_mod.Uses) !LoadResult {
         .ref_label = ref_label,
         .sha = jsonFindString(data, "sha") orelse "",
         .repository = repository,
-        .ref = u.ref,
+        .ref = from.ref,
     } };
 }
 
@@ -1140,20 +1141,19 @@ pub fn fetchAction(x: *Exec, u: job_mod.Uses) !LoadResult {
 pub fn actionTreeQuery(
     x: *Exec,
     u: job_mod.Uses,
-    repository: []const u8,
+    from: job_mod.Resolved,
     own_repo: bool,
 ) ![]const u8 {
     const arena = x.arena;
-    const server = std.mem.trimEnd(u8, x.job.github.server_url, "/");
-    const url = try std.fmt.allocPrint(arena, "{s}/{s}.git", .{ server, repository });
+    const url = try std.fmt.allocPrint(arena, "{s}/{s}.git", .{ from.server, from.repository });
     const auth: ?[]const u8 = if (own_repo) x.gitAuth() else null;
     const auth_user: ?[]const u8 = if (auth != null) "x-access-token" else null;
     var q: Query = .init(arena);
     try q.call("git", .{ .url = url, .httpAuthUsername = auth_user, .httpAuthToken = auth });
-    if (checkout.isSha(u.ref)) {
-        try q.call("commit", .{ .id = u.ref });
+    if (checkout.isSha(from.ref)) {
+        try q.call("commit", .{ .id = from.ref });
     } else {
-        try q.call("ref", .{ .name = u.ref });
+        try q.call("ref", .{ .name = from.ref });
     }
     try q.call("tree", .{ .depth = @as(u32, 1) });
     try q.leaf("id");

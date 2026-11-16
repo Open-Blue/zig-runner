@@ -37,8 +37,11 @@ const config = @import("../config.zig");
 const Allocator = std.mem.Allocator;
 
 /// `Exec.loadAction`'s key for an action, so the loaded ones fill its map.
-pub fn key(arena: Allocator, u: job_mod.Uses) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{s}/{s}/{s}@{s}", .{ u.owner, u.name, u.path, u.ref });
+/// It names where the action is fetched from, so `self:` and `$/` of one repository at one commit
+/// are one fetch.
+pub fn key(arena: Allocator, job: job_mod.Job, u: job_mod.Uses) ![]const u8 {
+    const from = try u.resolve(arena, job);
+    return std.fmt.allocPrint(arena, "{s} {s}/{s}@{s}", .{ from.server, from.repository, u.path, from.ref });
 }
 
 /// Fetches and reads every remote action of `job` into `b.actions`, and says why the job cannot
@@ -63,7 +66,7 @@ fn reasonFor(b: *Backend, job: job_mod.Job, u: job_mod.Uses, depth: u32) anyerro
     const arena = b.arena;
     if (depth > max_depth) return null;
     if (u.local) return localReason(b, job, u.path, depth);
-    const k = try key(arena, u);
+    const k = try key(arena, job, u);
     const lr = b.actions.get(k) orelse lr: {
         const fetched = try fetch(b, job, u);
         try b.actions.put(arena, k, fetched);
@@ -317,11 +320,13 @@ fn gitEnv(b: *Backend, job: job_mod.Job, own: bool) ![]const []const u8 {
 /// repository's host directory in that layer, for a Dockerfile's build context.
 fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
     const arena = b.arena;
-    const repository = try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name });
+    const from = try u.resolve(arena, job);
+    const repository = from.repository;
+    const server = from.server;
+    const ref = from.ref;
     const sub = if (u.path.len > 0) try std.fmt.allocPrint(arena, "/{s}", .{u.path}) else "";
-    const ref_label = try std.fmt.allocPrint(arena, "{s}{s}@{s}", .{ repository, sub, u.ref });
-    const mount = try std.fmt.allocPrint(arena, "/github/_actions/{s}/{s}", .{ repository, u.ref });
-    const server = std.mem.trimEnd(u8, job.github.server_url, "/");
+    const ref_label = try std.fmt.allocPrint(arena, "{s}{s}@{s}", .{ repository, sub, ref });
+    const mount = try std.fmt.allocPrint(arena, "/github/_actions/{s}/{s}", .{ repository, ref });
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.writeAll("set -e\nmkdir -p ");
@@ -331,7 +336,7 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
     try w.writeAll("\ngit init -q\ngit remote add origin ");
     try dagger.shellQuote(w, try std.fmt.allocPrint(arena, "{s}/{s}.git", .{ server, repository }));
     try w.writeAll("\ngit -c protocol.version=2 fetch -q --depth=1 --no-tags origin ");
-    try dagger.shellQuote(w, u.ref);
+    try dagger.shellQuote(w, ref);
     try w.writeAll("\ngit checkout -q --detach FETCH_HEAD\nrm -f .git/FETCH_HEAD\n" ++
         "git rev-parse HEAD\n");
 
@@ -340,7 +345,7 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
     var ended: sandbox.Ended = .{ .code = 0, .failure = "" };
     // Once the image is known to have no git, its script is not run again.
     if (!b.no_git) {
-        const env = try gitEnv(b, job, std.mem.eql(u8, repository, job.github.repository));
+        const env = try gitEnv(b, job, from.token);
         ended = try b.execOn(&.{ "sh", "-c", aw.written() }, env, &.{git_config_file}, 0, 0, out.output(), null);
         // `sh` found no git in the image (any image is native since P3, not only the provisioned
         // default one): the action's tarball instead (`tarball.zig`), here and for the job's later
@@ -351,17 +356,16 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
         }
     }
     if (b.no_git) {
-        if (tarball.refProblem(u.ref)) |why| return .{ .unresolved = try std.fmt.allocPrint(
+        if (tarball.refProblem(ref)) |why| return .{ .unresolved = try std.fmt.allocPrint(
             arena,
             "Unable to resolve action `{s}`: {s}",
             .{ ref_label, why },
         ) };
-        const own = std.mem.eql(u8, repository, job.github.repository);
-        const src = if (own and job.job_token.len > 0)
-            try tarball.checkoutSource(arena, server, repository, u.ref, job.job_token)
+        const src = if (from.token and job.job_token.len > 0 and u.source == .default)
+            try tarball.checkoutSource(arena, server, repository, ref, job.job_token)
         else
-            try tarball.actionSource(arena, server, repository, u.ref);
-        switch (try tarball.fetchInto(b, mount, src, if (checkout_mod.isSha(u.ref)) u.ref else null, 0, 0)) {
+            try tarball.actionSource(arena, server, repository, ref);
+        switch (try tarball.fetchInto(b, mount, src, if (checkout_mod.isSha(ref)) ref else null, 0, 0)) {
             .sha => |s| tar_sha = s,
             .failed => |why| return .{ .unresolved = try std.fmt.allocPrint(
                 arena,
@@ -415,7 +419,7 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
         .ref_label = ref_label,
         .sha = if (sha.len == 40) sha else "",
         .repository = repository,
-        .ref = u.ref,
+        .ref = ref,
     } };
 }
 
@@ -617,6 +621,56 @@ test "a job with an action keeps its steps cached: the action's tree is keyed by
     try std.testing.expect(std.mem.indexOf(u8, texts[0], dagger.native_reused_note) == null);
     try std.testing.expect(std.mem.count(u8, texts[1], dagger.native_reused_note) >= 1);
     try std.testing.expect(std.mem.indexOf(u8, texts[1], "after the action") != null);
+}
+
+test "an action is fetched from the server its `uses` names: the default actions URL, self: or $/" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testActions(arena, &tmp);
+    try testRepo(arena, &tmp, "comp", &.{.{
+        "action.yml",
+        \\runs:
+        \\  using: composite
+        \\  steps:
+        \\    - shell: bash
+        \\      run: echo composite ran
+    }});
+    var steps = [_]job_mod.Step{
+        usesStep("dflt", "o", "comp", "v1", &.{}),
+        usesStep("inst", "o", "comp", "v1", &.{}),
+        usesStep("self", "", "", "", &.{}),
+    };
+    steps[1].action.uses.source = .instance;
+    steps[2].action.uses.source = .workflow_repo;
+    // The job where the default actions URL has the repository and the instance has nothing runs
+    // the first step; the one where it is the other way round runs the other two, `$/` being the
+    // job's own repository (`o/comp`) at its commit (here the tag).
+    for ([_]struct { run: []const job_mod.Step, server: []const u8, actions: []const u8 }{
+        .{ .run = steps[0..1], .server = "file:///srv/nowhere", .actions = "file:///srv/git" },
+        .{ .run = steps[1..3], .server = "file:///srv/git", .actions = "file:///srv/nowhere" },
+    }) |c| {
+        var job = testJob(c.run);
+        job.github.repository = "o/comp";
+        job.github.sha = "v1";
+        job.github.server_url = c.server;
+        job.github.actions_url = c.actions;
+        var env: std.process.Environ.Map = .init(arena);
+        var w: std.Io.Writer.Allocating = .init(arena);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+        const res = try dagger.run(arena, std.testing.io, &env, .{
+            .native = cfg,
+            .step_user = .root,
+            .gpa = std.testing.allocator,
+        }, job, &log);
+        const text = w.written();
+        errdefer std.debug.print("{s}\n", .{text});
+        try std.testing.expectEqual(c.run.len, res.steps.len);
+        for (res.steps) |st| try std.testing.expectEqual(dagger.Outcome.success, st.outcome);
+        try std.testing.expectEqual(c.run.len, std.mem.count(u8, text, "stdout] composite ran"));
+    }
 }
 
 test "a Dockerfile action whose base image changed under its tag is built again, not replayed" {
