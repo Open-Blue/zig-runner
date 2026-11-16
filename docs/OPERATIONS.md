@@ -158,9 +158,9 @@ A step's `uses:` is read as Gitea's workflow model reads it (`model.ParseActionU
 | `uses:` | fetched from |
 |---|---|
 | `owner/repo[/path]@ref` | the instance's default actions URL, which the task carries as `gitea_default_actions_url` (`https://github.com` on a default Gitea, `https://data.forgejo.org` on Forgejo; the instance's own address when it is configured `self`) |
-| `self:owner/repo[/path]@ref` | the instance the job runs on, with the task's token |
+| `self:owner/repo[/path]@ref` | the instance the job runs on, with the task's `GITHUB_TOKEN` secret (what the instance sends as the task's token; the `gitea_runtime_token` is for its artifact and cache services, and git refuses it) |
 | `https://host/owner/repo[/path]@ref` | that host, anonymously; the instance's own address is the instance |
-| `$/path` | the workflow's own repository at the job's commit (no `@ref`, no `..`), with the task's token |
+| `$/path` | the workflow's own repository at the job's commit (no `@ref`, no `..`), with the same token |
 | `./path` | the workspace, as on GitHub |
 
 `ssh://` and credentials in the URL (`https://token@host/...`) are refused, with the reason in the step's log. A composite action's own
