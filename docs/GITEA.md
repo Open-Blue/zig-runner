@@ -104,9 +104,9 @@ and `forgejo/runner` (`internal/app/run/runner.go`, `act/runner/run_context.go`)
 | `FORGEJO_ACTIONS_RUNNER_VERSION` | not set | the runner's version | this runner's version, on Forgejo |
 | `FORGEJO_<X>` for `<X>` in `WORKFLOW RUN_ATTEMPT RUN_ID RUN_NUMBER ACTOR REPOSITORY EVENT_NAME EVENT_PATH WORKSPACE SHA REF REF_NAME REF_TYPE JOB REPOSITORY_OWNER RETENTION_DAYS BASE_REF HEAD_REF SERVER_URL API_URL WORKFLOW_REF` | not set | the same value as `GITHUB_<X>` | the same, on Forgejo |
 | `FORGEJO_ACTION`, `_ACTION_PATH`, `_ACTION_REPOSITORY`, `_ACTION_REF` | not set | twins of `GITHUB_ACTION*` | not set (known gap) |
-| `GITHUB_TOKEN`, `FORGEJO_TOKEN` in the environment | not set | both, the job's token | not set: a step gets the token only where the workflow passes `${{ secrets.GITHUB_TOKEN }}`, as on GitHub (a difference on purpose for `GITHUB_TOKEN` itself: it is not in an action's environment. An action step does get `ACTIONS_RUNTIME_TOKEN`, in the next row, as act_runner gives it, and on Gitea that token also authenticates API requests while the task runs) |
-| `ACTIONS_RUNTIME_URL`, `ACTIONS_RUNTIME_TOKEN`, `ACTIONS_RESULTS_URL` | the instance's artifact service, the task's runtime token | the same | not set until artifacts go through the instance (#520, G5) |
-| `ACTIONS_CACHE_URL`, `ACTIONS_CACHE_MODE` | the runner's cache proxy | the same | not set until `actions/cache` does (#520, G6) |
+| `GITHUB_TOKEN`, `FORGEJO_TOKEN` in the environment | not set | both, the job's token | not set: a step gets the token only where the workflow passes `${{ secrets.GITHUB_TOKEN }}`, as on GitHub (a difference on purpose for `GITHUB_TOKEN` itself: it is not in an action's environment. An action step does get `ACTIONS_RUNTIME_TOKEN`, in the next row, as act_runner gives it, and on Gitea that token also authenticates API requests while the task runs; see "Artifacts and the cache") |
+| `ACTIONS_RUNTIME_URL`, `ACTIONS_RUNTIME_TOKEN`, `ACTIONS_RESULTS_URL` | the instance's artifact service, the task's runtime token | the same | set for the steps that run an action (not for `run:` steps, as on GitHub): `ACTIONS_RUNTIME_URL` is the instance's `/api/actions_pipeline/`, `ACTIONS_RESULTS_URL` the instance, `ACTIONS_RUNTIME_TOKEN` the task's runtime token, which the log masks |
+| `ACTIONS_CACHE_URL`, `ACTIONS_CACHE_MODE` | the runner's cache proxy | the same | not set: the instance has no cache service, and the runner serves none (see "Artifacts and the cache") |
 | `ACTIONS_ID_TOKEN_REQUEST_URL`, `_TOKEN` | from the task's context, when it has them | from `forgejo_actions_id_token_request_*` | not set |
 | `ACT`, `ACT_SKIP_CHECKOUT`, `JOB_CONTAINER_NAME`, `ImageOS` | set by act | set by act | not set: they name the runner's implementation |
 | `RUNNER_PERFLOG`, `RUNNER_TRACKING_ID` | not set | from the task | not set |
@@ -137,3 +137,30 @@ task"): a task's YAML goes through `gitea/job.zig`, the services start from a fi
 task's own `cmd`, the step reaches one by name and by `localhost:<published port>`, and it is gone
 with the job. Services from real postgres and redis images run in the existing
 `ZIG_RUNNER_SERVICE_IMAGES` test.
+
+## Artifacts and the cache
+
+**Artifacts** go through the instance, as with its own runner: an action that uploads or downloads one
+talks to the instance's artifact service with `ACTIONS_RESULTS_URL` and `ACTIONS_RUNTIME_TOKEN`
+(artifacts v4, a Twirp service) or `ACTIONS_RUNTIME_URL` (v3, the pipelines API), which every
+action step gets. The runner serves nothing of its own. The instance's addresses are the ones the job
+reaches it by (the runner makes a loopback or LAN instance reachable from the job's network;
+`gitea/reach.zig`), and the runtime token is a different, narrower token than `GITHUB_TOKEN` (it
+reaches the artifact services only), masked in the log.
+
+GitHub's own `actions/upload-artifact@v4` and `download-artifact@v4` refuse to run when
+`GITHUB_SERVER_URL` is not github.com ("not currently supported on GHES"), on Gitea and Forgejo as on
+any server that is not GitHub's. Use `forgejo/upload-artifact@v4` and `forgejo/download-artifact@v4`
+(`uses: https://code.forgejo.org/forgejo/upload-artifact@v4`, which Gitea's service takes too) or
+`actions/upload-artifact@v3` where the instance still serves v3. The live jobs
+([CI.md](CI.md)) upload and download one with the first, on a real Gitea and a real Forgejo.
+
+**`actions/cache` does nothing** here: act_runner and forgejo-runner run a cache server of their own
+(the runner's, not the instance's), which zig-runner does not, so `ACTIONS_CACHE_URL` is not set and
+the action reports that the cache service is unavailable and carries on (a restore finds no entry, a
+save is skipped; the step does not fail). What the runner offers in its place needs no action: the
+step cache replays a step whose inputs have not changed, and the Zig, Cargo and package caches are
+volumes the runner keeps for a repository's trusted jobs (`RUNNER_ZIG_LOCAL_CACHE`,
+`RUNNER_CARGO_TARGET_CACHE`; [OPERATIONS.md](OPERATIONS.md#cache-volumes-and-trust)), the same as for
+a GitHub job. A workflow that relies on `actions/cache` for something else (a dependency directory)
+rebuilds it each job.

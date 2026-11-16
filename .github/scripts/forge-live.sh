@@ -48,7 +48,7 @@ main() {
 	forgejo)
 		image=${ZR_FORGE_IMAGE:-data.forgejo.org/forgejo/forgejo@sha256:d05b9e587f02a746784d42c815c486b1d4f138646128f990a841833f513fe088}
 		cli=forgejo prefix=FORGEJO
-		default_actions=http://127.0.0.1:${ZR_FORGE_PORT:-3398}
+		default_actions=
 		;;
 	*) echo "forge-live: --forge is gitea or forgejo" >&2 && exit 2 ;;
 	esac
@@ -57,7 +57,13 @@ main() {
 	# a FORWARD chain that drops, as Docker leaves one; never on a machine that routes).
 	base=${ZR_FORGE_BASE:-ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5}
 	port=${ZR_FORGE_PORT:-3398}
-	url=http://127.0.0.1:$port
+	# The instance's address as a job reaches it: the VM's own, not the loopback, so that the
+	# addresses the instance puts in its answers (the artifact service's upload URLs are made from
+	# its ROOT_URL) are ones a job's network reaches too (`gitea/reach.zig` opens them).
+	host=${ZR_FORGE_HOST:-$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')}
+	host=${host:-127.0.0.1}
+	url=http://$host:$port
+	[[ $forge == gitea ]] || default_actions=$url
 	lock=${ZR_FORGE_LOCK:-$HOME/.cache/zig-runner-locks/root-tests.lock}
 	instance=zr-forge-live-$forge runner=zr-forge-live-runner-$forge store=zr-forge-live-store-$forge
 	script_dir=$(cd "$(dirname "$0")" && pwd)
@@ -87,7 +93,7 @@ main() {
 
 	# The instance: its default actions URL is itself, so that a bare `owner/repo@ref`
 	# resolves to the repositories made below.
-	docker run -d --name "$instance" --memory=1g --oom-score-adj=800 -p "127.0.0.1:$port:3000" \
+	docker run -d --name "$instance" --memory=1g --oom-score-adj=800 -p "$host:$port:3000" \
 		-e "${prefix}__security__INSTALL_LOCK=true" -e "${prefix}__actions__ENABLED=true" \
 		-e "${prefix}__actions__DEFAULT_ACTIONS_URL=$default_actions" -e "${prefix}__server__ROOT_URL=$url/" \
 		-e "${prefix}__server__DISABLE_SSH=true" "$image" >/dev/null
@@ -118,7 +124,7 @@ main() {
 	put act sub/action.yml "$act_action"
 	put main .gitea/actions/mine/action.yml "$act_action"
 	api -o /dev/null -X POST -d '{"tag_name":"v1","target":"main"}' "$url/api/v1/repos/zradmin/act/tags"
-	for w in actions env services features; do
+	for w in actions env services artifacts features; do
 		put main ".gitea/workflows/$w.yml" "$(workflow "$w" "$url" "$port" "$prefix")"
 	done
 	api "$url/api/v1/repos/zradmin/main/contents/.gitea/workflows/actions.yml" >/dev/null
@@ -174,7 +180,7 @@ IN
 	}
 
 	failed=0
-	for w in actions env services features; do
+	for w in actions env services artifacts features; do
 		before=$(api "$url/api/v1/repos/zradmin/main/actions/runs?limit=1" | python3 -I -c 'import json,sys; r=json.load(sys.stdin)["workflow_runs"]; print(max([x["id"] for x in r], default=0))')
 		api -o /dev/null -X POST -d '{"ref":"main"}' "$url/api/v1/repos/zradmin/main/actions/workflows/$w.yml/dispatches"
 		rid=0

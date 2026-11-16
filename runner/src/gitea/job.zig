@@ -114,6 +114,7 @@ const Builder = struct {
         const token = contextString(t.context, "gitea_runtime_token");
         const id_text = try std.fmt.allocPrint(arena, "{d}", .{t.id});
 
+        const github = try githubOf(arena, t.context, key);
         const j: job_mod.Job = .{
             .plan_id = id_text,
             .job_id = id_text,
@@ -128,7 +129,8 @@ const Builder = struct {
             .environment = try b.environment(jn.get("environment")),
             .secrets = try secretValues(arena, t, token),
             .secret_vars = try secretVars(arena, t),
-            .github = try githubOf(arena, t.context, key),
+            .github = github,
+            .runtime = try runtimeFor(arena, github.server_url),
             .env = try b.jobEnv(doc.get("env"), jn.get("env")),
             .defaults_run = dflt.run,
             .defaults_error = dflt.err,
@@ -708,6 +710,19 @@ fn githubOf(arena: Allocator, context: Value, job_key: []const u8) Allocator.Err
     return g;
 }
 
+/// What artifact actions reach the instance by: `ACTIONS_RUNTIME_URL` (the pipelines API of
+/// artifacts v3) and `ACTIONS_RESULTS_URL` (the results service of artifacts v4), as act_runner
+/// sets them (`internal/app/run/runner.go`), with the job's runtime token as `ACTIONS_RUNTIME_TOKEN`
+/// (`job_token`). Made from the server the job reaches the instance by, so a job whose instance is on
+/// the host's loopback has them rewritten with it (`run.zig`). There is no cache service: the
+/// instance has none, and `actions/cache` finds no `ACTIONS_CACHE_URL` (docs/GITEA.md).
+pub fn runtimeFor(arena: Allocator, server_url: []const u8) Allocator.Error!job_mod.Runtime {
+    return .{
+        .pipelines_url = try std.fmt.allocPrint(arena, "{s}/api/actions_pipeline/", .{std.mem.trimEnd(u8, server_url, "/")}),
+        .results_url = std.mem.trimEnd(u8, server_url, "/"),
+    };
+}
+
 /// `context` with its `server_url` not ending in `/`.
 fn withServerUrlTrimmed(arena: Allocator, context: Value) Allocator.Error!Value {
     if (context != .object) return context;
@@ -936,8 +951,10 @@ test "Gitea's fixture becomes the job GitHub's message would" {
     try testing.expectEqualStrings("hello", j.github.job);
     try testing.expectEqualStrings("1", j.github.run_id);
     try testing.expectEqualStrings("http://127.0.0.1:3300", j.github.server_url);
-    // Left for G5.
-    try testing.expectEqualStrings("", j.runtime.pipelines_url);
+    // Artifacts go through the instance: its pipelines API and its results service.
+    try testing.expectEqualStrings("http://127.0.0.1:3300/api/actions_pipeline/", j.runtime.pipelines_url);
+    try testing.expectEqualStrings("http://127.0.0.1:3300", j.runtime.results_url);
+    try testing.expectEqualStrings("", j.runtime.cache_url);
     try testing.expectEqualStrings("", j.results_endpoint);
     try testing.expectEqualStrings("", j.container_error orelse "");
 
