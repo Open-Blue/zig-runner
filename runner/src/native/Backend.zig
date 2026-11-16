@@ -2272,6 +2272,22 @@ fn rollZigLocal(b: *Backend, as_runner: bool) void {
     b.dropLastLayer();
     if (ended.failure.len > 0 or ended.code != 0)
         std.log.warn("native: Zig local cache not rolled: {s}{s}", .{ ended.failure, out.tail() });
+    b.pinCargoTarget(as_runner);
+}
+
+/// CARGO_TARGET_DIR in the generation `current` points at now (`set_up.cargoTargetIn`), for the
+/// whole job: cargo resolves the path on every file operation, so through `current` it would
+/// follow a roll another job starts while this one's cargo runs. Without a link it stays as is.
+fn pinCargoTarget(b: *Backend, as_runner: bool) void {
+    const host = b.cache_plan.zig_local_roll orelse return;
+    for (b.cache_plan.early_env.items) |*e| {
+        if (!std.mem.eql(u8, e.name, "CARGO_TARGET_DIR")) continue;
+        const link = std.fmt.allocPrint(b.arena, "{s}/current", .{host}) catch return;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = std.Io.Dir.readLinkAbsolute(b.io, link, &buf) catch return;
+        const gen = set_up.generationOf(buf[0..n]) orelse return;
+        e.value = set_up.cargoTargetIn(b.arena, as_runner, b.caches.zig_local_cache_max_mb, gen) catch return;
+    }
 }
 
 /// The job's Zig cache seeds, each built once per release, architecture and step user, under a
@@ -10267,7 +10283,7 @@ test "native cache volumes: kept between jobs, apart by scope, Zig's local cache
     try std.testing.expect(std.mem.indexOf(u8, third.text, "stdout] leaked") == null);
 }
 
-test "native cargo target cache: two repo jobs share cargo's target directory, an untrusted job and a job without the option do not" {
+test "native cargo target cache: two repo jobs share cargo's target directory, a roll does not move a running job's, an untrusted job and a job without the option do not" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -10278,32 +10294,57 @@ test "native cargo target cache: two repo jobs share cargo's target directory, a
         .package_caches = true,
         .trusted = true,
         .zig_local_cache = true,
+        .zig_local_cache_max_mb = 1,
         .cargo_target_cache = true,
     };
+    const local = "/root/.cache/zig-local";
 
     // A Zig job (whose build may run cargo) gets the crate registry as a mount of its own, which
-    // is what keeps `build-zr-net.sh` from putting CARGO_HOME in the job's temp directory.
+    // is what keeps `build-zr-net.sh` from putting CARGO_HOME in the job's temp directory. Its
+    // target directory is in the generation `current` pointed at when it started.
     const build = testStep("echo TARGET=$CARGO_TARGET_DIR\n" ++
         "mkdir -p $CARGO_TARGET_DIR/release && echo compiled > $CARGO_TARGET_DIR/release/libzr_net.a\n" ++
         "grep -q ' /root/.cargo/registry ' /proc/self/mountinfo && echo registry-mounted\n" ++
         "echo crate > /root/.cargo/registry/crate-marker # zig");
     const first = try runCachedJob(arena, cfg, testJob(&.{build}), caches, .{});
-    try expectLines(first.text, &.{ "TARGET=/root/.cache/zig-local/cargo-target", "registry-mounted" });
+    try expectLines(first.text, &.{ "TARGET=" ++ local ++ "/gen-0/cargo-target", "registry-mounted" });
 
     // The next job of the repository finds what the first compiled, and the crate it downloaded.
     const again = testStep("cat $CARGO_TARGET_DIR/release/libzr_net.a\ncat /root/.cargo/registry/crate-marker # zig");
     const second = try runCachedJob(arena, cfg, testJob(&.{again}), caches, .{});
     try expectLines(second.text, &.{ "compiled", "crate" });
 
-    // A job the runner does not trust with the repository's caches (a fork's pull request) has
-    // its own, empty target directory, and its own crates.
+    // The cache is over its limit now, so the next job rolls it to gen-1 and builds there. A roll
+    // another job starts while this one runs (here a step that re-points `current`) does not move
+    // its target directory: cargo resolves the path on every file operation.
+    const big = testStep("head -c 2000000 /dev/zero > $ZIG_LOCAL_CACHE_DIR/big");
+    _ = try runCachedJob(arena, cfg, testJob(&.{big}), caches, .{});
+    const before = testStep("echo TARGET=$CARGO_TARGET_DIR\n" ++
+        "mkdir " ++ local ++ "/gen-77 && ln -s gen-77 " ++ local ++ "/.moved && mv -T " ++ local ++ "/.moved " ++ local ++ "/current\n" ++
+        "readlink " ++ local ++ "/current");
+    const after = testStep("mkdir -p $CARGO_TARGET_DIR && echo late > $CARGO_TARGET_DIR/late\n" ++
+        "test -e " ++ local ++ "/gen-1/cargo-target/late && echo write-in-gen-1\n" ++
+        "test -e " ++ local ++ "/gen-77/cargo-target/late && echo write-in-gen-$((70 + 7)) || true");
+    const rolled = try runCachedJob(arena, cfg, testJob(&.{ before, after }), caches, .{});
+    try expectLines(rolled.text, &.{ "TARGET=" ++ local ++ "/gen-1/cargo-target", "gen-77", "write-in-gen-1" });
+    try std.testing.expect(std.mem.indexOf(u8, rolled.text, "write-in-gen-77\n") == null);
+
+    // A job the runner does not trust with the repository's caches (a fork's pull request) has its
+    // own target directory (the variable is set, and what it writes is on no shared volume), its
+    // own crates, and no cargo registry just for running Zig.
     var untrusted = caches;
     untrusted.trusted = false;
-    const apart = testStep("test -e $CARGO_TARGET_DIR/release && echo leaked || echo target-own\n" ++
-        "test -e /root/.cargo/registry/crate-marker && echo leaked || echo registry-own # zig");
+    const apart = testStep("test -n \"$CARGO_TARGET_DIR\" && echo target-set\n" ++
+        "mkdir -p $CARGO_TARGET_DIR && echo x > $CARGO_TARGET_DIR/untrusted-mark\n" ++
+        "test -e $CARGO_TARGET_DIR/release && echo leaked || echo target-own\n" ++
+        // Spelled so that the script does not name cargo itself, which would mount the registry.
+        "grep -q ' /root/.carg[o]/registry ' /proc/self/mountinfo && echo leaked-mount || echo registry-not-mounted # zig");
     const third = try runCachedJob(arena, cfg, testJob(&.{apart}), untrusted, .{});
-    try expectLines(third.text, &.{ "target-own", "registry-own" });
+    try expectLines(third.text, &.{ "target-set", "target-own", "registry-not-mounted" });
     try std.testing.expect(std.mem.indexOf(u8, third.text, "stdout] leaked") == null);
+    const marks = testStep("echo mark-count=$(find " ++ local ++ " -name untrusted-mark | wc -l)");
+    const seen = try runCachedJob(arena, cfg, testJob(&.{marks}), caches, .{});
+    try expectLines(seen.text, &.{"mark-count=0"});
 
     // Without the option the variable is not set, and cargo keeps `target/` in the workspace.
     var off = caches;
