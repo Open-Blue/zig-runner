@@ -591,7 +591,7 @@ pub fn runNestedCheckout(
     const f = if (x.native) |b|
         try b.fetchCheckout(x, co, num)
     else blk: {
-        var retry = x.checkoutRetry(num, x.fetch_backoff_ms);
+        var retry = x.fetchRetry("repository", num, x.fetch_backoff_ms);
         break :blk try checkout.fetch(arena, x.transport, x.job.*, co, x.gitAuth(), &retry);
     };
     if (f.result == .failed) return x.actionFailed(num, "{s}", .{f.result.failed});
@@ -1107,18 +1107,11 @@ pub fn fetchAction(x: *Exec, u: job_mod.Uses) !LoadResult {
     const tree_query = try x.actionTreeQuery(u, from, own_repo);
     // The engine's git failing on the network (a lookup, a connection) is tried again
     // (`fetch_retry.zig`); a missing repository or version is the answer at once.
-    var at: fetch_retry.Attempts = .{
-        .io = x.io,
-        .cancel = if (x.watch) |w| if (w.cancel) |c| &c.requested else null else null,
-        .base_ms = x.fetch_backoff_ms,
-    };
+    var retry = x.fetchRetry("action", 0, x.fetch_backoff_ms);
     const data = while (true) {
         msg = "";
         break gql(arena, x.transport, tree_query, &msg) catch |e| {
-            if (e == error.DaggerQueryFailed and try at.again(arena, ref_label, msg, fetch_retry.transientText(msg))) {
-                x.setUpLine(at.said);
-                continue;
-            }
+            if (e == error.DaggerQueryFailed and try retry.again(arena, ref_label, msg, fetch_retry.transientText(msg))) continue;
             return .{ .unresolved = try unresolvedMessage(arena, u, msg, own_repo) };
         };
     };
@@ -1979,4 +1972,36 @@ test "an action fetch on Dagger that fails on the network is tried again; a miss
     try std.testing.expect(res2.set_up_failed);
     try std.testing.expectEqual(@as(usize, 2), fake2.seen.items.len);
     try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "Failed to fetch action") == null);
+}
+
+test "an action fetch's warning on Dagger never carries the job's secret" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const dns = "{\"errors\":[{\"message\":\"git error: failed to fetch https://x-access-token:tok-123@github.com/o/act: " ++
+        "Could not resolve host: github.com\"}]}";
+    const steps = [_]job_mod.Step{usesStep("act", "o", "act", "v1", &.{})};
+    var job = testJob(&steps);
+    job.secret_vars = &.{.{ .name = "GITHUB_TOKEN", .value = "tok-123" }};
+    const answers = [_][]const u8{
+        base_answer,
+        dns,
+        try treeAnswer(arena, "DL", &.{"action.yml"}),
+        try fileAnswer(arena, "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo hi\n"),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [16384]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    log.setSecrets(try @import("../redact.zig").expand(arena, &.{"tok-123"}));
+    _ = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+        .test_fetch_backoff_ms = 1,
+    }, job, &log);
+    const out = w.buffered();
+    errdefer std.debug.print("{s}\n", .{out});
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "##[warning]Failed to fetch action 'o/act@v1'"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "tok-123") == null);
 }

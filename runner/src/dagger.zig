@@ -1927,7 +1927,7 @@ fn prepareCheckout(
     const f = if (x.native) |b|
         try b.fetchCheckout(x, co, num)
     else blk: {
-        var retry = x.checkoutRetry(num, x.fetch_backoff_ms);
+        var retry = x.fetchRetry("repository", num, x.fetch_backoff_ms);
         break :blk try checkout.fetch(arena, x.transport, x.job.*, co, x.gitAuth(), &retry);
     };
     if (f.result == .failed) {
@@ -2382,6 +2382,7 @@ fn runStepsPaused(
         else => return e,
     };
     const base: Base = if (native) |b| base: {
+        b.live_log = sh;
         b.base(&ev, plan, &err_msg) catch |e| {
             if (e == error.NativeToDagger) return e;
             // Before any step, and before "Set up job" has said anything: a native set-up that
