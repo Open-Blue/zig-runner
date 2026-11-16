@@ -391,6 +391,50 @@ jobs:
         working-directory: runner
         run: zig build test-tls-oracle -Dtls-oracle
 
+  # The Pi's tests, compiled here: a push to main runs "Tests (x86_64)" on prod, a Raspberry Pi
+  # (aarch64, SD card), where compiling the tests and the runner with LLVM took about two minutes
+  # and 4.0 GB of the job's 4.5 GB, before the tests' own 41 s. This job, on GitHub's fast runner,
+  # cross-compiles them for aarch64 musl, as the Pi would (same graph, flags and network
+  # library, LLVM, debug info: a failure there still names file and line), and the Test job runs
+  # them (zig-test-prebuilt.sh). Only for a push, and only when prod is a self-hosted runner:
+  # pull requests compile on GitHub's runner in the Test job itself, cold, and a prod that is a
+  # hosted runner does too. The digest of the tar is this job's output, which the Test job
+  # checks the downloaded file against: the tests it runs are the ones this job built, for this
+  # commit, in this run (an artifact of this run only; nothing is read from another).
+  prebuild:
+    name: Tests, compiled for the Pi
+    if: github.event_name == 'push' && contains(vars.PROD_RUNNER, 'self-hosted')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+    outputs:
+      sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      # The pinned Rust, with the aarch64 musl target the network library is built for.
+      - name: Compile the tests for aarch64
+        id: build
+        run: |
+          .github/scripts/memory-peak.sh cross-compile -- \
+            .github/scripts/zig-test-prebuilt.sh build aarch64 "$RUNNER_TEMP/tests-aarch64.tar" >"$RUNNER_TEMP/sha256"
+          echo "sha256=$(cat "$RUNNER_TEMP/sha256")" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tests-aarch64
+          path: ${{ runner.temp }}/tests-aarch64.tar
+          if-no-files-found: error
+          retention-days: 1
+          # A tar of executables: already as small as it gets in a few seconds.
+          compression-level: 1
+
   # A push to main runs on prod, this project's own runner, so every merge exercises it; pull
   # requests and the merge queue run on GitHub's runner on purpose, cold every time, the worst case
   # for a build (docs/OPERATIONS.md, "Environments"). The repository variables PROD_RUNNER and PREPROD_RUNNER
@@ -400,6 +444,11 @@ jobs:
   # mounts, nftables), so upgrade it deliberately, here and in the other workflows together.
   test:
     name: Tests (x86_64)
+    # After the prebuild, which runs on a push to main when prod is self-hosted and is skipped
+    # otherwise: `always` and not the default, so that a skipped prebuild does not skip this job
+    # (a skipped required check passes); one that failed or was cancelled fails it, below.
+    needs: prebuild
+    if: ${{ !cancelled() }}
     runs-on: ${{ fromJSON(github.event_name == 'push' && (vars.PROD_RUNNER || '"ubuntu-26.04"') || (vars.PREPROD_RUNNER || '"ubuntu-26.04"')) }}
     timeout-minutes: 30
     # The store stress test's workers for 10 s, and 10 s more with the deferred sync, where it defaults to 30 and 15:
@@ -443,6 +492,27 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/expr-conformance.sh
 
+      # What the prebuild made, for the Test step. A prebuild that did not succeed is this job's
+      # failure, not a reason to compile on the Pi again.
+      - name: The prebuilt tests
+        id: prebuilt
+        if: steps.scope.outputs.run == 'true' && needs.prebuild.result != 'skipped'
+        env:
+          PREBUILD_RESULT: ${{ needs.prebuild.result }}
+        run: |
+          if [ "$PREBUILD_RESULT" != success ]; then
+            echo "The prebuild job ended $PREBUILD_RESULT: no tests to run" >&2
+            exit 1
+          fi
+          echo "dir=$RUNNER_TEMP/prebuilt" >>"$GITHUB_OUTPUT"
+
+      - name: Download the prebuilt tests
+        if: steps.prebuilt.outputs.dir != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tests-aarch64
+          path: ${{ steps.prebuilt.outputs.dir }}
+
       # The database tests skip themselves here: the Database tests job runs them. On GitHub's
       # runners, whose cache always starts empty, without `zig build` (zig-test.sh); on the
       # project's own, whose cache is kept, through it, as developers build. On the Pi (ARM64),
@@ -456,6 +526,9 @@ jobs:
       - name: Test
         if: steps.scope.outputs.run == 'true'
         working-directory: runner
+        env:
+          PREBUILT_DIR: ${{ steps.prebuilt.outputs.dir }}
+          PREBUILT_SHA256: ${{ needs.prebuild.outputs.sha256 }}
         run: |
           if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
             # GitHub's runner can make the native backend's sandboxes, so its tests must run here,
@@ -475,9 +548,15 @@ jobs:
             # of its job's 3.1 GB limit and killed one run. `test` after `test-compile` only runs.
             jobs=()
             [ "$RUNNER_ARCH" = ARM64 ] && jobs=(-j1)
-            ../.github/scripts/memory-peak.sh compile -- zig build test-compile "${jobs[@]}" --summary all 2>&1 | tee "$log" >&2 || status=$?
-            if [ "$status" = 0 ]; then
-              ../.github/scripts/memory-peak.sh run -- zig build test "${jobs[@]}" --summary all 2>&1 | tee "$log" >&2 || status=$?
+            if [ -n "$PREBUILT_DIR" ]; then
+              # Nothing to compile: the prebuild job did, and this runs its tests, after checking the
+              # tar against the digest that job output (zig-test-prebuilt.sh).
+              ../.github/scripts/memory-peak.sh run -- ../.github/scripts/zig-test-prebuilt.sh run "$PREBUILT_DIR/tests-aarch64.tar" "$PREBUILT_SHA256" 2>&1 | tee "$log" >&2 || status=$?
+            else
+              ../.github/scripts/memory-peak.sh compile -- zig build test-compile "${jobs[@]}" --summary all 2>&1 | tee "$log" >&2 || status=$?
+              if [ "$status" = 0 ]; then
+                ../.github/scripts/memory-peak.sh run -- zig build test "${jobs[@]}" --summary all 2>&1 | tee "$log" >&2 || status=$?
+              fi
             fi
             echo "::$stop::" >&2
             # A floor on the tests that passed (as the overlayfs step's, ZIG_TEST_MIN_PASSED): the

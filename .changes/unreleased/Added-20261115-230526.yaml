@@ -1,0 +1,3 @@
+kind: Added
+body: 'On a push to main, the Pi''s tests are compiled on GitHub''s fast runner and only run on the Pi: a "Tests, compiled for the Pi" job cross-compiles the tests, the runner and the shard runner for aarch64 musl (LLVM, debug info kept), and "Tests (x86_64)" downloads that one tar, checks it against the sha256 the build job output, and runs it (.github/scripts/zig-test-prebuilt.sh), so the Pi no longer spends its two minutes and 4 GB of memory compiling. Pull requests compile in the Test job as before (docs/CI.md).'
+time: 2026-11-15T23:05:26.697261259-05:00
