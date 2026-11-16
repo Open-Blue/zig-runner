@@ -55,7 +55,7 @@ main() {
 	port=${ZR_FORGE_PORT:-3398}
 	url=http://127.0.0.1:$port
 	lock=${ZR_FORGE_LOCK:-$HOME/.cache/zig-runner-locks/root-tests.lock}
-	instance=zr-forge-live-$forge runner=zr-forge-live-runner-$forge
+	instance=zr-forge-live-$forge runner=zr-forge-live-runner-$forge store=zr-forge-live-store-$forge
 	script_dir=$(cd "$(dirname "$0")" && pwd)
 	out=${out:-$dir/run-$forge-$(date +%Y%m%d-%H%M%S)}
 
@@ -72,12 +72,14 @@ main() {
 	cleanup() {
 		trap - EXIT INT TERM
 		docker rm -f "$runner" "$instance" >/dev/null 2>&1 || true
+		docker volume rm "$store" >/dev/null 2>&1 || true
 		rm -f "$token_file" "$reg_file"
 	}
 	trap cleanup EXIT
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
 	docker rm -f "$runner" "$instance" >/dev/null 2>&1 || true
+	docker volume rm "$store" >/dev/null 2>&1 || true
 
 	# The instance: its default actions URL is itself, so that a bare `owner/repo@ref`
 	# resolves to the repositories made below.
@@ -149,7 +151,7 @@ IN
 	# shellcheck disable=SC2064
 	trap "rm -f '$dir/reg-token'; cleanup" EXIT
 	docker run -d --name "$runner" --privileged --network host --cgroupns private --memory 4g --memory-swap 4g \
-		--oom-score-adj=800 -e FORGE_URL="$url" -e FORGE_PLATFORM="$forge" -v "$dir:/live:ro" -v "$out:/out" \
+		--oom-score-adj=800 -e FORGE_URL="$url" -e FORGE_PLATFORM="$forge" -v "$dir:/live:ro" -v "$out:/out" -v "$store:/store" \
 		ubuntu:24.04 bash -c '/live/inner.sh >>/out/runner.log 2>&1' >/dev/null
 	for _ in $(seq 360); do
 		grep -aq "registered runner\|registered earlier" "$out/runner.log" 2>/dev/null && break
