@@ -1,0 +1,3 @@
+kind: Added
+body: 'Gitea and Forgejo steps get the variables their own runners set (#520, G5): GITEA_ACTIONS, GITEA_ACTIONS_RUNNER_VERSION and GITEA_RUN_ID on Gitea, FORGEJO_ACTIONS, FORGEJO_ACTIONS_RUNNER_VERSION and a FORGEJO_ twin of each GITHUB_ variable Forgejo''s runner copies on Forgejo, and GITHUB_SERVER_URL and github.server_url have no trailing slash, as act_runner has them. The job''s token is still not put in the environment (docs/GITEA.md has the table against act_runner and forgejo-runner).'
+time: 2026-11-16T11:34:01.12620229-05:00

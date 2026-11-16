@@ -425,7 +425,49 @@ pub fn defaultEnv(ev: *const Evaluator) ![]const job_mod.EnvVar {
         if (try ev.githubText(m[1])) |v|
             try out.append(ev.arena, .{ .name = m[0], .value = v });
     }
+    try ev.forgeEnv(&out);
     return out.items;
+}
+
+/// What a Gitea or Forgejo runner (act_runner, forgejo-runner) sets besides GitHub's, as of
+/// `gitea/act_runner` `internal/app/run/runner.go` and `forgejo/runner` `act/runner/run_context.go`
+/// (docs/GITEA.md has the table): Gitea's `GITEA_ACTIONS`, its runner version and run id, and
+/// Forgejo's `FORGEJO_ACTIONS`, its runner version and a `FORGEJO_` twin of the `GITHUB_` ones it
+/// copies. `GITHUB_TOKEN` and `FORGEJO_TOKEN` are not set in the environment (docs/GITEA.md says why).
+fn forgeEnv(ev: *const Evaluator, out: *std.ArrayList(job_mod.EnvVar)) !void {
+    const version = @import("../version.zig").string;
+    switch (ev.job.github.forge) {
+        .github => {},
+        .gitea => {
+            try out.appendSlice(ev.arena, &.{
+                .{ .name = "GITEA_ACTIONS", .value = "true" },
+                .{ .name = "GITEA_ACTIONS_RUNNER_VERSION", .value = version },
+            });
+            if (try ev.githubText("run_id")) |v| try out.append(ev.arena, .{ .name = "GITEA_RUN_ID", .value = v });
+        },
+        .forgejo => {
+            try out.appendSlice(ev.arena, &.{
+                .{ .name = "FORGEJO_ACTIONS", .value = "true" },
+                .{ .name = "FORGEJO_ACTIONS_RUNNER_VERSION", .value = version },
+            });
+            const copied = [_][]const u8{
+                "WORKFLOW",  "RUN_ATTEMPT", "RUN_ID",     "RUN_NUMBER", "ACTOR",        "REPOSITORY", "EVENT_NAME",       "EVENT_PATH",
+                "WORKSPACE", "SHA",         "REF",        "REF_NAME",   "REF_TYPE",     "JOB",        "REPOSITORY_OWNER", "RETENTION_DAYS",
+                "BASE_REF",  "HEAD_REF",    "SERVER_URL", "API_URL",    "WORKFLOW_REF",
+            };
+            const n = out.items.len;
+            for (copied) |suffix| {
+                const from = try std.fmt.allocPrint(ev.arena, "GITHUB_{s}", .{suffix});
+                for (out.items[0..n]) |e| if (std.mem.eql(u8, e.name, from)) {
+                    try out.append(ev.arena, .{
+                        .name = try std.fmt.allocPrint(ev.arena, "FORGEJO_{s}", .{suffix}),
+                        .value = e.value,
+                    });
+                    break;
+                };
+            }
+        },
+    }
 }
 
 /// `env`, an `env` context (workflow, job, GITHUB_ENV), without the variables GitHub sets again
@@ -480,6 +522,50 @@ test "the variables GitHub's runner sets: empty ones too, numbers and booleans a
     for (env) |e| try std.testing.expect(!std.mem.eql(u8, e.name, "GITHUB_ACTOR_ID"));
     // The workflow's commit and ref follow the commit and branch: not part of step cache keys.
     try std.testing.expect(isVolatile("GITHUB_WORKFLOW_SHA") and isVolatile("GITHUB_WORKFLOW_REF"));
+}
+
+fn envValue(env: []const job_mod.EnvVar, name: []const u8) ?[]const u8 {
+    for (env) |e| if (std.mem.eql(u8, e.name, name)) return e.value;
+    return null;
+}
+
+test "a Gitea or Forgejo job's steps see what act_runner and forgejo-runner set besides GitHub's" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var job = testJob(&.{});
+    job.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"run_id","v":"32"},{"k":"server_url","v":"http://h:3300"},
+        \\ {"k":"api_url","v":"http://h:3300/api/v1"},{"k":"sha","v":"abc"},{"k":"workflow","v":"ci.yml"},{"k":"base_ref","v":""}]}}
+    , .{});
+    // GitHub's: none of the others.
+    var env = try (try Evaluator.init(arena, &job)).defaultEnv();
+    try std.testing.expect(envValue(env, "GITEA_ACTIONS") == null and envValue(env, "FORGEJO_ACTIONS") == null);
+    try std.testing.expectEqualStrings("o/r", envValue(env, "GITHUB_REPOSITORY").?);
+
+    job.github.forge = .gitea;
+    env = try (try Evaluator.init(arena, &job)).defaultEnv();
+    try std.testing.expectEqualStrings("true", envValue(env, "GITEA_ACTIONS").?);
+    try std.testing.expectEqualStrings(@import("../version.zig").string, envValue(env, "GITEA_ACTIONS_RUNNER_VERSION").?);
+    try std.testing.expectEqualStrings("32", envValue(env, "GITEA_RUN_ID").?);
+    try std.testing.expect(envValue(env, "FORGEJO_ACTIONS") == null and envValue(env, "FORGEJO_SHA") == null);
+    try std.testing.expectEqualStrings("http://h:3300/api/v1", envValue(env, "GITHUB_API_URL").?);
+
+    job.github.forge = .forgejo;
+    env = try (try Evaluator.init(arena, &job)).defaultEnv();
+    try std.testing.expectEqualStrings("true", envValue(env, "FORGEJO_ACTIONS").?);
+    try std.testing.expect(envValue(env, "GITEA_ACTIONS") == null);
+    // A twin of each variable forgejo-runner copies, with the GitHub one's value, empty ones too.
+    for ([_][2][]const u8{
+        .{ "SHA", "abc" },                  .{ "REPOSITORY", "o/r" },  .{ "RUN_ID", "32" },
+        .{ "SERVER_URL", "http://h:3300" }, .{ "WORKFLOW", "ci.yml" }, .{ "BASE_REF", "" },
+    }) |w| {
+        const got = envValue(env, try std.fmt.allocPrint(arena, "FORGEJO_{s}", .{w[0]})) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(w[1], got);
+    }
+    try std.testing.expectEqualStrings(envValue(env, "GITHUB_WORKSPACE").?, envValue(env, "FORGEJO_WORKSPACE").?);
+    // The token is not copied into the environment, under either name.
+    try std.testing.expect(envValue(env, "FORGEJO_TOKEN") == null and envValue(env, "GITHUB_TOKEN") == null);
 }
 
 test "the env context reaches processes but for the defaults GitHub sets again" {

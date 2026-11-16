@@ -78,8 +78,12 @@ const Builder = struct {
         return error.Bad;
     }
 
-    fn convert(b: *Builder, t: task_mod.Task) BuildError!Converted {
+    fn convert(b: *Builder, task: task_mod.Task) BuildError!Converted {
         const arena = b.arena;
+        // The instance's address without a trailing slash, as the runner act_runner makes it
+        // (`GitHubInstance`), for `github.server_url` and GITHUB_SERVER_URL.
+        var t = task;
+        t.context = try withServerUrlTrimmed(arena, task.context);
         var diag: yaml.Diag = .{};
         const doc = yaml.parseTyped(arena, t.workflow, &diag) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -702,6 +706,19 @@ fn githubOf(arena: Allocator, context: Value, job_key: []const u8) Allocator.Err
     return g;
 }
 
+/// `context` with its `server_url` not ending in `/`.
+fn withServerUrlTrimmed(arena: Allocator, context: Value) Allocator.Error!Value {
+    if (context != .object) return context;
+    const url = switch (context.object.get("server_url") orelse return context) {
+        .string => |u| u,
+        else => return context,
+    };
+    if (!std.mem.endsWith(u8, url, "/")) return context;
+    var obj = try context.object.clone(arena);
+    try obj.put(arena, "server_url", .{ .string = std.mem.trimEnd(u8, url, "/") });
+    return .{ .object = obj };
+}
+
 /// Whether two URLs name the same server: scheme, host and port, case aside, a trailing `/` aside.
 fn sameServer(a: []const u8, b: []const u8) bool {
     const x = std.mem.trimEnd(u8, a, "/");
@@ -916,7 +933,7 @@ test "Gitea's fixture becomes the job GitHub's message would" {
     try testing.expectEqualStrings("push", j.github.event_name);
     try testing.expectEqualStrings("hello", j.github.job);
     try testing.expectEqualStrings("1", j.github.run_id);
-    try testing.expectEqualStrings("http://127.0.0.1:3300/", j.github.server_url);
+    try testing.expectEqualStrings("http://127.0.0.1:3300", j.github.server_url);
     // Left for G5.
     try testing.expectEqualStrings("", j.runtime.pipelines_url);
     try testing.expectEqualStrings("", j.results_endpoint);
@@ -972,7 +989,7 @@ test "Forgejo's fixture is read the same" {
         "format('echo \"{0} {1}\"', matrix.n, github.repository)",
         c.job.steps[1].action.script.script.expr,
     );
-    try testing.expectEqualStrings("http://127.0.0.1:3400/", c.job.github.server_url);
+    try testing.expectEqualStrings("http://127.0.0.1:3400", c.job.github.server_url);
     try testing.expect(c.job.steps[2].action.script.script == .lit);
     // The summary file command is an ordinary script for the backends.
     try testing.expect(std.mem.indexOf(u8, c.job.steps[2].action.script.script.lit, "GITHUB_STEP_SUMMARY") != null);
