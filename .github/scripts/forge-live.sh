@@ -151,13 +151,15 @@ IN
 	docker run -d --name "$runner" --privileged --network host --cgroupns private --memory 4g --memory-swap 4g \
 		--oom-score-adj=800 -e FORGE_URL="$url" -e FORGE_PLATFORM="$forge" -v "$dir:/live:ro" -v "$out:/out" \
 		ubuntu:24.04 bash -c '/live/inner.sh >>/out/runner.log 2>&1' >/dev/null
-	for _ in $(seq 120); do
+	for _ in $(seq 360); do
 		grep -aq "registered runner\|registered earlier" "$out/runner.log" 2>/dev/null && break
 		sleep 1
 	done
 	grep -aq "registered runner\|registered earlier" "$out/runner.log" || {
 		echo "forge-live: the runner did not register; its log:" >&2
 		tail -n 30 "$out/runner.log" >&2
+		docker logs "$runner" 2>&1 | tail -n 20 >&2
+		docker ps -a --filter "name=$runner" --format '{{.Status}}' >&2
 		exit 1
 	}
 
