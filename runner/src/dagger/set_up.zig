@@ -55,6 +55,8 @@ const testJob = @import("testing.zig").testJob;
 const usesStep = @import("testing.zig").usesStep;
 const braceBalanced = @import("testing.zig").braceBalanced;
 
+const logfmt = @import("../logfmt.zig");
+
 const Allocator = std.mem.Allocator;
 
 /// What the default image (`ubuntu:24.04`, pinned by digest) gets before a job: what workflows written for GitHub's
@@ -782,8 +784,13 @@ fn writeRunEnv(q: *Query, ev: *Evaluator, plan: BasePlan) !void {
     // After the roll and not in the base container's first nodes (`writeFrom`), which are the
     // pre-warm's: the generation the job resolved, so a roll another job starts later does not
     // move this job's target directory under a running cargo.
-    if (plan.cargo_target_env) |dir|
-        try q.call("withEnvVariable", .{ .name = "CARGO_TARGET_DIR", .value = dir });
+    // A `container:`'s own `env:` wins over the runner's, as over Zig's (`writeFrom`) and natively.
+    if (plan.cargo_target_env) |dir| {
+        const own = for (plan.container_env) |e| {
+            if (std.mem.eql(u8, e.name, "CARGO_TARGET_DIR")) break true;
+        } else false;
+        if (!own) try q.call("withEnvVariable", .{ .name = "CARGO_TARGET_DIR", .value = dir });
+    }
     if (plan.uv_env) |e| {
         try q.call("withEnvVariable", .{ .name = "UV_PROJECT_ENVIRONMENT", .value = e });
         // The environment outlives the job, and `uv venv` refuses to replace one that exists
@@ -894,6 +901,11 @@ pub fn basePlan(
     var generation: ?[]const u8 = null;
     if (volumes.zig_local) |id| if (opts.zig_local_cache_max_mb > 0) {
         generation = try rollZigLocal(arena, transport, id, opts.zig_local_cache_max_mb, as_runner, pulled, ran_marker);
+        if (generation == null and opts.cargo_target_cache) logfmt.warn(
+            "cargo_target_unpinned",
+            "backend=dagger why={f}",
+            .{logfmt.q("the roll printed no generation")},
+        );
     };
     if (volumes.zig_builtin) |id| if (zig_seed) |seed|
         try seedBuiltin(arena, transport, id, seed, as_runner, pulled, ran_marker);
@@ -2453,6 +2465,42 @@ test "a job's CARGO_TARGET_DIR is in the generation its roll resolved, and a rol
     const base = fake.seen.items[2];
     try std.testing.expect(std.mem.indexOf(u8, base, "withEnvVariable(name:\"CARGO_TARGET_DIR\",value:\"/home/runner/.cache/zig-local/gen-3/cargo-target\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, base, "zig-local/current/cargo-target") == null);
+}
+
+test "a container: job's own env CARGO_TARGET_DIR wins over the runner's on Dagger" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("zig build test")};
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll("{\"data\":{\"czl\":{\"id\":\"VZL\"},\"czb\":{\"id\":\"VZB\"}");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print(",\"c{d}\":{{\"id\":\"V{d}\"}}", .{ i, i });
+    try vols.writer.writeAll("}}");
+    for ([_]bool{ true, false }) |own| {
+        var job = testJob(&steps);
+        const own_env = [_]job_mod.Input{.{ .name = "CARGO_TARGET_DIR", .value = .{ .lit = "/mine" } }};
+        job.container = .{ .name = "", .image = .{ .lit = "custom/image:1" }, .env = if (own) &own_env else &.{} };
+        const answers = [_][]const u8{ vols.written(), base_answer, try exec(arena, "C1", 0, "") };
+        var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        const res = try run(arena, std.testing.io, &env, .{
+            .package_caches = true,
+            .trusted = true,
+            .zig_local_cache = true,
+            .cargo_target_cache = true,
+            .step_user = .runner,
+            .test_session_argv = &.{ "sh", "-c", fake_child },
+            .test_transport = fake.transport(),
+        }, job, &log);
+        _ = res; // Only the base container matters: the job stops when the answers run out.
+        const base = fake.seen.items[1];
+        // The runner's value only when the container sets none; the container's own is the last.
+        try std.testing.expectEqual(!own, std.mem.indexOf(u8, base, "CARGO_TARGET_DIR\",value:\"/root/.cache/zig-local/cargo-target\"") != null);
+        try std.testing.expectEqual(own, std.mem.indexOf(u8, base, "name:\"CARGO_TARGET_DIR\",value:\"/mine\"") != null);
+    }
 }
 
 /// The `withMountedCache(...)` call of a document that mounts the volume `cache` (quoted).
