@@ -777,6 +777,7 @@ pub const Warmer = struct {
             .package_caches = cfg.package_caches,
             .zig_local_cache = cfg.zig_local_cache,
             .zig_local_cache_max_mb = cfg.zig_local_cache_max_mb,
+            .cargo_target_cache = cfg.cargo_target_cache,
             .zig_seeds = cfg.zig_seeds,
             .step_user = cfg.step_user,
             .provisioned_image = cfg.provisioned_image,

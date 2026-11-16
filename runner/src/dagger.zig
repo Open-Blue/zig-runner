@@ -739,6 +739,8 @@ pub const Options = struct {
     /// `Config.zig_local_cache_max_mb`: past it, Zig's local cache starts over in a new generation
     /// (`set_up.rollZigLocal`). 0, the default here, keeps it in the volume's root, unbounded.
     zig_local_cache_max_mb: u32 = 0,
+    /// `Config.cargo_target_cache`: cargo's target directory goes in the Zig local cache's volume.
+    cargo_target_cache: bool = false,
     /// `Config.zig_seeds`: the verified Zig releases Zig jobs' global cache is seeded from (see
     /// `set_up.zigSeedFor`); empty for none.
     zig_seeds: []const config.ZigSeed = &.{},
@@ -1272,6 +1274,7 @@ fn runNative(
     opts.output_keys = false;
     opts.package_caches = false;
     opts.zig_local_cache = false;
+    opts.cargo_target_cache = false;
     opts.zig_seeds = &.{};
     opts.zig_seeds_unverified = &.{};
     opts.zig_seed_registry = null;

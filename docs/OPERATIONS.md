@@ -72,6 +72,31 @@ ends. Only the package tarballs (`p/`, which Zig hashes again when it unpacks th
 scope's volume. Zig's local cache volume (`RUNNER_ZIG_LOCAL_CACHE`) is kept only for jobs the
 runner vouches for.
 
+### Cargo's caches
+
+Two caches keep a Rust build from starting over in every job, each in the scope of the job's other
+caches (`repo` or `untrusted`, never across them), on the Dagger and the native backends:
+
+* The crate registry and git checkouts (`~/.cargo/registry`, `~/.cargo/git`) are cache volumes of the
+  scope, as before. They are now mounted for jobs that run Zig as well as those that name cargo,
+  because Zig's build system runs cargo for a project with Rust in it (zig-runner's own `zr-net`).
+  Cargo checks a `.crate` file's checksum against `Cargo.lock` only when it downloads it; the
+  unpacked `src/` it finds later is used unchecked, so the registry stays inside one scope and is
+  not shared more widely.
+* `RUNNER_CARGO_TARGET_CACHE=true` (needs `RUNNER_ZIG_LOCAL_CACHE`) sets `CARGO_TARGET_DIR` to
+  `cargo-target/` inside Zig's local cache volume. Cargo's compiled output and build-script binaries
+  run in later jobs without being checked, as Zig's `o/` does, so they have the same scope (only
+  jobs the runner vouches for; an untrusted job's directory is its own and goes with the job), the
+  same size limit (`RUNNER_ZIG_LOCAL_CACHE_MAX_MB`, counted with Zig's) and the same generations
+  (the cache starts over, whole, past the limit). Off by default because `target/` leaves the
+  workspace for jobs that run cargo: a workflow that reads `target/release/...` sets its own
+  `CARGO_TARGET_DIR`, which wins. Cargo locks the directory, so jobs that build at once take turns.
+
+`.github/scripts/build-zr-net.sh` (zig-runner's own Rust library) uses both: it keeps cargo's home in
+the job's temp directory unless `~/.cargo/registry` is a mount of its own, and builds with
+`--frozen` first when the registry has crates, so a job whose crates.io lookup fails still builds
+from the cache; if a crate is missing it builds again with `--locked` and the network.
+
 ### Running jobs through the dagger CLI
 
 `RUNNER_ENGINE=cli` runs each job as `dagger run --progress=logs sh -c ...` (`DAGGER_CMD`, default
