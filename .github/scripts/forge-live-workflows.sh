@@ -113,6 +113,27 @@ jobs:
           ping localhost 6380
 EOF
 		;;
+	artifacts)
+		cat <<'EOF'
+name: artifacts
+on: workflow_dispatch
+jobs:
+  j:
+    runs-on: live
+    steps:
+      - run: echo hello-artifact > out.txt
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with: {name: probe, path: out.txt}
+      - run: rm out.txt
+      - uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with: {name: probe, path: dl}
+      - run: test "$(cat dl/out.txt)" = hello-artifact
+      # There is no cache service: the action says so and the step does not fail.
+      - uses: https://github.com/actions/cache@v4
+        with: {path: dl, key: probe}
+      - run: echo after-cache
+EOF
+		;;
 	features)
 		cat <<'EOF'
 name: features

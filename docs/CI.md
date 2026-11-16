@@ -174,13 +174,14 @@ against a pool from `main`: `.github/scripts/e2e.sh check <its label>`, with gh 
 
 "Live gitea" and "Live forgejo" (`.github/scripts/forge-live.sh`) run the Gitea and Forgejo support
 against a real instance of each, on a hosted runner, with no secrets: a throwaway instance (a
-container, published on the VM's loopback, its default actions URL its own), the runner built from
+container, published on the VM's own address, its default actions URL its own), the runner built from
 the pull request in a privileged container with a memory limit (native backend, no engine), and
-four workflows, in `forge-live-workflows.sh`, dispatched through the instance's API and read back
+five workflows, in `forge-live-workflows.sh`, dispatched through the instance's API and read back
 from its run list. They check `uses:` as Gitea's model reads it (a bare `owner/repo@ref`, `self:`, an
 absolute URL, a directory of the repository, `$/path`), the variables the instance's own runner sets
-(`docs/GITEA.md`), services (by name and on localhost, one started with the workflow's `cmd:`), and the
-checkout, outputs, masking and a failing step (that run must end `failure`). Not required, and skipped
+(`docs/GITEA.md`), services (by name and on localhost, one started with the workflow's `cmd:`), an artifact
+uploaded and downloaded through the instance (and `actions/cache` finding no service without
+failing), and the checkout, outputs, masking and a failing step (that run must end `failure`). Not required, and skipped
 (still reporting) on a change that cannot affect them (`ci-scope.sh forge`: the Gitea code, the native and Dagger backends, `version.zig`, the build and what they import; not the GitHub side). The nightly memory soak
 polls a Gitea of its own the same way. Locally, `forge-live.sh --forge forgejo --setup-only` starts the
 instance and makes the repositories, workflows and token without the runner (nothing privileged), and
