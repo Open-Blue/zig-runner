@@ -485,9 +485,23 @@ fn runsOthers(w: []const u8) bool {
 pub fn needsDaemon(script: []const u8) ?[]const u8 {
     var i: usize = 0;
     var at_command = true;
+    var redirect = false;
     var words: [2][]const u8 = undefined;
     while (i < script.len) {
         const c = script[i];
+        // A redirection's target (`>/dev/null`, `2>&1`, `&>f`) is a file, not a command.
+        if (c == '>' or c == '<') {
+            i += 1;
+            if (i < script.len and script[i] == '&') i += 1;
+            if (i < script.len and script[i] == '>') i += 1;
+            redirect = true;
+            continue;
+        }
+        if (c == '&' and i + 1 < script.len and script[i + 1] == '>') {
+            i += 2;
+            redirect = true;
+            continue;
+        }
         if (c == '\n' or c == ';' or c == '&' or c == '|' or c == '(' or c == '{' or c == '`') {
             at_command = true;
             i += 1;
@@ -508,6 +522,10 @@ pub fn needsDaemon(script: []const u8) ?[]const u8 {
             continue;
         }
         i += w.len;
+        if (redirect) {
+            redirect = false;
+            continue;
+        }
         const base = if (std.mem.lastIndexOfScalar(u8, w, '/')) |s| w[s + 1 ..] else w;
         const is_docker = std.mem.eql(u8, base, "docker") and (w.len == base.len or std.mem.endsWith(u8, w, "/docker"));
         if (!is_docker) {
@@ -633,6 +651,7 @@ test "docker api job: scripts that only build, tag, inspect and remove images ar
         "docker",
         "",
         "mkdir -p out && cp a b && echo done",
+        "docker image inspect secret:1 2>&1 >/dev/null | head -1\nexport DOCKER_CLI_HINTS=false\nmkdir -p /tmp/s && printf 'FROM redis:8-alpine\\nARG TOKEN\\nRUN test -n \"$TOKEN\" && echo \"layer made\"\\n' > /tmp/s/Dockerfile\ndocker build -t secret:1 --build-arg TOKEN=\"$(printf 's3cr3t-%s' value-0042)\" /tmp/s 2>&1",
     };
     for (served) |s| if (needsDaemon(s)) |why| {
         std.debug.print("ERROR served script found to need {s}: {s}\n", .{ why, s });
