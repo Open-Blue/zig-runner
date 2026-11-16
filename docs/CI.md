@@ -74,6 +74,21 @@ unreported instead, and the merge queue waiting for it.
   own expression test cases. On hosted runners CI calls the compiler directly
   (`.github/scripts/zig-test.sh`) rather than `zig build`, which first spends about 100 s compiling
   Zig's build system.
+
+  On a push to main, when `PROD_RUNNER` is a self-hosted runner (the Raspberry Pi, aarch64), the
+  Pi does not compile: **Tests, compiled for the Pi** (`prebuild`, GitHub's runner) cross-compiles
+  the tests, the runner executable the native tests start, and `test_shards` for
+  `aarch64-linux-musl` (`.github/scripts/zig-test-prebuilt.sh build`: zig-test.sh's module graph
+  and flags, LLVM with debug info, the network library from `build-zr-net.sh aarch64`; for the
+  baseline Arm CPU, not the Pi's own). It uploads one tar as the run's `tests-aarch64` artifact
+  (kept a day) and outputs the tar's sha256. "Tests (x86_64)", still the required check by that
+  name, downloads it, checks the file against that sha256, the architecture and the commit it was
+  built from, and runs the tests from `runner/` of its own checkout (`zig-test-prebuilt.sh run`:
+  the shard runner's tests, then `test_shards` over the tests, as `zig build test` does), so the
+  Pi's Test step compiles nothing and needs no memory for it; the tests still run on the Pi. A
+  prebuild that failed fails the Test job; one that is skipped (pull requests, the merge queue, a
+  hosted `PROD_RUNNER`) leaves the Test job compiling for itself as above. The Rust tests and the
+  expression conformance step still build on the runner they run on.
 - **Native tests as root**: the native backend's root-only tests, in two parts per architecture,
   the slow tests (`test_shards.zig`'s `slow`) shared out among the parts on their own. In ci the
   store stress test runs for 10 s, where analysis runs it for minutes.
