@@ -63,11 +63,12 @@ if [[ -n ${RUNNER_TEMP:-} && -z ${CARGO_HOME:-} ]] &&
 fi
 # Build offline first when the registry already holds crates: with every crate of Cargo.lock
 # present (`--frozen` is `--locked --offline`) the build needs no network at all, and so does not
-# fail when index.crates.io cannot be resolved (it did, in one of main's runs). Cargo does not
-# check a crate it finds unpacked in the registry's `src/` again: the registry is only ever one
-# trust scope's. "Holds crates" is only that registry/cache has a .crate file, so a registry
-# missing some of them fails the offline build and the retry fetches them. Missing crates, or any other failure, repeat the build online, which prints the
-# real error; the first attempt's output is kept for that case only.
+# fail when index.crates.io cannot be resolved (it did, in one of main's runs).
+# Cargo does not check a crate it finds unpacked in the registry's `src/` again: the registry is
+# only ever one trust scope's. "Holds crates" is only that registry/cache has a .crate file, so a
+# registry missing some of them fails the offline build and the retry fetches them. That retry
+# also follows any other failure; it prints the real error, and the first attempt's output is shown
+# only when it succeeds.
 cargo_release() {
 	local cache=${CARGO_HOME:-$HOME/.cargo}/registry/cache log
 	if compgen -G "$cache/*/*.crate" >/dev/null; then
