@@ -1481,3 +1481,57 @@ jobs:
           name: e2e-timings
           path: ${{ runner.temp }}/e2e/timings.tsv
           if-no-files-found: ignore
+
+  # Gitea and Forgejo support against a real instance of each (forge-live.sh): a throwaway
+  # container of the instance, the real runner (native backend, no engine) in a privileged
+  # container, and four workflows dispatched through the instance's API: `uses:` as Gitea reads it,
+  # the variables its runner sets, services, and the checkout, outputs, masking and a failing step.
+  # About 6 minutes. Skipped, still reporting, on a change that cannot affect it (ci-scope.sh forge);
+  # not a required check, and not on main (the merge queue ran it).
+  forge-live:
+    name: Live ${{ matrix.forge }}
+    if: github.event_name != 'push'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+    strategy:
+      fail-fast: false
+      matrix:
+        forge: [gitea, forgejo]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether this change can affect Gitea and Forgejo support
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh forge
+
+      - name: Install Zig
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/install-zig.sh
+
+      - name: Build the runner
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/e2e.sh build "$RUNNER_TEMP/zig-runner"
+
+      # The runner needs root and user namespaces: it runs in a container of its own, with a
+      # memory limit, as the memory soak runs it; the instance is a container too, published on
+      # the VM's loopback, which the runner makes reachable from a job's network.
+      - name: Run the workflows
+        if: steps.scope.outputs.run == 'true'
+        env:
+          ZR_FORGE_DIR: ${{ runner.temp }}/forge-live
+          ZR_FORGE_LOCK: ${{ runner.temp }}/forge-live.lock
+          FORGE: ${{ matrix.forge }}
+        run: .github/scripts/forge-live.sh --forge "$FORGE" --bin "$RUNNER_TEMP/zig-runner"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' }}
+        with:
+          name: forge-live-${{ matrix.forge }}
+          path: ${{ runner.temp }}/forge-live/run-*/runner.log
+          if-no-files-found: ignore
