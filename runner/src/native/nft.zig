@@ -22,7 +22,10 @@
 //!   to by the kernel (a reply from 127.0.0.1 may not leave by the bridge), so the runner listens
 //!   on the bridge's address at the same port and forwards to it (`gitea/reach.zig`); `input`
 //!   accepts that port at the bridge's address. A job reaches that one port and no other service
-//!   of the host's.
+//!   of the host's. In `forward` the instance is matched by the connection's original destination
+//!   (`ct original`), so that an instance in a Docker container with a published port on that
+//!   address, whose packets Docker's DNAT has already sent on to the container's bridge, is reached
+//!   too, and only through that address and port.
 //! - `output` (filter): to the bridge, replies only. No process of the host's reaches a job, its
 //!   services' ports included (P6's `not_asked`).
 //!
@@ -411,9 +414,19 @@ fn reachRules(b: *Batch, chain: []const u8, reach: []const net.Reach, subnet: ne
         const port: [2]u8 = std.mem.toBytes(std.mem.nativeToBig(u16, inst.port));
         const r = b.rule(table, chain, linux.NLM_F_APPEND);
         b.ifname(.iif, .eq, bridge_name);
-        b.payloadEq(nft_payload_network_header, 16, &addr);
-        b.l4proto(ipproto_tcp);
-        b.payloadEq(nft_payload_transport_header, 2, &port);
+        if (std.mem.eql(u8, chain, "forward")) {
+            // What a job dials is not what `forward` sees when the instance is a Docker container
+            // with a published port on this address: Docker's DNAT in prerouting has made the
+            // destination the container's, and the packet is routed on, to its bridge. The
+            // connection's original destination is still the instance's address and port.
+            b.l4proto(ipproto_tcp);
+            b.ctOriginalEq(nft_ct_dst_ip, &addr);
+            b.ctOriginalEq(nft_ct_proto_dst, &port);
+        } else {
+            b.payloadEq(nft_payload_network_header, 16, &addr);
+            b.l4proto(ipproto_tcp);
+            b.payloadEq(nft_payload_transport_header, 2, &port);
+        }
         b.counter();
         b.verdict(nf_accept);
         b.endRule(r);
@@ -496,6 +509,10 @@ const nfta_bitwise_xor = 5;
 const nfta_ct_dreg = 1;
 const nfta_ct_key = 2;
 const nft_ct_state = 0;
+const nfta_ct_direction = 3;
+const nft_ct_proto_dst = 12;
+const nft_ct_dst_ip = 20;
+const ct_dir_original: u8 = 0;
 /// conntrack's state bits as `ct state` loads them: ESTABLISHED and RELATED.
 const ct_established_related: u32 = 0x2 | 0x4;
 const nft_reg_verdict = 0;
@@ -711,6 +728,18 @@ const Batch = struct {
         b.endExpr(d);
         b.bitwise(std.mem.asBytes(&ct_established_related));
         b.cmp(.neq, &.{ 0, 0, 0, 0 });
+    }
+
+    /// `ct original <key> <value>`: the connection's first packet's destination address
+    /// (`nft_ct_dst_ip`) or port (`nft_ct_proto_dst`), as it was before any NAT changed it.
+    fn ctOriginalEq(b: *Batch, key: u32, value: []const u8) void {
+        b.expr("ct");
+        const d = b.begin(nfta_expr_data);
+        b.attrBe32(nfta_ct_key, key);
+        b.attr(nfta_ct_direction, &.{ct_dir_original});
+        b.attrBe32(nfta_ct_dreg, nft_reg_1);
+        b.endExpr(d);
+        b.cmp(.eq, value);
     }
 
     /// `reg 1 = reg 1 & mask` (xor zero), over the mask's length.
@@ -1201,5 +1230,102 @@ test "native nft: rules made by several makers at once are all made, none lost t
             failed_n, makers * applies, c.first[0..c.first_len],
         });
         return error.TestUnexpectedResult;
+    }
+}
+
+/// What `dockerPublished` found: the script's lines, or why the test cannot run here.
+const Published = struct {
+    unavailable: bool = false,
+    out: [2048]u8 = undefined,
+    out_len: usize = 0,
+};
+
+/// In a network namespace of its own (this thread's), the host of a Docker-published instance:
+/// the jobs' bridge `zr0` with a job on it, a Docker-like bridge with a "container" listening on
+/// :3000, the host's LAN address on a dummy interface, and Docker's own rule for `-p
+/// 10.1.0.48:3398:3000`: a DNAT in the nat table's prerouting. Then the runner's rules are applied
+/// (`apply`), with the instance at `10.1.0.48:3398` the one it may reach, and the job dials: the
+/// instance must answer, and neither another published port, nor the container itself, may.
+fn dockerPublished(c: *Published, with_reach: bool) void {
+    const unshared = linux.unshare(linux.CLONE.NEWNET);
+    if (linux.errno(unshared) != .SUCCESS) {
+        c.unavailable = true;
+        return;
+    }
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    const setup =
+        \\set -e
+        \\ip netns del zrt-job 2>/dev/null || true; ip netns del zrt-ctr 2>/dev/null || true
+        \\ip link set lo up
+        \\ip link add zr0 type bridge; ip addr add 10.211.0.1/16 dev zr0; ip link set zr0 up
+        \\ip link add dk0 type bridge; ip addr add 172.17.0.1/16 dev dk0; ip link set dk0 up
+        \\ip link add d0 type dummy; ip addr add 10.1.0.48/24 dev d0; ip link set d0 up
+        \\ip netns add zrt-job; ip netns add zrt-ctr
+        \\ip link add vj type veth peer name vj1; ip link set vj1 netns zrt-job; ip link set vj master zr0; ip link set vj up
+        \\ip netns exec zrt-job sh -c 'ip link set lo up; ip addr add 10.211.0.2/16 dev vj1; ip link set vj1 up; ip route add default via 10.211.0.1'
+        \\ip link add vc type veth peer name vc1; ip link set vc1 netns zrt-ctr; ip link set vc master dk0; ip link set vc up
+        \\ip netns exec zrt-ctr sh -c 'ip link set lo up; ip addr add 172.17.0.2/16 dev vc1; ip link set vc1 up; ip route add default via 172.17.0.1'
+        \\echo 1 > /proc/sys/net/ipv4/ip_forward
+        \\nft add table ip zrt_docker
+        \\nft add chain ip zrt_docker pre '{ type nat hook prerouting priority -100; }'
+        \\nft add rule ip zrt_docker pre ip daddr 10.1.0.48 tcp dport 3398 dnat to 172.17.0.2:3000
+        \\nft add rule ip zrt_docker pre ip daddr 10.1.0.48 tcp dport 3399 dnat to 172.17.0.2:3000
+        \\ip netns exec zrt-ctr python3 -c 'import socket,select,time
+        \\s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("0.0.0.0", 3000)); s.listen()
+        \\end=time.time()+25
+        \\while time.time()<end:
+        \\    if select.select([s],[],[],1)[0]:
+        \\        c,_=s.accept(); c.sendall(b"hi\\n"); c.close()' >/dev/null 2>&1 &
+    ;
+    const ran = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", setup } }) catch {
+        c.unavailable = true;
+        return;
+    };
+    if (ran.term != .exited or ran.term.exited != 0) {
+        std.debug.print("native nft: the topology failed: {s}\n", .{ran.stderr});
+        c.unavailable = true;
+        return;
+    }
+    const reach: []const net.Reach = if (with_reach) &.{.{ .addr = .{ 10, 1, 0, 48 }, .port = 3398 }} else &.{};
+    if (apply(net.Subnet.default, &.{"d0"}, &.{}, reach)) |why| {
+        std.debug.print("native nft: apply: {s}\n", .{why});
+        c.unavailable = true;
+        return;
+    }
+    const dial =
+        \\try() { ip netns exec zrt-job python3 -c "import socket,sys
+        \\try:
+        \\    s=socket.create_connection((sys.argv[1], int(sys.argv[2])), 3); print('answer' if s.recv(8) else 'silent')
+        \\except OSError as e:
+        \\    print('refused')" "$1" "$2"; }
+        \\echo "instance $(try 10.1.0.48 3398)"
+        \\echo "other_port $(try 10.1.0.48 3399)"
+        \\echo "container $(try 172.17.0.2 3000)"
+        \\ip netns del zrt-job; ip netns del zrt-ctr
+    ;
+    const got = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", dial } }) catch {
+        c.unavailable = true;
+        return;
+    };
+    c.out_len = @min(got.stdout.len, c.out.len);
+    @memcpy(c.out[0..c.out_len], got.stdout[0..c.out_len]);
+}
+
+test "native nft: a job reaches an instance Docker publishes on the host's address, and nothing else behind the NAT" {
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    for ([_]bool{ true, false }) |with_reach| {
+        var c: Published = .{};
+        const t = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, dockerPublished, .{ &c, with_reach });
+        t.join();
+        if (c.unavailable) return error.SkipZigTest;
+        const out = c.out[0..c.out_len];
+        errdefer std.debug.print("native nft (reach {}): {s}\n", .{ with_reach, out });
+        // Allowed: answered. Not allowed: no answer at all, whatever the NAT leads to.
+        try std.testing.expect((std.mem.indexOf(u8, out, "instance answer") != null) == with_reach);
+        try std.testing.expect(std.mem.indexOf(u8, out, "other_port answer") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "container answer") == null);
     }
 }
