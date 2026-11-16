@@ -68,6 +68,10 @@ pub const Limits = struct {
     /// finds none left is 429. The server's work is the runner's, outside the job's CPU limit.
     rate_per_s: u32 = 100,
     burst: u32 = 200,
+    /// What a request over the budget waits before it is answered 429 and the connection closed.
+    deny_delay_ms: u32 = 100,
+    /// How long `settle` waits for the connections to take in what they were sent.
+    settle_ms: u32 = 2000,
 };
 
 pub const Config = struct {
@@ -78,6 +82,9 @@ pub const Config = struct {
     /// The runner's version, as `--version` prints it.
     version: []const u8,
     limits: Limits = .{},
+    /// Tests only: how long a request waits before it is routed and counted, so that a test can
+    /// end a step with its request still unread (`settle`).
+    test_route_delay_ms: u32 = 0,
 };
 
 /// What a job did with its API, said once when the job ends (`Server.stop`).
@@ -111,6 +118,9 @@ pub const Server = struct {
     /// `/version` and `/info`, made once at the start: a client asking again costs a copy.
     version_body: []const u8,
     info_body: []const u8,
+    /// Readable for good while `settle` waits: a connection with nothing more to read says so.
+    settle_fd: linux.fd_t,
+    settle_epoch: std.atomic.Value(u32) = .init(0),
     /// The request budget: milli-tokens in the high half, the `nowMs` of the last refill below.
     bucket: std.atomic.Value(u64),
     counters: struct {
@@ -127,6 +137,11 @@ pub const Server = struct {
     const Slot = struct {
         thread: ?std.Thread = null,
         done: std.atomic.Value(bool) = .init(false),
+        /// A connection is being served in it, and which one (a slot is reused).
+        live: std.atomic.Value(bool) = .init(false),
+        generation: std.atomic.Value(u32) = .init(0),
+        /// The `settle` this connection last answered.
+        ack: std.atomic.Value(u32) = .init(0),
         server: *Server = undefined,
         fd: linux.fd_t = -1,
     };
@@ -160,6 +175,8 @@ pub const Server = struct {
         errdefer gpa.free(version_body);
         const info_body = try gpa.dupe(u8, try infoJson(arena.allocator(), own_cfg));
         errdefer gpa.free(info_body);
+        const sfd = try fdOf(linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK));
+        errdefer _ = linux.close(sfd);
         for (slots) |*sl| sl.* = .{};
         s.* = .{
             .gpa = gpa,
@@ -168,6 +185,7 @@ pub const Server = struct {
             .listen_fd = lfd,
             .wake_fd = wfd,
             .slots = slots,
+            .settle_fd = sfd,
             .version_body = version_body,
             .info_body = info_body,
             .bucket = .init(@as(u64, cfg.limits.burst) * 1000 << 32 | (nowMs() & 0xffff_ffff)),
@@ -184,6 +202,7 @@ pub const Server = struct {
         const st = s.stats();
         _ = linux.close(s.listen_fd);
         _ = linux.close(s.wake_fd);
+        _ = linux.close(s.settle_fd);
         unlinkPath(s.path);
         const gpa = s.gpa;
         gpa.free(s.path);
@@ -211,20 +230,54 @@ pub const Server = struct {
         };
     }
 
-    /// Takes one request from the budget: false when there is none left.
-    fn admit(s: *Server) bool {
-        const lim = s.cfg.limits;
-        const now: u32 = @truncate(nowMs());
-        var old = s.bucket.load(.acquire);
-        while (true) {
-            const tokens: u64 = old >> 32;
-            const last: u32 = @truncate(old);
-            const refill = @as(u64, now -% last) * lim.rate_per_s;
-            const have = @min(@as(u64, lim.burst) * 1000, tokens + refill);
-            if (have < 1000) return false;
-            const next = (have - 1000) << 32 | now;
-            old = s.bucket.cmpxchgWeak(old, next, .acq_rel, .acquire) orelse return true;
+    /// Takes one request from the budget: null when there was one, else the milliseconds until
+    /// there is.
+    fn admit(s: *Server) ?u32 {
+        return takeToken(&s.bucket, s.cfg.limits, realClock);
+    }
+
+    /// Returns once every connection has taken in what its client had sent before this call (a
+    /// step's processes are gone when the runner asks), so that what the step asked of the API is
+    /// counted (`Stats.beyond`) before anything reads the count. Each connection is asked, at its
+    /// next wait for a request, whether it has more to read: one that does reads it first. At most
+    /// `settle_ms`.
+    pub fn settle(s: *Server) void {
+        const deadline = nowMs() + s.cfg.limits.settle_ms;
+        // A connection still in the listen queue is taken first.
+        while (nowMs() < deadline) {
+            var queue = [_]linux.pollfd{.{ .fd = s.listen_fd, .events = linux.POLL.IN, .revents = 0 }};
+            var wake = [_]linux.pollfd{.{ .fd = s.wake_fd, .events = linux.POLL.IN, .revents = 0 }};
+            const queued = linux.poll(&queue, 1, 0) > 0 and queue[0].revents & linux.POLL.IN != 0;
+            if (!queued) break;
+            if (linux.poll(&wake, 1, 1) > 0 and wake[0].revents != 0) return;
         }
+        // And the one just taken is given a slot.
+        _ = waitStop(s, 2);
+        var live: [32]struct { slot: *Slot, generation: u32 } = undefined;
+        var n: usize = 0;
+        for (s.slots) |*sl| {
+            if (n == live.len) break;
+            if (sl.live.load(.acquire)) {
+                live[n] = .{ .slot = sl, .generation = sl.generation.load(.acquire) };
+                n += 1;
+            }
+        }
+        if (n == 0) return;
+        const epoch = s.settle_epoch.fetchAdd(1, .acq_rel) +% 1;
+        const one: u64 = 1;
+        _ = linux.write(s.settle_fd, std.mem.asBytes(&one).ptr, @sizeOf(u64));
+        while (nowMs() < deadline) {
+            var all = true;
+            for (live[0..n]) |l| {
+                const gone = !l.slot.live.load(.acquire) or l.slot.generation.load(.acquire) != l.generation;
+                if (!gone and l.slot.ack.load(.acquire) != epoch) all = false;
+            }
+            if (all) break;
+            var wake = [_]linux.pollfd{.{ .fd = s.wake_fd, .events = linux.POLL.IN, .revents = 0 }};
+            if (linux.poll(&wake, 1, 1) > 0 and wake[0].revents != 0) break;
+        }
+        var drained: u64 = 0;
+        _ = linux.read(s.settle_fd, std.mem.asBytes(&drained).ptr, @sizeOf(u64));
     }
 
     fn bump(s: *Server, comptime field: []const u8) void {
@@ -270,7 +323,13 @@ pub const Server = struct {
                 _ = linux.close(fd);
                 continue;
             };
-            slot.* = .{ .server = s, .fd = fd };
+            // Field by field: `settle` reads the atomic ones from another thread.
+            slot.server = s;
+            slot.fd = fd;
+            slot.done.store(false, .release);
+            slot.ack.store(0, .release);
+            slot.generation.store(slot.generation.load(.monotonic) +% 1, .release);
+            slot.live.store(true, .release);
             slot.thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, connection, .{slot}) catch {
                 _ = linux.close(fd);
                 continue;
@@ -294,6 +353,43 @@ pub const Server = struct {
 };
 
 const accept_backoff_ms = 100;
+
+const Clock = *const fn () u32;
+
+fn realClock() u32 {
+    return @truncate(nowMs());
+}
+
+/// Takes a token from `bucket` (milli-tokens above, the clock's last refill below): null when it
+/// did, else the milliseconds until one is due. The clock is read in every round of the loop, so a
+/// thread that lost the race does not refill from a reading older than the bucket's; a reading
+/// behind the bucket's own refills nothing and moves nothing back.
+fn takeToken(bucket: *std.atomic.Value(u64), lim: Limits, clock: Clock) ?u32 {
+    var old = bucket.load(.acquire);
+    while (true) {
+        const now = clock();
+        const tokens: u64 = old >> 32;
+        const last: u32 = @truncate(old);
+        const since = now -% last;
+        const behind = since > (1 << 31);
+        const refill: u64 = if (behind) 0 else @as(u64, since) * lim.rate_per_s;
+        const have = @min(@as(u64, lim.burst) * 1000, tokens + refill);
+        if (have < 1000) {
+            const rate = @max(lim.rate_per_s, 1);
+            return std.math.lossyCast(u32, @max(1, (1000 - have + rate - 1) / rate));
+        }
+        const next = (have - 1000) << 32 | (if (behind) last else now);
+        old = bucket.cmpxchgWeak(old, next, .acq_rel, .acquire) orelse return null;
+    }
+}
+
+const limited_body = "{\"message\":\"too many requests to this job's Docker API: slow down\"}\n";
+/// A 429, ready to send: no request is parsed or answered at this cost.
+const limited_answer = std.fmt.comptimePrint(
+    "HTTP/1.1 429 Too Many Requests\r\nApi-Version: " ++ api_version ++ "\r\nContent-Type: application/json\r\n" ++
+        "Content-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+    .{ limited_body.len, limited_body },
+);
 
 const busy_answer = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n" ++
     "Content-Length: 46\r\nConnection: close\r\n\r\n" ++
@@ -392,6 +488,38 @@ fn nowMs() u64 {
 
 const Wait = enum { ready, timeout, stopped, gone };
 
+/// Waits `ms` or until the stop: false when it was the stop.
+fn waitStop(s: *const Server, ms: u32) bool {
+    var wake = [_]linux.pollfd{.{ .fd = s.wake_fd, .events = linux.POLL.IN, .revents = 0 }};
+    return !(linux.poll(&wake, 1, std.math.lossyCast(i32, ms)) > 0 and wake[0].revents != 0);
+}
+
+/// `waitFor` the connection to be readable, which also answers a `settle` once the connection has
+/// nothing to read: a poll that finds data takes it first.
+fn waitHead(s: *const Server, slot: *Server.Slot, deadline: u64) Wait {
+    const fd = slot.fd;
+    while (true) {
+        const now = nowMs();
+        if (now >= deadline) return .timeout;
+        const epoch = s.settle_epoch.load(.acquire);
+        const asking = slot.ack.load(.acquire) != epoch;
+        var fds = [_]linux.pollfd{
+            .{ .fd = fd, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = s.wake_fd, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = if (asking) s.settle_fd else -1, .events = linux.POLL.IN, .revents = 0 },
+        };
+        const rc = linux.poll(&fds, fds.len, std.math.lossyCast(i32, deadline - now));
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return .gone,
+        }
+        if (fds[1].revents != 0) return .stopped;
+        if (fds[0].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) != 0) return .ready;
+        if (fds[2].revents != 0) slot.ack.store(epoch, .release);
+    }
+}
+
 /// Waits for `fd` to be readable (or writable) until `deadline` (milliseconds of `nowMs`), or for
 /// the server's stop.
 fn waitFor(s: *const Server, fd: linux.fd_t, events: i16, deadline: u64) Wait {
@@ -439,14 +567,16 @@ fn connection(slot: *Server.Slot) void {
     const s = slot.server;
     defer {
         _ = linux.close(slot.fd);
+        slot.live.store(false, .release);
         slot.done.store(true, .release);
     }
     var arena: std.heap.ArenaAllocator = .init(s.gpa);
     defer arena.deinit();
-    serve(s, slot.fd, &arena);
+    serve(s, slot, &arena);
 }
 
-fn serve(s: *Server, fd: linux.fd_t, arena: *std.heap.ArenaAllocator) void {
+fn serve(s: *Server, slot: *Server.Slot, arena: *std.heap.ArenaAllocator) void {
+    const fd = slot.fd;
     const lim = s.cfg.limits;
     const head_buf = s.gpa.alloc(u8, lim.header_bytes) catch return;
     defer s.gpa.free(head_buf);
@@ -465,7 +595,7 @@ fn serve(s: *Server, fd: linux.fd_t, arena: *std.heap.ArenaAllocator) void {
                 _ = reply(s, fd, arena.allocator(), 431, error_json(arena.allocator(), "request header too large"), false, false);
                 return;
             }
-            switch (waitFor(s, fd, linux.POLL.IN, deadline)) {
+            switch (waitHead(s, slot, deadline)) {
                 .ready => {},
                 .timeout => {
                     if (started) {
@@ -504,18 +634,21 @@ fn serve(s: *Server, fd: linux.fd_t, arena: *std.heap.ArenaAllocator) void {
         s.bump("requests");
         served += 1;
         const has_body = req.chunked or (req.content_length orelse 0) > 0;
-        const answer = if (s.admit())
-            route(a, s, req.method, req.target) catch Answer.oom
-        else
-            error_json_status(a, 429, "too many requests to this job's Docker API: slow down (the budget is " ++
-                "100 a second, refilled continuously)");
+        if (s.admit() != null) {
+            // Over the budget: the client waits, is told once, and is let go. Nothing is parsed
+            // further or allocated, so a flood costs the runner little and a thread's time is the
+            // flooder's to wait.
+            s.bump("limited");
+            s.bump("refused");
+            s.bump("beyond");
+            _ = waitStop(s, lim.deny_delay_ms);
+            if (sendAll(s, fd, limited_answer, lim.write_ms)) {} else |_| {}
+            return;
+        }
+        if (s.cfg.test_route_delay_ms > 0) _ = waitStop(s, s.cfg.test_route_delay_ms);
+        const answer = route(a, s, req.method, req.target) catch Answer.oom;
         switch (answer.status) {
             200 => {},
-            429 => {
-                s.bump("limited");
-                s.bump("refused");
-                s.bump("beyond");
-            },
             501 => {
                 s.bump("unsupported");
                 s.bump("beyond");
@@ -636,12 +769,6 @@ const Answer = struct {
     /// Only on /_ping: Docker's headers (the others carry them too, as the daemon's do).
     const oom: Answer = .{ .status = 500, .body = "{\"message\":\"out of memory\"}\n" };
 };
-
-fn error_json_status(a: Allocator, status: u16, message: []const u8) Answer {
-    var ans = error_json(a, message);
-    ans.status = status;
-    return ans;
-}
 
 fn error_json(a: Allocator, message: []const u8) Answer {
     return .{ .status = 0, .body = jsonMessage(a, message) catch "{\"message\":\"error\"}\n" };
@@ -1627,10 +1754,66 @@ test "docker api: the Server header names no version, /info's Name is the job's 
     try expectContains(info2, "\"Name\":\"zig-runner\"");
 }
 
-test "docker api: past its budget a job's API answers 429, counted, and refills" {
+var test_now: u32 = 0;
+fn testClock() u32 {
+    return test_now;
+}
+
+test "docker api: the budget refills with the clock, and a stale reading refills and moves nothing" {
+    const lim: Limits = .{ .rate_per_s = 20, .burst = 5 };
+    test_now = 1_000;
+    var bucket: std.atomic.Value(u64) = .init(@as(u64, lim.burst) * 1000 << 32 | test_now);
+    // The burst, then none: the wait is the time to the next token (50 ms at 20 a second).
+    for (0..5) |_| try testing.expectEqual(@as(?u32, null), takeToken(&bucket, lim, testClock));
+    try testing.expectEqual(@as(?u32, 50), takeToken(&bucket, lim, testClock));
+    test_now += 25;
+    try testing.expectEqual(@as(?u32, 25), takeToken(&bucket, lim, testClock));
+    test_now += 25;
+    try testing.expectEqual(@as(?u32, null), takeToken(&bucket, lim, testClock));
+    try testing.expectEqual(@as(?u32, 50), takeToken(&bucket, lim, testClock));
+    // A long quiet refills to the burst and no further.
+    test_now += 60_000;
+    for (0..5) |_| try testing.expectEqual(@as(?u32, null), takeToken(&bucket, lim, testClock));
+    try testing.expect(takeToken(&bucket, lim, testClock) != null);
+    // A reading older than the bucket's last refill (a thread that read the clock, lost a race and
+    // retried): not the 2^32 milliseconds that `now -% last` would make it, and `last` stays.
+    const before = bucket.load(.acquire);
+    test_now -= 40;
+    try testing.expect(takeToken(&bucket, lim, testClock) != null);
+    try testing.expectEqual(before, bucket.load(.acquire));
+    test_now += 40 + 50;
+    try testing.expectEqual(@as(?u32, null), takeToken(&bucket, lim, testClock));
+    // The clock wrapping round is no jump back either.
+    test_now = 5;
+    bucket.store(@as(u64, 2) * 1000 << 32 | 0xffff_fff0, .release);
+    try testing.expectEqual(@as(?u32, null), takeToken(&bucket, lim, testClock));
+    try testing.expectEqual(@as(?u32, null), takeToken(&bucket, lim, testClock));
+}
+
+var racing_calls: u32 = 0;
+/// A clock that reads late the first time: the thread that took the reading was passed by another.
+fn racingClock() u32 {
+    racing_calls += 1;
+    return if (racing_calls == 1) 100 else 900;
+}
+
+test "docker api: a retry reads the clock again, so a stale first reading refills nothing" {
+    const lim: Limits = .{ .rate_per_s = 1000, .burst = 3 };
+    // Another thread refilled at 500 and took a token: 1.5 tokens left.
+    var bucket: std.atomic.Value(u64) = .init(@as(u64, 1500) << 32 | 500);
+    racing_calls = 0;
+    // 100 is behind 500: nothing to refill from, 1.5 tokens, so one is taken at once; the next
+    // reading (900) is the one that counts for what follows.
+    try testing.expectEqual(@as(?u32, null), takeToken(&bucket, lim, racingClock));
+    try testing.expectEqual(@as(u64, 500), bucket.load(.acquire) >> 32);
+    try testing.expectEqual(@as(u32, 500), @as(u32, @truncate(bucket.load(.acquire))));
+}
+
+test "docker api: over its budget a job's API is told 429 once, after a wait, and let go; the rest is counted" {
     var cfg = test_cfg;
-    cfg.limits.rate_per_s = 20;
+    cfg.limits.rate_per_s = 1;
     cfg.limits.burst = 5;
+    cfg.limits.deny_delay_ms = 50;
     var f = try Fixture.start(cfg);
     const fd = try connect(f.path);
     defer _ = linux.close(fd);
@@ -1639,25 +1822,52 @@ test "docker api: past its budget a job's API answers 429, counted, and refills"
     defer heard.deinit(testing.allocator);
     const until = nowMs() + 3000;
     var first = true;
-    while (std.mem.count(u8, heard.items, "HTTP/1.1 ") < 12 and nowMs() < until) {
+    var closed = false;
+    while (!closed and nowMs() < until) {
         const part = try askOn(fd, if (first) batch else "", 100);
         defer testing.allocator.free(part.text);
         first = false;
+        closed = part.closed;
         try heard.appendSlice(testing.allocator, part.text);
     }
-    try testing.expectEqual(@as(usize, 12), std.mem.count(u8, heard.items, "HTTP/1.1 "));
-    const limited = std.mem.count(u8, heard.items, "HTTP/1.1 429 ");
-    try testing.expect(limited >= 5 and limited <= 8);
+    // Five answered at the rate of the burst, the sixth refused and the connection closed: the
+    // other six were never read.
+    try testing.expect(closed);
+    try testing.expectEqual(@as(usize, 5), std.mem.count(u8, heard.items, "HTTP/1.1 200 "));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, heard.items, "HTTP/1.1 429 "));
     try expectContains(heard.items, "too many requests to this job's Docker API");
-    // 20 a second: 100 ms later there are tokens again.
-    const later = try askOn(fd, "", 150);
-    testing.allocator.free(later.text);
-    const again = try askOn(fd, "GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n", 500);
-    defer testing.allocator.free(again.text);
-    try testing.expectEqual(@as(u16, 200), statusOf(again.text));
     const st = f.finish();
-    try testing.expectEqual(limited, @as(usize, st.limited));
-    try testing.expect(st.beyond >= st.limited);
+    try testing.expectEqual(@as(u32, 1), st.limited);
+    try testing.expect(st.beyond >= 1);
+}
+
+test "docker api: settle waits for what a client sent before it went to be counted" {
+    var cfg = test_cfg;
+    cfg.test_route_delay_ms = 300;
+    var f = try Fixture.start(cfg);
+    defer _ = f.finish();
+    {
+        // A request written and the client gone without reading the answer, as a step ends.
+        const fd = try connect(f.path);
+        const req = "GET /images/json HTTP/1.1\r\nHost: d\r\n\r\n";
+        _ = linux.sendto(fd, req.ptr, req.len, linux.MSG.NOSIGNAL, null, 0);
+        _ = linux.close(fd);
+    }
+    try testing.expectEqual(@as(u32, 0), f.server.stats().beyond);
+    const t0 = nowMs();
+    f.server.settle();
+    // The request was routed and counted by the time it returned, though it was held 300 ms.
+    try testing.expectEqual(@as(u32, 1), f.server.stats().beyond);
+    try testing.expect(nowMs() - t0 >= 250);
+    // With nothing sent, nothing to wait for, and an idle kept connection answers at once.
+    const keep = try connect(f.path);
+    defer _ = linux.close(keep);
+    const one = try askOn(keep, "GET /_ping HTTP/1.1\r\nHost: d\r\n\r\n", 1000);
+    testing.allocator.free(one.text);
+    const t1 = nowMs();
+    f.server.settle();
+    try testing.expect(nowMs() - t1 < 250);
+    try testing.expectEqual(@as(u32, 1), f.server.stats().beyond);
 }
 
 test "docker api: an oversized head is counted as refused, a stalled one as a timeout and refused" {

@@ -652,8 +652,9 @@ fn refuseVolume(arena: Allocator, why: *[]const u8, raw: []const u8, reason: []c
 
 /// What GitHub's runner mounts itself in a job container (`ContainerInfo`, `ContainerOperationProvider`),
 /// which Docker would refuse a second mount of.
+const docker_socket = "/var/run/docker.sock";
 const runner_mounts = [_][]const u8{
-    "/__w", "/__t", "/__e", "/github/home", "/github/workflow", "/var/run/docker.sock",
+    "/__w", "/__t", "/__e", "/github/home", "/github/workflow", docker_socket,
 };
 /// Directories the sandbox mounts itself, and everything below them.
 const sandbox_trees = [_][]const u8{ "/proc", "/sys", "/dev" };
@@ -708,6 +709,13 @@ pub fn withoutCgroup(o: Options) ?[]const u8 {
 /// read-only volume (that would need a mount of its own), and a target that is not a plain
 /// directory of the container.
 pub fn parseVolume(arena: Allocator, raw: []const u8, why: *[]const u8) Error!Volume {
+    return parseVolumeWith(arena, raw, why, false);
+}
+
+/// `parseVolume`; with `socket_ok` a target at the runner's `/var/run/docker.sock` is read, not
+/// refused: the job has the option for a Docker API of its own on, and gives up the API where
+/// its own volume is (`Backend.dropDockerApi`) instead of going to another backend.
+pub fn parseVolumeWith(arena: Allocator, raw: []const u8, why: *[]const u8, socket_ok: bool) Error!Volume {
     var parts: [3][]const u8 = undefined;
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, raw, ':');
@@ -746,7 +754,7 @@ pub fn parseVolume(arena: Allocator, raw: []const u8, why: *[]const u8) Error!Vo
             "absolute path without `.` or `..`"),
     };
     if (clean.len <= 1) return refuseVolume(arena, why, raw, "mounts the root directory");
-    for (runner_mounts) |m| if (std.mem.eql(u8, clean, m)) return refuseVolume(arena, why, raw, "mounts " ++
+    for (runner_mounts) |m| if (std.mem.eql(u8, clean, m) and !(socket_ok and std.mem.eql(u8, m, docker_socket))) return refuseVolume(arena, why, raw, "mounts " ++
         "where the runner mounts its own directory");
     for (sandbox_trees) |t| if (under(clean, t)) return refuseVolume(arena, why, raw, "mounts " ++
         "inside a directory the sandbox mounts itself");
@@ -786,6 +794,10 @@ fn cleanTarget(arena: Allocator, path: []const u8) error{ OutOfMemory, NotPlain 
 /// one path or one named volume at two (Docker refuses the first, and the second would need a
 /// bind to be one directory in two places).
 pub fn volumes(arena: Allocator, list: []const job_mod.Template, why: *[]const u8) Error!Volumes {
+    return volumesWith(arena, list, why, false);
+}
+
+pub fn volumesWith(arena: Allocator, list: []const job_mod.Template, why: *[]const u8, socket_ok: bool) Error!Volumes {
     var all: std.ArrayList(Volume) = .empty;
     var targets: std.ArrayList([]const u8) = .empty;
     var names: std.ArrayList([]const u8) = .empty;
@@ -798,7 +810,7 @@ pub fn volumes(arena: Allocator, list: []const job_mod.Template, why: *[]const u
                 return error.Refused;
             },
         };
-        const v = try parseVolume(arena, raw, why);
+        const v = try parseVolumeWith(arena, raw, why, socket_ok);
         for (targets.items) |earlier| if (std.mem.eql(u8, earlier, v.target))
             return refuseVolume(arena, why, raw, "mounts a path an earlier volume mounts");
         if (v.name) |name| {
@@ -819,6 +831,12 @@ pub fn volumes(arena: Allocator, list: []const job_mod.Template, why: *[]const u
 /// container's. `services` are the job's: a native service mounts no volume, so a named volume
 /// of the job container could not be shared with one.
 pub fn unsupported(jc: job_mod.Service, provisioned: bool, services: []const job_mod.Service) ?[]const u8 {
+    return unsupportedWith(jc, provisioned, services, false);
+}
+
+/// `unsupported`, where `socket_ok` is whether a volume at `/var/run/docker.sock` is carried out
+/// (the job has a Docker API of its own, which it then gives up).
+pub fn unsupportedWith(jc: job_mod.Service, provisioned: bool, services: []const job_mod.Service, socket_ok: bool) ?[]const u8 {
     if (jc.ports.len > 0) {
         var fba: std.heap.FixedBufferAllocator = .init(&scratch);
         var why: []const u8 = "";
@@ -831,7 +849,7 @@ pub fn unsupported(jc: job_mod.Service, provisioned: bool, services: []const job
     if (jc.volumes.len > 0) {
         var fba: std.heap.FixedBufferAllocator = .init(&scratch);
         var why: []const u8 = "";
-        const found = volumes(fba.allocator(), jc.volumes, &why) catch |e| return switch (e) {
+        const found = volumesWith(fba.allocator(), jc.volumes, &why, socket_ok) catch |e| return switch (e) {
             error.Refused => why,
             error.OutOfMemory => "a job container's `volumes:` are too long to read natively" ++
                 dropped_volumes,
@@ -856,7 +874,7 @@ pub fn unsupported(jc: job_mod.Service, provisioned: bool, services: []const job
         "image, whose steps run as RUNNER_STEP_USER's user, is not native" ++ dropped;
     if (o.tmpfs.len > 0 and jc.volumes.len > 0) {
         // Fail closed: a job whose volumes cannot be read here is not one to run natively.
-        const found = volumes(fba.allocator(), jc.volumes, &why) catch return "a job container's " ++
+        const found = volumesWith(fba.allocator(), jc.volumes, &why, socket_ok) catch return "a job container's " ++
             "`--tmpfs` could not be checked against its `volumes:`" ++ dropped;
         for (o.tmpfs) |fs| for (found.targets) |v| if (under(fs.target, v) or under(v, fs.target))
             return "a job container's `--tmpfs` is at or beside a path a volume mounts" ++ dropped;
@@ -1515,4 +1533,15 @@ test "allocation failures: a container's options, ports and volumes" {
         try af.checkOne(S.port, .{text});
     for ([_][]const u8{ "/data", "cache:/cache:ro", "/srv/data:/data", "v:/a//b/./c/", "x:/y:bogus:z", "" }) |text|
         try af.checkOne(S.volume, .{text});
+}
+
+test "a volume at the runner's docker.sock is refused, unless the job gives its own API up for it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var why: []const u8 = "";
+    try std.testing.expectError(error.Refused, parseVolume(a.allocator(), "/var/run/docker.sock:/var/run/docker.sock", &why));
+    const v = try parseVolumeWith(a.allocator(), "/var/run/docker.sock:/var/run/docker.sock", &why, true);
+    try std.testing.expectEqualStrings("/var/run/docker.sock", v.target);
+    // Nothing else the runner mounts is let through by it.
+    try std.testing.expectError(error.Refused, parseVolumeWith(a.allocator(), "x:/__w", &why, true));
 }
