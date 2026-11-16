@@ -34,6 +34,10 @@ name: analysis
 #                  backends with a runner built under ThreadSanitizer: the runner's main loop, its
 #                  pool and its helpers, which no test reaches. Any report in the runner's log or
 #                  the jobs' fails it.
+#   Tests, every sweep in full
+#                  the whole suite with ZIG_TEST_FULL=1 (the test script, as ci runs it): the
+#                  allocation-failure, bit-flip and long-chain tests that ci and pull requests
+#                  run sampled, in full (nightly, not on pull requests).
 #   Memory soak    50 jobs of seven shapes through one runner, one at a time: its resident and
 #                  anonymous memory, heap, descriptors, threads, mounts and zombies must not grow
 #                  (.github/scripts/memory-soak.sh; nightly, not on pull requests).
@@ -885,3 +889,28 @@ jobs:
             ${{ runner.temp }}/soak/run-*/verdict.txt
             ${{ runner.temp }}/soak/run-*/runner.log
           if-no-files-found: ignore
+
+  # Every test with nothing sampled (ZIG_TEST_FULL=1, CONTRIBUTING.md): every allocation failed in
+  # turn, every bit of the small seeds flipped, the long eviction chains at full depth on the real
+  # clock. The runs on a pull request and in ci sample them to stay short. About 5 minutes on
+  # GitHub's runner; nightly only. A failure fails the night like the other jobs here.
+  full-tests:
+    name: Tests, every sweep in full
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    permissions:
+      contents: read # to check out the code
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      - name: Every test, in full
+        env:
+          ZIG_TEST_FULL: "1"
+          ZIG_TEST_TIMES: "1"
+        run: .github/scripts/zig-test.sh

@@ -39,7 +39,9 @@ last; the bit-flip fuzz tests flip every bit of a seed's header and end and ever
 two long eviction tests and the many-entries hashFiles test use smaller trees (the eviction ones with
 a clock that stands still, so that a pass removes the same on every machine). `ZIG_TEST_FULL=1` runs
 every allocation, every bit and the full-size trees: do it after changing code such a test covers
-(`ZIG_TEST_FULL=1 ZIG_TEST_FILTER="allocation failures" .github/scripts/zig-test.sh`; `zig build test` does not hand that variable on to the tests, though it does `ZIG_TEST_TIMES` and `ZIG_TEST_SHARDS`), and a new sweep of this
+(`ZIG_TEST_FULL=1 zig build test`, or through `.github/scripts/zig-test.sh`). The nightly's "Tests,
+every sweep in full" job (`.github/workflows/analysis.yml`) runs it, so what a pull request's
+sampled run skips is checked in full that night. A new sweep of this
 kind should take its samples from `alloc_failures.zig` (`full()`, `sampledIndex`) and say what it
 skips. Waits on a deadline in a test (a pass of the eviction, a peer that never answers) are bounded
 by what the code guarantees (a count of passes, a short deadline for the silent request and a long
