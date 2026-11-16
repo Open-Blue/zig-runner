@@ -111,6 +111,8 @@ nesting: bool,
 nesting_withheld: bool = false,
 /// Unchanged steps may be reused across runs (see `Options.step_cache`).
 step_cache: bool,
+/// What a minute of `timeout-minutes` is, in ms; the tests make it shorter.
+timeout_unit_ms: i64 = std.time.ms_per_min,
 /// Where the tool cache is mounted, when it is a cache volume (`set_up.package_cache_dirs`), and
 /// the trees "Set up job" found in it (`ZIG_RUNNER_TOOL_TREES`), when it checked them: a replayed
 /// step that names a directory in it that no tree holds runs again (`toolDirNotHeld`, #229).
