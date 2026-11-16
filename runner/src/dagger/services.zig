@@ -301,7 +301,16 @@ pub fn serviceSpec(x: *Exec, ls: u32, sc: expr.Scope, svc: job_mod.Service) !?Sp
         try ports.append(arena, port);
     }
     var cmd: std.ArrayList([]const u8) = .empty;
-    for (svc.cmd) |t| try cmd.append(arena, ev.render(t, sc) catch "");
+    for (svc.cmd) |t| {
+        const arg = ev.render(t, sc) catch {
+            x.sh.errorLine(
+                ls,
+                try std.fmt.allocPrint(arena, "Could not evaluate the cmd of service '{s}': {s}", .{ svc.name, ev.diag }),
+            );
+            return null;
+        };
+        try cmd.append(arena, arg);
+    }
     x.sh.append(ls, try std.fmt.allocPrint(arena, "Image: {s}", .{image}));
     if (svc.options) |t| {
         const ignored = try ignoredOptions(arena, ev.render(t, sc) catch "");
