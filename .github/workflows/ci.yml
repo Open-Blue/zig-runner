@@ -111,6 +111,11 @@ jobs:
       - name: spin.sh leaves nothing behind
         run: .github/scripts/spin-heartbeat-test.sh
 
+      # memory-peak.sh's /proc sampler (the Pi's native steps) ends with the script on TERM and INT,
+      # and takes the command and its temp file with it.
+      - name: memory-peak.sh leaves nothing behind
+        run: .github/scripts/memory-peak-test.sh
+
       # The release binaries, against their pinned checksums: a new version (Renovate's) fails
       # here until they are updated. shfmt shows the diff that would format a script.
       - name: shfmt
@@ -683,8 +688,9 @@ jobs:
         run: zig build-exe --dep runner --dep corpus -Mroot=tools/hashfilescorpus.zig -Mrunner=src/hashfiles_corpus.zig -Mcorpus=tools/corpus.zig --name hashfilescorpus -fno-emit-bin
 
       # Not on the prebuilt path: the job "Every test file is compiled (for the Pi)" ran it
-      # (natively, on GitHub's runner) and a failure there fails this job already. Where the Test step compiled for itself (a pull
-      # request, the merge queue, a hosted prod, or a failed download) it runs here as before.
+      # (natively, on GitHub's runner) and a failure there fails this job already. Where the Test
+      # step compiled for itself (a pull request, the merge queue, a hosted prod, or a failed
+      # download) it runs here as before.
       - name: Every test file is compiled
         if: steps.scope.outputs.run == 'true'
         run: |
