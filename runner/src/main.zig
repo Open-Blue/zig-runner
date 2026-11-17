@@ -46,6 +46,7 @@ comptime {
     _ = @import("native/docker_api.zig");
     _ = @import("native/docker_build.zig");
     _ = @import("native/build_env.zig");
+    _ = @import("native/build_frames.zig");
     _ = @import("native/docker_api_job.zig");
     _ = @import("native/cgroup.zig");
     _ = @import("native/Store.zig");
