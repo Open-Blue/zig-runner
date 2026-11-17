@@ -34,7 +34,9 @@
 //!   port of the host itself, reaches `input` and is matched there by the address and port as the
 //!   job dialled them, which the NAT may have changed (not handled: Docker does neither). The
 //!   instances are the host's runners' together (`mergedReach`, the file below), so a job reaches
-//!   the instance another runner of the host serves too.
+//!   the instance another runner of the host serves too. What the rule does not do: it does not
+//!   check a job's source address, which no rule here does (a job can send as another job's
+//!   address on the shared bridge, in the first direction; #603).
 //! - `output` (filter): to the bridge, replies only. No process of the host's reaches a job, its
 //!   services' ports included (P6's `not_asked`).
 //!
@@ -1262,9 +1264,18 @@ test "native nft: rules made by several makers at once are all made, none lost t
 /// `nft` or python3: a failure where `ZIG_RUNNER_REQUIRE_NATIVE=1`, as CI sets).
 const Published = struct {
     skip: ?[]const u8 = null,
-    failure: ?[]const u8 = null,
+    failed: bool = false,
+    why: [1024]u8 = undefined,
+    why_len: usize = 0,
     out: [2048]u8 = undefined,
     out_len: usize = 0,
+
+    /// Says why the test failed, in a buffer of its own: the thread's arena is gone when the
+    /// test reads it.
+    fn fail(c: *Published, comptime fmt: []const u8, args: anytype) void {
+        c.failed = true;
+        c.why_len = if (std.fmt.bufPrint(&c.why, fmt, args)) |text| text.len else |_| 0;
+    }
 };
 
 /// The host's side of a published instance, in a network namespace of its own (this thread's):
@@ -1298,6 +1309,9 @@ fn dockerPublished(c: *Published, suffix: []const u8, dir: []const u8) void {
         \\set -e
         \\sfx=$1; d=$2
         \\ip link set lo up
+        \\# Loose or off, whatever the host's: a strict filter would drop what B makes up before `forward`,
+        \\# with or without the rule, and the test would pass for the wrong reason.
+        \\echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 0 > /proc/sys/net/ipv4/conf/default/rp_filter
         \\ip link add zr0 type bridge; ip addr add 10.211.0.1/16 dev zr0; ip link set zr0 up
         \\ip link add dk0 type bridge; ip addr add 172.17.0.1/16 dev dk0; ip link set dk0 up
         \\ip link add d0 type dummy; ip addr add 10.1.0.48/24 dev d0; ip link set d0 up
@@ -1310,6 +1324,14 @@ fn dockerPublished(c: *Published, suffix: []const u8, dir: []const u8) void {
         \\ip link add vc type veth peer name vc1; ip link set vc1 netns zrt-c-$sfx; ip link set vc master dk0; ip link set vc up
         \\ip netns exec zrt-c-$sfx sh -c 'ip link set lo up; ip addr add 172.17.0.2/16 dev vc1; ip link set vc1 up; ip route add default via 172.17.0.1'
         \\echo 1 > /proc/sys/net/ipv4/ip_forward
+        \\for f in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > $f; done
+        \\# A probe that sees what reaches `forward` before the runner's rules (priority -10): a packet
+        \\# that came in on the bridge and goes out of it, from the container's address (the NAT puts
+        \\# the instance's back after `forward`), which only a reply made up for another job's
+        \\# connection is.
+        \\nft add table ip zrt_probe
+        \\nft add chain ip zrt_probe seen '{ type filter hook forward priority -10; }'
+        \\nft add rule ip zrt_probe seen iifname zr0 oifname zr0 ip saddr 172.17.0.2 tcp sport 3000 counter
         \\nft add table ip zrt_docker
         \\nft add chain ip zrt_docker pre '{ type nat hook prerouting priority -100; }'
         \\nft add rule ip zrt_docker pre ip daddr 10.1.0.48 tcp dport 3398 dnat to 172.17.0.2:3000
@@ -1360,20 +1382,23 @@ fn dockerPublished(c: *Published, suffix: []const u8, dir: []const u8) void {
         \\ip netns exec zrt-c-$sfx python3 $d/server.py >/dev/null 2>&1 &
     ;
     const ran = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", setup, "sh", suffix, dir } }) catch |e| {
-        c.failure = @errorName(e);
+        c.fail("the topology: {s}", .{@errorName(e)});
         return;
     };
     if (ran.term != .exited or ran.term.exited != 0) {
-        c.failure = std.fmt.allocPrint(arena, "the topology: {s}", .{ran.stderr}) catch "the topology";
+        c.fail("the topology: {s}", .{ran.stderr[0..@min(ran.stderr.len, 600)]});
         return;
     }
     if (apply(net.Subnet.default, &.{"d0"}, &.{}, &.{.{ .addr = .{ 10, 1, 0, 48 }, .port = 3398 }})) |why| {
-        c.failure = std.fmt.allocPrint(arena, "apply: {s}", .{why}) catch "apply";
+        c.fail("apply: {s}", .{why});
         return;
     }
     const attack =
         \\sfx=$1; d=$2
-        \\cnt() { nft list chain ip zig_runner forward | grep 'ct original ip daddr' | sed -n 's/.*counter packets \([0-9]*\).*/\1/p' | head -1; }
+        \\# A counter, or NaN when the output has changed and nothing parses: the checks below then fail.
+        \\num() { v=$(sed -n 's/.*counter packets \([0-9][0-9]*\).*/\1/p' | head -1); echo "${v:-NaN}"; }
+        \\cnt() { nft list chain ip zig_runner forward | grep 'ct original ip daddr' | num; }
+        \\probe() { nft list chain ip zrt_probe seen | grep 'sport 3000' | num; }
         \\echo "other_port $(ip netns exec zrt-a-$sfx python3 $d/try.py 10.1.0.48 3399)"
         \\echo "container $(ip netns exec zrt-a-$sfx python3 $d/try.py 172.17.0.2 3000)"
         \\ip netns exec zrt-a-$sfx python3 $d/hold.py > $d/a.out &
@@ -1382,6 +1407,8 @@ fn dockerPublished(c: *Published, suffix: []const u8, dir: []const u8) void {
         \\# The masquerade keeps a source port that is free: the reply's destination port is A's own.
         \\m=$(cut -d' ' -f2 $d/a.out)
         \\n0=$(cnt)
+        \\# The positive control: A's handshake matched the rule, or the counter below counts nothing.
+        \\echo "rule_matched $([ "$n0" -gt 0 ] 2>/dev/null && echo yes || echo NO)"
         \\# B: a segment that looks like the instance's reply on A's connection.
         \\ip netns exec zrt-b-$sfx python3 $d/spoof.py 172.17.0.2 3000 172.17.0.1 "$m" 16 SPOOF1
         \\sleep 0.5
@@ -1391,16 +1418,20 @@ fn dockerPublished(c: *Published, suffix: []const u8, dir: []const u8) void {
         \\ip netns exec zrt-b-$sfx python3 $d/spoof.py 10.211.0.250 41000 10.1.0.48 3398 2 ""
         \\sleep 0.5
         \\n2=$(cnt)
-        \\m2=41000
-        \\ip netns exec zrt-b-$sfx python3 $d/spoof.py 172.17.0.2 3000 172.17.0.1 "$m2" 16 SPOOF2
+        \\# Another positive control: a packet of the first direction from B reaches `forward` and is
+        \\# counted, so B's packets do get that far.
+        \\echo "probe_counted $([ "$n2" -eq $((n1 + 1)) ] 2>/dev/null && echo yes || echo NO)"
+        \\ip netns exec zrt-b-$sfx python3 $d/spoof.py 172.17.0.2 3000 172.17.0.1 41000 16 SPOOF2
         \\sleep 0.5
         \\n3=$(cnt)
         \\echo "spoofed_source_reply $([ "$n3" = "$n2" ] && echo dropped || echo passed)"
-        \\echo "counter $n0 $n1 $n2 $n3 port=$m"
-        \\cat /proc/net/nf_conntrack | head -6
+        \\# Both made-up replies were un-NATed, routed out of the bridge and seen by `forward`: it is the
+        \\# runner's rule that did not take them.
+        \\echo "reached_forward $(probe)"
+        \\echo "counter $n0 $n1 $n2 $n3"
     ;
     const got = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", attack, "sh", suffix, dir } }) catch |e| {
-        c.failure = @errorName(e);
+        c.fail("the probes: {s}", .{@errorName(e)});
         return;
     };
     c.out_len = @min(got.stdout.len, c.out.len);
@@ -1424,8 +1455,13 @@ test "native nft: a job reaches an instance Docker publishes, and a job cannot u
     var c: Published = .{};
     const t = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, dockerPublished, .{ &c, suffix, dir });
     t.join();
-    // Whatever happened, the namespaces made are removed, and the container's server with them.
-    const clean = try std.fmt.allocPrint(arena, "for j in a b c; do ip netns del zrt-$j-{s} 2>/dev/null; done; true", .{suffix});
+    // Whatever happened, the container's server is stopped (deleting a namespace does not end the
+    // processes in it) and the namespaces made are removed.
+    const clean = try std.fmt.allocPrint(
+        arena,
+        "for j in a b c; do for p in $(ip netns pids zrt-$j-{s} 2>/dev/null); do kill $p; done; ip netns del zrt-$j-{s} 2>/dev/null; done; true",
+        .{ suffix, suffix },
+    );
     _ = std.process.run(arena, std.testing.io, .{ .argv = &.{ "sh", "-c", clean } }) catch {};
     if (c.skip) |why| {
         if (required) {
@@ -1434,8 +1470,8 @@ test "native nft: a job reaches an instance Docker publishes, and a job cannot u
         }
         return error.SkipZigTest;
     }
-    if (c.failure) |why| {
-        std.debug.print("native nft: {s}\n", .{why});
+    if (c.failed) {
+        std.debug.print("native nft: {s}\n", .{c.why[0..c.why_len]});
         return error.TestUnexpectedResult;
     }
     const out = c.out[0..c.out_len];
@@ -1443,6 +1479,13 @@ test "native nft: a job reaches an instance Docker publishes, and a job cannot u
     try std.testing.expect(std.mem.indexOf(u8, out, "instance answer") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "other_port answer") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "container answer") == null);
+    // The controls first: the rule matched A's handshake, B's first-direction packet reached `forward`
+    // and was counted, and the made-up replies got as far as `forward` (so it was the rule, not an
+    // earlier filter, that did not take them).
+    try std.testing.expect(std.mem.indexOf(u8, out, "rule_matched yes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "probe_counted yes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "reached_forward 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "NaN") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "spoofed_reply dropped") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "spoofed_source_reply dropped") != null);
 }
