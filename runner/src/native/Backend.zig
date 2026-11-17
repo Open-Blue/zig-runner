@@ -23,6 +23,7 @@ const expr = @import("../expr.zig");
 const dagger = @import("../dagger.zig");
 const sandbox = @import("sandbox.zig");
 const net = @import("net.zig");
+const nft = @import("nft.zig");
 const dns_probe = @import("dns_probe.zig");
 const Store = @import("Store.zig");
 const oci = @import("oci/image.zig");
@@ -1655,6 +1656,9 @@ pub fn deinit(b: *Backend) void {
             so.close();
         }
     }
+    // Its pin on the job's source address (`nft.pinSource`), under the slot's lock still: the
+    // slot's next holder replaces it when it makes its own.
+    if (b.slot) |s| nft.unpinSource(s.n);
     t = b.timings.since(arena, .veth_rm, t);
     removeJobDir(arena, b.io, b.dir);
     t = b.timings.since(arena, .tree_rm, t);
@@ -6851,6 +6855,78 @@ test "root runner: a job's own network, out of reach of the host's services and 
         "urllib.request.urlopen(\"https://github.com\", timeout=20).status)'");
     const r = try runNativeJob(arena, cfg, testJob(&.{out}), .root);
     try expectLines(r.text, &.{ "dns-ok", "http 200" });
+}
+
+test "root runner: a job's source address pin is on the host while it runs, and gone after (#603)" {
+    try requireRoot();
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    const env = try std.testing.environ.createMap(arena);
+    const required = std.mem.eql(u8, env.get("ZIG_RUNNER_REQUIRE_NATIVE") orelse "", "1");
+    // With handles: other shards' root jobs make and remove pins of their own meanwhile, and a slot
+    // this job left may be the next job's at once; a pin made again is a new table, a new handle.
+    const list: []const []const u8 = &.{ "nft", "-a", "list", "tables", "bridge" };
+    const tool = std.process.run(arena, io, .{ .argv = list }) catch null;
+    if (tool == null or tool.?.term != .exited or tool.?.term.exited != 0)
+        return skip(required, "this machine has no `nft` to list the host's bridge tables");
+    // The network helper makes the pin; made in the job's namespace instead (after its unshare),
+    // it would protect nothing, and only a real job's network tells the two apart.
+    const step = testStep(
+        \\python3 -c 'import socket; u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.connect(("192.0.2.1", 9)); print("addr", u.getsockname()[0])'
+        \\sleep 4
+    );
+    const Job = struct {
+        fn run(arena_: Allocator, cfg_: Config, step_: @TypeOf(step), out: *[]const u8) bool {
+            const r = runNativeJob(arena_, cfg_, testJob(&.{step_}), .root) catch return false;
+            out.* = r.text;
+            return r.res.steps[0].outcome == .success;
+        }
+    };
+    var job_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer job_arena.deinit();
+    var text: []const u8 = "";
+    var job = try io.concurrent(Job.run, .{ job_arena.allocator(), cfg, step, &text });
+    // Every listing while the job runs: which slot is the job's is known only from its output.
+    var seen: std.ArrayList([]const u8) = .empty;
+    for (0..40) |_| {
+        const got = std.process.run(arena, io, .{ .argv = list }) catch break;
+        try seen.append(arena, got.stdout);
+        try io.sleep(.fromMilliseconds(100), .awake);
+    }
+    const ok = job.await(io);
+    if (!ok) std.debug.print("{s}\n", .{text});
+    try std.testing.expect(ok);
+    const at = std.mem.indexOf(u8, text, "addr ") orelse return error.TestUnexpectedResult;
+    const addr_end = std.mem.indexOfAnyPos(u8, text, at, "\r\n") orelse text.len;
+    const addr = net.parseIp4(text[at + 5 .. addr_end]) orelse return error.TestUnexpectedResult;
+    const first = cfg.subnet.jobAddress(0);
+    const slot: u32 = addr[3] - first[3];
+    try std.testing.expectEqual(cfg.subnet.jobAddress(slot), addr);
+    const name = try std.fmt.allocPrint(arena, "table bridge zig_runner_pin{d} ", .{slot});
+    var handle: ?[]const u8 = null;
+    for (seen.items) |listing| if (lineWith(listing, name)) |line| {
+        handle = line;
+        break;
+    };
+    if (handle == null) std.debug.print("no pin for slot {d} while the job ran\n", .{slot});
+    try std.testing.expect(handle != null);
+    const after = try std.process.run(arena, io, .{ .argv = list });
+    if (lineWith(after.stdout, name)) |line| {
+        if (std.mem.eql(u8, line, handle.?)) std.debug.print("the pin outlived its job: {s}\n", .{line});
+        try std.testing.expect(!std.mem.eql(u8, line, handle.?));
+    }
+}
+
+/// The line of `text` that starts with `prefix`.
+fn lineWith(text: []const u8, prefix: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| if (std.mem.startsWith(u8, line, prefix)) return line;
+    return null;
 }
 
 test "root runner: a native job resolves through a nameserver only another interface reaches, and reaches nothing else there" {

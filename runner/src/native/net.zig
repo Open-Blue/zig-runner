@@ -138,6 +138,13 @@ pub fn upMain(
     const bridge_ipv6 = "/proc/sys/net/ipv6/conf/" ++ bridge ++ "/disable_ipv6";
     if (!sysctlIs(arena, bridge_ipv6, "1") and !writeSysctl(arena, bridge_ipv6, "1"))
         return fail("turn IPv6 off on the bridge", .ACCES);
+    // The job's address is its alone before its port exists: nothing it sends is let through as
+    // another's (#603). Here, in the host's namespace: after the unshare below, nftables would be
+    // the job's own. Not made, no network.
+    if (nft.pinSource(slot, subnet.jobAddress(slot))) |why| {
+        const what = std.fmt.allocPrint(arena, "pin the job's source address: {s}", .{why}) catch "pin the job's source address";
+        return fail(what, .INVAL);
+    }
     const unshared = linux.unshare(linux.CLONE.NEWNET);
     if (linux.errno(unshared) != .SUCCESS) return fail("unshare(net)", linux.errno(unshared));
     var job = Socket.open() catch return fail("open rtnetlink in the job's namespace", .ACCES);
