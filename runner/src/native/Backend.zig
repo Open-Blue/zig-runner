@@ -136,8 +136,6 @@ preflights: u32 = 0,
 /// The job's image has no git (a fetch ran `git` and the image said it is not found): the
 /// checkout and the actions' fetch download the repository's tarball instead (`tarball.zig`).
 no_git: bool = false,
-/// Why the last Dockerfile could not be planned or built, for the step's message.
-build_reason: []const u8 = "",
 /// Why the job runs on Dagger after all, found in `base` (`error.NativeToDagger`): one of its
 /// actions is something native steps cannot run yet (`actions.preload`).
 to_dagger: []const u8 = "",

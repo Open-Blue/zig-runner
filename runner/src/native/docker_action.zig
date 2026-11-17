@@ -17,6 +17,8 @@ const std = @import("std");
 const job_mod = @import("../job.zig");
 const dagger = @import("../dagger.zig");
 const Backend = @import("Backend.zig");
+const build_env = @import("build_env.zig");
+const Env = build_env.Env;
 const sandbox = @import("sandbox.zig");
 const images = @import("images.zig");
 const expr = @import("../expr.zig");
@@ -508,7 +510,7 @@ fn ipv4Local(a: u8, b: u8) bool {
 const Planning = struct {
     net: Net = .{},
     added: u64 = 0,
-    b: *Backend,
+    env: *Env,
     /// The context to read the sources' content from; null when `digests` is not wanted.
     context: ?*layer_view.View,
     digests: bool,
@@ -521,15 +523,15 @@ const Planning = struct {
 
     fn resolve(iface: *dockerfile.Bases, arena: Allocator, ref: []const u8, why: *[]const u8) anyerror!?dockerfile.BaseImage {
         const p: *Planning = @fieldParentPtr("bases_iface", iface);
-        const b = p.b;
+        const env = p.env;
         // An image the job's Docker API built and tagged (`docker build -t x .`) is `FROM x`'s first.
-        if (b.docker_api_state) |st| if (try st.baseOf(arena, ref)) |local| {
+        if (try env.host.localImage(arena, ref)) |local| {
             return .{ .config = local.config, .id = if (p.digests) local.id else "" };
-        };
+        }
         // `find` grows the job's list of held locks from the arena it is given: the job's.
-        const found = try cancellable(anyerror!images.Found, b.io, p.net.cancel, find, .{ b.arena, b.gpa, b.io, b.images_dir, b.store_cfg.root, ref, b.image_tag_ttl_s, &b.held });
+        const found = try cancellable(anyerror!images.Found, env.io, p.net.cancel, find, .{ env.arena, env.gpa, env.io, env.images_dir, env.store_cfg.root, ref, env.image_tag_ttl_s, env.held });
         switch (try found) {
-            .image => |i| return .{ .config = i, .id = if (p.digests) try baseId(arena, b.io, i) else "" },
+            .image => |i| return .{ .config = i, .id = if (p.digests) try baseId(arena, env.io, i) else "" },
             .missing => |w| {
                 why.* = w;
                 return null;
@@ -555,7 +557,7 @@ const Planning = struct {
         if (p.added >= p.net.add_budget) return error.TooMuchAdded;
         // A server that stalls ends the build at its limits (the job's own cancel is the step's end,
         // which waits for them): no first byte or no byte for 30 s, 10 minutes in all.
-        const res = try try cancellable(net_client.Error!net_client.Response, p.b.io, p.net.cancel, net_client.fetch, .{ arena, p.b.io, net_client.Options{
+        const res = try try cancellable(net_client.Error!net_client.Response, p.env.io, p.net.cancel, net_client.fetch, .{ arena, p.env.io, net_client.Options{
             .url = url,
             .max_response = std.math.lossyCast(usize, @min(max_add_bytes, p.net.add_budget - p.added)),
             .first_byte = .fromSeconds(30),
@@ -567,8 +569,8 @@ const Planning = struct {
         var sum: [32]u8 = undefined;
         Sha256.hash(res.body, &sum, .{});
         const hex = std.fmt.bytesToHex(sum, .lower);
-        const file = try std.fmt.allocPrint(arena, "{s}/ADD-{s}", .{ p.b.dir, hex[0..32] });
-        try std.Io.Dir.cwd().writeFile(p.b.io, .{ .sub_path = file, .data = res.body });
+        const file = try std.fmt.allocPrint(arena, "{s}/ADD-{s}", .{ p.env.dir, hex[0..32] });
+        try std.Io.Dir.cwd().writeFile(p.env.io, .{ .sub_path = file, .data = res.body });
         return .{ .file = file, .digest = hex };
     }
 };
@@ -579,32 +581,32 @@ const max_add_bytes = 128 << 20;
 
 /// The Dockerfile of `bd` read from `context` and planned, with the base images from the native
 /// store, the sources' content and the images' identity keyed (a build).
-fn planBuild(b: *Backend, bd: Build, context: *layer_view.View) !dockerfile.Plan {
-    const arena = b.arena;
+fn planBuild(env: *Env, bd: Build, context: *layer_view.View) !dockerfile.Plan {
+    const arena = env.arena;
     const df = (try context.resolve(bd.dockerfile, true)) orelse return error.NoDockerfile;
     if (df.kind != .file) return error.NoDockerfile;
-    const text = try df.parent().readFileAlloc(b.io, df.name, arena, .limited(max_dockerfile));
-    try ignoreFiles(b, bd, context);
-    return planText(b, text, context);
+    const text = try df.parent().readFileAlloc(env.io, df.name, arena, .limited(max_dockerfile));
+    try ignoreFiles(env, bd, context);
+    return planText(env, text, context);
 }
 
 /// What the context leaves out of a build: its `.dockerignore` (a `<Dockerfile>.dockerignore`
 /// beside the Dockerfile is the one then), and, for an action fetched by git, the repository's
 /// own `.git`, which GitHub's copy of the action has not. Set on the view once the Dockerfile,
 /// which is always the builder's to read, has been read through it.
-fn ignoreFiles(b: *Backend, bd: Build, context: *layer_view.View) !void {
+fn ignoreFiles(env: *Env, bd: Build, context: *layer_view.View) !void {
     const always: []const []const u8 = if (std.fs.path.isAbsolutePosix(bd.dir)) &.{".git"} else &.{};
-    return ignoreFilesOf(b, b.arena, bd.dockerfile, always, context);
+    return ignoreFilesOf(env, env.arena, bd.dockerfile, always, context);
 }
 
 /// `ignoreFiles` for the Dockerfile `dockerfile` and `always` left out whatever the ignore file says.
-fn ignoreFilesOf(b: *Backend, arena: Allocator, dockerfile_name: []const u8, always: []const []const u8, context: *layer_view.View) !void {
+fn ignoreFilesOf(env: *Env, arena: Allocator, dockerfile_name: []const u8, always: []const []const u8, context: *layer_view.View) !void {
     var text: []const u8 = "";
     const specific = try std.fmt.allocPrint(arena, "{s}.dockerignore", .{dockerfile_name});
     for ([_][]const u8{ specific, ".dockerignore" }) |name| {
         const e = (try context.resolve(name, true)) orelse continue;
         if (e.kind != .file) continue;
-        text = try e.parent().readFileAlloc(b.io, e.name, arena, .limited(max_dockerfile));
+        text = try e.parent().readFileAlloc(env.io, e.name, arena, .limited(max_dockerfile));
         break;
     }
     const ignore = try arena.create(dockerfile.Ignore);
@@ -617,8 +619,8 @@ const max_dockerfile = 1 << 20;
 
 /// `text` planned: with a `context`, a build's (what the sources hold and what the images are
 /// keyed); without, only whether it can be built, with fixed keys and nothing downloaded.
-fn planText(b: *Backend, text: []const u8, context: ?*layer_view.View) !dockerfile.Plan {
-    return planTextFor(b, b.arena, text, context, .action, .{}, .{});
+fn planText(env: *Env, text: []const u8, context: ?*layer_view.View) !dockerfile.Plan {
+    return planTextFor(env, env.arena, text, context, .action, .{}, .{});
 }
 
 /// What a plan is for: a Docker action, whose image the runner then runs (as its `USER`), or the
@@ -626,7 +628,7 @@ fn planText(b: *Backend, text: []const u8, context: ?*layer_view.View) !dockerfi
 const PlanFor = enum { action, api };
 
 fn planTextFor(
-    b: *Backend,
+    env: *Env,
     arena: Allocator,
     text: []const u8,
     context: ?*layer_view.View,
@@ -638,27 +640,27 @@ fn planTextFor(
     const ins = switch (try dockerfile.parse(arena, text)) {
         .ok => |i| i,
         .refused => |r| {
-            b.build_reason = try std.fmt.allocPrint(arena, "line {d}: {s}", .{ r.line, r.why });
+            env.build_reason = try std.fmt.allocPrint(arena, "line {d}: {s}", .{ r.line, r.why });
             return error.Refused;
         },
     };
-    var planning: Planning = .{ .b = b, .context = context, .digests = digests, .net = net };
+    var planning: Planning = .{ .env = env, .context = context, .digests = digests, .net = net };
     const p = switch (try dockerfile.planWith(arena, ins, planning.bases(), planning.ctx(), opts)) {
         .ok => |p| p,
         .refused => |r| {
-            b.build_reason = try std.fmt.allocPrint(arena, "line {d}: {s}", .{ r.line, r.why });
+            env.build_reason = try std.fmt.allocPrint(arena, "line {d}: {s}", .{ r.line, r.why });
             return error.Refused;
         },
     };
     // Whether the USER is one the image has is known once it is built (`run`).
     const user = p.stages[p.final].config.user;
-    if (purpose == .action and !images.runsAsRoot(user) and b.how.userns != .mapped) {
-        b.build_reason = try std.fmt.allocPrint(arena, "the image runs as USER {s}, and a " ++
+    if (purpose == .action and !images.runsAsRoot(user) and !env.mapped) {
+        env.build_reason = try std.fmt.allocPrint(arena, "the image runs as USER {s}, and a " ++
             "rootless runner's Docker actions run as root only", .{user});
         return error.Refused;
     }
     for (p.stages) |stage| for (stage.steps) |st| if (st.op == .run and !images.runsAsRoot(st.op.run.user)) {
-        b.build_reason = try std.fmt.allocPrint(arena, "line {d}: a RUN as USER {s} is not " ++
+        env.build_reason = try std.fmt.allocPrint(arena, "line {d}: a RUN as USER {s} is not " ++
             "native yet", .{ st.line, st.op.run.user });
         return error.Refused;
     };
@@ -683,9 +685,11 @@ pub fn buildReason(b: *Backend, bd: Build, label: []const u8) !?[]const u8 {
 /// `buildReason` for a Dockerfile whose text is all there is (a local action's, read from the
 /// job's commit before the job: its context is not anywhere yet).
 pub fn buildReasonText(b: *Backend, text: []const u8, label: []const u8) !?[]const u8 {
-    _ = planText(b, text, null) catch |e| return switch (e) {
+    var ad: Adapter = .{ .b = b };
+    var env = ad.env();
+    _ = planText(&env, text, null) catch |e| return switch (e) {
         error.Refused => try std.fmt.allocPrint(b.arena, "{s}'s Dockerfile cannot be built " ++
-            "natively: {s}", .{ label, b.build_reason }),
+            "natively: {s}", .{ label, env.build_reason }),
         else => e,
     };
     return null;
@@ -700,27 +704,29 @@ pub const Built = union(enum) {
 /// instruction's layer taken from the native layer store by its key, or made and stored there
 /// (`dockerfile.build`), a RUN in a sandbox on the layers before it (`Backend.execBuild`).
 pub fn buildImage(b: *Backend, bd: Build) !Built {
-    const arena = b.arena;
+    var ad: Adapter = .{ .b = b };
+    var env = ad.env();
+    const arena = env.arena;
     const ctx = (try openContext(b, bd)) orelse return .{ .failed = "the build context is " ++
         "not a directory of the action" };
     defer ctx.close();
-    const p = planBuild(b, bd, ctx) catch |e| return switch (e) {
-        error.Refused => .{ .failed = b.build_reason },
+    const p = planBuild(&env, bd, ctx) catch |e| return switch (e) {
+        error.Refused => .{ .failed = env.build_reason },
         error.NoDockerfile => .{ .failed = "the action has no such Dockerfile" },
         else => e,
     };
     // P2's layer store: published there, held for the job, evicted under its cap.
     const store: layers.Store = .{
-        .dir = b.dir,
-        .store = b.store_cfg,
-        .held = &b.held,
-        .scope = b.scope,
-        .userns = @tagName(b.how.userns),
+        .dir = env.dir,
+        .store = env.store_cfg,
+        .held = env.held,
+        .scope = env.scope,
+        .userns = env.userns,
     };
-    var runner: BuildRunner = .{ .b = b };
-    return switch (try dockerfile.build(arena, b.io, p, store, runner.runner(), .{
+    var runner: BuildRunner = .{ .env = &env };
+    return switch (try dockerfile.build(arena, env.io, p, store, runner.runner(), .{
         .context = ctx,
-        .opaque_xattr = b.opaqueXattr(),
+        .opaque_xattr = env.opaque_xattr,
     })) {
         .ok => |built| if (built.lowers.len == 0)
             .{ .failed = "the Dockerfile builds an image with no files" }
@@ -741,12 +747,57 @@ pub fn buildImage(b: *Backend, bd: Build) !Built {
     };
 }
 
+/// What a `Backend` gives a build (`build_env.zig`): its job's data, and a `RUN` through the job's
+/// own sandbox launcher.
+pub const Adapter = struct {
+    b: *Backend,
+    host: build_env.Host = .{ .runFn = runFn, .localImageFn = localImageFn },
+
+    pub fn env(ad: *Adapter) Env {
+        const b = ad.b;
+        return .{
+            .io = b.io,
+            .gpa = b.gpa,
+            .arena = b.arena,
+            .dir = b.dir,
+            .store_cfg = b.store_cfg,
+            .held = &b.held,
+            .scope = b.scope,
+            .userns = @tagName(b.how.userns),
+            .mapped = b.how.userns == .mapped,
+            .id_base = b.idBase(),
+            .slot_ids = b.slotIds(),
+            .images_dir = b.images_dir,
+            .image_tag_ttl_s = b.image_tag_ttl_s,
+            .opaque_xattr = b.opaqueXattr(),
+            .host = &ad.host,
+        };
+    }
+
+    fn runFn(h: *build_env.Host, call: build_env.RunCall) anyerror!sandbox.Ended {
+        const ad: *Adapter = @fieldParentPtr("host", h);
+        const b = ad.b;
+        const workdir = b.workdir;
+        b.workdir = call.workdir;
+        defer b.workdir = workdir;
+        if (call.running) |running| return b.execBuildApi(running, call.argv, call.env, call.out, call.container);
+        return b.execBuild(call.argv, call.env, 0, 0, call.out, call.container);
+    }
+
+    fn localImageFn(h: *build_env.Host, arena: Allocator, ref: []const u8) anyerror!?build_env.LocalImage {
+        const ad: *Adapter = @fieldParentPtr("host", h);
+        const st = ad.b.docker_api_state orelse return null;
+        const local = (try st.baseOf(arena, ref)) orelse return null;
+        return .{ .config = local.config, .id = local.id };
+    }
+};
+
 /// `dockerfile.Runner` over the sandbox: a RUN on the image's layers so far (each idmapped on a
 /// root runner, as the image's are when it runs), writing into the build's new layer. On a root
 /// runner what the RUN writes has the job's host ids; they are shifted back to the image's own
 /// (`Store.unshift`), so the layer is the same whichever job's range built it.
 const BuildRunner = struct {
-    b: *Backend,
+    env: *Env,
     last: Backend.Captured = undefined,
     failure: []const u8 = "",
     /// Set for a build the job's Docker API runs, while a step of the job is running.
@@ -763,18 +814,14 @@ const BuildRunner = struct {
         op: @FieldType(dockerfile.Step.Op, "run"),
     ) anyerror!i32 {
         const r: *BuildRunner = @ptrCast(@alignCast(ptr));
-        const b = r.b;
-        const arena = b.arena;
+        const env = r.env;
+        const arena = env.arena;
         for ([_][]const u8{ "BU", "BW", "BC" }) |d|
-            try std.Io.Dir.cwd().createDirPath(b.io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, d }));
-        const mapped = b.how.userns == .mapped;
-        if (mapped) {
+            try std.Io.Dir.cwd().createDirPath(env.io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ env.dir, d }));
+        if (env.mapped) {
             const p = try arena.dupeSentinel(u8, upper, 0);
-            _ = std.os.linux.chown(p, b.idBase(), b.idBase());
+            _ = std.os.linux.chown(p, env.id_base, env.id_base);
         }
-        const workdir = b.workdir;
-        b.workdir = op.workdir;
-        defer b.workdir = workdir;
         r.last = .{ .arena = arena };
         const container: sandbox.Spec.Container = .{
             .lowers = lowers,
@@ -782,13 +829,18 @@ const BuildRunner = struct {
             .work = "BW",
             .merged = "BC",
         };
-        const ended = if (r.api) |api| api: {
-            if (api.cancelled()) {
-                r.failure = "the build was cancelled";
-                return 125;
-            }
-            break :api try b.execBuildApi(api.running, op.argv, op.env, api.out, container);
-        } else try b.execBuild(op.argv, op.env, 0, 0, r.last.output(), container);
+        if (r.api) |api| if (api.cancelled()) {
+            r.failure = "the build was cancelled";
+            return 125;
+        };
+        const ended = try env.host.run(.{
+            .argv = op.argv,
+            .env = op.env,
+            .workdir = op.workdir,
+            .container = container,
+            .running = if (r.api) |api| api.running else null,
+            .out = if (r.api) |api| api.out else r.last.output(),
+        });
         // The sandbox's own failure is the build's, with why.
         if (ended.failure.len > 0) {
             r.failure = ended.failure;
@@ -798,8 +850,8 @@ const BuildRunner = struct {
         if (ended.killed) return ended.code;
         // The layer gets the canonical ids, as P2 gives a step's before it is stored
         // (`Store.unshift`, #276), so it serves every slot. Half shifted, it must not be stored.
-        if (mapped) Store.unshift(b.arena, b.io, upper, b.slotIds()) catch |e| {
-            r.failure = try std.fmt.allocPrint(b.arena, "the RUN's layer could not be given the " ++
+        if (env.mapped) Store.unshift(env.arena, env.io, upper, env.slot_ids) catch |e| {
+            r.failure = try std.fmt.allocPrint(env.arena, "the RUN's layer could not be given the " ++
                 "image's ids: {s}", .{@errorName(e)});
             return 125;
         };
@@ -858,18 +910,24 @@ pub const ApiBuilt = union(enum) {
 /// included as Docker's context has it, and the `RUN`s in the job's cgroup beside the step that
 /// asked. Layers are the store's, keyed with the job's trust scope, as an action's are.
 pub fn buildApi(b: *Backend, req: ApiRequest) !ApiBuilt {
+    var ad: Adapter = .{ .b = b };
+    var env = ad.env();
+    return buildApiIn(&env, req);
+}
+
+/// `buildApi` for a build's `Env`: the job's own, or the builder process's.
+pub fn buildApiIn(env: *Env, req: ApiRequest) !ApiBuilt {
     const arena = req.arena;
-    defer b.build_reason = "";
-    const ctx = (try layer_view.View.open(arena, b.io, &.{req.dir}, "", b.opaqueXattr())) orelse
+    const ctx = (try layer_view.View.open(arena, env.io, &.{req.dir}, "", env.opaque_xattr)) orelse
         return .{ .failed = "the build context is empty" };
     defer ctx.close();
     const missing = try std.fmt.allocPrint(arena, "Cannot locate specified Dockerfile: {s}", .{req.dockerfile});
     const df = (try ctx.resolve(req.dockerfile, true)) orelse return .{ .failed = missing };
     if (df.kind != .file) return .{ .failed = missing };
-    const text = try df.parent().readFileAlloc(b.io, df.name, arena, .limited(max_dockerfile));
-    try ignoreFilesOf(b, arena, req.dockerfile, &.{}, ctx);
-    const p = planTextFor(b, arena, text, ctx, .api, req.options, .{ .cancel = req.cancel, .deny_local = true }) catch |e| return switch (e) {
-        error.Refused => .{ .failed = b.build_reason },
+    const text = try df.parent().readFileAlloc(env.io, df.name, arena, .limited(max_dockerfile));
+    try ignoreFilesOf(env, arena, req.dockerfile, &.{}, ctx);
+    const p = planTextFor(env, arena, text, ctx, .api, req.options, .{ .cancel = req.cancel, .deny_local = true }) catch |e| return switch (e) {
+        error.Refused => .{ .failed = env.build_reason },
         error.Cancelled => .{ .failed = "the build was cancelled" },
         error.LocalAddress => .{ .failed = "an ADD of an address of the machine itself (loopback, link-local) is refused: the fetch is made from the runner's network, not the job's" },
         else => e,
@@ -879,17 +937,17 @@ pub fn buildApi(b: *Backend, req: ApiRequest) !ApiBuilt {
         .refused => {},
     };
     const store: layers.Store = .{
-        .dir = b.dir,
-        .store = b.store_cfg,
-        .held = &b.held,
-        .held_arena = b.arena,
-        .scope = b.scope,
-        .userns = @tagName(b.how.userns),
+        .dir = env.dir,
+        .store = env.store_cfg,
+        .held = env.held,
+        .held_arena = env.arena,
+        .scope = env.scope,
+        .userns = env.userns,
     };
-    var runner: BuildRunner = .{ .b = b, .api = req.api };
-    return switch (dockerfile.build(arena, b.io, p, store, runner.runner(), .{
+    var runner: BuildRunner = .{ .env = env, .api = req.api };
+    return switch (dockerfile.build(arena, env.io, p, store, runner.runner(), .{
         .context = ctx,
-        .opaque_xattr = b.opaqueXattr(),
+        .opaque_xattr = env.opaque_xattr,
         .progress = if (req.observer) |o| &o.progress else null,
         .cancel = req.cancel,
     }) catch |e| switch (e) {
