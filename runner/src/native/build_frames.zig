@@ -43,6 +43,9 @@ pub const Request = struct {
         config: images.Image,
         /// An image the job's own Docker API built: `COPY --from` it is refused.
         local: bool = false,
+        /// Why the executor could not have it (a pull that failed): the planner refuses the line
+        /// that asks for it with this.
+        missing: []const u8 = "",
     };
 };
 
@@ -55,9 +58,13 @@ pub const Out = struct {
     /// A Dockerfile or a context that cannot be built, and why (`refused`, `failed`).
     line: u32 = 0,
     why: []const u8 = "",
+    /// The Dockerfile's instructions, for the build's progress lines (`Step 3/7 : RUN ...`).
+    ins: []const Ins = &.{},
 
     pub const Status = enum { plan, need, refused, failed };
 };
+
+pub const Ins = struct { line: u32, kind: dockerfile.Kind, text: []const u8 };
 
 pub const Error = error{ BadFrame, TooBig, Invalid } || Allocator.Error;
 
@@ -149,6 +156,11 @@ fn strings(list: []const []const u8, max_count: usize, max_each: usize, max_all:
     return all <= max_all;
 }
 
+/// A stage that starts from a job's own image carries the planner's `/local` marker; no other layer.
+fn localOnly(layers: []const []const u8) bool {
+    return layers.len == 0 or (layers.len == 1 and std.mem.eql(u8, layers[0], "/local"));
+}
+
 fn config(c: images.Image) bool {
     if (c.rootfs.len != 0) return false;
     if (!strings(c.entrypoint, max_words, max_string, 256 * 1024)) return false;
@@ -159,7 +171,7 @@ fn config(c: images.Image) bool {
     if (c.labels.len > max_labels) return false;
     for (c.labels) |l| if (!text(l.name, 1024) or !text(l.value, max_string)) return false;
     // Nothing a plan has no use for.
-    return c.healthcheck == null and c.digest == null and c.manifest == null and c.layers.len == 0;
+    return c.healthcheck == null and c.digest == null and c.manifest == null and localOnly(c.layers);
 }
 
 /// Why `out` is not a plan this side acts on, or null. Everything is bounded and written as the
@@ -182,6 +194,13 @@ pub fn validate(out: Out) ?[]const u8 {
         },
     }
     const p = out.plan orelse return "a plan with no plan";
+    if (out.ins.len > max_total_steps * 2) return "the plan has too many instructions";
+    var ins_bytes: usize = 0;
+    for (out.ins) |x| {
+        if (!text(x.text, max_string)) return "an instruction is not text";
+        ins_bytes += x.text.len;
+    }
+    if (ins_bytes > (1 << 20) + max_total_steps) return "the instructions are too big";
     if (p.stages.len == 0 or p.stages.len > max_stages) return "a plan with no stages or too many";
     if (p.final >= p.stages.len or !p.stages[p.final].needed) return "the plan's final stage is not built";
     var total: usize = 0;
@@ -198,7 +217,7 @@ pub fn validate(out: Out) ?[]const u8 {
             .image => |im| {
                 if (!imageRef(im.ref)) return "a base's reference is not a reference";
                 if (isBase(im.rootfs) == null) return "a base is not a placeholder";
-                if (im.layers.len != 0) return "a base has layers of its own";
+                if (!localOnly(im.layers)) return "a base has layers of its own";
             },
         }
         if (!config(st.config)) return "a stage's config is not one";

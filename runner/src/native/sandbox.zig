@@ -121,6 +121,11 @@ pub const Spec = struct {
     /// A job container's `options:` the sandbox carries out (`container_options.zig`), for the
     /// job's own steps: a Docker action's container has none of them, as on GitHub.
     container_opts: ContainerOpts = .{},
+    /// The process handles bytes it does not trust (an API build's planner, `native-parse`): it has
+    /// an empty network namespace of its own, no capability at all (the bounding set empty), and
+    /// `no_new_privs`, on top of the step's own pid, mount and user namespaces and Docker's seccomp
+    /// profile. A step never has it.
+    confined: bool = false,
 
     /// `--hostname`, `--shm-size` and `--tmpfs`, as `docker create` sets them on the job container.
     pub const ContainerOpts = struct {
@@ -759,7 +764,7 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper, early: []const u
 
     // 2. The step's own namespaces, owned by the user namespace; its first process is PID 1.
     check("unshare(mount, pid, uts, ipc)", linux.unshare(linux.CLONE.NEWNS | linux.CLONE.NEWPID |
-        linux.CLONE.NEWUTS | linux.CLONE.NEWIPC));
+        linux.CLONE.NEWUTS | linux.CLONE.NEWIPC | @as(u32, if (spec.confined) linux.CLONE.NEWNET else 0)));
     if (spec.container == null and spec.container_opts.hostname.len > 0) {
         const name = spec.container_opts.hostname;
         check("set the hostname", linux.syscall2(.sethostname, @intFromPtr(name.ptr), name.len));
@@ -818,13 +823,13 @@ fn runStep(arena: Allocator, spec: Spec, marks: *phases.Helper, early: []const u
         _ = linux.close(alive[1]);
         // no_new_privs for every step but the runner user's on a root runner: its sudo can
         // reach only the job's own root, bounded still by the capabilities and seccomp below.
-        const nnp = spec.userns != .mapped or spec.uid == 0;
+        const nnp = spec.userns != .mapped or spec.uid == 0 or spec.confined;
         const program: Program = if (spec.exec.len > 0)
             .{ .path = spec.exec }
         else
             .{ .search = .{ .name = spec.argv[0], .env = env } };
         const in_image = spec.container != null;
-        stepInit(arena, root, shmSize(spec), workdir, spec.uid, spec.gid, spec.groups, nnp, alive[0], in_image, program, argv, envp);
+        stepInit(arena, root, shmSize(spec), workdir, spec.uid, spec.gid, spec.groups, nnp, spec.confined, alive[0], in_image, program, argv, envp);
     }
     _ = linux.close(alive[0]);
     const st = if (spec.service) |s|
@@ -1970,6 +1975,7 @@ fn stepInit(
     gid: u32,
     groups: []const u32,
     no_new_privs: bool,
+    confined: bool,
     alive: linux.fd_t,
     in_image: bool,
     program: Program,
@@ -1996,7 +2002,7 @@ fn stepInit(
     _ = linux.mkdir(workdir, 0o755);
     check("chdir to the working directory", linux.chdir(workdir));
 
-    dropCapabilities();
+    if (confined) dropAllCapabilities() else dropCapabilities();
     // The filter goes in while PID 1 is still the namespace's root: without no_new_privs (the
     // runner user on a root runner), installing one takes CAP_SYS_ADMIN, which the bounding set
     // no longer holds but the effective set does until `setuid` or exec. It binds every process
@@ -2164,6 +2170,25 @@ pub fn dropCapabilities() void {
             if (linux.errno(rc) == .INVAL) break;
             check("drop a capability", rc);
         }
+        if (cap == 63) break;
+    }
+    check("clear ambient capabilities", linux.prctl(
+        @backingInt(linux.PR.CAP_AMBIENT),
+        linux.PR.CAP_AMBIENT_CLEAR_ALL,
+        0,
+        0,
+        0,
+    ));
+}
+
+/// No capability at all: the bounding set emptied and the ambient set cleared (a confined process,
+/// `Spec.confined`).
+pub fn dropAllCapabilities() void {
+    var cap: u6 = 0;
+    while (true) : (cap += 1) {
+        const rc = linux.prctl(@backingInt(linux.PR.CAPBSET_DROP), cap, 0, 0, 0);
+        if (linux.errno(rc) == .INVAL) break;
+        check("drop a capability", rc);
         if (cap == 63) break;
     }
     check("clear ambient capabilities", linux.prctl(

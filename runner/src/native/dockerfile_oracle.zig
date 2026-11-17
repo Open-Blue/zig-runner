@@ -208,14 +208,20 @@ const Discard = struct {
     }
 };
 
-/// The API path's build of the case's context, compared with the Docker action path's: the same
-/// layers in the same order (they are keyed by what made them, so the store gives the one set to
-/// both) and the same config. 0 when they are the same, else the differences, printed, counted.
-fn sameThroughApi(b: *Backend, arena: Allocator, name: []const u8, ctx: []const u8, built: anytype, same_layers: bool) !usize {
+/// The case's context built as the Docker API's `POST /build` builds it (a tar, the confined
+/// planner, the executor's own keys): its filesystem and config as entries, to be compared with the
+/// Docker action path's (they are the same image, in other layers: the API's keys are their own).
+fn viaApi(b: *Backend, arena: Allocator, io: std.Io, name: []const u8, case_dir: []const u8, work: []const u8) !?[]const Entry {
+    const tar = try std.fmt.allocPrint(arena, "{s}/api-{s}.tar", .{ work, name });
+    try run(arena, io, &.{ "tar", "-C", try std.fmt.allocPrint(arena, "{s}/ctx", .{case_dir}), "-cf", tar, "." });
+    const ctx = try std.fmt.allocPrint(arena, "{s}/api-ctx-{s}", .{ work, name });
+    try std.Io.Dir.cwd().createDirPath(io, ctx);
     var running: sandbox.Running = .{};
     const api: docker_action.Api = .{ .running = &running, .out = Discard.out(), .cancelledFn = Discard.never };
     const got = try docker_action.buildApi(b, .{
         .dir = ctx,
+        .tar = tar,
+        .id = 900,
         .dockerfile = "Dockerfile",
         .options = .{},
         .api = &api,
@@ -225,25 +231,17 @@ fn sameThroughApi(b: *Backend, arena: Allocator, name: []const u8, ctx: []const 
         .image => |i| i,
         .failed => |why| {
             std.debug.print("{s}: the build through the API failed: {s}\n", .{ name, why });
-            return 1;
+            return null;
         },
     };
-    var bad: usize = 0;
-    if (same_layers and image.lowers.len != built.lowers.len) {
-        std.debug.print("{s}: the API's image has {d} layers, the action's {d}\n", .{ name, image.lowers.len, built.lowers.len });
-        return 1;
-    }
-    if (same_layers) for (image.lowers, built.lowers) |x, y| if (!std.mem.eql(u8, x, y)) {
-        std.debug.print("{s}: the API's layer {s} is not the action's {s}\n", .{ name, x, y });
-        bad += 1;
-    };
-    const a = try configLines(arena, image.config);
-    const c = try configLines(arena, built.config);
-    if (a.len != c.len) bad += 1 else for (a, c) |x, y| if (!std.mem.eql(u8, x.line, y.line)) {
-        std.debug.print("{s}: the API's config differs: {s} against {s}\n", .{ name, x.line, y.line });
-        bad += 1;
-    };
-    return bad;
+    const bottom_first = try arena.alloc([]const u8, image.lowers.len);
+    for (image.lowers, 0..) |l, k| bottom_first[image.lowers.len - 1 - k] = l;
+    const merged = try std.fmt.allocPrint(arena, "{s}/api-{s}", .{ work, name });
+    try Store.flatten(arena, io, bottom_first, merged, b.opaqueXattr());
+    const entries = try std.mem.concat(arena, Entry, &.{ try walk(arena, io, merged), try configLines(arena, image.config) });
+    std.mem.sortUnstable(Entry, @constCast(entries), {}, lessThan);
+    std.Io.Dir.cwd().deleteTree(io, merged) catch |e| std.debug.print("oracle: could not remove {s}: {s}\n", .{ merged, @errorName(e) });
+    return entries;
 }
 
 test "allows: a path with a trailing = allows that path alone, any other one what is under it" {
@@ -323,21 +321,6 @@ test "oracle: the Dockerfile builder builds what BuildKit builds" {
                 continue;
             },
         };
-        // And as the Docker API's `POST /build` builds it (`docker_action.buildApi`): the same
-        // planner and layers, so the same image, found in the store by its keys.
-        // The action path again: a case whose `COPY --from=<image>` keys move between two builds in a
-        // process (the base's fingerprint is of its ctimes, which the first build's reads move) has
-        // layers the API path cannot be compared by; its config is compared still.
-        const again = try docker_action.buildImage(&b, .{
-            .dir = try std.fmt.allocPrint(arena, "{s}/ctx", .{case_dir}),
-            .context = ".",
-            .dockerfile = "Dockerfile",
-        });
-        var stable = again == .image and again.image.lowers.len == built.lowers.len;
-        if (stable) for (again.image.lowers, built.lowers) |x, y| {
-            stable = stable and std.mem.eql(u8, x, y);
-        };
-        failures += try sameThroughApi(&b, arena, name, try std.fmt.allocPrint(arena, "{s}/ctx", .{case_dir}), built, stable);
         const bottom_first = try arena.alloc([]const u8, built.lowers.len);
         for (built.lowers, 0..) |l, k| bottom_first[built.lowers.len - 1 - k] = l;
         const merged = try std.fmt.allocPrint(arena, "{s}/native-{s}", .{ work, name });
@@ -354,11 +337,16 @@ test "oracle: the Dockerfile builder builds what BuildKit builds" {
         std.mem.sortUnstable(Entry, @constCast(native), {}, lessThan);
         std.mem.sortUnstable(Entry, @constCast(expected), {}, lessThan);
         failures += try compare(name, native, expected, allowed);
+        // The same build through the API: the same filesystem and config as the action's.
+        if (try viaApi(&b, arena, io, name, case_dir, work)) |api_entries| {
+            var none: [0]Allowed = .{};
+            failures += try compare(name, api_entries, native, &none);
+        } else failures += 1;
         for (allowed) |al| if (!al.seen) {
             std.debug.print("{s}: differences.txt allows {s} ({s}), which does not differ\n", .{ name, al.path, al.why });
             failures += 1;
         };
-        std.Io.Dir.cwd().deleteTree(io, merged) catch {};
+        std.Io.Dir.cwd().deleteTree(io, merged) catch |e| std.debug.print("oracle: could not remove {s}: {s}\n", .{ merged, @errorName(e) });
     }
     try std.testing.expectEqual(@as(usize, 0), failures);
 }

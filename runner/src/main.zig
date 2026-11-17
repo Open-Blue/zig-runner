@@ -5,6 +5,7 @@ const inspect = @import("inspect.zig");
 const dagger = @import("dagger.zig");
 const provisioned = @import("dagger/provisioned.zig");
 const sandbox = @import("native/sandbox.zig");
+const planner = @import("native/planner.zig");
 const net = @import("native/net.zig");
 const nft = @import("native/nft.zig");
 const key_diff = @import("native/key_diff.zig");
@@ -166,6 +167,7 @@ pub fn main(process_init: std.process.Init) !u8 {
     // started a thread when it makes its namespaces.
     if (args.len == 2 and std.mem.eql(u8, args[1], sandbox.command)) return sandbox.main(arena);
     if (args.len == 2 and std.mem.eql(u8, args[1], forward.command)) return forward.main(arena);
+    if (args.len == 6 and std.mem.eql(u8, args[1], planner.command)) return planner.main(arena, io, args[2..]);
     if (args.len == 6 and std.mem.eql(u8, args[1], net.command))
         return net.upMain(arena, args[2], args[3], args[4], args[5]);
     if (args.len == 5 and std.mem.eql(u8, args[1], sandbox.userns_command))

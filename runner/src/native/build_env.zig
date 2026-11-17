@@ -43,9 +43,14 @@ pub const Env = struct {
 pub const Host = struct {
     runFn: *const fn (h: *Host, call: RunCall) anyerror!sandbox.Ended,
     localImageFn: *const fn (h: *Host, arena: Allocator, ref: []const u8) anyerror!?LocalImage,
+    planFn: *const fn (h: *Host, call: PlanCall) anyerror!sandbox.Ended,
 
     pub fn run(h: *Host, call: RunCall) !sandbox.Ended {
         return h.runFn(h, call);
+    }
+
+    pub fn plan(h: *Host, call: PlanCall) !sandbox.Ended {
+        return h.planFn(h, call);
     }
 
     pub fn localImage(h: *Host, arena: Allocator, ref: []const u8) !?LocalImage {
@@ -62,6 +67,17 @@ pub const RunCall = struct {
     /// A build the job's Docker API makes runs its `RUN`s under its own (`Api.running`); null for a
     /// Docker action's.
     running: ?*sandbox.Running,
+    out: sandbox.Output,
+};
+
+/// The planner's run (`planner.zig`): in a root of its own (made under the job's directory, `dir`
+/// relative to it), with the spooled tar, the context and the plan directory bound in, confined.
+pub const PlanCall = struct {
+    /// `px-<n>` under the job's directory: `root`, `upper`, `work`, `merged` and `plan` below it.
+    dir: []const u8,
+    tar: []const u8,
+    ctx: []const u8,
+    running: *sandbox.Running,
     out: sandbox.Output,
 };
 

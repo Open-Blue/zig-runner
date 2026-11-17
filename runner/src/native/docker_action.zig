@@ -18,6 +18,8 @@ const job_mod = @import("../job.zig");
 const dagger = @import("../dagger.zig");
 const Backend = @import("Backend.zig");
 const build_env = @import("build_env.zig");
+const build_frames = @import("build_frames.zig");
+const planner = @import("planner.zig");
 const Env = build_env.Env;
 const sandbox = @import("sandbox.zig");
 const images = @import("images.zig");
@@ -751,7 +753,7 @@ pub fn buildImage(b: *Backend, bd: Build) !Built {
 /// own sandbox launcher.
 pub const Adapter = struct {
     b: *Backend,
-    host: build_env.Host = .{ .runFn = runFn, .localImageFn = localImageFn },
+    host: build_env.Host = .{ .runFn = runFn, .localImageFn = localImageFn, .planFn = planFn },
 
     pub fn env(ad: *Adapter) Env {
         const b = ad.b;
@@ -782,6 +784,51 @@ pub const Adapter = struct {
         defer b.workdir = workdir;
         if (call.running) |running| return b.execBuildApi(running, call.argv, call.env, call.out, call.container);
         return b.execBuild(call.argv, call.env, 0, 0, call.out, call.container);
+    }
+
+    /// The planner, confined (`Spec.confined`), in a root of nothing but its mount points.
+    fn planFn(h: *build_env.Host, call: build_env.PlanCall) anyerror!sandbox.Ended {
+        const ad: *Adapter = @fieldParentPtr("host", h);
+        const b = ad.b;
+        const arena = b.arena;
+        const cwd = std.Io.Dir.cwd();
+        const base = try std.fmt.allocPrint(arena, "{s}/{s}", .{ b.dir, call.dir });
+        for ([_][]const u8{ "root/dev", "root/proc", "root/sys", "root/tmp", "root/ctx", "root/plan", "upper", "work", "merged", "plan" }) |d|
+            try cwd.createDirPath(b.io, try std.fmt.allocPrint(arena, "{s}/{s}", .{ base, d }));
+        for ([_][]const u8{ "root/spool.tar", "root/parse" }) |f|
+            try cwd.writeFile(b.io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ base, f }), .data = "" });
+        const plan_dir = try std.fmt.allocPrint(arena, "{s}/plan", .{base});
+        // The planner is the job's root: what it writes is the slot's ids on a root runner.
+        if (b.how.userns == .mapped) for ([_][]const u8{ call.ctx, plan_dir, call.tar, try std.fmt.allocPrint(arena, "{s}/upper", .{base}) }) |p| {
+            const z = try arena.dupeSentinel(u8, p, 0);
+            _ = std.os.linux.chown(z, b.idBase(), b.idBase());
+        };
+        const rel = try std.fmt.allocPrint(arena, "{s}/", .{call.dir});
+        const spec: sandbox.Spec = .{
+            .root = b.dir,
+            .lowers = &.{try std.fmt.allocPrint(arena, "{s}root", .{rel})},
+            .upper = try std.fmt.allocPrint(arena, "{s}upper", .{rel}),
+            .work = try std.fmt.allocPrint(arena, "{s}work", .{rel}),
+            .merged = try std.fmt.allocPrint(arena, "{s}merged", .{rel}),
+            .workdir = "/",
+            .argv = &.{ "/parse", planner.command, planner.request_at, planner.tar_at, planner.context_at, planner.out_at },
+            .exec = "/parse",
+            .env = &.{"PATH=/"},
+            .binds = &.{
+                .{ .host = b.self_exe, .at = "/parse", .read_only = true, .nosuid = true },
+                .{ .host = call.tar, .at = planner.tar_at, .read_only = true, .nosuid = true },
+                .{ .host = call.ctx, .at = planner.context_at, .read_only = false, .nosuid = true },
+                .{ .host = plan_dir, .at = "/plan", .read_only = false, .nosuid = true },
+            },
+            .userns = b.how.userns,
+            .id_base = b.idBase(),
+            .id_count = Backend.ids_per_slot,
+            .cgroup = if (b.job_cgroup) |j| j.stepsDir() else null,
+            .image_layers = 1,
+            .confined = true,
+        };
+        const ended = try sandbox.run(arena, b.io, b.how.argv_prefix, spec, call.running, call.out);
+        return ended;
     }
 
     fn localImageFn(h: *build_env.Host, arena: Allocator, ref: []const u8) anyerror!?build_env.LocalImage {
@@ -882,8 +929,11 @@ pub const Observer = struct {
 };
 
 pub const ApiRequest = struct {
-    /// The unpacked context, absolute.
+    /// The context's directory, absolute, empty: the planner unpacks the tar into it.
     dir: []const u8,
+    /// The spooled tar (absolute) and the build's number (the planner's directory, `px-<id>`).
+    tar: []const u8,
+    id: u32,
     dockerfile: []const u8,
     options: dockerfile.Options,
     api: *const Api,
@@ -918,24 +968,34 @@ pub fn buildApi(b: *Backend, req: ApiRequest) !ApiBuilt {
 /// `buildApi` for a build's `Env`: the job's own, or the builder process's.
 pub fn buildApiIn(env: *Env, req: ApiRequest) !ApiBuilt {
     const arena = req.arena;
+    var world: ApiWorld = .{ .env = env, .arena = arena, .net = .{ .cancel = req.cancel, .deny_local = true } };
+    const planned = switch (try planThroughChild(env, req, &world)) {
+        .failed => |why| return .{ .failed = why },
+        .ok => |p| p,
+    };
+    // The planner is dead and gone: the context is the executor's to read now, through a view that
+    // follows no link.
     const ctx = (try layer_view.View.open(arena, env.io, &.{req.dir}, "", env.opaque_xattr)) orelse
         return .{ .failed = "the build context is empty" };
     defer ctx.close();
-    const missing = try std.fmt.allocPrint(arena, "Cannot locate specified Dockerfile: {s}", .{req.dockerfile});
-    const df = (try ctx.resolve(req.dockerfile, true)) orelse return .{ .failed = missing };
-    if (df.kind != .file) return .{ .failed = missing };
-    const text = try df.parent().readFileAlloc(env.io, df.name, arena, .limited(max_dockerfile));
     try ignoreFilesOf(env, arena, req.dockerfile, &.{}, ctx);
-    const p = planTextFor(env, arena, text, ctx, .api, req.options, .{ .cancel = req.cancel, .deny_local = true }) catch |e| return switch (e) {
-        error.Refused => .{ .failed = env.build_reason },
-        error.Cancelled => .{ .failed = "the build was cancelled" },
-        error.LocalAddress => .{ .failed = "an ADD of an address of the machine itself (loopback, link-local) is refused: the fetch is made from the runner's network, not the job's" },
-        else => e,
+    world.ctx = ctx;
+    // What an `ADD` fetches, by this side, before a key is made of it.
+    for (planned.plan.stages) |stage| for (stage.steps) |step| if (step.op == .copy) for (step.op.copy.sources) |src| if (src == .url) {
+        if (world.urls.get(src.url.url) != null) continue;
+        const got = fetchUrl(env, arena, src.url.url, req.cancel, &world.added) catch |e| return .{ .failed = switch (e) {
+            error.Cancelled => "the build was cancelled",
+            error.LocalAddress => "an ADD of an address of the machine itself (loopback, link-local) is refused: the fetch is made from the runner's network, not the job's",
+            else => try std.fmt.allocPrint(arena, "ADD of {s} failed: {s}", .{ src.url.url, @errorName(e) }),
+        } };
+        try world.urls.put(arena, src.url.url, got);
     };
-    if (req.observer) |o| switch (try dockerfile.parse(arena, text)) {
-        .ok => |ins| o.plannedFn(o, p, ins),
-        .refused => {},
+    const salt = req.options.salt;
+    const p = dockerfile.rekeyApi(arena, planned.plan, salt, &world.iface) catch |e| switch (e) {
+        error.SourceMissing => return .{ .failed = "a source of a COPY is not in the build context" },
+        else => return e,
     };
+    if (req.observer) |o| o.plannedFn(o, p, planned.ins);
     const store: layers.Store = .{
         .dir = env.dir,
         .store = env.store_cfg,
@@ -971,6 +1031,172 @@ pub fn buildApiIn(env: *Env, req: ApiRequest) !ApiBuilt {
                 try std.fmt.allocPrint(arena, "The command on line {d} returned a non-zero code: {d}", .{ f.line, f.code }) },
         },
     };
+}
+
+/// The one `ADD` of `url`, fetched by the executor: into the job's directory, hashed, bounded by
+/// what a build may add in all (`Net.add_budget`) and cancelled with the build.
+fn fetchUrl(env: *Env, arena: Allocator, url: []const u8, cancel: ?*const std.atomic.Value(bool), added: *u64) !dockerfile.Fetched {
+    const net: Net = .{ .cancel = cancel, .deny_local = true };
+    if (net.deny_local and hostIsLocal(url)) return error.LocalAddress;
+    if (added.* >= net.add_budget) return error.TooMuchAdded;
+    const res = try try cancellable(net_client.Error!net_client.Response, env.io, cancel, net_client.fetch, .{ arena, env.io, net_client.Options{
+        .url = url,
+        .max_response = std.math.lossyCast(usize, @min(max_add_bytes, net.add_budget - added.*)),
+        .first_byte = .fromSeconds(30),
+        .read_idle = .fromSeconds(30),
+        .deadline = .fromSeconds(600),
+    } });
+    if (res.status != .ok) return error.BadStatus;
+    added.* += res.body.len;
+    var sum: [32]u8 = undefined;
+    Sha256.hash(res.body, &sum, .{});
+    const hex = std.fmt.bytesToHex(sum, .lower);
+    const file = try std.fmt.allocPrint(arena, "{s}/ADD-{s}", .{ env.dir, hex[0..32] });
+    try std.Io.Dir.cwd().writeFile(env.io, .{ .sub_path = file, .data = res.body });
+    return .{ .file = file, .digest = hex };
+}
+
+/// A base the executor has: the image, its id (made when a key needs it), and where it came from.
+const BaseEntry = struct {
+    ref: []const u8,
+    image: ?images.Image = null,
+    id: ?[]const u8 = null,
+    local: bool = false,
+    missing: []const u8 = "",
+};
+
+/// What the keys of an API build need of the world (`dockerfile.KeyWorld`): the executor's own
+/// answers, from the bases it resolved, the context it reads and the fetches it made.
+const ApiWorld = struct {
+    env: *Env,
+    arena: Allocator,
+    net: Net,
+    ctx: ?*layer_view.View = null,
+    bases: std.ArrayList(BaseEntry) = .empty,
+    urls: std.StringHashMapUnmanaged(dockerfile.Fetched) = .empty,
+    added: u64 = 0,
+    iface: dockerfile.KeyWorld = .{ .baseFn = base, .sourcesFn = sources, .urlFn = urlOf },
+
+    fn base(w: *const dockerfile.KeyWorld, rootfs: []const u8) ?dockerfile.KeyWorld.Resolved {
+        const self: *ApiWorld = @constCast(@fieldParentPtr("iface", w));
+        const prefix = "/base/";
+        if (!std.mem.startsWith(u8, rootfs, prefix)) return null;
+        const n = std.fmt.parseInt(usize, rootfs[prefix.len..], 10) catch return null;
+        if (n >= self.bases.items.len) return null;
+        const e = &self.bases.items[n];
+        const image = e.image orelse return null;
+        if (e.id == null) e.id = baseId(self.arena, self.env.io, image) catch return null;
+        return .{ .id = e.id.?, .rootfs = image.rootfs, .layers = image.layers };
+    }
+
+    fn sources(w: *const dockerfile.KeyWorld, arena: Allocator, paths: []const []const u8) anyerror![64]u8 {
+        const self: *const ApiWorld = @fieldParentPtr("iface", w);
+        return dockerfile.contextDigest(arena, self.ctx.?, paths);
+    }
+
+    fn urlOf(w: *const dockerfile.KeyWorld, url: []const u8) ?dockerfile.Fetched {
+        const self: *const ApiWorld = @fieldParentPtr("iface", w);
+        return self.urls.get(url);
+    }
+};
+
+const Planned = struct { plan: dockerfile.Plan, ins: []const dockerfile.Instruction };
+
+/// The plan of the request's Dockerfile, made by the confined planner (`planner.zig`) in as many
+/// rounds as it needs bases resolved, and read here as hostile input (`build_frames.decode`).
+fn planThroughChild(env: *Env, req: ApiRequest, world: *ApiWorld) !union(enum) { ok: Planned, failed: []const u8 } {
+    const arena = req.arena;
+    const cwd = std.Io.Dir.cwd();
+    const dir = try std.fmt.allocPrint(arena, "px-{d}", .{req.id});
+    const plan_dir = try std.fmt.allocPrint(arena, "{s}/{s}/plan", .{ env.dir, dir });
+    var round: u32 = 0;
+    while (round < 16) : (round += 1) {
+        if (req.cancel) |c| if (c.load(.acquire)) return .{ .failed = "the build was cancelled" };
+        // The request: the bases resolved so far, by number.
+        const wire = try arena.alloc(build_frames.Request.Base, world.bases.items.len);
+        for (world.bases.items, wire) |e, *w| {
+            var cfg = e.image orelse images.Image{ .rootfs = "" };
+            cfg.rootfs = "";
+            cfg.layers = &.{};
+            cfg.healthcheck = null;
+            cfg.digest = null;
+            cfg.manifest = null;
+            w.* = .{ .ref = e.ref, .config = cfg, .local = e.local, .missing = e.missing };
+        }
+        const pairs = try arena.alloc(build_frames.Request.Pair, req.options.build_args.len);
+        for (req.options.build_args, pairs) |a, *p| p.* = .{ .name = a.name, .value = a.value };
+        const lpairs = try arena.alloc(build_frames.Request.Pair, req.options.labels.len);
+        for (req.options.labels, lpairs) |a, *p| p.* = .{ .name = a.name, .value = a.value };
+        var json: std.Io.Writer.Allocating = .init(arena);
+        try std.json.Stringify.value(build_frames.Request{
+            .dockerfile = req.dockerfile,
+            .build_args = pairs,
+            .labels = lpairs,
+            .target = req.options.target,
+            .bases = wire,
+        }, .{}, &json.writer);
+        // (The plan directory is made by `planFn`; the request is written once it is there.)
+        try cwd.createDirPath(env.io, plan_dir);
+        try cwd.writeFile(env.io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}/request.json", .{plan_dir}), .data = json.written() });
+        cwd.deleteFile(env.io, try std.fmt.allocPrint(arena, "{s}/out.bin", .{plan_dir})) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        };
+        var tail: Backend.Captured = .{ .arena = arena };
+        const ended = try env.host.plan(.{
+            .dir = dir,
+            .tar = req.tar,
+            .ctx = req.dir,
+            .running = req.api.running,
+            .out = tail.output(),
+        });
+        if (req.cancel) |c| if (c.load(.acquire)) return .{ .failed = "the build was cancelled" };
+        if (ended.failure.len > 0) return .{ .failed = try std.fmt.allocPrint(arena, "the planner could not run: {s}", .{ended.failure}) };
+        const bytes = cwd.readFileAlloc(env.io, try std.fmt.allocPrint(arena, "{s}/out.bin", .{plan_dir}), arena, .limited(build_frames.max_frame + 1)) catch
+            return .{ .failed = try std.fmt.allocPrint(arena, "the planner ended with code {d} and no plan: {s}", .{ ended.code, try printable(arena, tail.tail()) }) };
+        var why: []const u8 = "";
+        const out = build_frames.decode(arena, bytes, &why) catch |e| switch (e) {
+            error.Invalid, error.BadFrame, error.TooBig => return .{ .failed = if (why.len > 0) why else "the planner's frame is malformed" },
+            else => return e,
+        };
+        switch (out.status) {
+            .failed => return .{ .failed = out.why },
+            .refused => return .{ .failed = try std.fmt.allocPrint(arena, "line {d}: {s}", .{ out.line, out.why }) },
+            .need => {
+                if (out.need.len == 0) return .{ .failed = "the planner asked for nothing" };
+                for (out.need) |ref| {
+                    if (world.bases.items.len >= build_frames.max_bases) return .{ .failed = "the Dockerfile names too many images" };
+                    try world.bases.append(arena, try resolveBase(env, arena, ref, req.cancel));
+                }
+            },
+            .plan => {
+                const ins = try arena.alloc(dockerfile.Instruction, out.ins.len);
+                for (out.ins, ins) |x, *i| i.* = .{ .kind = x.kind, .text = x.text, .line = x.line };
+                return .{ .ok = .{ .plan = out.plan.?, .ins = ins } };
+            },
+        }
+    }
+    return .{ .failed = "the Dockerfile needs more rounds of bases than a build may" };
+}
+
+/// A base the planner asked for: the job's own image of that name, else the native store's (pulled
+/// when it must be, and stopped with the build).
+fn resolveBase(env: *Env, arena: Allocator, ref: []const u8, cancel: ?*const std.atomic.Value(bool)) !BaseEntry {
+    if (try env.host.localImage(arena, ref)) |local|
+        return .{ .ref = ref, .image = local.config, .id = local.id, .local = true };
+    const found = cancellable(anyerror!images.Found, env.io, cancel, find, .{ env.arena, env.gpa, env.io, env.images_dir, env.store_cfg.root, ref, env.image_tag_ttl_s, env.held }) catch
+        return .{ .ref = ref, .missing = "the build was cancelled" };
+    return switch (found catch |e| return .{ .ref = ref, .missing = try std.fmt.allocPrint(arena, "the image {s} could not be had: {s}", .{ ref, @errorName(e) }) }) {
+        .image => |i| .{ .ref = ref, .image = i },
+        .missing => |w| .{ .ref = ref, .missing = w },
+    };
+}
+
+/// A client's text as one short printable line.
+fn printable(arena: Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (text[0..@min(text.len, 300)]) |c| try out.append(arena, if (c < 0x20 or c == 0x7f) '?' else c);
+    return out.items;
 }
 
 /// The action's environment, as the Dagger path's container gives its command

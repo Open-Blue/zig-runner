@@ -1670,6 +1670,14 @@ pub fn removeTree(arena: Allocator, io: std.Io, p: []const u8) void {
     };
 }
 
+/// `name` in the directory `fd` given `mode`, never through a link (`fchmodat2`, Linux 6.6; before it
+/// the listing's own word that it is a directory, which nothing can change in a tree whose writers
+/// are gone).
+fn chmodNoFollow(fd: linux.fd_t, name: [*:0]const u8, mode: u32) void {
+    const rc = linux.fchmodat2(fd, name, mode, linux.AT.SYMLINK_NOFOLLOW);
+    if (linux.errno(rc) == .NOSYS) _ = linux.fchmodat(fd, name, mode);
+}
+
 /// Every directory under `p` given its owner's permissions, top down, with no limit on depth: a
 /// directory is opened only once the ones above it are searchable again.
 fn chmodDirs(arena: Allocator, io: std.Io, p: []const u8) void {
@@ -1687,7 +1695,7 @@ fn chmodDirs(arena: Allocator, io: std.Io, p: []const u8) void {
         const nodes = listDir(arena, io, fd) catch continue;
         for (nodes) |n| {
             if (n.kind() != linux.S.IFDIR) continue;
-            _ = linux.fchmodat(fd, n.name, 0o700);
+            chmodNoFollow(fd, n.name, 0o700);
             const sub = if (rel.len == 0)
                 arena.dupe(u8, n.name) catch return
             else

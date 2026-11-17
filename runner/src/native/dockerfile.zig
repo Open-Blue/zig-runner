@@ -1083,7 +1083,7 @@ pub const KeyWorld = struct {
     /// The file an `ADD <url>` fetched (the executor's own) and its content's digest.
     urlFn: *const fn (w: *const KeyWorld, url: []const u8) ?Fetched,
 
-    pub const Resolved = struct { id: []const u8, rootfs: []const u8 };
+    pub const Resolved = struct { id: []const u8, rootfs: []const u8, layers: []const []const u8 = &.{} };
 };
 
 /// The plan of an API build with the keys the executor makes. The planner (unprivileged, handling
@@ -1110,7 +1110,7 @@ pub fn rekeyApi(arena: Allocator, plan_in: Plan, salt: []const u8, w: *const Key
             .image => |im| {
                 const got = w.baseFn(w, im.rootfs) orelse return error.BadPlan;
                 parent = apiFromKey(try images.normalize(arena, im.ref), got.id);
-                stage.base = .{ .image = .{ .ref = im.ref, .rootfs = got.rootfs, .layers = im.layers } };
+                stage.base = .{ .image = .{ .ref = im.ref, .rootfs = got.rootfs, .layers = got.layers } };
             },
         }
         const steps = try arena.alloc(Step, stage.steps.len);

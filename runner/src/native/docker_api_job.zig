@@ -275,17 +275,13 @@ fn run(st: *State, call: *docker_api.BuildCall) !void {
     const dir = try std.fmt.allocPrint(a, "{s}/api-build-{d}", .{ b.dir, call.id });
     try std.Io.Dir.cwd().createDirPath(b.io, dir);
     defer Store.removeTree(a, b.io, dir);
-    var why: []const u8 = "";
     if (st.unpacked.load(.acquire) +| call.tar_bytes > context_budget) return fail(call, "this job's builds have used " ++
         "the contexts the runner allows one job (4 GiB in all)");
-    const unpacked = docker_build.unpack(a, b.io, dir, call.tar_path, call.limits, &active.flag, &why) catch |e| switch (e) {
-        error.BadContext => return fail(call, why),
-        else => return e,
-    };
+    // The tar is unpacked by the confined planner, not here: its size is what counts.
+    _ = st.unpacked.fetchAdd(call.tar_bytes, .acq_rel);
 
     var tell: Telling = .{ .arena = a, .sink = call.sink, .quiet = q.quiet };
-    // The CLI says "Sending build context" itself.
-    _ = st.unpacked.fetchAdd(unpacked.bytes, .acq_rel);
+    // (The CLI says "Sending build context" itself.)
 
     var args: std.ArrayList(dockerfile.Var) = .empty;
     for (q.build_args) |p| try args.append(a, .{ .name = p.name, .value = p.value });
@@ -301,6 +297,8 @@ fn run(st: *State, call: *docker_api.BuildCall) !void {
     active.api.out = tell.output();
     const built = try docker_action.buildApi(b, .{
         .dir = dir,
+        .tar = call.tar_path,
+        .id = call.id,
         .dockerfile = q.dockerfile,
         .options = .{ .build_args = args.items, .target = q.target, .salt = salt, .labels = labels.items },
         .api = &active.api,
