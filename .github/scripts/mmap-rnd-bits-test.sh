@@ -18,7 +18,7 @@ printf '#!/bin/sh\nexit 0\n' >"$scratch/ignore"
 # shellcheck disable=SC2016 # the fake's own variables
 printf '#!/bin/sh\necho "${3#vm.mmap_rnd_bits=}" > "$PROC_SYS/vm/mmap_rnd_bits"\n' >"$scratch/accept"
 chmod +x "$scratch/refuse" "$scratch/ignore" "$scratch/accept"
-run() { PROC_SYS=$scratch/sys SYSCTL=$scratch/$1 ./mmap-rnd-bits.sh 28 >"$scratch/out" 2>&1; }
+run() { READ=cat PROC_SYS=$scratch/sys SYSCTL=$scratch/$1 ./mmap-rnd-bits.sh 28 >"$scratch/out" 2>&1; }
 
 if run accept; then fail "a missing key passed"; fi
 grep -q "::error title=vm.mmap_rnd_bits::.*mmap_rnd_bits cannot be read" "$scratch/out" || fail "missing key not named: $(cat "$scratch/out")"
