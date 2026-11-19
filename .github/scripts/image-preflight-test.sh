@@ -35,7 +35,7 @@ grep -q '^::error title=Runner image lacks a tool::ip nsenter ' "$scratch/out" |
 grep -q 'preflight: kernel ' "$scratch/out" || fail "no kernel line"
 grep -q 'preflight: page size [0-9]' "$scratch/out" || fail "no page size line"
 
-run python3 nft? >"$scratch/out" 2>&1 || fail "an optional tool's absence failed: $(cat "$scratch/out")"
+run python3 'nft?' >"$scratch/out" 2>&1 || fail "an optional tool's absence failed: $(cat "$scratch/out")"
 grep -q 'nft not installed (optional)' "$scratch/out" || fail "optional absence not said"
 
 run python3 unshare >"$scratch/out" 2>&1 || fail "all present failed"
