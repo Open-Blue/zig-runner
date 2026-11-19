@@ -428,6 +428,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # What this image gives the job, as facts in its log, and a failure naming a missing tool
+      # (image-preflight.sh), not a test that blames itself.
+      - name: Runner image preflight
+        run: .github/scripts/image-preflight.sh python3 ip unshare nsenter docker 'nft?'
+
       - name: Install Zig
         run: .github/scripts/install-zig.sh
 
@@ -692,6 +697,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # What this image gives the job, as facts in its log, and a failure naming a missing tool
+      # (image-preflight.sh), not a test that blames itself.
+      - name: Runner image preflight
+        run: .github/scripts/image-preflight.sh python3 ip unshare nsenter docker 'nft?'
+
       - name: Install Zig
         run: .github/scripts/install-zig.sh
 
@@ -796,6 +806,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # What this image gives the job, as facts in its log, and a failure naming a missing tool
+      # (image-preflight.sh), not a test that blames itself.
+      - name: Runner image preflight
+        run: .github/scripts/image-preflight.sh python3 ip unshare nsenter docker 'nft?'
 
       - name: Install Zig
         run: .github/scripts/install-zig.sh

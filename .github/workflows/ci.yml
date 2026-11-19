@@ -116,6 +116,10 @@ jobs:
       - name: memory-peak.sh leaves nothing behind
         run: .github/scripts/memory-peak-test.sh
 
+      # image-preflight.sh's failure path: a PATH with only some tools names each missing one.
+      - name: Runner image preflight names a missing tool
+        run: .github/scripts/image-preflight-test.sh
+
       # The release binaries, against their pinned checksums: a new version (Renovate's) fails
       # here until they are updated. shfmt shows the diff that would format a script.
       - name: shfmt
@@ -305,6 +309,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # What this image gives the job, as facts in its log, and a failure naming a missing tool
+      # (image-preflight.sh), not a test that blames itself.
+      - name: Runner image preflight
+        run: .github/scripts/image-preflight.sh docker
 
       - name: Whether this change can affect the tests
         id: scope
@@ -496,6 +505,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # What this image gives the job, as facts in its log, and a failure naming a missing tool
+      # (image-preflight.sh), not a test that blames itself.
+      - name: Runner image preflight
+        if: runner.environment == 'github-hosted'
+        run: .github/scripts/image-preflight.sh python3 ip unshare nsenter docker 'nft?'
 
       # Skipped, still reporting, on a change that cannot affect them (ci-scope.sh); never on main.
       - name: Whether this change can affect the build and tests
@@ -731,6 +746,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # What this image gives the job, as facts in its log, and a failure naming a missing tool
+      # (image-preflight.sh), not a test that blames itself.
+      - name: Runner image preflight
+        run: .github/scripts/image-preflight.sh python3 ip unshare nsenter docker 'nft?'
+
       - name: Whether this change can affect the tests
         id: scope
         env:
@@ -875,6 +895,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # What this image gives the job, as facts in its log, and a failure naming a missing tool
+      # (image-preflight.sh), not a test that blames itself.
+      - name: Runner image preflight
+        run: .github/scripts/image-preflight.sh python3 ip unshare nsenter docker 'nft?'
+
       # Razorbill (a Pi) runs 16 KiB pages; GitHub's arm64 runner does not, so a test that depends
       # on the page size passes here on 4 KiB and is not seen at 16: said in the log, so a runner
       # image that changes it is noticed.
@@ -945,6 +970,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # What this image gives the job, as facts in its log, and a failure naming a missing tool
+      # (image-preflight.sh), not a test that blames itself.
+      - name: Runner image preflight
+        run: .github/scripts/image-preflight.sh docker
 
       - name: Whether this change can affect the runner
         id: scope
