@@ -62,6 +62,7 @@ comptime {
     _ = @import("action.zig");
     _ = @import("config.zig");
     _ = @import("admission.zig");
+    _ = @import("admission_replay.zig");
     _ = @import("github/http.zig");
     _ = @import("github/jitconfig.zig");
     _ = @import("github/rsa_sign.zig");
