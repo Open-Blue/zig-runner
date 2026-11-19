@@ -53,14 +53,48 @@ started=$SECONDS
 stop="fuzz-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 echo "::stop-commands::$stop"
 status=0
-# GNU timeout signals the whole process group: the build runner and the test it runs.
-timeout --kill-after=30 "$((minutes * 60))" \
-	zig build test -Dllvm -Dtest-filter="fuzz: $target" --fuzz="$runs" 2>&1 | tee "$out/log" ||
-	status=$?
+# In chunks of a million runs, each a `zig build --fuzz` of its own on the corpus the last one kept
+# (the runs add up: the report says "Runs: 20466 -> 1026029" for each), so that the job says how
+# long each chunk took: the fuzzer itself says nothing until it finishes, and a target that gets
+# dearer from night to night shows in the chunks of one night. The time limit is the whole run's.
+case $runs in
+*[Kk]) total=$((${runs%[Kk]} * 1000)) ;;
+*[Mm]) total=$((${runs%[Mm]} * 1000000)) ;;
+*) total=$runs ;;
+esac
+chunk=1000000
+: >"$out/log"
+done_runs=0
+remaining=$total
+number=0
+while ((remaining > 0)); do
+	n=$((remaining < chunk ? remaining : chunk))
+	number=$((number + 1))
+	left=$((minutes * 60 - (SECONDS - started)))
+	if ((left <= 0)); then
+		status=124
+		break
+	fi
+	chunk_started=$SECONDS
+	chunk_status=0
+	# GNU timeout signals the whole process group: the build runner and the test it runs.
+	timeout --kill-after=30 "$left" \
+		zig build test -Dllvm -Dtest-filter="fuzz: $target" --fuzz="$n" 2>&1 | tee "$out/chunk.log" ||
+		chunk_status=$?
+	cat "$out/chunk.log" >>"$out/log"
+	got=$(awk '/^Runs: / { print $4 - $2; exit }' "$out/chunk.log" 2>/dev/null || true)
+	echo "fuzz: $target: chunk $number: ${got:-no count} of $n runs in $((SECONDS - chunk_started)) s, load $(cut -d' ' -f1 /proc/loadavg), $((SECONDS - started)) s in (exit $chunk_status)"
+	done_runs=$((done_runs + ${got:-0}))
+	if ((chunk_status != 0)); then
+		status=$chunk_status
+		break
+	fi
+	[[ -e .zig-cache/f/crash ]] && break
+	grep -q '^error: ' "$out/chunk.log" && break
+	remaining=$((remaining - n))
+done
 echo "::$stop::"
-# The fuzzer's report says "Runs: 20466 -> 1026029": the runs of this one, on top of the kept corpus's.
-done_runs=$(awk '/^Runs: / { print $4 - $2; exit }' "$out/log" 2>/dev/null || true)
-echo "fuzz: $target: ${done_runs:-no count (the fuzzer reports only when it finishes)} runs in $((SECONDS - started)) s (exit $status)"
+echo "fuzz: $target: $done_runs runs in $((SECONDS - started)) s (exit $status)"
 
 # `zig build --fuzz=N` exits 0 even when the test failed (Zig 0.17 prints the failure, saves the
 # input, and goes on to its report), so the crash file and the build runner's `error:` lines decide.
