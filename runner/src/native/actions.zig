@@ -272,10 +272,38 @@ pub const git_config_path = "/etc/zig-runner-gitconfig";
 /// (`GIT_CONFIG_COUNT`, `-c`) because a local fetch spawns `upload-pack` with that stripped
 /// (git's `local_repo_env`), and git before 2.50 reads `safe.directory` only from a global or
 /// system file there. Written by the runner, bound read-only for the step and gone after it.
+///
+/// No automatic maintenance or gc either: git 2.48 and later start `git maintenance run --auto`
+/// in the background after a fetch, which takes `.git/objects/maintenance.lock` and writes the
+/// repository while the step goes on. The checkout's `find . -exec touch` then met the lock gone
+/// ("touch: setting times of './.git/objects/maintenance.lock': No such file or directory", the
+/// checkout failed), and a fetch into a layer could still be written after its step had ended.
+/// Only the runner's own fetches read this file; a job's own git keeps its defaults.
 pub const git_config_file: sandbox.Spec.File = .{
     .path = git_config_path,
-    .contents = "[safe]\n\tdirectory = *\n",
+    .contents = "[safe]\n\tdirectory = *\n[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n",
 };
+
+test "the runner's git config turns off git's automatic maintenance and gc, as git reads it" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "gitconfig", .data = git_config_file.contents });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const script = try std.fmt.allocPrint(arena,
+        \\command -v git >/dev/null || exit 77
+        \\export GIT_CONFIG_GLOBAL='{s}/gitconfig' GIT_CONFIG_NOSYSTEM=1
+        \\echo "$(git config --global --get maintenance.auto) $(git config --global --get gc.auto) $(git config --global --get safe.directory)"
+    , .{root});
+    const res = try std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", script } });
+    if (res.term == .exited and res.term.exited == 77) return error.SkipZigTest;
+    errdefer std.debug.print("git read: {s}{s}\n", .{ res.stdout, res.stderr });
+    try std.testing.expect(res.term == .exited and res.term.exited == 0);
+    try std.testing.expectEqualStrings("false 0 *\n", res.stdout);
+}
 
 /// git's environment in the job's image before the base is made (the container's env is not set
 /// yet): its PATH and HOME, no prompt, its global config the runner's own (`git_config_file`: the
