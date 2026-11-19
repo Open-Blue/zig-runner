@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'CI on a push to main: "Every test file is compiled" runs in the hosted prebuild job, not on the Pi (about 2.5 min and 3.6 GB less on the Pi job, to be confirmed on the first push to main), and the Test step''s `memory-peak:` line reports a peak on the prebuilt path (sampled from /proc where there is no cgroup or GNU time) instead of "unavailable".'
-time: 2026-11-16T01:52:52.330234355-05:00

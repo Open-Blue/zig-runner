@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A deploy''s restart no longer kills the native jobs a runner is running: deploy/zig-runner.service sets KillMode=mixed, so systemd''s SIGTERM goes to the runner alone, which lets running jobs finish (RUNNER_STOP_GRACE_SECS) as it says. With the default, control-group, the signal also reached every process of the jobs in the unit''s cgroup and their steps died at once (exit 143). Existing units take it with a drop-in (docs/OPERATIONS.md).'
-time: 2026-11-15T23:47:47.205981194-05:00
