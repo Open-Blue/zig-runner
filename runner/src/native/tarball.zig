@@ -998,6 +998,56 @@ test "a remote action fetched in an image with no git: its archive extracted, th
     try std.testing.expect(!srv.cdn_saw_auth.load(.acquire));
 }
 
+test "an action on a host the workflow names is not downloaded by the runner in an image with no git; the instance's own server still is" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    const ar = try testArchiveOf(arena, &tmp, "printf 'runs:\\n  using: composite\\n  steps:\\n    - shell: bash\\n      run: echo instance-ran\\n' > action.yml");
+    try tmp.dir.writeFile(io, .{ .sub_path = "nogit.sh", .data = "#!/bin/sh\necho \"sh: 1: git: not found\" >&2\nexit 127\n", .flags = .{ .permissions = .fromMode(0o755) } });
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{
+        .host = try std.fmt.allocPrint(arena, "{s}/nogit.sh", .{ar.root}),
+        .at = "/usr/bin/git",
+    }} });
+    // The host's loopback: the instance's server, and another service of the host's the workflow
+    // points a URL at.
+    var instance: TestServer = .{ .archive_path = "/o/act/archive/v1.tar.gz", .body = ar.tgz };
+    try instance.start();
+    defer instance.stop();
+    var other: TestServer = .{ .archive_path = "/o/act/archive/v1.tar.gz", .body = ar.tgz };
+    try other.start();
+    defer other.stop();
+
+    // First the foreign host alone: refused, the reason said, nothing reached.
+    var steps = [_]job_mod.Step{ usesStep("foreign", "o", "act", "v1", &.{}), usesStep("own", "o", "act", "v1", &.{}) };
+    steps[0].action.uses.source = .url;
+    steps[0].action.uses.url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{other.port});
+    var job = testJob(steps[0..1]);
+    job.github.server_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{instance.port});
+    var env: std.process.Environ.Map = .init(arena);
+    var w: Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    var res = try dagger.run(arena, io, &env, .{ .native = cfg, .step_user = .root, .gpa = std.testing.allocator }, job, &log);
+    errdefer std.debug.print("{s}\n", .{w.written()});
+    try std.testing.expect(res.steps.len == 0 or res.steps[0].outcome != .success);
+    try std.testing.expect(std.mem.indexOf(u8, w.written(), "the runner does not fetch other hosts from its own network") != null);
+    try std.testing.expectEqual(@as(u32, 0), other.requests.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), instance.requests.load(.acquire));
+
+    // The instance's own server, in the same image: fetched.
+    w.clearRetainingCapacity();
+    job = testJob(steps[1..2]);
+    job.github.server_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{instance.port});
+    res = try dagger.run(arena, io, &env, .{ .native = cfg, .step_user = .root, .gpa = std.testing.allocator }, job, &log);
+    try std.testing.expectEqual(dagger.Outcome.success, res.steps[0].outcome);
+    try std.testing.expect(std.mem.indexOf(u8, w.written(), "instance-ran") != null);
+    try std.testing.expect(instance.requests.load(.acquire) > 0);
+    try std.testing.expectEqual(@as(u32, 0), other.requests.load(.acquire));
+}
+
 test "after the first fetch finds no git, the next action's fetch does not run git again" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();

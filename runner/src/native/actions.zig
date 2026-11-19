@@ -400,6 +400,17 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
         }
     }
     if (b.no_git) {
+        // The archive is downloaded by this process, from the host's network, where git ran in the
+        // job's: a host the workflow names (`https://host/o/r@v1`) is not the host's to reach (a
+        // port probe of its loopback, its LAN, a metadata service), however it is spelt or where it
+        // redirects. Only the instance's own servers are (`isInstanceServer`).
+        if (!isInstanceServer(job, server)) return .{ .unresolved = try std.fmt.allocPrint(
+            arena,
+            "Unable to resolve action `{s}`: it is on {s}, and the job's image has no git: " ++
+                "an action on a server other than the instance's needs git in the image, " ++
+                "the runner does not fetch other hosts from its own network",
+            .{ ref_label, server },
+        ) };
         if (tarball.refProblem(ref)) |why| return .{ .unresolved = try std.fmt.allocPrint(
             arena,
             "Unable to resolve action `{s}`: {s}",
@@ -446,6 +457,14 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
     const layer = try b.layerPath(b.layers.items.len - 1);
     if (sha.len == 40) try b.fetched_trees.put(arena, tree_key, .{ .layer = layer, .sha = sha });
     return readAction(b, u, ref_label, repository, ref, mount, layer, sha);
+}
+
+/// Whether `server` (as `Uses.resolve` gives it) is one the instance named: its own address, or the
+/// default actions URL it sent with the task. Not a host a workflow names.
+fn isInstanceServer(job: job_mod.Job, server: []const u8) bool {
+    const own = std.mem.trimEnd(u8, job.github.server_url, "/");
+    const actions = std.mem.trimEnd(u8, job.github.actions_url, "/");
+    return std.mem.eql(u8, server, own) or (actions.len > 0 and std.mem.eql(u8, server, actions));
 }
 
 /// Where the tree is mounted: GitHub's `/github/_actions/<repository>/<ref>` for the job's default
