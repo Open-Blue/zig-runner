@@ -124,10 +124,18 @@ pub fn transientText(text: []const u8) bool {
 }
 
 /// Whether a failed tarball download's message (`tarball.fetchInto`'s `.failed`: "could not
-/// download <url>: <why or the error's name>") is a transport failure. An HTTP status is not
-/// judged here: the download already tried a 5xx and a 429 again (`tarball.max_retries`).
+/// download <url>: <why or the error's name>") is a transport failure: the part after the URL is
+/// one of the client's error names, whole. The URL is not looked at (a repository may be named
+/// `ConnectionRefused`), and nor is an unpack's failure ("could not unpack ..."). An HTTP status
+/// is not judged here: the download already tried a 5xx and a 429 again (`tarball.max_retries`).
 pub fn transientDownload(text: []const u8) bool {
-    for (transient_errors) |n| if (std.mem.indexOf(u8, text, n) != null) return true;
+    const prefix = "could not download ";
+    if (!std.mem.startsWith(u8, text, prefix)) return false;
+    const rest = text[prefix.len..];
+    // The URL has no space, so the first ": " ends it (its own "://" has none).
+    const at = std.mem.indexOf(u8, rest, ": ") orelse return false;
+    const why = std.mem.trim(u8, rest[at + 2 ..], " \r\n");
+    for (transient_errors) |n| if (std.mem.eql(u8, why, n)) return true;
     return false;
 }
 
@@ -331,6 +339,12 @@ test "transientDownload: the client's transport errors, not a status or its own 
     try t.expect(transientDownload("could not download https://x/y: TlsInitializationFailed"));
     // A body cut short after bytes came is not told from the archive being wrong: not retried.
     try t.expect(!transientDownload("could not download https://x/y: ReadFailed"));
+    // Only the error part counts: a repository named after an error is not one, and a failure
+    // that is not the download's (the unpack's) is never one.
+    try t.expect(!transientDownload("could not download https://github.com/o/ConnectionRefused/archive/v1.tar.gz: HTTP 404 (not found, or a private repository the job's token cannot read)"));
+    try t.expect(!transientDownload("could not download https://github.com/o/UnknownHostName/archive/v1.tar.gz: TooManyRedirects"));
+    try t.expect(transientDownload("could not download https://github.com/o/ConnectionRefused/archive/v1.tar.gz: ConnectionRefused"));
+    try t.expect(!transientDownload("could not unpack https://github.com/o/r/archive/v1.tar.gz in the job's image (it needs `tar` and `gzip`): ConnectionRefused"));
     try t.expect(!transientDownload("could not download https://x/y: EndOfStream"));
 }
 

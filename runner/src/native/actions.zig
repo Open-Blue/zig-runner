@@ -410,13 +410,14 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
         const env = try gitEnv(b, job, from.token);
         while (true) {
             out = .{ .arena = arena };
+            const mark = b.layers_pushed;
             const ran = try b.execLimited(&.{ "sh", "-c", aw.written() }, env, &.{git_config_file}, 0, 0, out.output(), b.fetch_attempt_limit_ms);
             ended = ran.ended;
             // `sh` found no git in the image (any image is native since P3, not only the provisioned
             // default one): the action's tarball instead (`tarball.zig`), here and for the job's later
             // fetches.
             if (Backend.gitMissing(ended, &out)) {
-                b.dropTop();
+                b.dropPushedSince(mark);
                 b.no_git = true;
                 break;
             }
@@ -427,8 +428,9 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
                 "";
             const why = if (ran.timed_out) stopped else if (ended.failure.len > 0) ended.failure else out.text.items;
             const again = try retry.plan(arena, ref_label, why, ran.timed_out or fetch_retry.transientText(why));
-            // The failed attempt's layer goes whether another follows or not.
-            b.dropTop();
+            // The failed attempt's layer goes whether another follows or not (when it made one:
+            // a run that failed before it started leaves the job's earlier layer on top).
+            b.dropPushedSince(mark);
             if (!again or !retry.wait()) break;
         }
     }
@@ -1950,4 +1952,14 @@ test "fetch retry: an action fetch's warning never carries the job's secret" {
     try std.testing.expectEqual(@as(u32, 2), r.fetches);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.text, "##[warning]Failed to fetch action 'o/comp@v1' (attempt 1 of 5): fatal: unable to access 'https://x-access-token:***@github.com"));
     try std.testing.expect(std.mem.indexOf(u8, r.text, "tok-123") == null);
+}
+
+test "fetch retry: a fetch still making progress is not stopped at the old 120 seconds; the attempt limit is the tarball's 15 minutes" {
+    // A 150 MB repository over 1 MB/s takes 150 s and succeeded before any limit existed: an
+    // attempt may take as long as the tarball download's deadline (stalls end by git's low-speed
+    // limit, `gitEnv`), on the backend and on the config that makes it.
+    const old_limit_ms: u64 = 120 * 1000;
+    const cfg: Backend.Config = .{};
+    try std.testing.expect(cfg.fetch_attempt_limit_ms >= 5 * old_limit_ms);
+    try std.testing.expectEqual(Backend.default_fetch_attempt_limit_ms, cfg.fetch_attempt_limit_ms);
 }

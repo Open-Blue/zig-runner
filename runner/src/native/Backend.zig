@@ -133,10 +133,15 @@ fetched_trees: std.StringHashMapUnmanaged(FetchedTree) = .empty,
 /// The first wait before an action's fetch is tried again after a network failure
 /// (`dagger/fetch_retry.zig`), doubled for each retry; a test's is a millisecond.
 fetch_backoff_ms: i64 = @import("../dagger/fetch_retry.zig").default_base_ms,
-/// The longest an action's fetch attempt takes before it is stopped (and tried again): an action's
-/// repository is fetched at depth 1, and the kernel's own time to give up on a connection is
-/// longer than two of these.
-fetch_attempt_limit_ms: u64 = 120 * 1000,
+/// The longest an action's fetch attempt may take before it is stopped (and tried again). Not a
+/// speed limit: a slow fetch that moves bytes is the fetch, and succeeded without any limit before
+/// (a 150 MB repository at 1 MB/s takes 150 s). A transfer that stalls ends by git's own low-speed
+/// limit (`actions.gitEnv`) and the kernel gives up on a connection that never answers by itself;
+/// this only ends an attempt that hangs some other way, so it is the tarball download's 15 minutes.
+fetch_attempt_limit_ms: u64 = default_fetch_attempt_limit_ms,
+/// How many layers `runIn` has pushed, ever: a caller that drops the layer of its failed attempt
+/// drops one only when the attempt pushed one (`dropPushedSince`).
+layers_pushed: u64 = 0,
 /// The JavaScript runtime JavaScript actions run with (`Options.js_runtime`, `actions.preload`).
 js_runtime: config.JsRuntime = .bun,
 /// This runner has no Dagger engine to send a job to (`Options.engineless`): what native cannot
@@ -316,7 +321,7 @@ pub const Config = struct {
     /// Tests: the first wait before an action's fetch is tried again (`Backend.fetch_backoff_ms`).
     fetch_backoff_ms: i64 = @import("../dagger/fetch_retry.zig").default_base_ms,
     /// Tests: `Backend.fetch_attempt_limit_ms` and the job's retry budget (`fetch_retry.Budget`).
-    fetch_attempt_limit_ms: u64 = 120 * 1000,
+    fetch_attempt_limit_ms: u64 = default_fetch_attempt_limit_ms,
     fetch_budget_ms: i64 = 180_000,
     /// Where jobs' layers live while they run, and pulled images and provisioned rootfs
     /// (`RUNNER_NATIVE_STORE`).
@@ -2793,6 +2798,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout, num: u32) !dag
     var ended: sandbox.Ended = undefined;
     while (true) {
         out = .{ .arena = arena };
+        const mark = b.layers_pushed;
         ended = try b.exec(
             aw.written(),
             env,
@@ -2805,7 +2811,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout, num: u32) !dag
         if (ended.killed or gitMissing(ended, &out)) break;
         const said = if (ended.failure.len > 0) ended.failure else out.text.items;
         const again = try retry.plan(arena, try std.fmt.allocPrint(arena, "{s}@{s}", .{ f.repo, f.ref_label }), said, fetch_retry.transientText(said));
-        b.dropTop();
+        b.dropPushedSince(mark);
         if (!again) break;
         claim.release(b.io);
         claim.lock = null;
@@ -3169,6 +3175,8 @@ pub fn execOn(
     return b.execIn(argv, env, files, uid, gid, out, container, true);
 }
 
+pub const default_fetch_attempt_limit_ms: u64 = 15 * 60 * 1000;
+
 /// What `execLimited` found: how the script ended, and whether it was stopped for its time.
 pub const Limited = struct { ended: sandbox.Ended, timed_out: bool };
 
@@ -3315,7 +3323,10 @@ fn runIn(
         .container_opts = b.sandbox_opts,
     }, &b.running, out);
     b.timings.helper(arena, ended.helper, ended.spawned, ended.ended);
-    if (new_layer) try b.layers.append(arena, .{ .name = upper, .path = upper_path, .canonical = idmapped });
+    if (new_layer) {
+        try b.layers.append(arena, .{ .name = upper, .path = upper_path, .canonical = idmapped });
+        b.layers_pushed += 1;
+    }
     return ended;
 }
 
@@ -3895,6 +3906,13 @@ pub fn dropTop(b: *Backend) void {
     if (top.key != null) return;
     _ = b.layers.pop();
     Store.removeTree(b.arena, b.io, top.path);
+}
+
+/// `dropTop` for a failed attempt, only if it pushed a layer (`mark` is `layers_pushed` before it):
+/// an exec that failed before it ran (the stack's flattening, the job's network) pushed none, and
+/// the top is then an earlier step's, which must stay.
+pub fn dropPushedSince(b: *Backend, mark: u64) void {
+    if (b.layers_pushed != mark) b.dropTop();
 }
 
 /// The stack's top layer, a tree git fetched at a commit (an action's, `actions.fetch`), keyed by
@@ -12919,4 +12937,41 @@ test "native docker api: a step that made a request beyond ping, version and inf
         ,
         "echo two",
     }, "late"));
+}
+
+test "fetch retry: a failed attempt that ran nothing leaves the job's earlier layer, one that pushed a layer loses it (before a retry is tried again)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var b = try init(arena, io, std.testing.allocator, cfg);
+    defer b.deinit();
+    // An earlier action's tree: the job's own layer, nothing keyed.
+    const earlier = try std.fmt.allocPrint(arena, "{s}/earlier", .{b.dir});
+    try std.Io.Dir.cwd().createDirPath(io, earlier);
+    try b.layers.append(arena, .{ .name = "earlier", .path = earlier });
+
+    // The job's network could not be made: the attempt fails before it runs, with no layer.
+    b.net_why = "the job's network could not be made";
+    const mark = b.layers_pushed;
+    var out: Captured = .{ .arena = arena };
+    const ended = try b.execOn(&.{"true"}, &.{}, &.{}, 0, 0, out.output(), null);
+    try std.testing.expect(ended.failure.len > 0);
+    b.dropPushedSince(mark);
+    try std.testing.expectEqual(@as(usize, 1), b.layers.items.len);
+    try std.testing.expectEqualStrings("earlier", b.layers.items[0].name);
+    std.Io.Dir.cwd().access(io, earlier, .{}) catch return error.TestUnexpectedResult;
+
+    // An attempt that did push one drops it, and only it.
+    const mark2 = b.layers_pushed;
+    const attempt = try std.fmt.allocPrint(arena, "{s}/attempt", .{b.dir});
+    try std.Io.Dir.cwd().createDirPath(io, attempt);
+    try b.layers.append(arena, .{ .name = "attempt", .path = attempt });
+    b.layers_pushed += 1;
+    b.dropPushedSince(mark2);
+    try std.testing.expectEqual(@as(usize, 1), b.layers.items.len);
+    try std.testing.expectEqualStrings("earlier", b.layers.items[0].name);
 }
