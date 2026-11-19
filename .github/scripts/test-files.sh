@@ -7,19 +7,26 @@
 # binary is compared with its count in the source. A file whose tests are missing, or whose count
 # differs, fails, naming it; the fix is its import in main.zig's test block. CI's "Format, build and
 # test" job and the pre-push hook run this, after the tests, where zig-test.sh has cached the compile.
+#
+# For test-files-test.sh: TEST_FILES_ROOT replaces the runner directory, and TEST_FILES_NAMES, a
+# file of the binary's test names, replaces the compile.
 set -euo pipefail
-cd "$(dirname "$0")/../../runner"
-
-# shellcheck source=.github/scripts/zig-modules.sh
-. ../.github/scripts/zig-modules.sh
+here=$(cd "$(dirname "$0")" && pwd)
+cd "${TEST_FILES_ROOT:-$here/../../runner}"
 
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
-git describe --tags --always --dirty --abbrev=8 >"$scratch/version"
-zig_modules "$scratch" "$scratch/version"
-zig test "${modules[@]}" --test-no-exec -femit-bin="$scratch/tests"
-zig build-exe tools/test_shards.zig -femit-bin="$scratch/test_shards"
-"$scratch/test_shards" --names "$scratch/tests" >"$scratch/names"
+if [[ -n ${TEST_FILES_NAMES:-} ]]; then
+	cp "$TEST_FILES_NAMES" "$scratch/names"
+else
+	# shellcheck source=.github/scripts/zig-modules.sh
+	. "$here/zig-modules.sh"
+	git describe --tags --always --dirty --abbrev=8 >"$scratch/version"
+	zig_modules "$scratch" "$scratch/version"
+	zig test "${modules[@]}" --test-no-exec -femit-bin="$scratch/tests"
+	zig build-exe tools/test_shards.zig -femit-bin="$scratch/test_shards"
+	"$scratch/test_shards" --names "$scratch/tests" >"$scratch/names"
+fi
 
 status=0
 while IFS= read -r file; do
