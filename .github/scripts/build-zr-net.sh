@@ -31,19 +31,22 @@ esac
 readonly arch out libc
 # Said before anything is sourced, so the log has the request as it came, whatever follows.
 echo "build-zr-net.sh: asked for $arch ($libc), out $out" >&2
-# The pinned Rust (install-rust.sh): rustup's, when the machine has it and rust-toolchain.toml
-# picks this version, or one unpacked into the tool cache. `tsan`: the pinned nightly, always from
-# the tool cache (rustup's shims would follow rust-toolchain.toml to the stable one).
+# The pinned Rust, always: `tsan` the pinned nightly (install-rust-nightly.sh), the others
+# install-rust.sh's hash-pinned 1.99.1, from the tool cache. Never the cargo that happens to be on
+# PATH (rustup's, on a hosted runner image that has 1.99.1 and not on one that has not: the image
+# must not choose the path), so cargo and rustc are RUST_HOME's below, checked.
 if [[ $libc == tsan ]]; then
 	rust_from="the pinned nightly (install-rust-nightly.sh)"
 	# shellcheck source=.github/scripts/install-rust-nightly.sh
 	. "$here/install-rust-nightly.sh"
-elif [[ $(cargo --version 2>/dev/null | cut -d' ' -f2) != 1.99.1 ]]; then
-	rust_from="install-rust.sh (no cargo 1.99.1 on PATH)"
+else
 	# shellcheck source=.github/scripts/install-rust.sh
 	. "$here/install-rust.sh"
-else
-	rust_from="the cargo already on PATH"
+	rust_from="install-rust.sh ($rust_how)"
+	if [[ $(command -v cargo) != "$RUST_HOME/bin/cargo" || $(command -v rustc) != "$RUST_HOME/bin/rustc" ]]; then
+		echo "build-zr-net.sh: cargo is $(command -v cargo) and rustc $(command -v rustc), not the ones in $RUST_HOME/bin" >&2
+		exit 1
+	fi
 fi
 cd "$here/../../runner/rust"
 case $arch in
@@ -65,10 +68,9 @@ export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PWD/target}
 echo "build-zr-net.sh: rust cache: ${ZR_RUST_CACHE:-none (not CI, or a job without it)}" >&2
 # In the job's log, what the build is and what it builds with: cargo's target (beside the request
 # logged above), which Rust and from where, and where it builds.
-# The version test above ran in the repository root; the build runs here, where rust-toolchain.toml
-# applies to a rustup shim, so what builds is asked in this directory.
-echo "build-zr-net.sh: toolchain in $PWD: $(cargo --version 2>&1 | tail -n1), $(rustc --version 2>&1 | tail -n1), cargo at $(command -v cargo)" >&2
-echo "build-zr-net.sh: building $arch ($libc): cargo target $triple; $(cargo --version) at $(command -v cargo), from $rust_from; CARGO_TARGET_DIR $CARGO_TARGET_DIR" >&2
+# Asked here in runner/rust, where a rustup shim would follow rust-toolchain.toml: the stable
+# build's cargo is install-rust.sh's own (checked above), the tsan build's the pinned nightly's.
+echo "build-zr-net.sh: building $arch ($libc): cargo target $triple; $(cargo --version) at $(command -v cargo), $(rustc --version) at $(command -v rustc), from $rust_from, in $PWD; CARGO_TARGET_DIR $CARGO_TARGET_DIR" >&2
 # In a job, cargo's registry and crate cache go in the job's own temp directory: a self-hosted
 # runner's $HOME/.cargo can belong to another user (main's first Rust build failed there with
 # "Permission denied"), and one job's downloaded crates are not meant to reach another's build.

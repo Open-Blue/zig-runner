@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The network library's own tests (runner/rust/zr-net, docs/rust-net.md): `cargo test` on the
-# machine's target, with the pinned Rust (install-rust.sh, as build-zr-net.sh finds it). They cover
+# machine's target, with the pinned Rust (install-rust.sh, always, as build-zr-net.sh). They cover
 # what the Zig tests cannot see from outside the ABI: the TLS state machine against an in-process
 # rustls server (names, CAs, client certificates), the roots loader, malformed input.
 #
@@ -21,10 +21,15 @@ echo "cargo-test.sh: rust cache: ${ZR_RUST_CACHE:-none (not CI, or a job without
 mode=${1:-}
 case $mode in
 "")
-	if [[ $(cargo --version 2>/dev/null | cut -d' ' -f2) != 1.99.1 ]]; then
-		# shellcheck source=.github/scripts/install-rust.sh
-		. "$here/install-rust.sh"
+	# Always the hash-pinned Rust, never the cargo on PATH (rustup's, if the image has one): the
+	# machine must not choose which toolchain the tests run on.
+	# shellcheck source=.github/scripts/install-rust.sh
+	. "$here/install-rust.sh"
+	if [[ $(command -v cargo) != "$RUST_HOME/bin/cargo" || $(command -v rustc) != "$RUST_HOME/bin/rustc" ]]; then
+		echo "cargo-test.sh: cargo is $(command -v cargo) and rustc $(command -v rustc), not the ones in $RUST_HOME/bin" >&2
+		exit 1
 	fi
+	echo "cargo-test.sh: testing with $(cargo --version) at $(command -v cargo), $(rustc --version) at $(command -v rustc), from install-rust.sh ($rust_how)" >&2
 	cd "$here/../../runner/rust/zr-net"
 	export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PWD/../target}
 	cargo test --locked
