@@ -26,15 +26,22 @@ musl | gnu | tsan) ;;
 	exit 1
 	;;
 esac
+# What this build was asked for cannot change under it: a script sourced below that assigns one of
+# these fails at once, naming it (install-rust.sh's own `arch` once replaced this one silently).
+readonly arch out libc
 # The pinned Rust (install-rust.sh): rustup's, when the machine has it and rust-toolchain.toml
 # picks this version, or one unpacked into the tool cache. `tsan`: the pinned nightly, always from
 # the tool cache (rustup's shims would follow rust-toolchain.toml to the stable one).
 if [[ $libc == tsan ]]; then
+	rust_from="the pinned nightly (install-rust-nightly.sh)"
 	# shellcheck source=.github/scripts/install-rust-nightly.sh
 	. "$here/install-rust-nightly.sh"
 elif [[ $(cargo --version 2>/dev/null | cut -d' ' -f2) != 1.99.1 ]]; then
+	rust_from="install-rust.sh (no cargo 1.99.1 on PATH)"
 	# shellcheck source=.github/scripts/install-rust.sh
 	. "$here/install-rust.sh"
+else
+	rust_from="the cargo already on PATH"
 fi
 cd "$here/../../runner/rust"
 case $arch in
@@ -51,6 +58,9 @@ export "CC_${triple//-/_}=$here/zig-cc.sh"
 export "AR_${triple//-/_}=${AR_ZIG:-ar}"
 export "CARGO_TARGET_${upper}_LINKER=$here/zig-cc.sh"
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PWD/target}
+# In the job's log, what the build is and what it builds with: the architecture asked for, cargo's
+# target, which Rust and from where, and where it builds and writes.
+echo "build-zr-net.sh: asked for $arch ($libc): cargo target $triple; $(cargo --version) at $(command -v cargo), from $rust_from; CARGO_TARGET_DIR $CARGO_TARGET_DIR; out $out" >&2
 # In a job, cargo's registry and crate cache go in the job's own temp directory: a self-hosted
 # runner's $HOME/.cargo can belong to another user (main's first Rust build failed there with
 # "Permission denied"), and one job's downloaded crates are not meant to reach another's build.
@@ -96,3 +106,22 @@ else
 fi
 mkdir -p "$(dirname "$out")"
 cp "$CARGO_TARGET_DIR/$triple/release/libzr_net.a" "$out"
+# The archive is for $arch, checked by the ELF machine of its first object (e_machine, at offset 18:
+# 62 x86_64, 183 aarch64): built for another, it fails here, by name, not as the link's hundreds of
+# "incompatible with" lines.
+case $arch in
+x86_64) want=62 ;;
+aarch64) want=183 ;;
+esac
+# Neither read stops early in a pipe (`grep -m1`, `od -N2` on `ar p`): `ar` would die of SIGPIPE,
+# and pipefail would fail the build for it.
+member=$(ar t "$out" | awk '/\.o$/ && !seen { print; seen = 1 }')
+object=$(mktemp)
+ar p "$out" "$member" >"$object"
+got=$(od -An -tu2 -j18 -N2 "$object" | tr -d ' ')
+rm -f "$object"
+if [[ $got != "$want" ]]; then
+	echo "build-zr-net.sh: $out is not for $arch: $member has ELF machine $got, not $want" >&2
+	exit 1
+fi
+echo "build-zr-net.sh: $out: for $arch (ELF machine $got in $member), $(ar t "$out" | wc -l) members, sha256 $(sha256sum "$out" | cut -d' ' -f1)" >&2
