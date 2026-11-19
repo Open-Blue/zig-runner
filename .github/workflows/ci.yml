@@ -257,6 +257,11 @@ jobs:
       - name: Merge queue reuse decision
         run: .github/scripts/ci-reuse-test.sh
 
+      # allow-userns.sh, which every native job runs before its tests: a kernel without the AppArmor
+      # key is a note, a write that does not take a failure that says so.
+      - name: allow-userns.sh says what it found
+        run: .github/scripts/allow-userns-test.sh
+
       # The release binaries, against their pinned checksums: a new version (Renovate's) fails
       # here until they are updated. shfmt shows the diff that would format a script.
       - name: shfmt
@@ -797,7 +802,7 @@ jobs:
             # not skip (src/native/Backend.zig, `testConfig`): rootless here; as root, the path
             # with each job's own ids and network (nft makes its NAT), in `native-root`.
             # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
-            sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+            ../.github/scripts/allow-userns.sh
             ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/memory-peak.sh compile-and-run -- ../.github/scripts/zig-test.sh
           else
             stop="tests-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
@@ -986,7 +991,7 @@ jobs:
           ZIG_TEST_TIMES: "1"
         run: |
           # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
-          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          ../.github/scripts/allow-userns.sh
           # Real postgres and redis images for the native services test (native/services.zig),
           # which needs root: their entrypoints change to the images' own users.
           ../.github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
@@ -1234,7 +1239,7 @@ jobs:
         working-directory: runner
         run: |
           # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
-          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          ../.github/scripts/allow-userns.sh
           ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/zig-test.sh
 
       # Nothing may be left under the tests' temporary directory, nor a chain of directories deeper

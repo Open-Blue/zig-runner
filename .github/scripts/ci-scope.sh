@@ -54,7 +54,7 @@ needed() {
 		case $1 in
 		# What the build and the tests read (db/: the database tests' migrations), and what runs them.
 		runner/* | db/* | .github/workflows/ci.yml | .github/scripts/ci-scope.sh | .github/tsan.supp | \
-			.github/scripts/install-zig.sh | .github/scripts/ci-database.sh | \
+			.github/scripts/install-zig.sh | .github/scripts/allow-userns.sh | .github/scripts/ci-database.sh | \
 			.github/scripts/zig-test.sh | .github/scripts/zig-modules.sh | \
 			.github/scripts/cargo-test.sh | .github/scripts/pg-tls-fixture.sh | .github/scripts/build-zr-net.sh | \
 			.github/scripts/zig-cc.sh | .github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | \
@@ -92,7 +92,7 @@ needed() {
 			.github/workflows/ci.yml | .github/scripts/ci-scope.sh | \
 			.github/scripts/install-zig.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
 			.github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | runner/rust/* | \
-			.github/scripts/e2e.sh | .github/scripts/image-preflight.sh) return 0 ;;
+			.github/scripts/e2e.sh | .github/scripts/image-preflight.sh | .github/scripts/allow-userns.sh) return 0 ;;
 		*) return 1 ;;
 		esac
 		;;
@@ -206,7 +206,7 @@ needed() {
 		runner/src/* | runner/build.zig | .github/workflows/analysis.yml | \
 			.github/scripts/ci-scope.sh | runner/rust/* | .github/tsan.supp | \
 			.github/scripts/build-zr-net.sh | .github/scripts/install-rust-nightly.sh | \
-			.github/scripts/zig-modules.sh | .github/scripts/image-preflight.sh) return 0 ;;
+			.github/scripts/zig-modules.sh | .github/scripts/image-preflight.sh | .github/scripts/allow-userns.sh) return 0 ;;
 		*) return 1 ;;
 		esac
 		;;
@@ -222,7 +222,7 @@ needed() {
 			.github/scripts/zig-test.sh | runner/src/native/store_crash.zig | \
 			runner/src/native/oci/Store.zig | runner/src/native/volumes.zig | \
 			runner/src/native/evict.zig | \
-			.github/scripts/image-preflight.sh | .github/scripts/store-crash.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
+			.github/scripts/image-preflight.sh | .github/scripts/store-crash.sh | .github/scripts/allow-userns.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
 			.github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | runner/rust/*) return 0 ;;
 		*) return 1 ;;
 		esac
@@ -257,7 +257,7 @@ needed() {
 			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
 			.github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
 			.github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | runner/rust/* | .github/scripts/zig-coverage.sh | \
-			.github/scripts/native-service-images.sh | .github/scripts/image-preflight.sh) return 0 ;;
+			.github/scripts/native-service-images.sh | .github/scripts/image-preflight.sh | .github/scripts/allow-userns.sh) return 0 ;;
 		*) return 1 ;;
 		esac
 		;;

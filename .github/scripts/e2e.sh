@@ -223,8 +223,8 @@ start() {
 	local native=()
 	if [[ $backend == native ]]; then
 		wait_rootfs
-		# Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; ci.yml's Test lifts it too.
-		sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+		# Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; the helper lifts it, as ci.yml's Test does.
+		.github/scripts/allow-userns.sh
 		native=(RUNNER_NATIVE_ROOTFS="$rootfs")
 	fi
 	log=$out/runner-$backend.log

@@ -450,7 +450,7 @@ jobs:
       # it ("personality query 0" fails).
       - name: Rootless
         run: |
-          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          .github/scripts/allow-userns.sh
           sudo sysctl -q -w vm.mmap_rnd_bits=28
           .github/scripts/zig-test.sh
 
@@ -748,7 +748,7 @@ jobs:
           ZIG_TEST_PART: ${{ matrix.part }}/4
         run: |
           # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
-          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          .github/scripts/allow-userns.sh
           # The root pass's services test runs real postgres and redis images (ci.yml's Test).
           .github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
           ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_COVERAGE_ROOT=1 \
@@ -854,7 +854,7 @@ jobs:
           ZIG_TEST_STORE_STRESS_PROCS: "8"
         run: |
           # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
-          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          ../.github/scripts/allow-userns.sh
           ../.github/scripts/zig-test.sh
           ZIG_TEST_NATIVE_AS_ROOT=1 ../.github/scripts/zig-test.sh
 
