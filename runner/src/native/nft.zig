@@ -1681,7 +1681,8 @@ fn pinned(c: *Pinned, suffix: []const u8, dir: []const u8, pin: bool) void {
         \\nft add rule bridge zrt_pre c iifname zrh2 ether type vlan counter
         \\nft add table ip zrt_post
         \\nft add chain ip zrt_post f '{ type filter hook forward priority -10; }'
-        \\nft add rule ip zrt_post f iifname zr0 ip saddr 10.211.1.3 tcp sport 43000-43002 counter
+        \\# SYNs only: without the pin a spoof reaches the instance, whose SYN-ACK goes to the real A, which resets it from the same port.
+        \\nft add rule ip zrt_post f iifname zr0 ip saddr 10.211.1.3 tcp sport 43000-43002 'tcp flags & (syn | ack | rst) == syn' counter
         \\nft add rule ip zrt_post f iifname zr0 ip saddr 10.211.1.4 counter
     ;
     const ports =
