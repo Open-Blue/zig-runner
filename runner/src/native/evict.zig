@@ -1751,8 +1751,11 @@ const Hostile = struct {
         while (!h.done.load(.acquire) and std.Io.Clock.awake.now(testing.io).toMilliseconds() - start < 3000)
             try testing.io.sleep(.fromMilliseconds(20), .awake);
         const stuck = !h.done.load(.acquire);
-        var buf: [4096]u8 = undefined;
-        const z = try std.fmt.bufPrintSentinel(&buf, "{s}", .{fifo}, 0);
+        // Off the stack: with this frame's `Pass` (a `Store` by value) a 4 KiB buffer takes it past a
+        // page, and Zig's stack probe at its entry is a read below the stack pointer, which memcheck
+        // reports (the nightly's Valgrind job from 11-15).
+        const z = try testing.allocator.dupeSentinel(u8, fifo, 0);
+        defer testing.allocator.free(z);
         while (!h.done.load(.acquire)) {
             const rc = linux.open(z, .{ .ACCMODE = .WRONLY, .NONBLOCK = true }, 0);
             if (linux.errno(rc) != .SUCCESS) continue;

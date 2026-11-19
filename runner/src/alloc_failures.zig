@@ -90,14 +90,32 @@ fn siteOf(first_address: usize) u64 {
 /// power of two after, and the last, at most `max_runs` of them (spread evenly if more). A run's allocations that vary (threads) have no sites to
 /// tell: `sites` is empty and every one is picked. Freed with `gpa`.
 fn sample(sites: []const u64, n: usize) ![]bool {
+    return sampleFor(.fromEnvironment(), sites, n);
+}
+
+/// How a run chooses its allocations: all of them (`ZIG_TEST_FULL=1`), every `stride`th (Valgrind),
+/// or by site. A parameter and not only the environment, so that a test of the sampling and of the
+/// checkers it serves means the same in the nightly's full run and under Valgrind.
+const Mode = struct {
+    all: bool,
+    stride: usize,
+
+    const sampled: Mode = .{ .all = false, .stride = 1 };
+
+    fn fromEnvironment() Mode {
+        return .{ .all = full(), .stride = stride() };
+    }
+};
+
+fn sampleFor(mode: Mode, sites: []const u64, n: usize) ![]bool {
     const keep = try gpa.alloc(bool, n);
     errdefer gpa.free(keep);
-    if (stride() != 1) {
-        for (keep, 0..) |*k, i| k.* = i % stride() == 0;
+    if (mode.stride != 1) {
+        for (keep, 0..) |*k, i| k.* = i % mode.stride == 0;
         return keep;
     }
     @memset(keep, true);
-    if (full() or sites.len != n) return keep;
+    if (mode.all or sites.len != n) return keep;
     @memset(keep, false);
     var totals: std.AutoHashMapUnmanaged(u64, u32) = .empty;
     defer totals.deinit(gpa);
@@ -267,10 +285,14 @@ fn countAllocations(comptime f: anytype, args: anytype) !usize {
 /// square of the input, and `gpa` records a stack trace for every allocation, so they go to a
 /// faster allocator; `FailOnce` counts what is left, so a leak after a failure is still found.
 fn checkEachAllocationFailure(comptime f: anytype, args: anytype) !void {
+    return checkEachAllocationFailureIn(.fromEnvironment(), f, args);
+}
+
+fn checkEachAllocationFailureIn(mode: Mode, comptime f: anytype, args: anytype) !void {
     const sites = try discover(f, args);
     defer gpa.free(sites);
     const n = if (sites.len == 0) try countAllocations(f, args) else sites.len;
-    const keep = try sample(sites, n);
+    const keep = try sampleFor(mode, sites, n);
     defer gpa.free(keep);
     for (keep, 0..) |k, i| {
         if (!k) continue;
@@ -403,7 +425,7 @@ test "allocation failures: with no stack traces the sample falls back to a strid
     const n = 300;
     // Empty traces: one site for every allocation. Not 16 and a few, but the cap, spread out.
     const blind: [n]u64 = @splat(7);
-    const keep = try sample(&blind, n);
+    const keep = try sampleFor(.sampled, &blind, n);
     defer gpa.free(keep);
     var picked: usize = 0;
     var middle: usize = 0;
@@ -422,7 +444,7 @@ test "allocation failures: with no stack traces the sample falls back to a strid
     // the last) and not by stride.
     var told: [n]u64 = undefined;
     for (&told, 0..) |*t, i| t.* = i % 2;
-    const by_site = try sample(&told, n);
+    const by_site = try sampleFor(.sampled, &told, n);
     defer gpa.free(by_site);
     var kept: usize = 0;
     for (by_site) |k| kept += @intFromBool(k);
@@ -447,8 +469,10 @@ test "allocation failures: a leak after one failure is found" {
             second = try a.realloc(second, 4096);
         }
     };
-    try std.testing.expectError(error.MemoryLeakDetected, checkEachAllocationFailure(S.run, .{}));
-    try checkEachAllocationFailure(S.whole, .{});
+    // Whatever the environment: Valgrind's stride would skip the second allocation, and this test
+    // is of the check, not of what it samples.
+    try std.testing.expectError(error.MemoryLeakDetected, checkEachAllocationFailureIn(.sampled, S.run, .{}));
+    try checkEachAllocationFailureIn(.sampled, S.whole, .{});
 }
 
 test "allocation failures: YAML" {
