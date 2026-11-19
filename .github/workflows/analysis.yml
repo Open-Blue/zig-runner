@@ -451,7 +451,7 @@ jobs:
       - name: Rootless
         run: |
           .github/scripts/allow-userns.sh
-          sudo sysctl -q -w vm.mmap_rnd_bits=28
+          .github/scripts/mmap-rnd-bits.sh 28
           .github/scripts/zig-test.sh
 
       - name: As root, with the service images
@@ -510,7 +510,7 @@ jobs:
       - name: Build the runner, under ThreadSanitizer
         if: steps.go.outputs.run == 'true'
         run: |
-          sudo sysctl -q -w vm.mmap_rnd_bits=28
+          .github/scripts/mmap-rnd-bits.sh 28
           .github/scripts/e2e.sh build "$RUNNER_TEMP/zig-runner" tsan
 
       - name: Make the native rootfs
@@ -651,7 +651,7 @@ jobs:
       # pinned here, so every night loads the machine the same way.
       - name: Install stress-ng
         run: |
-          sudo .github/scripts/apt.sh install --no-install-recommends stress-ng=0.20.01-1
+          sudo .github/scripts/apt-pinned.sh --no-install-recommends stress-ng=0.20.01-1
           stress-ng --version
 
       - name: Wait for the database
@@ -740,7 +740,7 @@ jobs:
         env:
           KCOV_VERSION: 43+dfsg-2
         run: |
-          sudo .github/scripts/apt.sh install --no-install-recommends "kcov=$KCOV_VERSION"
+          sudo .github/scripts/apt-pinned.sh --no-install-recommends "kcov=$KCOV_VERSION"
           kcov --version
 
       - name: Coverage, part ${{ matrix.part }} of 4
@@ -796,7 +796,7 @@ jobs:
         env:
           KCOV_VERSION: 43+dfsg-2
         run: |
-          sudo .github/scripts/apt.sh install --no-install-recommends "kcov=$KCOV_VERSION"
+          sudo .github/scripts/apt-pinned.sh --no-install-recommends "kcov=$KCOV_VERSION"
           kcov --version
 
       - name: Merge

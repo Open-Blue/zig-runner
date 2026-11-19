@@ -16,9 +16,27 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
+# In CI a ruleset that cannot be read is a failure, naming why: the check was skipped quietly
+# there when the image lost `gh`, and a required check renamed in one place went unseen. Outside
+# CI (the pre-push hook, a laptop without a login) it is skipped, and said so.
+unreadable() {
+	if [[ ${GITHUB_ACTIONS:-} == true ]]; then
+		echo "::error title=check-names cannot read the rulesets::$1 (runner image ${ImageOS:-unknown} ${ImageVersion:-unknown})"
+		exit 1
+	fi
+	echo "check-names: skipping the rulesets' required checks: $1" >&2
+}
+
 rulesets=''
-if command -v gh >/dev/null && repo=${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)}; then
-	ids=$(gh api "repos/$repo/rulesets" --jq '.[] | select(.target == "branch") | .id' 2>/dev/null) || ids=''
+if ! command -v gh >/dev/null; then
+	unreadable "gh is not installed"
+elif ! repo=${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)} || [[ -z $repo ]]; then
+	unreadable "the repository is not known (GITHUB_REPOSITORY unset and gh repo view failed)"
+elif ! ids=$(gh api "repos/$repo/rulesets" --jq '.[] | select(.target == "branch") | .id' 2>&1); then
+	unreadable "gh api repos/$repo/rulesets failed: ${ids:-no output}"
+elif [[ -z $ids ]]; then
+	unreadable "repos/$repo/rulesets lists no branch ruleset (the token may not see them)"
+else
 	for id in $ids; do
 		# shellcheck disable=SC2016 # $n is jq's, not the shell's
 		rulesets+=$(gh api "repos/$repo/rulesets/$id" --jq '.name as $n | .rules[] |
@@ -157,7 +175,11 @@ if rs:
         if ctx not in on_pr:
             errors.append(f"ruleset {ruleset!r} requires {ctx!r}, which is not a job run on pull requests and in the merge queue")
 else:
-    print("check-names: the rulesets could not be read, so their required checks were not checked", file=sys.stderr)
+    # Read, but naming no required check: in CI that is as much a failure as unreadable.
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        errors.append("the rulesets were read and name no required status check")
+    else:
+        print("check-names: no required checks from the rulesets, so none were checked", file=sys.stderr)
 
 # Only names something waits for must be fillable; say the others once.
 for u in unfilled:

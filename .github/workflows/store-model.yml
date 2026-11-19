@@ -31,6 +31,7 @@ on:
       - .github/checks-on-main
       - .github/workflows/store-model.yml
       - .github/scripts/spin.sh
+      - .github/scripts/apt-pinned.sh
   pull_request:
     paths:
       - proofs/tla/**
@@ -49,6 +50,7 @@ on:
       - .github/checks-on-main
       - .github/workflows/store-model.yml
       - .github/scripts/spin.sh
+      - .github/scripts/apt-pinned.sh
   schedule:
     - cron: "41 5 * * 1" # Mondays, 05:41 UTC, with proofs.yml
   workflow_dispatch:
@@ -80,7 +82,7 @@ jobs:
         env:
           SPIN_VERSION: 6.5.2+dfsg-2build1
         run: |
-          sudo .github/scripts/apt.sh install --no-install-recommends "spin=$SPIN_VERSION"
+          sudo .github/scripts/apt-pinned.sh --no-install-recommends "spin=$SPIN_VERSION"
           spin -V
 
       - name: Check the store's locking and the release pipeline
