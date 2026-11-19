@@ -45,7 +45,9 @@ dir="zig-$arch-linux-$version"
 cache="${RUNNER_TOOL_CACHE:-${RUNNER_TEMP:-/tmp}}/zig/$version"
 tarball="$cache/$dir.tar.xz"
 tree="$cache/$dir"
-verified() { echo "$sum  $tarball" | sha256sum --check --quiet --status; }
+# Silent either way: with no tarball in the cache yet (the usual case on a GitHub-hosted runner),
+# sha256sum --status still prints "FAILED open or read", which reads like a failed check.
+verified() { echo "$sum  $tarball" | sha256sum --check --quiet --status >/dev/null 2>&1; }
 digest() { (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1); }
 
 checked() { grep -qxF "$tree_sum $tree" <<<"${ZIG_RUNNER_TOOL_TREES:-}"; }
@@ -58,7 +60,10 @@ plain() { [ -z "$(find "$1" ! -type f ! -type d -print -quit 2>/dev/null)" ]; }
 if checked && [ -d "$tree" ] && plain "$tree"; then
 	echo "Zig $version: $tree is the tree zig-runner checked in Set up job"
 elif [ ! -d "$tree" ] || ! plain "$tree" || [ "$(digest "$tree" 2>/dev/null)" != "$tree_sum" ]; then
-	if ! verified 2>/dev/null; then
+	if verified; then
+		echo "Zig $version: no usable tree in $cache; unpacking the tarball there, which matches its pinned checksum"
+	else
+		echo "Zig $version: no usable tree and no checked tarball in $cache; downloading $dir.tar.xz"
 		mkdir -p "$cache"
 		curl -fsSL -o "$tarball.part" "https://ziglang.org/download/$version/$dir.tar.xz"
 		mv "$tarball.part" "$tarball"

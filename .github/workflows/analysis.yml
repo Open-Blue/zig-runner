@@ -196,6 +196,8 @@ jobs:
           # Slows as its corpus grows (more files per layer): 3M took 27 minutes with a kept one.
           - { target: OCI layer, runs: 1M }
           - { target: OCI references and challenges, runs: 8M }
+          # 8M took 6 minutes on 11-13, 29 on 11-18, and ran out of the 30 on 11-19: not a hang (the
+          # input in flight replays in 0.0 s) but each run costing more; under investigation.
           - { target: OCI manifests, runs: 8M }
           - { target: tarball sources and pax header, runs: 8M }
           - { target: expressions, runs: 1M }
@@ -578,6 +580,20 @@ jobs:
             echo "::$stop::"
             echo "::endgroup::"
           done
+          # The whole logs, tokens masked, as an artifact: the 300 lines above are the end of a run,
+          # and a leg whose jobs never started (11-19, Dagger) has its cause at the start.
+          mkdir -p "$RUNNER_TEMP/e2e-logs"
+          for f in "$RUNNER_TEMP"/e2e/engine.log "$RUNNER_TEMP"/e2e/rootfs.log "$RUNNER_TEMP"/e2e/runner-*.log; do
+            [ -e "$f" ] || continue
+            sed -E 's/(gh[opsu]|github_pat)_[A-Za-z0-9_]{20,}/***/g' "$f" >"$RUNNER_TEMP/e2e-logs/$(basename "$f")"
+          done
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ failure() && steps.go.outputs.run == 'true' }}
+        with:
+          name: tsan-e2e-logs
+          path: ${{ runner.temp }}/e2e-logs
+          if-no-files-found: ignore
 
       - name: Clean up
         if: ${{ always() && steps.go.outputs.run == 'true' }}

@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The nightly analysis: the fuzz job says its corpus, runs and time; the memory soak waits for its container''s packages with retries and says what it did when the runner does not start; Install Zig no longer prints sha256sum''s FAILED line when it downloads'
+time: 2026-11-19T11:02:14.980942808-05:00
