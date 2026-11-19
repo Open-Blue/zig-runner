@@ -520,10 +520,9 @@ connect (`http.withinClosing`) ends it where it blocks. Errors come back with a 
 - **Toolchain without rustup.** `install-rust.sh`: cargo, rustc and rust-std (host plus both musl targets) tarballs from
   static.rust-lang.org, each SHA-256 pinned from the release manifest (`channel-rust-1.99.1.toml`), unpacked to `RUNNER_TOOL_CACHE/rust/1.99.1/<arch>` (or
   `~/.cache/zig-runner-rust`), once per version, and **the tree is checked against a pinned digest of its 292 files** every run (0.7 s), as `install-zig.sh` does for Zig, so a job that wrote
-  the tool cache cannot swap the compiler. Nothing else is cached there on purpose: a shared `target/` or `CARGO_HOME/registry/src` is not verified by cargo and would let one job's bytes into another's release. `build-zr-net.sh` calls it itself when the machine's `cargo` is not 1.99.1, so
-  no workflow job had to change (every job that builds the runner already goes through `zig-modules.sh`). A developer with rustup gets the
-  same version from `rust-toolchain.toml` (`targets = [...]`). Cost, measured here: **45 s and 969 MB on disk** on first use per
-  machine. GitHub's hosted runners have rustup; the script does not use it so that hosted and self-hosted builds are the same bytes.
+  the tool cache cannot swap the compiler. Nothing else is cached there on purpose: a shared `target/` or `CARGO_HOME/registry/src` is not verified by cargo and would let one job's bytes into another's release. `build-zr-net.sh` and `cargo-test.sh` (plain mode) always source it, whatever `cargo` the machine has (a hosted image that adds or drops a rustup 1.99.1 changes nothing), so
+  no workflow job had to change (every job that builds the runner already goes through `zig-modules.sh`). A developer with rustup uses the same installed tree (`~/.cache/zig-runner-rust`, once per version, digest-checked) in these scripts, not `~/.cargo/bin`; rustup and `rust-toolchain.toml` (`targets = [...]`) only serve a plain `cargo` typed by hand. The scripts put `RUST_HOME/bin` first on `PATH` and fail if `cargo` or `rustc` resolves elsewhere, and log both with their versions. Cost, measured here: **45 s and 969 MB on disk** on first use per
+  machine. GitHub's hosted runners have rustup; the scripts never use it, so that hosted and self-hosted builds are the same bytes.
   On razorbill (SD card) the one-time 1 GB write is the cost to watch (R2 measures it, and may drop `rust-docs`-class components
   if any sneak in: none are installed now).
 - **Cost (measured, cowbird, 12 cores, load average 3-5).** Cargo for the tokio-only skeleton: cold 3.4 s (x86_64) and 4.8 s (aarch64), warm

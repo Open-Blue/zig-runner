@@ -11,7 +11,7 @@
 #   . install-rust.sh         sets RUST_HOME and puts RUST_HOME/bin on PATH
 #   install-rust.sh           prints RUST_HOME
 #
-# build-zr-net.sh runs this itself when `cargo` is not this version, so no job's steps change.
+# build-zr-net.sh and cargo-test.sh always source this (never the cargo already on PATH), so no job's steps change.
 #
 # Sourced, its variables are the caller's: each is `rust_`-prefixed, so none takes a name a caller
 # uses. Its `arch` was the machine's and replaced build-zr-net.sh's own, so on a runner without
