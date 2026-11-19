@@ -369,16 +369,21 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
         return readAction(b, u, ref_label, repository, ref, mount, prev.layer, prev.sha);
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
-    // What an earlier fetch of this directory left (one that failed half-way, from another server)
-    // is not this tree.
-    try w.writeAll("set -e\nrm -rf ");
-    try dagger.shellQuote(w, mount);
-    try w.writeAll("\nmkdir -p ");
+    // Nothing is removed: on the default server a ref `v1/b` is a directory inside `v1`'s (as on
+    // GitHub), so deleting a mount would delete the other tree. What a fetch of this same directory
+    // left half-made (a failed fetch of this server's repository at this ref: the mount names the
+    // server, the repository and the ref) is made over: `git init` and `remote set-url` are
+    // repeatable, and the fetch and the checkout overwrite.
+    try w.writeAll("set -e\nmkdir -p ");
     try dagger.shellQuote(w, mount);
     try w.writeAll(" && cd ");
     try dagger.shellQuote(w, mount);
-    try w.writeAll("\ngit init -q\ngit remote add origin ");
-    try dagger.shellQuote(w, try std.fmt.allocPrint(arena, "{s}/{s}.git", .{ server, repository }));
+    const url = try std.fmt.allocPrint(arena, "{s}/{s}.git", .{ server, repository });
+    try w.writeAll("\ngit init -q\n(git remote add origin ");
+    try dagger.shellQuote(w, url);
+    try w.writeAll(" || git remote set-url origin ");
+    try dagger.shellQuote(w, url);
+    try w.writeAll(")");
     try w.writeAll("\ngit -c protocol.version=2 fetch -q --depth=1 --no-tags -- origin ");
     try dagger.shellQuote(w, ref);
     try w.writeAll("\ngit checkout -q --detach FETCH_HEAD\nrm -f .git/FETCH_HEAD\n" ++
@@ -888,8 +893,23 @@ test "a ref with a slash and the ref that is its prefix are two trees, in either
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cfg = try testActions(arena, &tmp);
-    // The tag `v1` and the branch `v1/b`: `/github/_actions/o/comp/v1/b` would be inside `.../v1`.
-    try testRepo(arena, &tmp, "comp", &.{.{ "action.yml", "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo comp-ran\n" }});
+    // The tag `v1` and the branch `v1/b`: on the job's default server `/github/_actions/o/comp/v1/b`
+    // is inside `.../v1`, as on GitHub. Each tree has a file the other has not, and the action says
+    // which files its directory holds when it runs.
+    const action_yml = "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo \"tree[${{ github.action_path }}]: $(ls ${{ github.action_path }} | tr '\\n' ' ')\"\n";
+    try testRepo(arena, &tmp, "comp", &.{ .{ "action.yml", action_yml }, .{ "only-v1.txt", "v1\n" } });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena);
+    const branch = try std.process.run(arena, std.testing.io, .{ .argv = &.{
+        "sh", "-c",
+        try std.fmt.allocPrint(arena,
+            \\set -e
+            \\git clone -q '{s}/git/o/comp.git' '{s}/branch-work'
+            \\cd '{s}/branch-work'
+            \\git checkout -q v1/b && git rm -q only-v1.txt && echo b > only-b.txt && git add only-b.txt
+            \\git -c user.name=t -c user.email=t@t commit -q -m branch && git push -q origin v1/b
+        , .{ root, root, root }),
+    } });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, branch.term);
     for ([_][2][]const u8{ .{ "v1/b", "v1" }, .{ "v1", "v1/b" } }) |order| {
         var steps = [_]job_mod.Step{
             usesStep("first", "o", "comp", order[0], &.{}),
@@ -908,8 +928,21 @@ test "a ref with a slash and the ref that is its prefix are two trees, in either
         const text = w.written();
         errdefer std.debug.print("{s}\n", .{text});
         for (res.steps) |st| try std.testing.expectEqual(dagger.Outcome.success, st.outcome);
-        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "stdout] comp-ran"));
+        // Each step ran from its own tree, both after both fetches (not only its action.yml).
+        const tag = lineWith(text, "tree[/github/_actions/o/comp/v1]: action.yml") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, tag, "only-v1.txt") != null);
+        try std.testing.expect(std.mem.indexOf(u8, tag, "only-b.txt") == null);
+        const br = lineWith(text, "tree[/github/_actions/o/comp/v1/b]: action.yml") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, br, "only-b.txt") != null);
+        try std.testing.expect(std.mem.indexOf(u8, br, "only-v1.txt") == null);
     }
+}
+
+/// The line of `text` that holds `needle`, or null.
+fn lineWith(text: []const u8, needle: []const u8) ?[]const u8 {
+    const at = std.mem.indexOf(u8, text, needle) orelse return null;
+    const start = if (std.mem.lastIndexOfScalar(u8, text[0..at], '\n')) |i| i + 1 else 0;
+    return text[start .. std.mem.indexOfScalarPos(u8, text, at, '\n') orelse text.len];
 }
 
 test "an action's name or ref that moves a path or starts an option is not fetched, and two servers' o/comp@v1 are two trees" {
