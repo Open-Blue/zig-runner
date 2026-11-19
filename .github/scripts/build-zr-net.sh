@@ -29,6 +29,8 @@ esac
 # What this build was asked for cannot change under it: a script sourced below that assigns one of
 # these fails at once, naming it (install-rust.sh's own `arch` once replaced this one silently).
 readonly arch out libc
+# Said before anything is sourced, so the log has the request as it came, whatever follows.
+echo "build-zr-net.sh: asked for $arch ($libc), out $out" >&2
 # The pinned Rust (install-rust.sh): rustup's, when the machine has it and rust-toolchain.toml
 # picks this version, or one unpacked into the tool cache. `tsan`: the pinned nightly, always from
 # the tool cache (rustup's shims would follow rust-toolchain.toml to the stable one).
@@ -58,9 +60,9 @@ export "CC_${triple//-/_}=$here/zig-cc.sh"
 export "AR_${triple//-/_}=${AR_ZIG:-ar}"
 export "CARGO_TARGET_${upper}_LINKER=$here/zig-cc.sh"
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PWD/target}
-# In the job's log, what the build is and what it builds with: the architecture asked for, cargo's
-# target, which Rust and from where, and where it builds and writes.
-echo "build-zr-net.sh: asked for $arch ($libc): cargo target $triple; $(cargo --version) at $(command -v cargo), from $rust_from; CARGO_TARGET_DIR $CARGO_TARGET_DIR; out $out" >&2
+# In the job's log, what the build is and what it builds with: cargo's target (beside the request
+# logged above), which Rust and from where, and where it builds.
+echo "build-zr-net.sh: building $arch ($libc): cargo target $triple; $(cargo --version) at $(command -v cargo), from $rust_from; CARGO_TARGET_DIR $CARGO_TARGET_DIR" >&2
 # In a job, cargo's registry and crate cache go in the job's own temp directory: a self-hosted
 # runner's $HOME/.cargo can belong to another user (main's first Rust build failed there with
 # "Permission denied"), and one job's downloaded crates are not meant to reach another's build.
@@ -116,8 +118,16 @@ esac
 # Neither read stops early in a pipe (`grep -m1`, `od -N2` on `ar p`): `ar` would die of SIGPIPE,
 # and pipefail would fail the build for it.
 member=$(ar t "$out" | awk '/\.o$/ && !seen { print; seen = 1 }')
+if [[ -z $member ]]; then
+	echo "build-zr-net.sh: $out has no object (.o) member to check its architecture by" >&2
+	exit 1
+fi
+# No trap of its own: it would replace the one a sourced installer set for its work directory.
 object=$(mktemp)
-ar p "$out" "$member" >"$object"
+ar p "$out" "$member" >"$object" || {
+	rm -f "$object"
+	exit 1
+}
 got=$(od -An -tu2 -j18 -N2 "$object" | tr -d ' ')
 rm -f "$object"
 if [[ $got != "$want" ]]; then
