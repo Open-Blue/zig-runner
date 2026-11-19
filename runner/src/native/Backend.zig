@@ -6872,7 +6872,9 @@ test "root runner: a job's source address pin is on the host while it runs, and 
     const required = std.mem.eql(u8, env.get("ZIG_RUNNER_REQUIRE_NATIVE") orelse "", "1");
     // With handles: other shards' root jobs make and remove pins of their own meanwhile, and a slot
     // this job left may be the next job's at once; a pin made again is a new table, a new handle.
-    const list: []const []const u8 = &.{ "nft", "-a", "list", "tables", "bridge" };
+    // `list ruleset`, not `list tables`: only it prints each table's handle (`table bridge <name> {
+    // # handle N`).
+    const list: []const []const u8 = &.{ "nft", "-a", "list", "ruleset", "bridge" };
     const tool = std.process.run(arena, io, .{ .argv = list }) catch null;
     if (tool == null or tool.?.term != .exited or tool.?.term.exited != 0)
         return skip(required, "this machine has no `nft` to list the host's bridge tables");
@@ -6919,7 +6921,11 @@ test "root runner: a job's source address pin is on the host while it runs, and 
         handle = line;
         break;
     };
-    if (handle == null) std.debug.print("no pin for slot {d} while the job ran\n", .{slot});
+    if (handle == null) std.debug.print("no pin for slot {d} while the job ran; {d} listings, the last:\n{s}\n", .{
+        slot,
+        seen.items.len,
+        if (seen.items.len > 0) seen.items[seen.items.len - 1] else "",
+    });
     try std.testing.expect(handle != null);
     const after = try std.process.run(arena, io, .{ .argv = list });
     if (lineWith(after.stdout, name)) |line| {

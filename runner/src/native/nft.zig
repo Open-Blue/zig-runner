@@ -1690,7 +1690,7 @@ fn pinned(c: *Pinned, suffix: []const u8, dir: []const u8, pin: bool) void {
         \\for j in a:1:3 b:2:4; do
         \\  n=${j%%:*}; r=${j#*:}; s=${r%%:*}; h=${r#*:}
         \\  ip link add zrh$s type veth peer name e0; ip link set e0 netns zrt-$n-$sfx; ip link set zrh$s master zr0; ip link set zrh$s up
-        \\  ip netns exec zrt-$n-$sfx sh -c "ip link set lo up; ip addr add 10.211.1.$h/16 dev e0; ip link set e0 up; ip route add default via 10.211.0.1"
+        \\  ip netns exec zrt-$n-$sfx sh -c "echo 1 > /proc/sys/net/ipv6/conf/e0/disable_ipv6; ip link set lo up; ip addr add 10.211.1.$h/16 dev e0; ip link set e0 up; ip route add default via 10.211.0.1"
         \\done
         \\ip link add vc type veth peer name vc1; ip link set vc1 netns zrt-c-$sfx; ip link set vc master dk0; ip link set vc up
         \\ip netns exec zrt-c-$sfx sh -c 'ip link set lo up; ip addr add 172.17.0.2/16 dev vc1; ip link set vc1 up; ip route add default via 172.17.0.1'
@@ -1805,7 +1805,7 @@ fn pinned(c: *Pinned, suffix: []const u8, dir: []const u8, pin: bool) void {
         \\pin_ip() { t=$(pin); [ "$t" = none ] && echo none || echo "$t" | grep -v arp | grep 'ip saddr !=' | num; }
         \\pin_arp() { t=$(pin); [ "$t" = none ] && echo none || echo "$t" | grep 'arp saddr' | num; }
         \\pin_other() { t=$(pin); [ "$t" = none ] && echo none || echo "$t" | grep 'ether type !=' | grep -v saddr | num; }
-        \\pre_vlan() { nft list chain bridge zrt_pre c | grep 'ether type vlan' | num; }
+        \\pre_vlan() { nft list chain bridge zrt_pre c | grep -E 'ether type (vlan|8021q)' | num; }
         \\ip netns exec zrt-a-$sfx python3 $d/hold.py > $d/a.out &
         \\for i in $(seq 50); do grep -q answer $d/a.out 2>/dev/null && break; sleep 0.2; done
         \\echo "a_instance $(cut -d' ' -f1 $d/a.out)"
@@ -1875,7 +1875,9 @@ test "native nft: a job's packets carry its own source address, and nothing else
         try std.testing.expect(std.mem.indexOf(u8, out, "a_instance answer") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "b_own_instance answer") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "b_own_counted yes") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out, "arrived_ip 2 arp 1 vlan 1") != null);
+        // The `ip saddr` probe counts the tagged frame as well (nft's bridge family looks past the
+        // tag), so three: the two plain spoofs and the tagged one.
+        try std.testing.expect(std.mem.indexOf(u8, out, "arrived_ip 3 arp 1 vlan 1") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "a_still answer") != null);
         if (pin) {
             try std.testing.expect(std.mem.indexOf(u8, out, "pin_dropped_ip 2 arp 1") != null);
