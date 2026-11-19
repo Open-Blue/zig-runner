@@ -41,6 +41,14 @@ for attempt in 1 2 3; do
 	sleep $((attempt * 15))
 done
 
+# The corpus the run starts from: the fuzzer says nothing while it runs, so a run that ends at the
+# time limit leaves this and its own timing as the facts to tell a slow target from a hang.
+# (No directory on a first run: `find` fails, and pipefail with it.)
+corpus_files=$({ find .zig-cache/f -type f 2>/dev/null || true; } | wc -l)
+corpus_bytes=$({ find .zig-cache/f -type f -printf '%s\n' 2>/dev/null || true; } | awk '{ s += $1 } END { print s + 0 }')
+echo "fuzz: $target: $runs runs asked, $minutes minutes allowed, from a corpus of $corpus_files files, $corpus_bytes bytes"
+started=$SECONDS
+
 # The tests' output is only text to the job (zig-test.sh): an input can hold `::` lines.
 stop="fuzz-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 echo "::stop-commands::$stop"
@@ -50,6 +58,9 @@ timeout --kill-after=30 "$((minutes * 60))" \
 	zig build test -Dllvm -Dtest-filter="fuzz: $target" --fuzz="$runs" 2>&1 | tee "$out/log" ||
 	status=$?
 echo "::$stop::"
+# The fuzzer's report says "Runs: 20466 -> 1026029": the runs of this one, on top of the kept corpus's.
+done_runs=$(awk '/^Runs: / { print $4 - $2; exit }' "$out/log" 2>/dev/null || true)
+echo "fuzz: $target: ${done_runs:-no count (the fuzzer reports only when it finishes)} runs in $((SECONDS - started)) s (exit $status)"
 
 # `zig build --fuzz=N` exits 0 even when the test failed (Zig 0.17 prints the failure, saves the
 # input, and goes on to its report), so the crash file and the build runner's `error:` lines decide.

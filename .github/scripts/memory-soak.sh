@@ -139,8 +139,21 @@ main() {
 #!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq >/dev/null
-apt-get install -y -qq nftables iproute2 util-linux procps ca-certificates >/dev/null
+# The container's first minutes are this, and its log says nothing until the runner starts: so it
+# says what it is doing, and tries again, since a mirror that stalls or fails fails the night's
+# soak before the runner has run a job (2026-11-19: nothing in the log for the 120 s the host waits).
+started=$SECONDS
+for attempt in 1 2 3; do
+	if apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update -qq >/dev/null &&
+		apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y -qq \
+			nftables iproute2 util-linux procps ca-certificates >/dev/null; then
+		break
+	fi
+	echo "soak: apt failed after $((SECONDS - started)) s (attempt $attempt of 3)" >&2
+	((attempt < 3)) || exit 1
+	sleep $((attempt * 10))
+done
+echo "soak: packages installed in $((SECONDS - started)) s"
 mkdir -p /sys/fs/cgroup/init
 # Every process out of the container's root cgroup, so that it can hand controllers to a child
 # (a cgroup with processes of its own cannot), and the jobs' cgroup under it.
@@ -173,12 +186,21 @@ EOF
 	pid=$(docker inspect -f '{{.State.Pid}}' "$name")
 	# `bash -c` is the container's first process, and runs the script as a child: the runner is the
 	# newest descendant, so find it (its pid is what /proc is read for).
-	for _ in $(seq 120); do
+	# Up to five minutes (the container installs its packages first: apt's mirror may be slow), and
+	# no longer than the container lives.
+	for _ in $(seq 300); do
 		rpid=$(docker top "$name" -eo pid,comm 2>/dev/null | awk '$2 == "runner" { print $1; exit }') || true
 		[[ -n ${rpid:-} ]] && break
+		[[ $(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null) == true ]] || break
 		sleep 1
 	done
-	[[ -n ${rpid:-} ]] || { echo "the runner did not start; its log:" >&2 && tail -n 20 "$out/runner.log" >&2 && exit 1; }
+	[[ -n ${rpid:-} ]] || {
+		echo "the runner did not start (the container is $(docker inspect -f '{{.State.Status}}, exit {{.State.ExitCode}}' "$name" 2>&1)); its log:" >&2
+		tail -n 20 "$out/runner.log" >&2
+		echo "the container's processes:" >&2
+		docker top "$name" -eo pid,etime,comm >&2 || true
+		exit 1
+	}
 	echo "runner pid $rpid (container main pid $pid), log $out/runner.log, results $out"
 
 	# The runner's mappings before and after, to say where a growth is (ZR_SOAK_SMAPS=1).
