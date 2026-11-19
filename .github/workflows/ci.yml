@@ -268,6 +268,14 @@ jobs:
       - name: test-files.sh names a file whose tests are not in the binary
         run: .github/scripts/test-files-test.sh
 
+      # The pinned apt installs' failure path (apt-pinned.sh) and the TSan address-space setting's
+      # (mmap-rnd-bits.sh), against fakes: a failure says what the archive offers, or why the key
+      # did not take.
+      - name: Pinned apt and mmap_rnd_bits failures say why
+        run: |
+          .github/scripts/apt-pinned-test.sh
+          .github/scripts/mmap-rnd-bits-test.sh
+
       # The release binaries, against their pinned checksums: a new version (Renovate's) fails
       # here until they are updated. shfmt shows the diff that would format a script.
       - name: shfmt
@@ -1260,13 +1268,19 @@ jobs:
       - name: Runner image preflight
         run: .github/scripts/image-preflight.sh python3 ip unshare nsenter docker 'nft?'
 
-      # Razorbill (a Pi) runs 16 KiB pages; GitHub's arm64 runner does not, so a test that depends
-      # on the page size passes here on 4 KiB and is not seen at 16: said in the log, so a runner
-      # image that changes it is noticed.
+      # Razorbill (a Pi) runs 16 KiB pages; GitHub's arm64 runner has 4 KiB, which the tests here
+      # are held to: a test that depends on the page size passes here on 4 KiB and is not seen at
+      # 16. Printed either way, and a different size fails, so a runner image that changes it is
+      # noticed here, not by a test that starts failing for no change of ours.
       - name: Page size
         run: |
-          echo "page size: $(getconf PAGESIZE) bytes, kernel $(uname -r)"
-          echo "::notice title=arm64 page size::GitHub's arm64 runner has $(getconf PAGESIZE)-byte pages; razorbill has 16384"
+          size=$(getconf PAGESIZE)
+          echo "page size: $size bytes (expected 4096 on GitHub's arm64 runner; razorbill has 16384), kernel $(uname -r), $(uname -m)"
+          echo "::notice title=arm64 page size::GitHub's arm64 runner has $size-byte pages; razorbill has 16384"
+          if [ "$size" != 4096 ]; then
+            echo "::error title=arm64 page size changed::the runner has $size-byte pages, not the 4096 these tests assume: check what the image changed, then update this step and the tests"
+            exit 1
+          fi
 
       - name: Whether this change can affect the tests
         id: scope
