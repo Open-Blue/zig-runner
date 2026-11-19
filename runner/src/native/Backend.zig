@@ -1656,9 +1656,11 @@ pub fn deinit(b: *Backend) void {
             so.close();
         }
     }
-    // Its pin on the job's source address (`nft.pinSource`), under the slot's lock still: the
-    // slot's next holder replaces it when it makes its own.
-    if (b.slot) |s| nft.unpinSource(s.n);
+    // Its pin on the job's source address (`nft.pinSource`), under the slot's lock still, and
+    // only once no process of the job is left: one that is may still hold the namespace and its
+    // port, and could send as another job's address. Left, the slot's next holder replaces it
+    // when it makes its own.
+    if (b.slot) |s| if (processes_gone) nft.unpinSource(s.n);
     t = b.timings.since(arena, .veth_rm, t);
     removeJobDir(arena, b.io, b.dir);
     t = b.timings.since(arena, .tree_rm, t);
@@ -6881,7 +6883,8 @@ test "root runner: a job's source address pin is on the host while it runs, and 
         \\sleep 4
     );
     const Job = struct {
-        fn run(arena_: Allocator, cfg_: Config, step_: @TypeOf(step), out: *[]const u8) bool {
+        fn run(arena_: Allocator, cfg_: Config, step_: @TypeOf(step), out: *[]const u8, done: *std.atomic.Value(bool)) bool {
+            defer done.store(true, .release);
             const r = runNativeJob(arena_, cfg_, testJob(&.{step_}), .root) catch return false;
             out.* = r.text;
             return r.res.steps[0].outcome == .success;
@@ -6890,10 +6893,13 @@ test "root runner: a job's source address pin is on the host while it runs, and 
     var job_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer job_arena.deinit();
     var text: []const u8 = "";
-    var job = try io.concurrent(Job.run, .{ job_arena.allocator(), cfg, step, &text });
-    // Every listing while the job runs: which slot is the job's is known only from its output.
+    var done: std.atomic.Value(bool) = .init(false);
+    var job = try io.concurrent(Job.run, .{ job_arena.allocator(), cfg, step, &text, &done });
+    // Every listing until the job ends, however slow its set-up under other shards' jobs (30 s at
+    // most): which slot is the job's is known only from its output.
     var seen: std.ArrayList([]const u8) = .empty;
-    for (0..40) |_| {
+    for (0..300) |_| {
+        if (done.load(.acquire)) break;
         const got = std.process.run(arena, io, .{ .argv = list }) catch break;
         try seen.append(arena, got.stdout);
         try io.sleep(.fromMilliseconds(100), .awake);

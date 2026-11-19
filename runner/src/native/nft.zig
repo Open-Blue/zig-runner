@@ -294,11 +294,12 @@ pub fn forwardPolicy() Policy {
 /// with the other's source address going out through the gateway (#603). Each job's host-side
 /// port therefore has a table of its own, in the `bridge` family (`zig_runner_pin<slot>`, one
 /// chain on the pre-routing hook): IPv4 from that port with any source but the job's address is
-/// dropped, and so is ARP whose sender is not. It is made in one batch (the table replaced if a
-/// dead job's is there) before the port exists, by the job's network helper, which fails the job's
-/// network if it cannot: a job is never up without it. The job's teardown removes it
-/// (`unpinSource`); one left by a crash is still a pin on a port that is gone, and the slot's
-/// next job replaces it.
+/// dropped, so is ARP whose sender is not, and so is any other frame, a VLAN-tagged one among
+/// them. It is made in one batch (the table replaced if a dead job's is there) before the port
+/// exists, by the job's network helper, which fails the job's network if it cannot: a job is
+/// never up without it. The job's teardown removes it once no process of the job is left
+/// (`unpinSource`); one left by a crash, or by a job whose processes may remain, is replaced by
+/// the slot's next job.
 pub fn pinSource(slot: u32, addr: [4]u8) ?[]const u8 {
     var sock = Socket.open() catch return "cannot open an nftables netlink socket";
     defer sock.close();
@@ -374,6 +375,19 @@ fn pinBatch(b: *Batch, tbl: []const u8, link: []const u8, addr: [4]u8) void {
     b.ifname(.iif, .eq, link);
     b.payloadEq(nft_payload_ll_header, 12, &.{ 0x08, 0x06 });
     b.payloadCmp(nft_payload_network_header, 14, .neq, &addr);
+    b.counter();
+    b.verdict(nf_drop);
+    b.endRule(r);
+    // `iifname <port> ether type != ip ether type != arp counter drop`: nothing else, and above
+    // all no VLAN tag. A tagged frame's tag is out of band by the time the hook runs, and the
+    // link-layer payload puts it back (offset 12 reads 0x8100 or 0x88a8, so neither rule above
+    // matches it), while the bridge's own stack drops a VLAN 0 tag and takes the frame as the
+    // IPv4 or ARP inside. A job needs neither (no IPv6 either: it is off on the bridge and in
+    // the job).
+    r = b.rule(tbl, "pin", linux.NLM_F_APPEND);
+    b.ifname(.iif, .eq, link);
+    b.payloadCmp(nft_payload_ll_header, 12, .neq, &.{ 0x08, 0x00 });
+    b.payloadCmp(nft_payload_ll_header, 12, .neq, &.{ 0x08, 0x06 });
     b.counter();
     b.verdict(nf_drop);
     b.endRule(r);
@@ -1624,9 +1638,11 @@ const Pinned = struct {
 ///
 ///  - a packet from its own address to the instance: passes, and the reach rule counts it;
 ///  - the first packet of a connection to the instance and one to an address out of the uplink,
-///    each with A's address as its source; an ARP whose sender is A's address.
+///    each with A's address as its source; an ARP whose sender is A's address; and the first
+///    packet of one to the instance as A in a frame with a VLAN 0 tag, which the bridge's stack
+///    takes as plain IPv4.
 ///
-/// Probes ahead of the pin (a bridge table at pre-routing -300) must see all three arrive, the pin's
+/// Probes ahead of the pin (a bridge table at pre-routing -300) must see all four arrive, the pin's
 /// own counters must count them, and a probe after it (the `ip` forward hook, -10) must see none
 /// of them and see B's own packet: so it is the pin that stops them.
 fn pinned(c: *Pinned, suffix: []const u8, dir: []const u8, pin: bool) void {
@@ -1662,9 +1678,10 @@ fn pinned(c: *Pinned, suffix: []const u8, dir: []const u8, pin: bool) void {
         \\nft add chain bridge zrt_pre c '{ type filter hook prerouting priority -300; }'
         \\nft add rule bridge zrt_pre c iifname zrh2 ip saddr 10.211.1.3 counter
         \\nft add rule bridge zrt_pre c iifname zrh2 arp saddr ip 10.211.1.3 counter
+        \\nft add rule bridge zrt_pre c iifname zrh2 ether type vlan counter
         \\nft add table ip zrt_post
         \\nft add chain ip zrt_post f '{ type filter hook forward priority -10; }'
-        \\nft add rule ip zrt_post f iifname zr0 ip saddr 10.211.1.3 tcp sport 43000-43001 counter
+        \\nft add rule ip zrt_post f iifname zr0 ip saddr 10.211.1.3 tcp sport 43000-43002 counter
         \\nft add rule ip zrt_post f iifname zr0 ip saddr 10.211.1.4 counter
     ;
     const ports =
@@ -1719,6 +1736,26 @@ fn pinned(c: *Pinned, suffix: []const u8, dir: []const u8, pin: bool) void {
         \\s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW); s.bind(("e0", 0))
         \\s.send(b"\xff" * 6 + mac + struct.pack("!H", 0x0806) + arp)
         \\EOF
+        \\cat > $d/vlan.py <<'EOF'
+        \\import socket, struct, sys
+        \\src, sport, dst, dport = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+        \\def csum(b):
+        \\    if len(b) % 2: b += b"\0"
+        \\    t = sum(struct.unpack("!%dH" % (len(b) // 2), b))
+        \\    t = (t >> 16) + (t & 0xffff); t += t >> 16
+        \\    return ~t & 0xffff
+        \\sa, da = socket.inet_aton(src), socket.inet_aton(dst)
+        \\tcp = struct.pack("!HHLLBBHHH", sport, dport, 1000, 0, 5 << 4, 2, 65535, 0, 0)
+        \\tcp = tcp[:16] + struct.pack("!H", csum(sa + da + struct.pack("!BBH", 0, 6, len(tcp)) + tcp)) + tcp[18:]
+        \\ip = struct.pack("!BBHHHBBH", 0x45, 0, 20 + len(tcp), 4244, 0, 64, 6, 0) + sa + da
+        \\ip = ip[:10] + struct.pack("!H", csum(ip)) + ip[12:]
+        \\mac = bytes.fromhex(open("/sys/class/net/e0/address").read().strip().replace(":", ""))
+        \\gw = next(l.split()[3] for l in open("/proc/net/arp").read().splitlines()[1:] if l.split()[0] == "10.211.0.1")
+        \\gw = bytes.fromhex(gw.replace(":", ""))
+        \\# An 802.1Q tag with VLAN 0 (priority only): the bridge's stack drops it and takes the IPv4 inside.
+        \\s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW); s.bind(("e0", 0))
+        \\s.send(gw + mac + struct.pack("!HHH", 0x8100, 0, 0x0800) + ip + tcp)
+        \\EOF
         \\cat > $d/hold.py <<'EOF'
         \\import socket, time
         \\s = socket.create_connection(("10.1.0.48", 3398), 3)
@@ -1764,8 +1801,11 @@ fn pinned(c: *Pinned, suffix: []const u8, dir: []const u8, pin: bool) void {
         \\pre_arp() { nft list chain bridge zrt_pre c | grep 'arp saddr' | num; }
         \\post_a() { nft list chain ip zrt_post f | grep 'saddr 10.211.1.3' | num; }
         \\post_b() { nft list chain ip zrt_post f | grep 'saddr 10.211.1.4' | num; }
-        \\pin_ip() { nft list table bridge zig_runner_pin2 2>/dev/null | grep -v arp | grep 'ip saddr !=' | num; }
-        \\pin_arp() { nft list table bridge zig_runner_pin2 2>/dev/null | grep 'arp saddr' | num; }
+        \\pin() { nft list table bridge zig_runner_pin2 2>/dev/null || echo none; }
+        \\pin_ip() { t=$(pin); [ "$t" = none ] && echo none || echo "$t" | grep -v arp | grep 'ip saddr !=' | num; }
+        \\pin_arp() { t=$(pin); [ "$t" = none ] && echo none || echo "$t" | grep 'arp saddr' | num; }
+        \\pin_other() { t=$(pin); [ "$t" = none ] && echo none || echo "$t" | grep 'ether type !=' | grep -v saddr | num; }
+        \\pre_vlan() { nft list chain bridge zrt_pre c | grep 'ether type vlan' | num; }
         \\ip netns exec zrt-a-$sfx python3 $d/hold.py > $d/a.out &
         \\for i in $(seq 50); do grep -q answer $d/a.out 2>/dev/null && break; sleep 0.2; done
         \\echo "a_instance $(cut -d' ' -f1 $d/a.out)"
@@ -1776,9 +1816,11 @@ fn pinned(c: *Pinned, suffix: []const u8, dir: []const u8, pin: bool) void {
         \\ip netns exec zrt-b-$sfx python3 $d/spoof.py 10.211.1.3 43000 10.1.0.48 3398 2
         \\ip netns exec zrt-b-$sfx python3 $d/spoof.py 10.211.1.3 43001 10.1.0.77 80 2
         \\ip netns exec zrt-b-$sfx python3 $d/arp.py 10.211.1.3
+        \\ip netns exec zrt-b-$sfx python3 $d/vlan.py 10.211.1.3 43002 10.1.0.48 3398
         \\sleep 0.7
-        \\echo "arrived_ip $(pre_ip) arp $(pre_arp)"
+        \\echo "arrived_ip $(pre_ip) arp $(pre_arp) vlan $(pre_vlan)"
         \\echo "pin_dropped_ip $(pin_ip) arp $(pin_arp)"
+        \\echo "pin_dropped_other $(pin_other)"
         \\echo "reached_forward spoof=$(post_a) own=$(post_b)"
         \\echo "a_still $(ip netns exec zrt-a-$sfx python3 $d/try.py 10.1.0.48 3398)"
     ;
@@ -1833,14 +1875,17 @@ test "native nft: a job's packets carry its own source address, and nothing else
         try std.testing.expect(std.mem.indexOf(u8, out, "a_instance answer") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "b_own_instance answer") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "b_own_counted yes") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out, "arrived_ip 2 arp 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "arrived_ip 2 arp 1 vlan 1") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "a_still answer") != null);
         if (pin) {
             try std.testing.expect(std.mem.indexOf(u8, out, "pin_dropped_ip 2 arp 1") != null);
+            try std.testing.expect(std.mem.indexOf(u8, out, "pin_dropped_other 1") != null);
             try std.testing.expect(std.mem.indexOf(u8, out, "reached_forward spoof=0 own=") != null);
         } else {
-            // No pin: the spoofs of A's address reach `forward` (the one to the instance, and the one out of the uplink).
-            try std.testing.expect(std.mem.indexOf(u8, out, "reached_forward spoof=2") != null);
+            // No pin: the spoofs of A's address reach `forward` (the one to the instance, the one
+            // out of the uplink, and the VLAN 0 tagged one to the instance).
+            try std.testing.expect(std.mem.indexOf(u8, out, "pin_dropped_ip none arp none") != null);
+            try std.testing.expect(std.mem.indexOf(u8, out, "reached_forward spoof=3") != null);
         }
     }
 }

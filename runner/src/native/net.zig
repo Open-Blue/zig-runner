@@ -140,7 +140,9 @@ pub fn upMain(
         return fail("turn IPv6 off on the bridge", .ACCES);
     // The job's address is its alone before its port exists: nothing it sends is let through as
     // another's (#603). Here, in the host's namespace: after the unshare below, nftables would be
-    // the job's own. Not made, no network.
+    // the job's own. Not made, no network. Like the veth below, only for the runner that holds
+    // the slot's lock: a dead runner's helper changes nothing of the slot's.
+    if (linux.getppid() != parent) return fail("find the runner that holds the slot's lock", .SRCH);
     if (nft.pinSource(slot, subnet.jobAddress(slot))) |why| {
         const what = std.fmt.allocPrint(arena, "pin the job's source address: {s}", .{why}) catch "pin the job's source address";
         return fail(what, .INVAL);
