@@ -420,17 +420,38 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
     return readAction(b, u, ref_label, repository, ref, mount, layer, sha);
 }
 
-/// Where the tree is mounted: GitHub's `/github/_actions/<repository>/<ref>` (the ref as one
-/// directory name: its `/` escaped, so that no mount is inside another, as `o/r@a/b` would be in
-/// `o/r@a`), and under `@<host>` when it comes from a server other than the job's default one, so
-/// that two servers' `o/r@v1` are two trees.
-fn mountFor(arena: Allocator, job: job_mod.Job, from: job_mod.Resolved) ![]const u8 {
+/// Where the tree is mounted: GitHub's `/github/_actions/<repository>/<ref>` for the job's default
+/// server (as before: `github.action_path` is that, the ref as written), and, for a tree from any
+/// other server, under `@<server>` (its whole URL, scheme included, as one escaped segment: `http`
+/// and `https` of one host, and two servers' `o/r@v1`, are two trees) with the ref as one directory
+/// name (its `/` escaped, so that no mount is inside another, as `o/r@a/b` would be in `o/r@a`).
+/// The native and the Dagger path both mount here.
+pub fn mountFor(arena: Allocator, job: job_mod.Job, from: job_mod.Resolved) ![]const u8 {
     const default = std.mem.trimEnd(u8, if (job.github.actions_url.len > 0) job.github.actions_url else job.github.server_url, "/");
-    const ref = try escapeSegment(arena, from.ref);
     if (std.mem.eql(u8, from.server, default))
-        return std.fmt.allocPrint(arena, "/github/_actions/{s}/{s}", .{ from.repository, ref });
-    const host = try escapeSegment(arena, if (std.mem.indexOf(u8, from.server, "://")) |i| from.server[i + 3 ..] else from.server);
-    return std.fmt.allocPrint(arena, "/github/_actions/@{s}/{s}/{s}", .{ host, from.repository, ref });
+        return std.fmt.allocPrint(arena, "/github/_actions/{s}/{s}", .{ from.repository, from.ref });
+    const server = try escapeSegment(arena, from.server);
+    const ref = try escapeSegment(arena, from.ref);
+    return std.fmt.allocPrint(arena, "/github/_actions/@{s}/{s}/{s}", .{ server, from.repository, ref });
+}
+
+test "mountFor: GitHub's path for the default server, one tree per server and scheme otherwise" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var job = std.mem.zeroInit(job_mod.Job, .{});
+    job.github.server_url = "https://git.example.org";
+    const u: job_mod.Uses = .{ .owner = "o", .name = "r", .ref = "release/v1" };
+    // The default server: the path GitHub's runner has, its ref as written.
+    try std.testing.expectEqualStrings("/github/_actions/o/r/release/v1", try mountFor(arena, job, try u.resolve(arena, job)));
+    var other = u;
+    other.source = .url;
+    other.url = "http://h.example";
+    const plain = try mountFor(arena, job, try other.resolve(arena, job));
+    other.url = "https://h.example";
+    const tls = try mountFor(arena, job, try other.resolve(arena, job));
+    try std.testing.expectEqualStrings("/github/_actions/@https%3A%2F%2Fh.example/o/r/release%2Fv1", tls);
+    try std.testing.expect(!std.mem.eql(u8, plain, tls));
 }
 
 /// `s` as one path segment, injectively: letters, digits and `-._+@` kept, every other byte as

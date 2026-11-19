@@ -1123,10 +1123,7 @@ pub fn fetchAction(x: *Exec, u: job_mod.Uses) !LoadResult {
         .ok => |m| m,
         .invalid => |why| return loadFailed(arena, "{s} of {s} {s}", .{ name, ref_label, why }),
     };
-    const mount = try std.fmt.allocPrint(arena, "/github/_actions/{s}/{s}", .{
-        repository,
-        from.ref,
-    });
+    const mount = try @import("../native/actions.zig").mountFor(arena, x.job.*, from);
     return .{ .ok = .{
         .meta = meta,
         .dir = dir,
@@ -1589,6 +1586,46 @@ test "a composite action's uses: steps: nested actions, the built-in checkout, o
     try std.testing.expect(!res2.succeeded);
     try std.testing.expectEqual(@as(usize, 3), fake2.seen.items.len);
     try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "o/loop@v1: composite actions can be nested at most 9 levels deep") != null);
+}
+
+test "two servers' o/act@v1 are two mounts, and each step runs its own action" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const composite = "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo ran-{s}\n";
+    var steps = [_]job_mod.Step{
+        usesStep("dflt", "o", "act", "v1", &.{}),
+        usesStep("inst", "o", "act", "v1", &.{}),
+    };
+    steps[1].action.uses.source = .instance;
+    var job = testJob(&steps);
+    job.github.server_url = "https://git.example.org";
+    job.github.actions_url = "https://github.com";
+    const answers = [_][]const u8{
+        base_answer,
+        try treeAnswer(arena, "D1", &.{"action.yml"}),
+        try fileAnswer(arena, try std.fmt.allocPrint(arena, composite, .{"github"})),
+        try treeAnswer(arena, "D2", &.{"action.yml"}),
+        try fileAnswer(arena, try std.fmt.allocPrint(arena, composite, .{"instance"})),
+        try exec(arena, "C1", 0, ""),
+        try exec(arena, "C2", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    errdefer std.debug.print("{s}\n", .{w.buffered()});
+    try std.testing.expect(res.succeeded);
+    const seen = fake.seen.items;
+    try std.testing.expectEqual(@as(usize, 7), seen.len);
+    // The first action is where GitHub's runner puts it, the second under its server: two
+    // directories mounted, not the first one's tree under both.
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "ran-github") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "withDirectory(path:\"/github/_actions/o/act/v1\",source:\"D1\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[6], "ran-instance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[6], "withDirectory(path:\"/github/_actions/@https%3A%2F%2Fgit.example.org/o/act/v1\",source:\"D2\")") != null);
 }
 
 test "an action that cannot be resolved: GitHub's message" {
