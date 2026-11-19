@@ -187,12 +187,18 @@ pub fn fetchInto(b: *Backend, mount: []const u8, src: Source, expect: ?[]const u
     }} });
     defer b.binds = saved;
     var out: Backend.Captured = .{ .arena = arena };
+    const mark = b.layers_pushed;
     const ended = try b.execOn(&.{ "sh", "-c", script }, &.{"PATH=" ++ Backend.image_path}, &.{}, uid, gid, out.output(), null);
-    if (ended.failure.len > 0 or ended.code != 0) return .{ .failed = try std.fmt.allocPrint(
-        arena,
-        "could not unpack {s} in the job's image (it needs `tar` and `gzip`): {s}",
-        .{ src.url, if (ended.failure.len > 0) ended.failure else out.tail() },
-    ) };
+    if (ended.failure.len > 0 or ended.code != 0) {
+        // The failed extraction's layer, with its half-made tree, is not the job's: dropped here, so
+        // a retry, or the step that fails, does not build on it.
+        b.dropPushedSince(mark);
+        return .{ .failed = try std.fmt.allocPrint(
+            arena,
+            "could not unpack {s} in the job's image (it needs `tar` and `gzip`): {s}",
+            .{ src.url, if (ended.failure.len > 0) ended.failure else out.tail() },
+        ) };
+    }
     return .{ .sha = sha };
 }
 
@@ -1234,4 +1240,34 @@ test "fetch retry: a checkout over the tarball whose connection is dropped every
     try expectSucceeded(res, w.written(), 1);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.written(), "##[warning]Failed to fetch repository 'o/r@"));
     try std.testing.expect(std.mem.indexOf(u8, w.written(), "tok-123") == null);
+}
+
+test "fetch retry: a tarball whose unpacking fails leaves no layer behind, so a fetch tried again starts from the job's own tree" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    const ar = try testArchiveOf(arena, &tmp, "echo x > f");
+    // An image whose `tar` fails: the extraction runs, makes its layer, and ends with an error.
+    try tmp.dir.writeFile(io, .{ .sub_path = "badtar.sh", .data = "#!/bin/sh\necho 'tar: broken' >&2\nexit 2\n", .flags = .{ .permissions = .fromMode(0o755) } });
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{
+        .host = try std.fmt.allocPrint(arena, "{s}/badtar.sh", .{ar.root}),
+        .at = "/usr/bin/tar",
+    }} });
+    var srv: TestServer = .{ .archive_path = "/o/act/archive/v1.tar.gz", .body = ar.tgz };
+    try srv.start();
+    defer srv.stop();
+    var b = try Backend.init(arena, io, std.testing.allocator, cfg);
+    defer b.deinit();
+    const src = try actionSource(arena, try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port}), "o/act", "v1");
+    const before = b.layers.items.len;
+    const got = try fetchInto(&b, "/github/_actions/o/act/v1", src, null, 0, 0);
+    try std.testing.expect(got == .failed);
+    try std.testing.expect(std.mem.startsWith(u8, got.failed, "could not unpack "));
+    try std.testing.expectEqual(before, b.layers.items.len);
+    // And it is not the download's failure: never tried again, whatever the names in it.
+    try std.testing.expect(!@import("../dagger/fetch_retry.zig").transientDownload(got.failed));
 }

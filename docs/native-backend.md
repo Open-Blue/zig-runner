@@ -2613,8 +2613,8 @@ that fails (`Could not resolve host`), a refused or reset connection, a timeout,
 Up to 5 attempts, waiting 4, 8, 16 and 32 s between them, each a random half to all of that, so 30 to 60 s of waiting
 in all: actions/runner (`ActionManager.cs`, `DownloadRepositoryArchive`) tries 3 times, 10 to 30 s apart, any error but a 404 or
 an access denial, and a cancel ends its waiting too. A missing repository or ref, refused credentials, a body cut short
-after bytes came and an exhausted 15 minutes are not retried. Bounds: an action's attempt is stopped after 120 s (and at
-the job's cancel; `Backend.execLimited`) and git ends a transfer that moves under 1 KB/s for 30 s
+after bytes came and an exhausted 15 minutes are not retried. Bounds: an action's attempt is stopped only after 15 minutes, the tarball's own (and at
+the job's cancel; `Backend.execLimited`), so a slow fetch that moves bytes is never killed (a 150 MB repository at 1 MB/s takes 150 s); git ends a transfer that moves under 1 KB/s for 30 s
 (`GIT_HTTP_LOW_SPEED_*`); and a job has one retry budget for all its fetches, 180 s of failed attempts and waits
 (`fetch_retry.Budget`), after which a failure is the answer, so a network that never answers costs the job minutes, not
 5 attempts for each action. Each retry is a `##[warning]Failed to fetch action '<owner>/<repo>@<ref>' (attempt N of 5): <the
