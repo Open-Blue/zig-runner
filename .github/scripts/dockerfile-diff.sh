@@ -73,7 +73,7 @@ fi
 
 # The runner's builds, compared; as root. The test's own filter, so it is the only test run.
 cd runner
-sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+../.github/scripts/allow-userns.sh
 ZIG_RUNNER_DOCKERFILE_ORACLE="$work" ZIG_RUNNER_DOCKERFILE_ORACLE_ONLY="$only" \
 	ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 ZIG_TEST_SHARDS=1 \
 	ZIG_TEST_FILTER="oracle: the Dockerfile builder" ../.github/scripts/zig-test.sh
