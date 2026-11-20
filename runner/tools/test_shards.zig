@@ -75,6 +75,55 @@ fn slow(name: []const u8) bool {
     return false;
 }
 
+/// The tests that take the longest in the root run (measured by ZIG_TEST_TIMES=1 on CI's hosted
+/// runners, 2026-11-20, x86_64 and arm64 averaged; the weight is tenths of a second; the ones of
+/// 2 s and more, which together are 221 s of the 312 s the root tests take). As root every native
+/// test runs alone, so a part takes the sum of its tests' times, and sharing out every N-th test
+/// left one part with most of the long ones. These are shared out first, each to the part with the
+/// least weight so far (longest first), and the rest alternate as before: a deterministic split,
+/// the same in every process, needing no file at run time. Refresh: run the root part with
+/// ZIG_TEST_TIMES=1 (`time:` lines, longest first), and put the tests of 2 s and more here; a
+/// test missing or out of date only makes the parts less equal, never drops or repeats a test.
+const heavy = [_]struct { u32, []const u8 }{
+    .{ 202, "native docker api: while job A is running, job B cannot reach A's socket, finds no other socket, and has an API of its own" },
+    .{ 187, "root runner: a job's own network, out of reach of the host's services and other jobs" },
+    .{ 185, "root runner: a native job resolves through a nameserver only another interface reaches, and reaches nothing else there" },
+    .{ 164, "native nft: a job's packets carry its own source address, and nothing else of its use of the bridge changes" },
+    .{ 143, "native nft: a job reaches an instance Docker publishes, and a job cannot use the rule for anything else" },
+    .{ 108, "native store under load: with the deferred sync, jobs miss one another's pending layers" },
+    .{ 108, "native store under load: processes share one store under a small cap" },
+    .{ 106, "a native step that forks all through the ladder leaves nothing at its end" },
+    .{ 83, "root runner: native gate accuracy, each job's own cgroup against the engine-wide reading" },
+    .{ 80, "a native step that takes no SIGINT hears SIGTERM 7500 ms on, and its end counts as cancelled" },
+    .{ 73, "root runner: all native jobs together stay under the limit on their parent" },
+    .{ 71, "a container job's ports: published on the host, never another job's nor a bridge's, gone with the job; a taken port fails it; a bare one is the kernel's pick" },
+    .{ 70, "root runner: a container job's --cpus 0.5 sets the job's cpu.max and throttles a busy loop, with no engine" },
+    .{ 63, "root runner: a native job's runaway is OOM-killed in its own cgroup, a fork bomb stops at pids.max" },
+    .{ 63, "native services: the host and other jobs cannot reach a job's services (root runner)" },
+    .{ 62, "root runner: a job the runner does not vouch for does not run where no total can hold" },
+    .{ 45, "root runner: with no swap a job past what the gate reserves is not held there" },
+    .{ 43, "root runner: a job's source address pin is on the host while it runs, and gone after (#603)" },
+    .{ 37, "each post script of a native job hears its own SIGINT at the job's limit" },
+    .{ 35, "native cgroup: under pressure the lower job's steps are frozen and use no CPU, the higher job's go on, and the pause ends" },
+    .{ 33, "a native step that ignores every signal is dead at the ladder's end, whatever it started" },
+    .{ 26, "native tool trees: a job's first step ends the epoch of the tool cache for those that have not checked yet" },
+    .{ 25, "native eviction under a real job: a seed and a volume stay until it ends, and a seed built again is a new key" },
+    .{ 25, "a published port's quiet connections make way for a newcomer, and idle ones are closed" },
+    .{ 24, "native hashFiles: calls that each hold memory and need more run in turn, none waits on another for good" },
+    .{ 24, "a container job's named volumes: kept between jobs, filled from the image once, apart by scope and repository, :ro read-only" },
+    .{ 24, "native step cache: with the deferred sync, a job that lost a key to another's pending layer keeps caching its later steps" },
+    .{ 24, "root runner: a native step's fork bomb that ignores signals goes at the ladder's end" },
+    .{ 22, "native services: postgres and redis from real images (ZIG_RUNNER_SERVICE_IMAGES, root)" },
+    .{ 21, "a published port with no idle timeout keeps a quiet connection" },
+    .{ 20, "native cgroup: a job's directory left frozen is thawed when it is made again" },
+    .{ 20, "native cgroup: an explicit --cpu-shares weight is written after the priority's, and so wins" },
+};
+
+fn heavyWeight(name: []const u8) ?u32 {
+    for (heavy) |h| if (std.mem.endsWith(u8, name, h[1])) return h[0];
+    return null;
+}
+
 /// Tests that are single-threaded and exhaustive (every bit of a seed flipped, every allocation
 /// failed in turn): ThreadSanitizer, which reports races between threads, has nothing to find in
 /// them, and slows them about tenfold. Under it (ZIG_TEST_SANITIZE_THREAD=1, zig-test.sh) they
@@ -181,20 +230,7 @@ pub fn main(init: std.process.Init) !u8 {
     var free: std.ArrayList(u32) = .empty;
     var alone: std.ArrayList(u32) = .empty;
     var tsan_skipped: usize = 0;
-    // A part's tests: every N-th of the slow ones, and every N-th of the others, each counted on
-    // its own, so the slow ones are spread over the parts.
-    const in_part = try arena.alloc(bool, names.len);
-    var slow_seen: usize = 0;
-    var other_seen: usize = 0;
-    for (names, in_part) |name, *in| {
-        const p = part orelse {
-            in.* = true;
-            continue;
-        };
-        const seen = if (slow(name)) &slow_seen else &other_seen;
-        in.* = seen.* % p.of == p.index;
-        seen.* += 1;
-    }
+    const in_part = try inPart(arena, names, part);
     for ([_]bool{ true, false }) |slow_first| {
         for (names, 0..) |name, i| {
             if (!in_part[i]) continue;
@@ -241,6 +277,71 @@ pub fn main(init: std.process.Init) !u8 {
         run.passed.load(.monotonic), run.skipped.load(.monotonic), failed, shards, seconds,
     });
     return if (failed == 0) 0 else 1;
+}
+
+/// Which of `names` are in `part` (all of them without one): the heavy ones to the part with the
+/// least weight so far, longest first (the table's order); every N-th of the other slow ones, and
+/// every N-th of the rest, each counted on its own, so the slow ones are spread over the parts.
+/// Each test is in exactly one of the N parts.
+fn inPart(arena: std.mem.Allocator, names: []const []const u8, part: ?Part) ![]bool {
+    const in_part = try arena.alloc(bool, names.len);
+    const heavy_load = try arena.alloc(u64, if (part) |p| p.of else 0);
+    @memset(heavy_load, 0);
+    if (part) |p| {
+        @memset(in_part, false);
+        for (heavy) |h| for (names, 0..) |name, i| {
+            if (!std.mem.endsWith(u8, name, h[1])) continue;
+            var least: usize = 0;
+            for (heavy_load, 0..) |load, k| {
+                if (load < heavy_load[least]) least = k;
+            }
+            heavy_load[least] += h[0];
+            in_part[i] = least == p.index;
+        };
+    }
+    var slow_seen: usize = 0;
+    var other_seen: usize = 0;
+    for (names, in_part) |name, *in| {
+        const p = part orelse {
+            in.* = true;
+            continue;
+        };
+        if (heavyWeight(name) != null) continue;
+        const seen = if (slow(name)) &slow_seen else &other_seen;
+        in.* = seen.* % p.of == p.index;
+        seen.* += 1;
+    }
+    return in_part;
+}
+
+test "every test is in exactly one part, the heavy ones shared by weight" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var names: std.ArrayList([]const u8) = .empty;
+    for (heavy) |h| try names.append(arena, try std.fmt.allocPrint(arena, "native.X.test.{s}", .{h[1]}));
+    for (0..50) |i| {
+        try names.append(arena, try std.fmt.allocPrint(arena, "native.Y.test.small {d}", .{i}));
+        if (i % 7 == 0) try names.append(arena, try std.fmt.allocPrint(arena, "native.Y.test.a container job's ports {d}", .{i}));
+    }
+    for ([_]usize{ 1, 2, 3 }) |of| {
+        const counts = try arena.alloc(u8, names.items.len);
+        @memset(counts, 0);
+        for (0..of) |k| {
+            const in = try inPart(arena, names.items, .{ .index = k, .of = of });
+            for (in, counts) |x, *c| c.* += @intFromBool(x);
+        }
+        for (counts) |c| try std.testing.expectEqual(@as(u8, 1), c);
+    }
+    // Two parts: the heavy tests' weights differ by less than the lightest of them.
+    var weight = [2]u32{ 0, 0 };
+    for (0..2) |k| {
+        const in = try inPart(arena, names.items, .{ .index = k, .of = 2 });
+        for (names.items, in) |name, x| {
+            if (x) weight[k] += heavyWeight(name) orelse 0;
+        }
+    }
+    try std.testing.expect(@max(weight[0], weight[1]) - @min(weight[0], weight[1]) < 20);
 }
 
 /// The tests that took longest, up to `slowest_shown` of those past `slowest_min_ns`: what holds

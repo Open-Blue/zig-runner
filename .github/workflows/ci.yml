@@ -948,7 +948,9 @@ jobs:
         working-directory: runner
         env:
           PART: ${{ matrix.part }}/2
-          ZIG_TEST_TIMES: "1" # TEMPORARY: per-test times, to balance the parts
+          # Every test's time in the log (longest first): what tools/test_shards.zig's `heavy` table is
+          # refreshed from, which shares the root tests out between the parts by time.
+          ZIG_TEST_TIMES: "1"
         run: |
           # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
           sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
