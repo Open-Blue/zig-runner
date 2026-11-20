@@ -47,7 +47,7 @@ tarball="$cache/$dir.tar.xz"
 tree="$cache/$dir"
 # Silent either way: with no tarball in the cache yet (the usual case on a GitHub-hosted runner),
 # sha256sum --status still prints "FAILED open or read", which reads like a failed check.
-verified() { echo "$sum  $tarball" | sha256sum --check --quiet --status >/dev/null 2>&1; }
+verified() { echo "$sum  ${1:-$tarball}" | sha256sum --check --quiet --status >/dev/null 2>&1; }
 digest() { (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1); }
 
 checked() { grep -qxF "$tree_sum $tree" <<<"${ZIG_RUNNER_TOOL_TREES:-}"; }
@@ -65,13 +65,20 @@ elif [ ! -d "$tree" ] || ! plain "$tree" || [ "$(digest "$tree" 2>/dev/null)" !=
 	else
 		echo "Zig $version: no usable tree and no checked tarball in $cache; downloading $dir.tar.xz"
 		mkdir -p "$cache"
-		curl -fsSL -o "$tarball.part" "https://ziglang.org/download/$version/$dir.tar.xz"
-		mv "$tarball.part" "$tarball"
-		if ! verified; then
+		# Into a file of this job's own, checked, and only then renamed into place: jobs that share
+		# the tool cache and start cold together (a new Zig version on a self-hosted pool) each
+		# download, and with one name for the download the first job's rename took the file from
+		# under the second ("mv: cannot stat ....tar.xz.part", 2026-11-20), and the second's curl
+		# rewrote the tarball the first was checking. The rename is atomic, so the tarball at its
+		# name is always whole and checked; a later job's rename replaces it with the same bytes.
+		download=$(mktemp "$cache/.$dir.tar.xz.XXXXXX")
+		curl -fsSL -o "$download" "https://ziglang.org/download/$version/$dir.tar.xz"
+		if ! verified "$download"; then
 			echo "Zig $version for $arch does not match its pinned checksum" >&2
-			rm -f "$tarball"
+			rm -f "$download"
 			exit 1
 		fi
+		mv -f "$download" "$tarball"
 	fi
 	# Unpacked beside the tree and moved into place whole, so a job running at the same time never
 	# sees half a tree.
@@ -82,8 +89,16 @@ elif [ ! -d "$tree" ] || ! plain "$tree" || [ "$(digest "$tree" 2>/dev/null)" !=
 		rm -rf "$part"
 		exit 1
 	fi
-	rm -rf "$tree"
-	mv -T "$part/$dir" "$tree" || { plain "$tree" && [ "$(digest "$tree")" = "$tree_sum" ]; }
+	# Into place whole, and no tree is ever removed where it stands: another job may be checking or
+	# using it (three jobs installing at once removed each other's trees mid-check, 2026-11-20).
+	# The rename works when no tree is there; a tree that is there and whole is another job's,
+	# finished first, and is used as it is; a bad one is renamed aside first, then removed.
+	if ! mv -T "$part/$dir" "$tree" 2>/dev/null && ! { plain "$tree" && [ "$(digest "$tree")" = "$tree_sum" ]; }; then
+		stale=$(mktemp -d "$cache/.stale.XXXXXX")
+		mv -T "$tree" "$stale/tree" 2>/dev/null || true
+		mv -T "$part/$dir" "$tree" || { plain "$tree" && [ "$(digest "$tree")" = "$tree_sum" ]; }
+		rm -rf "$stale"
+	fi
 	rm -rf "$part"
 fi
 
