@@ -1351,9 +1351,10 @@ test "the batch: begin, every message acknowledged, end, within its buffer" {
     while (it.next()) |m| try types.append(std.testing.allocator, m.hdr.type);
     try std.testing.expectEqual(@as(u16, nfnl_msg_batch_begin), types.items[0]);
     try std.testing.expectEqual(@as(u16, nfnl_msg_batch_end), types.getLast());
-    // 3 table messages, 4 chains, 2 uplinks' accepts and 8 more rules of ours, UDP and TCP to 2
+    // 3 table messages, 4 chains, 2 uplinks' accepts and 10 more rules of ours (2 of them dropping
+    // what a job's port itself sends the host), UDP and TCP to 2
     // nameservers in forward and input, 1 removal, and 2 accepts in each of the host's 2 chains.
-    try std.testing.expectEqual(@as(u32, 3 + 4 + 10 + 2 * 2 * 2 + 1 + 4), b.acks);
+    try std.testing.expectEqual(@as(u32, 3 + 4 + 12 + 2 * 2 * 2 + 1 + 4), b.acks);
     try std.testing.expectEqual(@as(usize, b.acks + 2), types.items.len);
 }
 
