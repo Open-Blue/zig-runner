@@ -966,6 +966,75 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/tmp-leaks.sh
 
+  # The Rust build cache for the jobs that never run on a push to main (docs/rust-net.md, "The build
+  # cache"): GitHub scopes caches by ref, a merge group and a pull request's first run read only
+  # main's entries, and main saves only from jobs that run on a push. Tests (x86_64) runs self-hosted
+  # there (its cache step is skipped), and Native tests as root and End to end do not run there at
+  # all, so each merge group built zr-net cold in them. Each leg uses the action as its consumer does
+  # (same `name`, `tools`, runner image family and checkout path, so the same key) and builds what
+  # that consumer builds of the Rust side, nothing of the Zig. Nothing needs it, it is no required
+  # check, and the release builds never restore. An exact hit builds nothing and saves nothing.
+  rust-cache-warmer:
+    name: Rust cache warmer (${{ matrix.name }}, ${{ matrix.arch }})
+    # TEMPORARY (evidence on the PR): also on pull_request. Push only before it is handed over.
+    if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
+    timeout-minutes: 20
+    permissions:
+      contents: read # to check out the code
+    strategy:
+      # Each entry is its own: one failing does not stop the others' saves.
+      fail-fast: false
+      matrix:
+        include:
+          # What `test` builds: the library's tests (cargo-test.sh) and the musl archive of the Zig tests.
+          - {name: test, arch: x86_64, cargo_arch: x86_64, cargo_test: true}
+          - {name: native-root, arch: x86_64, cargo_arch: x86_64, cargo_test: false}
+          - {name: native-root, arch: arm64, cargo_arch: aarch64, cargo_test: false}
+          - {name: e2e, arch: x86_64, cargo_arch: x86_64, cargo_test: false}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Before Zig, so that a hit costs a restore and no more.
+      - name: Rust build cache
+        uses: ./.github/actions/rust-cache # zizmor: ignore[self-repository] actionlint rejects the `$/` form
+        with:
+          name: ${{ matrix.name }}
+          tools: stable
+
+      # Both entries restored: they are what the consumers will restore, and nothing is left to save.
+      - name: Already cached
+        env:
+          CACHE: ${{ env.ZR_RUST_CACHE }}
+          LEG: ${{ matrix.name }} (${{ matrix.arch }})
+        run: |
+          if [[ $CACHE == 'toolchains hit '* && $CACHE == *'; target dir hit '* ]]; then
+            echo "rust-cache-warmer: $LEG is cached already, nothing to build: $CACHE"
+            echo "WARM_BUILD=false" >>"$GITHUB_ENV"
+          else
+            echo "rust-cache-warmer: $LEG: $CACHE; building it"
+            echo "WARM_BUILD=true" >>"$GITHUB_ENV"
+          fi
+
+      - name: Install Zig
+        if: env.WARM_BUILD == 'true'
+        run: .github/scripts/install-zig.sh
+
+      - name: Rust tests, as Tests (x86_64) builds them
+        if: env.WARM_BUILD == 'true' && matrix.cargo_test
+        run: .github/scripts/cargo-test.sh
+
+      # The archive the Zig tests and the runner link (zig_modules, `zig build`): musl, for this arch.
+      - name: The network library, musl
+        if: env.WARM_BUILD == 'true'
+        env:
+          CARGO_ARCH: ${{ matrix.cargo_arch }}
+        run: |
+          .github/scripts/build-zr-net.sh "$CARGO_ARCH" "$RUNNER_TEMP/libzr_net-$CARGO_ARCH-musl.a" musl
+          echo "rust-cache-warmer: built $CARGO_ARCH musl; the entry will be saved under the target key logged above"
+
   # Native tests as root is a matrix, and a matrix job skipped by its `if:` or `needs:` may report
   # under its unexpanded name, which would leave the required checks below waiting: so on a reuse these
   # report them, in seconds. Not the code's tests: that is what the reuse job decided was already run.
