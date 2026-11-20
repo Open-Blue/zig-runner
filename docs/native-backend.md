@@ -239,7 +239,21 @@ On a root runner, each step runs:
   workflow reads (`github.server_url` in expressions, `GITHUB_SERVER_URL`) still says 127.0.0.1.
   The table is the runner's alone and replaced whole, so runners of one host that serve
   different instances must be one pool: the last to make the rules decides. Jobs cannot reach each other: each veth is an isolated bridge port
-  (`IFLA_BRPORT_ISOLATED`), and `FORWARD` drops traffic from `zr0` back to `zr0`. IPv6 is off on the
+  (`IFLA_BRPORT_ISOLATED`), and `FORWARD` drops traffic from `zr0` back to `zr0`. A job also sends only its own frames: its port's bridge-family
+  table (`zig_runner_pin<slot>`, #603) drops IPv4 and ARP from any other address, anything that is not
+  IPv4 or ARP, and (#616) any frame whose Ethernet source is not the MAC the helper gave the job's
+  `eth0` (random, set when the veth is made, so the pin names it before the port exists). The rule
+  runs before the bridge learns a frame's source, so no frame of a job puts a made-up MAC in the
+  bridge's table or moves another job's. Besides, the port has `IFLA_BRPORT_LEARNING` and
+  `IFLA_BRPORT_UNICAST_FLOOD` off and a static entry for the job's MAC, added before the port is up:
+  the table holds nothing a job sent (so `fdb_max_learned` has nothing to bound), and the host's
+  frames for a job go to its port, never flooded to others. Broadcast (ARP) is unaffected.
+  Either layer alone stops the flood and the poisoning (measured by the wire test, which also runs
+  with neither, where 200 made-up MACs enter the table and a job's MAC moves to the sender's port,
+  cutting the host off from that job); both are kept, so a gap in one rule (VLAN tags once were
+  one) does not leave the table open. The static entry goes with the port when the veth does; a
+  failure to make the pin, the port's settings or the entry fails the job's network.
+  IPv6 is off on the
   job's `eth0` and on the bridge, so no link-local address slips past those IPv4 rules (`lo` keeps
   its ::1). Ports below 1024 and ping work without capabilities on the host's
   (`ip_unprivileged_port_start=0`, `ping_group_range`, set in the job's namespace only). The
