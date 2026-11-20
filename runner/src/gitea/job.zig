@@ -17,7 +17,7 @@
 //!   - `plan_id` and `job_id` are the task's id, as text. The instance has no plan, and the task id
 //!     is the one name for this job on both sides, which logs and `UpdateTask` use.
 //!   - `check_run_id` is the task id too (0 if it does not fit), the database's key for the job.
-//!   - `job_token` is the context's `gitea_runtime_token` (what every action step gets as
+//!   - `job_token` is the context's `forgejo_runtime_token`, else its `gitea_runtime_token` (what every action step gets as
 //!     `ACTIONS_RUNTIME_TOKEN`; Gitea also accepts it as an API bearer, docs/GITEA.md), else, as
 //!     act_runner does for an instance that sends none, the job's token (`runtimeTokenOf`), or
 //!     empty. There is no `completejob` here to use it.
@@ -718,6 +718,8 @@ fn githubOf(arena: Allocator, context: Value, job_key: []const u8) Allocator.Err
 
 /// Where a job's runtime token came from.
 pub const RuntimeTokenSource = enum {
+    /// The context's `forgejo_runtime_token`: Forgejo's own key, which stays when it drops the other.
+    forgejo_key,
     /// The context's `gitea_runtime_token`.
     context_runtime,
     /// A secret (`GITEA_TOKEN`, `FORGEJO_TOKEN` or `GITHUB_TOKEN`): the instance sent no runtime token.
@@ -729,19 +731,24 @@ pub const RuntimeTokenSource = enum {
     /// What the task's log says of it. Never the token.
     pub fn describe(source: RuntimeTokenSource) []const u8 {
         return switch (source) {
+            .forgejo_key => "the runtime token is the task's forgejo_runtime_token",
             .context_runtime => "the runtime token is the task's gitea_runtime_token",
-            .secret => "the task has no gitea_runtime_token: the runtime token is the task's GITHUB_TOKEN secret, as act_runner does for an older instance",
-            .context_token => "the task has no gitea_runtime_token: the runtime token is the context's token, as act_runner does for an older instance",
+            .secret => "the task has no forgejo_runtime_token or gitea_runtime_token: the runtime token is the task's GITHUB_TOKEN secret, as act_runner does for an older instance",
+            .context_token => "the task has no forgejo_runtime_token or gitea_runtime_token: the runtime token is the context's token, as act_runner does for an older instance",
             .none => "the task has no runtime token and no job token: artifact services are not set",
         };
     }
 };
 
 /// The token for `ACTIONS_RUNTIME_TOKEN`, as act_runner takes it (`internal/app/run/runner.go`):
-/// the context's `gitea_runtime_token`, and when an older instance sends none, the job's token:
+/// the context's `forgejo_runtime_token` (Forgejo sends both keys, and marks `gitea_runtime_token`
+/// "can be removed after Forgejo 19", `services/actions/task.go` lines 195-196), else its
+/// `gitea_runtime_token`, and when an older instance sends none, the job's token:
 /// the secret `GITEA_TOKEN` (`FORGEJO_TOKEN` for forgejo-runner), else `GITHUB_TOKEN`, else the
 /// context's `token`.
 fn runtimeTokenOf(t: task_mod.Task) struct { token: []const u8, source: RuntimeTokenSource } {
+    const forgejo = contextString(t.context, "forgejo_runtime_token");
+    if (forgejo.len > 0) return .{ .token = forgejo, .source = .forgejo_key };
     const own = contextString(t.context, "gitea_runtime_token");
     if (own.len > 0) return .{ .token = own, .source = .context_runtime };
     for ([_][]const u8{ "GITEA_TOKEN", "FORGEJO_TOKEN", "GITHUB_TOKEN" }) |name|
@@ -1267,7 +1274,23 @@ test "with no gitea_runtime_token the runtime token is the job's token, as act_r
     try testing.expectEqualStrings("rt-tok", c.job.job_token);
     try testing.expectEqual(RuntimeTokenSource.context_runtime, c.runtime_token_source);
 
-    // An older instance sends none: GITEA_TOKEN, then GITHUB_TOKEN, then the context's token.
+    // Forgejo's own key is read first, and alone it is enough: it keeps the key Forgejo may drop.
+    t = try textTask(arena, text, "{\"server_url\":\"http://h:3300\",\"token\":\"ctx-tok\",\"forgejo_runtime_token\":\"fj-tok\",\"gitea_runtime_token\":\"rt-tok\"}");
+    c = try fromTask(arena, t, &why);
+    try testing.expectEqualStrings("fj-tok", c.job.job_token);
+    try testing.expectEqual(RuntimeTokenSource.forgejo_key, c.runtime_token_source);
+    try testing.expect(contains(c.job.secrets, "fj-tok"));
+    t = try textTask(arena, text, "{\"server_url\":\"http://h:3300\",\"forgejo_runtime_token\":\"fj-tok\"}");
+    c = try fromTask(arena, t, &why);
+    try testing.expectEqualStrings("fj-tok", c.job.job_token);
+    try testing.expectEqual(RuntimeTokenSource.forgejo_key, c.runtime_token_source);
+    // Only the gitea key (Gitea, or a Forgejo before it sent the other): that one.
+    t = try textTask(arena, text, "{\"server_url\":\"http://h:3300\",\"gitea_runtime_token\":\"rt-tok\"}");
+    c = try fromTask(arena, t, &why);
+    try testing.expectEqualStrings("rt-tok", c.job.job_token);
+    try testing.expectEqual(RuntimeTokenSource.context_runtime, c.runtime_token_source);
+
+    // Neither key (an older instance): GITEA_TOKEN, then GITHUB_TOKEN, then the context's token.
     t = try textTask(arena, text, "{\"server_url\":\"http://h:3300\",\"token\":\"ctx-tok\"}");
     t.secrets = &.{ .{ .name = "GITHUB_TOKEN", .value = "gh-tok" }, .{ .name = "GITEA_TOKEN", .value = "gt-tok" } };
     c = try fromTask(arena, t, &why);

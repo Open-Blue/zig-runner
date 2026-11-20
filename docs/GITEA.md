@@ -181,17 +181,19 @@ so a third-party action has it, and it is not limited to the artifact service:
   lines 22-39), accepts it, from the form or an Authorization Bearer, while the task is running, as the actions user
   of that task; it is on the API's auth group (`routers/api/shared/middleware.go` line 57) and the
   web and git groups (`routers/web/web.go` lines 129 and 184). Neither takes it as HTTP Basic, so git still uses the `GITHUB_TOKEN` secret.
-  Forgejo's context also names it `forgejo_runtime_token` (`services/actions/task.go` lines 195-196,
-  with the `gitea_runtime_token` key marked "can be removed after Forgejo 19").
+  Forgejo's task context carries the token under two keys, `gitea_runtime_token` (marked "Can be
+  removed after Forgejo 19") and `forgejo_runtime_token`, set one after the other in
+  `services/actions/task.go` lines 195-196.
 
 zig-runner keeps act_runner's behaviour: the action steps get the token. Where that matters, run only
 actions you trust on the instance. On Gitea one that you do not trust holds, while the job runs, what the
 job's own token can do through the API. (`GITHUB_TOKEN` itself is not put in an action's environment;
 an action that needs it gets it as the workflow passes it, `${{ secrets.GITHUB_TOKEN }}`.)
 
-If the instance sends no `gitea_runtime_token` (an older Gitea), the runtime token is the job's token,
+zig-runner reads `forgejo_runtime_token` first, then `gitea_runtime_token`, so it keeps working when
+Forgejo drops the second. If the instance sends neither (an older Gitea), the runtime token is the job's token,
 as act_runner does it: the `GITEA_TOKEN` secret (or `FORGEJO_TOKEN`), else `GITHUB_TOKEN`, else the
-context's `token`. The task's log says which one it used ("the runtime token is ..."), never the value, which is masked
+context's `token`. The task's log says which key or secret it used ("the runtime token is ..."), never the value, which is masked
 all the same.
 
 GitHub's own `actions/upload-artifact@v4` and `download-artifact@v4` refuse to run when
