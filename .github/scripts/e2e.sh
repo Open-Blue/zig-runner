@@ -241,6 +241,8 @@ start() {
 		RUNNER_STOP_GRACE_SECS=30 RUNNER_BACKEND="$backend" "${native[@]}" \
 		"$bin" >"$log" 2>&1 &
 	echo $! >"$out/runner.pid"
+	# For `stop`, which runs as its own invocation and has no $backend (stuck_runner reads it).
+	echo "$backend" >"$out/runner.backend"
 	echo "runner ($backend) started, serving $label on $repo; its log: $log"
 }
 
@@ -267,6 +269,9 @@ stop() {
 # stacks if gdb is on the image (it is not installed if missing), and the end of the runner's log.
 stuck_runner() {
 	local pid=${1:?} runner t f
+	# `check` has $backend; `stop` runs as an invocation of its own and reads what `start` recorded.
+	# With neither, "" (set -u stopped the 2026-11-20 nightly's diagnostics here, failing the step).
+	local backend=${backend:-$(cat "$out/runner.backend" 2>/dev/null || true)}
 	echo "::group::${2:-why the runner did not stop}"
 	# Every process under PID, by walking parent links: sudo may run its command through a monitor
 	# process of its own (sudo-rs with a pty), so the runner need not be PID's child.

@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The ThreadSanitizer end-to-end job no longer fails on its own diagnostics: when the runner didn''t stop, e2e.sh''s stuck-runner report read $backend, which isn''t set in a separate e2e.sh stop call, and under set -u that failed the step after every check had passed (nightly 2026-11-20). start now records the backend for stop to read.'
+time: 2026-11-20T12:16:17.89108565-05:00
