@@ -159,6 +159,8 @@ pub const Client = struct {
     why: []const u8 = "",
     /// The last response's.
     content_type: []const u8 = "",
+    /// The last response's `Docker-Content-Digest`, "" when it had none.
+    content_digest: []const u8 = "",
     /// What the last 429's `Retry-After` asked for.
     retry_ms: i64 = 0,
     /// The last request's HTTP status; 0 when none came (the network failed).
@@ -190,6 +192,20 @@ pub const Client = struct {
             return error.DigestMismatch;
         }
         return .{ .bytes = body.memory.bytes.items, .media_type = ct, .digest = digest };
+    }
+
+    /// The digest the registry says a tag names, from a HEAD request: Docker Hub does not count it
+    /// toward its pull limit (docs.docker.com/docker-hub/usage/pulls: "Using GET emulates a real pull
+    /// and counts towards the limit. Using HEAD won't."). Null when the answer has no valid digest
+    /// (the caller then fetches the manifest). Nothing here is hashed, so it is only ever compared
+    /// with a digest whose bytes were checked when they were fetched.
+    pub fn head(c: *Client, reference: []const u8) !?[]const u8 {
+        const url = try std.fmt.allocPrint(c.arena, "{s}://{s}/v2/{s}/manifests/{s}", .{
+            c.ref.scheme(), c.ref.host, c.ref.repository, reference,
+        });
+        var body: Body = .{ .memory = .{ .arena = c.arena, .limit = 4096 } };
+        _ = try c.request(.HEAD, url, manifest_accept, &body);
+        return if (validDigest(c.content_digest)) c.content_digest else null;
     }
 
     /// A blob into `file`, checked against its digest and size as it arrives.
@@ -235,12 +251,16 @@ pub const Client = struct {
 
     /// GET `url` into `body`, answering one auth challenge. The response's content type.
     fn get(c: *Client, url: []const u8, accept: []const u8, body: *Body) ![]const u8 {
+        return c.request(.GET, url, accept, body);
+    }
+
+    fn request(c: *Client, method: std.http.Method, url: []const u8, accept: []const u8, body: *Body) ![]const u8 {
         var challenged = false;
         var waits: u6 = 0;
         while (true) {
             var challenge: ?[]const u8 = null;
             c.retry_ms = 0;
-            const ct = c.once(url, accept, body, &challenge) catch |e| {
+            const ct = c.once(method, url, accept, body, &challenge) catch |e| {
                 if (e == error.HttpStatus and c.status == 429 and c.wait_on_limit and waits < max_waits) {
                     // What it asked for, else 1 s, 2 s: each wait is at most `ratelimit.max_wait_ms`, and there are at most `max_waits`.
                     const ms = if (c.retry_ms > 0) c.retry_ms else @as(i64, 1000) << waits;
@@ -272,12 +292,14 @@ pub const Client = struct {
     /// runner's next pull, minutes or hours later, found it dead, razorbill 2026-11-01) is replaced
     /// by the library before anything is sent, or the request sent again on a new one when it was
     /// refused at once, so there is nothing to retry here.
-    fn once(c: *Client, url: []const u8, accept: []const u8, body: *Body, challenge: *?[]const u8) ![]const u8 {
+    fn once(c: *Client, method: std.http.Method, url: []const u8, accept: []const u8, body: *Body, challenge: *?[]const u8) ![]const u8 {
         const headers = try c.arena.alloc(std.http.Header, if (c.authorization != null) 2 else 1);
         headers[0] = .{ .name = "Accept", .value = accept };
         if (c.authorization) |a| headers[1] = .{ .name = "Authorization", .value = a };
         c.status = 0;
+        c.content_digest = "";
         var stream = net_client.open(c.arena, c.io, .{
+            .method = method,
             .url = url,
             .headers = headers,
             .max_redirects = max_redirects,
@@ -292,6 +314,7 @@ pub const Client = struct {
         const status = stream.status;
         c.status = @backingInt(status);
         c.content_type = "";
+        if (stream.header("docker-content-digest")) |d| c.content_digest = try c.arena.dupe(u8, std.mem.trim(u8, d, " "));
         if (status == .too_many_requests) c.retry_ms = ratelimit.parse(
             status,
             stream.header("retry-after"),

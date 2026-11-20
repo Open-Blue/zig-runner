@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const registry = @import("registry.zig");
+const logfmt = @import("../../logfmt.zig");
 const layer = @import("layer.zig");
 const Store = @import("Store.zig");
 const admission = @import("../../admission.zig");
@@ -130,13 +131,19 @@ pub fn pull(
     errdefer if (c.why.len > 0 and why.len == 0) {
         why.* = c.why;
     };
+    // Past the TTL, with a digest known: a HEAD (not counted by Docker Hub) tells whether the tag
+    // still names it, and the manifest is fetched only when it does not.
+    if (fallback) |*img| {
+        const k = known_tag.?;
+        if (c.head(ref.reference())) |named| {
+            if (named) |d| if (std.mem.eql(u8, d, k.top)) {
+                if (tag_path) |p| try writeTag(arena, io, p, k.top, k.manifest);
+                return img.*;
+            };
+        } else |e| if (c.unavailable()) return reuse(arena, img, &c, e, req.image, k.top);
+    }
     const top = c.manifest(ref.reference()) catch |e| {
-        if (fallback) |*img| if (c.unavailable()) {
-            img.reused = try std.fmt.allocPrint(arena, "the registry did not answer ({s}); using the last " ++
-                "known digest of {s}, {s}", .{ if (c.why.len > 0) c.why else @errorName(e), req.image, known_tag.?.top });
-            std.log.warn("image {s}: {s}", .{ req.image, img.reused.? });
-            return img.*;
-        };
+        if (fallback) |*img| if (c.unavailable()) return reuse(arena, img, &c, e, req.image, known_tag.?.top);
         return fail(arena, why, &c, e, "its manifest");
     };
     // Not needed: the pull goes on, and holds what it pulls itself.
@@ -189,6 +196,14 @@ pub fn pull(
         .devices = unpack.totals.devices,
     };
     return img;
+}
+
+/// The last known digest's image, for a registry that cannot answer: the job goes on, and says so.
+fn reuse(arena: Allocator, img: *Image, c: *const registry.Client, e: anyerror, name: []const u8, digest: []const u8) !Image {
+    const reason = if (c.why.len > 0) c.why else @errorName(e);
+    img.reused = try std.fmt.allocPrint(arena, "the registry did not answer ({s}); using the last known digest of {s}, {s}", .{ reason, name, digest });
+    logfmt.warn("image_tag_reused", "image={f} digest={s} status={d} reason={s}", .{ logfmt.q(name), digest, c.status, @errorName(e) });
+    return img.*;
 }
 
 fn fail(arena: Allocator, why: *[]const u8, c: *const registry.Client, e: anyerror, what: []const u8) anyerror {

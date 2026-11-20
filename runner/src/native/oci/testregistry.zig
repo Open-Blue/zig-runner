@@ -54,6 +54,8 @@ pub const Server = struct {
     /// When not 0, every manifest request is answered with this status (401, 403, 503, ...).
     refuse: std.atomic.Value(u32) = .init(0),
     requests: std.atomic.Value(u32) = .init(0),
+    /// Of `requests`, the HEADs (a tag's digest asked for, not its manifest).
+    heads: std.atomic.Value(u32) = .init(0),
     connections: std.atomic.Value(u32) = .init(0),
 
     /// What a request is answered from: the routes, or those swapped in after the start.
@@ -105,6 +107,9 @@ pub const Server = struct {
     }
 };
 
+/// Whether the request being answered on this thread is a HEAD: its answer has no body.
+threadlocal var head_request: bool = false;
+
 /// One request (the client may keep the connection: each is answered and then it is closed, with
 /// `Connection: close`). True for /quit.
 fn answer(s: *Server, conn: Io.net.Stream) bool {
@@ -113,7 +118,7 @@ fn answer(s: *Server, conn: Io.net.Stream) bool {
     var r = conn.reader(io, &rb);
     const first = r.interface.takeDelimiterInclusive('\n') catch return false;
     var parts = std.mem.tokenizeAny(u8, first, " \r\n");
-    _ = parts.next();
+    head_request = std.mem.eql(u8, parts.next() orelse "", "HEAD");
     var path_buf: [1024]u8 = undefined;
     const raw_path = parts.next() orelse return false;
     if (raw_path.len > path_buf.len) return false;
@@ -140,6 +145,7 @@ fn answer(s: *Server, conn: Io.net.Stream) bool {
     }
     if (std.mem.eql(u8, path, "/quit")) return true;
     _ = s.requests.fetchAdd(1, .acq_rel);
+    if (head_request) _ = s.heads.fetchAdd(1, .acq_rel);
     if (s.mute.load(.acquire)) return false;
     if (std.mem.startsWith(u8, path, "/token?") and s.resets.load(.acquire) > 0) {
         _ = s.resets.fetchSub(1, .acq_rel);
@@ -190,6 +196,12 @@ fn answer(s: *Server, conn: Io.net.Stream) bool {
                 out.flush() catch return false;
                 return false;
             }
+            if (head_request) {
+                const dg = digestOf(std.heap.page_allocator, rt.body) catch return false;
+                defer std.heap.page_allocator.free(dg);
+                const extra = std.fmt.bufPrint(&hb, "Docker-Content-Digest: {s}\r\n", .{dg}) catch return false;
+                return respond(s, out, "200 OK", extra, rt.content_type, rt.body);
+            }
             return respond(s, out, "200 OK", "", rt.content_type, rt.body);
         };
         return respond(s, out, "404 Not Found", "", "application/json", "{\"errors\":[{\"code\":\"MANIFEST_UNKNOWN\"}]}");
@@ -202,7 +214,7 @@ fn respond(s: *const Server, out: *Io.Writer, status: []const u8, extra: []const
     out.print("HTTP/1.1 {s}\r\n{s}Content-Type: {s}\r\nContent-Length: {d}\r\n{s}\r\n", .{
         status, extra, ct, body.len, close,
     }) catch return false;
-    out.writeAll(body) catch return false;
+    if (!head_request) out.writeAll(body) catch return false;
     out.flush() catch {};
     return false;
 }
@@ -407,6 +419,94 @@ test "native oci pull: a tag resolved within the TTL costs no request, one past 
     const after = server.requests.load(.acquire);
     try testing.expectEqualStrings(two.index, (try pullTag(arena, store, ref, 300, &why)).digest);
     try testing.expectEqual(after, server.requests.load(.acquire));
+}
+
+/// A job's requests: the registry's count since `since`, as `.{ all, heads }`.
+fn since(server: *const Server, before: [2]u32) [2]u32 {
+    return .{ server.requests.load(.acquire) - before[0], server.heads.load(.acquire) - before[1] };
+}
+
+fn mark(server: *const Server) [2]u32 {
+    return .{ server.requests.load(.acquire), server.heads.load(.acquire) };
+}
+
+test "native oci pull: requests per job for a cached image, by reference form (#551)" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(testing.io, ".", arena) };
+    const one = try tinyImage(arena, "test/img", "t", "one");
+    const two = try tinyImage(arena, "test/img", "t", "two");
+    var server: Server = .{ .routes = one.routes };
+    try server.start();
+    defer server.stop();
+    const tag = try server.image(arena, "test/img:t");
+    var why: []const u8 = "";
+
+    // The cold pull: manifests and blobs, no HEAD (nothing is known to compare with).
+    var m = mark(&server);
+    _ = try pullTag(arena, store, tag, 300, &why);
+    try testing.expect(since(&server, m)[0] > 1 and since(&server, m)[1] == 0);
+
+    // Within the TTL: 0 requests, however many jobs.
+    m = mark(&server);
+    for (0..10) |_| _ = try pullTag(arena, store, tag, 300, &why);
+    try testing.expectEqual([2]u32{ 0, 0 }, since(&server, m));
+
+    // Past the TTL: one HEAD, and nothing else when the tag has not moved (a HEAD is not counted
+    // by Docker Hub). Before this, it was two GETs: the index and the platform's manifest.
+    m = mark(&server);
+    const same = try pullTag(arena, store, tag, 0, &why);
+    try testing.expectEqual([2]u32{ 1, 1 }, since(&server, m));
+    try testing.expectEqualStrings(one.index, same.digest);
+    try testing.expect(same.pulled == null and same.reused == null);
+    // The HEAD renewed the record: the next job, within the TTL, asks nothing.
+    m = mark(&server);
+    _ = try pullTag(arena, store, tag, 300, &why);
+    try testing.expectEqual([2]u32{ 0, 0 }, since(&server, m));
+
+    // A registry that limits the HEAD: the cached digest serves, with the warning's text.
+    server.limited.store(100, .release);
+    m = mark(&server);
+    const limited = try pullTag(arena, store, tag, 0, &why);
+    try testing.expectEqual([2]u32{ 1, 1 }, since(&server, m));
+    try testing.expectEqualStrings(one.index, limited.digest);
+    try testing.expect(limited.reused != null and std.mem.indexOf(u8, limited.reused.?, "429") != null);
+    server.limited.store(0, .release);
+
+    // The tag moves: within the TTL it is not seen; past it the HEAD differs and the manifests are fetched.
+    server.setRoutes(&two.routes);
+    m = mark(&server);
+    try testing.expectEqualStrings(one.index, (try pullTag(arena, store, tag, 300, &why)).digest);
+    try testing.expectEqual([2]u32{ 0, 0 }, since(&server, m));
+    const moved = try pullTag(arena, store, tag, 0, &why);
+    try testing.expectEqualStrings(two.index, moved.digest);
+    try testing.expect(moved.pulled != null);
+    try testing.expectEqual(@as(u32, 1), since(&server, m)[1]);
+
+    // A pinned digest and a tag@digest: asked once, then never.
+    server.setRoutes(&two.routes);
+    for ([_][]const u8{ "test/img@", "test/img:t@" }) |form| {
+        const pinned = try std.fmt.allocPrint(arena, "{s}{s}", .{ try server.image(arena, form), two.index });
+        _ = try pullTag(arena, store, pinned, 300, &why);
+        m = mark(&server);
+        for ([_]u32{ 300, 0 }) |ttl| {
+            const img = try pullTag(arena, store, pinned, ttl, &why);
+            try testing.expectEqualStrings(two.index, img.digest);
+        }
+        try testing.expectEqual([2]u32{ 0, 0 }, since(&server, m));
+    }
+
+    // Nothing cached: a registry that keeps answering 429 fails the job, naming it, and a pinned
+    // digest nobody has fails the same way.
+    var empty = testing.tmpDir(.{});
+    defer empty.cleanup();
+    const fresh: Store = .{ .root = try empty.dir.realPathFileAlloc(testing.io, ".", arena) };
+    server.limited.store(1000, .release);
+    try testing.expectError(error.HttpStatus, pullTag(arena, fresh, tag, 300, &why));
+    try testing.expect(std.mem.indexOf(u8, why, "429") != null);
 }
 
 test "native oci pull: a registry that answers 429 gives the last known digest; a first pull waits out Retry-After" {
