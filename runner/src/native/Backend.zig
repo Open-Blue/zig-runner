@@ -6952,7 +6952,7 @@ test "root runner: a job's source address pin is on the host while it runs, and 
     try std.testing.expect(saddr_rule);
     const learning = try std.fmt.allocPrint(arena, "/sys/class/net/zrh{d}/brport/learning:0", .{slot});
     const flood = try std.fmt.allocPrint(arena, "/sys/class/net/zrh{d}/brport/unicast_flood:0", .{slot});
-    const entry = try std.fmt.allocPrint(arena, " dev zrh{d} master zr0 permanent", .{slot});
+    const entry = try std.fmt.allocPrint(arena, " dev zrh{d} master zr0 static", .{slot});
     var guarded = false;
     var entered = false;
     for (ports_seen.items) |listing| {
@@ -6961,6 +6961,15 @@ test "root runner: a job's source address pin is on the host while it runs, and 
     }
     if (!guarded) std.debug.print("the port zrh{d} was not seen with learning and unicast flood off; {d} samples, the last:\n{s}\n", .{ slot, ports_seen.items.len, if (ports_seen.items.len > 0) ports_seen.items[ports_seen.items.len - 1] else "" });
     try std.testing.expect(guarded);
+    // The bridge does not learn from frames to link-local group addresses (#616).
+    const bridge_opts = try std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", "ip -d link show zr0 2>/dev/null" } });
+    // `ip -d link` prints the option as "on" or as "1", by its version.
+    if (std.mem.indexOf(u8, bridge_opts.stdout, "no_linklocal_learn") != null) {
+        const on = std.mem.indexOf(u8, bridge_opts.stdout, "no_linklocal_learn on") != null or
+            std.mem.indexOf(u8, bridge_opts.stdout, "no_linklocal_learn 1") != null;
+        if (!on) std.debug.print("zr0: {s}\n", .{bridge_opts.stdout});
+        try std.testing.expect(on);
+    }
     if (!entered) std.debug.print("no static entry on zrh{d} in the bridge's table; the last sample:\n{s}\n", .{ slot, if (ports_seen.items.len > 0) ports_seen.items[ports_seen.items.len - 1] else "" });
     try std.testing.expect(entered);
     if (handle == null) std.debug.print("no pin for slot {d} while the job ran; {d} listings, the last:\n{s}\n", .{

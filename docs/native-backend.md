@@ -243,15 +243,21 @@ On a root runner, each step runs:
   table (`zig_runner_pin<slot>`, #603) drops IPv4 and ARP from any other address, anything that is not
   IPv4 or ARP, and (#616) any frame whose Ethernet source is not the MAC the helper gave the job's
   `eth0` (random, set when the veth is made, so the pin names it before the port exists). The rule
-  runs before the bridge learns a frame's source, so no frame of a job puts a made-up MAC in the
-  bridge's table or moves another job's. Besides, the port has `IFLA_BRPORT_LEARNING` and
-  `IFLA_BRPORT_UNICAST_FLOOD` off and a static entry for the job's MAC, added before the port is up:
-  the table holds nothing a job sent (so `fdb_max_learned` has nothing to bound), and the host's
-  frames for a job go to its port, never flooded to others. Broadcast (ARP) is unaffected.
-  Either layer alone stops the flood and the poisoning (measured by the wire test, which also runs
-  with neither, where 200 made-up MACs enter the table and a job's MAC moves to the sender's port,
-  cutting the host off from that job); both are kept, so a gap in one rule (VLAN tags once were
-  one) does not leave the table open. The static entry goes with the port when the veth does; a
+  runs before the bridge learns a frame's source, so no frame it sees puts a made-up MAC in the
+  bridge's table or moves another job's. It does not see frames to a link-local group address
+  (01:80:c2:00:00:0X): the bridge handles those before its netfilter hooks and learns from them,
+  so `zr0` is made with `no_linklocal_learn` (`BR_BOOLOPT_NO_LL_LEARN`; also set on a bridge an
+  earlier runner made), and each port has `IFLA_BRPORT_LEARNING` and `IFLA_BRPORT_UNICAST_FLOOD`
+  off and a static entry (not a local one, `NUD_NOARP`, which would pass a frame for it up to the
+  host) for the job's MAC, added before the port is up: the table holds nothing a job sent (so
+  `fdb_max_learned` has nothing to bound), and the host's frames for a job go to its port, never
+  flooded to others. Broadcast (ARP) is unaffected. Each of the three (the pin, `no_linklocal_learn`
+  with the pin, the port's settings) alone stops the flood and the poisoning, which the wire test
+  shows, with neither as the control (200 made-up MACs and 20 sent to 01:80:c2:00:00:03 enter the
+  table and a job's MAC moves to the sender's port, cutting the host off from that job; the pin
+  alone, without `no_linklocal_learn`, lets the 20 in); all are kept, so a gap in one (VLAN
+  tags once were one) does not leave the table open. The static entry goes with the port when the
+  veth does; a
   failure to make the pin, the port's settings or the entry fails the job's network.
   IPv6 is off on the
   job's `eth0` and on the bridge, so no link-local address slips past those IPv4 rules (`lo` keeps

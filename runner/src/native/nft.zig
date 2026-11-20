@@ -362,10 +362,13 @@ fn pinBatch(b: *Batch, tbl: []const u8, link: []const u8, addr: [4]u8, mac: [6]u
     b.tableNamed(.DELTABLE, 0, tbl);
     b.tableNamed(.NEWTABLE, linux.NLM_F_CREATE, tbl);
     b.baseChainIn(tbl, "pin", "filter", hook_br_prerouting, priority_br_filter);
-    // `iifname <port> ether saddr != <the job's MAC> counter drop`: first, and before the bridge
-    // learns anything of the frame (its learning is in what follows this hook), so no frame of a
-    // job enters the bridge's table under another's MAC (#616). The job's end of the veth has the
-    // MAC the helper gave it.
+    // `iifname <port> ether saddr != <the job's MAC> counter drop`: first. For the frames this hook
+    // sees it is before the bridge learns the source (learning follows the hook), so no such frame
+    // enters the bridge's table under another's MAC (#616). It does not see frames to a link-local
+    // group address (01:80:c2:00:00:0X): the bridge takes them before its netfilter hooks and
+    // learns from them (or not) by its own settings, which is why `zr0` has
+    // `BR_BOOLOPT_NO_LL_LEARN` (`net.Socket.ensureBridge`) and the port no learning at all. The
+    // job's end of the veth has the MAC the helper gave it.
     var r = b.rule(tbl, "pin", linux.NLM_F_APPEND);
     b.ifname(.iif, .eq, link);
     b.payloadCmp(nft_payload_ll_header, 6, .neq, &mac);
@@ -1905,7 +1908,7 @@ test "native nft: a job's packets carry its own source address, and nothing else
 
 /// What each way of protecting the bridge's table did (see `fdbWire`): the ports the job's helper
 /// makes (`net.Socket.addVeth` with or without its FDB guard) and the pin's Ethernet source rule.
-const FdbMode = struct { pin: bool, port: bool };
+const FdbMode = struct { pin: bool, port: bool, ll_off: bool };
 
 /// Jobs A (10.211.1.3, MAC 02:aa:..:01, port `zrh1`) and B (10.211.1.4, MAC 02:bb:..:02, `zrh2`) on
 /// `zr0` in a network namespace of this thread's own, the ports made by the code the job's helper
@@ -1959,14 +1962,32 @@ fn fdbWire(c: *Pinned, suffix: []const u8, dir: []const u8, mode: FdbMode) void 
         \\mine = bytes.fromhex(open("/sys/class/net/eth0/address").read().strip().replace(":", ""))
         \\victim = bytes.fromhex("02aa00000001")
         \\s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW); s.bind(("eth0", 0))
-        \\def frame(src):
+        \\def frame(src, dst=b"\xff" * 6):
         \\    arp = struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1) + mine + socket.inet_aton("10.211.1.4") + b"\0" * 6 + socket.inet_aton("10.211.0.1")
-        \\    return b"\xff" * 6 + src + struct.pack("!H", 0x0806) + arp
+        \\    return dst + src + struct.pack("!H", 0x0806) + arp
         \\for i in range(200):
         \\    src = bytearray(os.urandom(6)); src[0] = (src[0] & 0xfe) | 0x02
         \\    s.send(frame(bytes(src)))
         \\for i in range(5):
         \\    s.send(frame(victim))
+        \\# Unicast to A's MAC from B's own: neither A nor the host's stack should get it.
+        \\for i in range(5):
+        \\    s.send(frame(mine, victim))
+        \\# To a link-local group address: the bridge handles it before its netfilter hooks.
+        \\for i in range(20):
+        \\    src = bytearray(os.urandom(6)); src[0] = (src[0] & 0xfe) | 0x02
+        \\    s.send(frame(bytes(src), bytes.fromhex("0180c2000003")))
+        \\EOF
+        \\cat > $d/listen.py <<'EOF'
+        \\import socket, struct, sys, time
+        \\iface, dst, secs = sys.argv[1], bytes.fromhex(sys.argv[2]), float(sys.argv[3])
+        \\s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)); s.bind((iface, 0)); s.settimeout(0.2)
+        \\n = 0; end = time.time() + secs
+        \\while time.time() < end:
+        \\    try: f = s.recv(2048)
+        \\    except socket.timeout: continue
+        \\    if f[0:6] == dst and f[6:12] == bytes.fromhex("02bb00000002") and f[12:14] == b"\x08\x06": n += 1
+        \\print(n)
         \\EOF
     ;
     const ran = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", topology, "sh", suffix, dir } }) catch |e| {
@@ -1982,6 +2003,11 @@ fn fdbWire(c: *Pinned, suffix: []const u8, dir: []const u8, mode: FdbMode) void 
         return;
     };
     defer host.close();
+    // As the helper does when it finds the bridge (the shell made it above).
+    if (mode.ll_off) host.ensureBridge(net.Subnet.default) catch |e| {
+        c.fail("ensureBridge: {s}", .{@errorName(e)});
+        return;
+    };
     for ([_]struct { u32, [4]u8, [6]u8, u8 }{
         .{ 1, .{ 10, 211, 1, 3 }, mac_a, 'a' },
         .{ 2, .{ 10, 211, 1, 4 }, mac_b, 'b' },
@@ -2031,7 +2057,7 @@ fn fdbWire(c: *Pinned, suffix: []const u8, dir: []const u8, mode: FdbMode) void 
         \\num() { v=$(sed -n 's/.*counter packets \([0-9][0-9]*\).*/\1/p' | head -1); echo "${v:-NaN}"; }
         \\amac=02:aa:00:00:00:01; bmac=02:bb:00:00:00:02
         \\fdb() { bridge fdb show br zr0; }
-        \\foreign() { fdb | grep -v -e "$amac" -e "$bmac" -e permanent -e ' self' | wc -l; }
+        \\foreign() { fdb | grep -v -e "$amac" -e "$bmac" -e permanent -e static -e ' self' | wc -l; }
         \\a_on() { fdb | grep "^$amac" | grep -o 'dev zrh[0-9]*' | sort -u | tr '\n' ' '; }
         \\pin_saddr() { t=$(nft list table bridge zig_runner_pin2 2>/dev/null || echo none); [ "$t" = none ] && echo none || echo "$t" | grep 'ether saddr !=' | num; }
         \\ip netns exec zrt-a-$sfx python3 $d/server.py >$d/a.log 2>&1 &
@@ -2039,8 +2065,12 @@ fn fdbWire(c: *Pinned, suffix: []const u8, dir: []const u8, mode: FdbMode) void 
         \\sleep 1
         \\echo "before a=$(python3 $d/try.py 10.211.1.3 3000) b=$(python3 $d/try.py 10.211.1.4 3000)"
         \\echo "foreign_before $(foreign) a_on_before $(a_on)"
-        \\ip netns exec zrt-b-$sfx python3 $d/forge.py
+        \\python3 $d/listen.py zr0 02aa00000001 3 > $d/up.out &
+        \\ip netns exec zrt-a-$sfx python3 $d/listen.py eth0 02aa00000001 3 > $d/ga.out &
         \\sleep 0.5
+        \\ip netns exec zrt-b-$sfx python3 $d/forge.py
+        \\sleep 3
+        \\echo "unicast_to_a up=$(cat $d/up.out) a_got=$(cat $d/ga.out)"
         \\echo "foreign_after $(foreign) a_on_after $(a_on)"
         \\echo "pin_dropped $(pin_saddr)"
         \\echo "after a=$(python3 $d/try.py 10.211.1.3 3000) b=$(python3 $d/try.py 10.211.1.4 3000)"
@@ -2074,10 +2104,12 @@ test "native nft: a job's frames carry its veth's MAC, and cannot add or move en
     };
     // The first is the control: no protection, and the attacks must work, or the test proves nothing.
     const modes = [_]FdbMode{
-        .{ .pin = false, .port = false },
-        .{ .pin = true, .port = false },
-        .{ .pin = false, .port = true },
-        .{ .pin = true, .port = true },
+        .{ .pin = false, .port = false, .ll_off = false },
+        // The pin alone: the frames to a link-local group address skip it, and the bridge learns them.
+        .{ .pin = true, .port = false, .ll_off = false },
+        .{ .pin = true, .port = false, .ll_off = true },
+        .{ .pin = false, .port = true, .ll_off = false },
+        .{ .pin = true, .port = true, .ll_off = true },
     };
     for (modes) |mode| {
         var c: Pinned = .{};
@@ -2101,20 +2133,27 @@ test "native nft: a job's frames carry its veth's MAC, and cannot add or move en
             return error.TestUnexpectedResult;
         }
         const out = c.out[0..c.out_len];
-        std.debug.print("native nft #616 (pin {}, port guard {}):\n{s}", .{ mode.pin, mode.port, out });
+        std.debug.print("native nft #616 (pin {}, port guard {}, no link-local learning {}):\n{s}", .{ mode.pin, mode.port, mode.ll_off, out });
         try std.testing.expect(std.mem.indexOf(u8, out, "NaN") == null);
         // Both jobs reach their own: before the attack, always.
         try std.testing.expect(std.mem.indexOf(u8, out, "before a=answer b=answer") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "foreign_before 0 a_on_before dev zrh1 \n") != null);
         // Teardown: a deleted veth leaves no entry of its port.
         try std.testing.expect(std.mem.indexOf(u8, out, "a_entries_on_deleted_port 0") != null);
-        if (mode.pin or mode.port) {
+        // B's unicast frames to A's MAC reach neither A nor the host's stack (an isolated port
+        // forwards nothing, and a static entry is not the bridge's own address).
+        try std.testing.expect(std.mem.indexOf(u8, out, "unicast_to_a up=0 a_got=0") != null);
+        if (mode.pin and !mode.port and !mode.ll_off) {
+            // The pin alone, link-local learning not off: the 20 frames to 01:80:c2:00:00:03 are learned.
+            try std.testing.expect(std.mem.indexOf(u8, out, "foreign_after 20 a_on_after dev zrh1 \n") != null);
+            try std.testing.expect(std.mem.indexOf(u8, out, "after a=answer b=answer") != null);
+        } else if (mode.pin or mode.port) {
             // Nothing added, nothing moved, A's traffic still arrives (and B's).
             try std.testing.expect(std.mem.indexOf(u8, out, "foreign_after 0 a_on_after dev zrh1 \n") != null);
             try std.testing.expect(std.mem.indexOf(u8, out, "after a=answer b=answer") != null);
         } else {
-            // The attack: 200 made-up MACs in the table, A's on B's port, A unreachable.
-            try std.testing.expect(std.mem.indexOf(u8, out, "foreign_after 200 a_on_after dev zrh2 \n") != null);
+            // The attack: 200 made-up MACs and 20 more by link-local frames in the table, A's on B's port, A unreachable.
+            try std.testing.expect(std.mem.indexOf(u8, out, "foreign_after 220 a_on_after dev zrh2 \n") != null);
             try std.testing.expect(std.mem.indexOf(u8, out, "after a=lost") != null);
         }
         if (mode.pin) {

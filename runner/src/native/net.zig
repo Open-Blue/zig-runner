@@ -303,17 +303,56 @@ pub const Socket = struct {
         // Every request below takes the kernel's one lock for link changes, which seven jobs
         // starting together queue for, so a bridge that is as wanted (the usual case) is only
         // read, which takes none.
-        if (s.bridgeReady(subnet)) return;
-        var m: Message = .init(.RTM_NEWLINK, linux.NLM_F_CREATE | linux.NLM_F_EXCL);
-        m.ifinfo(0, 0);
-        m.attrString(ifla_ifname, bridge);
-        const info = m.begin(ifla_linkinfo);
-        m.attrString(ifla_info_kind, "bridge");
-        m.end(info);
-        try expect(s.request(&m), true);
+        const ready = s.bridgeReady(subnet);
+        if (ready and s.bridgeNoLinkLocalLearn()) return;
+        if (!ready) {
+            var m: Message = .init(.RTM_NEWLINK, linux.NLM_F_CREATE | linux.NLM_F_EXCL);
+            m.ifinfo(0, 0);
+            m.attrString(ifla_ifname, bridge);
+            const info = m.begin(ifla_linkinfo);
+            m.attrString(ifla_info_kind, "bridge");
+            m.end(info);
+            try expect(s.request(&m), true);
+        }
         const i = s.index(bridge) orelse return error.NoBridge;
+        // Frames to 01:80:c2:00:00:0X are handled before the bridge's netfilter hooks (the jobs'
+        // pins are on them) and learned from like any other, unless the bridge is told not to
+        // (#616): a bridge a runner of an earlier version made is set here too.
+        var opt: Message = .init(.RTM_NEWLINK, 0);
+        opt.ifinfo(i, 0);
+        const info = opt.begin(ifla_linkinfo);
+        opt.attrString(ifla_info_kind, "bridge");
+        const data = opt.begin(ifla_info_data);
+        opt.attrBytes(ifla_br_multi_boolopt, std.mem.asBytes(&BoolOpt{ .optval = 1 << br_boolopt_no_ll_learn, .optmask = 1 << br_boolopt_no_ll_learn }));
+        opt.end(data);
+        opt.end(info);
+        try expect(s.request(&opt), false);
+        if (ready) return;
         try s.addAddress(i, subnet.gateway(), subnet.prefix);
         try s.up(i);
+    }
+
+    /// Whether the bridge has `BR_BOOLOPT_NO_LL_LEARN` set, read from the kernel (a read takes no
+    /// lock for link changes); false when it cannot be told.
+    fn bridgeNoLinkLocalLearn(s: *Socket) bool {
+        const i = s.index(bridge) orelse return false;
+        var m: Message = .init(.RTM_GETLINK, 0);
+        m.flags = linux.NLM_F_REQUEST;
+        m.ifinfo(i, 0);
+        m.finish(s.seq + 1);
+        s.seq += 1;
+        const sent = linux.sendto(s.fd, m.buf[0..m.len].ptr, m.len, 0, null, 0);
+        if (linux.errno(sent) != .SUCCESS) return false;
+        var buf: [8192]u8 align(4) = undefined;
+        const n = linux.recvfrom(s.fd, &buf, buf.len, 0, null, null);
+        if (linux.errno(n) != .SUCCESS) return false;
+        const hdr_len = @sizeOf(linux.nlmsghdr) + @sizeOf(IfInfoMsg);
+        if (n < hdr_len) return false;
+        const found = findAttr(buf[hdr_len..n], &.{ ifla_linkinfo, ifla_info_data, ifla_br_multi_boolopt }) orelse return false;
+        if (found.len < @sizeOf(BoolOpt)) return false;
+        const opt = std.mem.bytesToValue(BoolOpt, found[0..@sizeOf(BoolOpt)]);
+        const bit = 1 << br_boolopt_no_ll_learn;
+        return opt.optmask & bit != 0 and opt.optval & bit != 0;
     }
 
     /// Whether the bridge is up and has the gateway's address with the subnet's prefix.
@@ -375,9 +414,11 @@ pub const Socket = struct {
         iso.end(protinfo);
         try expect(s.request(&iso), false);
         if (fdb_guard) {
-            // `bridge fdb add <mac> dev <port> master static`
-            var fdb: Message = .init(.RTM_NEWNEIGH, linux.NLM_F_CREATE | linux.NLM_F_REPLACE);
-            fdb.put(NdMsg, .{ .family = af_bridge, .index = i, .state = nud_permanent, .flags = ntf_master });
+            // `bridge fdb add <mac> dev <port> master static`: not local (a frame for it is not
+            // passed up to the host), and exclusive: a MAC that is another slot's entry already
+            // fails the job's network, and does not move that entry.
+            var fdb: Message = .init(.RTM_NEWNEIGH, linux.NLM_F_CREATE | linux.NLM_F_EXCL);
+            fdb.put(NdMsg, .{ .family = af_bridge, .index = i, .state = nud_noarp, .flags = ntf_master });
             fdb.attrBytes(nda_lladdr, &mac);
             try expect(s.request(&fdb), false);
         }
@@ -434,6 +475,10 @@ fn expect(e: linux.E, exist_ok: bool) !void {
 }
 
 const ifla_address = 1;
+const ifla_br_multi_boolopt = 46;
+const br_boolopt_no_ll_learn = 0;
+/// `struct br_boolopt_multi`.
+const BoolOpt = extern struct { optval: u32, optmask: u32 };
 const ifla_ifname = 3;
 const ifla_master = 10;
 const ifla_protinfo = 12;
@@ -441,7 +486,9 @@ const ifla_brport_learning = 8;
 const ifla_brport_unicast_flood = 9;
 const ifla_brport_isolated = 33;
 const nda_lladdr = 2;
-const nud_permanent = 0x80;
+/// `NUD_NOARP`: a static entry. `NUD_PERMANENT` (0x80) is a local one, the bridge's own address:
+/// the bridge passes a frame for it up to the host, not on to the port.
+const nud_noarp = 0x40;
 const ntf_master = 0x04;
 const nla_f_nested = 0x8000;
 const af_bridge = 7;
@@ -494,6 +541,21 @@ const RtMsg = extern struct {
     type: u8 = 1,
     flags: u32 = 0,
 };
+
+/// The payload of the attribute reached by nesting `path` (each but the last a nested one) in the
+/// attributes `buf` holds.
+fn findAttr(buf: []const u8, path: []const u16) ?[]const u8 {
+    var off: usize = 0;
+    while (off + @sizeOf(linux.rtattr) <= buf.len) {
+        const len = std.mem.readInt(u16, buf[off..][0..2], .little);
+        const kind = std.mem.readInt(u16, buf[off + 2 ..][0..2], .little) & 0x3fff;
+        if (len < @sizeOf(linux.rtattr) or off + len > buf.len) return null;
+        const payload = buf[off + @sizeOf(linux.rtattr) .. off + len];
+        if (kind == path[0]) return if (path.len == 1) payload else findAttr(payload, path[1..]);
+        off += std.mem.alignForward(usize, len, 4);
+    }
+    return null;
+}
 
 /// One netlink request being built: a header, a fixed part, then attributes, nested ones with
 /// `begin` and `end`.
