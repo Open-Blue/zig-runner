@@ -1787,7 +1787,7 @@ fn pinned(c: *Pinned, suffix: []const u8, dir: []const u8, pin: bool) void {
     }
     // The pins first, before the ports exist, as the job's network helper makes them.
     if (pin) for ([_]struct { u32, [4]u8 }{ .{ 1, .{ 10, 211, 1, 3 } }, .{ 2, .{ 10, 211, 1, 4 } } }) |sa| {
-        if (pinSource(sa[0], sa[1], .{ 2, 0, 0, 0, 0, @intCast(sa[0]) })) |why| {
+        if (pinSource(sa[0], sa[1], .{ 2, 0, 0, 0, 0, std.math.lossyCast(u8, sa[0]) })) |why| {
             c.fail("pinSource: {s}", .{why});
             return;
         }
@@ -2002,8 +2002,9 @@ fn fdbWire(c: *Pinned, suffix: []const u8, dir: []const u8, mode: FdbMode) void 
             c.fail("open {s}: {t}", .{ path, linux.errno(nsfd) });
             return;
         }
-        defer _ = linux.close(@intCast(nsfd));
-        host.addVeth(slot, @intCast(nsfd), mac, mode.port) catch |e| {
+        const fd = std.math.lossyCast(linux.fd_t, nsfd);
+        defer _ = linux.close(fd);
+        host.addVeth(slot, fd, mac, mode.port) catch |e| {
             c.fail("addVeth {d}: {s}", .{ slot, @errorName(e) });
             return;
         };
