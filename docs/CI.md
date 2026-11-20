@@ -29,7 +29,7 @@ to end", "Proofs", and `release`'s "Binaries (check)", "Binaries (same as zig bu
 On a change that can't affect what a job checks, the job reports without running its steps
 (`.github/scripts/ci-scope.sh tests|binaries|proofs|packaging`, each with the files that can). The
 build and tests run for any file the script doesn't know. A path filter would leave the check
-unreported instead, and the merge queue waiting for it.
+unreported instead, and the merge queue waiting for it. (Demonstration commit: documentation only, to show the Scope job skipping the rest.)
 
 In ci.yml the first job, "Scope", decides every scope once (its log names the base, the changed
 files and the file that decided each scope), and a job whose scopes are all false is skipped before
