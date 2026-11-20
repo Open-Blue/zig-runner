@@ -247,7 +247,8 @@ On a root runner, each step runs:
   bridge's table or moves another job's. It does not see frames to a link-local group address
   (01:80:c2:00:00:0X): the bridge handles those before its netfilter hooks and learns from them,
   so `zr0` is made with `no_linklocal_learn` (`BR_BOOLOPT_NO_LL_LEARN`; also set on a bridge an
-  earlier runner made), and each port has `IFLA_BRPORT_LEARNING` and `IFLA_BRPORT_UNICAST_FLOOD`
+  earlier runner made; best-effort: a kernel before 5.12 cannot, the runner logs
+  `kind=bridge_no_linklocal_learn_unsupported` and goes on, as the ports' own settings below stop that learning), and each port has `IFLA_BRPORT_LEARNING` and `IFLA_BRPORT_UNICAST_FLOOD`
   off and a static entry (not a local one, `NUD_NOARP`, which would pass a frame for it up to the
   host) for the job's MAC, added before the port is up: the table holds nothing a job sent (so
   `fdb_max_learned` has nothing to bound), and the host's frames for a job go to its port, never
