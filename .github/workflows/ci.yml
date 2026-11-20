@@ -977,8 +977,7 @@ jobs:
   # nothing and saves nothing (each leg logs `rust-cache-warmer:` and the action's key lines).
   rust-cache-warmer:
     name: Rust cache warmer (${{ matrix.name }}, ${{ matrix.arch }})
-    # TEMPORARY (evidence on the PR): also on pull_request. Push only before it is handed over.
-    if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'push' }}
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
     timeout-minutes: 20
     permissions:
