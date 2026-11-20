@@ -19,8 +19,9 @@
 //! test (a `--test-filter`), runs the binary itself, as without this program.
 //! `--names` only prints the binary's test names, one a line, as `.github/scripts/test-files.sh`
 //! compares them with the source's. ZIG_TEST_SHARDS=N sets the number of shards; the default is the cores this process may use.
-//! ZIG_TEST_PART=K/N runs only part K of N: every N-th test, starting at the K-th, so N machines
-//! share a suite (CI's native tests as root, which run one at a time on each).
+//! ZIG_TEST_PART=K/N runs only part K of N, so N machines share a suite (CI's native tests as root,
+//! which run one at a time on each): the longest tests (`heavy`) are shared out by their measured
+//! time, the others every N-th, starting at the K-th.
 //! `zig build test -Dshard-tests=false` runs the tests without it.
 //! ZIG_TEST_TIMES=1 prints every test's wall time (`time: 1.234 s name`, longest first) and each
 //! shard's busy time and test count before the totals line; off by default (only the five slowest
