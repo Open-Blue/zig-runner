@@ -1,0 +1,3 @@
+kind: Added
+body: 'CI fails a pull request that adds a change entry of a kind that bumps the major version (Changed or Removed, as .changie.yaml''s auto: major says) unless it is labelled breaking. #610 merged a fix filed as Changed, and the next release would have been v1.0.0. Only the entries a pull request adds or changes count.'
+time: 2026-11-20T11:53:37.270571697-05:00

@@ -330,6 +330,21 @@ jobs:
             changie batch auto --dry-run >/dev/null
           fi
 
+      # A change entry of a kind that bumps the major version (.changie.yaml's `auto: major`: Changed
+      # and Removed) needs the pull request labelled `breaking`: #610 merged a fix filed as Changed,
+      # and the next release would have been v1.0.0 (#643). Only the entries the pull request adds or
+      # changes count. Labelling does not re-run the check: re-run it after adding the label.
+      - name: No major bump without the breaking label
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: .github/scripts/changie-major-guard.sh "$BASE" "$LABELS"
+
+      - name: The major-bump guard's own test
+        if: ${{ !cancelled() }}
+        run: .github/scripts/changie-major-guard-test.sh
+
       # The busybox the runner puts into job containers (runner/src/dagger.zig), pinned by digest:
       # checked to be a pullable multi-arch index (amd64 and arm64) with the applets Docker actions,
       # services and output keys use, so a Renovate busybox pull request, or a re-wrapped literal,
