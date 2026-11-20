@@ -913,7 +913,9 @@ jobs:
     # After Release builds, whose binaries it checks and runs: a second build would take as long again
     # (about 110 s on a runner of its own) for the same bytes.
     needs: binaries
-    if: github.event_name != 'push'
+    # Whether Release builds passed, said outright: the implicit success() also asks every job before
+    # it, and `reuse`, skipped outside the merge queue, would skip this job on every pull request.
+    if: ${{ !cancelled() && needs.binaries.result == 'success' && github.event_name != 'push' }}
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 30
     permissions:
