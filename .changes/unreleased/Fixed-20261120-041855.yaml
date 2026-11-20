@@ -1,0 +1,3 @@
+kind: Fixed
+body: CI's Workflows job keeps Go's build and module caches between runs, so staticcheck, actionlint and the comparison tools are no longer compiled from source, nor the Go toolchain go-lint.sh asks for downloaded, on every run. Both caches are Go's own content-addressed stores, so an older entry is safe to restore by its prefix.
+time: 2026-11-20T04:18:55.624732203-05:00

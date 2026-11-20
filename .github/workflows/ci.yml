@@ -176,6 +176,39 @@ jobs:
       # Skipped on a change that cannot affect them (ci-scope.sh go); compare.yml runs it weekly
       # whatever changed. Go is on GitHub's runner; it fetches the pinned staticcheck and the
       # toolchain the go.mods name, checked against Go's checksum database.
+      # Go's build and module caches, for the Go tools below and actionlint: otherwise every run
+      # compiles staticcheck, actionlint and the comparison tools, and downloads the toolchain
+      # go-lint.sh asks for (GOTOOLCHAIN). Both are Go's own content-addressed stores (a build
+      # output is used only for the exact inputs that made it; a module version's files are fixed
+      # by go.sum and Go's checksum database), so an older entry restored by its prefix is safe,
+      # and Go trims build entries unused for five days. A merge group restores, never saves.
+      - name: Go caches' key
+        id: go_cache
+        if: ${{ !cancelled() }}
+        run: |
+          echo "go-cache: $(go env GOVERSION); GOCACHE $(go env GOCACHE), GOMODCACHE $(go env GOMODCACHE)"
+          {
+            echo "version=$(go env GOVERSION)"
+            echo "build=$(go env GOCACHE)"
+            echo "mod=$(go env GOMODCACHE)"
+          } >>"$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ !cancelled() && github.event_name != 'merge_group' }}
+        with:
+          path: |
+            ${{ steps.go_cache.outputs.build }}
+            ${{ steps.go_cache.outputs.mod }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go_cache.outputs.version }}-${{ hashFiles('.github/scripts/go-lint.sh', 'runner/tools/*/go.mod', 'runner/tools/*/go.sum', '.github/workflows/ci.yml') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go_cache.outputs.version }}-
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ !cancelled() && github.event_name == 'merge_group' }}
+        with:
+          path: |
+            ${{ steps.go_cache.outputs.build }}
+            ${{ steps.go_cache.outputs.mod }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go_cache.outputs.version }}-${{ hashFiles('.github/scripts/go-lint.sh', 'runner/tools/*/go.mod', 'runner/tools/*/go.sum', '.github/workflows/ci.yml') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go_cache.outputs.version }}-
+
       - name: Whether this change can affect the Go tools
         id: go_scope
         if: ${{ !cancelled() }}
