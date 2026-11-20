@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'security.yml''s cargo-deny check no longer waits for rustup to install the pinned Rust toolchain and its two musl targets: cargo-deny only reads the dependency graph through cargo metadata, which any cargo answers the same way for the lock file, so it runs under the runner''s default toolchain, named in the log.'
+time: 2026-11-20T04:23:03.447560887-05:00
