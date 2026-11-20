@@ -533,8 +533,9 @@ jobs, so `rust=` covers nothing today; it becomes meaningful once the library's 
 when R4 and R5 merge, and its margins in `LIMITS` are unmeasured until then), and 11 descriptors, 13 threads, 14 mounts and no zombies, all exactly as at job 20; resident
 and anonymous memory rose from 7.8 and 2.6 MiB to 9.3 and 4.1 MiB, in steps at first use (threads
 touching their stacks) and then 0.87 KiB a job, which the margins of `memory_soak.py` allow and
-explain. The container shape asks Docker Hub about its image on every job, and Docker Hub's
-unauthenticated limit is 100 pulls in 6 hours from one address: after that those jobs fail ("HTTP
+explain. The container shape asks Docker Hub about its image once per `RUNNER_IMAGE_TAG_TTL` (a `HEAD`, which
+Docker Hub does not count), where before #551's fix it asked on every job, and Docker Hub's
+unauthenticated limit is 100 pulls in 6 hours from one address: a runner without that fix failed those jobs ("HTTP
 429") and the run says so (`ended 'failure', expected 'success'`). `--shapes` narrows a run to some
 shapes, `ZR_SOAK_SMAPS=1` saves the runner's `/proc/<pid>/smaps` before and after (`ZR_SOAK_SMAPS_AT=N`
 after job N as well), to say which mappings grew.
@@ -591,6 +592,11 @@ error: kind=upload_failed job=123 what=job_log name="" detail=NameServerFailure
   `HostLacksNetworkAddresses`; with no lookup time the line has `total_ms`). Nothing about the job's resolver
   changes; the thresholds are fixed. A job's resolv.conf holds the host's IPv4 nameservers off the loopback
   (razorbill: Tailscale's 100.100.100.100 only, its IPv6 one is dropped). Rootless jobs have no namespace and no probe.
+- Image pulls (#551): `warn: kind=image_tag_reused image=alpine:3.20 digest=sha256:.. status=429 reason=HttpStatus`
+  when a native container job's registry could not answer (a 429, a 5xx, the network) and the tag's last known
+  digest, still in the store, ran instead of failing the job. A tag is asked about at most once per
+  `RUNNER_IMAGE_TAG_TTL` seconds (default 300), by a `HEAD` that Docker Hub does not count; a digest-pinned image
+  never. See docs/native-backend.md.
 - `info` lines (`info(scope): …`) and the lines with formats of their own are not warnings and
   keep them: `health:`, `job-end:`, `step-end:`, `request:`, and the plain `job N: …` progress
   lines. What a job's log shows to the user (GitHub's `##[warning]`, an action's `Warning:`) is

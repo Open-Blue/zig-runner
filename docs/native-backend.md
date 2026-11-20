@@ -1012,8 +1012,15 @@ directories and the step's file-command files at a 4 KiB block each.
   registry once, not twice a job (the index, then its platform's manifest), which also keeps
   Docker Hub's anonymous limit out of reach. Five minutes because a tag that moved is then seen by
   the next job after that and the saving is almost all of a burst's; `0` asks on every job, as
-  `docker pull` does. When the registry cannot answer (the network, a 429 or a 5xx) and the store
-  holds the tag's last resolution, that image runs and "Set up job" says which digest; a 401, a 403
+  `docker pull` does. Past the TTL, with the store holding the tag's last digest, the runner asks
+  with one `HEAD` of the tag's manifest and compares its `Docker-Content-Digest` with that digest:
+  equal, the stored image runs and the TTL starts again, with no manifest fetched; different, the
+  manifests are fetched and verified as before. Docker Hub does not count a `HEAD` toward its pull
+  limit ("Using GET emulates a real pull and counts towards the limit. Using HEAD won't.",
+  docs.docker.com/docker-hub/usage/pulls); the digest of a `HEAD` is only compared with one whose
+  bytes were hashed when fetched, never trusted on its own. A reference pinned by digest (`image@sha256:...`, also
+  `image:tag@sha256:...`) never contacts the registry once its image is in the store. When the registry cannot answer (the network, a 429 or a 5xx) and the store
+  holds the tag's last resolution, that image runs, "Set up job" says which digest, and the runner logs `warn: kind=image_tag_reused image=.. digest=.. status=.. reason=..` (the status 0 is no answer at all); a 401, a 403
   or a 404 is an error, never the old image. With nothing to fall back on, a 429 is waited out as
   its `Retry-After` asks (each wait at most 60 s, at most two). A record belongs to the credentials that resolved it (an HMAC-SHA256 of the reference and the registry login, or "anonymous", keyed by a random per-store secret in `oci/refs.key`, mode 0600, made on first use and made again if lost, which only costs the records; the login itself is never stored, nor guessable from the file names): another login, or none, asks the registry and gets its 401. For the same credentials a tag that was deleted, or access that was revoked, is still served until the TTL passes, and by the fallback. The runner has no `pull_policy`; a job that must
   have the newest tag pins `image@sha256:...` or runs where the setting is 0.
