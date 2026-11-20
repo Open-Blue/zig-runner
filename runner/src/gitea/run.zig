@@ -165,6 +165,8 @@ fn runTask(c: loop.Runner, client: client_mod.Client, t: client_mod.Task) !void 
         f.cancel(c.io);
     };
 
+    reporter.say(converted.runtime_token_source.describe());
+
     // An error in what follows still ends the task: reported failed, with the error in its log.
     runJob(c, converted, &collect, &reporter, &cancel, &pumping) catch |e| {
         var buf: [160]u8 = undefined;
