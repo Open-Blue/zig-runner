@@ -181,7 +181,8 @@ jobs:
       # go-lint.sh asks for (GOTOOLCHAIN). Both are Go's own content-addressed stores (a build
       # output is used only for the exact inputs that made it; a module version's files are fixed
       # by go.sum and Go's checksum database), so an older entry restored by its prefix is safe,
-      # and Go trims build entries unused for five days. A merge group restores, never saves.
+      # and Go trims build entries unused for five days. Only a push to main saves; a pull request or
+      # merge group restores (as the Rust cache does: their own entries evicted main's).
       - name: Go caches' key
         id: go_cache
         if: ${{ !cancelled() }}
@@ -193,7 +194,7 @@ jobs:
             echo "mod=$(go env GOMODCACHE)"
           } >>"$GITHUB_OUTPUT"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: ${{ !cancelled() && github.event_name != 'merge_group' }}
+        if: ${{ !cancelled() && github.event_name == 'push' }}
         with:
           path: |
             ${{ steps.go_cache.outputs.build }}
@@ -201,7 +202,7 @@ jobs:
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go_cache.outputs.version }}-${{ hashFiles('.github/scripts/go-lint.sh', 'runner/tools/*/go.mod', 'runner/tools/*/go.sum', '.github/workflows/ci.yml') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-${{ steps.go_cache.outputs.version }}-
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: ${{ !cancelled() && github.event_name == 'merge_group' }}
+        if: ${{ !cancelled() && github.event_name != 'push' }}
         with:
           path: |
             ${{ steps.go_cache.outputs.build }}
