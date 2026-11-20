@@ -20,6 +20,38 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # The merge queue's run, when a pull request's run already passed the very tree it tests, on the
+  # very base it is built on (.github/scripts/ci-reuse.sh says exactly when, and logs why): the
+  # jobs below then skip, and a skipped required check passes
+  # (https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks).
+  # Only on merge_group; on push and pull_request it is skipped at once, and the jobs below run
+  # (`!cancelled()`: a skipped `needs` would skip them otherwise). Any failure here reads as "no
+  # reuse", never as a skip: an empty output is not 'true'.
+  reuse:
+    name: Reuse a pull request's pass
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      actions: read # to list the pull request's ci runs
+      contents: read # to check out the script and read commits' trees
+    outputs:
+      reuse: ${{ steps.decide.outputs.reuse }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether a pull request's run passed this tree on this base
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_REF: ${{ github.event.merge_group.head_ref }}
+        run: .github/scripts/ci-reuse.sh
+
   # The workflows themselves: actionlint for mistakes, zizmor for security; the shell scripts
   # they and the deployment run, with shellcheck and shfmt; and the Dockerfile, with hadolint
   # (docs/CI.md). Also the checks that each took a runner of their own for seconds, and waited
@@ -27,6 +59,8 @@ jobs:
   # whatever failed before it (`!cancelled()`), so one failure hides none of the others.
   workflows:
     name: Workflows
+    needs: reuse
+    if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
@@ -119,6 +153,11 @@ jobs:
       # image-preflight.sh's failure path: a PATH with only some tools names each missing one.
       - name: Runner image preflight names a missing tool
         run: .github/scripts/image-preflight-test.sh
+
+      # ci-reuse.sh's decision for the merge queue, against a stub gh: the same tree and base reuse a
+      # pull request's pass; a different base, a failed run, a fork or any failed lookup do not.
+      - name: Merge queue reuse decision
+        run: .github/scripts/ci-reuse-test.sh
 
       # The release binaries, against their pinned checksums: a new version (Renovate's) fails
       # here until they are updated. shfmt shows the diff that would format a script.
@@ -291,6 +330,8 @@ jobs:
   # than the longest root part).
   database:
     name: Database tests
+    needs: reuse
+    if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
@@ -365,6 +406,8 @@ jobs:
   # the clients is for a pull request to read, and the oracle goes with the old client at R6.
   tls-oracle:
     name: TLS oracle
+    needs: reuse
+    if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
@@ -490,8 +533,8 @@ jobs:
     # After the prebuild, which runs on a push to main when prod is self-hosted and is skipped
     # otherwise: `always` and not the default, so that a skipped prebuild does not skip this job
     # (a skipped required check passes); one that failed or was cancelled fails it, below.
-    needs: [prebuild, test-files]
-    if: ${{ !cancelled() }}
+    needs: [reuse, prebuild, test-files]
+    if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' }}
     runs-on: ${{ fromJSON(github.event_name == 'push' && (vars.PROD_RUNNER || '"ubuntu-26.04"') || (vars.PREPROD_RUNNER || '"ubuntu-26.04"')) }}
     timeout-minutes: 30
     # The store stress test's workers for 10 s, and 10 s more with the deferred sync, where it defaults to 30 and 15:
@@ -725,7 +768,8 @@ jobs:
   # branches" ruleset). Not on main: a push runs `zig build test` on prod (`test`).
   native-root:
     name: Native tests as root (${{ matrix.arch }}, ${{ matrix.part }}/2)
-    if: github.event_name != 'push'
+    needs: reuse
+    if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' && github.event_name != 'push' }}
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
     timeout-minutes: 30
     # The store stress test's workers for 10 s, and 10 s more with the deferred sync, where it defaults to 30 and 15:
@@ -783,6 +827,27 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/tmp-leaks.sh
 
+  # Native tests as root is a matrix, and a matrix job skipped by its `if:` or `needs:` may report
+  # under its unexpanded name, which would leave the required checks below waiting: so on a reuse these
+  # report them, in seconds. Not the code's tests: that is what the reuse job decided was already run.
+  native-root-reused:
+    name: Native tests as root (${{ matrix.arch }}, ${{ matrix.part }}/2)
+    needs: reuse
+    if: ${{ needs.reuse.outputs.reuse == 'true' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, arm64]
+        part: [1, 2]
+    steps:
+      - name: Reused from the pull request's run
+        env:
+          NAME: ${{ matrix.arch }} ${{ matrix.part }}/2
+        run: echo "Native tests as root ($NAME) reused from the pull request's run of this tree on this base; see the reuse job"
+
   # The release's own builds, both targets in ReleaseSafe (build-binaries.sh), which nothing else
   # compiles before the tag: the tests build x86_64 in Debug, and release.yml's checks run only for
   # a change to the packaging. Code that compiles there and not for aarch64, or not in ReleaseSafe,
@@ -792,7 +857,8 @@ jobs:
   # tag's release builds them anyway.
   binaries:
     name: Release builds
-    if: github.event_name != 'push'
+    needs: reuse
+    if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' && github.event_name != 'push' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
@@ -880,7 +946,8 @@ jobs:
   # (`arm64-builds`), which used to run first in the same job and held the tests back.
   arm64-test:
     name: Tests (arm64)
-    if: github.event_name != 'push'
+    needs: reuse
+    if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' && github.event_name != 'push' }}
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 30
     # The store stress test's workers for 10 s, and 10 s more with the deferred sync, where it defaults to 30 and 15:
@@ -952,7 +1019,8 @@ jobs:
   # whose commits the merge queue checked.
   e2e:
     name: End to end
-    if: github.event_name != 'push'
+    needs: reuse
+    if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' && github.event_name != 'push' }}
     runs-on: ubuntu-26.04
     # Setup takes about 4 minutes, a pass 2 to 3, and the whole job 5 to 10; the limit is what a hang
     # costs. The two passes' step limits below (11 and 12 minutes) are their worst cases, so that a
