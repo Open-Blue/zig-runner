@@ -325,26 +325,87 @@ pub fn pinSource(slot: u32, addr: [4]u8, mac: [6]u8) ?[]const u8 {
         explain(e);
 }
 
-/// Removes slot's pin (the job's port is gone); none there is no error.
+/// An nftables socket that stays in the network namespace it was opened in, for `dropLinkLocal`:
+/// the job's network helper opens it in the host's, before its unshare into the job's.
+pub const Guard = struct {
+    sock: Socket,
+
+    pub fn open() ?Guard {
+        return .{ .sock = Socket.open() catch return null };
+    }
+
+    pub fn close(g: *Guard) void {
+        g.sock.close();
+    }
+
+    /// Drops what slot's port receives for a link-local group address (01:80:c2:00:00:00 to
+    /// 01:80:c2:00:00:0f: STP, pause, LACP, LLDP, 802.1X): a table of its own in the `netdev`
+    /// family (`zig_runner_ll<slot>`) with a chain on the port's ingress, the one hook that sees
+    /// them. The bridge takes such a frame before its own hooks (the pin is on them) and does
+    /// not forward it, but hands it to the host's stack as received on the port itself, past the
+    /// runner's rules (they name the bridge): a forged-source datagram for any address of the
+    /// host's, IPv4 or IPv6, would reach its sockets, or be forwarded out through an uplink
+    /// (found in #642's review). Made once the port exists (the hook is bound to it), before the
+    /// job's end is up, replacing a dead job's; removed by `unpinSource`. The reason it could not be made, or null.
+    pub fn dropLinkLocal(g: *Guard, slot: u32) ?[]const u8 {
+        var buf: [4096]u8 align(4) = undefined;
+        var b: Batch = .init(&buf, g.sock.seq);
+        var name_buf: [32]u8 = undefined;
+        var dev_buf: [16]u8 = undefined;
+        const tbl = slotTable(&name_buf, "zig_runner_ll", slot);
+        b.family = nfproto_netdev;
+        b.tableNamed(.NEWTABLE, linux.NLM_F_CREATE, tbl);
+        b.tableNamed(.DELTABLE, 0, tbl);
+        b.tableNamed(.NEWTABLE, linux.NLM_F_CREATE, tbl);
+        b.baseChainDev(tbl, "ingress", net.hostLink(&dev_buf, slot));
+        // `ether daddr & ff:ff:ff:ff:ff:f0 == 01:80:c2:00:00:00 counter drop`
+        const r = b.rule(tbl, "ingress", linux.NLM_F_APPEND);
+        b.payloadLoad(nft_payload_ll_header, 0, 6);
+        b.bitwise(&.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0 });
+        b.cmp(.eq, &.{ 0x01, 0x80, 0xc2, 0x00, 0x00, 0x00 });
+        b.counter();
+        b.verdict(nf_drop);
+        b.endRule(r);
+        const bytes = b.finish();
+        if (b.overflow) return "the rule does not fit its batch";
+        const e = g.sock.send(bytes, b.first_seq, b.seq, b.acks) catch |err| return @errorName(err);
+        g.sock.seq = b.seq + 1;
+        if (e == .SUCCESS) return null;
+        return if (e == .OPNOTSUPP or e == .PROTONOSUPPORT or e == .AFNOSUPPORT)
+            "the kernel has no nftables netdev family (nf_tables_netdev)"
+        else
+            explain(e);
+    }
+};
+
+/// Removes slot's pin and its link-local table (the job's port is gone); none there is no error.
 pub fn unpinSource(slot: u32) void {
     var sock = Socket.open() catch return;
     defer sock.close();
     var buf: [1024]u8 align(4) = undefined;
     var b: Batch = .init(&buf, sock.seq);
     var name_buf: [32]u8 = undefined;
+    var ll_buf: [32]u8 = undefined;
     const tbl = pinTable(&name_buf, slot);
-    b.family = nfproto_bridge;
     // Made if missing, so that deleting it is no error.
+    b.family = nfproto_bridge;
     b.tableNamed(.NEWTABLE, linux.NLM_F_CREATE, tbl);
     b.tableNamed(.DELTABLE, 0, tbl);
+    b.family = nfproto_netdev;
+    const ll = slotTable(&ll_buf, "zig_runner_ll", slot);
+    b.tableNamed(.NEWTABLE, linux.NLM_F_CREATE, ll);
+    b.tableNamed(.DELTABLE, 0, ll);
     const bytes = b.finish();
     _ = sock.send(bytes, b.first_seq, b.seq, b.acks) catch return;
 }
 
 fn pinTable(buf: *[32]u8, slot: u32) []const u8 {
+    return slotTable(buf, "zig_runner_pin", slot);
+}
+
+fn slotTable(buf: *[32]u8, prefix: []const u8, slot: u32) []const u8 {
     // At most three digits after the prefix: it always fits.
     std.debug.assert(slot < net.max_slots);
-    const prefix = "zig_runner_pin";
     @memcpy(buf[0..prefix.len], prefix);
     const digits = std.fmt.printInt(buf[prefix.len..], slot, 10, .lower, .{});
     return buf[0 .. prefix.len + digits];
@@ -410,6 +471,8 @@ fn pinBatch(b: *Batch, tbl: []const u8, link: []const u8, addr: [4]u8, mac: [6]u
 
 const nfproto_ipv4 = 2;
 const nfproto_bridge = 7;
+const nfproto_netdev = 5;
+const nfta_hook_dev = 3;
 /// The bridge family's pre-routing hook, and its filter priority.
 const hook_br_prerouting = 0;
 const priority_br_filter = -200;
@@ -424,6 +487,8 @@ const priority_srcnat = 100;
 
 /// The bridge's name as iptables-nft matches an interface exactly: with its terminating zero.
 const bridge_name = net.bridge ++ "\x00";
+/// A job's port's name as far as its slot number: `iifname "zrh*"` (no terminating zero).
+const job_port_prefix = "zrh";
 
 /// `ip zig_runner` replaced, and the jobs' accepts in the iptables-nft chains made again, in one
 /// batch: the kernel's errno for it (`.SUCCESS` when it was committed).
@@ -444,6 +509,18 @@ fn ruleBatch(
     b.baseChain("input", "filter", hook_input, priority_filter);
     b.baseChain("output", "filter", hook_output, priority_filter);
     b.baseChain("postrouting", "nat", hook_postrouting, priority_srcnat);
+
+    // Nothing that arrives on a job's own port (`zrh<slot>`) is the host's to handle: the bridge
+    // hands the host's stack frames it does not forward (to a link-local group address) as received
+    // on the port, not on `zr0`, past every rule below (found in #642's review). The port's ingress drops those
+    // (`Guard.dropLinkLocal`, which covers IPv6 as well); these are the second layer, for IPv4.
+    for ([_][]const u8{ "input", "forward" }) |chain| {
+        const rr = b.rule(table, chain, linux.NLM_F_APPEND);
+        b.ifname(.iif, .eq, job_port_prefix);
+        b.counter();
+        b.verdict(nf_drop);
+        b.endRule(rr);
+    }
 
     // forward: from the bridge out through an uplink, and DNS to the jobs' nameservers out of
     // any interface, nothing else from it; to it, replies only.
@@ -780,6 +857,21 @@ const Batch = struct {
         b.baseChainIn(table, name, kind, hook, priority);
     }
 
+    /// A `netdev` family chain on the ingress of the device `dev`.
+    fn baseChainDev(b: *Batch, tbl: []const u8, name: []const u8, dev: []const u8) void {
+        b.message(.NEWCHAIN, linux.NLM_F_CREATE);
+        b.attrStr(nfta_chain_table, tbl);
+        b.attrStr(nfta_chain_name, name);
+        const h = b.begin(nfta_chain_hook);
+        b.attrBe32(nfta_hook_hooknum, 0);
+        b.attrBe32(nfta_hook_priority, 0);
+        b.attrStr(nfta_hook_dev, dev);
+        b.end(h);
+        b.attrBe32(nfta_chain_policy, nf_accept);
+        b.attrStr(nfta_chain_type, "filter");
+        b.endMsg();
+    }
+
     fn baseChainIn(b: *Batch, tbl: []const u8, name: []const u8, kind: []const u8, hook: u32, priority: i32) void {
         b.message(.NEWCHAIN, linux.NLM_F_CREATE);
         b.attrStr(nfta_chain_table, tbl);
@@ -927,14 +1019,19 @@ const Batch = struct {
 
     /// `payload load <value.len>b @ <base> + <offset> => reg 1; cmp <op> reg 1 <value>`.
     fn payloadCmp(b: *Batch, base: u32, offset: u32, op: CmpOp, value: []const u8) void {
+        b.payloadLoad(base, offset, std.math.lossyCast(u32, value.len));
+        b.cmp(op, value);
+    }
+
+    /// `payload load <len>b @ <base> + <offset> => reg 1`.
+    fn payloadLoad(b: *Batch, base: u32, offset: u32, len: u32) void {
         b.expr("payload");
         const d = b.begin(nfta_expr_data);
         b.attrBe32(nfta_payload_dreg, nft_reg_1);
         b.attrBe32(nfta_payload_base, base);
         b.attrBe32(nfta_payload_offset, offset);
-        b.attrBe32(nfta_payload_len, std.math.lossyCast(u32, value.len));
+        b.attrBe32(nfta_payload_len, len);
         b.endExpr(d);
-        b.cmp(op, value);
     }
 
     /// `meta l4proto <proto>`.
@@ -2162,5 +2259,210 @@ test "native nft: a job's frames carry its veth's MAC, and cannot add or move en
         } else {
             try std.testing.expect(std.mem.indexOf(u8, out, "pin_dropped none") != null);
         }
+    }
+}
+
+/// Which of the two layers against frames to a link-local group address a run of `linkLocal` has:
+/// the runner's `ip` rules (`apply`) and the port's ingress rule (`Guard.dropLinkLocal`).
+const LinkLocalMode = struct { rules: bool, guard: bool };
+
+/// The host of a job B (10.211.1.4, MAC 02:bb:..:02, port `zrh2`, pinned with `pinSource`) on
+/// `zr0` in a network namespace of this thread's own, an uplink (a dummy `d0`, 10.1.0.0/24) and a
+/// host UDP service on 9999 (IPv4) and 9998 (IPv6). B, root in its namespace, sends frames to
+/// 01:80:c2:00:00:03, the bridge's handling of which skips the pin: a UDP datagram, from an address
+/// that is not B's, to the host's address on `zr0` (a host service), one to an address behind the
+/// uplink (forwarded), and an IPv6 UDP datagram to the host's address on `zrh2` if it has one.
+/// Counted: what the host's UDP sockets got, what reached the `forward` hook after the runner's
+/// chain, and the pin's own counters.
+fn linkLocal(c: *Pinned, suffix: []const u8, dir: []const u8, mode: LinkLocalMode) void {
+    const unshared = linux.unshare(linux.CLONE.NEWNET);
+    if (linux.errno(unshared) != .SUCCESS) {
+        c.skip = "no network namespace of its own";
+        return;
+    }
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    const tools = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", "command -v ip nft python3 >/dev/null" } }) catch null;
+    if (tools == null or tools.?.term != .exited or tools.?.term.exited != 0) {
+        c.skip = "ip, nft or python3 is missing";
+        return;
+    }
+    const topology =
+        \\set -e
+        \\sfx=$1; d=$2
+        \\ip link set lo up
+        \\echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 0 > /proc/sys/net/ipv4/conf/default/rp_filter
+        \\ip link add zr0 type bridge; ip addr add 10.211.0.1/16 dev zr0; ip link set zr0 up
+        \\echo 1 > /proc/sys/net/ipv6/conf/zr0/disable_ipv6
+        \\ip link add d0 type dummy; ip addr add 10.1.0.48/24 dev d0; ip link set d0 up
+        \\echo 1 > /proc/sys/net/ipv4/ip_forward
+        \\ip netns add zrt-b-$sfx
+        \\# After the runner's chain (priority 0): only what it let through.
+        \\nft add table ip zrt_post
+        \\nft add chain ip zrt_post f '{ type filter hook forward priority 10; }'
+        \\nft add rule ip zrt_post f iifname zrh2 counter
+        \\ip link add zrh2 type veth peer name e0 address 02:bb:00:00:00:02; ip link set e0 netns zrt-b-$sfx; ip link set zrh2 master zr0
+        \\cat > $d/udp.py <<'EOF'
+        \\import socket, sys, time
+        \\v6 = sys.argv[1] == "6"; port = int(sys.argv[2]); secs = float(sys.argv[3])
+        \\s = socket.socket(socket.AF_INET6 if v6 else socket.AF_INET, socket.SOCK_DGRAM)
+        \\s.bind(("::" if v6 else "0.0.0.0", port)); s.settimeout(0.2)
+        \\n = 0; end = time.time() + secs
+        \\while time.time() < end:
+        \\    try: s.recvfrom(100); n += 1
+        \\    except socket.timeout: pass
+        \\print(n)
+        \\EOF
+        \\cat > $d/ll.py <<'EOF'
+        \\import socket, struct, sys
+        \\def csum(b):
+        \\    if len(b) % 2: b += b"\0"
+        \\    t = sum(struct.unpack("!%dH" % (len(b) // 2), b))
+        \\    t = (t >> 16) + (t & 0xffff); t += t >> 16
+        \\    return ~t & 0xffff
+        \\mine = bytes.fromhex("02bb00000002")
+        \\dst = bytes.fromhex("0180c2000003")
+        \\s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW); s.bind(("e0", 0))
+        \\def v4(src, dstip, dport):
+        \\    udp = struct.pack("!HHHH", 40000, dport, 9, 0) + b"x"
+        \\    ip = struct.pack("!BBHHHBBH", 0x45, 0, 20 + len(udp), 4245, 0, 64, 17, 0) + socket.inet_aton(src) + socket.inet_aton(dstip)
+        \\    ip = ip[:10] + struct.pack("!H", csum(ip)) + ip[12:]
+        \\    return dst + mine + struct.pack("!H", 0x0800) + ip + udp
+        \\def v6(src, dstip, dport):
+        \\    sa, da = socket.inet_pton(socket.AF_INET6, src), socket.inet_pton(socket.AF_INET6, dstip)
+        \\    udp = struct.pack("!HHHH", 40000, dport, 9, 0) + b"x"
+        \\    udp = udp[:6] + struct.pack("!H", csum(sa + da + struct.pack("!IBBBB", len(udp), 0, 0, 0, 17) + udp)) + udp[8:]
+        \\    return dst + mine + struct.pack("!H", 0x86dd) + struct.pack("!IHBB", 0x60000000, len(udp), 17, 64) + sa + da + udp
+        \\for i in range(5):
+        \\    s.send(v4("10.211.1.4", "10.211.0.1", 9999))
+        \\    s.send(v4("192.0.2.9", "10.211.0.1", 9999))
+        \\    s.send(v4("10.211.1.4", "10.1.0.77", 9))
+        \\    if len(sys.argv) > 1: s.send(v6("fe80::bb", sys.argv[1], 9998))
+        \\EOF
+    ;
+    const ran = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", topology, "sh", suffix, dir } }) catch |e| {
+        c.fail("the topology: {s}", .{@errorName(e)});
+        return;
+    };
+    if (ran.term != .exited or ran.term.exited != 0) {
+        c.fail("the topology: {s}", .{ran.stderr[0..@min(ran.stderr.len, 600)]});
+        return;
+    }
+    // As the job's network helper does: the pin before the port is made, the ingress rule once the
+    // port exists, the runner's rules once.
+    if (pinSource(2, .{ 10, 211, 1, 4 })) |why| {
+        c.fail("pinSource: {s}", .{why});
+        return;
+    }
+    if (mode.rules) if (apply(net.Subnet.default, &.{"d0"}, &.{}, &.{})) |why| {
+        c.fail("apply: {s}", .{why});
+        return;
+    };
+    if (mode.guard) {
+        var guard = Guard.open() orelse {
+            c.fail("Guard.open", .{});
+            return;
+        };
+        defer guard.close();
+        if (guard.dropLinkLocal(2)) |why| {
+            c.fail("dropLinkLocal: {s}", .{why});
+            return;
+        }
+    }
+    const attack =
+        \\sfx=$1; d=$2
+        \\num() { v=$(sed -n 's/.*counter packets \([0-9][0-9]*\).*/\1/p' | head -1); echo "${v:-NaN}"; }
+        \\ip link set zrh2 up
+        \\ip netns exec zrt-b-$sfx sh -c "echo 1 > /proc/sys/net/ipv6/conf/e0/disable_ipv6; ip link set lo up; ip addr add 10.211.1.4/16 dev e0; ip link set e0 up; ip route add default via 10.211.0.1"
+        \\# Until the host's address on the port is out of duplicate address detection.
+        \\sleep 3
+        \\# The host's address on the port, if it has one: IPv6 is on for it (only the bridge has it off).
+        \\v6=$(ip -6 addr show dev zrh2 scope link | sed -n 's/.*inet6 \([0-9a-f:]*\)\/.*/\1/p' | head -1)
+        \\echo "host_v6_on_port ${v6:-none}"
+        \\pin_sum() { nft list table bridge zig_runner_pin2 | sed -n 's/.*counter packets \([0-9][0-9]*\).*/\1/p' | awk '{s+=$1} END {print s+0}'; }
+        \\p0=$(pin_sum)
+        \\python3 $d/udp.py 4 9999 3 > $d/v4.out &
+        \\python3 $d/udp.py 6 9998 3 > $d/v6.out &
+        \\sleep 0.5
+        \\ip netns exec zrt-b-$sfx python3 $d/ll.py $v6
+        \\sleep 3
+        \\echo "host_udp4 $(cat $d/v4.out) udp6 $(cat $d/v6.out)"
+        \\echo "forwarded $(nft list chain ip zrt_post f | grep zrh2 | num)"
+        \\echo "pin_counted $(( $(pin_sum) - p0 ))"
+        \\t=$(nft list table netdev zig_runner_ll2 2>/dev/null) || t=none
+        \\[ -z "$t" ] && t=none
+        \\echo "ingress_dropped $([ "$t" = none ] && echo none || echo "$t" | num)"
+    ;
+    const got = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", attack, "sh", suffix, dir } }) catch |e| {
+        c.fail("the probes: {s}", .{@errorName(e)});
+        return;
+    };
+    c.out_len = @min(got.stdout.len, c.out.len);
+    @memcpy(c.out[0..c.out_len], got.stdout[0..c.out_len]);
+}
+
+test "native nft: a job's frames to a link-local group address reach nothing of the host's" {
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena);
+    const suffix = try std.fmt.allocPrint(arena, "l{d}", .{linux.getpid()});
+    const required = blk: {
+        var env = try std.testing.environ.createMap(arena);
+        break :blk std.mem.eql(u8, env.get("ZIG_RUNNER_REQUIRE_NATIVE") orelse "", "1");
+    };
+    // Neither layer is the control: the frames must get through then, or the test proves nothing.
+    const modes = [_]LinkLocalMode{
+        .{ .rules = false, .guard = false },
+        .{ .rules = true, .guard = false },
+        .{ .rules = false, .guard = true },
+        .{ .rules = true, .guard = true },
+    };
+    for (modes) |mode| {
+        var c: Pinned = .{};
+        const t = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, linkLocal, .{ &c, suffix, dir, mode });
+        t.join();
+        const clean = try std.fmt.allocPrint(
+            arena,
+            "for p in $(ip netns pids zrt-b-{s} 2>/dev/null); do kill $p; done; ip netns del zrt-b-{s} 2>/dev/null; true",
+            .{ suffix, suffix },
+        );
+        _ = std.process.run(arena, std.testing.io, .{ .argv = &.{ "sh", "-c", clean } }) catch {};
+        if (c.skip) |why| {
+            if (required) {
+                std.debug.print("native nft: cannot run ({s}), and ZIG_RUNNER_REQUIRE_NATIVE=1\n", .{why});
+                return error.TestUnexpectedResult;
+            }
+            return error.SkipZigTest;
+        }
+        if (c.failed) {
+            std.debug.print("native nft: {s}\n", .{c.why[0..c.why_len]});
+            return error.TestUnexpectedResult;
+        }
+        const out = c.out[0..c.out_len];
+        std.debug.print("native nft link-local (runner rules {}, port ingress rule {}):\n{s}", .{ mode.rules, mode.guard, out });
+        try std.testing.expect(std.mem.indexOf(u8, out, "NaN") == null);
+        // The pin never sees them, in any mode.
+        try std.testing.expect(std.mem.indexOf(u8, out, "pin_counted 0") != null);
+        if (mode.guard) {
+            // The port's ingress rule: nothing of either protocol.
+            try std.testing.expect(std.mem.indexOf(u8, out, "host_udp4 0 udp6 0") != null);
+            try std.testing.expect(std.mem.indexOf(u8, out, "ingress_dropped 20") != null);
+        } else if (mode.rules) {
+            // The runner's `ip` rules cover IPv4 only; the 5 IPv6 datagrams to the host's address on the
+            // port still arrive (when it has one), which is why the ingress rule is the layer for them.
+            try std.testing.expect(std.mem.indexOf(u8, out, "host_udp4 0 ") != null);
+        } else {
+            // Control: the 10 datagrams to the host's service (the forged-source ones among them)
+            // arrive. (Forwarding is refused by the kernel for a frame that is not for the host's
+            // own MAC, so `forwarded` stays 0 whatever the rules.)
+            try std.testing.expect(std.mem.indexOf(u8, out, "host_udp4 10") != null);
+        }
+        try std.testing.expect(std.mem.indexOf(u8, out, "forwarded 0") != null);
     }
 }
