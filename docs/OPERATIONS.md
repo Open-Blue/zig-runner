@@ -609,6 +609,11 @@ error: kind=upload_failed job=123 what=job_log name="" detail=NameServerFailure
   once per job network made, when the kernel (before 5.12) cannot set `no_linklocal_learn` on the jobs'
   bridge. The job's network is made anyway: each job port already learns nothing, which is what stops a
   job's link-local frames from filling the bridge's table; the option is the second layer.
+- Link-local frames (#642): `warn: kind=netdev_linklocal_drop_unsupported slot=3 err=AFNOSUPPORT` (or `OPNOTSUPP`,
+  `NOENT`), once per job network made, when the kernel has no nftables netdev family
+  (`CONFIG_NF_TABLES_NETDEV` off), so the job's port has no ingress rule dropping frames to link-local group
+  addresses. The job's network is made anyway: the runner's `ip` table drops what `zrh*` sends the host's
+  stack in IPv4, and the port has IPv6 off.
 - `info` lines (`info(scope): …`) and the lines with formats of their own are not warnings and
   keep them: `health:`, `job-end:`, `step-end:`, `request:`, and the plain `job N: …` progress
   lines. What a job's log shows to the user (GitHub's `##[warning]`, an action's `Warning:`) is

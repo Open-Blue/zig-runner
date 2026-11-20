@@ -265,12 +265,20 @@ On a root runner, each step runs:
   to a link-local group address (01:80:c2:00:00:00 to 0f), as received on the job's own port
   `zrh<slot>`, past every rule that names `zr0`, and past the pin (which is on a hook they skip): a forged-source IPv4
   or IPv6 datagram for any address of the host's would reach a host socket (shown on the wire, with a
-  control). Two rules close it: a `netdev` table per slot (`zig_runner_ll<slot>`, made with the port
-  and before the job's end is up, by the helper, which fails the job's network if it cannot) drops, on
-  the port's ingress, every frame to 01:80:c2:00:00:0X, IPv4, IPv6 or other; the runner's own table
-  drops anything `input` or `forward` sees from `zrh*` (IPv4: the second layer). The job's teardown
-  removes the table with the pin. So a job reaches the host's own sockets only through `zr0`, by the
-  rules above. IPv6 is off on the
+  control). Three layers close it: a `netdev` table per slot (`zig_runner_ll<slot>`, made with the port
+  and before the job's end is up, by the helper) drops, on the port's ingress, every frame to
+  01:80:c2:00:00:0X, IPv4, IPv6 or other; the runner's own table drops anything `input` or `forward`
+  sees from `zrh*` (IPv4); and the port has IPv6 off (`net.ipv6.conf.zrh<slot>.disable_ipv6`, written
+  by the helper before the port is up, so the port has no address and an IPv6 frame handed up there
+  reaches no socket). The wire test shows each with the others off, and none as the control (an
+  IPv4 datagram to the host's service, an IPv6 one to an address of the host's on another interface:
+  both arrive). The frames are not forwarded (the kernel refuses one that is not for the host's own
+  MAC): the exposure is the host's own sockets. The netdev table is best-effort: a kernel without
+  the netdev family (`CONFIG_NF_TABLES_NETDEV` off) logs `kind=netdev_linklocal_drop_unsupported` and
+  the job's network is made, the other two layers covering both protocols; any other failure of
+  it, and a failure to turn IPv6 off on the port, fails the job's network. The job's teardown
+  removes the table with the pin. So a job reaches the host's own sockets only through `zr0`, by
+  the rules above. IPv6 is off on the
   job's `eth0` and on the bridge, so no link-local address slips past those IPv4 rules (`lo` keeps
   its ::1). Ports below 1024 and ping work without capabilities on the host's
   (`ip_unprivileged_port_start=0`, `ping_group_range`, set in the job's namespace only). The
@@ -542,8 +550,9 @@ the workflow logs their fingerprint.
 **What the runner needs.** As root (the supported mode): `CAP_SYS_ADMIN` (namespaces, mounts,
 idmapped mounts, `pivot_root`), `CAP_NET_ADMIN` (the bridge, veths, addresses, routes, NAT),
 `CAP_SETUID`/`CAP_SETGID` (writing the job's id maps), Linux 5.19 or later (idmapped overlay
-layers), nftables in the kernel (`nf_tables`, `nft_ct`, `nft_masq`, `nft_chain_nat`; no `nft` or
-`iptables` binary since P5), a default route, a free
+layers), nftables in the kernel (`nf_tables`, `nft_ct`, `nft_masq`, `nft_chain_nat`, and for the jobs' ports
+`nf_tables_bridge`, required (the per-job pin); `nf_tables_netdev` is best-effort, its absence is
+logged and costs one layer; no `nft` or `iptables` binary since P5), a default route, a free
 `RUNNER_NATIVE_SUBNET`, and a writable `/run/zig-runner`. The runner makes `zr0` and its rules
 itself on its first native job, and removes each job's namespace when the job ends, or at the
 next start after a crash (`sweep`, by the jobs' locks).
@@ -567,6 +576,11 @@ What it changes on the host, which is shared by every runner on it:
   runners' jobs need it, and turning it off under them would cut their network. The runner logs
   a warning when it turns it on, and another when the FORWARD policy is ACCEPT, since the host
   would then route for any neighbour; set that policy to DROP (Docker does).
+- **Per-job tables and sysctl.** For each running job, in the host's namespace: the bridge-family
+  table `zig_runner_pin<n>` (the job's source address and MAC, #603, #616), the netdev-family table
+  `zig_runner_ll<n>` (link-local frames, dropped on the port's ingress) and `net.ipv6.conf.zrh<n>.disable_ipv6=1`
+  (which goes with the veth). The tables are removed when the job ends; a dead job's is replaced by
+  the slot's next job.
 - **nftables rules** (since P5, over netlink; P1 made the same with `iptables`): a table of the
   runner's own, `ip zig_runner`, replaced atomically whenever the rules are made. It masquerades
   the subnet; drops what comes from `zr0` to the host and is not a reply; drops what the host's own
