@@ -956,7 +956,7 @@ var verdicts_dropped: std.atomic.Value(bool) = .init(false);
 /// FileNotFound"), for "Set up job": an error's name alone does not say which of the job's
 /// directories, locks, helpers or files it was.
 pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *[]const u8) !Backend {
-    oci.tag_max_stale_s = cfg.image_tag_max_stale_s;
+    oci.tag_max_stale_s.store(cfg.image_tag_max_stale_s, .monotonic);
     var ph: phases.Phases = .{};
     var t = phases.now();
     if (Store.secure(arena, io, cfg.store, .{ .check_parents = cfg.check_store_parents }) catch |e|
