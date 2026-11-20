@@ -58,4 +58,5 @@ runs:
       run: |
         [[ $HIT == true ]] && state=hit || state=miss
         echo "zig-cache: $state, key $KEY"
+        echo "ZR_ZIG_CACHE_STATE=$state" >>"$GITHUB_ENV"
         echo "zig-cache: restored $(du -sh "$DIR" | cut -f1), $(find "$DIR/o" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l) output entries"

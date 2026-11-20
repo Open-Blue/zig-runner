@@ -493,6 +493,11 @@ jobs:
 
       # Without `zig build`, whose first step here would be compiling Zig's build system (about
       # 100 s): this job's cache always starts empty (zig-test.sh).
+      # EXPERIMENT: the compile alone, timed.
+      - name: Zig compile probe
+        if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        run: .github/scripts/zig-cache-probe.sh tsan
+
       - name: Test, with the database
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/zig-test.sh
@@ -783,6 +788,11 @@ jobs:
       # commands: the native backend's tests write `##[error]` lines into their jobs' logs (the
       # process and memory limits), which would otherwise become this job's annotations
       # (zig-test.sh does the same for its own runs).
+      # EXPERIMENT: the compile alone, timed.
+      - name: Zig compile probe
+        if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        run: .github/scripts/zig-cache-probe.sh plain
+
       - name: Test
         id: test
         if: steps.scope.outputs.run == 'true'
@@ -990,6 +1000,11 @@ jobs:
 
       # As the tests' output in `test`: only text to this job, never its workflow commands
       # (zig-test.sh stops them).
+      # EXPERIMENT: the compile alone, timed.
+      - name: Zig compile probe
+        if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        run: .github/scripts/zig-cache-probe.sh plain
+
       - name: Test, as root
         if: steps.scope.outputs.run == 'true'
         working-directory: runner
@@ -1187,6 +1202,11 @@ jobs:
           cpu: native
 
       # As the hosted test job's Test step: the native backend's tests must run here, not skip.
+      # EXPERIMENT: the compile alone, timed.
+      - name: Zig compile probe
+        if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        run: .github/scripts/zig-cache-probe.sh plain
+
       - name: Test
         if: steps.scope.outputs.run == 'true'
         working-directory: runner
