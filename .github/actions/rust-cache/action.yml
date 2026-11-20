@@ -21,27 +21,19 @@ runs:
     - id: keys
       shell: bash
       env:
-        TOOLS_KEY: rust-tools-v2-${{ runner.os }}-${{ runner.arch }}-@IMAGE@-${{ inputs.tools }}-${{ hashFiles('.github/actions/rust-cache/action.yml', '.github/scripts/install-rust.sh', '.github/scripts/install-rust-nightly.sh', 'runner/rust/rust-toolchain.toml') }}
-        TARGET_KEY: rust-target-v2-${{ runner.os }}-${{ runner.arch }}-@IMAGE@-${{ inputs.name }}-${{ hashFiles('.github/actions/rust-cache/action.yml', 'runner/rust/**', '!runner/rust/target/**', '.github/scripts/build-zr-net.sh', '.github/scripts/cargo-test.sh', '.github/scripts/zig-cc.sh', '.github/scripts/install-rust.sh', '.github/scripts/install-rust-nightly.sh', '.github/scripts/install-zig.sh') }}
+        TOOLS_KEY: rust-tools-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.tools }}-${{ hashFiles('.github/actions/rust-cache/action.yml', '.github/scripts/install-rust.sh', '.github/scripts/install-rust-nightly.sh', 'runner/rust/rust-toolchain.toml') }}
+        TARGET_KEY: rust-target-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.name }}-${{ hashFiles('.github/actions/rust-cache/action.yml', 'runner/rust/**', '!runner/rust/target/**', '.github/scripts/build-zr-net.sh', '.github/scripts/cargo-test.sh', '.github/scripts/zig-cc.sh', '.github/scripts/zig-cc-host.sh', '.github/scripts/zig-cc-env.sh', '.github/scripts/zig-ar.sh', '.github/scripts/install-rust.sh', '.github/scripts/install-rust-nightly.sh', '.github/scripts/install-zig.sh') }}
       run: |
-        # What the build reads from the runner image is in both keys, not the image's version
-        # (hosted images roll out over days and several are in use at once): cargo does not
-        # fingerprint the system's compiler, linker and libc, which the host build scripts and the
-        # gnu and ThreadSanitizer test links use (the target's own C is Zig's: zig-cc.sh, whose
-        # version install-zig.sh pins and the keys hash). The OS name stays in the key as it is.
-        tool_version() { "$@" 2>&1 | head -n1 || true; }
-        inputs=$(
-          printf 'cc: %s\n' "$(tool_version cc --version)"
-          printf 'ld: %s\n' "$(tool_version ld --version)"
-          printf 'ar: %s\n' "$(tool_version ar --version)"
-          printf 'ldd: %s\n' "$(tool_version ldd --version)"
-        )
-        hash=$(sha256sum <<<"$inputs" | cut -c1-16)
-        image="${ImageOS:-unknown-os}-$hash"
-        echo "rust-cache: runner image ${ImageOS:-unset} ${ImageVersion:-unset} (not in the keys), in the keys as $image from:"
-        sed 's/^/rust-cache:   /' <<<"$inputs"
-        echo "tools=${TOOLS_KEY//@IMAGE@/$image}" >>"$GITHUB_OUTPUT"
-        echo "target=${TARGET_KEY//@IMAGE@/$image}" >>"$GITHUB_OUTPUT"
+        # The runner image is not in the keys: hosted images roll out over days and several are in
+        # use at once, and a key that held the image's compiler and libc missed on every new one
+        # (2026-11-20: 450-555 s instead of 300 s). The build does not read the image's: every
+        # C compile, link and archive, the host's (build scripts, proc-macros) included, is the
+        # pinned Zig's (zig-cc-env.sh; the keys hash it, install-zig.sh pins its version), the host
+        # side for glibc 2.28, and the Rust is install-rust*.sh's digest-pinned tree. The OS name
+        # and the architecture stay in the keys as they are. The image is logged, as information.
+        echo "rust-cache: runner image ${ImageOS:-unset} ${ImageVersion:-unset} (information; not in the keys)"
+        echo "tools=$TOOLS_KEY" >>"$GITHUB_OUTPUT"
+        echo "target=$TARGET_KEY" >>"$GITHUB_OUTPUT"
 
     # The toolchains the scripts unpack into the tool cache (install-rust.sh, install-rust-nightly.sh;
     # which of them a job uses depends on the runner image's own default Rust).
