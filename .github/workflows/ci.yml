@@ -518,7 +518,7 @@ jobs:
             exit 0
           fi
           echo "rust-image-free-check: Rust build inputs changed:"
-          sed 's/^/  /' <<<"$inputs"
+          while IFS= read -r input; do echo "  $input"; done <<<"$inputs"
           .github/scripts/rust-image-free-check.sh
 
       # The network library's own tests under ThreadSanitizer (the pinned nightly, -Zbuild-std): the
