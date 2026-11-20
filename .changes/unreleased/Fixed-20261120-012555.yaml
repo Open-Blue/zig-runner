@@ -1,0 +1,3 @@
+kind: Fixed
+body: The nightly ThreadSanitizer end-to-end check ignores a job GitHub lists twice (one that never had a runner) and, when jobs report no step for five minutes, prints the runner's threads, the engine's log and each run's jobs before cancelling
+time: 2026-11-20T01:25:55.894918916-05:00

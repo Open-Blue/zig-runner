@@ -267,7 +267,7 @@ stop() {
 # stacks if gdb is on the image (it is not installed if missing), and the end of the runner's log.
 stuck_runner() {
 	local pid=${1:?} runner t f
-	echo "::group::why the runner did not stop"
+	echo "::group::${2:-why the runner did not stop}"
 	# Every process under PID, by walking parent links: sudo may run its command through a monitor
 	# process of its own (sudo-rs with a pty), so the runner need not be PID's child.
 	local tree
@@ -292,6 +292,11 @@ stuck_runner() {
 		sudo gnutimeout 30 gdb -p "$runner" -batch -ex 'thread apply all bt' 2>&1 | tail -n 300 || true
 	else
 		echo "== gdb is not installed on this image: no userspace stacks"
+	fi
+	if [[ $backend == dagger ]] && docker inspect "$engine_name" >/dev/null 2>&1; then
+		echo "== the engine's container: its state and the last 60 lines of its log"
+		docker ps -a --filter "name=$engine_name" --format '{{.Status}}' 2>&1 || true
+		docker logs --tail 60 "$engine_name" 2>&1 | sed -E 's/(gh[opsu]|github_pat)_[A-Za-z0-9_]{20,}/***/g' || true
 	fi
 	for f in "$out"/runner-*.log; do
 		[[ -e $f ]] || continue
@@ -409,16 +414,34 @@ jobs_of() { api "repos/$repo/actions/runs/$1/attempts/${2:-1}/jobs?per_page=50";
 # native runner showed no steps at all. So a job that ran also needs its steps, each concluded.
 # Re-reads for up to a minute; what it last read, if some job never settles.
 jobs_settled() {
-	local jobs=""
+	local jobs="" raw="" ghosts
 	for _ in $(seq 20); do
-		jobs=$(jobs_of "$@" 2>/dev/null) || jobs=""
+		raw=$(jobs_of "$@" 2>/dev/null) || raw=""
+		jobs=$(distinct_jobs <<<"$raw" 2>/dev/null) || jobs=$raw
 		jq -e '(.jobs | length) > 0 and all(.jobs[]; .status == "completed" and .conclusion != null and
 			(.conclusion == "skipped" or ((.steps | length) > 0 and all(.steps[]; .conclusion != null))))' \
 			<<<"$jobs" >/dev/null 2>&1 && break
 		((SECONDS < hard_end)) || break
 		sleep 3
 	done
+	ghosts=$(jq -rn --argjson raw "${raw:-null}" --argjson kept "${jobs:-null}" \
+		'[($raw.jobs // [])[] | select(.id as $i | ([($kept.jobs // [])[] | .id] | index($i)) == null)
+		 | "\(.name) (job \(.id), \(.status), no runner)"] | join(", ")' 2>/dev/null || true)
+	[[ -z $ghosts ]] || echo "e2e: GitHub also lists, for jobs that ran: $ghosts; ignored (see distinct_jobs)" >&2
 	printf '%s\n' "$jobs"
+}
+
+# distinct_jobs: a jobs list (stdin) without the records GitHub made of a job twice. A run's list can
+# hold two jobs of one name, one that ran and one that never had a runner and stays `queued` with no
+# steps for good, while the run completes successfully (runner-bench run 44306203521, 2026-11-18: two
+# `toolcache`, 2 s apart, the first queued still two days later; 1 run of the 120 e2e runs listed).
+# Left in, it keeps the jobs from settling and `e2e/toolcache` reads "null" and "success". A record
+# is dropped only when it has no runner and no conclusion and another of its name has either: a job
+# that never started and has no twin still fails the run's checks.
+distinct_jobs() {
+	jq -c '.jobs |= (. as $all | map(. as $j | select(
+		((.runner_name // "") != "" or .conclusion != null) or
+		([$all[] | select(.name == $j.name and ((.runner_name // "") != "" or .conclusion != null))] | length) == 0)))'
 }
 
 # run_conclusion ID: the run's conclusion, re-read while it is still null.
@@ -588,6 +611,14 @@ check() {
 		fi
 		if ((running >= last_resort)); then
 			echo "e2e-cancel: neither the runner's log nor the step list shows Hog after $((running * 5)) s of the job running; cancelling anyway"
+			# A job that sets up in 2 to 10 s (the suite's jobs under ThreadSanitizer, 16 passes of
+			# 2026-11-20) is not slow here but stuck (2026-11-19, Dagger: all eight jobs assigned to
+			# runners, none reported a step in 15 minutes, until GitHub cancelled them, and the runner's
+			# own log was 300 lines of 400s by the time anyone looked). The runner is alive and stuck
+			# now, which is when its threads can be read: say where each run is, and the runner's state.
+			stuck_run "$main" >&2
+			stuck_run "$cancel" >&2
+			[[ ! -e $out/runner.pid ]] || stuck_runner "$(<"$out/runner.pid")" "the runner's jobs report no step"
 			started=1 && break
 		fi
 		sleep 5
@@ -674,6 +705,7 @@ engine) engine ;;
 rootfs) make_rootfs "${2:?}" ;;
 start) start "$@" ;;
 stop) stop ;;
+distinct-jobs) distinct_jobs ;;
 races) races "${2:?}" ;;
 check) check "$@" ;;
 *) usage ;;

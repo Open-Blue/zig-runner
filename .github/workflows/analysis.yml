@@ -542,6 +542,10 @@ jobs:
       # thread's state, stacks and signal masks and the log's end before it kills, which is
       # where to read why. Reports are written as races happen, so only a race in the shutdown
       # itself is lost.
+      - name: e2e.sh reads a run's jobs
+        if: steps.go.outputs.run == 'true'
+        run: .github/scripts/e2e-test.sh
+
       - name: End to end on Dagger
         if: steps.go.outputs.run == 'true'
         env:
