@@ -331,12 +331,26 @@ find_run() {
 	return 1
 }
 
+# runner_exit_check: when the runner `start` left running has exited, fails the suite at once with
+# the last of its log. Its jobs would only stay queued: on 2026-11-19 the runner exited at its first
+# App call, and the suite spent 240 s on each run before saying so, never naming the cause.
+runner_exit_check() {
+	local pid
+	[[ -e $out/runner.pid ]] || return 0
+	pid=$(<"$out/runner.pid")
+	sudo kill -0 "$pid" 2>/dev/null && return 0
+	fail "the runner (pid $pid) exited while its jobs were queued or running; the last of its log:"
+	tail -n 20 "$out/runner-$backend.log" >&2 2>/dev/null || true
+	exit 1
+}
+
 # wait_run ID [ATTEMPT]: until that attempt of the run has completed, at most $timeout s, and not
-# past the suite's own limit.
+# past the suite's own limit. Stops the suite once the runner has exited (`runner_exit_check`).
 wait_run() {
 	local deadline=$((SECONDS + timeout)) state
 	((deadline <= suite_end)) || deadline=$suite_end
 	while ((SECONDS < deadline)); do
+		runner_exit_check
 		state=$(api "repos/$repo/actions/runs/$1" --jq '"\(.run_attempt) \(.status)"' 2>/dev/null) || state=""
 		[[ $state == "${2:-1} completed" ]] && return 0
 		sleep 5
@@ -517,6 +531,7 @@ check() {
 	local hog_end=$((SECONDS + timeout)) last_resort=$((timeout / 10))
 	((hog_end <= suite_end)) || hog_end=$suite_end
 	while ((SECONDS < hog_end)); do
+		runner_exit_check
 		jobs=$(jobs_of "$cancel" 2>/dev/null) || jobs=""
 		state=$(jq -r '.jobs[0].steps[]? | select(.name == "Hog") | .status' <<<"$jobs" 2>/dev/null) || state=""
 		[[ $state == in_progress || $state == completed ]] && { started=1 && break; }
