@@ -1,3 +1,0 @@
-kind: Changed
-body: Rust builds (build-zr-net.sh, cargo-test.sh) always use install-rust.sh's hash-pinned toolchain, never the cargo on PATH, so a runner image that adds or drops a rustup Rust 1.99.1 no longer changes the path a build takes; the job log names the cargo and rustc used and whether the tree was reused or unpacked
-time: 2026-11-19T01:48:39.170470547-05:00
