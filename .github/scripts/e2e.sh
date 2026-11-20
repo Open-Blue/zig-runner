@@ -268,10 +268,19 @@ stop() {
 stuck_runner() {
 	local pid=${1:?} runner t f
 	echo "::group::why the runner did not stop"
+	# Every process under PID, by walking parent links: sudo may run its command through a monitor
+	# process of its own (sudo-rs with a pty), so the runner need not be PID's child.
+	local tree
+	tree=$(ps -eo pid=,ppid= | awk -v root="$pid" '{ parent[$1] = $2 } END {
+		for (p in parent) { q = p; while (q != "" && q != root && q != 1 && q != 0) q = parent[q]; if (q == root) print p }
+		print root }' | sort -nu | paste -sd, -)
 	echo "== process tree (PID $pid signalled)"
-	sudo ps --forest -o pid,ppid,pgid,stat,wchan:20,etime,args -g "$(ps -o pgid= -p "$pid" | tr -d ' ')" 2>&1 || true
-	runner=$(pgrep -P "$pid" | head -n1 || true)
+	sudo ps -o pid,ppid,pgid,stat,wchan:20,etime,args -p "$tree" 2>&1 || true
+	# The runner: the process under PID that runs the runner's binary (`zig-runner`, as `build` names
+	# it), else PID itself.
+	runner=$(ps -o pid=,comm= -p "$tree" 2>/dev/null | awk '$2 ~ /^zig-runner/ { print $1; exit }')
 	runner=${runner:-$pid}
+	echo "== the runner is PID $runner"
 	echo "== runner PID $runner: signal state and kernel stack of each thread"
 	for t in /proc/"$runner"/task/*; do
 		echo "-- thread ${t##*/}: $(sudo cat "$t/comm" 2>&1) state=$(sudo awk '{print $3}' "$t/stat" 2>&1) wchan=$(sudo cat "$t/wchan" 2>&1)"
