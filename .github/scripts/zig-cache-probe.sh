@@ -30,4 +30,5 @@ for p in "${pids[@]}"; do wait "$p"; done
 end=$(date +%s.%N)
 printf 'zig-cache probe: %s, global cache %s: Rust archive %.1f s, Zig compile of tests+runner+test_shards %.1f s (local cache empty)\n' \
 	"$mode" "${ZR_ZIG_CACHE_STATE:-unset}" "$(awk -v a="$archive" -v b="$start" 'BEGIN{print a-b}')" "$(awk -v a="$end" -v b="$archive" 'BEGIN{print a-b}')"
+# shellcheck disable=SC2153 # set by the cache action
 du -sh "$ZIG_GLOBAL_CACHE_DIR" | sed 's/^/zig-cache probe: global cache after: /'
