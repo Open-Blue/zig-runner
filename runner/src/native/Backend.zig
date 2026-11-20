@@ -6917,6 +6917,9 @@ test "root runner: a job's source address pin is on the host while it runs, and 
     // Every listing until the job ends, however slow its set-up under other shards' jobs (30 s at
     // most): which slot is the job's is known only from its output.
     var seen: std.ArrayList([]const u8) = .empty;
+    // The port's link-local rule (a `netdev` table), listed in the same rounds.
+    const list_ll: []const []const u8 = &.{ "nft", "-a", "list", "ruleset", "netdev" };
+    var seen_ll: std.ArrayList([]const u8) = .empty;
     // The ports' settings and the bridge's table (#616) in the same rounds.
     const ports_cmd: []const []const u8 = &.{ "sh", "-c", "grep -H . /sys/class/net/zrh*/brport/learning /sys/class/net/zrh*/brport/unicast_flood 2>/dev/null; bridge fdb show br zr0 2>/dev/null; true" };
     var ports_seen: std.ArrayList([]const u8) = .empty;
@@ -6924,6 +6927,7 @@ test "root runner: a job's source address pin is on the host while it runs, and 
         if (done.load(.acquire)) break;
         const got = std.process.run(arena, io, .{ .argv = list }) catch break;
         try seen.append(arena, got.stdout);
+        if (std.process.run(arena, io, .{ .argv = list_ll })) |g| try seen_ll.append(arena, g.stdout) else |_| {}
         if (std.process.run(arena, io, .{ .argv = ports_cmd })) |p| try ports_seen.append(arena, p.stdout) else |_| {}
         try io.sleep(.fromMilliseconds(100), .awake);
     }
@@ -6978,7 +6982,20 @@ test "root runner: a job's source address pin is on the host while it runs, and 
         if (seen.items.len > 0) seen.items[seen.items.len - 1] else "",
     });
     try std.testing.expect(handle != null);
+    const ll_name = try std.fmt.allocPrint(arena, "table netdev zig_runner_ll{d} ", .{slot});
+    var ll_handle: ?[]const u8 = null;
+    for (seen_ll.items) |listing| if (lineWith(listing, ll_name)) |line| {
+        ll_handle = line;
+        break;
+    };
+    if (ll_handle == null) std.debug.print("no link-local table for slot {d} while the job ran; {d} listings\n", .{ slot, seen_ll.items.len });
+    try std.testing.expect(ll_handle != null);
     const after = try std.process.run(arena, io, .{ .argv = list });
+    const after_ll = try std.process.run(arena, io, .{ .argv = list_ll });
+    if (lineWith(after_ll.stdout, ll_name)) |line| {
+        if (std.mem.eql(u8, line, ll_handle.?)) std.debug.print("the link-local table outlived its job: {s}\n", .{line});
+        try std.testing.expect(!std.mem.eql(u8, line, ll_handle.?));
+    }
     if (lineWith(after.stdout, name)) |line| {
         if (std.mem.eql(u8, line, handle.?)) std.debug.print("the pin outlived its job: {s}\n", .{line});
         try std.testing.expect(!std.mem.eql(u8, line, handle.?));

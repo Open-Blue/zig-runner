@@ -150,6 +150,9 @@ pub fn upMain(
         const what = std.fmt.allocPrint(arena, "pin the job's source address and MAC: {s}", .{why}) catch "pin the job's source address and MAC";
         return fail(what, .INVAL);
     }
+    // For the port's link-local rule below: a socket of the host's namespace, kept past the unshare.
+    var guard = nft.Guard.open() orelse return fail("open an nftables socket", .ACCES);
+    defer guard.close();
     const unshared = linux.unshare(linux.CLONE.NEWNET);
     if (linux.errno(unshared) != .SUCCESS) return fail("unshare(net)", linux.errno(unshared));
     var job = Socket.open() catch return fail("open rtnetlink in the job's namespace", .ACCES);
@@ -174,6 +177,10 @@ pub fn upMain(
     // may have died meanwhile.
     if (linux.getppid() != parent) return fail("find the runner that holds the slot's lock", .SRCH);
     host.addVeth(slot, @intCast(ns), mac, true) catch return fail("make the veth pair", .INVAL);
+    if (guard.dropLinkLocal(slot)) |why| {
+        const what = std.fmt.allocPrint(arena, "drop the port's link-local frames: {s}", .{why}) catch "drop the port's link-local frames";
+        return fail(what, .INVAL);
+    }
     job.configureJob(subnet, slot) catch return fail("configure the job's network", .INVAL);
     return 0;
 }

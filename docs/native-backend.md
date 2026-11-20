@@ -260,7 +260,17 @@ On a root runner, each step runs:
   tags once were one) does not leave the table open. The static entry goes with the port when the
   veth does; a
   failure to make the pin, the port's settings or the entry fails the job's network.
-  IPv6 is off on the
+  What reaches the host's own stack from a job is what comes in on `zr0`, which `input` and `forward`
+  judge (replies, DNS, the instance). The bridge hands the stack the frames it does not forward, those
+  to a link-local group address (01:80:c2:00:00:00 to 0f), as received on the job's own port
+  `zrh<slot>`, past every rule that names `zr0`, and past the pin (which is on a hook they skip): a forged-source IPv4
+  or IPv6 datagram for any address of the host's would reach a host socket (shown on the wire, with a
+  control). Two rules close it: a `netdev` table per slot (`zig_runner_ll<slot>`, made with the port
+  and before the job's end is up, by the helper, which fails the job's network if it cannot) drops, on
+  the port's ingress, every frame to 01:80:c2:00:00:0X, IPv4, IPv6 or other; the runner's own table
+  drops anything `input` or `forward` sees from `zrh*` (IPv4: the second layer). The job's teardown
+  removes the table with the pin. So a job reaches the host's own sockets only through `zr0`, by the
+  rules above. IPv6 is off on the
   job's `eth0` and on the bridge, so no link-local address slips past those IPv4 rules (`lo` keeps
   its ::1). Ports below 1024 and ping work without capabilities on the host's
   (`ip_unprivileged_port_start=0`, `ping_group_range`, set in the job's namespace only). The
