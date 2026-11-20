@@ -6,6 +6,8 @@ runs:
   steps:
     - shell: bash
       run: |
+        # A report: it never fails the job (head closing the pipe is a SIGPIPE under pipefail).
+        set +e +o pipefail
         dir=${ZIG_GLOBAL_CACHE_DIR:-}
         [[ -d $dir ]] || { echo "zig-cache report: no global cache directory"; exit 0; }
         echo "zig-cache report: at job end $(du -sh "$dir" | cut -f1) ($(du -sk "$dir" | cut -f1) KiB); $(find "$dir/o" -mindepth 1 -maxdepth 1 | wc -l) output entries, $(find "$dir/z" -type f 2>/dev/null | wc -l) ZIR files, $(find "$dir/h" -type f 2>/dev/null | wc -l) manifests"
