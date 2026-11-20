@@ -500,9 +500,26 @@ jobs:
       # The proof that the cache's keys need not hold the runner image: the musl and gnu builds
       # with failing cc, ld and ar on PATH (a pull request only: it is a cold build, about a minute
       # and a half with the stable Rust's install, and the cache above holds what the next step needs).
+      # Only when the Rust build's own inputs change: those alone could bring the image's C
+      # toolchain back, and the check is a cold build (about a minute of runner time).
       - name: Rust builds without the image's C toolchain
         if: steps.scope.outputs.run == 'true' && github.event_name == 'pull_request'
-        run: .github/scripts/rust-image-free-check.sh
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git cat-file -e "$BASE^{commit}" 2>/dev/null || git fetch -q --depth=1 --no-tags origin "$BASE"
+          inputs=$(git diff --name-only "$BASE" HEAD -- runner/rust .github/actions/rust-cache \
+            .github/scripts/build-zr-net.sh .github/scripts/cargo-test.sh .github/scripts/zig-cc.sh \
+            .github/scripts/zig-cc-env.sh .github/scripts/zig-cc-host.sh .github/scripts/zig-ar.sh \
+            .github/scripts/install-rust.sh .github/scripts/install-rust-nightly.sh \
+            .github/scripts/install-zig.sh .github/scripts/rust-image-free-check.sh)
+          if [[ -z $inputs ]]; then
+            echo "rust-image-free-check: no Rust build input changed since $BASE; not run"
+            exit 0
+          fi
+          echo "rust-image-free-check: Rust build inputs changed:"
+          sed 's/^/  /' <<<"$inputs"
+          .github/scripts/rust-image-free-check.sh
 
       # The network library's own tests under ThreadSanitizer (the pinned nightly, -Zbuild-std): the
       # races among its own threads, which Zig's TSan only sees through the archive below, linked
