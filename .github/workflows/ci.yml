@@ -973,7 +973,8 @@ jobs:
   # all, so each merge group built zr-net cold in them. Each leg uses the action as its consumer does
   # (same `name`, `tools`, runner image family and checkout path, so the same key) and builds what
   # that consumer builds of the Rust side, nothing of the Zig. Nothing needs it, it is no required
-  # check, and the release builds never restore. An exact hit builds nothing and saves nothing.
+  # check, and the release builds never restore. An exact hit of both entries installs no Zig, builds
+  # nothing and saves nothing (each leg logs `rust-cache-warmer:` and the action's key lines).
   rust-cache-warmer:
     name: Rust cache warmer (${{ matrix.name }}, ${{ matrix.arch }})
     # TEMPORARY (evidence on the PR): also on pull_request. Push only before it is handed over.
