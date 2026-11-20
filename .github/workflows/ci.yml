@@ -20,6 +20,70 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Decides every scope once, so that a job whose scopes are all false is skipped before it takes a
+  # runner (`needs: scope` and an `if:`): GitHub-hosted runners are the queue, a docs-only change
+  # used to take about eleven of them, each to find it had nothing to do. A job skipped by its `if:`
+  # reports as skipped, which counts as passed for a required check; jobs that do run keep their
+  # step-level gates below. Fails open: a scope that cannot be decided is true (ci-scope.sh), and
+  # so is every scope when this job itself fails (`needs.scope.result != 'success'`). On a push
+  # (prod) this job is skipped and every job runs as before.
+  scope:
+    name: Scope
+    if: github.event_name != 'push'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read # to check out the code and compare it with the base
+    outputs:
+      tests: ${{ steps.decide.outputs.tests }}
+      binaries: ${{ steps.decide.outputs.binaries }}
+      e2e: ${{ steps.decide.outputs.e2e }}
+      go: ${{ steps.decide.outputs.go }}
+      apt: ${{ steps.decide.outputs.apt }}
+      soak: ${{ steps.decide.outputs.soak }}
+      workflows: ${{ steps.decide.outputs.workflows }}
+      branch: ${{ steps.decide.outputs.branch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Each scope's decision and the file that decided it are in the log (ci-scope.sh says which),
+      # with the base and everything that changed since it.
+      - name: Which scopes this change is in
+        id: decide
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          echo "event: $GITHUB_EVENT_NAME, base: ${BASE:-none}"
+          if [[ $BASE =~ ^[0-9a-f]{40}$ ]] && { git cat-file -e "$BASE^{commit}" 2>/dev/null || git fetch -q --depth=1 --no-tags origin "$BASE"; }; then
+            echo "changed since the base:"
+            git diff --name-only --no-renames "$BASE" HEAD | sed 's/^/  /'
+          fi
+          scratch=$(mktemp)
+          for scope in tests binaries e2e go apt soak workflows; do
+            : >"$scratch"
+            if GITHUB_OUTPUT=$scratch .github/scripts/ci-scope.sh "$scope"; then
+              run=$(sed -n 's/^run=//p' "$scratch" | tail -n 1)
+            else
+              echo "$scope: ci-scope.sh failed: everything in this scope runs"
+              run=true
+            fi
+            echo "$scope=${run:-true}" >>"$GITHUB_OUTPUT"
+          done
+          # The branch-name rule (the Workflows job's first step) also holds for a change that is
+          # in no scope: a bad name sends the Workflows job to run, and fail on it.
+          branch=ok
+          if [[ $GITHUB_EVENT_NAME == pull_request ]]; then
+            case "$BRANCH" in
+              feature/?* | feat/?* | bugfix/?* | hotfix/?* | ci/?* | release/?* | docs/?* | perf/?* | refactor/?* | renovate/?*) ;;
+              *) branch=bad ;;
+            esac
+          fi
+          echo "branch name '$BRANCH': $branch"
+          echo "branch=$branch" >>"$GITHUB_OUTPUT"
+
   # The workflows themselves: actionlint for mistakes, zizmor for security; the shell scripts
   # they and the deployment run, with shellcheck and shfmt; and the Dockerfile, with hadolint
   # (docs/CI.md). Also the checks that each took a runner of their own for seconds, and waited
@@ -27,6 +91,8 @@ jobs:
   # whatever failed before it (`!cancelled()`), so one failure hides none of the others.
   workflows:
     name: Workflows
+    needs: scope
+    if: ${{ !cancelled() && (github.event_name == 'push' || needs.scope.outputs.branch == 'bad' || needs.scope.result != 'success' || needs.scope.outputs.workflows == 'true' || needs.scope.outputs.tests == 'true' || needs.scope.outputs.go == 'true' || needs.scope.outputs.apt == 'true' || needs.scope.outputs.soak == 'true') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
@@ -291,6 +357,8 @@ jobs:
   # than the longest root part).
   database:
     name: Database tests
+    needs: scope
+    if: ${{ !cancelled() && (github.event_name == 'push' || needs.scope.result != 'success' || needs.scope.outputs.tests == 'true') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
@@ -365,6 +433,8 @@ jobs:
   # the clients is for a pull request to read, and the oracle goes with the old client at R6.
   tls-oracle:
     name: TLS oracle
+    needs: scope
+    if: ${{ !cancelled() && (github.event_name == 'push' || needs.scope.result != 'success' || needs.scope.outputs.tests == 'true') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
@@ -490,8 +560,8 @@ jobs:
     # After the prebuild, which runs on a push to main when prod is self-hosted and is skipped
     # otherwise: `always` and not the default, so that a skipped prebuild does not skip this job
     # (a skipped required check passes); one that failed or was cancelled fails it, below.
-    needs: [prebuild, test-files]
-    if: ${{ !cancelled() }}
+    needs: [scope, prebuild, test-files]
+    if: ${{ !cancelled() && (github.event_name == 'push' || needs.scope.result != 'success' || needs.scope.outputs.tests == 'true') }}
     runs-on: ${{ fromJSON(github.event_name == 'push' && (vars.PROD_RUNNER || '"ubuntu-26.04"') || (vars.PREPROD_RUNNER || '"ubuntu-26.04"')) }}
     timeout-minutes: 30
     # The store stress test's workers for 10 s, and 10 s more with the deferred sync, where it defaults to 30 and 15:
@@ -725,7 +795,8 @@ jobs:
   # branches" ruleset). Not on main: a push runs `zig build test` on prod (`test`).
   native-root:
     name: Native tests as root (${{ matrix.arch }}, ${{ matrix.part }}/2)
-    if: github.event_name != 'push'
+    needs: scope
+    if: ${{ !cancelled() && github.event_name != 'push' && (needs.scope.result != 'success' || needs.scope.outputs.tests == 'true') }}
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
     timeout-minutes: 30
     # The store stress test's workers for 10 s, and 10 s more with the deferred sync, where it defaults to 30 and 15:
@@ -792,7 +863,8 @@ jobs:
   # tag's release builds them anyway.
   binaries:
     name: Release builds
-    if: github.event_name != 'push'
+    needs: scope
+    if: ${{ !cancelled() && github.event_name != 'push' && (needs.scope.result != 'success' || needs.scope.outputs.binaries == 'true') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
@@ -846,8 +918,8 @@ jobs:
     name: Release builds (arm64)
     # After Release builds, whose binaries it checks and runs: a second build would take as long again
     # (about 110 s on a runner of its own) for the same bytes.
-    needs: binaries
-    if: github.event_name != 'push'
+    needs: [scope, binaries]
+    if: ${{ !cancelled() && github.event_name != 'push' && needs.binaries.result == 'success' && (needs.scope.result != 'success' || needs.scope.outputs.binaries == 'true') }}
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 30
     permissions:
@@ -880,7 +952,8 @@ jobs:
   # (`arm64-builds`), which used to run first in the same job and held the tests back.
   arm64-test:
     name: Tests (arm64)
-    if: github.event_name != 'push'
+    needs: scope
+    if: ${{ !cancelled() && github.event_name != 'push' && (needs.scope.result != 'success' || needs.scope.outputs.tests == 'true') }}
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 30
     # The store stress test's workers for 10 s, and 10 s more with the deferred sync, where it defaults to 30 and 15:
@@ -952,7 +1025,8 @@ jobs:
   # whose commits the merge queue checked.
   e2e:
     name: End to end
-    if: github.event_name != 'push'
+    needs: scope
+    if: ${{ !cancelled() && github.event_name != 'push' && (needs.scope.result != 'success' || needs.scope.outputs.e2e == 'true') }}
     runs-on: ubuntu-26.04
     # Setup takes about 4 minutes, a pass 2 to 3, and the whole job 5 to 10; the limit is what a hang
     # costs. The two passes' step limits below (11 and 12 minutes) are their worst cases, so that a
