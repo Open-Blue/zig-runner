@@ -273,5 +273,8 @@ fn addZrNet(module: *std.Build.Module, arch: std.Target.Cpu.Arch, abi: std.Targe
     cargo.has_side_effects = true;
     module.addObjectFile(archive);
     module.link_libc = true;
-    module.linkSystemLibrary("unwind", .{});
+    // Zig's own libunwind, never the host's through pkg-config: a host libunwind-dev (Ubuntu's adds
+    // -I/usr/include/x86_64-linux-gnu) puts glibc's headers into a musl build, and the vendored C
+    // fails to compile (cowbird, 2026-11-19).
+    module.linkSystemLibrary("unwind", .{ .use_pkg_config = .no });
 }
