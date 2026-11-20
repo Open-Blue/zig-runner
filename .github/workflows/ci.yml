@@ -70,6 +70,7 @@ jobs:
       tests: ${{ steps.decide.outputs.tests }}
       binaries: ${{ steps.decide.outputs.binaries }}
       e2e: ${{ steps.decide.outputs.e2e }}
+      forge: ${{ steps.decide.outputs.forge }}
       go: ${{ steps.decide.outputs.go }}
       apt: ${{ steps.decide.outputs.apt }}
       soak: ${{ steps.decide.outputs.soak }}
@@ -94,7 +95,7 @@ jobs:
             git diff --name-only --no-renames "$BASE" HEAD | sed 's/^/  /'
           fi
           scratch=$(mktemp)
-          for scope in tests binaries e2e go apt soak workflows; do
+          for scope in tests binaries e2e forge go apt soak workflows; do
             : >"$scratch"
             if GITHUB_OUTPUT=$scratch .github/scripts/ci-scope.sh "$scope"; then
               run=$(sed -n 's/^run=//p' "$scratch" | tail -n 1)
@@ -1481,11 +1482,12 @@ jobs:
   # container of the instance, the real runner (native backend, no engine) in a privileged
   # container, and four workflows dispatched through the instance's API: `uses:` as Gitea reads it,
   # the variables its runner sets, services, and the checkout, outputs, masking and a failing step.
-  # About 6 minutes. Skipped, still reporting, on a change that cannot affect it (ci-scope.sh forge);
+  # About 6 minutes. Skipped before it takes a runner, still reporting, on a change that cannot affect it (ci-scope.sh forge, decided by the Scope job; the step gate below is the second check);
   # not a required check, and not on main (the merge queue ran it).
   forge-live:
     name: Live ${{ matrix.forge }}
-    if: github.event_name != 'push'
+    needs: [reuse, scope]
+    if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' && github.event_name != 'push' && (needs.scope.result != 'success' || needs.scope.outputs.forge == 'true') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
