@@ -31,6 +31,13 @@ On a change that can't affect what a job checks, the job reports without running
 build and tests run for any file the script doesn't know. A path filter would leave the check
 unreported instead, and the merge queue waiting for it.
 
+In ci.yml the first job, "Scope", decides every scope once (its log names the base, the changed
+files and the file that decided each scope), and a job whose scopes are all false is skipped before
+it takes a hosted runner (`needs: scope` and an `if:`): a skipped job reports as skipped, which
+counts as passed for a required check. Hosted runners are the queue, so a documentation-only change
+takes the Scope job (and the Workflows job, for its change entry) instead of eleven runners. A job
+that does run keeps its step-level gates, and a push to main skips Scope and runs every job.
+
 In the merge queue, `ci` reuses a pull request's pass of the same tree on the same base
 (`.github/scripts/ci-reuse.sh`, tested by `ci-reuse-test.sh`). Its first job, "Reuse a pull
 request's pass", looks for a successful `ci` run of the pull request's head, from this repository.
