@@ -173,12 +173,22 @@ needed() {
 	forge)
 		# Gitea and Forgejo support, run against a real instance of each (forge-live.sh): what
 		# talks to the instance, what turns its tasks into jobs, and what the jobs' actions,
-		# variables and services go through.
+		# variables and services go through. The live jobs run the native backend, so its files
+		# (the sandbox, the network and its nft rules, the images, the store) and the Evaluator and
+		# Exec (which sets the ACTIONS_* variables), version.zig (GITEA_*_VERSION) and what they
+		# import are listed, found by following the imports of gitea/run.zig; the GitHub side
+		# (runner/src/github/, the Postgres sink, the live view) is not.
 		case $1 in
-		runner/src/gitea/* | runner/src/job.zig | runner/src/native/actions.zig | \
-			runner/src/native/services.zig | runner/src/dagger/Evaluator.zig | \
-			runner/src/dagger/actions.zig | runner/src/dagger/services.zig | runner/src/loop/* | \
-			runner/src/config.zig | runner/src/main.zig | \
+		runner/src/gitea/* | runner/src/job.zig | runner/src/loop/* | runner/src/loop.zig | \
+			runner/src/config.zig | runner/src/main.zig | runner/src/version.zig | \
+			runner/src/native/* | runner/src/dagger/* | runner/src/dagger.zig | runner/src/engine.zig | \
+			runner/src/action.zig | runner/src/commands.zig | runner/src/context.zig | runner/src/expr.zig | \
+			runner/src/yaml.zig | runner/src/redact.zig | runner/src/sha256.zig | runner/src/glob.zig | \
+			runner/src/matcher.zig | runner/src/regex.zig | runner/src/sink.zig | runner/src/logfmt.zig | \
+			runner/src/trust.zig | runner/src/priority.zig | runner/src/admission.zig | runner/src/timefmt.zig | \
+			runner/src/proc_stats.zig | runner/src/zig_release.zig | runner/src/net_client.zig | \
+			runner/src/tls_stream.zig | runner/src/zr_net.zig | runner/src/vendor/* | \
+			runner/build.zig | runner/build.zig.zon | \
 			.github/workflows/ci.yml | .github/scripts/ci-scope.sh | .github/scripts/e2e.sh | \
 			.github/scripts/forge-live.sh | .github/scripts/forge-live-workflows.sh | \
 			.github/scripts/install-zig.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | \

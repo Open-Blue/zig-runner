@@ -181,7 +181,7 @@ from its run list. They check `uses:` as Gitea's model reads it (a bare `owner/r
 absolute URL, a directory of the repository, `$/path`), the variables the instance's own runner sets
 (`docs/GITEA.md`), services (by name and on localhost, one started with the workflow's `cmd:`), and the
 checkout, outputs, masking and a failing step (that run must end `failure`). Not required, and skipped
-(still reporting) on a change that cannot affect them (`ci-scope.sh forge`). The nightly memory soak
+(still reporting) on a change that cannot affect them (`ci-scope.sh forge`: the Gitea code, the native and Dagger backends, `version.zig`, the build and what they import; not the GitHub side). The nightly memory soak
 polls a Gitea of its own the same way. Locally, `forge-live.sh --forge forgejo --setup-only` starts the
 instance and makes the repositories, workflows and token without the runner (nothing privileged), and
 removes them.
