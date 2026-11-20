@@ -15,6 +15,12 @@
 #   apt.sh mirror-suffix
 #       The command, starting with " && ", that undoes mirror-prefix: after the build's script, so a
 #       published image's sources are exactly what they would be without the fallback.
+#   apt.sh probe ARCH CODENAME
+#       One line on how the primary archive answers now (status and time, or curl's error), for a
+#       job waiting on a build to log. Always exits 0.
+#
+# Every choice, and every probe behind it, is said on stderr (`apt.sh: …`), so a job's log names a
+# slow or silent archive and the mirror taken instead of showing a build that seems to hang.
 #
 # The trust is unchanged. Only the URIs are rewritten: the keyrings (Signed-By) stay Ubuntu's, and
 # apt checks every index and package against them, so a mirror can serve only what Ubuntu signed.
@@ -69,9 +75,26 @@ primary_probe() {
 # Whether URL answers within seconds. apt itself is slow to give up on a name that does not
 # resolve (minutes, with its retries), so each archive and mirror is asked with curl first. With no
 # curl (a bare container) everything is taken to answer, and apt's own failure decides.
+#
+# What it found is left in `probe_said` (the URL, its HTTP status and time, or curl's error), for the
+# job's log: a slow or silent archive is then named there, not left to look like a hung build.
 answers() {
-	command -v curl >/dev/null || return 0
-	curl -fsS -o /dev/null --max-time 10 --retry 2 --retry-delay 1 "$1" 2>/dev/null
+	if ! command -v curl >/dev/null; then
+		probe_said="$1: not probed (no curl), taken to answer"
+		return 0
+	fi
+	local said errors rc=0
+	errors=$(mktemp)
+	said=$(curl -fsS -o /dev/null -w '%{http_code} in %{time_total} s' --max-time 10 --retry 2 --retry-delay 1 "$1" 2>"$errors") || rc=$?
+	if ((rc == 0)); then
+		probe_said="$1 answered: $said"
+	else
+		# curl says its error once per try: the last is enough. It retries only what may pass (a
+		# timeout, a refused connection, 5xx), so a 404 is one try.
+		probe_said="$1 failed (curl exit $rc, last try $said: $(tail -n 1 "$errors")); up to 3 tries of at most 10 s each"
+	fi
+	rm -f "$errors"
+	return "$rc"
 }
 
 # The sed command that points every Ubuntu archive URI at MIRROR, over the source files in DIR.
@@ -88,15 +111,29 @@ mirror_suffix() {
 	printf ' && %s' "cp -a $backup/${1:?apt dir}/. $1/ && rm -rf $backup"
 }
 
+# Its choice and every probe behind it are said on stderr, in the job's log; stdout is the command.
 mirror_prefix() {
 	local arch=${1:?arch} codename=${2:?codename} mirror
-	answers "$(primary_probe "$arch" "$codename")" && return 0
+	if answers "$(primary_probe "$arch" "$codename")"; then
+		echo "apt.sh: $probe_said; the container keeps its own sources" >&2
+		return 0
+	fi
+	echo "apt.sh: $probe_said" >&2
 	for mirror in $(mirrors_for "$arch"); do
 		if answers "${mirror}dists/$codename/InRelease"; then
+			echo "apt.sh: $probe_said; the container's sources are pointed at $mirror" >&2
 			printf '%s && ' "$(rewrite_command "$mirror" /etc/apt)"
 			return 0
 		fi
+		echo "apt.sh: $probe_said" >&2
 	done
+	echo "apt.sh: no fallback mirror answered either; the container keeps its own sources" >&2
+}
+
+# One line on how the primary archive of ARCH answers now, for a waiting job's log; never fails.
+probe_primary() {
+	answers "$(primary_probe "${1:?arch}" "${2:?codename}")" || true
+	echo "$probe_said"
 }
 
 apt_install() {
@@ -121,8 +158,12 @@ apt_install() {
 	codename=$(sed -n 's/^VERSION_CODENAME=//p' /etc/os-release)
 
 	# The sources as configured, when their archive answers.
-	if answers "$(primary_probe "$arch" "$codename")" && attempt "$@"; then
-		return 0
+	if answers "$(primary_probe "$arch" "$codename")"; then
+		echo "apt.sh: $probe_said; installing from the configured sources" >&2
+		attempt "$@" && return 0
+		echo "apt.sh: apt-get failed against the configured sources" >&2
+	else
+		echo "apt.sh: $probe_said" >&2
 	fi
 
 	# The originals, kept so each mirror is tried from them, and put back when none works.
@@ -133,7 +174,11 @@ apt_install() {
 		[[ -f $f ]] && cp -p "$f" "$saved/$(echo "$f" | tr / _)"
 	done
 	for mirror in $(mirrors_for "$arch"); do
-		answers "${mirror}dists/$codename/InRelease" || continue
+		if ! answers "${mirror}dists/$codename/InRelease"; then
+			echo "apt.sh: $probe_said" >&2
+			continue
+		fi
+		echo "apt.sh: $probe_said" >&2
 		echo "::warning::apt failed against the configured sources: trying $mirror"
 		for f in "${sources[@]}"; do
 			[[ -f $f ]] && sed -E "s#$official#$mirror#g" "$saved/$(echo "$f" | tr / _)" >"$f"
@@ -163,12 +208,16 @@ mirror-prefix)
 mirror-suffix)
 	mirror_suffix /etc/apt
 	;;
+probe)
+	shift
+	probe_primary "$@"
+	;;
 mirror-list)
 	# The default mirrors of ARCH, one per line (apt-test.sh --real-mirrors probes them).
 	APT_MIRRORS='' mirrors_for "${2:?ARCH}" | tr ' ' '\n'
 	;;
 *)
-	echo "usage: apt.sh install [apt-get options] PACKAGE... | apt.sh mirror-prefix ARCH CODENAME | apt.sh mirror-list ARCH" >&2
+	echo "usage: apt.sh install [apt-get options] PACKAGE... | apt.sh mirror-prefix ARCH CODENAME | apt.sh probe ARCH CODENAME | apt.sh mirror-list ARCH" >&2
 	exit 2
 	;;
 esac
