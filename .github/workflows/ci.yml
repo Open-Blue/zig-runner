@@ -545,6 +545,38 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
+      # Zig's global cache, for `zig build`'s build runner above all: compiling build.zig and the
+      # build system was 70 s of this job's 230 s on a hosted runner, and a hit cuts it to about 1 s
+      # (measured in PR #638). The runner is built for this machine's CPU, so the CPU model is in
+      # the key, and so are what makes it: Zig's version (install-zig.sh), build.zig and
+      # build.zig.zon. Zig content-addresses what it restores, but does not check an output again
+      # once made, so only a push to main saves; a pull request or merge group restores.
+      - name: Zig global cache's key
+        id: zig_cache
+        if: steps.scope.outputs.run == 'true'
+        env:
+          FILES: ${{ hashFiles('.github/scripts/install-zig.sh', 'runner/build.zig', 'runner/build.zig.zon') }}
+        run: |
+          cpu=$(lscpu | sed -n 's/^Model name: *//p' | head -n1)
+          zig=$(sed -n 's/^version=//p' .github/scripts/install-zig.sh)
+          dir=$RUNNER_TEMP/zig-global-cache
+          mkdir -p "$dir"
+          key="zig-global-v1-$RUNNER_OS-$RUNNER_ARCH-$zig-$(sha256sum <<<"$cpu" | cut -c1-12)-tls-oracle-$FILES"
+          echo "zig-cache: CPU '$cpu', Zig $zig, key $key"
+          echo "key=$key" >>"$GITHUB_OUTPUT"
+          echo "dir=$dir" >>"$GITHUB_OUTPUT"
+          echo "ZIG_GLOBAL_CACHE_DIR=$dir" >>"$GITHUB_ENV"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.scope.outputs.run == 'true' && github.event_name == 'push'
+        with:
+          path: ${{ steps.zig_cache.outputs.dir }}
+          key: ${{ steps.zig_cache.outputs.key }}
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.scope.outputs.run == 'true' && github.event_name != 'push'
+        with:
+          path: ${{ steps.zig_cache.outputs.dir }}
+          key: ${{ steps.zig_cache.outputs.key }}
+
       # The Rust toolchain and the network library's build outputs, restored from the last run
       # with the same inputs and saved after this one (.github/actions/rust-cache); a miss builds as before.
       - name: Rust build cache
