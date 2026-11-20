@@ -210,7 +210,7 @@ pub const runtimes: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
     },
     .node = .{
         .image = "node:24-bookworm-slim" ++
-            "@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc9749addbf383b1920c",
+            "@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54",
         .binary = "/usr/local/bin/node",
         .npm_dir = "/usr/local/lib/node_modules/npm",
     },
@@ -225,7 +225,7 @@ pub const runtimes_musl: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(
     },
     .node = .{
         .image = "node:24-alpine" ++
-            "@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85",
+            "@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5",
         .binary = "/usr/local/bin/node",
         .npm_dir = "/usr/local/lib/node_modules/npm",
     },
