@@ -297,6 +297,9 @@ pub const Config = struct {
     provisioned_pins: provisioned.Pins = provisioned.pinned,
     /// How long an image tag's resolution is reused (`RUNNER_IMAGE_TAG_TTL`).
     image_tag_ttl_s: u32 = oci.default_tag_ttl_s,
+    /// How long a tag's last known digest covers a registry that cannot answer
+    /// (`RUNNER_IMAGE_TAG_MAX_STALE`); `oci.tag_max_stale_s` takes it when the backend starts.
+    image_tag_max_stale_s: u32 = oci.default_tag_max_stale_s,
     /// Where jobs' layers live while they run, and pulled images and provisioned rootfs
     /// (`RUNNER_NATIVE_STORE`).
     store: []const u8 = "",
@@ -490,6 +493,7 @@ pub fn configFor(
         .rootfs = cfg.native_rootfs,
         .provisioned_image = cfg.provisioned_image,
         .image_tag_ttl_s = cfg.image_tag_ttl_secs,
+        .image_tag_max_stale_s = cfg.image_tag_max_stale_secs,
         .store = try cfg.nativeStore(arena, environ),
         .self_exe = exe.path,
         .self_exe_replaced = exe.replaced,
@@ -952,6 +956,7 @@ var verdicts_dropped: std.atomic.Value(bool) = .init(false);
 /// FileNotFound"), for "Set up job": an error's name alone does not say which of the job's
 /// directories, locks, helpers or files it was.
 pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *[]const u8) !Backend {
+    oci.tag_max_stale_s = cfg.image_tag_max_stale_s;
     var ph: phases.Phases = .{};
     var t = phases.now();
     if (Store.secure(arena, io, cfg.store, .{ .check_parents = cfg.check_store_parents }) catch |e|

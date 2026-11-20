@@ -49,7 +49,20 @@ pub const Request = struct {
     /// How long a tag's resolution (`tag_record`) is reused without asking the registry, in
     /// seconds; 0 asks every time (a failed ask still falls back to the last known digest).
     tag_ttl_s: u32 = 0,
+    /// The longest a registry that cannot answer is covered for, in seconds since the tag's record
+    /// was last confirmed by a manifest or a HEAD; null is `tag_max_stale_s`.
+    tag_max_stale_s: ?u32 = null,
 };
+
+/// What `Config.image_tag_max_stale_secs` sets, at the runner's start (a job's pull has no config
+/// of its own): the fallback's limit for a `Request` that does not carry one.
+pub var tag_max_stale_s: u32 = default_tag_max_stale_s;
+
+/// A registry that cannot answer is covered by the last known digest for a day: long enough for an
+/// outage or a weekend of a registry's rate limit to pass over a runner's cached images, short enough
+/// that a tag deleted or replaced for a vulnerability is refused within a day of the registry's
+/// coming back being the only thing that could have told us. 0 never falls back.
+pub const default_tag_max_stale_s: u32 = 24 * 60 * 60;
 
 /// What a tag resolved to by default (`Config.image_tag_ttl_secs`): minutes, so that a burst of
 /// jobs asks the registry once and a moved tag is picked up before the next one.
@@ -72,8 +85,8 @@ pub const Image = struct {
     /// Held shared on the image in the store (`Store.hold`) until the caller closes it, which a
     /// job does at its end: a pull's rootfs is a lower of its mounts, and of what it provisions.
     lock: std.Io.File,
-    /// Why the registry was not asked or did not answer, when this is its last known digest for
-    /// the tag (`tag_record`) and not a fresh resolution; for the job's log.
+    /// For the job's log: why this is the last known digest for the tag (`tag_record`) and not a
+    /// fresh resolution (the registry did not answer), or that a HEAD just confirmed it.
     reused: ?[]const u8 = null,
 };
 
@@ -123,9 +136,13 @@ pub fn pull(
         }
     }
 
-    // The last known digest's image, if the store still has it: what a registry that cannot answer
-    // is replaced by, and then its "slow down" is not waited out.
-    var fallback: ?Image = if (known_tag) |k| try fromKnown(arena, io, store, k.top, k.manifest, req.owners) else null;
+    // The last known digest's image, if the store still has it and the record was confirmed not
+    // longer ago than `tag_max_stale_s`: what a registry that cannot answer is replaced by, and then
+    // its "slow down" is not waited out.
+    const max_stale = req.tag_max_stale_s orelse tag_max_stale_s;
+    const age_s: i64 = if (known_tag) |k| std.Io.Clock.real.now(io).toSeconds() - k.at else 0;
+    const covered = max_stale > 0 and age_s >= 0 and age_s <= max_stale;
+    var fallback: ?Image = if (known_tag != null and covered) try fromKnown(arena, io, store, known_tag.?.top, known_tag.?.manifest, req.owners) else null;
     errdefer if (fallback) |f| f.lock.close(io);
     var c: registry.Client = .{ .arena = arena, .io = io, .ref = ref, .creds = req.creds, .wait_on_limit = fallback == null };
     errdefer if (c.why.len > 0 and why.len == 0) {
@@ -133,17 +150,31 @@ pub fn pull(
     };
     // Past the TTL, with a digest known: a HEAD (not counted by Docker Hub) tells whether the tag
     // still names it, and the manifest is fetched only when it does not.
+    var moved_to: ?[]const u8 = null;
     if (fallback) |*img| {
         const k = known_tag.?;
         if (c.head(ref.reference())) |named| {
             if (named) |d| if (std.mem.eql(u8, d, k.top)) {
                 if (tag_path) |p| try writeTag(arena, io, p, k.top, k.manifest);
+                img.reused = try std.fmt.allocPrint(arena, "{s} is still {s}: the registry confirmed it by a HEAD " ++
+                    "(last confirmed {d} s ago)", .{ req.image, k.top, age_s });
                 return img.*;
+            } else {
+                moved_to = d;
             };
-        } else |e| if (c.unavailable()) return reuse(arena, img, &c, e, req.image, k.top);
+        } else |e| if (c.unavailable()) return reuse(arena, img, &c, e, req.image, k.top, age_s, null);
     }
     const top = c.manifest(ref.reference()) catch |e| {
-        if (fallback) |*img| if (c.unavailable()) return reuse(arena, img, &c, e, req.image, known_tag.?.top);
+        if (fallback) |*img| if (c.unavailable()) return reuse(arena, img, &c, e, req.image, known_tag.?.top, age_s, moved_to);
+        // A registry that cannot answer and a record too old to stand in for it: the job fails, and
+        // says how stale what it holds is.
+        if (known_tag != null and !covered and c.unavailable()) {
+            why.* = try std.fmt.allocPrint(arena, "{s}; the stored image of {s} ({s}) was last confirmed {d} s ago, " ++
+                "past the {d} s a registry that cannot answer is covered for (RUNNER_IMAGE_TAG_MAX_STALE)", .{
+                if (c.why.len > 0) c.why else @errorName(e), req.image, known_tag.?.top, age_s, max_stale,
+            });
+            return e;
+        }
         return fail(arena, why, &c, e, "its manifest");
     };
     // Not needed: the pull goes on, and holds what it pulls itself.
@@ -199,10 +230,20 @@ pub fn pull(
 }
 
 /// The last known digest's image, for a registry that cannot answer: the job goes on, and says so.
-fn reuse(arena: Allocator, img: *Image, c: *const registry.Client, e: anyerror, name: []const u8, digest: []const u8) !Image {
+/// `moved_to` is what a HEAD said the tag names now, when the registry did answer that far: the job
+/// then knowingly runs an image the tag has left, for the registry's sake, within the same age limit.
+fn reuse(arena: Allocator, img: *Image, c: *const registry.Client, e: anyerror, name: []const u8, digest: []const u8, age_s: i64, moved_to: ?[]const u8) !Image {
     const reason = if (c.why.len > 0) c.why else @errorName(e);
-    img.reused = try std.fmt.allocPrint(arena, "the registry did not answer ({s}); using the last known digest of {s}, {s}", .{ reason, name, digest });
-    logfmt.warn("image_tag_reused", "image={f} digest={s} status={d} reason={s}", .{ logfmt.q(name), digest, c.status, @errorName(e) });
+    img.reused = if (moved_to) |n|
+        try std.fmt.allocPrint(arena, "the registry did not answer ({s}) after saying the tag has moved to {s}; using the " ++
+            "last known digest of {s}, {s}, confirmed {d} s ago", .{ reason, n, name, digest, age_s })
+    else
+        try std.fmt.allocPrint(arena, "the registry did not answer ({s}); using the last known digest of {s}, {s}, " ++
+            "confirmed {d} s ago", .{ reason, name, digest, age_s });
+    if (moved_to) |n|
+        logfmt.warn("image_tag_reused", "image={f} digest={s} status={d} reason={s} age_s={d} moved=true new_digest={s}", .{ logfmt.q(name), digest, c.status, @errorName(e), age_s, n })
+    else
+        logfmt.warn("image_tag_reused", "image={f} digest={s} status={d} reason={s} age_s={d} moved=false", .{ logfmt.q(name), digest, c.status, @errorName(e), age_s });
     return img.*;
 }
 
