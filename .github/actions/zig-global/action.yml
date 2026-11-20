@@ -1,0 +1,61 @@
+name: Zig global cache (EXPERIMENT)
+description: >-
+  EXPERIMENT, not for merging. Zig's global cache directory (libc, compiler-rt, libunwind, the build
+  runner, ZIR of std: what does not change from commit to commit), restored from the last run with
+  the same key and saved after this one, on GitHub-hosted runners. Exact key only, no restore-keys;
+  restore-only on a merge group.
+inputs:
+  name:
+    description: The job's own name, part of the key (each job builds its own set of variants).
+    required: true
+  cpu:
+    description: >-
+      `native` when the job compiles for the machine's own CPU (Zig's default: the tests), so the
+      CPU model is in the key; `baseline` when it names a target (-target x86_64-linux-musl).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - id: keys
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        CPU: ${{ inputs.cpu }}
+        FILES: ${{ hashFiles('.github/actions/zig-global/action.yml', '.github/scripts/install-zig.sh', '.github/scripts/zig-modules.sh') }}
+      run: |
+        cpu_model=$(lscpu | sed -n 's/^Model name: *//p' | head -n1)
+        cpu_flags=$(sed -n 's/^\(flags\|Features\)[[:space:]]*: //p' /proc/cpuinfo | head -n1 | tr ' ' '\n' | sort | sha256sum | cut -c1-8)
+        zig_version=$(sed -n 's/^version=//p' .github/scripts/install-zig.sh)
+        if [[ $CPU == native ]]; then cpu_key=$(sha256sum <<<"$cpu_model" | cut -c1-12); else cpu_key=baseline; fi
+        key="zig-global-v1-${RUNNER_OS}-${RUNNER_ARCH}-${zig_version}-${cpu_key}-${NAME}-${FILES}"
+        echo "zig-cache: runner image ${ImageOS:-unset} ${ImageVersion:-unset}; cpu '$cpu_model', feature set $cpu_flags, in the key as $cpu_key ($CPU); Zig $zig_version; nproc $(nproc)"
+        echo "key=$key" >>"$GITHUB_OUTPUT"
+        dir="$RUNNER_TEMP/zig-global-cache"
+        mkdir -p "$dir"
+        echo "dir=$dir" >>"$GITHUB_OUTPUT"
+        # Every Zig in the job (zig build and the compiler alike) reads this variable.
+        echo "ZIG_GLOBAL_CACHE_DIR=$dir" >>"$GITHUB_ENV"
+
+    - id: cache
+      if: github.event_name != 'merge_group'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.keys.outputs.dir }}
+        key: ${{ steps.keys.outputs.key }}
+    - id: cache-ro
+      if: github.event_name == 'merge_group'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.keys.outputs.dir }}
+        key: ${{ steps.keys.outputs.key }}
+
+    - shell: bash
+      env:
+        HIT: ${{ steps.cache.outputs.cache-hit || steps.cache-ro.outputs.cache-hit }}
+        KEY: ${{ steps.keys.outputs.key }}
+        DIR: ${{ steps.keys.outputs.dir }}
+      run: |
+        [[ $HIT == true ]] && state=hit || state=miss
+        echo "zig-cache: $state, key $KEY"
+        echo "zig-cache: restored $(du -sh "$DIR" | cut -f1), $(find "$DIR/o" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l) output entries"

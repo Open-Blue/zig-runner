@@ -1,0 +1,14 @@
+name: Zig global cache report (EXPERIMENT)
+description: What the job added to Zig's global cache, in the log, before the cache is saved.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        dir=${ZIG_GLOBAL_CACHE_DIR:-}
+        [[ -d $dir ]] || { echo "zig-cache report: no global cache directory"; exit 0; }
+        echo "zig-cache report: at job end $(du -sh "$dir" | cut -f1) ($(du -sk "$dir" | cut -f1) KiB); $(find "$dir/o" -mindepth 1 -maxdepth 1 | wc -l) output entries, $(find "$dir/z" -type f 2>/dev/null | wc -l) ZIR files, $(find "$dir/h" -type f 2>/dev/null | wc -l) manifests"
+        echo "zig-cache report: the largest output entries:"
+        du -sk "$dir"/o/* 2>/dev/null | sort -rn | head -n 8 | sed 's/^/zig-cache report:   /'
+        echo "zig-cache report: compressed (tar.zst, as actions/cache stores it): $(tar -C "$dir" -cf - . | zstd -3 -q | wc -c) bytes"

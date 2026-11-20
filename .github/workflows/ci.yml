@@ -467,6 +467,14 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
+      # EXPERIMENT: Zig's global cache, restored and saved (.github/actions/zig-global).
+      - name: Zig global cache
+        if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        uses: ./.github/actions/zig-global # zizmor: ignore[self-repository] actionlint rejects the `$/` form
+        with:
+          name: database
+          cpu: native
+
       # The Rust toolchain and the network library's build outputs, restored from the last run
       # with the same inputs and saved after this one (.github/actions/rust-cache); a miss builds as before.
       - name: Rust build cache
@@ -500,6 +508,11 @@ jobs:
       - name: A killed test's leftovers
         if: steps.scope.outputs.run == 'true'
         run: ZIG_TEST_KILL_CHECK=1 .github/scripts/zig-test.sh
+
+      # EXPERIMENT: what the job added to Zig's global cache, before the cache is saved.
+      - name: Zig global cache report
+        if: always() && steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        uses: ./.github/actions/zig-global-report # zizmor: ignore[self-repository] actionlint rejects the `$/` form
 
   # The old TLS client (tls.zig, a lazy dependency only this job fetches) against the one the
   # runner has, on the same servers: the database of the Database tests job (the same script starts
@@ -544,6 +557,14 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
+      # EXPERIMENT: Zig's global cache, restored and saved (.github/actions/zig-global).
+      - name: Zig global cache
+        if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        uses: ./.github/actions/zig-global # zizmor: ignore[self-repository] actionlint rejects the `$/` form
+        with:
+          name: tls-oracle
+          cpu: native
+
       # The Rust toolchain and the network library's build outputs, restored from the last run
       # with the same inputs and saved after this one (.github/actions/rust-cache); a miss builds as before.
       - name: Rust build cache
@@ -561,6 +582,11 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         working-directory: runner
         run: zig build test-tls-oracle -Dtls-oracle
+
+      # EXPERIMENT: what the job added to Zig's global cache, before the cache is saved.
+      - name: Zig global cache report
+        if: always() && steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        uses: ./.github/actions/zig-global-report # zizmor: ignore[self-repository] actionlint rejects the `$/` form
 
   # The Pi's tests, compiled here: a push to main runs "Tests (x86_64)" on prod, a Raspberry Pi
   # (aarch64, SD card), where compiling the tests and the runner with LLVM took about two minutes
@@ -679,6 +705,14 @@ jobs:
       - name: Install Zig
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
+
+      # EXPERIMENT: Zig's global cache, restored and saved (.github/actions/zig-global).
+      - name: Zig global cache
+        if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        uses: ./.github/actions/zig-global # zizmor: ignore[self-repository] actionlint rejects the `$/` form
+        with:
+          name: test
+          cpu: native
 
       # The Rust toolchain and the network library's build outputs, restored from the last run
       # with the same inputs and saved after this one (.github/actions/rust-cache); a miss builds as before.
@@ -882,6 +916,11 @@ jobs:
         env:
           PREBUILT: ${{ steps.test.outputs.prebuilt }}
 
+      # EXPERIMENT: what the job added to Zig's global cache, before the cache is saved.
+      - name: Zig global cache report
+        if: always() && steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        uses: ./.github/actions/zig-global-report # zizmor: ignore[self-repository] actionlint rejects the `$/` form
+
   # The native backend's tests as root, on both architectures, in two parts each. As root they run
   # one at a time (a root job takes the host's first free slot of ids and addresses,
   # runner/tools/test_shards.zig, `serial`): about 200 s on one runner, which held the whole run
@@ -941,6 +980,14 @@ jobs:
           name: native-root
           tools: stable
 
+      # EXPERIMENT: Zig's global cache, restored and saved (.github/actions/zig-global).
+      - name: Zig global cache
+        if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        uses: ./.github/actions/zig-global # zizmor: ignore[self-repository] actionlint rejects the `$/` form
+        with:
+          name: native-root-${{ matrix.arch }}
+          cpu: native
+
       # As the tests' output in `test`: only text to this job, never its workflow commands
       # (zig-test.sh stops them).
       - name: Test, as root
@@ -959,6 +1006,11 @@ jobs:
           ../.github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
           ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 ZIG_TEST_PART="$PART" \
             ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" ../.github/scripts/zig-test.sh
+
+      # EXPERIMENT: what the job added to Zig's global cache, before the cache is saved.
+      - name: Zig global cache report
+        if: always() && steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        uses: ./.github/actions/zig-global-report # zizmor: ignore[self-repository] actionlint rejects the `$/` form
 
       # Nothing may be left under the tests' temporary directory, nor a chain of directories deeper
       # than 32 levels there (tools/test_shards.zig checks each run, naming the tests).
@@ -1126,6 +1178,14 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
+      # EXPERIMENT: Zig's global cache, restored and saved (.github/actions/zig-global).
+      - name: Zig global cache
+        if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        uses: ./.github/actions/zig-global # zizmor: ignore[self-repository] actionlint rejects the `$/` form
+        with:
+          name: arm64-test
+          cpu: native
+
       # As the hosted test job's Test step: the native backend's tests must run here, not skip.
       - name: Test
         if: steps.scope.outputs.run == 'true'
@@ -1134,6 +1194,11 @@ jobs:
           # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
           sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
           ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/zig-test.sh
+
+      # EXPERIMENT: what the job added to Zig's global cache, before the cache is saved.
+      - name: Zig global cache report
+        if: always() && steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        uses: ./.github/actions/zig-global-report # zizmor: ignore[self-repository] actionlint rejects the `$/` form
 
       # Nothing may be left under the tests' temporary directory, nor a chain of directories deeper
       # than 32 levels there (tools/test_shards.zig checks each run, naming the tests).
@@ -1228,9 +1293,22 @@ jobs:
           name: e2e
           tools: stable
 
+      # EXPERIMENT: Zig's global cache, restored and saved (.github/actions/zig-global).
+      - name: Zig global cache
+        if: steps.go.outputs.run == 'true' && runner.environment == 'github-hosted'
+        uses: ./.github/actions/zig-global # zizmor: ignore[self-repository] actionlint rejects the `$/` form
+        with:
+          name: e2e
+          cpu: baseline
+
       - name: Build the runner
         if: steps.go.outputs.run == 'true'
         run: .github/scripts/e2e.sh build "$RUNNER_TEMP/zig-runner"
+
+      # EXPERIMENT: what the job added to Zig's global cache, before the cache is saved.
+      - name: Zig global cache report
+        if: always() && steps.go.outputs.run == 'true' && runner.environment == 'github-hosted'
+        uses: ./.github/actions/zig-global-report # zizmor: ignore[self-repository] actionlint rejects the `$/` form
 
       # The native pass's rootfs (apt in a container, about a minute), in the background: done
       # while the Dagger pass runs (when it does), before the native one, which waits for it.
