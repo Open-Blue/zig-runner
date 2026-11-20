@@ -53,6 +53,8 @@ pub const Server = struct {
     limited: std.atomic.Value(u32) = .init(0),
     /// When not 0, every manifest request is answered with this status (401, 403, 503, ...).
     refuse: std.atomic.Value(u32) = .init(0),
+    /// The same for manifest requests that are not a HEAD.
+    refuse_get: std.atomic.Value(u32) = .init(0),
     requests: std.atomic.Value(u32) = .init(0),
     /// Of `requests`, the HEADs (a tag's digest asked for, not its manifest).
     heads: std.atomic.Value(u32) = .init(0),
@@ -179,9 +181,10 @@ fn answer(s: *Server, conn: Io.net.Stream) bool {
             _ = s.limited.fetchSub(1, .acq_rel);
             return respond(s, out, "429 Too Many Requests", "Retry-After: 1\r\n", "application/json", "{\"errors\":[{\"code\":\"TOOMANYREQUESTS\"}]}");
         }
-        if (std.mem.indexOf(u8, path, "/manifests/") != null and s.refuse.load(.acquire) != 0) {
+        const refused = if (s.refuse.load(.acquire) != 0) s.refuse.load(.acquire) else if (!head_request) s.refuse_get.load(.acquire) else 0;
+        if (std.mem.indexOf(u8, path, "/manifests/") != null and refused != 0) {
             var sb: [32]u8 = undefined;
-            const line = std.fmt.bufPrint(&sb, "{d} Refused", .{s.refuse.load(.acquire)}) catch return false;
+            const line = std.fmt.bufPrint(&sb, "{d} Refused", .{refused}) catch return false;
             return respond(s, out, line, "", "application/json", "{\"errors\":[]}");
         }
         for (s.current()) |rt| if (std.mem.eql(u8, rt.path, path)) {
@@ -379,7 +382,11 @@ fn tinyImage(arena: Allocator, repo: []const u8, tag: []const u8, marker: []cons
 }
 
 fn pullTag(arena: Allocator, store: Store, ref: []const u8, ttl: u32, why: *[]const u8) !image.Image {
-    const img = try image.pull(arena, testing.allocator, testing.io, store, .{ .image = ref, .owners = false, .tag_ttl_s = ttl }, why);
+    return pullStale(arena, store, ref, ttl, null, why);
+}
+
+fn pullStale(arena: Allocator, store: Store, ref: []const u8, ttl: u32, max_stale: ?u32, why: *[]const u8) !image.Image {
+    const img = try image.pull(arena, testing.allocator, testing.io, store, .{ .image = ref, .owners = false, .tag_ttl_s = ttl, .tag_max_stale_s = max_stale }, why);
     img.lock.close(testing.io);
     return img;
 }
@@ -461,7 +468,7 @@ test "native oci pull: requests per job for a cached image, by reference form (#
     const same = try pullTag(arena, store, tag, 0, &why);
     try testing.expectEqual([2]u32{ 1, 1 }, since(&server, m));
     try testing.expectEqualStrings(one.index, same.digest);
-    try testing.expect(same.pulled == null and same.reused == null);
+    try testing.expect(same.pulled == null and std.mem.indexOf(u8, same.reused.?, "confirmed it by a HEAD") != null);
     // The HEAD renewed the record: the next job, within the TTL, asks nothing.
     m = mark(&server);
     _ = try pullTag(arena, store, tag, 300, &why);
@@ -507,6 +514,56 @@ test "native oci pull: requests per job for a cached image, by reference form (#
     server.limited.store(1000, .release);
     try testing.expectError(error.HttpStatus, pullTag(arena, fresh, tag, 300, &why));
     try testing.expect(std.mem.indexOf(u8, why, "429") != null);
+}
+
+test "native oci pull: a registry that cannot answer is covered for the maximum age only; a tag known to have moved says so" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store: Store = .{ .root = try tmp.dir.realPathFileAlloc(testing.io, ".", arena) };
+    const one = try tinyImage(arena, "test/img", "t", "one");
+    const two = try tinyImage(arena, "test/img", "t", "two");
+    var server: Server = .{ .routes = one.routes };
+    try server.start();
+    defer server.stop();
+    const ref = try server.image(arena, "test/img:t");
+    var why: []const u8 = "";
+    _ = try pullTag(arena, store, ref, 300, &why);
+
+    // Last confirmed 1000 s ago.
+    const old = std.Io.Clock.real.now(testing.io).toSeconds() - 1000;
+    _ = try tagRecord(arena, store, try std.fmt.allocPrint(arena, "{s} {s} {d}\n", .{ one.manifest, one.index, old }));
+    server.refuse.store(503, .release);
+    // Within the maximum age: the stored image runs, saying how long ago it was confirmed.
+    const covered = try pullStale(arena, store, ref, 0, 2000, &why);
+    try testing.expectEqualStrings(one.index, covered.digest);
+    try testing.expect(std.mem.indexOf(u8, covered.reused.?, "confirmed 1000 s ago") != null or std.mem.indexOf(u8, covered.reused.?, "confirmed 100") != null);
+    // Past it, or with 0: the job fails, with the registry's reason and how stale the image is.
+    for ([_]u32{ 500, 0 }) |max| {
+        try testing.expectError(error.HttpStatus, pullStale(arena, store, ref, 0, max, &why));
+        try testing.expect(std.mem.indexOf(u8, why, "503") != null);
+        try testing.expect(std.mem.indexOf(u8, why, "last confirmed 100") != null);
+        try testing.expect(std.mem.indexOf(u8, why, "RUNNER_IMAGE_TAG_MAX_STALE") != null);
+        why = "";
+    }
+    server.refuse.store(0, .release);
+    // The registry back, the old record is no obstacle: the manifests are fetched, and it is renewed.
+    const back = try pullStale(arena, store, ref, 0, 500, &why);
+    try testing.expectEqualStrings(one.index, back.digest);
+    try testing.expect(back.reused == null);
+
+    // The tag moves and the manifest fetch fails after the HEAD saw it: the old digest still runs
+    // (availability), and the reason says the tag has moved and to what.
+    server.setRoutes(&two.routes);
+    server.refuse_get.store(503, .release);
+    const moved = try pullStale(arena, store, ref, 0, 2000, &why);
+    try testing.expectEqualStrings(one.index, moved.digest);
+    try testing.expect(std.mem.indexOf(u8, moved.reused.?, "has moved to") != null);
+    try testing.expect(std.mem.indexOf(u8, moved.reused.?, two.index) != null);
+    server.refuse_get.store(0, .release);
+    try testing.expectEqualStrings(two.index, (try pullStale(arena, store, ref, 0, 2000, &why)).digest);
 }
 
 test "native oci pull: a registry that answers 429 gives the last known digest; a first pull waits out Retry-After" {

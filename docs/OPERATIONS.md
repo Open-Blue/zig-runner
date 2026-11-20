@@ -596,7 +596,15 @@ error: kind=upload_failed job=123 what=job_log name="" detail=NameServerFailure
   when a native container job's registry could not answer (a 429, a 5xx, the network) and the tag's last known
   digest, still in the store, ran instead of failing the job. A tag is asked about at most once per
   `RUNNER_IMAGE_TAG_TTL` seconds (default 300), by a `HEAD` that Docker Hub does not count; a digest-pinned image
-  never. See docs/native-backend.md.
+  never. The warning also has `age_s` (seconds since the registry last confirmed the tag) and `moved=false`; when a
+  `HEAD` had already shown that the tag names another digest and only the manifest fetch then failed, it is
+  `moved=true new_digest=sha256:..` and the old image still runs (chosen for availability, within the age limit below).
+  `RUNNER_IMAGE_TAG_MAX_STALE` (`--image-tag-max-stale`, seconds, default 86400, 0 never falls back) bounds that cover,
+  counted from the last successful manifest or `HEAD`: past it a registry that cannot answer fails the job, naming the
+  registry's error (`HTTP 429`, ...) and how long ago the stored image was confirmed, so a deleted or replaced tag is not run
+  for ever. A day rides out an outage or a rate limit's window and a weekend's neglect, and bounds a CVE-fixed tag's life.
+  A `HEAD` that confirms the tag also says so in the job's "Set up job" (`Image: from the native store; <tag> is still
+  <digest>: the registry confirmed it by a HEAD`). See docs/native-backend.md.
 - `info` lines (`info(scope): …`) and the lines with formats of their own are not warnings and
   keep them: `health:`, `job-end:`, `step-end:`, `request:`, and the plain `job N: …` progress
   lines. What a job's log shows to the user (GitHub's `##[warning]`, an action's `Warning:`) is
