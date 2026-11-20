@@ -158,9 +158,14 @@ needed() {
 	workflows)
 		# Everything but prose: the workflow job's checks read the workflows, scripts, deployment,
 		# Dockerfile, change entries (.changes/) and the runner's pins and vendored code, and a
-		# change entry is on every pull request.
+		# change entry is on every pull request. Prose is docs/ and the top level's own Markdown and
+		# LICENSE only: a .md or LICENSE elsewhere may be checked (changie's .changes/*.md, the
+		# vendored libraries' licences, compared byte for byte), and docs/CHANGELOG.md is changie's.
 		case $1 in
-		*.md | docs/* | LICENSE) return 1 ;;
+		docs/CHANGELOG.md) return 0 ;;
+		docs/*) return 1 ;;
+		*/*) return 0 ;;
+		*.md | LICENSE) return 1 ;;
 		*) return 0 ;;
 		esac
 		;;
