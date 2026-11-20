@@ -3206,7 +3206,15 @@ test "a whole job: a step paused longer than its timeout is not stopped while pa
     try std.testing.expect(took >= 1_490);
     try std.testing.expectEqual(@as(u32, 1), HoldingSession.aborted.load(.acquire));
     try std.testing.expectEqual(Outcome.failure, res.steps[0].outcome);
-    try std.testing.expect(res.steps[0].paused_ms > 0 and res.steps[0].paused_ms <= 1_200);
+    // At most the pause as it was: endPauseAfter counts from its start to when it ended, which is
+    // 1_200 ms plus however late the sleep woke (tens of ms on a busy arm64 runner, 2026-11-20).
+    const pause_was = blk: {
+        pool.mu.lockUncancelable(io);
+        defer pool.mu.unlock(io);
+        break :blk slots[0].paused_total_ms;
+    };
+    try std.testing.expect(pause_was >= 1_200);
+    try std.testing.expect(res.steps[0].paused_ms > 0 and res.steps[0].paused_ms <= pause_was);
     try std.testing.expect(std.mem.indexOf(u8, ends.written(), " paused_ms=") != null);
     var told = false;
     for (res.output_lines) |l| told = told or std.mem.indexOf(u8, l, "was paused for 1.") != null;

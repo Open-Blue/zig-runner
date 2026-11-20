@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The test of a step paused past its timeout no longer fails on a busy runner: it held the step''s paused time to the nominal 1.2 s, but the pause it ends runs 1.2 s plus however late its sleep wakes, so a slow arm64 runner measured more (Tests (arm64), 2026-11-20). The bound is now the pause as it was recorded.'
+time: 2026-11-19T23:40:48.775207094-05:00
