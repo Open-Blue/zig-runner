@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'CI: the native tests as root and End to end restore the Rust toolchain and zr-net''s build outputs from the cache, and the root tests are shared between their two parts by measured time.'
+time: 2026-11-20T04:09:47.464456539-05:00
