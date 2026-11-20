@@ -533,6 +533,14 @@ connect (`http.withinClosing`) ends it where it blocks. Errors come back with a 
   35 s to a release build (the two arches run in parallel after the Rust step, which is serial per arch in `zig_modules` today and parallel
   later if it matters) and 0 for a warm cache. CI jobs that build the runner on a cold GitHub runner pay the cold figure once each (no job shares a cache today:
   the cargo cache action keyed on `Cargo.lock` + toolchain version is R2's CI change, measured then).
+- **The build cache (CI).** The Database tests, TLS oracle and Tests (x86_64, hosted runner) jobs restore the unpacked Rust toolchain
+  (the toolchains the install scripts unpack into `$RUNNER_TOOL_CACHE`, whose trees they check against a pinned digest on every use; rustup's own `~/.rustup` is not cached, since nothing would re-check it) and `runner/rust/target` with
+  `.github/actions/rust-cache` (actions/cache): the toolchain under a key of the OS name and a hash of the image's `cc`, `ld`, `ar` and glibc versions (not the image version: several are in use at once), the action's own file, `install-rust*.sh` and `rust-toolchain.toml`, the target directory under a key of
+  the same hash and action file and `runner/rust/**` (sources, `Cargo.lock`, `rust-toolchain.toml`), the build scripts, `zig-cc.sh`, `install-zig.sh`, the runner and the job. Exact keys only:
+  a miss is today's full build, never a restore from older inputs. The scripts still build through cargo (which rebuilds what its own fingerprints
+  call stale) and still check the archive's ELF machine; the job log says hit or miss, the key, and the archive's sha256. Pull requests save their own
+  entries (readable by that ref only) and read main's, which every push to main saves; a merge group only restores. Release and candidate builds
+  never use it. The registry is not cached: its download is about a second.
 - **Supply chain.** `deny.toml` (licenses allow-list: MIT, Apache-2.0, Apache-2.0 WITH LLVM-exception, ISC, BSD-3-Clause, Unicode-3.0, Zlib; advisories; crates.io
   only; wildcards denied), run by `.github/scripts/cargo-deny.sh` in `security.yml` ("Rust dependencies": on pull requests and weekly for new advisories), tarball pinned by
   SHA-256 as gitleaks is. GitHub's dependency review reads `Cargo.lock` for free. `docs/THIRD_PARTY.md` lists direct dependencies and

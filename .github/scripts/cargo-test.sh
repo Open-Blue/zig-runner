@@ -16,6 +16,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 if [[ -n ${RUNNER_TEMP:-} && -z ${CARGO_HOME:-} ]]; then
 	export CARGO_HOME=$RUNNER_TEMP/cargo-home
 fi
+# CI restores the toolchain and the target directory from a cache (.github/actions/rust-cache).
+echo "cargo-test.sh: rust cache: ${ZR_RUST_CACHE:-none (not CI, or a job without it)}" >&2
 mode=${1:-}
 case $mode in
 "")

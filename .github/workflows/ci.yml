@@ -434,6 +434,15 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
+      # The Rust toolchain and the network library's build outputs, restored from the last run
+      # with the same inputs and saved after this one (.github/actions/rust-cache); a miss builds as before.
+      - name: Rust build cache
+        if: steps.scope.outputs.run == 'true'
+        uses: ./.github/actions/rust-cache # zizmor: ignore[self-repository] actionlint rejects the `$/` form
+        with:
+          name: database
+          tools: nightly
+
       # The network library's own tests under ThreadSanitizer (the pinned nightly, -Zbuild-std): the
       # races among its own threads, which Zig's TSan only sees through the archive below, linked
       # instrumented too (docs/rust-net.md, "ThreadSanitizer").
@@ -502,6 +511,14 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
+      # The Rust toolchain and the network library's build outputs, restored from the last run
+      # with the same inputs and saved after this one (.github/actions/rust-cache); a miss builds as before.
+      - name: Rust build cache
+        if: steps.scope.outputs.run == 'true'
+        uses: ./.github/actions/rust-cache # zizmor: ignore[self-repository] actionlint rejects the `$/` form
+        with:
+          name: tls-oracle
+          tools: stable
       # The database starts in the background (about 25 s): wait for it only now, with Zig installed.
       - name: Wait for the database
         if: steps.scope.outputs.run == 'true'
@@ -630,6 +647,14 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
+      # The Rust toolchain and the network library's build outputs, restored from the last run
+      # with the same inputs and saved after this one (.github/actions/rust-cache); a miss builds as before.
+      - name: Rust build cache
+        if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        uses: ./.github/actions/rust-cache # zizmor: ignore[self-repository] actionlint rejects the `$/` form
+        with:
+          name: test
+          tools: stable
       # Named, not `.`: zig-pkg/ holds the dependencies once anything has built, in their own style.
       - name: Format check
         if: steps.scope.outputs.run == 'true'

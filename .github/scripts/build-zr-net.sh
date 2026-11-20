@@ -60,8 +60,14 @@ export "CC_${triple//-/_}=$here/zig-cc.sh"
 export "AR_${triple//-/_}=${AR_ZIG:-ar}"
 export "CARGO_TARGET_${upper}_LINKER=$here/zig-cc.sh"
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PWD/target}
+# CI restores the toolchain and the target directory from a cache (.github/actions/rust-cache,
+# docs/rust-net.md): what it restored, and under which key, is in ZR_RUST_CACHE.
+echo "build-zr-net.sh: rust cache: ${ZR_RUST_CACHE:-none (not CI, or a job without it)}" >&2
 # In the job's log, what the build is and what it builds with: cargo's target (beside the request
 # logged above), which Rust and from where, and where it builds.
+# The version test above ran in the repository root; the build runs here, where rust-toolchain.toml
+# applies to a rustup shim, so what builds is asked in this directory.
+echo "build-zr-net.sh: toolchain in $PWD: $(cargo --version 2>&1 | tail -n1), $(rustc --version 2>&1 | tail -n1), cargo at $(command -v cargo)" >&2
 echo "build-zr-net.sh: building $arch ($libc): cargo target $triple; $(cargo --version) at $(command -v cargo), from $rust_from; CARGO_TARGET_DIR $CARGO_TARGET_DIR" >&2
 # In a job, cargo's registry and crate cache go in the job's own temp directory: a self-hosted
 # runner's $HOME/.cargo can belong to another user (main's first Rust build failed there with
