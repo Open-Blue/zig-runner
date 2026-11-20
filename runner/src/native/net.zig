@@ -153,6 +153,12 @@ pub fn upMain(
     // For the port's link-local rule below: a socket of the host's namespace, kept past the unshare.
     var guard = nft.Guard.open() orelse return fail("open an nftables socket", .ACCES);
     defer guard.close();
+    // The host's namespace, to go back to for the port's own sysctl (`/proc/sys/net` is the calling
+    // thread's namespace's).
+    const host_ns_open = linux.open("/proc/self/ns/net", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(host_ns_open) != .SUCCESS) return fail("open the host's namespace", linux.errno(host_ns_open));
+    const host_ns = std.math.lossyCast(linux.fd_t, host_ns_open);
+    defer _ = linux.close(host_ns);
     const unshared = linux.unshare(linux.CLONE.NEWNET);
     if (linux.errno(unshared) != .SUCCESS) return fail("unshare(net)", linux.errno(unshared));
     var job = Socket.open() catch return fail("open rtnetlink in the job's namespace", .ACCES);
@@ -177,10 +183,24 @@ pub fn upMain(
     // may have died meanwhile.
     if (linux.getppid() != parent) return fail("find the runner that holds the slot's lock", .SRCH);
     host.addVeth(slot, @intCast(ns), mac, true) catch return fail("make the veth pair", .INVAL);
-    if (guard.dropLinkLocal(slot)) |why| {
-        const what = std.fmt.allocPrint(arena, "drop the port's link-local frames: {s}", .{why}) catch "drop the port's link-local frames";
-        return fail(what, .INVAL);
+    // The port has no IPv6 (before it is up: no link-local address is made, and a frame handed
+    // up on it, to any address of the host's, reaches no socket). The sysctl is the host's: a
+    // step into its namespace and back. Fatal: it is a layer that nothing else of the port's
+    // IPv6 has (the ingress rule below is best-effort).
+    const port_ipv6 = std.fmt.allocPrint(arena, "/proc/sys/net/ipv6/conf/zrh{d}/disable_ipv6", .{slot}) catch return fail("a path", .NOMEM);
+    if (linux.errno(linux.setns(host_ns, linux.CLONE.NEWNET)) != .SUCCESS) return fail("enter the host's namespace", .PERM);
+    const wrote = writeSysctl(arena, port_ipv6, "1");
+    if (linux.errno(linux.setns(std.math.lossyCast(linux.fd_t, ns), linux.CLONE.NEWNET)) != .SUCCESS) return fail("go back to the job's namespace", .PERM);
+    if (!wrote) return fail("turn IPv6 off on the job's port", .ACCES);
+    switch (guard.dropLinkLocal(slot)) {
+        .made => {},
+        .unsupported => |e| logfmt.warn("netdev_linklocal_drop_unsupported", "slot={d} err={t}", .{ slot, e }),
+        .failed => |why| {
+            const what = std.fmt.allocPrint(arena, "drop the port's link-local frames: {s}", .{why}) catch "drop the port's link-local frames";
+            return fail(what, .INVAL);
+        },
     }
+    host.upPort(slot) catch return fail("bring the port up", .INVAL);
     job.configureJob(subnet, slot) catch return fail("configure the job's network", .INVAL);
     return 0;
 }
@@ -387,7 +407,7 @@ pub const Socket = struct {
     /// Makes the veth pair of slot `n`, its job's end in the namespace `netns` (a file
     /// descriptor) and named `eth0` there, its host's end on the bridge, isolated
     /// (`IFLA_BRPORT_ISOLATED`: the bridge forwards nothing between two isolated ports, so one
-    /// job cannot reach another's address), and up. The job's end has the MAC `mac`; with
+    /// job cannot reach another's address), and down. The job's end has the MAC `mac`; the port is left down (`upPort`); with
     /// `fdb_guard` the port learns no source addresses (`IFLA_BRPORT_LEARNING` off, so a job's
     /// frames cannot add entries to the bridge's table or move another job's), floods no unknown
     /// unicast (`IFLA_BRPORT_UNICAST_FLOOD` off: nothing is unknown, the one address behind the
@@ -436,7 +456,12 @@ pub const Socket = struct {
             fdb.attrBytes(nda_lladdr, &mac);
             try expect(s.request(&fdb), false);
         }
-        try s.up(i);
+    }
+
+    /// Brings slot `n`'s host-side port up (`addVeth` leaves it down, for what must be in place first).
+    pub fn upPort(s: *Socket, slot: u32) !void {
+        var buf: [16]u8 = undefined;
+        try s.up(s.index(hostLink(&buf, slot)) orelse return error.NoVeth);
     }
 
     /// Removes slot `n`'s veth pair (both ends go with the host's); none there is no error.
