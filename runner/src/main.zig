@@ -26,6 +26,7 @@ const net_hooks = @import("github/net_hooks.zig");
 const request_log = @import("github/request_log.zig");
 const zig_release = @import("zig_release.zig");
 const broker = @import("github/broker.zig");
+const results = @import("github/results.zig");
 const jitconfig = @import("github/jitconfig.zig");
 const gitea_poller = @import("gitea/poller.zig");
 const app = @import("github/app.zig");
@@ -485,14 +486,18 @@ fn startApp(
     };
     var status: std.http.Status = .ok;
     var message: []const u8 = "";
-    _ = a.token(arena, io, &status, &message) catch |e| {
+    _ = firstToken(&a, arena, io, &status, &message, &app_start_delays_ms) catch |e| {
         try logfmt.line(err, .err, "github_app", "app={f} err={t} http={d} message={f}", .{
             logfmt.q(settings.id), e, @backingInt(status), logfmt.q(message),
         });
         try logfmt.line(err, .err, "github_app_hint", "hint={f}", .{logfmt.q(
-            "The App must be installed on GH_SCOPE with \"Administration: read " ++
-                "and write\" (a repository) or \"Self-hosted runners: read and write\" (an " ++
-                "organization).",
+            if (appTransient(e, status))
+                "GitHub could not be reached, or did not answer, through every retry: " ++
+                    "check the machine's DNS and network; the App's settings were not tried."
+            else
+                "The App must be installed on GH_SCOPE with \"Administration: read " ++
+                    "and write\" (a repository) or \"Self-hosted runners: read and write\" (an " ++
+                    "organization).",
         )});
         return error.AppRejected;
     };
@@ -502,6 +507,83 @@ fn startApp(
         .{ settings.id, a.installation_id.? },
     ));
     return a;
+}
+
+/// The waits between tries of the first App token: 31 s in all. A resolver or network that is
+/// back within that does not stop the runner at its start (a hosted VM's one lookup of
+/// api.github.com failed, 2026-11-19, and the runner exited before its first job).
+const app_start_delays_ms = [_]u32{ 1000, 2000, 4000, 8000, 16000 };
+
+/// Whether the App's token may come on another try: the name server, the connection, or GitHub
+/// answering 5xx or 429. A refusal (4xx) or a bad key is said at once.
+fn appTransient(e: anyerror, status: std.http.Status) bool {
+    if (e == error.AppRejected) return results.transientStatus(status);
+    return results.transientError(e);
+}
+
+/// `auth.token`, tried again after each of `delays_ms` while it fails transiently and no stop
+/// signal came; each retry is a `github_app_retry` warning.
+fn firstToken(
+    auth: anytype,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    status: *std.http.Status,
+    message: *[]const u8,
+    delays_ms: []const u32,
+) ![]const u8 {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        status.* = .ok;
+        message.* = "";
+        if (auth.token(arena, io, status, message)) |t| return t else |e| {
+            if (!appTransient(e, status.*) or attempt == delays_ms.len or loop.stopRequested())
+                return e;
+            logfmt.warn("github_app_retry", "err={t} http={d} try={d} retry_ms={d}", .{
+                e, @backingInt(status.*), attempt + 1, delays_ms[attempt],
+            });
+            io.sleep(.fromMilliseconds(delays_ms[attempt]), .awake) catch return e;
+        }
+    }
+}
+
+test "the first App token is tried again on a network failure, not on a refusal" {
+    const Stub = struct {
+        calls: u32 = 0,
+        fail_first: u32,
+        fail_with: anyerror,
+        fail_status: std.http.Status = .ok,
+        fn token(s: *@This(), _: std.mem.Allocator, _: std.Io, st: *std.http.Status, _: *[]const u8) ![]const u8 {
+            s.calls += 1;
+            if (s.calls > s.fail_first) return "tok";
+            st.* = s.fail_status;
+            return s.fail_with;
+        }
+    };
+    const arena = std.testing.allocator;
+    const io = std.testing.io;
+    const delays = [_]u32{ 0, 0, 0 };
+    var status: std.http.Status = .ok;
+    var message: []const u8 = "";
+
+    // A lookup that fails twice, then passes: the runner starts.
+    var dns: Stub = .{ .fail_first = 2, .fail_with = error.DnsFailed };
+    try std.testing.expectEqualStrings("tok", try firstToken(&dns, arena, io, &status, &message, &delays));
+    try std.testing.expectEqual(@as(u32, 3), dns.calls);
+
+    // GitHub busy (503) past every retry: one try and one per delay, then the error.
+    var busy: Stub = .{ .fail_first = 100, .fail_with = error.AppRejected, .fail_status = .service_unavailable };
+    try std.testing.expectError(error.AppRejected, firstToken(&busy, arena, io, &status, &message, &delays));
+    try std.testing.expectEqual(@as(u32, 4), busy.calls);
+    try std.testing.expect(appTransient(error.AppRejected, status));
+
+    // Not installed (404): said at once, and the installation hint is the one given.
+    var refused: Stub = .{ .fail_first = 100, .fail_with = error.AppRejected, .fail_status = .not_found };
+    try std.testing.expectError(error.AppRejected, firstToken(&refused, arena, io, &status, &message, &delays));
+    try std.testing.expectEqual(@as(u32, 1), refused.calls);
+    try std.testing.expect(!appTransient(error.AppRejected, status));
+
+    // A bad key is not the network's.
+    try std.testing.expect(!appTransient(error.BadKey, .ok));
 }
 
 /// The runners, until a stop signal: `cfg.runners` of them in one process (see `loop.pool`).

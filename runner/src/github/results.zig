@@ -255,7 +255,7 @@ fn delayWithinBudget(io: std.Io, retry: Retry, attempt: usize, asked_ms: i64, el
 
 /// Whether a request that failed with `err` may pass when made again: the name server, the
 /// connection or the time it took, not the request (a log that changed while it went up).
-fn transientError(err: anyerror) bool {
+pub fn transientError(err: anyerror) bool {
     return switch (err) {
         error.NameServerFailure,
         error.TemporaryNameServerFailure,
@@ -282,7 +282,7 @@ fn transientError(err: anyerror) bool {
 }
 
 /// 5xx and 429 pass with time; any other status is the request's own fault.
-fn transientStatus(status: std.http.Status) bool {
+pub fn transientStatus(status: std.http.Status) bool {
     return status.class() == .server_error or status == .too_many_requests;
 }
 
