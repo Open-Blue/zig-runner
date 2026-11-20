@@ -55,8 +55,10 @@ pub const Request = struct {
 };
 
 /// What `Config.image_tag_max_stale_secs` sets, at the runner's start (a job's pull has no config
-/// of its own): the fallback's limit for a `Request` that does not carry one.
-pub var tag_max_stale_s: u32 = default_tag_max_stale_s;
+/// of its own): the fallback's limit for a `Request` that does not carry one. Atomic: every native
+/// job's `Backend.initWhy` stores it, and jobs start at once (a plain `u32` was a data race under
+/// ThreadSanitizer, arm64 native run 44826754900, 2026-11-20), the same value each time.
+pub var tag_max_stale_s: std.atomic.Value(u32) = .init(default_tag_max_stale_s);
 
 /// A registry that cannot answer is covered by the last known digest for a day: long enough for an
 /// outage or a weekend of a registry's rate limit to pass over a runner's cached images, short enough
@@ -139,7 +141,7 @@ pub fn pull(
     // The last known digest's image, if the store still has it and the record was confirmed not
     // longer ago than `tag_max_stale_s`: what a registry that cannot answer is replaced by, and then
     // its "slow down" is not waited out.
-    const max_stale = req.tag_max_stale_s orelse tag_max_stale_s;
+    const max_stale = req.tag_max_stale_s orelse tag_max_stale_s.load(.monotonic);
     const age_s: i64 = if (known_tag) |k| std.Io.Clock.real.now(io).toSeconds() - k.at else 0;
     const covered = max_stale > 0 and age_s >= 0 and age_s <= max_stale;
     var fallback: ?Image = if (known_tag != null and covered) try fromKnown(arena, io, store, known_tag.?.top, known_tag.?.manifest, req.owners) else null;
