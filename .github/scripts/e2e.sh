@@ -61,6 +61,8 @@ engine_name=zig-runner-e2e-engine
 # The engine's socket, on the host: the runner reaches it as compose's runner does, with no Docker.
 engine_dir=/run/zig-runner-e2e
 rootfs=/var/lib/zig-runner-e2e/rootfs
+# The container make_rootfs provisions in; wait_rootfs looks into it for its status lines.
+rootfs_container=zig-runner-e2e-rootfs
 
 usage() {
 	sed -n 's/^#   \(e2e\.sh .*\)/\1/p' "$0" >&2
@@ -125,16 +127,19 @@ make_rootfs() {
 	image=$(tr -d '\n' <runner/src/dagger.zig |
 		grep -oE '"ubuntu:[A-Za-z0-9._-]+" *\+\+ *"@sha256:[a-f0-9]{64}"' | tr -d '" +')
 	script=$("$bin" --provision-script)
-	# With Ubuntu's archive down, the container's sources point at a mirror first (apt.sh, which
-	# prints nothing while the archive answers); the runner's script is otherwise the one it ships.
+	echo "rootfs: building from $image for $(dpkg --print-architecture), with the runner's provision script (apt-get, quiet: its progress is the waiting job's status lines)"
+	# With Ubuntu's archive down, the container's sources point at a mirror first (apt.sh, which says
+	# on stderr, here in rootfs.log, what it probed and chose); the runner's script is otherwise the
+	# one it ships.
 	prefix=$(.github/scripts/apt.sh mirror-prefix "$(dpkg --print-architecture)" noble)
 	if [[ -n $prefix ]]; then
 		script="$prefix$script$(.github/scripts/apt.sh mirror-suffix)"
 	fi
 	sudo rm -rf "$rootfs" "$rootfs.ok" "$rootfs.failed"
 	sudo mkdir -p "$rootfs"
-	if docker run --name zig-runner-e2e-rootfs "$image" sh -c "$script" &&
-		docker export zig-runner-e2e-rootfs | sudo tar -x -C "$rootfs"; then
+	echo "rootfs: provisioning in container $rootfs_container"
+	if docker run --name "$rootfs_container" "$image" sh -c "$script" &&
+		docker export "$rootfs_container" | sudo tar -x -C "$rootfs"; then
 		# The provisioning stamp, as the recipe makes it (docs/native-backend.md, "The rootfs").
 		sudo touch "$rootfs/.zig-runner-provisioned" "$rootfs.ok"
 		echo "rootfs: $image, provisioned, in $rootfs"
@@ -142,16 +147,38 @@ make_rootfs() {
 		sudo touch "$rootfs.failed"
 		echo "rootfs: provisioning $image failed" >&2
 	fi
-	docker rm zig-runner-e2e-rootfs >/dev/null || true
+	docker rm "$rootfs_container" >/dev/null || true
+}
+
+# rootfs_status: one line on where the rootfs build is, for the job's log: the container's state, how
+# much apt has fetched (its index lists, and its package archives with the partial downloads), its
+# apt and dpkg processes with how long each has run, and how Ubuntu's archive answers the runner now.
+# The provision script is quiet (apt-get -qq), so these are what tell a slow archive from a hang.
+rootfs_status() {
+	local state fetched="" procs=""
+	state=$(docker inspect -f '{{.State.Status}}' "$rootfs_container" 2>/dev/null) || state="not made yet"
+	if [[ $state == running ]]; then
+		fetched=$(docker exec "$rootfs_container" sh -c 'du -sk /var/lib/apt/lists /var/cache/apt/archives/partial /var/cache/apt/archives 2>/dev/null' |
+			awk '{ printf "%s%s %d KiB", sep, $2, $1; sep = ", " }')
+		# `docker top` needs the pid column; it is dropped, and so is the `sh -c` around the whole
+		# provision script (its arguments are the script).
+		procs=$(docker top "$rootfs_container" -eo pid,etime,args 2>/dev/null |
+			awk 'NR > 1 { $1 = ""; sub(/^ +/, "") } NR > 1 && !/^[0-9:-]+ sh -c/ && /apt|dpkg|http/ {
+				gsub(/ +/, " "); printf "%s[%s]", sep, substr($0, 1, 100); sep = " " }')
+	fi
+	echo "container $state; fetched: ${fetched:-nothing yet}; running: ${procs:-no apt or dpkg}; archive now: $(.github/scripts/apt.sh probe "$(dpkg --print-architecture)" noble)"
 }
 
 # wait_rootfs: until `e2e.sh rootfs` has left $rootfs.ok, or $rootfs.failed, at most $timeout s (the
 # suite's own limit). The build runs apt against Ubuntu's archive, so how long it takes depends on
 # the network: it is waited for as long as its process (the pid in $out/rootfs.pid) is alive, and
-# one that exited without a marker is reported at once. Prints the build's last line every minute.
+# one that exited without a marker is reported at once. Every minute it prints the build's last log
+# line and its status (rootfs_status); a timeout says the last status. Time is the clock's, not the
+# loop's: the status's archive probe can take up to 30 s.
 wait_rootfs() {
-	local deadline=$((SECONDS + timeout)) pid="" waited=0
+	local start=$SECONDS deadline=$((SECONDS + timeout)) pid="" waited=0 next=60 status="none taken yet"
 	while ((SECONDS < deadline)); do
+		waited=$((SECONDS - start))
 		sudo test -e "$rootfs.ok" -o -e "$rootfs.failed" && break
 		[[ -z $pid && -e $out/rootfs.pid ]] && pid=$(<"$out/rootfs.pid")
 		# Not started yet: the step that starts it runs well before this one, so 30 s is plenty.
@@ -165,14 +192,17 @@ wait_rootfs() {
 			tail -n 5 "$out/rootfs.log" >&2 2>/dev/null || true
 			exit 1
 		fi
-		if ((waited > 0 && waited % 60 == 0)); then
+		if ((waited >= next)); then
+			status=$(rootfs_status)
 			echo "waiting for the native rootfs, ${waited} s so far; rootfs.log: $(tail -n 1 "$out/rootfs.log" 2>/dev/null)"
+			echo "  rootfs build at ${waited} s: $status"
+			next=$((next + 60))
 		fi
 		sleep 1
-		waited=$((waited + 1))
 	done
+	waited=$((SECONDS - start))
 	sudo test -e "$rootfs.ok" ||
-		{ echo "no native rootfs (e2e.sh rootfs): ${waited} s, and the build $(sudo test -e "$rootfs.failed" && echo failed || echo is still running)" >&2 && exit 1; }
+		{ echo "no native rootfs (e2e.sh rootfs): ${waited} s, and the build $(sudo test -e "$rootfs.failed" && echo failed || echo "is still running: $(rootfs_status)"); the last status before: $status" >&2 && exit 1; }
 }
 
 start() {
