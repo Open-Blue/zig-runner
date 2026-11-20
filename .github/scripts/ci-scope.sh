@@ -10,6 +10,7 @@
 #   ci-scope.sh go           Workflows' Go tools steps (ci.yml)
 #   ci-scope.sh apt          Workflows' apt mirror fallback step (ci.yml)
 #   ci-scope.sh soak         Workflows' memory soak selftest step (ci.yml)
+#   ci-scope.sh workflows    Workflows' checks that read the repository at large (ci.yml)
 #   ci-scope.sh analysis     Fuzz, Valgrind, Stress, ZLint (suppressed-errors) (analysis.yml)
 #   ci-scope.sh tsan         ThreadSanitizer, native; ThreadSanitizer, end to end (analysis.yml)
 #   ci-scope.sh store        Store stress, Store crash (analysis.yml)
@@ -154,6 +155,15 @@ needed() {
 		*) return 1 ;;
 		esac
 		;;
+	workflows)
+		# Everything but prose: the workflow job's checks read the workflows, scripts, deployment,
+		# Dockerfile, change entries (.changes/) and the runner's pins and vendored code, and a
+		# change entry is on every pull request.
+		case $1 in
+		*.md | docs/* | LICENSE) return 1 ;;
+		*) return 0 ;;
+		esac
+		;;
 	analysis)
 		# Only the searches themselves, on a pull request: a change to the runner's code is the
 		# nightly run's to search, not every pull request's (each costs minutes per target).
@@ -250,10 +260,10 @@ needed() {
 }
 
 case $scope in
-tests | binaries | e2e | proofs | packaging | go | apt | soak | analysis | tsan | store | coverage | \
+tests | binaries | e2e | proofs | packaging | go | apt | soak | workflows | analysis | tsan | store | coverage | \
 	codeql-actions | codeql-go | codeql-python) ;;
 *)
-	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|apt|soak|analysis|tsan|store|coverage|codeql-actions|codeql-go|codeql-python" >&2
+	echo "usage: ci-scope.sh tests|binaries|e2e|proofs|packaging|go|apt|soak|workflows|analysis|tsan|store|coverage|codeql-actions|codeql-go|codeql-python" >&2
 	exit 2
 	;;
 esac
