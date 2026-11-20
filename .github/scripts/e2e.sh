@@ -556,7 +556,12 @@ check() {
 		fail "e2e-cancel: its Hog step never started, within $timeout s or the suite's ${E2E_SUITE_LIMIT:-1800} s"
 		stuck_run "$cancel"
 	fi
-	api -X POST "repos/$repo/actions/runs/$cancel/cancel" >/dev/null
+	# gh's answer to the cancel is said, not trusted: GitHub accepts it with a 202 whose body has come
+	# back empty, which gh calls a failure ("unexpected end of JSON input", 2026-11-20) though the run
+	# was cancelled, and under set -e the suite then ended with no reason given. Whether the cancel
+	# took is checked below: the run's conclusion must be cancelled, and its steps' outcomes.
+	api -X POST "repos/$repo/actions/runs/$cancel/cancel" >/dev/null ||
+		echo "e2e-cancel: gh said the cancel request failed (above); the run's conclusion decides"
 
 	# A run that does not finish is a hang, not a failed check: say where it is, and stop, so that the
 	# step ends here with the runner's log, not at its limit.
