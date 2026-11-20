@@ -249,6 +249,13 @@ pub const Heap = struct {
     }
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
+        // ThreadSanitizer does not intercept `mremap`, which the page allocator uses to grow a large
+        // allocation (libc `mremap`, MAYMOVE). A move leaves the old range's shadow behind, and a
+        // later grow that lands in it writes over another thread's stale accesses: reported as a
+        // race in `SafeAllocator`'s footer writes, ordered by the kernel in fact. Refusing makes
+        // the caller allocate, copy and free, through the intercepted mmap and munmap, which reset
+        // the shadow. Only a sanitized build changes. See the test below.
+        if (builtin.sanitize_thread) return null;
         const h = of(ctx);
         const p = h.child.rawRemap(memory, alignment, new_len, ret) orelse return null;
         h.moved(memory.len, new_len);
@@ -317,4 +324,29 @@ test "the process's stats read, a child left unwaited counts as a zombie, and a 
     w = .fixed(&buf);
     try w.print("{f}", .{Stats{ .rss_kb = 64 * 1024, .heap_bytes = 41 * 1024 * 1024 + 3072, .heap_blocks = 7, .rust_bytes = 4096 }});
     try std.testing.expectEqualStrings("rss=64M anon=? thr=? fds=? mounts=? zombies=? heap=41987K/7 rust=4K", w.buffered());
+}
+
+test "growing large buffers on several threads through the heap wrapper does not trip ThreadSanitizer" {
+    // The pattern of the engine's log readers (`Sse.take`): each thread grows its own buffer to a few
+    // MB, which the page allocator does with `mremap`. Under `-Dsanitize-thread` and without the
+    // refusal in `Heap.remap`, this reports a race in `SafeAllocator.AllocFooter.populate`
+    // (intermittent: 17 to 22 reports in 4 of 4 runs of the standalone program).
+    var safe: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    defer _ = safe.deinit();
+    var h: Heap = .{};
+    const a = h.allocator(safe.allocator());
+    const Grow = struct {
+        fn run(alloc: std.mem.Allocator) void {
+            var chunk: [40000]u8 = @splat(7);
+            for (0..100) |_| {
+                var l: std.ArrayList(u8) = .empty;
+                for (0..40) |_| l.appendSlice(alloc, &chunk) catch return;
+                l.deinit(alloc);
+            }
+        }
+    };
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Grow.run, .{a});
+    for (threads) |t| t.join();
+    try std.testing.expectEqual(@as(u64, 0), h.bytes.load(.monotonic));
 }
