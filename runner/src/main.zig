@@ -276,6 +276,8 @@ pub fn main(process_init: std.process.Init) !u8 {
         .write_buffer_size = http.write_buffer_size,
     };
     defer client.deinit();
+    // On the main thread, before any runner starts (http.preloadCa says why).
+    _ = http.preloadCa(&client);
     http.shared.store(&client, .release);
     // Before `client`'s, as defers run: the clients `renew` made in its place.
     defer http.deinitShared(io);

@@ -35,6 +35,24 @@ var renewed_at_s: std.atomic.Value(i64) = .init(0);
 /// old one is kept (`retire`) while it may be in use: a job's live feed holds one of its
 /// connections for as long as the job runs. So one every `renew_every_s` at most: `staleClock`
 /// cannot tell a stale clock from a TLS failure with another cause.
+/// Loads `client`'s CA bundle and sets its TLS clock (`now`) before the client is shared. std's
+/// client does it on its first HTTPS request, writing `now` under `ca_bundle_lock`, while
+/// `Connection.Tls.create` reads `now` without that lock (Zig 0.17, std/http/Client.zig:1724 and
+/// :352): runners whose first live-feed connects run at once raced on it (ThreadSanitizer, the
+/// e2e suite, 2026-11-20). Loaded here, `now` is set before any other thread can see the client,
+/// and std writes it no more (it rescans only while `now` is null). A failed load leaves the
+/// client as std makes it, to load on its first request, says so, and returns false. A machine
+/// with no certificates loads an empty bundle, as std's first request would.
+pub fn preloadCa(c: *std.http.Client) bool {
+    const now = std.Io.Clock.real.now(c.io);
+    c.ca_bundle.rescan(c.allocator, c.io, now) catch |e| {
+        logfmt.warn("ca_bundle_preload_failed", "err={t}", .{e});
+        return false;
+    };
+    c.now = now;
+    return true;
+}
+
 pub fn renew(stale: *std.http.Client) void {
     const now = std.Io.Clock.real.now(stale.io).toSeconds();
     const last = renewed_at_s.load(.acquire);
@@ -43,7 +61,12 @@ pub fn renew(stale: *std.http.Client) void {
     const gpa = stale.allocator;
     const fresh = gpa.create(std.http.Client) catch return;
     fresh.* = .{ .allocator = gpa, .io = stale.io, .write_buffer_size = stale.write_buffer_size };
-    if (shared.cmpxchgStrong(stale, fresh, .acq_rel, .acquire) != null) return gpa.destroy(fresh);
+    // Before it is shared: the runners' next requests use it at once (`preloadCa`).
+    _ = preloadCa(fresh);
+    if (shared.cmpxchgStrong(stale, fresh, .acq_rel, .acquire) != null) {
+        fresh.deinit();
+        return gpa.destroy(fresh);
+    }
     const stale_owned = shared_owned.swap(true, .acq_rel);
     // Its idle connections close now, and the ones in use as they finish.
     stale.connection_pool.resize(stale.io, 0) catch |e|
@@ -352,7 +375,10 @@ test "renew replaces the shared client once, however many saw it go stale" {
     defer gpa.destroy(second);
     defer second.deinit();
     try std.testing.expect(second != &first);
-    try std.testing.expect(second.now == null); // takes the time again on its first request
+    // Takes the time again, as it is made (preloadCa), not on its first request: then no runner's
+    // first request through it writes the clock while another reads it.
+    try std.testing.expect(second.now != null);
+    try std.testing.expect(first.now == null);
     // A second runner that saw the same stale client finds it already replaced.
     renew(&first);
     try std.testing.expectEqual(second, shared.load(.acquire).?);
@@ -446,4 +472,13 @@ test "a request can get past every idle connection the pool keeps" {
     // 16 runners, each leaving a connection behind: more than the 8 tries there used to be.
     try std.testing.expect(staleRetries(&c) > 16);
     try std.testing.expectEqual(@as(u32, 33), staleRetries(null));
+}
+
+test "preloadCa sets the client's TLS clock and its CA bundle before the client is shared" {
+    var c: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer c.deinit();
+    try std.testing.expect(c.now == null);
+    // Loaded (even an empty bundle, on a machine with no certificates): the clock is set, so std's
+    // first HTTPS request finds `now` set and writes it no more. Not loaded: left as std makes it.
+    if (preloadCa(&c)) try std.testing.expect(c.now != null) else try std.testing.expect(c.now == null);
 }
