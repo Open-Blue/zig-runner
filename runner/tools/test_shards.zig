@@ -370,6 +370,37 @@ test "every test is in exactly one part, the heavy ones shared by weight" {
     try std.testing.expect(@max(weight[0], weight[1]) - @min(weight[0], weight[1]) < 20);
 }
 
+test "every test is in exactly one part when the heavy table is stale or names repeat" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var names: std.ArrayList([]const u8) = .empty;
+    // Only every third heavy test still exists: the table's other entries match nothing.
+    for (heavy, 0..) |h, i| {
+        if (i % 3 != 0) continue;
+        const name = try std.fmt.allocPrint(arena, "native.X.test.{s}", .{h[1]});
+        try names.append(arena, name);
+        // The same name twice (two modules with a test of one name), and a longer name that ends
+        // with a heavy entry's text, so it matches that entry too.
+        if (i % 2 == 0) try names.append(arena, name);
+        try names.append(arena, try std.fmt.allocPrint(arena, "native.Z.test.also {s}", .{h[1]}));
+    }
+    for (0..20) |i| {
+        const small = try std.fmt.allocPrint(arena, "native.Y.test.small {d}", .{i});
+        try names.append(arena, small);
+        if (i % 4 == 0) try names.append(arena, small);
+    }
+    for ([_]usize{ 1, 2, 3 }) |of| {
+        const counts = try arena.alloc(u8, names.items.len);
+        @memset(counts, 0);
+        for (0..of) |k| {
+            const in = try inPart(arena, names.items, .{ .index = k, .of = of });
+            for (in, counts) |x, *c| c.* += @intFromBool(x);
+        }
+        for (counts) |c| try std.testing.expectEqual(@as(u8, 1), c);
+    }
+}
+
 /// The tests that took longest, up to `slowest_shown` of those past `slowest_min_ns`: what holds
 /// a run, or a part of one (ZIG_TEST_PART), back.
 fn printSlowest(arena: std.mem.Allocator, run: *const Run) void {
