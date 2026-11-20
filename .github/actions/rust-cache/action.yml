@@ -1,0 +1,103 @@
+name: Rust build cache
+description: >-
+  The Rust toolchains unpacked by install-rust*.sh into the tool cache (checked against a pinned digest on every use) and the target directory of runner/rust, cached
+  between CI runs on GitHub-hosted runners, each under a key of everything that makes its content
+  (docs/rust-net.md, "The build cache"). Only for the CI jobs that build to test: the release
+  builds (release.yml, candidate.yml) never use it. A miss builds as before.
+inputs:
+  name:
+    description: The job's own name, part of the target directory's key (each job builds its own set of variants).
+    required: true
+  tools:
+    description: >-
+      Which jobs share a toolchain entry (the entry holds what the job's scripts unpacked, so jobs that
+      use the same Rust share one of about 500 MB and not one each): `nightly` for the job that also builds under ThreadSanitizer, `stable` for the rest.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # The keys, once, here: the cache actions below read them from this step's outputs.
+    - id: keys
+      shell: bash
+      env:
+        TOOLS_KEY: rust-tools-v2-${{ runner.os }}-${{ runner.arch }}-@IMAGE@-${{ inputs.tools }}-${{ hashFiles('.github/actions/rust-cache/action.yml', '.github/scripts/install-rust.sh', '.github/scripts/install-rust-nightly.sh', 'runner/rust/rust-toolchain.toml') }}
+        TARGET_KEY: rust-target-v2-${{ runner.os }}-${{ runner.arch }}-@IMAGE@-${{ inputs.name }}-${{ hashFiles('.github/actions/rust-cache/action.yml', 'runner/rust/**', '!runner/rust/target/**', '.github/scripts/build-zr-net.sh', '.github/scripts/cargo-test.sh', '.github/scripts/zig-cc.sh', '.github/scripts/install-rust.sh', '.github/scripts/install-rust-nightly.sh', '.github/scripts/install-zig.sh') }}
+      run: |
+        # What the build reads from the runner image is in both keys, not the image's version
+        # (hosted images roll out over days and several are in use at once): cargo does not
+        # fingerprint the system's compiler, linker and libc, which the host build scripts and the
+        # gnu and ThreadSanitizer test links use (the target's own C is Zig's: zig-cc.sh, whose
+        # version install-zig.sh pins and the keys hash). The OS name stays in the key as it is.
+        tool_version() { "$@" 2>&1 | head -n1 || true; }
+        inputs=$(
+          printf 'cc: %s\n' "$(tool_version cc --version)"
+          printf 'ld: %s\n' "$(tool_version ld --version)"
+          printf 'ar: %s\n' "$(tool_version ar --version)"
+          printf 'ldd: %s\n' "$(tool_version ldd --version)"
+        )
+        hash=$(sha256sum <<<"$inputs" | cut -c1-16)
+        image="${ImageOS:-unknown-os}-$hash"
+        echo "rust-cache: runner image ${ImageOS:-unset} ${ImageVersion:-unset} (not in the keys), in the keys as $image from:"
+        sed 's/^/rust-cache:   /' <<<"$inputs"
+        echo "tools=${TOOLS_KEY//@IMAGE@/$image}" >>"$GITHUB_OUTPUT"
+        echo "target=${TARGET_KEY//@IMAGE@/$image}" >>"$GITHUB_OUTPUT"
+
+    # The toolchains the scripts unpack into the tool cache (install-rust.sh, install-rust-nightly.sh;
+    # which of them a job uses depends on the runner image's own default Rust).
+    # rustup's own ~/.rustup is not cached: nothing re-checks what is restored there. The install scripts check the unpacked tree in the tool cache against a pinned
+    # digest before they use it, so a restored tree that is not what they installed is replaced,
+    # never used. The key
+    # covers the scripts that name the versions and the checksums.
+    - id: tools
+      if: github.event_name != 'merge_group'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ runner.tool_cache }}/rust
+          ${{ runner.tool_cache }}/rust-nightly
+        key: ${{ steps.keys.outputs.tools }}
+    # A merge group's ref could not be read by anything else: it restores, never saves.
+    - id: tools-ro
+      if: github.event_name == 'merge_group'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ runner.tool_cache }}/rust
+          ${{ runner.tool_cache }}/rust-nightly
+        key: ${{ steps.keys.outputs.tools }}
+
+    # The build outputs: runner/rust/target, where build-zr-net.sh and cargo-test.sh build every
+    # variant (musl, gnu, tsan and its tests). Exact key only, no restore-keys: a target directory
+    # restored from older inputs would keep growing with each save, and cargo would rebuild
+    # what changed anyway. The key is everything that can change a built file: the Rust sources
+    # and lock file, the toolchain pin, the scripts that build (and the C compiler wrapper and the
+    # Zig it runs), the runner and the job.
+    - id: target
+      if: github.event_name != 'merge_group'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: runner/rust/target
+        key: ${{ steps.keys.outputs.target }}
+    - id: target-ro
+      if: github.event_name == 'merge_group'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: runner/rust/target
+        key: ${{ steps.keys.outputs.target }}
+
+    # The decisive facts, in the log and in ZR_RUST_CACHE, which build-zr-net.sh and cargo-test.sh
+    # print before they build: what was restored, under which key, how big.
+    - shell: bash
+      env:
+        TOOLS_HIT: ${{ steps.tools.outputs.cache-hit || steps.tools-ro.outputs.cache-hit }}
+        TOOLS_KEY: ${{ steps.keys.outputs.tools }}
+        TARGET_HIT: ${{ steps.target.outputs.cache-hit || steps.target-ro.outputs.cache-hit }}
+        TARGET_KEY: ${{ steps.keys.outputs.target }}
+      run: |
+        # An exact hit gives "true"; a miss, "false" or nothing.
+        say() { [[ $1 == true ]] && echo hit || echo miss; }
+        tools=$(say "$TOOLS_HIT") target=$(say "$TARGET_HIT")
+        echo "rust-cache: toolchains $tools, key $TOOLS_KEY"
+        echo "rust-cache: target dir $target, key $TARGET_KEY, $(du -sh runner/rust/target 2>/dev/null | cut -f1) restored"
+        echo "ZR_RUST_CACHE=toolchains $tools ($TOOLS_KEY); target dir $target ($TARGET_KEY)" >>"$GITHUB_ENV"
