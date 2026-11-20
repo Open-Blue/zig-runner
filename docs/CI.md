@@ -35,7 +35,9 @@ In ci.yml the first job, "Scope", decides every scope once (its log names the ba
 files and the file that decided each scope), and a job whose scopes are all false is skipped before
 it takes a hosted runner (`needs: scope` and an `if:`): a skipped job reports as skipped, which
 counts as passed for a required check. Hosted runners are the queue, so a documentation-only change
-takes the Scope job (and the Workflows job, for its change entry) instead of eleven runners. A job
+takes the Scope job (and the Workflows job, for its change entry) and the four Native tests as root
+(a matrix job skipped by its `if:` reports under its unexpanded name, which would leave the required
+ones with their parts unreported, so those skip their steps) instead of eleven runners. A job
 that does run keeps its step-level gates, and a push to main skips Scope and runs every job.
 
 In the merge queue, `ci` reuses a pull request's pass of the same tree on the same base
