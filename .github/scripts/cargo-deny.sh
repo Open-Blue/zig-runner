@@ -26,4 +26,14 @@ echo "$sum  $dir/cargo-deny.tar.gz" | sha256sum --check --quiet --status || {
 }
 tar -xzf "$dir/cargo-deny.tar.gz" -C "$dir" --strip-components=1 "cargo-deny-$version-$arch-unknown-linux-musl/cargo-deny"
 cd "$(dirname "$0")/../../runner/rust/zr-net"
+# cargo-deny reads the dependency graph through `cargo metadata`, which any cargo answers the same
+# way for this lock file. In runner/rust, rust-toolchain.toml would have rustup install the pinned
+# toolchain and its two musl targets first, for nothing here. So the runner's default toolchain is
+# used, and named in the log.
+if command -v rustup >/dev/null && default=$(rustup default 2>/dev/null) && [[ -n $default ]]; then
+	export RUSTUP_TOOLCHAIN=${default%% *}
+	echo "cargo-deny.sh: cargo metadata under the runner's default toolchain $RUSTUP_TOOLCHAIN ($(cargo --version)), not rust-toolchain.toml's"
+else
+	echo "cargo-deny.sh: no rustup default; cargo metadata under $(cargo --version 2>&1)"
+fi
 "$dir/cargo-deny" --manifest-path Cargo.toml --config ../deny.toml check
