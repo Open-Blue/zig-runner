@@ -317,7 +317,8 @@ pub const Socket = struct {
         const i = s.index(bridge) orelse return error.NoBridge;
         // Frames to 01:80:c2:00:00:0X are handled before the bridge's netfilter hooks (the jobs'
         // pins are on them) and learned from like any other, unless the bridge is told not to
-        // (#616): a bridge a runner of an earlier version made is set here too.
+        // (#616): a bridge a runner of an earlier version made is set here too. A kernel that cannot
+        // is logged, not fatal.
         var opt: Message = .init(.RTM_NEWLINK, 0);
         opt.ifinfo(i, 0);
         const info = opt.begin(ifla_linkinfo);
@@ -326,7 +327,13 @@ pub const Socket = struct {
         opt.attrBytes(ifla_br_multi_boolopt, std.mem.asBytes(&BoolOpt{ .optval = 1 << br_boolopt_no_ll_learn, .optmask = 1 << br_boolopt_no_ll_learn }));
         opt.end(data);
         opt.end(info);
-        try expect(s.request(&opt), false);
+        // Best-effort: the port's own settings already stop learning from link-local frames, this
+        // is the second layer, and an older kernel (before 5.12) has no such option.
+        const set = s.request(&opt);
+        if (set != .SUCCESS) {
+            if (!optionUnsupported(set)) return error.Netlink;
+            logfmt.warn("bridge_no_linklocal_learn_unsupported", "bridge=" ++ bridge ++ " err={t}", .{set});
+        }
         if (ready) return;
         try s.addAddress(i, subnet.gateway(), subnet.prefix);
         try s.up(i);
@@ -541,6 +548,21 @@ const RtMsg = extern struct {
     type: u8 = 1,
     flags: u32 = 0,
 };
+
+/// Whether the kernel's answer to setting the bridge's `no_linklocal_learn` says it has no such
+/// option (one before 5.12 answers `EOPNOTSUPP` or `EINVAL`), which `ensureBridge` carries on past:
+/// any other answer fails the job's network.
+fn optionUnsupported(e: linux.E) bool {
+    return e == .OPNOTSUPP or e == .INVAL;
+}
+
+test "an older kernel's answer to the bridge option is carried on past, any other is not" {
+    try std.testing.expect(optionUnsupported(.OPNOTSUPP));
+    try std.testing.expect(optionUnsupported(.INVAL));
+    try std.testing.expect(!optionUnsupported(.PERM));
+    try std.testing.expect(!optionUnsupported(.NODEV));
+    try std.testing.expect(!optionUnsupported(.NOMEM));
+}
 
 /// The payload of the attribute reached by nesting `path` (each but the last a nested one) in the
 /// attributes `buf` holds.

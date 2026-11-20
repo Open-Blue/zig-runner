@@ -605,6 +605,10 @@ error: kind=upload_failed job=123 what=job_log name="" detail=NameServerFailure
   for ever. A day rides out an outage or a rate limit's window and a weekend's neglect, and bounds a CVE-fixed tag's life.
   A `HEAD` that confirms the tag also says so in the job's "Set up job" (`Image: from the native store; <tag> is still
   <digest>: the registry confirmed it by a HEAD`). See docs/native-backend.md.
+- Bridge option (#616): `warn: kind=bridge_no_linklocal_learn_unsupported bridge=zr0 err=OPNOTSUPP` (or `INVAL`),
+  once per job network made, when the kernel (before 5.12) cannot set `no_linklocal_learn` on the jobs'
+  bridge. The job's network is made anyway: each job port already learns nothing, which is what stops a
+  job's link-local frames from filling the bridge's table; the option is the second layer.
 - `info` lines (`info(scope): …`) and the lines with formats of their own are not warnings and
   keep them: `health:`, `job-end:`, `step-end:`, `request:`, and the plain `job N: …` progress
   lines. What a job's log shows to the user (GitHub's `##[warning]`, an action's `Warning:`) is
