@@ -16,11 +16,18 @@ if ! command -v bwrap >/dev/null || ! bwrap --ro-bind / / true 2>/dev/null; then
 fi
 scratch=$(mktemp -d)
 trap 'rm -rf "${scratch:?}"' EXIT
-git describe --tags --always --dirty --abbrev=8 >"$scratch/version"
-# shellcheck source=.github/scripts/zig-modules.sh
-. ../.github/scripts/zig-modules.sh
-zig_modules "$scratch" "$scratch/version"
-zig test "${modules[@]}" --test-filter "really full" -femit-bin="$scratch/tests" --test-no-exec
+if [[ -n ${ZIG_PREBUILT_DIR:-} ]]; then
+	# EXPERIMENT: the tests compiled once for the job (zig-test-prebuilt.sh unpack); only this one runs.
+	export ZIG_TEST_NAME_FILTER="really full" ZIG_TEST_SHARDS=1 ZIG_RUNNER_TEST_EXE=$ZIG_PREBUILT_DIR/runner
+	run=("$ZIG_PREBUILT_DIR/test_shards" "$ZIG_PREBUILT_DIR/tests")
+else
+	git describe --tags --always --dirty --abbrev=8 >"$scratch/version"
+	# shellcheck source=.github/scripts/zig-modules.sh
+	. ../.github/scripts/zig-modules.sh
+	zig_modules "$scratch" "$scratch/version"
+	zig test "${modules[@]}" --test-filter "really full" -femit-bin="$scratch/tests" --test-no-exec
+	run=("$scratch/tests")
+fi
 # The tmpfs is a mount of the sandbox; the test's own scratch directory stays on the real disk.
 bwrap --bind / / --dev /dev --proc /proc --size 67108864 --tmpfs /mnt \
-	--setenv ZIG_RUNNER_FULL_DISK /mnt "$scratch/tests"
+	--setenv ZIG_RUNNER_FULL_DISK /mnt "${run[@]}"

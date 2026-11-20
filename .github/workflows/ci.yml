@@ -512,6 +512,94 @@ jobs:
         working-directory: runner
         run: zig build test-tls-oracle -Dtls-oracle
 
+  # EXPERIMENT, do not merge: the tests compiled once per architecture on a pull request, and the
+  # jobs that run them (Tests, Tests (arm64), Native tests as root) unpack the result instead of
+  # each compiling it (zig-test-prebuilt.sh, as the push's `prebuild`). The Database tests job
+  # (ThreadSanitizer, another binary) and the TLS oracle (`zig build`) compile their own.
+  shared-build-x86_64:
+    name: Tests, compiled once (x86_64)
+    needs: scope
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.scope.result != 'success' || needs.scope.outputs.tests == 'true') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+    outputs:
+      sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether this change can affect the tests
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh tests
+
+      - name: Install Zig
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/install-zig.sh
+
+      - name: Compile the tests for x86_64
+        id: build
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          .github/scripts/zig-test-prebuilt.sh build x86_64 "$RUNNER_TEMP/tests.tar" >"$RUNNER_TEMP/sha256"
+          echo "sha256=$(cat "$RUNNER_TEMP/sha256")" >>"$GITHUB_OUTPUT"
+          ls -l "$RUNNER_TEMP/tests.tar"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.scope.outputs.run == 'true'
+        with:
+          name: tests-x86_64
+          path: ${{ runner.temp }}/tests.tar
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 1
+
+  shared-build-arm64:
+    name: Tests, compiled once (arm64)
+    needs: scope
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.scope.result != 'success' || needs.scope.outputs.tests == 'true') }}
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read # to check out the code
+    outputs:
+      sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Whether this change can affect the tests
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh tests
+
+      - name: Install Zig
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/install-zig.sh
+
+      - name: Compile the tests for aarch64
+        id: build
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          .github/scripts/zig-test-prebuilt.sh build aarch64 "$RUNNER_TEMP/tests.tar" >"$RUNNER_TEMP/sha256"
+          echo "sha256=$(cat "$RUNNER_TEMP/sha256")" >>"$GITHUB_OUTPUT"
+          ls -l "$RUNNER_TEMP/tests.tar"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.scope.outputs.run == 'true'
+        with:
+          name: tests-aarch64
+          path: ${{ runner.temp }}/tests.tar
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 1
+
   # The Pi's tests, compiled here: a push to main runs "Tests (x86_64)" on prod, a Raspberry Pi
   # (aarch64, SD card), where compiling the tests and the runner with LLVM took about two minutes
   # and 4.0 GB of the job's 4.5 GB, before the tests' own 41 s. This job, on GitHub's fast runner,
@@ -597,7 +685,7 @@ jobs:
     # After the prebuild, which runs on a push to main when prod is self-hosted and is skipped
     # otherwise: `always` and not the default, so that a skipped prebuild does not skip this job
     # (a skipped required check passes); one that failed or was cancelled fails it, below.
-    needs: [reuse, scope, prebuild, test-files]
+    needs: [reuse, scope, prebuild, test-files, shared-build-x86_64]
     if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' && (github.event_name == 'push' || needs.scope.result != 'success' || needs.scope.outputs.tests == 'true') }}
     runs-on: ${{ fromJSON(github.event_name == 'push' && (vars.PROD_RUNNER || '"ubuntu-26.04"') || (vars.PREPROD_RUNNER || '"ubuntu-26.04"')) }}
     timeout-minutes: 30
@@ -647,6 +735,22 @@ jobs:
       - name: Expressions against GitHub's test cases
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/expr-conformance.sh
+
+      # EXPERIMENT: the shared build's tests, unpacked once for this job's steps (ZIG_PREBUILT_DIR).
+      - name: Download the shared build
+        if: steps.scope.outputs.run == 'true' && github.event_name == 'pull_request'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tests-x86_64
+          path: ${{ runner.temp }}/shared
+
+      - name: Unpack the shared build
+        if: steps.scope.outputs.run == 'true' && github.event_name == 'pull_request'
+        env:
+          SHA256: ${{ needs.shared-build-x86_64.outputs.sha256 }}
+        run: |
+          .github/scripts/zig-test-prebuilt.sh unpack "$RUNNER_TEMP/shared/tests.tar" "$SHA256" "$RUNNER_TEMP/prebuilt"
+          echo "ZIG_PREBUILT_DIR=$RUNNER_TEMP/prebuilt" >>"$GITHUB_ENV"
 
       # What the prebuild made, for the Test step. A prebuild that did not succeed is this job's
       # failure, not a reason to compile on the Pi again.
@@ -707,7 +811,11 @@ jobs:
             # with each job's own ids and network (nft makes its NAT), in `native-root`.
             # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
             sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
-            ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/memory-peak.sh compile-and-run -- ../.github/scripts/zig-test.sh
+            if [ -n "${ZIG_PREBUILT_DIR:-}" ]; then
+              ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/memory-peak.sh run -- ../.github/scripts/zig-test-prebuilt.sh run - -
+            else
+              ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/memory-peak.sh compile-and-run -- ../.github/scripts/zig-test.sh
+            fi
           else
             stop="tests-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
             echo "::stop-commands::$stop" >&2
@@ -778,7 +886,12 @@ jobs:
         env:
           ZIG_TEST_IN_CONTAINER: "1"
           ZIG_TEST_MIN_PASSED: "500"
-        run: ../.github/scripts/zig-test.sh
+        run: |
+          if [ -n "${ZIG_PREBUILT_DIR:-}" ]; then
+            ../.github/scripts/zig-test-prebuilt.sh run - -
+          else
+            ../.github/scripts/zig-test.sh
+          fi
 
       # Nothing may be left under the tests' temporary directory, nor a chain of directories deeper
       # than 32 levels there (tools/test_shards.zig checks each run, naming the tests).
@@ -836,7 +949,7 @@ jobs:
     # unexpanded name ("Native tests as root (${{ matrix.arch }}, ${{ matrix.part }}/2)"), and the
     # four required names, with their parts, would never report. It skips its steps instead. On a
     # reused merge-queue pass, `native-root-reused` reports the four names.
-    needs: reuse
+    needs: [reuse, shared-build-x86_64, shared-build-arm64]
     if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' && github.event_name != 'push' }}
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
     timeout-minutes: 30
@@ -873,6 +986,22 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
+      # EXPERIMENT: the shared build's tests, unpacked once for this job's steps (ZIG_PREBUILT_DIR).
+      - name: Download the shared build
+        if: steps.scope.outputs.run == 'true' && github.event_name == 'pull_request'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.arch == 'arm64' && 'tests-aarch64' || 'tests-x86_64' }}
+          path: ${{ runner.temp }}/shared
+
+      - name: Unpack the shared build
+        if: steps.scope.outputs.run == 'true' && github.event_name == 'pull_request'
+        env:
+          SHA256: ${{ matrix.arch == 'arm64' && needs.shared-build-arm64.outputs.sha256 || needs.shared-build-x86_64.outputs.sha256 }}
+        run: |
+          .github/scripts/zig-test-prebuilt.sh unpack "$RUNNER_TEMP/shared/tests.tar" "$SHA256" "$RUNNER_TEMP/prebuilt"
+          echo "ZIG_PREBUILT_DIR=$RUNNER_TEMP/prebuilt" >>"$GITHUB_ENV"
+
       # As the tests' output in `test`: only text to this job, never its workflow commands
       # (zig-test.sh stops them).
       - name: Test, as root
@@ -886,8 +1015,10 @@ jobs:
           # Real postgres and redis images for the native services test (native/services.zig),
           # which needs root: their entrypoints change to the images' own users.
           ../.github/scripts/native-service-images.sh "$RUNNER_TEMP/native-images"
+          run_tests=../.github/scripts/zig-test.sh
+          [ -z "${ZIG_PREBUILT_DIR:-}" ] || run_tests="../.github/scripts/zig-test-prebuilt.sh run - -"
           ZIG_RUNNER_REQUIRE_NATIVE=1 ZIG_TEST_NATIVE_AS_ROOT=1 ZIG_TEST_PART="$PART" \
-            ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" ../.github/scripts/zig-test.sh
+            ZIG_RUNNER_SERVICE_IMAGES="$RUNNER_TEMP/native-images" $run_tests
 
       # Nothing may be left under the tests' temporary directory, nor a chain of directories deeper
       # than 32 levels there (tools/test_shards.zig checks each run, naming the tests).
@@ -1016,7 +1147,7 @@ jobs:
   # (`arm64-builds`), which used to run first in the same job and held the tests back.
   arm64-test:
     name: Tests (arm64)
-    needs: [reuse, scope]
+    needs: [reuse, scope, shared-build-arm64]
     if: ${{ !cancelled() && needs.reuse.outputs.reuse != 'true' && github.event_name != 'push' && (needs.scope.result != 'success' || needs.scope.outputs.tests == 'true') }}
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 30
@@ -1055,6 +1186,22 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
+      # EXPERIMENT: the shared build's tests, unpacked once for this job's steps (ZIG_PREBUILT_DIR).
+      - name: Download the shared build
+        if: steps.scope.outputs.run == 'true' && github.event_name == 'pull_request'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tests-aarch64
+          path: ${{ runner.temp }}/shared
+
+      - name: Unpack the shared build
+        if: steps.scope.outputs.run == 'true' && github.event_name == 'pull_request'
+        env:
+          SHA256: ${{ needs.shared-build-arm64.outputs.sha256 }}
+        run: |
+          .github/scripts/zig-test-prebuilt.sh unpack "$RUNNER_TEMP/shared/tests.tar" "$SHA256" "$RUNNER_TEMP/prebuilt"
+          echo "ZIG_PREBUILT_DIR=$RUNNER_TEMP/prebuilt" >>"$GITHUB_ENV"
+
       # As the hosted test job's Test step: the native backend's tests must run here, not skip.
       - name: Test
         if: steps.scope.outputs.run == 'true'
@@ -1062,7 +1209,11 @@ jobs:
         run: |
           # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
           sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
-          ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/zig-test.sh
+          if [ -n "${ZIG_PREBUILT_DIR:-}" ]; then
+            ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/zig-test-prebuilt.sh run - -
+          else
+            ZIG_RUNNER_REQUIRE_NATIVE=1 ../.github/scripts/zig-test.sh
+          fi
 
       # Nothing may be left under the tests' temporary directory, nor a chain of directories deeper
       # than 32 levels there (tools/test_shards.zig checks each run, naming the tests).

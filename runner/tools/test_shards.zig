@@ -186,7 +186,14 @@ pub fn main(init: std.process.Init) !u8 {
     const in_part = try arena.alloc(bool, names.len);
     var slow_seen: usize = 0;
     var other_seen: usize = 0;
+    // EXPERIMENT: what `zig test --test-filter` does at compile time, at run time, for a binary
+    // compiled once and run by several jobs (ZIG_TEST_NAME_FILTER=native: the root parts).
+    const name_filter = init.environ_map.get("ZIG_TEST_NAME_FILTER");
     for (names, in_part) |name, *in| {
+        if (name_filter) |f| if (std.mem.indexOf(u8, name, f) == null) {
+            in.* = false;
+            continue;
+        };
         const p = part orelse {
             in.* = true;
             continue;

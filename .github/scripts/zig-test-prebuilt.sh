@@ -27,10 +27,11 @@ mode=${1:-}
 case $mode in
 build) [[ $# == 3 ]] || mode= ;;
 run) [[ $# == 3 ]] || mode= ;;
+unpack) [[ $# == 4 ]] || mode= ;;
 *) mode= ;;
 esac
 [[ -n $mode ]] || {
-	echo "usage: zig-test-prebuilt.sh build ARCH TAR | run TAR SHA256" >&2
+	echo "usage: zig-test-prebuilt.sh build ARCH TAR | run TAR SHA256 | unpack TAR SHA256 DIR" >&2
 	exit 2
 }
 
@@ -85,36 +86,91 @@ if [[ $mode == build ]]; then
 	exit 0
 fi
 
-tar_path=$(realpath "$2")
+tar_path=$(realpath -m "$2")
 expected=$3
-[[ $expected =~ ^[0-9a-f]{64}$ ]] || {
-	echo "zig-test-prebuilt.sh: '$expected' is not a sha256" >&2
-	exit 1
+# EXPERIMENT: `unpack` checks and unpacks once (DIR, kept), so that several steps of a job run
+# from it (ZIG_PREBUILT_DIR=DIR: `run` then skips the checks and the unpacking).
+if [[ $mode == unpack ]]; then
+	dir=$(realpath -m "$4")
+	mkdir -p "$dir"
+elif [[ -n ${ZIG_PREBUILT_DIR:-} ]]; then
+	dir=$ZIG_PREBUILT_DIR
+else
+	dir=$(mktemp -d)
+	trap 'rm -rf "$dir"' EXIT
+fi
+if [[ $mode == unpack || -z ${ZIG_PREBUILT_DIR:-} ]]; then
+	[[ $expected =~ ^[0-9a-f]{64}$ ]] || {
+		echo "zig-test-prebuilt.sh: '$expected' is not a sha256" >&2
+		exit 1
+	}
+	actual=$(sha256sum "$tar_path" | cut -d' ' -f1)
+	[[ $actual == "$expected" ]] || {
+		echo "zig-test-prebuilt.sh: $tar_path is $actual, not the $expected the build job made" >&2
+		exit 1
+	}
+	# Only the six files the build puts in, none with a path of its own.
+	tar -C "$dir" -xf "$tar_path" --no-same-owner
+	[[ $(find "$dir" -mindepth 1 -printf "%f\n" | LC_ALL=C sort | tr '\n' ' ') == "arch commit runner shards_tests test_shards tests " ]] || {
+		echo "zig-test-prebuilt.sh: the tar does not hold what the build puts in" >&2
+		exit 1
+	}
+	[[ $(cat "$dir/arch") == "$(uname -m)" ]] || {
+		echo "zig-test-prebuilt.sh: built for $(cat "$dir/arch"), this machine is $(uname -m)" >&2
+		exit 1
+	}
+	[[ $(cat "$dir/commit") == "$(git rev-parse HEAD)" ]] || {
+		echo "zig-test-prebuilt.sh: built from $(cat "$dir/commit"), this checkout is $(git rev-parse HEAD)" >&2
+		exit 1
+	}
+fi
+[[ $mode != unpack ]] || {
+	echo "zig-test-prebuilt.sh: unpacked into $dir" >&2
+	exit 0
 }
-actual=$(sha256sum "$tar_path" | cut -d' ' -f1)
-[[ $actual == "$expected" ]] || {
-	echo "zig-test-prebuilt.sh: $tar_path is $actual, not the $expected the build job made" >&2
-	exit 1
-}
-dir=$(mktemp -d)
-trap 'rm -rf "$dir"' EXIT
-# Only the six files the build puts in, none with a path of its own.
-tar -C "$dir" -xf "$tar_path" --no-same-owner
-[[ $(find "$dir" -mindepth 1 -printf "%f\n" | LC_ALL=C sort | tr '\n' ' ') == "arch commit runner shards_tests test_shards tests " ]] || {
-	echo "zig-test-prebuilt.sh: the tar does not hold what the build puts in" >&2
-	exit 1
-}
-[[ $(cat "$dir/arch") == "$(uname -m)" ]] || {
-	echo "zig-test-prebuilt.sh: built for $(cat "$dir/arch"), this machine is $(uname -m)" >&2
-	exit 1
-}
-[[ $(cat "$dir/commit") == "$(git rev-parse HEAD)" ]] || {
-	echo "zig-test-prebuilt.sh: built from $(cat "$dir/commit"), this checkout is $(git rev-parse HEAD)" >&2
-	exit 1
-}
-echo "zig-test-prebuilt.sh: ran prebuilt binaries from $(cat "$dir/commit"), built for $(cat "$dir/arch"), tar sha256 $actual" >&2
+echo "zig-test-prebuilt.sh: ran prebuilt binaries from $(cat "$dir/commit"), built for $(cat "$dir/arch")" >&2
 export ZIG_RUNNER_TEST_EXE=$dir/runner
+if [[ -n ${ZIG_PREBUILT_DIR:-} ]]; then
+	# EXPERIMENT: the tests' output is only text to the job, never its workflow commands (as
+	# zig-test.sh does; the non-hosted caller of this script does it itself).
+	stop="tests-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+	echo "::stop-commands::$stop" >&2
+	trap 'echo "::$stop::" >&2' EXIT
+fi
 status=0
+if [[ ${ZIG_TEST_IN_CONTAINER:-} == 1 ]]; then
+	# As zig-test.sh's container run: the same image the project's runner runs on, the working
+	# directory the container's overlayfs, the native backend's tests skipping (Docker's seccomp).
+	image=$(tr -d '\n' <src/dagger.zig | grep -oE '"ubuntu:[A-Za-z0-9._-]+" *\+\+ *"@sha256:[a-f0-9]{64}"' | tr -d '" +')
+	[[ -n $image ]] || {
+		echo "zig-test-prebuilt.sh: no default_image in runner/src/dagger.zig" >&2
+		exit 1
+	}
+	for attempt in 1 2 3; do
+		docker pull -q "$image" >/dev/null && break
+		((attempt < 3)) || exit 1
+		sleep $((attempt * 10))
+	done
+	log=$(mktemp)
+	docker run --rm --init --user "$(id -u):$(id -g)" -w /tmp -v "$dir:$dir:ro" \
+		-e ZIG_RUNNER_TEST_EXE -e ZIG_TEST_SHARDS -e ZIG_TEST_FULL -e ZIG_TEST_TIMES \
+		"$image" "$dir/test_shards" "$dir/tests" 2>&1 | tee "$log" || status=${PIPESTATUS[0]}
+	passed=$(sed -n 's/^\([0-9][0-9]*\) passed;.*/\1/p' "$log" | tail -n 1)
+	rm -f "$log"
+	if ((status == 0)) && ((${passed:-0} < ${ZIG_TEST_MIN_PASSED:-1})); then
+		echo "zig-test-prebuilt.sh: ${passed:-0} tests passed in the container, fewer than the ${ZIG_TEST_MIN_PASSED:-1} expected" >&2
+		exit 1
+	fi
+	exit "$status"
+fi
+if [[ ${ZIG_TEST_NATIVE_AS_ROOT:-} == 1 ]]; then
+	# As zig-test.sh's root run: only the native backend's tests (a name filter at run time, as the
+	# compile-time one it passes there), as root, with the variables they read.
+	export ZIG_TEST_NAME_FILTER=native
+	sudo --preserve-env=ZIG_RUNNER_TEST_EXE,ZIG_RUNNER_REQUIRE_NATIVE,ZIG_RUNNER_SERVICE_IMAGES,ZIG_RUNNER_DOCKERFILE_ORACLE,ZIG_RUNNER_DOCKERFILE_ORACLE_ONLY,ZIG_TEST_STORE_STRESS_SECONDS,ZIG_TEST_STORE_STRESS_PROCS,ZIG_TEST_STORE_STRESS_SEED,ZIG_TEST_SHARDS,ZIG_TEST_PART,ZIG_TEST_TIMES,ZIG_TEST_FULL,ZIG_TEST_NAME_FILTER,TSAN_OPTIONS \
+		"$dir/test_shards" "$dir/tests" || status=$?
+	exit "$status"
+fi
 # The shard runner's own tests first (build.zig's run_shards_tests), so the tests' count is the
 # last "N passed" line, which CI's floor reads.
 "$dir/shards_tests" || status=$?

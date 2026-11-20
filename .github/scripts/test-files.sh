@@ -15,11 +15,16 @@ cd "$(dirname "$0")/../../runner"
 
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
-git describe --tags --always --dirty --abbrev=8 >"$scratch/version"
-zig_modules "$scratch" "$scratch/version"
-zig test "${modules[@]}" --test-no-exec -femit-bin="$scratch/tests"
-zig build-exe tools/test_shards.zig -femit-bin="$scratch/test_shards"
-"$scratch/test_shards" --names "$scratch/tests" >"$scratch/names"
+if [[ -n ${ZIG_PREBUILT_DIR:-} ]]; then
+	# EXPERIMENT: the tests compiled once for the job (zig-test-prebuilt.sh unpack).
+	"$ZIG_PREBUILT_DIR/test_shards" --names "$ZIG_PREBUILT_DIR/tests" >"$scratch/names"
+else
+	git describe --tags --always --dirty --abbrev=8 >"$scratch/version"
+	zig_modules "$scratch" "$scratch/version"
+	zig test "${modules[@]}" --test-no-exec -femit-bin="$scratch/tests"
+	zig build-exe tools/test_shards.zig -femit-bin="$scratch/test_shards"
+	"$scratch/test_shards" --names "$scratch/tests" >"$scratch/names"
+fi
 
 status=0
 while IFS= read -r file; do
