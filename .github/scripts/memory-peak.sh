@@ -148,7 +148,14 @@ if [[ -r /proc/self/status ]] && command -v awk >/dev/null; then
 		trap stop EXIT
 		trap 'forward TERM 143' TERM
 		trap 'forward INT 130' INT
-		"$@" <&0 &
+		# Not "$@" & alone: bash starts a background command with SIGINT and SIGQUIT ignored, so the
+		# INT forwarded to it (GitHub's first signal on a cancel) did nothing, and the step ran on
+		# until its command ended by itself or the TERM after (memory-peak-test.sh's INT case
+		# waited out its 30 s sleep). The subshell puts their default actions back before the exec.
+		(
+			trap - INT QUIT
+			exec "$@"
+		) <&0 &
 		cmd=$!
 		wait "$cmd"
 		status=$?

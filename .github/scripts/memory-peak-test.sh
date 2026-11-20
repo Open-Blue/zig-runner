@@ -46,9 +46,12 @@ for sig in TERM INT; do
 	sleep 0.5
 	kill -s "$sig" "$pid"
 	status=0
+	start=$SECONDS
 	wait "$pid" || status=$?
 	pid=
 	((status == 128 + $(kill -l "$sig"))) || fail "$sig: the script's status was $status"
+	# Promptly: the command sleeps 30 s, so a signal that did not reach it shows as a long wait.
+	((SECONDS - start <= 5)) || fail "$sig: the script took $((SECONDS - start)) s to end, so the command did not get the $sig"
 	sleep 0.5
 	pgrep -f "^$marker " >/dev/null && fail "$sig: the command is still running"
 	[[ -z $(ls -A "$scratch/tmp") ]] || fail "$sig: a temp file is left: $(ls -A "$scratch/tmp")"
