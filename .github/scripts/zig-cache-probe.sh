@@ -11,6 +11,17 @@ cd "$(dirname "$0")/../../runner"
 mode=${1:-plain}
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
+if [[ $mode == maker ]]; then
+	# `zig build` on a project of one empty build.zig: Zig compiles its build runner (the maker), the
+	# part of `zig build test-tls-oracle` that no commit changes.
+	mkdir "$scratch/mini"
+	echo 'pub fn build(b: *@import("std").Build) void { _ = b; }' >"$scratch/mini/build.zig"
+	start=$(date +%s.%N)
+	(cd "$scratch/mini" && ZIG_LOCAL_CACHE_DIR="$scratch/local" zig build --help >/dev/null)
+	end=$(date +%s.%N)
+	printf 'zig-cache probe: maker, global cache %s: `zig build --help` on an empty build.zig %.1f s\n' "${ZR_ZIG_CACHE_STATE:-unset}" "$(awk -v a="$end" -v b="$start" 'BEGIN{print a-b}')"
+	exit 0
+fi
 git describe --tags --always --dirty --abbrev=8 >"$scratch/version"
 flags=()
 [[ $mode == tsan ]] && flags=(-fsanitize-thread)
