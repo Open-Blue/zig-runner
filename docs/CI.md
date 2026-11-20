@@ -1,4 +1,4 @@
-# CI pipeline
+# CI pipeline 
 
 What each workflow checks, and how the workflows are hardened. For making a change, see
 [CONTRIBUTING.md](../CONTRIBUTING.md).
