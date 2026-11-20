@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'ThreadSanitizer no longer reports a false data race in the Dagger session''s log reader: the process heap wrapper declines to remap in a sanitized build, because ThreadSanitizer does not intercept mremap.'
-time: 2026-11-19T23:43:34.182408709-05:00

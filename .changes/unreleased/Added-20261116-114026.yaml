@@ -1,3 +1,0 @@
-kind: Added
-body: 'Job priority (#549): a job paused by RUNNER_PRIORITY_FREEZE keeps its timeouts: the time it was paused (monotonic, all pauses added) moves the deadline of the running step and, where the runner enforces it (Gitea and Forgejo), of the job, so a pause never eats a timeout-minutes. The step-end line carries paused_ms= for a paused step, "Set up job" says a pool may pause, "Complete job" says how long the job was. Not extended: a GitHub job''s own timeout-minutes (GitHub enforces it), the readiness waits of services and image pulls (set-up, before the steps run). docs/OPERATIONS.md documents job priority and that the policy file format is experimental until it has run on real pools.'
-time: 2026-11-16T11:40:26.249128046-05:00

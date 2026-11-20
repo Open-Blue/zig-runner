@@ -1,3 +1,0 @@
-kind: Added
-body: CI jobs say what the runner image gives them (image, kernel, page size, cgroup version, each tool's path and version) as their first step, and fail naming every missing tool (nft, ip, unshare, python3, Docker), instead of a test that blames itself
-time: 2026-11-19T01:46:40.736110875-05:00

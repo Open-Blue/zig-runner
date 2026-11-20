@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'CI''s apt.sh says what it probed and chose, on stderr in the job''s log: each archive and mirror URL with its HTTP status and time, or curl''s error, and whether the configured sources or which mirror were used. apt.sh probe ARCH CODENAME prints one such line. The e2e suite''s native rootfs build logs its image and container, and while it is waited for, a status line every minute: the container''s state, how much apt has fetched, its running apt and dpkg processes, and how Ubuntu''s archive answers now; a timeout says the last status. A slow archive is then told apart from a hung build.'
-time: 2026-11-19T22:22:11.907524642-05:00

@@ -1,3 +1,0 @@
-kind: Fixed
-body: The ThreadSanitizer end-to-end stop prints why a runner that ignores SIGTERM did not stop (process tree, thread states, signal masks, log end) before killing it (#628)
-time: 2026-11-20T00:22:21.695335245-05:00
