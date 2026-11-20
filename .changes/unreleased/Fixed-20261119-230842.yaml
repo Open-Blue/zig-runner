@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'CI: one Scope job decides every scope once, and the jobs it rules out are skipped before they take a hosted runner, so a documentation-only change no longer queues for about eleven runners'
+time: 2026-11-19T23:08:42.315012584-05:00
