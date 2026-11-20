@@ -19,7 +19,7 @@ if [[ $mode == maker ]]; then
 	start=$(date +%s.%N)
 	(cd "$scratch/mini" && ZIG_LOCAL_CACHE_DIR="$scratch/local" zig build --help >/dev/null)
 	end=$(date +%s.%N)
-	printf 'zig-cache probe: maker, global cache %s: `zig build --help` on an empty build.zig %.1f s\n' "${ZR_ZIG_CACHE_STATE:-unset}" "$(awk -v a="$end" -v b="$start" 'BEGIN{print a-b}')"
+	printf 'zig-cache probe: maker, global cache %s: zig build --help on an empty build.zig %.1f s\n' "${ZR_ZIG_CACHE_STATE:-unset}" "$(awk -v a="$end" -v b="$start" 'BEGIN{print a-b}')"
 	exit 0
 fi
 git describe --tags --always --dirty --abbrev=8 >"$scratch/version"
