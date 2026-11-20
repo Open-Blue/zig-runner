@@ -6917,10 +6917,14 @@ test "root runner: a job's source address pin is on the host while it runs, and 
     // Every listing until the job ends, however slow its set-up under other shards' jobs (30 s at
     // most): which slot is the job's is known only from its output.
     var seen: std.ArrayList([]const u8) = .empty;
+    // The ports' settings and the bridge's table (#616) in the same rounds.
+    const ports_cmd: []const []const u8 = &.{ "sh", "-c", "grep -H . /sys/class/net/zrh*/brport/learning /sys/class/net/zrh*/brport/unicast_flood 2>/dev/null; bridge fdb show br zr0 2>/dev/null; true" };
+    var ports_seen: std.ArrayList([]const u8) = .empty;
     for (0..300) |_| {
         if (done.load(.acquire)) break;
         const got = std.process.run(arena, io, .{ .argv = list }) catch break;
         try seen.append(arena, got.stdout);
+        if (std.process.run(arena, io, .{ .argv = ports_cmd })) |p| try ports_seen.append(arena, p.stdout) else |_| {}
         try io.sleep(.fromMilliseconds(100), .awake);
     }
     const ok = job.await(io);
@@ -6938,6 +6942,27 @@ test "root runner: a job's source address pin is on the host while it runs, and 
         handle = line;
         break;
     };
+    // The pin has the Ethernet source rule, and the port learns nothing and floods no unknown
+    // unicast, with its job's MAC as a static entry of the bridge's table (#616).
+    var saddr_rule = false;
+    for (seen.items) |listing| {
+        if (std.mem.indexOf(u8, listing, "ether saddr !=") != null) saddr_rule = true;
+    }
+    if (!saddr_rule) std.debug.print("no Ethernet source rule in any pin listing\n", .{});
+    try std.testing.expect(saddr_rule);
+    const learning = try std.fmt.allocPrint(arena, "/sys/class/net/zrh{d}/brport/learning:0", .{slot});
+    const flood = try std.fmt.allocPrint(arena, "/sys/class/net/zrh{d}/brport/unicast_flood:0", .{slot});
+    const entry = try std.fmt.allocPrint(arena, " dev zrh{d} master zr0 permanent", .{slot});
+    var guarded = false;
+    var entered = false;
+    for (ports_seen.items) |listing| {
+        if (std.mem.indexOf(u8, listing, learning) != null and std.mem.indexOf(u8, listing, flood) != null) guarded = true;
+        if (std.mem.indexOf(u8, listing, entry) != null) entered = true;
+    }
+    if (!guarded) std.debug.print("the port zrh{d} was not seen with learning and unicast flood off; {d} samples, the last:\n{s}\n", .{ slot, ports_seen.items.len, if (ports_seen.items.len > 0) ports_seen.items[ports_seen.items.len - 1] else "" });
+    try std.testing.expect(guarded);
+    if (!entered) std.debug.print("no static entry on zrh{d} in the bridge's table; the last sample:\n{s}\n", .{ slot, if (ports_seen.items.len > 0) ports_seen.items[ports_seen.items.len - 1] else "" });
+    try std.testing.expect(entered);
     if (handle == null) std.debug.print("no pin for slot {d} while the job ran; {d} listings, the last:\n{s}\n", .{
         slot,
         seen.items.len,

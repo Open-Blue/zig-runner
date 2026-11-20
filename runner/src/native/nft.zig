@@ -293,14 +293,14 @@ pub fn forwardPolicy() Policy {
 /// address: the bridge's port isolation stops it reaching the other job's port, but not a packet
 /// with the other's source address going out through the gateway (#603). Each job's host-side
 /// port therefore has a table of its own, in the `bridge` family (`zig_runner_pin<slot>`, one
-/// chain on the pre-routing hook): IPv4 from that port with any source but the job's address is
-/// dropped, so is ARP whose sender is not, and so is any other frame, a VLAN-tagged one among
+/// chain on the pre-routing hook): a frame from that port with any Ethernet source but the job's
+/// veth MAC is dropped (#616), IPv4 with any source but the job's address is dropped, so is ARP whose sender is not, and so is any other frame, a VLAN-tagged one among
 /// them. It is made in one batch (the table replaced if a dead job's is there) before the port
 /// exists, by the job's network helper, which fails the job's network if it cannot: a job is
 /// never up without it. The job's teardown removes it once no process of the job is left
 /// (`unpinSource`); one left by a crash, or by a job whose processes may remain, is replaced by
 /// the slot's next job.
-pub fn pinSource(slot: u32, addr: [4]u8) ?[]const u8 {
+pub fn pinSource(slot: u32, addr: [4]u8, mac: [6]u8) ?[]const u8 {
     var sock = Socket.open() catch return "cannot open an nftables netlink socket";
     defer sock.close();
     var buf: [4096]u8 align(4) = undefined;
@@ -314,7 +314,7 @@ pub fn pinSource(slot: u32, addr: [4]u8) ?[]const u8 {
     @memcpy(link_buf[0..host.len], host);
     link_buf[host.len] = 0;
     const link = link_buf[0 .. host.len + 1];
-    pinBatch(&b, tbl, link, addr);
+    pinBatch(&b, tbl, link, addr, mac);
     const bytes = b.finish();
     if (b.overflow) return "the pin's rules do not fit their batch";
     const e = sock.send(bytes, b.first_seq, b.seq, b.acks) catch |err| return @errorName(err);
@@ -356,14 +356,24 @@ test "a pin's table is named by its slot" {
     try std.testing.expectEqualStrings("zig_runner_pin249", pinTable(&buf, net.max_slots - 1));
 }
 
-fn pinBatch(b: *Batch, tbl: []const u8, link: []const u8, addr: [4]u8) void {
+fn pinBatch(b: *Batch, tbl: []const u8, link: []const u8, addr: [4]u8, mac: [6]u8) void {
     b.family = nfproto_bridge;
     b.tableNamed(.NEWTABLE, linux.NLM_F_CREATE, tbl);
     b.tableNamed(.DELTABLE, 0, tbl);
     b.tableNamed(.NEWTABLE, linux.NLM_F_CREATE, tbl);
     b.baseChainIn(tbl, "pin", "filter", hook_br_prerouting, priority_br_filter);
-    // `iifname <port> ether type ip ip saddr != <the job's address> counter drop`
+    // `iifname <port> ether saddr != <the job's MAC> counter drop`: first, and before the bridge
+    // learns anything of the frame (its learning is in what follows this hook), so no frame of a
+    // job enters the bridge's table under another's MAC (#616). The job's end of the veth has the
+    // MAC the helper gave it.
     var r = b.rule(tbl, "pin", linux.NLM_F_APPEND);
+    b.ifname(.iif, .eq, link);
+    b.payloadCmp(nft_payload_ll_header, 6, .neq, &mac);
+    b.counter();
+    b.verdict(nf_drop);
+    b.endRule(r);
+    // `iifname <port> ether type ip ip saddr != <the job's address> counter drop`
+    r = b.rule(tbl, "pin", linux.NLM_F_APPEND);
     b.ifname(.iif, .eq, link);
     b.payloadEq(nft_payload_ll_header, 12, &.{ 0x08, 0x00 });
     b.payloadCmp(nft_payload_network_header, 12, .neq, &addr);
@@ -1690,7 +1700,7 @@ fn pinned(c: *Pinned, suffix: []const u8, dir: []const u8, pin: bool) void {
         \\sfx=$1; d=$2
         \\for j in a:1:3 b:2:4; do
         \\  n=${j%%:*}; r=${j#*:}; s=${r%%:*}; h=${r#*:}
-        \\  ip link add zrh$s type veth peer name e0; ip link set e0 netns zrt-$n-$sfx; ip link set zrh$s master zr0; ip link set zrh$s up
+        \\  ip link add zrh$s type veth peer name e0 address 02:00:00:00:00:0$s; ip link set e0 netns zrt-$n-$sfx; ip link set zrh$s master zr0; ip link set zrh$s up
         \\  ip netns exec zrt-$n-$sfx sh -c "echo 1 > /proc/sys/net/ipv6/conf/e0/disable_ipv6; ip link set lo up; ip addr add 10.211.1.$h/16 dev e0; ip link set e0 up; ip route add default via 10.211.0.1"
         \\done
         \\ip link add vc type veth peer name vc1; ip link set vc1 netns zrt-c-$sfx; ip link set vc master dk0; ip link set vc up
@@ -1777,7 +1787,7 @@ fn pinned(c: *Pinned, suffix: []const u8, dir: []const u8, pin: bool) void {
     }
     // The pins first, before the ports exist, as the job's network helper makes them.
     if (pin) for ([_]struct { u32, [4]u8 }{ .{ 1, .{ 10, 211, 1, 3 } }, .{ 2, .{ 10, 211, 1, 4 } } }) |sa| {
-        if (pinSource(sa[0], sa[1])) |why| {
+        if (pinSource(sa[0], sa[1], .{ 2, 0, 0, 0, 0, @intCast(sa[0]) })) |why| {
             c.fail("pinSource: {s}", .{why});
             return;
         }
@@ -1889,6 +1899,228 @@ test "native nft: a job's packets carry its own source address, and nothing else
             // out of the uplink, and the VLAN 0 tagged one to the instance).
             try std.testing.expect(std.mem.indexOf(u8, out, "pin_dropped_ip none arp none") != null);
             try std.testing.expect(std.mem.indexOf(u8, out, "reached_forward spoof=3") != null);
+        }
+    }
+}
+
+/// What each way of protecting the bridge's table did (see `fdbWire`): the ports the job's helper
+/// makes (`net.Socket.addVeth` with or without its FDB guard) and the pin's Ethernet source rule.
+const FdbMode = struct { pin: bool, port: bool };
+
+/// Jobs A (10.211.1.3, MAC 02:aa:..:01, port `zrh1`) and B (10.211.1.4, MAC 02:bb:..:02, `zrh2`) on
+/// `zr0` in a network namespace of this thread's own, the ports made by the code the job's helper
+/// runs. B, root in its namespace, sends 200 ARP requests, each from its own address and a made-up
+/// Ethernet source, and 5 with A's MAC as the source. Probes: the host reaches a server in A before
+/// and after; the bridge's table has no entry for a MAC of neither job before and after; whose port
+/// A's MAC is on, and the pin's counter for the frames its rule dropped.
+fn fdbWire(c: *Pinned, suffix: []const u8, dir: []const u8, mode: FdbMode) void {
+    const unshared = linux.unshare(linux.CLONE.NEWNET);
+    if (linux.errno(unshared) != .SUCCESS) {
+        c.skip = "no network namespace of its own";
+        return;
+    }
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    const tools = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", "command -v ip nft bridge python3 >/dev/null" } }) catch null;
+    if (tools == null or tools.?.term != .exited or tools.?.term.exited != 0) {
+        c.skip = "ip, nft, bridge or python3 is missing";
+        return;
+    }
+    const mac_a: [6]u8 = .{ 0x02, 0xaa, 0, 0, 0, 1 };
+    const mac_b: [6]u8 = .{ 0x02, 0xbb, 0, 0, 0, 2 };
+    const topology =
+        \\set -e
+        \\sfx=$1; d=$2
+        \\ip link set lo up
+        \\ip link add zr0 type bridge; ip addr add 10.211.0.1/16 dev zr0; ip link set zr0 up
+        \\echo 1 > /proc/sys/net/ipv6/conf/zr0/disable_ipv6
+        \\for j in a b; do ip netns add zrt-$j-$sfx; done
+        \\cat > $d/server.py <<'EOF'
+        \\import socket, time
+        \\s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("0.0.0.0", 3000)); s.listen()
+        \\s.settimeout(1)
+        \\end = time.time() + 40
+        \\while time.time() < end:
+        \\    try: c, _ = s.accept()
+        \\    except socket.timeout: continue
+        \\    c.sendall(b"hi\n"); c.close()
+        \\EOF
+        \\cat > $d/try.py <<'EOF'
+        \\import socket, sys
+        \\try:
+        \\    s = socket.create_connection((sys.argv[1], int(sys.argv[2])), 2); print("answer" if s.recv(8) else "silent")
+        \\except OSError:
+        \\    print("lost")
+        \\EOF
+        \\cat > $d/forge.py <<'EOF'
+        \\import os, socket, struct
+        \\mine = bytes.fromhex(open("/sys/class/net/eth0/address").read().strip().replace(":", ""))
+        \\victim = bytes.fromhex("02aa00000001")
+        \\s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW); s.bind(("eth0", 0))
+        \\def frame(src):
+        \\    arp = struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1) + mine + socket.inet_aton("10.211.1.4") + b"\0" * 6 + socket.inet_aton("10.211.0.1")
+        \\    return b"\xff" * 6 + src + struct.pack("!H", 0x0806) + arp
+        \\for i in range(200):
+        \\    src = bytearray(os.urandom(6)); src[0] = (src[0] & 0xfe) | 0x02
+        \\    s.send(frame(bytes(src)))
+        \\for i in range(5):
+        \\    s.send(frame(victim))
+        \\EOF
+    ;
+    const ran = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", topology, "sh", suffix, dir } }) catch |e| {
+        c.fail("the topology: {s}", .{@errorName(e)});
+        return;
+    };
+    if (ran.term != .exited or ran.term.exited != 0) {
+        c.fail("the topology: {s}", .{ran.stderr[0..@min(ran.stderr.len, 600)]});
+        return;
+    }
+    var host = net.Socket.open() catch {
+        c.fail("open rtnetlink", .{});
+        return;
+    };
+    defer host.close();
+    for ([_]struct { u32, [4]u8, [6]u8, u8 }{
+        .{ 1, .{ 10, 211, 1, 3 }, mac_a, 'a' },
+        .{ 2, .{ 10, 211, 1, 4 }, mac_b, 'b' },
+    }) |job| {
+        const slot, const addr, const mac, const letter = job;
+        // The pin first, then the port, as the job's network helper does.
+        if (mode.pin) if (pinSource(slot, addr, mac)) |why| {
+            c.fail("pinSource: {s}", .{why});
+            return;
+        };
+        var path_buf: [96:0]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "/run/netns/zrt-{c}-{s}", .{ letter, suffix }, 0) catch {
+            c.fail("namespace path", .{});
+            return;
+        };
+        const nsfd = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(nsfd) != .SUCCESS) {
+            c.fail("open {s}: {t}", .{ path, linux.errno(nsfd) });
+            return;
+        }
+        defer _ = linux.close(@intCast(nsfd));
+        host.addVeth(slot, @intCast(nsfd), mac, mode.port) catch |e| {
+            c.fail("addVeth {d}: {s}", .{ slot, @errorName(e) });
+            return;
+        };
+        var cfg_buf: [512]u8 = undefined;
+        const cfg = std.fmt.bufPrint(
+            &cfg_buf,
+            "ip netns exec zrt-{c}-{s} sh -c 'echo 1 > /proc/sys/net/ipv6/conf/eth0/disable_ipv6; ip link set lo up; ip addr add {d}.{d}.{d}.{d}/16 dev eth0; ip link set eth0 up; ip route add default via 10.211.0.1'",
+            .{ letter, suffix, addr[0], addr[1], addr[2], addr[3] },
+        ) catch {
+            c.fail("configure", .{});
+            return;
+        };
+        const done = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", cfg } }) catch |e| {
+            c.fail("configure: {s}", .{@errorName(e)});
+            return;
+        };
+        if (done.term != .exited or done.term.exited != 0) {
+            c.fail("configure: {s}", .{done.stderr[0..@min(done.stderr.len, 600)]});
+            return;
+        }
+    }
+    const attack =
+        \\sfx=$1; d=$2
+        \\num() { v=$(sed -n 's/.*counter packets \([0-9][0-9]*\).*/\1/p' | head -1); echo "${v:-NaN}"; }
+        \\amac=02:aa:00:00:00:01; bmac=02:bb:00:00:00:02
+        \\fdb() { bridge fdb show br zr0; }
+        \\foreign() { fdb | grep -v -e "$amac" -e "$bmac" -e permanent -e ' self' | wc -l; }
+        \\a_on() { fdb | grep "^$amac" | grep -o 'dev zrh[0-9]*' | sort -u | tr '\n' ' '; }
+        \\pin_saddr() { t=$(nft list table bridge zig_runner_pin2 2>/dev/null || echo none); [ "$t" = none ] && echo none || echo "$t" | grep 'ether saddr !=' | num; }
+        \\ip netns exec zrt-a-$sfx python3 $d/server.py >$d/a.log 2>&1 &
+        \\ip netns exec zrt-b-$sfx python3 $d/server.py >$d/b.log 2>&1 &
+        \\sleep 1
+        \\echo "before a=$(python3 $d/try.py 10.211.1.3 3000) b=$(python3 $d/try.py 10.211.1.4 3000)"
+        \\echo "foreign_before $(foreign) a_on_before $(a_on)"
+        \\ip netns exec zrt-b-$sfx python3 $d/forge.py
+        \\sleep 0.5
+        \\echo "foreign_after $(foreign) a_on_after $(a_on)"
+        \\echo "pin_dropped $(pin_saddr)"
+        \\echo "after a=$(python3 $d/try.py 10.211.1.3 3000) b=$(python3 $d/try.py 10.211.1.4 3000)"
+        \\for p in $(ip netns pids zrt-a-$sfx zrt-b-$sfx 2>/dev/null); do :; done
+    ;
+    const got = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", attack, "sh", suffix, dir } }) catch |e| {
+        c.fail("the probes: {s}", .{@errorName(e)});
+        return;
+    };
+    // The teardown: A's veth deleted as `deleteVeth` does (`Socket.deleteVeth` looks the link up in
+    // /sys/class/net, which is the test's mount namespace's, not this thread's network
+    // namespace's), its entry (a static one) with it.
+    const gone = std.process.run(arena, io, .{ .argv = &.{ "sh", "-c", "ip link del zrh1; bridge fdb show br zr0 | grep ^02:aa:00:00:00:01 | grep -c 'dev zrh1 ' || true" } }) catch null;
+    const left = if (gone) |g| std.mem.trim(u8, g.stdout, " \n") else "?";
+    const text = std.fmt.bufPrint(&c.out, "{s}a_entries_on_deleted_port {s}\n", .{ got.stdout[0..@min(got.stdout.len, 1500)], left }) catch "";
+    c.out_len = text.len;
+}
+
+test "native nft: a job's frames carry its veth's MAC, and cannot add or move entries of the bridge's table (#616)" {
+    if (linux.geteuid() != 0) return error.SkipZigTest;
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", arena);
+    const suffix = try std.fmt.allocPrint(arena, "f{d}", .{linux.getpid()});
+    const required = blk: {
+        var env = try std.testing.environ.createMap(arena);
+        break :blk std.mem.eql(u8, env.get("ZIG_RUNNER_REQUIRE_NATIVE") orelse "", "1");
+    };
+    // The first is the control: no protection, and the attacks must work, or the test proves nothing.
+    const modes = [_]FdbMode{
+        .{ .pin = false, .port = false },
+        .{ .pin = true, .port = false },
+        .{ .pin = false, .port = true },
+        .{ .pin = true, .port = true },
+    };
+    for (modes) |mode| {
+        var c: Pinned = .{};
+        const t = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, fdbWire, .{ &c, suffix, dir, mode });
+        t.join();
+        const clean = try std.fmt.allocPrint(
+            arena,
+            "for j in a b; do for p in $(ip netns pids zrt-$j-{s} 2>/dev/null); do kill $p; done; ip netns del zrt-$j-{s} 2>/dev/null; done; true",
+            .{ suffix, suffix },
+        );
+        _ = std.process.run(arena, std.testing.io, .{ .argv = &.{ "sh", "-c", clean } }) catch {};
+        if (c.skip) |why| {
+            if (required) {
+                std.debug.print("native nft: cannot run ({s}), and ZIG_RUNNER_REQUIRE_NATIVE=1\n", .{why});
+                return error.TestUnexpectedResult;
+            }
+            return error.SkipZigTest;
+        }
+        if (c.failed) {
+            std.debug.print("native nft: {s}\n", .{c.why[0..c.why_len]});
+            return error.TestUnexpectedResult;
+        }
+        const out = c.out[0..c.out_len];
+        std.debug.print("native nft #616 (pin {}, port guard {}):\n{s}", .{ mode.pin, mode.port, out });
+        try std.testing.expect(std.mem.indexOf(u8, out, "NaN") == null);
+        // Both jobs reach their own: before the attack, always.
+        try std.testing.expect(std.mem.indexOf(u8, out, "before a=answer b=answer") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "foreign_before 0 a_on_before dev zrh1 \n") != null);
+        // Teardown: a deleted veth leaves no entry of its port.
+        try std.testing.expect(std.mem.indexOf(u8, out, "a_entries_on_deleted_port 0") != null);
+        if (mode.pin or mode.port) {
+            // Nothing added, nothing moved, A's traffic still arrives (and B's).
+            try std.testing.expect(std.mem.indexOf(u8, out, "foreign_after 0 a_on_after dev zrh1 \n") != null);
+            try std.testing.expect(std.mem.indexOf(u8, out, "after a=answer b=answer") != null);
+        } else {
+            // The attack: 200 made-up MACs in the table, A's on B's port, A unreachable.
+            try std.testing.expect(std.mem.indexOf(u8, out, "foreign_after 200 a_on_after dev zrh2 \n") != null);
+            try std.testing.expect(std.mem.indexOf(u8, out, "after a=lost") != null);
+        }
+        if (mode.pin) {
+            // The rule saw them: 200 made-up and 5 of A's.
+            try std.testing.expect(std.mem.indexOf(u8, out, "pin_dropped 205") != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, out, "pin_dropped none") != null);
         }
     }
 }

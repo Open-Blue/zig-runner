@@ -143,8 +143,11 @@ pub fn upMain(
     // the job's own. Not made, no network. Like the veth below, only for the runner that holds
     // the slot's lock: a dead runner's helper changes nothing of the slot's.
     if (linux.getppid() != parent) return fail("find the runner that holds the slot's lock", .SRCH);
-    if (nft.pinSource(slot, subnet.jobAddress(slot))) |why| {
-        const what = std.fmt.allocPrint(arena, "pin the job's source address: {s}", .{why}) catch "pin the job's source address";
+    // The job's own end of the veth gets a MAC chosen here, so that the pin below can name it
+    // before the veth exists, and the port's static entry for it needs no lookup (#616).
+    const mac = randomMac() orelse return fail("get a MAC address for the veth", .IO);
+    if (nft.pinSource(slot, subnet.jobAddress(slot), mac)) |why| {
+        const what = std.fmt.allocPrint(arena, "pin the job's source address and MAC: {s}", .{why}) catch "pin the job's source address and MAC";
         return fail(what, .INVAL);
     }
     const unshared = linux.unshare(linux.CLONE.NEWNET);
@@ -170,9 +173,23 @@ pub fn upMain(
     // Again: the delete may have waited for the kernel's lock for link changes, and the runner
     // may have died meanwhile.
     if (linux.getppid() != parent) return fail("find the runner that holds the slot's lock", .SRCH);
-    host.addVeth(slot, @intCast(ns)) catch return fail("make the veth pair", .INVAL);
+    host.addVeth(slot, @intCast(ns), mac, true) catch return fail("make the veth pair", .INVAL);
     job.configureJob(subnet, slot) catch return fail("configure the job's network", .INVAL);
     return 0;
+}
+
+/// A random unicast, locally administered MAC address: the job's end of its veth (`addVeth`).
+fn randomMac() ?[6]u8 {
+    var mac: [6]u8 = undefined;
+    var got: usize = 0;
+    while (got < mac.len) {
+        const n = linux.getrandom(mac[got..].ptr, mac.len - got, 0);
+        if (linux.errno(n) == .INTR) continue;
+        if (linux.errno(n) != .SUCCESS) return null;
+        got += n;
+    }
+    mac[0] = (mac[0] & 0xfe) | 0x02;
+    return mac;
 }
 
 /// Whether a sysctl already has `value`: writing it again is a request to the kernel for nothing,
@@ -317,8 +334,13 @@ pub const Socket = struct {
     /// Makes the veth pair of slot `n`, its job's end in the namespace `netns` (a file
     /// descriptor) and named `eth0` there, its host's end on the bridge, isolated
     /// (`IFLA_BRPORT_ISOLATED`: the bridge forwards nothing between two isolated ports, so one
-    /// job cannot reach another's address), and up.
-    pub fn addVeth(s: *Socket, slot: u32, netns: linux.fd_t) !void {
+    /// job cannot reach another's address), and up. The job's end has the MAC `mac`; with
+    /// `fdb_guard` the port learns no source addresses (`IFLA_BRPORT_LEARNING` off, so a job's
+    /// frames cannot add entries to the bridge's table or move another job's), floods no unknown
+    /// unicast (`IFLA_BRPORT_UNICAST_FLOOD` off: nothing is unknown, the one address behind the
+    /// port is a static entry of the bridge's table), and the entry is made before the port is up
+    /// (#616). The entry goes with the port when the veth is deleted.
+    pub fn addVeth(s: *Socket, slot: u32, netns: linux.fd_t, mac: [6]u8, fdb_guard: bool) !void {
         var buf: [16]u8 = undefined;
         const host = hostLink(&buf, slot);
         var m: Message = .init(.RTM_NEWLINK, linux.NLM_F_CREATE | linux.NLM_F_EXCL);
@@ -330,6 +352,7 @@ pub const Socket = struct {
         const peer = m.begin(veth_info_peer);
         m.ifinfo(0, 0);
         m.attrString(ifla_ifname, "eth0");
+        m.attrBytes(ifla_address, &mac);
         m.attrU32(ifla_net_ns_fd, @intCast(netns));
         m.end(peer);
         m.end(data);
@@ -345,8 +368,19 @@ pub const Socket = struct {
         iso.put(IfInfoMsg, .{ .family = af_bridge, .index = i });
         const protinfo = iso.begin(ifla_protinfo | nla_f_nested);
         iso.attrBytes(ifla_brport_isolated, &.{1});
+        if (fdb_guard) {
+            iso.attrBytes(ifla_brport_learning, &.{0});
+            iso.attrBytes(ifla_brport_unicast_flood, &.{0});
+        }
         iso.end(protinfo);
         try expect(s.request(&iso), false);
+        if (fdb_guard) {
+            // `bridge fdb add <mac> dev <port> master static`
+            var fdb: Message = .init(.RTM_NEWNEIGH, linux.NLM_F_CREATE | linux.NLM_F_REPLACE);
+            fdb.put(NdMsg, .{ .family = af_bridge, .index = i, .state = nud_permanent, .flags = ntf_master });
+            fdb.attrBytes(nda_lladdr, &mac);
+            try expect(s.request(&fdb), false);
+        }
         try s.up(i);
     }
 
@@ -399,10 +433,16 @@ fn expect(e: linux.E, exist_ok: bool) !void {
     return error.Netlink;
 }
 
+const ifla_address = 1;
 const ifla_ifname = 3;
 const ifla_master = 10;
 const ifla_protinfo = 12;
+const ifla_brport_learning = 8;
+const ifla_brport_unicast_flood = 9;
 const ifla_brport_isolated = 33;
+const nda_lladdr = 2;
+const nud_permanent = 0x80;
+const ntf_master = 0x04;
 const nla_f_nested = 0x8000;
 const af_bridge = 7;
 const ifla_linkinfo = 18;
@@ -422,6 +462,16 @@ const IfInfoMsg = extern struct {
     index: i32 = 0,
     flags: u32 = 0,
     change: u32 = 0,
+};
+
+const NdMsg = extern struct {
+    family: u8 = 0,
+    pad1: u8 = 0,
+    pad2: u16 = 0,
+    index: i32 = 0,
+    state: u16 = 0,
+    flags: u8 = 0,
+    type: u8 = 0,
 };
 
 const IfAddrMsg = extern struct {
