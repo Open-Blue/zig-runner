@@ -795,8 +795,10 @@ jobs:
   # branches" ruleset). Not on main: a push runs `zig build test` on prod (`test`).
   native-root:
     name: Native tests as root (${{ matrix.arch }}, ${{ matrix.part }}/2)
-    needs: scope
-    if: ${{ !cancelled() && github.event_name != 'push' && (needs.scope.result != 'success' || needs.scope.outputs.tests == 'true') }}
+    # Not skipped by the Scope job: a matrix job skipped by its `if:` reports once, under its
+    # unexpanded name ("Native tests as root (${{ matrix.arch }}, ${{ matrix.part }}/2)"), and the
+    # four required names, with their parts, would never report. It skips its steps instead.
+    if: github.event_name != 'push'
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
     timeout-minutes: 30
     # The store stress test's workers for 10 s, and 10 s more with the deferred sync, where it defaults to 30 and 15:
