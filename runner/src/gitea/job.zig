@@ -17,8 +17,10 @@
 //!   - `plan_id` and `job_id` are the task's id, as text. The instance has no plan, and the task id
 //!     is the one name for this job on both sides, which logs and `UpdateTask` use.
 //!   - `check_run_id` is the task id too (0 if it does not fit), the database's key for the job.
-//!   - `job_token` is the context's `gitea_runtime_token` (the token the job presents to the
-//!     instance's artifact and cache services), or empty. There is no `completejob` here to use it.
+//!   - `job_token` is the context's `gitea_runtime_token` (what every action step gets as
+//!     `ACTIONS_RUNTIME_TOKEN`; Gitea also accepts it as an API bearer, docs/GITEA.md), else, as
+//!     act_runner does for an instance that sends none, the job's token (`runtimeTokenOf`), or
+//!     empty. There is no `completejob` here to use it.
 //!   - The job's own `runs-on`, `if`, `timeout-minutes` and `continue-on-error` have no field in
 //!     `job.Job`, which GitHub enforces itself; they are in `Converted`, for the poller to use.
 const std = @import("std");
@@ -38,6 +40,8 @@ pub const Error = error{BadWorkflow} || Allocator.Error;
 /// The job and what the task says of it that `job.Job` has no place for.
 pub const Converted = struct {
     job: job_mod.Job,
+    /// Where `job.job_token` (ACTIONS_RUNTIME_TOKEN) came from, for the task's log.
+    runtime_token_source: RuntimeTokenSource = .none,
     /// `runs-on`: the labels the instance matched to this runner. The server has already chosen
     /// the runner by them; they are kept for the log.
     runs_on: []const []const u8 = &.{},
@@ -111,7 +115,8 @@ const Builder = struct {
         const svcs = try b.servicesOf(jn.get("services"));
         const ctr = try b.containerOf(jn.get("container"));
         const dflt = try b.defaults(doc.get("defaults"), jn.get("defaults"));
-        const token = contextString(t.context, "gitea_runtime_token");
+        const rt = runtimeTokenOf(t);
+        const token = rt.token;
         const id_text = try std.fmt.allocPrint(arena, "{d}", .{t.id});
 
         const github = try githubOf(arena, t.context, key);
@@ -139,6 +144,7 @@ const Builder = struct {
         };
         return .{
             .job = j,
+            .runtime_token_source = rt.source,
             .runs_on = try labels(arena, jn.get("runs-on")),
             .condition = if (jn.get("if")) |c| c.scalarText() orelse "" else "",
             .timeout_minutes = if (jn.get("timeout-minutes")) |n| try b.optionalTemplate(n) else null,
@@ -710,6 +716,43 @@ fn githubOf(arena: Allocator, context: Value, job_key: []const u8) Allocator.Err
     return g;
 }
 
+/// Where a job's runtime token came from.
+pub const RuntimeTokenSource = enum {
+    /// The context's `gitea_runtime_token`.
+    context_runtime,
+    /// A secret (`GITEA_TOKEN`, `FORGEJO_TOKEN` or `GITHUB_TOKEN`): the instance sent no runtime token.
+    secret,
+    /// The context's own `token`: the instance sent neither.
+    context_token,
+    none,
+
+    /// What the task's log says of it. Never the token.
+    pub fn describe(source: RuntimeTokenSource) []const u8 {
+        return switch (source) {
+            .context_runtime => "the runtime token is the task's gitea_runtime_token",
+            .secret => "the task has no gitea_runtime_token: the runtime token is the task's GITHUB_TOKEN secret, as act_runner does for an older instance",
+            .context_token => "the task has no gitea_runtime_token: the runtime token is the context's token, as act_runner does for an older instance",
+            .none => "the task has no runtime token and no job token: artifact services are not set",
+        };
+    }
+};
+
+/// The token for `ACTIONS_RUNTIME_TOKEN`, as act_runner takes it (`internal/app/run/runner.go`):
+/// the context's `gitea_runtime_token`, and when an older instance sends none, the job's token:
+/// the secret `GITEA_TOKEN` (`FORGEJO_TOKEN` for forgejo-runner), else `GITHUB_TOKEN`, else the
+/// context's `token`.
+fn runtimeTokenOf(t: task_mod.Task) struct { token: []const u8, source: RuntimeTokenSource } {
+    const own = contextString(t.context, "gitea_runtime_token");
+    if (own.len > 0) return .{ .token = own, .source = .context_runtime };
+    for ([_][]const u8{ "GITEA_TOKEN", "FORGEJO_TOKEN", "GITHUB_TOKEN" }) |name|
+        for (t.secrets) |sec|
+            if (std.mem.eql(u8, sec.name, name) and sec.value.len > 0)
+                return .{ .token = sec.value, .source = .secret };
+    const ctx = contextString(t.context, "token");
+    if (ctx.len > 0) return .{ .token = ctx, .source = .context_token };
+    return .{ .token = "", .source = .none };
+}
+
 /// What artifact actions reach the instance by: `ACTIONS_RUNTIME_URL` (the pipelines API of
 /// artifacts v3) and `ACTIONS_RESULTS_URL` (the results service of artifacts v4), as act_runner
 /// sets them (`internal/app/run/runner.go`), with the job's runtime token as `ACTIONS_RUNTIME_TOKEN`
@@ -1208,6 +1251,50 @@ test "with no runtime token the artifact services are not named, and a job that 
     const with_token = try runtimeFor(arena, "http://h:3300/");
     try testing.expectEqualStrings("http://h:3300/api/actions_pipeline/", with_token.pipelines_url);
     try testing.expectEqualStrings("http://h:3300", with_token.results_url);
+}
+
+test "with no gitea_runtime_token the runtime token is the job's token, as act_runner takes it, and it is masked" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const text = "jobs:\n  j:\n    steps:\n      - run: echo\n";
+    var why: []const u8 = "";
+
+    // The instance's runtime token wins over the job's.
+    var t = try textTask(arena, text, "{\"server_url\":\"http://h:3300\",\"token\":\"ctx-tok\",\"gitea_runtime_token\":\"rt-tok\"}");
+    t.secrets = &.{.{ .name = "GITHUB_TOKEN", .value = "sec-tok" }};
+    var c = try fromTask(arena, t, &why);
+    try testing.expectEqualStrings("rt-tok", c.job.job_token);
+    try testing.expectEqual(RuntimeTokenSource.context_runtime, c.runtime_token_source);
+
+    // An older instance sends none: GITEA_TOKEN, then GITHUB_TOKEN, then the context's token.
+    t = try textTask(arena, text, "{\"server_url\":\"http://h:3300\",\"token\":\"ctx-tok\"}");
+    t.secrets = &.{ .{ .name = "GITHUB_TOKEN", .value = "gh-tok" }, .{ .name = "GITEA_TOKEN", .value = "gt-tok" } };
+    c = try fromTask(arena, t, &why);
+    try testing.expectEqualStrings("gt-tok", c.job.job_token);
+    try testing.expectEqual(RuntimeTokenSource.secret, c.runtime_token_source);
+    t.secrets = &.{ .{ .name = "GITHUB_TOKEN", .value = "gh-tok" }, .{ .name = "GITEA_TOKEN", .value = "" } };
+    c = try fromTask(arena, t, &why);
+    try testing.expectEqualStrings("gh-tok", c.job.job_token);
+    try testing.expect(contains(c.job.secrets, "gh-tok"));
+    t.secrets = &.{};
+    c = try fromTask(arena, t, &why);
+    try testing.expectEqualStrings("ctx-tok", c.job.job_token);
+    try testing.expectEqual(RuntimeTokenSource.context_token, c.runtime_token_source);
+    try testing.expect(contains(c.job.secrets, "ctx-tok"));
+
+    // The artifact services are named, which is what makes the artifact actions work.
+    try testing.expectEqualStrings("http://h:3300/api/actions_pipeline/", c.job.runtime.pipelines_url);
+    try testing.expectEqualStrings("http://h:3300", c.job.runtime.results_url);
+    // The log line names the source, never the token.
+    try testing.expect(std.mem.indexOf(u8, c.runtime_token_source.describe(), "ctx-tok") == null);
+
+    // No token anywhere: none, and no services.
+    t = try textTask(arena, text, "{\"server_url\":\"http://h:3300\"}");
+    c = try fromTask(arena, t, &why);
+    try testing.expectEqualStrings("", c.job.job_token);
+    try testing.expectEqual(RuntimeTokenSource.none, c.runtime_token_source);
+    try testing.expectEqualStrings("", c.job.runtime.results_url);
 }
 
 test "the default actions URL: the instance's own is the server, another is kept, github and self are named" {

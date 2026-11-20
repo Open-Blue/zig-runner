@@ -270,8 +270,10 @@ pub const Job = struct {
 
     /// What git over HTTPS to the job's server authenticates with: the job's `GITHUB_TOKEN`, else,
     /// on GitHub, its job token (one token). On Gitea and Forgejo the job token is the runtime
-    /// token (for the artifact and cache services), which git refuses: the secret `GITHUB_TOKEN`
-    /// is the task's token for the repository, and with none there is no token ("").
+    /// token (`ACTIONS_RUNTIME_TOKEN`): git sends its token as HTTP Basic, which the instance does
+    /// not take a runtime token in (it takes it as a Bearer, for its API and artifact services, as
+    /// the task's actions user; docs/GITEA.md). The secret `GITHUB_TOKEN` is the task's token for
+    /// the repository, and with none there is no token ("").
     pub fn gitToken(job: Job) []const u8 {
         for (job.secret_vars) |sv|
             if (std.mem.eql(u8, sv.name, "GITHUB_TOKEN") and sv.value.len > 0) return sv.value;

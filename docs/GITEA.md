@@ -142,13 +142,13 @@ with the job. Services from real postgres and redis images run in the existing
 
 A job's network reaches the instance's address and port, and nothing else of the host's
 (`native/nft.zig`). That holds for an instance on the host's loopback (the runner forwards it, so the
-job's `github.server_url` works), on another machine, and on the host's own address when it listens
-there. It did **not** hold in the live jobs' first run for an instance in a Docker container with a
-published port, dialled at the host's own address: the jobs' connections timed out. The probable
-cause is that Docker's NAT rewrites the destination before the runner's rule sees it; the live jobs
-run the instance on the host's network (`--network host`), where it works. An instance on the
-loopback also cannot hand a job URLs made from its `ROOT_URL` (artifact uploads, for one): the job's
-`127.0.0.1` is its own. Give `ROOT_URL` the address the host has on its network.
+job's `github.server_url` works), on another machine, on the host's own address when it listens
+there, and for an instance in a Docker container with a published port (`-p HOST_ADDRESS:3000:3000`),
+dialled at the host's address. Docker's NAT rewrites that destination to the container before a
+packet reaches the job's rule, and the rule matches what the job dialled (`ct original`, #602 and
+#603), so the published port works; the live jobs ([CI.md](CI.md)) run the instance that way. An
+instance on the loopback also cannot hand a job URLs made from its `ROOT_URL` (artifact uploads, for
+one): the job's `127.0.0.1` is its own. Give `ROOT_URL` the address the host has on its network.
 
 ## Artifacts and the cache
 
@@ -157,8 +157,42 @@ talks to the instance's artifact service with `ACTIONS_RESULTS_URL` and `ACTIONS
 (artifacts v4, a Twirp service) or `ACTIONS_RUNTIME_URL` (v3, the pipelines API), which every
 action step gets. The runner serves nothing of its own. The instance's addresses are the ones the job
 reaches it by (the runner makes a loopback or LAN instance reachable from the job's network;
-`gitea/reach.zig`), and the runtime token is a different, narrower token than `GITHUB_TOKEN` (it
-reaches the artifact services only), masked in the log.
+`gitea/reach.zig`), and the runtime token is masked in the log.
+
+**What the runtime token can do.** Every step that runs an action (`uses:`, not `run:`) gets
+`ACTIONS_RUNTIME_TOKEN`, as act_runner and forgejo-runner give it (act_runner `internal/app/run/runner.go`
+lines 528-538, v6.0.1 at commit `ff4f626`; forgejo-runner `internal/app/run/runner.go` lines 306-310, commit `dcd6b48`),
+so a third-party action has it, and it is not limited to the artifact service:
+
+- **Gitea** (go-gitea/gitea `main`, commit `47f6278`, 2026-11-20; latest release v28.4.0): the
+  `gitea_runtime_token` is a JWT made by `CreateAuthorizationToken` (`services/actions/auth.go`
+  lines 43-61, scope `Actions.Results:<run>:<job>`), and `services/auth/oauth2.go` `userFromToken`
+  (lines 110-118) accepts it as a bearer token for the API: it decodes it with `TokenToTaskID`, and
+  while the task's status is running (`CheckTaskIsRunning`, line 61) the request is made by Gitea's
+  actions user for that task (`NewActionsUserWithTaskID`). That user is the one the job's own
+  `GITHUB_TOKEN` is, so the token reaches what that task's token reaches in the API, not only the artifact services. It is valid
+  for one hour plus the instance's endless-task timeout (`auth.go` line 66: `ExpiresAt` is
+  `1h + setting.Actions.EndlessTaskTimeout`) and stops working when the task ends. It is a Bearer
+  token: sent as HTTP Basic, which is how git sends its token, the instance does not take it, which is why git
+  uses the `GITHUB_TOKEN` secret and not this token.
+- **Forgejo** (`forgejo/forgejo` branch `forgejo`, commit `1a13355`, release v17.0.2): the same in
+  effect, with differences. The runtime token is a JWT of 24 hours (`services/actions/auth.go`
+  line 85), and a separate method, `ActionRuntimeToken` (`services/auth/method/action_runtime_token.go`
+  lines 22-39), accepts it, from the form or an Authorization Bearer, while the task is running, as the actions user
+  of that task; it is on the API's auth group (`routers/api/shared/middleware.go` line 57) and the
+  web and git groups (`routers/web/web.go` lines 129 and 184). Neither takes it as HTTP Basic, so git still uses the `GITHUB_TOKEN` secret.
+  Forgejo's context also names it `forgejo_runtime_token` (`services/actions/task.go` lines 195-196,
+  with the `gitea_runtime_token` key marked "can be removed after Forgejo 19").
+
+zig-runner keeps act_runner's behaviour: the action steps get the token. Where that matters, run only
+actions you trust on the instance. On Gitea one that you do not trust holds, while the job runs, what the
+job's own token can do through the API. (`GITHUB_TOKEN` itself is not put in an action's environment;
+an action that needs it gets it as the workflow passes it, `${{ secrets.GITHUB_TOKEN }}`.)
+
+If the instance sends no `gitea_runtime_token` (an older Gitea), the runtime token is the job's token,
+as act_runner does it: the `GITEA_TOKEN` secret (or `FORGEJO_TOKEN`), else `GITHUB_TOKEN`, else the
+context's `token`. The task's log says which one it used ("the runtime token is ..."), never the value, which is masked
+all the same.
 
 GitHub's own `actions/upload-artifact@v4` and `download-artifact@v4` refuse to run when
 `GITHUB_SERVER_URL` is not github.com ("not currently supported on GHES"), on Gitea and Forgejo as on
@@ -169,8 +203,14 @@ any server that is not GitHub's. Use `forgejo/upload-artifact@v4` and `forgejo/d
 
 **`actions/cache` does nothing** here: act_runner and forgejo-runner run a cache server of their own
 (the runner's, not the instance's), which zig-runner does not, so `ACTIONS_CACHE_URL` is not set and
-the action reports that the cache service is unavailable and carries on (a restore finds no entry, a
-save is skipped; the step does not fail). What the runner offers in its place needs no action: the
+the action warns that the cache is unavailable and carries on. The message is `actions/cache`'s own, from
+the live jobs' log (pinned at v4.3.0, `@actions/cache` 4.1.0): with no `ACTIONS_CACHE_URL` its
+`isFeatureAvailable` is false (the v1 service needs that variable, and the action does not use v2 off
+github.com), so before any request it prints "[warning]Cache action is only supported on GHES version
+>= 3.5. If you are on version >=3.5 Please check with GHES admin if Actions cache service is enabled or
+not. ..." (the instance's `GITHUB_SERVER_URL` is not github.com, so the action takes it for a GHES), sets `cache-hit` to
+`false` and returns. `ACTIONS_RESULTS_URL` is set, but the action does not look for a cache there
+without `ACTIONS_CACHE_URL` (a restore finds no entry, a save is skipped; the step does not fail). What the runner offers in its place needs no action: the
 step cache replays a step whose inputs have not changed, and the Zig, Cargo and package caches are
 volumes the runner keeps for a repository's trusted jobs (`RUNNER_ZIG_LOCAL_CACHE`,
 `RUNNER_CARGO_TARGET_CACHE`; [OPERATIONS.md](OPERATIONS.md#cache-volumes-and-trust)), the same as for

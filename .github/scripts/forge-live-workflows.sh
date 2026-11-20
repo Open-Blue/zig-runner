@@ -129,7 +129,7 @@ jobs:
         with: {name: probe, path: dl}
       - run: test "$(cat dl/out.txt)" = hello-artifact
       # (Pinned by commit: v4 of each, as the first run fetched them; they run beside the runtime token.)
-      # There is no cache service: the action says so and the step does not fail.
+      # There is no cache service: the action warns (no ACTIONS_CACHE_URL) and the step does not fail.
       - uses: https://github.com/actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with: {path: dl, key: probe}
       - run: echo after-cache
