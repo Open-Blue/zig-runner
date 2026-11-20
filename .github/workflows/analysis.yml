@@ -534,10 +534,14 @@ jobs:
         run: (umask 077 && printf '%s\n' "$KEY" >"$RUNNER_TEMP/e2e-app.pem")
 
       # A pass's suite failing and its races are both reported, the races last. The TSan runner
-      # does not stop on its SIGTERM, and `stop` kills it after 60 s: TSan defers a signal to its
-      # thread's next call into libc, and Zig's std.Io parks its threads in raw futex syscalls,
-      # so a signal that lands on a parked thread is never handled (the plain runner stops at
-      # once). Reports are written as races happen, so only a race in the shutdown itself is lost.
+      # has not stopped on its SIGTERM within 60 s in these passes, and `stop` then kills it
+      # (#628). The cause first assumed here, that TSan defers a signal to its thread's next call
+      # into libc while std.Io parks its threads in raw futex syscalls, did not reproduce: a
+      # signal sent to a thread parked in a raw futex is handled at once in a TSan build, and an
+      # idle TSan runner stops in under a second. `stop` now prints the process tree, each
+      # thread's state, stacks and signal masks and the log's end before it kills, which is
+      # where to read why. Reports are written as races happen, so only a race in the shutdown
+      # itself is lost.
       - name: End to end on Dagger
         if: steps.go.outputs.run == 'true'
         env:

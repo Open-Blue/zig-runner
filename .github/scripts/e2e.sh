@@ -255,8 +255,41 @@ stop() {
 		sudo kill -0 "$pid" 2>/dev/null || { echo "runner stopped" && return 0; }
 		sleep 1
 	done
-	echo "the runner did not stop within 60 s: killed" >&2
+	echo "::warning::the runner did not stop within 60 s: killed (#628: the facts below say why)" >&2
+	stuck_runner "$pid" || true
 	sudo kill -KILL "$pid" 2>/dev/null || true
+}
+
+# What a runner that ignored SIGTERM looks like (#628), printed before it is killed; never fails.
+# PID is the process `start` launched (sudo, which passes signals on to its command): whether sudo
+# is still there and the runner is its child, each thread's state, kernel stack and signal masks
+# (SigBlk blocked, SigPnd/ShdPnd pending for the thread/process, SigCgt caught), the userspace
+# stacks if gdb is on the image (it is not installed if missing), and the end of the runner's log.
+stuck_runner() {
+	local pid=${1:?} runner t f
+	echo "::group::why the runner did not stop"
+	echo "== process tree (PID $pid signalled)"
+	sudo ps --forest -o pid,ppid,pgid,stat,wchan:20,etime,args -g "$(ps -o pgid= -p "$pid" | tr -d ' ')" 2>&1 || true
+	runner=$(pgrep -P "$pid" | head -n1 || true)
+	runner=${runner:-$pid}
+	echo "== runner PID $runner: signal state and kernel stack of each thread"
+	for t in /proc/"$runner"/task/*; do
+		echo "-- thread ${t##*/}: $(sudo cat "$t/comm" 2>&1) state=$(sudo awk '{print $3}' "$t/stat" 2>&1) wchan=$(sudo cat "$t/wchan" 2>&1)"
+		sudo grep -E '^(SigPnd|ShdPnd|SigBlk|SigIgn|SigCgt):' "$t/status" 2>&1 || true
+		sudo cat "$t/stack" 2>&1 | head -n 8 || true
+	done
+	if command -v gdb >/dev/null; then
+		echo "== userspace stacks"
+		sudo gnutimeout 30 gdb -p "$runner" -batch -ex 'thread apply all bt' 2>&1 | tail -n 300 || true
+	else
+		echo "== gdb is not installed on this image: no userspace stacks"
+	fi
+	for f in "$out"/runner-*.log; do
+		[[ -e $f ]] || continue
+		echo "== the last 40 lines of $(basename "$f")"
+		tail -n 40 "$f" | sed -E 's/(gh[opsu]|github_pat)_[A-Za-z0-9_]{20,}/***/g'
+	done
+	echo "::endgroup::"
 }
 
 # A ThreadSanitizer report anywhere in a pass's logs: the runner's own (its threads), and the
