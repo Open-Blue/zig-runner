@@ -825,7 +825,7 @@ jobs:
           .github/scripts/checksec.sh "$RUNNER_TEMP/dist/zig-runner-linux-x86_64" "$RUNNER_TEMP/dist/zig-runner-linux-aarch64"
           "$RUNNER_TEMP/dist/zig-runner-linux-x86_64" --version
 
-      # The arm64 job runs the aarch64 binary where it runs, from this build rather than a second one
+      # Tests (arm64) runs the aarch64 binary where it runs, from this build rather than a second one
       # (the same compiler, the same sources, both targets: the same bytes, whichever host built them).
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.scope.outputs.run == 'true'
@@ -876,10 +876,18 @@ jobs:
           .github/scripts/checksec.sh "$RUNNER_TEMP/dist/zig-runner-linux-aarch64" "$RUNNER_TEMP/dist/zig-runner-linux-x86_64"
           "$RUNNER_TEMP/dist/zig-runner-linux-aarch64" --version
 
-  # The tests on arm64, rootless; as root they are `native-root`'s. Apart from the release builds
-  # (`arm64-builds`), which used to run first in the same job and held the tests back.
+  # The tests on arm64, rootless; as root they are `native-root`'s. Also the one place the aarch64
+  # release binary is run where it runs: on GitHub's arm64 runner, as on razorbill (a Pi, prod),
+  # which would otherwise be the first machine ever to execute it. It is Release builds' own binary
+  # (same compiler, same sources: the same bytes, whichever host built them), run once after the
+  # tests (a static PIE relocates itself at startup, before anything else). Release builds checks the
+  # hardening of both binaries (checksec.sh reads the files, on any host); `arm64-builds` does
+  # too, until it is removed. Starting after Release builds (about 200 s) puts this job's end (about 390 s) beside the
+  # Database tests' (about 440 s), not after them. Skipped, still reporting, as for the tests'
+  # scope; the binary run follows ci-scope.sh binaries.
   arm64-test:
     name: Tests (arm64)
+    needs: binaries
     if: github.event_name != 'push'
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 30
@@ -932,6 +940,25 @@ jobs:
       - name: Test leftovers
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/tmp-leaks.sh
+
+      - name: Whether this change can affect the release's builds
+        id: binaries-scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: .github/scripts/ci-scope.sh binaries
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: steps.binaries-scope.outputs.run == 'true'
+        with:
+          name: release-builds
+          path: ${{ runner.temp }}/dist
+
+      - name: The aarch64 release binary, run on arm64
+        if: steps.binaries-scope.outputs.run == 'true'
+        run: |
+          chmod +x "$RUNNER_TEMP/dist/zig-runner-linux-aarch64"
+          uname -m
+          "$RUNNER_TEMP/dist/zig-runner-linux-aarch64" --version
 
   # The end-to-end suite (.github/scripts/e2e.sh): the runner built from this change serves
   # runner-bench's e2e workflows (Open-Blue/runner-bench, e2e.yml and e2e-cancel.yml) on GitHub's
