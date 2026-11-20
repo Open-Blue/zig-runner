@@ -931,6 +931,16 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
 
+      # The Rust toolchain and the network library's build outputs, restored from the last run
+      # with the same inputs and saved after this one (.github/actions/rust-cache); a miss builds as before.
+      # One entry per arch, shared by the two parts: they build the same variants (the arch is in the key).
+      - name: Rust build cache
+        if: steps.scope.outputs.run == 'true' && runner.environment == 'github-hosted'
+        uses: ./.github/actions/rust-cache # zizmor: ignore[self-repository] actionlint rejects the `$/` form
+        with:
+          name: native-root
+          tools: stable
+
       # As the tests' output in `test`: only text to this job, never its workflow commands
       # (zig-test.sh stops them).
       - name: Test, as root
@@ -938,6 +948,7 @@ jobs:
         working-directory: runner
         env:
           PART: ${{ matrix.part }}/2
+          ZIG_TEST_TIMES: "1" # TEMPORARY: per-test times, to balance the parts
         run: |
           # Ubuntu's AppArmor (24.04 on) blocks unprivileged user namespaces; lift it on this throwaway VM.
           sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -1205,6 +1216,15 @@ jobs:
       - name: Install Zig
         if: steps.go.outputs.run == 'true'
         run: .github/scripts/install-zig.sh
+
+      # The Rust toolchain and the network library's build outputs (zr-net, musl), restored from the
+      # last run with the same inputs and saved after this one (.github/actions/rust-cache); a miss builds as before.
+      - name: Rust build cache
+        if: steps.go.outputs.run == 'true' && runner.environment == 'github-hosted'
+        uses: ./.github/actions/rust-cache # zizmor: ignore[self-repository] actionlint rejects the `$/` form
+        with:
+          name: e2e
+          tools: stable
 
       - name: Build the runner
         if: steps.go.outputs.run == 'true'
