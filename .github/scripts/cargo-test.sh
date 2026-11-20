@@ -18,6 +18,11 @@ if [[ -n ${RUNNER_TEMP:-} && -z ${CARGO_HOME:-} ]]; then
 fi
 # CI restores the toolchain and the target directory from a cache (.github/actions/rust-cache).
 echo "cargo-test.sh: rust cache: ${ZR_RUST_CACHE:-none (not CI, or a job without it)}" >&2
+# Zig for every C compile, link and archive, the host's included (zig-cc-env.sh): the tests link
+# against glibc 2.28's stubs, not the machine's libc, so nothing the image has reaches the outputs.
+# shellcheck source=.github/scripts/zig-cc-env.sh
+. "$here/zig-cc-env.sh"
+zig_cc_env "$(uname -m)-unknown-linux-gnu"
 mode=${1:-}
 case $mode in
 "")

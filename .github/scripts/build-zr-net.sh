@@ -58,10 +58,10 @@ x86_64 | aarch64) ;;
 esac
 triple=$arch-unknown-linux-${libc/tsan/gnu}
 upper=$(tr a-z- A-Z_ <<<"$triple")
-export ZR_ZIG_TARGET=$arch-linux-${libc/tsan/gnu}
-export "CC_${triple//-/_}=$here/zig-cc.sh"
-export "AR_${triple//-/_}=${AR_ZIG:-ar}"
-export "CARGO_TARGET_${upper}_LINKER=$here/zig-cc.sh"
+# Zig for every C compile, link and archive, host side included (zig-cc-env.sh).
+# shellcheck source=.github/scripts/zig-cc-env.sh
+. "$here/zig-cc-env.sh"
+zig_cc_env "$triple"
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PWD/target}
 # CI restores the toolchain and the target directory from a cache (.github/actions/rust-cache,
 # docs/rust-net.md): what it restored, and under which key, is in ZR_RUST_CACHE.
@@ -125,14 +125,14 @@ aarch64) want=183 ;;
 esac
 # Neither read stops early in a pipe (`grep -m1`, `od -N2` on `ar p`): `ar` would die of SIGPIPE,
 # and pipefail would fail the build for it.
-member=$(ar t "$out" | awk '/\.o$/ && !seen { print; seen = 1 }')
+member=$("$here/zig-ar.sh" t "$out" | awk '/\.o$/ && !seen { print; seen = 1 }')
 if [[ -z $member ]]; then
 	echo "build-zr-net.sh: $out has no object (.o) member to check its architecture by" >&2
 	exit 1
 fi
 # No trap of its own: it would replace the one a sourced installer set for its work directory.
 object=$(mktemp)
-ar p "$out" "$member" >"$object" || {
+"$here/zig-ar.sh" p "$out" "$member" >"$object" || {
 	rm -f "$object"
 	exit 1
 }
@@ -142,4 +142,4 @@ if [[ $got != "$want" ]]; then
 	echo "build-zr-net.sh: $out is not for $arch: $member has ELF machine $got, not $want" >&2
 	exit 1
 fi
-echo "build-zr-net.sh: $out: for $arch (ELF machine $got in $member), $(ar t "$out" | wc -l) members, sha256 $(sha256sum "$out" | cut -d' ' -f1)" >&2
+echo "build-zr-net.sh: $out: for $arch (ELF machine $got in $member), $("$here/zig-ar.sh" t "$out" | wc -l) members, sha256 $(sha256sum "$out" | cut -d' ' -f1)" >&2

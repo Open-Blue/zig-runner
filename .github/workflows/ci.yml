@@ -497,6 +497,13 @@ jobs:
           name: database
           tools: nightly
 
+      # The proof that the cache's keys need not hold the runner image: the musl and gnu builds
+      # with failing cc, ld and ar on PATH (a pull request only: it is a cold build, about a minute
+      # and a half with the stable Rust's install, and the cache above holds what the next step needs).
+      - name: Rust builds without the image's C toolchain
+        if: steps.scope.outputs.run == 'true' && github.event_name == 'pull_request'
+        run: .github/scripts/rust-image-free-check.sh
+
       # The network library's own tests under ThreadSanitizer (the pinned nightly, -Zbuild-std): the
       # races among its own threads, which Zig's TSan only sees through the archive below, linked
       # instrumented too (docs/rust-net.md, "ThreadSanitizer").
