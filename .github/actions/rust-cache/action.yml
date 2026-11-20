@@ -50,16 +50,20 @@ runs:
     # never used. The key
     # covers the scripts that name the versions and the checksums.
     - id: tools
-      if: github.event_name != 'merge_group'
+      if: github.event_name == 'push'
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ${{ runner.tool_cache }}/rust
           ${{ runner.tool_cache }}/rust-nightly
         key: ${{ steps.keys.outputs.tools }}
-    # A merge group's ref could not be read by anything else: it restores, never saves.
+    # Only a push to main saves (main's entries are what every pull request and merge group can
+    # read; the Rust cache warmer fills those of the jobs that do not run on a push). A pull
+    # request or merge group restores and never saves: their entries, readable by their own ref
+    # only, filled the repository's 10 GB and evicted main's (2026-11-20: 9.9 GB, 6.5 of it on
+    # three pull requests' refs).
     - id: tools-ro
-      if: github.event_name == 'merge_group'
+      if: github.event_name != 'push'
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
@@ -74,13 +78,13 @@ runs:
     # and lock file, the toolchain pin, the scripts that build (and the C compiler wrapper and the
     # Zig it runs), the runner and the job.
     - id: target
-      if: github.event_name != 'merge_group'
+      if: github.event_name == 'push'
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: runner/rust/target
         key: ${{ steps.keys.outputs.target }}
     - id: target-ro
-      if: github.event_name == 'merge_group'
+      if: github.event_name != 'push'
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: runner/rust/target
