@@ -31,6 +31,17 @@ On a change that can't affect what a job checks, the job reports without running
 build and tests run for any file the script doesn't know. A path filter would leave the check
 unreported instead, and the merge queue waiting for it.
 
+In the merge queue, `ci` reuses a pull request's pass of the same tree on the same base
+(`.github/scripts/ci-reuse.sh`, tested by `ci-reuse-test.sh`). Its first job, "Reuse a pull
+request's pass", looks for a successful `ci` run of the pull request's head, from this repository.
+The head's tree, workflows included, must be the group commit's tree, and the run's base must be
+the group's base. When both match, every other job reports skipped. The four "Native tests as
+root" names report through `native-root-reused`, because a skipped matrix job reports under its
+unexpanded name, so the group merges in about a minute. Anything less, including any failed lookup,
+runs the whole workflow as before. The job's log names both trees, each run it looked at, and why it
+did or didn't reuse one. `proofs` and `release` still run in the queue; they are scope-gated and
+short.
+
 ## Workflows
 
 | Workflow | When | What |
