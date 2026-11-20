@@ -57,7 +57,7 @@ needed() {
 			.github/scripts/install-zig.sh | .github/scripts/allow-userns.sh | .github/scripts/ci-database.sh | \
 			.github/scripts/zig-test.sh | .github/scripts/zig-modules.sh | \
 			.github/scripts/cargo-test.sh | .github/scripts/pg-tls-fixture.sh | .github/scripts/build-zr-net.sh | \
-			.github/scripts/zig-cc.sh | .github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | \
+			.github/scripts/zig-cc.sh | .github/scripts/zig-cc-env.sh | .github/scripts/zig-cc-host.sh | .github/scripts/zig-ar.sh | .github/scripts/rust-image-free-check.sh | .github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | \
 			.github/scripts/expr-conformance.sh | .github/scripts/zlint.sh | \
 			.github/scripts/zlint-suppressed.baseline | \
 			.github/scripts/native-service-images.sh | .github/scripts/image-preflight.sh) return 0 ;;
@@ -77,7 +77,7 @@ needed() {
 		case $1 in
 		runner/src/* | runner/build.zig | runner/build.zig.zon | .github/workflows/ci.yml | \
 			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
-			.github/scripts/build-binaries.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
+			.github/scripts/build-binaries.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | .github/scripts/zig-cc-env.sh | .github/scripts/zig-cc-host.sh | .github/scripts/zig-ar.sh | .github/scripts/rust-image-free-check.sh | \
 			.github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | runner/rust/* | \
 			.github/scripts/checksec.sh) return 0 ;;
 		*) return 1 ;;
@@ -90,7 +90,7 @@ needed() {
 		case $1 in
 		runner/src/* | runner/build.zig | runner/build.zig.zon | deploy/engine.json | \
 			.github/workflows/ci.yml | .github/scripts/ci-scope.sh | \
-			.github/scripts/install-zig.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
+			.github/scripts/install-zig.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | .github/scripts/zig-cc-env.sh | .github/scripts/zig-cc-host.sh | .github/scripts/zig-ar.sh | .github/scripts/rust-image-free-check.sh | \
 			.github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | runner/rust/* | \
 			.github/scripts/e2e.sh | .github/scripts/image-preflight.sh | .github/scripts/allow-userns.sh) return 0 ;;
 		*) return 1 ;;
@@ -124,7 +124,7 @@ needed() {
 		runner/build.zig | runner/build.zig.zon | runner/Dockerfile | runner/.dockerignore | \
 			deploy/* | .trivyignore.yaml | .github/workflows/release.yml | \
 			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
-			.github/scripts/build-binaries.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
+			.github/scripts/build-binaries.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | .github/scripts/zig-cc-env.sh | .github/scripts/zig-cc-host.sh | .github/scripts/zig-ar.sh | .github/scripts/rust-image-free-check.sh | \
 			.github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | runner/rust/* | \
 			.github/scripts/sbom.sh | .github/scripts/checksec.sh) return 0 ;;
 		*) return 1 ;;
@@ -193,7 +193,7 @@ needed() {
 			runner/src/zr_net.zig | runner/src/tls_stream.zig | runner/src/net_client.zig | runner/src/net_oracle.zig | runner/src/fuzz_corpus/tls/* | runner/rust/* | \
 			runner/tls_oracle.zig | runner/tools/tls_oracle/* | .github/scripts/pg-tls-fixture.sh | \
 			.github/scripts/build-zr-net.sh | \
-			.github/scripts/zig-cc.sh | .github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | \
+			.github/scripts/zig-cc.sh | .github/scripts/zig-cc-env.sh | .github/scripts/zig-cc-host.sh | .github/scripts/zig-ar.sh | .github/scripts/rust-image-free-check.sh | .github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | \
 			runner/src/native/tarball.zig | \
 			.github/valgrind.supp) return 0 ;;
 		*) return 1 ;;
@@ -222,7 +222,7 @@ needed() {
 			.github/scripts/zig-test.sh | runner/src/native/store_crash.zig | \
 			runner/src/native/oci/Store.zig | runner/src/native/volumes.zig | \
 			runner/src/native/evict.zig | \
-			.github/scripts/image-preflight.sh | .github/scripts/store-crash.sh | .github/scripts/allow-userns.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
+			.github/scripts/image-preflight.sh | .github/scripts/store-crash.sh | .github/scripts/allow-userns.sh | .github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | .github/scripts/zig-cc-env.sh | .github/scripts/zig-cc-host.sh | .github/scripts/zig-ar.sh | .github/scripts/rust-image-free-check.sh | \
 			.github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | runner/rust/*) return 0 ;;
 		*) return 1 ;;
 		esac
@@ -255,7 +255,7 @@ needed() {
 		case $1 in
 		.github/workflows/analysis.yml | \
 			.github/scripts/ci-scope.sh | .github/scripts/install-zig.sh | \
-			.github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | \
+			.github/scripts/zig-modules.sh | .github/scripts/build-zr-net.sh | .github/scripts/zig-cc.sh | .github/scripts/zig-cc-env.sh | .github/scripts/zig-cc-host.sh | .github/scripts/zig-ar.sh | .github/scripts/rust-image-free-check.sh | \
 			.github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | runner/rust/* | .github/scripts/zig-coverage.sh | \
 			.github/scripts/native-service-images.sh | .github/scripts/image-preflight.sh | .github/scripts/allow-userns.sh) return 0 ;;
 		*) return 1 ;;
