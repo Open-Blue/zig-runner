@@ -46,6 +46,8 @@ pub const Server = struct {
     released: std.atomic.Value(bool) = .init(false),
     stopping: std.atomic.Value(bool) = .init(false),
     held: ?Io.net.Stream = null,
+    /// The last error that ended a session (a client that went away is one).
+    err: ?anyerror = null,
 
     pub fn start(s: *Server, gpa: std.mem.Allocator, io: Io, mode: Mode) !void {
         const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -78,7 +80,7 @@ pub const Server = struct {
     }
 
     pub fn url(s: *const Server, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "ws://127.0.0.1:{d}/_ws/ingest.sock", .{s.port}) catch unreachable;
+        return std.fmt.bufPrint(buf, "ws://127.0.0.1:{d}/_ws/ingest.sock", .{s.port}) catch @panic("the url buffer is too small");
     }
 
     pub fn release(s: *Server) void {
@@ -126,7 +128,9 @@ pub const Server = struct {
                     s.held = conn;
                 },
                 else => {
-                    s.session(conn) catch {};
+                    s.session(conn) catch |e| {
+                        s.err = e;
+                    };
                     conn.close(s.io);
                     s.ended.store(true, .release);
                 },
@@ -150,7 +154,9 @@ pub const Server = struct {
         while (true) {
             const line = try in.takeDelimiterInclusive('\n');
             s.mu.lockUncancelable(s.io);
-            s.head.appendSlice(s.gpa, line) catch {};
+            s.head.appendSlice(s.gpa, line) catch |e| {
+                s.err = e;
+            };
             s.mu.unlock(s.io);
             const header = std.mem.trimEnd(u8, line, "\r\n");
             if (header.len == 0) break;
