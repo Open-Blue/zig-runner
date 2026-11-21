@@ -3320,7 +3320,7 @@ test "native store: jobs ending together share one syncfs, and each one's last l
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
     const root = try endStore(arena, io, tmp);
     var jobs: [4]EndJob = undefined;
     for (&jobs, 0..) |*j, i| j.* = try EndJob.make(arena, io, tmp, root, try std.fmt.allocPrint(arena, "j{d}", .{i}), 10_000);
@@ -3347,7 +3347,7 @@ test "native store: a failed shared syncfs poisons every job's layer, and a job'
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
     const root = try endStore(arena, io, tmp);
     var jobs: [3]EndJob = undefined;
     for (&jobs, 0..) |*j, i| j.* = try EndJob.make(arena, io, tmp, root, try std.fmt.allocPrint(arena, "f{d}", .{i}), 10_000);
@@ -3390,7 +3390,7 @@ test "native store: a job ending after the window starts a batch of its own, as 
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    if (epochOf(arena, io, ".") == null) return error.SkipZigTest;
+    if (epochOf(io, ".") == null) return error.SkipZigTest;
     const root = try endStore(arena, io, tmp);
     var jobs: [2]EndJob = undefined;
     for (&jobs, 0..) |*j, i| j.* = try EndJob.make(arena, io, tmp, root, try std.fmt.allocPrint(arena, "w{d}", .{i}), 20);
