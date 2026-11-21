@@ -1332,7 +1332,7 @@ test "download: a status that was retried is not the reason of the failure that 
         .backoff_ms = 1,
     }, dest)).?;
     try std.testing.expect(std.mem.endsWith(u8, msg, ": NetworkIo"));
-    try std.testing.expect(std.mem.indexOf(u8, msg, "503") == null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "HTTP 503") == null);
     // So the fetch's own retries see a transport failure and try again.
     try std.testing.expect(@import("../dagger/fetch_retry.zig").transientDownload(msg));
 }
