@@ -91,6 +91,8 @@ pub const Error = error{
     TlsNameMismatch,
     TlsCertificate,
     TlsFailed,
+    /// A handshake the peer broke for good: no shared version or cipher, malformed records (not tried again).
+    TlsProtocol,
     /// No first byte or a body that stopped within the call's limits, or the whole request's deadline.
     Timeout,
     TooManyRedirects,
@@ -134,6 +136,7 @@ fn errorOf(code: i32) Error {
         18 => error.NetworkConfig,
         19 => error.StaleConnection,
         20 => error.WebSocketRefused,
+        21 => error.TlsProtocol,
         else => error.NetworkIo,
     };
 }

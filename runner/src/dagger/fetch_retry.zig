@@ -349,6 +349,7 @@ test "transientDownload: the client's transport errors, not a status or its own 
     try t.expect(transientDownload("could not download https://x/y: NetworkIo"));
     try t.expect(transientDownload("could not download https://x/y: DnsFailed"));
     try t.expect(!transientDownload("could not download https://x/y: TlsUnknownIssuer"));
+    try t.expect(!transientDownload("could not download https://x/y: TlsProtocol"));
     // A body cut short after bytes came is not told from the archive being wrong: not retried.
     try t.expect(!transientDownload("could not download https://x/y: ReadFailed"));
     // Only the error part counts: a repository named after an error is not one, and a failure

@@ -155,7 +155,7 @@ pub fn run(r: &Request) -> Answer {
     let rc = unsafe { zr_net_call_start(client, &spec, &mut call, &mut fd, msg.as_mut_ptr(), msg.len()) };
     if rc != 0 {
         // Refused before it started (a bad method, URL or header): a code and a NUL-terminated message.
-        assert!((1..=19).contains(&rc), "start returned {rc}");
+        assert!((1..=19).contains(&rc) || rc == 21, "start returned {rc}");
         assert!(msg.contains(&0) || msg[255] != 0, "message not terminated");
         unsafe { zr_net_client_free(client) };
         return Answer { error: rc, status: 0, headers: vec![], body: vec![], message: vec![] };
@@ -219,7 +219,7 @@ pub fn run(r: &Request) -> Answer {
     } else {
         let n = unsafe { zr_net_call_copy(call, 2, a.message.as_mut_ptr(), a.message.len()) };
         assert_eq!(n, info.message_len);
-        assert!((1..=19).contains(&info.error), "error code {}", info.error);
+        assert!((1..=19).contains(&info.error) || info.error == 21, "error code {}", info.error);
     }
     unsafe {
         zr_net_call_free(call);
