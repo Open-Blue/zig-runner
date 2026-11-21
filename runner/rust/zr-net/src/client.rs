@@ -53,13 +53,15 @@ pub enum Code {
     /// A kept connection that turned out to be closed after part of a streamed body had been taken
     /// from the caller: the body cannot be repeated here, the caller sends it again.
     Stale = 19,
+    /// The server did not accept the WebSocket upgrade (`ws.rs`): it answered with another status.
+    WsRefused = 20,
 }
 
 pub type Fail = (Code, String);
 
-trait Rw: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(crate) trait Rw: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Rw for T {}
-type Stream = Box<dyn Rw>;
+pub(crate) type Stream = Box<dyn Rw>;
 
 /// What one request measured, nanoseconds; `UNKNOWN` where nothing was.
 #[derive(Clone, Copy, Debug)]
@@ -152,14 +154,14 @@ fn is_redirect(s: u16) -> bool {
     matches!(s, 301 | 302 | 303 | 307 | 308)
 }
 
-struct Target {
-    https: bool,
-    host: String,
-    port: u16,
-    path: String,
+pub(crate) struct Target {
+    pub(crate) https: bool,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) path: String,
 }
 
-fn parse_url(url: &str) -> Result<Target, Fail> {
+pub(crate) fn parse_url(url: &str) -> Result<Target, Fail> {
     let bad = |m: &str| (Code::BadUrl, format!("{url}: {m}"));
     let uri: Uri = url.parse().map_err(|e: http::uri::InvalidUri| bad(&e.to_string()))?;
     let https = match uri.scheme_str() {
@@ -325,8 +327,11 @@ impl Client {
         Err(last)
     }
 
-    /// A new connection for `key`: through the proxy when there is one, TLS when the target is https.
-    async fn connect(&self, target: &Target, via: Option<&crate::proxy::Target>) -> Result<(Idle, bool), Fail> {
+    /// The bytes of a new connection to `target`, before any protocol runs on it: through the proxy when
+    /// there is one (CONNECT for https), TLS when the target is https. With the DNS and connect times,
+    /// and the TLS handshake's (`UNKNOWN` where there was none). The HTTP client and the WebSocket
+    /// (`ws.rs`) both connect here, so the proxy, roots, timeouts and socket options are one policy.
+    pub(crate) async fn transport(&self, target: &Target, via: Option<&crate::proxy::Target>) -> Result<(Stream, (u64, u64), u64), Fail> {
         let mut t = (UNKNOWN, UNKNOWN);
         let mut tls_ns = UNKNOWN;
         let mut stream: Stream = match via {
@@ -368,6 +373,12 @@ impl Client {
             tls_ns = ns(started.elapsed());
             stream = Box::new(tls);
         }
+        Ok((stream, t, tls_ns))
+    }
+
+    /// A new connection for `key`: through the proxy when there is one, TLS when the target is https.
+    async fn connect(&self, target: &Target, via: Option<&crate::proxy::Target>) -> Result<(Idle, bool), Fail> {
+        let (stream, t, tls_ns) = self.transport(target, via).await?;
         // A read buffer of one fixed size: hyper's adaptive one grows to hundreds of KiB, and each
         // chunk of that size is a fresh mapping (musl's malloc maps what is over 128 KiB), faulted in
         // and returned for every read of a big download; 64 KiB is reused from the heap.

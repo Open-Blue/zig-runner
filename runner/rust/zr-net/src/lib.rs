@@ -2,7 +2,7 @@
 //! pointers and opaque handles; no Rust type crosses.
 //!
 //! R1: the library's version and the lifetime of the tokio runtime. R2: TLS for Postgres (sans-IO)
-//! and the count of what Rust allocates.
+//! and the count of what Rust allocates. R3 to R5: the HTTP client. R6: the WebSocket (`ws`).
 
 mod alloc;
 mod body;
@@ -13,6 +13,7 @@ mod proxy;
 mod roots;
 mod runtime;
 pub mod tls;
+pub mod ws;
 
 #[global_allocator]
 static COUNTING: alloc::Counting = alloc::Counting;

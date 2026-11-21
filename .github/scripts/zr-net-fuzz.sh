@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # cargo-fuzz's targets for the network library (runner/rust/zr-net/fuzz; docs/rust-net.md): what an
-# HTTP server answers the client with, what a caller's request becomes on the wire, and what a TLS
-# server sends. They share the C ABI Zig calls, and Zig's own fuzz targets (runner/src/fuzz.zig,
+# HTTP server answers the client with, what a caller's request becomes on the wire, what a TLS
+# server sends, and what a WebSocket server sends after the upgrade. They share the C ABI Zig calls,
+# and Zig's own fuzz targets (runner/src/fuzz.zig,
 # "HTTP responses", "TLS records") run the same code from the other side, in analysis.yml's Fuzz
 # job; these are libFuzzer with AddressSanitizer, which needs the nightly Rust (install-rust-nightly.sh).
 #
@@ -26,7 +27,7 @@ if [[ ! -x $tools/bin/cargo-fuzz ]]; then
 fi
 export PATH=$tools/bin:$PATH
 
-targets=(http_response request_spec tls_records)
+targets=(http_response request_spec tls_records ws_frames)
 
 # cargo-fuzz has no --locked of its own: this fails when fuzz/Cargo.lock does not satisfy the
 # manifests, which the build would otherwise rewrite (fuzz/Cargo.lock started as zr-net's lock file,

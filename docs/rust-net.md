@@ -1,6 +1,6 @@
 # One network stack in Rust (design)
 
-Status: R1 (build, skeleton, ABI smoke test) is in this pull request; R2 to R6 follow, each after review.
+Status: R1 to R6 are built (R1 the build, skeleton and ABI smoke test; R2 Postgres TLS; R3 the HTTP client; R4 streaming; R5 the broker, run service and Gitea; R6 the live feed). The std client's removal is the last step, in its own pull request ("The WebSocket feed (R6, as built)").
 Origin: the HTTP client study (`docs/http-client-study.md` on `perf/http-client-study`, 2026-11-13) and the user's decision
 to move all of the runner's HTTP, the live WebSocket feed and the database's TLS to Rust (hyper + rustls), so that the
 runner has **one network and TLS stack with real hooks and no shims**: no `net_hooks.zig` wrapper around `std.Io`, no
@@ -430,17 +430,44 @@ What the classes rest on: actions/runner's own `RunServer` (`src/Runner.Common/R
 
 Also found at this review, **a flake in the stale-connection registry test** (CI run 43625088890, `native oci pull: a kept-alive connection the registry closed is replaced...`, `NetworkIo` from a blob GET, log line "operation was canceled"): reproduced locally at 13-17 failures in 300 runs of that test alone, on R4's `298e017` as well (17 of 300), so not a result of R5. The registry test's server answers and then closes every connection; a request that took a kept connection as the server closed it came back from hyper as `Canceled` (nothing written), which `is_dead` did not count, so the library neither replaced the connection nor sent the request again. Not the 200 ms window of that retry (a 200 s window: 14 of 300) and not the pool (a retry that skips it: still failing). With `e.is_canceled()` in `is_dead`: 0 failures in 300 runs (same machine, load average 5-13). The same cause failed the `.never` case of the new oracle test once.
 
-## The WebSocket feed (R6)
+## The WebSocket feed (R6, as built)
 
-`feed.zig` upgrades a std request by hand and frames in Zig. The Rust side uses `tokio-tungstenite` (rustls via the
-shared `ClientConfig`, so the same CA/proxy policy) behind `Ws` handles: `zr_net_ws_connect` (handle, same timings and
-`request:` line for the upgrade), `zr_net_ws_send` (text/binary, bounded queue, wake when drained), `zr_net_ws_recv`
-into a caller buffer, `zr_net_ws_close`; ping/pong and close handshakes inside Rust; the same eventfd wait and
-cancel as requests. The feed is send-mostly (log lines), so send backpressure matters, receive is only control messages. The framing
-code in `feed.zig` (and its fuzz target) is deleted in R6; the std path stays as an oracle until then.
-Alternative considered: `hyper::upgrade` yielding the raw IO and keeping framing in Zig (zero new crates). Rejected because the point is one stack
-with real hooks and fewer lines of protocol in Zig; the decision is cheap to revisit in R6 if `tokio-tungstenite` adds more than
-~150 KB.
+`feed.zig` (`Socket`) runs on `rust/zr-net/src/ws.rs` through `net_client.Ws`. The design above stood: `tokio-tungstenite` (handshake only, no connector, no TLS of its own) on the connection
+the HTTP client makes (`Client::transport`, factored out of `connect`: proxy and CONNECT, roots, the TLS handshake and its timeout, the socket options), so a WebSocket has the same CA, proxy and
+root policy as a request, and the same keepalive (60 s idle, 10 s apart, 3 probes) and `TCP_USER_TIMEOUT` (90 s) that #100 needed.
+
+- **ABI** (`zr_net_ws_*`, a handle and a descriptor like a call's). `connect(client, spec)` returns at once; the descriptor is readable when something happened (the upgrade finished, a full send queue
+  went below half, a message arrived, the connection ended); `info` fills the state (connecting, open, closing, closed), the upgrade's status and the same DNS, connect, TLS and first-byte figures as a request,
+  the close code, the counts and the error `Code` (a new one, `WsRefused`, for a server that answered the upgrade with another status; its message is copied with `message`); `send(kind, data)` queues text,
+  binary or a ping (0 queued, 1 full: wait on the descriptor, 2 over); `recv(buf)` takes the oldest message (0, 1 none yet, 2 clean end, 3 buffer too small, 100 plus a `Code`); `close` asks for the
+  handshake; `free` drops the connection at once, from any thread. The Zig side (`Ws`: `open`, `sendText`, `sendBinary`, `ping`, `recv`, `close`, `abort`) waits through std.Io on the descriptor, so a cancel ends
+  a blocked send or receive, and `open` is within a deadline like any request and writes one `request:` line for the upgrade through `request_log.zig` (`GET`, status 101, the exact phases).
+- **Queues and backpressure.** One task per connection polls the stream and the send queue in one `poll_fn` (no split, so nothing is lost between a reader and a writer). Sending goes through a queue of at most
+  64 KiB (`queue_limit`; a message bigger than the bound is taken when the queue is empty): `send` says "full", and the caller is woken when the queue has drained below half. Messages are written in frames of at most
+  `max_frame` bytes (the feed passes 1024, as actions/runner does: the first frame text, the rest continuations), masked by the library. Received messages wait in a queue of their own (1 MiB); one that does not
+  fit is dropped and counted, never stopping the reads that answer pings. The feed sends only, so nothing is read by its caller.
+- **Control frames are the library's.** A ping from the peer is answered while the caller does nothing; a close from the peer is answered and ends the connection (its code is in `info`); `close` sends what is queued,
+  then a close frame with status 1000 (as `feed.zig` did), and waits for the peer's within `close_wait_ms` (the feed passes 1 s, so the job's end never hangs on a feed that went away). A connection that ends
+  without a close frame is an error (`Io`), seen at once because the library reads all the time: the next `sendText` fails, which `live.zig` answers by opening the feed again, as before.
+- **Unchanged for `live.zig`.** `Socket.open/sendText/ping/close`, the 30 s upgrade deadline (`http.request_deadline`; a server that accepts and never answers gives `error.Timeout`), the 15 s keepalive ping, the reopen
+  logic and every message it logs. One difference in behaviour: `sendText` returns when the message is queued, not when it is in the kernel's buffer, so a loss is seen by the next call (the message in the queue,
+  at most 64 KiB, is lost with the connection, as what sat in the kernel's buffer was).
+- **The oracle** (`feed.zig`, `ws_server.zig`): the old client is kept as `StdSocket`, for this test only. A test server (`github/ws_server.zig`: it answers the upgrade, records every frame as it arrives, answers
+  pings and closes, and can stall, never answer, or go) is driven by the same script through both (a short message, one of 2500 bytes, an empty one, one of exactly a frame, one of a frame and a byte, a ping,
+  a last message, the close): the frames (opcode, FIN, masked, payload) and the upgrade's request line and headers (Authorization, Upgrade, Connection, version) are identical, and both give `Timeout` for a server that never answers.
+- **Validation.** 9 cargo tests (`ws.rs`: both directions with the headers seen by the server, the peer's ping answered and the close handshake, a close from the peer, a stalled reader with the queue bound and the wake,
+  cancel in the middle of a send and of a receive with the heap back to where it was, a server that never answers the upgrade, a refused upgrade, a bad URL and a lost connection, frames on the wire, a full inbox,
+  `wss://` with the roots given and the unknown issuer by its own error); 7 Zig tests on the feed and `Ws` (the oracle, the deadline, a server that went away, the URL check, ping and close, a slow reader through
+  `sendText`, a cancel of a blocked sender and receiver); a fuzz target `ws_frames` (`zr-net-fuzz.sh`, in the night's run and the analysis scope with the others): the server's bytes after the upgrade, verbatim, through the
+  ABI, with what the caller sends chosen by the first byte, checking that nothing panics or hangs, that the queues hold their bounds and that every return is a documented one (seeded with frames, fragments, closes,
+  masked and reserved-bit frames, bad UTF-8, huge lengths).
+- **Cost.** Release binary (`build-binaries.sh`, ReleaseSafe, strip, musl), parent commit against this one: x86_64 6 996 520 to 7 155 264 bytes (+158 744, +2.3%), aarch64 5 887 528 to 6 029 112 (+141 584, +2.4%),
+  with `Ws`, the feed's change and the std feed's code that is no longer compiled into the runner counted: about the 150 KB the design allowed, so `hyper::upgrade` stays the unused fallback. Memory per connection,
+  50 feed connections held to a local server on the laptop, resident set after the first (which starts the runtime) and after 50: library `wss://` 63 KiB each (the first +3.9 MiB, the runtime's threads),
+  `ws://` 39 KiB; std `ws://` 33 KiB (std's TLS could not be given the test CA, so its TLS figure is the 0.6 MiB measured before). tungstenite's default buffers (128 KiB each way) first made it 141-177 KiB; they are 16 KiB now.
+  The test is `measure: resident memory per feed connection` (skipped unless `ZR_FEED_RSS` names a server).
+- **Left for the removal pull request:** `net_hooks.zig`, `http.zig`'s retired list, `renew` and `keepFresh`, `preloadCa`, `StdSocket` and the oracle harness (`net_oracle.zig`, `std_broker.zig`), main.zig's shared client. The std client's last other user
+  is `native/tarball.zig` (action tarballs), which that pull request must move first.
 
 ## Postgres TLS (R2, as built)
 
@@ -565,7 +592,7 @@ Each PR brings its own checks; none is left to "later".
    and the build scripts to that case. Zig's fuzzer is the one that holds them to an oracle, and the shared ABI is the
    boundary that matters to the runner. Rust's libFuzzer runs the same boundary under AddressSanitizer too (`runner/rust/zr-net/fuzz`, driven by
    `.github/scripts/zr-net-fuzz.sh`: `http_response`, `request_spec` and `tls_records`, seeded from `fuzz/seeds`; a pull request builds them and the
-   night runs each for a minute, in analysis.yml's `zr-net-fuzz` job; OpenSSF Scorecard's Fuzzing check looks for it). R2 brings the TLS one, R3 HTTP head and header parsing, R6 WebSocket frames.
+   night runs each for a minute, in analysis.yml's `zr-net-fuzz` job; OpenSSF Scorecard's Fuzzing check looks for it). R2 brings the TLS one, R3 HTTP head and header parsing, R6 WebSocket frames (`ws_frames`).
 3. **Valgrind clean on the Zig tests that call into Rust.** `zig-valgrind.sh` already runs every test through the module graph, which
    now includes the archive, so tests that start the runtime run under memcheck: R1's does, with **no reports** (done: `the runtime starts...` passes
    under `zig-valgrind.sh` with no suppression). Limits, to know what that proves: a static musl binary hides `malloc` from Valgrind's
