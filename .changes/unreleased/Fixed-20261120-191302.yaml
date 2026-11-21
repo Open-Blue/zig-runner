@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'When the e2e suite gives up waiting for a run, it now says what it last saw: the attempt and status GitHub reported, how many polls failed and the last API error, and whether the suite''s limit or the per-run timeout ended it. A failed wait had printed only "not done within 240 s", even once when GitHub had marked that attempt completed four minutes earlier.'
+time: 2026-11-20T19:13:02.620648133-05:00
