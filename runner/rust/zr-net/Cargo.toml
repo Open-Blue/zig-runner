@@ -26,7 +26,7 @@ http-body-util = "0.1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # The WebSocket feed (src/ws.rs): the protocol on the connection the HTTP client makes (its TLS, proxy and
 # roots), none of tungstenite's own connectors or TLS.
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # TCP_NODELAY, keepalive and TCP_USER_TIMEOUT on the sockets we connect.
 socket2 = { version = "0.6", features = ["all"] }
