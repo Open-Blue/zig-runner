@@ -1,0 +1,3 @@
+kind: Added
+body: 'The live log feed runs on the network library (tokio-tungstenite on the same connection, proxy and CA policy as every request, with a request: line for the upgrade); ping, pong and the close handshake are handled there and sending is bounded with backpressure. The std client version of the feed stays as a test oracle until its removal'
+time: 2026-11-20T21:46:02.142680499-05:00

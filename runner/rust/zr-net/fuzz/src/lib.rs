@@ -227,3 +227,190 @@ pub fn run(r: &Request) -> Answer {
     }
     a
 }
+
+/// The WebSocket's server side (`zr_net::ws`): a loopback server that accepts the upgrade as a real
+/// server does and then sends the fuzzer's bytes, verbatim, as the frames of the connection; it
+/// reads and drops what the client sends until the client goes. Only the loopback interface is
+/// reached: the URL is the fixture's own address.
+pub mod ws {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::os::fd::FromRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+    use zr_net::call::{zr_net_client_free, zr_net_client_new, ClientConfig};
+    use zr_net::ws::*;
+
+    pub struct Fixture {
+        pub port: u16,
+        /// What the server sends after the upgrade.
+        pub after: Mutex<Vec<u8>>,
+    }
+
+    pub fn fixture() -> &'static Fixture {
+        static F: OnceLock<&'static Fixture> = OnceLock::new();
+        F.get_or_init(|| {
+            assert_eq!(zr_net::zr_net_runtime_start(2), 0);
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let f: &'static Fixture = Box::leak(Box::new(Fixture { port: l.local_addr().unwrap().port(), after: Mutex::new(Vec::new()) }));
+            std::thread::spawn(move || {
+                for s in l.incoming().flatten() {
+                    std::thread::spawn(move || serve(s, f));
+                }
+            });
+            f
+        })
+    }
+
+    fn serve(mut s: TcpStream, f: &Fixture) {
+        let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") && head.len() < 1 << 14 {
+            match s.read(&mut b) {
+                Ok(1) => head.push(b[0]),
+                _ => return,
+            }
+        }
+        let text = String::from_utf8_lossy(&head);
+        let key = text.lines().find_map(|l| l.strip_prefix("Sec-WebSocket-Key: ")).unwrap_or("").trim().to_string();
+        let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+        let _ = s.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes());
+        let after = f.after.lock().unwrap().clone();
+        let _ = s.write_all(&after);
+        // Reads and drops what the client sends, until it goes or is silent for the timeout.
+        let mut sink = [0u8; 4096];
+        while let Ok(n) = s.read(&mut sink) {
+            if n == 0 {
+                break;
+            }
+        }
+    }
+
+    pub const QUEUE: u32 = 4096;
+    pub const RECV: u32 = 2048;
+
+    /// What the client is asked to do with the connection: what it sends, and whether it asks for the close.
+    pub struct Plan {
+        pub sends: Vec<(u32, Vec<u8>)>,
+        pub close: bool,
+    }
+
+    /// One connection through the C ABI, as the Zig side drives it, with the checks the ABI promises
+    /// of any peer: every return is one it documents, counts stay within what the buffers and queues
+    /// hold, and a connection that ends says how.
+    pub fn run(plan: &Plan) {
+        let f = fixture();
+        let url = format!("ws://127.0.0.1:{}/_ws/ingest.sock", f.port);
+        let cfg = ClientConfig { user_agent: std::ptr::null(), user_agent_len: 0, roots: std::ptr::null(), roots_len: 0, connect_timeout_ms: 2000, tls_timeout_ms: 2000, idle_timeout_ms: 1000, max_idle_per_host: 0, flags: 0 };
+        let mut client = std::ptr::null_mut();
+        assert_eq!(unsafe { zr_net_client_new(&cfg, &mut client, std::ptr::null_mut(), 0) }, 0);
+        let spec = WsSpec { url: url.as_ptr(), url_len: url.len(), headers: b"x-token: secret\n".as_ptr(), headers_len: 16, max_frame: 16, open_ms: 3000, close_wait_ms: 200, queue_limit: QUEUE, recv_limit: RECV };
+        let (mut ws, mut fd) = (std::ptr::null_mut(), -1);
+        let mut msg = [0u8; 256];
+        assert_eq!(unsafe { zr_net_ws_connect(client, &spec, &mut ws, &mut fd, msg.as_mut_ptr(), msg.len()) }, 0);
+        let wake = unsafe { UnixStream::from_raw_fd(fd) };
+        wake.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // Waits for a wake; false when there was none in time (the caller decides what that means).
+        let wait = || loop {
+            let mut b = [0u8; 64];
+            // libFuzzer's timer signal interrupts a read: ask again.
+            match (&wake).read(&mut b) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) | Ok(0) => return false,
+                Ok(_) => return true,
+            }
+        };
+        let info = || {
+            let mut i: WsInfo = unsafe { std::mem::zeroed() };
+            unsafe { zr_net_ws_info(ws, &mut i) };
+            assert!(i.state <= 3, "state {}", i.state);
+            assert!(i.queued <= (QUEUE as usize).max(plan.sends.iter().map(|s| s.1.len()).max().unwrap_or(0)), "{} bytes queued", i.queued);
+            assert!(i.waiting <= RECV as usize, "{} bytes waiting", i.waiting);
+            i
+        };
+        let mut i = info();
+        while i.state == 0 {
+            assert!(wait(), "the upgrade neither finished nor failed");
+            i = info();
+        }
+        if i.error != 0 {
+            assert!((1..=20).contains(&i.error), "error code {}", i.error);
+            let n = unsafe { zr_net_ws_message(ws, msg.as_mut_ptr(), msg.len()) };
+            assert_eq!(i.message_len > 0, n > 0);
+            unsafe {
+                zr_net_ws_free(ws);
+                zr_net_client_free(client);
+            }
+            return;
+        }
+        assert_eq!(i.status, 101);
+        // From here on a wait that finds nothing is an answer (the peer is silent), not a failure.
+        wake.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+        for (kind, data) in &plan.sends {
+            for _ in 0..8 {
+                match unsafe { zr_net_ws_send(ws, *kind, data.as_ptr(), data.len()) } {
+                    0 | 2 => break,
+                    1 => {
+                        // Full: the library wakes when the queue is below half, or the connection ends.
+                        if !wait() {
+                            break;
+                        }
+                    }
+                    rc => panic!("send returned {rc}"),
+                }
+            }
+        }
+        // Takes what arrived: every message within what the inbox holds, the end with a documented code.
+        let mut buf = vec![0u8; RECV as usize];
+        let mut idle = 0;
+        let mut ended_once = false;
+        for _ in 0..64 {
+            let (mut n, mut kind) = (0usize, 99u32);
+            match unsafe { zr_net_ws_recv(ws, buf.as_mut_ptr(), buf.len(), &mut n, &mut kind) } {
+                0 => assert!(n <= buf.len() && kind <= 1, "message of {n} bytes, kind {kind}"),
+                1 => {
+                    // The connection may have ended just after recv looked; asking again then must
+                    // say so (the end, or a message that came before it), never "nothing yet".
+                    if info().state == 3 {
+                        assert!(!ended_once, "recv says nothing yet on a connection that ended");
+                        ended_once = true;
+                        continue;
+                    }
+                    idle += 1;
+                    if idle > 1 || !wait() {
+                        break;
+                    }
+                }
+                2 => {
+                    assert_eq!(info().state, 3);
+                    break;
+                }
+                3 => panic!("a message of {n} bytes was taken into a buffer of {}", buf.len()),
+                rc => {
+                    assert!((101..=120).contains(&rc), "recv returned {rc}");
+                    assert_eq!(info().state, 3);
+                    break;
+                }
+            }
+        }
+        if plan.close {
+            unsafe { zr_net_ws_close(ws) };
+            // Over within the close wait (200 ms) and a margin, or already.
+            let started = std::time::Instant::now();
+            while info().state != 3 && started.elapsed() < Duration::from_secs(5) {
+                wait();
+            }
+            assert_eq!(info().state, 3, "the close did not end the connection");
+            let i = info();
+            if i.error != 0 {
+                assert!((1..=20).contains(&i.error), "error code {}", i.error);
+            }
+        }
+        unsafe {
+            zr_net_ws_free(ws);
+            zr_net_client_free(client);
+        }
+    }
+}

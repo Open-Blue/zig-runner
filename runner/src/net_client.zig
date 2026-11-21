@@ -107,6 +107,10 @@ pub const Error = error{
     /// The writer of a request body wrote more than the `len` it declared; what it wrote past
     /// that was not sent.
     BodyLongerThanDeclared,
+    /// The server did not accept a WebSocket upgrade (`Ws.open`): it answered with another status.
+    WebSocketRefused,
+    /// A WebSocket that ended (the peer closed it, or the connection was lost) before what was asked of it.
+    WebSocketClosed,
 } || Allocator.Error || Io.Cancelable;
 
 fn errorOf(code: i32) Error {
@@ -129,6 +133,7 @@ fn errorOf(code: i32) Error {
         16 => error.ProxyFailed,
         18 => error.NetworkConfig,
         19 => error.StaleConnection,
+        20 => error.WebSocketRefused,
         else => error.NetworkIo,
     };
 }
@@ -656,3 +661,262 @@ fn openCall(arena: Allocator, io: Io, opts: Options, probe: *Probe) Error!Stream
     const status = std.enums.fromInt(std.http.Status, info.status) orelse return error.ProtocolError;
     return .{ .status = status, .headers = headers, .head_timings = probe.timings, .live = live, .probe = probe.* };
 }
+
+// --- WebSocket (R6) ---
+
+const WsHandle = opaque {};
+
+const WsSpec = extern struct {
+    url: [*]const u8,
+    url_len: usize,
+    headers: [*]const u8,
+    headers_len: usize,
+    max_frame: u32,
+    open_ms: u32,
+    close_wait_ms: u32,
+    queue_limit: u32,
+    recv_limit: u32,
+};
+
+const WsInfo = extern struct {
+    @"error": i32,
+    state: u32,
+    status: u16,
+    close_code: u16,
+    dns_ns: u64,
+    connect_ns: u64,
+    tls_ns: u64,
+    ttfb_ns: u64,
+    total_ns: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    queued: usize,
+    waiting: usize,
+    dropped: u64,
+    message_len: usize,
+};
+
+const ws_connecting = 0;
+const ws_closed = 3;
+const ws_text = 0;
+const ws_binary = 1;
+const ws_ping = 2;
+
+extern fn zr_net_ws_connect(c: *Handle, spec: *const WsSpec, out: *?*WsHandle, fd: *i32, msg: [*]u8, msg_cap: usize) i32;
+extern fn zr_net_ws_info(ws: *WsHandle, info: *WsInfo) void;
+extern fn zr_net_ws_message(ws: *WsHandle, out: [*]u8, cap: usize) usize;
+extern fn zr_net_ws_send(ws: *WsHandle, kind: u32, data: [*]const u8, len: usize) i32;
+extern fn zr_net_ws_recv(ws: *WsHandle, out: [*]u8, cap: usize, n: *usize, kind: *u32) i32;
+extern fn zr_net_ws_close(ws: *WsHandle) void;
+extern fn zr_net_ws_free(ws: ?*WsHandle) void;
+
+/// A WebSocket the library runs (`rust/zr-net/src/ws.rs`): the upgrade is made on the same
+/// connection code as a request (proxy, roots, timeouts, `request:` line), and ping, pong and the
+/// close handshake are the library's. Waits go through std.Io on a descriptor the library wakes, so
+/// a cancel ends a wait where it blocks. Must not move after `open`.
+pub const Ws = struct {
+    io: Io,
+    handle: *WsHandle,
+    done: Io.File,
+    own: ?*Handle,
+    closed: bool = false,
+
+    pub const Config = struct {
+        /// `wss://` or `ws://`.
+        url: []const u8,
+        headers: []const std.http.Header = &.{},
+        /// A message goes in frames of at most this many bytes (the first text or binary, the rest
+        /// continuations); 0: one frame.
+        max_frame: u32 = 0,
+        /// The upgrade's limit, from connecting to the server's answer; null for none.
+        deadline: ?Io.Duration = http.request_deadline,
+        /// Bytes of messages waiting to be sent before `sendText` waits (0: the library's 64 KiB),
+        /// and of received ones waiting to be read (0: 1 MiB).
+        queue_limit: u32 = 0,
+        recv_limit: u32 = 0,
+        /// How long `close` waits for the peer's close frame (0: 2 s).
+        close_wait: ?Io.Duration = null,
+        /// Whether the upgrade writes its `request:` line.
+        log: bool = true,
+        /// Roots (PEM) that replace the system's, for the client this connection creates. Tests.
+        roots_pem: []const u8 = "",
+    };
+
+    /// What `recv` gives: a message and whether it is text.
+    pub const Message = struct { len: usize, text: bool };
+
+    /// Connects within `opts.deadline`, with the upgrade's `request:` line. An error is the library's
+    /// (`Error`): `WebSocketRefused` for a server that answered with another status.
+    pub fn open(arena: Allocator, io: Io, opts: Config) Error!Ws {
+        var line: Probe = .{ .io = io, .opts = .{ .url = opts.url, .log = opts.log } };
+        line.start(io);
+        const limit = opts.deadline orelse no_deadline;
+        const r = http.withinClosing(io, limit, upgrade, .{ arena, io, opts, &line }, {}, dropLate) catch |e| {
+            line.finish(.{ .err = "Canceled" });
+            return e;
+        };
+        return (r orelse {
+            line.finish(.{ .err = "Timeout" });
+            return error.Timeout;
+        }) catch |e| {
+            line.finish(.{ .err = @errorName(e) });
+            return e;
+        };
+    }
+
+    fn dropLate(_: void, r: Error!Ws) void {
+        if (r) |ok| {
+            var w = ok;
+            w.abort();
+        } else |_| {}
+    }
+
+    fn upgrade(arena: Allocator, io: Io, opts: Config, probe: *Probe) Error!Ws {
+        const c = try client(opts.roots_pem);
+        errdefer if (opts.roots_pem.len > 0) zr_net_client_free(c);
+        var header_lines: std.Io.Writer.Allocating = .init(arena);
+        for (opts.headers) |h| header_lines.writer.print("{s}: {s}\n", .{ h.name, h.value }) catch return error.OutOfMemory;
+        const spec: WsSpec = .{
+            .url = opts.url.ptr,
+            .url_len = opts.url.len,
+            .headers = header_lines.written().ptr,
+            .headers_len = header_lines.written().len,
+            .max_frame = opts.max_frame,
+            .open_ms = ms(opts.deadline),
+            .close_wait_ms = ms(opts.close_wait),
+            .queue_limit = opts.queue_limit,
+            .recv_limit = opts.recv_limit,
+        };
+        var handle: ?*WsHandle = null;
+        var fd: i32 = -1;
+        var msg: [256]u8 = undefined;
+        const rc = zr_net_ws_connect(c, &spec, &handle, &fd, &msg, msg.len);
+        if (rc != 0) {
+            std.log.warn("net: {s}", .{std.mem.sliceTo(&msg, 0)});
+            return errorOf(rc);
+        }
+        var w: Ws = .{
+            .io = io,
+            .handle = handle.?,
+            .done = .{ .handle = fd, .flags = .{ .nonblocking = false } },
+            .own = if (opts.roots_pem.len > 0) c else null,
+        };
+        errdefer w.abort();
+        var info: WsInfo = undefined;
+        while (true) {
+            zr_net_ws_info(w.handle, &info);
+            if (info.state != ws_connecting) break;
+            try w.wait();
+        }
+        probe.timings = .{
+            .dns_ns = opt(info.dns_ns),
+            .connect_ns = opt(info.connect_ns),
+            .tls_ns = opt(info.tls_ns),
+            .ttfb_ns = opt(info.ttfb_ns),
+            .total_ns = if (info.total_ns == std.math.maxInt(u64)) 0 else info.total_ns,
+        };
+        if (info.@"error" != 0) {
+            std.log.warn("net: GET {s}: {s}", .{ opts.url, w.message(&msg) });
+            return errorOf(info.@"error");
+        }
+        probe.status = info.status;
+        probe.finish(.{ .code = info.status });
+        return w;
+    }
+
+    fn message(w: *const Ws, buf: []u8) []const u8 {
+        const n = zr_net_ws_message(w.handle, buf.ptr, buf.len);
+        return buf[0..n];
+    }
+
+    /// Waits until the library has something to say: a wake on the descriptor, spurious ones included.
+    fn wait(w: *const Ws) Error!void {
+        var sink: [64]u8 = undefined;
+        var bufs = [_][]u8{&sink};
+        const n = w.done.readStreaming(w.io, &bufs) catch |e| switch (e) {
+            error.Canceled => return error.Canceled,
+            else => return error.NetworkIo,
+        };
+        _ = n;
+    }
+
+    /// Why the connection is over: the library's error, or a close.
+    fn ended(w: *Ws) Error {
+        var info: WsInfo = undefined;
+        zr_net_ws_info(w.handle, &info);
+        if (info.@"error" == 0) return error.WebSocketClosed;
+        var msg: [256]u8 = undefined;
+        std.log.warn("net: websocket: {s}", .{w.message(&msg)});
+        return errorOf(info.@"error");
+    }
+
+    fn send(w: *Ws, kind: u32, data: []const u8) Error!void {
+        while (true) switch (zr_net_ws_send(w.handle, kind, data.ptr, data.len)) {
+            0 => return,
+            1 => try w.wait(),
+            else => return w.ended(),
+        };
+    }
+
+    /// One text message, queued; waits while the queue is full (the peer reads slower than this
+    /// sends). The library writes it, in frames of `max_frame`, in the order queued.
+    pub fn sendText(w: *Ws, payload: []const u8) Error!void {
+        return w.send(ws_text, payload);
+    }
+
+    pub fn sendBinary(w: *Ws, payload: []const u8) Error!void {
+        return w.send(ws_binary, payload);
+    }
+
+    /// A ping, so a socket that has nothing to say for a while is not closed as idle on the way. The
+    /// peer's are answered by the library.
+    pub fn ping(w: *Ws) Error!void {
+        return w.send(ws_ping, "");
+    }
+
+    /// The oldest message the peer sent, into `buf`, waiting for one; null when the peer closed the
+    /// connection and nothing is left. `error.BodyTooLarge` when it does not fit `buf`.
+    pub fn recv(w: *Ws, buf: []u8) Error!?Message {
+        while (true) {
+            var n: usize = 0;
+            var kind: u32 = 0;
+            switch (zr_net_ws_recv(w.handle, buf.ptr, buf.len, &n, &kind)) {
+                0 => return .{ .len = n, .text = kind == ws_text },
+                1 => try w.wait(),
+                2 => return null,
+                3 => return error.BodyTooLarge,
+                else => |rc| return errorOf(rc - 100),
+            }
+        }
+    }
+
+    /// Bytes still queued to be sent, and the library's counts.
+    pub fn counts(w: *Ws) struct { queued: usize, waiting: usize, dropped: u64, bytes_out: u64, close_code: u16 } {
+        var i: WsInfo = undefined;
+        zr_net_ws_info(w.handle, &i);
+        return .{ .queued = i.queued, .waiting = i.waiting, .dropped = i.dropped, .bytes_out = i.bytes_out, .close_code = i.close_code };
+    }
+
+    /// The close handshake: what is queued is sent, then a close frame (1000), then the peer's is
+    /// waited for (the library's limit, 2 s; a cancel ends the wait), and the connection freed.
+    pub fn close(w: *Ws) void {
+        if (w.closed) return;
+        zr_net_ws_close(w.handle);
+        while (true) {
+            var i: WsInfo = undefined;
+            zr_net_ws_info(w.handle, &i);
+            if (i.state == ws_closed) break;
+            w.wait() catch break;
+        }
+        w.abort();
+    }
+
+    /// Drops the connection at once, with no close frame, and frees it.
+    pub fn abort(w: *Ws) void {
+        if (w.closed) return;
+        w.closed = true;
+        zr_net_ws_free(w.handle);
+        w.done.close(w.io);
+        if (w.own) |c| zr_net_client_free(c);
+    }
+};

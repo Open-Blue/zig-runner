@@ -3,7 +3,7 @@ name = "zr-net-fuzz"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "cargo-fuzz targets for zr-net: what servers answer the HTTP client with, what the caller's request lines turn into on the wire, and what a TLS server sends (docs/rust-net.md)"
+description = "cargo-fuzz targets for zr-net: what servers answer the HTTP client with, what the caller's request lines turn into on the wire, and what a TLS server sends, and what a WebSocket server sends after the upgrade (docs/rust-net.md)"
 
 [package.metadata]
 cargo-fuzz = true
@@ -12,6 +12,8 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 # The parser the client resolves redirects and URLs with (`safe_response` reads URLs as it does).
 http = "1"
+# The accept key of the upgrade the fixture answers (`ws.rs` runs on tokio-tungstenite, same version).
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 zr-net = { path = ".." }
 
 # Not a member of zr-net's workspace (it has none): its own lock file and target directory.
@@ -34,6 +36,13 @@ bench = false
 [[bin]]
 name = "tls_records"
 path = "fuzz_targets/tls_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ws_frames"
+path = "fuzz_targets/ws_frames.rs"
 test = false
 doc = false
 bench = false
