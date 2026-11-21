@@ -918,7 +918,9 @@ pub const Ws = struct {
     pub fn close(w: *Ws) void {
         if (w.closed) return;
         zr_net_ws_close(w.handle);
-        _ = http.within(w.io, w.close_limit, untilClosed, .{w}) catch {};
+        if (http.within(w.io, w.close_limit, untilClosed, .{w})) |ended_in_time| {
+            if (ended_in_time == null) std.log.info("net: websocket: no close from the peer within {d} ms, dropped", .{w.close_limit.toMilliseconds()});
+        } else |e| std.log.debug("net: websocket close: {t}", .{e});
         w.abort();
     }
 
