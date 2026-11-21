@@ -88,6 +88,9 @@ impl ServerCertVerifier for AcceptAny {
 }
 
 /// Builds the connection state; `Err` is (kind, text).
+///
+/// # Safety
+/// The pointers in `cfg` are valid for their lengths for the call.
 pub unsafe fn new(cfg: &Config) -> Result<Tls, (Kind, String)> {
     let bad = |m: String| (Kind::Config, m);
     let provider = Arc::new(ring::default_provider());

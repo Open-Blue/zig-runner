@@ -693,6 +693,7 @@ const WsInfo = extern struct {
     queued: usize,
     waiting: usize,
     dropped: u64,
+    unsent: u64,
     message_len: usize,
 };
 
@@ -719,6 +720,8 @@ pub const Ws = struct {
     handle: *WsHandle,
     done: Io.File,
     own: ?*Handle,
+    /// How long `close` waits in all (see `close`).
+    close_limit: Io.Duration,
     closed: bool = false,
 
     pub const Config = struct {
@@ -773,7 +776,11 @@ pub const Ws = struct {
 
     fn upgrade(arena: Allocator, io: Io, opts: Config, probe: *Probe) Error!Ws {
         const c = try client(opts.roots_pem);
-        errdefer if (opts.roots_pem.len > 0) zr_net_client_free(c);
+        // A client made for this connection (`roots_pem`) is freed once: here until the `Ws` owns it
+        // (`own`), then by `abort`, whichever way the upgrade ends.
+        const own = opts.roots_pem.len > 0;
+        var handed_over = false;
+        errdefer if (own and !handed_over) zr_net_client_free(c);
         var header_lines: std.Io.Writer.Allocating = .init(arena);
         for (opts.headers) |h| header_lines.writer.print("{s}: {s}\n", .{ h.name, h.value }) catch return error.OutOfMemory;
         const spec: WsSpec = .{
@@ -799,8 +806,10 @@ pub const Ws = struct {
             .io = io,
             .handle = handle.?,
             .done = .{ .handle = fd, .flags = .{ .nonblocking = false } },
-            .own = if (opts.roots_pem.len > 0) c else null,
+            .own = if (own) c else null,
+            .close_limit = closeLimit(opts.close_wait),
         };
+        handed_over = true;
         errdefer w.abort();
         var info: WsInfo = undefined;
         while (true) {
@@ -844,8 +853,12 @@ pub const Ws = struct {
     fn ended(w: *Ws) Error {
         var info: WsInfo = undefined;
         zr_net_ws_info(w.handle, &info);
-        if (info.@"error" == 0) return error.WebSocketClosed;
         var msg: [256]u8 = undefined;
+        if (info.@"error" == 0) {
+            // The peer closed it: its code and reason, for the log.
+            std.log.info("net: websocket: {s}", .{w.message(&msg)});
+            return error.WebSocketClosed;
+        }
         std.log.warn("net: websocket: {s}", .{w.message(&msg)});
         return errorOf(info.@"error");
     }
@@ -891,24 +904,36 @@ pub const Ws = struct {
     }
 
     /// Bytes still queued to be sent, and the library's counts.
-    pub fn counts(w: *Ws) struct { queued: usize, waiting: usize, dropped: u64, bytes_out: u64, close_code: u16 } {
+    pub fn counts(w: *Ws) struct { queued: usize, waiting: usize, dropped: u64, bytes_out: u64, close_code: u16, unsent: u64 } {
         var i: WsInfo = undefined;
         zr_net_ws_info(w.handle, &i);
-        return .{ .queued = i.queued, .waiting = i.waiting, .dropped = i.dropped, .bytes_out = i.bytes_out, .close_code = i.close_code };
+        return .{ .queued = i.queued, .waiting = i.waiting, .dropped = i.dropped, .bytes_out = i.bytes_out, .close_code = i.close_code, .unsent = i.unsent };
     }
 
     /// The close handshake: what is queued is sent, then a close frame (1000), then the peer's is
-    /// waited for (the library's limit, 2 s; a cancel ends the wait), and the connection freed.
+    /// waited for (the library's limit, `close_wait`, 2 s by default), and the connection freed. The
+    /// whole wait is within `close_limit` (`close_wait` and 3 s more, for the queue to drain): a peer
+    /// that stopped reading, or went away without a word, does not hold the caller for TCP's own
+    /// limit (90 s of unacknowledged data), the connection is dropped then. A cancel ends it too.
     pub fn close(w: *Ws) void {
         if (w.closed) return;
         zr_net_ws_close(w.handle);
+        _ = http.within(w.io, w.close_limit, untilClosed, .{w}) catch {};
+        w.abort();
+    }
+
+    fn untilClosed(w: *Ws) void {
         while (true) {
             var i: WsInfo = undefined;
             zr_net_ws_info(w.handle, &i);
-            if (i.state == ws_closed) break;
-            w.wait() catch break;
+            if (i.state == ws_closed) return;
+            w.wait() catch return;
         }
-        w.abort();
+    }
+
+    fn closeLimit(close_wait: ?Io.Duration) Io.Duration {
+        const wait_ms: i64 = if (close_wait) |d| d.toMilliseconds() else 2000;
+        return .fromMilliseconds(wait_ms + 3000);
     }
 
     /// Drops the connection at once, with no close frame, and frees it.

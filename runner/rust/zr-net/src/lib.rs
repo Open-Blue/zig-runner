@@ -4,6 +4,10 @@
 //! R1: the library's version and the lifetime of the tokio runtime. R2: TLS for Postgres (sans-IO)
 //! and the count of what Rust allocates. R3 to R5: the HTTP client. R6: the WebSocket (`ws`).
 
+// The policy of docs/rust-net.md ("Risks"): a panic aborts the runner, so no `unwrap`, `expect` or
+// index that can panic in the library; each exception says why it cannot. Tests may.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing))]
+
 mod alloc;
 mod body;
 // `call` and `tls` are public for the fuzz targets (fuzz/), which drive the C ABI as Zig does.

@@ -57,6 +57,11 @@ pub const Socket = struct {
         try s.ws.ping();
     }
 
+    /// Messages that were queued, or being written, when the connection ended: never sent (for the log).
+    pub fn unsent(s: *Socket) u64 {
+        return s.ws.counts().unsent;
+    }
+
     pub fn close(s: *Socket, gpa: Allocator) void {
         _ = gpa;
         s.ws.close();
@@ -614,4 +619,61 @@ test "measure: resident memory per feed connection" {
         defer f.close(io);
         try f.writePositionalAll(io, line, try f.length(io));
     }
+}
+
+test "an upgrade that fails frees the client made for its roots once, whichever way it ends" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // A refused upgrade with roots of its own (the connection's client is its own): the client was
+    // freed twice, by `abort` and by the open's own cleanup.
+    var server: ws_server.Server = undefined;
+    try server.start(gpa, io, .refuse);
+    defer server.stop();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(error.WebSocketRefused, net_client.Ws.open(gpa, io, .{ .url = server.url(&buf), .roots_pem = "not used by ws://" }));
+    // A deadline that passes with the upgrade unanswered, and one that succeeds and is closed.
+    var silent: ws_server.Server = undefined;
+    try silent.start(gpa, io, .never_answer);
+    defer silent.stop();
+    try std.testing.expectError(error.Timeout, net_client.Ws.open(gpa, io, .{ .url = silent.url(&buf), .roots_pem = "x", .deadline = .fromMilliseconds(200) }));
+    var ok: ws_server.Server = undefined;
+    try ok.start(gpa, io, .record);
+    defer ok.stop();
+    var ws = try net_client.Ws.open(gpa, io, .{ .url = ok.url(&buf), .roots_pem = "x" });
+    ws.close();
+}
+
+test "close does not wait for a peer that stopped reading, beyond its limit" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var server: ws_server.Server = undefined;
+    try server.start(gpa, io, .stall);
+    defer server.stop();
+    var buf: [64]u8 = undefined;
+    var ws = try net_client.Ws.open(gpa, io, .{ .url = server.url(&buf), .queue_limit = 4096, .close_wait = .fromMilliseconds(300) });
+    const Sender = struct {
+        ws: *net_client.Ws,
+        fn run(self: *@This()) void {
+            const msg: [2048]u8 = @splat('s');
+            while (true) self.ws.sendText(&msg) catch return;
+        }
+    };
+    var sender: Sender = .{ .ws = &ws };
+    var task = try io.concurrent(Sender.run, .{&sender});
+    var last: usize = 0;
+    var steady: u32 = 0;
+    while (steady < 30) {
+        try io.sleep(.fromMilliseconds(10), .awake);
+        const q = ws.counts().queued;
+        steady = if (q == last and q > 0) steady + 1 else 0;
+        last = q;
+    }
+    task.cancel(io);
+    // The queue is full and the writer blocked: the close frame cannot be written. `close` gives up
+    // at its limit (the wait of 300 ms and 3 s), not at TCP's.
+    const started = std.Io.Clock.awake.now(io);
+    ws.close();
+    const took = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    try std.testing.expect(took >= 2000 and took < 8000);
+    server.release();
 }

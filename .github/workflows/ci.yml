@@ -783,6 +783,12 @@ jobs:
         if: steps.scope.outputs.run == 'true'
         run: .github/scripts/cargo-test.sh
 
+      # clippy over the library with `-D warnings` and its policy: no unwrap, expect or panicking
+      # index outside tests (docs/rust-net.md, "Risks"), with a clippy of the pinned Rust's version.
+      - name: Rust lints
+        if: steps.scope.outputs.run == 'true'
+        run: .github/scripts/clippy.sh
+
       # runner/src/expr.zig against GitHub's own expression test cases (actions/languageservices):
       # fails on a case that broke, or on one that now passes and is still listed as failing.
       - name: Expressions against GitHub's test cases

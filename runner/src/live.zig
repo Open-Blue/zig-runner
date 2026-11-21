@@ -361,6 +361,9 @@ pub const Live = struct {
                 l.feed_last_ms = std.Io.Clock.real.now(l.io).toMilliseconds();
                 return;
             } else |e| {
+                // What was queued in the library and never written is lost with the connection (the
+                // live view only: the log is uploaded whole at the end).
+                const unsent = l.socket.unsent();
                 l.socket.close(l.gpa);
                 if (attempt == 0 and l.feed_reopened < max_reopen) {
                     l.feed_reopened += 1;
@@ -370,8 +373,8 @@ pub const Live = struct {
                 }
                 l.feed_open = false;
                 l.say(
-                    "live log feed lost ({s}); the log appears when the job ends",
-                    .{@errorName(e)},
+                    "live log feed lost ({s}, {d} queued messages never sent); the log appears when the job ends",
+                    .{ @errorName(e), unsent },
                 );
                 return;
             }

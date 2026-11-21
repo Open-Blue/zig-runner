@@ -94,6 +94,8 @@ pub struct WsInfo {
     pub waiting: usize,
     /// Messages received that did not fit the queue and were dropped.
     pub dropped: u64,
+    /// Messages queued or being written when the connection ended, which were never sent.
+    pub unsent: u64,
     pub message_len: usize,
 }
 
@@ -120,6 +122,12 @@ struct State {
     inbox: VecDeque<(u32, Bytes)>,
     in_bytes: usize,
     dropped: u64,
+    /// A message taken from `out` that is being cut into frames and written: lost with the connection too.
+    writing: u64,
+    /// Messages queued or being written when the connection ended: never sent.
+    unsent: u64,
+    /// What the peer's close said ("closed by the peer: 1001 going away"), for the log.
+    note: String,
 }
 
 struct Shared {
@@ -152,6 +160,9 @@ impl Shared {
                 inbox: VecDeque::new(),
                 in_bytes: 0,
                 dropped: 0,
+                writing: 0,
+                unsent: 0,
+                note: String::new(),
             }),
             wake,
             queue_limit,
@@ -183,6 +194,7 @@ impl Shared {
     fn finish(&self, error: Option<Fail>) {
         let mut g = lock(&self.st);
         g.phase = CLOSED;
+        g.unsent += g.out.len() as u64 + g.writing;
         if g.error.is_none() {
             g.error = error;
         }
@@ -291,6 +303,8 @@ enum End {
 async fn transfer(ws: &mut WebSocketStream<Stream>, shared: &Shared, o: &Opened) -> End {
     let mut frames_left: VecDeque<Message> = VecDeque::new();
     let mut dirty = false;
+    // The peer sent its close: it is answered (by the stream's own poll) and nothing more is sent.
+    let mut peer_closed = false;
     poll_fn(|cx| {
         // The read side first: answering the peer's pings and closes happens inside the stream's
         // poll, whatever the caller is doing.
@@ -306,8 +320,26 @@ async fn transfer(ws: &mut WebSocketStream<Stream>, shared: &Shared, o: &Opened)
                         Message::Text(t) => received(&mut g, shared, KIND_TEXT, Bytes::from(t)),
                         Message::Binary(b) => received(&mut g, shared, KIND_BINARY, b),
                         Message::Close(f) => {
-                            g.close_code = f.map_or(0, |f| u16::from(f.code));
+                            g.close_code = f.as_ref().map_or(0, |f| u16::from(f.code));
+                            g.note = match &f {
+                                Some(f) => format!("closed by the peer: {} {}", u16::from(f.code), f.reason),
+                                None => "closed by the peer".to_string(),
+                            };
                             g.phase = CLOSING;
+                            // What is queued is not sent to a peer that closed: it is counted as lost, and
+                            // nothing is written after the close (tungstenite refuses it as a protocol error).
+                            if !peer_closed {
+                                peer_closed = true;
+                                frames_left.clear();
+                                g.unsent = g.out.len() as u64 + g.writing;
+                                g.writing = 0;
+                                g.out.clear();
+                                g.out_bytes = 0;
+                                if g.full {
+                                    g.full = false;
+                                    shared.wake.ping();
+                                }
+                            }
                         }
                         Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
                     }
@@ -316,9 +348,16 @@ async fn transfer(ws: &mut WebSocketStream<Stream>, shared: &Shared, o: &Opened)
         }
         // The write side: messages from the queue, frame by frame, then the flush.
         loop {
+            if peer_closed {
+                break;
+            }
             if frames_left.is_empty() {
+                lock(&shared.st).writing = 0;
                 match shared.pop(cx.waker()) {
-                    Some(m) => frames_left.extend(frames(m, o.max_frame)),
+                    Some(m) => {
+                        lock(&shared.st).writing = 1;
+                        frames_left.extend(frames(m, o.max_frame))
+                    }
                     None => break,
                 }
                 continue;
@@ -493,7 +532,8 @@ pub unsafe extern "C" fn zr_net_ws_info(ws: *mut Ws, info: *mut WsInfo) {
         queued: g.out_bytes,
         waiting: g.in_bytes,
         dropped: g.dropped,
-        message_len: g.error.as_ref().map_or(0, |e| e.1.len()),
+        unsent: g.unsent,
+        message_len: g.error.as_ref().map_or(g.note.len(), |e| e.1.len()),
     };
 }
 
@@ -504,7 +544,10 @@ pub unsafe extern "C" fn zr_net_ws_info(ws: *mut Ws, info: *mut WsInfo) {
 #[no_mangle]
 pub unsafe extern "C" fn zr_net_ws_message(ws: *mut Ws, out: *mut u8, cap: usize) -> usize {
     let g = lock(&shared_of(ws).st);
-    let Some((_, m)) = g.error.as_ref() else { return 0 };
+    let m = match g.error.as_ref() {
+        Some((_, m)) => m,
+        None => &g.note,
+    };
     copy_message(m, out, cap);
     m.len().min(cap.saturating_sub(1))
 }
@@ -861,6 +904,47 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_closing_while_messages_are_queued_is_a_clean_close_with_its_code_and_the_unsent_counted() {
+        let _g = crate::runtime::test_lock();
+        let go = Arc::new(Notify::new());
+        let g2 = go.clone();
+        let port = serve(true, move |s| {
+            let go = g2.clone();
+            async move {
+                let mut ws = accept(s, Default::default()).await;
+                // Reads nothing, so the client's writer blocks with messages queued; then it closes.
+                go.notified().await;
+                let frame = CloseFrame { code: CloseCode::Away, reason: "going away".into() };
+                let _ = ws.close(Some(frame)).await;
+                while let Some(Ok(_)) = ws.next().await {}
+            }
+        });
+        let c = spec_with(&url(port), "", |s| s.queue_limit = 8192);
+        c.open();
+        let msg = vec![5u8; 2048];
+        // Until the kernel's buffers are full and the queue stays full: the writer is blocked.
+        let (mut n, mut steady) = (0, 0);
+        while steady < 40 {
+            if unsafe { zr_net_ws_send(c.ws, KIND_BINARY, msg.as_ptr(), msg.len()) } == 0 {
+                n += 1;
+                steady = 0;
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+                steady += 1;
+            }
+            assert!(n < 100_000, "never blocked");
+        }
+        go.notify_one();
+        let i = c.until(|i| i.state == CLOSED);
+        // A clean close (no protocol error from writing after it), with the peer's code and reason.
+        assert_eq!((i.error, i.close_code), (0, 1001), "{}", c.message());
+        assert_eq!(c.message(), "closed by the peer: 1001 going away");
+        assert!(i.unsent > 0, "the queue was not counted as lost: queued {} unsent {} sent {} out {}", i.queued, i.unsent, n, i.bytes_out);
+        assert_eq!(i.queued, 0);
+        assert_eq!(c.send(KIND_TEXT, b"x"), 2);
+    }
+
+    #[test]
     fn a_slow_reader_stops_the_sender_at_the_queue_bound_and_the_drain_wakes_it() {
         let _g = crate::runtime::test_lock();
         const LIMIT: usize = 8 * 1024;
@@ -1170,7 +1254,7 @@ mod tests {
         use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose, SanType};
         use rustls::pki_types::PrivateKeyDer;
 
-        fn acceptor() -> (tokio_rustls::TlsAcceptor, String) {
+        fn acceptor(names: &[&str]) -> (tokio_rustls::TlsAcceptor, String) {
             let mut p = CertificateParams::new(vec![]).expect("params");
             p.distinguished_name.push(DnType::CommonName, "ws test CA");
             p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -1179,7 +1263,13 @@ mod tests {
             let ca = p.self_signed(&ca_key).expect("ca");
             let issuer = rcgen::Issuer::new(p, ca_key);
             let mut lp = CertificateParams::new(vec![]).expect("params");
-            lp.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().expect("ip"))];
+            lp.subject_alt_names = names
+                .iter()
+                .map(|n| match n.parse::<std::net::IpAddr>() {
+                    Ok(ip) => SanType::IpAddress(ip),
+                    Err(_) => SanType::DnsName((*n).try_into().expect("dns name")),
+                })
+                .collect();
             lp.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
             let k = KeyPair::generate().expect("key");
             let cert = lp.signed_by(&k, &issuer).expect("cert");
@@ -1195,7 +1285,7 @@ mod tests {
         #[test]
         fn wss_trusts_the_roots_it_was_given_and_says_why_it_does_not_trust_the_others() {
             let _g = crate::runtime::test_lock();
-            let (acceptor, pem) = acceptor();
+            let (acceptor, pem) = acceptor(&["127.0.0.1"]);
             let (l, port) = listener(false);
             rt().spawn(async move {
                 let l = TcpListener::from_std(l).expect("listener");
@@ -1217,10 +1307,77 @@ mod tests {
             assert!(i.tls_ns != UNKNOWN && i.connect_ns != UNKNOWN);
             assert_eq!(c.send(KIND_TEXT, b"echo"), 0);
             assert_eq!(c.recv().expect("the echo"), (KIND_TEXT, b"echo".to_vec()));
+            // A name the certificate is not for: its own error, though the CA is trusted.
+            let named = format!("wss://localhost:{port}/_ws/ingest.sock");
+            let spec_named = WsSpec { url: named.as_ptr(), url_len: named.len(), ..spec_copy(&spec) };
+            let wrong = connect_with(new_client(&pem), &spec_named);
+            let i = wrong.until(|i| i.state != CONNECTING);
+            assert_eq!(i.error, Code::TlsNameMismatch as i32, "{}", wrong.message());
             // The system's roots do not know this CA.
             let other = connect_with(new_client(""), &spec);
             let i = other.until(|i| i.state != CONNECTING);
             assert_eq!(i.error, Code::TlsUnknownIssuer as i32, "{}", other.message());
+            drop(c);
+        }
+
+        fn spec_copy(s: &WsSpec) -> WsSpec {
+            WsSpec { url: s.url, url_len: s.url_len, headers: s.headers, headers_len: s.headers_len, max_frame: s.max_frame, open_ms: s.open_ms, close_wait_ms: s.close_wait_ms, queue_limit: s.queue_limit, recv_limit: s.recv_limit }
+        }
+
+        #[test]
+        fn wss_through_an_http_proxys_connect_reaches_the_server_with_the_names_of_its_certificate() {
+            let _g = crate::runtime::test_lock();
+            let (acceptor, pem) = acceptor(&["wss.example.test"]);
+            let (l, server_port) = listener(false);
+            rt().spawn(async move {
+                let l = TcpListener::from_std(l).expect("listener");
+                while let Ok((s, _)) = l.accept().await {
+                    let a = acceptor.clone();
+                    tokio::spawn(async move {
+                        let Ok(tls) = a.accept(s).await else { return };
+                        let Ok(mut ws) = tokio_tungstenite::accept_async(tls).await else { return };
+                        while let Some(Ok(m)) = ws.next().await {
+                            let _ = ws.send(m).await;
+                        }
+                    });
+                }
+            });
+            // The proxy: reads CONNECT, notes its target, tunnels to the server above whatever name it was.
+            let seen: Seen = Default::default();
+            let seen2 = seen.clone();
+            let proxy = serve(false, move |mut s| {
+                let seen = seen2.clone();
+                async move {
+                    let mut head = Vec::new();
+                    let mut b = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if s.read(&mut b).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        head.push(b[0]);
+                    }
+                    seen.lock().expect("lock").push(String::from_utf8_lossy(&head).lines().next().unwrap_or("").to_string());
+                    let Ok(mut up) = TcpStream::connect(("127.0.0.1", server_port)).await else { return };
+                    let _ = s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await;
+                    let _ = tokio::io::copy_bidirectional(&mut s, &mut up).await;
+                }
+            });
+            // The client reads the proxy from the environment, as the runner's does (flags bit 0).
+            std::env::set_var("HTTPS_PROXY", format!("http://127.0.0.1:{proxy}"));
+            std::env::remove_var("https_proxy");
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+            let cfg = ClientConfig { user_agent: b"zr-test".as_ptr(), user_agent_len: 7, roots: pem.as_ptr(), roots_len: pem.len(), connect_timeout_ms: 0, tls_timeout_ms: 0, idle_timeout_ms: 0, max_idle_per_host: 0, flags: 1 };
+            let mut client = std::ptr::null_mut();
+            assert_eq!(unsafe { zr_net_client_new(&cfg, &mut client, std::ptr::null_mut(), 0) }, 0);
+            std::env::remove_var("HTTPS_PROXY");
+            let u = format!("wss://wss.example.test:{server_port}/_ws/ingest.sock");
+            let spec = WsSpec { url: u.as_ptr(), url_len: u.len(), headers: std::ptr::null(), headers_len: 0, max_frame: 0, open_ms: 5000, close_wait_ms: 0, queue_limit: 0, recv_limit: 0 };
+            let c = connect_with(client, &spec);
+            c.open();
+            assert_eq!(c.send(KIND_TEXT, b"through"), 0);
+            assert_eq!(c.recv().expect("the echo"), (KIND_TEXT, b"through".to_vec()));
+            assert_eq!(*seen.lock().expect("lock"), [format!("CONNECT wss.example.test:{server_port} HTTP/1.1")]);
             drop(c);
         }
     }

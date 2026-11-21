@@ -57,7 +57,7 @@ needed() {
 		runner/* | db/* | .github/workflows/ci.yml | .github/scripts/ci-scope.sh | .github/tsan.supp | \
 			.github/scripts/install-zig.sh | .github/scripts/allow-userns.sh | .github/scripts/ci-database.sh | \
 			.github/scripts/zig-test.sh | .github/scripts/zig-modules.sh | \
-			.github/scripts/cargo-test.sh | .github/scripts/pg-tls-fixture.sh | .github/scripts/build-zr-net.sh | \
+			.github/scripts/cargo-test.sh | .github/scripts/clippy.sh | .github/scripts/pg-tls-fixture.sh | .github/scripts/build-zr-net.sh | \
 			.github/scripts/zig-cc.sh | .github/scripts/zig-cc-env.sh | .github/scripts/zig-cc-host.sh | .github/scripts/zig-ar.sh | .github/scripts/rust-image-free-check.sh | .github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | \
 			.github/scripts/expr-conformance.sh | .github/scripts/zlint.sh | \
 			.github/scripts/zlint-suppressed.baseline | \

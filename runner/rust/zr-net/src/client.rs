@@ -430,7 +430,7 @@ impl Client {
         let plain_proxy = via.is_some() && !target.https;
         let mut req = http::Request::builder().method(method.clone());
         req = req.uri(if plain_proxy { target.url() } else { target.path.clone() });
-        let h = req.headers_mut().expect("a request being built has headers");
+        let Some(h) = req.headers_mut() else { return Err((Code::Protocol, "the request could not be built".to_string())) };
         h.insert(header::HOST, HeaderValue::from_str(&target.authority()).map_err(|e| (Code::BadUrl, e.to_string()))?);
         h.insert(header::USER_AGENT, HeaderValue::from_str(&self.settings.user_agent).map_err(|e| (Code::Config, e.to_string()))?);
         for (n, v) in headers {
@@ -657,8 +657,9 @@ pub fn parse_headers(lines: &[u8]) -> Result<Vec<(HeaderName, HeaderValue)>, Fai
     let mut out = Vec::new();
     for line in lines.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
         let colon = line.iter().position(|&b| b == b':').ok_or((Code::BadUrl, "a header without a colon".to_string()))?;
-        let name = HeaderName::from_bytes(&line[..colon]).map_err(|e| (Code::BadUrl, format!("header name: {e}")))?;
-        let value = HeaderValue::from_bytes(line[colon + 1..].trim_ascii()).map_err(|e| (Code::BadUrl, format!("header value: {e}")))?;
+        let (name, rest) = line.split_at_checked(colon).unwrap_or((line, &[]));
+        let name = HeaderName::from_bytes(name).map_err(|e| (Code::BadUrl, format!("header name: {e}")))?;
+        let value = HeaderValue::from_bytes(rest.get(1..).unwrap_or(&[]).trim_ascii()).map_err(|e| (Code::BadUrl, format!("header value: {e}")))?;
         out.push((name, value));
     }
     Ok(out)
