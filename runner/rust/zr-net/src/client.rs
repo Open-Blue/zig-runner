@@ -55,8 +55,6 @@ pub enum Code {
     Stale = 19,
     /// The server did not accept the WebSocket upgrade (`ws.rs`): it answered with another status.
     WsRefused = 20,
-    /// A TLS handshake that the peer's side broke for good (no shared protocol version or cipher, malformed
-    /// records): not a flaky link's failure, so a caller does not try again.
     /// What rustls's classification (`tls::classify`) leaves in its catch-all (`Kind::Protocol`): malformed or
     /// unexpected records (`InvalidMessage`, `DecryptError`, `PeerMisbehaved`, `PeerIncompatible`, `General`...), which
     /// is what a peer that does not speak TLS (a captive portal answering plain HTTP on 443) or shares no protocol
