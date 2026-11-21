@@ -107,6 +107,15 @@ const transient_errors = [_][]const u8{
     "ResetBeforeHead",
     "BrokenPipe",
     "TlsInitializationFailed",
+    // The network library's names (`net_client.Error`), which the download's errors are now: a name
+    // that does not resolve, a connection refused, timed out or failed, one lost with no answer or
+    // cut short (the library's `Io`: a body that stopped is read again from the start, which costs
+    // what the attempt did), a TLS handshake that failed. Not a certificate's error, a status or its
+    // own timeout.
+    "DnsFailed",
+    "ConnectionFailed",
+    "NetworkIo",
+    "TlsFailed",
     "TlsConnectionTruncated",
     "TlsAlertCloseNotify",
     "TlsAlertInternalError",
@@ -337,6 +346,9 @@ test "transientDownload: the client's transport errors, not a status or its own 
     try t.expect(!transientDownload("could not download https://x/y: it took longer than 15 minutes"));
     try t.expect(!transientDownload("could not download https://x/y: TooManyRedirects"));
     try t.expect(transientDownload("could not download https://x/y: TlsInitializationFailed"));
+    try t.expect(transientDownload("could not download https://x/y: NetworkIo"));
+    try t.expect(transientDownload("could not download https://x/y: DnsFailed"));
+    try t.expect(!transientDownload("could not download https://x/y: TlsUnknownIssuer"));
     // A body cut short after bytes came is not told from the archive being wrong: not retried.
     try t.expect(!transientDownload("could not download https://x/y: ReadFailed"));
     // Only the error part counts: a repository named after an error is not one, and a failure
