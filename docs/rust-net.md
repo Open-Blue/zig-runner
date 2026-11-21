@@ -252,6 +252,8 @@ documents (DNS approximate, TLS inferred) go away with the wrapper.
 
 ## The HTTP client (R3, as built)
 
+*Note: `net_oracle.zig`, `std_broker.zig` and the std client, named below, were deleted in R6 ("The std client's removal"); they are in git history before that commit.*
+
 `runner/src/net_client.zig` is the Zig side (`fetch(arena, io, options)`), `rust/zr-net/src/client.rs`, `proxy.rs` and `call.rs` the library's.
 
 - **API.** `zr_net_client_new` makes the process's client (user agent `zig-runner/<version>`, proxies from the environment, the pool); `zr_net_call_start`
@@ -288,6 +290,8 @@ documents (DNS approximate, TLS inferred) go away with the wrapper.
 - **Not in R3**: the std client's other users (registry, release downloads, uploads: R4, below; run service, broker, Gitea: R5; the feed: R6), `http.zig`'s renew/retire machinery (still needed by those), HTTP/2, streaming.
 
 ## Streaming: downloads, uploads, the registry (R4, as built)
+
+*Note: `net_oracle.zig`, `std_broker.zig` and the std client, named below, were deleted in R6 ("The std client's removal"); they are in git history before that commit.*
 
 - **What moved.** `zig_release.zig` (the Zig tarballs), `github/results.zig`'s blob upload (`putBlob`: the step and job logs) and `native/oci/registry.zig` (manifests, blobs, the token service; `image.zig` and `Backend.zig` lose
   the std client they carried). No other std client user is in R4's scope: tool and action downloads happen inside the Dagger engine or the jobs' own steps, not in the runner, and the artifact and cache uploads are
@@ -378,6 +382,8 @@ documents (DNS approximate, TLS inferred) go away with the wrapper.
 
 ## The broker, the run service and Gitea (R5, as built)
 
+*Note: `net_oracle.zig`, `std_broker.zig` and the std client, named below, were deleted in R6 ("The std client's removal"); they are in git history before that commit.*
+
 - **What moved.** `broker.request` (`github/broker.zig`), which every call of the run service (`runservice.zig`), the broker's session and long poll
   (`loop.zig`, `loop/job.zig`), `inspect.zig`, the Dagger engine's queries (`dagger.zig`, `log = false`) and the Gitea and Forgejo client (`gitea/client.zig`) use, is now
   `net_client.fetch` with the same options and result: the std request, its hand-written redirects, `net_hooks.wrap` per request, the per-request client of a retry and the
@@ -385,7 +391,7 @@ documents (DNS approximate, TLS inferred) go away with the wrapper.
 - **Kept.** Deadlines through `http.within` (`fetch`'s), cancel through std.Io (the descriptor wait; a cancel frees the call and its connection), the `request:` lines (one implementation),
   the redirect rule (token dropped at another origin), the #100 retry: a connection that died under the request (`Timeout`, `NetworkIo`, `StaleConnection`) is tried once more on a connection
   of its own (`Options.fresh`), **only for a call that says so** (below). A kept connection found closed before anything was sent is replaced by the library, unseen, so `http.staleRetries` (the pool's size plus one) and
-  `http.renew`/`keepFresh` (the stale clock) are no longer needed by any call but the live feed's: the library's roots are loaded once and reloaded when a handshake fails with an unknown issuer.
+  `http.renew`/`keepFresh` (the stale clock) are no longer needed by any call but the live feed's: the library's roots are loaded once, read again after an hour, and read again when a handshake fails with an unknown issuer (`roots::refresh_after_unknown_issuer`, built in the removal pull request: at most once a minute, so a server presenting a chain nobody trusts cannot make every handshake read the bundle, and the connection is made once more), which is what `renew` did for a CA added after the runner started.
 - **std's client is left for the feed.** `main` still makes one std client for `feed.zig` (GitHub only; the Gitea path has none now), and `feed.zig` calls `http.keepFresh` before it uses it and `http.renew`
   when a handshake failed (the other calls did that for it); R6 deletes all of it. The old `broker.request` lives on in `std_broker.zig`, imported by the oracle only, until R6.
 - **Differences from std** (each in `net_oracle.zig`): a request with a body that is redirected is followed (a 302 of a POST is a GET; 307 and 308 repeat it) where std handed the 3xx back, a streamed body

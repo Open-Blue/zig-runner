@@ -950,3 +950,266 @@ pub const Ws = struct {
         if (w.own) |c| zr_net_client_free(c);
     }
 };
+
+// --- tests the std oracle (deleted in R6, in git history as `net_oracle.zig`) used to cover, now against the test server alone ---
+
+const testserver = @import("github/testserver.zig");
+
+test "the request line has every figure it measured, for a plain request" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    var captured: Io.Writer.Allocating = .init(arena);
+    request_log.capture = &captured;
+    request_log.enabled.store(true, .monotonic);
+    defer {
+        request_log.enabled.store(false, .monotonic);
+        request_log.capture = null;
+    }
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/unavailable/x?x=y", .{server.port});
+    _ = try fetch(arena, std.testing.io, .{ .url = url, .headers = &.{.{ .name = "Authorization", .value = "Bearer secret-token" }} });
+    const line = captured.written();
+    errdefer std.debug.print("line: {s}\n", .{line});
+    var want: [96]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, line, try std.fmt.bufPrint(&want, "request: host=127.0.0.1:{d} method=GET path=/unavailable/x status=503 dns_ms=", .{server.port})));
+    // Nothing of the query or the token; a plain http request has no TLS to time; a new connection.
+    try std.testing.expect(std.mem.indexOf(u8, line, "secret") == null and std.mem.indexOf(u8, line, "x=y") == null);
+    try std.testing.expect(std.mem.indexOf(u8, line, " tls_ms=? ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, " retry=0 reused=0 ") != null);
+    for ([_][]const u8{ " dns_ms=?", " connect_ms=?", " ttfb_ms=?", " total_ms=?" }) |unknown|
+        try std.testing.expect(std.mem.indexOf(u8, line, unknown) == null);
+    try std.testing.expect(std.mem.endsWith(u8, line, " rl_remaining=? rl_limit=? rl_reset=? rl_resource=?\n"));
+}
+
+test "requests are logged by the same switch as the others' (RUNNER_LOG_REQUESTS)" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    var captured: Io.Writer.Allocating = .init(arena);
+    request_log.capture = &captured;
+    defer request_log.capture = null;
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/unavailable/x", .{server.port});
+    // `main` stores `config.log_requests` there; tests start with it off.
+    request_log.enabled.store(false, .monotonic);
+    _ = try fetch(arena, std.testing.io, .{ .url = url });
+    try std.testing.expectEqual(@as(usize, 0), captured.written().len);
+    request_log.enabled.store(true, .monotonic);
+    defer request_log.enabled.store(false, .monotonic);
+    _ = try fetch(arena, std.testing.io, .{ .url = url });
+    try std.testing.expect(std.mem.startsWith(u8, captured.written(), "request: host=127.0.0.1:"));
+}
+
+test "fetch: a request nobody answers is given up at its deadline, and cancelling one ends it at once" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/silent", .{server.port});
+
+    const started = Io.Clock.awake.now(io);
+    try std.testing.expectError(error.Timeout, fetch(arena, io, .{ .url = url, .deadline = .fromMilliseconds(300) }));
+    try std.testing.expect(started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 5_000);
+
+    // The same, cancelled by the caller rather than by the deadline.
+    const Runner = struct {
+        fn run(a: std.mem.Allocator, i: Io, u: []const u8) Error!void {
+            _ = try fetch(a, i, .{ .url = u, .deadline = .fromSeconds(60) });
+        }
+    };
+    var f = try io.concurrent(Runner.run, .{ arena, io, url });
+    try io.sleep(.fromMilliseconds(100), .awake);
+    const cancelled_at = Io.Clock.awake.now(io);
+    try std.testing.expectError(error.Canceled, f.cancel(io));
+    try std.testing.expect(cancelled_at.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 5_000);
+}
+
+test "fetch with no deadline waits as long as it is let, and a cancel ends it at once" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var buf: [64]u8 = undefined;
+    const url = server.url(&buf, "127.0.0.1", "/silent");
+    const Poll = struct {
+        fn run(a: std.mem.Allocator, i: Io, u: []const u8) anyerror!void {
+            _ = try fetch(a, i, .{ .url = u, .deadline = null, .headers = &.{.{ .name = "Authorization", .value = "Bearer t" }} });
+        }
+    };
+    var f = try io.concurrent(Poll.run, .{ arena, io, url });
+    try io.sleep(.fromMilliseconds(700), .awake);
+    const at = Io.Clock.awake.now(io);
+    try std.testing.expectError(error.Canceled, f.cancel(io));
+    try std.testing.expect(at.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 5_000);
+}
+
+test "a body written past its declared length is an error the caller sees, not a silent cut" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/sink", .{server.port});
+    const Long = struct {
+        /// How many bytes `write` writes, set per case (it runs on this thread).
+        var total: usize = 0;
+        fn write(_: *const Body, w: *Io.Writer) anyerror!void {
+            var left = total;
+            const chunk: [4096]u8 = @splat('x');
+            while (left > 0) {
+                const n = @min(left, chunk.len);
+                try w.writeAll(chunk[0..n]);
+                left -= n;
+            }
+        }
+    };
+    // Declared 100, 110 written (in the buffer, over at the flush); declared 0; declared 3 MiB
+    // and 10 bytes more (the writer meets the refusal at the end of a long body).
+    for ([_][2]usize{ .{ 100, 110 }, .{ 0, 10 }, .{ 3 << 20, (3 << 20) + 10 } }) |c| {
+        Long.total = c[1];
+        const body: Body = .{ .len = c[0], .writeFn = Long.write };
+        try std.testing.expectError(error.BodyLongerThanDeclared, fetch(arena, io, .{ .method = .PUT, .url = url, .upload = &body, .deadline = .fromSeconds(10) }));
+    }
+    // Exactly its length is fine.
+    Long.total = 100;
+    const ok: Body = .{ .len = 100, .writeFn = Long.write };
+    try std.testing.expectEqual(std.http.Status.ok, (try fetch(arena, io, .{ .method = .PUT, .url = url, .upload = &ok, .deadline = .fromSeconds(10) })).status);
+}
+
+test "a response limit of 0 allows no body, whole or streamed, and maxInt none" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const io = std.testing.io;
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/blob/1000", .{server.port});
+    try std.testing.expectError(error.BodyTooLarge, fetch(arena, io, .{ .url = url, .max_response = 0 }));
+    // Streamed: the head says how long the body is, or the first read finds it too long.
+    if (open(arena, io, .{ .url = url, .max_response = 0 })) |opened| {
+        var s = opened;
+        defer s.close();
+        var buf: [4096]u8 = undefined;
+        try std.testing.expectError(error.BodyTooLarge, s.read(&buf));
+    } else |e| try std.testing.expectEqual(error.BodyTooLarge, e);
+    var s = try open(arena, io, .{ .url = url, .max_response = std.math.maxInt(usize) });
+    defer s.close();
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = try s.read(&buf);
+        if (n == 0) break;
+        total += n;
+    }
+    try std.testing.expectEqual(@as(usize, 1000), total);
+}
+
+test "a streamed download's request line has the whole body's bytes and the final figures" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    var captured: Io.Writer.Allocating = .init(arena);
+    request_log.capture = &captured;
+    request_log.enabled.store(true, .monotonic);
+    defer {
+        request_log.enabled.store(false, .monotonic);
+        request_log.capture = null;
+    }
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/blob/300000?sig=secret", .{server.port});
+    var dl = try open(arena, std.testing.io, .{ .url = url, .headers = &.{.{ .name = "Authorization", .value = "Bearer secret-token" }}, .max_response = 1 << 30 });
+    defer dl.close();
+    var chunk: [4096]u8 = undefined;
+    while ((try dl.read(&chunk)) > 0) {}
+    const line = captured.written();
+    errdefer std.debug.print("line: {s}\n", .{line});
+    // One line, written when the body ended, with its size; nothing of the query or the token.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "request: "));
+    try std.testing.expect(std.mem.startsWith(u8, line, "request: host=127.0.0.1:"));
+    try std.testing.expect(std.mem.indexOf(u8, line, " method=GET path=/blob/300000 status=200 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, " bytes_in=300000 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "secret") == null);
+}
+
+test "a stream closed before its end gives up its connection and still logs its line" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    var captured: Io.Writer.Allocating = .init(arena);
+    request_log.capture = &captured;
+    request_log.enabled.store(true, .monotonic);
+    defer {
+        request_log.enabled.store(false, .monotonic);
+        request_log.capture = null;
+    }
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/blob/{d}", .{ server.port, 8 << 20 });
+    var s = try open(arena, std.testing.io, .{ .url = url, .max_response = 1 << 30 });
+    var buf: [1000]u8 = undefined;
+    try std.testing.expect((try s.read(&buf)) > 0);
+    s.close();
+    s.close();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, captured.written(), "request: "));
+    try std.testing.expect(std.mem.indexOf(u8, captured.written(), "status=200") != null);
+    // The server's thread is still serving: a next request is answered.
+    const again = try fetch(arena, std.testing.io, .{ .url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/echo", .{server.port}) });
+    try std.testing.expectEqual(std.http.Status.ok, again.status);
+}
+
+test "allocation failures: a request through the network library (the arena path)" {
+    const af = @import("alloc_failures.zig");
+    var server: testserver.Server = undefined;
+    try server.start();
+    defer server.stop();
+    const S = struct {
+        /// The response, or out of memory; a failure of the request itself is the same as without one.
+        fn run(a: std.mem.Allocator, port: u16, path: []const u8, want_status: u16, want_body: []const u8) !void {
+            var arena: af.Scratch = .init(a);
+            defer arena.deinit();
+            var url_buf: [128]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ port, path });
+            const r = fetch(arena.allocator(), std.testing.io, .{
+                .url = url,
+                .headers = &.{ .{ .name = "Authorization", .value = "Bearer t0k" }, .{ .name = "Accept", .value = "*/*" } },
+            }) catch |e| {
+                if (want_status == 0 and e == error.TooManyRedirects) return;
+                return e;
+            };
+            try std.testing.expectEqual(want_status, @as(u16, @backingInt(r.status)));
+            try std.testing.expectEqualStrings(want_body, r.body);
+            // The headers the request log reads, from the same memory.
+            _ = r.header("content-type");
+        }
+    };
+    try af.checkOne(S.run, .{ server.port, "/echo", 200, "GET Bearer t0k" });
+    try af.checkOne(S.run, .{ server.port, "/same", 200, "GET Bearer t0k" });
+    try af.checkOne(S.run, .{ server.port, "/nothing-here", 404, "{\"message\":\"Not Found\"}" });
+    try af.checkOne(S.run, .{ server.port, "/limited/x", 429, "" });
+    // A redirect loop ends in the library's error, not in a swallowed one.
+    try af.checkOne(S.run, .{ server.port, "/loop", 0, "" });
+}
