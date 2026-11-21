@@ -336,7 +336,7 @@ pub mod ws {
             i = info();
         }
         if i.error != 0 {
-            assert!((1..=20).contains(&i.error), "error code {}", i.error);
+            assert!((1..=21).contains(&i.error), "error code {}", i.error);
             let n = unsafe { zr_net_ws_message(ws, msg.as_mut_ptr(), msg.len()) };
             assert_eq!(i.message_len > 0, n > 0);
             unsafe {
@@ -405,7 +405,7 @@ pub mod ws {
             assert_eq!(info().state, 3, "the close did not end the connection");
             let i = info();
             if i.error != 0 {
-                assert!((1..=20).contains(&i.error), "error code {}", i.error);
+                assert!((1..=21).contains(&i.error), "error code {}", i.error);
             }
         }
         unsafe {

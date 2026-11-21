@@ -1,3 +1,3 @@
 kind: Fixed
-body: 'The runner no longer carries Zig''s std HTTP client: the last users (the live feed, the action tarball downloads) run on the network library, so the std client''s stale-TLS-clock workarounds (renew, keepFresh, preloadCa, the retired-client list), the std timing wrapper and the oracle tests that compared the two stacks are removed'
+body: 'The runner no longer carries Zig''s std HTTP client: the last users (the live feed, the action tarball downloads) run on the network library, so the std client''s stale-TLS-clock workarounds (renew, keepFresh, preloadCa, the retired-client list), the std timing wrapper and the oracle tests that compared the two stacks are removed; the network library now reads the system CA bundle again when a handshake meets an unknown issuer (at most once a minute), which replaces what the std client's renew did for a CA added after the runner started'
 time: 2026-11-20T22:32:17.151943567-05:00
