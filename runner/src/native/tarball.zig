@@ -16,7 +16,7 @@
 //! 40-digit hex string.
 
 const std = @import("std");
-const http = @import("../github/http.zig");
+const net_client = @import("../net_client.zig");
 const ratelimit = @import("../github/ratelimit.zig");
 const checkout = @import("../dagger/checkout.zig");
 const sandbox = @import("sandbox.zig");
@@ -49,6 +49,10 @@ pub const Source = struct {
 /// backoff (1, 2, 4 s) and what GitHub asks (at most `ratelimit.max_wait_ms` each) this stays well
 /// inside the download's own `deadline`, which bounds the whole of it.
 const max_retries = 3;
+
+/// The requests the library makes for one download whose connection is closed with no answer every
+/// time: the try, and its one repeat on a new connection (tests).
+const library_attempts = 2;
 
 /// GitHub's API for a server: `api.github.com` for github.com, `<server>/api/v3` for a GitHub
 /// Enterprise Server, `api.<host>` for GitHub's data-residency hosts (`*.ghe.com`).
@@ -227,36 +231,21 @@ fn commitMismatch(arena: Allocator, expect: ?[]const u8, archived: ?[]const u8) 
     return try std.fmt.allocPrint(arena, "the archive holds commit {s}, not the {s} that was asked for", .{ got, want });
 }
 
-/// GET `src` into the file `path`, following up to `max_redirects` redirects itself: std's client
-/// keeps an Authorization header across a redirect to another host, and the token is GitHub's API's
-/// to see, not the signed URL's CDN.
+/// GET `src` into the file `path`, through the network library's stream (a 4 GiB archive costs its
+/// 1 MiB queue, not its size). The library follows up to `max_redirects` redirects and drops the
+/// Authorization header when one leaves the origin (scheme, host, port): the token is GitHub's API's
+/// to see, not the signed URL's CDN (tested). It also sends a request again once, on a new
+/// connection, when a kept one turns out to be closed (what std's `staleRetries` did, there as many
+/// times as the client kept connections). The whole download is within `deadline`, and a cancel of the
+/// job ends the wait where it blocks.
 pub fn download(arena: Allocator, gpa: Allocator, io: std.Io, src: Source, path: []const u8, why: *[]const u8) !void {
-    var local: std.http.Client = .{ .allocator = gpa, .io = io, .write_buffer_size = http.write_buffer_size };
-    defer local.deinit();
-    const r = try http.within(io, deadline, downloadWith, .{ arena, http.client(&local), io, src, path, why });
-    return r orelse {
-        why.* = "it took longer than 15 minutes";
-        return error.Timeout;
-    };
-}
-
-fn downloadWith(arena: Allocator, client: *std.http.Client, io: std.Io, src: Source, path: []const u8, why: *[]const u8) !void {
+    _ = gpa;
     const file = try std.Io.Dir.cwd().createFile(io, path, .{});
     defer file.close(io);
-    var uri = try std.Uri.parse(src.url);
-    const origin = uri;
-    var redirects: u32 = 0;
-    var stale: u32 = 0;
     var retries: u32 = 0;
     while (true) {
-        const own = sameOrigin(uri, origin);
-        const bearer: ?[]const u8 = if (own) (if (src.token) |t| try std.fmt.allocPrint(arena, "Bearer {s}", .{t}) else null) else null;
         var miss: Miss = .{};
-        const next = onceAt(arena, client, uri, bearer, file, why, &miss, io) catch |e| switch (e) {
-            error.HttpConnectionClosing, error.ResetBeforeHead => if (stale < http.staleRetries(client)) {
-                stale += 1;
-                continue;
-            } else return e,
+        attempt(arena, io, src, file, why, &miss) catch |e| switch (e) {
             // A server that is busy or limiting: again, after at least what it asked for (a
             // cancel of the job ends the sleep), a bounded number of times.
             error.HttpStatus => if (miss.retryable() and retries < max_retries) {
@@ -265,24 +254,22 @@ fn downloadWith(arena: Allocator, client: *std.http.Client, io: std.Io, src: Sou
                 try io.sleep(.fromMilliseconds(ratelimit.wait(io, backoff, miss.asked_ms)), .awake);
                 continue;
             } else return e,
+            error.Timeout => {
+                why.* = "it took longer than 15 minutes";
+                return e;
+            },
+            error.TooManyRedirects => {
+                why.* = "too many redirects";
+                return e;
+            },
+            error.BodyTooLarge => {
+                why.* = "the archive is larger than 4 GiB";
+                return error.ResponseTooLarge;
+            },
             else => return e,
         };
-        uri = next orelse return;
-        redirects += 1;
-        if (redirects > max_redirects) {
-            why.* = "too many redirects";
-            return error.TooManyRedirects;
-        }
+        return;
     }
-}
-
-fn sameOrigin(a: std.Uri, b: std.Uri) bool {
-    if (!std.mem.eql(u8, a.scheme, b.scheme)) return false;
-    var ba: [std.Io.net.HostName.max_len]u8 = undefined;
-    var bb: [std.Io.net.HostName.max_len]u8 = undefined;
-    const ha = std.Io.net.HostName.fromUri(a, &ba) catch return false;
-    const hb = std.Io.net.HostName.fromUri(b, &bb) catch return false;
-    return std.ascii.eqlIgnoreCase(ha.bytes, hb.bytes) and a.port == b.port;
 }
 
 /// What a refused request says of trying again.
@@ -296,55 +283,28 @@ const Miss = struct {
     }
 };
 
-/// One request: null when answered (the body is in `file`), else where it redirects to.
-fn onceAt(arena: Allocator, client: *std.http.Client, uri: std.Uri, bearer: ?[]const u8, file: std.Io.File, why: *[]const u8, miss: *Miss, io: std.Io) !?std.Uri {
-    var req = try client.request(.GET, uri, .{
-        .headers = .{
-            .accept_encoding = .omit,
-            .user_agent = .{ .override = "zig-runner" },
-            .authorization = if (bearer) |a| .{ .override = a } else .omit,
-        },
-        .redirect_behavior = .unhandled,
-    });
-    defer req.deinit();
-    errdefer if (req.connection) |conn| {
-        conn.closing = true;
-    };
-    try req.sendBodiless();
-    var res = req.receiveHead(&.{}) catch |e| return switch (e) {
-        error.ReadFailed => error.ResetBeforeHead,
-        else => e,
-    };
-    const status = res.head.status;
-    var location: ?[]const u8 = null;
-    var retry_after: ?[]const u8 = null;
-    var remaining: ?[]const u8 = null;
-    var reset: ?[]const u8 = null;
-    var it = res.head.iterateHeaders();
-    while (it.next()) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, "location")) location = try arena.dupe(u8, h.value);
-        if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) retry_after = try arena.dupe(u8, h.value);
-        if (std.ascii.eqlIgnoreCase(h.name, "x-ratelimit-remaining")) remaining = try arena.dupe(u8, h.value);
-        if (std.ascii.eqlIgnoreCase(h.name, "x-ratelimit-reset")) reset = try arena.dupe(u8, h.value);
+/// One request (and its redirects): the body is in `file`.
+fn attempt(arena: Allocator, io: std.Io, src: Source, file: std.Io.File, why: *[]const u8, miss: *Miss) !void {
+    var headers: [1]std.http.Header = undefined;
+    var n: usize = 0;
+    if (src.token) |t| {
+        headers[0] = .{ .name = "Authorization", .value = try std.fmt.allocPrint(arena, "Bearer {s}", .{t}) };
+        n = 1;
     }
-    var transfer: [64]u8 = undefined;
-    const r = res.reader(&transfer);
-    if (status.class() == .redirect) if (location) |loc| {
-        _ = r.discardRemaining() catch {
-            req.connection.?.closing = true;
-        };
-        var buf = try arena.alloc(u8, loc.len + 2048);
-        @memcpy(buf[0..loc.len], loc);
-        var aux: []u8 = buf;
-        const next = uri.resolveInPlace(loc.len, &aux) catch return error.HttpRedirectLocationInvalid;
-        if (!std.mem.eql(u8, next.scheme, "https") and !std.mem.eql(u8, next.scheme, "http"))
-            return error.HttpRedirectLocationInvalid;
-        return next;
-    };
+    var s = try net_client.open(arena, io, .{
+        .url = src.url,
+        .headers = headers[0..n],
+        .max_redirects = max_redirects,
+        .max_response = max_bytes,
+        .deadline = deadline,
+        .total = deadline,
+    });
+    defer s.close();
+    const status = s.status;
     if (status != .ok) {
         miss.* = .{
             .status = status,
-            .asked_ms = ratelimit.parse(status, retry_after, remaining, reset, std.Io.Clock.real.now(io).toMilliseconds()),
+            .asked_ms = ratelimit.parse(status, s.header("retry-after"), s.header("x-ratelimit-remaining"), s.header("x-ratelimit-reset"), std.Io.Clock.real.now(io).toMilliseconds()),
         };
         why.* = try std.fmt.allocPrint(arena, "HTTP {d}{s}", .{
             @backingInt(status),
@@ -353,20 +313,11 @@ fn onceAt(arena: Allocator, client: *std.http.Client, uri: std.Uri, bearer: ?[]c
         return if (status == .not_found) error.NotFound else error.HttpStatus;
     }
     var buf: [64 * 1024]u8 = undefined;
-    var written: u64 = 0;
     while (true) {
-        const n = r.readSliceShort(&buf) catch |e| switch (e) {
-            error.ReadFailed => return res.bodyErr() orelse e,
-        };
-        if (n == 0) break;
-        written += n;
-        if (written > max_bytes) {
-            why.* = "the archive is larger than 4 GiB";
-            return error.ResponseTooLarge;
-        }
-        try writeAll(file, buf[0..n]);
+        const got = try s.read(&buf);
+        if (got == 0) return;
+        try writeAll(file, buf[0..got]);
     }
-    return null;
 }
 
 fn writeAll(file: std.Io.File, bytes: []const u8) !void {
@@ -778,10 +729,11 @@ test "an allocation that fails is OutOfMemory, not a failed download" {
     const io = std.testing.io;
     const dest = try std.fmt.allocPrint(arena, "{s}/got.tgz", .{ar.root});
     const src: Source = .{ .url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/o/r/archive/v1.tar.gz", .{srv.port}) };
-    // Each allocation fails in turn, in the step's arena (a token makes it allocate) and then in
-    // the client's: the outcome is never a message.
+    // Each allocation fails in turn, in the step's arena (a token makes it allocate): the outcome is
+    // never a message. The client's own allocations are the library's (counted in `zr_net.heap`), not
+    // a Zig allocator's, so there is no second pass over a failing client allocator.
     const with_token: Source = .{ .url = src.url, .token = "tok" };
-    inline for (.{ true, false }) |in_arena| {
+    inline for (.{true}) |in_arena| {
         var index: usize = 0;
         while (true) : (index += 1) {
             var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = index });
@@ -1150,7 +1102,7 @@ test "fetch retry: an action fetch over the tarball whose connection is dropped 
         .host = try std.fmt.allocPrint(arena, "{s}/nogit.sh", .{ar.root}),
         .at = "/usr/bin/git",
     }} });
-    var srv: TestServer = .{ .archive_path = "/o/act/archive/v1.tar.gz", .body = ar.tgz, .drop_first = http.staleRetries(null) + 1 };
+    var srv: TestServer = .{ .archive_path = "/o/act/archive/v1.tar.gz", .body = ar.tgz, .drop_first = library_attempts };
     try srv.start();
     defer srv.stop();
 
@@ -1164,9 +1116,9 @@ test "fetch retry: an action fetch over the tarball whose connection is dropped 
     const text = w.written();
     errdefer std.debug.print("{s}\n", .{text});
     try std.testing.expectEqual(dagger.Outcome.success, res.steps[0].outcome);
-    // The first fetch met a connection closed on every try (the client's own stale-connection
-    // retries, `staleRetries`, all spent); the second got the archive.
-    try std.testing.expectEqual(http.staleRetries(null) + 2, srv.requests.load(.acquire));
+    // The first fetch met a connection closed on every try (the library's own try and its one
+    // repeat on a new connection, both spent); the second got the archive.
+    try std.testing.expectEqual(library_attempts + 1, srv.requests.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "##[warning]Failed to fetch action 'o/act@v1' (attempt 1 of 5): could not download "));
     try std.testing.expect(std.mem.indexOf(u8, text, "Download action repository 'o/act@v1' (SHA:") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "composite-ran") != null);
@@ -1222,7 +1174,7 @@ test "fetch retry: a checkout over the tarball whose connection is dropped every
     var srv: TestServer = .{
         .api_path = try std.fmt.allocPrint(arena, "/api/v3/repos/o/r/tarball/{s}", .{ar.sha}),
         .body = ar.tgz,
-        .drop_first = http.staleRetries(null) + 1,
+        .drop_first = library_attempts,
     };
     try srv.start();
     defer srv.stop();
