@@ -12,8 +12,14 @@ here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=.github/scripts/install-rust.sh
 . "$here/install-rust.sh"
 case $rust_arch in
-x86_64) clippy_sum=458339712a058e52cc4522ff9ef8b59cd1ea1340312216cd94194c464a3f6dc5 ;;
-aarch64) clippy_sum=3bea76c26dcf30c176c0a8a8cc283eb59fabd754e24a68b4ca0701e5f3245f6b ;;
+x86_64)
+	clippy_sum=458339712a058e52cc4522ff9ef8b59cd1ea1340312216cd94194c464a3f6dc5
+	clippy_bins_sum=73fe0820179ef2e5964bbe499f1f748bd9a9775ea1fcff2c16a923205402bda3
+	;;
+aarch64)
+	clippy_sum=3bea76c26dcf30c176c0a8a8cc283eb59fabd754e24a68b4ca0701e5f3245f6b
+	clippy_bins_sum=b68c6510e1de4d1331d7b5dbb64814cfafe1eaa1ffca7c89c3bc925cdb518c1d
+	;;
 *)
 	echo "clippy.sh: no clippy checksum for $rust_arch" >&2
 	exit 1
@@ -21,7 +27,10 @@ aarch64) clippy_sum=3bea76c26dcf30c176c0a8a8cc283eb59fabd754e24a68b4ca0701e5f324
 esac
 clippy_file=clippy-$rust_version-$rust_arch-unknown-linux-gnu
 clippy_home=$rust_tool/clippy-$rust_arch
-if [[ ! -x $clippy_home/bin/cargo-clippy || ! -x $clippy_home/bin/clippy-driver ]]; then
+# What is in the tool cache is checked on every use, as the toolchain's tree is: the digest of the two
+# binaries (cargo-clippy then clippy-driver, concatenated) is pinned here, and a mismatch installs again.
+clippy_have() { [[ -x $clippy_home/bin/cargo-clippy && -x $clippy_home/bin/clippy-driver && $(cat "$clippy_home/bin/cargo-clippy" "$clippy_home/bin/clippy-driver" | sha256sum | cut -d' ' -f1) == "$clippy_bins_sum" ]]; }
+if ! clippy_have; then
 	clippy_work=$(mktemp -d)
 	trap 'rm -rf "$clippy_work"' EXIT
 	for clippy_attempt in 1 2 3; do
@@ -35,6 +44,10 @@ if [[ ! -x $clippy_home/bin/cargo-clippy || ! -x $clippy_home/bin/clippy-driver 
 	mkdir -p "$clippy_home/bin"
 	cp "$clippy_work/$clippy_file/clippy-preview/bin/cargo-clippy" "$clippy_work/$clippy_file/clippy-preview/bin/clippy-driver" "$clippy_home/bin/"
 	ln -s "$RUST_HOME/lib" "$clippy_home/lib"
+	clippy_have || {
+		echo "clippy.sh: the binaries of $clippy_file are not the ones whose digest is pinned: update clippy_bins_sum" >&2
+		exit 1
+	}
 fi
 # In a job, cargo's registry goes in the job's temp directory, as in cargo-test.sh (#543).
 if [[ -n ${RUNNER_TEMP:-} && -z ${CARGO_HOME:-} ]]; then

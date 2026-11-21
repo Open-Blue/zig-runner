@@ -306,7 +306,7 @@ pub mod ws {
         let cfg = ClientConfig { user_agent: std::ptr::null(), user_agent_len: 0, roots: std::ptr::null(), roots_len: 0, connect_timeout_ms: 2000, tls_timeout_ms: 2000, idle_timeout_ms: 1000, max_idle_per_host: 0, flags: 0 };
         let mut client = std::ptr::null_mut();
         assert_eq!(unsafe { zr_net_client_new(&cfg, &mut client, std::ptr::null_mut(), 0) }, 0);
-        let spec = WsSpec { url: url.as_ptr(), url_len: url.len(), headers: b"x-token: secret\n".as_ptr(), headers_len: 16, max_frame: 16, open_ms: 3000, close_wait_ms: 200, queue_limit: QUEUE, recv_limit: RECV };
+        let spec = WsSpec { url: url.as_ptr(), url_len: url.len(), headers: b"x-token: secret\n".as_ptr(), headers_len: 16, max_frame: 16, open_ms: 3000, close_wait_ms: 200, queue_limit: QUEUE, recv_limit: RECV, close_flush_ms: 500 };
         let (mut ws, mut fd) = (std::ptr::null_mut(), -1);
         let mut msg = [0u8; 256];
         assert_eq!(unsafe { zr_net_ws_connect(client, &spec, &mut ws, &mut fd, msg.as_mut_ptr(), msg.len()) }, 0);

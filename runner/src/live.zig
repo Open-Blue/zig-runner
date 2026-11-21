@@ -51,6 +51,8 @@ pub const Live = struct {
     /// When the feed last sent something (see `keepalive_ms`); used by the sending task only.
     feed_last_ms: i64 = 0,
     feed_reopened: u32 = 0,
+    /// Queued messages the feed lost with connections that were lost, over the job (the live view only).
+    feed_unsent: u64 = 0,
     steps_failed: bool = false,
     stop: std.atomic.Value(bool) = .init(false),
     /// Set by `finish`: later lines and steps are ignored (guarded by `mu`).
@@ -363,18 +365,22 @@ pub const Live = struct {
             } else |e| {
                 // What was queued in the library and never written is lost with the connection (the
                 // live view only: the log is uploaded whole at the end).
-                const unsent = l.socket.unsent();
+                l.feed_unsent += l.socket.unsent();
                 l.socket.close(l.gpa);
                 if (attempt == 0 and l.feed_reopened < max_reopen) {
                     l.feed_reopened += 1;
-                    if (l.socket.open(l.gpa, l.io, l.job.runtime.feed_url, l.job.job_token)) |_|
-                        continue
-                    else |_| {}
+                    if (l.socket.open(l.gpa, l.io, l.job.runtime.feed_url, l.job.job_token)) |_| {
+                        if (l.feed_unsent > 0) l.say(
+                            "live log feed lost ({s}) and opened again; {d} queued messages were never sent",
+                            .{ @errorName(e), l.feed_unsent },
+                        );
+                        continue;
+                    } else |_| {}
                 }
                 l.feed_open = false;
                 l.say(
                     "live log feed lost ({s}, {d} queued messages never sent); the log appears when the job ends",
-                    .{ @errorName(e), unsent },
+                    .{ @errorName(e), l.feed_unsent },
                 );
                 return;
             }

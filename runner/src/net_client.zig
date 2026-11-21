@@ -679,6 +679,7 @@ const WsSpec = extern struct {
     close_wait_ms: u32,
     queue_limit: u32,
     recv_limit: u32,
+    close_flush_ms: u32,
 };
 
 const WsInfo = extern struct {
@@ -740,8 +741,11 @@ pub const Ws = struct {
         /// and of received ones waiting to be read (0: 1 MiB).
         queue_limit: u32 = 0,
         recv_limit: u32 = 0,
-        /// How long `close` waits for the peer's close frame (0: 2 s).
+        /// How long `close` waits for the peer's close frame (null: 2 s).
         close_wait: ?Io.Duration = null,
+        /// How long what is queued may take to be written once `close` is called (null: 3 s); then the
+        /// connection is dropped. The library keeps this limit itself, so it holds with no concurrent task.
+        close_flush: ?Io.Duration = null,
         /// Whether the upgrade writes its `request:` line.
         log: bool = true,
         /// Roots (PEM) that replace the system's, for the client this connection creates. Tests.
@@ -796,6 +800,7 @@ pub const Ws = struct {
             .close_wait_ms = ms(opts.close_wait),
             .queue_limit = opts.queue_limit,
             .recv_limit = opts.recv_limit,
+            .close_flush_ms = ms(opts.close_flush),
         };
         var handle: ?*WsHandle = null;
         var fd: i32 = -1;
@@ -810,7 +815,7 @@ pub const Ws = struct {
             .handle = handle.?,
             .done = .{ .handle = fd, .flags = .{ .nonblocking = false } },
             .own = if (own) c else null,
-            .close_limit = closeLimit(opts.close_wait),
+            .close_limit = closeLimit(opts.close_wait, opts.close_flush),
         };
         handed_over = true;
         errdefer w.abort();
@@ -936,9 +941,11 @@ pub const Ws = struct {
         }
     }
 
-    fn closeLimit(close_wait: ?Io.Duration) Io.Duration {
+    fn closeLimit(close_wait: ?Io.Duration, close_flush: ?Io.Duration) Io.Duration {
         const wait_ms: i64 = if (close_wait) |d| d.toMilliseconds() else 2000;
-        return .fromMilliseconds(wait_ms + 3000);
+        const flush_ms: i64 = if (close_flush) |d| d.toMilliseconds() else 3000;
+        // The library's own limits end it by then; this one is a second belt.
+        return .fromMilliseconds(wait_ms + flush_ms + 1000);
     }
 
     /// Drops the connection at once, with no close frame, and frees it.
