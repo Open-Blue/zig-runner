@@ -55,6 +55,9 @@ pub enum Code {
     Stale = 19,
     /// The server did not accept the WebSocket upgrade (`ws.rs`): it answered with another status.
     WsRefused = 20,
+    /// A TLS handshake that the peer's side broke for good (no shared protocol version or cipher, malformed
+    /// records): not a flaky link's failure, so a caller does not try again.
+    TlsProtocol = 21,
 }
 
 pub type Fail = (Code, String);
@@ -257,6 +260,7 @@ fn tls_kind(e: &std::io::Error) -> Code {
             crate::tls::Kind::Expired => Code::TlsExpired,
             crate::tls::Kind::NameMismatch => Code::TlsNameMismatch,
             crate::tls::Kind::Certificate => Code::TlsCertificate,
+            crate::tls::Kind::Protocol => Code::TlsProtocol,
             _ => Code::TlsFailed,
         };
     }
@@ -1077,5 +1081,16 @@ mod tests {
         let c = client(&origin.ca_pem, Proxy::new("", &format!("http://127.0.0.1:{rport}"), ""));
         let Err(((code, m), _)) = c.run(spec(Method::GET, "https://origin.test:1/".into())).await else { panic!() };
         assert_eq!(code, Code::Proxy, "{m}");
+    }
+
+    #[test]
+    fn a_tls_failure_of_the_link_is_told_from_one_the_peer_broke_for_good() {
+        let wrap = |e: rustls::Error| std::io::Error::other(e);
+        // An alert, or the connection going in the handshake: a flaky network's, tried again by callers.
+        assert_eq!(tls_kind(&wrap(rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure))), Code::TlsFailed);
+        assert_eq!(tls_kind(&std::io::Error::from(std::io::ErrorKind::UnexpectedEof)), Code::TlsFailed);
+        // No shared version or cipher, or garbage records: not.
+        assert_eq!(tls_kind(&wrap(rustls::Error::General("no shared cipher".into()))), Code::TlsProtocol);
+        assert_eq!(tls_kind(&wrap(rustls::Error::PeerIncompatible(rustls::PeerIncompatible::Tls12NotOffered))), Code::TlsProtocol);
     }
 }

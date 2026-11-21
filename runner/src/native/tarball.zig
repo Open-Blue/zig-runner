@@ -32,7 +32,8 @@ const archive_name = "source.tar.gz";
 /// is above the repositories this is meant for and below a full disk.
 pub const max_bytes: u64 = 4 * 1024 * 1024 * 1024;
 
-/// A download takes at most this long (a slow link, a large monorepo, a Pi).
+/// A download takes at most this long in all, its retries and the waits between them included (a slow
+/// link, a large monorepo, a Pi): each attempt is given what is left of it, and so is each wait.
 const deadline: std.Io.Duration = .fromSeconds(15 * 60);
 
 const max_redirects = 5;
@@ -43,11 +44,17 @@ pub const Source = struct {
     token: ?[]const u8 = null,
     /// The first wait before a retry, doubled for each after it (a test's is a millisecond).
     backoff_ms: i64 = 1000,
+    /// The whole download's limit (a test's is short).
+    limit: std.Io.Duration = deadline,
+    /// A connection cut after more than this many bytes of the body is not tried again (here or by the
+    /// fetch's own retries, which see the "cut after" text): the worst a cut can cost is then this times
+    /// the fetch's outer attempts less one, and the last attempt's, at most `max_bytes`.
+    cut_retry_limit: u64 = 64 << 20,
 };
 
-/// How many times a download is made again after a 429, a 5xx or a rate-limited 403. With the
-/// backoff (1, 2, 4 s) and what GitHub asks (at most `ratelimit.max_wait_ms` each) this stays well
-/// inside the download's own `deadline`, which bounds the whole of it.
+/// How many times a download is made again after a 429, a 5xx or a rate-limited 403. Whatever the
+/// backoff (1, 2, 4 s) and what GitHub asks (at most `ratelimit.max_wait_ms` each) come to, the
+/// download's own `deadline` bounds the whole of it: attempts and waits share it.
 const max_retries = 3;
 
 /// The requests the library makes for one download whose connection is closed with no answer every
@@ -232,26 +239,42 @@ fn commitMismatch(arena: Allocator, expect: ?[]const u8, archived: ?[]const u8) 
 }
 
 /// GET `src` into the file `path`, through the network library's stream (a 4 GiB archive costs its
-/// 1 MiB queue, not its size). The library follows up to `max_redirects` redirects and drops the
-/// Authorization header when one leaves the origin (scheme, host, port): the token is GitHub's API's
-/// to see, not the signed URL's CDN (tested). It also sends a request again once, on a new
-/// connection, when a kept one turns out to be closed (what std's `staleRetries` did, there as many
-/// times as the client kept connections). The whole download is within `deadline`, and a cancel of the
-/// job ends the wait where it blocks.
+/// 1 MiB queue, not its size). The library follows up to `max_redirects` redirects (301, 302, 303, 307
+/// and 308; https to http is refused) and drops the Authorization header when one leaves the origin
+/// (scheme, host, port): the token is GitHub's API's to see, not the signed URL's CDN (tested). It
+/// also sends a request again once, on a new connection, when a kept one turns out to be closed (what
+/// std's `staleRetries` did, there as many times as the client kept connections). The whole download,
+/// every attempt and the waits between them, is within `src.limit` (15 minutes): an attempt gets what
+/// is left, a wait is cut to it, and a cancel of the job ends the wait where it blocks.
 pub fn download(arena: Allocator, gpa: Allocator, io: std.Io, src: Source, path: []const u8, why: *[]const u8) !void {
     _ = gpa;
     const file = try std.Io.Dir.cwd().createFile(io, path, .{});
     defer file.close(io);
+    const started = std.Io.Clock.awake.now(io);
     var retries: u32 = 0;
+    var received: u64 = 0;
     while (true) {
+        const left = src.limit.toMilliseconds() - started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+        if (left <= 0) {
+            why.* = "it took longer than 15 minutes";
+            return error.Timeout;
+        }
+        // Each attempt reports its own reason: a status that was retried is not the reason of what follows.
+        why.* = "";
         var miss: Miss = .{};
-        attempt(arena, io, src, file, why, &miss) catch |e| switch (e) {
+        attempt(arena, io, src, file, why, &miss, .fromMilliseconds(left), retries, &received) catch |e| switch (e) {
             // A server that is busy or limiting: again, after at least what it asked for (a
-            // cancel of the job ends the sleep), a bounded number of times.
+            // cancel of the job ends the sleep), a bounded number of times, within the time left.
             error.HttpStatus => if (miss.retryable() and retries < max_retries) {
                 const backoff = std.math.shl(@TypeOf(src.backoff_ms), src.backoff_ms, retries);
                 retries += 1;
-                try io.sleep(.fromMilliseconds(ratelimit.wait(io, backoff, miss.asked_ms)), .awake);
+                const wait = ratelimit.wait(io, backoff, miss.asked_ms);
+                const remaining = src.limit.toMilliseconds() - started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+                if (wait >= remaining) {
+                    why.* = "it took longer than 15 minutes";
+                    return error.Timeout;
+                }
+                try io.sleep(.fromMilliseconds(wait), .awake);
                 continue;
             } else return e,
             error.Timeout => {
@@ -265,6 +288,13 @@ pub fn download(arena: Allocator, gpa: Allocator, io: std.Io, src: Source, path:
             error.BodyTooLarge => {
                 why.* = "the archive is larger than 4 GiB";
                 return error.ResponseTooLarge;
+            },
+            error.NetworkIo, error.ConnectionFailed => {
+                // A body cut after a good part of the archive is not pulled again: with the fetch's
+                // own attempts that is the cost the limit bounds. The text is not a transport error's
+                // name, so `fetch_retry.transientDownload` does not retry it.
+                if (received > src.cut_retry_limit) why.* = try std.fmt.allocPrint(arena, "the connection was cut after {d} bytes; not tried again", .{received});
+                return e;
             },
             else => return e,
         };
@@ -284,7 +314,7 @@ const Miss = struct {
 };
 
 /// One request (and its redirects): the body is in `file`.
-fn attempt(arena: Allocator, io: std.Io, src: Source, file: std.Io.File, why: *[]const u8, miss: *Miss) !void {
+fn attempt(arena: Allocator, io: std.Io, src: Source, file: std.Io.File, why: *[]const u8, miss: *Miss, left: std.Io.Duration, retry: u32, received: *u64) !void {
     var headers: [1]std.http.Header = undefined;
     var n: usize = 0;
     if (src.token) |t| {
@@ -296,8 +326,10 @@ fn attempt(arena: Allocator, io: std.Io, src: Source, file: std.Io.File, why: *[
         .headers = headers[0..n],
         .max_redirects = max_redirects,
         .max_response = max_bytes,
-        .deadline = deadline,
-        .total = deadline,
+        .deadline = left,
+        .total = left,
+        // The line's `retry=` counts the attempts of this download.
+        .retry = retry,
     });
     defer s.close();
     const status = s.status;
@@ -316,6 +348,7 @@ fn attempt(arena: Allocator, io: std.Io, src: Source, file: std.Io.File, why: *[
     while (true) {
         const got = try s.read(&buf);
         if (got == 0) return;
+        received.* += got;
         try writeAll(file, buf[0..got]);
     }
 }
@@ -489,6 +522,17 @@ const TestServer = struct {
     /// The first `drop_first` requests for `archive_path` are closed with no answer at all, as a
     /// connection that a network resets.
     drop_first: u32 = 0,
+    /// A 5xx of `flaky_path` is answered after this long (a slow server).
+    flaky_delay_ms: i64 = 0,
+    /// After its `flaky_fails` answers, `flaky_path` closes the connection with no answer instead of
+    /// serving the archive.
+    flaky_then_drop: bool = false,
+    /// `cut_path` promises a body of a million bytes, sends `cut_at` of them and closes.
+    cut_path: []const u8 = "",
+    cut_at: usize = 0,
+    /// Where the API's redirect leads: this port on 127.0.0.1 (another origin, the same host); 0: the
+    /// `localhost` name on this server's own port.
+    redirect_port: u16 = 0,
     drop_seen: std.atomic.Value(u32) = .init(0),
 
     fn start(s: *TestServer) !void {
@@ -559,7 +603,10 @@ const TestServer = struct {
             @memcpy(s.api_auth[0..auth.len], auth);
             s.api_auth_len.store(auth.len, .release);
             var hb: [128]u8 = undefined;
-            const loc = std.fmt.bufPrint(&hb, "Location: http://localhost:{d}/cdn\r\n", .{s.port}) catch return false;
+            const loc = (if (s.redirect_port != 0)
+                std.fmt.bufPrint(&hb, "Location: http://127.0.0.1:{d}/cdn\r\n", .{s.redirect_port})
+            else
+                std.fmt.bufPrint(&hb, "Location: http://localhost:{d}/cdn\r\n", .{s.port})) catch return false;
             return reply(out, "302 Found", loc, "");
         }
         if (std.mem.eql(u8, path, "/cdn")) {
@@ -570,9 +617,24 @@ const TestServer = struct {
             return reply(out, "200 OK", "", s.body);
         }
         if (s.flaky_path.len > 0 and std.mem.eql(u8, path, s.flaky_path)) {
-            if (s.flaky_seen.fetchAdd(1, .acq_rel) < s.flaky_fails)
+            if (s.flaky_seen.fetchAdd(1, .acq_rel) < s.flaky_fails) {
+                if (s.flaky_delay_ms > 0) io.sleep(.fromMilliseconds(s.flaky_delay_ms), .awake) catch return false;
                 return reply(out, s.flaky_status, s.flaky_extra, "busy");
+            }
+            if (s.flaky_then_drop) return false;
             return reply(out, "200 OK", "", s.body);
+        }
+        if (s.cut_path.len > 0 and std.mem.eql(u8, path, s.cut_path)) {
+            out.writeAll("HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n") catch return false;
+            var left = s.cut_at;
+            const chunk: [1024]u8 = @splat('x');
+            while (left > 0) {
+                const n = @min(left, chunk.len);
+                out.writeAll(chunk[0..n]) catch return false;
+                left -= n;
+            }
+            out.flush() catch return false;
+            return false;
         }
         if (std.mem.eql(u8, path, s.archive_path) or (s.archive_path2.len > 0 and std.mem.eql(u8, path, s.archive_path2))) {
             if (auth.len > 0) s.cdn_saw_auth.store(true, .release);
@@ -1222,4 +1284,104 @@ test "fetch retry: a tarball whose unpacking fails leaves no layer behind, so a 
     try std.testing.expectEqual(before, b.layers.items.len);
     // And it is not the download's failure: never tried again, whatever the names in it.
     try std.testing.expect(!@import("../dagger/fetch_retry.zig").transientDownload(got.failed));
+}
+
+test "download: the whole download, its attempts and the waits between them, is within one limit" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ar = try testArchive(arena, &tmp);
+    const io = std.testing.io;
+    const dest = try std.fmt.allocPrint(arena, "{s}/got.tgz", .{ar.root});
+    var why: []const u8 = "";
+    // A server that answers 503 after 250 ms, every time: each attempt, and each wait, would pass the
+    // limit of 600 ms some time after it if each had the whole of it again.
+    var slow: TestServer = .{ .flaky_path = "/slow", .flaky_status = "503 Service Unavailable", .flaky_fails = 1000, .flaky_delay_ms = 250, .body = ar.tgz };
+    try slow.start();
+    defer slow.stop();
+    const started = std.Io.Clock.awake.now(io);
+    try std.testing.expectError(error.Timeout, download(arena, std.testing.allocator, io, .{
+        .url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/slow", .{slow.port}),
+        .backoff_ms = 1,
+        .limit = .fromMilliseconds(600),
+    }, dest, &why));
+    const took = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    try std.testing.expect(took >= 500 and took < 1500);
+    try std.testing.expect(std.mem.indexOf(u8, why, "15 minutes") != null);
+    // The attempts counted in the lines' `retry=` are the retries made: fewer than max_retries + 1.
+    try std.testing.expect(slow.flaky_seen.load(.acquire) <= max_retries + 1);
+}
+
+test "download: a status that was retried is not the reason of the failure that follows it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ar = try testArchive(arena, &tmp);
+    const io = std.testing.io;
+    const dest = try std.fmt.allocPrint(arena, "{s}/got.tgz", .{ar.root});
+    // One 503, then connections closed with no answer.
+    var flaky: TestServer = .{ .flaky_path = "/f", .flaky_status = "503 Service Unavailable", .flaky_fails = 1, .flaky_then_drop = true, .body = ar.tgz };
+    try flaky.start();
+    defer flaky.stop();
+    const msg = (try downloadFailure(arena, std.testing.allocator, io, .{
+        .url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/f", .{flaky.port}),
+        .backoff_ms = 1,
+    }, dest)).?;
+    try std.testing.expect(std.mem.endsWith(u8, msg, ": NetworkIo"));
+    try std.testing.expect(std.mem.indexOf(u8, msg, "503") == null);
+    // So the fetch's own retries see a transport failure and try again.
+    try std.testing.expect(@import("../dagger/fetch_retry.zig").transientDownload(msg));
+}
+
+test "download: a body cut after a good part of the archive is not tried again; one cut early is" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ar = try testArchive(arena, &tmp);
+    const io = std.testing.io;
+    const dest = try std.fmt.allocPrint(arena, "{s}/got.tgz", .{ar.root});
+    const retry = @import("../dagger/fetch_retry.zig");
+    var cut: TestServer = .{ .cut_path = "/cut", .cut_at = 5000, .body = ar.tgz };
+    try cut.start();
+    defer cut.stop();
+    const url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/cut", .{cut.port});
+    // 5000 bytes received, of a limit of 1000: the message says so, and is not a transport error's name.
+    const big = (try downloadFailure(arena, std.testing.allocator, io, .{ .url = url, .cut_retry_limit = 1000 }, dest)).?;
+    try std.testing.expect(std.mem.indexOf(u8, big, "cut after 5000 bytes; not tried again") != null);
+    try std.testing.expect(!retry.transientDownload(big));
+    // The same cut under the limit is a transport failure to try again.
+    const small = (try downloadFailure(arena, std.testing.allocator, io, .{ .url = url, .cut_retry_limit = 1 << 20 }, dest)).?;
+    try std.testing.expect(std.mem.endsWith(u8, small, ": NetworkIo"));
+    try std.testing.expect(retry.transientDownload(small));
+}
+
+test "download: the token goes to the first origin only, a port of the same host included" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ar = try testArchive(arena, &tmp);
+    const io = std.testing.io;
+    const dest = try std.fmt.allocPrint(arena, "{s}/got.tgz", .{ar.root});
+    var why: []const u8 = "";
+    var cdn: TestServer = .{ .body = ar.tgz };
+    try cdn.start();
+    defer cdn.stop();
+    var api: TestServer = .{ .api_path = "/api/v3/repos/o/r/tarball/abc", .body = ar.tgz, .redirect_port = cdn.port };
+    try api.start();
+    defer api.stop();
+    try download(arena, std.testing.allocator, io, .{
+        .url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/api/v3/repos/o/r/tarball/abc", .{api.port}),
+        .token = "s3cret",
+    }, dest, &why);
+    try std.testing.expectEqualStrings("Bearer s3cret", api.api_auth[0..api.api_auth_len.load(.acquire)]);
+    // The same host name, another port: another origin, no token (the CDN answers 400 to one).
+    try std.testing.expect(!cdn.cdn_saw_auth.load(.acquire));
 }
