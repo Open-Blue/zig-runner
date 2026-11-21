@@ -380,7 +380,9 @@ test "a feed to a server that went away fails its next sends, which live.zig ans
     defer server.stop();
     var buf: [64]u8 = undefined;
     var sock: Socket = undefined;
-    try sock.open(gpa, io, server.url(&buf), "tok");
+    // The server drops the connection right after the upgrade: the loss may be seen before `open`
+    // returns, which is the same answer sooner.
+    sock.open(gpa, io, server.url(&buf), "tok") catch |e| return std.testing.expectEqual(error.NetworkIo, e);
     defer sock.close(gpa);
     // The connection is lost with no close frame: sends fail within a moment, not after TCP's own
     // limits (the library reads the connection all the time, so it knows).
