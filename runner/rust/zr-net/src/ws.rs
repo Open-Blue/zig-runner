@@ -42,6 +42,10 @@ pub const QUEUE_LIMIT: usize = 64 * 1024;
 pub const RECV_LIMIT: usize = 1 << 20;
 const OPEN_LIMIT: Duration = Duration::from_secs(10);
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
+const CLOSE_FLUSH: Duration = Duration::from_secs(3);
+/// The size of the frames a message is cut into when the caller asks for none: a message of any size is taken
+/// (tungstenite refuses a frame over its write buffer's bound).
+const DEFAULT_FRAME: usize = 16 * 1024;
 
 const CONNECTING: u32 = 0;
 const OPEN: u32 = 1;
@@ -57,7 +61,8 @@ pub struct WsSpec {
     pub headers: *const u8,
     pub headers_len: usize,
     /// A message is sent in frames of at most this many bytes (the first of its kind, the rest
-    /// continuations, as actions/runner sends the feed); 0: one frame.
+    /// continuations, as actions/runner sends the feed); 0: 16 KiB, and at most 64 KiB whatever is asked (a
+    /// message of any size is taken either way).
     pub max_frame: u32,
     /// The upgrade's limit, from connecting to the answer; 0: ten seconds.
     pub open_ms: u32,
@@ -67,6 +72,9 @@ pub struct WsSpec {
     pub queue_limit: u32,
     /// The most bytes of messages received and waiting, and the longest message; 0: `RECV_LIMIT`.
     pub recv_limit: u32,
+    /// How long after `zr_net_ws_close` what is queued may take to be written before the connection is given up
+    /// (a peer that stopped reading, or went away without a word: TCP's own limit is 90 s); 0: three seconds.
+    pub close_flush_ms: u32,
 }
 
 /// What a `Ws` reports, any time.
@@ -132,6 +140,8 @@ struct State {
 
 struct Shared {
     st: Mutex<State>,
+    /// `zr_net_ws_close` was called: starts the limit on what is queued being written.
+    closing: tokio::sync::Notify,
     wake: Arc<Wake>,
     queue_limit: usize,
     recv_limit: usize,
@@ -144,6 +154,7 @@ fn lock(m: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
 impl Shared {
     fn new(wake: Arc<Wake>, queue_limit: usize, recv_limit: usize) -> Shared {
         Shared {
+            closing: tokio::sync::Notify::new(),
             st: Mutex::new(State {
                 phase: CONNECTING,
                 error: None,
@@ -263,6 +274,7 @@ struct Opened {
     headers: Vec<(HeaderName, HeaderValue)>,
     open: Duration,
     close_wait: Duration,
+    close_flush: Duration,
     max_frame: usize,
     recv_limit: usize,
 }
@@ -422,7 +434,16 @@ async fn run(client: Arc<Client>, shared: Arc<Shared>, o: Opened) {
         g.phase = OPEN;
     }
     shared.wake.ping();
-    let end = transfer(&mut ws, &shared, &o).await;
+    // What is queued is written within `close_flush` of the close being asked for: a peer that reads nothing
+    // does not hold it until TCP gives the connection up.
+    let flush_limit = async {
+        shared.closing.notified().await;
+        tokio::time::sleep(o.close_flush).await;
+    };
+    let end = tokio::select! {
+        e = transfer(&mut ws, &shared, &o) => e,
+        () = flush_limit => End::Failed((Code::Timeout, format!("what was queued was not written within {:?} of the close", o.close_flush))),
+    };
     match end {
         End::Failed(f) => shared.finish(Some(f)),
         End::Peer => shared.finish(None),
@@ -499,7 +520,8 @@ pub unsafe extern "C" fn zr_net_ws_connect(c: *mut Arc<Client>, spec: *const WsS
         headers,
         open: if s.open_ms == 0 { OPEN_LIMIT } else { Duration::from_millis(s.open_ms as u64) },
         close_wait: if s.close_wait_ms == 0 { CLOSE_WAIT } else { Duration::from_millis(s.close_wait_ms as u64) },
-        max_frame: s.max_frame as usize,
+        close_flush: if s.close_flush_ms == 0 { CLOSE_FLUSH } else { Duration::from_millis(s.close_flush_ms as u64) },
+        max_frame: if s.max_frame == 0 { DEFAULT_FRAME } else { (s.max_frame as usize).min(4 * DEFAULT_FRAME) },
         recv_limit,
     };
     let shared = Arc::new(Shared::new(Arc::new(Wake(ours)), queue_limit, recv_limit));
@@ -621,6 +643,8 @@ pub unsafe extern "C" fn zr_net_ws_close(ws: *mut Ws) {
     if let Some(w) = g.waker.take() {
         w.wake();
     }
+    drop(g);
+    shared_of(ws).closing.notify_one();
 }
 
 /// Ends the connection at once (no close frame if the handshake is not done) and frees the handle.
@@ -723,6 +747,7 @@ mod tests {
             close_wait_ms: 0,
             queue_limit: 0,
             recv_limit: 0,
+            close_flush_ms: 0,
         };
         f(&mut s);
         connect_with(new_client(""), &s)
@@ -945,6 +970,64 @@ mod tests {
     }
 
     #[test]
+    fn a_close_against_a_peer_that_reads_nothing_ends_within_the_flush_limit_by_the_librarys_own_clock() {
+        let _g = crate::runtime::test_lock();
+        let port = serve(true, |s| async move {
+            let _ws = accept(s, Default::default()).await;
+            // Reads nothing, for as long as the test runs.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let c = spec_with(&url(port), "", |s| {
+            s.queue_limit = 8192;
+            s.close_flush_ms = 400;
+        });
+        c.open();
+        let msg = vec![5u8; 2048];
+        let (mut n, mut steady) = (0, 0);
+        while steady < 40 {
+            if unsafe { zr_net_ws_send(c.ws, KIND_BINARY, msg.as_ptr(), msg.len()) } == 0 {
+                n += 1;
+                steady = 0;
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+                steady += 1;
+            }
+            assert!(n < 100_000, "never blocked");
+        }
+        // Nothing of the caller's is waiting on a timer: the library ends it by itself.
+        let started = Instant::now();
+        unsafe { zr_net_ws_close(c.ws) };
+        let i = c.until(|i| i.state == CLOSED);
+        let took = started.elapsed();
+        assert_eq!(i.error, Code::Timeout as i32, "{}", c.message());
+        assert!(took >= Duration::from_millis(350) && took < Duration::from_secs(5), "{took:?}");
+        assert!(i.unsent > 0);
+    }
+
+    #[test]
+    fn a_message_of_any_size_is_taken_when_no_frame_size_is_asked_for() {
+        let _g = crate::runtime::test_lock();
+        let (tx, rx) = std::sync::mpsc::channel::<usize>();
+        let tx = Mutex::new(Some(tx));
+        let port = serve(false, move |s| {
+            let tx = tx.lock().expect("lock").take();
+            async move {
+                let mut ws = accept(s, Default::default()).await;
+                if let Some(Ok(Message::Binary(b))) = ws.next().await {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(b.len());
+                    }
+                }
+            }
+        });
+        let c = spec_with(&url(port), "", |s| s.recv_limit = 1 << 20);
+        c.open();
+        let big = vec![3u8; 300 * 1024];
+        assert_eq!(c.send(KIND_BINARY, &big), 0);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).expect("the message arrived whole"), big.len());
+    }
+
+    #[test]
     fn a_slow_reader_stops_the_sender_at_the_queue_bound_and_the_drain_wakes_it() {
         let _g = crate::runtime::test_lock();
         const LIMIT: usize = 8 * 1024;
@@ -1126,7 +1209,7 @@ mod tests {
         assert_eq!(i.error, Code::WsRefused as i32);
         assert!(c.message().contains("403"), "{}", c.message());
 
-        let spec = WsSpec { url: b"http://x".as_ptr(), url_len: 8, headers: std::ptr::null(), headers_len: 0, max_frame: 0, open_ms: 0, close_wait_ms: 0, queue_limit: 0, recv_limit: 0 };
+        let spec = WsSpec { url: b"http://x".as_ptr(), url_len: 8, headers: std::ptr::null(), headers_len: 0, max_frame: 0, open_ms: 0, close_wait_ms: 0, queue_limit: 0, recv_limit: 0, close_flush_ms: 0 };
         let (mut ws, mut fd) = (std::ptr::null_mut(), -1);
         let mut msg = [0u8; 64];
         let rc = unsafe { zr_net_ws_connect(new_client(""), &spec, &mut ws, &mut fd, msg.as_mut_ptr(), msg.len()) };
@@ -1301,7 +1384,7 @@ mod tests {
                 }
             });
             let u = format!("wss://127.0.0.1:{port}/_ws/ingest.sock");
-            let spec = WsSpec { url: u.as_ptr(), url_len: u.len(), headers: std::ptr::null(), headers_len: 0, max_frame: 0, open_ms: 5000, close_wait_ms: 0, queue_limit: 0, recv_limit: 0 };
+            let spec = WsSpec { url: u.as_ptr(), url_len: u.len(), headers: std::ptr::null(), headers_len: 0, max_frame: 0, open_ms: 5000, close_wait_ms: 0, queue_limit: 0, recv_limit: 0, close_flush_ms: 0 };
             let c = connect_with(new_client(&pem), &spec);
             let i = c.open();
             assert!(i.tls_ns != UNKNOWN && i.connect_ns != UNKNOWN);
@@ -1321,7 +1404,7 @@ mod tests {
         }
 
         fn spec_copy(s: &WsSpec) -> WsSpec {
-            WsSpec { url: s.url, url_len: s.url_len, headers: s.headers, headers_len: s.headers_len, max_frame: s.max_frame, open_ms: s.open_ms, close_wait_ms: s.close_wait_ms, queue_limit: s.queue_limit, recv_limit: s.recv_limit }
+            WsSpec { url: s.url, url_len: s.url_len, headers: s.headers, headers_len: s.headers_len, max_frame: s.max_frame, open_ms: s.open_ms, close_wait_ms: s.close_wait_ms, queue_limit: s.queue_limit, recv_limit: s.recv_limit, close_flush_ms: s.close_flush_ms }
         }
 
         #[test]
@@ -1372,7 +1455,7 @@ mod tests {
             assert_eq!(unsafe { zr_net_client_new(&cfg, &mut client, std::ptr::null_mut(), 0) }, 0);
             std::env::remove_var("HTTPS_PROXY");
             let u = format!("wss://wss.example.test:{server_port}/_ws/ingest.sock");
-            let spec = WsSpec { url: u.as_ptr(), url_len: u.len(), headers: std::ptr::null(), headers_len: 0, max_frame: 0, open_ms: 5000, close_wait_ms: 0, queue_limit: 0, recv_limit: 0 };
+            let spec = WsSpec { url: u.as_ptr(), url_len: u.len(), headers: std::ptr::null(), headers_len: 0, max_frame: 0, open_ms: 5000, close_wait_ms: 0, queue_limit: 0, recv_limit: 0, close_flush_ms: 0 };
             let c = connect_with(client, &spec);
             c.open();
             assert_eq!(c.send(KIND_TEXT, b"through"), 0);

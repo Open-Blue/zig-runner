@@ -21,7 +21,7 @@ runs:
     - id: keys
       shell: bash
       env:
-        TOOLS_KEY: rust-tools-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.tools }}-${{ hashFiles('.github/actions/rust-cache/action.yml', '.github/scripts/install-rust.sh', '.github/scripts/install-rust-nightly.sh', 'runner/rust/rust-toolchain.toml') }}
+        TOOLS_KEY: rust-tools-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.tools }}-${{ hashFiles('.github/actions/rust-cache/action.yml', '.github/scripts/install-rust.sh', '.github/scripts/install-rust-nightly.sh', '.github/scripts/clippy.sh', 'runner/rust/rust-toolchain.toml') }}
         TARGET_KEY: rust-target-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.name }}-${{ hashFiles('.github/actions/rust-cache/action.yml', 'runner/rust/**', '!runner/rust/target/**', '.github/scripts/build-zr-net.sh', '.github/scripts/cargo-test.sh', '.github/scripts/zig-cc.sh', '.github/scripts/zig-cc-host.sh', '.github/scripts/zig-cc-env.sh', '.github/scripts/zig-ar.sh', '.github/scripts/install-rust.sh', '.github/scripts/install-rust-nightly.sh', '.github/scripts/install-zig.sh') }}
       run: |
         # The runner image is not in the keys: hosted images roll out over days and several are in
