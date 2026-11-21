@@ -339,6 +339,16 @@ impl Client {
     /// and the TLS handshake's (`UNKNOWN` where there was none). The HTTP client and the WebSocket
     /// (`ws.rs`) both connect here, so the proxy, roots, timeouts and socket options are one policy.
     pub(crate) async fn transport(&self, target: &Target, via: Option<&crate::proxy::Target>) -> Result<(Stream, (u64, u64), u64), Fail> {
+        match self.transport_once(target, via).await {
+            // The system's roots may have been updated since they were read (a CA added after the
+            // runner started): they are read again, at most once a minute, and the connection is
+            // made once more. A certificate the new roots do not know is the same error again.
+            Err((Code::TlsUnknownIssuer, _)) if self.settings.roots_pem.is_empty() && roots::refresh_after_unknown_issuer() => self.transport_once(target, via).await,
+            r => r,
+        }
+    }
+
+    async fn transport_once(&self, target: &Target, via: Option<&crate::proxy::Target>) -> Result<(Stream, (u64, u64), u64), Fail> {
         let mut t = (UNKNOWN, UNKNOWN);
         let mut tls_ns = UNKNOWN;
         let mut stream: Stream = match via {

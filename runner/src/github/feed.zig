@@ -87,7 +87,7 @@ fn script(sock: anytype, gpa: Allocator) !void {
     sock.close(gpa);
 }
 
-test "the feed's frames on the wire: 1 KiB frames, masked, a ping, a close with status 1000, and the upgrade's headers" {
+test "the feed's frames on the wire: every byte, 1 KiB frames, masked, a ping, a close with status 1000, and the handshake" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var server: ws_server.Server = undefined;
@@ -101,44 +101,66 @@ test "the feed's frames on the wire: 1 KiB frames, masked, a ping, a close with 
     var seen: std.ArrayList(Frame) = .empty;
     defer seen.deinit(gpa);
     try server.recorded(&seen, gpa);
-    // What the std client sent for the same script (the oracle test, until it was removed): the short
-    // message, the long one in three frames, the empty one, the one of exactly a frame, the one of a
-    // frame and a byte (two), the ping, the last message, and the close (1000).
-    const want = [_]struct { opcode: u8, fin: bool, len: usize }{
-        .{ .opcode = 1, .fin = true, .len = 11 },
-        .{ .opcode = 1, .fin = false, .len = 1024 },
-        .{ .opcode = 0, .fin = false, .len = 1024 },
-        .{ .opcode = 0, .fin = true, .len = 452 },
-        .{ .opcode = 1, .fin = true, .len = 0 },
-        .{ .opcode = 1, .fin = true, .len = 1024 },
-        .{ .opcode = 1, .fin = false, .len = 1024 },
-        .{ .opcode = 0, .fin = true, .len = 1 },
-        .{ .opcode = 9, .fin = true, .len = 0 },
-        .{ .opcode = 1, .fin = true, .len = 4 },
-        .{ .opcode = 8, .fin = true, .len = 2 },
+    // What the std client sent for the same script (the oracle test, until it was removed), every
+    // byte: the short message, the long one (a pattern, so a shifted or repeated byte shows) in
+    // three frames across the 1 KiB boundaries, the empty one, the one of exactly a frame, the one of
+    // a frame and a byte (two), the ping, the last message, and the close (1000).
+    var long: [2500]u8 = undefined;
+    for (&long, 0..) |*c, i| c.* = 'a' + @as(u8, @truncate(i % 26));
+    const want = [_]struct { opcode: u8, fin: bool, payload: []const u8 }{
+        .{ .opcode = 1, .fin = true, .payload = "{\"hello\":1}" },
+        .{ .opcode = 1, .fin = false, .payload = long[0..1024] },
+        .{ .opcode = 0, .fin = false, .payload = long[1024..2048] },
+        .{ .opcode = 0, .fin = true, .payload = long[2048..2500] },
+        .{ .opcode = 1, .fin = true, .payload = "" },
+        .{ .opcode = 1, .fin = true, .payload = long[0..1024] },
+        .{ .opcode = 1, .fin = false, .payload = long[0..1024] },
+        .{ .opcode = 0, .fin = true, .payload = long[1024..1025] },
+        .{ .opcode = 9, .fin = true, .payload = "" },
+        .{ .opcode = 1, .fin = true, .payload = "last" },
+        .{ .opcode = 8, .fin = true, .payload = &.{ 0x03, 0xE8 } },
     };
     try std.testing.expectEqual(want.len, seen.items.len);
-    for (want, seen.items) |w, f| {
+    for (want, seen.items, 0..) |w, f, i| {
+        errdefer std.debug.print("frame {d}\n", .{i});
         try std.testing.expectEqual(w.opcode, f.opcode);
         try std.testing.expectEqual(w.fin, f.fin);
-        try std.testing.expectEqual(w.len, f.payload.len);
         try std.testing.expect(f.masked);
+        try std.testing.expectEqualSlices(u8, w.payload, f.payload);
     }
-    try std.testing.expectEqualSlices(u8, &.{ 0x03, 0xE8 }, seen.items[10].payload);
-    // The upgrade: a GET of the path with the token as a bearer, the version and the upgrade headers.
-    try std.testing.expect(std.mem.startsWith(u8, server.head.items, "GET /_ws/ingest.sock HTTP/1.1\r\n"));
-    // Header names are case-insensitive and the spaces after the colon are not the point.
-    const squeezed = try gpa.alloc(u8, server.head.items.len);
-    defer gpa.free(squeezed);
-    var n: usize = 0;
-    for (server.head.items) |c| if (c != ' ') {
-        squeezed[n] = std.ascii.toLower(c);
-        n += 1;
-    };
-    for ([_][]const u8{ "authorization:bearertok-123", "sec-websocket-version:13", "upgrade:websocket" }) |h| {
-        errdefer std.debug.print("missing {s} in:\n{s}\n", .{ h, server.head.items });
-        try std.testing.expect(std.mem.indexOf(u8, squeezed[0..n], h) != null);
+    // The upgrade: a GET of the path with the token as a bearer, the version, `Upgrade` and
+    // `Connection`, and a key of 16 random bytes in base64.
+    const head = server.head.items;
+    try std.testing.expect(std.mem.startsWith(u8, head, "GET /_ws/ingest.sock HTTP/1.1\r\n"));
+    var key: ?[]const u8 = null;
+    var squeezed: std.ArrayList(u8) = .empty;
+    defer squeezed.deinit(gpa);
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(line[0..colon], "sec-websocket-key")) key = std.mem.trim(u8, line[colon + 1 ..], " ");
+        for (line) |c| if (c != ' ') try squeezed.append(gpa, std.ascii.toLower(c));
+        try squeezed.append(gpa, '\n');
     }
+    for ([_][]const u8{ "authorization:bearertok-123\n", "sec-websocket-version:13\n", "upgrade:websocket\n", "connection:upgrade\n" }) |h| {
+        errdefer std.debug.print("missing {s} in:\n{s}\n", .{ h, head });
+        try std.testing.expect(std.mem.indexOf(u8, squeezed.items, h) != null);
+    }
+    const k = key orelse return error.NoKey;
+    try std.testing.expectEqual(@as(usize, 24), k.len);
+    var raw: [16]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&raw, k);
+}
+
+test "an upgrade answered with the wrong Sec-WebSocket-Accept is refused" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var server: ws_server.Server = undefined;
+    try server.start(gpa, io, .wrong_accept);
+    defer server.stop();
+    var buf: [64]u8 = undefined;
+    var sock: Socket = undefined;
+    try std.testing.expectError(error.ProtocolError, sock.open(gpa, io, server.url(&buf), "tok"));
 }
 
 test "a feed that accepts and never answers the upgrade is given up at its deadline" {

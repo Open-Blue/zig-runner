@@ -25,6 +25,8 @@ pub const Mode = enum {
     vanish,
     /// Answers the upgrade with a 403.
     refuse,
+    /// Answers the upgrade with a 101 whose Sec-WebSocket-Accept is not the key's: a client must refuse it.
+    wrong_accept,
     /// Answers the upgrade and reads nothing until `release`, then records as `record`.
     stall,
 };
@@ -180,6 +182,7 @@ pub const Server = struct {
         h.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
         h.final(&sha);
         var accept: [28]u8 = undefined;
+        if (s.mode == .wrong_accept) sha[0] ^= 0xff;
         _ = std.base64.standard.Encoder.encode(&accept, &sha);
         try out.print("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept});
         try out.flush();
