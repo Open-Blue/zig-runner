@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'memory-peak.sh, which wraps CI''s compile and test steps, passes an interrupt on to its command again. Bash starts a background command with SIGINT ignored, so the INT that GitHub sends first when a job is cancelled did nothing, and the step ran on until its command ended or the TERM came. The command now starts with the default action for INT and QUIT. Its self-test also checks that a signal ends the script promptly: the INT case had passed by waiting out a 30 s sleep, which cost every Workflows run 30 s.'
-time: 2026-11-20T04:13:38.825322253-05:00

@@ -1,3 +1,0 @@
-kind: Security
-body: 'A native job''s frames to a link-local group address (01:80:c2:00:00:0X) no longer reach the host''s own sockets, IPv4 or IPv6, past the runner''s rules: the bridge hands them to the host''s stack as received on the job''s own port, which the rules (they name zr0) did not cover; each port now drops them on ingress'
-time: 2026-11-20T13:03:31.817921765-05:00

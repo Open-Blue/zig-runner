@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'CI''s Rust build cache no longer misses when GitHub rolls out a new runner image: every C compile, link and archive of the Rust builds, the host''s build scripts and proc-macros included, now goes through the pinned Zig (host side for glibc 2.28) and `zig ar`, so the cached outputs do not depend on the image''s compiler, linker or glibc, and the keys no longer hold the image. The shipped musl archive is byte-identical.'
-time: 2026-11-20T12:04:10.445316264-05:00

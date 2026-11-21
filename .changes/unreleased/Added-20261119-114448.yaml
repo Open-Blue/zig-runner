@@ -1,3 +1,0 @@
-kind: Added
-body: 'CI tests test-files.sh''s failure path with no compile: a fixture tree and a list of test names, where a file whose tests are missing from the test binary, or fewer there, must fail naming that file'
-time: 2026-11-19T11:44:48.485884649-05:00

@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Install Zig no longer fails when jobs that share a tool cache install the same Zig at once, as on a self-hosted pool after a Zig version bump. Each job downloaded to one shared .part name, so the first job''s rename took the file from under the second ("mv: cannot stat ....tar.xz.part"), and the second''s curl rewrote the tarball the first was checking. Each job now downloads to a file of its own, checks it, and only then renames it into place. A tree in place is no longer removed before a job''s own is moved in: a whole one is another job''s and is used, and a bad one is renamed aside first. Found by the v0.37.0 smoke test with an empty tool cache.'
-time: 2026-11-20T02:26:16.130153101-05:00

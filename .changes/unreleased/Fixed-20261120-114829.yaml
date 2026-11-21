@@ -1,3 +1,0 @@
-kind: Fixed
-body: '#610''s changelog entry is filed as a fix, as it is one, not a breaking change: it had been filed as Changed, which bumps the major version.'
-time: 2026-11-20T11:48:29.566685791-05:00

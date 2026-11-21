@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Gitea and Forgejo actions: an action''s owner, name and ref are checked before anything is fetched (no .., no leading -, only the characters a repository name and a git ref have), so a uses: such as o/r@../../.. cannot reach a directory above the action''s own or put an option on git''s command line, and git''s refs follow --; two servers'' o/r@v1 are two trees in two directories; an instance''s archive of a private repository takes the task''s token when the image has no git; and the task''s runtime token is never sent to git (#520, G5).'
-time: 2026-11-16T15:21:40.598587759-05:00

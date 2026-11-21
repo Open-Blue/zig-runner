@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'CI: on a push to main a hosted job per consumer (Tests (x86_64), Native tests as root on both architectures, End to end) builds the Rust side and saves it under the consumer''s own Rust build cache key, so a merge group and a pull request''s first run no longer build zr-net cold there'
-time: 2026-11-20T05:19:34.499145382-05:00

@@ -1,3 +1,0 @@
-kind: Fixed
-body: Native container jobs ask the registry about a tag past its TTL with a HEAD, which Docker Hub does not count toward its pull limit, and run the stored image when the digest is unchanged, so a cached image costs one uncounted request per RUNNER_IMAGE_TAG_TTL (300 s) instead of two counted GETs; a registry that cannot answer (429, 5xx, network) runs the tag's last known digest with a warn kind=image_tag_reused line, and digest-pinned images never contact the registry once cached (#551)
-time: 2026-11-20T11:55:12.983761762-05:00

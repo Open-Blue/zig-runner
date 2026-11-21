@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'CI''s TLS oracle job keeps Zig''s global cache between runs, so zig build no longer compiles build.zig and Zig''s build system from scratch each time: 70 s of a 230 s job on a hosted runner, about 1 s on a hit (measured in #638). The key holds the CPU model (the build runner is built for the machine''s CPU), Zig''s version, build.zig and build.zig.zon; only a push to main saves.'
-time: 2026-11-20T10:46:19.429396911-05:00

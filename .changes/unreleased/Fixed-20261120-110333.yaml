@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'CI: one script, allow-userns.sh, replaces the bare writes of the AppArmor user-namespace sysctl; it logs the kernel, whether the key exists and its value before and after, and a kernel without it no longer fails every native job'
-time: 2026-11-20T11:03:33.794364756-05:00

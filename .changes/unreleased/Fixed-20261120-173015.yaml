@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The image tag fallback''s maximum age (RUNNER_IMAGE_TAG_MAX_STALE) is read and set atomically: every native job''s start stored it into a plain global, and jobs starting at once raced on it (ThreadSanitizer, arm64 native tests).'
-time: 2026-11-20T17:30:15.319196339-05:00

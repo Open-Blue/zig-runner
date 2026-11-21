@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Gitea and Forgejo jobs whose image has no git no longer download an action named by an arbitrary host (uses: https://host/owner/repo@ref) from the runner''s own network, which let a workflow probe the host''s loopback and LAN; such an action fails its step saying that it needs git in the image, and only the instance''s own server and its default actions URL are fetched by the runner (#520, G5).'
-time: 2026-11-19T11:15:03.397912496-05:00

@@ -1,3 +1,0 @@
-kind: Fixed
-body: CI's Rust and Go caches are saved only by pushes to main; pull requests and merge groups restore main's entries and save none. Each pull request that changed the Rust inputs or ci.yml had saved its own copies (about 1.6 GB of Rust, 0.7 GB of Go), readable by that pull request only. They filled the repository's 10 GB cache and evicted main's entries, which every merge group and pull request needs. The Rust cache warmer now fills main's entries for the jobs that don't run on a push.
-time: 2026-11-20T06:25:55.037264501-05:00

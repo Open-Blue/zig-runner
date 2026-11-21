@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Quiet CI checks fail loudly: check-names fails in CI when gh or the rulesets are unreadable, the arm64 page size is asserted, vm.mmap_rnd_bits is read back for the TSan jobs, and a failed pinned apt install (stress-ng, kcov, spin) prints what the archive offers'
-time: 2026-11-20T11:03:50.319721532-05:00

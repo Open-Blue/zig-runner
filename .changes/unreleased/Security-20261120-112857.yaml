@@ -1,3 +1,0 @@
-kind: Security
-body: 'A native job can no longer add entries to the jobs'' bridge''s MAC table with made-up source addresses, or move another job''s address to its own port: each job''s port drops frames whose Ethernet source is not its veth''s MAC, learns nothing and floods no unknown unicast (#616)'
-time: 2026-11-20T11:28:57.873634436-05:00

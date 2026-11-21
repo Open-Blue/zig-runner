@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'The nightly''s full test run and Valgrind job pass again: the allocation-failure sampling test and the leak test no longer depend on the environment''s sampling mode, and the eviction FIFO test keeps its buffer off the stack (Valgrind reported Zig''s stack probe)'
-time: 2026-11-19T11:02:08.676002825-05:00

@@ -1,6 +1,6 @@
 .{
     .name = .zig_actions_runner,
-    .version = "0.37.0",
+    .version = "0.38.0",
     // tls.zig, the database's TLS before the network library, only for `zig build test-tls-oracle
     // -Dtls-oracle` (tls_oracle.zig): lazy, so no other build fetches it. Pinned by commit.
     .dependencies = .{

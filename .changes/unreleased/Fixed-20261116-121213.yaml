@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Gitea and Forgejo jobs fetch self: and $/ actions with the task''s GITHUB_TOKEN, not the runtime token (which git refuses: "could not read Username"), and an action fetch no longer trips on the half-made checkout an earlier fetch of the same repository and ref left ("remote origin already exists"); two actions of one repository at one ref (the root and a directory of it) share one fetch (#520, G5).'
-time: 2026-11-16T12:12:13.193058674-05:00

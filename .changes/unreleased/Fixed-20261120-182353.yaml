@@ -1,3 +1,0 @@
-kind: Fixed
-body: The runners' shared live-feed HTTPS client loads its CA bundle once at the start, on the main thread, and a renewed client does too before it is shared. Zig 0.17's std.http.Client set its TLS clock on the first HTTPS request under a lock that the TLS handshake didn't take when reading it, so runners whose first feed connects ran at once raced on it (ThreadSanitizer, the e2e suite).
-time: 2026-11-20T18:23:53.111852978-05:00

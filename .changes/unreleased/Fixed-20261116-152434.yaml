@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'A Gitea service''s cmd: that does not evaluate fails the service with the reason in the log, instead of starting it with an empty argument (#520, G6).'
-time: 2026-11-16T15:24:34.895934069-05:00
