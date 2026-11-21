@@ -1,3 +1,0 @@
-kind: Fixed
-body: 'Action and repository tarballs (an image with no git) are downloaded through the network library, as every other download is: the token still goes to the first host only, redirects, the retries of a busy server and a lost connection are kept; this removes the last download that used Zig''s std HTTP client'
-time: 2026-11-20T22:08:41.889690283-05:00
