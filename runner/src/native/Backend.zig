@@ -462,7 +462,9 @@ pub const default_subid_base: u32 = 1_900_000_000;
 /// `Config.settle_window_ms`'s default: a few teardowns' worth on the Pi, where one `syncfs` beside
 /// a writer took 5-8 s and the jobs of a burst end within a second or so of each other. Only waited
 /// while another job's end is on its way (`Store.announceSettle`): a job ending alone waits none.
-pub const default_settle_window_ms: u32 = 100;
+/// Off (each job's last layer synced on its own, as before) until the batch is measured on razorbill
+/// against it (#521, step 2: 100 ms against 0, idle and beside a writer); then the default moves.
+pub const default_settle_window_ms: u32 = 0;
 /// Every id below it may be a host user's or group's (`useradd` gives up to 60000, and LDAP or
 /// SSSD ranges commonly start at 10000 or 100000).
 pub const min_subid_base: u32 = 100_000;
