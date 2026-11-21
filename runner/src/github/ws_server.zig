@@ -178,7 +178,7 @@ pub const Server = struct {
         try out.flush();
         if (s.mode == .vanish) return;
         if (s.ping_on_open) |p| {
-            try out.writeAll(&.{ 0x89, @intCast(p.len) });
+            try out.writeAll(&.{ 0x89, @as(u8, @truncate(p.len)) });
             try out.writeAll(p);
             try out.flush();
         }
@@ -193,7 +193,7 @@ pub const Server = struct {
             var mask: [4]u8 = @splat(0);
             const masked = b1 & 0x80 != 0;
             if (masked) try in.readSliceAll(&mask);
-            const payload = try s.gpa.alloc(u8, @intCast(len));
+            const payload = try s.gpa.alloc(u8, std.math.cast(usize, len) orelse return error.FrameTooLong);
             // Owned by the list once it is in it.
             var owned = false;
             errdefer if (!owned) s.gpa.free(payload);
@@ -213,14 +213,14 @@ pub const Server = struct {
             switch (frame.opcode) {
                 // A close is answered with a close (the same status), and that is the end.
                 0x8 => {
-                    try out.writeAll(&.{ 0x88, @intCast(payload.len) });
+                    try out.writeAll(&.{ 0x88, @as(u8, @truncate(payload.len)) });
                     try out.writeAll(payload);
                     try out.flush();
                     return;
                 },
                 // A ping is answered with a pong of the same payload.
                 0x9 => {
-                    try out.writeAll(&.{ 0x8a, @intCast(payload.len) });
+                    try out.writeAll(&.{ 0x8a, @as(u8, @truncate(payload.len)) });
                     try out.writeAll(payload);
                     try out.flush();
                 },

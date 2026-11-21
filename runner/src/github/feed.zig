@@ -249,7 +249,7 @@ const Frame = ws_server.Frame;
 /// one of a frame and a byte, a ping, and the close.
 fn script(sock: anytype, gpa: Allocator) !void {
     var long: [2500]u8 = undefined;
-    for (&long, 0..) |*c, i| c.* = 'a' + @as(u8, @intCast(i % 26));
+    for (&long, 0..) |*c, i| c.* = 'a' + @as(u8, @truncate(i % 26));
     try sock.sendText("{\"hello\":1}");
     try sock.sendText(&long);
     try sock.sendText("");
@@ -459,7 +459,7 @@ test "a peer that reads slowly holds the queue at its bound, wakes the sender wh
         fn run(self: *@This()) void {
             var msg: [4096]u8 = @splat('x');
             for (0..self.total) |i| {
-                _ = std.fmt.bufPrint(msg[0..8], "{d:0>8}", .{i}) catch unreachable;
+                _ = std.fmt.bufPrint(msg[0..8], "{d:0>8}", .{i}) catch @panic("8 digits");
                 self.ws.sendText(&msg) catch return;
                 _ = self.sent.fetchAdd(1, .acq_rel);
             }
@@ -494,7 +494,7 @@ test "a peer that reads slowly holds the queue at its bound, wakes the sender wh
     try std.testing.expectEqual(@as(usize, sender.total + 1), seen.items.len);
     for (seen.items[0..sender.total], 0..) |f, i| {
         var want: [8]u8 = undefined;
-        _ = std.fmt.bufPrint(&want, "{d:0>8}", .{i}) catch unreachable;
+        _ = std.fmt.bufPrint(&want, "{d:0>8}", .{i}) catch @panic("8 digits");
         try std.testing.expectEqualStrings(&want, f.payload[0..8]);
     }
 }
