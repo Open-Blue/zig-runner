@@ -355,7 +355,7 @@ RUNNER_NATIVE_IMAGES_MAX_MB=8192                  # default; images', rootfs' an
 RUNNER_NATIVE_MIN_FREE_PCT=10                     # default; the disk's floor, 0 for none ("Eviction")
 RUNNER_NATIVE_ROOTLESS=0                          # default; 1 for a rootless runner
 RUNNER_NATIVE_DEFER_COLLECT=true                  # default; false runs a job's store upkeep before its end returns
-RUNNER_NATIVE_SETTLE_WINDOW_MS=100                # default; 0 syncs each job's last layer on its own
+RUNNER_NATIVE_SETTLE_WINDOW_MS=0                  # default (off: each job's last layer synced on its own); 100 batches, being measured (#521)
 RUNNER_NATIVE_IDMAPPED_UPPER=true                 # default; false shifts each layer's ids with a
                                                   # walk instead of writing them through an
                                                   # idmapped upper ("The canonical ids")
@@ -822,7 +822,7 @@ What it covers, as built:
   layer is available to others once its publisher made it durable: at the publisher's next publish,
   or at its teardown for its last layer (`RUNNER_NATIVE_DEFER_SYNC=false` has none of this).
   **The ends of jobs ending together share one `syncfs`** (`Store.settleEnd`,
-  `RUNNER_NATIVE_SETTLE_WINDOW_MS`, 100 by default): seven jobs ending in a burst synced the whole
+  `RUNNER_NATIVE_SETTLE_WINDOW_MS`, off (0) by default until #521's measurement; 100 is the window measured): seven jobs ending in a burst synced the whole
   filesystem seven times, each 5-8 s beside a writer on the Pi. A job's end announces its settle as
   its teardown begins; the first to reach its settle waits up to the window for the others announced
   (none when it ends alone), and those that reach theirs while its `syncfs` runs wait for it and share
