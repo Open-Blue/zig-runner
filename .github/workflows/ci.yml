@@ -263,6 +263,11 @@ jobs:
       - name: allow-userns.sh says what it found
         run: .github/scripts/allow-userns-test.sh
 
+      # test-files.sh's verdicts against a fixture tree and a list of test names, with no compile: a
+      # file whose tests are missing from the binary, or fewer there, fails naming that file.
+      - name: test-files.sh names a file whose tests are not in the binary
+        run: .github/scripts/test-files-test.sh
+
       # The release binaries, against their pinned checksums: a new version (Renovate's) fails
       # here until they are updated. shfmt shows the diff that would format a script.
       - name: shfmt

@@ -799,6 +799,8 @@ pub const Options = struct {
     /// transport.
     test_session_argv: ?[]const []const u8 = null,
     test_transport: ?Transport = null,
+    /// Tests: the first wait before a remote action's fetch is tried again (`fetch_retry.zig`).
+    test_fetch_backoff_ms: i64 = @import("dagger/fetch_retry.zig").default_base_ms,
     /// Tests: this job's `ran_env` value instead of a random one.
     test_ran_marker: ?[]const u8 = null,
     /// Tests: what a minute of `timeout-minutes` is, in ms.
@@ -1923,9 +1925,11 @@ fn prepareCheckout(
         },
     };
     const f = if (x.native) |b|
-        try b.fetchCheckout(x, co)
-    else
-        try checkout.fetch(arena, x.transport, x.job.*, co, x.gitAuth());
+        try b.fetchCheckout(x, co, num)
+    else blk: {
+        var retry = x.fetchRetry("repository", num, x.fetch_backoff_ms);
+        break :blk try checkout.fetch(arena, x.transport, x.job.*, co, x.gitAuth(), &retry);
+    };
     if (f.result == .failed) {
         try failStep(ev, sh, x.observer, step, res, num, f.result.failed, coe);
         return null;
@@ -2378,6 +2382,7 @@ fn runStepsPaused(
         else => return e,
     };
     const base: Base = if (native) |b| base: {
+        b.live_log = sh;
         b.base(&ev, plan, &err_msg) catch |e| {
             if (e == error.NativeToDagger) return e;
             // Before any step, and before "Set up job" has said anything: a native set-up that
@@ -2406,6 +2411,7 @@ fn runStepsPaused(
     x.container_path = base.runtime_path;
     x.timeout_unit_ms = opts.test_timeout_unit_ms;
     x.native = native;
+    x.fetch_backoff_ms = opts.test_fetch_backoff_ms;
     x.tool_trees = base.tool_trees;
     // A native job's tool cache is its `toolcache` volume, in no layer, so a replayed step that
     // points at a tree there runs again (#229), unless "Set up job" checked a tree that holds it

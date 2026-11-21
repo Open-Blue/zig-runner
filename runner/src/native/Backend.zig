@@ -46,6 +46,7 @@ const publish = @import("publish.zig");
 const host_paths = @import("host_paths.zig");
 const native_actions = @import("actions.zig");
 const tarball = @import("tarball.zig");
+const fetch_retry = @import("../dagger/fetch_retry.zig");
 const Exec = @import("../dagger/Exec.zig");
 const Evaluator = @import("../dagger/Evaluator.zig");
 const SpanDemux = @import("../dagger/JobLog.zig").SpanDemux;
@@ -119,11 +120,28 @@ runtime_path: ?[]const u8 = null,
 timings: phases.Phases = .{},
 /// What "Set up job" says of the image and its provisioning, the job's cgroup and its caches.
 notes: std.ArrayList([]const u8) = .empty,
+/// The job's log, for what native says before "Set up job" does (the retries of an action's fetch,
+/// `fetch_retry.Retrying`); set by `dagger.run` before the base.
+live_log: ?*@import("../dagger/JobLog.zig") = null,
+/// What the job's fetches may still spend on retries (`fetch_retry.Budget`).
+fetch_budget: fetch_retry.Budget = .{},
 /// Remote actions fetched before "Set up job" (`actions.preload`), by `Exec.loadAction`'s key.
 actions: std.StringHashMapUnmanaged(Exec.LoadResult) = .empty,
 /// The trees of those actions that are in a layer of the job (`actions.fetch`), by server,
 /// repository and ref: another action of the same tree (a directory of it) is read from there.
 fetched_trees: std.StringHashMapUnmanaged(FetchedTree) = .empty,
+/// The first wait before an action's fetch is tried again after a network failure
+/// (`dagger/fetch_retry.zig`), doubled for each retry; a test's is a millisecond.
+fetch_backoff_ms: i64 = @import("../dagger/fetch_retry.zig").default_base_ms,
+/// The longest an action's fetch attempt may take before it is stopped (and tried again). Not a
+/// speed limit: a slow fetch that moves bytes is the fetch, and succeeded without any limit before
+/// (a 150 MB repository at 1 MB/s takes 150 s). A transfer that stalls ends by git's own low-speed
+/// limit (`actions.gitEnv`) and the kernel gives up on a connection that never answers by itself;
+/// this only ends an attempt that hangs some other way, so it is the tarball download's 15 minutes.
+fetch_attempt_limit_ms: u64 = default_fetch_attempt_limit_ms,
+/// How many layers `runIn` has pushed, ever: a caller that drops the layer of its failed attempt
+/// drops one only when the attempt pushed one (`dropPushedSince`).
+layers_pushed: u64 = 0,
 /// The JavaScript runtime JavaScript actions run with (`Options.js_runtime`, `actions.preload`).
 js_runtime: config.JsRuntime = .bun,
 /// This runner has no Dagger engine to send a job to (`Options.engineless`): what native cannot
@@ -300,6 +318,11 @@ pub const Config = struct {
     /// How long a tag's last known digest covers a registry that cannot answer
     /// (`RUNNER_IMAGE_TAG_MAX_STALE`); `oci.tag_max_stale_s` takes it when the backend starts.
     image_tag_max_stale_s: u32 = oci.default_tag_max_stale_s,
+    /// Tests: the first wait before an action's fetch is tried again (`Backend.fetch_backoff_ms`).
+    fetch_backoff_ms: i64 = @import("../dagger/fetch_retry.zig").default_base_ms,
+    /// Tests: `Backend.fetch_attempt_limit_ms` and the job's retry budget (`fetch_retry.Budget`).
+    fetch_attempt_limit_ms: u64 = default_fetch_attempt_limit_ms,
+    fetch_budget_ms: i64 = 180_000,
     /// Where jobs' layers live while they run, and pulled images and provisioned rootfs
     /// (`RUNNER_NATIVE_STORE`).
     store: []const u8 = "",
@@ -1024,6 +1047,9 @@ pub fn initWhy(arena: Allocator, io: std.Io, gpa: Allocator, cfg: Config, why: *
         .provisioned_image = cfg.provisioned_image,
         .provisioned_pins = cfg.provisioned_pins,
         .image_tag_ttl_s = cfg.image_tag_ttl_s,
+        .fetch_backoff_ms = cfg.fetch_backoff_ms,
+        .fetch_attempt_limit_ms = cfg.fetch_attempt_limit_ms,
+        .fetch_budget = .{ .limit_ms = cfg.fetch_budget_ms },
         .binds = cfg.binds,
         .lock = lock,
         .how = how,
@@ -2658,7 +2684,7 @@ pub const host_id = "host:";
 /// checked out with its `.git` and no refs (the step's script adds them, `checkout.refCommands`)
 /// and every file at `checkout.mtime`. Its output is not the step's, as Dagger's fetch is not:
 /// on failure the step says why.
-pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetched {
+pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout, num: u32) !dagger.Fetched {
     const arena = b.arena;
     var f = try checkout.describe(arena, x.job.*, co);
     f.fetched_with = "git in the job's image";
@@ -2666,7 +2692,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
         f.result = .{ .failed = "no repository to check out (the job has no github.repository)" };
         return f;
     }
-    if (b.no_git) return b.fetchCheckoutTarball(x, co, f);
+    if (b.no_git) return b.fetchCheckoutTarball(x, co, f, num);
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.writeAll("set -e\nmkdir -p ");
@@ -2746,7 +2772,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
         null
     else
         try b.keyFor(.step, try std.fmt.allocPrint(arena, "{s}\n# tags {s}", .{ aw.written(), tags.? }), &.{}, b.uid, b.gid);
-    const claim = b.claimKey(key, "fetch") catch |e| switch (e) {
+    var claim = b.claimKey(key, "fetch") catch |e| switch (e) {
         error.Stopped => {
             f.result = .{ .failed = "the step was stopped" };
             return f;
@@ -2758,15 +2784,50 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
         f.result = .{ .dir = "native" };
         return f;
     }
+    // A network failure is tried again (`fetch_retry.zig`) from a clean layer: the failed
+    // attempt's, with its half-made clone, is dropped. The whole script runs again, so a failed
+    // tags or submodule fetch is retried too. The step cache's claim on the key is let go while
+    // the retry waits (another job filling the same key then need not wait for it), and taken
+    // again after: the commit may be there by then. A checkout is not limited in time here (a large
+    // clone takes as long as it takes): the step's own timeout and the job's cancel stop it
+    // (`Watch`), and a connect that never answers ends by the kernel's own limit, not retried
+    // past the job's budget.
+    var retry = x.fetchRetry("repository", num, b.fetch_backoff_ms);
+    retry.at.budget = &b.fetch_budget;
     var out: Captured = .{ .arena = arena };
-    const ended = try b.exec(
-        aw.written(),
-        env,
-        &.{native_actions.git_config_file},
-        b.uid,
-        b.gid,
-        out.output(),
-    );
+    var ended: sandbox.Ended = undefined;
+    while (true) {
+        out = .{ .arena = arena };
+        const mark = b.layers_pushed;
+        ended = try b.exec(
+            aw.written(),
+            env,
+            &.{native_actions.git_config_file},
+            b.uid,
+            b.gid,
+            out.output(),
+        );
+        if (ended.code == 0 and ended.failure.len == 0 and !ended.killed) break;
+        if (ended.killed or gitMissing(ended, &out)) break;
+        const said = if (ended.failure.len > 0) ended.failure else out.text.items;
+        const again = try retry.plan(arena, try std.fmt.allocPrint(arena, "{s}@{s}", .{ f.repo, f.ref_label }), said, fetch_retry.transientText(said));
+        b.dropPushedSince(mark);
+        if (!again) break;
+        claim.release(b.io);
+        claim.lock = null;
+        if (!retry.wait()) break;
+        claim = b.claimKey(key, "fetch") catch |e| switch (e) {
+            error.Stopped => {
+                f.result = .{ .failed = "the step was stopped" };
+                return f;
+            },
+            else => return e,
+        };
+        if (claim.hit != null) {
+            f.result = .{ .dir = "native" };
+            return f;
+        }
+    }
     if (ended.code == 0 and ended.failure.len == 0 and !ended.killed) {
         if (claim.key) |k| try b.publishTop(k, .fetch, .{ .log = "", .fc = "" });
         f.result = .{ .dir = "native" };
@@ -2776,7 +2837,7 @@ pub fn fetchCheckout(b: *Backend, x: *Exec, co: job_mod.Checkout) !dagger.Fetche
     if (gitMissing(ended, &out)) {
         b.dropTop();
         b.no_git = true;
-        return b.fetchCheckoutTarball(x, co, f);
+        return b.fetchCheckoutTarball(x, co, f, num);
     }
     // The sandbox's own failure fails the step, as a fetch Dagger could not make does.
     const why = if (ended.failure.len > 0) ended.failure else out.tail();
@@ -2811,7 +2872,7 @@ pub fn gitMissing(ended: sandbox.Ended, out: *const Captured) bool {
 /// The built-in checkout in an image with no git (`tarball.zig`): the repository's tarball from
 /// GitHub's API with the job's token, extracted by the image's `tar`. A tree with no `.git`, as
 /// actions/checkout leaves it without git; what needs one (submodules) fails the step and says so.
-fn fetchCheckoutTarball(b: *Backend, x: *Exec, co: job_mod.Checkout, f_in: dagger.Fetched) !dagger.Fetched {
+fn fetchCheckoutTarball(b: *Backend, x: *Exec, co: job_mod.Checkout, f_in: dagger.Fetched, num: u32) !dagger.Fetched {
     const arena = b.arena;
     var f = f_in;
     f.fetched_with = "the repository's tarball (the job's image has no git)";
@@ -2827,14 +2888,15 @@ fn fetchCheckoutTarball(b: *Backend, x: *Exec, co: job_mod.Checkout, f_in: dagge
         return f;
     }
     const token: ?[]const u8 = if (x.gitAuth()) |id| plaintext(x, id) else null;
-    const src = try tarball.checkoutSource(arena, x.job.github.server_url, f.repo, f.want, token);
+    var src = try tarball.checkoutSource(arena, x.job.github.server_url, f.repo, f.want, token);
+    src.backoff_ms = b.fetch_backoff_ms;
     const script = try tarball.extractScript(arena, f.mount);
     // A commit is the same tree every time, so a step under caching like any other; a branch moves.
     const key = if (checkout.isSha(f.want))
         try b.keyFor(.step, try std.fmt.allocPrint(arena, "# tarball {s}\n{s}", .{ src.url, script }), &.{}, b.uid, b.gid)
     else
         null;
-    const claim = b.claimKey(key, "fetch") catch |e| switch (e) {
+    var claim = b.claimKey(key, "fetch") catch |e| switch (e) {
         error.Stopped => {
             f.result = .{ .failed = "the step was stopped" };
             return f;
@@ -2846,17 +2908,39 @@ fn fetchCheckoutTarball(b: *Backend, x: *Exec, co: job_mod.Checkout, f_in: dagge
         f.result = .{ .dir = "native" };
         return f;
     }
-    const got = try tarball.fetchInto(b, f.mount, src, if (checkout.isSha(f.want)) f.want else null, b.uid, b.gid);
-    switch (got) {
+    var retry = x.fetchRetry("repository", num, b.fetch_backoff_ms);
+    retry.at.budget = &b.fetch_budget;
+    while (true) switch (try tarball.fetchInto(b, f.mount, src, if (checkout.isSha(f.want)) f.want else null, b.uid, b.gid)) {
         .sha => {
             if (claim.key) |k| try b.publishTop(k, .fetch, .{ .log = "", .fc = "" });
             f.result = .{ .dir = "native" };
+            break;
         },
         .failed => |why| {
             const msg = x.sh.redacted(arena, why) catch why;
+            if (try retry.plan(arena, try std.fmt.allocPrint(arena, "{s}@{s}", .{ f.repo, f.ref_label }), msg, fetch_retry.transientDownload(msg))) {
+                // As the git path: the claim is let go while the retry waits, and taken again.
+                claim.release(b.io);
+                claim.lock = null;
+                if (retry.wait()) {
+                    claim = b.claimKey(key, "fetch") catch |e| switch (e) {
+                        error.Stopped => {
+                            f.result = .{ .failed = "the step was stopped" };
+                            return f;
+                        },
+                        else => return e,
+                    };
+                    if (claim.hit != null) {
+                        f.result = .{ .dir = "native" };
+                        break;
+                    }
+                    continue;
+                }
+            }
             f.result = .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}@{s}: {s}", .{ f.repo, f.ref_label, msg }) };
+            break;
         },
-    }
+    };
     return f;
 }
 
@@ -3091,6 +3175,38 @@ pub fn execOn(
     return b.execIn(argv, env, files, uid, gid, out, container, true);
 }
 
+pub const default_fetch_attempt_limit_ms: u64 = 15 * 60 * 1000;
+
+/// What `execLimited` found: how the script ended, and whether it was stopped for its time.
+pub const Limited = struct { ended: sandbox.Ended, timed_out: bool };
+
+/// `execOn` with no container, stopped after `limit_ms` (`timed_out`) or at the job's cancel: for a
+/// fetch that no other watch covers (an action's, before any step), so a network that never
+/// answers cannot hold the job for the kernel's connect time per attempt.
+pub fn execLimited(
+    b: *Backend,
+    argv: []const []const u8,
+    env: []const []const u8,
+    files: []const sandbox.Spec.File,
+    uid: u32,
+    gid: u32,
+    out: sandbox.Output,
+    limit_ms: u64,
+) !Limited {
+    var dog: SeedWatch = .{};
+    var watch = b.io.concurrent(SeedWatch.run, .{ &dog, b, limit_ms }) catch
+        return .{ .ended = try b.execOn(argv, env, files, uid, gid, out, null), .timed_out = false };
+    const ended = b.execOn(argv, env, files, uid, gid, out, null) catch |e| {
+        dog.done.store(true, .release);
+        watch.await(b.io);
+        return e;
+    };
+    dog.done.store(true, .release);
+    watch.await(b.io);
+    const cancelled = if (b.cancel) |c| c.requested.load(.acquire) else false;
+    return .{ .ended = ended, .timed_out = dog.fired.load(.acquire) and !cancelled };
+}
+
 /// A Dockerfile's `RUN` in its `container` (`docker_action.zig`): what it writes goes to the
 /// container's upper, the build's layer, and the job gets no layer (its overlay's upper is a
 /// scratch one, which nothing writes, since the build shares nothing).
@@ -3207,7 +3323,10 @@ fn runIn(
         .container_opts = b.sandbox_opts,
     }, &b.running, out);
     b.timings.helper(arena, ended.helper, ended.spawned, ended.ended);
-    if (new_layer) try b.layers.append(arena, .{ .name = upper, .path = upper_path, .canonical = idmapped });
+    if (new_layer) {
+        try b.layers.append(arena, .{ .name = upper, .path = upper_path, .canonical = idmapped });
+        b.layers_pushed += 1;
+    }
     return ended;
 }
 
@@ -3787,6 +3906,13 @@ pub fn dropTop(b: *Backend) void {
     if (top.key != null) return;
     _ = b.layers.pop();
     Store.removeTree(b.arena, b.io, top.path);
+}
+
+/// `dropTop` for a failed attempt, only if it pushed a layer (`mark` is `layers_pushed` before it):
+/// an exec that failed before it ran (the stack's flattening, the job's network) pushed none, and
+/// the top is then an earlier step's, which must stay.
+pub fn dropPushedSince(b: *Backend, mark: u64) void {
+    if (b.layers_pushed != mark) b.dropTop();
 }
 
 /// The stack's top layer, a tree git fetched at a commit (an action's, `actions.fetch`), keyed by
@@ -12811,4 +12937,41 @@ test "native docker api: a step that made a request beyond ping, version and inf
         ,
         "echo two",
     }, "late"));
+}
+
+test "fetch retry: a failed attempt that ran nothing leaves the job's earlier layer, one that pushed a layer loses it (before a retry is tried again)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg = try testConfig(arena, &tmp);
+    var b = try init(arena, io, std.testing.allocator, cfg);
+    defer b.deinit();
+    // An earlier action's tree: the job's own layer, nothing keyed.
+    const earlier = try std.fmt.allocPrint(arena, "{s}/earlier", .{b.dir});
+    try std.Io.Dir.cwd().createDirPath(io, earlier);
+    try b.layers.append(arena, .{ .name = "earlier", .path = earlier });
+
+    // The job's network could not be made: the attempt fails before it runs, with no layer.
+    b.net_why = "the job's network could not be made";
+    const mark = b.layers_pushed;
+    var out: Captured = .{ .arena = arena };
+    const ended = try b.execOn(&.{"true"}, &.{}, &.{}, 0, 0, out.output(), null);
+    try std.testing.expect(ended.failure.len > 0);
+    b.dropPushedSince(mark);
+    try std.testing.expectEqual(@as(usize, 1), b.layers.items.len);
+    try std.testing.expectEqualStrings("earlier", b.layers.items[0].name);
+    std.Io.Dir.cwd().access(io, earlier, .{}) catch return error.TestUnexpectedResult;
+
+    // An attempt that did push one drops it, and only it.
+    const mark2 = b.layers_pushed;
+    const attempt = try std.fmt.allocPrint(arena, "{s}/attempt", .{b.dir});
+    try std.Io.Dir.cwd().createDirPath(io, attempt);
+    try b.layers.append(arena, .{ .name = "attempt", .path = attempt });
+    b.layers_pushed += 1;
+    b.dropPushedSince(mark2);
+    try std.testing.expectEqual(@as(usize, 1), b.layers.items.len);
+    try std.testing.expectEqualStrings("earlier", b.layers.items[0].name);
 }

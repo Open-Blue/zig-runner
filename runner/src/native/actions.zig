@@ -29,6 +29,7 @@ const sandbox = @import("sandbox.zig");
 const images = @import("images.zig");
 const docker_action = @import("docker_action.zig");
 const tarball = @import("tarball.zig");
+const fetch_retry = @import("../dagger/fetch_retry.zig");
 const checkout_mod = @import("../dagger/checkout.zig");
 const Exec = @import("../dagger/Exec.zig");
 const js = @import("../dagger/js.zig");
@@ -325,6 +326,10 @@ fn gitEnv(b: *Backend, job: job_mod.Job, own: bool) ![]const []const u8 {
         "HOME=/root",
         "GIT_TERMINAL_PROMPT=0",
         "GIT_CONFIG_GLOBAL=" ++ git_config_path,
+        // A transfer that moves less than 1 KB/s for 30 s is a stalled one, not a slow one
+        // (an action's fetch is small): git ends it, and `fetch_retry` tries again.
+        "GIT_HTTP_LOW_SPEED_LIMIT=1000",
+        "GIT_HTTP_LOW_SPEED_TIME=30",
     });
     var git_config: std.ArrayList([2][]const u8) = .empty;
     if (own and job.gitToken().len > 0) {
@@ -392,16 +397,41 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
     var out: Backend.Captured = .{ .arena = arena };
     var tar_sha: []const u8 = "";
     var ended: sandbox.Ended = .{ .code = 0, .failure = "" };
+    // Why the last attempt failed, when it was the runner that stopped it (its time limit).
+    var stopped: []const u8 = "";
+    // A network failure is tried again (`fetch_retry.zig`), each time in a new layer: the one a
+    // failed attempt left, with its half-made `.git`, is dropped first, as for a missing git.
+    // Each attempt is stopped at `attempt_limit_ms` or the job's cancel (`Backend.execLimited`),
+    // and a transfer that stalls ends by git's own low-speed limit (`gitEnv`).
+    const cancel = if (b.cancel) |c| &c.requested else null;
+    var retry = fetch_retry.Retrying.init(b.io, cancel, b.fetch_backoff_ms, "action", &b.fetch_budget, b.live_log, 0);
     // Once the image is known to have no git, its script is not run again.
     if (!b.no_git) {
         const env = try gitEnv(b, job, from.token);
-        ended = try b.execOn(&.{ "sh", "-c", aw.written() }, env, &.{git_config_file}, 0, 0, out.output(), null);
-        // `sh` found no git in the image (any image is native since P3, not only the provisioned
-        // default one): the action's tarball instead (`tarball.zig`), here and for the job's later
-        // fetches.
-        if (Backend.gitMissing(ended, &out)) {
-            b.dropTop();
-            b.no_git = true;
+        while (true) {
+            out = .{ .arena = arena };
+            const mark = b.layers_pushed;
+            const ran = try b.execLimited(&.{ "sh", "-c", aw.written() }, env, &.{git_config_file}, 0, 0, out.output(), b.fetch_attempt_limit_ms);
+            ended = ran.ended;
+            // `sh` found no git in the image (any image is native since P3, not only the provisioned
+            // default one): the action's tarball instead (`tarball.zig`), here and for the job's later
+            // fetches.
+            if (Backend.gitMissing(ended, &out)) {
+                b.dropPushedSince(mark);
+                b.no_git = true;
+                break;
+            }
+            if (ended.failure.len == 0 and ended.code == 0) break;
+            stopped = if (ran.timed_out)
+                try std.fmt.allocPrint(arena, "the fetch took longer than {d} seconds", .{b.fetch_attempt_limit_ms / 1000})
+            else
+                "";
+            const why = if (ran.timed_out) stopped else if (ended.failure.len > 0) ended.failure else out.text.items;
+            const again = try retry.plan(arena, ref_label, why, ran.timed_out or fetch_retry.transientText(why));
+            // The failed attempt's layer goes whether another follows or not (when it made one:
+            // a run that failed before it started leaves the job's earlier layer on top).
+            b.dropPushedSince(mark);
+            if (!again or !retry.wait()) break;
         }
     }
     if (b.no_git) {
@@ -424,27 +454,38 @@ fn fetch(b: *Backend, job: job_mod.Job, u: job_mod.Uses) !Exec.LoadResult {
         // The job's token goes where it is GitHub's own repository (its API's tarball), or to the
         // instance's archive of any repository the job's token is for (`from.token`).
         const token = job.gitToken();
-        const src = if (!from.token or token.len == 0)
+        var src = if (!from.token or token.len == 0)
             try tarball.actionSource(arena, server, repository, ref)
         else if (job.github.forge == .github and u.source == .default)
             try tarball.checkoutSource(arena, server, repository, ref, token)
         else
             try tarball.instanceSource(arena, server, repository, ref, token);
-        switch (try tarball.fetchInto(b, mount, src, if (checkout_mod.isSha(ref)) ref else null, 0, 0)) {
-            .sha => |s| tar_sha = s,
-            .failed => |why| return .{ .unresolved = try std.fmt.allocPrint(
-                arena,
-                "Unable to resolve action `{s}`: {s}",
-                .{ ref_label, why },
-            ) },
-        }
+        src.backoff_ms = b.fetch_backoff_ms;
+        // The tarball's own attempts, from the first (not what the git script used up). A
+        // lookup, a connection or a stream that fails is tried again (a 5xx or a 429 already is,
+        // in `tarball.download`).
+        var tar_retry = fetch_retry.Retrying.init(b.io, cancel, b.fetch_backoff_ms, "action", &b.fetch_budget, b.live_log, 0);
+        while (true) switch (try tarball.fetchInto(b, mount, src, if (checkout_mod.isSha(ref)) ref else null, 0, 0)) {
+            .sha => |s| {
+                tar_sha = s;
+                break;
+            },
+            .failed => |why| {
+                if (try tar_retry.again(arena, ref_label, why, fetch_retry.transientDownload(why))) continue;
+                return .{ .unresolved = try std.fmt.allocPrint(
+                    arena,
+                    "Unable to resolve action `{s}`: {s}",
+                    .{ ref_label, why },
+                ) };
+            },
+        };
     } else if (ended.failure.len > 0 or ended.code != 0) return .{
         .unresolved = try std.fmt.allocPrint(
             arena,
             "Unable to resolve action `{s}`: {s}{s}",
             .{
                 ref_label,
-                if (ended.failure.len > 0) ended.failure else out.tail(),
+                if (stopped.len > 0) stopped else if (ended.failure.len > 0) ended.failure else out.tail(),
                 // The instance would have answered a token it takes; this job has none to send.
                 if (from.token and job.gitToken().len == 0 and job.github.forge != .github)
                     " (the task has no GITHUB_TOKEN secret, so the fetch had no credentials)"
@@ -1574,4 +1615,351 @@ test "no engine: a node local action in an image with no JavaScript runtime fail
     try std.testing.expect(!res.succeeded);
     try expectLog(res.log, &.{ "JavaScript", "runtime" });
     try std.testing.expect(std.mem.indexOf(u8, res.log, "never") == null);
+}
+
+/// A `git` for the job's image that says `fail_text` (and exits 128) at its `fetch`, the first
+/// `fails` times it is asked (counted in `/srv/ctr/n`, which outlives the layers), and is the
+/// host's git after. Bound over `/usr/bin/git`, with the real one at `/srv/bin/realgit`. Null
+/// when this machine has no git to put under it.
+fn testFlakyGit(arena: Allocator, tmp: *std.testing.TmpDir, cfg: *Backend.Config, fails: u32, fail_text: []const u8) !void {
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    try tmp.dir.createDirPath(io, "rootfs/srv/bin");
+    // Where the count is kept: writable by whoever the job's root is, and outliving the layers a
+    // failed attempt's tree is dropped with.
+    try tmp.dir.createDirPath(io, "rootfs/srv/ctr");
+    try tmp.dir.createDirPath(io, "ctr");
+    const ctr = try std.fmt.allocPrint(arena, "{s}/ctr", .{root});
+    const made = try std.process.run(arena, io, .{ .argv = &.{ "chmod", "777", ctr } });
+    if (made.term != .exited or made.term.exited != 0) return error.SkipZigTest;
+    try tmp.dir.writeFile(io, .{ .sub_path = "rootfs/srv/bin/realgit", .data = "" });
+    // What the fetch does while it fails: say `fail_text`, or (`hang`) never answer.
+    const body: []const u8 = if (std.mem.eql(u8, fail_text, hang))
+        "      exec sleep 3600"
+    else
+        try std.fmt.allocPrint(arena, "      cat >&2 <<'MSG'\n{s}\nMSG", .{fail_text});
+    try tmp.dir.writeFile(io, .{ .sub_path = "flaky-git.sh", .flags = .{ .permissions = .fromMode(0o755) }, .data = try std.fmt.allocPrint(arena,
+        \\#!/bin/sh
+        \\for a in "$@"; do
+        \\  if [ "$a" = fetch ]; then
+        \\    n=$(cat /srv/ctr/n 2>/dev/null || echo 0); n=$((n + 1)); echo $n > /srv/ctr/n
+        \\    if [ $n -le {d} ]; then
+        \\{s}
+        \\      exit 128; fi
+        \\  fi
+        \\done
+        \\exec /srv/bin/realgit "$@"
+        \\
+    , .{ fails, body }) });
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{
+        .{ .host = try std.fmt.allocPrint(arena, "{s}/flaky-git.sh", .{root}), .at = "/usr/bin/git" },
+        .{ .host = "/usr/bin/git", .at = "/srv/bin/realgit" },
+        .{ .host = ctr, .at = "/srv/ctr", .read_only = false },
+    } });
+}
+
+/// `testFlakyGit`'s `fail_text` for a fetch that never answers.
+const hang = "HANG";
+
+const dns_failure = "fatal: unable to access 'https://github.com/o/comp.git/': Could not resolve host: github.com";
+
+fn flakyJob(arena: Allocator, tmp: *std.testing.TmpDir, cfg: Backend.Config, cancel: ?*dagger.Cancel) !struct { res: dagger.Result, text: []const u8, fetches: u32 } {
+    try testRepo(arena, tmp, "comp", &.{.{
+        "action.yml",
+        \\runs:
+        \\  using: composite
+        \\  steps:
+        \\    - shell: bash
+        \\      run: echo composite step ran
+    }});
+    const steps = [_]job_mod.Step{usesStep("comp", "o", "comp", "v1", &.{})};
+    var job = testJob(&steps);
+    job.github.server_url = "file:///srv/git";
+    job.secret_vars = &.{.{ .name = "GITHUB_TOKEN", .value = "tok-123" }};
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    log.setSecrets(try @import("../redact.zig").expand(arena, &.{"tok-123"}));
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .gpa = std.testing.allocator,
+        .cancel = cancel,
+    }, job, &log);
+    const n = tmp.dir.readFileAlloc(std.testing.io, "ctr/n", arena, .limited(16)) catch "0";
+    return .{ .res = res, .text = w.written(), .fetches = std.fmt.parseInt(u32, std.mem.trim(u8, n, "\n"), 10) catch 0 };
+}
+
+test "fetch retry: a native action fetch that fails on DNS twice is tried again, each time from a clean layer, and the job runs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    try testFlakyGit(arena, &tmp, &cfg, 2, dns_failure);
+    const r = try flakyJob(arena, &tmp, cfg, null);
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expectEqual(dagger.Outcome.success, r.res.steps[0].outcome);
+    // The third fetch was the first that worked; the first two were said, with the git error.
+    try std.testing.expectEqual(@as(u32, 3), r.fetches);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.text, "##[warning]Failed to fetch action 'o/comp@v1' (attempt "));
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "(attempt 1 of 5): fatal: unable to access 'https://github.com/o/comp.git/': Could not resolve host: github.com. Retrying in ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "(attempt 2 of 5)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "Download action repository 'o/comp@v1' (SHA:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "composite step ran") != null);
+}
+
+test "fetch retry: a native action fetch that never gets through gives up after max_attempts and fails Set up job with the git error" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    try testFlakyGit(arena, &tmp, &cfg, 1000, dns_failure);
+    const r = try flakyJob(arena, &tmp, cfg, null);
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(!r.res.succeeded and r.res.set_up_failed);
+    try std.testing.expectEqual(fetch_retry.max_attempts, r.fetches);
+    try std.testing.expectEqual(@as(usize, fetch_retry.max_attempts - 1), std.mem.count(u8, r.text, "##[warning]Failed to fetch action"));
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "##[error]Unable to resolve action `o/comp@v1`: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "Could not resolve host: github.com") != null);
+}
+
+test "fetch retry: a native action fetch that fails for good (no such repository, refused credentials) is not tried again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    for ([_][]const u8{
+        "remote: Repository not found.\nfatal: repository 'https://github.com/o/comp.git/' not found",
+        "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+        "fatal: couldn't find remote ref v1",
+    }) |text| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var cfg = try testActions(arena, &tmp);
+        cfg.fetch_backoff_ms = 1;
+        try testFlakyGit(arena, &tmp, &cfg, 1000, text);
+        const r = try flakyJob(arena, &tmp, cfg, null);
+        errdefer std.debug.print("{s}\n", .{r.text});
+        try std.testing.expect(!r.res.succeeded and r.res.set_up_failed);
+        try std.testing.expectEqual(@as(u32, 1), r.fetches);
+        try std.testing.expect(std.mem.indexOf(u8, r.text, "Failed to fetch action") == null);
+    }
+}
+
+test "fetch retry: a job's cancel during an action fetch's backoff stops the waiting at once" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    // An hour's wait: only the cancel can end it.
+    cfg.fetch_backoff_ms = 60 * 60 * 1000;
+    try testFlakyGit(arena, &tmp, &cfg, 1000, dns_failure);
+    var cancel: dagger.Cancel = .{};
+    const io = std.testing.io;
+    const T = struct {
+        fn later(c: *dagger.Cancel, where: std.Io, dir: std.Io.Dir) void {
+            // After the first attempt failed and its wait began (the counter is its fetch's).
+            var tries: u32 = 0;
+            while (tries < 600) : (tries += 1) {
+                var buf: [16]u8 = undefined;
+                const got = dir.readFile(where, "ctr/n", &buf) catch &.{};
+                if (got.len > 0) break;
+                where.sleep(.fromMilliseconds(50), .awake) catch return;
+            }
+            where.sleep(.fromMilliseconds(500), .awake) catch return;
+            c.requested.store(true, .release);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, T.later, .{ &cancel, io, tmp.dir });
+    const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
+    const r = try flakyJob(arena, &tmp, cfg, &cancel);
+    th.join();
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - t0 < 120_000);
+    // One attempt: no second one after the cancel.
+    try std.testing.expectEqual(@as(u32, 1), r.fetches);
+}
+
+/// A job of one checkout step of the repository `o/r` (at `<tmp>/git/o/r.git`, which the fake
+/// git's `fetch` fails for), after `first`, a step that runs before it.
+fn checkoutJob(arena: Allocator, tmp: *std.testing.TmpDir, cfg: Backend.Config, first: ?[]const u8, cancel: ?*dagger.Cancel) !struct { res: dagger.Result, text: []const u8, fetches: u32 } {
+    const sha = try ownRepo(arena, tmp, &.{.{ "README", "x\n" }});
+    var co = testStep("");
+    co.action = .{ .checkout = &.{} };
+    const steps = [_]job_mod.Step{ testStep(first orelse "true"), co };
+    var job = testJob(&steps);
+    job.github.server_url = "file:///srv/git";
+    job.github.sha = sha;
+    var env: std.process.Environ.Map = .init(arena);
+    var w: std.Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, std.testing.io, &env, .{
+        .native = cfg,
+        .step_user = .root,
+        .engineless = true,
+        .gpa = std.testing.allocator,
+        .cancel = cancel,
+    }, job, &log);
+    const n = tmp.dir.readFileAlloc(std.testing.io, "ctr/n", arena, .limited(16)) catch "0";
+    return .{ .res = res, .text = w.written(), .fetches = std.fmt.parseInt(u32, std.mem.trim(u8, n, "\n"), 10) catch 0 };
+}
+
+test "fetch retry: a checkout that fails on DNS twice is tried again from a clean clone, and the step succeeds" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    try testFlakyGit(arena, &tmp, &cfg, 2, dns_failure);
+    const r = try checkoutJob(arena, &tmp, cfg, null, null);
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(r.res.succeeded);
+    try std.testing.expectEqual(@as(u32, 3), r.fetches);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.text, "##[warning]Failed to fetch repository 'o/r@"));
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "Could not resolve host: github.com. Retrying in ") != null);
+}
+
+test "fetch retry: a checkout that never gets through gives up after max_attempts, and a masked value stays out of its warnings" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    try testFlakyGit(arena, &tmp, &cfg, 1000, "fatal: unable to access 'https://x-access-token:SEKRET-VALUE@github.com/o/r.git/': Could not resolve host: github.com");
+    const r = try checkoutJob(arena, &tmp, cfg, "echo ::add-mask::SEKRET-VALUE", null);
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(!r.res.succeeded);
+    try std.testing.expectEqual(fetch_retry.max_attempts, r.fetches);
+    try std.testing.expectEqual(@as(usize, fetch_retry.max_attempts - 1), std.mem.count(u8, r.text, "##[warning]Failed to fetch repository 'o/r@"));
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "could not fetch o/r@") != null);
+    var lines = std.mem.splitScalar(u8, r.text, '\n');
+    while (lines.next()) |line| if (std.mem.indexOf(u8, line, "Failed to fetch repository") != null or std.mem.indexOf(u8, line, "could not fetch") != null)
+        try std.testing.expect(std.mem.indexOf(u8, line, "SEKRET-VALUE") == null);
+}
+
+test "fetch retry: a checkout that fails for good is not tried again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    for ([_][]const u8{
+        "remote: Repository not found.\nfatal: repository 'https://github.com/o/r.git/' not found",
+        "fatal: couldn't find remote ref v9",
+    }) |text| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var cfg = try testActions(arena, &tmp);
+        cfg.fetch_backoff_ms = 1;
+        try testFlakyGit(arena, &tmp, &cfg, 1000, text);
+        const r = try checkoutJob(arena, &tmp, cfg, null, null);
+        errdefer std.debug.print("{s}\n", .{r.text});
+        try std.testing.expect(!r.res.succeeded);
+        try std.testing.expectEqual(@as(u32, 1), r.fetches);
+        try std.testing.expect(std.mem.indexOf(u8, r.text, "Failed to fetch repository") == null);
+    }
+}
+
+test "fetch retry: a job's cancel during a checkout's backoff stops the waiting at once" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    cfg.fetch_backoff_ms = 60 * 60 * 1000;
+    try testFlakyGit(arena, &tmp, &cfg, 1000, dns_failure);
+    var cancel: dagger.Cancel = .{};
+    const io = std.testing.io;
+    const T = struct {
+        fn later(c: *dagger.Cancel, where: std.Io, dir: std.Io.Dir) void {
+            var tries: u32 = 0;
+            while (tries < 600) : (tries += 1) {
+                var buf: [16]u8 = undefined;
+                const got = dir.readFile(where, "ctr/n", &buf) catch &.{};
+                if (got.len > 0) break;
+                where.sleep(.fromMilliseconds(50), .awake) catch return;
+            }
+            where.sleep(.fromMilliseconds(500), .awake) catch return;
+            c.requested.store(true, .release);
+        }
+    };
+    const th = try std.Thread.spawn(.{}, T.later, .{ &cancel, io, tmp.dir });
+    const t0 = std.Io.Clock.awake.now(io).toMilliseconds();
+    const r = try checkoutJob(arena, &tmp, cfg, null, &cancel);
+    th.join();
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - t0 < 120_000);
+    try std.testing.expectEqual(@as(u32, 1), r.fetches);
+}
+
+test "fetch retry: an action fetch that never answers is stopped at the attempt's limit and tried again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    cfg.fetch_attempt_limit_ms = 2000;
+    try testFlakyGit(arena, &tmp, &cfg, 2, hang);
+    const r = try flakyJob(arena, &tmp, cfg, null);
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expectEqual(dagger.Outcome.success, r.res.steps[0].outcome);
+    try std.testing.expectEqual(@as(u32, 3), r.fetches);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.text, "the fetch took longer than 2 seconds. Retrying in "));
+}
+
+test "fetch retry: the job's budget ends the retries of a network that never answers" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    cfg.fetch_attempt_limit_ms = 1000;
+    // Two attempts' time and a little more: a third is made, a fourth is not.
+    cfg.fetch_budget_ms = 2500;
+    try testFlakyGit(arena, &tmp, &cfg, 1000, hang);
+    const r = try flakyJob(arena, &tmp, cfg, null);
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expect(!r.res.succeeded and r.res.set_up_failed);
+    try std.testing.expectEqual(@as(u32, 3), r.fetches);
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "Unable to resolve action `o/comp@v1`: the fetch took longer than 1 seconds") != null);
+}
+
+test "fetch retry: an action fetch's warning never carries the job's secret" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try testActions(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    try testFlakyGit(arena, &tmp, &cfg, 1, "fatal: unable to access 'https://x-access-token:tok-123@github.com/o/comp.git/': Could not resolve host: github.com");
+    const r = try flakyJob(arena, &tmp, cfg, null);
+    errdefer std.debug.print("{s}\n", .{r.text});
+    try std.testing.expectEqual(@as(u32, 2), r.fetches);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.text, "##[warning]Failed to fetch action 'o/comp@v1' (attempt 1 of 5): fatal: unable to access 'https://x-access-token:***@github.com"));
+    try std.testing.expect(std.mem.indexOf(u8, r.text, "tok-123") == null);
+}
+
+test "fetch retry: a fetch still making progress is not stopped at the old 120 seconds; the attempt limit is the tarball's 15 minutes" {
+    // A 150 MB repository over 1 MB/s takes 150 s and succeeded before any limit existed: an
+    // attempt may take as long as the tarball download's deadline (stalls end by git's low-speed
+    // limit, `gitEnv`), on the backend and on the config that makes it.
+    const old_limit_ms: u64 = 120 * 1000;
+    const cfg: Backend.Config = .{};
+    try std.testing.expect(cfg.fetch_attempt_limit_ms >= 5 * old_limit_ms);
+    try std.testing.expectEqual(Backend.default_fetch_attempt_limit_ms, cfg.fetch_attempt_limit_ms);
 }

@@ -187,12 +187,18 @@ pub fn fetchInto(b: *Backend, mount: []const u8, src: Source, expect: ?[]const u
     }} });
     defer b.binds = saved;
     var out: Backend.Captured = .{ .arena = arena };
+    const mark = b.layers_pushed;
     const ended = try b.execOn(&.{ "sh", "-c", script }, &.{"PATH=" ++ Backend.image_path}, &.{}, uid, gid, out.output(), null);
-    if (ended.failure.len > 0 or ended.code != 0) return .{ .failed = try std.fmt.allocPrint(
-        arena,
-        "could not unpack {s} in the job's image (it needs `tar` and `gzip`): {s}",
-        .{ src.url, if (ended.failure.len > 0) ended.failure else out.tail() },
-    ) };
+    if (ended.failure.len > 0 or ended.code != 0) {
+        // The failed extraction's layer, with its half-made tree, is not the job's: dropped here, so
+        // a retry, or the step that fails, does not build on it.
+        b.dropPushedSince(mark);
+        return .{ .failed = try std.fmt.allocPrint(
+            arena,
+            "could not unpack {s} in the job's image (it needs `tar` and `gzip`): {s}",
+            .{ src.url, if (ended.failure.len > 0) ended.failure else out.tail() },
+        ) };
+    }
     return .{ .sha = sha };
 }
 
@@ -529,6 +535,10 @@ const TestServer = struct {
     flaky_extra: []const u8 = "",
     flaky_fails: u32 = 0,
     flaky_seen: std.atomic.Value(u32) = .init(0),
+    /// The first `drop_first` requests for `archive_path` are closed with no answer at all, as a
+    /// connection that a network resets.
+    drop_first: u32 = 0,
+    drop_seen: std.atomic.Value(u32) = .init(0),
 
     fn start(s: *TestServer) !void {
         const io = std.testing.io;
@@ -592,6 +602,8 @@ const TestServer = struct {
         var wb: [64 * 1024]u8 = undefined;
         var w = conn.writer(io, &wb);
         const out = &w.interface;
+        if ((std.mem.eql(u8, path, s.archive_path) or (s.api_path.len > 0 and std.mem.eql(u8, path, s.api_path))) and
+            s.drop_seen.fetchAdd(1, .acq_rel) < s.drop_first) return false;
         if (std.mem.eql(u8, path, s.api_path)) {
             @memcpy(s.api_auth[0..auth.len], auth);
             s.api_auth_len.store(auth.len, .release);
@@ -1120,4 +1132,142 @@ test "an action pinned to a commit the archive is not: the step says both" {
     const text = w.written();
     try std.testing.expect(std.mem.indexOf(u8, text, asked) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, ar.sha) != null);
+}
+
+test "fetch retry: an action fetch over the tarball whose connection is dropped every time once is tried again, and the job runs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    const ar = try testArchiveOf(arena, &tmp, "printf 'runs:\\n  using: composite\\n  steps:\\n" ++
+        "    - shell: bash\\n      run: echo composite-ran\\n' > action.yml");
+    try tmp.dir.writeFile(io, .{ .sub_path = "nogit.sh", .data = "#!/bin/sh\necho \"sh: 1: git: not found\" >&2\nexit 127\n", .flags = .{ .permissions = .fromMode(0o755) } });
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{
+        .host = try std.fmt.allocPrint(arena, "{s}/nogit.sh", .{ar.root}),
+        .at = "/usr/bin/git",
+    }} });
+    var srv: TestServer = .{ .archive_path = "/o/act/archive/v1.tar.gz", .body = ar.tgz, .drop_first = http.staleRetries(null) + 1 };
+    try srv.start();
+    defer srv.stop();
+
+    const steps = [_]job_mod.Step{usesStep("act", "o", "act", "v1", &.{})};
+    var job = testJob(&steps);
+    job.github.server_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port});
+    var env: std.process.Environ.Map = .init(arena);
+    var w: Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, io, &env, .{ .native = cfg, .step_user = .root, .gpa = std.testing.allocator }, job, &log);
+    const text = w.written();
+    errdefer std.debug.print("{s}\n", .{text});
+    try std.testing.expectEqual(dagger.Outcome.success, res.steps[0].outcome);
+    // The first fetch met a connection closed on every try (the client's own stale-connection
+    // retries, `staleRetries`, all spent); the second got the archive.
+    try std.testing.expectEqual(http.staleRetries(null) + 2, srv.requests.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "##[warning]Failed to fetch action 'o/act@v1' (attempt 1 of 5): could not download "));
+    try std.testing.expect(std.mem.indexOf(u8, text, "Download action repository 'o/act@v1' (SHA:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "composite-ran") != null);
+}
+
+test "fetch retry: an action fetch over the tarball that gets a 404 is not tried again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    try tmp.dir.writeFile(io, .{ .sub_path = "nogit.sh", .data = "#!/bin/sh\necho \"sh: 1: git: not found\" >&2\nexit 127\n", .flags = .{ .permissions = .fromMode(0o755) } });
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{
+        .host = try std.fmt.allocPrint(arena, "{s}/nogit.sh", .{try tmp.dir.realPathFileAlloc(io, ".", arena)}),
+        .at = "/usr/bin/git",
+    }} });
+    var srv: TestServer = .{ .body = "" };
+    try srv.start();
+    defer srv.stop();
+    const steps = [_]job_mod.Step{usesStep("act", "o", "act", "v1", &.{})};
+    var job = testJob(&steps);
+    job.github.server_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port});
+    var env: std.process.Environ.Map = .init(arena);
+    var w: Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    const res = try dagger.run(arena, io, &env, .{ .native = cfg, .step_user = .root, .gpa = std.testing.allocator }, job, &log);
+    const text = w.written();
+    errdefer std.debug.print("{s}\n", .{text});
+    try std.testing.expect(!res.succeeded and res.set_up_failed);
+    try std.testing.expectEqual(@as(u32, 1), srv.requests.load(.acquire));
+    try std.testing.expect(std.mem.indexOf(u8, text, "Failed to fetch action") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "HTTP 404") != null);
+}
+
+test "fetch retry: a checkout over the tarball whose connection is dropped every time once is tried again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    cfg.fetch_backoff_ms = 1;
+    const ar = try testArchive(arena, &tmp);
+    try tmp.dir.writeFile(io, .{ .sub_path = "nogit.sh", .data = "#!/bin/sh\necho \"sh: 1: git: not found\" >&2\nexit 127\n", .flags = .{ .permissions = .fromMode(0o755) } });
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{
+        .host = try std.fmt.allocPrint(arena, "{s}/nogit.sh", .{ar.root}),
+        .at = "/usr/bin/git",
+    }} });
+    var srv: TestServer = .{
+        .api_path = try std.fmt.allocPrint(arena, "/api/v3/repos/o/r/tarball/{s}", .{ar.sha}),
+        .body = ar.tgz,
+        .drop_first = http.staleRetries(null) + 1,
+    };
+    try srv.start();
+    defer srv.stop();
+    var co = testStep("");
+    co.name = "checkout";
+    co.action = .{ .checkout = &.{.{ .name = "ref", .value = .{ .lit = ar.sha } }} };
+    var env: std.process.Environ.Map = .init(arena);
+    var w: Io.Writer.Allocating = .init(arena);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w.writer } };
+    var job = testJob(&.{co});
+    job.github.server_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port});
+    job.secret_vars = &.{.{ .name = "GITHUB_TOKEN", .value = "tok-123" }};
+    const res = try dagger.run(arena, io, &env, .{ .native = cfg, .step_user = .root, .gpa = std.testing.allocator }, job, &log);
+    errdefer std.debug.print("{s}\n", .{w.written()});
+    try expectSucceeded(res, w.written(), 1);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.written(), "##[warning]Failed to fetch repository 'o/r@"));
+    try std.testing.expect(std.mem.indexOf(u8, w.written(), "tok-123") == null);
+}
+
+test "fetch retry: a tarball whose unpacking fails leaves no layer behind, so a fetch tried again starts from the job's own tree" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = try Backend.testConfig(arena, &tmp);
+    const ar = try testArchiveOf(arena, &tmp, "echo x > f");
+    // An image whose `tar` fails: the extraction runs, makes its layer, and ends with an error.
+    try tmp.dir.writeFile(io, .{ .sub_path = "badtar.sh", .data = "#!/bin/sh\necho 'tar: broken' >&2\nexit 2\n", .flags = .{ .permissions = .fromMode(0o755) } });
+    cfg.binds = try std.mem.concat(arena, sandbox.Spec.Bind, &.{ cfg.binds, &.{.{
+        .host = try std.fmt.allocPrint(arena, "{s}/badtar.sh", .{ar.root}),
+        .at = "/usr/bin/tar",
+    }} });
+    var srv: TestServer = .{ .archive_path = "/o/act/archive/v1.tar.gz", .body = ar.tgz };
+    try srv.start();
+    defer srv.stop();
+    var b = try Backend.init(arena, io, std.testing.allocator, cfg);
+    defer b.deinit();
+    const src = try actionSource(arena, try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{srv.port}), "o/act", "v1");
+    const before = b.layers.items.len;
+    const got = try fetchInto(&b, "/github/_actions/o/act/v1", src, null, 0, 0);
+    try std.testing.expect(got == .failed);
+    try std.testing.expect(std.mem.startsWith(u8, got.failed, "could not unpack "));
+    try std.testing.expectEqual(before, b.layers.items.len);
+    // And it is not the download's failure: never tried again, whatever the names in it.
+    try std.testing.expect(!@import("../dagger/fetch_retry.zig").transientDownload(got.failed));
 }

@@ -576,6 +576,7 @@ error: kind=upload_failed job=123 what=job_log name="" detail=NameServerFailure
   `HostLacksNetworkAddresses`; with no lookup time the line has `total_ms`). Nothing about the job's resolver
   changes; the thresholds are fixed. A job's resolv.conf holds the host's IPv4 nameservers off the loopback
   (razorbill: Tailscale's 100.100.100.100 only, its IPv6 one is dropped). Rootless jobs have no namespace and no probe.
+- The live feed's HTTPS client: `warn: kind=ca_bundle_preload_failed err=..` when the system's CA bundle could not be loaded at the start (or for a renewed client); the client then loads it on its first request, as before.
 - Image pulls (#551): `warn: kind=image_tag_reused image=alpine:3.20 digest=sha256:.. status=429 reason=HttpStatus`
   when a native container job's registry could not answer (a 429, a 5xx, the network) and the tag's last known
   digest, still in the store, ran instead of failing the job. A tag is asked about at most once per

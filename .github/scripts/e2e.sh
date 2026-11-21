@@ -398,15 +398,33 @@ runner_exit_check() {
 
 # wait_run ID [ATTEMPT]: until that attempt of the run has completed, at most $timeout s, and not
 # past the suite's own limit. Stops the suite once the runner has exited (`runner_exit_check`).
+# On giving up it says on stderr what it last saw: the attempt and status GitHub reported, how many
+# polls failed and the last API error, and whether the suite's limit or $timeout ended it (#611's
+# 2026-11-21 run waited 240 s for an attempt GitHub had marked completed 4 minutes earlier, and the
+# log could not say whether the API failed or answered stale).
 wait_run() {
-	local deadline=$((SECONDS + timeout)) state
+	local deadline=$((SECONDS + timeout)) state="" last="" err="" errors=0 polls=0 ef why
 	((deadline <= suite_end)) || deadline=$suite_end
+	ef=$(mktemp)
 	while ((SECONDS < deadline)); do
 		runner_exit_check
-		state=$(api "repos/$repo/actions/runs/$1" --jq '"\(.run_attempt) \(.status)"' 2>/dev/null) || state=""
-		[[ $state == "${2:-1} completed" ]] && return 0
+		polls=$((polls + 1))
+		if state=$(api "repos/$repo/actions/runs/$1" --jq '"\(.run_attempt) \(.status)"' 2>"$ef"); then
+			last=$state
+		else
+			errors=$((errors + 1))
+			err=$(head -c 300 "$ef")
+			state=""
+		fi
+		[[ $state == "${2:-1} completed" ]] && {
+			rm -f "$ef"
+			return 0
+		}
 		sleep 5
 	done
+	rm -f "$ef"
+	((deadline == suite_end)) && why="the suite's ${E2E_SUITE_LIMIT:-1800} s" || why="$timeout s"
+	echo "wait_run $1, attempt ${2:-1}: gave up after $why; $polls polls, last answer '${last:-none}' (attempt status), $errors failed${err:+, the last: $err}" >&2
 	return 1
 }
 

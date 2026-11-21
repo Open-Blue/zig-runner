@@ -185,6 +185,11 @@ default_working_directory: ?[]const u8 = null,
 /// Watches each step for a stop; post and pre scripts are bracketed too, so a stop of one does not
 /// run over the next.
 watch: ?*@import("../dagger.zig").Watch = null,
+/// The first wait before a remote action's fetch is tried again after a network failure
+/// (`fetch_retry.zig`); a test's is a millisecond.
+fetch_backoff_ms: i64 = @import("fetch_retry.zig").default_base_ms,
+/// What the job's fetches may still spend on retries (`fetch_retry.Budget`).
+fetch_budget: @import("fetch_retry.zig").Budget = .{},
 /// The job runs on the native backend: each exec goes there instead of to Dagger
 /// (`Backend.execScript`), and so do reads of the container's files.
 native: ?*Backend = null,
@@ -1141,6 +1146,20 @@ pub const hashFiles = @import("hash_files.zig").hashFiles;
 pub const hashListed = @import("hash_files.zig").hashListed;
 
 /// A line of the job's "Set up job" log (step 0).
+/// The attempts of a fetch (`fetch_retry.Retrying`) of `kind` (`repository` for a checkout), said at
+/// step `num` of the job's log, ended by the job's cancel, with the job's retry budget.
+pub fn fetchRetry(x: *Exec, kind: []const u8, num: u32, base_ms: i64) @import("fetch_retry.zig").Retrying {
+    return @import("fetch_retry.zig").Retrying.init(
+        x.io,
+        if (x.watch) |w| if (w.cancel) |c| &c.requested else null else null,
+        base_ms,
+        kind,
+        &x.fetch_budget,
+        x.sh,
+        num,
+    );
+}
+
 pub fn setUpLine(x: *Exec, line: []const u8) void {
     x.sh.append(0, line);
 }
