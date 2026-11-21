@@ -957,8 +957,11 @@ mod tests {
         // The handshake waited 150 ms before the server began it; the answer 100 ms after the request.
         assert!((150.0..400.0).contains(&ms(t.tls)), "tls {} ms", ms(t.tls));
         assert!((100.0..300.0).contains(&ms(t.ttfb)), "ttfb {} ms", ms(t.ttfb));
-        // DNS and connect are the loopback's: small. And none of the others is counted in them.
-        assert!(ms(t.dns) < 50.0 && ms(t.connect) < 50.0, "dns {} connect {}", ms(t.dns), ms(t.connect));
+        // Connect is the loopback's: small, and neither delay is counted in it. DNS is measured, but
+        // its length is the host's resolver's (a hosted runner took 600 ms for localhost), so no
+        // bound: the two windows above already show the delays were not counted in it.
+        assert!(t.dns != UNKNOWN, "dns not measured");
+        assert!(ms(t.connect) < 50.0, "connect {} ms", ms(t.connect));
         assert!(ms(t.total) >= ms(t.tls) + ms(t.ttfb));
         assert!(ms(t.total) < ms(t.dns) + ms(t.connect) + ms(t.tls) + ms(t.ttfb) + 100.0);
         // The next one rides the same connection: no phase of its own but the first byte.

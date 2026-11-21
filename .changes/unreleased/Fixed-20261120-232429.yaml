@@ -1,0 +1,3 @@
+kind: Fixed
+body: 'The network library''s test of where each phase of a request is timed no longer fails when the host''s resolver is slow: it bounded the lookup of localhost at 50 ms, and a hosted runner took 600 ms. It still checks that the lookup is measured, that connect is the loopback''s, and that neither the TLS nor the answer''s delay is counted in them.'
+time: 2026-11-20T23:24:29.053245341-05:00
