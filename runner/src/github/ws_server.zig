@@ -23,6 +23,8 @@ pub const Mode = enum {
     never_answer,
     /// Answers the upgrade and goes: the connection is closed with no close frame.
     vanish,
+    /// Answers the upgrade with a 403.
+    refuse,
     /// Answers the upgrade and reads nothing until `release`, then records as `record`.
     stall,
 };
@@ -166,6 +168,11 @@ pub const Server = struct {
                 @memcpy(key_buf[0..v.len], v);
                 key = key_buf[0..v.len];
             }
+        }
+        if (s.mode == .refuse) {
+            try out.writeAll("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            try out.flush();
+            return;
         }
         var sha: [20]u8 = undefined;
         var h: std.crypto.hash.Sha1 = .init(.{});

@@ -143,7 +143,7 @@ impl UpStream {
         if n == 0 {
             return if data.is_empty() { Push::Took(0) } else { Push::Full };
         }
-        g.q.push_back(Bytes::copy_from_slice(&data[..n]));
+        g.q.push_back(Bytes::copy_from_slice(data.split_at_checked(n).map_or(data, |(head, _)| head)));
         g.queued += n;
         g.pushed += n as u64;
         if let Some(w) = g.waker.take() {
@@ -301,7 +301,9 @@ impl DownStream {
             let front = g.front;
             let Some(chunk) = g.q.front() else { break };
             let take = (chunk.len() - front).min(out.len() - n);
-            out[n..n + take].copy_from_slice(&chunk[front..front + take]);
+            // Both ranges are `take` long and inside their buffers by construction of `take`.
+            let (Some(dst), Some(src)) = (out.get_mut(n..n + take), chunk.get(front..front + take)) else { break };
+            dst.copy_from_slice(src);
             n += take;
             let done = front + take == chunk.len();
             if done {
