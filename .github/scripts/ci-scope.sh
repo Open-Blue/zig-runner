@@ -217,7 +217,7 @@ needed() {
 			runner/src/native/oci/zlibng.zig | runner/src/vendor/zlib-ng/* | \
 			runner/src/fuzz_corpus/gzip/* | \
 			runner/src/native/dockerfile.zig | runner/src/native/layer_view.zig | runner/src/fuzz.zig | \
-			runner/src/zr_net.zig | runner/src/tls_stream.zig | runner/src/net_client.zig | runner/src/net_oracle.zig | runner/src/fuzz_corpus/tls/* | runner/rust/* | \
+			runner/src/zr_net.zig | runner/src/tls_stream.zig | runner/src/net_client.zig | runner/src/fuzz_corpus/tls/* | runner/rust/* | \
 			runner/tls_oracle.zig | runner/tools/tls_oracle/* | .github/scripts/pg-tls-fixture.sh | \
 			.github/scripts/build-zr-net.sh | \
 			.github/scripts/zig-cc.sh | .github/scripts/zig-cc-env.sh | .github/scripts/zig-cc-host.sh | .github/scripts/zig-ar.sh | .github/scripts/rust-image-free-check.sh | .github/scripts/install-rust.sh | .github/scripts/install-rust-nightly.sh | \

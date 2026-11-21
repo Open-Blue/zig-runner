@@ -270,7 +270,6 @@ pub fn transientError(err: anyerror) bool {
         error.ConnectionResetByPeer,
         error.EndOfStream,
         error.BrokenPipe,
-        error.HttpConnectionClosing,
         // The network library's (`net_client.Error`): the same kinds.
         error.DnsFailed,
         error.ConnectionFailed,

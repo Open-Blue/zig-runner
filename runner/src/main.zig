@@ -20,9 +20,7 @@ const db = @import("db.zig");
 const pg = @import("pg.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
-const http = @import("github/http.zig");
 const net_client = @import("net_client.zig");
-const net_hooks = @import("github/net_hooks.zig");
 const request_log = @import("github/request_log.zig");
 const zig_release = @import("zig_release.zig");
 const broker = @import("github/broker.zig");
@@ -41,7 +39,6 @@ comptime {
     _ = @import("sha256.zig");
     _ = @import("zr_net.zig");
     _ = @import("net_client.zig");
-    _ = @import("net_oracle.zig");
     _ = @import("sink.zig");
     _ = @import("native/Backend.zig");
     _ = @import("native/docker_api.zig");
@@ -51,7 +48,6 @@ comptime {
     _ = @import("native/reaper.zig");
     _ = @import("native/collector.zig");
     _ = @import("proc_stats.zig");
-    _ = @import("github/net_hooks.zig");
     _ = @import("dagger/step_end.zig");
     _ = @import("dagger/fetch_retry.zig");
     _ = @import("github/request_log.zig");
@@ -266,22 +262,9 @@ pub fn main(process_init: std.process.Init) !u8 {
 
     if (try refuseNativeWithoutEngine(arena, io, init, &cfg, err)) |code| return code;
 
-    // The network library's client, which every call but the live feed's uses, is made on first use
-    // and freed here, once the runners are done (`net_client.zig`).
+    // The network library's client, which every call uses (the live feed included), is made on first
+    // use and freed here, once the runners are done (`net_client.zig`).
     defer net_client.deinit();
-    // One std HTTP client for every runner's live feed, the last of its users (see `github/http.zig`).
-    // Its connects are timed for the `request:` lines (`github/net_hooks.zig`).
-    var client: std.http.Client = .{
-        .allocator = init.gpa,
-        .io = net_hooks.wrap(io),
-        .write_buffer_size = http.write_buffer_size,
-    };
-    defer client.deinit();
-    // On the main thread, before any runner starts (http.preloadCa says why).
-    _ = http.preloadCa(&client);
-    http.shared.store(&client, .release);
-    // Before `client`'s, as defers run: the clients `renew` made in its place.
-    defer http.deinitShared(io);
     var zig_seeds: zig_release.Registry = undefined;
     try resolveZigSeeds(arena, init, &cfg, &zig_seeds);
     defer zig_seeds.deinit();

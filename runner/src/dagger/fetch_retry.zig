@@ -90,7 +90,7 @@ const permanent_needles = [_][]const u8{
 
 /// The names the runner's own HTTP client gives a download's transport failures (the tarball path
 /// has no git to print them): the lookup, the connection, the TLS handshake and a connection
-/// closed before the answer's head (`ResetBeforeHead`). Not a body cut short after bytes arrived
+/// closed before the answer's head (the library's `NetworkIo`). Not a body cut short after bytes arrived
 /// (`ReadFailed`, `EndOfStream`), nor a certificate's alert, nor the 15-minute `Timeout`: that
 /// already took the time a retry would.
 const transient_errors = [_][]const u8{
@@ -103,10 +103,7 @@ const transient_errors = [_][]const u8{
     "ConnectionAborted",
     "NetworkUnreachable",
     "HostUnreachable",
-    "HttpConnectionClosing",
-    "ResetBeforeHead",
     "BrokenPipe",
-    "TlsInitializationFailed",
     // The network library's names (`net_client.Error`), which the download's errors are now: a name
     // that does not resolve, a connection refused, timed out or failed, one lost with no answer or
     // cut short (the library's `Io`: a body that stopped is read again from the start, which costs
@@ -116,7 +113,6 @@ const transient_errors = [_][]const u8{
     "ConnectionFailed",
     "NetworkIo",
     "TlsFailed",
-    "TlsConnectionTruncated",
     "TlsAlertCloseNotify",
     "TlsAlertInternalError",
 };
@@ -340,12 +336,10 @@ test "transientDownload: the client's transport errors, not a status or its own 
     const t = std.testing;
     try t.expect(transientDownload("could not download https://github.com/o/r/archive/v1.tar.gz: UnknownHostName"));
     try t.expect(transientDownload("could not download https://x/y: ConnectionRefused"));
-    try t.expect(transientDownload("could not download https://x/y: ResetBeforeHead"));
     try t.expect(!transientDownload("could not download https://x/y: HTTP 404 (not found, or a private repository the job's token cannot read)"));
     try t.expect(!transientDownload("could not download https://x/y: HTTP 500"));
     try t.expect(!transientDownload("could not download https://x/y: it took longer than 15 minutes"));
     try t.expect(!transientDownload("could not download https://x/y: TooManyRedirects"));
-    try t.expect(transientDownload("could not download https://x/y: TlsInitializationFailed"));
     try t.expect(transientDownload("could not download https://x/y: NetworkIo"));
     try t.expect(transientDownload("could not download https://x/y: DnsFailed"));
     try t.expect(!transientDownload("could not download https://x/y: TlsUnknownIssuer"));

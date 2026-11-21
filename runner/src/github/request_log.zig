@@ -1,5 +1,5 @@
 //! One `request:` line per HTTP request the runner makes to GitHub, Gitea or Forgejo
-//! (`broker.request`, `http.fetch`), for finding where time and rate limit go:
+//! (`net_client.fetch` and `open`, `broker.request`), for finding where time and rate limit go:
 //!
 //!   request: host=api.github.com method=GET path=/repos/o/r status=200 dns_ms=1.2 connect_ms=8.0
 //!   tls_ms=20.5 ttfb_ms=61.0 total_ms=95.3 bytes_in=512 retry=0 reused=0 rl_remaining=4999
@@ -13,7 +13,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const hooks = @import("net_hooks.zig");
 const logfmt = @import("../logfmt.zig");
 const dns_probe = @import("../native/dns_probe.zig");
 
@@ -203,170 +202,6 @@ pub fn emit(io: std.Io, l: Line, retry_after: []const u8) void {
             std.log.warn("request: {s} {s}{s} answered {d}", .{ l.method, l.host, l.path, l.status.code });
     }
 }
-
-const max_value = 48;
-
-/// A header value kept past the response's head, printable ASCII only and cut short, so that
-/// whatever a server sends cannot spoil the line.
-const Value = struct {
-    buf: [max_value]u8 = undefined,
-    len: usize = 0,
-
-    fn set(v: *Value, s: []const u8) void {
-        v.len = 0;
-        for (s) |c| {
-            if (v.len == max_value) break;
-            if (c < 0x21 or c > 0x7e) continue;
-            v.buf[v.len] = c;
-            v.len += 1;
-        }
-    }
-
-    fn get(v: *const Value) []const u8 {
-        return v.buf[0..v.len];
-    }
-
-    fn int(v: *const Value) ?u64 {
-        return std.fmt.parseInt(u64, v.get(), 10) catch null;
-    }
-};
-
-/// One request being measured: `exchange` feeds it as the request goes, `finish` emits its line.
-/// It owns what it keeps, as the request's own buffers are gone by then.
-pub const Probe = struct {
-    io: std.Io,
-    on: bool,
-    method: []const u8,
-    host: [255]u8 = undefined,
-    host_len: usize = 0,
-    path: [256]u8 = undefined,
-    path_len: usize = 0,
-    retry: u32,
-    start: u64 = 0,
-    /// The client's io was wrapped (`net_hooks.wrap`), so that its connects can be timed.
-    hooked: bool = false,
-    dns_ns: ?u64 = null,
-    connect_ns: ?u64 = null,
-    tls_ns: ?u64 = null,
-    ttfb_ns: ?u64 = null,
-    reused: ?bool = null,
-    sent_at: u64 = 0,
-    status: ?u16 = null,
-    err: []const u8 = "",
-    bytes_in: ?u64 = null,
-    remaining: Value = .{},
-    limit: Value = .{},
-    reset: Value = .{},
-    resource: Value = .{},
-    retry_after: Value = .{},
-    logged: bool = false,
-
-    pub fn init(io: std.Io, on: bool, method: std.http.Method, uri: std.Uri, retry: u32) Probe {
-        var p: Probe = .{ .io = io, .on = on and enabled.load(.monotonic), .method = @tagName(method), .retry = retry };
-        p.hop(uri);
-        return p;
-    }
-
-    /// A request to `uri`: the first, or after a redirect.
-    pub fn hop(p: *Probe, uri: std.Uri) void {
-        if (!p.on) return;
-        p.* = .{ .io = p.io, .on = true, .method = p.method, .retry = p.retry };
-        p.start = hooks.now();
-        var raw_host: [255]u8 = undefined;
-        const host = if (uri.host) |h| (h.toRaw(&raw_host) catch "?") else "?";
-        const shown = (if (uri.port) |port|
-            std.fmt.bufPrint(&p.host, "{s}:{d}", .{ host, port })
-        else
-            std.fmt.bufPrint(&p.host, "{s}", .{host})) catch p.host[0..0];
-        p.host_len = shown.len;
-        var path_buf: [512]u8 = undefined;
-        const raw_path = switch (uri.path) {
-            .raw, .percent_encoded => |s| s,
-        };
-        const path = redactPath(&path_buf, if (raw_path.len > 0) raw_path else "/");
-        p.path_len = @min(path.len, p.path.len);
-        @memcpy(p.path[0..p.path_len], path[0..p.path_len]);
-    }
-
-    /// The client has opened (or taken from its pool) the connection of `req`, which `now` is
-    /// the end of.
-    pub fn connected(p: *Probe, client_io: std.Io, conn: ?*std.http.Client.Connection) void {
-        if (!p.on) return;
-        p.hooked = hooks.hooked(client_io);
-        if (!p.hooked) return;
-        const c = conn orelse return;
-        const t = hooks.now();
-        const fd = c.stream_reader.stream.socket.handle;
-        if (hooks.takeOpened(fd, p.host[0..p.host_len], p.start, t)) |o| {
-            p.reused = false;
-            p.dns_ns = o.dns_ns orelse 0;
-            p.connect_ns = o.connect_ns;
-            p.tls_ns = if (c.protocol == .tls) o.after_connect_ns else 0;
-        } else {
-            p.reused = true;
-            p.dns_ns = 0;
-            p.connect_ns = 0;
-            p.tls_ns = 0;
-        }
-    }
-
-    /// The request is written out; the first byte is waited for.
-    pub fn sent(p: *Probe) void {
-        if (p.on) p.sent_at = hooks.now();
-    }
-
-    /// The response's head is in: its status and the headers worth keeping.
-    pub fn head(p: *Probe, h: std.http.Client.Response.Head) void {
-        if (!p.on) return;
-        p.ttfb_ns = hooks.now() - p.sent_at;
-        p.status = @backingInt(h.status);
-        var it = h.iterateHeaders();
-        while (it.next()) |header| {
-            const targets = [_]struct { []const u8, *Value }{
-                .{ "x-ratelimit-remaining", &p.remaining },
-                .{ "x-ratelimit-limit", &p.limit },
-                .{ "x-ratelimit-reset", &p.reset },
-                .{ "x-ratelimit-resource", &p.resource },
-                .{ "retry-after", &p.retry_after },
-            };
-            for (targets) |t| if (std.ascii.eqlIgnoreCase(header.name, t[0])) t[1].set(header.value);
-        }
-    }
-
-    /// The request ended: with its response (`err` null) or with `err`, not `Canceled`, which its
-    /// caller reports (`finishOuter`).
-    pub fn finish(p: *Probe, err: ?anyerror) void {
-        if (!p.on or p.logged) return;
-        if (err) |e| p.err = @errorName(e);
-        p.logged = true;
-        const total = hooks.now() - p.start;
-        var path_text: [256]u8 = undefined;
-        @memcpy(path_text[0..p.path_len], p.path[0..p.path_len]);
-        emit(p.io, .{
-            .host = p.host[0..p.host_len],
-            .method = p.method,
-            .path = path_text[0..p.path_len],
-            .status = if (p.err.len > 0) .{ .err = p.err } else if (p.status) |c| .{ .code = c } else .{ .err = "NoStatus" },
-            .dns_ns = p.dns_ns,
-            .connect_ns = p.connect_ns,
-            .tls_ns = p.tls_ns,
-            .ttfb_ns = p.ttfb_ns,
-            .total_ns = total,
-            .bytes_in = p.bytes_in,
-            .retry = p.retry,
-            .reused = p.reused,
-            .rl_remaining = p.remaining.int(),
-            .rl_limit = p.limit.int(),
-            .rl_reset = p.reset.int(),
-            .rl_resource = p.resource.get(),
-        }, p.retry_after.get());
-    }
-
-    /// The attempt is over and no line was written: it timed out (`timed_out`) or was cancelled.
-    pub fn finishOuter(p: *Probe, timed_out: bool) void {
-        if (p.on and !p.logged) p.finish(if (timed_out) error.Timeout else error.Canceled);
-    }
-};
 
 test "a line is the same text whatever made it: exact fields, tenths of a millisecond" {
     var buf: [1024]u8 = undefined;

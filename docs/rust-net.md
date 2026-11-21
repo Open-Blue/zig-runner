@@ -1,6 +1,6 @@
 # One network stack in Rust (design)
 
-Status: R1 to R6 are built (R1 the build, skeleton and ABI smoke test; R2 Postgres TLS; R3 the HTTP client; R4 streaming; R5 the broker, run service and Gitea; R6 the live feed). The std client's removal is the last step, in its own pull request ("The WebSocket feed (R6, as built)").
+Status: R1 to R6 are built (R1 the build, skeleton and ABI smoke test; R2 Postgres TLS; R3 the HTTP client; R4 streaming; R5 the broker, run service and Gitea; R6 the live feed). The std client is removed ("The std client's removal", below): the runner has one network and TLS stack.
 Origin: the HTTP client study (`docs/http-client-study.md` on `perf/http-client-study`, 2026-11-13) and the user's decision
 to move all of the runner's HTTP, the live WebSocket feed and the database's TLS to Rust (hyper + rustls), so that the
 runner has **one network and TLS stack with real hooks and no shims**: no `net_hooks.zig` wrapper around `std.Io`, no
@@ -472,8 +472,17 @@ root policy as a request, and the same keepalive (60 s idle, 10 s apart, 3 probe
   50 feed connections held to a local server on the laptop, resident set after the first (which starts the runtime) and after 50: library `wss://` 63 KiB each (the first +3.9 MiB, the runtime's threads),
   `ws://` 39 KiB; std `ws://` 33 KiB (std's TLS could not be given the test CA, so its TLS figure is the 0.6 MiB measured before). tungstenite's default buffers (128 KiB each way) first made it 141-177 KiB; they are 16 KiB now.
   The test is `measure: resident memory per feed connection` (skipped unless `ZR_FEED_RSS` names a server).
-- **Left for the removal pull request:** `net_hooks.zig`, `http.zig`'s retired list, `renew` and `keepFresh`, `preloadCa`, `StdSocket` and the oracle harness (`net_oracle.zig`, `std_broker.zig`), main.zig's shared client. The std client's last other user
-  is `native/tarball.zig` (action tarballs), which that pull request must move first.
+
+## The std client's removal (as built)
+
+What R6 left, deleted in its own pull request once the feed's checks had shown parity (and after `native/tarball.zig`, the last other production user, moved to the library: action and repository tarballs stream through `net_client.open`, with the library's redirect privacy, one repeat on a new
+connection in place of std's `staleRetries`, and `fetch_retry` counting the library's error names as transport failures):
+
+- `net_hooks.zig` (the `std.Io` wrapper that timed lookups and connects), `request_log.zig`'s std `Probe`, `http.zig`'s shared client, `renew`, `keepFresh`, the retired list, `preloadCa` (#650's workaround for a Zig 0.17 `std.http.Client` data race in the TLS clock), `staleRetries`, `staleClock`, `fetch`;
+  what stays in `http.zig` is what has nothing to do with std's client: `request_deadline`, `within`/`withinClosing`, and `keepAlive` for the sockets Zig itself opens (the database's, the Dagger engine's).
+- main.zig's shared client; the oracle harness (`net_oracle.zig`, `std_broker.zig`, with the `bench:` tests that were in it); `feed.zig`'s `StdSocket` and its hand-written framing (RFC 6455 masking and lengths), whose oracle test became `the feed's frames on the wire`, which keeps the frames and the upgrade's headers it established as fixed expectations.
+- Proof that nothing in production uses std's HTTP client: `grep -rn 'std\.http\.Client' runner/src` finds nothing but the comment in `jitconfig.zig`'s, and the binary no longer links the code (it is only referenced from tests of the std types `std.http.Status`/`Method`/`Header`, which are plain enums and structs).
+- The R3 to R5 sections above describe the oracle as it was built; it is in git history (`net_oracle.zig`, the commit before this removal).
 
 ## Postgres TLS (R2, as built)
 
