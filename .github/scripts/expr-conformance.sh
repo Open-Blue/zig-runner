@@ -13,7 +13,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../../runner"
 
-LANGUAGESERVICES_REV=4043eda158e16579cc5fb1b0b07a4bce2a76f0b5
+LANGUAGESERVICES_REV=8e5973b4c9a14ebd526a44799823ac168dbcd291
 
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
