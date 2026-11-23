@@ -5,8 +5,9 @@
 Please report it privately, through GitHub's
 [private vulnerability reporting](https://github.com/Open-Blue/zig-runner/security/advisories/new)
 ("Report a vulnerability" on the Security tab), not in a public issue. Say what is affected, how
-to reproduce it, and what an attacker gains. Reports are read by the maintainer and answered on a
-best-effort basis; a fix is released as soon as it is ready, and the advisory published with it.
+to reproduce it, and what an attacker gains. The maintainer reads every report and responds
+within 14 days. After that, a fix is released as soon as it is ready, and the advisory published
+with it.
 
 ## What is in scope
 
