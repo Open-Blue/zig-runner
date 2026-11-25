@@ -107,7 +107,7 @@ jobs:
       # bundles LLVM's libFuzzer under NCSA (permissive, BSD-style, OSI approved); it is in
       # runner/rust/zr-net/fuzz/Cargo.lock only, builds the fuzz targets and never ships, so it is
       # allowed by name and another NCSA dependency is still flagged.
-      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+      - uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
         with:
           fail-on-severity: moderate
           allow-ghsas: GHSA-g3hv-75wg-m249

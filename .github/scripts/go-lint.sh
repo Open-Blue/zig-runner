@@ -17,7 +17,7 @@ cd "$(dirname "$0")/../../runner/tools"
 
 # Staticcheck's releases are named by year, its module versions by semver: v0.8.2 is 2026.2.2.
 staticcheck=honnef.co/go/tools/cmd/staticcheck@v0.8.2
-govulncheck=golang.org/x/vuln/cmd/govulncheck@v1.9.0
+govulncheck=golang.org/x/vuln/cmd/govulncheck@v1.10.0
 
 mode=${1:-lint}
 case $mode in
