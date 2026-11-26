@@ -204,8 +204,8 @@ const RuntimeSource = struct {
 /// literals are split over two lines with ++, the shape renovate.json reads).
 pub const runtimes: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
     .bun = .{
-        .image = "oven/bun:1.4.4" ++
-            "@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d",
+        .image = "oven/bun:1.4.5" ++
+            "@sha256:3aa040e5445efa09d75bb428a64ba50db13e2b3ac9b6b0c7f145615f62b2ee18",
         .binary = "/usr/local/bin/bun",
     },
     .node = .{
@@ -219,8 +219,8 @@ pub const runtimes: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
 /// C++ runtime from their image (mounted at `lib_dir`).
 pub const runtimes_musl: std.EnumArray(config.JsRuntime, RuntimeSource) = .init(.{
     .bun = .{
-        .image = "oven/bun:1.4.4-alpine" ++
-            "@sha256:4cf82f5686b196504fe119db3fcd9185b191f82ece82c40680e597228ec6070a",
+        .image = "oven/bun:1.4.5-alpine" ++
+            "@sha256:da816670775f4c2b4e990b6b1847cf5540dcdc721a42033dd331ce7a88ba6a3b",
         .binary = "/usr/local/bin/bun",
     },
     .node = .{
