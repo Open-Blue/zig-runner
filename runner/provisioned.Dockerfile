@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+# syntax=docker/dockerfile:1@sha256:572cebbc2b15e6f84c077742952674889cb63cd5e9b80abdffcbe587b6f19183
 # The default job image with the runner's packages installed: what the runner provisions every
 # new machine with (set_up.zig, `provision_script` and `provision_runner_script`), built once here
 # and pulled instead (runner/src/dagger/provisioned.zig). It holds no copy of that script: the
